@@ -83,6 +83,37 @@ const MAX_HUMAN_HELD_RECOVERY_ATTEMPT: u32 = 10;
 const ESCALATION_REVIEWER: &str = "dark-factory-escalation";
 const ESCALATION_SENTINEL_ATTEMPT: u32 = u32::MAX;
 
+/// Task 1 (reviewer-outage-resilience): N consecutive pending assessments
+/// before a provider is marked in-outage in the `vendor_health` ledger.
+const VENDOR_OUTAGE_CONSECUTIVE_PENDING_THRESHOLD: u32 = 3;
+
+/// Task 2 (reviewer-outage-resilience): grace period (seconds) measured from
+/// the PR head commit's committer epoch after which an in-outage provider's
+/// stale pending check-run status is waived so the verification step can
+/// proceed and report the true CI result. 15 minutes.
+const OUTAGE_GRACE_PERIOD_SECS: u64 = 900;
+
+/// Bead jleechan-msmq: an ATTESTED bead with `reroll_count > 0` is in the
+/// reroll pipeline. The OLD PR's gate verdict cannot advance the bead
+/// (the reroll branch IS the advancement); re-assessing it on every
+/// subsequent tick is pure churn that races with two breakers:
+///
+///   * the autonomy timebox — `autonomy_secs` keeps bumping, and once it
+///     crosses `autonomy_timebox_secs`, the timebox-park branch calls
+///     `kill_session_and_clear_handle`, killing the fresh coder lane
+///     that was just fabricated by the reroll before it has a chance to
+///     push a fix. Symptom: bead goes HumanHeld → recover-held → QUEUED,
+///     dispatched session dead, bead ping-pongs forever.
+///   * the circuit-breaker — same reviewer citing the same red gate on
+///     identical evidence trips on attempt 2 and parks HUMAN_HELD, even
+///     though the fresh lane was about to land a fix.
+///
+/// The fix: skip the per-tick gate assessment for ATTESTED beads whose
+/// `reroll_count > 0`. The reroll branch (which runs below this guard in
+/// `run_fast_tier`) is the ONLY consumer of the fresh lane's progress;
+/// the OLD PR's gates are not relevant once reroll has been initiated.
+/// Emitting `VERIFIER_SKIPPED_REROLL_IN_PROGRESS` lets an operator tell
+/// the skip from a transient snapshot error or a circuit-breaker trip.
 /// Result of looking up CI-pending state for an active overlay (used by the
 /// autonomy/timebox bookkeeping in `run_tick`'s active-overlay loop).
 ///
@@ -1613,6 +1644,43 @@ fn skeptic_evidence(
     // `er_runner::build_er_prompt` — makes the reviewer query the RIGHT repo
     // regardless of daemon cwd, instead of silently reviewing PR #{pr} in
     // whatever repo happened to be checked out.
+    //
+    // Task 3 (reviewer-outage-resilience): tell the skeptic reviewer which
+    // review providers are currently in outage so its completeness check can
+    // account for the missing signals (their gates have been waived). Only
+    // append the note when at least one vendor is in outage; the healthy path
+    // keeps the prompt byte-identical to before.
+    let outage_note = {
+        let mut waived: Vec<&str> = Vec::new();
+        if deps
+            .store
+            .vendor_health("coderabbit")
+            .ok()
+            .flatten()
+            .is_some_and(|h| h.in_outage)
+        {
+            waived.push("coderabbit");
+        }
+        if deps
+            .store
+            .vendor_health("bugbot")
+            .ok()
+            .flatten()
+            .is_some_and(|h| h.in_outage)
+        {
+            waived.push("bugbot");
+        }
+        if waived.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\nNote: the following review providers are currently in \
+                 outage and their gates have been waived: {}. Account for \
+                 this in your completeness check.",
+                waived.join(", ")
+            )
+        }
+    };
     let prompt = format!(
         "You are the Stage-1 Skeptic gate for an autonomous coding factory.\n\
          Review bead {bead_id}'s PR #{pr} in repo {repo} end-to-end (diff, \
@@ -1621,7 +1689,7 @@ fn skeptic_evidence(
            gh pr view {pr} --repo {repo} --json body,comments\n\
            gh pr checks {pr} --repo {repo}\n\
          Respond with exactly one line of the form:\n\
-         pass|warn <note>|fail <reason>",
+         pass|warn <note>|fail <reason>{outage_note}",
     );
 
     let coder_agent = std::env::var("DARK_FACTORY_CODER_DEFAULT")
@@ -2121,6 +2189,137 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 continue;
             }
         };
+        // Task 2 (reviewer-outage-resilience): outage-aware CI-pending
+        // override. When `ci_pending` is true ONLY because of stale pending
+        // check-runs from in-outage review-bot providers (and every real CI
+        // check has completed), waive those pending statuses after a 15-minute
+        // grace period (measured from the head commit's committer epoch) so
+        // the assessment can proceed and report the true CI result. All real
+        // CI failures still fail the assessment exactly as before — the
+        // override never waives a FAILED check, only a stale PENDING status.
+        if snapshot.ci_pending {
+            // Build the set of in-outage provider name-match patterns from
+            // the vendor_health ledger. "coderabbit" -> ["coderabbit"];
+            // "bugbot" -> ["bugbot", "cursor"] (matching the bugbot_status
+            // derivation in adapters.rs).
+            let mut outage_patterns: Vec<&str> = Vec::new();
+            let mut outage_vendors: Vec<&str> = Vec::new();
+            if deps
+                .store
+                .vendor_health("coderabbit")
+                .ok()
+                .flatten()
+                .is_some_and(|h| h.in_outage)
+            {
+                outage_patterns.push("coderabbit");
+                outage_vendors.push("coderabbit");
+            }
+            if deps
+                .store
+                .vendor_health("bugbot")
+                .ok()
+                .flatten()
+                .is_some_and(|h| h.in_outage)
+            {
+                outage_patterns.push("bugbot");
+                outage_patterns.push("cursor");
+                outage_vendors.push("bugbot");
+            }
+
+            // Partition pending check names: those matching an in-outage
+            // provider pattern (case-insensitive substring) vs. real CI.
+            let matches_outage = |name: &str| {
+                let lower = name.to_lowercase();
+                outage_patterns.iter().any(|p| lower.contains(p))
+            };
+            let waived: Vec<String> = snapshot
+                .pending_check_names
+                .iter()
+                .filter(|n| matches_outage(n))
+                .cloned()
+                .collect();
+            let real_pending: Vec<String> = snapshot
+                .pending_check_names
+                .iter()
+                .filter(|n| !matches_outage(n))
+                .cloned()
+                .collect();
+
+            // Only override when ALL pending check-runs belong to in-outage
+            // providers. Any real CI still pending => keep waiting.
+            if real_pending.is_empty() && !outage_patterns.is_empty() {
+                let now_epoch_ovr = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let elapsed = now_epoch_ovr.saturating_sub(snapshot.head_committed_epoch);
+                if elapsed >= OUTAGE_GRACE_PERIOD_SECS {
+                    // Recompute ci_success/ci_status from the full check-run
+                    // list, EXCLUDING in-outage provider checks. Real CI
+                    // failures remain failures; an all-outage-provider PR
+                    // (no remaining checks) is treated as green (waived).
+                    let remaining: Vec<&(String, String)> = snapshot
+                        .check_names_and_buckets
+                        .iter()
+                        .filter(|(name, _)| !matches_outage(name))
+                        .collect();
+                    let any_real_fail = remaining
+                        .iter()
+                        .any(|(_, b)| b == "fail" || b == "cancel");
+                    let any_real_pending = remaining
+                        .iter()
+                        .any(|(_, b)| b == "pending");
+                    let (ci_success, ci_status) = if remaining.is_empty() {
+                        (true, "green".to_string())
+                    } else if any_real_fail {
+                        (false, "red".to_string())
+                    } else if any_real_pending {
+                        // Should not happen (real_pending was empty), but
+                        // fail-closed: keep pending rather than false-green.
+                        (snapshot.ci_success, snapshot.ci_status.clone())
+                    } else {
+                        (true, "green".to_string())
+                    };
+                    snapshot.ci_pending = false;
+                    snapshot.ci_success = ci_success;
+                    snapshot.ci_status = ci_status;
+                    let _ = emit(
+                        deps.telemetry_log,
+                        bead_id,
+                        overlay.attempt,
+                        OverlayState::Attested.as_str(),
+                        "VERIFICATION_OUTAGE_GRACE_PERIOD",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "vendor": outage_vendors,
+                            "head_sha": snapshot.head_sha,
+                            "head_committed_epoch": snapshot.head_committed_epoch,
+                            "grace_period_secs": OUTAGE_GRACE_PERIOD_SECS,
+                            "pending_checks_waived": waived,
+                            "real_ci_result": if snapshot.ci_success { "green" } else { "red" },
+                        }),
+                    );
+                } else {
+                    // Grace period not yet elapsed — keep waiting.
+                    let _ = emit(
+                        deps.telemetry_log,
+                        bead_id,
+                        overlay.attempt,
+                        OverlayState::Attested.as_str(),
+                        "VERIFICATION_OUTAGE_GRACE_WAIT",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "vendor": outage_vendors,
+                            "head_sha": snapshot.head_sha,
+                            "head_committed_epoch": snapshot.head_committed_epoch,
+                            "elapsed_secs": elapsed,
+                            "grace_period_secs": OUTAGE_GRACE_PERIOD_SECS,
+                            "pending_checks_waived": waived,
+                        }),
+                    );
+                }
+            }
+        }
         if snapshot.ci_pending {
             emit(
                 deps.telemetry_log,
@@ -2158,6 +2357,89 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        // Task 1 (reviewer-outage-resilience): record vendor health
+        // observations for BOTH external review-bot providers from the
+        // fetched PrSnapshot, BEFORE verifier::assess. Outage marker if the
+        // provider's status is "unknown" (pending/unavailable); success if
+        // the provider approved / is clean. Emit VENDOR_WAIVED / VENDOR_RECOVERED
+        // telemetry ONLY on state transitions (0→1 for waived, 1→0 for recovered).
+        {
+            let vendors: [(&str, bool, bool); 2] = [
+                (
+                    "coderabbit",
+                    snapshot.coderabbit_status == "unknown",
+                    snapshot.coderabbit_approved,
+                ),
+                (
+                    "bugbot",
+                    snapshot.bugbot_status == "unknown",
+                    snapshot.bugbot_status == "green",
+                ),
+            ];
+            for (vendor, is_outage_marker, is_success) in vendors {
+                let prior = deps.store.vendor_health(vendor).ok().flatten();
+                let row = match deps.store.record_vendor_observation(
+                    vendor,
+                    is_outage_marker,
+                    is_success,
+                    &snapshot.head_sha,
+                    now_epoch,
+                    VENDOR_OUTAGE_CONSECUTIVE_PENDING_THRESHOLD,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = emit(
+                            deps.telemetry_log,
+                            bead_id,
+                            overlay.attempt,
+                            OverlayState::Attested.as_str(),
+                            "VENDOR_HEALTH_RECORD_ERROR",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "vendor": vendor,
+                                "error": format!("{e:?}"),
+                            }),
+                        );
+                        continue;
+                    }
+                };
+                let was_in_outage = prior.as_ref().is_some_and(|p| p.in_outage);
+                if row.in_outage && !was_in_outage {
+                    let _ = emit(
+                        deps.telemetry_log,
+                        bead_id,
+                        overlay.attempt,
+                        OverlayState::Attested.as_str(),
+                        "VENDOR_WAIVED",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "vendor": vendor,
+                            "consecutive_pending": row.consecutive_pending,
+                            "head_sha": snapshot.head_sha,
+                            "reason": format!(
+                                "provider marked in-outage after {} consecutive pending assessments",
+                                row.consecutive_pending
+                            ),
+                        }),
+                    );
+                } else if !row.in_outage && was_in_outage {
+                    let _ = emit(
+                        deps.telemetry_log,
+                        bead_id,
+                        overlay.attempt,
+                        OverlayState::Attested.as_str(),
+                        "VENDOR_RECOVERED",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "vendor": vendor,
+                            "last_success_head": row.last_success_head.clone().unwrap_or_default(),
+                            "outage_observations": row.outage_observations,
+                            "success_observations": row.success_observations,
+                        }),
+                    );
+                }
+            }
+        }
         let runner_outcome = match crate::er_runner::maybe_run(deps, bead_id, pr, now_epoch) {
             Ok(out) => out,
             Err(e) => {
@@ -2281,8 +2563,42 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         // `verifier::assess`'s own serialization, so this can't drift from
         // what was actually computed, and `evidence.skeptic_reviewers`
         // names the vendor(s) that produced this tick's skeptic verdict.
-        let mut gate_assessment_context = report.to_json();
+        //
+        // Task 3 (reviewer-outage-resilience): annotate in-outage provider
+        // gates with the canonical "waived_vendor_unavailable" token. Build
+        // the in-outage vendor list from the `vendor_health` ledger for both
+        // review providers, then pass it to `to_json_with_outage` so the
+        // provider's OWN gate key (coderabbit / bugbot) carries the waiver
+        // token instead of its real verdict. All other gates keep their real
+        // verdict and remain fully enforced/blocking.
+        let mut in_outage_vendors: Vec<&str> = Vec::new();
+        if deps
+            .store
+            .vendor_health("coderabbit")
+            .ok()
+            .flatten()
+            .is_some_and(|h| h.in_outage)
+        {
+            in_outage_vendors.push("coderabbit");
+        }
+        if deps
+            .store
+            .vendor_health("bugbot")
+            .ok()
+            .flatten()
+            .is_some_and(|h| h.in_outage)
+        {
+            in_outage_vendors.push("bugbot");
+        }
+        let mut gate_assessment_context = report.to_json_with_outage(&in_outage_vendors);
         if let Some(obj) = gate_assessment_context.as_object_mut() {
+            // Task 3: surface the list of vendors whose gates were waived so
+            // the merge authority and operators can see which gates carried
+            // "waived_vendor_unavailable" without re-deriving it.
+            obj.insert(
+                "waived_vendors".to_string(),
+                serde_json::json!(in_outage_vendors),
+            );
             obj.insert(
                 "skeptic_reviewers".to_string(),
                 serde_json::json!(evidence.skeptic_reviewers),

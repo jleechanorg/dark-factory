@@ -33,6 +33,21 @@ pub enum GateName {
 }
 
 impl GateName {
+    /// Task 3 (reviewer-outage-resilience): map a gate to the review-provider
+    /// vendor whose outage would waive it. `CodeRabbitApproved` → "coderabbit",
+    /// `BugbotClean` → "bugbot"; every other gate returns `None` and is NEVER
+    /// waived — skeptic, evidence, CI, comments_resolved, and vacuous_red_green
+    /// remain fully enforced and blocking even during a provider outage. This
+    /// is the single source of truth for the outage-annotation mapping so the
+    /// `to_json_with_outage` emitter and any future consumers cannot drift.
+    pub fn vendor_for_gate(&self) -> Option<&'static str> {
+        match self {
+            GateName::CodeRabbitApproved => Some("coderabbit"),
+            GateName::BugbotClean => Some("bugbot"),
+            _ => None,
+        }
+    }
+
     /// Canonical snake_case JSON key for this gate (jleechan-wzgl:
     /// GATE_ASSESSMENT serializes the full per-gate report). This is NOT a
     /// free choice — it MUST match three other already-checked-in
@@ -114,18 +129,44 @@ impl GateReport {
     /// a one-element `evidence` list) — both shapes are accepted by
     /// `factory-overlay.sh`'s `normalize()`.
     pub fn to_json(&self) -> serde_json::Value {
+        self.to_json_with_outage(&[])
+    }
+
+    /// Task 3 (reviewer-outage-resilience): serialize the per-gate breakdown,
+    /// waiving in-outage provider gates. For each gate whose
+    /// `GateName::vendor_for_gate()` returns `Some(v)` and `v` is in
+    /// `in_outage_vendors`, the gate's verdict is replaced with the canonical
+    /// string `"waived_vendor_unavailable"` instead of the normal
+    /// "pass"/"fail"/"unknown" verdict. This token round-trips the gate-key
+    /// JSON schema both shell merge authorities (`auto-merge-guard.sh` and
+    /// `factory-overlay.sh`) read: it is neither "fail" nor "unknown", so it
+    /// neither blocks nor defers the merge, and it is explicitly accepted by
+    /// both scripts' ALIAS/VALID sets.
+    ///
+    /// Only the in-outage provider's OWN gate key is waived — every other gate
+    /// (skeptic, evidence, CI, comments_resolved, vacuous_red_green) keeps its
+    /// real verdict and remains fully enforced and blocking. `all_green` is
+    /// NOT recomputed here (it still reflects `assess`'s strict verdict); the
+    /// merge authorities read the per-gate `waived_vendor_unavailable` token
+    /// to decide non-blocking, so the aggregate flag is informational only.
+    pub fn to_json_with_outage(&self, in_outage_vendors: &[&str]) -> serde_json::Value {
         let mut gates = serde_json::Map::new();
         for (name, result) in &self.results {
-            let value = match result {
-                GateResult::Green => serde_json::Value::String("pass".to_string()),
-                GateResult::Red(reason) => serde_json::json!({
-                    "verdict": "fail",
-                    "evidence": [reason],
-                }),
-                GateResult::Unknown(reason) => serde_json::json!({
-                    "verdict": "unknown",
-                    "evidence": [reason],
-                }),
+            let value = match name.vendor_for_gate() {
+                Some(v) if in_outage_vendors.contains(&v) => {
+                    serde_json::Value::String("waived_vendor_unavailable".to_string())
+                }
+                _ => match result {
+                    GateResult::Green => serde_json::Value::String("pass".to_string()),
+                    GateResult::Red(reason) => serde_json::json!({
+                        "verdict": "fail",
+                        "evidence": [reason],
+                    }),
+                    GateResult::Unknown(reason) => serde_json::json!({
+                        "verdict": "unknown",
+                        "evidence": [reason],
+                    }),
+                },
             };
             gates.insert(name.as_str().to_string(), value);
         }
@@ -757,8 +798,11 @@ mod tests {
             updated_at_epoch: 0,
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
+            bugbot_status: "green".to_string(),
             ci_pending: false,
             head_committed_epoch: 0,
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![],
         }
     }
 
@@ -780,8 +824,11 @@ mod tests {
             updated_at_epoch: 0,
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
+            bugbot_status: "green".to_string(),
             ci_pending: false,
             head_committed_epoch: 0,
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![],
         }
     }
 
@@ -1341,6 +1388,96 @@ mod tests {
 
         let msg = "fail\nMore context.\nVerdict: PASS\nFooter mentions fail again.\n";
         assert_eq!(parse_skeptic_verdict(msg), Some(SkepticVerdict::Pass));
+    }
+
+    // --- Task 3 (reviewer-outage-resilience): outage annotation in gate results
+    //
+    // When a review provider is in-outage, its gate key in GATE_ASSESSMENT
+    // telemetry carries the canonical "waived_vendor_unavailable" token
+    // instead of the normal verdict. Only the provider's OWN gate is waived;
+    // every other gate keeps its real verdict and remains fully enforced.
+
+    #[test]
+    fn to_json_with_outage_waives_bugbot_gate_only() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
+
+        let json = report.to_json_with_outage(&["bugbot"]);
+        let gates = json.get("gates").unwrap().as_object().unwrap();
+        assert_eq!(
+            gates.get("bugbot").unwrap().as_str().unwrap(),
+            "waived_vendor_unavailable"
+        );
+        assert_eq!(gates.get("coderabbit").unwrap().as_str().unwrap(), "pass");
+    }
+
+    #[test]
+    fn to_json_with_outage_waives_both_providers() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
+
+        let json = report.to_json_with_outage(&["coderabbit", "bugbot"]);
+        let gates = json.get("gates").unwrap().as_object().unwrap();
+        assert_eq!(
+            gates.get("coderabbit").unwrap().as_str().unwrap(),
+            "waived_vendor_unavailable"
+        );
+        assert_eq!(
+            gates.get("bugbot").unwrap().as_str().unwrap(),
+            "waived_vendor_unavailable"
+        );
+        // Non-provider gates still pass.
+        assert_eq!(gates.get("ci_green").unwrap().as_str().unwrap(), "pass");
+        assert_eq!(gates.get("skeptic").unwrap().as_str().unwrap(), "pass");
+    }
+
+    #[test]
+    fn to_json_with_outage_empty_unchanged_from_to_json() {
+        // Empty outage list must produce identical output to to_json() so the
+        // healthy path is byte-identical to before Task 3.
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
+
+        assert_eq!(report.to_json(), report.to_json_with_outage(&[]));
+    }
+
+    #[test]
+    fn to_json_with_outage_preserves_red_and_unknown_for_other_gates() {
+        // A Red evidence gate + Unknown comments gate must stay Red/Unknown
+        // even when a provider is waived — the waiver covers ONLY the
+        // provider's own gate key.
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, snapshot_with_unknown_thread_count(7));
+        let cfg = test_cfg();
+        let evidence = PrEvidence {
+            is_production: true,
+            non_test_changed_loc: 150,
+            er_verdict: ErVerdict::Fail,
+            skeptic_verdict: Some(SkepticVerdict::Pass),
+            ..Default::default()
+        };
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
+        assert!(!report.all_green);
+
+        let json = report.to_json_with_outage(&["coderabbit"]);
+        let gates = json.get("gates").unwrap().as_object().unwrap();
+        // coderabbit waived.
+        assert_eq!(
+            gates.get("coderabbit").unwrap().as_str().unwrap(),
+            "waived_vendor_unavailable"
+        );
+        // evidence_review stays Red (object form).
+        let ev = gates.get("evidence_review").unwrap().as_object().unwrap();
+        assert_eq!(ev.get("verdict").unwrap().as_str().unwrap(), "fail");
+        // comments_resolved stays Unknown (object form).
+        let cr = gates.get("comments_resolved").unwrap().as_object().unwrap();
+        assert_eq!(cr.get("verdict").unwrap().as_str().unwrap(), "unknown");
     }
 
     #[test]

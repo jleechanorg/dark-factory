@@ -150,6 +150,10 @@ fn one_full_tick_cycle_keeps_unknown_only_gate_attested() {
             coderabbit_status: "green".to_string(),
             ci_pending: false,
             head_committed_epoch: 0,
+            bugbot_status: "unknown".to_string(),
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![]
+        
         },
     );
     // The router call already happened in tick 1; re-script the same `FakeLlm`
@@ -1056,6 +1060,10 @@ fn test_wedge_detection_attested_session_stalled() {
             coderabbit_status: "green".to_string(),
             ci_pending: false,
             head_committed_epoch: 0,
+            bugbot_status: "unknown".to_string(),
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![]
+        
         },
     );
 
@@ -1153,6 +1161,10 @@ fn test_wedge_detection_attested_session_not_stalled_if_remote_ahead() {
             coderabbit_status: "green".to_string(),
             ci_pending: false,
             head_committed_epoch: 0,
+            bugbot_status: "unknown".to_string(),
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![]
+        
         },
     );
 
@@ -1267,6 +1279,10 @@ fn test_wedge_detection_still_parks_when_local_matches_remote() {
             files: vec![],
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
+            bugbot_status: "unknown".to_string(),
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![]
+        
         },
     );
 
@@ -1362,6 +1378,10 @@ fn test_wedge_detection_still_parks_when_local_is_ahead_of_remote() {
             files: vec![],
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
+            bugbot_status: "unknown".to_string(),
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![]
+        
         },
     );
 
@@ -1473,6 +1493,10 @@ fn test_wedge_detection_still_parks_when_branches_have_diverged() {
             files: vec![],
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
+            bugbot_status: "unknown".to_string(),
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![]
+        
         },
     );
 
@@ -2567,6 +2591,10 @@ fn drive_existing_pr_pending_ci_does_not_reach_ready() {
             coderabbit_status: "approved".into(),
             ci_pending: true,
             head_committed_epoch: 0,
+            bugbot_status: "unknown".to_string(),
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![]
+        
         },
     );
 
@@ -2659,6 +2687,10 @@ fn drive_existing_pr_failed_ci_parks_human_held() {
             coderabbit_status: "approved".into(),
             ci_pending: false,
             head_committed_epoch: 0,
+            bugbot_status: "unknown".to_string(),
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![]
+        
         },
     );
 
@@ -3462,6 +3494,10 @@ fn er_runner_capped_unknown_only_gate_report_escalates_and_parks_at_recovery_cap
             coderabbit_status: "green".into(),
             ci_pending: false,
             head_committed_epoch: 0,
+            bugbot_status: "unknown".to_string(),
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![]
+        
         },
     );
 
@@ -3718,6 +3754,10 @@ fn attested_ci_pending_does_not_bump_autonomy_secs() {
             coderabbit_status: "approved".into(),
             ci_pending: true,
             head_committed_epoch: 0,
+            bugbot_status: "unknown".to_string(),
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![]
+        
         },
     );
     store
@@ -3820,6 +3860,10 @@ fn attested_ci_pending_does_not_timebox_park() {
             coderabbit_status: "approved".into(),
             ci_pending: true,
             head_committed_epoch: 0,
+            bugbot_status: "unknown".to_string(),
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![]
+        
         },
     );
     store
@@ -4021,6 +4065,10 @@ fn attested_ci_not_pending_does_bump_autonomy_secs() {
             coderabbit_status: "approved".into(),
             ci_pending: false,
             head_committed_epoch: 0,
+            bugbot_status: "unknown".to_string(),
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![]
+        
         },
     );
     store
@@ -4137,6 +4185,10 @@ fn qdw_per_bead_isolation_snapshot_failure_does_not_abort_fast_tier() {
             coderabbit_status: "green".into(),
             ci_pending: false,
             head_committed_epoch: 0,
+            bugbot_status: "unknown".to_string(),
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![]
+        
         },
     );
     // PR 101 deliberately has no scripted entry — `pr_snapshot(101)`
@@ -4313,6 +4365,10 @@ fn qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead() {
             coderabbit_status: "green".into(),
             ci_pending: false,
             head_committed_epoch: 0,
+            bugbot_status: "unknown".to_string(),
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![]
+        
         },
     );
 
@@ -4678,6 +4734,10 @@ fn qdw_green_snapshot(pr: u64, comments: Vec<PrComment>) -> PrSnapshot {
         coderabbit_status: "green".into(),
         ci_pending: false,
         head_committed_epoch: 0,
+            bugbot_status: "unknown".to_string(),
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![]
+        
     }
 }
 
@@ -5248,6 +5308,10 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
             coderabbit_status: "green".into(),
             ci_pending: false,
             head_committed_epoch: 0,
+            bugbot_status: "unknown".to_string(),
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![]
+        
         },
     );
 
@@ -5439,6 +5503,10 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
             coderabbit_status: "green".into(),
             ci_pending: false,
             head_committed_epoch: 0,
+            bugbot_status: "unknown".to_string(),
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![]
+        
         },
     );
 
@@ -5627,6 +5695,10 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
             coderabbit_status: "green".into(),
             ci_pending: false,
             head_committed_epoch: 0,
+            bugbot_status: "unknown".to_string(),
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![]
+        
         },
     );
 
@@ -5790,6 +5862,10 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
             coderabbit_status: "green".into(),
             ci_pending: false,
             head_committed_epoch: 0,
+            bugbot_status: "unknown".to_string(),
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![]
+        
         },
     );
 
@@ -6253,6 +6329,10 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
             coderabbit_status: "green".into(),
             ci_pending: false,
             head_committed_epoch: 0,
+            bugbot_status: "unknown".to_string(),
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![]
+        
         },
     );
 

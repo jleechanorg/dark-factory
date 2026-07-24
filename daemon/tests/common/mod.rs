@@ -8,7 +8,10 @@
 #![allow(dead_code)]
 
 use daemon::errors::DaemonError;
-use daemon::state::{BeadOverlay, OverlayState, StateStore};
+use daemon::state::{
+    BeadOverlay,
+    OverlayState, StateStore, VendorHealth,
+};
 use daemon::tools::{
     Bead, Issue, LabeledPr, Llm, Permission, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec,
     Tracker, Vcs,
@@ -638,6 +641,30 @@ pub struct FakeStateStore {
     pub branch_beads: RefCell<HashMap<String, String>>,
     pub rejections: RefCell<HashMap<(String, u32), RejectionRecord>>,
     pub fail_save_for_state: RefCell<Vec<(String, OverlayState)>>,
+    /// Bead jleechan-zeij / issue #322 r2: consecutive re-roll deferral count
+    /// per bead. Persisted independently of `BeadOverlay` (mirrors the real
+    /// `reroll_deferral_count` SQLite column), so the fail-closed defer/cap
+    /// path can be driven across repeated `reroll::execute` calls in a test.
+    pub reroll_deferrals: RefCell<HashMap<String, u32>>,
+    /// Bead jleechan-zaga / issue #348 r3: per-bead held-recheck cooldown
+    /// epoch (mirrors the `held_recheck_after` SQLite column), stored
+    /// independently of `BeadOverlay`.
+    pub held_recheck_after: RefCell<HashMap<String, u64>>,
+    /// Bead jleechan-yoqy / issue #323: per-bead last-/er evidence-marker hash
+    /// (mirrors the `last_er_evidence_hash` column), for the retrigger tests.
+    pub last_er_evidence_hash: RefCell<HashMap<String, String>>,
+    /// 1s2q-escalation-dedup: per-(bead_id, reason) escalation ledger rows
+    /// (mirrors the `escalation_ledger` SQLite table). Each entry is
+    /// `(context_hash, last_emitted_epoch, terminal)`. Used by the fake's
+    /// `escalation_should_emit`/`record_escalation_emit`/
+    /// `mark_escalation_undeliverable` impls so tick-integration tests can
+    /// exercise the dedup + terminal-marking paths without a real SQLite DB.
+    pub escalation_ledger:
+        RefCell<HashMap<(String, String), EscalationLedgerEntry>>,
+    /// Task 1 (reviewer-outage-resilience): per-vendor health rows mirroring
+    /// the `vendor_health` SQLite table, so tick-integration tests can exercise
+    /// the outage/recovery transition paths without a real SQLite DB.
+    pub vendor_health: RefCell<HashMap<String, VendorHealth>>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -853,4 +880,132 @@ impl StateStore for FakeStateStore {
             .get(&(bead_id.to_string(), attempt))
             .map(|(_, _, feedback_text)| feedback_text.clone()))
     }
+
+    fn escalation_should_emit(
+        &self,
+        bead_id: &str,
+        reason: &str,
+        context_hash: &str,
+        now_epoch: u64,
+        refire_secs: u64,
+    ) -> Result<bool, DaemonError> {
+        self.calls.borrow_mut().push(format!(
+            "escalation_should_emit({bead_id},{reason})"
+        ));
+        match self
+            .escalation_ledger
+            .borrow()
+            .get(&(bead_id.to_string(), reason.to_string()))
+        {
+            None => Ok(true),
+            Some(entry) => {
+                if entry.terminal {
+                    return Ok(false);
+                }
+                if entry.context_hash != context_hash {
+                    return Ok(true);
+                }
+                Ok(now_epoch.saturating_sub(entry.last_emitted_epoch) >= refire_secs)
+            }
+        }
+    }
+
+    fn record_escalation_emit(
+        &self,
+        bead_id: &str,
+        reason: &str,
+        context_hash: &str,
+        now_epoch: u64,
+    ) -> Result<(), DaemonError> {
+        self.calls.borrow_mut().push(format!(
+            "record_escalation_emit({bead_id},{reason})"
+        ));
+        let mut ledger = self.escalation_ledger.borrow_mut();
+        let entry = ledger
+            .entry((bead_id.to_string(), reason.to_string()))
+            .or_default();
+        entry.context_hash = context_hash.to_string();
+        entry.last_emitted_epoch = now_epoch;
+        // record_escalation_emit never flips terminal on (only
+        // mark_escalation_undeliverable does), but it must not clear an
+        // already-terminal flag either.
+        Ok(())
+    }
+
+    fn mark_escalation_undeliverable(
+        &self,
+        bead_id: &str,
+        reason: &str,
+    ) -> Result<(), DaemonError> {
+        self.calls.borrow_mut().push(format!(
+            "mark_escalation_undeliverable({bead_id},{reason})"
+        ));
+        let mut ledger = self.escalation_ledger.borrow_mut();
+        let entry = ledger
+            .entry((bead_id.to_string(), reason.to_string()))
+            .or_default();
+        entry.terminal = true;
+        Ok(())
+    }
+
+    fn vendor_health(&self, vendor: &str) -> Result<Option<VendorHealth>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("vendor_health({vendor})"));
+        Ok(self.vendor_health.borrow().get(vendor).cloned())
+    }
+
+    fn record_vendor_observation(
+        &self,
+        vendor: &str,
+        is_outage_marker: bool,
+        is_success: bool,
+        head_sha: &str,
+        now_epoch: u64,
+        consecutive_pending_threshold: u32,
+    ) -> Result<VendorHealth, DaemonError> {
+        self.calls.borrow_mut().push(format!(
+            "record_vendor_observation({vendor},{is_outage_marker},{is_success})"
+        ));
+        let mut map = self.vendor_health.borrow_mut();
+        let row = map
+            .entry(vendor.to_string())
+            .or_insert(VendorHealth {
+                vendor: vendor.to_string(),
+                in_outage: false,
+                consecutive_pending: 0,
+                outage_observations: 0,
+                success_observations: 0,
+                last_success_head: None,
+                last_outage_epoch: None,
+                last_observed_head: None,
+                last_observed_epoch: None,
+            });
+        row.last_observed_head = Some(head_sha.to_string());
+        row.last_observed_epoch = Some(now_epoch);
+        if is_success {
+            row.success_observations += 1;
+            row.consecutive_pending = 0;
+            row.last_success_head = Some(head_sha.to_string());
+            if row.in_outage {
+                row.in_outage = false;
+            }
+        } else if is_outage_marker {
+            row.outage_observations += 1;
+            row.consecutive_pending += 1;
+            if row.consecutive_pending >= consecutive_pending_threshold && !row.in_outage {
+                row.in_outage = true;
+                row.last_outage_epoch = Some(now_epoch);
+            }
+        }
+        Ok(row.clone())
+    }
+}
+
+// jsby vendor_health test stub.
+#[derive(Clone, Debug, Default)]
+pub struct EscalationLedgerEntry {
+    pub context_hash: String,
+    pub last_emitted_epoch: u64,
+    pub terminal: bool,
 }

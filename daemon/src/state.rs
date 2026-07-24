@@ -156,6 +156,33 @@ impl BeadOverlay {
     }
 }
 
+/// Task 1 (reviewer-outage-resilience): one row of the `vendor_health`
+/// ledger, tracking whether each external review-bot provider ("coderabbit"
+/// or "bugbot") is currently in-outage or recovered, with strict semantics
+/// and a full audit trail. Populated from the production assessment path in
+/// `tick::run_fast_tier` via `StateStore::record_vendor_observation`; read
+/// by the verification step's outage-aware CI-pending logic.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VendorHealth {
+    pub vendor: String,
+    /// 1 = currently in outage, 0 = healthy
+    pub in_outage: bool,
+    /// consecutive assessments where status was "unknown"/pending
+    pub consecutive_pending: u32,
+    /// total outage marker observations (audit trail)
+    pub outage_observations: u32,
+    /// total success observations (audit trail)
+    pub success_observations: u32,
+    /// PR head SHA of the last successful review/status
+    pub last_success_head: Option<String>,
+    /// unix epoch when in_outage was first set to 1
+    pub last_outage_epoch: Option<u64>,
+    /// PR head SHA at the last observation
+    pub last_observed_head: Option<String>,
+    /// unix epoch of the last observation
+    pub last_observed_epoch: Option<u64>,
+}
+
 pub trait StateStore {
     fn load(&self, bead_id: &str) -> Result<Option<BeadOverlay>, DaemonError>;
     fn save(&self, overlay: &BeadOverlay) -> Result<(), DaemonError>;
@@ -243,6 +270,93 @@ pub trait StateStore {
     fn reconcile_dispatching(&self) -> Result<(), DaemonError> {
         Ok(())
     }
+    /// Escalation dedup query (1s2q-escalation-dedup): returns `true` if an
+    /// ESCALATION_REQUIRED / ESCALATION_NOTIFICATION_FAILED event should be
+    /// emitted for `(bead_id, reason)` at `now_epoch` — i.e. no prior record
+    /// exists, the context hash changed, or the last emit is older than
+    /// `refire_secs`. Returns `false` (suppress) when the same context was
+    /// emitted within the backoff window. Default `Ok(true)` so fakes that
+    /// don't persist the ledger never suppress (preserve prior behavior).
+    fn escalation_should_emit(
+        &self,
+        _bead_id: &str,
+        _reason: &str,
+        _context_hash: &str,
+        _now_epoch: u64,
+        _refire_secs: u64,
+    ) -> Result<bool, DaemonError> {
+        Ok(true)
+    }
+    /// Record that an escalation event was just emitted for
+    /// `(bead_id, reason)` with `context_hash` at `now_epoch` (upsert the
+    /// ledger row). Default no-op for fakes that don't persist the ledger.
+    fn record_escalation_emit(
+        &self,
+        _bead_id: &str,
+        _reason: &str,
+        _context_hash: &str,
+        _now_epoch: u64,
+    ) -> Result<(), DaemonError> {
+        Ok(())
+    }
+    /// 1s2q-escalation-dedup Task 2: mark the `(bead_id, reason)` escalation
+    /// ledger row as terminal ("escalation_undeliverable") so
+    /// `escalation_should_emit` returns `Ok(false)` for it on every future
+    /// tick, regardless of context hash or backoff window. Used when the
+    /// notification failure was caused by a PERMANENT (non-transient per
+    /// `DaemonError::is_transient`) gh error that will never resolve (e.g.
+    /// `invalid issue format: "local-xxx"`). Upserts the ledger row with
+    /// `terminal = 1` (inserts a fresh terminal row if none existed, or flips
+    /// an existing row to terminal). Default no-op for fakes that don't
+    /// persist the ledger.
+    fn mark_escalation_undeliverable(
+        &self,
+        _bead_id: &str,
+        _reason: &str,
+    ) -> Result<(), DaemonError> {
+        Ok(())
+    }
+    /// Read the vendor_health row for `vendor`. Returns None if no row exists
+    /// (vendor has never been observed). Used by the production assessment path
+    /// and by the verification step's outage-aware CI-pending logic.
+    fn vendor_health(&self, _vendor: &str) -> Result<Option<VendorHealth>, DaemonError> {
+        Ok(None)
+    }
+    /// Record a vendor health observation and return the resulting VendorHealth
+    /// row (so the caller can emit telemetry with the new state). The
+    /// implementation applies the outage/recovery semantics described in the
+    /// plan:
+    /// - If the observation is an outage marker (status pending/unknown):
+    ///   increment consecutive_pending and outage_observations. If
+    ///   consecutive_pending >= N, set in_outage=1 and last_outage_epoch (if
+    ///   not already set).
+    /// - If the observation is a success (approved/clean) for the PR's current
+    ///   head: record it as a success_observation (NEVER as an outage
+    ///   observation), set consecutive_pending=0, last_success_head=head. If
+    ///   in_outage was 1, flip to 0 (recovered) and return the row so the
+    ///   caller can emit VENDOR_RECOVERED.
+    /// - The absence of errors alone must NEVER flip in_outage to 0.
+    fn record_vendor_observation(
+        &self,
+        _vendor: &str,
+        _is_outage_marker: bool,
+        _is_success: bool,
+        _head_sha: &str,
+        _now_epoch: u64,
+        _consecutive_pending_threshold: u32,
+    ) -> Result<VendorHealth, DaemonError> {
+        Ok(VendorHealth {
+            vendor: _vendor.to_string(),
+            in_outage: false,
+            consecutive_pending: 0,
+            outage_observations: 0,
+            success_observations: 0,
+            last_success_head: None,
+            last_outage_epoch: None,
+            last_observed_head: None,
+            last_observed_epoch: None,
+        })
+    }
 }
 
 /// `StateStore` impl against `~/.dark-factory/daemon-cxdb.sqlite` (WAL mode,
@@ -302,6 +416,13 @@ impl SqliteStateStore {
         Self::ensure_pre_session_head_sha_column(&conn)?;
         Self::ensure_park_reason_column(&conn)?;
         Self::ensure_target_repo_column(&conn)?;
+        Self::ensure_reroll_deferral_count_column(&conn)?;
+        Self::ensure_held_recheck_after_column(&conn)?;
+        Self::ensure_last_er_evidence_hash_column(&conn)?;
+        Self::ensure_disposition_required_state(&conn)?;
+        Self::ensure_escalation_ledger_table(&conn)?;
+        Self::ensure_escalation_ledger_terminal_column(&conn)?;
+        Self::ensure_vendor_health_table(&conn)?;
         Ok(Self { conn })
     }
 
@@ -318,6 +439,13 @@ impl SqliteStateStore {
         Self::ensure_pre_session_head_sha_column(&conn)?;
         Self::ensure_park_reason_column(&conn)?;
         Self::ensure_target_repo_column(&conn)?;
+        Self::ensure_reroll_deferral_count_column(&conn)?;
+        Self::ensure_held_recheck_after_column(&conn)?;
+        Self::ensure_last_er_evidence_hash_column(&conn)?;
+        Self::ensure_disposition_required_state(&conn)?;
+        Self::ensure_escalation_ledger_table(&conn)?;
+        Self::ensure_escalation_ledger_terminal_column(&conn)?;
+        Self::ensure_vendor_health_table(&conn)?;
         Ok(Self { conn })
     }
 
@@ -333,7 +461,7 @@ impl SqliteStateStore {
                 "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
                  WHERE name = 'attempt_er_runner_count'",
                 [],
-                |row| row.get(0),
+                |row: &rusqlite::Row| row.get(0),
             )
             .map_err(|e| tool_err("ensure_er_runner_columns: pragma count", e))?;
         if !has_count {
@@ -349,7 +477,7 @@ impl SqliteStateStore {
                 "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
                  WHERE name = 'last_er_runner_attempt_at'",
                 [],
-                |row| row.get(0),
+                |row: &rusqlite::Row| row.get(0),
             )
             .map_err(|e| tool_err("ensure_er_runner_columns: pragma last", e))?;
         if !has_last {
@@ -375,7 +503,7 @@ impl SqliteStateStore {
                 "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
                  WHERE name = 'is_adopted'",
                 [],
-                |row| row.get(0),
+                |row: &rusqlite::Row| row.get(0),
             )
             .map_err(|e| tool_err("ensure_is_adopted_column: pragma", e))?;
         if !has_is_adopted {
@@ -399,7 +527,7 @@ impl SqliteStateStore {
                 "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
                  WHERE name = 'spawn_failure_count'",
                 [],
-                |row| row.get(0),
+                |row: &rusqlite::Row| row.get(0),
             )
             .map_err(|e| tool_err("ensure_spawn_failure_count_column: pragma", e))?;
         if !has_spawn_failure_count {
@@ -423,7 +551,7 @@ impl SqliteStateStore {
                 "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
                  WHERE name = 'pre_session_head_sha'",
                 [],
-                |row| row.get(0),
+                |row: &rusqlite::Row| row.get(0),
             )
             .map_err(|e| tool_err("ensure_pre_session_head_sha_column: pragma", e))?;
         if !has_col {
@@ -447,7 +575,7 @@ impl SqliteStateStore {
                 "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
                  WHERE name = 'park_reason'",
                 [],
-                |row| row.get(0),
+                |row: &rusqlite::Row| row.get(0),
             )
             .map_err(|e| tool_err("ensure_park_reason_column: pragma", e))?;
         if !has_col {
@@ -470,12 +598,327 @@ impl SqliteStateStore {
                 "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
                  WHERE name = 'target_repo'",
                 [],
-                |row| row.get(0),
+                |row: &rusqlite::Row| row.get(0),
             )
             .map_err(|e| tool_err("ensure_target_repo_column: pragma", e))?;
         if !has_col {
             conn.execute("ALTER TABLE bead_overlay ADD COLUMN target_repo TEXT", [])
                 .map_err(|e| tool_err("ensure_target_repo_column: add column", e))?;
+        }
+        Ok(())
+    }
+
+    /// Idempotent migration for the `reroll_deferral_count` column (bead
+    /// jleechan-zeij / issue #322 r2). Same probe-then-`ALTER` pattern as
+    /// `ensure_target_repo_column`. The consecutive-defer counter the
+    /// fail-closed re-roll proceed predicate uses; every pre-existing row
+    /// correctly defaults to `0` ("never deferred").
+    fn ensure_reroll_deferral_count_column(conn: &Connection) -> Result<(), DaemonError> {
+        let has_col: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
+                 WHERE name = 'reroll_deferral_count'",
+                [],
+                |row: &rusqlite::Row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_reroll_deferral_count_column: pragma", e))?;
+        if !has_col {
+            conn.execute(
+                "ALTER TABLE bead_overlay ADD COLUMN reroll_deferral_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| tool_err("ensure_reroll_deferral_count_column: add column", e))?;
+        }
+        Ok(())
+    }
+
+    /// Idempotent migration for the `held_recheck_after` column (bead
+    /// jleechan-zaga / issue #348 r3). Same probe-then-`ALTER` pattern as
+    /// `ensure_reroll_deferral_count_column`. Nullable (NULL = "re-assess
+    /// now"). MUST run before `ensure_disposition_required_state` so the
+    /// table's column set is complete before the CHECK rebuild.
+    fn ensure_held_recheck_after_column(conn: &Connection) -> Result<(), DaemonError> {
+        let has_col: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
+                 WHERE name = 'held_recheck_after'",
+                [],
+                |row: &rusqlite::Row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_held_recheck_after_column: pragma", e))?;
+        if !has_col {
+            conn.execute(
+                "ALTER TABLE bead_overlay ADD COLUMN held_recheck_after INTEGER",
+                [],
+            )
+            .map_err(|e| tool_err("ensure_held_recheck_after_column: add column", e))?;
+        }
+        Ok(())
+    }
+
+    /// Idempotent migration for the `last_er_evidence_hash` column (bead
+    /// jleechan-yoqy / issue #323). Same probe-then-`ALTER` pattern. Nullable
+    /// (NULL = "no /er run recorded"). MUST run before
+    /// `ensure_disposition_required_state` so the column is present for the
+    /// CHECK rebuild's column-intersection copy.
+    fn ensure_last_er_evidence_hash_column(conn: &Connection) -> Result<(), DaemonError> {
+        let has_col: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
+                 WHERE name = 'last_er_evidence_hash'",
+                [],
+                |row: &rusqlite::Row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_last_er_evidence_hash_column: pragma", e))?;
+        if !has_col {
+            conn.execute(
+                "ALTER TABLE bead_overlay ADD COLUMN last_er_evidence_hash TEXT",
+                [],
+            )
+            .map_err(|e| tool_err("ensure_last_er_evidence_hash_column: add column", e))?;
+        }
+        Ok(())
+    }
+
+    /// Idempotent migration for the `escalation_ledger` table
+    /// (1s2q-escalation-dedup). Unlike the `ensure_*_column` migrations above
+    /// (which probe `pragma_table_info` for a column), this probes
+    /// `sqlite_master` for the table's existence, then issues
+    /// `CREATE TABLE IF NOT EXISTS` (idempotent on its own, but the probe keeps
+    /// the migration log honest for legacy DBs that already ran the old
+    /// schema.sql before this table was added). Safe to call repeatedly.
+    /// Runs AFTER `ensure_disposition_required_state` since it is an
+    /// independent table (NOT a column on `bead_overlay`) and therefore does
+    /// NOT participate in that CHECK rebuild's column-intersection copy.
+    fn ensure_escalation_ledger_table(conn: &Connection) -> Result<(), DaemonError> {
+        let has_table: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'escalation_ledger'",
+                [],
+                |row: &rusqlite::Row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_escalation_ledger_table: probe", e))?;
+        if !has_table {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS escalation_ledger (\
+                   bead_id           TEXT NOT NULL,\
+                   reason            TEXT NOT NULL,\
+                   context_hash      TEXT NOT NULL,\
+                   last_emitted_epoch INTEGER NOT NULL,\
+                   PRIMARY KEY (bead_id, reason)\
+                 )",
+            )
+            .map_err(|e| tool_err("ensure_escalation_ledger_table: create", e))?;
+        }
+        Ok(())
+    }
+
+    /// Idempotent migration for the `escalation_ledger.terminal` column
+    /// (1s2q-escalation-dedup Task 2). Older on-disk DBs that got the
+    /// `escalation_ledger` table from a pre-Task-2 `ensure_escalation_ledger_table`
+    /// predate the `terminal` column declared in the CREATE TABLE block; SQLite
+    /// has no `ADD COLUMN IF NOT EXISTS`, so we probe `pragma_table_info` first
+    /// and only ALTER when the column is missing. Safe to call repeatedly — a
+    /// no-op when the column is already present. Defaults every pre-existing
+    /// row to `0` (not terminal), preserving the pre-Task-2 dedup behavior for
+    /// rows written before the terminal concept existed.
+    fn ensure_escalation_ledger_terminal_column(conn: &Connection) -> Result<(), DaemonError> {
+        let has_col: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('escalation_ledger') \
+                 WHERE name = 'terminal'",
+                [],
+                |row: &rusqlite::Row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_escalation_ledger_terminal_column: pragma", e))?;
+        if !has_col {
+            conn.execute(
+                "ALTER TABLE escalation_ledger \
+                 ADD COLUMN terminal INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| tool_err("ensure_escalation_ledger_terminal_column: add column", e))?;
+        }
+        Ok(())
+    }
+
+    /// Idempotent migration for the `vendor_health` table
+    /// (reviewer-outage-resilience Task 1). Same pattern as
+    /// `ensure_escalation_ledger_table`: probes `sqlite_master` for the
+    /// table's existence, then issues `CREATE TABLE IF NOT EXISTS`. Safe to
+    /// call repeatedly. Tracks whether each external review-bot provider
+    /// ("coderabbit" or "bugbot") is in-outage or recovered, with a full
+    /// audit trail. Runs after `ensure_escalation_ledger_terminal_column`
+    /// since it is an independent table.
+    fn ensure_vendor_health_table(conn: &Connection) -> Result<(), DaemonError> {
+        let has_table: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'vendor_health'",
+                [],
+                |row: &rusqlite::Row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_vendor_health_table: probe", e))?;
+        if !has_table {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS vendor_health (\
+                   vendor               TEXT PRIMARY KEY,\
+                   in_outage            INTEGER NOT NULL DEFAULT 0,\
+                   consecutive_pending  INTEGER NOT NULL DEFAULT 0,\
+                   outage_observations  INTEGER NOT NULL DEFAULT 0,\
+                   success_observations INTEGER NOT NULL DEFAULT 0,\
+                   last_success_head    TEXT,\
+                   last_outage_epoch    INTEGER,\
+                   last_observed_head   TEXT,\
+                   last_observed_epoch  INTEGER\
+                 )",
+            )
+            .map_err(|e| tool_err("ensure_vendor_health_table: create", e))?;
+        }
+        Ok(())
+    }
+
+    /// Canonical `bead_overlay` column list (in `schema.sql` order). The
+    /// DISPOSITION_REQUIRED CHECK rebuild uses this to build the new table and
+    /// to copy data by EXPLICIT column name. Keep in sync with `schema.sql`'s
+    /// CREATE TABLE and the `ensure_*_column` migrations above.
+    const BEAD_OVERLAY_COLUMNS: &'static [&'static str] = &[
+        "bead_id",
+        "state",
+        "attempt",
+        "reroll_count",
+        "autonomy_secs",
+        "spend_usd",
+        "pr_number",
+        "branch",
+        "session_id",
+        "updated_at",
+        "attempt_er_runner_count",
+        "last_er_runner_attempt_at",
+        "is_adopted",
+        "spawn_failure_count",
+        "pre_session_head_sha",
+        "park_reason",
+        "target_repo",
+        "reroll_deferral_count",
+        "held_recheck_after",
+        "last_er_evidence_hash",
+    ];
+
+    /// The canonical `CREATE TABLE bead_overlay` statement (with the current
+    /// state CHECK list, incl. `DISPOSITION_REQUIRED`) as shipped in
+    /// `schema.sql`, but under a temp name for the rebuild. Hardcoded rather
+    /// than transformed from the live DDL so the migration is robust to
+    /// whitespace variants, quoted identifiers, and any other legal DDL
+    /// formatting that a string-edit would silently break.
+    const REBUILD_TABLE_DDL: &'static str = "CREATE TABLE bead_overlay_disposition_migrated (\
+        bead_id TEXT PRIMARY KEY, \
+        state TEXT NOT NULL CHECK (state IN \
+            ('QUEUED','DISPATCHING','DISPATCHED','ATTESTED','READY','RE_ROLL','RECOVERY',\
+             'REDISPATCHED','BUDGET_HELD','HUMAN_HELD','DISPOSITION_REQUIRED')), \
+        attempt INTEGER NOT NULL DEFAULT 1, \
+        reroll_count INTEGER NOT NULL DEFAULT 0, \
+        autonomy_secs INTEGER NOT NULL DEFAULT 0, \
+        spend_usd REAL NOT NULL DEFAULT 0, \
+        pr_number INTEGER, \
+        branch TEXT, \
+        session_id TEXT, \
+        updated_at TEXT NOT NULL, \
+        attempt_er_runner_count INTEGER NOT NULL DEFAULT 0, \
+        last_er_runner_attempt_at INTEGER, \
+        is_adopted INTEGER NOT NULL DEFAULT 0, \
+        spawn_failure_count INTEGER NOT NULL DEFAULT 0, \
+        pre_session_head_sha TEXT, \
+        park_reason TEXT, \
+        target_repo TEXT, \
+        reroll_deferral_count INTEGER NOT NULL DEFAULT 0, \
+        held_recheck_after INTEGER, \
+        last_er_evidence_hash TEXT)";
+
+    /// Bead jleechan-zaga / issue #348: migrate the `bead_overlay.state` CHECK
+    /// constraint to allow `'DISPOSITION_REQUIRED'`. Unlike every other
+    /// migration above (which add nullable/defaulted COLUMNS via `ALTER TABLE
+    /// … ADD COLUMN`), this changes a CHECK constraint — and SQLite supports
+    /// no `ALTER TABLE … DROP/ALTER CONSTRAINT`. `CREATE TABLE IF NOT EXISTS`
+    /// in `schema.sql` is a NO-OP on a live DB that already has the table, so
+    /// it never updates the constraint: a live daemon started against a
+    /// pre-#348 DB would hit `CHECK constraint failed` the first time it tried
+    /// to persist a `DISPOSITION_REQUIRED` bead. The only portable fix is the
+    /// documented SQLite table-rebuild dance (create-copy-drop-rename).
+    ///
+    /// Robust migration (r3): the need to migrate is detected by PROBING —
+    /// attempting a `DISPOSITION_REQUIRED` INSERT inside a savepoint that is
+    /// always rolled back — NOT by string-matching the stored DDL (fragile to
+    /// whitespace / quoted identifiers). When a migration IS needed, the new
+    /// table is built from a CANONICAL hardcoded CREATE (`REBUILD_TABLE_DDL`),
+    /// and data is copied by EXPLICIT column name for the intersection of the
+    /// live table's columns and the canonical set — never a positional
+    /// `SELECT *` against a transformed copy of the old DDL. Runs after every
+    /// `ensure_*_column` migration so the live column set is complete.
+    fn ensure_disposition_required_state(conn: &Connection) -> Result<(), DaemonError> {
+        // Probe: is `DISPOSITION_REQUIRED` already accepted by the live CHECK?
+        // Attempt the INSERT inside a savepoint we ALWAYS roll back so the
+        // probe row never persists; a `CHECK constraint failed` means migrate.
+        conn.execute_batch("SAVEPOINT drp_probe")
+            .map_err(|e| tool_err("ensure_disposition_required_state: savepoint", e))?;
+        let probe = conn.execute(
+            "INSERT INTO bead_overlay (bead_id, state, updated_at) \
+             VALUES ('__drp_migration_probe__', 'DISPOSITION_REQUIRED', '')",
+            [],
+        );
+        conn.execute_batch("ROLLBACK TO drp_probe; RELEASE drp_probe")
+            .map_err(|e| tool_err("ensure_disposition_required_state: rollback probe", e))?;
+        let needs_migration = match probe {
+            Ok(_) => false, // CHECK already allows it (fresh/already-migrated DB).
+            Err(ref e) if e.to_string().to_ascii_lowercase().contains("check constraint") => true,
+            Err(e) => {
+                // A different failure (e.g. a table shape we don't understand)
+                // — do not attempt a rebuild we can't reason about; surface it.
+                return Err(tool_err("ensure_disposition_required_state: probe", e));
+            }
+        };
+        if !needs_migration {
+            return Ok(());
+        }
+
+        // Copy only columns that exist in BOTH the live table and the
+        // canonical schema, by explicit name (order-independent).
+        let mut live_cols: std::collections::HashSet<String> = std::collections::HashSet::new();
+        {
+            let mut stmt = conn
+                .prepare("SELECT name FROM pragma_table_info('bead_overlay')")
+                .map_err(|e| tool_err("ensure_disposition_required_state: pragma prepare", e))?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| tool_err("ensure_disposition_required_state: pragma query", e))?;
+            for name in rows {
+                live_cols
+                    .insert(name.map_err(|e| tool_err("ensure_disposition_required_state: pragma row", e))?);
+            }
+        }
+        let copy_cols: Vec<&str> = Self::BEAD_OVERLAY_COLUMNS
+            .iter()
+            .copied()
+            .filter(|c| live_cols.contains(*c))
+            .collect();
+        let col_list = copy_cols.join(", ");
+
+        let batch = format!(
+            "BEGIN IMMEDIATE;\n\
+             {create};\n\
+             INSERT INTO bead_overlay_disposition_migrated ({cols}) SELECT {cols} FROM bead_overlay;\n\
+             DROP TABLE bead_overlay;\n\
+             ALTER TABLE bead_overlay_disposition_migrated RENAME TO bead_overlay;\n\
+             COMMIT;",
+            create = Self::REBUILD_TABLE_DDL,
+            cols = col_list,
+        );
+        if let Err(e) = conn.execute_batch(&batch) {
+            // Best-effort rollback so a half-applied rebuild doesn't wedge the
+            // next open; surface the original error either way.
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(tool_err("ensure_disposition_required_state: rebuild", e));
         }
         Ok(())
     }
@@ -520,7 +963,7 @@ impl SqliteStateStore {
             )
             .map_err(|e| tool_err(&format!("{op} prepare"), e))?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map([], |row: &rusqlite::Row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -565,6 +1008,205 @@ impl SqliteStateStore {
 }
 
 impl StateStore for SqliteStateStore {
+
+
+
+    fn escalation_should_emit(
+        &self,
+        bead_id: &str,
+        reason: &str,
+        context_hash: &str,
+        now_epoch: u64,
+        refire_secs: u64,
+    ) -> Result<bool, DaemonError> {
+        let row: Result<(String, i64, i64), rusqlite::Error> = self.conn.query_row(
+            "SELECT context_hash, last_emitted_epoch, terminal FROM escalation_ledger \
+             WHERE bead_id = ?1 AND reason = ?2",
+            params![bead_id, reason],
+            |row: &rusqlite::Row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        );
+        match row {
+            // No prior record — emit.
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(true),
+            Err(e) => Err(tool_err("escalation_should_emit: load", e)),
+            Ok((prior_hash, last_epoch, terminal)) => {
+                let (prior_hash, last_epoch, terminal): (String, i64, i64) = (prior_hash, last_epoch, terminal);
+                // 1s2q-escalation-dedup Task 2: a terminal row means the
+                // escalation was classified undeliverable (permanent gh
+                // error). Never re-emit, regardless of hash or backoff.
+                if terminal != 0 {
+                    return Ok(false);
+                }
+                // Hash changed — re-emit regardless of backoff.
+                if prior_hash != context_hash {
+                    return Ok(true);
+                }
+                // Same hash: re-emit only if the backoff window has elapsed.
+                let last = last_epoch.max(0_i64) as u64;
+                Ok(now_epoch.saturating_sub(last) >= refire_secs)
+            }
+        }
+    }
+
+
+    fn record_escalation_emit(
+        &self,
+        bead_id: &str,
+        reason: &str,
+        context_hash: &str,
+        now_epoch: u64,
+    ) -> Result<(), DaemonError> {
+        self.conn
+            .execute(
+                "INSERT INTO escalation_ledger (bead_id, reason, context_hash, last_emitted_epoch) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(bead_id, reason) DO UPDATE SET \
+                   context_hash = excluded.context_hash, \
+                   last_emitted_epoch = excluded.last_emitted_epoch",
+                params![bead_id, reason, context_hash, now_epoch as i64],
+            )
+            .map_err(|e| tool_err("record_escalation_emit: upsert", e))?;
+        Ok(())
+    }
+
+
+    fn mark_escalation_undeliverable(
+        &self,
+        bead_id: &str,
+        reason: &str,
+    ) -> Result<(), DaemonError> {
+        self.conn
+            .execute(
+                "INSERT INTO escalation_ledger (bead_id, reason, context_hash, last_emitted_epoch, terminal) \
+                 VALUES (?1, ?2, '', 0, 1) \
+                 ON CONFLICT(bead_id, reason) DO UPDATE SET terminal = 1",
+                params![bead_id, reason],
+            )
+            .map_err(|e| tool_err("mark_escalation_undeliverable: upsert", e))?;
+        Ok(())
+    }
+
+
+    #[allow(clippy::type_complexity)]
+    fn vendor_health(&self, vendor: &str) -> Result<Option<VendorHealth>, DaemonError> {
+        let row: Result<
+            (i64, i64, i64, i64, Option<String>, Option<i64>, Option<String>, Option<i64>),
+            rusqlite::Error,
+        > = self.conn.query_row(
+            "SELECT in_outage, consecutive_pending, outage_observations, \
+                    success_observations, last_success_head, last_outage_epoch, \
+                    last_observed_head, last_observed_epoch \
+             FROM vendor_health WHERE vendor = ?1",
+            params![vendor],
+            |row: &rusqlite::Row| -> rusqlite::Result<(i64, i64, i64, i64, Option<String>, Option<i64>, Option<String>, Option<i64>)> {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        );
+        match row {
+            Ok((in_outage, consecutive_pending, outage_observations, success_observations, last_success_head, last_outage_epoch, last_observed_head, last_observed_epoch)) => {
+                let (in_outage, consecutive_pending, outage_observations, success_observations, last_success_head, last_outage_epoch, last_observed_head, last_observed_epoch): (i64, i64, i64, i64, Option<String>, Option<i64>, Option<String>, Option<i64>) = (in_outage, consecutive_pending, outage_observations, success_observations, last_success_head, last_outage_epoch, last_observed_head, last_observed_epoch);
+                Ok(Some(VendorHealth {
+                vendor: vendor.to_string(),
+                in_outage: in_outage != 0,
+                consecutive_pending: consecutive_pending.max(0_i64) as u32,
+                outage_observations: outage_observations.max(0_i64) as u32,
+                success_observations: success_observations.max(0_i64) as u32,
+                last_success_head,
+                last_outage_epoch: last_outage_epoch.map(|v: i64| v.max(0_i64) as u64),
+                last_observed_head,
+                last_observed_epoch: last_observed_epoch.map(|v: i64| v.max(0_i64) as u64),
+            }))
+            },
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(tool_err("vendor_health: load", e)),
+        }
+    }
+
+
+    fn record_vendor_observation(
+        &self,
+        vendor: &str,
+        is_outage_marker: bool,
+        is_success: bool,
+        head_sha: &str,
+        now_epoch: u64,
+        consecutive_pending_threshold: u32,
+    ) -> Result<VendorHealth, DaemonError> {
+        let prior = self.vendor_health(vendor)?;
+        let mut row = prior.clone().unwrap_or(VendorHealth {
+            vendor: vendor.to_string(),
+            in_outage: false,
+            consecutive_pending: 0,
+            outage_observations: 0,
+            success_observations: 0,
+            last_success_head: None,
+            last_outage_epoch: None,
+            last_observed_head: None,
+            last_observed_epoch: None,
+        });
+        row.last_observed_head = Some(head_sha.to_string());
+        row.last_observed_epoch = Some(now_epoch);
+        if is_success {
+            row.success_observations += 1;
+            row.consecutive_pending = 0;
+            row.last_success_head = Some(head_sha.to_string());
+            if row.in_outage {
+                row.in_outage = false;
+            }
+        } else if is_outage_marker {
+            row.outage_observations += 1;
+            row.consecutive_pending += 1;
+            if row.consecutive_pending >= consecutive_pending_threshold && !row.in_outage {
+                row.in_outage = true;
+                row.last_outage_epoch = Some(now_epoch);
+            }
+        }
+        self.conn
+            .execute(
+                "INSERT INTO vendor_health (\
+                   vendor, in_outage, consecutive_pending, outage_observations, \
+                   success_observations, last_success_head, last_outage_epoch, \
+                   last_observed_head, last_observed_epoch\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                 ON CONFLICT(vendor) DO UPDATE SET \
+                   in_outage = excluded.in_outage, \
+                   consecutive_pending = excluded.consecutive_pending, \
+                   outage_observations = excluded.outage_observations, \
+                   success_observations = excluded.success_observations, \
+                   last_success_head = excluded.last_success_head, \
+                   last_outage_epoch = excluded.last_outage_epoch, \
+                   last_observed_head = excluded.last_observed_head, \
+                   last_observed_epoch = excluded.last_observed_epoch",
+                params![
+                    vendor,
+                    if row.in_outage { 1 } else { 0 },
+                    row.consecutive_pending as i64,
+                    row.outage_observations as i64,
+                    row.success_observations as i64,
+                    row.last_success_head,
+                    row.last_outage_epoch.map(|v| v as i64),
+                    row.last_observed_head,
+                    row.last_observed_epoch.map(|v| v as i64),
+                ],
+            )
+            .map_err(|e| tool_err("record_vendor_observation: upsert", e))?;
+        Ok(row)
+    }
     fn reconcile_dispatching(&self) -> Result<(), DaemonError> {
         self.conn
             .execute(
@@ -584,7 +1226,7 @@ impl StateStore for SqliteStateStore {
                  park_reason, target_repo \
                  FROM bead_overlay WHERE bead_id = ?1",
                 params![bead_id],
-                |row| {
+                |row: &rusqlite::Row| {
                     let state_str: String = row.get(1)?;
                     let is_adopted: i64 = row.get(9)?;
                     let spawn_failure_count: i64 = row.get(10)?;
@@ -840,7 +1482,7 @@ impl StateStore for SqliteStateStore {
             .prepare(&select_sql)
             .map_err(|e| tool_err("recover_human_held prepare", e))?;
         let rows = stmt
-            .query_map(&select_params[..], |row| {
+            .query_map(&select_params[..], |row: &rusqlite::Row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -897,7 +1539,7 @@ impl StateStore for SqliteStateStore {
             )
             .map_err(|e| tool_err("human_held_at_or_above_attempt prepare", e))?;
         let rows = stmt
-            .query_map(params![max_attempt as i64], |row| {
+            .query_map(params![max_attempt as i64], |row: &rusqlite::Row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -966,7 +1608,7 @@ impl StateStore for SqliteStateStore {
             .query_row(
                 "SELECT reviewer, feedback_hash FROM review_rejection WHERE bead_id = ?1 AND attempt = ?2",
                 params![bead_id, attempt],
-                |row| {
+                |row: &rusqlite::Row| {
                     let reviewer: String = row.get(0)?;
                     let feedback_hash: String = row.get(1)?;
                     Ok((reviewer, feedback_hash))
@@ -981,7 +1623,7 @@ impl StateStore for SqliteStateStore {
             .query_row(
                 "SELECT feedback_text FROM review_rejection WHERE bead_id = ?1 AND attempt = ?2",
                 params![bead_id, attempt],
-                |row| row.get(0),
+                |row: &rusqlite::Row| row.get(0),
             )
             .optional()
             .map_err(|e| tool_err("load_rejection_text", e))
@@ -1029,6 +1671,7 @@ impl StateStore for SqliteStateStore {
     }
 }
 
+
 /// True when `err` is the SQLite "no such column" schema-mismatch signal.
 /// `rusqlite::Error` does not expose a typed `message` field on every
 /// feature combo, so we stringify + match — this is the same trick
@@ -1037,931 +1680,3 @@ fn no_such_column(err: &rusqlite::Error) -> bool {
     err.to_string().to_lowercase().contains("no such column")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    fn store() -> SqliteStateStore {
-        SqliteStateStore::open_in_memory_with_schema(include_str!("../contracts/schema.sql"))
-            .unwrap()
-    }
-
-    #[test]
-    fn overlay_roundtrip() {
-        let s = store();
-        let o = BeadOverlay {
-            bead_id: "b1".into(),
-            state: OverlayState::Queued,
-            attempt: 1,
-            reroll_count: 0,
-            autonomy_secs: 0,
-            spend_usd: 0.0,
-            pr_number: None,
-            branch: None,
-            session_id: None,
-            is_adopted: false,
-            spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
-        };
-        s.save(&o).unwrap();
-        let got = s.load("b1").unwrap().unwrap();
-        assert_eq!(got.state, OverlayState::Queued);
-        assert_eq!(got.attempt, 1);
-        assert_eq!(got.bead_id, "b1");
-        assert_eq!(got.pr_number, None);
-        assert_eq!(got.branch, None);
-    }
-
-    #[test]
-    fn overlay_roundtrip_updates_on_conflict() {
-        let s = store();
-        let mut o = BeadOverlay {
-            bead_id: "b2".into(),
-            state: OverlayState::Queued,
-            attempt: 1,
-            reroll_count: 0,
-            autonomy_secs: 10,
-            spend_usd: 0.5,
-            pr_number: None,
-            branch: None,
-            session_id: None,
-            is_adopted: false,
-            spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
-        };
-        s.save(&o).unwrap();
-        o.state = OverlayState::Attested;
-        o.attempt = 2;
-        o.pr_number = Some(42);
-        o.branch = Some("factory/b2-r2".into());
-        s.save(&o).unwrap();
-        let got = s.load("b2").unwrap().unwrap();
-        assert_eq!(got.state, OverlayState::Attested);
-        assert_eq!(got.attempt, 2);
-        assert_eq!(got.pr_number, Some(42));
-        assert_eq!(got.branch, Some("factory/b2-r2".into()));
-    }
-
-    #[test]
-    fn load_missing_bead_returns_none() {
-        let s = store();
-        assert!(s.load("nope").unwrap().is_none());
-    }
-
-    #[test]
-    fn reconcile_dispatching_requeues_and_clears_stale_session_and_branch() {
-        let s = store();
-        let o = BeadOverlay {
-            bead_id: "b-stale".into(),
-            state: OverlayState::Dispatching,
-            attempt: 1,
-            reroll_count: 0,
-            autonomy_secs: 0,
-            spend_usd: 0.0,
-            pr_number: None,
-            branch: Some("stale-branch".into()),
-            session_id: Some("stale-session-id".into()),
-            is_adopted: false,
-            spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
-        };
-
-        s.save(&o).unwrap();
-        s.reconcile_dispatching().unwrap();
-
-        let got = s.load("b-stale").unwrap().unwrap();
-        assert_eq!(got.state, OverlayState::Queued);
-        assert_eq!(got.session_id, None);
-        assert_eq!(got.branch, None);
-    }
-
-    #[test]
-    fn illegal_state_string_rejected_by_schema() {
-        let s = store();
-        let r = s.conn.execute(
-            "INSERT INTO bead_overlay (bead_id,state,updated_at) VALUES ('x','BOGUS','now')",
-            [],
-        );
-        assert!(r.is_err(), "CHECK constraint must reject unknown states");
-    }
-
-    #[test]
-    fn all_ten_overlay_states_accepted_by_schema() {
-        let s = store();
-        for (i, state) in [
-            OverlayState::Queued,
-            OverlayState::Dispatching,
-            OverlayState::Dispatched,
-            OverlayState::Attested,
-            OverlayState::Ready,
-            OverlayState::ReRoll,
-            OverlayState::Recovery,
-            OverlayState::Redispatched,
-            OverlayState::BudgetHeld,
-            OverlayState::HumanHeld,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let o = BeadOverlay {
-                bead_id: format!("bead-{i}"),
-                state,
-                attempt: 1,
-                reroll_count: 0,
-                autonomy_secs: 0,
-                spend_usd: 0.0,
-                pr_number: None,
-                branch: None,
-                session_id: None,
-                is_adopted: false,
-                spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
-            };
-            s.save(&o).unwrap();
-            let got = s.load(&o.bead_id).unwrap().unwrap();
-            assert_eq!(got.state, state);
-        }
-    }
-
-    #[test]
-    fn owned_branches_lists_only_registered() {
-        let s = store();
-        s.register_branch("b1", "factory/b1-r1").unwrap();
-        assert_eq!(s.owned_branches().unwrap(), vec!["factory/b1-r1".to_string()]);
-    }
-
-    #[test]
-    fn owned_branches_deletion_guard_survives_bead_overlay_delete() {
-        // Spec §4.2.8: the daemon may delete ONLY refs recorded in branch_registry.
-        // There is intentionally no FK between bead_overlay and branch_registry in
-        // contracts/schema.sql, so deleting a bead_overlay row must NOT cascade,
-        // error, or silently orphan/mutate branch_registry — owned_branches() must
-        // keep returning exactly what was registered, independent of overlay state.
-        let s = store();
-        let o = BeadOverlay {
-            bead_id: "b1".into(),
-            state: OverlayState::Attested,
-            attempt: 1,
-            reroll_count: 0,
-            autonomy_secs: 0,
-            spend_usd: 0.0,
-            pr_number: Some(7),
-            branch: Some("factory/b1-r1".into()),
-            session_id: None,
-            is_adopted: false,
-            spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
-        };
-        s.save(&o).unwrap();
-        s.register_branch("b1", "factory/b1-r1").unwrap();
-        assert_eq!(s.owned_branches().unwrap(), vec!["factory/b1-r1".to_string()]);
-
-        // Delete the overlay row directly (simulates a bead being purged/reset).
-        s.conn
-            .execute("DELETE FROM bead_overlay WHERE bead_id = ?1", params!["b1"])
-            .unwrap();
-
-        // branch_registry must be unaffected: still exactly the registered branch,
-        // proving the guard is enforced at the DB layer (no FK cascade exists to
-        // exploit) rather than merely documented in a comment.
-        assert_eq!(
-            s.owned_branches().unwrap(),
-            vec!["factory/b1-r1".to_string()],
-            "deleting bead_overlay must not orphan/violate branch_registry"
-        );
-        assert!(s.load("b1").unwrap().is_none());
-    }
-
-    #[test]
-    fn register_branch_rejects_conflicting_owner() {
-        let s = store();
-        s.register_branch("b1", "factory/b1-r1").unwrap();
-        s.register_branch("b1", "factory/b1-r1").unwrap(); // idempotent for same bead
-        let err = s.register_branch("b2", "factory/b1-r1").unwrap_err();
-        assert!(
-            err.to_string().contains("already registered to bead b1"),
-            "unexpected conflict error: {err}"
-        );
-        let branches = s.owned_branches().unwrap();
-        assert_eq!(branches, vec!["factory/b1-r1".to_string()]);
-        assert_eq!(
-            s.bead_id_for_branch("factory/b1-r1").unwrap(),
-            Some("b1".to_string())
-        );
-    }
-
-    /// jleechan-8in: file-backed `open()` must not silently swallow a failed
-    /// `PRAGMA journal_mode=WAL`. This asserts the happy path actually took
-    /// effect (readback == "wal") on a real temp-file-backed connection —
-    /// proving `configure(is_memory=false)` verifies rather than discards.
-    #[test]
-    fn open_on_real_file_actually_sets_wal_mode() {
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "dark-factory-state-test-{}-{}.sqlite",
-            std::process::id(),
-            now_iso8601().replace([':', '-', 'T', 'Z'], "")
-        ));
-        let _cleanup = TempFileGuard(path.clone());
-
-        let s = SqliteStateStore::open(&path).unwrap();
-        let mode: String = s
-            .conn
-            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(mode.to_ascii_lowercase(), "wal");
-    }
-
-    /// jleechan-8in: a non-"wal" (or errored) readback on a file-backed connection
-    /// must propagate as `DaemonError::Config`, not be discarded. Exercises
-    /// `configure` directly with `is_memory=false` against an in-memory connection
-    /// (WAL cannot take effect there), which is exactly the failure mode the bead
-    /// describes for real files with unsupported filesystems/permissions/NFS.
-    #[test]
-    fn configure_file_backed_propagates_wal_failure_as_config_error() {
-        let conn = Connection::open_in_memory().unwrap();
-        let err = SqliteStateStore::configure(&conn, false).unwrap_err();
-        match err {
-            DaemonError::Config(msg) => {
-                assert!(
-                    msg.contains("journal_mode=WAL"),
-                    "error message should mention the failing pragma: {msg}"
-                );
-            }
-            other => panic!("expected DaemonError::Config, got {other:?}"),
-        }
-    }
-
-    /// Cleans up the temp file (+ WAL/SHM sidecars) created by
-    /// `open_on_real_file_actually_sets_wal_mode`, even on panic.
-    struct TempFileGuard(std::path::PathBuf);
-    impl Drop for TempFileGuard {
-        fn drop(&mut self) {
-            for suffix in ["", "-wal", "-shm"] {
-                let _ = std::fs::remove_file(format!("{}{suffix}", self.0.display()));
-            }
-        }
-    }
-
-    /// jleechan-qqq: an on-disk DB that lacks the `/er` runner columns must
-    /// be auto-migrated by `open()` and `open_in_memory_with_schema()`, so
-    /// the runner's first `incr_er_runner_attempt` doesn't fail with
-    /// "no such column". This pins the idempotency of the migration: a
-    /// second `open()` against the same file must NOT error on the
-    /// re-applied `ALTER TABLE` (a hard crash here would also block every
-    /// daemon restart, since `execute_batch(schema.sql)` re-runs).
-    #[test]
-    fn open_migrates_legacy_db_missing_er_runner_columns() {
-        use rusqlite::Connection;
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "dark-factory-er-migrate-{}-{}.sqlite",
-            std::process::id(),
-            now_iso8601().replace([':', '-', 'T', 'Z'], "")
-        ));
-        let _cleanup = TempFileGuard(path.clone());
-
-        // Build a "legacy" DB: just `bead_overlay` and `branch_registry`,
-        // no `/er` runner columns.
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE bead_overlay (bead_id TEXT PRIMARY KEY, state TEXT NOT NULL, \
-                 attempt INTEGER NOT NULL DEFAULT 1, reroll_count INTEGER NOT NULL DEFAULT 0, \
-                 autonomy_secs INTEGER NOT NULL DEFAULT 0, spend_usd REAL NOT NULL DEFAULT 0, \
-                 pr_number INTEGER, branch TEXT, session_id TEXT, updated_at TEXT NOT NULL); \
-                 CREATE TABLE branch_registry (branch TEXT PRIMARY KEY, bead_id TEXT NOT NULL, \
-                 created_at TEXT NOT NULL);",
-            )
-            .unwrap();
-        }
-
-        // First open: must apply the migration without error.
-        let _store = SqliteStateStore::open(&path).expect("legacy DB should auto-migrate");
-
-        // Re-open: must NOT fail on the second ALTER (idempotency).
-        let _store2 = SqliteStateStore::open(&path).expect("second open must be idempotent");
-
-        // Both columns are present, with the expected defaults.
-        let conn = Connection::open(&path).unwrap();
-        let count_col: i64 = conn
-            .query_row(
-                "SELECT 1 FROM pragma_table_info('bead_overlay') \
-                 WHERE name = 'attempt_er_runner_count'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("attempt_er_runner_count column should exist after migration");
-        let last_col: i64 = conn
-            .query_row(
-                "SELECT 1 FROM pragma_table_info('bead_overlay') \
-                 WHERE name = 'last_er_runner_attempt_at'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("last_er_runner_attempt_at column should exist after migration");
-        assert_eq!(count_col, 1);
-        assert_eq!(last_col, 1);
-    }
-
-    /// jleechan-gib: the real-SQLite `recover_human_held` requeues every
-    /// HUMAN_HELD row under the cap and leaves HUMAN_HELD rows at/above the
-    /// cap alone. Mirrors the shell overlay's
-    /// `recover-held` (daemon/factory-overlay.sh:319-333) exactly so the
-    /// Rust tick can replace the shell caller.
-    #[test]
-    fn recover_human_held_requeues_below_cap_leaves_at_or_above_alone() {
-        let schema = include_str!("../contracts/schema.sql");
-        let store = SqliteStateStore::open_in_memory_with_schema(schema).unwrap();
-
-        let mut overlays = HashMap::new();
-        overlays.insert(
-            "below".to_string(),
-            BeadOverlay {
-                bead_id: "below".into(),
-                state: OverlayState::HumanHeld,
-                attempt: 2,
-                reroll_count: 0,
-                autonomy_secs: 9999,
-                spend_usd: 0.0,
-                pr_number: Some(11),
-                branch: Some("factory/below-r2".into()),
-                session_id: None,
-                is_adopted: false,
-                spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
-            },
-        );
-        overlays.insert(
-            "at-cap".to_string(),
-            BeadOverlay {
-                bead_id: "at-cap".into(),
-                state: OverlayState::HumanHeld,
-                attempt: 10,
-                reroll_count: 0,
-                autonomy_secs: 0,
-                spend_usd: 0.0,
-                pr_number: Some(22),
-                branch: Some("factory/at-cap-r10".into()),
-                session_id: None,
-                is_adopted: false,
-                spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
-            },
-        );
-        overlays.insert(
-            "over-cap".to_string(),
-            BeadOverlay {
-                bead_id: "over-cap".into(),
-                state: OverlayState::HumanHeld,
-                attempt: 12,
-                reroll_count: 0,
-                autonomy_secs: 0,
-                spend_usd: 0.0,
-                pr_number: Some(33),
-                branch: Some("factory/over-cap-r12".into()),
-                session_id: None,
-                is_adopted: false,
-                spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
-            },
-        );
-        // Non-HUMAN_HELD rows must never be touched.
-        overlays.insert(
-            "dispatched".to_string(),
-            BeadOverlay {
-                bead_id: "dispatched".into(),
-                state: OverlayState::Dispatched,
-                attempt: 1,
-                reroll_count: 0,
-                autonomy_secs: 100,
-                spend_usd: 0.0,
-                pr_number: Some(44),
-                branch: Some("factory/dispatched-r1".into()),
-                session_id: None,
-                is_adopted: false,
-                spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
-            },
-        );
-        overlays.insert(
-            "ready".to_string(),
-            BeadOverlay {
-                bead_id: "ready".into(),
-                state: OverlayState::Ready,
-                attempt: 1,
-                reroll_count: 0,
-                autonomy_secs: 0,
-                spend_usd: 0.0,
-                pr_number: Some(55),
-                branch: Some("factory/ready-r1".into()),
-                session_id: None,
-                is_adopted: false,
-                spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
-            },
-        );
-        for overlay in overlays.values() {
-            store.save(overlay).unwrap();
-        }
-
-        let recovered = store.recover_human_held(10).unwrap();
-        assert_eq!(recovered.len(), 1, "only `below` should be recovered");
-        assert_eq!(recovered[0].bead_id, "below");
-
-        // `below` was requeued and reset
-        let below = store.load("below").unwrap().unwrap();
-        assert_eq!(below.state, OverlayState::Queued);
-        assert_eq!(below.attempt, 3);
-        assert_eq!(below.autonomy_secs, 0);
-        // P2 (Codex): stale PR metadata must be cleared on requeue so the
-        // next dispatch doesn't conflate the fresh attempt with the dead PR.
-        assert_eq!(
-            below.pr_number, None,
-            "recover_human_held must clear pr_number to prevent stale-PR churn"
-        );
-        assert_eq!(
-            below.session_id, None,
-            "recover_human_held must clear session_id (belonged to the prior attempt)"
-        );
-        // branch is intentionally preserved so the recovered_from telemetry
-        // can still record what was being worked on; dispatch will rewrite
-        // it on the next attempt.
-        assert_eq!(
-            below.branch.as_deref(),
-            Some("factory/below-r2"),
-            "recover_human_held keeps branch as a stale-attempt breadcrumb"
-        );
-
-        // `at-cap` and `over-cap` are still HUMAN_HELD
-        let at_cap = store.load("at-cap").unwrap().unwrap();
-        assert_eq!(at_cap.state, OverlayState::HumanHeld);
-        assert_eq!(at_cap.attempt, 10);
-        let over_cap = store.load("over-cap").unwrap().unwrap();
-        assert_eq!(over_cap.state, OverlayState::HumanHeld);
-        assert_eq!(over_cap.attempt, 12);
-        let capped = store.human_held_at_or_above_attempt(10).unwrap();
-        let capped_ids: std::collections::HashSet<_> =
-            capped.iter().map(|overlay| overlay.bead_id.as_str()).collect();
-        assert_eq!(capped_ids.len(), 2);
-        assert!(capped_ids.contains("at-cap"));
-        assert!(capped_ids.contains("over-cap"));
-
-        // Non-HUMAN_HELD rows are untouched
-        let dispatched = store.load("dispatched").unwrap().unwrap();
-        assert_eq!(dispatched.state, OverlayState::Dispatched);
-        assert_eq!(dispatched.autonomy_secs, 100);
-        let ready = store.load("ready").unwrap().unwrap();
-        assert_eq!(ready.state, OverlayState::Ready);
-    }
-
-    /// bead jleechan-4jn1 (live incident jleechan-93ft / PR
-    /// worldarchitect.ai#7888): a bead parked HUMAN_HELD by the circuit
-    /// breaker (`park_reason` starting with `"circuit-breaker"`) must NOT be
-    /// requeued by `recover_human_held`, even though its `attempt` is well
-    /// under the recovery cap — the circuit breaker parks it specifically to
-    /// STOP the same reviewer/feedback loop from re-triggering. A bead
-    /// parked for a transient reason (`session_stalled`, mirroring
-    /// `tick::run_tick`'s wedge-detection park) at the exact same attempt
-    /// must still be recovered normally. This is the behavioral difference
-    /// this bead's fix depends on: before the fix, `recover_human_held`'s
-    /// SQL (`WHERE state = 'HUMAN_HELD' AND attempt < ?1`) could not tell
-    /// the two apart and requeued both identically.
-    #[test]
-    fn recover_human_held_excludes_circuit_breaker_parks_but_recovers_transient_parks() {
-        let schema = include_str!("../contracts/schema.sql");
-        let store = SqliteStateStore::open_in_memory_with_schema(schema).unwrap();
-
-        let mut overlays = HashMap::new();
-        overlays.insert(
-            "circuit-broken".to_string(),
-            BeadOverlay {
-                bead_id: "circuit-broken".into(),
-                state: OverlayState::HumanHeld,
-                attempt: 6,
-                reroll_count: 3,
-                autonomy_secs: 500,
-                spend_usd: 0.0,
-                pr_number: Some(7888),
-                branch: Some("factory/circuit-broken-r6".into()),
-                session_id: None,
-                is_adopted: false,
-                spawn_failure_count: 0,
-                pre_session_head_sha: None,
-                park_reason: Some(crate::reroll::CIRCUIT_BREAKER_PARK_REASON.to_string()),
-                target_repo: None,
-            },
-        );
-        overlays.insert(
-            "transient-stalled".to_string(),
-            BeadOverlay {
-                bead_id: "transient-stalled".into(),
-                state: OverlayState::HumanHeld,
-                attempt: 2,
-                reroll_count: 0,
-                autonomy_secs: 1800,
-                spend_usd: 0.0,
-                pr_number: Some(99),
-                branch: Some("factory/transient-stalled-r2".into()),
-                session_id: Some("session-abc".into()),
-                is_adopted: false,
-                spawn_failure_count: 0,
-                pre_session_head_sha: None,
-                park_reason: Some("session_stalled".to_string()),
-                target_repo: None,
-            },
-        );
-        for overlay in overlays.values() {
-            store.save(overlay).unwrap();
-        }
-
-        let recovered = store.recover_human_held(10).unwrap();
-        assert_eq!(
-            recovered.len(),
-            1,
-            "only the transient park should be recovered; the circuit-breaker park must be excluded"
-        );
-        assert_eq!(recovered[0].bead_id, "transient-stalled");
-
-        // The circuit-breaker-parked bead is untouched: still HUMAN_HELD,
-        // same attempt, park_reason preserved. This is the exact regression
-        // this bead fixes — production requeued this bead 21 seconds after
-        // park and re-triggered the same rejected fix 769 times in 30
-        // minutes.
-        let circuit_broken = store.load("circuit-broken").unwrap().unwrap();
-        assert_eq!(
-            circuit_broken.state,
-            OverlayState::HumanHeld,
-            "circuit-breaker park must NOT be auto-requeued"
-        );
-        assert_eq!(circuit_broken.attempt, 6, "attempt must not be bumped");
-        assert_eq!(
-            circuit_broken.park_reason.as_deref(),
-            Some(crate::reroll::CIRCUIT_BREAKER_PARK_REASON),
-            "park_reason must survive an excluded recovery pass"
-        );
-
-        // The transient park recovers exactly like the pre-existing
-        // `session_stalled` / `autonomy_timebox_exceeded` behavior: QUEUED,
-        // attempt bumped, autonomy reset, park_reason cleared.
-        let transient = store.load("transient-stalled").unwrap().unwrap();
-        assert_eq!(transient.state, OverlayState::Queued);
-        assert_eq!(transient.attempt, 3);
-        assert_eq!(transient.autonomy_secs, 0);
-        assert_eq!(
-            transient.park_reason, None,
-            "recover_human_held clears park_reason once a bead is back in play"
-        );
-    }
-
-    /// jleechan-35y4 (adversarial review of PR #245): a bead parked
-    /// HUMAN_HELD with `park_reason = "unmapped_target_repo"` (bead
-    /// jleechan-35y4's own dispatch-time park — see
-    /// `dispatch::dispatch_ready`) must NOT be auto-requeued, for the same
-    /// reason circuit-breaker parks aren't: an unmapped repo is a config
-    /// problem no bare requeue fixes. Without this exclusion the bead would
-    /// ping-pong HUMAN_HELD -> QUEUED -> re-park identically every recovery
-    /// cycle instead of staying HUMAN_HELD until an operator fixes the
-    /// config. A same-attempt transient park (`session_stalled`) must still
-    /// recover normally, exactly like the circuit-breaker test above.
-    #[test]
-    fn recover_human_held_excludes_unmapped_target_repo_parks_but_recovers_transient_parks() {
-        let schema = include_str!("../contracts/schema.sql");
-        let store = SqliteStateStore::open_in_memory_with_schema(schema).unwrap();
-
-        let mut overlays = HashMap::new();
-        overlays.insert(
-            "unmapped-repo".to_string(),
-            BeadOverlay {
-                bead_id: "unmapped-repo".into(),
-                state: OverlayState::HumanHeld,
-                attempt: 2,
-                reroll_count: 0,
-                autonomy_secs: 0,
-                spend_usd: 0.0,
-                pr_number: None,
-                branch: None,
-                session_id: None,
-                is_adopted: false,
-                spawn_failure_count: 0,
-                pre_session_head_sha: None,
-                park_reason: Some("unmapped_target_repo".to_string()),
-                target_repo: Some("someorg/unrelated-repo".to_string()),
-            },
-        );
-        overlays.insert(
-            "transient-stalled".to_string(),
-            BeadOverlay {
-                bead_id: "transient-stalled".into(),
-                state: OverlayState::HumanHeld,
-                attempt: 2,
-                reroll_count: 0,
-                autonomy_secs: 1800,
-                spend_usd: 0.0,
-                pr_number: Some(99),
-                branch: Some("factory/transient-stalled-r2".into()),
-                session_id: Some("session-abc".into()),
-                is_adopted: false,
-                spawn_failure_count: 0,
-                pre_session_head_sha: None,
-                park_reason: Some("session_stalled".to_string()),
-                target_repo: None,
-            },
-        );
-        for overlay in overlays.values() {
-            store.save(overlay).unwrap();
-        }
-
-        let recovered = store.recover_human_held(10).unwrap();
-        assert_eq!(
-            recovered.len(),
-            1,
-            "only the transient park should be recovered; the unmapped-repo park must be excluded"
-        );
-        assert_eq!(recovered[0].bead_id, "transient-stalled");
-
-        let unmapped = store.load("unmapped-repo").unwrap().unwrap();
-        assert_eq!(
-            unmapped.state,
-            OverlayState::HumanHeld,
-            "unmapped_target_repo park must NOT be auto-requeued"
-        );
-        assert_eq!(unmapped.attempt, 2, "attempt must not be bumped");
-        assert_eq!(
-            unmapped.park_reason.as_deref(),
-            Some("unmapped_target_repo"),
-            "park_reason must survive an excluded recovery pass"
-        );
-
-        let transient = store.load("transient-stalled").unwrap().unwrap();
-        assert_eq!(transient.state, OverlayState::Queued);
-        assert_eq!(transient.attempt, 3);
-    }
-
-    /// jleechan-bqdv Stage C: `worktree_remote_mismatch` parks must be
-    /// excluded from `recover_human_held`'s auto-requeue exactly like
-    /// `unmapped_target_repo` — this is the "fail loud, never guess"
-    /// spawn-time park for a coder worktree whose git remote doesn't match
-    /// the bead's resolved repo (jleechan-9sh5 discipline). Without this
-    /// exclusion the bead would ping-pong HUMAN_HELD -> QUEUED -> re-spawn
-    /// into the same (still misconfigured) worktree every recovery cycle.
-    #[test]
-    fn recover_human_held_excludes_worktree_remote_mismatch_parks_but_recovers_transient_parks() {
-        let schema = include_str!("../contracts/schema.sql");
-        let store = SqliteStateStore::open_in_memory_with_schema(schema).unwrap();
-
-        let mut overlays = HashMap::new();
-        overlays.insert(
-            "wrong-remote".to_string(),
-            BeadOverlay {
-                bead_id: "wrong-remote".into(),
-                state: OverlayState::HumanHeld,
-                attempt: 2,
-                reroll_count: 0,
-                autonomy_secs: 0,
-                spend_usd: 0.0,
-                pr_number: None,
-                branch: Some("factory/wrong-remote-r2".into()),
-                session_id: None,
-                is_adopted: false,
-                spawn_failure_count: 0,
-                pre_session_head_sha: None,
-                park_reason: Some("worktree_remote_mismatch".to_string()),
-                target_repo: Some("jleechanorg/worldarchitect.ai".to_string()),
-            },
-        );
-        overlays.insert(
-            "transient-stalled-2".to_string(),
-            BeadOverlay {
-                bead_id: "transient-stalled-2".into(),
-                state: OverlayState::HumanHeld,
-                attempt: 2,
-                reroll_count: 0,
-                autonomy_secs: 1800,
-                spend_usd: 0.0,
-                pr_number: Some(99),
-                branch: Some("factory/transient-stalled-2-r2".into()),
-                session_id: Some("session-abc".into()),
-                is_adopted: false,
-                spawn_failure_count: 0,
-                pre_session_head_sha: None,
-                park_reason: Some("session_stalled".to_string()),
-                target_repo: None,
-            },
-        );
-        for overlay in overlays.values() {
-            store.save(overlay).unwrap();
-        }
-
-        let recovered = store.recover_human_held(10).unwrap();
-        assert_eq!(
-            recovered.len(),
-            1,
-            "only the transient park should be recovered; the worktree-remote-mismatch park must be excluded"
-        );
-        assert_eq!(recovered[0].bead_id, "transient-stalled-2");
-
-        let wrong_remote = store.load("wrong-remote").unwrap().unwrap();
-        assert_eq!(
-            wrong_remote.state,
-            OverlayState::HumanHeld,
-            "worktree_remote_mismatch park must NOT be auto-requeued"
-        );
-        assert_eq!(wrong_remote.attempt, 2, "attempt must not be bumped");
-        assert_eq!(
-            wrong_remote.park_reason.as_deref(),
-            Some("worktree_remote_mismatch"),
-            "park_reason must survive an excluded recovery pass"
-        );
-
-        let transient = store.load("transient-stalled-2").unwrap().unwrap();
-        assert_eq!(transient.state, OverlayState::Queued);
-        assert_eq!(transient.attempt, 3);
-    }
-
-    /// P2 (Codex review): `recover_human_held` must return ONLY the rows
-    /// that were actually requeued — not every QUEUED bead with
-    /// `autonomy_secs = 0` (which is what the original heuristic-query did).
-    /// Pre-existing QUEUED beads with `autonomy_secs = 0` would otherwise
-    /// be reported as RECOVERED_FROM_HELD and pollute telemetry + the
-    /// tick summary. Run with a populated QUEUED backlog + a single
-    /// recoverable HUMAN_HELD bead, and assert the returned vec contains
-    /// only the bead we just recovered.
-    #[test]
-    fn recover_human_held_returns_only_rows_actually_recovered() {
-        let schema = include_str!("../contracts/schema.sql");
-        let store = SqliteStateStore::open_in_memory_with_schema(schema).unwrap();
-
-        // Pre-existing QUEUED backlog with autonomy_secs=0 (these are
-        // exactly the rows that would have been incorrectly reported as
-        // RECOVERED_FROM_HELD before the fix).
-        for (id, attempt) in [("queued-a", 1), ("queued-b", 2), ("queued-c", 3)] {
-            store
-                .save(&BeadOverlay {
-                    bead_id: id.into(),
-                    state: OverlayState::Queued,
-                    attempt,
-                    reroll_count: 0,
-                    autonomy_secs: 0,
-                    spend_usd: 0.0,
-                    pr_number: None,
-                    branch: None,
-                    session_id: None,
-                    is_adopted: false,
-                    spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
-                })
-                .unwrap();
-        }
-
-        // One recoverable HUMAN_HELD bead.
-        store
-            .save(&BeadOverlay {
-                bead_id: "held-only".into(),
-                state: OverlayState::HumanHeld,
-                attempt: 1,
-                reroll_count: 0,
-                autonomy_secs: 4321,
-                spend_usd: 0.0,
-                pr_number: Some(7777),
-                branch: Some("factory/held-only-r1".into()),
-                session_id: Some("session-xyz".into()),
-                is_adopted: false,
-                spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
-            })
-            .unwrap();
-
-        let recovered = store.recover_human_held(10).unwrap();
-        assert_eq!(
-            recovered.len(),
-            1,
-            "only the HUMAN_HELD row should be reported as recovered"
-        );
-        assert_eq!(recovered[0].bead_id, "held-only");
-
-        // Pre-existing QUEUED rows are untouched.
-        for id in ["queued-a", "queued-b", "queued-c"] {
-            let o = store.load(id).unwrap().unwrap();
-            assert_eq!(o.state, OverlayState::Queued, "{id} must stay QUEUED");
-            assert_eq!(o.autonomy_secs, 0, "{id} autonomy_secs unchanged");
-        }
-    }
-
-    /// jleechan-54ky: `list_active_overlays` returns the active set
-    /// unchanged (no implicit increment). `bump_autonomy_secs` advances a
-    /// single row. Together they replace the old
-    /// `increment_active_autonomy` SQL update + select in a way that lets
-    /// the caller skip rows whose PR has `ci_pending=true` (the
-    /// sub-fix-for-gib autonomy pause).
-    #[test]
-    fn list_active_overlays_does_not_bump_and_bump_autonomy_secs_targets_one_row() {
-        let schema = include_str!("../contracts/schema.sql");
-        let store = SqliteStateStore::open_in_memory_with_schema(schema).unwrap();
-
-        store
-            .save(&BeadOverlay {
-                bead_id: "d".into(),
-                state: OverlayState::Dispatched,
-                attempt: 1,
-                reroll_count: 0,
-                autonomy_secs: 100,
-                spend_usd: 0.0,
-                pr_number: None,
-                branch: Some("factory/d-r1".into()),
-                session_id: None,
-                is_adopted: false,
-                spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
-            })
-            .unwrap();
-        store
-            .save(&BeadOverlay {
-                bead_id: "a".into(),
-                state: OverlayState::Attested,
-                attempt: 1,
-                reroll_count: 0,
-                autonomy_secs: 200,
-                spend_usd: 0.0,
-                pr_number: Some(7),
-                branch: Some("factory/a-r1".into()),
-                session_id: None,
-                is_adopted: false,
-                spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
-            })
-            .unwrap();
-        store
-            .save(&BeadOverlay {
-                bead_id: "h".into(),
-                state: OverlayState::HumanHeld,
-                attempt: 1,
-                reroll_count: 0,
-                autonomy_secs: 300,
-                spend_usd: 0.0,
-                pr_number: None,
-                branch: Some("factory/h-r1".into()),
-                session_id: None,
-                is_adopted: false,
-                spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
-            })
-            .unwrap();
-
-        let active = store.list_active_overlays().unwrap();
-        assert_eq!(active.len(), 2, "DISPATCHED + ATTESTED only");
-        let names: Vec<&str> = active.iter().map(|o| o.bead_id.as_str()).collect();
-        assert!(names.contains(&"d"));
-        assert!(names.contains(&"a"));
-
-        // list_active_overlays must NOT have bumped autonomy_secs
-        let d_before = store.load("d").unwrap().unwrap();
-        assert_eq!(
-            d_before.autonomy_secs, 100,
-            "list_active_overlays must not bump autonomy_secs"
-        );
-
-        // bump_autonomy_secs targets exactly the row named
-        store.bump_autonomy_secs("d", 50).unwrap();
-        store.bump_autonomy_secs("a", 75).unwrap();
-        store.bump_autonomy_secs("h", 9999).unwrap(); // HUMAN_HELD row still bumps
-
-        let d_after = store.load("d").unwrap().unwrap();
-        assert_eq!(d_after.autonomy_secs, 150);
-        let a_after = store.load("a").unwrap().unwrap();
-        assert_eq!(a_after.autonomy_secs, 275);
-        let h_after = store.load("h").unwrap().unwrap();
-        assert_eq!(h_after.autonomy_secs, 10299);
-    }
-}
