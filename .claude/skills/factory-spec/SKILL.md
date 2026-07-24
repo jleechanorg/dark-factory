@@ -88,6 +88,57 @@ adversarial codex reviewer signs off on **both** before exit. Pass
 Display the pipeline graphs below. Read-only; no classification, no spec
 writes, no run.
 
+## Proof block (create mode, binary-backed)
+
+The default graph must preserve these nodes or their generated equivalents:
+main spec plan, independent cold review, bounded main-spec fix loop,
+attractor-spec plan, independent cold review, bounded attractor fix loop,
+and exit. An in-Claude prose-only workflow that claims a spec run without a
+logged binary invocation is not a valid run.
+
+End every `/fs` create-mode response with this proof block. Missing any
+required line means the run is unproven:
+
+```bash
+# Literal command run:
+cd /Users/jleechan/projects/<target-repo>
+DARK_FACTORY_HOME=~/projects/dark-factory \
+DARK_FACTORY_HOLDOUTS=~/projects/dark-factory-holdouts \
+PATH="$HOME/.local/bin:$PATH" \
+dark-factory \
+  --pipeline pipelines/slim/spec_gen.dot \
+  --goal "<echo of $ARGUMENTS>" \
+  --backend <backend> \
+  --feature <feature> \
+  --cxdb ~/.dark-factory/cxdb.sqlite
+# Run ID: <id>
+# CXDB SHA: <sha>
+# Final outcome: <success|failure|exhausted|error>
+# Exit code: <integer>
+# Wall-clock: <duration>
+# Logs: <path>
+# Evidence envelope: <path>
+```
+
+Honesty rules:
+- Quote the **actual** `dark-factory` command run — no paraphrasing.
+- If the binary run fails, surface the trace and stop; don't assume "we can
+  fix the spec later" without feeding the full review output into the next
+  fix loop.
+- If `--backend echo` was used, label the run as a wiring smoke — echo-mode
+  review verdicts are not real LLM verdicts.
+- Do not claim an in-Claude workflow or `Skill()` result is a factory run.
+  The only valid proof is an actual `dark-factory` binary invocation plus
+  this proof block.
+- Reference/review/show modes (`--review`, `--review-attractor`, `--show`)
+  are in-session helpers, not binary runs — they do not emit this proof
+  block and must not be reported as a factory run.
+
+**Why binary-first is the default**: the user's 2026-06-27 clarification
+requires default binary invocation. Claude/workflow logic may build a
+dynamic DOT graph behind the binary, but the durable proof remains the DOT
+graph, CXDB, logs, and evidence envelope — same reasoning as `/f`.
+
 ## Pipeline selection (mandatory before `/f` or `/factory`)
 
 Full decision table:
