@@ -11,6 +11,10 @@ path = "src/bin/vacuous_test_detector.rs"
 name = "vacuous_red_green"
 path = "src/bin/vacuous_red_green.rs"
 
+[[bin]]
+name = "claimd"
+path = "src/bin/claimd.rs"
+
 [dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

@@ -123,7 +123,17 @@ CREATE TABLE IF NOT EXISTS bead_overlay (
   -- `set_er_evidence_hash` StateStore methods (NOT a BeadOverlay field). Older
   -- DBs get it via the idempotent `ensure_last_er_evidence_hash_column`
   -- migration in `SqliteStateStore::open`.
-  last_er_evidence_hash TEXT
+  last_er_evidence_hash TEXT,
+  -- Bead jleechan-g1ib / CLAIMED tag coordination: which machine holds the
+  -- multi-machine claim for this bead, if any. NULL means "no claim" (free to
+  -- dispatch). The tick dispatch loop skips rows where `claimed_by IS NOT NULL
+  -- AND claimed_at > now - ttl_secs` (default ttl=30 min), so a machine crash
+  -- that leaves a stale claim eventually frees the bead. Claim/release/heartbeat
+  -- are atomic via `StateStore::try_claim`/`release_claim`/`heartbeat_claim`.
+  -- Pre-existing rows legitimately default to NULL. Older DBs get these via the
+  -- idempotent `ensure_claimed_by_columns` migration in `SqliteStateStore::open`.
+  claimed_by TEXT,
+  claimed_at INTEGER
 );
 
 -- Deletion guard: the daemon/skills may delete ONLY refs recorded here (spec §4.2.8).
@@ -175,6 +185,23 @@ CREATE TABLE IF NOT EXISTS escalation_ledger (
   -- `SqliteStateStore::open` (probes `pragma_table_info` then `ALTER TABLE`).
   terminal          INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (bead_id, reason)
+);
+
+-- Bead jleechan-g1ib / CLAIMED tag coordination: per-(machine, bead) cache of
+-- the peer daemon's last-reported live claims. Populated by `claimd daemon`'s
+-- periodic GET /sync (or peer POST /sync push). Used by `StateStore::try_claim`
+-- to refuse a local claim when the peer already holds it within the TTL.
+-- Replaced wholesale on every sync (delete-then-insert in a transaction), so
+-- a missing entry means "peer no longer reports this claim". Expires_at is
+-- the peer's own assertion of when its claim dies (no local recompute), so
+-- each daemon's TTL choice is honored.
+CREATE TABLE IF NOT EXISTS peer_claims (
+  machine        TEXT NOT NULL,
+  bead_id        TEXT NOT NULL,
+  claimed_at     INTEGER NOT NULL,
+  expires_at     INTEGER NOT NULL,
+  last_synced_at INTEGER NOT NULL,
+  PRIMARY KEY (machine, bead_id)
 );
 
 -- /er runner state (bead jleechan-qqq): per-bead attempt counter + last

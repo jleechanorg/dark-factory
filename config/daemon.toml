@@ -21,3 +21,26 @@ push_remote = "worldai"
 [repos."jleechanorg/dark-factory"]
 ao_project = "dark-factory"
 push_remote = "origin"
+
+# Multi-machine CLAIMED tag coordination (bead jleechan-g1ib). One tagger
+# per machine runs `bin/claimd` against the daemon-cxdb.sqlite shared with
+# this factory daemon. Each machine has its own `claimed-by:<machine>`
+# label; the daemon only refuses a claim when the LOCAL overlay says the
+# bead is already held (within ttl_minutes) OR the peer's last /sync
+# reported the bead as held by the other machine. unset peer = single-
+# machine mode (no peer sync). On jeff-ubuntu port=7821; on mac port=7822.
+[claim]
+ttl_minutes = 30
+heartbeat_seconds = 600
+gh_reapply_minutes = 10
+sync_seconds = 60
+[claim.jeff-ubuntu]
+hostname = "jeff-ubuntu"
+daemon_port = 7821
+peer_host = "mac.lan"
+peer_port = 7822
+[claim.mac]
+hostname = "mac"
+daemon_port = 7822
+peer_host = "jeff-ubuntu.lan"
+peer_port = 7821

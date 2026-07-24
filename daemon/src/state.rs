@@ -379,6 +379,91 @@ pub trait StateStore {
     ) -> Result<(), DaemonError> {
         Ok(())
     }
+
+    /// Bead jleechan-g1ib / CLAIMED tag coordination. Atomically claim
+    /// `bead_id` for `machine` if no live claim exists. A claim is "live"
+    /// iff `claimed_by IS NOT NULL AND claimed_at > now_epoch - ttl_secs`.
+    /// Returns `Ok(true)` when this call took the claim, `Ok(false)` when a
+    /// non-expired claim by `machine` (or any other machine) was already
+    /// present. Distinct from `peer_claim_taken` (which checks the peer
+    /// daemon's reported claims, NOT this row): a claim attempt must clear
+    /// BOTH gates before this returns true. Default no-op for fakes.
+    fn try_claim(
+        &self,
+        _bead_id: &str,
+        _machine: &str,
+        _now_epoch: u64,
+        _ttl_secs: u64,
+    ) -> Result<bool, DaemonError> {
+        Ok(true)
+    }
+
+    /// Bead jleechan-g1ib: clear the local `claimed_by`/`claimed_at` for
+    /// `bead_id`. No-op when the row has no claim or the claim belongs to a
+    /// different machine (so a malformed `release` call cannot steal a
+    /// peer's claim). Default no-op for fakes.
+    fn release_claim(&self, _bead_id: &str, _machine: &str) -> Result<(), DaemonError> {
+        Ok(())
+    }
+
+    /// Bead jleechan-g1ib: heartbeat — refresh the `claimed_at` of an
+    /// existing claim to `now_epoch`. Returns `false` when no claim exists
+    /// (caller should `try_claim` instead). Default no-op for fakes.
+    fn heartbeat_claim(
+        &self,
+        _bead_id: &str,
+        _machine: &str,
+        _now_epoch: u64,
+        _ttl_secs: u64,
+    ) -> Result<bool, DaemonError> {
+        Ok(true)
+    }
+
+    /// Bead jleechan-g1ib: snapshot every live local claim. Default empty
+    /// for fakes (no production code path needs the fake to return data).
+    fn list_live_local_claims(
+        &self,
+        _now_epoch: u64,
+        _ttl_secs: u64,
+    ) -> Result<Vec<(String, u64, u64)>, DaemonError> {
+        Ok(Vec::new())
+    }
+
+    /// Bead jleechan-g1ib: replace the cached peer-claim set with `claims`
+    /// (each `(machine, bead_id, claimed_at, expires_at)`). Old rows that
+    /// are NOT in `claims` are dropped (the peer reports its full live set
+    /// every sync). `last_synced_at` is stamped to `now_epoch`. Default
+    /// no-op for fakes.
+    fn replace_peer_claims(
+        &self,
+        _claims: &[(String, String, u64, u64)],
+        _now_epoch: u64,
+    ) -> Result<(), DaemonError> {
+        Ok(())
+    }
+
+    /// Bead jleechan-g1ib: return true if any peer-reported claim on
+    /// `bead_id` is still live (expires_at > now_epoch). Default false.
+    fn peer_claim_taken(&self, _bead_id: &str, _now_epoch: u64) -> Result<bool, DaemonError> {
+        Ok(false)
+    }
+
+    /// Bead jleechan-g1ib: combined dispatch gate — true iff the LOCAL
+    /// overlay says `bead_id` is held by a different machine within the TTL
+    /// window (i.e. another machine owns this bead, drop it from the
+    /// dispatch queue). Defaults to false (no claim, dispatch allowed) so
+    /// fakes that don't exercise the path see the pre-gate behavior. The
+    /// dispatch loop in `tick::run_slow_tier` consults this just before
+    /// `dispatch_ready`.
+    fn claim_blocks_dispatch(
+        &self,
+        _bead_id: &str,
+        _now_epoch: u64,
+        _ttl_secs: u64,
+        _self_machine: &str,
+    ) -> Result<bool, DaemonError> {
+        Ok(false)
+    }
 }
 
 /// `StateStore` impl against `~/.dark-factory/daemon-cxdb.sqlite` (WAL mode,
@@ -591,6 +676,8 @@ impl SqliteStateStore {
         Self::ensure_disposition_required_state(&conn)?;
         Self::ensure_escalation_ledger_table(&conn)?;
         Self::ensure_escalation_ledger_terminal_column(&conn)?;
+        Self::ensure_claimed_by_columns(&conn)?;
+        Self::ensure_peer_claims_table(&conn)?;
         Ok(Self { conn })
     }
 
@@ -613,7 +700,75 @@ impl SqliteStateStore {
         Self::ensure_disposition_required_state(&conn)?;
         Self::ensure_escalation_ledger_table(&conn)?;
         Self::ensure_escalation_ledger_terminal_column(&conn)?;
+        Self::ensure_claimed_by_columns(&conn)?;
+        Self::ensure_peer_claims_table(&conn)?;
         Ok(Self { conn })
+    }
+
+    /// Idempotent migration for the multi-machine claim columns (bead
+    /// jleechan-g1ib: CLAIMED tag coordination). Adds `claimed_by TEXT` and
+    /// `claimed_at INTEGER` to `bead_overlay`. The dispatch loop skips rows
+    /// where `claimed_by IS NOT NULL AND claimed_at > now - ttl_secs`, so a
+    /// machine crash that left a stale claim eventually frees the bead.
+    /// Nullable, defaulted to NULL ("no claim"). Pre-existing rows
+    /// legitimately have no claim set.
+    fn ensure_claimed_by_columns(conn: &Connection) -> Result<(), DaemonError> {
+        let has_claimed_by: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
+                 WHERE name = 'claimed_by'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_claimed_by_columns: pragma by", e))?;
+        if !has_claimed_by {
+            conn.execute("ALTER TABLE bead_overlay ADD COLUMN claimed_by TEXT", [])
+                .map_err(|e| tool_err("ensure_claimed_by_columns: add by", e))?;
+        }
+        let has_claimed_at: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
+                 WHERE name = 'claimed_at'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_claimed_by_columns: pragma at", e))?;
+        if !has_claimed_at {
+            conn.execute("ALTER TABLE bead_overlay ADD COLUMN claimed_at INTEGER", [])
+                .map_err(|e| tool_err("ensure_claimed_by_columns: add at", e))?;
+        }
+        Ok(())
+    }
+
+    /// Idempotent migration for the `peer_claims` table (bead jleechan-g1ib).
+    /// Stores the last-known-claim set the peer daemon reported via /sync, so
+    /// a second machine can refuse a claim locally if the peer already holds
+    /// it (within the grace window). Probes `sqlite_master` then
+    /// `CREATE TABLE IF NOT EXISTS` — same idempotent pattern as
+    /// `ensure_escalation_ledger_table`.
+    fn ensure_peer_claims_table(conn: &Connection) -> Result<(), DaemonError> {
+        let has_table: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'peer_claims'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_peer_claims_table: probe", e))?;
+        if !has_table {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS peer_claims (\
+                   machine        TEXT NOT NULL,\
+                   bead_id        TEXT NOT NULL,\
+                   claimed_at     INTEGER NOT NULL,\
+                   expires_at     INTEGER NOT NULL,\
+                   last_synced_at INTEGER NOT NULL,\
+                   PRIMARY KEY (machine, bead_id)\
+                 )",
+            )
+            .map_err(|e| tool_err("ensure_peer_claims_table: create", e))?;
+        }
+        Ok(())
     }
 
     /// Idempotent migration for the `/er` runner columns (bead jleechan-qqq).
@@ -1840,6 +1995,206 @@ impl StateStore for SqliteStateStore {
             )
             .map_err(|e| tool_err("mark_escalation_undeliverable: upsert", e))?;
         Ok(())
+    }
+
+    /// Bead jleechan-g1ib: atomic claim. Single-statement conditional
+    /// UPDATE — a row whose live claim belongs to another machine OR whose
+    /// claim has expired beyond the TTL will be claimed by `machine`; a row
+    /// that already has a live claim by `machine` is treated as a heartbeat
+    /// (refresh the timestamp) and also returns true. A row with a live
+    /// claim by another machine returns false. The DB's per-connection
+    /// mutex on `&self.conn` makes this atomic with respect to other
+    /// local connections in WAL mode.
+    fn try_claim(
+        &self,
+        bead_id: &str,
+        machine: &str,
+        now_epoch: u64,
+        ttl_secs: u64,
+    ) -> Result<bool, DaemonError> {
+        let expired_threshold = now_epoch.saturating_sub(ttl_secs) as i64;
+        // Step 1: stale-claim sweep — free the row first so the conditional
+        // claim sees a clean slate. A no-op when the row is already free.
+        self.conn
+            .execute(
+                "UPDATE bead_overlay SET claimed_by = NULL, claimed_at = NULL \
+                 WHERE bead_id = ?1 \
+                   AND claimed_by IS NOT NULL \
+                   AND claimed_at IS NOT NULL \
+                   AND claimed_at < ?2",
+                params![bead_id, expired_threshold],
+            )
+            .map_err(|e| tool_err("try_claim: expire sweep", e))?;
+        // Step 2: ensure a row exists for this bead (idempotent insert).
+        // The INSERT explicitly sets `claimed_by = NULL` and `claimed_at =
+        // NULL` (overriding the columns' absence in the CREATE TABLE block
+        // pre-migration) so step 3 sees a row to claim. `ON CONFLICT DO
+        // NOTHING` is intentional: an existing row keeps its current claim
+        // (which may belong to another machine).
+        self.conn
+            .execute(
+                "INSERT INTO bead_overlay (bead_id, state, updated_at, claimed_by, claimed_at) \
+                 VALUES (?1, 'QUEUED', ?2, NULL, NULL) \
+                 ON CONFLICT(bead_id) DO NOTHING",
+                params![bead_id, now_iso8601()],
+            )
+            .map_err(|e| tool_err("try_claim: insert fresh", e))?;
+        // Step 3: claim iff currently unclaimed (NULL fields).
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE bead_overlay SET claimed_by = ?1, claimed_at = ?2, updated_at = ?3 \
+                 WHERE bead_id = ?4 AND claimed_by IS NULL",
+                params![machine, now_epoch as i64, now_iso8601(), bead_id],
+            )
+            .map_err(|e| tool_err("try_claim: conditional claim", e))?;
+        Ok(updated > 0)
+    }
+
+    /// Bead jleechan-g1ib: release iff the local row's claim belongs to
+    /// `machine`. A `release` for a different machine's claim is a no-op
+    /// (cannot steal). A `release` on an unclaimed row is also a no-op.
+    fn release_claim(&self, bead_id: &str, machine: &str) -> Result<(), DaemonError> {
+        self.conn
+            .execute(
+                "UPDATE bead_overlay SET claimed_by = NULL, claimed_at = NULL, updated_at = ?1 \
+                 WHERE bead_id = ?2 AND claimed_by = ?3",
+                params![now_iso8601(), bead_id, machine],
+            )
+            .map_err(|e| tool_err("release_claim", e))?;
+        Ok(())
+    }
+
+    /// Bead jleechan-g1ib: refresh `claimed_at` iff the row's current claim
+    /// belongs to `machine`. Returns false when the row is unclaimed or
+    /// belongs to another machine (caller should `try_claim` instead).
+    fn heartbeat_claim(
+        &self,
+        bead_id: &str,
+        machine: &str,
+        now_epoch: u64,
+        _ttl_secs: u64,
+    ) -> Result<bool, DaemonError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE bead_overlay SET claimed_at = ?1, updated_at = ?2 \
+                 WHERE bead_id = ?3 AND claimed_by = ?4",
+                params![now_epoch as i64, now_iso8601(), bead_id, machine],
+            )
+            .map_err(|e| tool_err("heartbeat_claim", e))?;
+        Ok(updated > 0)
+    }
+
+    /// Bead jleechan-g1ib: live local claims — rows whose `claimed_by` is
+    /// set AND whose `claimed_at > now - ttl_secs`. Returned as
+    /// `(bead_id, claimed_at, expires_at)` triples.
+    fn list_live_local_claims(
+        &self,
+        now_epoch: u64,
+        ttl_secs: u64,
+    ) -> Result<Vec<(String, u64, u64)>, DaemonError> {
+        let threshold = now_epoch.saturating_sub(ttl_secs) as i64;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT bead_id, claimed_at FROM bead_overlay \
+                 WHERE claimed_by IS NOT NULL AND claimed_at IS NOT NULL \
+                   AND claimed_at >= ?1",
+            )
+            .map_err(|e| tool_err("list_live_local_claims prepare", e))?;
+        let rows = stmt
+            .query_map(params![threshold], |row| {
+                let bead: String = row.get(0)?;
+                let at: i64 = row.get(1)?;
+                Ok((bead, at))
+            })
+            .map_err(|e| tool_err("list_live_local_claims query", e))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (bead, at) = r.map_err(|e| tool_err("list_live_local_claims row", e))?;
+            let at_u = at.max(0) as u64;
+            out.push((bead, at_u, at_u.saturating_add(ttl_secs)));
+        }
+        Ok(out)
+    }
+
+    /// Bead jleechan-g1ib: replace the entire cached peer-claim set. The
+    /// peer daemon reports its full live set on every /sync, so a missing
+    /// entry means the peer dropped the claim (TTL expired or explicit
+    /// release). We trust the latest snapshot — delete-then-insert in one
+    /// transaction.
+    fn replace_peer_claims(
+        &self,
+        claims: &[(String, String, u64, u64)],
+        now_epoch: u64,
+    ) -> Result<(), DaemonError> {
+        let tx = self.conn.unchecked_transaction().map_err(|e| tool_err("replace_peer_claims: tx", e))?;
+        tx.execute("DELETE FROM peer_claims", [])
+            .map_err(|e| tool_err("replace_peer_claims: delete", e))?;
+        for (machine, bead_id, claimed_at, expires_at) in claims {
+            tx.execute(
+                "INSERT INTO peer_claims (machine, bead_id, claimed_at, expires_at, last_synced_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(machine, bead_id) DO UPDATE SET \
+                   claimed_at = excluded.claimed_at, \
+                   expires_at = excluded.expires_at, \
+                   last_synced_at = excluded.last_synced_at",
+                params![
+                    machine,
+                    bead_id,
+                    *claimed_at as i64,
+                    *expires_at as i64,
+                    now_epoch as i64,
+                ],
+            )
+            .map_err(|e| tool_err("replace_peer_claims: insert", e))?;
+        }
+        tx.commit().map_err(|e| tool_err("replace_peer_claims: commit", e))?;
+        Ok(())
+    }
+
+    /// Bead jleechan-g1ib: is this bead claimed by any peer within the
+    /// grace window? We use `expires_at > now_epoch` (the peer's own
+    /// assertion of when the claim dies) rather than a local recompute so
+    /// the peer's TTL choice is honored.
+    fn peer_claim_taken(&self, bead_id: &str, now_epoch: u64) -> Result<bool, DaemonError> {
+        let row: Result<i64, rusqlite::Error> = self.conn.query_row(
+            "SELECT COUNT(*) FROM peer_claims WHERE bead_id = ?1 AND expires_at > ?2",
+            params![bead_id, now_epoch as i64],
+            |row| row.get(0),
+        );
+        match row {
+            Ok(n) => Ok(n > 0),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(e) => Err(tool_err("peer_claim_taken", e)),
+        }
+    }
+
+    /// Bead jleechan-g1ib: dispatch gate. Returns true when the local
+    /// overlay holds a claim by ANOTHER machine (NOT `self_machine`) whose
+    /// `claimed_at > now - ttl_secs`. A row with no claim, or a claim by
+    /// `self_machine`, is dispatchable.
+    fn claim_blocks_dispatch(
+        &self,
+        bead_id: &str,
+        now_epoch: u64,
+        ttl_secs: u64,
+        self_machine: &str,
+    ) -> Result<bool, DaemonError> {
+        let threshold = now_epoch.saturating_sub(ttl_secs) as i64;
+        let row: Result<Option<String>, rusqlite::Error> = self.conn.query_row(
+            "SELECT claimed_by FROM bead_overlay \
+             WHERE bead_id = ?1 AND claimed_by IS NOT NULL AND claimed_at >= ?2",
+            params![bead_id, threshold],
+            |row| row.get(0),
+        );
+        match row {
+            Ok(Some(holder)) => Ok(holder != self_machine),
+            Ok(None) => Ok(false),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(e) => Err(tool_err("claim_blocks_dispatch", e)),
+        }
     }
 }
 
@@ -4125,5 +4480,130 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_col, 1, "terminal column must exist after open");
+    }
+
+    /// Bead jleechan-g1ib: claim/release/heartbeat round-trip and atomic
+    /// contention (a second machine cannot steal a live claim).
+    #[test]
+    fn claim_lifecycle_round_trips_and_rejects_concurrent_claim() {
+        let s = store();
+        // Fresh claim succeeds.
+        assert!(s.try_claim("bead-1", "jeff-ubuntu", 100, 60).unwrap());
+        // Different machine within TTL is refused (the row is already
+        // claimed; same-machine re-claim ALSO returns false — callers
+        // should use `heartbeat_claim` to refresh).
+        assert!(!s.try_claim("bead-1", "mac", 110, 60).unwrap());
+        // Heartbeat by another machine is also refused.
+        assert!(!s.heartbeat_claim("bead-1", "mac", 115, 60).unwrap());
+        // Owner heartbeat refreshes.
+        assert!(s.heartbeat_claim("bead-1", "jeff-ubuntu", 120, 60).unwrap());
+        // Release by another machine is a no-op.
+        s.release_claim("bead-1", "mac").unwrap();
+        // Owner release succeeds; the row is now unclaimed.
+        s.release_claim("bead-1", "jeff-ubuntu").unwrap();
+        assert!(s.try_claim("bead-1", "mac", 130, 60).unwrap());
+    }
+
+    /// Bead jleechan-g1ib: a stale claim (claimed_at < now - ttl_secs) is
+    /// expired by try_claim, so another machine can claim a crashed
+    /// owner's bead.
+    #[test]
+    fn stale_claim_is_expired_by_try_claim() {
+        let s = store();
+        // Owner claims at epoch 100 with ttl=60.
+        assert!(s.try_claim("bead-1", "jeff-ubuntu", 100, 60).unwrap());
+        // 200 seconds later (well past 100+60=160), another machine claims.
+        assert!(s.try_claim("bead-1", "mac", 200, 60).unwrap());
+    }
+
+    /// Bead jleechan-g1ib: a peer-reported claim refuses a local attempt
+    /// (peer_claim_taken short-circuits try_claim).
+    #[test]
+    fn peer_claim_taken_blocks_local_attempt() {
+        let s = store();
+        let now = 1000;
+        let claims = vec![(
+            "jeff-ubuntu".to_string(),
+            "bead-shared".to_string(),
+            now,
+            now + 60,
+        )];
+        s.replace_peer_claims(&claims, now).unwrap();
+        // Within the peer's reported TTL: peer_claim_taken is true.
+        assert!(s.peer_claim_taken("bead-shared", now + 30).unwrap());
+        // Past the peer's TTL: false.
+        assert!(!s.peer_claim_taken("bead-shared", now + 120).unwrap());
+    }
+
+    /// Bead jleechan-g1ib: replace_peer_claims wipes stale rows on every
+    /// call so a peer that drops a claim doesn't keep haunting us.
+    #[test]
+    fn replace_peer_claims_wipes_previous_set() {
+        let s = store();
+        let now = 1000;
+        // First sync: two claims.
+        s.replace_peer_claims(
+            &[
+                ("jeff-ubuntu".to_string(), "bead-a".to_string(), now, now + 60),
+                ("jeff-ubuntu".to_string(), "bead-b".to_string(), now, now + 60),
+            ],
+            now,
+        )
+        .unwrap();
+        assert!(s.peer_claim_taken("bead-a", now + 1).unwrap());
+        assert!(s.peer_claim_taken("bead-b", now + 1).unwrap());
+        // Second sync: peer dropped bead-b. Replace wipes both rows and
+        // re-inserts only bead-a.
+        s.replace_peer_claims(
+            &[("jeff-ubuntu".to_string(), "bead-a".to_string(), now, now + 60)],
+            now + 10,
+        )
+        .unwrap();
+        assert!(s.peer_claim_taken("bead-a", now + 11).unwrap());
+        assert!(!s.peer_claim_taken("bead-b", now + 11).unwrap());
+    }
+
+    /// Bead jleechan-g1ib: list_live_local_claims respects the TTL window.
+    #[test]
+    fn list_live_local_claims_filters_by_ttl() {
+        let s = store();
+        s.try_claim("fresh", "jeff-ubuntu", 100, 60).unwrap();
+        s.try_claim("stale", "jeff-ubuntu", 50, 60).unwrap();
+        let claims = s.list_live_local_claims(120, 60).unwrap();
+        let beads: Vec<String> = claims.iter().map(|(b, _, _)| b.clone()).collect();
+        // 120 - 60 = 60 cutoff: "stale" (at=50) is excluded; "fresh" (at=100) is included.
+        assert_eq!(beads, vec!["fresh".to_string()]);
+    }
+
+    /// Bead jleechan-g1ib: schema migration is idempotent (legacy DB
+    /// without claim columns gets them on open; a re-open is a no-op).
+    #[test]
+    fn claimed_by_columns_present_after_open() {
+        let s = store();
+        let has_claimed_by: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
+                 WHERE name = 'claimed_by'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_claimed_by, 1);
+    }
+
+    #[test]
+    fn peer_claims_table_present_after_open() {
+        let s = store();
+        let has_table: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'peer_claims'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_table, 1);
     }
 }

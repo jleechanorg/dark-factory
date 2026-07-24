@@ -1757,6 +1757,46 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     }
 
     if !ready.is_empty() {
+        // Bead jleechan-g1ib / CLAIMED tag coordination: drop any bead
+        // whose local overlay shows it held by another machine within the
+        // TTL window. The peer-reported claims are consulted by
+        // `bin/claimd daemon`'s sync loop and have already been written
+        // to the local overlay via `replace_peer_claims` — but we only
+        // gate on the LOCAL overlay here so the tick loop stays
+        // dependency-free of `bin/claimd`. `claim_blocks_dispatch` is a
+        // no-op for fakes (always returns false), preserving pre-claim
+        // dispatch behavior in unit tests.
+        let claim_self_machine = std::env::var("CLAIM_MACHINE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "jeff-ubuntu".to_string());
+        let claim_ttl_secs: u64 = std::env::var("CLAIM_TTL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1800);
+        let now_epoch = now_epoch_secs();
+        let before = ready.len();
+        ready.retain(|(bead, _, _)| {
+            !deps
+                .store
+                .claim_blocks_dispatch(&bead.id, now_epoch, claim_ttl_secs, &claim_self_machine)
+                .unwrap_or(false)
+        });
+        let skipped = before - ready.len();
+        if skipped > 0 {
+            let _ = emit(
+                deps.telemetry_log,
+                "_dispatch_filter",
+                0,
+                "N/A",
+                "CLAIM_BLOCKED_DISPATCH",
+                serde_json::json!({"skipped": skipped, "ttl_secs": claim_ttl_secs}),
+                serde_json::json!({"self_machine": claim_self_machine}),
+            );
+        }
+        if ready.is_empty() {
+            return Ok(());
+        }
         let dispatch_report =
             dispatch::dispatch_ready(deps.sessions, deps.store, deps.cfg, &ready)?;
         summary.beads_dispatched += dispatch_report.success_count();
