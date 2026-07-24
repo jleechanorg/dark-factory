@@ -281,10 +281,14 @@ g = json.loads(sys.argv[1])
 # Legacy aliases "green"/"red"/"unknown" map to "pass"/"fail"/"unknown".
 # Unknown verdict tokens are rejected (no keyword routing — only the
 # invoking model decides pass|warn|fail).
-REQUIRED_KEYS = {"ci_green","no_conflicts","coderabbit","bugbot","comments_resolved","evidence_review","skeptic"}
+# Task 3 (reviewer-outage-resilience): "waived_vendor_unavailable" is a
+# canonical waiver token emitted for in-outage review-provider gates
+# (coderabbit / bugbot). It is neither "fail" nor "unknown", so it neither
+# blocks nor defers the merge; accepted explicitly so the token round-trips.
+REQUIRED_KEYS = {"ci_green","no_conflicts","coderabbit","bugbot","comments_resolved","evidence_review","skeptic","vacuous_red_green"}
 OPTIONAL_KEYS = {"code_standards","zfc"}
-ALIAS = {"green":"pass","red":"fail","warn":"warn","unknown":"unknown","pass":"pass","fail":"fail"}
-VALID = {"pass","warn","fail","unknown"}
+ALIAS = {"green":"pass","red":"fail","warn":"warn","unknown":"unknown","pass":"pass","fail":"fail","waived_vendor_unavailable":"waived_vendor_unavailable"}
+VALID = {"pass","warn","fail","unknown","waived_vendor_unavailable"}
 
 def normalize(v, key):
     if isinstance(v, str):
@@ -314,7 +318,7 @@ PYGA
   all_green="$(python3 - "$4" <<'PYGB'
 import json, sys
 g = json.loads(sys.argv[1])
-ALIAS = {"green":"pass","red":"fail","warn":"warn","unknown":"unknown","pass":"pass","fail":"fail"}
+ALIAS = {"green":"pass","red":"fail","warn":"warn","unknown":"unknown","pass":"pass","fail":"fail","waived_vendor_unavailable":"waived_vendor_unavailable"}
 def verdict(v):
     if isinstance(v, str):
         return ALIAS.get(v, v)
@@ -327,7 +331,10 @@ def verdict(v):
 # verifier hasn't gathered evidence yet and must wait for the next tick;
 # treating unknown as green would let stale beads race to READY without
 # independent review.
-print("true" if all(verdict(v) in ("pass","warn") for v in g.values()) else "false")
+# Task 3: "waived_vendor_unavailable" (in-outage review-provider gate) is
+# treated as non-blocking like "pass"/"warn" so a waived provider gate
+# does not block an otherwise-green assessment.
+print("true" if all(verdict(v) in ("pass","warn","waived_vendor_unavailable") for v in g.values()) else "false")
 PYGB
 )"
   prior_last="$(grep '"eventType": *"GATE_ASSESSMENT"' "$LOG" 2>/dev/null | grep -E "\"pr_number\": *$3[,}]" | tail -1 || true)"
