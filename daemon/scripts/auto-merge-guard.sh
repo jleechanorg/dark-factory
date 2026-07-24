@@ -51,13 +51,8 @@ except Exception:
 # blocking token); "warn" and "unknown" stay non-blocking per the documented
 # no-red merge policy (infra walls like CodeRabbit/Bugbot quota should not
 # deadlock the factory).
-# Task 3 (reviewer-outage-resilience): "waived_vendor_unavailable" is a
-# canonical waiver token for in-outage review-provider gates (coderabbit /
-# bugbot). It is neither "fail" nor "unknown", so it neither blocks nor
-# defers the merge; documented in ALIAS so the intent is explicit.
 ALIAS = {"pass":"pass","warn":"warn","fail":"fail","unknown":"unknown",
-         "green":"pass","red":"fail","yellow":"warn",
-         "waived_vendor_unavailable":"waived_vendor_unavailable"}
+         "green":"pass","red":"fail","yellow":"warn"}
 def verdict(v):
     if isinstance(v, str):
         return ALIAS.get(v, v)
