@@ -1498,6 +1498,7 @@ mod tests {
             reroll_head_stability_window_secs: 30,
             reroll_death_confirm_secs: 5,
             held_recheck_cooldown_secs: 900,
+            escalation_refire_secs: 3600,
             repos: std::collections::HashMap::new(),
         }
     }

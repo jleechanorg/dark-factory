@@ -98,6 +98,16 @@ pub struct Config {
     /// unchanged.
     #[serde(default = "default_held_recheck_cooldown_secs")]
     pub held_recheck_cooldown_secs: u64,
+    /// Backoff window (seconds) governing escalation re-fire dedup
+    /// (1s2q-escalation-dedup, re-introduced by clean replay of PR #470):
+    /// an ESCALATION_REQUIRED / ESCALATION_NOTIFICATION_FAILED event is
+    /// suppressed unless its context hash changed OR the last emit for
+    /// `(bead_id, reason)` is older than this window. Stops the
+    /// live-incident spam where a bead with an identical permanent
+    /// condition re-fired every ~40s. Default 1 hour. `#[serde(default)]`
+    /// so every pre-existing `daemon.toml` parses unchanged.
+    #[serde(default = "default_escalation_refire_secs")]
+    pub escalation_refire_secs: u64,
     /// Multi-repo routing table (bead jleechan-35y4 Stage B). Absent entirely
     /// from a config file (the common case for every pre-existing
     /// `daemon.toml`) deserializes to an empty map via `#[serde(default)]` —
@@ -125,6 +135,13 @@ fn default_held_recheck_cooldown_secs() -> u64 {
 /// r3): 5s, per the Codex review's "3 attempts over ≥5s".
 fn default_reroll_death_confirm_secs() -> u64 {
     5
+}
+
+/// Default escalation re-fire backoff (1s2q-escalation-dedup, re-introduced
+/// by clean replay of PR #470): 1 hour between re-emissions of an
+/// identical-context escalation event for the same `(bead_id, reason)`.
+fn default_escalation_refire_secs() -> u64 {
+    3600
 }
 
 impl Config {
@@ -444,6 +461,9 @@ spec_dir = ".factory/specs/"
         // Bead jleechan-zaga / issue #348 r3: the held-recheck cooldown
         // defaults to 15 minutes and is config-overridable.
         assert_eq!(cfg.held_recheck_cooldown_secs, 900);
+        // Bead jleechan-rouf (PR #470 clean replay): the escalation
+        // re-fire backoff defaults to 1 hour and is config-overridable.
+        assert_eq!(cfg.escalation_refire_secs, 3600);
     }
 
     #[test]
