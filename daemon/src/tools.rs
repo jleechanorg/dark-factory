@@ -141,7 +141,7 @@ pub struct PrFile {
 }
 
 /// One gate's read from the SCM, gathered for the 7/8-green verifier (spec §4.2.5).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PrSnapshot {
     pub pr_number: u64,
     pub ci_success: bool,

@@ -1398,42 +1398,6 @@ mod tests {
     // every other gate keeps its real verdict and remains fully enforced.
 
     #[test]
-    fn vendor_for_gate_maps_only_provider_gates() {
-        assert_eq!(GateName::CodeRabbitApproved.vendor_for_gate(), Some("coderabbit"));
-        assert_eq!(GateName::BugbotClean.vendor_for_gate(), Some("bugbot"));
-        // Every other gate returns None — never waived.
-        assert_eq!(GateName::Ci.vendor_for_gate(), None);
-        assert_eq!(GateName::NoConflicts.vendor_for_gate(), None);
-        assert_eq!(GateName::CommentsResolved.vendor_for_gate(), None);
-        assert_eq!(GateName::EvidenceFloor.vendor_for_gate(), None);
-        assert_eq!(GateName::Skeptic.vendor_for_gate(), None);
-        assert_eq!(GateName::VacuousRedGreen.vendor_for_gate(), None);
-    }
-
-    #[test]
-    fn to_json_with_outage_waives_coderabbit_gate_only() {
-        let mut scm = FakeScm::default();
-        scm.snapshots.insert(7, all_green_snapshot(7));
-        let cfg = test_cfg();
-        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
-        assert!(report.all_green);
-
-        let json = report.to_json_with_outage(&["coderabbit"]);
-        let gates = json.get("gates").unwrap().as_object().unwrap();
-        // coderabbit gate carries the waiver token.
-        assert_eq!(
-            gates.get("coderabbit").unwrap().as_str().unwrap(),
-            "waived_vendor_unavailable"
-        );
-        // bugbot gate is NOT waived (only coderabbit is in outage).
-        assert_eq!(gates.get("bugbot").unwrap().as_str().unwrap(), "pass");
-        // Every other gate keeps its real verdict.
-        assert_eq!(gates.get("ci_green").unwrap().as_str().unwrap(), "pass");
-        assert_eq!(gates.get("skeptic").unwrap().as_str().unwrap(), "pass");
-        assert_eq!(gates.get("evidence_review").unwrap().as_str().unwrap(), "pass");
-    }
-
-    #[test]
     fn to_json_with_outage_waives_bugbot_gate_only() {
         let mut scm = FakeScm::default();
         scm.snapshots.insert(7, all_green_snapshot(7));

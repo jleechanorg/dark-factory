@@ -9,7 +9,7 @@
 
 use daemon::errors::DaemonError;
 use daemon::state::{
-    is_permanent_human_hold_reason, set_human_hold_reason, BeadOverlay, HumanHoldReason,
+    BeadOverlay,
     OverlayState, StateStore, VendorHealth,
 };
 use daemon::tools::{
@@ -1000,4 +1000,12 @@ impl StateStore for FakeStateStore {
         }
         Ok(row.clone())
     }
+}
+
+// jsby vendor_health test stub.
+#[derive(Clone, Debug, Default)]
+pub struct EscalationLedgerEntry {
+    pub context_hash: String,
+    pub last_emitted_epoch: u64,
+    pub terminal: bool,
 }

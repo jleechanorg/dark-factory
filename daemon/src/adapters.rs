@@ -989,9 +989,7 @@ impl Scm for CliScm {
                     }
                 }
             }
-            if !any_present {
-                "unknown".to_string()
-            } else if any_pending {
+            if !any_present || any_pending {
                 "unknown".to_string()
             } else if any_failed {
                 "red".to_string()
