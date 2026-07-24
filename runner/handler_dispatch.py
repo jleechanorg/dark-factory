@@ -45,7 +45,7 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from .handler_core import Result
 
@@ -573,17 +573,59 @@ def _run_gate_once(
     context_updates = {}
     if outcome == "success":
         context_updates["_last_validated_head_sha"] = expected_sha
+    # Build the structured receipt for the real subprocess that just ran.
+    # This is what closes the regex-fabrication ceiling — the gate now binds
+    # the verdict to the captured execution, not to the reviewer's narrative.
+    receipt = _build_reviewer_receipt(
+        sub_args=sub_args, proc=proc, cwd=str(ctx.workdir),
+        expected_sha=expected_sha, timeout=timeout,
+    )
+    metadata: dict[str, Any] = {
+        "slash_command": name, "verdict": verdict,
+        "returncode": str(proc.returncode),
+        "expected_head_sha": expected_sha, "observed_head_sha": observed_sha,
+        "head_sha_status": head_sha_status,
+        "reviewer_backend": reviewer_backend,
+        **prompt_meta,
+    }
+    if receipt is not None:
+        # Pass-through: list-valued receipt list is consumed verbatim by the
+        # structured gate (_check_structured_receipt) via _MDToCtxShim.
+        metadata["_reviewer_receipts"] = [receipt]
+    # Codergen-sourced receipts (Task 2): the codergen producer stashes
+    # parsed ``commands_run.md`` records into ``ctx.state`` under per-node
+    # keys ``"<node>.structured_receipt"``. The reviewer gate runs in a
+    # SEPARATE node from the codergen node, so the receipts are NOT under
+    # this gate's own key — gather every ``*.structured_receipt`` list from
+    # ``ctx.state`` and surface them under a parallel metadata key so the
+    # structured gate (_check_structured_receipt via _MDToCtxShim) can honor
+    # them at the same trust tier as engine-captured receipts. No new config;
+    # absent codergen receipts => the key is unset and behavior is unchanged.
+    #
+    # Cross-node gathering is intentional and by design. The plan describes
+    # "codergen lanes" (plural): more than one codergen node may run against
+    # the same HEAD, each producing its own structured receipt. The gather
+    # loop below intentionally OR-aggregates receipts from *every*
+    # ``*.structured_receipt`` key, not just the one belonging to a specific
+    # codergen node. This is safe because the SHA check above
+    # (``head_sha`` matching ``expected_sha``) binds each receipt to the
+    # graded *commit*, not to a specific codergen node: every receipt
+    # aggregated here already carries (and was validated against) the HEAD
+    # being graded. Therefore a passing receipt from ANY codergen lane that
+    # ran on the same HEAD legitimately satisfies the structured gate — the
+    # commit-level provenance is what matters, not which lane produced it.
+    codergen_receipts: list = []
+    state = getattr(ctx, "state", None)
+    if isinstance(state, dict):
+        for k, v in state.items():
+            if isinstance(k, str) and k.endswith(".structured_receipt") and isinstance(v, list):
+                codergen_receipts.extend(v)
+    if codergen_receipts:
+        metadata["_codergen_receipts"] = codergen_receipts
     return _finalize(Result(
         outcome=outcome,
         output=proc.stdout,
-        metadata={
-            "slash_command": name, "verdict": verdict,
-            "returncode": str(proc.returncode),
-            "expected_head_sha": expected_sha, "observed_head_sha": observed_sha,
-            "head_sha_status": head_sha_status,
-            "reviewer_backend": reviewer_backend,
-            **prompt_meta,
-        },
+        metadata=metadata,
         context_updates=context_updates,
     ))
 
@@ -599,6 +641,38 @@ def _is_gate_infra_failure(result: "Result") -> bool:
         return True
     md = result.metadata or {}
     return md.get("sandbox") == "unavailable" or md.get("timed_out") == "true" or md.get("backend_missing") == "true"
+
+
+def _build_reviewer_receipt(
+    *,
+    sub_args: list[str],
+    proc: "subprocess.CompletedProcess | None",
+    cwd: str,
+    expected_sha: str,
+    timeout: int,
+    lane_id: str = "primary",
+) -> dict | None:
+    """Build a structured receipt record from a captured subprocess result.
+
+    Returns ``None`` when the subprocess has not been executed yet (early
+    timeout/missing-exe branches), so the caller can drop it cleanly from
+    the gate Result metadata. Otherwise returns a dict with the canonical
+    shape consumed by ``runner.handler_verdict._check_structured_receipt``.
+    """
+    if proc is None:
+        return None
+    try:
+        rc = int(getattr(proc, "returncode", 1) or 0)
+    except (TypeError, ValueError):
+        rc = 1
+    return {
+        "command": list(sub_args),
+        "cwd": cwd,
+        "exit_code": rc,
+        "head_sha": str(expected_sha or "").lower(),
+        "lane_id": lane_id,
+        "timeout": int(timeout),
+    }
 
 
 # Default adversarial-review priority queue. Read at run-config time

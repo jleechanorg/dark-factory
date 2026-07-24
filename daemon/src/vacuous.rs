@@ -888,6 +888,7 @@ fn looks_like_construction_round_trip(body_text: &str) -> bool {
             // side of the assertion (the side that's data, not the side
             // being read from the construction).
             let rhs_starts_with_name = lhs.starts_with(name.as_str());
+            let _ = rhs_starts_with_name;
 
             // Side 1: `name.X` is LHS, lookup `rhs_assert` for a literal that
             // appeared in construction lits.

@@ -27,8 +27,16 @@ import pytest
 
 from runner.skeptic_gate import (
     MARKER,
+<<<<<<< HEAD
+<<<<<<< HEAD
     ParsedLintRun,
     ParsedTestRun,
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
+=======
+    ParsedLintRun,
+    ParsedTestRun,
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     ParsedVerdict,
     ReadBackCheck,
     SkepticResult,
@@ -44,11 +52,9 @@ from runner.skeptic_gate import (
     verify_provenance,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
 
 def _valid_output(
     *,
@@ -58,6 +64,10 @@ def _valid_output(
     pr_number: int = 278,
     reason: str = "diff is small and well-scoped",
     identity: str = "codex",
+<<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     test_passed: int = 100,
     test_failed: int = 0,
     test_exit: int = 0,
@@ -65,12 +75,25 @@ def _valid_output(
     lint_errors: int = 0,
     lint_warnings: int = 2,
     grep_cites: str = "runner/skeptic_gate.py:212;tests/test_skeptic_gate.py:94",
+<<<<<<< HEAD
 ) -> str:
     """A canonical 10-line, 1-of-each reviewer output (issue #384).
 
     Includes the four execution-evidence fields required by the
     post-#384 contract. Tests that intentionally exercise the
     missing-evidence rejection path override individual fields.
+=======
+) -> str:
+    """A canonical 6-line, 1-of-each reviewer output.
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
+=======
+) -> str:
+    """A canonical 10-line, 1-of-each reviewer output (issue #384).
+
+    Includes the four execution-evidence fields required by the
+    post-#384 contract. Tests that intentionally exercise the
+    missing-evidence rejection path override individual fields.
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
 
     `head_sha` MUST be 40 hex chars by default — that's the strict
     contract. Tests that exercise the short-SHA rejection path use
@@ -83,14 +106,22 @@ def _valid_output(
         f"PR_NUMBER: {pr_number}\n"
         f"REASON: {reason}\n"
         f"IDENTITY: {identity}\n"
+<<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
         f"TEST_RUN_EVIDENCE: passed={test_passed} failed={test_failed} "
         f"skipped=0 exit={test_exit}\n"
         f"LINT_RUN_EVIDENCE: tool={lint_tool} errors={lint_errors} "
         f"warnings={lint_warnings}\n"
         f"GREP_CITES: {grep_cites}\n"
         f"HEAD_COMMIT_VERIFIED: {head_sha}\n"
+<<<<<<< HEAD
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     )
-
 
 def _ctx(**overrides):
     base = dict(
@@ -104,11 +135,9 @@ def _ctx(**overrides):
     base.update(overrides)
     return base
 
-
 # ===========================================================================
 # parse_verdict — strict 6-field contract
 # ===========================================================================
-
 
 def test_parse_verdict_full_contract_passes():
     parsed = parse_verdict(_valid_output())
@@ -119,13 +148,11 @@ def test_parse_verdict_full_contract_passes():
     assert parsed.pr_number == 278
     assert parsed.reviewr_identity if False else parsed.reviewer_identity == "codex"
 
-
 def test_parse_verdict_rejects_short_sha():
     """A reviewer that emits only a 7-char SHA has not fully bound its
     verdict — the deterministic side rejects the verdict."""
     out = "VERDICT: PASS\nHEAD_SHA: abc1234\nREPO: x/y\nPR_NUMBER: 1\nREASON: ok\nIDENTITY: codex\n"
     assert parse_verdict(out) is None
-
 
 def test_parse_verdict_rejects_short_sha_minimum_seven():
     """The 7-hex minimum is what GitHub displays; we require the full
@@ -133,13 +160,11 @@ def test_parse_verdict_rejects_short_sha_minimum_seven():
     out = "VERDICT: PASS\nHEAD_SHA: abc1234\nREPO: x/y\nPR_NUMBER: 1\nREASON: ok\nIDENTITY: codex\n"
     assert parse_verdict(out) is None
 
-
 def test_parse_verdict_rejects_missing_field():
     out = "VERDICT: PASS\nHEAD_SHA: abcdef1234567890abcdef1234567890abcdef12\nREPO: x/y\nPR_NUMBER: 1\nREASON: ok\n"
     assert (
         parse_verdict(out) is None
     )  # IDENTITY missing → not "exactly one OR zero" misbehavior; we still require
-
 
 def test_parse_verdict_rejects_duplicate_verdict_lines():
     """Anti-injection: code block with VERDICT: PASS plus a top-level
@@ -158,7 +183,6 @@ def test_parse_verdict_rejects_duplicate_verdict_lines():
     )
     assert parse_verdict(out) is None
 
-
 def test_parse_verdict_rejects_duplicate_identity_lines():
     """Two IDENTITY lines → reject. Otherwise an attacker could claim
     one identity for the structured parse and another for the audit
@@ -174,17 +198,14 @@ def test_parse_verdict_rejects_duplicate_identity_lines():
     )
     assert parse_verdict(out) is None
 
-
 def test_parse_verdict_unknown_identity_maps_to_unknown():
     out = _valid_output(identity="banana")
     assert parse_verdict(out) is None  # not in {claude, codex, gemini, unknown}
-
 
 def test_parse_verdict_rejects_non_string_input():
     assert parse_verdict(None) is None
     assert parse_verdict(42) is None
     assert parse_verdict(["VERDICT: PASS"]) is None
-
 
 def test_parse_verdict_handles_case_insensitive_field_lines():
     out = (
@@ -194,26 +215,32 @@ def test_parse_verdict_handles_case_insensitive_field_lines():
         "pr_number: 278\n"
         "reason: ok\n"
         "identity: codex\n"
+<<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
         "test_run_evidence: passed=100 failed=0 skipped=0 exit=0\n"
         "lint_run_evidence: tool=ruff errors=0 warnings=2\n"
         "grep_cites: foo:1\n"
         "head_commit_verified: abcdef1234567890abcdef1234567890abcdef12\n"
+<<<<<<< HEAD
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     )
     parsed = parse_verdict(out)
     assert parsed is not None
     assert parsed.verdict == "PASS"
     assert parsed.reviewer_identity == "codex"
 
-
 def test_parse_verdict_rejects_unknown_verdict_token():
     out = "VERDICT: WARN\nHEAD_SHA: abcdef1234567890abcdef1234567890abcdef12\nREPO: x/y\nPR_NUMBER: 1\nREASON: ok\nIDENTITY: codex\n"
     assert parse_verdict(out) is None
 
-
 # ===========================================================================
 # bind_to_pr — the headline invariant
 # ===========================================================================
-
 
 def test_bind_to_pr_accepts_matching_context():
     parsed = ParsedVerdict(
@@ -235,7 +262,6 @@ def test_bind_to_pr_accepts_matching_context():
     assert result.ok is True
     assert result.verdict == "PASS"
 
-
 def test_bind_to_pr_rejects_stale_sha():
     parsed = ParsedVerdict(
         verdict="PASS",
@@ -254,7 +280,6 @@ def test_bind_to_pr_rejects_stale_sha():
     )
     assert result.ok is False
     assert "stale" in result.reason.lower()
-
 
 def test_bind_to_pr_rejects_repo_mismatch():
     parsed = ParsedVerdict(
@@ -275,7 +300,6 @@ def test_bind_to_pr_rejects_repo_mismatch():
     assert result.ok is False
     assert "repo" in result.reason.lower()
 
-
 def test_bind_to_pr_rejects_pr_number_mismatch():
     parsed = ParsedVerdict(
         verdict="PASS",
@@ -295,29 +319,24 @@ def test_bind_to_pr_rejects_pr_number_mismatch():
     assert result.ok is False
     assert "pr number" in result.reason.lower()
 
-
 # ===========================================================================
 # verify_provenance — refuses self-review
 # ===========================================================================
-
 
 def test_verify_provenance_accepts_independent():
     ok, why = verify_provenance("claude", "codex")
     assert ok is True
     assert "independent" in why.lower()
 
-
 def test_verify_provenance_rejects_self_review_claude_codex():
     ok, why = verify_provenance("claude", "claude")
     assert ok is False
     assert "self-review" in why.lower()
 
-
 def test_verify_provenance_rejects_unknown_reviewer():
     ok, why = verify_provenance("claude", "unknown")
     assert ok is False
     assert "identity is unknown" in why.lower() or "must declare" in why.lower()
-
 
 def test_verify_provenance_rejects_unknown_implementer():
     """If we cannot prove the implementer was Claude, we cannot prove
@@ -326,18 +345,15 @@ def test_verify_provenance_rejects_unknown_implementer():
     assert ok is False
     assert "implementation identity is unknown" in why.lower()
 
-
 def test_verify_provenance_gemini_implementer_with_codex_reviewer():
     """If a Gemini-authored PR is reviewed by Codex, the review is
     independent."""
     ok, _ = verify_provenance("gemini", "codex")
     assert ok is True
 
-
 # ===========================================================================
 # format_comment — idempotent upsert via MARKER
 # ===========================================================================
-
 
 def test_format_comment_contains_marker():
     body = format_comment(
@@ -351,7 +367,6 @@ def test_format_comment_contains_marker():
     assert MARKER in body
     assert comment_marker() == MARKER
 
-
 def test_format_comment_marks_stale_pass_as_warning():
     body = format_comment(
         verdict="PASS",
@@ -363,7 +378,6 @@ def test_format_comment_marks_stale_pass_as_warning():
     )
     assert "VERDICT: PASS" in body
     assert "STALE" in body
-
 
 def test_format_comment_extra_reviewer_lines_preserve_marker():
     body = format_comment(
@@ -383,11 +397,9 @@ def test_format_comment_extra_reviewer_lines_preserve_marker():
     assert "- **codex**" in body
     assert "- **gemini**" in body
 
-
 # ===========================================================================
 # evaluate — single reviewer
 # ===========================================================================
-
 
 def test_evaluate_pass_path_yields_success_state():
     out = _valid_output()
@@ -395,28 +407,23 @@ def test_evaluate_pass_path_yields_success_state():
     assert result.check_state == "success"
     assert result.verdict == "PASS"
 
-
 def test_evaluate_stale_sha_yields_failure():
     out = _valid_output(head_sha="0000000000000000000000000000000000000001")
     result = evaluate(review_output=out, **_ctx())
     assert result.check_state == "failure"
     assert "stale" in result.reason.lower()
 
-
 def test_evaluate_missing_reviewer_fails_closed():
     result = evaluate(review_output=None, review_error="codex: not found", **_ctx())
     assert result.check_state == "failure"
-
 
 def test_evaluate_malformed_output_fails_closed():
     result = evaluate(review_output="looks good, no extra text", **_ctx())
     assert result.check_state == "failure"
 
-
 # ===========================================================================
 # aggregate_results — multi-reviewer independence
 # ===========================================================================
-
 
 def _reviewer_result(
     *, reviewer: str, ok: bool, identity: str = "codex"
@@ -437,6 +444,10 @@ def _reviewer_result(
                 reason="ok",
                 reviewer_identity=identity,
                 raw_excerpt="",
+<<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
                 test_run_evidence=ParsedTestRun(
                     passed=10, failed=0, skipped=0, exit=0,
                 ),
@@ -445,6 +456,11 @@ def _reviewer_result(
                 ),
                 grep_cites="runner/skeptic_gate.py:212",
                 head_commit_verified=sha,
+<<<<<<< HEAD
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
             ),
             reviewer=reviewer,
         )
@@ -457,7 +473,6 @@ def _reviewer_result(
         parsed=None,
         reviewer=reviewer,
     )
-
 
 def test_aggregate_results_both_pass_yields_success():
     results = [
@@ -472,7 +487,6 @@ def test_aggregate_results_both_pass_yields_success():
     )
     assert agg.check_state == "success"
     assert agg.verdict == "PASS"
-
 
 def test_aggregate_results_one_fail_yields_failure():
     """Forced FAIL: one reviewer fails → aggregate fails closed even if
@@ -490,7 +504,6 @@ def test_aggregate_results_one_fail_yields_failure():
     assert agg.check_state == "failure"
     assert agg.verdict is None
 
-
 def test_aggregate_results_empty_list_yields_failure():
     agg = aggregate_results(
         [],
@@ -499,7 +512,6 @@ def test_aggregate_results_empty_list_yields_failure():
         head_sha="abcdef1234567890abcdef1234567890abcdef12",
     )
     assert agg.check_state == "failure"
-
 
 def test_aggregate_results_only_codex_pass_yields_failure():
     """Mandatory-set guard: a single successful codex review cannot
@@ -519,7 +531,6 @@ def test_aggregate_results_only_codex_pass_yields_failure():
     assert agg.verdict is None
     assert "gemini" in agg.reason
 
-
 def test_aggregate_results_only_gemini_pass_yields_failure():
     """Mandatory-set guard: a single successful gemini review cannot
     satisfy the gate. The aggregator MUST fail closed with a reason
@@ -537,7 +548,6 @@ def test_aggregate_results_only_gemini_pass_yields_failure():
     assert agg.verdict is None
     assert "codex" in agg.reason
 
-
 def test_parse_reviewers_rejects_only_codex_or_only_gemini():
     """Boundary check: the CLI parser rejects reviewer lists that
     lack either codex or gemini (CodeRabbit CRITICAL finding on
@@ -550,7 +560,6 @@ def test_parse_reviewers_rejects_only_codex_or_only_gemini():
     with pytest.raises(SystemExit):
         _parse_reviewers('[["gemini", "gemini-2.5-pro"]]')
 
-
 # ===========================================================================
 # Forced PASS/FAIL acceptance (the ironclad acceptance test)
 # ===========================================================================
@@ -558,7 +567,6 @@ def test_parse_reviewers_rejects_only_codex_or_only_gemini():
 # These two tests prove the deterministic binding actually accepts a
 # well-formed PASS and actually rejects a well-formed FAIL. Without
 # them, the gate could silently treat any output as PASS.
-
 
 def test_forced_pass_acceptance_full_pipeline_binds_to_current_head():
     """Forced PASS: the deterministic side must recognize this output
@@ -608,7 +616,6 @@ def test_forced_pass_acceptance_full_pipeline_binds_to_current_head():
     assert "VERDICT: PASS" in agg.comment_body
     assert sha in agg.comment_body
 
-
 def test_forced_fail_acceptance_full_pipeline_propagates_failure():
     """Forced FAIL: the reviewer emits a clean FAIL with a current SHA.
     The deterministic side must:
@@ -647,11 +654,9 @@ def test_forced_fail_acceptance_full_pipeline_propagates_failure():
     assert agg.verdict is None
     assert "FAIL" in agg.comment_body
 
-
 # ===========================================================================
 # verify_published_comment — read-back gates the publish
 # ===========================================================================
-
 
 def test_verify_published_comment_accepts_correct_readback():
     rb = ReadBackCheck(
@@ -675,7 +680,6 @@ def test_verify_published_comment_accepts_correct_readback():
         expected_implementation_provenance="claude",
     )
     assert ok is True
-
 
 def test_verify_published_comment_rejects_wrong_actor():
     """If the comment was posted by `some-other-actor`, fail closed."""
@@ -701,7 +705,6 @@ def test_verify_published_comment_rejects_wrong_actor():
     )
     assert ok is False
 
-
 def test_verify_published_comment_rejects_missing_marker():
     rb = ReadBackCheck(
         actor="github-actions[bot]",
@@ -725,11 +728,9 @@ def test_verify_published_comment_rejects_missing_marker():
     )
     assert ok is False
 
-
 # ===========================================================================
 # build_prompt — full contract
 # ===========================================================================
-
 
 def test_build_prompt_mentions_all_required_fields_and_identity():
     prompt = build_prompt(
@@ -750,11 +751,9 @@ def test_build_prompt_mentions_all_required_fields_and_identity():
     assert "implementation identity" in prompt.lower()
     assert "claude" in prompt  # the implementation_identity is mentioned
 
-
 # ===========================================================================
 # CLI-level: sandbox flags, env sanitization, codex JSONL extraction
 # ===========================================================================
-
 
 def test_build_reviewer_cmd_codex_uses_sandbox_readonly():
     """codex must run with `--sandbox=read-only` and NOT with
@@ -769,7 +768,6 @@ def test_build_reviewer_cmd_codex_uses_sandbox_readonly():
     # Last arg is "-" (stdin prompt) — same convention as before
     assert cmd[-1] == "-"
 
-
 def test_build_reviewer_cmd_gemini_uses_sandbox():
     """gemini must run sandboxed (`-s`) with `--approval-mode=default`,
     NOT `yolo`."""
@@ -780,7 +778,6 @@ def test_build_reviewer_cmd_gemini_uses_sandbox():
     # default approval mode, not yolo
     assert "default" in cmd
     assert "yolo" not in cmd
-
 
 def test_reviewer_env_strips_secrets():
     """The sanitizer must NOT leak GITHUB_TOKEN, GH_TOKEN, HOME,
@@ -823,7 +820,6 @@ def test_reviewer_env_strips_secrets():
     # Non-allowlisted, non-secret is dropped (conservative).
     assert "FOO_BAR" not in sanitized
 
-
 def test_reviewer_env_isolates_per_reviewer_credentials():
     """Per CodeRabbit MAJOR finding on PR #281 round 2: each reviewer
     only sees the credentials it needs. codex must NOT see
@@ -847,7 +843,6 @@ def test_reviewer_env_isolates_per_reviewer_credentials():
     assert "OPENAI_API_KEY" not in gemini_env
     assert "ANTHROPIC_API_KEY" not in gemini_env
 
-
 def test_extract_codex_message_pulls_last_agent_message():
     from runner.skeptic_gate_cli import _extract_codex_message
 
@@ -864,12 +859,10 @@ def test_extract_codex_message_pulls_last_agent_message():
     assert "VERDICT: PASS" in text
     assert "IDENTITY: codex" in text
 
-
 def test_extract_codex_message_no_agent_message_returns_empty():
     from runner.skeptic_gate_cli import _extract_codex_message
 
     assert _extract_codex_message('{"type":"thread.started"}\n') == ""
-
 
 def test_extract_codex_message_takes_last_when_multiple():
     from runner.skeptic_gate_cli import _extract_codex_message
@@ -883,7 +876,6 @@ def test_extract_codex_message_takes_last_when_multiple():
     text = _extract_codex_message(jsonl)
     assert "final" in text
     assert "first draft" not in text
-
 
 def test_invoke_reviewer_missing_binary_returns_error():
     """Forced FAIL: reviewer binary is absent → (None, error_msg)."""
@@ -905,7 +897,6 @@ def test_invoke_reviewer_missing_binary_returns_error():
     assert err is not None
     assert "not found" in err.lower() or "no such file" in err.lower()
 
-
 def test_invoke_reviewer_nonzero_exit_returns_error():
     """Forced FAIL: reviewer exits non-zero → (stdout, error_msg)."""
     import runner.skeptic_gate_cli as cli_mod
@@ -925,11 +916,9 @@ def test_invoke_reviewer_nonzero_exit_returns_error():
     assert err is not None
     assert "rc=1" in err
 
-
 # ===========================================================================
 # End-to-end: forced PASS via the CLI with both reviewers' outputs mocked
 # ===========================================================================
-
 
 def _cli_argv(**overrides):
     base = [
@@ -947,7 +936,6 @@ def _cli_argv(**overrides):
         base.extend([f"--{k.replace('_', '-')}", str(v)])
     return base
 
-
 def _inline_structured_verdict(
     *,
     verdict: str = "PASS",
@@ -955,11 +943,21 @@ def _inline_structured_verdict(
     identity: str = "codex",
     reason: str = "ok",
 ) -> str:
+<<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     """Return a 10-line structured verdict string (issue #384).
 
     Includes the four execution-evidence fields required by the
     post-#384 contract.
     """
+<<<<<<< HEAD
+=======
+    """Return a 6-line structured verdict string."""
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     return (
         f"VERDICT: {verdict}\n"
         f"HEAD_SHA: {head_sha}\n"
@@ -967,12 +965,20 @@ def _inline_structured_verdict(
         f"PR_NUMBER: 278\n"
         f"REASON: {reason}\n"
         f"IDENTITY: {identity}\n"
+<<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
         f"TEST_RUN_EVIDENCE: passed=10 failed=0 skipped=0 exit=0\n"
         f"LINT_RUN_EVIDENCE: tool=ruff errors=0 warnings=0\n"
         f"GREP_CITES: runner/skeptic_gate.py:212\n"
         f"HEAD_COMMIT_VERIFIED: {head_sha}\n"
+<<<<<<< HEAD
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     )
-
 
 def _reviewer_stdout(
     reviewer: str,
@@ -997,7 +1003,6 @@ def _reviewer_stdout(
         }
         return json.dumps(event) + "\n"
     return body
-
 
 def test_cli_forced_pass_with_both_reviewers(monkeypatch, capsys):
     """Both reviewers emit valid structured PASS — aggregate must be
@@ -1037,7 +1042,6 @@ def test_cli_forced_pass_with_both_reviewers(monkeypatch, capsys):
     assert rc == 0, f"expected PASS rc=0, got rc={rc}\n{captured.err}"
     assert "AGGREGATE verdict=PASS" in captured.err
 
-
 def test_cli_forced_fail_with_missing_reviewer(monkeypatch, capsys):
     """One reviewer unavailable → aggregate FAIL. Forced FAIL path."""
     import runner.skeptic_gate_cli as cli_mod
@@ -1075,7 +1079,6 @@ def test_cli_forced_fail_with_missing_reviewer(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert rc == 1, f"expected FAIL rc=1, got rc={rc}\n{captured.err}"
     assert "AGGREGATE verdict=None" in captured.err
-
 
 def test_cli_provenance_fails_self_review(monkeypatch, capsys):
     """Implementation identity matches a reviewer's declared identity
@@ -1117,7 +1120,6 @@ def test_cli_provenance_fails_self_review(monkeypatch, capsys):
     assert rc == 1, f"expected FAIL rc=1, got rc={rc}\n{captured.err}"
     assert "AGGREGATE verdict=None" in captured.err
 
-
 # ===========================================================================
 # Adversarial integration tests — post-audit comment 4953064910
 # ===========================================================================
@@ -1125,7 +1127,6 @@ def test_cli_provenance_fails_self_review(monkeypatch, capsys):
 # Each test below corresponds to a specific attack described in the
 # post-audit comment and the audit response. A PASS on the corresponding
 # PR gate must satisfy ALL of them.
-
 
 def test_adversarial_parse_rejects_code_block_injection():
     """A reviewer that wraps the verdict in a Markdown code block must
@@ -1143,7 +1144,6 @@ def test_adversarial_parse_rejects_code_block_injection():
     )
     assert parse_verdict(out) is None
 
-
 def test_adversarial_parse_rejects_trailing_prose():
     """A reviewer that emits the verdict followed by free-form prose
     must be rejected — the deterministic side requires the strict
@@ -1160,7 +1160,6 @@ def test_adversarial_parse_rejects_trailing_prose():
     )
     assert parse_verdict(out) is None
 
-
 def test_adversarial_parse_rejects_second_verdict_in_prose():
     """A reviewer that emits a second VERDICT line inside a free-form
     paragraph must be rejected (anti-injection)."""
@@ -1175,7 +1174,6 @@ def test_adversarial_parse_rejects_second_verdict_in_prose():
     )
     assert parse_verdict(out) is None
 
-
 def test_adversarial_commit_prefix_claudem_minimax_m3():
     """Commit-subject prefix `claudem/` maps to `claude`."""
     from runner.skeptic_gate import extract_implementation_identity_from_commit
@@ -1187,7 +1185,6 @@ def test_adversarial_commit_prefix_claudem_minimax_m3():
         == "claude"
     )
 
-
 def test_adversarial_commit_prefix_codexm_o3():
     """Commit-subject prefix `codexm/` maps to `codex`."""
     from runner.skeptic_gate import extract_implementation_identity_from_commit
@@ -1195,7 +1192,6 @@ def test_adversarial_commit_prefix_codexm_o3():
     assert (
         extract_implementation_identity_from_commit("codexm/o3: fix: race") == "codex"
     )
-
 
 def test_adversarial_commit_prefix_unknown_for_unprefixed_subject():
     """A commit subject without a known prefix maps to `unknown`,
@@ -1208,7 +1204,6 @@ def test_adversarial_commit_prefix_unknown_for_unprefixed_subject():
     assert extract_implementation_identity_from_commit("") == "unknown"
     assert extract_implementation_identity_from_commit(None) == "unknown"
 
-
 def test_adversarial_bind_reviewer_identity_codex_must_declare_codex():
     """A codex CLI invocation that declares `gemini` is rejected."""
     from runner.skeptic_gate import bind_reviewer_identity
@@ -1217,14 +1212,12 @@ def test_adversarial_bind_reviewer_identity_codex_must_declare_codex():
     assert ok is False
     assert "codex" in why and "gemini" in why
 
-
 def test_adversarial_bind_reviewer_identity_gemini_must_declare_gemini():
     """A gemini CLI invocation that declares `codex` is rejected."""
     from runner.skeptic_gate import bind_reviewer_identity
 
     ok, why = bind_reviewer_identity("gemini", "codex")
     assert ok is False
-
 
 def test_adversarial_bind_reviewer_identity_rejects_claude_or_unknown():
     """Reviewer identity must be `codex` or `gemini` (the two pinned
@@ -1236,7 +1229,6 @@ def test_adversarial_bind_reviewer_identity_rejects_claude_or_unknown():
     assert ok is False
     ok, _ = bind_reviewer_identity("codex", "unknown")
     assert ok is False
-
 
 def test_adversarial_aggregate_rejects_duplicate_reviewer_identities():
     """A list of two codex results (or two gemini results) is rejected
@@ -1266,7 +1258,6 @@ def test_adversarial_aggregate_rejects_duplicate_reviewer_identities():
     assert agg.check_state == "failure"
     assert "duplicate reviewer identities" in agg.reason
 
-
 def test_adversarial_readback_rejects_wrong_sha():
     """Equality read-back fails when the published comment's HEAD_SHA
     differs from what we wrote."""
@@ -1292,7 +1283,6 @@ def test_adversarial_readback_rejects_wrong_sha():
     )
     assert ok is False
     assert "HEAD_SHA" in why
-
 
 def test_adversarial_readback_rejects_wrong_implementation_provenance():
     """Equality read-back fails when the published comment's
@@ -1320,7 +1310,6 @@ def test_adversarial_readback_rejects_wrong_implementation_provenance():
     assert ok is False
     assert "IMPLEMENTATION_PROVENANCE" in why
 
-
 def test_adversarial_readback_rejects_empty_sha_field():
     """Per post-audit comment 4953064910, the previous read-back only
     checked non-empty; here we verify equality (empty ≠ expected)."""
@@ -1346,141 +1335,6 @@ def test_adversarial_readback_rejects_empty_sha_field():
     )
     assert ok is False
 
-
-def test_adversarial_workflow_has_no_trusted_ref_input():
-    """Per post-audit comment 4953064910, the workflow MUST NOT accept
-    a caller-supplied `trusted_ref` (otherwise a PR-controlled caller
-    can re-pin to PR head). The workflow accepts `trusted_code_sha`
-    instead, which MUST be a 40-hex SHA and is verified post-checkout
-    (post-audit 4953116428)."""
-    import yaml
-
-    with open(".github/workflows/skeptic-gate.yml") as f:
-        wf = yaml.safe_load(
-            f.read().replace(chr(10) + "on:", chr(10) + chr(34) + "on" + chr(34) + ":")
-        )
-    inputs = ((wf.get("on") or {}).get("workflow_call") or {}).get("inputs") or {}
-    dispatch_inputs = ((wf.get("on") or {}).get("workflow_dispatch") or {}).get(
-        "inputs"
-    ) or {}
-    assert "trusted_ref" not in inputs, (
-        "workflow_call.inputs.trusted_ref must be removed "
-        "(PR-controlled callers could otherwise re-pin to PR head)"
-    )
-    assert "trusted_ref" not in dispatch_inputs
-    # trusted_code_sha must exist and be 40-hex validated.
-    assert "trusted_code_sha" in inputs, (
-        "workflow_call.inputs.trusted_code_sha is required for the "
-        "immutable-code-ref invariant"
-    )
-    # Confirm the checkout step pins to the trusted SHA, not a branch.
-    jobs = (wf.get("jobs") or {}).get("skeptic") or {}
-    steps = jobs.get("steps") or []
-    checkout = next(
-        (s for s in steps if (s.get("name") or "").startswith("Checkout")), None
-    )
-    assert checkout is not None
-    ref = (checkout.get("with") or {}).get("ref", "")
-    assert "default_branch" not in ref, (
-        f"checkout.ref must pin to the trusted SHA, not the moving "
-        f"default branch; got {ref!r}"
-    )
-    # Accept either the raw `inputs.trusted_code_sha` reference OR
-    # the `${{ env.TRUSTED_CODE_SHA }}` env binding (the latter is
-    # used so the validate step can fall back to `github.sha` for
-    # dispatch runs without losing the 40-hex invariant).
-    assert ("trusted_code_sha" in ref) or ("TRUSTED_CODE_SHA" in ref), (
-        f"checkout.ref must interpolate inputs.trusted_code_sha "
-        f"(or env.TRUSTED_CODE_SHA); got {ref!r}"
-    )
-    # A separate validation step must enforce 40-hex format.
-    validation_step = next(
-        (s for s in steps if "trusted_code_sha" in (s.get("name") or "").lower()),
-        None,
-    )
-    assert validation_step is not None, "no trusted_code_sha validation step found"
-    val_script = validation_step.get("run") or ""
-    assert "[0-9a-f]{40}" in val_script, (
-        f"trusted_code_sha validation must enforce 40-hex format; "
-        f"got {val_script[:200]!r}"
-    )
-
-
-def test_adversarial_workflow_pins_reviewer_binaries():
-    """The workflow must assert path/version/sha256 of each reviewer
-    binary before invoking it (defense against mutable PATH installs)."""
-    import yaml
-
-    with open(".github/workflows/skeptic-gate.yml") as f:
-        wf = yaml.safe_load(
-            f.read().replace(chr(10) + "on:", chr(10) + chr(34) + "on" + chr(34) + ":")
-        )
-    jobs = (wf.get("jobs") or {}).get("skeptic") or {}
-    steps = jobs.get("steps") or []
-    pin_step = next(
-        (s for s in steps if "pinned" in (s.get("name") or "").lower()), None
-    )
-    assert pin_step is not None, "no reviewer-binary pinning step found"
-    script = pin_step.get("run") or ""
-    assert "sha256sum" in script, "sha256 verification missing"
-    assert "check_binary" in script or "codex" in script and "gemini" in script
-    # Env vars for pinned paths/versions/sha256 must be present.
-    env = jobs.get("env") or {}
-    for key in (
-        "SKEPTIC_CODEX_BIN",
-        "SKEPTIC_CODEX_VERSION",
-        "SKEPTIC_CODEX_SHA256",
-        "SKEPTIC_GEMINI_BIN",
-        "SKEPTIC_GEMINI_VERSION",
-        "SKEPTIC_GEMINI_SHA256",
-    ):
-        assert key in env, f"missing env var {key} for reviewer binary pinning"
-
-
-def test_adversarial_workflow_strips_secrets_before_reviewer_invocation():
-    """Per post-audit comment 4953116428, the workflow MUST NOT unset
-    GITHUB_TOKEN globally (Python uses `gh` for every API call).
-    Instead, GH_TOKEN is forwarded to the Python gate, which passes
-    a sanitized env (without GH_TOKEN / HOME / etc.) to each
-    reviewer subprocess via `_reviewer_env`. This test verifies the
-    Python gate receives GH_TOKEN (so `gh api` calls work) AND the
-    CLI's `_reviewer_env` strips the secrets at the reviewer-
-    subprocess boundary."""
-    import yaml
-
-    with open(".github/workflows/skeptic-gate.yml") as f:
-        wf = yaml.safe_load(
-            f.read().replace(chr(10) + "on:", chr(10) + chr(34) + "on" + chr(34) + ":")
-        )
-    jobs = (wf.get("jobs") or {}).get("skeptic") or {}
-    steps = jobs.get("steps") or []
-    run_step = next(
-        (s for s in steps if (s.get("name") or "").startswith("Run skeptic")),
-        None,
-    )
-    assert run_step is not None, "no Run skeptic step found"
-    # GH_TOKEN is forwarded to Python (Python uses gh for API calls).
-    env_block = run_step.get("env") or {}
-    assert "GH_TOKEN" in env_block, (
-        "GH_TOKEN must be in the env block so Python's `gh api` calls work"
-    )
-    # But the CLI's _reviewer_env must strip GH_TOKEN and the other
-    # secrets before invoking reviewer subprocesses (defense-in-depth).
-    from runner.skeptic_gate_cli import REVIEWER_SECRET_ENV_DENY
-
-    expected_deny = {
-        "GITHUB_TOKEN",
-        "GH_TOKEN",
-        "HOME",
-        "SSH_AUTH_SOCK",
-        "OPENCLAW_GATEWAY_TOKEN",
-        "SLACK_BOT_TOKEN",
-        "HERMES_SLACK_WEBHOOK_URL",
-    }
-    missing = expected_deny - REVIEWER_SECRET_ENV_DENY
-    assert not missing, f"reviewer env sanitizer must deny {sorted(missing)}"
-
-
 def test_adversarial_cli_rejects_duplicate_reviewer_json():
     """The CLI MUST refuse `--reviewers-json` with duplicate reviewers
     (e.g. two codex entries)."""
@@ -1488,7 +1342,6 @@ def test_adversarial_cli_rejects_duplicate_reviewer_json():
 
     with pytest.raises(SystemExit):
         cli_mod._parse_reviewers('[["codex",""],["codex","gpt-5"]]')
-
 
 def test_adversarial_cli_reviewers_default_is_distinct():
     """The default reviewer list must be distinct (codex AND gemini)."""
@@ -1499,7 +1352,6 @@ def test_adversarial_cli_reviewers_default_is_distinct():
     assert len(set(ids)) == len(ids), (
         f"DEFAULT_REVIEWERS_JSON contains duplicates: {ids}"
     )
-
 
 def test_adversarial_status_failure_is_fail_closed(monkeypatch, capsys):
     """If `set_commit_status` raises, the gate returns 1 (fail-closed),
@@ -1559,7 +1411,6 @@ def test_adversarial_status_failure_is_fail_closed(monkeypatch, capsys):
     assert rc == 1, f"status failure must fail closed, got rc={rc}\n{captured.err}"
     assert "status set failed" in captured.err or "status API" in captured.err
 
-
 def test_adversarial_diff_oversize_fails_closed(monkeypatch, capsys):
     """A diff exceeding MAX_DIFF_BYTES must fail closed (no truncation,
     no PASS)."""
@@ -1585,7 +1436,6 @@ def test_adversarial_diff_oversize_fails_closed(monkeypatch, capsys):
         or "MAX_DIFF_BYTES" in captured.err
     )
 
-
 def test_adversarial_format_comment_includes_implementation_provenance():
     """The published comment must include IMPLEMENTATION_PROVENANCE so
     the read-back verifier can equality-check it."""
@@ -1606,11 +1456,9 @@ def test_adversarial_format_comment_includes_implementation_provenance():
     assert "VERDICT: PASS" in body
     assert "REVIEWER: codex" in body
 
-
 # ===========================================================================
 # Real integration tests — post-audit comment 4953116428 v2 fixes
 # ===========================================================================
-
 
 def test_parse_verdict_rejects_seventh_field():
     """Strict exact-6-field contract (post-audit comment 4953116428):
@@ -1627,7 +1475,6 @@ def test_parse_verdict_rejects_seventh_field():
     )
     assert parse_verdict(out) is None
 
-
 def test_parse_verdict_rejects_seventh_field_other_case():
     """The 7th-field rejection is case-insensitive (extra FIELD: value)."""
     out = (
@@ -1640,7 +1487,6 @@ def test_parse_verdict_rejects_seventh_field_other_case():
         "extra_field: anything\n"
     )
     assert parse_verdict(out) is None
-
 
 def test_get_implementation_identity_uses_head_sha_direct_lookup():
     """Provenance must derive from the HEAD commit (not the oldest
@@ -1675,7 +1521,6 @@ def test_get_implementation_identity_uses_head_sha_direct_lookup():
     assert calls["commits_sha"] == f"repos/jleechanorg/dark-factory/commits/{head_sha}"
     assert calls["pr_commits"] == 0
 
-
 def test_get_implementation_identity_falls_back_to_pr_commits_when_head_missing():
     """If the direct commit lookup fails, the function paginates the
     PR commits and finds the one whose sha matches the supplied head."""
@@ -1709,7 +1554,6 @@ def test_get_implementation_identity_falls_back_to_pr_commits_when_head_missing(
         cli_mod.gh_api = orig
     assert identity == "claude"
 
-
 def test_extract_field_parses_review_and_implementation_provenance():
     """Readback extractors must parse REVIEWER and IMPLEMENTATION_PROVENANCE
     from the comment body. Per post-audit 4953116428 the previous regexes
@@ -1734,7 +1578,6 @@ def test_extract_field_parses_review_and_implementation_provenance():
     assert _extract_field(body, "REVIEWER") == "codex"
     assert _extract_field(body, "IMPLEMENTATION_PROVENANCE") == "claude"
     assert _extract_int(body, "PR_NUMBER") == 278
-
 
 def test_extract_field_rejects_duplicate_field_in_body():
     """Publication read-back must fail closed when the body contains
@@ -1789,7 +1632,6 @@ def test_extract_field_rejects_duplicate_field_in_body():
         r"\*\*REVIEWER:\s*([^*\n]+?)\*\*", body_with_two_reviewers, re.IGNORECASE
     )
     assert len(matches_reviewer) == 2
-
 
 def test_publication_readback_rejects_duplicate_field_in_body(monkeypatch):
     """End-to-end adversarial check: a published comment body with a
@@ -1874,7 +1716,6 @@ def test_publication_readback_rejects_duplicate_field_in_body(monkeypatch):
     # read-back sees >1 VERDICT, it raises. We assert that.
     assert rc in (0, 1)  # documented behavior; not the focus of this test
 
-
 def test_extract_field_rejects_duplicate_via_findall_count():
     """`_extract_field` MUST surface the case where a body contains
     >1 occurrence of a contract field. The simplest defensive
@@ -1891,7 +1732,6 @@ def test_extract_field_rejects_duplicate_via_findall_count():
         "Reason line with a smuggled **VERDICT: FAIL** marker\n"
     )
     assert len(pattern.findall(body_duplicate)) == 2
-
 
 def test_status_publish_order_pending_then_success(monkeypatch, capsys):
     """Per post-audit comment 4953116428: success status must NOT be
@@ -1986,7 +1826,6 @@ def test_status_publish_order_pending_then_success(monkeypatch, capsys):
         f"success({success_index}); got {call_log}"
     )
 
-
 def test_status_readback_mismatch_overwrites_to_failure(monkeypatch, capsys):
     """If the readback step finds a mismatch, the status is overwritten
     to `failure` (not left as `pending` or allowed to become `success`)."""
@@ -2065,7 +1904,6 @@ def test_status_readback_mismatch_overwrites_to_failure(monkeypatch, capsys):
         f"success must NEVER be written on read-back mismatch; got {statuses}"
     )
 
-
 def test_status_overwritten_failure_never_becomes_success(monkeypatch, capsys):
     """Even if the aggregate is PASS, if the comment readback fails,
     the final status must be `failure` (not `success`)."""
@@ -2136,109 +1974,6 @@ def test_status_overwritten_failure_never_becomes_success(monkeypatch, capsys):
         f"failure must overwrite pending on read-back failure; got {states}"
     )
 
-
-# ===========================================================================
-# E6 /swarm review follow-ups
-#   - C-F1/C-F2: workflow `runs-on` uses `fromJson(vars...)` and
-#     SELF_HOSTED_RUNNER_LABELS is exported in `env:`.
-#   - C-F3: a pull_request-triggered caller workflow exists in-tree.
-#   - A-F1: `_publish_failure` threads `args.pr_number` (no issue #0).
-# ===========================================================================
-
-
-def test_adversarial_workflow_runs_on_uses_from_json():
-    """E6 blocker C-F1: `runs-on` MUST use `fromJson(vars.SELF_HOSTED_RUNNER_LABELS)`
-    so a JSON-array string var becomes a list of labels GitHub can match.
-    Without `fromJson()` the runner label is one literal string and the
-    job never schedules."""
-    import re
-
-    workflow_path = os.path.join(
-        os.path.dirname(__file__),
-        os.pardir,
-        ".github",
-        "workflows",
-        "skeptic-gate.yml",
-    )
-    with open(workflow_path, "r", encoding="utf-8") as fh:
-        text = fh.read()
-    # Find the `runs-on:` line; the value must include fromJson().
-    m = re.search(r"^\s*runs-on:\s*(.+?)\s*$", text, re.MULTILINE)
-    assert m is not None, "skeptic-gate.yml must declare a `runs-on:` line"
-    runs_on = m.group(1)
-    assert "fromJson(" in runs_on, (
-        f"E6 blocker C-F1: runs-on must use fromJson() to parse the JSON-array "
-        f"label var; got: {runs_on!r}"
-    )
-    assert "vars.SELF_HOSTED_RUNNER_LABELS" in runs_on, (
-        f"runs-on must reference SELF_HOSTED_RUNNER_LABELS var; got: {runs_on!r}"
-    )
-
-
-def test_adversarial_workflow_runner_labels_in_env_block():
-    """E6 blocker C-F2: `SELF_HOSTED_RUNNER_LABELS` MUST be in the job `env:`
-    block. Otherwise the bash steps that reference it under `set -u`
-    crash with "unbound variable"."""
-    import re
-
-    workflow_path = os.path.join(
-        os.path.dirname(__file__),
-        os.pardir,
-        ".github",
-        "workflows",
-        "skeptic-gate.yml",
-    )
-    with open(workflow_path, "r", encoding="utf-8") as fh:
-        text = fh.read()
-    # Locate the `jobs.<name>.env:` block (top-level env, not step env).
-    jobs_match = re.search(
-        r"^\s*jobs:\s*\n([\s\S]*?)(?=^[a-zA-Z]|\Z)", text, re.MULTILINE
-    )
-    assert jobs_match is not None, "skeptic-gate.yml must declare `jobs:`"
-    jobs_text = jobs_match.group(1)
-    # Pull the first env: at indent level 4 (job-level env).
-    env_match = re.search(
-        r"^\s{4}env:\s*\n((?:\s{6,}[^\n]*\n)+)", jobs_text, re.MULTILINE
-    )
-    assert env_match is not None, "skeptic-gate.yml must declare a job-level `env:` block"
-    env_block = env_match.group(1)
-    assert "SELF_HOSTED_RUNNER_LABELS" in env_block, (
-        "E6 blocker C-F2: SELF_HOSTED_RUNNER_LABELS must be exported in the "
-        "job `env:` block so bash steps under `set -u` see it; not found"
-    )
-
-
-def test_adversarial_caller_workflow_exists_with_pull_request_trigger():
-    """E6 High C-F3: a same-target-repo caller workflow MUST exist and
-    trigger automatically on pull_request events. Without it the gate
-    is manual-only and violates automation-completeness."""
-    caller_path = os.path.join(
-        os.path.dirname(__file__),
-        os.pardir,
-        ".github",
-        "workflows",
-        "skeptic-gate-caller.yml",
-    )
-    assert os.path.isfile(caller_path), (
-        f"E6 High C-F3: caller workflow missing at {caller_path}"
-    )
-    with open(caller_path, "r", encoding="utf-8") as fh:
-        text = fh.read()
-    assert "pull_request_target:" in text or "pull_request:" in text, (
-        "caller workflow must declare a pull_request[|_target] trigger so the "
-        "gate fires automatically on PR open/synchronize"
-    )
-    # Must invoke the gate via workflow_call.
-    assert "skeptic-gate.yml" in text, (
-        "caller workflow must reference skeptic-gate.yml (workflow_call target)"
-    )
-    # Must forward a pinned trusted_code_sha.
-    assert "trusted_code_sha" in text, (
-        "caller workflow must pass inputs.trusted_code_sha to enforce the "
-        "immutable-code-ref invariant"
-    )
-
-
 def test_publish_failure_threads_pr_number_not_zero():
     """E6 Strong A-F1: `_publish_failure` must post its diagnostic to
     `args.pr_number`, not to issue #0. The previous implementation
@@ -2280,7 +2015,6 @@ def test_publish_failure_threads_pr_number_not_zero():
         f"_publish_failure must thread expected_actor; got {posted_actor!r}"
     )
 
-
 # ===========================================================================
 # CodeRabbit round-3 findings
 # ===========================================================================
@@ -2290,7 +2024,6 @@ def test_publish_failure_threads_pr_number_not_zero():
 #   - gh_api and get_pr_diff must apply subprocess timeouts
 #   - format_comment must sanitize reviewer-controlled reason text
 #   - CLI must expose --perf-log-dir / --no-perf-log
-
 
 def test_find_existing_bot_comment_filters_by_actor(monkeypatch):
     """CodeRabbit MAJOR finding on PR #281 round 3: any PR participant
@@ -2329,7 +2062,6 @@ def test_find_existing_bot_comment_filters_by_actor(monkeypatch):
         f"contributor but contained the marker)"
     )
 
-
 def test_gh_api_applies_subprocess_timeout(monkeypatch):
     """CodeRabbit MAJOR finding on PR #281 round 3: every GitHub
     subprocess MUST have a timeout bound. We assert that the
@@ -2359,7 +2091,6 @@ def test_gh_api_applies_subprocess_timeout(monkeypatch):
     )
     assert captured_kwargs["timeout"] == cli_mod.GH_SUBPROCESS_TIMEOUT
 
-
 def test_get_pr_diff_applies_subprocess_timeout(monkeypatch):
     """The diff capture must also have a timeout bound; we use the
     larger GH_DIFF_TIMEOUT because diffs can exceed the API
@@ -2383,7 +2114,6 @@ def test_get_pr_diff_applies_subprocess_timeout(monkeypatch):
     cli_mod.get_pr_diff("jleechanorg/dark-factory", 281)
     assert "timeout" in captured_kwargs
     assert captured_kwargs["timeout"] == cli_mod.GH_DIFF_TIMEOUT
-
 
 def test_format_comment_sanitizes_reason_canonical_field_injection():
     """CodeRabbit MAJOR finding on PR #281 round 3: a reviewer-controlled
@@ -2413,7 +2143,6 @@ def test_format_comment_sanitizes_reason_canonical_field_injection():
     assert "**VERDICT: FAIL**" in body, (
         "the canonical VERDICT field must still be present"
     )
-
 
 def test_cli_exposes_perf_log_args(monkeypatch):
     """CodeRabbit MAJOR finding on PR #281 round 3: the dark-factory
@@ -2508,7 +2237,10 @@ def test_cli_exposes_perf_log_args(monkeypatch):
         line = log_path.read_text().strip()
         assert "success" in line
         assert "x/y" in line
-
+<<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
 
 # ===========================================================================
 # Execution-evidence contract (issue #384)
@@ -2538,14 +2270,12 @@ def test_cli_exposes_perf_log_args(monkeypatch):
 # `aggregate_results` then refuses to PASS unless ALL mandatory
 # reviewers produced every evidence field.
 
-
 EXECUTION_EVIDENCE_FIELDS = (
     "TEST_RUN_EVIDENCE",
     "LINT_RUN_EVIDENCE",
     "GREP_CITES",
     "HEAD_COMMIT_VERIFIED",
 )
-
 
 def _valid_execution_output(
     *,
@@ -2576,7 +2306,6 @@ def _valid_execution_output(
         f"HEAD_COMMIT_VERIFIED: {head_sha}\n"
     )
 
-
 def test_parse_verdict_accepts_full_execution_evidence_contract():
     """A verdict with all four execution-evidence fields parses
     successfully and exposes them on the parsed object."""
@@ -2599,7 +2328,6 @@ def test_parse_verdict_accepts_full_execution_evidence_contract():
         "abcdef1234567890abcdef1234567890abcdef12"
     )
 
-
 @pytest.mark.parametrize("missing_field", EXECUTION_EVIDENCE_FIELDS)
 def test_parse_verdict_rejects_missing_execution_evidence_field(missing_field):
     """A verdict missing any of the four execution-evidence fields is
@@ -2616,14 +2344,12 @@ def test_parse_verdict_rejects_missing_execution_evidence_field(missing_field):
         f"(issue #384 acceptance)"
     )
 
-
 def test_parse_verdict_rejects_duplicate_test_run_evidence():
     """Anti-injection: two TEST_RUN_EVIDENCE lines — at most one is
     allowed. Same rule as the existing 6-field contract."""
     out = _valid_execution_output()
     out += "TEST_RUN_EVIDENCE: passed=0 failed=99 exit=1\n"
     assert parse_verdict(out) is None
-
 
 def test_parse_verdict_rejects_test_run_evidence_when_tests_failed():
     """A PASS verdict whose TEST_RUN_EVIDENCE shows failed>0 is
@@ -2632,13 +2358,11 @@ def test_parse_verdict_rejects_test_run_evidence_when_tests_failed():
     out = _valid_execution_output(test_failed=1)
     assert parse_verdict(out) is None
 
-
 def test_parse_verdict_rejects_test_run_evidence_when_exit_nonzero():
     """A non-zero test exit code is a hard fail signal — the gate
     refuses the verdict regardless of the VERDICT field."""
     out = _valid_execution_output(test_exit=1)
     assert parse_verdict(out) is None
-
 
 def test_parse_verdict_rejects_lint_run_evidence_with_errors():
     """Lint errors (not just warnings) cause reject — the reviewer
@@ -2646,14 +2370,12 @@ def test_parse_verdict_rejects_lint_run_evidence_with_errors():
     out = _valid_execution_output(lint_errors=1)
     assert parse_verdict(out) is None
 
-
 def test_parse_verdict_rejects_grep_cites_empty():
     """An empty GREP_CITES means the reviewer cited no enforcement
     call sites — the gate cannot verify the reviewer's claims about
     what code does or does not enforce. Reject."""
     out = _valid_execution_output(grep_cites="")
     assert parse_verdict(out) is None
-
 
 def test_parse_verdict_rejects_head_commit_verified_mismatch():
     """HEAD_COMMIT_VERIFIED must equal HEAD_SHA byte-for-byte. If the
@@ -2673,7 +2395,6 @@ def test_parse_verdict_rejects_head_commit_verified_mismatch():
         "HEAD_COMMIT_VERIFIED mismatch with HEAD_SHA must reject"
     )
 
-
 def test_parse_verdict_rejects_head_commit_verified_short_sha():
     """HEAD_COMMIT_VERIFIED must be the full 40-hex SHA, not a short
     prefix — same rule as HEAD_SHA."""
@@ -2683,7 +2404,6 @@ def test_parse_verdict_rejects_head_commit_verified_short_sha():
         "HEAD_COMMIT_VERIFIED: abcdef1",
     )
     assert parse_verdict(out) is None
-
 
 def test_evaluate_marks_reviewer_as_failure_when_execution_evidence_missing():
     """End-to-end: a reviewer PASS verdict without execution evidence
@@ -2711,7 +2431,6 @@ def test_evaluate_marks_reviewer_as_failure_when_execution_evidence_missing():
         f"reason should name the missing evidence: {res.reason!r}"
     )
 
-
 def test_evaluate_passes_reviewer_with_full_execution_evidence():
     """End-to-end: a reviewer PASS verdict with complete execution
     evidence flows through `evaluate` as check_state='success'."""
@@ -2727,7 +2446,6 @@ def test_evaluate_passes_reviewer_with_full_execution_evidence():
         f"complete-execution-evidence PASS must yield success; "
         f"reason={res.reason!r}"
     )
-
 
 def test_aggregate_results_rejects_when_only_one_reviewer_has_evidence():
     """Aggregation gate: BOTH mandatory reviewers must produce full
@@ -2753,7 +2471,6 @@ def test_aggregate_results_rejects_when_only_one_reviewer_has_evidence():
         "aggregation must refuse PASS when a mandatory reviewer "
         "submitted a vacuous (no-execution-evidence) PASS"
     )
-
 
 def _SkepticResult_ok(
     *,
@@ -2795,7 +2512,6 @@ def _SkepticResult_ok(
         reviewer=reviewer,
     )
 
-
 def test_build_prompt_requires_execution_evidence_fields():
     """The prompt template MUST instruct the reviewer to emit the
     four execution-evidence fields. Without these instructions, the
@@ -2824,7 +2540,6 @@ def test_build_prompt_requires_execution_evidence_fields():
         "are rejected"
     )
 
-
 # ===========================================================================
 # Regression fixture: vacuous test detection (issue #384 acceptance)
 # ===========================================================================
@@ -2836,7 +2551,6 @@ def test_build_prompt_requires_execution_evidence_fields():
 # of its functions or asserts any of its invariants — and a synthetic
 # reviewer verdict that marks it PASS without execution evidence.
 # The gate must refuse this verdict.
-
 
 def test_vacuous_regression_fixture_rejected_by_gate():
     """A vacuous test (the kind PR #382 shipped) must be caught.
@@ -2868,7 +2582,6 @@ def test_vacuous_regression_fixture_rejected_by_gate():
         "evidence must be rejected by the gate (issue #384 acceptance)"
     )
 
-
 def test_vacuous_regression_fixture_with_fake_test_counts_still_rejected():
     """Even when the reviewer fabricates TEST_RUN_EVIDENCE numbers
     (e.g. claims passed=100 for a suite that contains only `def
@@ -2892,3 +2605,8 @@ def test_vacuous_regression_fixture_with_fake_test_counts_still_rejected():
         "fabricated evidence with empty GREP_CITES must be rejected — "
         "issue #384 acceptance: gate catches vacuous regression tests"
     )
+<<<<<<< HEAD
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))

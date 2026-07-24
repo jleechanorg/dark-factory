@@ -35,48 +35,56 @@ assert() {
   fi
 }
 
+# Synthetic head SHA carried in every synthetic GATE_ASSESSMENT line so
+# the predicate's P1 #1 exact-head binding passes (PR #328 / bze8.1).
+LIVE_HEAD="0123456789abcdef0123456789abcdef01234567"
+
 # emit a synthetic GATE_ASSESSMENT line that the guard can grep against
 emit_assessment() { # <gates_json>
-  printf '{"timestamp":"2026-07-07T00:00:00Z","eventType":"GATE_ASSESSMENT","bead_id":"x","attempt":1,"state":"ATTESTED","context":{"pr_number":%d,"gates":%s,"all_green":true}}\n' "$PR_NUM" "$1" > "$LOG"
+  printf '{"timestamp":"2026-07-07T00:00:00Z","eventType":"GATE_ASSESSMENT","bead_id":"x","attempt":1,"state":"ATTESTED","context":{"pr_number":%d,"gates":%s,"all_green":true,"head_sha":"%s"}}\n' "$PR_NUM" "$1" "$LIVE_HEAD" > "$LOG"
 }
 
 # Extract the predicate as a standalone command via. Reuses the exact
-# python heredoc block that lives at lines 41-69 of the production
-# script (line 40 is the bash `printf ... | python3 -c '` wrapper and
-# line 70 is the trailing `'` close-quote, neither of which Python
-# accepts inside `-c`).
-predicate_block="$(sed -n '41,69p' "$GUARD")"
+# python heredoc block that lives at lines 41-114 of the production
+# script (PR #328 / bze8.1 added head_sha / canonical gate-key set /
+# operator_disposition; line 40 is the bash `printf ... | python3 -c '`
+# wrapper and line 115 is the trailing `'"$live_head"` close-arg, neither
+# of which Python accepts inside `-c`).
+# jleechan-ni1k / issue #437 P2 widened the predicate to 8 required gates
+# (added `vacuous_red_green`) and added the P1 LIVE_HEAD_MISSING branch;
+# the block now spans 41..=114 (was 41..=104).
+predicate_block="$(sed -n '41,114p' "$GUARD" | sed 's/^  //')"
 
 run_predicate() { # <input_json>
-  printf '%s' "$1" | python3 -c "$predicate_block"
+  printf '%s' "$1" | python3 -c "$predicate_block" "$LIVE_HEAD"
 }
 
 echo "=== auto-merge-guard: gate vocabulary predicate ==="
 
 # 1. Legacy 7-gate schema with all-green -> all_pass (exit 0)
-emit_assessment '{"ci_green":"green","no_conflicts":"green","coderabbit":"green","bugbot":"green","comments_resolved":"green","evidence_review":"green","skeptic":"green"}'
+emit_assessment '{"ci_green":"green","no_conflicts":"green","coderabbit":"green","bugbot":"green","comments_resolved":"green","evidence_review":"green","skeptic":"green","vacuous_red_green":"green"}'
 last="$(tail -1 "$LOG")"
 set +e
 out="$(run_predicate "$last")"
 rc=$?
 set -e
-assert "legacy 7-gate all-green -> exit 0" "0" "$rc"
+assert "legacy 8-gate all-green -> exit 0" "0" "$rc"
 case "$out" in
-  *no-fail*) echo "PASS: legacy 7-gate all-green -> no-fail message"; PASS=$((PASS+1)) ;;
-  *) echo "FAIL: legacy 7-gate all-green -> unexpected output: $out"; FAIL=$((FAIL+1)) ;;
+  *no-fail*) echo "PASS: legacy 8-gate all-green -> no-fail message"; PASS=$((PASS+1)) ;;
+  *) echo "FAIL: legacy 8-gate all-green -> unexpected output: $out"; FAIL=$((FAIL+1)) ;;
 esac
 
-# 2. 7 required gates + optional code_standards/zfc all-pass -> no-fail (exit 0)
-emit_assessment '{"ci_green":"pass","no_conflicts":"pass","coderabbit":"pass","bugbot":"pass","comments_resolved":"pass","evidence_review":"pass","skeptic":"pass","code_standards":"pass","zfc":"pass"}'
+# 2. 8 required gates + optional code_standards/zfc all-pass -> no-fail (exit 0)
+emit_assessment '{"ci_green":"pass","no_conflicts":"pass","coderabbit":"pass","bugbot":"pass","comments_resolved":"pass","evidence_review":"pass","skeptic":"pass","vacuous_red_green":"pass","code_standards":"pass","zfc":"pass"}'
 last="$(tail -1 "$LOG")"
 set +e
 out="$(run_predicate "$last")"
 rc=$?
 set -e
-assert "7-gate+optional all-pass -> exit 0" "0" "$rc"
+assert "8-gate+optional all-pass -> exit 0" "0" "$rc"
 
 # 3. Optional zfc: "fail" still blocks merging (guard checks ALL gates present)
-emit_assessment '{"ci_green":"pass","no_conflicts":"pass","coderabbit":"pass","bugbot":"pass","comments_resolved":"pass","evidence_review":"pass","skeptic":"pass","code_standards":"pass","zfc":"fail"}'
+emit_assessment '{"ci_green":"pass","no_conflicts":"pass","coderabbit":"pass","bugbot":"pass","comments_resolved":"pass","evidence_review":"pass","skeptic":"pass","vacuous_red_green":"pass","code_standards":"pass","zfc":"fail"}'
 last="$(tail -1 "$LOG")"
 set +e
 out="$(run_predicate "$last")"
@@ -89,7 +97,7 @@ case "$out" in
 esac
 
 # 4. NEW: structured object {"verdict":"fail"} -> blocks merging (exit 1)
-emit_assessment '{"ci_green":"pass","no_conflicts":"pass","coderabbit":"pass","bugbot":"pass","comments_resolved":"pass","evidence_review":"pass","skeptic":"pass","code_standards":"pass","zfc":{"verdict":"fail","evidence":[{"path":"x","line":1,"msg":"y"}]}}'
+emit_assessment '{"ci_green":"pass","no_conflicts":"pass","coderabbit":"pass","bugbot":"pass","comments_resolved":"pass","evidence_review":"pass","skeptic":"pass","vacuous_red_green":"pass","code_standards":"pass","zfc":{"verdict":"fail","evidence":[{"path":"x","line":1,"msg":"y"}]}}'
 last="$(tail -1 "$LOG")"
 set +e
 out="$(run_predicate "$last")"
@@ -98,7 +106,7 @@ set -e
 assert "structured {verdict:fail} -> exit 1 (BLOCK)" "1" "$rc"
 
 # 5. warn verdict stays non-blocking (per documented no-red policy)
-emit_assessment '{"ci_green":"pass","no_conflicts":"pass","coderabbit":"warn","bugbot":"pass","comments_resolved":"pass","evidence_review":"pass","skeptic":"pass","code_standards":"pass","zfc":"pass"}'
+emit_assessment '{"ci_green":"pass","no_conflicts":"pass","coderabbit":"warn","bugbot":"pass","comments_resolved":"pass","evidence_review":"pass","skeptic":"pass","vacuous_red_green":"pass","code_standards":"pass","zfc":"pass"}'
 last="$(tail -1 "$LOG")"
 set +e
 out="$(run_predicate "$last")"
@@ -111,7 +119,7 @@ case "$out" in
 esac
 
 # 6. unknown verdict stays non-blocking (defers to next tick)
-emit_assessment '{"ci_green":"unknown","no_conflicts":"unknown","coderabbit":"unknown","bugbot":"unknown","comments_resolved":"unknown","evidence_review":"unknown","skeptic":"unknown","code_standards":"unknown","zfc":"unknown"}'
+emit_assessment '{"ci_green":"unknown","no_conflicts":"unknown","coderabbit":"unknown","bugbot":"unknown","comments_resolved":"unknown","evidence_review":"unknown","skeptic":"unknown","vacuous_red_green":"unknown","code_standards":"unknown","zfc":"unknown"}'
 last="$(tail -1 "$LOG")"
 set +e
 out="$(run_predicate "$last")"
@@ -120,7 +128,7 @@ set -e
 assert "all-unknown -> exit 0 (defers to next tick)" "0" "$rc"
 
 # 7. Legacy "red" alias -> still blocks (back-compat)
-emit_assessment '{"ci_green":"green","no_conflicts":"green","coderabbit":"green","bugbot":"red","comments_resolved":"green","evidence_review":"green","skeptic":"green","code_standards":"green","zfc":"green"}'
+emit_assessment '{"ci_green":"green","no_conflicts":"green","coderabbit":"green","bugbot":"red","comments_resolved":"green","evidence_review":"green","skeptic":"green","vacuous_red_green":"green","code_standards":"green","zfc":"green"}'
 last="$(tail -1 "$LOG")"
 set +e
 out="$(run_predicate "$last")"
@@ -129,7 +137,7 @@ set -e
 assert "legacy red alias -> exit 1 (BLOCK, back-compat)" "1" "$rc"
 
 # 8. fail mixed with warn + unknown still blocks (any fail is enough)
-emit_assessment '{"ci_green":"pass","no_conflicts":"warn","coderabbit":"unknown","bugbot":"pass","comments_resolved":"unknown","evidence_review":"unknown","skeptic":"unknown","code_standards":"pass","zfc":"fail"}'
+emit_assessment '{"ci_green":"pass","no_conflicts":"warn","coderabbit":"unknown","bugbot":"pass","comments_resolved":"unknown","evidence_review":"unknown","skeptic":"unknown","vacuous_red_green":"pass","code_standards":"pass","zfc":"fail"}'
 last="$(tail -1 "$LOG")"
 set +e
 out="$(run_predicate "$last")"

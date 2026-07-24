@@ -69,6 +69,7 @@ impl Scm for ScmMock {
     fn labeled_prs(
         &self,
         label: &str,
+        _gh_calls: &mut u32,
     ) -> Result<Vec<daemon::tools::LabeledPr>, daemon::errors::DaemonError> {
         self.calls.borrow_mut().push(format!("labeled_prs({label})"));
         Ok(Vec::new())
@@ -322,6 +323,7 @@ fn test_cfg() -> Config {
         held_recheck_cooldown_secs: 900,
         repos: std::collections::HashMap::new(),
         pre_gate_validation_enabled: false,
+        escalation_refire_secs: 3600,
     }
 }
 

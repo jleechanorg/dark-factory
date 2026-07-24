@@ -14,7 +14,7 @@ The Auto-Factory Daemon automates the **backward-recovery path** in Level-5 auto
 *   **Decoupled Control Planes (Single-Owner)**: To prevent concurrent write conflicts, a single active `aow` worker session owns all *in-place* commits on a branch, while the daemon exclusively performs *read-only* verification and *structural re-rolls* (branch reset, spec mutation, and re-dispatch).
 *   **Wrapper-First & Discardable Components**: The daemon is implemented as a thin scheduler wrapping existing workflows. Components are designed to be discarded if upstream tools (Claude Code or `agent-orchestrator-mirror`) later absorb their functionality.
 *   **Offline Fail-Safe**: If GitHub is down, agents and the daemon coordinate via a parallel local bead-file protocol to prevent pipeline stalls.
-*   **7/8-Green Skeptic verification**: PRs are verified against standard SCM gates (CI, conflicts, comments, CodeRabbit) combined with adversarial Skeptic reviewer runs to ensure evidence compliance and logic correctness before release.
+*   **8-Green Skeptic verification**: PRs are verified against standard SCM gates (CI, conflicts, comments, CodeRabbit) combined with adversarial Skeptic reviewer runs to ensure evidence compliance and logic correctness before release. The canonical 8 gates are listed in §4.2.5 (gates 1-5 SCM-derived, gate 6 Evidence Review `/er`, gate 7 Skeptic, gate 8 Vacuous red/green). The previous "7-green" label reflected an older gate count (pre-#387); the contract is currently 8 — see `daemon/src/verifier.rs::GateName` (8 variants) and `daemon/factory-overlay.sh::REQUIRED_KEYS` (8 keys).
 
 ---
 
@@ -40,7 +40,7 @@ The Auto-Factory Daemon automates the **backward-recovery path** in Level-5 auto
         *   4.2.2 [Default Coder & Fallback Configuration](#422-default-coder--fallback-configuration)
         *   4.2.3 [Intake & Durable-State Split (Symphony §7 & §11)](#423-intake--durable-state-split-symphony-7--11)
         *   4.2.4 [PR Ownership & Handoff](#424-pr-ownership--handoff)
-        *   4.2.5 [Verifier Gates (7/8-Green) & Evidence Floors](#425-verifier-gates-78-green--evidence-floors)
+        *   4.2.5 [Verifier Gates (8-Green) & Evidence Floors](#425-verifier-gates-8-green--evidence-floors)
         *   4.2.6 [Re-Roll Handover, Constraint Extraction & Branching](#426-re-roll-handover-constraint-extraction--branching)
         *   4.2.7 [Spec Mutation Grammar & Overlay States](#427-spec-mutation-grammar--overlay-states)
         *   4.2.8 [Safety Envelope & Cumulative Time-Box](#428-safety-envelope--cumulative-time-box)
@@ -89,12 +89,12 @@ direct           then /f (full gated pipeline) unless waived by routing verdict
 [AO session = in-place remediation owner]  ← CI fixes, review comments,
               │                              merge conflicts (aow native loop)
               ▼
-[Daemon green VERIFIER]  ← read-only each tick: 7-green assessment,
+[Daemon green VERIFIER]  ← read-only each tick: 8-green assessment,
               │            evidence floor, independent-reviewer check
               │
      ┌────────┼──────────────────────────────┐
      ▼        ▼                              ▼
-[7-green]  [CHANGES_REQUESTED:          [AO session stalled /
+[8-green]  [CHANGES_REQUESTED:          [AO session stalled /
  ready +    cooldown 1 tick, then        cumulative time-box hit]
  merge-     model verdict in-place       ▼
  watch      vs re-roll]                 [HUMAN_HELD + Healer report]
@@ -117,7 +117,7 @@ graph TD
     F --> G
     H --> I[In-place Remediation Loop: CI/Review comments]
     I --> J{Daemon Green Verifier}
-    J -->|7-green passes| K[Readiness Report + Merge Watch]
+    J -->|8-green passes| K[Readiness Report + Merge Watch]
     J -->|CHANGES_REQUESTED| L{Re-Roll Verdict}
     L -->|In-place fixable| I
     L -->|Re-roll-worthy| M[Re-Roll Engine]
@@ -149,9 +149,9 @@ graph TD
 *   **Gap Proof:** The mirror has no task-routing logic; it accepts a workspace and runs a session. Claude Code has no model-based pipeline routing.
 
 #### 4.1.4 SCM Observer & Verification Loop
-*   **Definition:** A verifier that polls SCM PR metadata to independently validate the 7/8-green gates, evidence floor, and review decisions.
+*   **Definition:** A verifier that polls SCM PR metadata to independently validate the 8-green gates, evidence floor, and review decisions.
 *   **Need:** Ensures that the PR has met the rigorous evidence standards before release.
-*   **Gap Proof:** While AO's native loop reacts to SCM updates within the workspace, it cannot verify the overall 7-green status, check evidence compliance, or trigger cross-attempt re-rolls. Claude Code cannot autonomously verify PR state.
+*   **Gap Proof:** While AO's native loop reacts to SCM updates within the workspace, it cannot verify the overall 8-green status, check evidence compliance, or trigger cross-attempt re-rolls. Claude Code cannot autonomously verify PR state.
 
 #### 4.1.5 Re-Roll Engine
 *   **Definition:** An automated processor that stops active worker sessions, resets branches to mainline, extracts constraints from rejection text, screens for leaks, mutates spec files append-only, and re-dispatches.
@@ -180,7 +180,7 @@ graph TD
 #### 4.2.1 Component Stack & Discardable Design
 The stack composes three existing systems plus one new thin daemon. The composition is governed by the single remediation owner rule:
 *   At any moment, exactly one control plane may write to a PR's branch. Every open factory PR is owned by exactly one `aow` session that performs all in-place remediation natively.
-*   The daemon never pushes fixes alongside AO; it owns exactly two things: read-only verification (7-green assessment, evidence floor) and the re-roll decision.
+*   The daemon never pushes fixes alongside AO; it owns exactly two things: read-only verification (8-green assessment, evidence floor) and the re-roll decision.
 *   **Discardable Design:** In alignment with the "dorodango" architecture (polish, discard, rebuild), the daemon's integration adapters are designed as loosely coupled, disposable wrappers. If Claude Code improves its built-in workflows or `agent-orchestrator-mirror` merges new features, the corresponding daemon component/plugin is discarded and replaced by the new upstream implementation. Standard interface boundaries (JSON payloads over CLI/IPC) are maintained to allow plug-and-play swaps of intake, execution, or review components.
 
 #### 4.2.2 Default Coder & Fallback Configuration
@@ -208,19 +208,29 @@ The single-owner rule requires every open factory PR to have exactly one AO sess
 *   **Standard path:** `/f` is a one-shot pipeline that exits when the PR opens. At PR-open, the daemon attaches an `aow` session to the `/f`-produced branch (spawned with the bead's spec as context in remediation mode).
 *   The daemon leverages the AO daemon's native `scm.Observer` loop which registers ETags, performs diffs, and fires reaction nudges for PRs owned by active sessions.
 
-#### 4.2.5 Verifier Gates (7/8-Green) & Evidence Floors
-Each fast-tick, the daemon independently evaluates the PR against the full **7/8-green** definition (as implemented in `~/.claude/commands/green.md` and `~/.claude/skills/pr-green-definition.md`):
+#### 4.2.5 Verifier Gates (8-Green) & Evidence Floors
+Each fast-tick, the daemon independently evaluates the PR against the full **8-green** definition (as implemented in `~/.claude/commands/green.md` and `~/.claude/skills/pr-green-definition.md`). The canonical 8 gates mirror `daemon/src/verifier.rs::GateName` and the `REQUIRED_KEYS` contract in `daemon/factory-overlay.sh` — adding or removing a gate requires updating **all three** places together (see canonical-source comment in `verifier.rs::GateName::as_str`):
 1.  **CI Green**: All check-runs (e.g. GitHub Actions) report a `success` conclusion.
 2.  **No Conflicts**: The SCM mergeable status is `true` (no git conflicts).
 3.  **CodeRabbit APPROVED**: The latest review from the `coderabbitai` bot is `APPROVED`.
 4.  **Bugbot Clean**: Zero error-severity review remarks from `cursor[bot]`.
 5.  **Comments Resolved**: All PR review comment threads have GraphQL `isResolved` set to `true`.
 6.  **Evidence Review (`/er`)**: The `/er` verification workflow/comment returns a `PASS` verdict.
-7.  **Skeptic PASS**: Runs the Skeptic review loop. Under the daemon, the Skeptic review represents the combined execution of the specialized reviewer fleet:
+7.  **Skeptic PASS**: Runs the Skeptic review loop. Under the daemon, the Skeptic review represents the combined execution of the specialized reviewer fleet. The GH-side `skeptic-gate` workflow that previously published this verdict was deleted in PR #407 (`abfcee8`) because its bootstrap caller never shipped; the daemon-side `GateName::Skeptic` + `daemon/src/skeptic_evidence.rs` path is the surviving enforcement:
     *   **Default Reviewer**: The default reviewer agent is the **`agy` CLI** running inside an **AO worker** session.
     *   **Evidence & General Reviewer Chain**: For the high-stakes `/er` (Evidence Reviewer) and `alignment` (General Reviewer) gates, the review execution is routed through a prioritized fallback chain:
         `codex` (running GPT-5.5) -> `claude-code` (running Sonnet) -> `agy` -> `minimax`.
         The chain distinguishes between **transient failures** (API timeouts, rate limits, 5xx errors) and **substantive failures** (model produced wrong/empty answer, context overflow). Transient failures trigger a retry of the **same** model (up to 2 retries with exponential backoff) before falling back to the next model. Substantive failures fall back immediately. This distinction avoids double-billing for retry-able failures while still guaranteeing review completion.
+    *   **Contract-echo + PriorFinding**: The Skeptic verdict must echo each acceptance criterion of the governing bead with a per-item `pass | warn | fail` marker and re-state prior findings (issue #386 / bead `jleechan-pq08`). The verifier rejects verdicts missing the echo or dropping prior findings (PR #412 / bead `jleechan-ijod`).
+8.  **Vacuous red/green**: Runtime vacuous-test detector verdict (gate 8, added by PR #387 / bead `jleechan-ijod`). The detector computes a verdict from `PrEvidence.vacuous_red_green`. The mapping to `GateResult` is canonical and lives in `daemon/src/verifier.rs::vacuous_red_green_gate` (issue #387 r6 / PR #413):
+    *   `NotProvided` → `Green` (test-repo PRs and PRs with no test files have nothing to measure; the gate must not block)
+    *   `Genuine` → `Green`
+    *   `Vacuous` → `Red` (real defect: targeted tests pass on the reverted production tree)
+    *   `BaselineFailed` → `Green` (infra can't materialise the base worktree — no `GH_TOKEN` in CI, `gh pr view` failed, etc. The detector has no actionable signal; mapping to `Unknown` would make `all_green=false` for every PR on a runner without credentials and deadlock the bead in `Attested`. Infra failures fall through to the existing logger/Healer surfaces rather than blocking READY.)
+    *   `GreenFailed` → `Unknown` (the detector has a partial signal it can't resolve — the bead gets one more tick to re-evaluate rather than being promoted with an unverified gate)
+    *   `NoChangedTests` → `Unknown`
+    *   `ManifestMissing` → `Unknown`
+    Vacuous-test regressions — pattern-matched PASS verdicts on test counts that were never actually executed — fail the PR at this gate.
 
 Additional floors and optimizations are enforced:
 
@@ -270,7 +280,11 @@ All existing operator policies bind the daemon:
 *   **Token expenditure monitoring:** Per-bead token spend is tracked in CXDB as a monitoring metric (sum of coder tokens + reviewer chain tokens across all attempts). The daemon emits a warning to telemetry at 80% of a configurable per-bead token budget. This is a **monitoring-only** metric in Stage 1/2; it does not gate execution, since the 3hr time-box and circuit-breaker already bound runaway cost. The metric exists to inform budget decisions and detect cost anomalies before they become operator surprises.
 *   **Force-push: never.** Re-rolls create fresh branches.
 *   **Branch deletion:** Only refs in the daemon's own creation registry.
+<<<<<<< HEAD
 *   **Merge is never an automatic daemon side effect.** The daemon's own role stops at READY-state computation and a `READY_FOR_MERGE` readiness signal — `verifier::assess` runs every tick and `tick.rs` sets `overlay.state = OverlayState::Ready` only when `report.all_green` (verifier.rs's `all_green` requires every one of the 8 gates (canonical 7 + VacuousRedGreen) to be Green; a single Unknown forces `false`). The daemon process itself never calls a merge API. Actual merge execution is a separate, explicitly authorized action outside the daemon: either a human clicking merge, or an operator-granted, session-scoped authority for a coding-agent session to merge via `gh api -X PUT .../pulls/N/merge`, conditional on a per-PR adversarial review/`/advice` PASS verdict. Terminal state on the automated path remains ready-to-merge + readiness report, not an automatic merge.
+=======
+*   **Merge is never an automatic daemon side effect.** The daemon's own role stops at READY-state computation and a `READY_FOR_MERGE` readiness signal — `verifier::assess` runs every tick and `tick.rs` sets `overlay.state = OverlayState::Ready` only when `report.all_green` (verifier.rs's `all_green` requires every one of the 8 gates to be Green; a single Unknown forces `false`). The daemon process itself never calls a merge API. Actual merge execution is a separate, explicitly authorized action outside the daemon: either a human clicking merge, or an operator-granted, session-scoped authority for a coding-agent session to merge via `gh api -X PUT .../pulls/N/merge`, conditional on a per-PR adversarial review/`/advice` PASS verdict. Terminal state on the automated path remains ready-to-merge + readiness report, not an automatic merge.
+>>>>>>> 53a3999 (claude/antig: feat(daemon): runtime vacuous-red-green detector + gate-contract updates (#387))
 *   **Holdout isolation:** Sanitized environments and holdout-leak screens remain active.
 
 #### 4.2.9 Two-Stage Pilot Deployment

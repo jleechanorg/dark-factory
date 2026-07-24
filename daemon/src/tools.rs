@@ -110,10 +110,26 @@ pub struct LabeledPr {
     pub is_cross_repository: bool,
     pub head_repo_full_name: Option<String>,
     pub head_repo_owner_login: Option<String>,
+    /// jtg8: the head commit SHA at the time `gh pr list` returned this row.
+    /// Used as the primary cache key for the adoption-probe cache — if the
+    /// SHA is unchanged between ticks, the daemon serves adoption/duplicate
+    /// decisions from cache and skips per-PR gh probes (`collaborator_permission`,
+    /// the REST `pulls/{n}` lookup). `None` when the upstream `gh pr list`
+    /// JSON did not include a head SHA (defensive — the daemon MUST treat
+    /// `None` as "uncacheable" and probe fresh every tick, preserving current
+    /// behavior on under-detailed upstream payloads).
+    pub head_sha: Option<String>,
+    /// jtg8: PR `updated_at` epoch seconds at the time `gh pr list` returned
+    /// this row. Secondary cache key alongside `head_sha`: edits to the PR
+    /// body or comments bump `updated_at` without changing `head_sha`, and
+    /// both must invalidate the cache for the per-PR permission / metadata
+    /// probes to stay fresh. `None` = uncacheable (same rationale as
+    /// `head_sha`).
+    pub updated_at_epoch: Option<u64>,
 }
 
 /// Collaborator permission tier, coarsened to the write-tier gate (spec §4.2.3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Permission {
     None,
     Read,
@@ -389,7 +405,15 @@ pub trait Tracker {
 /// TTL caches for repeated tick reads; a durable ETag cache is not wired yet.
 pub trait Scm {
     fn labeled_issues(&self, label: &str) -> Result<Vec<Issue>, DaemonError>;
-    fn labeled_prs(&self, label: &str) -> Result<Vec<LabeledPr>, DaemonError>;
+    /// Fetch labeled PRs. `gh_calls` is incremented by every `gh` (or
+    /// equivalent) subprocess the implementation makes — including the
+    /// REST fallback's per-PR `pulls/{n}` calls. The intake code adds
+    /// this into `IntakeProbeMetrics.gh_call_count` so the slow-tier
+    /// `INTAKE_GH_CALL_WARN_THRESHOLD` warning reflects real subprocess
+    /// invocations rather than counting the list query as 1 while
+    /// silently burning O(N) on the REST fallback (bead jtg8-r5, codex
+    /// P2 review "Count REST fallback subprocesses in gh metrics").
+    fn labeled_prs(&self, label: &str, gh_calls: &mut u32) -> Result<Vec<LabeledPr>, DaemonError>;
     fn collaborator_permission(&self, login: &str) -> Result<Permission, DaemonError>;
     fn pr_snapshot(&self, pr: u64) -> Result<PrSnapshot, DaemonError>;
     /// Repo-scoped variant of [`pr_snapshot`](Scm::pr_snapshot) (bead

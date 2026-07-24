@@ -80,6 +80,7 @@ digraph Level5Feature {
         label="Adversarial reviewer (primary + shadow Codex)",
         backend_priority="codex,minimax,agy,claude-sonnet",
         prefer_adversarial="true",
+        receipt_required="true",
         timeout=600
     ]
     gate_er [

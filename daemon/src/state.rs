@@ -333,6 +333,52 @@ pub trait StateStore {
     fn reconcile_dispatching(&self) -> Result<(), DaemonError> {
         Ok(())
     }
+    /// Escalation dedup query (1s2q-escalation-dedup): returns `true` if an
+    /// ESCALATION_REQUIRED / ESCALATION_NOTIFICATION_FAILED event should be
+    /// emitted for `(bead_id, reason)` at `now_epoch` — i.e. no prior record
+    /// exists, the context hash changed, or the last emit is older than
+    /// `refire_secs`. Returns `false` (suppress) when the same context was
+    /// emitted within the backoff window. Default `Ok(true)` so fakes that
+    /// don't persist the ledger never suppress (preserve prior behavior).
+    fn escalation_should_emit(
+        &self,
+        _bead_id: &str,
+        _reason: &str,
+        _context_hash: &str,
+        _now_epoch: u64,
+        _refire_secs: u64,
+    ) -> Result<bool, DaemonError> {
+        Ok(true)
+    }
+    /// Record that an escalation event was just emitted for
+    /// `(bead_id, reason)` with `context_hash` at `now_epoch` (upsert the
+    /// ledger row). Default no-op for fakes that don't persist the ledger.
+    fn record_escalation_emit(
+        &self,
+        _bead_id: &str,
+        _reason: &str,
+        _context_hash: &str,
+        _now_epoch: u64,
+    ) -> Result<(), DaemonError> {
+        Ok(())
+    }
+    /// 1s2q-escalation-dedup Task 2: mark the `(bead_id, reason)` escalation
+    /// ledger row as terminal ("escalation_undeliverable") so
+    /// `escalation_should_emit` returns `Ok(false)` for it on every future
+    /// tick, regardless of context hash or backoff window. Used when the
+    /// notification failure was caused by a PERMANENT (non-transient per
+    /// `DaemonError::is_transient`) gh error that will never resolve (e.g.
+    /// `invalid issue format: "local-xxx"`). Upserts the ledger row with
+    /// `terminal = 1` (inserts a fresh terminal row if none existed, or flips
+    /// an existing row to terminal). Default no-op for fakes that don't
+    /// persist the ledger.
+    fn mark_escalation_undeliverable(
+        &self,
+        _bead_id: &str,
+        _reason: &str,
+    ) -> Result<(), DaemonError> {
+        Ok(())
+    }
 }
 
 /// `StateStore` impl against `~/.dark-factory/daemon-cxdb.sqlite` (WAL mode,
@@ -543,6 +589,8 @@ impl SqliteStateStore {
         Self::ensure_held_recheck_after_column(&conn)?;
         Self::ensure_last_er_evidence_hash_column(&conn)?;
         Self::ensure_disposition_required_state(&conn)?;
+        Self::ensure_escalation_ledger_table(&conn)?;
+        Self::ensure_escalation_ledger_terminal_column(&conn)?;
         Ok(Self { conn })
     }
 
@@ -563,6 +611,8 @@ impl SqliteStateStore {
         Self::ensure_held_recheck_after_column(&conn)?;
         Self::ensure_last_er_evidence_hash_column(&conn)?;
         Self::ensure_disposition_required_state(&conn)?;
+        Self::ensure_escalation_ledger_table(&conn)?;
+        Self::ensure_escalation_ledger_terminal_column(&conn)?;
         Ok(Self { conn })
     }
 
@@ -793,6 +843,69 @@ impl SqliteStateStore {
                 [],
             )
             .map_err(|e| tool_err("ensure_last_er_evidence_hash_column: add column", e))?;
+        }
+        Ok(())
+    }
+
+    /// Idempotent migration for the `escalation_ledger` table
+    /// (1s2q-escalation-dedup). Unlike the `ensure_*_column` migrations above
+    /// (which probe `pragma_table_info` for a column), this probes
+    /// `sqlite_master` for the table's existence, then issues
+    /// `CREATE TABLE IF NOT EXISTS` (idempotent on its own, but the probe keeps
+    /// the migration log honest for legacy DBs that already ran the old
+    /// schema.sql before this table was added). Safe to call repeatedly.
+    /// Runs AFTER `ensure_disposition_required_state` since it is an
+    /// independent table (NOT a column on `bead_overlay`) and therefore does
+    /// NOT participate in that CHECK rebuild's column-intersection copy.
+    fn ensure_escalation_ledger_table(conn: &Connection) -> Result<(), DaemonError> {
+        let has_table: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'escalation_ledger'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_escalation_ledger_table: probe", e))?;
+        if !has_table {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS escalation_ledger (\
+                   bead_id           TEXT NOT NULL,\
+                   reason            TEXT NOT NULL,\
+                   context_hash      TEXT NOT NULL,\
+                   last_emitted_epoch INTEGER NOT NULL,\
+                   PRIMARY KEY (bead_id, reason)\
+                 )",
+            )
+            .map_err(|e| tool_err("ensure_escalation_ledger_table: create", e))?;
+        }
+        Ok(())
+    }
+
+    /// Idempotent migration for the `escalation_ledger.terminal` column
+    /// (1s2q-escalation-dedup Task 2). Older on-disk DBs that got the
+    /// `escalation_ledger` table from a pre-Task-2 `ensure_escalation_ledger_table`
+    /// predate the `terminal` column declared in the CREATE TABLE block; SQLite
+    /// has no `ADD COLUMN IF NOT EXISTS`, so we probe `pragma_table_info` first
+    /// and only ALTER when the column is missing. Safe to call repeatedly — a
+    /// no-op when the column is already present. Defaults every pre-existing
+    /// row to `0` (not terminal), preserving the pre-Task-2 dedup behavior for
+    /// rows written before the terminal concept existed.
+    fn ensure_escalation_ledger_terminal_column(conn: &Connection) -> Result<(), DaemonError> {
+        let has_col: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('escalation_ledger') \
+                 WHERE name = 'terminal'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_escalation_ledger_terminal_column: pragma", e))?;
+        if !has_col {
+            conn.execute(
+                "ALTER TABLE escalation_ledger \
+                 ADD COLUMN terminal INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| tool_err("ensure_escalation_ledger_terminal_column: add column", e))?;
         }
         Ok(())
     }
@@ -1650,6 +1763,84 @@ impl StateStore for SqliteStateStore {
             Err(e) => Err(tool_err("set_er_evidence_hash", e)),
         }
     }
+
+    fn escalation_should_emit(
+        &self,
+        bead_id: &str,
+        reason: &str,
+        context_hash: &str,
+        now_epoch: u64,
+        refire_secs: u64,
+    ) -> Result<bool, DaemonError> {
+        let row: Result<(String, i64, i64), rusqlite::Error> = self.conn.query_row(
+            "SELECT context_hash, last_emitted_epoch, terminal FROM escalation_ledger \
+             WHERE bead_id = ?1 AND reason = ?2",
+            params![bead_id, reason],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        );
+        match row {
+            // No prior record — emit.
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(true),
+            Err(e) => Err(tool_err("escalation_should_emit: load", e)),
+            Ok((prior_hash, last_epoch, terminal)) => {
+                // 1s2q-escalation-dedup Task 2: a terminal row means the
+                // escalation was classified undeliverable (permanent gh
+                // error). Never re-emit, regardless of hash or backoff.
+                if terminal != 0 {
+                    return Ok(false);
+                }
+                // Hash changed — re-emit regardless of backoff.
+                if prior_hash != context_hash {
+                    return Ok(true);
+                }
+                // Same hash: re-emit only if the backoff window has elapsed.
+                let last = last_epoch.max(0) as u64;
+                Ok(now_epoch.saturating_sub(last) >= refire_secs)
+            }
+        }
+    }
+
+    fn record_escalation_emit(
+        &self,
+        bead_id: &str,
+        reason: &str,
+        context_hash: &str,
+        now_epoch: u64,
+    ) -> Result<(), DaemonError> {
+        self.conn
+            .execute(
+                "INSERT INTO escalation_ledger (bead_id, reason, context_hash, last_emitted_epoch) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(bead_id, reason) DO UPDATE SET \
+                   context_hash = excluded.context_hash, \
+                   last_emitted_epoch = excluded.last_emitted_epoch",
+                params![bead_id, reason, context_hash, now_epoch as i64],
+            )
+            .map_err(|e| tool_err("record_escalation_emit: upsert", e))?;
+        Ok(())
+    }
+
+    fn mark_escalation_undeliverable(
+        &self,
+        bead_id: &str,
+        reason: &str,
+    ) -> Result<(), DaemonError> {
+        self.conn
+            .execute(
+                "INSERT INTO escalation_ledger (bead_id, reason, context_hash, last_emitted_epoch, terminal) \
+                 VALUES (?1, ?2, '', 0, 1) \
+                 ON CONFLICT(bead_id, reason) DO UPDATE SET terminal = 1",
+                params![bead_id, reason],
+            )
+            .map_err(|e| tool_err("mark_escalation_undeliverable: upsert", e))?;
+        Ok(())
+    }
 }
 
 /// True when `err` is the SQLite "no such column" schema-mismatch signal.
@@ -2303,6 +2494,394 @@ mod tests {
             .expect("last_er_runner_attempt_at column should exist after migration");
         assert_eq!(count_col, 1);
         assert_eq!(last_col, 1);
+    }
+
+    /// Cross-model review P2 #2 (bead jleechan-n6mk, follow-up to PR #447):
+    /// the existing `open_migrates_legacy_db_missing_er_runner_columns` test
+    /// uses a 3-column `bead_overlay` stub — that hides migration regressions
+    /// in the long tail of `ensure_*_column` migrations and the disposition
+    /// CHECK rebuild, because a 3-column table can't exercise them. This test
+    /// uses a production-shaped fixture: a SQLite DB built from the EXACT
+    /// pre-PR-#447 schema (every column the current `schema.sql` declares,
+    /// EXCEPT the `escalation_ledger` table + its `terminal` column which
+    /// PR #447 introduces) populated with realistic rows in every table,
+    /// then asserts that `open()` migrates it to the current schema without
+    /// dropping, reordering, or rewriting any pre-existing row.
+    ///
+    /// The pre-PR-#447 fixture has the disposition-state CHECK missing
+    /// `DISPOSITION_REQUIRED` (which PR #387 introduced), so this test
+    /// simultaneously exercises the disposition-rebuild migration. Pre-PR-#447
+    /// legacy DBs are precisely the population that would hit that rebuild
+    /// path in production.
+    #[test]
+    fn open_migrates_production_shaped_legacy_db_preserves_every_row() {
+        use rusqlite::Connection;
+
+        // Tuple alias for the per-row overlay snapshot. The 11-element tuple
+        // is verbose enough to trip `clippy::type_complexity`, so we alias it
+        // here. The field order matches the SELECT in `pre_overlays` /
+        // `post_overlays`.
+        type OverlaySnapshotRow = (
+            String, // bead_id
+            String, // state
+            i64,    // attempt
+            Option<i64>,        // pr_number
+            Option<String>,     // branch
+            Option<String>,     // session_id
+            Option<String>,     // target_repo
+            Option<String>,     // park_reason
+            Option<String>,     // last_er_evidence_hash
+            Option<i64>,        // held_recheck_after
+            Option<String>,     // pre_session_head_sha
+        );
+
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "dark-factory-prod-shaped-migrate-{}-{}.sqlite",
+            std::process::id(),
+            now_iso8601().replace([':', '-', 'T', 'Z'], "")
+        ));
+        let _cleanup = TempFileGuard(path.clone());
+
+        // Build a production-shaped "legacy" DB: every table + column the
+        // current schema.sql declares, EXCEPT (a) `escalation_ledger` (PR
+        // #447 introduces it), and (b) the `terminal` column on
+        // `escalation_ledger` (PR #447 introduces it as a follow-up). The
+        // disposition CHECK is the pre-#387 variant (no
+        // `DISPOSITION_REQUIRED`) so the rebuild migration has real work to do.
+        //
+        // Column order in `bead_overlay` matches the canonical schema so
+        // any column-add migration is a `tail-append` (SQLite-safe) and
+        // doesn't trigger an unintended rebuild.
+        const LEGACY_SCHEMA: &str = r#"
+            CREATE TABLE bead_overlay (
+              bead_id       TEXT PRIMARY KEY,
+              state         TEXT NOT NULL CHECK (state IN
+                              ('QUEUED','DISPATCHING','DISPATCHED','ATTESTED','READY','RE_ROLL','RECOVERY',
+                               'REDISPATCHED','BUDGET_HELD','HUMAN_HELD')),
+              attempt       INTEGER NOT NULL DEFAULT 1,
+              reroll_count  INTEGER NOT NULL DEFAULT 0,
+              autonomy_secs INTEGER NOT NULL DEFAULT 0,
+              spend_usd     REAL    NOT NULL DEFAULT 0,
+              pr_number     INTEGER,
+              branch        TEXT,
+              session_id    TEXT,
+              updated_at    TEXT    NOT NULL,
+              attempt_er_runner_count INTEGER NOT NULL DEFAULT 0,
+              last_er_runner_attempt_at INTEGER,
+              is_adopted INTEGER NOT NULL DEFAULT 0,
+              spawn_failure_count INTEGER NOT NULL DEFAULT 0,
+              pre_session_head_sha TEXT,
+              park_reason TEXT,
+              target_repo TEXT,
+              reroll_deferral_count INTEGER NOT NULL DEFAULT 0,
+              held_recheck_after INTEGER,
+              last_er_evidence_hash TEXT
+            );
+            CREATE TABLE branch_registry (
+              branch     TEXT PRIMARY KEY,
+              bead_id    TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE review_rejection (
+              bead_id       TEXT NOT NULL,
+              attempt       INTEGER NOT NULL,
+              reviewer      TEXT NOT NULL,
+              feedback_hash TEXT NOT NULL,
+              feedback_text TEXT NOT NULL,
+              created_at    TEXT NOT NULL,
+              PRIMARY KEY (bead_id, attempt)
+            );
+            -- NOTE: no `escalation_ledger` table — that's what PR #447 adds.
+        "#;
+
+        // Seed realistic rows in every table. Each row is chosen so any of
+        // the migrations would visibly mangle it if they did a wrong table
+        // rebuild (e.g. NULL DEFAULTs being clobbered, CHECK constraint
+        // reordering altering the surviving set, etc.).
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(LEGACY_SCHEMA).unwrap();
+
+        // bead_overlay: cover every state value the legacy CHECK allows,
+        // plus every NOT-NULL column with a non-default value, plus every
+        // nullable column set to a non-NULL value (so a migration that
+        // dropped/reordered columns would change the visible row).
+        let mut inserted_overlays = Vec::new();
+        let mut seed_overlay = |bead_id: &str,
+                                state: &str,
+                                attempt: i64,
+                                pr_number: Option<i64>,
+                                branch: Option<&str>,
+                                session_id: Option<&str>,
+                                target_repo: Option<&str>,
+                                park_reason: Option<&str>,
+                                last_er_evidence_hash: Option<&str>,
+                                held_recheck_after: Option<i64>,
+                                pre_session_head_sha: Option<&str>| {
+            conn.execute(
+                "INSERT INTO bead_overlay \
+                 (bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
+                  pr_number, branch, session_id, updated_at, \
+                  attempt_er_runner_count, last_er_runner_attempt_at, is_adopted, \
+                  spawn_failure_count, pre_session_head_sha, park_reason, target_repo, \
+                  reroll_deferral_count, held_recheck_after, last_er_evidence_hash) \
+                 VALUES (?1, ?2, ?3, 0, 0, 0.0, ?4, ?5, ?6, '2026-07-22T00:00:00Z', \
+                         3, 1700000000, 1, 2, ?7, ?8, ?9, 4, ?10, ?11)",
+                rusqlite::params![
+                    bead_id, state, attempt, pr_number, branch, session_id,
+                    pre_session_head_sha, park_reason, target_repo,
+                    held_recheck_after, last_er_evidence_hash
+                ],
+            )
+            .unwrap();
+            inserted_overlays.push((
+                bead_id.to_string(),
+                state.to_string(),
+                attempt,
+                pr_number,
+                branch.map(String::from),
+                session_id.map(String::from),
+                target_repo.map(String::from),
+                park_reason.map(String::from),
+                last_er_evidence_hash.map(String::from),
+                held_recheck_after,
+                pre_session_head_sha.map(String::from),
+            ));
+        };
+
+        seed_overlay("bead-1", "QUEUED", 1, Some(101), Some("factory/bead-1-r1"), Some("sess-a"), Some("owner/repo1"), None, None, None, None);
+        seed_overlay("bead-2", "DISPATCHED", 2, Some(102), Some("factory/bead-2-r2"), Some("sess-b"), Some("owner/repo1"), None, Some("abc123"), None, None);
+        seed_overlay("bead-3", "ATTESTED", 3, Some(103), Some("factory/bead-3-r3"), Some("sess-c"), Some("owner/repo2"), None, None, Some(1700001000), Some("deadbeef1234"));
+        seed_overlay("bead-4", "READY", 4, Some(104), Some("factory/bead-4-r4"), None, None, None, Some("def456"), None, None);
+        seed_overlay("bead-5", "HUMAN_HELD", 10, Some(105), Some("factory/bead-5-r10"), None, None, Some("circuit-breaker-triggered"), None, None, None);
+        seed_overlay("bead-6", "DISPATCHING", 1, None, None, None, None, None, None, None, None);
+        seed_overlay("bead-7", "RE_ROLL", 2, Some(107), Some("factory/bead-7-r2"), Some("sess-g"), Some("owner/repo3"), None, None, None, None);
+        seed_overlay("bead-8", "RECOVERY", 3, Some(108), Some("factory/bead-8-r3"), None, Some("owner/repo3"), None, None, None, None);
+        seed_overlay("bead-9", "REDISPATCHED", 4, Some(109), Some("factory/bead-9-r4"), Some("sess-i"), Some("owner/repo1"), None, None, None, None);
+        seed_overlay("bead-10", "BUDGET_HELD", 5, Some(110), Some("factory/bead-10-r5"), None, None, Some("autonomy_timebox_exceeded"), None, Some(1700002000), None);
+
+        // branch_registry: a few rows that exercise the deletion-guard table.
+        conn.execute(
+            "INSERT INTO branch_registry (branch, bead_id, created_at) VALUES \
+             ('factory/bead-1-r1', 'bead-1', '2026-07-22T00:00:00Z'), \
+             ('factory/bead-2-r2', 'bead-2', '2026-07-22T00:00:01Z'), \
+             ('factory/bead-5-r10', 'bead-5', '2026-07-22T00:00:02Z')",
+            [],
+        ).unwrap();
+
+        // review_rejection: rows that exercise the per-bead rejection tracking.
+        conn.execute(
+            "INSERT INTO review_rejection (bead_id, attempt, reviewer, feedback_hash, feedback_text, created_at) VALUES \
+             ('bead-1', 1, 'cursor', 'hash-cursor-1', 'fake feedback 1', '2026-07-22T00:00:00Z'), \
+             ('bead-3', 3, 'coderabbit', 'hash-cr-3', 'fake feedback 3', '2026-07-22T00:00:01Z'), \
+             ('bead-5', 10, 'bugbot', 'hash-bb-10', 'fake feedback 5', '2026-07-22T00:00:02Z')",
+            [],
+        ).unwrap();
+
+        // Snapshot the entire DB before migration.
+        let pre_overlays: Vec<OverlaySnapshotRow> = {
+            let mut stmt = conn.prepare(
+                "SELECT bead_id, state, attempt, pr_number, branch, session_id, target_repo, \
+                        park_reason, last_er_evidence_hash, held_recheck_after, pre_session_head_sha \
+                 FROM bead_overlay ORDER BY bead_id",
+            ).unwrap();
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                ))
+            }).unwrap().map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(
+            pre_overlays.len(),
+            inserted_overlays.len(),
+            "fixture seed must round-trip pre-migration snapshot"
+        );
+
+        let pre_branches: Vec<(String, String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT branch, bead_id, created_at FROM branch_registry ORDER BY branch",
+            ).unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap().map(|r| r.unwrap()).collect()
+        };
+        let pre_rejections: Vec<(String, i64, String, String, String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT bead_id, attempt, reviewer, feedback_hash, feedback_text, created_at \
+                 FROM review_rejection ORDER BY bead_id, attempt",
+            ).unwrap();
+            stmt.query_map([], |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))).unwrap().map(|r| r.unwrap()).collect()
+        };
+        drop(conn);
+
+        // ── Migrate: open() must apply every ensure_*_column + the disposition
+        //    rebuild + the escalation_ledger CREATE TABLE + the terminal
+        //    column ADD without losing any pre-existing row.
+        let _store = SqliteStateStore::open(&path).expect("production-shaped legacy DB must auto-migrate");
+
+        // Re-open: idempotency guard — second open() must NOT fail.
+        let _store2 = SqliteStateStore::open(&path).expect("second open must be idempotent");
+
+        let conn = Connection::open(&path).unwrap();
+
+        // 1) Every pre-existing bead_overlay row must be present with the
+        //    same per-column values. The migration only appends columns
+        //    with sensible defaults, so NULL values stay NULL and the
+        //    legacy CHECK migration can rewrite the table without losing
+        //    rows that survive the new (wider) CHECK constraint.
+        let post_overlays: Vec<OverlaySnapshotRow> = {
+            let mut stmt = conn.prepare(
+                "SELECT bead_id, state, attempt, pr_number, branch, session_id, target_repo, \
+                        park_reason, last_er_evidence_hash, held_recheck_after, pre_session_head_sha \
+                 FROM bead_overlay ORDER BY bead_id",
+            ).unwrap();
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                ))
+            }).unwrap().map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(
+            post_overlays, pre_overlays,
+            "every pre-existing bead_overlay row must be preserved byte-for-byte after migration; \
+             got pre={pre_overlays:?} post={post_overlays:?}"
+        );
+
+        // 2) branch_registry rows preserved.
+        let post_branches: Vec<(String, String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT branch, bead_id, created_at FROM branch_registry ORDER BY branch",
+            ).unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap().map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(
+            post_branches, pre_branches,
+            "branch_registry rows must be preserved; got pre={pre_branches:?} post={post_branches:?}"
+        );
+
+        // 3) review_rejection rows preserved.
+        let post_rejections: Vec<(String, i64, String, String, String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT bead_id, attempt, reviewer, feedback_hash, feedback_text, created_at \
+                 FROM review_rejection ORDER BY bead_id, attempt",
+            ).unwrap();
+            stmt.query_map([], |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))).unwrap().map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(
+            post_rejections, pre_rejections,
+            "review_rejection rows must be preserved; got pre={pre_rejections:?} post={post_rejections:?}"
+        );
+
+        // 4) The new escalation_ledger table is present and empty
+        //    (migration does NOT backfill from review_rejection — the
+        //    ledger is populated lazily by `record_escalation_emit` on
+        //    the next escalation event).
+        let ledger_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM escalation_ledger", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(ledger_count, 0, "escalation_ledger must start empty after migration");
+
+        // 5) The terminal column exists with the documented default (0).
+        //    `pragma_table_info.dflt_value` is TEXT (the literal SQL fragment
+        //    — "0", "NULL", or NULL for "no default"). For an `INTEGER NOT
+        //    NULL DEFAULT 0` column, that fragment is the string "0".
+        let terminal_default: String = conn
+            .query_row(
+                "SELECT COALESCE((SELECT \"dflt_value\" FROM pragma_table_info('escalation_ledger') \
+                                  WHERE name = 'terminal'), 'MISSING')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            terminal_default, "0",
+            "escalation_ledger.terminal must default to 0 (non-terminal)"
+        );
+
+        // 6) The bead_overlay CHECK constraint was widened by the disposition
+        //    rebuild — `DISPOSITION_REQUIRED` must now be insertable (it's
+        //    the only state value that proves the wider CHECK is live).
+        conn.execute(
+            "INSERT INTO bead_overlay \
+             (bead_id, state, attempt, updated_at) \
+             VALUES ('bead-new-disp', 'DISPOSITION_REQUIRED', 1, '2026-07-22T00:00:03Z')",
+            [],
+        ).expect("DISPOSITION_REQUIRED must be insertable after the disposition-rebuild migration");
+
+        // 7) The bead_overlay CHECK constraint still rejects garbage — pins
+        //    the constraint is wired up (not silently dropped).
+        let res = conn.execute(
+            "INSERT INTO bead_overlay \
+             (bead_id, state, attempt, updated_at) \
+             VALUES ('bead-bogus', 'NOT_A_REAL_STATE', 1, '2026-07-22T00:00:04Z')",
+            [],
+        );
+        assert!(
+            res.is_err(),
+            "CHECK constraint must still reject invalid state values after migration"
+        );
+
+        // 8) Row counts — the migration must NOT delete anything.
+        let overlay_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM bead_overlay", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            overlay_count as usize,
+            inserted_overlays.len() + 1,
+            "bead_overlay must have {} seeded rows + 1 DISPOSITION_REQUIRED test row; got {}",
+            inserted_overlays.len(),
+            overlay_count
+        );
+
+        let branch_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM branch_registry", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            branch_count as usize,
+            pre_branches.len(),
+            "branch_registry must retain all pre-existing rows"
+        );
+
+        let rejection_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM review_rejection", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            rejection_count as usize,
+            pre_rejections.len(),
+            "review_rejection must retain all pre-existing rows"
+        );
     }
 
     /// The real-SQLite policy requeues only retry-safe no-session rows under
@@ -3259,5 +3838,292 @@ mod tests {
         assert_eq!(a_after.autonomy_secs, 275);
         let h_after = store.load("h").unwrap().unwrap();
         assert_eq!(h_after.autonomy_secs, 10299);
+    }
+
+    // 1s2q-escalation-dedup: the escalation_ledger migration + dedup logic.
+
+    #[test]
+    fn escalation_ledger_table_present_after_open() {
+        let s = store();
+        let count: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'escalation_ledger'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "escalation_ledger table must exist after open");
+    }
+
+    #[test]
+    fn ensure_escalation_ledger_table_migrates_legacy_db() {
+        // Simulate a legacy DB that pre-dates the escalation_ledger table: open
+        // an in-memory connection, create ONLY bead_overlay (minimal), then run
+        // the migration helper and verify the table appears.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE bead_overlay (\
+               bead_id TEXT PRIMARY KEY, state TEXT NOT NULL, updated_at TEXT NOT NULL\
+             )",
+        )
+        .unwrap();
+        // No escalation_ledger yet.
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'escalation_ledger'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, 0);
+        SqliteStateStore::ensure_escalation_ledger_table(&conn).unwrap();
+        let after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'escalation_ledger'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, 1);
+        // Idempotent: running again is a no-op.
+        SqliteStateStore::ensure_escalation_ledger_table(&conn).unwrap();
+        let still: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'escalation_ledger'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(still, 1);
+    }
+
+    #[test]
+    fn escalation_dedup_no_prior_record_emits() {
+        let s = store();
+        // No prior ledger row for this (bead_id, reason) — should emit.
+        assert!(s
+            .escalation_should_emit("bead-a", "some_reason", "hash-1", 1000, 3600)
+            .unwrap());
+    }
+
+    #[test]
+    fn escalation_dedup_same_hash_within_backoff_suppresses() {
+        let s = store();
+        s.record_escalation_emit("bead-a", "some_reason", "hash-1", 1000)
+            .unwrap();
+        // Same hash, only 100s later (< 3600s backoff) — suppress.
+        assert!(!s
+            .escalation_should_emit("bead-a", "some_reason", "hash-1", 1100, 3600)
+            .unwrap());
+    }
+
+    #[test]
+    fn escalation_dedup_same_hash_past_backoff_re_emits() {
+        let s = store();
+        s.record_escalation_emit("bead-a", "some_reason", "hash-1", 1000)
+            .unwrap();
+        // Same hash, but 4000s later (>= 3600s backoff) — re-emit.
+        assert!(s
+            .escalation_should_emit("bead-a", "some_reason", "hash-1", 5000, 3600)
+            .unwrap());
+    }
+
+    #[test]
+    fn escalation_dedup_hash_changed_re_emits_regardless_of_backoff() {
+        let s = store();
+        s.record_escalation_emit("bead-a", "some_reason", "hash-1", 1000)
+            .unwrap();
+        // Different hash, only 10s later — re-emit (context changed).
+        assert!(s
+            .escalation_should_emit("bead-a", "some_reason", "hash-2", 1010, 3600)
+            .unwrap());
+    }
+
+    #[test]
+    fn escalation_dedup_record_upserts_ledger_row() {
+        let s = store();
+        s.record_escalation_emit("bead-a", "some_reason", "hash-1", 1000)
+            .unwrap();
+        // Upsert: same (bead_id, reason), new hash + epoch.
+        s.record_escalation_emit("bead-a", "some_reason", "hash-2", 5000)
+            .unwrap();
+        // The new hash should now be the stored one; same-hash within backoff
+        // suppresses for hash-2, while hash-1 is gone.
+        assert!(!s
+            .escalation_should_emit("bead-a", "some_reason", "hash-2", 5100, 3600)
+            .unwrap());
+        // hash-1 is now a "changed" hash relative to the stored hash-2 → emit.
+        assert!(s
+            .escalation_should_emit("bead-a", "some_reason", "hash-1", 5100, 3600)
+            .unwrap());
+    }
+
+    #[test]
+    fn escalation_dedup_keys_are_per_reason() {
+        let s = store();
+        s.record_escalation_emit("bead-a", "reason-x", "hash-1", 1000)
+            .unwrap();
+        // Same bead, DIFFERENT reason — no prior record for that reason → emit.
+        assert!(s
+            .escalation_should_emit("bead-a", "reason-y", "hash-1", 1010, 3600)
+            .unwrap());
+    }
+
+    // 1s2q-escalation-dedup Task 2: terminal ("escalation_undeliverable") rows.
+
+    #[test]
+    fn mark_escalation_undeliverable_sets_terminal_flag_on_fresh_row() {
+        let s = store();
+        // No prior ledger row — mark_escalation_undeliverable inserts a
+        // terminal row.
+        s.mark_escalation_undeliverable("bead-perm", "human_held_recovery_attempt_cap_reached")
+            .unwrap();
+        // escalation_should_emit must now return false unconditionally.
+        assert!(!s
+            .escalation_should_emit(
+                "bead-perm",
+                "human_held_recovery_attempt_cap_reached",
+                "any-hash",
+                999_999,
+                0,
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn mark_escalation_undeliverable_flips_existing_row_to_terminal() {
+        let s = store();
+        // A prior non-terminal row exists (e.g. a transient failure was
+        // dedup-recorded on a previous tick).
+        s.record_escalation_emit("bead-perm", "some_reason", "hash-1", 1000)
+            .unwrap();
+        // Same hash within backoff would suppress normally...
+        assert!(!s
+            .escalation_should_emit("bead-perm", "some_reason", "hash-1", 1100, 3600)
+            .unwrap());
+        // ...but a changed hash would re-emit. After marking terminal, even a
+        // changed hash must NOT re-emit.
+        s.mark_escalation_undeliverable("bead-perm", "some_reason")
+            .unwrap();
+        assert!(!s
+            .escalation_should_emit("bead-perm", "some_reason", "totally-new-hash", 999_999, 0)
+            .unwrap());
+    }
+
+    #[test]
+    fn terminal_row_suppresses_regardless_of_hash_or_backoff() {
+        let s = store();
+        s.mark_escalation_undeliverable("bead-t", "reason-t")
+            .unwrap();
+        // Changed hash, zero backoff window — would normally emit, but terminal
+        // flag suppresses unconditionally.
+        assert!(!s
+            .escalation_should_emit("bead-t", "reason-t", "new-hash", 0, 0)
+            .unwrap());
+        // Same/any epoch, any backoff — still suppressed.
+        assert!(!s
+            .escalation_should_emit("bead-t", "reason-t", "another-hash", 10_000_000, 1)
+            .unwrap());
+    }
+
+    #[test]
+    fn terminal_marker_is_per_reason() {
+        let s = store();
+        s.mark_escalation_undeliverable("bead-t", "reason-t")
+            .unwrap();
+        // A DIFFERENT reason on the same bead is unaffected — still emits.
+        assert!(s
+            .escalation_should_emit("bead-t", "reason-other", "hash-1", 100, 3600)
+            .unwrap());
+    }
+
+    #[test]
+    fn record_escalation_emit_does_not_clear_terminal() {
+        let s = store();
+        s.mark_escalation_undeliverable("bead-t", "reason-t")
+            .unwrap();
+        // A late record_escalation_emit (e.g. from a race) must not flip
+        // terminal back off.
+        s.record_escalation_emit("bead-t", "reason-t", "hash-late", 5000)
+            .unwrap();
+        assert!(!s
+            .escalation_should_emit("bead-t", "reason-t", "hash-late", 999_999, 0)
+            .unwrap());
+    }
+
+    #[test]
+    fn ensure_escalation_ledger_terminal_column_migrates_legacy_db() {
+        // Simulate a legacy DB that got escalation_ledger from a pre-Task-2
+        // ensure_escalation_ledger_table (no terminal column).
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE escalation_ledger (\
+               bead_id TEXT NOT NULL,\
+               reason TEXT NOT NULL,\
+               context_hash TEXT NOT NULL,\
+               last_emitted_epoch INTEGER NOT NULL,\
+               PRIMARY KEY (bead_id, reason)\
+             )",
+        )
+        .unwrap();
+        // Insert a pre-existing row without the terminal column.
+        conn.execute(
+            "INSERT INTO escalation_ledger (bead_id, reason, context_hash, last_emitted_epoch) \
+             VALUES ('b-legacy', 'r1', 'h1', 100)",
+            [],
+        )
+        .unwrap();
+        // No terminal column yet.
+        let has_col_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('escalation_ledger') \
+                 WHERE name = 'terminal'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_col_before, 0);
+
+        SqliteStateStore::ensure_escalation_ledger_terminal_column(&conn).unwrap();
+
+        // Column now present, defaulting existing rows to 0 (not terminal).
+        let terminal_val: i64 = conn
+            .query_row(
+                "SELECT terminal FROM escalation_ledger WHERE bead_id = 'b-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(terminal_val, 0);
+        // Idempotent: a second run is a no-op.
+        SqliteStateStore::ensure_escalation_ledger_terminal_column(&conn).unwrap();
+        let terminal_val2: i64 = conn
+            .query_row(
+                "SELECT terminal FROM escalation_ledger WHERE bead_id = 'b-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(terminal_val2, 0);
+    }
+
+    #[test]
+    fn escalation_ledger_terminal_column_present_after_open() {
+        let s = store();
+        let has_col: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('escalation_ledger') \
+                 WHERE name = 'terminal'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_col, 1, "terminal column must exist after open");
     }
 }

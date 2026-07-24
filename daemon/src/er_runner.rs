@@ -187,8 +187,16 @@ pub fn maybe_run(
     // 6. Post verbatim reply as a PR comment. If the post fails (network
     //    blip, 403, etc.), do NOT consume an attempt — propagate the error
     //    so the next tick can retry without burning one of the 3 slots.
+    //
+    //    The head SHA is embedded on a dedicated line so the Evidence
+    //    Gate's Signal A can head-bind the verdict to the current PR head
+    //    (issue #433). A bare `/er PASS` from the PR author (no head SHA
+    //    line) is not bound to any specific commit and MUST NOT green
+    //    the gate; only verdicts whose embedded head SHA matches the
+    //    workflow's resolved PR head are accepted.
     let body = format!(
-        "🤖 **[dark-factory /er]** Evidence review verdict:\n\n```\n{reply}\n```"
+        "🤖 **[dark-factory /er]** Evidence review verdict:\n\n```\n{reply}\n```\n\nhead={head_sha}",
+        head_sha = snapshot.head_sha,
     );
     let ext_ref = format!("{}#{}", repo, pr);
     deps.tracker.comment_external(&ext_ref, &body)?;
@@ -353,7 +361,7 @@ mod tests {
                 .push(format!("labeled_issues({label})"));
             Ok(self.issues.clone())
         }
-        fn labeled_prs(&self, label: &str) -> Result<Vec<crate::tools::LabeledPr>, DaemonError> {
+        fn labeled_prs(&self, label: &str, _gh_calls: &mut u32) -> Result<Vec<crate::tools::LabeledPr>, DaemonError> {
             self.calls.borrow_mut().push(format!("labeled_prs({label})"));
             Ok(Vec::new())
         }
@@ -564,6 +572,7 @@ mod tests {
             held_recheck_cooldown_secs: 900,
             repos: std::collections::HashMap::new(),
             pre_gate_validation_enabled: false,
+            escalation_refire_secs: 3600,
         }
     }
 
@@ -857,6 +866,14 @@ mod tests {
         let (ext_ref, body) = &comment_calls[0];
         assert_eq!(ext_ref, "owner/repo#103");
         assert!(body.contains("/er PASS"), "verbatim verdict in comment: {body:?}");
+        // Issue #433: the posted verdict comment MUST embed the PR head
+        // SHA so the Evidence Gate's Signal A can head-bind the verdict
+        // to the current commit. A bare `/er PASS` without a head
+        // reference is forgeable by the PR author.
+        assert!(
+            body.contains("head=deadbeef"),
+            "posted verdict must embed the PR head SHA for Signal A head-binding: {body:?}"
+        );
     }
 
     /// jleechan-9xrs Stage D: when the bead has an explicit `target_repo`
@@ -1118,6 +1135,55 @@ mod tests {
         assert_eq!(parse_reviewer_reply("supersede"), ErVerdict::Absent);
         // Boundary: no `/er` token at all
         assert_eq!(parse_reviewer_reply("looks good"), ErVerdict::Absent);
+    }
+
+    /// Issue #433: the posted verdict comment MUST embed the PR head SHA
+    /// (`head=<sha>`) so the Evidence Gate's Signal A can head-bind the
+    /// verdict to the current PR head. A bare `/er PASS` (no head SHA)
+    /// is forgeable by the PR author — they can post the same string
+    /// and green the gate. This test pins the head-SHA line so a future
+    /// regression that drops it is caught immediately.
+    #[test]
+    fn posted_verdict_comment_embeds_head_sha_for_evidence_gate() {
+        telemetry_cleanup();
+        let scm = S::default();
+        let tracker = T::default();
+        let sessions = Ss;
+        let llm = L::default();
+        *llm.response.borrow_mut() = Some(Ok("/er PASS".into()));
+        let store = St::default();
+        let cfg = test_cfg();
+
+        let pr = 433;
+        let bead = "ifkt";
+        store
+            .overlays
+            .borrow_mut()
+            .insert(bead.into(), attested_overlay(bead, pr));
+        // Use a unique 40-char head SHA so the assertion is unambiguous.
+        let unique_head = "abcdef0123456789abcdef0123456789abcdef01";
+        let mut snap = snapshot_with_comments(pr, vec![]);
+        snap.head_sha = unique_head.into();
+        scm.snapshots.borrow_mut().insert(pr, snap);
+
+        let deps = make_deps(&scm, &tracker, &sessions, &llm, &store, &cfg);
+        let outcome = maybe_run(&deps, bead, pr, 8_000_000).unwrap();
+        assert!(matches!(outcome, Outcome::Posted { .. }));
+
+        let comment_calls = tracker.comment_calls.borrow();
+        assert_eq!(comment_calls.len(), 1, "exactly one PR comment expected");
+        let (_ext_ref, body) = &comment_calls[0];
+        assert!(
+            body.contains(&format!("head={unique_head}")),
+            "posted verdict must embed `head=<full-40-char-sha>` for Signal A: {body:?}"
+        );
+        // Also: the trusted-identity header MUST be present so Signal A
+        // can match the comment against the bot allowlist (issue #433
+        // forgery surface #1).
+        assert!(
+            body.contains("dark-factory /er"),
+            "posted verdict must carry the er_runner bot identity marker: {body:?}"
+        );
     }
 
     #[test]

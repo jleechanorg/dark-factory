@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import pathlib
 import re
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from ._git import _SHA_RE, _git_rev_parse
 
@@ -241,3 +241,231 @@ def _enforce_outcome_verdict_consistency(result: "Result", *, gate_strict: bool 
         suggested_next_ids=result.suggested_next_ids,
         context_updates=result.context_updates,
     )
+
+
+# Reproduction receipt: a reviewer PASS is only trustworthy when the review
+# transcript shows the reviewer actually RE-RAN a build/test runner and that
+# run SUCCEEDED (exit 0). Without that, a PASS is read-only theater; with a
+# nonzero-only exit trail, the reviewer reproduced a FAILURE and passed it
+# anyway. No outer \b anchors on runners: leading "./" and trailing chars
+# (e.g. "run_tests.sh") make \b-wrapping reject legitimate reproductions.
+_RECEIPT_RUNNER_RE = re.compile(
+    r"(uv run pytest|pytest|python[0-9.]* -m (?:pytest|unittest)|py -m (?:pytest|unittest)|"
+    r"npm (?:test|run|ci)|yarn (?:test|run)|pnpm (?:test|run)|vitest|jest|npx playwright|"
+    r"playwright test|go (?:test|build)|cargo (?:test|build)|\bmake |\bmvn |gradle|gradlew|"
+    r"bazel (?:test|build)|ctest|rspec|mix test|\btox\b|cmake --build|run_tests|"
+    r"bash \S*test|bash \S+\.sh|\./run)",
+    re.IGNORECASE,
+)
+
+# One capture group over the exit-code digits so the gate can require a
+# SUCCESSFUL reproduction, not merely a captured exit code. KNOWN CEILING:
+# a regex cannot bind an exit code to the command that produced it, so any
+# captured zero satisfies the gate; likewise fabricated prose naming a runner
+# plus "exit code: 0" passes. This stops read-only PASSes and honest-but-
+# failed reproductions, not a lying reviewer — the full fix is engine-captured
+# execution. Both ceilings are pinned in tests/test_reviewer_reproduction_receipt.py.
+_RECEIPT_EXIT_RE = re.compile(
+    r"(?:exit[_ ]?code\s*[:=]?\s*|exit\s*[:=]\s*|exited with\s+|returned\s+|"
+    r"\$\?\s*[:=]?\s*|\bexit\s+)(\d+)\b",
+    re.IGNORECASE,
+)
+
+
+def _reproduction_receipt_gap(text: str) -> str:
+    """Return why `text` fails as a reproduction receipt, or "" if it holds.
+
+    Callers apply this ONLY to a success outcome — a failure verdict needs no
+    reproduction. Pure text analysis; network-free.
+    """
+    body = text or ""
+    if not body.strip():
+        return (
+            "reproduction receipt: review passed but produced no transcript — "
+            "a PASS must re-run the build/test and capture its exit code, not "
+            "review from narrative alone"
+        )
+    has_runner = bool(_RECEIPT_RUNNER_RE.search(body))
+    exit_codes = [int(m.group(1)) for m in _RECEIPT_EXIT_RE.finditer(body)]
+    if not (has_runner and exit_codes):
+        return (
+            "reproduction receipt: review passed without a reproduced build/test "
+            f"and captured exit code (runner_found={has_runner}, "
+            f"exit_code_found={bool(exit_codes)}) — re-run the suite/build and "
+            "record its exit code in the review output, or the PASS is read-only"
+        )
+    if 0 not in exit_codes:
+        return (
+            "reproduction receipt: review passed but its reproduced build/test "
+            f"FAILED (captured exit codes: {sorted(set(exit_codes))}) — a PASS "
+            "requires a successful reproduction (exit code 0)"
+        )
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Structured reproduction receipts (issue #426 — ZFC fix).
+#
+# The regex path above classifies free-text prose. A sloppy or adversarial
+# reviewer can name-drop "uv run pytest" + "exit code: 0" and pass the gate
+# without ever running anything. The structured path instead captures the
+# *execution itself* at runtime — every reviewer subprocess records a
+# ``ReviewerReceipt`` (command, cwd, exit_code, head_sha, lane_id) into
+# ``ctx.state["_reviewer_receipts"]`` and into the structured event log
+# (``_emit_event`` with ``event="reviewer_receipt"``). The gate verifies the
+# captured record, not the reviewer's narrative.
+#
+# The regex path remains ONLY as a low-trust fallback for handlers that
+# have not yet been instrumented; the structured path is authoritative
+# whenever any receipt is present.
+# ---------------------------------------------------------------------------
+
+
+def _record_reviewer_receipt(
+    ctx: Any,
+    *,
+    command: list[str],
+    cwd: str,
+    exit_code: int,
+    head_sha: str,
+    lane_id: str,
+) -> None:
+    """Record a single reviewer-gate subprocess execution as a structured event.
+
+    Called by the gate subprocess wrapper (see ``handler_dispatch._run_gate_once``)
+    immediately after ``subprocess.run`` completes, with the real argv / cwd /
+    returncode. The receipt is appended to ``ctx.state["_reviewer_receipts"]``
+    AND emitted to the structured event log so audit readers can correlate
+    narrative PASSes against real subprocess runs.
+
+    State and event-log writes are best-effort — never fail the gate.
+    """
+    record = {
+        "command": list(command),
+        "cwd": cwd,
+        "exit_code": int(exit_code),
+        "head_sha": str(head_sha or "").lower(),
+        "lane_id": str(lane_id),
+    }
+    try:
+        state = getattr(ctx, "state", None)
+        if isinstance(state, dict):
+            existing = state.get("_reviewer_receipts")
+            if not isinstance(existing, list):
+                existing = []
+            existing.append(record)
+            state["_reviewer_receipts"] = existing
+    except Exception:
+        pass
+    try:
+        # Optional structured event emission. The event log is the durable
+        # record for post-hoc audit / Healer correlation; receipt entries
+        # are short and stable, safe to embed as JSON strings.
+        emit = getattr(ctx, "_emit_event", None)
+        if callable(emit):
+            emit(
+                "reviewer_receipt",
+                {
+                    "lane_id": record["lane_id"],
+                    "exit_code": str(record["exit_code"]),
+                    "head_sha": record["head_sha"],
+                    "cwd": record["cwd"],
+                    "command": " ".join(record["command"]),
+                },
+            )
+    except Exception:
+        pass
+
+
+def _check_structured_receipt(
+    ctx: Any, *, expected_sha: str, codergen_receipts: list | None = None,
+) -> str:
+    """Return "" if the structured receipts in ``ctx`` justify a PASS, else a gap.
+
+    A reviewer's PASS is only trustworthy when at least one recorded receipt
+    shows:
+      * ``exit_code == 0`` — the runner actually returned success.
+      * ``head_sha`` matches ``expected_sha`` — the run was on the same
+        commit the gate is grading (a stale receipt cannot be reused across
+        rerolls).
+
+    Receipts with mismatched SHA or nonzero exit are still recorded for
+    audit but do not satisfy the gate. Multiple receipts are OR-aggregated:
+    one good receipt holds even when a setup/teardown step failed.
+
+    Two structured sources are honored at the SAME trust tier (both are
+    captured execution, not prose): engine-captured receipts in
+    ``ctx.state["_reviewer_receipts"]`` and codergen-sourced receipts passed
+    via ``codergen_receipts`` (produced by ``handler_codergen`` from a coder
+    worktree's ``commands_run.md``). A passing record in EITHER list
+    satisfies the gate; diagnostics aggregate across both sources so the
+    most informative reason surfaces. Regex-prose remains a separate
+    low-trust fallback handled by the caller.
+    """
+    expected = str(expected_sha or "").lower()
+    if not expected:
+        return (
+            "structured receipt: gate cannot verify execution — "
+            "expected_sha is empty (worktree HEAD unavailable)"
+        )
+    state = getattr(ctx, "state", None)
+    engine_receipts = state.get("_reviewer_receipts") if isinstance(state, dict) else None
+    if not isinstance(engine_receipts, list):
+        engine_receipts = []
+    if not isinstance(codergen_receipts, list):
+        codergen_receipts = []
+    receipts = list(engine_receipts) + list(codergen_receipts)
+    if not receipts:
+        return (
+            "structured receipt: no execution recorded for this gate — "
+            "the reviewer subprocess did not register a runner invocation; "
+            "instrumented handlers must call _record_reviewer_receipt on every "
+            "subprocess completion"
+        )
+    sha_mismatches: list[str] = []
+    nonzero_exits: list[int] = []
+    for rec in receipts:
+        if not isinstance(rec, dict):
+            continue
+        rec_sha = str(rec.get("head_sha", "")).lower()
+        try:
+            rec_exit = int(rec.get("exit_code", 1))
+        except (TypeError, ValueError):
+            rec_exit = 1
+        if rec_sha != expected:
+            sha_mismatches.append(rec_sha or "<empty>")
+            continue
+        if rec_exit == 0:
+            return ""
+        nonzero_exits.append(rec_exit)
+    # No good receipt — surface the most informative reason first.
+    if sha_mismatches and not nonzero_exits:
+        return (
+            "structured receipt: every recorded receipt has a head_sha mismatch "
+            f"(recorded={sha_mismatches[:3]}, expected={expected}) — the review "
+            "ran against a different commit than the one being graded; rerun "
+            "the reviewer on the current HEAD"
+        )
+    if nonzero_exits:
+        return (
+            "structured receipt: reviewer subprocess FAILED — "
+            f"captured nonzero exit codes {sorted(set(nonzero_exits))} on "
+            f"head_sha={expected}; a PASS requires a successful reproduction"
+        )
+    return (
+        "structured receipt: recorded receipts are unusable "
+        f"(sha_mismatches={sha_mismatches[:3]}, "
+        f"nonzero_exits={sorted(set(nonzero_exits))})"
+    )
+
+
+def _reset_reviewer_receipts_for_test() -> None:
+    """Test-only reset hook.
+
+    Receipts live in ``ctx.state["_reviewer_receipts"]`` which is per-run, so
+    production callers do not need a reset. Tests that exercise the regex
+    fallback path reuse a fresh ``_Ctx`` per case; this helper exists so
+    future tests can explicitly clear cross-test state without rebuilding
+    the ctx.
+    """
+    return None

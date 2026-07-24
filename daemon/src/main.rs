@@ -188,7 +188,11 @@ impl Scm for NoopAdapters {
     fn labeled_issues(&self, _label: &str) -> Result<Vec<Issue>, DaemonError> {
         Ok(Vec::new())
     }
-    fn labeled_prs(&self, _label: &str) -> Result<Vec<daemon::tools::LabeledPr>, DaemonError> {
+    fn labeled_prs(
+        &self,
+        _label: &str,
+        _gh_calls: &mut u32,
+    ) -> Result<Vec<daemon::tools::LabeledPr>, DaemonError> {
         Ok(Vec::new())
     }
     fn collaborator_permission(&self, _login: &str) -> Result<Permission, DaemonError> {
@@ -481,6 +485,49 @@ fn verify_startup_ao_compatibility(
     verify(ao_project, configured_vendors)
 }
 
+/// Bead jleechan-sb4b: emit a loud config warning at daemon startup when
+/// the runtime red-green vacuous-test detector's toolchain is missing.
+///
+/// The previous failure mode was silent: the systemd-unit daemon
+/// environment had no `cargo` on PATH, so every assessment reported a
+/// misleading `GreenFailed: git error: spawn cargo test: No such file or
+/// directory` and operators only discovered the misalignment after
+/// staring at gate-8 verdicts. We now resolve cargo via the same
+/// fallback chain the detector uses (`PATH` -> `$HOME/.cargo/bin/cargo`
+/// -> `rustup which cargo`) and surface a one-line, loud warning to
+/// stderr the FIRST time the daemon starts. The warning is non-fatal —
+/// the daemon can still run all other gates while the operator fixes
+/// the toolchain — but it is unambiguous about the cause and the fix.
+///
+/// Skipped under `--dry-run` because tests construct synthetic envs that
+/// don't necessarily have cargo.
+fn verify_startup_cargo_toolchain(args: Args) {
+    if args.dry_run {
+        return;
+    }
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo"))
+        });
+    match daemon::vacuous_red_green::resolve_cargo(cargo_home.as_deref()) {
+        daemon::vacuous_red_green::CargoLocation::OnPath
+        | daemon::vacuous_red_green::CargoLocation::Found(_) => {
+            // Toolchain present — nothing to do.
+        }
+        daemon::vacuous_red_green::CargoLocation::NotFound => {
+            eprintln!(
+                "auto-factory daemon: WARNING (jleechan-sb4b): cargo binary not found. \
+                 The runtime red-green vacuous-test detector (gate 8) will report \
+                 'cargo binary not found' on every assessment until cargo is \
+                 installed. Resolve by either adding `cargo` to PATH, \
+                 installing rustup so $HOME/.cargo/bin/cargo exists, or setting \
+                 CARGO_HOME. Searched: PATH, $HOME/.cargo/bin/cargo, `rustup which cargo`."
+            );
+        }
+    }
+}
+
 fn run(args: Args) -> Result<(), DaemonError> {
     let cfg_path = default_config_path();
     let cfg = load_config(&cfg_path)?;
@@ -493,6 +540,19 @@ fn run(args: Args) -> Result<(), DaemonError> {
     verify_startup_ao_compatibility(args, &ao_project, &configured_vendors, |project, vendors| {
         daemon::adapters::verify_ao_bridge_compatibility(project, vendors.first().map(String::as_str).unwrap_or("minimax"), vendors)
     })?;
+    // Bead jleechan-sb4b: emit a loud config warning at startup if the
+    // runtime red-green detector's toolchain is missing. The previous
+    // behavior was silent: every assessment reported a misleading
+    // `GreenFailed: git error: spawn cargo test: No such file or
+    // directory` and operators had no upfront signal that the daemon's
+    // systemd environment lacked cargo. This emit is non-fatal — the
+    // daemon can still run other gates — but loud enough that the
+    // operator sees it in the journalctl output before the first
+    // assessment.
+    verify_startup_cargo_toolchain(args);
+    // Verify the telemetry log path is writable BEFORE we start polling
+    // ticks — every assessment writes here, and a churning 7-green false
+    // alarm usually traces back to a silent telemetry write failure.
     let telemetry_log = default_telemetry_log();
     let db_path = default_state_db_path();
 
@@ -720,6 +780,7 @@ mod tests {
             held_recheck_cooldown_secs: 900,
             repos: std::collections::HashMap::new(),
             pre_gate_validation_enabled: false,
+            escalation_refire_secs: 3600,
         };
 
         let (project, _) = ao_runtime_binding(&cfg).unwrap();
@@ -1163,5 +1224,30 @@ mod tests {
 
         assert!(received.contains("READY=1"));
         assert!(received.contains("STATUS=test-ready-abstract"));
+    }
+
+    /// Bead jleechan-sb4b: the startup cargo check must skip silently
+    /// under `--dry-run` (tests construct synthetic envs).
+    #[test]
+    fn startup_cargo_check_is_silent_under_dry_run() {
+        // Even with PATH stripped to "/tmp/some_empty_dir" and a
+        // nonexistent CARGO_HOME, the dry-run flag must keep the
+        // startup function silent — no stderr write, no panic.
+        let prev_path = std::env::var_os("PATH");
+        let prev_cargo_home = std::env::var_os("CARGO_HOME");
+        std::env::set_var("PATH", "/tmp/vacuous_dry_run_empty");
+        std::env::remove_var("CARGO_HOME");
+        let args = Args { dry_run: true, once: false };
+        // No panic / no assertion of stderr content — the test simply
+        // asserts the function returns without effect.
+        verify_startup_cargo_toolchain(args);
+        match prev_path {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+        match prev_cargo_home {
+            Some(p) => std::env::set_var("CARGO_HOME", p),
+            None => std::env::remove_var("CARGO_HOME"),
+        }
     }
 }

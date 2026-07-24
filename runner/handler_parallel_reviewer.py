@@ -171,9 +171,208 @@ def _coalesce_parallel_outcome(primary: str, shadows: list[str]) -> str:
     return "failure"
 
 
+def _receipt_required_flag(node: "Node") -> bool:
+    """Read the ``receipt_required`` node attribute as a bool.
+
+    Same acceptance rules as ``_gate_strict_flag``: ``True`` / ``"true"`` /
+    ``"1"`` / ``"yes"`` (case-insensitive) / ``1`` (as int). Anything else is
+    False so existing graphs do not regress. When True, a reviewer success
+    is only kept if the review transcript carries a reproduction receipt —
+    a real build/test runner AND a captured exit code 0 (see
+    ``handler_verdict._reproduction_receipt_gap``).
+    """
+    raw = node.attrs.get("receipt_required")
+    if raw is True:
+        return True
+    if isinstance(raw, str) and raw.strip().lower() in ("true", "1", "yes"):
+        return True
+    if isinstance(raw, int) and raw == 1:
+        return True
+    return False
+
+
+def _enforce_reproduction_receipt(
+    result: "Result",
+    expected_sha: str | None = None,
+) -> "Result":
+    """Downgrade a reviewer success whose execution is not reproduced.
+
+    A reviewer that verdicts PASS without re-running the build/test (or whose
+    re-run FAILED, nonzero-only exit trail) is read-only theater — the exact
+    self-reported-verdict hole the receipt gate closes. Only success outcomes
+    are touched; failure/error pass through so route-back reasons are never
+    masked. Mirrors the ``verdict_adjusted_for_consistency`` audit pattern:
+    the original verdict is preserved in metadata.
+
+    Audit chain note: when called AFTER ``_enforce_outcome_verdict_consistency``
+    (the call sites in ``_parallel_reviewer`` wire it that way on purpose —
+    consistency normalization operates on outcome↔verdict tokens, not
+    transcript content, and a successful-after-consistency pass is exactly
+    what we want to receipt-check), consistency may have already set
+    ``original_verdict`` to the RAW reviewer output (it does so on a genuine
+    contradiction). Honor that pre-existing value: do not overwrite it with
+    the post-consistency canonical token.
+
+    Issue #426 (ZFC): the receipt gate classifies free-text prose with
+    regexes, which an adversarial or sloppy reviewer can spoof ("ran pytest,
+    exit 0"). The structured path — captured subprocess receipts recorded at
+    execution time — is consulted FIRST whenever receipts are present
+    (``ctx.state["_reviewer_receipts"]`` populated by the subprocess wrapper).
+    The regex path is retained ONLY as a low-trust fallback for handlers
+    that have not yet been instrumented; the path used is recorded in
+    metadata (``receipt_path="structured"|"regex_low_trust"``) so audit
+    readers can see which classification produced the verdict.
+    """
+    # Lazy import to avoid circular import at module load time
+    from .handler_verdict import (
+        _check_structured_receipt,
+        _reproduction_receipt_gap,
+    )
+
+    if result.outcome != "success":
+        return result
+
+    md = dict(result.metadata or {})
+    receipts = md.get("_reviewer_receipts")
+    codergen_receipts = md.get("_codergen_receipts")
+    has_structured = (
+        (isinstance(receipts, list) and receipts)
+        or (isinstance(codergen_receipts, list) and codergen_receipts)
+    )
+    gap = ""
+    receipt_path = "regex_low_trust"
+    if has_structured and expected_sha:
+        gap = _check_structured_receipt(
+            _MDToCtxShim(md), expected_sha=expected_sha,
+            codergen_receipts=codergen_receipts,
+        )
+        if not gap:
+            # Structured path passed — record the path label so audit
+            # readers can distinguish the strong classification from the
+            # regex fallback. Mutate in place to preserve identity (legacy
+            # tests and downstream callers rely on ``is`` for the
+            # success-with-receipt branch).
+            md["receipt_path"] = "structured"
+            result.metadata = md
+            return result
+        receipt_path = "structured"
+    else:
+        gap = _reproduction_receipt_gap(result.output or "")
+    if not gap:
+        if has_structured:
+            md["receipt_path"] = "structured"
+        else:
+            md["receipt_path"] = "regex_low_trust"
+        result.metadata = md
+        return result
+    new_md = dict(md)
+    # Only set original_verdict if consistency didn't already record the raw
+    # reviewer output — otherwise we'd clobber the more truthful pre-consistency
+    # value with the post-consistency canonical token.
+    if "original_verdict" not in new_md:
+        new_md["original_verdict"] = str(new_md.get("verdict", ""))
+    new_md["verdict"] = "fail"
+    new_md["receipt_downgraded"] = "true"
+    new_md["receipt_gap"] = gap
+    new_md["receipt_path"] = receipt_path
+    return Result(
+        outcome="failure",
+        output=(result.output or "") + "\n\n" + gap,
+        metadata=new_md,
+        preferred_label=result.preferred_label,
+        suggested_next_ids=result.suggested_next_ids,
+        context_updates=result.context_updates,
+    )
+
+
+def _enforce_reproduction_receipt_for_lane(
+    result: "Result",
+    *,
+    lane_name: str,
+    expected_sha: str | None = None,
+) -> "Result":
+    """Per-lane reproduction-receipt check (issue #425 / finding 4).
+
+    ``handler_dispatch._finish_shadow_gate_review`` concatenates primary and
+    shadow transcripts; the legacy combined-text receipt check then blessed
+    any lane whose concatenated downstream text contained a receipt. That
+    let a read-only primary PASS survive when a shadow happened to reproduce.
+    Per-lane enforcement runs the receipt gap on the SINGLE lane's transcript
+    BEFORE concatenation, so a lane without its own receipt fails that lane
+    regardless of what other lanes produced.
+
+    Issue #426 layering: when ``expected_sha`` is provided, the underlying
+    ``_enforce_reproduction_receipt`` consults the STRUCTURED receipt path
+    (subprocess records captured at execution time) FIRST, falling back to
+    the regex prose path only when no receipts are present. The structured
+    path is authoritative; the regex path is the low-trust fallback that an
+    adversarial reviewer can spoof by name-dropping a runner and "exit 0".
+
+    Records ``receipt_gap_lane`` so audit readers can pinpoint the failing
+    lane and ``receipt_downgraded`` for downstream coalescing. The
+    ``receipt_gap`` text is preserved verbatim.
+    """
+    adjusted = _enforce_reproduction_receipt(result, expected_sha=expected_sha)
+    if adjusted is result:
+        return result
+    new_md = dict(adjusted.metadata or {})
+    new_md["receipt_gap_lane"] = lane_name
+    return Result(
+        outcome=adjusted.outcome,
+        output=adjusted.output,
+        metadata=new_md,
+        preferred_label=adjusted.preferred_label,
+        suggested_next_ids=adjusted.suggested_next_ids,
+        context_updates=adjusted.context_updates,
+    )
+
+
+class _MDToCtxShim:
+    """Minimal ctx-shaped shim so ``_check_structured_receipt`` can read
+    ``ctx.state["_reviewer_receipts"]`` without the full ``Context`` object.
+
+    The structured-receipt check only needs ``state``. The receipt is recorded
+    into ``result.metadata`` by the gate wrapper, so we project it onto a
+    ctx-shaped object that exposes ``state`` as a plain dict. This keeps the
+    structured path testable with just a ``Result`` and avoids depending on
+    the engine's ``Context`` constructor in unit tests.
+    """
+
+    def __init__(self, md: dict) -> None:
+        self.state = {
+            "_reviewer_receipts": list(md.get("_reviewer_receipts") or []),
+            "_codergen_receipts": list(md.get("_codergen_receipts") or []),
+        }
+
+
 def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     """Run parallel reviewer lanes and pass combined evidence downstream."""
     import runner.handlers as _handlers_shim  # late-bound shim for monkeypatched helpers
+<<<<<<< HEAD
+<<<<<<< HEAD
+=======
+    # Bug 2 fix: Check for stale spec artifacts before running review.
+    # If stale artifacts are detected, record the warning in ctx.state and emit
+    # a stale_artifact_warning event for observability; it does NOT modify the prompt.
+    stale_warnings = _check_stale_artifacts(ctx.workdir, ctx)
+    if stale_warnings:
+        # Store warnings in state for downstream nodes and emit observability event
+        ctx.state["_stale_artifact_warnings"] = "\n".join(stale_warnings)
+        try:
+            from . import engine_observability as _obs
+            seq = int(getattr(ctx, "_df_current_seq", getattr(ctx, "last_completed_seq", 0)))
+            _obs._emit_event(
+                ctx,
+                "stale_artifact_warning",
+                {"node": node.name, "warnings": stale_warnings},
+                seq,
+            )
+        except Exception:
+            pass
+
+>>>>>>> 7784052 (claude/fable: fix(runner): break handler_parallel_reviewer circular import (jleechan-ujt1) (#301))
+=======
+>>>>>>> 891a7c5 ([agento] [antig] fix(runner): delete nonfunctional stale-artifact detector (jleechan-6ug2) (#300))
     prompt = _handlers_shim._render_prompt(node, ctx)
     if ctx.backend in ("echo", "mock_llm"):
         hint = ctx.state.get(f"{node.name}.outcome", "success")
@@ -230,17 +429,88 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
         # verdict (e.g., outcome=failure with verdict=pass) can occur when stale
         # spec artifacts cause the reviewer to misjudge. Force verdict to match outcome.
         # Dispatch via the canonical re-export shim so the unqualified name here
-        # reaches the single definition in ``runner.handler_verdict``.
+        # reaches the single definition in ``runner.handler_verdict``. Then,
+        # when the graph declares ``receipt_required="true"`` on this
+        # parallel-reviewer node, downgrade a success whose transcript lacks
+        # a reproduction receipt (real build/test runner + exit code 0).
         primary = _handlers_shim._enforce_outcome_verdict_consistency(
             primary, gate_strict=gate_strict,
         )
+        if _receipt_required_flag(node):
+            # Per-lane (issue #425 / finding 4): the primary lane must carry
+            # its own reproduction receipt BEFORE any transcript aggregation.
+            # Issue #426 layering: ``expected_sha`` makes the per-lane check
+            # consult the structured subprocess receipts path first; the
+            # regex prose path remains only as a low-trust fallback.
+            primary = _enforce_reproduction_receipt_for_lane(
+                primary, lane_name="primary", expected_sha=expected_sha,
+            )
         return primary
 
     result = primary
     shadow_outcomes = []
+    shadow_lane_outcomes: list[str] = []
+    if _receipt_required_flag(node):
+        # Per-lane receipt enforcement (issue #425 / finding 4). Run BEFORE
+        # transcript concatenation in ``_finish_shadow_gate_review`` so a
+        # read-only primary cannot be saved by a shadow's reproduction. The
+        # shadow's own transcript is recorded in
+        # ``ctx.state[<node>.shadow_<backend>_gate_output]`` and used here as
+        # the single-lane text for receipt gap analysis. Issue #426 layering:
+        # ``expected_sha`` makes the per-lane check consult the structured
+        # subprocess receipts path first; the regex prose path remains only
+        # as a low-trust fallback.
+        primary = _enforce_reproduction_receipt_for_lane(
+            primary, lane_name="primary", expected_sha=expected_sha,
+        )
+        if primary.outcome == "failure":
+            # Record the lane outcome so downstream coalescing reflects the
+            # primary failure rather than the shadow's success.
+            primary_lane_outcome = "failure"
+        else:
+            primary_lane_outcome = primary.outcome
+        shadow_lane_outcomes.append(primary_lane_outcome)
     for shadow in shadows:
         result = _finish_shadow_gate_review(result, shadow, node.name, expected_sha, timeout, ctx)
-        shadow_outcomes.append(str(result.metadata.get(f"shadow_{shadow.backend}_gate_outcome", "unknown")))
+        if _receipt_required_flag(node):
+            # Per-lane: each shadow must reproduce on its own transcript.
+            # ``_finish_shadow_gate_review`` stores the shadow's single-lane
+            # transcript in ``context_updates[<node>.shadow_<backend>_gate_output]``;
+            # we read it from there so the receipt gap is computed on the
+            # shadow's own text, NOT the concatenated downstream output.
+            shadow_output = str(
+                result.context_updates.get(f"{node.name}.shadow_{shadow.backend}_gate_output", "") or ""
+            )
+            shadow_result_for_receipt = Result(
+                outcome="success",
+                output=shadow_output,
+                metadata={"verdict": "pass"},
+            )
+            adjusted = _enforce_reproduction_receipt_for_lane(
+                shadow_result_for_receipt,
+                lane_name=f"shadow_{shadow.backend}",
+            )
+            if adjusted.outcome == "failure":
+                # Apply the shadow lane outcome to the merged result so
+                # downstream coalescing sees the per-lane failure.
+                md = dict(result.metadata)
+                md[f"shadow_{shadow.backend}_gate_outcome"] = "failure"
+                md[f"shadow_{shadow.backend}_gate_verdict"] = "fail"
+                md["receipt_downgraded"] = "true"
+                md["receipt_gap_lane"] = f"shadow_{shadow.backend}"
+                result = Result(
+                    outcome="failure",
+                    output=result.output,
+                    metadata=md,
+                    preferred_label=result.preferred_label,
+                    suggested_next_ids=result.suggested_next_ids,
+                    context_updates=result.context_updates,
+                )
+                shadow_outcomes.append("failure")
+            else:
+                shadow_outcomes.append(str(result.metadata.get(f"shadow_{shadow.backend}_gate_outcome", "unknown")))
+        else:
+            shadow_outcomes.append(str(result.metadata.get(f"shadow_{shadow.backend}_gate_outcome", "unknown")))
     final_outcome = _coalesce_parallel_outcome(primary.outcome, shadow_outcomes)
     shadow_reviews = {
         s.backend: {
@@ -263,6 +533,18 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
         suggested_next_ids=result.suggested_next_ids,
         context_updates=result.context_updates,
     )
-    return _handlers_shim._enforce_outcome_verdict_consistency(
+    final_result = _handlers_shim._enforce_outcome_verdict_consistency(
         final_result, gate_strict=gate_strict,
     )
+    # Combined-text receipt check is now a no-op safety net; per-lane
+    # enforcement above is the gate (issue #425 / finding 4). Only run when
+    # all lanes passed per-lane so we still catch a transcript-level anomaly
+    # that slipped through lane-level checks (defense in depth). Issue #426
+    # layering: when ``expected_sha`` is provided, this combined-text check
+    # also consults the structured receipt path first; the regex path is
+    # only a low-trust fallback.
+    if _receipt_required_flag(node) and final_result.outcome == "success":
+        final_result = _enforce_reproduction_receipt(
+            final_result, expected_sha=expected_sha,
+        )
+    return final_result

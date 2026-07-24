@@ -87,6 +87,16 @@ pub struct Config {
     /// tests that don't script `open_pr_head_refs` set it explicitly `false`.
     #[serde(default = "default_pre_gate_validation_enabled")]
     pub pre_gate_validation_enabled: bool,
+    /// Backoff window (seconds) governing escalation re-fire dedup
+    /// (1s2q-escalation-dedup): an ESCALATION_REQUIRED /
+    /// ESCALATION_NOTIFICATION_FAILED event is suppressed unless its context
+    /// hash changed OR the last emit for `(bead_id, reason)` is older than
+    /// this window. Stops the live-incident spam where a bead with an
+    /// identical permanent condition re-fired every ~40s. Default 1 hour.
+    /// `#[serde(default)]` so every pre-existing `daemon.toml` parses
+    /// unchanged.
+    #[serde(default = "default_escalation_refire_secs")]
+    pub escalation_refire_secs: u64,
 }
 
 /// Default head-stability window (bead jleechan-zeij / issue #322 r3): 30s,
@@ -99,6 +109,13 @@ fn default_reroll_head_stability_window_secs() -> u64 {
 /// r12): TRUE — the pre-gate PR OPEN/head-match drift check is on by default.
 fn default_pre_gate_validation_enabled() -> bool {
     true
+}
+
+/// Default escalation re-fire backoff (1s2q-escalation-dedup): 1 hour between
+/// re-emissions of an identical-context escalation event for the same
+/// `(bead_id, reason)`.
+fn default_escalation_refire_secs() -> u64 {
+    3600
 }
 
 /// Default held-recheck cooldown (bead jleechan-zaga / issue #348 r3): 15
@@ -232,6 +249,8 @@ spec_dir = ".factory/specs/"
             cfg.pre_gate_validation_enabled,
             "pre_gate_validation_enabled must default to true when absent"
         );
+        // 1s2q-escalation-dedup: escalation re-fire backoff defaults to 1h.
+        assert_eq!(cfg.escalation_refire_secs, 3600);
     }
 
     #[test]
