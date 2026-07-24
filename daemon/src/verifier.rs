@@ -757,6 +757,7 @@ mod tests {
             updated_at_epoch: 0,
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
+            bugbot_status: "green".to_string(),
             ci_pending: false,
             head_committed_epoch: 0,
         }
@@ -780,6 +781,7 @@ mod tests {
             updated_at_epoch: 0,
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
+            bugbot_status: "green".to_string(),
             ci_pending: false,
             head_committed_epoch: 0,
         }

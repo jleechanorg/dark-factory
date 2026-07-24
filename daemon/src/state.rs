@@ -156,6 +156,33 @@ impl BeadOverlay {
     }
 }
 
+/// Task 1 (reviewer-outage-resilience): one row of the `vendor_health`
+/// ledger, tracking whether each external review-bot provider ("coderabbit"
+/// or "bugbot") is currently in-outage or recovered, with strict semantics
+/// and a full audit trail. Populated from the production assessment path in
+/// `tick::run_fast_tier` via `StateStore::record_vendor_observation`; read
+/// by the verification step's outage-aware CI-pending logic.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VendorHealth {
+    pub vendor: String,
+    /// 1 = currently in outage, 0 = healthy
+    pub in_outage: bool,
+    /// consecutive assessments where status was "unknown"/pending
+    pub consecutive_pending: u32,
+    /// total outage marker observations (audit trail)
+    pub outage_observations: u32,
+    /// total success observations (audit trail)
+    pub success_observations: u32,
+    /// PR head SHA of the last successful review/status
+    pub last_success_head: Option<String>,
+    /// unix epoch when in_outage was first set to 1
+    pub last_outage_epoch: Option<u64>,
+    /// PR head SHA at the last observation
+    pub last_observed_head: Option<String>,
+    /// unix epoch of the last observation
+    pub last_observed_epoch: Option<u64>,
+}
+
 pub trait StateStore {
     fn load(&self, bead_id: &str) -> Result<Option<BeadOverlay>, DaemonError>;
     fn save(&self, overlay: &BeadOverlay) -> Result<(), DaemonError>;
@@ -243,6 +270,93 @@ pub trait StateStore {
     fn reconcile_dispatching(&self) -> Result<(), DaemonError> {
         Ok(())
     }
+    /// Escalation dedup query (1s2q-escalation-dedup): returns `true` if an
+    /// ESCALATION_REQUIRED / ESCALATION_NOTIFICATION_FAILED event should be
+    /// emitted for `(bead_id, reason)` at `now_epoch` — i.e. no prior record
+    /// exists, the context hash changed, or the last emit is older than
+    /// `refire_secs`. Returns `false` (suppress) when the same context was
+    /// emitted within the backoff window. Default `Ok(true)` so fakes that
+    /// don't persist the ledger never suppress (preserve prior behavior).
+    fn escalation_should_emit(
+        &self,
+        _bead_id: &str,
+        _reason: &str,
+        _context_hash: &str,
+        _now_epoch: u64,
+        _refire_secs: u64,
+    ) -> Result<bool, DaemonError> {
+        Ok(true)
+    }
+    /// Record that an escalation event was just emitted for
+    /// `(bead_id, reason)` with `context_hash` at `now_epoch` (upsert the
+    /// ledger row). Default no-op for fakes that don't persist the ledger.
+    fn record_escalation_emit(
+        &self,
+        _bead_id: &str,
+        _reason: &str,
+        _context_hash: &str,
+        _now_epoch: u64,
+    ) -> Result<(), DaemonError> {
+        Ok(())
+    }
+    /// 1s2q-escalation-dedup Task 2: mark the `(bead_id, reason)` escalation
+    /// ledger row as terminal ("escalation_undeliverable") so
+    /// `escalation_should_emit` returns `Ok(false)` for it on every future
+    /// tick, regardless of context hash or backoff window. Used when the
+    /// notification failure was caused by a PERMANENT (non-transient per
+    /// `DaemonError::is_transient`) gh error that will never resolve (e.g.
+    /// `invalid issue format: "local-xxx"`). Upserts the ledger row with
+    /// `terminal = 1` (inserts a fresh terminal row if none existed, or flips
+    /// an existing row to terminal). Default no-op for fakes that don't
+    /// persist the ledger.
+    fn mark_escalation_undeliverable(
+        &self,
+        _bead_id: &str,
+        _reason: &str,
+    ) -> Result<(), DaemonError> {
+        Ok(())
+    }
+    /// Read the vendor_health row for `vendor`. Returns None if no row exists
+    /// (vendor has never been observed). Used by the production assessment path
+    /// and by the verification step's outage-aware CI-pending logic.
+    fn vendor_health(&self, _vendor: &str) -> Result<Option<VendorHealth>, DaemonError> {
+        Ok(None)
+    }
+    /// Record a vendor health observation and return the resulting VendorHealth
+    /// row (so the caller can emit telemetry with the new state). The
+    /// implementation applies the outage/recovery semantics described in the
+    /// plan:
+    /// - If the observation is an outage marker (status pending/unknown):
+    ///   increment consecutive_pending and outage_observations. If
+    ///   consecutive_pending >= N, set in_outage=1 and last_outage_epoch (if
+    ///   not already set).
+    /// - If the observation is a success (approved/clean) for the PR's current
+    ///   head: record it as a success_observation (NEVER as an outage
+    ///   observation), set consecutive_pending=0, last_success_head=head. If
+    ///   in_outage was 1, flip to 0 (recovered) and return the row so the
+    ///   caller can emit VENDOR_RECOVERED.
+    /// - The absence of errors alone must NEVER flip in_outage to 0.
+    fn record_vendor_observation(
+        &self,
+        _vendor: &str,
+        _is_outage_marker: bool,
+        _is_success: bool,
+        _head_sha: &str,
+        _now_epoch: u64,
+        _consecutive_pending_threshold: u32,
+    ) -> Result<VendorHealth, DaemonError> {
+        Ok(VendorHealth {
+            vendor: _vendor.to_string(),
+            in_outage: false,
+            consecutive_pending: 0,
+            outage_observations: 0,
+            success_observations: 0,
+            last_success_head: None,
+            last_outage_epoch: None,
+            last_observed_head: None,
+            last_observed_epoch: None,
+        })
+    }
 }
 
 /// `StateStore` impl against `~/.dark-factory/daemon-cxdb.sqlite` (WAL mode,
@@ -302,6 +416,13 @@ impl SqliteStateStore {
         Self::ensure_pre_session_head_sha_column(&conn)?;
         Self::ensure_park_reason_column(&conn)?;
         Self::ensure_target_repo_column(&conn)?;
+        Self::ensure_reroll_deferral_count_column(&conn)?;
+        Self::ensure_held_recheck_after_column(&conn)?;
+        Self::ensure_last_er_evidence_hash_column(&conn)?;
+        Self::ensure_disposition_required_state(&conn)?;
+        Self::ensure_escalation_ledger_table(&conn)?;
+        Self::ensure_escalation_ledger_terminal_column(&conn)?;
+        Self::ensure_vendor_health_table(&conn)?;
         Ok(Self { conn })
     }
 
@@ -318,6 +439,13 @@ impl SqliteStateStore {
         Self::ensure_pre_session_head_sha_column(&conn)?;
         Self::ensure_park_reason_column(&conn)?;
         Self::ensure_target_repo_column(&conn)?;
+        Self::ensure_reroll_deferral_count_column(&conn)?;
+        Self::ensure_held_recheck_after_column(&conn)?;
+        Self::ensure_last_er_evidence_hash_column(&conn)?;
+        Self::ensure_disposition_required_state(&conn)?;
+        Self::ensure_escalation_ledger_table(&conn)?;
+        Self::ensure_escalation_ledger_terminal_column(&conn)?;
+        Self::ensure_vendor_health_table(&conn)?;
         Ok(Self { conn })
     }
 
@@ -476,6 +604,321 @@ impl SqliteStateStore {
         if !has_col {
             conn.execute("ALTER TABLE bead_overlay ADD COLUMN target_repo TEXT", [])
                 .map_err(|e| tool_err("ensure_target_repo_column: add column", e))?;
+        }
+        Ok(())
+    }
+
+    /// Idempotent migration for the `reroll_deferral_count` column (bead
+    /// jleechan-zeij / issue #322 r2). Same probe-then-`ALTER` pattern as
+    /// `ensure_target_repo_column`. The consecutive-defer counter the
+    /// fail-closed re-roll proceed predicate uses; every pre-existing row
+    /// correctly defaults to `0` ("never deferred").
+    fn ensure_reroll_deferral_count_column(conn: &Connection) -> Result<(), DaemonError> {
+        let has_col: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
+                 WHERE name = 'reroll_deferral_count'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_reroll_deferral_count_column: pragma", e))?;
+        if !has_col {
+            conn.execute(
+                "ALTER TABLE bead_overlay ADD COLUMN reroll_deferral_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| tool_err("ensure_reroll_deferral_count_column: add column", e))?;
+        }
+        Ok(())
+    }
+
+    /// Idempotent migration for the `held_recheck_after` column (bead
+    /// jleechan-zaga / issue #348 r3). Same probe-then-`ALTER` pattern as
+    /// `ensure_reroll_deferral_count_column`. Nullable (NULL = "re-assess
+    /// now"). MUST run before `ensure_disposition_required_state` so the
+    /// table's column set is complete before the CHECK rebuild.
+    fn ensure_held_recheck_after_column(conn: &Connection) -> Result<(), DaemonError> {
+        let has_col: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
+                 WHERE name = 'held_recheck_after'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_held_recheck_after_column: pragma", e))?;
+        if !has_col {
+            conn.execute(
+                "ALTER TABLE bead_overlay ADD COLUMN held_recheck_after INTEGER",
+                [],
+            )
+            .map_err(|e| tool_err("ensure_held_recheck_after_column: add column", e))?;
+        }
+        Ok(())
+    }
+
+    /// Idempotent migration for the `last_er_evidence_hash` column (bead
+    /// jleechan-yoqy / issue #323). Same probe-then-`ALTER` pattern. Nullable
+    /// (NULL = "no /er run recorded"). MUST run before
+    /// `ensure_disposition_required_state` so the column is present for the
+    /// CHECK rebuild's column-intersection copy.
+    fn ensure_last_er_evidence_hash_column(conn: &Connection) -> Result<(), DaemonError> {
+        let has_col: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
+                 WHERE name = 'last_er_evidence_hash'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_last_er_evidence_hash_column: pragma", e))?;
+        if !has_col {
+            conn.execute(
+                "ALTER TABLE bead_overlay ADD COLUMN last_er_evidence_hash TEXT",
+                [],
+            )
+            .map_err(|e| tool_err("ensure_last_er_evidence_hash_column: add column", e))?;
+        }
+        Ok(())
+    }
+
+    /// Idempotent migration for the `escalation_ledger` table
+    /// (1s2q-escalation-dedup). Unlike the `ensure_*_column` migrations above
+    /// (which probe `pragma_table_info` for a column), this probes
+    /// `sqlite_master` for the table's existence, then issues
+    /// `CREATE TABLE IF NOT EXISTS` (idempotent on its own, but the probe keeps
+    /// the migration log honest for legacy DBs that already ran the old
+    /// schema.sql before this table was added). Safe to call repeatedly.
+    /// Runs AFTER `ensure_disposition_required_state` since it is an
+    /// independent table (NOT a column on `bead_overlay`) and therefore does
+    /// NOT participate in that CHECK rebuild's column-intersection copy.
+    fn ensure_escalation_ledger_table(conn: &Connection) -> Result<(), DaemonError> {
+        let has_table: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'escalation_ledger'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_escalation_ledger_table: probe", e))?;
+        if !has_table {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS escalation_ledger (\
+                   bead_id           TEXT NOT NULL,\
+                   reason            TEXT NOT NULL,\
+                   context_hash      TEXT NOT NULL,\
+                   last_emitted_epoch INTEGER NOT NULL,\
+                   PRIMARY KEY (bead_id, reason)\
+                 )",
+            )
+            .map_err(|e| tool_err("ensure_escalation_ledger_table: create", e))?;
+        }
+        Ok(())
+    }
+
+    /// Idempotent migration for the `escalation_ledger.terminal` column
+    /// (1s2q-escalation-dedup Task 2). Older on-disk DBs that got the
+    /// `escalation_ledger` table from a pre-Task-2 `ensure_escalation_ledger_table`
+    /// predate the `terminal` column declared in the CREATE TABLE block; SQLite
+    /// has no `ADD COLUMN IF NOT EXISTS`, so we probe `pragma_table_info` first
+    /// and only ALTER when the column is missing. Safe to call repeatedly — a
+    /// no-op when the column is already present. Defaults every pre-existing
+    /// row to `0` (not terminal), preserving the pre-Task-2 dedup behavior for
+    /// rows written before the terminal concept existed.
+    fn ensure_escalation_ledger_terminal_column(conn: &Connection) -> Result<(), DaemonError> {
+        let has_col: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('escalation_ledger') \
+                 WHERE name = 'terminal'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_escalation_ledger_terminal_column: pragma", e))?;
+        if !has_col {
+            conn.execute(
+                "ALTER TABLE escalation_ledger \
+                 ADD COLUMN terminal INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| tool_err("ensure_escalation_ledger_terminal_column: add column", e))?;
+        }
+        Ok(())
+    }
+
+    /// Idempotent migration for the `vendor_health` table
+    /// (reviewer-outage-resilience Task 1). Same pattern as
+    /// `ensure_escalation_ledger_table`: probes `sqlite_master` for the
+    /// table's existence, then issues `CREATE TABLE IF NOT EXISTS`. Safe to
+    /// call repeatedly. Tracks whether each external review-bot provider
+    /// ("coderabbit" or "bugbot") is in-outage or recovered, with a full
+    /// audit trail. Runs after `ensure_escalation_ledger_terminal_column`
+    /// since it is an independent table.
+    fn ensure_vendor_health_table(conn: &Connection) -> Result<(), DaemonError> {
+        let has_table: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'vendor_health'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_vendor_health_table: probe", e))?;
+        if !has_table {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS vendor_health (\
+                   vendor               TEXT PRIMARY KEY,\
+                   in_outage            INTEGER NOT NULL DEFAULT 0,\
+                   consecutive_pending  INTEGER NOT NULL DEFAULT 0,\
+                   outage_observations  INTEGER NOT NULL DEFAULT 0,\
+                   success_observations INTEGER NOT NULL DEFAULT 0,\
+                   last_success_head    TEXT,\
+                   last_outage_epoch    INTEGER,\
+                   last_observed_head   TEXT,\
+                   last_observed_epoch  INTEGER\
+                 )",
+            )
+            .map_err(|e| tool_err("ensure_vendor_health_table: create", e))?;
+        }
+        Ok(())
+    }
+
+    /// Canonical `bead_overlay` column list (in `schema.sql` order). The
+    /// DISPOSITION_REQUIRED CHECK rebuild uses this to build the new table and
+    /// to copy data by EXPLICIT column name. Keep in sync with `schema.sql`'s
+    /// CREATE TABLE and the `ensure_*_column` migrations above.
+    const BEAD_OVERLAY_COLUMNS: &'static [&'static str] = &[
+        "bead_id",
+        "state",
+        "attempt",
+        "reroll_count",
+        "autonomy_secs",
+        "spend_usd",
+        "pr_number",
+        "branch",
+        "session_id",
+        "updated_at",
+        "attempt_er_runner_count",
+        "last_er_runner_attempt_at",
+        "is_adopted",
+        "spawn_failure_count",
+        "pre_session_head_sha",
+        "park_reason",
+        "target_repo",
+        "reroll_deferral_count",
+        "held_recheck_after",
+        "last_er_evidence_hash",
+    ];
+
+    /// The canonical `CREATE TABLE bead_overlay` statement (with the current
+    /// state CHECK list, incl. `DISPOSITION_REQUIRED`) as shipped in
+    /// `schema.sql`, but under a temp name for the rebuild. Hardcoded rather
+    /// than transformed from the live DDL so the migration is robust to
+    /// whitespace variants, quoted identifiers, and any other legal DDL
+    /// formatting that a string-edit would silently break.
+    const REBUILD_TABLE_DDL: &'static str = "CREATE TABLE bead_overlay_disposition_migrated (\
+        bead_id TEXT PRIMARY KEY, \
+        state TEXT NOT NULL CHECK (state IN \
+            ('QUEUED','DISPATCHING','DISPATCHED','ATTESTED','READY','RE_ROLL','RECOVERY',\
+             'REDISPATCHED','BUDGET_HELD','HUMAN_HELD','DISPOSITION_REQUIRED')), \
+        attempt INTEGER NOT NULL DEFAULT 1, \
+        reroll_count INTEGER NOT NULL DEFAULT 0, \
+        autonomy_secs INTEGER NOT NULL DEFAULT 0, \
+        spend_usd REAL NOT NULL DEFAULT 0, \
+        pr_number INTEGER, \
+        branch TEXT, \
+        session_id TEXT, \
+        updated_at TEXT NOT NULL, \
+        attempt_er_runner_count INTEGER NOT NULL DEFAULT 0, \
+        last_er_runner_attempt_at INTEGER, \
+        is_adopted INTEGER NOT NULL DEFAULT 0, \
+        spawn_failure_count INTEGER NOT NULL DEFAULT 0, \
+        pre_session_head_sha TEXT, \
+        park_reason TEXT, \
+        target_repo TEXT, \
+        reroll_deferral_count INTEGER NOT NULL DEFAULT 0, \
+        held_recheck_after INTEGER, \
+        last_er_evidence_hash TEXT)";
+
+    /// Bead jleechan-zaga / issue #348: migrate the `bead_overlay.state` CHECK
+    /// constraint to allow `'DISPOSITION_REQUIRED'`. Unlike every other
+    /// migration above (which add nullable/defaulted COLUMNS via `ALTER TABLE
+    /// … ADD COLUMN`), this changes a CHECK constraint — and SQLite supports
+    /// no `ALTER TABLE … DROP/ALTER CONSTRAINT`. `CREATE TABLE IF NOT EXISTS`
+    /// in `schema.sql` is a NO-OP on a live DB that already has the table, so
+    /// it never updates the constraint: a live daemon started against a
+    /// pre-#348 DB would hit `CHECK constraint failed` the first time it tried
+    /// to persist a `DISPOSITION_REQUIRED` bead. The only portable fix is the
+    /// documented SQLite table-rebuild dance (create-copy-drop-rename).
+    ///
+    /// Robust migration (r3): the need to migrate is detected by PROBING —
+    /// attempting a `DISPOSITION_REQUIRED` INSERT inside a savepoint that is
+    /// always rolled back — NOT by string-matching the stored DDL (fragile to
+    /// whitespace / quoted identifiers). When a migration IS needed, the new
+    /// table is built from a CANONICAL hardcoded CREATE (`REBUILD_TABLE_DDL`),
+    /// and data is copied by EXPLICIT column name for the intersection of the
+    /// live table's columns and the canonical set — never a positional
+    /// `SELECT *` against a transformed copy of the old DDL. Runs after every
+    /// `ensure_*_column` migration so the live column set is complete.
+    fn ensure_disposition_required_state(conn: &Connection) -> Result<(), DaemonError> {
+        // Probe: is `DISPOSITION_REQUIRED` already accepted by the live CHECK?
+        // Attempt the INSERT inside a savepoint we ALWAYS roll back so the
+        // probe row never persists; a `CHECK constraint failed` means migrate.
+        conn.execute_batch("SAVEPOINT drp_probe")
+            .map_err(|e| tool_err("ensure_disposition_required_state: savepoint", e))?;
+        let probe = conn.execute(
+            "INSERT INTO bead_overlay (bead_id, state, updated_at) \
+             VALUES ('__drp_migration_probe__', 'DISPOSITION_REQUIRED', '')",
+            [],
+        );
+        conn.execute_batch("ROLLBACK TO drp_probe; RELEASE drp_probe")
+            .map_err(|e| tool_err("ensure_disposition_required_state: rollback probe", e))?;
+        let needs_migration = match probe {
+            Ok(_) => false, // CHECK already allows it (fresh/already-migrated DB).
+            Err(ref e) if e.to_string().to_ascii_lowercase().contains("check constraint") => true,
+            Err(e) => {
+                // A different failure (e.g. a table shape we don't understand)
+                // — do not attempt a rebuild we can't reason about; surface it.
+                return Err(tool_err("ensure_disposition_required_state: probe", e));
+            }
+        };
+        if !needs_migration {
+            return Ok(());
+        }
+
+        // Copy only columns that exist in BOTH the live table and the
+        // canonical schema, by explicit name (order-independent).
+        let mut live_cols: std::collections::HashSet<String> = std::collections::HashSet::new();
+        {
+            let mut stmt = conn
+                .prepare("SELECT name FROM pragma_table_info('bead_overlay')")
+                .map_err(|e| tool_err("ensure_disposition_required_state: pragma prepare", e))?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| tool_err("ensure_disposition_required_state: pragma query", e))?;
+            for name in rows {
+                live_cols
+                    .insert(name.map_err(|e| tool_err("ensure_disposition_required_state: pragma row", e))?);
+            }
+        }
+        let copy_cols: Vec<&str> = Self::BEAD_OVERLAY_COLUMNS
+            .iter()
+            .copied()
+            .filter(|c| live_cols.contains(*c))
+            .collect();
+        let col_list = copy_cols.join(", ");
+
+        let batch = format!(
+            "BEGIN IMMEDIATE;\n\
+             {create};\n\
+             INSERT INTO bead_overlay_disposition_migrated ({cols}) SELECT {cols} FROM bead_overlay;\n\
+             DROP TABLE bead_overlay;\n\
+             ALTER TABLE bead_overlay_disposition_migrated RENAME TO bead_overlay;\n\
+             COMMIT;",
+            create = Self::REBUILD_TABLE_DDL,
+            cols = col_list,
+        );
+        if let Err(e) = conn.execute_batch(&batch) {
+            // Best-effort rollback so a half-applied rebuild doesn't wedge the
+            // next open; surface the original error either way.
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(tool_err("ensure_disposition_required_state: rebuild", e));
         }
         Ok(())
     }
@@ -1042,9 +1485,619 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    fn set_held_recheck_after(&self, bead_id: &str, epoch: u64) -> Result<(), DaemonError> {
+        let res = self.conn.execute(
+            "UPDATE bead_overlay SET held_recheck_after = ?2, updated_at = ?3 WHERE bead_id = ?1",
+            params![bead_id, epoch as i64, now_iso8601()],
+        );
+        match res {
+            Ok(_) => Ok(()),
+            Err(e) if no_such_column(&e) => Ok(()),
+            Err(e) => Err(tool_err("set_held_recheck_after", e)),
+        }
+    }
+
+    fn last_er_evidence_hash(&self, bead_id: &str) -> Result<Option<String>, DaemonError> {
+        let row: Result<Option<String>, rusqlite::Error> = self.conn.query_row(
+            "SELECT last_er_evidence_hash FROM bead_overlay WHERE bead_id = ?1",
+            params![bead_id],
+            |row| row.get(0),
+        );
+        match row {
+            Ok(v) => Ok(v),
+            Err(e) if no_such_column(&e) => Ok(None),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(tool_err("last_er_evidence_hash", e)),
+        }
+    }
+
+    fn set_er_evidence_hash(&self, bead_id: &str, hash: &str) -> Result<(), DaemonError> {
+        let res = self.conn.execute(
+            "UPDATE bead_overlay SET last_er_evidence_hash = ?2, updated_at = ?3 WHERE bead_id = ?1",
+            params![bead_id, hash, now_iso8601()],
+        );
+        match res {
+            Ok(_) => Ok(()),
+            Err(e) if no_such_column(&e) => Ok(()),
+            Err(e) => Err(tool_err("set_er_evidence_hash", e)),
+        }
+    }
+
+    fn escalation_should_emit(
+        &self,
+        bead_id: &str,
+        reason: &str,
+        context_hash: &str,
+        now_epoch: u64,
+        refire_secs: u64,
+    ) -> Result<bool, DaemonError> {
+        let row: Result<(String, i64, i64), rusqlite::Error> = self.conn.query_row(
+            "SELECT context_hash, last_emitted_epoch, terminal FROM escalation_ledger \
+             WHERE bead_id = ?1 AND reason = ?2",
+            params![bead_id, reason],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        );
+        match row {
+            // No prior record — emit.
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(true),
+            Err(e) => Err(tool_err("escalation_should_emit: load", e)),
+            Ok((prior_hash, last_epoch, terminal)) => {
+                // 1s2q-escalation-dedup Task 2: a terminal row means the
+                // escalation was classified undeliverable (permanent gh
+                // error). Never re-emit, regardless of hash or backoff.
+                if terminal != 0 {
+                    return Ok(false);
+                }
+                // Hash changed — re-emit regardless of backoff.
+                if prior_hash != context_hash {
+                    return Ok(true);
+                }
+                // Same hash: re-emit only if the backoff window has elapsed.
+                let last = last_epoch.max(0) as u64;
+                Ok(now_epoch.saturating_sub(last) >= refire_secs)
+            }
+        }
+    }
+
+    fn record_escalation_emit(
+        &self,
+        bead_id: &str,
+        reason: &str,
+        context_hash: &str,
+        now_epoch: u64,
+    ) -> Result<(), DaemonError> {
+        self.conn
+            .execute(
+                "INSERT INTO escalation_ledger (bead_id, reason, context_hash, last_emitted_epoch) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(bead_id, reason) DO UPDATE SET \
+                   context_hash = excluded.context_hash, \
+                   last_emitted_epoch = excluded.last_emitted_epoch",
+                params![bead_id, reason, context_hash, now_epoch as i64],
+            )
+            .map_err(|e| tool_err("record_escalation_emit: upsert", e))?;
+        Ok(())
+    }
+
+    fn mark_escalation_undeliverable(
+        &self,
+        bead_id: &str,
+        reason: &str,
+    ) -> Result<(), DaemonError> {
+        self.conn
+            .execute(
+                "INSERT INTO escalation_ledger (bead_id, reason, context_hash, last_emitted_epoch, terminal) \
+                 VALUES (?1, ?2, '', 0, 1) \
+                 ON CONFLICT(bead_id, reason) DO UPDATE SET terminal = 1",
+                params![bead_id, reason],
+            )
+            .map_err(|e| tool_err("mark_escalation_undeliverable: upsert", e))?;
+        Ok(())
+    }
+
+    fn vendor_health(&self, vendor: &str) -> Result<Option<VendorHealth>, DaemonError> {
+        let row: Result<
+            (i64, i64, i64, i64, Option<String>, Option<i64>, Option<String>, Option<i64>),
+            rusqlite::Error,
+        > = self.conn.query_row(
+            "SELECT in_outage, consecutive_pending, outage_observations, \
+                    success_observations, last_success_head, last_outage_epoch, \
+                    last_observed_head, last_observed_epoch \
+             FROM vendor_health WHERE vendor = ?1",
+            params![vendor],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        );
+        match row {
+            Ok((
+                in_outage,
+                consecutive_pending,
+                outage_observations,
+                success_observations,
+                last_success_head,
+                last_outage_epoch,
+                last_observed_head,
+                last_observed_epoch,
+            )) => Ok(Some(VendorHealth {
+                vendor: vendor.to_string(),
+                in_outage: in_outage != 0,
+                consecutive_pending: consecutive_pending.max(0) as u32,
+                outage_observations: outage_observations.max(0) as u32,
+                success_observations: success_observations.max(0) as u32,
+                last_success_head,
+                last_outage_epoch: last_outage_epoch.map(|v| v.max(0) as u64),
+                last_observed_head,
+                last_observed_epoch: last_observed_epoch.map(|v| v.max(0) as u64),
+            })),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(tool_err("vendor_health: load", e)),
+        }
+    }
+
+    fn record_vendor_observation(
+        &self,
+        vendor: &str,
+        is_outage_marker: bool,
+        is_success: bool,
+        head_sha: &str,
+        now_epoch: u64,
+        consecutive_pending_threshold: u32,
+    ) -> Result<VendorHealth, DaemonError> {
+        let prior = self.vendor_health(vendor)?;
+        let mut row = prior.clone().unwrap_or(VendorHealth {
+            vendor: vendor.to_string(),
+            in_outage: false,
+            consecutive_pending: 0,
+            outage_observations: 0,
+            success_observations: 0,
+            last_success_head: None,
+            last_outage_epoch: None,
+            last_observed_head: None,
+            last_observed_epoch: None,
+        });
+        row.last_observed_head = Some(head_sha.to_string());
+        row.last_observed_epoch = Some(now_epoch);
+        if is_success {
+            row.success_observations += 1;
+            row.consecutive_pending = 0;
+            row.last_success_head = Some(head_sha.to_string());
+            if row.in_outage {
+                row.in_outage = false;
+            }
+        } else if is_outage_marker {
+            row.outage_observations += 1;
+            row.consecutive_pending += 1;
+            if row.consecutive_pending >= consecutive_pending_threshold && !row.in_outage {
+                row.in_outage = true;
+                row.last_outage_epoch = Some(now_epoch);
+            }
+        }
+        self.conn
+            .execute(
+                "INSERT INTO vendor_health (\
+                   vendor, in_outage, consecutive_pending, outage_observations, \
+                   success_observations, last_success_head, last_outage_epoch, \
+                   last_observed_head, last_observed_epoch\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                 ON CONFLICT(vendor) DO UPDATE SET \
+                   in_outage = excluded.in_outage, \
+                   consecutive_pending = excluded.consecutive_pending, \
+                   outage_observations = excluded.outage_observations, \
+                   success_observations = excluded.success_observations, \
+                   last_success_head = excluded.last_success_head, \
+                   last_outage_epoch = excluded.last_outage_epoch, \
+                   last_observed_head = excluded.last_observed_head, \
+                   last_observed_epoch = excluded.last_observed_epoch",
+                params![
+                    vendor,
+                    if row.in_outage { 1 } else { 0 },
+                    row.consecutive_pending as i64,
+                    row.outage_observations as i64,
+                    row.success_observations as i64,
+                    row.last_success_head,
+                    row.last_outage_epoch.map(|v| v as i64),
+                    row.last_observed_head,
+                    row.last_observed_epoch.map(|v| v as i64),
+                ],
+            )
+            .map_err(|e| tool_err("record_vendor_observation: upsert", e))?;
+        Ok(row)
+    }
+}
+
+/// True when `err` is the SQLite "no such column" schema-mismatch signal.
+/// `rusqlite::Error` does not expose a typed `message` field on every
+/// feature combo, so we stringify + match — this is the same trick
+/// the JSON parsers in tools.rs use for `find('{')` fallback.
+fn no_such_column(err: &rusqlite::Error) -> bool {
+    err.to_string().to_lowercase().contains("no such column")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    static RECOVERY_BUSY_HANDLER_ENTERED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    fn signal_recovery_busy(_attempt: i32) -> bool {
+        RECOVERY_BUSY_HANDLER_ENTERED.store(true, std::sync::atomic::Ordering::SeqCst);
+        true
+    }
+
     fn store() -> SqliteStateStore {
         SqliteStateStore::open_in_memory_with_schema(include_str!("../contracts/schema.sql"))
             .unwrap()
+    }
+
+    #[test]
+    fn every_production_park_reason_flows_through_the_typed_policy() {
+        let mut production_code = String::new();
+        for (file, source) in [
+            ("dispatch.rs", include_str!("dispatch.rs")),
+            ("reroll.rs", include_str!("reroll.rs")),
+            ("tick.rs", include_str!("tick.rs")),
+            ("state.rs", include_str!("state.rs")),
+        ] {
+            let production = source
+                .split("\n#[cfg(test)]\nmod tests")
+                .next()
+                .unwrap_or(source);
+            production_code.push_str(file);
+            for line in production.lines() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                production_code.extend(line.chars().filter(|character| !character.is_whitespace()));
+            }
+        }
+
+        assert_eq!(
+            production_code.matches(".park_reason=Some").count(),
+            1,
+            "only set_human_hold_reason may directly assign Some"
+        );
+        assert_eq!(
+            production_code.matches("park_reason:Some").count(),
+            0,
+            "production constructors must not bypass the typed policy"
+        );
+        assert_eq!(
+            production_code.matches("park_reason='").count(),
+            0,
+            "production SQL must bind typed policy values"
+        );
+        assert!(is_permanent_human_hold_reason(None));
+        assert!(is_permanent_human_hold_reason(Some(
+            "future_unknown_reason"
+        )));
+    }
+
+    #[test]
+    fn reroll_deferral_counter_increments_resets_and_persists() {
+        // Bead jleechan-zeij / issue #322 r2: the fail-closed defer/cap path
+        // depends on this counter surviving between ticks (separate
+        // `reroll::execute` calls). Exercise the REAL SqliteStateStore, not
+        // just the fake.
+        let s = store();
+        let o = BeadOverlay {
+            bead_id: "defer-bead".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(42),
+            branch: Some("factory/defer-bead-r1".into()),
+            session_id: Some("sess-live".into()),
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        };
+        s.save(&o).unwrap();
+
+        // Never deferred yet.
+        assert_eq!(s.reroll_deferral_count("defer-bead").unwrap(), 0);
+        // Consecutive increments accumulate and are returned.
+        assert_eq!(s.incr_reroll_deferral("defer-bead").unwrap(), 1);
+        assert_eq!(s.incr_reroll_deferral("defer-bead").unwrap(), 2);
+        assert_eq!(s.reroll_deferral_count("defer-bead").unwrap(), 2);
+        // A confirmed proceed resets the streak.
+        s.reset_reroll_deferral("defer-bead").unwrap();
+        assert_eq!(s.reroll_deferral_count("defer-bead").unwrap(), 0);
+        // Incrementing/reading a bead with no overlay row is a no-op read of 0
+        // (the UPDATE matches nothing) rather than an error.
+        assert_eq!(s.reroll_deferral_count("no-such-bead").unwrap(), 0);
+    }
+
+    /// Bead jleechan-zaga / issue #348 r3: the held-recheck cooldown epoch must
+    /// round-trip through the REAL SqliteStateStore column.
+    #[test]
+    fn held_recheck_after_round_trips() {
+        let s = store();
+        let o = BeadOverlay {
+            bead_id: "held-bead".into(),
+            state: OverlayState::DispositionRequired,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(42),
+            branch: Some("alice/feature".into()),
+            session_id: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        };
+        s.save(&o).unwrap();
+        // Unset by default.
+        assert_eq!(s.held_recheck_after("held-bead").unwrap(), None);
+        s.set_held_recheck_after("held-bead", 1_800_000_000).unwrap();
+        assert_eq!(s.held_recheck_after("held-bead").unwrap(), Some(1_800_000_000));
+        // No overlay row -> None, not an error.
+        assert_eq!(s.held_recheck_after("no-such-bead").unwrap(), None);
+    }
+
+    /// Task 1 (reviewer-outage-resilience): the `vendor_health` ledger must
+    /// mark a provider in-outage only after N consecutive pending
+    /// assessments, recover ONLY on a success observation, and never flip
+    /// to recovered on the absence of errors alone. Exercises the REAL
+    /// SqliteStateStore (not the fake).
+    #[test]
+    fn vendor_health_outage_and_recovery_semantics() {
+        let s = store();
+        // Never observed -> None.
+        assert!(s.vendor_health("coderabbit").unwrap().is_none());
+
+        // 1st pending: consecutive_pending=1, not yet in outage.
+        let r = s.record_vendor_observation(
+            "coderabbit", true, false, "sha1", 1000, 3,
+        ).unwrap();
+        assert_eq!(r.consecutive_pending, 1);
+        assert!(!r.in_outage);
+        assert_eq!(r.outage_observations, 1);
+        assert_eq!(r.success_observations, 0);
+
+        // 2nd pending: consecutive_pending=2, not yet in outage.
+        let r = s.record_vendor_observation(
+            "coderabbit", true, false, "sha2", 1001, 3,
+        ).unwrap();
+        assert_eq!(r.consecutive_pending, 2);
+        assert!(!r.in_outage);
+
+        // 3rd pending: consecutive_pending=3 >= threshold -> in_outage=1.
+        let r = s.record_vendor_observation(
+            "coderabbit", true, false, "sha3", 1002, 3,
+        ).unwrap();
+        assert_eq!(r.consecutive_pending, 3);
+        assert!(r.in_outage);
+        assert_eq!(r.last_outage_epoch, Some(1002));
+
+        // A non-outage, non-success observation (is_outage_marker=false,
+        // is_success=false) must NOT flip in_outage to 0 — absence of errors
+        // alone never recovers.
+        let r = s.record_vendor_observation(
+            "coderabbit", false, false, "sha4", 1003, 3,
+        ).unwrap();
+        assert!(r.in_outage, "absence of errors must not recover");
+
+        // A success observation recovers and records a success observation.
+        let r = s.record_vendor_observation(
+            "coderabbit", false, true, "sha5", 1004, 3,
+        ).unwrap();
+        assert!(!r.in_outage, "success must recover");
+        assert_eq!(r.consecutive_pending, 0);
+        assert_eq!(r.success_observations, 1);
+        assert_eq!(r.last_success_head.as_deref(), Some("sha5"));
+
+        // Round-trip read confirms persistence.
+        let loaded = s.vendor_health("coderabbit").unwrap().unwrap();
+        assert_eq!(loaded, r);
+    }
+
+    /// Task 1: a success observation must be recorded as a success
+    /// observation, NEVER as an outage observation, even when the provider
+    /// is currently in outage.
+    #[test]
+    fn vendor_health_success_never_counted_as_outage() {
+        let s = store();
+        // Drive into outage.
+        for i in 0..3 {
+            s.record_vendor_observation(
+                "bugbot", true, false, "sha", 1000 + i, 3,
+            ).unwrap();
+        }
+        let before = s.vendor_health("bugbot").unwrap().unwrap();
+        assert!(before.in_outage);
+        assert_eq!(before.outage_observations, 3);
+        assert_eq!(before.success_observations, 0);
+
+        // Success while in outage.
+        let r = s.record_vendor_observation(
+            "bugbot", false, true, "sha-new", 2000, 3,
+        ).unwrap();
+        assert!(!r.in_outage);
+        assert_eq!(r.outage_observations, 3, "outage count unchanged");
+        assert_eq!(r.success_observations, 1, "success counted as success");
+    }
+
+    /// Task 1: ensure_vendor_health_table migration is idempotent and the
+    /// table survives a fresh open.
+    #[test]
+    fn vendor_health_table_migration_is_idempotent() {
+        let s = store();
+        // Calling the migration twice (via a second open) must not error.
+        let _ = s.record_vendor_observation(
+            "coderabbit", true, false, "sha", 1000, 3,
+        ).unwrap();
+        // Re-open in-memory with the same schema — migration runs again.
+        let _s2 = SqliteStateStore::open_in_memory_with_schema(
+            include_str!("../contracts/schema.sql"),
+        ).unwrap();
+    }
+
+    /// Bead jleechan-zaga / issue #348 r3: the CHECK migration must be robust
+    /// to ANY legal DDL formatting, because the r3 detection is a PROBE (a
+    /// rolled-back INSERT), not a string-match on the stored DDL. Runs one
+    /// legacy `bead_overlay` DDL through the migration and asserts: (a) the
+    /// pre-existing row is preserved, (b) DISPOSITION_REQUIRED is accepted
+    /// afterward, (c) a second run is idempotent. `expect_rejected_before`
+    /// asserts the legacy CHECK rejected the new state pre-migration (false for
+    /// the already-migrated fixture, which accepts it from the start).
+    fn run_disposition_migration_case(bead_overlay_ddl: &str, expect_rejected_before: bool) {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(bead_overlay_ddl).unwrap();
+        conn.execute(
+            "INSERT INTO bead_overlay (bead_id, state, updated_at) \
+             VALUES ('b-legacy', 'ATTESTED', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let insert_new = |c: &Connection| {
+            c.execute(
+                "INSERT INTO bead_overlay (bead_id, state, updated_at) \
+                 VALUES ('b-new', 'DISPOSITION_REQUIRED', '2026-01-01T00:00:00Z')",
+                [],
+            )
+        };
+        if expect_rejected_before {
+            assert!(
+                insert_new(&conn).is_err(),
+                "legacy CHECK must reject DISPOSITION_REQUIRED before migration"
+            );
+        }
+
+        SqliteStateStore::ensure_disposition_required_state(&conn).unwrap();
+
+        // (a) row preserved.
+        let preserved: String = conn
+            .query_row(
+                "SELECT state FROM bead_overlay WHERE bead_id = 'b-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved, "ATTESTED");
+        // (b) new state accepted.
+        insert_new(&conn).expect("post-migration CHECK must accept DISPOSITION_REQUIRED");
+        // (c) idempotent second run preserves both rows and the usable CHECK.
+        SqliteStateStore::ensure_disposition_required_state(&conn).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM bead_overlay", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+        conn.execute(
+            "INSERT INTO bead_overlay (bead_id, state, updated_at) \
+             VALUES ('b-new2', 'DISPOSITION_REQUIRED', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("CHECK must remain usable after an idempotent second migration");
+    }
+
+    #[test]
+    fn disposition_migration_exact_production_ddl() {
+        run_disposition_migration_case(
+            "CREATE TABLE bead_overlay (\
+               bead_id TEXT PRIMARY KEY, \
+               state TEXT NOT NULL CHECK (state IN \
+                 ('QUEUED','DISPATCHING','DISPATCHED','ATTESTED','READY','RE_ROLL','RECOVERY',\
+                  'REDISPATCHED','BUDGET_HELD','HUMAN_HELD')), \
+               attempt INTEGER NOT NULL DEFAULT 1, \
+               updated_at TEXT NOT NULL)",
+            true,
+        );
+    }
+
+    #[test]
+    fn disposition_migration_whitespace_variant_ddl() {
+        // Newlines and irregular spacing inside the CHECK — a string-edit of
+        // `'HUMAN_HELD')` would silently miss this; the probe does not.
+        run_disposition_migration_case(
+            "CREATE TABLE bead_overlay (\n  bead_id TEXT PRIMARY KEY,\n  state TEXT NOT NULL\n    CHECK ( state IN (\n      'QUEUED', 'DISPATCHING', 'DISPATCHED', 'ATTESTED', 'READY',\n      'RE_ROLL', 'RECOVERY', 'REDISPATCHED', 'BUDGET_HELD', 'HUMAN_HELD'\n    ) ),\n  updated_at TEXT NOT NULL\n)",
+            true,
+        );
+    }
+
+    #[test]
+    fn disposition_migration_quoted_identifier_ddl() {
+        // Quoted table/column identifiers — `CREATE TABLE "bead_overlay"` and
+        // `"state"` would break a `replacen("CREATE TABLE bead_overlay", …)`.
+        run_disposition_migration_case(
+            "CREATE TABLE \"bead_overlay\" (\
+               \"bead_id\" TEXT PRIMARY KEY, \
+               \"state\" TEXT NOT NULL CHECK (\"state\" IN \
+                 ('QUEUED','DISPATCHING','DISPATCHED','ATTESTED','READY','RE_ROLL','RECOVERY',\
+                  'REDISPATCHED','BUDGET_HELD','HUMAN_HELD')), \
+               \"updated_at\" TEXT NOT NULL)",
+            true,
+        );
+    }
+
+    #[test]
+    fn disposition_migration_already_migrated_ddl_is_noop() {
+        // A DB whose CHECK already lists DISPOSITION_REQUIRED: the probe
+        // succeeds, so the migration is a no-op and the table stays usable.
+        run_disposition_migration_case(
+            "CREATE TABLE bead_overlay (\
+               bead_id TEXT PRIMARY KEY, \
+               state TEXT NOT NULL CHECK (state IN \
+                 ('QUEUED','DISPATCHING','DISPATCHED','ATTESTED','READY','RE_ROLL','RECOVERY',\
+                  'REDISPATCHED','BUDGET_HELD','HUMAN_HELD','DISPOSITION_REQUIRED')), \
+               updated_at TEXT NOT NULL)",
+            false,
+        );
+    }
+
+    /// End-to-end via the public open path: a store opened against a
+    /// legacy-constraint schema string can persist and reload a
+    /// DISPOSITION_REQUIRED overlay (the migration runs inside
+    /// `open_in_memory_with_schema`).
+    #[test]
+    fn open_migrates_legacy_check_and_persists_disposition_required_overlay() {
+        let legacy = include_str!("../contracts/schema.sql")
+            .replace("'HUMAN_HELD','DISPOSITION_REQUIRED')", "'HUMAN_HELD')");
+        let s = SqliteStateStore::open_in_memory_with_schema(&legacy).unwrap();
+        let o = BeadOverlay {
+            bead_id: "held-bead".into(),
+            state: OverlayState::DispositionRequired,
+            attempt: 2,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(708),
+            branch: Some("alice/feature".into()),
+            session_id: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        };
+        s.save(&o).expect("DISPOSITION_REQUIRED must persist after open-time migration");
+        let got = s.load("held-bead").unwrap().unwrap();
+        assert_eq!(got.state, OverlayState::DispositionRequired);
+        assert_eq!(got.pr_number, Some(708));
     }
 
     #[test]

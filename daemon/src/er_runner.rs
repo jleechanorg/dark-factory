@@ -271,6 +271,7 @@ pub fn snapshot_with_comments(pr: u64, comments: Vec<PrComment>) -> PrSnapshot {
         updated_at_epoch: 0,
         ci_status: "green".into(),
         coderabbit_status: "green".into(),
+        bugbot_status: "green".into(),
         ci_pending: false,
         head_committed_epoch: 0,
     }

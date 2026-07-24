@@ -83,6 +83,31 @@ const MAX_HUMAN_HELD_RECOVERY_ATTEMPT: u32 = 10;
 const ESCALATION_REVIEWER: &str = "dark-factory-escalation";
 const ESCALATION_SENTINEL_ATTEMPT: u32 = u32::MAX;
 
+/// Task 1 (reviewer-outage-resilience): N consecutive pending assessments
+/// before a provider is marked in-outage in the `vendor_health` ledger.
+const VENDOR_OUTAGE_CONSECUTIVE_PENDING_THRESHOLD: u32 = 3;
+
+/// Bead jleechan-msmq: an ATTESTED bead with `reroll_count > 0` is in the
+/// reroll pipeline. The OLD PR's gate verdict cannot advance the bead
+/// (the reroll branch IS the advancement); re-assessing it on every
+/// subsequent tick is pure churn that races with two breakers:
+///
+///   * the autonomy timebox — `autonomy_secs` keeps bumping, and once it
+///     crosses `autonomy_timebox_secs`, the timebox-park branch calls
+///     `kill_session_and_clear_handle`, killing the fresh coder lane
+///     that was just fabricated by the reroll before it has a chance to
+///     push a fix. Symptom: bead goes HumanHeld → recover-held → QUEUED,
+///     dispatched session dead, bead ping-pongs forever.
+///   * the circuit-breaker — same reviewer citing the same red gate on
+///     identical evidence trips on attempt 2 and parks HUMAN_HELD, even
+///     though the fresh lane was about to land a fix.
+///
+/// The fix: skip the per-tick gate assessment for ATTESTED beads whose
+/// `reroll_count > 0`. The reroll branch (which runs below this guard in
+/// `run_fast_tier`) is the ONLY consumer of the fresh lane's progress;
+/// the OLD PR's gates are not relevant once reroll has been initiated.
+/// Emitting `VERIFIER_SKIPPED_REROLL_IN_PROGRESS` lets an operator tell
+/// the skip from a transient snapshot error or a circuit-breaker trip.
 /// Result of looking up CI-pending state for an active overlay (used by the
 /// autonomy/timebox bookkeeping in `run_tick`'s active-overlay loop).
 ///
@@ -2158,6 +2183,89 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        // Task 1 (reviewer-outage-resilience): record vendor health
+        // observations for BOTH external review-bot providers from the
+        // fetched PrSnapshot, BEFORE verifier::assess. Outage marker if the
+        // provider's status is "unknown" (pending/unavailable); success if
+        // the provider approved / is clean. Emit VENDOR_WAIVED / VENDOR_RECOVERED
+        // telemetry ONLY on state transitions (0→1 for waived, 1→0 for recovered).
+        {
+            let vendors: [(&str, bool, bool); 2] = [
+                (
+                    "coderabbit",
+                    snapshot.coderabbit_status == "unknown",
+                    snapshot.coderabbit_approved,
+                ),
+                (
+                    "bugbot",
+                    snapshot.bugbot_status == "unknown",
+                    snapshot.bugbot_status == "green",
+                ),
+            ];
+            for (vendor, is_outage_marker, is_success) in vendors {
+                let prior = deps.store.vendor_health(vendor).ok().flatten();
+                let row = match deps.store.record_vendor_observation(
+                    vendor,
+                    is_outage_marker,
+                    is_success,
+                    &snapshot.head_sha,
+                    now_epoch,
+                    VENDOR_OUTAGE_CONSECUTIVE_PENDING_THRESHOLD,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = emit(
+                            deps.telemetry_log,
+                            bead_id,
+                            overlay.attempt,
+                            OverlayState::Attested.as_str(),
+                            "VENDOR_HEALTH_RECORD_ERROR",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "vendor": vendor,
+                                "error": format!("{e:?}"),
+                            }),
+                        );
+                        continue;
+                    }
+                };
+                let was_in_outage = prior.as_ref().is_some_and(|p| p.in_outage);
+                if row.in_outage && !was_in_outage {
+                    let _ = emit(
+                        deps.telemetry_log,
+                        bead_id,
+                        overlay.attempt,
+                        OverlayState::Attested.as_str(),
+                        "VENDOR_WAIVED",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "vendor": vendor,
+                            "consecutive_pending": row.consecutive_pending,
+                            "head_sha": snapshot.head_sha,
+                            "reason": format!(
+                                "provider marked in-outage after {} consecutive pending assessments",
+                                row.consecutive_pending
+                            ),
+                        }),
+                    );
+                } else if !row.in_outage && was_in_outage {
+                    let _ = emit(
+                        deps.telemetry_log,
+                        bead_id,
+                        overlay.attempt,
+                        OverlayState::Attested.as_str(),
+                        "VENDOR_RECOVERED",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "vendor": vendor,
+                            "last_success_head": row.last_success_head.clone().unwrap_or_default(),
+                            "outage_observations": row.outage_observations,
+                            "success_observations": row.success_observations,
+                        }),
+                    );
+                }
+            }
+        }
         let runner_outcome = match crate::er_runner::maybe_run(deps, bead_id, pr, now_epoch) {
             Ok(out) => out,
             Err(e) => {

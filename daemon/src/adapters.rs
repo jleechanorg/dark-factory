@@ -647,6 +647,7 @@ impl Scm for CliScm {
                         updated_at_epoch: snap.updated_at_epoch.unwrap_or(0),
                         ci_status,
                         coderabbit_status,
+                        bugbot_status: "green".to_string(),
                         ci_pending: false,
                         head_committed_epoch: snap.head_committed_epoch.unwrap_or(0),
                     });
@@ -950,6 +951,39 @@ impl Scm for CliScm {
             }
         }
 
+        // Task 1 (reviewer-outage-resilience): derive bugbot_status from the
+        // check-runs list, parallel to coderabbit_status. Any check-run whose
+        // `name` (case-insensitive) contains "bugbot" or "cursor" that is
+        // pending -> "unknown"; all completed-success -> "green"; any
+        // completed-failure -> "red". If NO bugbot/cursor check-runs exist at
+        // all, status stays "unknown" (absence is NOT success — fail-closed
+        // discipline matching coderabbit_status's `None => "unknown"` arm).
+        let bugbot_status = {
+            let mut any_pending = false;
+            let mut any_failed = false;
+            let mut any_present = false;
+            for c in &checks {
+                let name_lower = c.name.to_lowercase();
+                if name_lower.contains("bugbot") || name_lower.contains("cursor") {
+                    any_present = true;
+                    if c.bucket == "pending" {
+                        any_pending = true;
+                    } else if c.bucket == "fail" || c.bucket == "cancel" {
+                        any_failed = true;
+                    }
+                }
+            }
+            if !any_present {
+                "unknown".to_string()
+            } else if any_pending {
+                "unknown".to_string()
+            } else if any_failed {
+                "red".to_string()
+            } else {
+                "green".to_string()
+            }
+        };
+
         let owner = self.repo.split('/').next().unwrap_or("").to_string();
         let repo = self.repo.split('/').nth(1).unwrap_or("").to_string();
         let query = "query($owner:String!,$repo:String!,$pr:Int!){
@@ -1090,6 +1124,7 @@ impl Scm for CliScm {
             updated_at_epoch,
             ci_status,
             coderabbit_status,
+            bugbot_status,
             ci_pending,
             head_committed_epoch,
         };

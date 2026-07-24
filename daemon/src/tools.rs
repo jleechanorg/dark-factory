@@ -162,6 +162,17 @@ pub struct PrSnapshot {
     pub updated_at_epoch: u64,
     pub ci_status: String,
     pub coderabbit_status: String,
+    /// Bugbot/cursor review-bot status derived from GitHub check-runs whose
+    /// `name` (case-insensitive) contains "bugbot" or "cursor" (Task 1,
+    /// reviewer-outage-resilience). Parallel to `coderabbit_status`:
+    /// "green" = all such check-runs completed with success, "red" = any
+    /// completed with failure, "unknown" = any still pending OR no
+    /// bugbot/cursor check-runs exist at all (absence is NOT success —
+    /// fail-closed discipline matching `coderabbit_status`'s `None =>
+    /// "unknown"` arm). Consumed by the production assessment path in
+    /// `tick::run_fast_tier` to record vendor-health observations for the
+    /// `vendor_health` ledger.
+    pub bugbot_status: String,
     pub ci_pending: bool,
     /// Unix epoch (seconds) of the head commit's committer date, or 0 when
     /// unknown. jleechan-nplh: the freshness floor for `/er` verdict
