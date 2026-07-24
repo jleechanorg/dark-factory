@@ -78,6 +78,12 @@ pub struct TickSummary {
     /// churn). The fast tier keeps assessing on each tick; this counter
     /// just records the holds placed this tick.
     pub beads_held_disposition_required: usize,
+    /// Bead jleechan-rouf (worldarchitect.ai #8428 / #8420 / #8421): an
+    /// escalation event that the dedup ledger suppressed within the
+    /// `escalation_refire_secs` window because the same `(branch, reason)`
+    /// had already emitted. Distinct from `beads_escalated` so operators
+    /// can see the dedup work without it being mistaken for new alerts.
+    pub escalations_suppressed: usize,
 }
 
 /// Bounded retry cap for the automated HUMAN_HELD exit. Matches the shell
@@ -3565,4 +3571,137 @@ fn post_scm_comment_by_bead_id(
     Err(DaemonError::Config(format!(
         "no SCM comment target found for bead {bead_id}"
     )))
+}
+// === jleechan-rouf dedup helpers (added by clean replay of PR #470 / cb2136ffe) ===
+// PR #472 (origin/main) removed the FNV-1a hash helpers and the
+// `escalation_dedup_should_emit` / `record_escalation_emit_dedup` wrappers
+// during the vendor-outage refactor. The clean replay re-introduces them
+// in their `bc6ef0c36` shape so the `adoption_branch_collision` call-site
+// can re-key dedup on the branch (cb2136ffe's fix).
+//
+// Pinned by `mod escalation_context_hash_tests` at the bottom of this file
+// (FNV-1a reference-charter constants + cross-process determinism contract).
+
+/// FNV-1a 64-bit hash per the FNV reference charter.
+/// OFFSET_BASIS = 0xcbf29ce484222325, PRIME = 0x100000001b3.
+/// Non-cryptographic, intentionally cheap; needs to be deterministic
+/// across processes and Rust versions, which `std::hash::DefaultHasher`
+/// is NOT (per-process random `RandomState` seed).
+pub fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for &byte in bytes {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+/// Canonical-JSON byte form per RFC 8789 (JCS-lite): keys at every
+/// nesting level sorted lexicographically. `serde_json::to_string`
+/// preserves `serde_json::json!` macro insertion order, so without this
+/// sort, two structurally-identical JSON values built with different
+/// field declaration orders produce different hashes.
+pub fn canonical_json_bytes(value: &serde_json::Value) -> Vec<u8> {
+    use serde_json::Value;
+    match value {
+        Value::Null => b"null".to_vec(),
+        Value::Bool(b) => b.to_string().into_bytes(),
+        Value::Number(n) => n.to_string().into_bytes(),
+        Value::String(s) => serde_json::to_string(s).unwrap_or_default().into_bytes(),
+        Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len() * 8);
+            out.push(b'[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                out.extend_from_slice(&canonical_json_bytes(item));
+            }
+            out.push(b']');
+            out
+        }
+        Value::Object(map) => {
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let mut out = Vec::with_capacity(entries.len() * 16);
+            out.push(b'{');
+            for (i, (key, val)) in entries.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                out.extend_from_slice(&serde_json::to_string(key).unwrap_or_default().into_bytes());
+                out.push(b':');
+                out.extend_from_slice(&canonical_json_bytes(val));
+            }
+            out.push(b'}');
+            out
+        }
+    }
+}
+
+/// Stable 16-char lowercase-hex context hash for the escalation dedup
+/// ledger. `format!("{:016x}", fnv1a_64(&canonical_json_bytes(value)))`.
+/// Same format as the legacy `DefaultHasher`-based impl (also 16 hex
+/// chars) so callers comparing against pre-fix ledger rows keep working.
+pub fn escalation_context_hash(context: &serde_json::Value) -> String {
+    let canonical = canonical_json_bytes(context);
+    format!("{:016x}", fnv1a_64(&canonical))
+}
+
+/// Wall-clock epoch in seconds. Duplicates the helper in `crate::reroll`
+/// (where it is private) so `tick.rs` can compute `now_epoch` without
+/// widening the cross-module surface. If the two ever drift, the
+/// `escalations_suppressed` field's docstring + the test
+/// `escalation_refire_secs_default_is_3600` will surface the gap.
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Wrap `StateStore::escalation_should_emit` with the context-hash
+/// computation the call-site needs. Returns `(should_emit, ctx_hash)` so
+/// the caller can pass `ctx_hash` straight into
+/// `record_escalation_emit_dedup` without re-computing it (and risking
+/// drift between the dedup check and the ledger write).
+///
+/// Bead jleechan-rouf: the production caller passes the BRANCH as
+/// `bead_id` so all colliding beads for the same branch collapse to one
+/// ledger row. Pass the actual bead_id only when you genuinely want
+/// per-bead dedup.
+fn escalation_dedup_should_emit(
+    deps: &TickDeps,
+    bead_id: &str,
+    reason: &str,
+    context: &serde_json::Value,
+    now_epoch: u64,
+) -> Result<(bool, String), DaemonError> {
+    let context_hash = escalation_context_hash(context);
+    let should = deps.store.escalation_should_emit(
+        bead_id,
+        reason,
+        &context_hash,
+        now_epoch,
+        deps.cfg.escalation_refire_secs,
+    )?;
+    Ok((should, context_hash))
+}
+
+/// Wrap `StateStore::record_escalation_emit` with the same `(bead_id,
+/// reason, context_hash, now_epoch)` shape so the call-site stays
+/// symmetric with `escalation_dedup_should_emit` above. Returns the
+/// `DaemonError` directly so the caller can `?`-propagate without
+/// `map_err`.
+fn record_escalation_emit_dedup(
+    deps: &TickDeps,
+    bead_id: &str,
+    reason: &str,
+    context_hash: &str,
+    now_epoch: u64,
+) -> Result<(), DaemonError> {
+    deps.store
+        .record_escalation_emit(bead_id, reason, context_hash, now_epoch)
 }
