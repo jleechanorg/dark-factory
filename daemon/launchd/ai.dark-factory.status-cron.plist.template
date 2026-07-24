@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template: ai.dark-factory.status-cron.plist.template
+  Purpose: out-of-band every-5-min status beacon to the #factory Slack
+           channel (C0BGEC77EP4). Posts a 4-line snapshot of the dark-factory
+           daemon — dispatched(5m) / beads open / ao sessions / af-tick
+           uptime — via daemon/scripts/post-factory-status.sh.
+
+  Why this exists alongside factory-af-tick.sh:
+    The tick already posts a beacon when dispatch happens (per bead jleechan-nyp1).
+    This template fires REGARDLESS of dispatch activity so operators see a
+    heartbeat even during quiet periods. Per user request: "every 5 min or
+    when milestone happens or remote commit" — the milestone case is covered
+    by the GitHub webhook plist in commit 3 of this PR.
+
+  Invocation:
+    Same launchd-wrapper.sh bridge as the af-tick plist — it sources the
+    operator's interactive login env (PATH, br, gh, sqlite3, git config)
+    before exec. Without it, the heredoc in factory-intake-from-gh.sh would
+    crash with FileNotFoundError: 'br'. See bead jleechan-v2wv.
+
+  Usage (manual install):
+    launchctl bootstrap gui/$UID "$HOME/Library/LaunchAgents/ai.dark-factory.status-cron.plist"
+
+  Disarm:
+    launchctl bootout gui/$UID "$HOME/Library/LaunchAgents/ai.dark-factory.status-cron.plist"
+    rm "$HOME/Library/LaunchAgents/ai.dark-factory.status-cron.plist"
+
+  Notes:
+    - @HOME@, @FACTORY_SLACK_CHANNEL_ID@, @HERMES_SLACK_BOT_TOKEN@ are
+      substituted by install-launchagents.sh (commit 1 of this PR).
+    - @STATUS_INTERVAL@ is the beacon cadence in seconds (default 300).
+    - FACTORY_SLACK_CHANNEL_ID=C0BGEC77EP4 is the literal channel id; it is
+      NOT a secret (Slack channel ids appear in URLs and are public).
+    - KeepAlive=false + StartInterval is the standard "periodic timer" pattern;
+      we DO NOT want this to keep running across system sleep cycles beyond
+      one shot.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.dark-factory.status-cron</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>@HOME@/projects/dark-factory/daemon/launchd/launchd-wrapper.sh</string>
+        <string>@HOME@/projects/dark-factory/daemon/scripts/post-factory-status.sh</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>@STATUS_INTERVAL@</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>@HOME@/Library/Logs/dark-factory/status-cron.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>@HOME@/Library/Logs/dark-factory/status-cron.err.log</string>
+
+    <!--
+      Slack #factory channel id is public (URL-safe identifier); the bot
+      token is substituted at install time by install-launchagents.sh and is
+      NEVER committed (see install-launchagents.sh:resolve_slack_token).
+    -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>FACTORY_SLACK_CHANNEL_ID</key>
+        <string>C0BGEC77EP4</string>
+        <key>HERMES_SLACK_BOT_TOKEN</key>
+        <string>@HERMES_SLACK_BOT_TOKEN@</string>
+    </dict>
+</dict>
+</plist>

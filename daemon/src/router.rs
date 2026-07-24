@@ -156,6 +156,7 @@ mod tests {
             id: "jleechan-test".into(),
             title: "Fix the thing".into(),
             description: String::new(),
+            notes: String::new(),
             file_tree_summary: String::new(),
             external_ref: None,
         }

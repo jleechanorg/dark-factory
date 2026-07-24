@@ -1,0 +1,12 @@
+● dark-factory-merge-guard.timer - Schedule dark-factory-merge-guard.service every 60s (jleechan-s3c)
+     Loaded: loaded (/home/jleechan/.config/systemd/user/dark-factory-merge-guard.timer; enabled; preset: enabled)
+     Active: active (waiting) since Fri 2026-07-10 12:39:22 PDT; 5h 1min ago
+    Trigger: Fri 2026-07-10 17:41:00 PDT; 34s left
+   Triggers: ● dark-factory-merge-guard.service
+
+Jul 10 12:39:22 Jeff-Ubuntu systemd[3285]: Started dark-factory-merge-guard.timer - Schedule dark-factory-merge-guard.service every 60s (jleechan-s3c).
+---
+NEXT                        LEFT LAST                         PASSED UNIT                           ACTIVATES
+Fri 2026-07-10 17:41:00 PDT  34s Fri 2026-07-10 17:40:05 PDT 20s ago dark-factory-merge-guard.timer dark-factory-merge-guard.service
+
+1 timers listed.

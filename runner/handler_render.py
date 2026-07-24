@@ -19,6 +19,13 @@ Substitutions (in order):
     ``ctx.state["_lint_findings"]`` so a prompt that references the
     placeholder twice doesn't re-scan. Defaults to ``"(none)"`` when the
     scan returns no findings.
+
+The ``runner.handlers._holdout_denied_paths`` symbol is looked up via the
+shim at runtime (lazy import inside ``_render_prompt``) so existing test
+monkeypatching via ``monkeypatch.setattr("runner.handlers._holdout_denied_paths", ...)``
+keeps working. The shim is NOT imported at module top to avoid a load-time
+cycle: ``runner.handlers`` imports this file, and a partial re-import would
+re-enter the shim before ``_holdout_denied_paths`` was bound.
 """
 
 from __future__ import annotations
@@ -27,7 +34,6 @@ import json
 import pathlib
 from typing import TYPE_CHECKING
 
-import runner.handlers as _handlers_shim
 from .handler_core import _serialize_state_value
 from .pre_review_lint import findings_to_markdown, findings_to_json, lint_findings
 
@@ -87,6 +93,7 @@ def _substitute_placeholders(text: str, ctx: "Context") -> str:
 
 
 def _render_prompt(node: "Node", ctx: "Context") -> str:
+    import runner.handlers as _handlers_shim  # late-bound shim (see module docstring)
     backend = node.attrs.get("backend", node.attrs.get("model", ctx.backend))
     if isinstance(backend, bool):
         backend = ctx.backend

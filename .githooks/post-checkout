@@ -1,0 +1,2 @@
+#!/bin/sh
+GIT_LFS_VERB=post-checkout . "$(dirname "$0")/_git-lfs-hook.sh" "$@"

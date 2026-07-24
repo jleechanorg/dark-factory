@@ -7,8 +7,39 @@
 use crate::config::Config;
 use crate::errors::DaemonError;
 use crate::router::RoutingVerdict;
-use crate::state::{BeadOverlay, OverlayState, StateStore};
-use crate::tools::{remote_url_matches_repo, Bead, Sessions, SpawnSpec};
+use crate::state::{
+    set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore,
+};
+use crate::tools::{remote_url_for_display, remote_url_matches_repo, Bead, Sessions, SpawnSpec};
+
+#[cfg(test)]
+const SPAWN_CLEANUP_FAILED_PARK_REASON: &str = "spawn_cleanup_failed";
+
+fn record_spawn_cleanup_failure(
+    store: &dyn StateStore,
+    overlay: &mut BeadOverlay,
+    session_id: &crate::tools::SessionId,
+    root_error: DaemonError,
+    cleanup_error: DaemonError,
+) -> DaemonError {
+    // The kill failed, so retain the known session identity durably instead
+    // of leaving a live worker untracked behind a DISPATCHING row that
+    // startup reconciliation would blindly requeue.
+    overlay.state = OverlayState::HumanHeld;
+    overlay.session_id = Some(session_id.0.clone());
+    set_human_hold_reason(overlay, HumanHoldReason::SpawnCleanupFailed);
+    let cleanup_error = match store.save(overlay) {
+        Ok(()) => cleanup_error,
+        Err(state_error) => DaemonError::Config(format!(
+            "session cleanup failed: {cleanup_error}; additionally failed to persist the HUMAN_HELD cleanup record: {state_error}"
+        )),
+    };
+    DaemonError::SpawnCleanupFailed {
+        session: session_id.0.clone(),
+        spawn_error: Box::new(root_error),
+        cleanup_error: Box::new(cleanup_error),
+    }
+}
 
 /// Coder-dispatch prompt preamble (bead jleechan-bqdv, Stage C of the
 /// multi-repo dispatch fix — see
@@ -43,6 +74,31 @@ fn dispatch_prompt_preamble(repo: &str, remote: &str, branch: &str) -> String {
 /// frequent/short-lived than a full gate-rejection HUMAN_HELD cycle.
 pub(crate) const MAX_TRANSIENT_SPAWN_RETRY: u32 = 15;
 
+/// Caller-resolved drive-PR branch-binding decision (bead
+/// jleechan-drive-pr-branch-binding-pcpr), threaded from
+/// `tick.rs::run_slow_tier` into `dispatch_ready` via `ready`'s third tuple
+/// element — this module intentionally has no `Scm` access (see the module
+/// doc comment), so the `gh`-backed lookup happens before `ready` is built.
+/// Three states rather than `Option<String>` so a fork PR (confirmed open,
+/// but its head lives on a different repo — the fail-closed guard mirroring
+/// `intake::same_repo_pr`) is distinguishable in telemetry from "no drive-PR
+/// signal at all"; both fall back to the generated branch, but an operator
+/// needs to know WHY.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriveBranchDecision {
+    /// Bind the coder branch to this PR's own head ref.
+    PrHead(String),
+    /// An open PR was confirmed, but its head lives on a fork — refuse to
+    /// bind (would create an unrelated same-named branch in the queried
+    /// repo and never touch the actual PR). Falls back to the generated
+    /// branch, tagged distinctly in telemetry (`branch_mode:
+    /// "generated_fork_fallback"`).
+    ForkFallback,
+    /// Ordinary create-new-work bead, or a closed/missing/non-PR
+    /// `external_ref` — the generated-branch path.
+    Generated,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchSuccess {
     pub bead_id: String,
@@ -53,6 +109,15 @@ pub struct DispatchSuccess {
     /// surfaced so `tick.rs`'s `TASK_DISPATCHED` telemetry makes the
     /// resolved repo visible in daemon.jsonl.
     pub target_repo: String,
+    /// `"pr_head"` when `branch` was bound to a caller-resolved open PR's
+    /// own head ref (bead jleechan-drive-pr-branch-binding-pcpr — drive an
+    /// existing PR rather than fabricate a parallel branch),
+    /// `"generated_fork_fallback"` when an open PR was confirmed but its
+    /// head lives on a fork (fail-closed — see `DriveBranchDecision`),
+    /// `"generated"` for the ordinary `factory/<bead>-r<attempt>` path.
+    /// Surfaced so `tick.rs`'s `TASK_DISPATCHED` telemetry records which
+    /// mode fired.
+    pub branch_mode: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,18 +190,26 @@ fn failure(
 /// Returns a per-bead report. Never spawns past the cap; if zero slots are
 /// free, returns an empty report without calling `sessions.spawn` (verified by
 /// the fake's call log in tests — spec §4.2.8's caps are absolute).
+///
+/// `ready`'s third tuple element is the caller-resolved
+/// [`DriveBranchDecision`] (bead jleechan-drive-pr-branch-binding-pcpr,
+/// resolved by `tick.rs::run_slow_tier` via `Scm::open_pr_head_ref_for_repo`
+/// — this module intentionally has no `Scm` access, see the module doc
+/// comment, so the lookup happens before `ready` is built). This module
+/// never re-derives that decision; it only consumes whatever `ready`
+/// already contains, in order, exactly like the routing verdict beside it.
 pub fn dispatch_ready(
     sessions: &dyn Sessions,
     store: &dyn StateStore,
     cfg: &Config,
-    ready: &[(Bead, RoutingVerdict)],
+    ready: &[(Bead, RoutingVerdict, DriveBranchDecision)],
 ) -> Result<DispatchReport, DaemonError> {
     let active = sessions.active_count()?;
     let free_slots = cfg.max_workers.saturating_sub(active);
     let batch = free_slots.min(cfg.max_batch);
 
     let mut report = DispatchReport::default();
-    for (bead, verdict) in ready {
+    for (bead, verdict, drive_branch) in ready {
         if report.success_count() >= batch {
             break;
         }
@@ -157,7 +230,14 @@ pub fn dispatch_ready(
                 spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            // jleechan-8jxr r2: pre-fill with cfg.target_repo so this
+            // defensive fallback (no overlay row in the store yet —
+            // should be dead code in production since intake always
+            // persists before dispatch) survives the no-repo park. The
+            // bead's "real" repo would normally be set by
+            // `tick::run_slow_tier`/`intake::normalize`; this value is
+            // only used if the dispatch path runs before any intake.
+            target_repo: Some(cfg.target_repo.clone()),
             },
             Err(err) if err.is_transient() => {
                 report
@@ -168,8 +248,92 @@ pub fn dispatch_ready(
             Err(err) => return Err(err),
         };
 
-        // jleechan-35y4 Stage B: resolve this bead's repo BEFORE touching
-        // branch registration or dispatching state. A bead whose resolved
+        // jleechan-8jxr r2: handle the "no repo identity at all" case
+        // BEFORE the `BeadOverlay::repo()` fallback can mask it. A
+        // manually-created factory bead (`br create --type task` with no
+        // `target_repo:` body field and no parseable `external_ref`) leaves
+        // `overlay.target_repo = None`, which `overlay.repo(cfg)` would
+        // happily paper over with `cfg.target_repo`. That default landed
+        // work on `jleechanorg/worldarchitect.ai` five times in one day
+        // (2026-07-18: yvfe/vmy2/46dk/s9ba/txtd → PRs #8424-#8427 + a
+        // dispatched session) because the bead bodies were unambiguously
+        // about dark-factory internals but never resolved to that repo at
+        // intake. Distinguish this from `UnmappedTargetRepo` ("I resolved a
+        // repo and it's not in config") — both are config/operator-fix
+        // problems and both fail closed, but the operator's remediation is
+        // different: add a `[repos.*]` entry vs. add a `target_repo:` field
+        // or an `external_ref` to the bead body.
+        //
+        // jleechan-8jxr r3 (review follow-up, chatgpt-codex-connector P2):
+        // before declaring `unmapped_repo`, attempt to recover the repo
+        // from the CURRENT `Bead`'s body/external_ref. A legacy overlay
+        // (one that predates the `target_repo` column or was written
+        // before any `external_ref`/body-field resolution ran) can have
+        // `overlay.target_repo = None` while the bead itself still has a
+        // perfectly parseable repo identity today. Re-derive it via
+        // `intake::resolve_target_repo` (Stage A precedence — body field,
+        // then external_ref prefix, then None), persist the recovered
+        // value on the overlay, and continue normal dispatch. This is the
+        // same `Bead` the original intake path would have looked at; we
+        // are just giving it a second chance on the legacy overlay
+        // recovery path.
+        if overlay.target_repo.is_none() {
+            let recovered = crate::intake::resolve_target_repo(
+                bead.description.as_str(),
+                bead.external_ref.as_deref(),
+            );
+            if let Some(repo) = recovered {
+                overlay.target_repo = Some(repo);
+                if let Err(err) = store.save(&overlay) {
+                    if err.is_transient() {
+                        report.failures.push(failure(
+                            bead,
+                            overlay.attempt,
+                            None,
+                            "unmapped_repo_recover_save",
+                            err,
+                        ));
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        if overlay.target_repo.is_none() {
+            overlay.state = OverlayState::HumanHeld;
+            set_human_hold_reason(&mut overlay, HumanHoldReason::UnmappedRepo);
+            if let Err(err) = store.save(&overlay) {
+                if err.is_transient() {
+                    report.failures.push(failure(
+                        bead,
+                        overlay.attempt,
+                        None,
+                        "unmapped_repo_park_save",
+                        err,
+                    ));
+                    continue;
+                }
+                return Err(err);
+            }
+            report.failures.push(failure(
+                bead,
+                overlay.attempt,
+                None,
+                "unmapped_repo",
+                DaemonError::Config(format!(
+                    "bead {} has no resolvable repo identity at dispatch time (overlay.target_repo = None; \
+                     no `target_repo:` body field, no `external_ref` with a parseable `owner/repo#N` prefix, \
+                     and no adopted-PR context). The daemon's global cfg.target_repo ({:?}) cannot be assumed \
+                     for this bead — parking HUMAN_HELD rather than silently defaulting to it. Operator action: \
+                     either supply an explicit `target_repo: owner/repo` line in the bead body, or set \
+                     `external_ref = \"owner/repo#NNN\"`, or file under an issue/PR with the `factory` label \
+                     so intake can resolve the repo from the GitHub external_ref.",
+                    bead.id, cfg.target_repo
+                )),
+            ));
+            continue;
+        }
+        // jleechan-35y4 Stage B (unchanged): a bead whose resolved
         // `target_repo` (Stage A) names neither an explicit `[repos.*]`
         // entry nor the daemon's global `cfg.target_repo` is unmappable —
         // fail loud and park HUMAN_HELD rather than silently defaulting to
@@ -179,7 +343,7 @@ pub fn dispatch_ready(
             Some(routing) => routing,
             None => {
                 overlay.state = OverlayState::HumanHeld;
-                overlay.park_reason = Some("unmapped_target_repo".to_string());
+                set_human_hold_reason(&mut overlay, HumanHoldReason::UnmappedTargetRepo);
                 if let Err(err) = store.save(&overlay) {
                     if err.is_transient() {
                         report.failures.push(failure(
@@ -209,11 +373,31 @@ pub fn dispatch_ready(
             }
         };
 
-        let branch = format!("factory/{}-r{}", bead.id, overlay.attempt);
+        // jleechan-drive-pr-branch-binding-pcpr: a resolved open-PR head
+        // branch wins over the generated `factory/<bead>-r<attempt>` one —
+        // the coder MUST land work on the PR's own branch (that's what
+        // "drive an existing PR" means), and AO reusing a session already
+        // bound to that branch is exactly what the fail-closed
+        // `spawn_branch_mismatch` validation below expects to see, not a
+        // mismatch to reject.
+        let (branch, branch_mode) = match drive_branch {
+            DriveBranchDecision::PrHead(head_ref) => (head_ref.clone(), "pr_head"),
+            DriveBranchDecision::ForkFallback => (
+                format!("factory/{}-r{}", bead.id, overlay.attempt),
+                "generated_fork_fallback",
+            ),
+            DriveBranchDecision::Generated => (
+                format!("factory/{}-r{}", bead.id, overlay.attempt),
+                "generated",
+            ),
+        };
 
         // Register the branch + persist the DISPATCHING intent BEFORE
         // spawning a worker. Neither creates a live process, so a failure
-        // here needs no rollback.
+        // here needs no rollback. `register_branch` is idempotent for the
+        // SAME bead (see its doc comment), so re-registering a PR head
+        // branch on every redispatch/reroll of the same drive-PR bead is
+        // safe; only a genuine cross-bead collision errors.
         if let Err(err) = store.register_branch(&bead.id, &branch) {
             if err.is_transient() {
                 report.failures.push(failure(
@@ -230,6 +414,23 @@ pub fn dispatch_ready(
 
         overlay.state = OverlayState::Dispatching;
         overlay.branch = Some(branch.clone());
+        if branch_mode == "pr_head" {
+            // Explicit stored provenance flag (mirrors
+            // `intake::normalize_labeled_prs`'s ADOPTED path): a bead
+            // dispatched onto an external PR's own head branch must take
+            // `reroll::execute_adopted`'s append-only remediation path on a
+            // later reviewer rejection, never `reroll::execute`'s
+            // fabricate-new-branch-and-close-PR path — that would destroy
+            // the very PR this dispatch was told to drive.
+            overlay.is_adopted = true;
+            if overlay.pr_number.is_none() {
+                overlay.pr_number = bead
+                    .external_ref
+                    .as_deref()
+                    .and_then(|ext_ref| ext_ref.rsplit('#').next())
+                    .and_then(|num| num.parse::<u64>().ok());
+            }
+        }
         if let Err(err) = store.save(&overlay) {
             if err.is_transient() {
                 report.failures.push(failure(
@@ -277,6 +478,31 @@ pub fn dispatch_ready(
         };
         let session_id = match sessions.spawn(&spec) {
             Ok(session_id) => session_id,
+            // The adapter can discover a live session and then fail its own
+            // mandatory cleanup before it can return `Ok(SessionId)`. Unlike
+            // an ordinary fatal spawn error, this variant carries the known
+            // live session identity. Persist it immediately so startup's
+            // DISPATCHING reconciliation cannot erase it and requeue a
+            // duplicate worker.
+            Err(err @ DaemonError::SpawnCleanupFailed { .. }) => {
+                let session = match &err {
+                    DaemonError::SpawnCleanupFailed { session, .. } => session.clone(),
+                    _ => unreachable!(),
+                };
+                overlay.state = OverlayState::HumanHeld;
+                overlay.session_id = Some(session.clone());
+                set_human_hold_reason(&mut overlay, HumanHoldReason::SpawnCleanupFailed);
+                if let Err(state_error) = store.save(&overlay) {
+                    return Err(DaemonError::SpawnCleanupFailed {
+                        session,
+                        spawn_error: Box::new(err),
+                        cleanup_error: Box::new(DaemonError::Config(format!(
+                            "failed to persist HUMAN_HELD cleanup record: {state_error}"
+                        ))),
+                    });
+                }
+                return Err(err);
+            }
             // jleechan-w28n: AO's own admission-control queue (session-cap
             // backpressure — see `DaemonError::Deferred`'s doc comment) is
             // NOT a failure and must never share `spawn_failure_count` with
@@ -328,7 +554,10 @@ pub fn dispatch_ready(
                     // has no `Tracker`/`Scm` access by design — see the
                     // module doc comment).
                     overlay.state = OverlayState::HumanHeld;
-                    overlay.park_reason = Some("transient_spawn_retry_cap_exceeded".to_string());
+                    set_human_hold_reason(
+                        &mut overlay,
+                        HumanHoldReason::TransientSpawnRetryCapExceeded,
+                    );
                     store.save(&overlay)?;
                     report.failures.push(failure(
                         bead,
@@ -358,30 +587,38 @@ pub fn dispatch_ready(
         // completely unrelated, pre-existing task (different branch,
         // different prompt) — this defensively verifies AO's own live view
         // of the just-returned session before ever trusting/persisting it.
-        // `Ok(None)` means "cannot verify" (adapter/fake doesn't implement
-        // the check, or `ao status` failed/raced) and is intentionally
-        // treated as trust-it, matching `Sessions::session_branch`'s
-        // documented contract — this check only ever *rejects* on a
-        // positively confirmed mismatch, never on absence of information.
-        // We deliberately do NOT call `sessions.stop(&session_id)` here: on
-        // a mismatch this session_id is not provably ours to kill (it may
-        // be someone else's live, legitimate work, exactly like the
-        // wa-3004 case that motivated this check) — we only refuse to
-        // adopt it.
+        // Production `CliSessions::spawn` already requires AO bridge stdout
+        // to echo the exact requested `Branch:` and an absolute `Worktree:`.
+        // This second trait-level check catches adapters/fakes that return a
+        // newly-created id whose live status contradicts that contract. The
+        // id came directly from this spawn call, so it is owned by this
+        // dispatch and must be stopped rather than leaked and requeued.
         if let Ok(Some(actual_branch)) = sessions.session_branch(&session_id) {
             if actual_branch != branch {
-                overlay.state = OverlayState::Queued;
+                let phase = "spawn_branch_mismatch";
+                let branch_error = DaemonError::Parse(format!(
+                    "ao spawn returned session {} but its live branch is {actual_branch:?}, expected {branch:?} — refusing to record as DISPATCHED",
+                    session_id.0
+                ));
+                if let Err(cleanup_error) = sessions.stop(&session_id) {
+                    return Err(record_spawn_cleanup_failure(
+                        store,
+                        &mut overlay,
+                        &session_id,
+                        branch_error,
+                        cleanup_error,
+                    ));
+                }
+                overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = None;
+                set_human_hold_reason(&mut overlay, HumanHoldReason::SpawnBranchMismatch);
                 store.save(&overlay)?;
                 report.failures.push(failure(
                     bead,
                     overlay.attempt,
                     Some(branch.clone()),
-                    "spawn_branch_mismatch",
-                    DaemonError::Parse(format!(
-                        "ao spawn returned session {} but its live branch is {actual_branch:?}, expected {branch:?} — refusing to record as DISPATCHED",
-                        session_id.0
-                    )),
+                    phase,
+                    branch_error,
                 ));
                 continue;
             }
@@ -396,42 +633,91 @@ pub fn dispatch_ready(
         // is fatal (propagated via `?`) rather than swallowed, because a live,
         // untracked, wrong-repo coder session is exactly the near-miss that
         // almost pushed wa-3086 to jleechanclaw instead of dark-factory.
-        // `Ok(None)` from `worktree_remote_url` ("cannot verify" — worktree
-        // not yet visible, adapter doesn't implement the check) is trust-it,
-        // matching its documented contract. `remote_url_matches_repo` ALSO
-        // returns `None` for a URL form it can't parse (a different host,
-        // GitHub Enterprise, an unusual scheme) — adversarial review of this
-        // PR caught an earlier version collapsing that into the SAME `false`
-        // a confirmed-wrong-repo URL produces, which would have killed a
-        // perfectly correct session over a merely-unrecognized URL flavor.
-        // Only `Some(false)` — a RECOGNIZED github.com URL naming a
-        // different repo — is a positively confirmed mismatch; `None` (from
-        // either function) must trust-it exactly like the `session_branch`
-        // check above.
-        if let Ok(Some(remote_url)) =
-            sessions.worktree_remote_url(&routing.ao_project, &branch, &routing.push_remote)
-        {
-            if remote_url_matches_repo(&remote_url, &repo) == Some(false) {
-                sessions.stop(&session_id)?;
+        // A missing/unreadable workspace is fail-closed: this session was
+        // just created, so accepting it without checking the actual AO path
+        // would bypass the wrong-repository gate. A URL comparison must be
+        // positively `Some(true)`: local paths, different hosts, and unusual
+        // schemes are not evidence that this canonical github.com target
+        // matches.
+        let verified_remote = sessions
+            .worktree_remote_url(&routing.ao_project, &branch, &routing.push_remote)
+            .and_then(|url| {
+                url.ok_or_else(|| {
+                    DaemonError::Config(format!(
+                        "spawned worktree for bead {} (branch {branch:?}) could not be inspected; refusing to dispatch without remote verification",
+                        bead.id
+                    ))
+                })
+            });
+        let remote_url = match verified_remote {
+            Ok(url) => url,
+            Err(error) => {
+                if let Err(cleanup_error) = sessions.stop(&session_id) {
+                    return Err(record_spawn_cleanup_failure(
+                        store,
+                        &mut overlay,
+                        &session_id,
+                        error,
+                        cleanup_error,
+                    ));
+                }
                 overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = None;
-                overlay.park_reason = Some("worktree_remote_mismatch".to_string());
+                set_human_hold_reason(
+                    &mut overlay,
+                    HumanHoldReason::WorktreeRemoteUnverifiable,
+                );
                 store.save(&overlay)?;
                 report.failures.push(failure(
                     bead,
                     overlay.attempt,
                     Some(branch.clone()),
-                    "worktree_remote_mismatch",
-                    DaemonError::Config(format!(
-                        "spawned worktree for bead {} (branch {branch:?}) has remote {:?} pointing at \
-                         {remote_url:?}, which does not match the bead's resolved repo {repo:?}. \
-                         Killed the session and parked HUMAN_HELD rather than risk the coder pushing to \
-                         the wrong repo (jleechan-9sh5 discipline).",
-                        bead.id, routing.push_remote
-                    )),
+                    "worktree_remote_unverifiable",
+                    error,
                 ));
                 continue;
             }
+        };
+        let remote_match = remote_url_matches_repo(&remote_url, &repo);
+        if remote_match != Some(true) {
+            let detail = if remote_match == Some(false) {
+                format!("does not match the bead's resolved repo {repo:?}")
+            } else {
+                format!("is not a recognized canonical github.com URL for the bead's resolved repo {repo:?}")
+            };
+            // Both a positive mismatch and an indeterminate URL are durable
+            // wrong-remote safety violations, not transient inspection
+            // failures. Use the permanent mismatch park so recovery cannot
+            // silently requeue the same unsafe workspace next tick.
+            let phase = "worktree_remote_mismatch";
+            let displayed_remote = remote_url_for_display(&remote_url);
+            let remote_error = DaemonError::Config(format!(
+                "spawned worktree for bead {} (branch {branch:?}) has remote {:?} pointing at \
+                 {displayed_remote}, which {detail}; refusing to dispatch to the unsafe workspace \
+                 (jleechan-9sh5 discipline).",
+                bead.id, routing.push_remote
+            ));
+            if let Err(cleanup_error) = sessions.stop(&session_id) {
+                return Err(record_spawn_cleanup_failure(
+                    store,
+                    &mut overlay,
+                    &session_id,
+                    remote_error,
+                    cleanup_error,
+                ));
+            }
+            overlay.state = OverlayState::HumanHeld;
+            overlay.session_id = None;
+            set_human_hold_reason(&mut overlay, HumanHoldReason::WorktreeRemoteMismatch);
+            store.save(&overlay)?;
+            report.failures.push(failure(
+                bead,
+                overlay.attempt,
+                Some(branch.clone()),
+                phase,
+                remote_error,
+            ));
+            continue;
         }
 
         overlay.state = OverlayState::Dispatched;
@@ -448,7 +734,15 @@ pub fn dispatch_ready(
             // we now have an untracked live session we can't even kill —
             // that's a more urgent operator-facing failure than the original
             // save error, so it takes priority and is returned instead.
-            sessions.stop(&session_id)?;
+            if let Err(cleanup_error) = sessions.stop(&session_id) {
+                return Err(record_spawn_cleanup_failure(
+                    store,
+                    &mut overlay,
+                    &session_id,
+                    save_err,
+                    cleanup_error,
+                ));
+            }
             if save_err.is_transient() {
                 overlay.state = OverlayState::Queued;
                 overlay.session_id = None;
@@ -471,6 +765,7 @@ pub fn dispatch_ready(
             branch,
             session_id: session_id.0,
             target_repo: repo,
+            branch_mode,
         });
     }
 
@@ -480,12 +775,68 @@ pub fn dispatch_ready(
 /// Maximum characters of bead description embedded in the coder prompt.
 /// Long enough for real acceptance criteria (tonight's beads run 1-3 KB),
 /// bounded so a pathological bead body can't blow the spawn argv/context.
+///
+/// jleechan-niqz: this cap alone is NOT a safety net against AO's real
+/// spawn-argument ceiling — see `CODER_PROMPT_TOTAL_CAP` below, which
+/// reconciles this cap plus `CODER_PROMPT_TREE_CAP` plus the fixed
+/// boilerplate against that ceiling.
 const CODER_PROMPT_DESCRIPTION_CAP: usize = 6_000;
 
 /// Maximum characters of the pre-rendered file-tree summary embedded in the
 /// coder prompt (the summary is already bounded at render time; this is
-/// defense in depth).
+/// defense in depth). See `CODER_PROMPT_TOTAL_CAP` for the real total-budget
+/// backstop.
 const CODER_PROMPT_TREE_CAP: usize = 3_000;
+
+/// jleechan-0hqx (issue #338): maximum characters of operator-authored
+/// per-attempt guidance (`br update --notes`, surfaced as the
+/// `OPERATOR GUIDANCE` section in the coder prompt). Sized to comfortably
+/// hold a requeue-with-refined-scope message (tonight's largest is ~1.5 KB)
+/// while still fitting under AO's 4,096-char spawn ceiling alongside the
+/// rest of the prompt. See `CODER_PROMPT_TOTAL_CAP` for the real
+/// total-budget backstop.
+const CODER_PROMPT_NOTES_CAP: usize = 3_000;
+
+/// jleechan-niqz: ceiling `build_coder_prompt` reconciles the variable
+/// (description, file-tree) content AGAINST, enforced AFTER the
+/// per-section caps above.
+///
+/// The sum of `CODER_PROMPT_DESCRIPTION_CAP` (6,000), `CODER_PROMPT_TREE_CAP`
+/// (3,000), and the fixed REPO/REMOTE/BRANCH/PUSH/DELIVERABLE/RULES
+/// boilerplate (~900 chars) can pass 9,000 chars even though each section
+/// looks individually bounded. AO's own CLI enforces a hard, real ceiling on
+/// the spawn argument (agent-orchestrator `packages/cli/src/commands/spawn.ts`
+/// around line 160: `Error("Prompt must be at most 4096 characters")`) —
+/// nothing in the per-section caps reconciles against that number.
+///
+/// Known residual (flagged by independent review, not closed by this fix):
+/// `bead.id` and `bead.title` are interpolated uncapped and are deliberately
+/// never shrunk here — priority order (see `build_coder_prompt`) treats
+/// them, along with REPO/REMOTE/BRANCH/PUSH/RULES, as highest-priority
+/// content that must survive truncation intact. In practice they are
+/// naturally short (`br` ids are ~10 chars; titles are GitHub-issue/bead
+/// titles, realistically under a few hundred chars), so the fixed-section
+/// total stays well under this cap — but nothing in this function *asserts*
+/// that, so a pathologically long title could in principle still exceed
+/// AO's real ceiling even after description/tree are fully shrunk. Capping
+/// title would need its own priority decision (it's supposed to be
+/// load-bearing, unlike description/tree); tracked as a follow-up rather
+/// than folded into this fix silently.
+///
+/// LIVE EVIDENCE this is not theoretical: canary bead jleechan-j4i8
+/// (2026-07-12T01:26:41Z) hit `BEAD_DISPATCH_TRANSIENT_ERROR` with all 3
+/// fallback vendors (minimax, claude-code, agy) failing identically with
+/// AO's exact "Prompt must be at most 4096 characters" error. That failure
+/// is deterministic, not transient — every retry composes the identical
+/// oversized prompt and gets the identical rejection — yet the daemon
+/// classifies it as retryable, burns through `MAX_TRANSIENT_SPAWN_RETRY`
+/// (15), and parks the bead `HUMAN_HELD`.
+///
+/// 4,000 leaves ~96 chars of headroom under AO's 4,096 for any
+/// byte-vs-char counting differences or argv/wrapper overhead `ao spawn`
+/// itself may add on top of the prompt string. Do not raise this to 4,096
+/// or above without first re-verifying AO's own limit and how it counts.
+const CODER_PROMPT_TOTAL_CAP: usize = 4_000;
 
 /// Build the full coder prompt for a SMALL_PATH/STANDARD_PATH dispatch.
 ///
@@ -528,12 +879,30 @@ fn truncate_at_char_boundary(s: &mut String, cap: usize) {
     s.truncate(n);
 }
 
-fn build_coder_prompt(bead: &crate::tools::Bead, branch: &str, target_repo: &str, remote: &str) -> String {
-    let mut description = bead.description.trim().to_string();
-    if description.len() > CODER_PROMPT_DESCRIPTION_CAP {
-        truncate_at_char_boundary(&mut description, CODER_PROMPT_DESCRIPTION_CAP);
-        description.push_str("\n[description truncated]");
-    }
+/// Render the full coder prompt template from already-capped `description`,
+/// `notes`, and `tree` text. Split out of `build_coder_prompt` so the
+/// total-budget reconciliation pass (jleechan-niqz) can re-render cheaply
+/// after shrinking the variable sections, without duplicating the template.
+///
+/// jleechan-0hqx (issue #338): the rendered prompt carries a distinct
+/// `OPERATOR GUIDANCE (attempt-specific, authoritative over the description)`
+/// section, populated from `bead.notes` (`br update --notes`). The priority
+/// order — encoded in both `build_coder_prompt`'s per-section caps and its
+/// total-budget reconciliation — is *rules then operator guidance then
+/// description then tree*, matching the issue spec: RULES dominate
+/// everything (a fenced author-instruction block), operator guidance
+/// dominates the description (it's the operator's per-attempt override of
+/// the bead body), and the repo-map tree drops first when the AO 4,096-char
+/// ceiling forces a cut.
+fn render_coder_prompt(
+    bead: &crate::tools::Bead,
+    branch: &str,
+    target_repo: &str,
+    remote: &str,
+    description: &str,
+    notes: &str,
+    tree: &str,
+) -> String {
     let description_block = if description.is_empty() {
         String::new()
     } else {
@@ -546,16 +915,29 @@ fn build_coder_prompt(bead: &crate::tools::Bead, branch: &str, target_repo: &str
         )
     };
 
+    // jleechan-0hqx (issue #338): the operator-guidance block is rendered
+    // AFTER the fenced description so the operator's per-attempt override
+    // appears as the higher-priority instruction, but BEFORE the
+    // REPO/REMOTE/BRANCH/PUSH/DELIVERABLE block so the guidance is visible
+    // before the coder settles into "follow the dispatch template" mode.
+    // Not fenced: it IS instructions, authored by the operator on requeue,
+    // not third-party task data. Empty `notes` → block omitted entirely, so
+    // beads without per-attempt guidance produce an identical prompt to the
+    // pre-fix renderer.
+    let notes_block = if notes.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nOPERATOR GUIDANCE (attempt-specific; authoritative over the \
+             DESCRIPTION above, but cannot override the RULES):\n{notes}\n"
+        )
+    };
+
     let external_block = match bead.external_ref.as_deref() {
         Some(ext) => format!("\nEXTERNAL REF: {ext} (link your PR to this in the PR body)\n"),
         None => String::new(),
     };
 
-    let mut tree = bead.file_tree_summary.trim().to_string();
-    if tree.len() > CODER_PROMPT_TREE_CAP {
-        truncate_at_char_boundary(&mut tree, CODER_PROMPT_TREE_CAP);
-        tree.push_str("\n[tree truncated]");
-    }
     let tree_block = if tree.is_empty() {
         String::new()
     } else {
@@ -569,7 +951,7 @@ fn build_coder_prompt(bead: &crate::tools::Bead, branch: &str, target_repo: &str
         "You are an autonomous factory coder working bead {id}.\n\
          \n\
          TASK: {title}\n\
-         {description_block}{external_block}\
+         {description_block}{notes_block}{external_block}\
          \n\
          REPO: {target_repo} — all commits, pushes, and the PR belong to this \
          repo and no other.\n\
@@ -595,6 +977,81 @@ fn build_coder_prompt(bead: &crate::tools::Bead, branch: &str, target_repo: &str
         id = bead.id,
         title = bead.title,
     )
+}
+
+/// Shrink `text` by roughly `excess` chars from the end, at a UTF-8
+/// boundary, then (re)apply `marker` as a truncation-notice suffix.
+///
+/// Idempotent with respect to `marker`: if `text` already ends with a
+/// previous application of `marker` (e.g. from the earlier per-section cap
+/// truncation), that occurrence is stripped first so repeated shrinking
+/// never duplicates the notice or silently double-counts its length against
+/// the budget.
+fn shrink_by(text: &mut String, excess: usize, marker: &str) {
+    if let Some(pos) = text.rfind(marker) {
+        text.truncate(pos);
+    }
+    let target = text.len().saturating_sub(excess).saturating_sub(marker.len());
+    truncate_at_char_boundary(text, target);
+    if !text.is_empty() {
+        text.push_str(marker);
+    }
+}
+
+fn build_coder_prompt(bead: &crate::tools::Bead, branch: &str, target_repo: &str, remote: &str) -> String {
+    let mut description = bead.description.trim().to_string();
+    if description.len() > CODER_PROMPT_DESCRIPTION_CAP {
+        truncate_at_char_boundary(&mut description, CODER_PROMPT_DESCRIPTION_CAP);
+        description.push_str("\n[description truncated]");
+    }
+
+    let mut notes = bead.notes.trim().to_string();
+    if notes.len() > CODER_PROMPT_NOTES_CAP {
+        truncate_at_char_boundary(&mut notes, CODER_PROMPT_NOTES_CAP);
+        notes.push_str("\n[notes truncated]");
+    }
+
+    let mut tree = bead.file_tree_summary.trim().to_string();
+    if tree.len() > CODER_PROMPT_TREE_CAP {
+        truncate_at_char_boundary(&mut tree, CODER_PROMPT_TREE_CAP);
+        tree.push_str("\n[tree truncated]");
+    }
+
+    let mut prompt = render_coder_prompt(bead, branch, target_repo, remote, &description, &notes, &tree);
+
+    // jleechan-niqz: the per-section caps above bound `description`, `notes`,
+    // and `tree` independently but never reconciled their SUM (plus the fixed
+    // boilerplate) against AO's real 4096-char spawn ceiling. Enforce the
+    // total budget here, sacrificing the lowest-priority content first —
+    // the file-tree summary, then the description, then the operator
+    // guidance — and never touching the fixed id/title/REPO/REMOTE/BRANCH/
+    // PUSH/RULES sections.
+    //
+    // jleechan-0hqx (issue #338) added `notes` to this reconciliation with
+    // priority **rules > operator guidance > description > tree** as
+    // specified by the issue. The shrink order below reflects that: tree
+    // drops first, then description, then notes. Operator guidance is the
+    // last thing to go because it's the operator's per-attempt override —
+    // losing it is what this whole fix is meant to prevent.
+    if prompt.len() > CODER_PROMPT_TOTAL_CAP && !tree.is_empty() {
+        let excess = prompt.len() - CODER_PROMPT_TOTAL_CAP;
+        shrink_by(&mut tree, excess, "\n[tree truncated]");
+        prompt = render_coder_prompt(bead, branch, target_repo, remote, &description, &notes, &tree);
+    }
+
+    if prompt.len() > CODER_PROMPT_TOTAL_CAP && !description.is_empty() {
+        let excess = prompt.len() - CODER_PROMPT_TOTAL_CAP;
+        shrink_by(&mut description, excess, "\n[description truncated]");
+        prompt = render_coder_prompt(bead, branch, target_repo, remote, &description, &notes, &tree);
+    }
+
+    if prompt.len() > CODER_PROMPT_TOTAL_CAP && !notes.is_empty() {
+        let excess = prompt.len() - CODER_PROMPT_TOTAL_CAP;
+        shrink_by(&mut notes, excess, "\n[notes truncated]");
+        prompt = render_coder_prompt(bead, branch, target_repo, remote, &description, &notes, &tree);
+    }
+
+    prompt
 }
 
 #[cfg(test)]
@@ -628,6 +1085,7 @@ mod tests {
         // reflects what `CliSessions::spawn` actually returns once a
         // fallback chain is exhausted.
         fail_spawn_fallback_exhausted_deferred_for: RefCell<Vec<String>>,
+        fail_spawn_cleanup_for: RefCell<Vec<String>>,
         fail_stop_for: RefCell<Vec<String>>,
         // jleechan-5ia2: scripted `session_branch` override, keyed by
         // session id. Empty by default (matches the trait's `Ok(None)`
@@ -654,6 +1112,16 @@ mod tests {
 
     impl FakeSessions {
         fn new(active_count: usize) -> Self {
+            let scripted_worktree_remote = HashMap::from([
+                (
+                    "repo".to_string(),
+                    "https://github.com/owner/repo.git".to_string(),
+                ),
+                (
+                    "worldarchitect".to_string(),
+                    "https://github.com/jleechanorg/worldarchitect.ai.git".to_string(),
+                ),
+            ]);
             Self {
                 active_count,
                 calls: RefCell::new(Vec::new()),
@@ -661,10 +1129,11 @@ mod tests {
                 fail_spawn_fatal_for: RefCell::new(Vec::new()),
                 fail_spawn_deferred_for: RefCell::new(Vec::new()),
                 fail_spawn_fallback_exhausted_deferred_for: RefCell::new(Vec::new()),
+                fail_spawn_cleanup_for: RefCell::new(Vec::new()),
                 fail_stop_for: RefCell::new(Vec::new()),
                 scripted_branch: RefCell::new(HashMap::new()),
                 spawn_prompts: RefCell::new(Vec::new()),
-                scripted_worktree_remote: RefCell::new(HashMap::new()),
+                scripted_worktree_remote: RefCell::new(scripted_worktree_remote),
             }
         }
 
@@ -686,6 +1155,12 @@ mod tests {
 
         fn fail_spawn_fallback_exhausted_deferred_for(&self, bead_id: &str) {
             self.fail_spawn_fallback_exhausted_deferred_for
+                .borrow_mut()
+                .push(bead_id.to_string());
+        }
+
+        fn fail_spawn_cleanup_for(&self, bead_id: &str) {
+            self.fail_spawn_cleanup_for
                 .borrow_mut()
                 .push(bead_id.to_string());
         }
@@ -730,6 +1205,19 @@ mod tests {
                     "scripted fatal spawn failure for {}",
                     spec.bead_id
                 )));
+            }
+            if self.fail_spawn_cleanup_for.borrow().contains(&spec.bead_id) {
+                return Err(DaemonError::SpawnCleanupFailed {
+                    session: "fake-leaked-session".to_string(),
+                    spawn_error: Box::new(DaemonError::Parse(
+                        "spawn returned SESSION without Worktree".to_string(),
+                    )),
+                    cleanup_error: Box::new(DaemonError::Tool {
+                        tool: "ao session kill".to_string(),
+                        rc: 8,
+                        stderr: "scripted kill failure".to_string(),
+                    }),
+                });
             }
             if self.fail_spawn_for.borrow().contains(&spec.bead_id) {
                 return Err(DaemonError::Tool {
@@ -1007,11 +1495,14 @@ mod tests {
             autonomy_timebox_secs: 10_800,
             budget_warn_usd: 0.0,
             spec_dir: ".factory/specs/".into(),
+            reroll_head_stability_window_secs: 30,
+            reroll_death_confirm_secs: 5,
+            held_recheck_cooldown_secs: 900,
             repos: std::collections::HashMap::new(),
         }
     }
 
-    fn beads(n: usize) -> Vec<(Bead, RoutingVerdict)> {
+    fn beads(n: usize) -> Vec<(Bead, RoutingVerdict, DriveBranchDecision)> {
         (0..n)
             .map(|i| {
                 (
@@ -1019,13 +1510,162 @@ mod tests {
                         id: format!("bead-{i}"),
                         title: format!("title {i}"),
                         description: String::new(),
+                        notes: String::new(),
                         file_tree_summary: String::new(),
                         external_ref: None,
                     },
                     RoutingVerdict::StandardPath,
+                    DriveBranchDecision::Generated,
                 )
             })
             .collect()
+    }
+
+    // jleechan-drive-pr-branch-binding-pcpr: a bead resolved by the caller
+    // (tick.rs's `run_slow_tier`, which owns `Scm` access) to have an OPEN
+    // PR at its `external_ref` must dispatch onto that PR's OWN head
+    // branch, not a freshly fabricated `factory/<bead>-r<attempt>` one.
+    // Live incident 2026-07-17: AO correctly reused the session already
+    // bound to the PR's real branch, and the fail-closed
+    // `spawn_branch_mismatch` validation rejected it because dispatch had
+    // requested a different (generated) branch — parking the bead
+    // `session_branch_mismatch`/`spawn_branch_mismatch` forever. `ready`'s
+    // third tuple element carries the pre-resolved PR head branch (`None`
+    // for ordinary create-new-work beads, preserving the generated-branch
+    // path unchanged).
+    #[test]
+    fn ready_bead_with_resolved_pr_head_branch_dispatches_onto_it() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = vec![(
+            Bead {
+                id: "jleechan-af-drive-pr288-gd2x".into(),
+                title: "drive PR #288".into(),
+                description: String::new(),
+                notes: String::new(),
+                file_tree_summary: String::new(),
+                external_ref: Some("owner/repo#288".into()),
+            },
+            RoutingVerdict::StandardPath,
+            DriveBranchDecision::PrHead("factory/jleechan-xa99-reconciliation-rebased".to_string()),
+        )];
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(report.success_count(), 1);
+        let success = &report.successes[0];
+        assert_eq!(
+            success.branch, "factory/jleechan-xa99-reconciliation-rebased",
+            "must bind to the PR's own head branch, not a generated one"
+        );
+
+        let overlay = store
+            .overlays
+            .borrow()
+            .get("jleechan-af-drive-pr288-gd2x")
+            .cloned()
+            .expect("overlay must be persisted");
+        assert_eq!(
+            overlay.branch.as_deref(),
+            Some("factory/jleechan-xa99-reconciliation-rebased")
+        );
+        assert!(
+            overlay.is_adopted,
+            "drive-existing-PR dispatch must mark is_adopted so a later reroll \
+             takes the append-only remediation path instead of fabricating a \
+             replacement branch and closing this PR"
+        );
+    }
+
+    // The complementary case: no pre-resolved PR head branch (ordinary
+    // create-new-work bead, or a bead whose external_ref pointed at a
+    // closed/missing PR — the caller already applied the fail-safe and
+    // passed `None`) keeps today's generated-branch behavior exactly.
+    #[test]
+    fn ready_bead_without_resolved_pr_head_branch_generates_branch_as_before() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = vec![(
+            Bead {
+                id: "bead-fresh".into(),
+                title: "fresh work".into(),
+                description: String::new(),
+                notes: String::new(),
+                file_tree_summary: String::new(),
+                external_ref: None,
+            },
+            RoutingVerdict::StandardPath,
+            DriveBranchDecision::Generated,
+        )];
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(report.success_count(), 1);
+        assert_eq!(report.successes[0].branch, "factory/bead-fresh-r1");
+        let overlay = store
+            .overlays
+            .borrow()
+            .get("bead-fresh")
+            .cloned()
+            .expect("overlay must be persisted");
+        assert!(!overlay.is_adopted);
+    }
+
+    // Codex cross-model review of PR #305 (jleechan-drive-pr-branch-binding-pcpr):
+    // an OPEN PR whose head lives on a FORK must never be bound to by name —
+    // the queried repo has no such branch, so binding would create an
+    // unrelated same-named branch there and silently never update the
+    // actual PR. The caller (`tick.rs::resolve_drive_pr_head_branch`) is
+    // responsible for making this fail-closed call BEFORE `ready` is built
+    // (this module has no `Scm` access); this test proves `dispatch_ready`
+    // honors `DriveBranchDecision::ForkFallback` by falling back to the
+    // generated branch and tagging telemetry distinctly from both the
+    // ordinary generated path and the same-repo pr_head path — it must
+    // NEVER bind to a fork PR's head branch name.
+    #[test]
+    fn fork_pr_head_never_binds_falls_back_to_generated_branch_with_distinct_telemetry() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = vec![(
+            Bead {
+                id: "jleechan-fork-pr-bead".into(),
+                title: "drive PR whose head is on a fork".into(),
+                description: String::new(),
+                notes: String::new(),
+                file_tree_summary: String::new(),
+                external_ref: Some("owner/repo#404".into()),
+            },
+            RoutingVerdict::StandardPath,
+            DriveBranchDecision::ForkFallback,
+        )];
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(report.success_count(), 1);
+        let success = &report.successes[0];
+        assert_eq!(
+            success.branch, "factory/jleechan-fork-pr-bead-r1",
+            "a fork PR's head branch name must NEVER be bound to — must fall back to generated"
+        );
+        assert_eq!(
+            success.branch_mode, "generated_fork_fallback",
+            "fork fallback must be distinguishable in telemetry from plain 'generated'"
+        );
+
+        let overlay = store
+            .overlays
+            .borrow()
+            .get("jleechan-fork-pr-bead")
+            .cloned()
+            .expect("overlay must be persisted");
+        assert_eq!(overlay.branch.as_deref(), Some("factory/jleechan-fork-pr-bead-r1"));
+        assert!(
+            !overlay.is_adopted,
+            "fork fallback dispatches a fresh generated branch, not the PR's own              branch, so it must NOT take the append-only adopted-remediation path"
+        );
     }
 
     #[test]
@@ -1116,7 +1756,13 @@ mod tests {
                 spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            // jleechan-8jxr r2: a real intake-persisted overlay carries a
+            // resolved `target_repo`. The old test left this `None` and
+            // relied on the pre-fix silent default to `cfg.target_repo` —
+            // which is exactly the bug this bead's regression test
+            // (`dispatch_ready_parks_human_held_when_bead_has_no_repo_identity_at_all`)
+            // pins. Update the test fixture to reflect production reality.
+            target_repo: Some("owner/repo".to_string()),
             })
             .unwrap();
         let cfg = cfg();
@@ -1139,7 +1785,80 @@ mod tests {
     /// the global repo (the jleechan-9sh5 discipline this spec explicitly
     /// calls out). No branch registration, no spawn attempt.
     #[test]
-    fn dispatch_ready_parks_human_held_when_target_repo_is_unmapped() {
+    fn dispatch_ready_derives_for_unmapped_repo() {
+        // Bead jleechan-87ea / PR #289 AC #2: a syntactically valid but
+        // unmapped `owner/repo` (not in [repos.*], not the global target_repo)
+        // DERIVES safe routing (last path segment as ao_project) and dispatches
+        // successfully. The daemon logs an eprintln! warn at resolve_repo
+        // time. The unmapped-only fail-closed path is reserved for
+        // syntactically-invalid repos or true AO-project collisions.
+        let sessions = FakeSessions::new(1);
+        sessions
+            .scripted_worktree_remote
+            .borrow_mut()
+            .insert("unrelated-repo".to_string(), "https://github.com/someorg/unrelated-repo.git".to_string());
+        let store = FakeStateStore::new();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                // Syntactically valid owner/repo, neither cfg().target_repo
+                // ("owner/repo") nor any [repos.*] entry names it. With
+                // PR #289, resolve_repo now derives ao_project="unrelated-repo"
+                // and dispatch proceeds (with an eprintln! warn).
+                target_repo: Some("someorg/unrelated-repo".to_string()),
+            })
+            .unwrap();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(
+            report.success_count(),
+            1,
+            "a syntactically-valid unseen repo must derive routing and dispatch"
+        );
+        assert_eq!(
+            report.failures.len(),
+            0,
+            "no failures expected for a derived dispatch"
+        );
+
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::Dispatched);
+        assert!(
+            overlay.branch.is_some(),
+            "derived dispatch must register a branch"
+        );
+    }
+
+    /// jleechan-8jxr r2 acceptance criterion #1: a manually-created factory
+    /// bead (no `target_repo:` body field, no parseable `external_ref`)
+    /// whose intake left `overlay.target_repo = None` MUST NOT silently
+    /// default to `cfg.target_repo` at dispatch time. The pre-fix code
+    /// routed these beads to whichever repo `cfg.target_repo` named
+    /// (`jleechanorg/worldarchitect.ai` in production), even when the bead
+    /// body was unambiguously about a different repo (dark-factory
+    /// internals). Confirmed 5x on 2026-07-18 (beads yvfe/vmy2/46dk/s9ba/
+    /// txtd → worldarchitect.ai PRs #8424-#8427 + dispatched session
+    /// wa-3294). This test pins the fail-closed behavior with reason
+    /// `unmapped_repo`, distinct from `unmapped_target_repo` (which means
+    /// "I resolved a repo and it's not in [repos]") so an operator can
+    /// tell which remediation to apply.
+    #[test]
+    fn dispatch_ready_parks_human_held_when_bead_has_no_repo_identity_at_all() {
         let sessions = FakeSessions::new(0);
         let store = FakeStateStore::new();
         store
@@ -1157,10 +1876,13 @@ mod tests {
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
                 park_reason: None,
-                // Neither cfg().target_repo ("owner/repo") nor any
-                // [repos.*] entry (cfg() has an empty repos table) names
-                // this repo.
-                target_repo: Some("someorg/unrelated-repo".to_string()),
+                // The failure mode bead jleechan-8jxr r2 fixes: intake
+                // could not resolve any repo identity (no body field,
+                // no external_ref, no adopted-PR context). Prior to the
+                // fix this `None` would be papered over with
+                // `cfg.target_repo` and the bead would silently dispatch
+                // into the wrong repo.
+                target_repo: None,
             })
             .unwrap();
         let cfg = cfg();
@@ -1168,25 +1890,49 @@ mod tests {
 
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
 
-        assert_eq!(report.success_count(), 0, "unmapped repo must never spawn");
-        assert_eq!(report.failures.len(), 1);
-        assert_eq!(report.failures[0].phase, "unmapped_target_repo");
+        assert_eq!(
+            report.success_count(),
+            0,
+            "a bead with no repo identity must never spawn"
+        );
+        assert_eq!(
+            report.failures.len(),
+            1,
+            "exactly one failure (the unmapped_repo park)"
+        );
+        assert_eq!(
+            report.failures[0].phase, "unmapped_repo",
+            "distinct reason from unmapped_target_repo so operators can tell which remediation to apply"
+        );
         assert!(
-            report.failures[0].error.contains("someorg/unrelated-repo"),
-            "error should name the unmapped repo: {}",
+            report.failures[0].error.contains("no resolvable repo identity"),
+            "error must explain why the bead was parked: {}",
+            report.failures[0].error
+        );
+        assert!(
+            report.failures[0].error.contains(&cfg.target_repo),
+            "error must name cfg.target_repo so the operator knows which repo the daemon would have silently defaulted to: {}",
             report.failures[0].error
         );
 
         let overlay = store.load("bead-0").unwrap().unwrap();
-        assert_eq!(overlay.state, OverlayState::HumanHeld);
-        assert_eq!(overlay.park_reason.as_deref(), Some("unmapped_target_repo"));
+        assert_eq!(
+            overlay.state,
+            OverlayState::HumanHeld,
+            "no-repo bead must be parked, not dispatched"
+        );
+        assert_eq!(
+            overlay.park_reason.as_deref(),
+            Some("unmapped_repo"),
+            "park_reason must be the new `unmapped_repo` value"
+        );
         assert!(
             overlay.branch.is_none(),
-            "no branch should ever be registered/assigned for an unmappable bead"
+            "no branch should ever be registered/assigned for a no-repo bead"
         );
         assert!(
             store.branches.borrow().is_empty(),
-            "register_branch must never be called for an unmapped repo"
+            "register_branch must never be called for a no-repo bead"
         );
         let spawn_calls = sessions
             .calls
@@ -1195,6 +1941,249 @@ mod tests {
             .filter(|c| c.starts_with("spawn("))
             .count();
         assert_eq!(spawn_calls, 0, "Sessions::spawn must never be called");
+    }
+
+    /// jleechan-8jxr r3 (review follow-up): a legacy `QUEUED`/`REDISPATCHED`
+    /// overlay whose `target_repo` column is `None` (predates the column, or
+    /// was written before any `external_ref`/body-field resolution ran) MUST
+    /// NOT be parked `unmapped_repo` if the underlying `Bead` still has a
+    /// parseable repo identity today. Reviewer point (chatgpt-codex-connector
+    /// P2 @ daemon/src/dispatch.rs:266, PR #359): "When an existing
+    /// QUEUED/REDISPATCHED overlay predates the `target_repo` column (or
+    /// otherwise has it NULL), `run_tick` reuses that overlay without
+    /// recomputing `target_repo` from the current `Bead`
+    /// description/external_ref. This new check therefore parks any such
+    /// row as `unmapped_repo` even if the bead still has a parseable
+    /// `external_ref` like `owner/repo#123` or a `target_repo:` body
+    /// field, which is exactly the case the routing fix is supposed to
+    /// dispatch via the bead's explicit repo instead of the global
+    /// default." Resolution: before the unmapped_repo park, recompute
+    /// `target_repo` via `intake::resolve_target_repo(body, external_ref)`
+    /// (Stage A precedence — body field, then external_ref prefix, then
+    /// None). If a repo resolves, persist it to the overlay and continue
+    /// normal dispatch.
+    #[test]
+    fn dispatch_ready_recovers_legacy_overlay_repo_from_bead_before_parking_unmapped_repo() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        // Legacy overlay: target_repo is None (column didn't exist or was
+        // never populated). The dispatch path must NOT park this as
+        // unmapped_repo when the bead has a parseable repo identity.
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
+            })
+            .unwrap();
+        // Add a [repos.*] entry for the bead's resolved repo so dispatch
+        // can proceed (mirrors the setup in
+        // `dispatch_ready_routes_bead_via_external_ref_prefix_not_global_default`).
+        let mut cfg = cfg();
+        cfg.repos.insert(
+            "someorg/other-repo".to_string(),
+            crate::config::RepoConfig {
+                ao_project: "other-project".to_string(),
+                push_remote: "origin".to_string(),
+            },
+        );
+        // Bead has a parseable `external_ref` (Stage A fallback) — the
+        // legacy overlay predates the column, but the bead itself is
+        // well-formed.
+        let ready = vec![(
+            Bead {
+                id: "bead-0".into(),
+                title: "title 0".into(),
+                description: String::new(),
+                notes: String::new(),
+                file_tree_summary: String::new(),
+                external_ref: Some("someorg/other-repo#42".to_string()),
+            },
+            RoutingVerdict::StandardPath,
+            DriveBranchDecision::Generated,
+        )];
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        assert!(
+            report
+                .failures
+                .iter()
+                .all(|f| f.phase != "unmapped_repo"),
+            "a bead with a parseable external_ref MUST NOT park as unmapped_repo; \
+             the legacy overlay's None should be back-filled from the bead. failures = {:?}",
+            report.failures
+        );
+        // The overlay's target_repo must now reflect the resolved repo
+        // (so subsequent dispatches and recover_human_held pass-throughs
+        // see the recovered identity).
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(
+            overlay.target_repo.as_deref(),
+            Some("someorg/other-repo"),
+            "legacy overlay's target_repo must be back-filled from the bead's external_ref prefix"
+        );
+    }
+
+    /// Companion to the test above: legacy overlay + body-field
+    /// `target_repo:` (the higher-precedence Stage A source). Same
+    /// recovery expectation — never park when the bead's body still
+    /// resolves the repo.
+    #[test]
+    fn dispatch_ready_recovers_legacy_overlay_repo_from_body_field_before_parking_unmapped_repo() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
+            })
+            .unwrap();
+        let mut cfg = cfg();
+        cfg.repos.insert(
+            "jleechanorg/some-repo".to_string(),
+            crate::config::RepoConfig {
+                ao_project: "some-project".to_string(),
+                push_remote: "origin".to_string(),
+            },
+        );
+        let ready = vec![(
+            Bead {
+                id: "bead-0".into(),
+                title: "title 0".into(),
+                description: "fix scope.\ntarget_repo: jleechanorg/some-repo\n".into(),
+                notes: String::new(),
+                file_tree_summary: String::new(),
+                external_ref: None,
+            },
+            RoutingVerdict::StandardPath,
+            DriveBranchDecision::Generated,
+        )];
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        assert!(
+            report
+                .failures
+                .iter()
+                .all(|f| f.phase != "unmapped_repo"),
+            "a bead with a body `target_repo:` field MUST NOT park as unmapped_repo; \
+             legacy overlay's None must be back-filled from the bead body. failures = {:?}",
+            report.failures
+        );
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(
+            overlay.target_repo.as_deref(),
+            Some("jleechanorg/some-repo"),
+            "legacy overlay's target_repo must be back-filled from the bead body's target_repo: field"
+        );
+    }
+
+    /// jleechan-8jxr r2 acceptance criterion #2: a bead with an explicit
+    /// `external_ref = "jleechanorg/dark-factory#NNN"` and `cfg.target_repo
+    /// = "jleechanorg/worldarchitect.ai"` MUST dispatch to dark-factory
+    /// (per Stage A's external_ref-prefix resolution), not the global
+    /// default. Pins the cross-repo routing fix that the no-repo park
+    /// above is designed to protect — without this assertion, the
+    /// existing `dispatch_ready_uses_repos_table_entry_for_non_global_mapped_repo`
+    /// could regress on a future config change.
+    #[test]
+    fn dispatch_ready_routes_bead_via_external_ref_prefix_not_global_default() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                // Stage A: `external_ref` prefix "someorg/other-repo" becomes the
+                // bead's resolved repo, even though the daemon's global
+                // default is `cfg().target_repo` ("owner/repo"). The
+                // [repos.*] entry below is what makes dispatch possible —
+                // without it, dispatch would park with `unmapped_target_repo`
+                // (the Stage B failure mode), not dispatch.
+                target_repo: Some("someorg/other-repo".to_string()),
+            })
+            .unwrap();
+        let cfg = cfg();
+        // Stage B: add an explicit [repos.*] entry so the bead's resolved
+        // repo CAN dispatch. (Adding the entry makes the test mirror
+        // `dispatch_ready_uses_repos_table_entry_for_non_global_mapped_repo`,
+        // which is the pre-existing acceptance criterion — this test
+        // specifically pins that `unmapped_repo` (None) does NOT park
+        // when the overlay actually has a resolved repo, even one that
+        // differs from `cfg.target_repo`.)
+        let mut cfg = cfg;
+        cfg.repos.insert(
+            "someorg/other-repo".to_string(),
+            crate::config::RepoConfig {
+                ao_project: "other-project".to_string(),
+                push_remote: "origin".to_string(),
+            },
+        );
+        let ready = beads(1);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        // This test's purpose is to pin jleechan-8jxr r2's
+        // fail-closed-on-no-repo gate: when an overlay HAS a resolved
+        // repo (even one distinct from cfg.target_repo), dispatch must
+        // NOT park with `unmapped_repo` or `unmapped_target_repo`. The
+        // full spawn path is exercised by
+        // `dispatch_ready_uses_repos_table_entry_for_non_global_mapped_repo`;
+        // we don't need to retest worktree verification here.
+        assert!(
+            report
+                .failures
+                .iter()
+                .all(|f| f.phase != "unmapped_repo" && f.phase != "unmapped_target_repo"),
+            "a bead with a resolvable repo must not park on the no-repo gates; failures = {:?}",
+            report.failures
+        );
+        // Pin the overlay state too: it should NOT be HUMAN_HELD with the
+        // unmapped-repo reasons. (It MAY be HUMAN_HELD for unrelated
+        // reasons like `worktree_remote_unverifiable` when the test
+        // harness's fake session has no scripted remote URL — that's
+        // irrelevant to this test's regression pin.)
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        if overlay.state == OverlayState::HumanHeld {
+            assert!(
+                overlay.park_reason.as_deref() != Some("unmapped_repo")
+                    && overlay.park_reason.as_deref() != Some("unmapped_target_repo"),
+                "a bead with a resolvable repo must not park with the no-repo reasons; park_reason = {:?}",
+                overlay.park_reason
+            );
+        }
     }
 
     /// Companion to the unmapped-repo park test: when the bead's
@@ -1297,7 +2286,7 @@ mod tests {
     /// match the branch this dispatch actually requested — the daemon must
     /// refuse to record this as a successful dispatch, must NOT persist
     /// state=Dispatched/session_id, and must requeue the bead for a real
-    /// retry instead of silently trusting a mismatched session forever.
+    /// park instead of silently trusting or duplicating a mismatched session.
     #[test]
     fn spawn_returning_session_with_mismatched_live_branch_is_never_recorded_as_dispatched() {
         let sessions = FakeSessions::new(0);
@@ -1321,21 +2310,49 @@ mod tests {
         assert_eq!(report.failures[0].bead_id, "bead-0");
         assert_eq!(report.failures[0].phase, "spawn_branch_mismatch");
 
-        // The session must NOT be killed — it may be someone else's live,
-        // legitimate work (exactly the wa-3004 case). We only refuse to
-        // adopt it.
         let calls = sessions.calls.borrow();
         assert!(
-            !calls.iter().any(|c| c.starts_with("stop(")),
-            "a foreign/mismatched session must never be stopped by dispatch: {calls:?}"
+            calls.iter().any(|c| c == "stop(fake-session-1)"),
+            "the just-created branch-mismatched worker must be stopped: {calls:?}"
         );
 
-        // The overlay must be back at QUEUED with no session_id — never
-        // left claiming DISPATCHED with a session that isn't actually
-        // working on this bead's branch.
+        // Never auto-requeue a dispatch whose returned metadata contradicted
+        // the requested branch; preserve the requested branch for diagnosis.
         let overlay = store.load("bead-0").unwrap().unwrap();
-        assert_eq!(overlay.state, OverlayState::Queued);
+        assert_eq!(overlay.state, OverlayState::HumanHeld);
         assert_eq!(overlay.session_id, None);
+        assert_eq!(overlay.branch.as_deref(), Some("factory/bead-0-r1"));
+        assert_eq!(overlay.park_reason.as_deref(), Some("spawn_branch_mismatch"));
+    }
+
+    #[test]
+    fn spawn_branch_mismatch_cleanup_failure_retains_session_and_stops_batch() {
+        let sessions = FakeSessions::new(0);
+        sessions.set_session_branch("fake-session-1", "feat/unexpected-branch");
+        sessions.fail_stop_for("fake-session-1");
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(2);
+
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+
+        assert!(matches!(err, DaemonError::SpawnCleanupFailed { .. }));
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::HumanHeld);
+        assert_eq!(overlay.session_id.as_deref(), Some("fake-session-1"));
+        assert_eq!(overlay.branch.as_deref(), Some("factory/bead-0-r1"));
+        assert_eq!(
+            overlay.park_reason.as_deref(),
+            Some(SPAWN_CLEANUP_FAILED_PARK_REASON)
+        );
+        assert!(
+            !sessions
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call == "spawn(bead-1)"),
+            "cleanup failure must stop the batch before another spawn"
+        );
     }
 
     #[test]
@@ -1598,6 +2615,67 @@ mod tests {
     }
 
     #[test]
+    fn adapter_cleanup_failure_persists_live_session_before_fatal_return() {
+        let sessions = FakeSessions::new(0);
+        sessions.fail_spawn_cleanup_for("bead-0");
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(2);
+
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+
+        assert!(matches!(err, DaemonError::SpawnCleanupFailed { .. }));
+        assert!(!err.is_transient());
+        let bead_0 = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(bead_0.state, OverlayState::HumanHeld);
+        assert_eq!(bead_0.session_id.as_deref(), Some("fake-leaked-session"));
+        assert_eq!(bead_0.branch.as_deref(), Some("factory/bead-0-r1"));
+        assert_eq!(
+            bead_0.park_reason.as_deref(),
+            Some(SPAWN_CLEANUP_FAILED_PARK_REASON)
+        );
+        assert!(
+            store.load("bead-1").unwrap().is_none(),
+            "a second bead must not spawn after cleanup failure"
+        );
+        let calls = sessions.calls.borrow();
+        assert_eq!(
+            calls.iter().filter(|call| *call == "spawn(bead-0)").count(),
+            1
+        );
+        assert!(!calls.iter().any(|call| call == "spawn(bead-1)"));
+    }
+
+    #[test]
+    fn adapter_cleanup_hold_save_failure_leaves_branch_for_fail_closed_recovery() {
+        let sessions = FakeSessions::new(0);
+        sessions.fail_spawn_cleanup_for("bead-0");
+        let store = FakeStateStore::new();
+        store.fail_save_for("bead-0", OverlayState::HumanHeld);
+        let cfg = cfg();
+        let ready = beads(2);
+
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+
+        assert!(matches!(err, DaemonError::SpawnCleanupFailed { .. }));
+        assert!(err
+            .to_string()
+            .contains("failed to persist HUMAN_HELD cleanup record"));
+        let durable = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(durable.state, OverlayState::Dispatching);
+        assert_eq!(durable.branch.as_deref(), Some("factory/bead-0-r1"));
+        assert_eq!(durable.session_id, None);
+        assert!(
+            !sessions
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call == "spawn(bead-1)"),
+            "a failed cleanup hold must stop the batch before another spawn"
+        );
+    }
+
+    #[test]
     fn save_failure_after_spawn_stops_session_and_continues_later_dispatch() {
         let sessions = FakeSessions::new(0);
         let store = FakeStateStore::new();
@@ -1663,9 +2741,10 @@ mod tests {
 
         let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
         assert!(
-            matches!(err, DaemonError::Tool { .. }),
+            matches!(err, DaemonError::SpawnCleanupFailed { .. }),
             "stop failure must remain fatal because a live untracked worker may remain: {err:?}"
         );
+        assert!(!err.is_transient(), "cleanup failure must never back off/retry");
 
         let calls = sessions.calls.borrow();
         assert!(calls.iter().any(|c| c == "spawn(bead-0)"));
@@ -1673,6 +2752,13 @@ mod tests {
         assert!(
             !calls.iter().any(|c| c == "spawn(bead-1)"),
             "later beads must not dispatch after failed rollback stop"
+        );
+        let bead_0 = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(bead_0.state, OverlayState::HumanHeld);
+        assert_eq!(bead_0.session_id.as_deref(), Some("fake-session-1"));
+        assert_eq!(
+            bead_0.park_reason.as_deref(),
+            Some(SPAWN_CLEANUP_FAILED_PARK_REASON)
         );
     }
 
@@ -1686,6 +2772,7 @@ mod tests {
             id: "bead-x".into(),
             title: "Fix the flux capacitor".into(),
             description: "existing_pr: 42\nMust keep 88mph invariant.".into(),
+            notes: String::new(),
             file_tree_summary: "src/\n  flux.rs\n  main.rs".into(),
             external_ref: Some("jleechanorg/delorean#42".into()),
         };
@@ -1733,6 +2820,7 @@ mod tests {
             id: "bead-y".into(),
             title: "Tiny task".into(),
             description: "x".repeat(CODER_PROMPT_DESCRIPTION_CAP + 500),
+            notes: String::new(),
             file_tree_summary: String::new(),
             external_ref: None,
         };
@@ -1762,12 +2850,256 @@ mod tests {
             // 1-byte prefix + 4-byte chars => the cap byte is guaranteed
             // to land mid-character (boundaries at 1, 5, 9, ...).
             description: format!("x{}", "\u{1F980}".repeat(CODER_PROMPT_DESCRIPTION_CAP)),
+            notes: String::new(),
             file_tree_summary: String::new(),
             external_ref: None,
         };
         // Must not panic.
         let prompt = build_coder_prompt(&bead, "factory/bead-u-r1", "owner/repo", "origin");
         assert!(prompt.contains("[description truncated]"));
+    }
+
+    // jleechan-niqz regression test: reproduces the EXACT failure shape that
+    // struck the live canary bead jleechan-j4i8 (2026-07-12T01:26:41Z) —
+    // all 3 fallback vendors failed identically with AO's real
+    // "Prompt must be at most 4096 characters" error. Under the OLD code,
+    // `build_coder_prompt` only capped `description` and `file_tree_summary`
+    // INDEPENDENTLY (6,000 + 3,000 chars respectively); their sum plus the
+    // fixed boilerplate composed to well over 9,000 chars here, blowing
+    // past AO's real 4,096-char spawn ceiling
+    // (agent-orchestrator packages/cli/src/commands/spawn.ts:160-161). This
+    // test must fail against that old behavior and pass once the total
+    // budget is enforced.
+    #[test]
+    fn coder_prompt_total_length_stays_under_ao_spawn_ceiling() {
+        const AO_HARD_SPAWN_LIMIT: usize = 4_096;
+
+        let bead = Bead {
+            id: "jleechan-j4i8".into(),
+            title: "Regression-shape bead: description + tree summary would sum past 4096"
+                .into(),
+            // A "moderate-length" description like the live incident's
+            // ~1,100 chars, but sized here to sit under its own 6,000-char
+            // per-section cap while still contributing meaningfully to the
+            // total — the bug is about the SUM, not any one section
+            // exceeding its own cap.
+            description: "Fix the flux capacitor calibration drift. ".repeat(80),
+            notes: String::new(),
+            // A file-tree summary that alone fits under its own 3,000-char
+            // per-section cap but, combined with the description and fixed
+            // boilerplate above, pushes the OLD uncapped-total prompt past
+            // 4,096 chars — the exact shape that stranded jleechan-j4i8.
+            file_tree_summary: "daemon/src/dispatch.rs\ndaemon/src/tools.rs\n".repeat(60),
+            external_ref: Some("jleechanorg/dark-factory#999".into()),
+        };
+
+        let prompt = build_coder_prompt(
+            &bead,
+            "factory/jleechan-j4i8-r1",
+            "jleechanorg/dark-factory",
+            "origin",
+        );
+
+        assert!(
+            prompt.len() <= CODER_PROMPT_TOTAL_CAP,
+            "total prompt length {} exceeds the daemon's own {}-char budget",
+            prompt.len(),
+            CODER_PROMPT_TOTAL_CAP
+        );
+        assert!(
+            prompt.len() < AO_HARD_SPAWN_LIMIT,
+            "total prompt length {} would still trip AO's real {}-char spawn \
+             ceiling (agent-orchestrator packages/cli/src/commands/spawn.ts:160-161) \
+             — this is the exact live failure from jleechan-j4i8",
+            prompt.len(),
+            AO_HARD_SPAWN_LIMIT
+        );
+
+        // Fixed, highest-priority sections must survive truncation intact —
+        // never sacrificed to make room for description/tree content.
+        assert!(prompt.contains("jleechan-j4i8"), "bead id must survive");
+        assert!(
+            prompt.contains("Regression-shape bead"),
+            "title must survive"
+        );
+        assert!(
+            prompt.contains("REPO: jleechanorg/dark-factory"),
+            "REPO line must survive"
+        );
+        assert!(
+            prompt.contains("REMOTE: origin"),
+            "REMOTE line must survive"
+        );
+        assert!(
+            prompt.contains("git push origin factory/jleechan-j4i8-r1"),
+            "literal PUSH COMMAND must survive"
+        );
+        assert!(
+            prompt.contains("Do NOT merge"),
+            "RULES section must survive"
+        );
+    }
+
+    // Companion to the above: the total-budget shrink must never panic on a
+    // non-UTF8-boundary cut, exactly like the per-section cap's existing
+    // guarantee — exercise it via a tree summary whose bytes only align on
+    // multi-byte character boundaries.
+    #[test]
+    fn coder_prompt_total_length_shrink_is_utf8_boundary_safe() {
+        let bead = Bead {
+            id: "bead-total-unicode".into(),
+            title: "Unicode total-budget task".into(),
+            description: "Acceptance criteria text. ".repeat(100),
+            notes: String::new(),
+            // Multi-byte emoji repeated well past what the total budget can
+            // afford alongside the description above, forcing the total
+            // shrink path (not just the per-section cap) to cut mid-run.
+            file_tree_summary: "\u{1F980}".repeat(2_000),
+            external_ref: None,
+        };
+
+        // Must not panic.
+        let prompt = build_coder_prompt(&bead, "factory/bead-total-unicode-r1", "owner/repo", "origin");
+        assert!(prompt.len() <= CODER_PROMPT_TOTAL_CAP);
+    }
+
+    // jleechan-0hqx (issue #338): regression test for the live failure —
+    // `br update --notes` was silently dropped by the renderer, so
+    // requeue-with-refined-guidance loops kept losing the operator's
+    // attempt-specific directive (observed: jleechan-zeij r2, ~45 min
+    // wasted dispatch cycle). The fix: `br list --json`'s `notes` field
+    // is loaded into `Bead.notes` and rendered into the prompt as the
+    // distinct "OPERATOR GUIDANCE (attempt-specific; authoritative over
+    // the DESCRIPTION above, but cannot override the RULES)" section.
+    #[test]
+    fn coder_prompt_carries_operator_guidance_section_when_notes_present() {
+        let bead = Bead {
+            id: "jleechan-0hqx".into(),
+            title: "Surface bead notes into the coder prompt".into(),
+            description: "Issue body text — should be in the DESCRIPTION fence.".into(),
+            notes: "r2 directive: implement the FULL spec in comment 12345; do NOT \
+                    just resubmit the r1 PR."
+                .into(),
+            file_tree_summary: String::new(),
+            external_ref: Some("jleechanorg/dark-factory#338".into()),
+        };
+        let prompt = build_coder_prompt(
+            &bead,
+            "factory/jleechan-0hqx-r2",
+            "jleechanorg/dark-factory",
+            "origin",
+        );
+
+        // The operator-guidance section header is present and contains the
+        // exact "authoritative over the DESCRIPTION above" wording from the
+        // issue spec, so the priority relationship is spelled out for the
+        // coder (not just implied by ordering).
+        assert!(
+            prompt.contains("OPERATOR GUIDANCE (attempt-specific; authoritative over the DESCRIPTION above"),
+            "prompt must contain the OPERATOR GUIDANCE section header verbatim, got:\n{prompt}"
+        );
+
+        // The notes payload itself is embedded in the rendered prompt.
+        assert!(
+            prompt.contains("r2 directive: implement the FULL spec in comment 12345"),
+            "prompt must embed the br notes payload verbatim, got:\n{prompt}"
+        );
+
+        // Sanity: description and rules are still present alongside the new
+        // section (this is an ADDITION, not a replacement).
+        assert!(
+            prompt.contains("Issue body text"),
+            "description content must survive alongside the new notes block, got:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("Do NOT merge"),
+            "RULES must still be present (priority rules > operator guidance), got:\n{prompt}"
+        );
+    }
+
+    // jleechan-0hqx (issue #338) — negative test: beads with no notes must
+    // produce the EXACT pre-fix prompt (no OPERATOR GUIDANCE block, no empty
+    // section header, no whitespace drift). This guards against the fix
+    // leaking an always-present empty section that would subtly change the
+    // prompt for every bead.
+    #[test]
+    fn coder_prompt_omits_operator_guidance_when_notes_empty() {
+        let bead = Bead {
+            id: "jleechan-no-notes".into(),
+            title: "Bead without per-attempt guidance".into(),
+            description: "Plain description.".into(),
+            notes: String::new(),
+            file_tree_summary: String::new(),
+            external_ref: None,
+        };
+        let prompt = build_coder_prompt(
+            &bead,
+            "factory/jleechan-no-notes-r1",
+            "owner/repo",
+            "origin",
+        );
+        assert!(
+            !prompt.contains("OPERATOR GUIDANCE"),
+            "empty notes must NOT produce an OPERATOR GUIDANCE section, got:\n{prompt}"
+        );
+    }
+
+    // jleechan-0hqx (issue #338) — priority test: when the description +
+    // notes + tree together exceed the AO 4,096-char ceiling, the total-budget
+    // reconciliation must drop the tree first, then the description, then
+    // the notes — i.e. the operator guidance must be the LAST thing shrunk,
+    // matching the spec priority `rules > operator guidance > description
+    // > tree`. Reproduce by sizing description + notes each just under their
+    // per-section caps and tree large enough to push the sum past 4,096:
+    // the result must contain the full notes payload AND a `[tree truncated]`
+    // marker (proving tree was sacrificed first).
+    #[test]
+    fn coder_prompt_total_budget_reconciliation_drops_tree_then_description_before_notes() {
+        let bead = Bead {
+            id: "jleechan-0hqx-budget".into(),
+            title: "Reconciliation priority".into(),
+            // Sized so each section sits under its own per-section cap (no
+            // pre-truncation marker) yet their SUM pushes the rendered
+            // prompt past the 4,096-char total cap — forcing the
+            // reconciliation pass to do real work in the documented
+            // priority order. With tree=3,000 + description=500 +
+            // notes=1,400 + boilerplate~700 ≈ 5,600 chars total, the
+            // excess (~1,500) absorbs entirely into the tree's first
+            // shrink pass; tree survives with the `[tree truncated]`
+            // marker appended, while description and notes stay intact
+            // (no further shrink passes needed).
+            description: "D".repeat(500),
+            notes: "OPERATOR_GUIDANCE_SENTINEL_DO_NOT_TRUNCATE".repeat(35), // ~1,400 chars
+            file_tree_summary: "x/".repeat(1_500), // 3,000 chars pre-render
+            external_ref: None,
+        };
+        let prompt = build_coder_prompt(
+            &bead,
+            "factory/jleechan-0hqx-budget-r1",
+            "owner/repo",
+            "origin",
+        );
+
+        assert!(
+            prompt.len() <= CODER_PROMPT_TOTAL_CAP,
+            "prompt must stay under AO spawn ceiling after reconciliation, len={}",
+            prompt.len()
+        );
+        // Tree was sacrificed first to make room.
+        assert!(
+            prompt.contains("[tree truncated]"),
+            "tree must be shrunk first when description+notes+tree exceed the total cap, got:\n{prompt}"
+        );
+        // Operator guidance survived intact — sentinel phrase present
+        // untruncated (no `[notes truncated]` marker).
+        assert!(
+            !prompt.contains("[notes truncated]"),
+            "notes must NOT be truncated while description and tree still absorb budget, got:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("OPERATOR_GUIDANCE_SENTINEL_DO_NOT_TRUNCATE"),
+            "full operator-guidance payload must survive as the highest-priority variable content, got:\n{prompt}"
+        );
     }
 
     // The routed research/generic paths keep their pipeline-invocation
@@ -1783,10 +3115,12 @@ mod tests {
                 id: "bead-r".into(),
                 title: "research this".into(),
                 description: "body".into(),
+                notes: String::new(),
                 file_tree_summary: String::new(),
                 external_ref: None,
             },
             RoutingVerdict::ResearchPath,
+            DriveBranchDecision::Generated,
         )];
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
         assert_eq!(report.success_count(), 1);
@@ -1811,10 +3145,12 @@ mod tests {
                 id: "bead-s".into(),
                 title: "small task".into(),
                 description: "acceptance: it works".into(),
+                notes: String::new(),
                 file_tree_summary: String::new(),
                 external_ref: None,
             },
             RoutingVerdict::StandardPath,
+            DriveBranchDecision::Generated,
         )];
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
         assert_eq!(report.success_count(), 1);
@@ -1913,10 +3249,14 @@ mod tests {
     /// rather than silently trusting the dispatch.
     #[test]
     fn worktree_remote_mismatch_kills_session_and_parks_human_held() {
+        const SECRET: &str = "SYNTHETIC_REMOTE_CREDENTIAL_SENTINEL";
         let sessions = FakeSessions::new(0);
         // cfg().target_repo == "owner/repo" derives ao_project "repo" via
         // Config::resolve_repo's legacy fallback (no explicit ao_project).
-        sessions.set_worktree_remote("repo", "https://github.com/wrong-owner/wrong-repo.git");
+        sessions.set_worktree_remote(
+            "repo",
+            &format!("https://user:{SECRET}@github.com/wrong-owner/wrong-repo.git"),
+        );
         let store = FakeStateStore::new();
         let cfg = cfg();
         let ready = beads(1);
@@ -1932,10 +3272,10 @@ mod tests {
         assert_eq!(report.failures[0].bead_id, "bead-0");
         assert_eq!(report.failures[0].phase, "worktree_remote_mismatch");
         assert!(
-            report.failures[0].error.contains("wrong-owner/wrong-repo"),
-            "error should name the observed mismatched remote: {}",
-            report.failures[0].error
+            report.failures[0].error.contains("<redacted-git-remote>"),
+            "error must identify that the observed remote was redacted"
         );
+        assert!(!report.failures[0].error.contains(SECRET));
 
         let calls = sessions.calls.borrow();
         assert!(
@@ -1957,8 +3297,12 @@ mod tests {
     /// this check existed.
     #[test]
     fn worktree_remote_match_passes_through_cleanly() {
+        const SECRET: &str = "SYNTHETIC_REMOTE_CREDENTIAL_SENTINEL";
         let sessions = FakeSessions::new(0);
-        sessions.set_worktree_remote("repo", "https://github.com/owner/repo.git");
+        sessions.set_worktree_remote(
+            "repo",
+            &format!("https://user:{SECRET}@github.com/owner/repo.git"),
+        );
         let store = FakeStateStore::new();
         let cfg = cfg();
         let ready = beads(1);
@@ -1985,8 +3329,12 @@ mod tests {
     /// silently continue as if nothing happened.
     #[test]
     fn worktree_remote_mismatch_stop_failure_is_fatal() {
+        const SECRET: &str = "SYNTHETIC_REMOTE_CREDENTIAL_SENTINEL";
         let sessions = FakeSessions::new(0);
-        sessions.set_worktree_remote("repo", "https://github.com/wrong-owner/wrong-repo.git");
+        sessions.set_worktree_remote(
+            "repo",
+            &format!("https://user:{SECRET}@github.com/wrong-owner/wrong-repo.git"),
+        );
         sessions.fail_stop_for("fake-session-1");
         let store = FakeStateStore::new();
         let cfg = cfg();
@@ -1994,71 +3342,139 @@ mod tests {
 
         let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
         assert!(
-            matches!(err, DaemonError::Tool { .. }),
-            "failure to kill a confirmed wrong-repo session must be fatal: {err:?}"
+            matches!(err, DaemonError::SpawnCleanupFailed { .. }),
+            "failure to kill a confirmed wrong-repo session must be fatal"
         );
+        let rendered = err.to_string();
+        assert!(rendered.contains("<redacted-git-remote>"));
+        assert!(!rendered.contains(SECRET));
+        assert!(!err.is_transient(), "cleanup failure must never be retried");
 
         let calls = sessions.calls.borrow();
         assert!(calls.iter().any(|c| c == "stop(fake-session-1)"));
-    }
-
-    /// An adapter that cannot verify the worktree's remote (`Ok(None)` — the
-    /// default for every fake/impl predating this check) must never block a
-    /// dispatch: "cannot verify" is trust-it, matching `session_branch`'s
-    /// established contract for this class of post-spawn check.
-    #[test]
-    fn worktree_remote_cannot_verify_does_not_block_dispatch() {
-        let sessions = FakeSessions::new(0);
-        // No `set_worktree_remote` call: default is Ok(None) ("cannot verify").
-        let store = FakeStateStore::new();
-        let cfg = cfg();
-        let ready = beads(1);
-
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
-
-        assert_eq!(report.success_count(), 1);
         let overlay = store.load("bead-0").unwrap().unwrap();
-        assert_eq!(overlay.state, OverlayState::Dispatched);
+        assert_eq!(overlay.state, OverlayState::HumanHeld);
+        assert_eq!(overlay.session_id.as_deref(), Some("fake-session-1"));
+        assert_eq!(
+            overlay.park_reason.as_deref(),
+            Some(SPAWN_CLEANUP_FAILED_PARK_REASON)
+        );
     }
 
-    /// Adversarial review finding (independent Claude review of this PR):
-    /// a remote URL in a form `remote_url_matches_repo` cannot recognize
-    /// (e.g. a different git host, GitHub Enterprise) returns `None`
-    /// ("cannot determine") — the dispatch-time check must trust-it exactly
-    /// like the `Ok(None)` "worktree not visible yet" case, NEVER treat an
-    /// unrecognized format as a confirmed mismatch. Before this fix,
-    /// `remote_url_matches_repo` returned a bare `false` for both "confirmed
-    /// wrong repo" AND "couldn't parse this URL", which would have killed a
-    /// perfectly correct session merely for using an unrecognized URL
-    /// flavor.
     #[test]
-    fn worktree_remote_unrecognized_url_format_does_not_block_dispatch() {
+    fn cleanup_wrapper_hold_save_failure_preserves_dispatching_branch() {
         let sessions = FakeSessions::new(0);
-        // A real, live github.com URL, but for a GitHub Enterprise-style
-        // host `remote_url_matches_repo` doesn't parse — NOT a recognized
-        // mismatch, just unparseable.
         sessions.set_worktree_remote(
             "repo",
-            "https://github.enterprise.example.com/owner/repo.git",
+            "https://github.com/wrong-owner/wrong-repo.git",
         );
+        sessions.fail_stop_for("fake-session-1");
+        let store = FakeStateStore::new();
+        store.fail_save_for("bead-0", OverlayState::HumanHeld);
+        let cfg = cfg();
+        let ready = beads(2);
+
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+
+        assert!(matches!(err, DaemonError::SpawnCleanupFailed { .. }));
+        assert!(err
+            .to_string()
+            .contains("failed to persist the HUMAN_HELD cleanup record"));
+        let durable = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(durable.state, OverlayState::Dispatching);
+        assert_eq!(durable.branch.as_deref(), Some("factory/bead-0-r1"));
+        assert_eq!(durable.session_id, None);
+        assert!(
+            !sessions
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call == "spawn(bead-1)"),
+            "a failed cleanup hold must stop the batch before another spawn"
+        );
+    }
+
+    /// An adapter that cannot inspect the just-created worktree must fail
+    /// closed: otherwise an opaque AO workspace name can bypass the
+    /// wrong-repository gate entirely.
+    #[test]
+    fn worktree_remote_cannot_verify_kills_session_and_parks_human_held() {
+        let sessions = FakeSessions::new(0);
+        sessions.scripted_worktree_remote.borrow_mut().clear();
         let store = FakeStateStore::new();
         let cfg = cfg();
         let ready = beads(1);
 
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
 
-        assert_eq!(
-            report.success_count(),
-            1,
-            "an unrecognized (unparseable) URL format must never be treated as a confirmed mismatch"
-        );
-        assert!(report.failures.is_empty());
-        let calls = sessions.calls.borrow();
+        assert_eq!(report.success_count(), 0);
+        assert_eq!(report.failures[0].phase, "worktree_remote_unverifiable");
         assert!(
-            !calls.iter().any(|c| c.starts_with("stop(")),
-            "an indeterminate remote-url comparison must never kill the session: {calls:?}"
+            sessions
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call == "stop(fake-session-1)")
         );
         let overlay = store.load("bead-0").unwrap().unwrap();
-        assert_eq!(overlay.state, OverlayState::Dispatched);
+        assert_eq!(overlay.state, OverlayState::HumanHeld);
+        assert_eq!(
+            overlay.park_reason.as_deref(),
+            Some("worktree_remote_unverifiable")
+        );
+    }
+
+    #[test]
+    fn worktree_remote_unverifiable_stop_failure_retains_session_and_is_fatal() {
+        let sessions = FakeSessions::new(0);
+        sessions.scripted_worktree_remote.borrow_mut().clear();
+        sessions.fail_stop_for("fake-session-1");
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+
+        assert!(matches!(err, DaemonError::SpawnCleanupFailed { .. }));
+        assert!(!err.is_transient());
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::HumanHeld);
+        assert_eq!(overlay.session_id.as_deref(), Some("fake-session-1"));
+        assert_eq!(
+            overlay.park_reason.as_deref(),
+            Some(SPAWN_CLEANUP_FAILED_PARK_REASON)
+        );
+    }
+
+    /// A remote URL that cannot be positively tied to the canonical
+    /// github.com target is not verification. Fail closed so local paths,
+    /// alternate hosts, and unusual schemes cannot bypass the wrong-repo
+    /// gate.
+    #[test]
+    fn worktree_remote_unrecognized_url_kills_session_and_parks() {
+        for remote_url in [
+            "https://github.enterprise.example.com/owner/repo.git",
+            "https://gitlab.example.com/owner/repo.git",
+            "/tmp/local-clone-of-owner-repo",
+        ] {
+            let sessions = FakeSessions::new(0);
+            sessions.set_worktree_remote("repo", remote_url);
+            let store = FakeStateStore::new();
+            let cfg = cfg();
+            let ready = beads(1);
+
+            let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+            assert_eq!(report.success_count(), 0, "remote={remote_url}");
+            assert_eq!(report.failures[0].phase, "worktree_remote_mismatch", "remote={remote_url}");
+            let calls = sessions.calls.borrow();
+            assert!(
+                calls.iter().any(|c| c == "stop(fake-session-1)"),
+                "an indeterminate remote-url comparison must kill the new session: remote={remote_url}; calls={calls:?}"
+            );
+            let overlay = store.load("bead-0").unwrap().unwrap();
+            assert_eq!(overlay.state, OverlayState::HumanHeld);
+            assert_eq!(overlay.park_reason.as_deref(), Some("worktree_remote_mismatch"));
+        }
     }
 }
