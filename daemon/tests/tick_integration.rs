@@ -7118,7 +7118,7 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
     let predicate_block: String = guard_src
         .lines()
         .skip(40) // 0-indexed: line 41 (1-indexed) of auto-merge-guard.sh
-        .take(29) // lines 41..=69 inclusive, mirroring test_auto_merge_guard_gate_vocabulary.sh's `sed -n '41,69p'`
+        .take(24) // lines 41..=64 inclusive (the python block ends with print + sys.exit(0) on line 64); line 65 is the bash heredoc end-brace
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
