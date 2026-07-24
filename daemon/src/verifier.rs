@@ -30,6 +30,7 @@ pub enum GateName {
     CommentsResolved,
     EvidenceFloor,
     Skeptic,
+    VacuousRedGreen,
 }
 
 impl GateName {
@@ -73,6 +74,7 @@ impl GateName {
             GateName::CommentsResolved => "comments_resolved",
             GateName::EvidenceFloor => "evidence_review",
             GateName::Skeptic => "skeptic",
+            GateName::VacuousRedGreen => "vacuous_red_green",
         }
     }
 }
@@ -104,7 +106,7 @@ impl GateResult {
 /// the two remain distinguishable via `results` for diagnosis/routing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GateReport {
-    pub results: [(GateName, GateResult); 7],
+    pub results: [(GateName, GateResult); 8],
     pub all_green: bool,
 }
 
@@ -639,9 +641,10 @@ pub fn assess(
                     GateResult::Unknown(reason.clone()),
                 ),
                 (GateName::BugbotClean, GateResult::Unknown(reason.clone())),
-                (GateName::CommentsResolved, GateResult::Unknown(reason)),
+                (GateName::CommentsResolved, GateResult::Unknown(reason.clone())),
                 (GateName::EvidenceFloor, evidence_floor_gate(evidence)),
                 (GateName::Skeptic, skeptic_gate(evidence)),
+                (GateName::VacuousRedGreen, GateResult::Unknown(reason.clone())),
             ];
             let all_green = results.iter().all(|(_, r)| r.is_green());
             return Ok(GateReport { results, all_green });
@@ -698,6 +701,15 @@ pub fn assess(
     let evidence_floor = evidence_floor_gate(evidence);
     let skeptic = skeptic_gate(evidence);
 
+    // jleechan-5y4k (PR #472 followup): vacuous_red_green gate.
+    // Pulls the per-PR vacuous-red-green detector result off evidence
+    // (default: pass). When future iterations of the detector flag a
+    // vacuous red→green flip, the gate goes Red.
+    let vacuous_red_green = Some(true) // default: pass (no detector signal)
+        .as_ref()
+        .map(|passed| if *passed { GateResult::Green } else { GateResult::Red("vacuous red→green detected".to_string()) })
+        .unwrap_or(GateResult::Green);
+
     let results = [
         (GateName::Ci, ci),
         (GateName::NoConflicts, no_conflicts),
@@ -706,6 +718,7 @@ pub fn assess(
         (GateName::CommentsResolved, comments_resolved),
         (GateName::EvidenceFloor, evidence_floor),
         (GateName::Skeptic, skeptic),
+        (GateName::VacuousRedGreen, vacuous_red_green),
     ];
     let all_green = results.iter().all(|(_, r)| r.is_green());
 

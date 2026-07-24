@@ -44,15 +44,11 @@ try:
     g = ctx["gates"]
 except Exception:
     sys.exit(1)                                    # unparseable → block
-# jleechan-240 expand: gate values can be a string ("pass"|"warn"|"fail"|"unknown")
-# or a structured object {"verdict": "...", "evidence":[...]}; the merge-authority
-# guard must block on any fail verdict, not the literal "red" string the original
-# 7-gate schema emitted. Legacy "red" is treated as fail (it was the original
-# blocking token); "warn" and "unknown" stay non-blocking per the documented
-# no-red merge policy (infra walls like CodeRabbit/Bugbot quota should not
-# deadlock the factory).
+# gate values: string OR {"verdict":...}; block on any fail verdict (incl. legacy "red").
+# "warn"/"unknown" stay non-blocking — capped vendors must not deadlock the factory.
 ALIAS = {"pass":"pass","warn":"warn","fail":"fail","unknown":"unknown",
-         "green":"pass","red":"fail","yellow":"warn"}
+         "green":"pass","red":"fail","yellow":"warn",
+         "waived_vendor_unavailable":"waived_vendor_unavailable"}
 def verdict(v):
     if isinstance(v, str):
         return ALIAS.get(v, v)
@@ -63,11 +59,9 @@ fails = [k for k,v in g.items() if verdict(v) == "fail"]
 if fails:
     print("FAIL:" + ",".join(fails)); sys.exit(1)   # any fail → block
 unknowns = [k for k,v in g.items() if verdict(v) == "unknown"]
-if unknowns:
-    print("no-fail (unknowns defer: " + ",".join(unknowns) + ")")
-else:
-    print("no-fail (all gates cleared)")
-sys.exit(0)'
+if unknowns: print("no-fail (unknowns defer: " + ",".join(unknowns) + ")")
+else: print("no-fail (all gates cleared)")
+sys.exit(0)
 }
 
 gh pr list --repo "$REPO" --state open --json number,headRefName \
