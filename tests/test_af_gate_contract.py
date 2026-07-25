@@ -68,9 +68,6 @@ def extract_gate_names_from_rust() -> set[str]:
 
 
 def test_rust_verifier_has_8_gates():
-<<<<<<< HEAD
-    """Verify daemon/src/verifier.rs::GateName has exactly 7 variants."""
-=======
     """Verify daemon/src/verifier.rs::GateName has exactly 8 variants.
 
     Issue #387 (bead jleechan-ijod) added gate 8 (`VacuousRedGreen`) in
@@ -79,7 +76,6 @@ def test_rust_verifier_has_8_gates():
     (line 285) AND the canonical-vocabulary comment block at the top of
     `GateName::as_str` (verifier.rs:46-61).
     """
->>>>>>> 53a3999 (claude/antig: feat(daemon): runtime vacuous-red-green detector + gate-contract updates (#387))
     gates = extract_gate_names_from_rust()
     assert len(gates) == 8, f"Expected 8 gates, got {len(gates)}: {gates}"
     print(f"✓ Rust verifier has {len(gates)} gates: {sorted(gates)}")

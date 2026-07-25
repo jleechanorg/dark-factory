@@ -106,13 +106,6 @@ gh pr list --repo "$TARGET_REPO" --head "factory/<bead_id>-r<attempt>" --state o
 
 For every ATTESTED bead (PR opened/updated), run the canonical 8 gates as defined in
 `daemon/src/verifier.rs::GateName` (`Ci, NoConflicts, CodeRabbitApproved, BugbotClean,
-<<<<<<< HEAD
-CommentsResolved, EvidenceFloor, Skeptic, VacuousRedGreen`). The `code_standards` and `zfc` checks are
-optional advisory reviews — they are NOT required keys in the gate-assessment JSON and their
-absence never blocks `all_green`. If you DO record them, they participate like any recorded
-gate: a `fail` verdict blocks `all_green` and routes through the same `reroll-verdict` fix
-loop. See bead jleechan-1gft for promoting them to required `GateName` gates in the Rust verifier.
-=======
 CommentsResolved, EvidenceFloor, Skeptic, VacuousRedGreen`). The `code_standards` and `zfc`
 checks are optional advisory reviews — they are NOT required keys in the gate-assessment JSON
 and their absence never blocks `all_green`. If you DO record them, they participate like any
@@ -120,7 +113,6 @@ recorded gate: a `fail` verdict blocks `all_green` and routes through the same `
 fix loop. See bead jleechan-1gft for promoting them to required `GateName` gates in the Rust
 verifier. Gate 8 (`VacuousRedGreen`, issue #387 / bead jleechan-ijod) was added in
 PR #389 / r5 commit 175c6ad — runtime vacuous-test detector verdict.
->>>>>>> 53a3999 (claude/antig: feat(daemon): runtime vacuous-red-green detector + gate-contract updates (#387))
 
 | Verdict  | Meaning                                                                | Gate result     |
 |----------|------------------------------------------------------------------------|-----------------|
@@ -131,11 +123,7 @@ PR #389 / r5 commit 175c6ad — runtime vacuous-test detector verdict.
 
 `all_green=true` iff every gate returned `pass` or `warn`. `fail` routes through
 `reroll-verdict → HUMAN_HELD → recover-held → QUEUED` — the bounded fix loop
-<<<<<<< HEAD
-shared with the original 8 gates (7 canonical + VacuousRedGreen); **no parallel implementation**. `unknown`
-=======
 shared with the original 8 gates; **no parallel implementation**. `unknown`
->>>>>>> 53a3999 (claude/antig: feat(daemon): runtime vacuous-red-green detector + gate-contract updates (#387))
 defers to the next tick rather than racing to READY.
 
 ```bash

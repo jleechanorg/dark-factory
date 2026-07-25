@@ -27,16 +27,8 @@ import pytest
 
 from runner.skeptic_gate import (
     MARKER,
-<<<<<<< HEAD
-<<<<<<< HEAD
     ParsedLintRun,
     ParsedTestRun,
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
-    ParsedLintRun,
-    ParsedTestRun,
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     ParsedVerdict,
     ReadBackCheck,
     SkepticResult,
@@ -64,10 +56,6 @@ def _valid_output(
     pr_number: int = 278,
     reason: str = "diff is small and well-scoped",
     identity: str = "codex",
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     test_passed: int = 100,
     test_failed: int = 0,
     test_exit: int = 0,
@@ -75,25 +63,12 @@ def _valid_output(
     lint_errors: int = 0,
     lint_warnings: int = 2,
     grep_cites: str = "runner/skeptic_gate.py:212;tests/test_skeptic_gate.py:94",
-<<<<<<< HEAD
 ) -> str:
     """A canonical 10-line, 1-of-each reviewer output (issue #384).
 
     Includes the four execution-evidence fields required by the
     post-#384 contract. Tests that intentionally exercise the
     missing-evidence rejection path override individual fields.
-=======
-) -> str:
-    """A canonical 6-line, 1-of-each reviewer output.
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
-) -> str:
-    """A canonical 10-line, 1-of-each reviewer output (issue #384).
-
-    Includes the four execution-evidence fields required by the
-    post-#384 contract. Tests that intentionally exercise the
-    missing-evidence rejection path override individual fields.
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
 
     `head_sha` MUST be 40 hex chars by default — that's the strict
     contract. Tests that exercise the short-SHA rejection path use
@@ -106,21 +81,12 @@ def _valid_output(
         f"PR_NUMBER: {pr_number}\n"
         f"REASON: {reason}\n"
         f"IDENTITY: {identity}\n"
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
         f"TEST_RUN_EVIDENCE: passed={test_passed} failed={test_failed} "
         f"skipped=0 exit={test_exit}\n"
         f"LINT_RUN_EVIDENCE: tool={lint_tool} errors={lint_errors} "
         f"warnings={lint_warnings}\n"
         f"GREP_CITES: {grep_cites}\n"
         f"HEAD_COMMIT_VERIFIED: {head_sha}\n"
-<<<<<<< HEAD
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     )
 
 def _ctx(**overrides):
@@ -215,19 +181,10 @@ def test_parse_verdict_handles_case_insensitive_field_lines():
         "pr_number: 278\n"
         "reason: ok\n"
         "identity: codex\n"
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
         "test_run_evidence: passed=100 failed=0 skipped=0 exit=0\n"
         "lint_run_evidence: tool=ruff errors=0 warnings=2\n"
         "grep_cites: foo:1\n"
         "head_commit_verified: abcdef1234567890abcdef1234567890abcdef12\n"
-<<<<<<< HEAD
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     )
     parsed = parse_verdict(out)
     assert parsed is not None
@@ -444,10 +401,6 @@ def _reviewer_result(
                 reason="ok",
                 reviewer_identity=identity,
                 raw_excerpt="",
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
                 test_run_evidence=ParsedTestRun(
                     passed=10, failed=0, skipped=0, exit=0,
                 ),
@@ -456,11 +409,6 @@ def _reviewer_result(
                 ),
                 grep_cites="runner/skeptic_gate.py:212",
                 head_commit_verified=sha,
-<<<<<<< HEAD
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
             ),
             reviewer=reviewer,
         )
@@ -943,21 +891,11 @@ def _inline_structured_verdict(
     identity: str = "codex",
     reason: str = "ok",
 ) -> str:
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     """Return a 10-line structured verdict string (issue #384).
 
     Includes the four execution-evidence fields required by the
     post-#384 contract.
     """
-<<<<<<< HEAD
-=======
-    """Return a 6-line structured verdict string."""
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     return (
         f"VERDICT: {verdict}\n"
         f"HEAD_SHA: {head_sha}\n"
@@ -965,19 +903,10 @@ def _inline_structured_verdict(
         f"PR_NUMBER: 278\n"
         f"REASON: {reason}\n"
         f"IDENTITY: {identity}\n"
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
         f"TEST_RUN_EVIDENCE: passed=10 failed=0 skipped=0 exit=0\n"
         f"LINT_RUN_EVIDENCE: tool=ruff errors=0 warnings=0\n"
         f"GREP_CITES: runner/skeptic_gate.py:212\n"
         f"HEAD_COMMIT_VERIFIED: {head_sha}\n"
-<<<<<<< HEAD
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     )
 
 def _reviewer_stdout(
@@ -2237,10 +2166,6 @@ def test_cli_exposes_perf_log_args(monkeypatch):
         line = log_path.read_text().strip()
         assert "success" in line
         assert "x/y" in line
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
 
 # ===========================================================================
 # Execution-evidence contract (issue #384)
@@ -2605,8 +2530,3 @@ def test_vacuous_regression_fixture_with_fake_test_counts_still_rejected():
         "fabricated evidence with empty GREP_CITES must be rejected — "
         "issue #384 acceptance: gate catches vacuous regression tests"
     )
-<<<<<<< HEAD
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
