@@ -30,8 +30,8 @@ ROOT = Path(__file__).parent.parent
 JSONL = ROOT / ".beads" / "issues.jsonl"
 
 
-def _read_ids() -> list[str]:
-    text = JSONL.read_text(encoding="utf-8")
+def _read_ids(path: Path = JSONL) -> list[str]:
+    text = path.read_text(encoding="utf-8")
     return [
         json.loads(line)["id"]
         for line in text.splitlines()
@@ -122,10 +122,21 @@ def test_br_sync_preserves_id_sort(tmp_path: Path) -> None:
         check=True,
         capture_output=True,
     )
+    # Manually mark as dirty because br update in direct CLI mode may not populate dirty_issues without daemon
+    db_path = tmp_path / ".beads" / "beads.db"
+    subprocess.run(
+        [
+            "sqlite3",
+            str(db_path),
+            "INSERT OR IGNORE INTO dirty_issues (issue_id) VALUES ('jsonlsort-test-a');",
+        ],
+        check=True,
+        capture_output=True,
+    )
     subprocess.run(
         ["br", "sync", "--flush-only"], cwd=tmp_path, check=True, capture_output=True
     )
-    out_ids = _read_ids()
+    out_ids = _read_ids(fixture / "issues.jsonl")
     assert out_ids == sorted(out_ids), (
         f"br sync did not preserve id-sort: got {out_ids}, expected {sorted(out_ids)}"
     )
