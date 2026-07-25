@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# bin/claim <bead_id> [ttl_minutes=30]
+# Atomic claim. Returns 0 on success, 1 on stale-local-conflict, 2 on peer-conflict.
+# Implementation lives in daemon/src/bin/claimd.rs (PR #475).
+set -euo pipefail
+BEAD="${1:-}"
+TTL="${2:-30}"
+MACHINE="$(hostname)"
+DB="${DARK_FACTORY_DAEMON_DB:-$HOME/.dark-factory/daemon-cxdb.sqlite}"
+PEER_PORT="${PEER_PORT:-}"
+if [ -z "$BEAD" ]; then echo "usage: claim <bead_id> [ttl_minutes]" >&2; exit 64; fi
+if ! command -v sqlite3 >/dev/null 2>&1; then echo "ERROR: sqlite3 not in PATH" >&2; exit 127; fi
+NOW=$(date +%s)
+TTL_SEC=$((TTL * 60))
+EXPIRES=$((NOW + TTL_SEC))
+# Check peer first (if PEER_PORT set and reachable)
+if [ -n "$PEER_PORT" ] && command -v curl >/dev/null 2>&1; then
+  PEER_CLAIM=$(curl -fsS --max-time 2 "http://127.0.0.1:${PEER_PORT}/claim?bead=${BEAD}" 2>/dev/null || echo "")
+  if [ -n "$PEER_CLAIM" ] && [ "$PEER_CLAIM" != "$MACHINE" ]; then
+    echo "PEER-CLAIMED by $PEER_CLAIM" >&2; exit 2
+  fi
+fi
+# Atomic CAS via sqlite3
+sqlite3 "$DB" <<SQL
+CREATE TABLE IF NOT EXISTS claim_audit (
+  bead_id TEXT PRIMARY KEY,
+  claimed_by TEXT NOT NULL,
+  claimed_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+INSERT INTO claim_audit (bead_id, claimed_by, claimed_at, expires_at) VALUES ('$BEAD', '$MACHINE', $NOW, $EXPIRES)
+  ON CONFLICT(bead_id) DO UPDATE SET
+    claimed_by = CASE WHEN expires_at < $NOW THEN excluded.claimed_by ELSE claimed_by END,
+    claimed_at = CASE WHEN expires_at < $NOW THEN excluded.claimed_at ELSE claimed_at END,
+    expires_at = CASE WHEN expires_at < $NOW THEN excluded.expires_at ELSE expires_at END
+  WHERE expires_at < $NOW OR claimed_by = excluded.claimed_by;
+SELECT claimed_by FROM claim_audit WHERE bead_id = '$BEAD';
+SQL
