@@ -47,27 +47,31 @@ if ! command -v cargo >/dev/null 2>&1; then
     exit 2
 fi
 
-# Verify merged commit ancestry rather than checking for an ephemeral
-# branch. ce0e72a7 is the merge commit on `main` for the transcript-mtime
-# fix; the original feature branch `fix/jleechan-coder-silent-false-parks-h92r`
-# was deleted post-merge, so a `git branch --show-current` style guard
-# would produce a false NEGATIVE on a healthy repo. Instead, require the
-# merge-commit SHA to be reachable from the dark-factory HEAD (i.e. the
-# dark-factory checkout contains the fix).
-EXPECTED_DF_COMMIT="ce0e72a7650d5c43e6021602b291f162ec8cec81"
+# Gate on fix CONTENT, not commit ancestry. PR #304 was squash-merged, so
+# the branch-side SHA ce0e72a7 exists as an object but is NOT an ancestor
+# of main — an `--is-ancestor` gate false-NEGATIVEs on every healthy
+# checkout (probe run 2026-07-28 against clean origin/main 3cd8b54
+# reproduced exactly that). The durable, rebase/squash-proof signal is the
+# fix's own regression test source: both transcript-liveness test
+# functions must be defined in the daemon test suite.
+CODER_SILENT_TEST_SOURCE="$DARK_FACTORY_HOME/daemon/tests/tick_integration.rs"
 
 if [[ ! -d "$DARK_FACTORY_HOME/daemon" ]]; then
     echo "FAIL: dark-factory checkout not found at $DARK_FACTORY_HOME/daemon" >&2
-    echo "       clone jleechanorg/dark-factory and ensure ${EXPECTED_DF_COMMIT} is reachable" >&2
+    echo "       clone jleechanorg/dark-factory (transcript-mtime fix from PR #304 required)" >&2
     exit 2
 fi
 
-if ! git -C "$DARK_FACTORY_HOME" merge-base --is-ancestor "$EXPECTED_DF_COMMIT" HEAD; then
-    ACTUAL_DF_HEAD="$(git -C "$DARK_FACTORY_HOME" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-    echo "FAIL: dark-factory HEAD ($ACTUAL_DF_HEAD) does not contain required merge commit ${EXPECTED_DF_COMMIT}" >&2
-    echo "       fetch origin and rebase onto/main, or set DARK_FACTORY_HOME to a checkout that does" >&2
-    exit 2
-fi
+for required_test in \
+    "test_wedge_detection_dispatched_coder_silent_saved_by_transcript_activity" \
+    "test_wedge_detection_dispatched_coder_silent_stale_transcript_still_parks"; do
+    if ! grep -q "fn ${required_test}" "$CODER_SILENT_TEST_SOURCE" 2>/dev/null; then
+        ACTUAL_DF_HEAD="$(git -C "$DARK_FACTORY_HOME" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+        echo "FAIL: dark-factory HEAD ($ACTUAL_DF_HEAD) is missing regression test ${required_test}" >&2
+        echo "       (expected in daemon/tests/tick_integration.rs — fetch origin and check out a main containing PR #304's transcript-mtime fix)" >&2
+        exit 2
+    fi
+done
 
 # The two regression tests introduced by ce0e72a7 — operators must see
 # BOTH names appear in the cargo output AND both must show PASS for the
@@ -83,7 +87,7 @@ REQUIRED_TESTS=(
 
 echo "==> Running dark-factory coder_silent regression suite"
 echo "    dark-factory checkout: $DARK_FACTORY_HOME"
-echo "    required merge commit: $EXPECTED_DF_COMMIT (transcript-mtime fix)"
+echo "    required fix source: daemon/tests/tick_integration.rs (transcript-mtime fix, PR #304)"
 echo "    required tests: ${REQUIRED_TESTS[*]}"
 echo
 
