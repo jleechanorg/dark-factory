@@ -1975,6 +1975,89 @@ fn factory_labeled_existing_pr_second_tick_reuses_tracking_bead_without_spawn() 
 }
 
 #[test]
+fn factory_labeled_existing_pr_attested_does_not_re_emit_adoption_each_tick() {
+    // bead jleechan-mdun: cache adoption decisions so the EXISTING_PR_ADOPTED
+    // event is emitted ONCE per adopted PR, NOT on every slow-tier tick.
+    // Pre-fix symptom: ~24.8k EXISTING_PR_ADOPTED rows per day across ~14
+    // attested beads (slow tier 60s × 24h × 14 beads). After the first tick
+    // an adopted PR's overlay sits in Attested (no /er PASS comment yet),
+    // and `should_adopt = !matches!(state, Ready|HumanHeld)` evaluates to
+    // `true` on every subsequent tick — re-writing the overlay and
+    // re-emitting EXISTING_PR_ADOPTED every 60s for the lifetime of the PR.
+    //
+    // Expected behavior: EXISTING_PR_ADOPTED appears EXACTLY ONCE for this
+    // PR across two slow-tier ticks; second tick still re-registers the
+    // branch mapping but is a no-op for adoption telemetry.
+    let mut scm = FakeScm::new();
+    scm.prs.push(LabeledPr {
+        number: 705,
+        title: "Adopted PR waiting on review".into(),
+        body: "no er yet".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#705".into(),
+        head_ref_name: "feature/adopted-pr-705".into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("owner/repo".into()),
+        head_repo_owner_login: Some("owner".into()),
+        head_sha: Some("sha-stub".into()),
+        updated_at_epoch: Some(1_700_000_000),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+    // No /er PASS comment so the verifier cannot promote to Ready — the
+    // bead sits in Attested, which is exactly the steady-state that
+    // triggers the re-emit bug.
+    scm.pr_snapshots.insert(705, qdw_green_snapshot(705, Vec::new()));
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_existing_pr_no_double_adopt.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    run_tick(&deps, 0, 0).expect("first tick adopts PR");
+    let adopted_after_first = count_adopted_events(&telemetry_log);
+    assert_eq!(
+        adopted_after_first, 1,
+        "first tick must emit EXISTING_PR_ADOPTED exactly once; got {adopted_after_first}"
+    );
+    run_tick(&deps, 1, 1).expect("second tick is a no-op for adoption telemetry");
+    let adopted_after_second = count_adopted_events(&telemetry_log);
+    assert_eq!(
+        adopted_after_second, 1,
+        "second tick MUST NOT re-emit EXISTING_PR_ADOPTED for an already-attested PR; got {adopted_after_second}"
+    );
+    let overlay = store.load("fake-bead-1").unwrap().unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::Attested,
+        "steady-state without /er PASS comment is Attested"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+fn count_adopted_events(telemetry_log: &std::path::Path) -> usize {
+    std::fs::read_to_string(telemetry_log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains("\"eventType\":\"EXISTING_PR_ADOPTED\""))
+        .count()
+}
+
+#[test]
 fn factory_labeled_existing_pr_without_session_is_not_parked_as_stalled() {
     let mut scm = FakeScm::new();
     scm.prs.push(LabeledPr {

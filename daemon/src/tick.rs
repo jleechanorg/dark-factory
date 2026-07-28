@@ -105,6 +105,14 @@ pub struct TickSummary {
     /// full reroll cycle by the fast-rejection path" without re-deriving
     /// from telemetry.
     pub gates_assessed_fast_rejected: usize,
+    /// jleechan-mdun: existing-PR-adoption re-emissions suppressed because
+    /// the (bead_id, pr_number, branch, external_ref) tuple already fired
+    /// `EXISTING_PR_ADOPTED` in a prior tick. The full pre-fix behavior
+    /// emitted this event every slow-tier tick for every attested bead;
+    /// this counter records the saved writes so dashboards can quantify
+    /// the dedup (steady state should be roughly
+    /// `adopted_count × ticks_since_first_adoption`).
+    pub adoptions_suppressed: usize,
 }
 
 /// Bounded retry cap for the automated HUMAN_HELD exit. Matches the shell
@@ -1170,6 +1178,7 @@ pub fn run_tick(
             "beadsHeldDispositionRequired": summary.beads_held_disposition_required,
             "escalationsSuppressed": summary.escalations_suppressed,
             "escalationsUndeliverable": summary.escalations_undeliverable,
+            "adoptionsSuppressed": summary.adoptions_suppressed,
         }),
         serde_json::json!({"tick_index": tick_index, "slow_tier_due": slow_tier_due}),
     )?;
@@ -1489,21 +1498,55 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             // branch and closing the contributor's PR.
             overlay.is_adopted = true;
             deps.store.save(&overlay)?;
-        }
-        emit(
-            deps.telemetry_log,
-            &adopted.bead_id,
-            attempt,
-            OverlayState::Attested.as_str(),
-            "EXISTING_PR_ADOPTED",
-            serde_json::json!({}),
-            serde_json::json!({
+            // jleechan-mdun: cache the EXISTING_PR_ADOPTED decision so
+            // re-adoption of an already-attested bead does not re-emit
+            // every slow-tier tick. The pre-fix code emitted the event
+            // unconditionally for every adopted PR on every slow-tier tick,
+            // producing ~24.8k/day telemetry rows for ~14 attested beads
+            // (60s tick × 24h × 14 beads). We hash on
+            // (pr_number, branch, external_ref) — only an actual change
+            // to those fields re-emits (e.g. a head_ref rename). The hash
+            // is recorded via the same escalation_ledger the 1s2q dedup
+            // helper already manages, so no new schema column is needed.
+            let adopt_ctx = serde_json::json!({
                 "pr_number": adopted.pr_number,
                 "branch": adopted.head_ref_name,
                 "external_ref": adopted.external_ref,
-                "newly_created": adopted.newly_created,
-            }),
-        )?;
+            });
+            let adopt_now = now_epoch_secs();
+            let (should_emit_adopt, adopt_ctx_hash) = escalation_dedup_should_emit(
+                deps,
+                &adopted.bead_id,
+                "existing_pr_adopted",
+                &adopt_ctx,
+                adopt_now,
+            )?;
+            if should_emit_adopt {
+                emit(
+                    deps.telemetry_log,
+                    &adopted.bead_id,
+                    attempt,
+                    OverlayState::Attested.as_str(),
+                    "EXISTING_PR_ADOPTED",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "pr_number": adopted.pr_number,
+                        "branch": adopted.head_ref_name,
+                        "external_ref": adopted.external_ref,
+                        "newly_created": adopted.newly_created,
+                    }),
+                )?;
+                record_escalation_emit_dedup(
+                    deps,
+                    &adopted.bead_id,
+                    "existing_pr_adopted",
+                    &adopt_ctx_hash,
+                    adopt_now,
+                )?;
+            } else {
+                summary.adoptions_suppressed += 1;
+            }
+        }
     }
 
     let (created, issue_skip_outcomes) = intake::normalize(deps.scm, deps.tracker, deps.cfg)?;
