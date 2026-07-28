@@ -51,14 +51,7 @@ from typing import List, Optional, Tuple
 
 from runner.skeptic_gate import (
     MARKER,
-<<<<<<< HEAD
-<<<<<<< HEAD
     BeadContract,
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
-    BeadContract,
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
     ReadBackCheck,
     SkepticResult,
     aggregate_results,
@@ -67,16 +60,8 @@ from runner.skeptic_gate import (
     evaluate,
     extract_implementation_identity_from_commit,
     format_comment,
-<<<<<<< HEAD
-<<<<<<< HEAD
     load_bead_contract,
     load_bead_contract_from_bead,
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
-    load_bead_contract,
-    load_bead_contract_from_bead,
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
     verify_published_comment,
     verify_provenance,
 )
@@ -821,55 +806,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         action="store_true",
         help="Disable performance logging under --perf-log-dir.",
     )
-<<<<<<< HEAD
-    parser.add_argument(
-        "--contract-file",
-        default=os.environ.get("SKEPTIC_CONTRACT_FILE", ""),
-        help=(
-            "Path to a JSON file describing the bead's contract (issue #386). "
-            "When supplied, the reviewer prompt embeds the bead's prior "
-            "findings + acceptance items and the gate requires per-item "
-            "verdicts (ADDRESSED / NOT-ADDRESSED / N-A). Without this flag "
-            "the gate runs the legacy 10-field contract (issue #384)."
-        ),
-    )
-    parser.add_argument(
-        "--bead-id",
-        default=os.environ.get("SKEPTIC_BEAD_ID", ""),
-        help=(
-            "Bead id (e.g. 'jleechan-pq08') — when supplied, the gate loads "
-            "the contract from the live `br show --json <id>` source via "
-            "`load_bead_contract_from_bead`. Closes r3 gap 2 (no bead-loading "
-            "path). Mutually exclusive with --contract-file; if both are set "
-            "the CLI fails closed (exit 2) — never silently pick one."
-        ),
-    )
-    parser.add_argument(
-        "--br-bin",
-        default=os.environ.get("SKEPTIC_BR_BIN", "br"),
-        help=(
-            "Path to the `br` binary used by --bead-id. Defaults to `br` "
-            "on PATH. Override for self-hosted runners where the binary "
-            "is pinned at a non-default path."
-        ),
-    )
+
     args = parser.parse_args(argv)
     env = os.environ
 
-<<<<<<< HEAD
-    if args.contract_file and args.bead_id:
-        raise SystemExit(
-            "[skeptic-gate] FATAL: --contract-file and --bead-id are mutually "
-            "exclusive; supply one or the other (or neither for the legacy "
-            "10-field contract, issue #384)."
-        )
-
-=======
-    args = parser.parse_args(argv)
-    env = os.environ
-
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
     # ---- 0. Mutual-exclusivity check: --bead-id vs --contract-file ----------
     # Per issue #386 r3 gap 3: only ONE of these two contract sources may be
     # supplied. Mixing them is operator error (the bead-id load is the live
@@ -881,8 +821,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             "supply one or the other (the bead-id path is the live source "
             "of truth and supersedes --contract-file)."
         )
-
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
     reviewers = _parse_reviewers(args.reviewers_json)
 
     # ---- 1. Resolve PR + SHA, with API equality check ------------------------
@@ -973,80 +911,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 1
 
     # ---- 3. Implementation identity (commit-subject prefix) -----------------
-<<<<<<< HEAD
-    implementation_identity = get_implementation_identity(
-        repo, args.pr_number, head_sha
-    )
-
-<<<<<<< HEAD
-    # ---- 3a. Load bead contract (issue #386 r3) -----------------------------
-    # When the workflow operator wires `--contract-file` or `--bead-id`,
-    # the gate must enforce per-item verdicts against the bead's
-    # acceptance items. A missing or unreadable contract source is a
-    # hard error — we never silently fall back to the legacy 10-field
-    # contract when the operator asked for the contract-echo step.
-    contract: Optional[BeadContract] = None
-    if args.contract_file:
-        try:
-            contract = load_bead_contract(args.contract_file)
-        except (ValueError, TypeError, FileNotFoundError, json.JSONDecodeError) as exc:
-            print(
-                f"[skeptic-gate] contract load failed: {exc}; "
-                "refusing to gate without the operator-supplied contract",
-                file=sys.stderr,
-            )
-            _emit_perf_log(
-                perf_log_dir=args.perf_log_dir,
-                enabled=not args.no_perf_log,
-                repo=repo,
-                pr_number=args.pr_number,
-                head_sha=head_sha,
-                outcome="failure",
-                duration_ms=int((time.monotonic() - _perf_start) * 1000),
-            )
-            return 2
-    elif args.bead_id:
-        # r3 gap 2: load the contract from `br show --json <bead_id>`
-        # so production never depends on a hand-authored contract file.
-        # `load_bead_contract_from_bead` fails closed on subprocess or
-        # parse errors — never silently fabricates a contract.
-        try:
-            contract = load_bead_contract_from_bead(
-                args.bead_id, br_bin=args.br_bin or "br"
-            )
-        except (RuntimeError, ValueError, TypeError, json.JSONDecodeError) as exc:
-            print(
-                f"[skeptic-gate] bead contract load failed for {args.bead_id!r}: {exc}; "
-                "refusing to gate without the operator-supplied contract",
-                file=sys.stderr,
-            )
-            _emit_perf_log(
-                perf_log_dir=args.perf_log_dir,
-                enabled=not args.no_perf_log,
-                repo=repo,
-                pr_number=args.pr_number,
-                head_sha=head_sha,
-                outcome="failure",
-                duration_ms=int((time.monotonic() - _perf_start) * 1000),
-            )
-            return 2
-
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-    # ---- 4. Build prompt ----------------------------------------------------
-    prompt = build_prompt(
-        repo=repo,
-        pr_number=args.pr_number,
-        head_sha=head_sha,
-        base_sha="unknown",
-        diff=diff,
-        implementation_identity=implementation_identity,
-<<<<<<< HEAD
-        contract=contract,
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-    )
-=======
     if args.pr_number and not use_local_git:
         implementation_identity = get_implementation_identity(
             repo, args.pr_number, head_sha
@@ -1064,7 +928,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             implementation_identity = extract_implementation_identity_from_commit(subject)
         except Exception:
             implementation_identity = "unknown"
->>>>>>> 717cfa5 (gemini/gemini-3.5-flash: feat: integrate multi-skeptic review into _gate_skeptic and CLI)
 
     print(
         f"[skeptic-gate] repo={repo} pr=#{args.pr_number} head={head_sha[:12]} "
@@ -1073,53 +936,66 @@ def main(argv: Optional[list[str]] = None) -> int:
         file=sys.stderr,
     )
 
-<<<<<<< HEAD
-    # ---- 5. Run each reviewer (multi-reviewer independence) -----------------
-    per_reviewer: List[SkepticResult] = []
-    for reviewer_name, model in reviewers:
-        if model == "" and reviewer_name == "gemini":
-            model = "gemini-2.5-pro"
-        print(
-            f"[skeptic-gate] invoking reviewer={reviewer_name} "
-            f"model={model or '<account-default>'}",
-            file=sys.stderr,
-        )
-        review_output, review_error = invoke_reviewer(
-            reviewer_name,
-            model,
-            prompt,
-            parent_env=dict(env),
-            codex_bin=args.codex_bin,
-            gemini_bin=args.gemini_bin,
-        )
-        result = evaluate(
-            review_output=review_output,
-            review_error=review_error,
-            repo=repo,
-            pr_number=args.pr_number,
-            head_sha=head_sha,
-            implementation_provenance=implementation_identity,
-            base_sha="unknown",
-            diff=diff,
-            reviewer=reviewer_name,
-<<<<<<< HEAD
-            contract=contract,
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-        )
-        per_reviewer.append(result)
-        print(
-            f"[skeptic-gate] reviewer={reviewer_name} "
-            f"verdict={result.verdict} state={result.check_state} "
-            f"reason={result.reason[:200]}",
-            file=sys.stderr,
-        )
-=======
+    # ---- 3a. Load bead contract (issue #386) --------------------------------
+    # When the workflow operator wires --bead-id or --contract-file, the
+    # gate must enforce per-item verdicts against the bead's acceptance
+    # items. Resolution order (highest precedence first):
+    #   - --bead-id: live source of truth (`br show --json <bead>`).
+    #   - --contract-file: hand-authored JSON path (legacy fallback).
+    #   - neither: legacy 10-field contract (issue #384 invariant).
+    #
+    # A failing `br` lookup OR a missing/unreadable contract file is a
+    # hard error — we never silently fall back to the legacy 10-field
+    # contract when the operator asked for the contract-echo step.
+    contract: Optional[BeadContract] = None
+    if args.bead_id:
+        try:
+            contract = load_bead_contract_from_bead(args.bead_id, br_bin=args.br_bin)
+        except Exception as exc:
+            print(
+                f"[skeptic-gate] bead contract load failed for "
+                f"bead_id={args.bead_id!r}: {exc}; refusing to gate "
+                "without the operator-supplied contract",
+                file=sys.stderr,
+            )
+            _emit_perf_log(
+                perf_log_dir=args.perf_log_dir,
+                enabled=not args.no_perf_log,
+                repo=repo,
+                pr_number=args.pr_number,
+                head_sha=head_sha,
+                outcome="failure",
+                duration_ms=int((time.monotonic() - _perf_start) * 1000),
+            )
+            return 2
+    elif args.contract_file:
+        try:
+            contract = load_bead_contract(args.contract_file)
+        except (ValueError, TypeError, FileNotFoundError, json.JSONDecodeError, OSError) as exc:
+            # OSError covers PermissionError (chmod 0 / 000), IsADirectoryError,
+            # and other read failures that FileNotFoundError alone misses.
+            # All such failures must take the fail-closed return 2 path — never
+            # silently fall through to the legacy 10-field contract.
+            print(
+                f"[skeptic-gate] contract load failed: {exc}; "
+                "refusing to gate without the operator-supplied contract",
+                file=sys.stderr,
+            )
+            _emit_perf_log(
+                perf_log_dir=args.perf_log_dir,
+                enabled=not args.no_perf_log,
+                repo=repo,
+                pr_number=args.pr_number,
+                head_sha=head_sha,
+                outcome="failure",
+                duration_ms=int((time.monotonic() - _perf_start) * 1000),
+            )
+            return 2
+
     # ---- 4. Load rules and Dispatch ------------------------------------------
     from runner.rule_loader import RuleLoader
     from runner.dispatcher import VerifierDispatcher
     from runner.consensus import ConsensusAggregator
->>>>>>> 717cfa5 (gemini/gemini-3.5-flash: feat: integrate multi-skeptic review into _gate_skeptic and CLI)
 
     df_home = pathlib.Path(os.environ.get("DARK_FACTORY_HOME", "/home/jleechan/projects/dark-factory"))
     global_dir = df_home / "config" / "skeptic"

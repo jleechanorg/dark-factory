@@ -23,10 +23,7 @@ These tests prove:
 from __future__ import annotations
 
 import json
-<<<<<<< HEAD
-=======
 import os
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
 import sys
 from typing import List, Optional, Tuple
 
@@ -336,12 +333,6 @@ def _valid_pass_output(identity: str = "codex", *, with_contract_echo: bool = Tr
         f"HEAD_COMMIT_VERIFIED: {head}\n"
     )
     if with_contract_echo:
-<<<<<<< HEAD
-        base += (
-            f"CONTRACT_ECHO:\n"
-            f"ITEM: A1 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1\n"
-            f"ITEM: A2 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:2\n"
-=======
         # r10 (issue #386): prior_findings are now enforced end-to-end,
         # so the fixture output must also emit PRIOR_FINDING: lines for
         # the contract's prior finding (r5 reviewer in the CLI
@@ -351,7 +342,6 @@ def _valid_pass_output(identity: str = "codex", *, with_contract_echo: bool = Tr
             "ITEM: A1 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1\n"
             "ITEM: A2 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:2\n"
             "PRIOR_FINDING: r5 reviewer VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1\n"
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
         )
     return base
 
@@ -367,9 +357,6 @@ def _output_for_reviewer_no_contract(reviewer_name: str) -> str:
     """For the legacy no-contract path: the reviewer MUST NOT emit a
     CONTRACT_ECHO block (the strict 10-field parser rejects it as
     an 11th field)."""
-<<<<<<< HEAD
-    return _output_for_reviewer(reviewer_name, with_contract_echo=False)
-=======
     return _output_for_reviewer(reviewer_name, with_contract_echo=False)
 
 
@@ -468,4 +455,3 @@ def _output_for_reviewer_omitting_prior_findings(reviewer_name: str) -> str:
         "ITEM: A2 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:2\n"
         # NOTE: no PRIOR_FINDING: line — must fail closed.
     )
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
