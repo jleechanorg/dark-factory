@@ -66,9 +66,6 @@ HEAD_SHA = "abcdef1234567890abcdef1234567890abcdef12"
 
 
 def _sample_contract() -> BeadContract:
-<<<<<<< HEAD
-    """A canonical contract with two acceptance items + one prior finding."""
-=======
     """A canonical contract with three acceptance items + one prior finding.
 
     r8 (issue #386 r4 ATTEMPT GUIDANCE gap 6): three items, where the
@@ -78,7 +75,6 @@ def _sample_contract() -> BeadContract:
     constraint block, and the bead must stay ATTESTED so the
     next-round reroll carries the verbatim text.
     """
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
     return BeadContract(
         id="jleechan-pq08",
         description=(
@@ -109,8 +105,6 @@ def _sample_contract() -> BeadContract:
                     "verbatim so the worker reads the exact problem"
                 ),
             ),
-<<<<<<< HEAD
-=======
             AcceptanceItem(
                 id="A3",
                 text=(
@@ -118,7 +112,6 @@ def _sample_contract() -> BeadContract:
                     "fixture exercises parse + evaluate + extract"
                 ),
             ),
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
         ),
     )
 
@@ -129,8 +122,6 @@ def _addressed_output(items: list[ContractEchoItem]) -> str:
     return "CONTRACT_ECHO:\n" + "\n".join(lines)
 
 
-<<<<<<< HEAD
-=======
 def _addressed_output_with_prior_findings(
     items: list[ContractEchoItem],
     prior_sources: list[str],
@@ -145,27 +136,19 @@ def _addressed_output_with_prior_findings(
     return "CONTRACT_ECHO:\n" + "\n".join(lines)
 
 
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
 def _mixed_output() -> str:
     """A reviewer output where one item is NOT-ADDRESSED (the fixture case).
 
     This represents the exact failure mode the issue calls out: the
     diff is small, well-scoped, and the reviewer's other gates all
     pass — but the bead's acceptance items are NOT all addressed.
-<<<<<<< HEAD
-    The contract-echo step MUST fail closed.
-=======
     The contract-echo step MUST fail closed. r8 expanded this to 3
     items so the fixture exercises both ADDRESSED and NOT-ADDRESSED
     branches in a single contract.
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
     """
     return (
         "CONTRACT_ECHO:\n"
         "ITEM: A1 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1\n"
-<<<<<<< HEAD
-        "ITEM: A2 VERDICT: NOT-ADDRESSED REASON: omitted from diff\n"
-=======
         "ITEM: A2 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:2\n"
         "ITEM: A3 VERDICT: NOT-ADDRESSED REASON: omitted from diff\n"
         "PRIOR_FINDING: r5 reviewer VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:42\n"
@@ -190,7 +173,6 @@ def _three_item_round_trip_output() -> str:
         "ITEM: A1 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1\n"
         "ITEM: A2 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:2\n"
         "ITEM: A3 VERDICT: NOT-ADDRESSED REASON: handler missing in daemon\n"
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
     )
 
 
@@ -389,15 +371,11 @@ def test_parse_contract_echo_flags_unknown_item_id():
 
 def test_evaluate_contract_echo_passes_when_all_addressed():
     """Happy path: every acceptance item is ADDRESSED with a real
-<<<<<<< HEAD
-    file:line cite → gate green for the contract-echo step."""
-=======
     file:line cite → gate green for the contract-echo step.
 
     r8: the fixture contract has THREE items (A1, A2, A3); the
     reviewer addresses all three so the gate goes green.
     """
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
     contract = _sample_contract()
     output = _addressed_output(
         [
@@ -413,15 +391,12 @@ def test_evaluate_contract_echo_passes_when_all_addressed():
                 cite="runner/skeptic_gate.py:2",
                 reason="",
             ),
-<<<<<<< HEAD
-=======
             ContractEchoItem(
                 id="A3",
                 verdict="ADDRESSED",
                 cite="runner/skeptic_gate.py:3",
                 reason="",
             ),
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
         ]
     )
     report = parse_contract_echo(output, contract)
@@ -437,12 +412,9 @@ def test_evaluate_contract_echo_fails_closed_on_omitted_item():
     fail closed AND the constraint extraction MUST carry the
     unaddressed item verbatim — the worker reads the exact problem,
     not a paraphrase.
-<<<<<<< HEAD
-=======
 
     r8: the fixture is a 3-item contract where A3 is NOT-ADDRESSED.
     The gate must surface exactly A3 in `unaddressed_items`.
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
     """
     contract = _sample_contract()
     output = _mixed_output()
@@ -452,17 +424,10 @@ def test_evaluate_contract_echo_fails_closed_on_omitted_item():
     assert verdict.ok is False
     assert len(verdict.unaddressed_items) == 1
     unaddressed = verdict.unaddressed_items[0]
-<<<<<<< HEAD
-    assert unaddressed.id == "A2"
-    # Verbatim: the gate must surface the bead's acceptance text
-    # EXACTLY as the author wrote it, not a paraphrase.
-    assert unaddressed.text == contract.acceptance_items[1].text
-=======
     assert unaddressed.id == "A3"
     # Verbatim: the gate must surface the bead's acceptance text
     # EXACTLY as the author wrote it, not a paraphrase.
     assert unaddressed.text == contract.acceptance_items[2].text
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
 
 
 def test_evaluate_contract_echo_constraint_carries_verbatim_text():
@@ -477,18 +442,11 @@ def test_evaluate_contract_echo_constraint_carries_verbatim_text():
     # The constraint string is the canonical input to the next roll —
     # the worker will read this and act on it. Paraphrasing here
     # would silently change the contract, which the contract-echo
-<<<<<<< HEAD
-    # step is explicitly designed to prevent.
-    assert "A2" in verdict.constraint
-    assert (
-        "constraint extraction carries the unaddressed items verbatim"
-=======
     # step is explicitly designed to prevent. r8: A3 is the
     # NOT-ADDRESSED item in the 3-item fixture.
     assert "A3" in verdict.constraint
     assert (
         "3-item ADDRESSED/ADDRESSED/NOT-ADDRESSED round-trip fixture"
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
         in verdict.constraint
     )
 
@@ -500,13 +458,8 @@ def test_evaluate_contract_echo_treats_missing_report_as_not_addressed():
     contract = _sample_contract()
     verdict = evaluate_contract_echo(None, contract)
     assert verdict.ok is False
-<<<<<<< HEAD
-    assert len(verdict.unaddressed_items) == 2
-    assert {it.id for it in verdict.unaddressed_items} == {"A1", "A2"}
-=======
     assert len(verdict.unaddressed_items) == 3
     assert {it.id for it in verdict.unaddressed_items} == {"A1", "A2", "A3"}
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
 
 
 def test_evaluate_contract_echo_all_na_is_pass():
@@ -517,10 +470,7 @@ def test_evaluate_contract_echo_all_na_is_pass():
         "CONTRACT_ECHO:\n"
         "ITEM: A1 VERDICT: N-A REASON: superseded by issue #400\n"
         "ITEM: A2 VERDICT: N-A REASON: handled in a different PR\n"
-<<<<<<< HEAD
-=======
         "ITEM: A3 VERDICT: N-A REASON: out of scope this round\n"
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
     )
     report = parse_contract_echo(output, contract)
     assert report is not None
@@ -530,8 +480,6 @@ def test_evaluate_contract_echo_all_na_is_pass():
 
 
 # ===========================================================================
-<<<<<<< HEAD
-=======
 # Round-trip: 3-item ADDRESSED/ADDRESSED/NOT-ADDRESSED fixture (r8 / issue
 # #386 r4 ATTEMPT GUIDANCE gap 6)
 #
@@ -610,7 +558,6 @@ def test_three_item_addressed_addressed_not_addressed_round_trip():
 
 
 # ===========================================================================
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
 # build_prompt — the contract is in the prompt
 # ===========================================================================
 
@@ -702,26 +649,19 @@ from runner.skeptic_gate import evaluate, aggregate_results, ParsedVerdict, Pars
 
 def _verdict_with_contract_echo(contract: BeadContract) -> str:
     """Build a 10-field PASS verdict + a valid `CONTRACT_ECHO:` block
-<<<<<<< HEAD
-    addressing every acceptance item."""
-=======
     addressing every acceptance item AND every prior finding
     (issue #386 r10 — prior findings are now enforced; the reviewer
     MUST emit PRIOR_FINDING: lines or the gate fails closed)."""
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
     head = HEAD_SHA
     item_lines = "\n".join(
         f"ITEM: {item.id} VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1"
         for item in contract.acceptance_items
     )
-<<<<<<< HEAD
-=======
     prior_lines = "\n".join(
         f"PRIOR_FINDING: {pf.source} VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:42"
         for pf in contract.prior_findings
     )
     block = item_lines + ("\n" + prior_lines if prior_lines else "")
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
     return (
         f"VERDICT: PASS\n"
         f"HEAD_SHA: {head}\n"
@@ -734,11 +674,7 @@ def _verdict_with_contract_echo(contract: BeadContract) -> str:
         f"GREP_CITES: runner/skeptic_gate.py:1\n"
         f"HEAD_COMMIT_VERIFIED: {head}\n"
         f"CONTRACT_ECHO:\n"
-<<<<<<< HEAD
-        f"{item_lines}\n"
-=======
         f"{block}\n"
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
     )
 
 

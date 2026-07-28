@@ -57,7 +57,6 @@ on:
         required: false
         type: string
         default: ""
-<<<<<<< HEAD
       bead_id:
         description: "Optional bead id (issue #386 r3). When set, the gate loads the contract from `br show --json <id>` instead of running the legacy 10-field contract."
         required: false
@@ -68,72 +67,5 @@ on:
         required: false
         type: string
         default: ""
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-
-# Per-PR concurrency so a new push cancels an in-flight run on
-# the old head (matches the gate's own per-SHA concurrency).
-concurrency:
-  group: skeptic-caller-pr-${{ github.event.pull_request.number || inputs.pr_number }}
-  cancel-in-progress: true
-
-permissions:
-  contents: read
-  pull-requests: write
-  statuses: write
-
-jobs:
-  resolve-caller-sha:
-    name: Resolve caller SHA (immutable ref to pin the gate to)
-    runs-on: ubuntu-latest
-    timeout-minutes: 2
-    outputs:
-      caller_sha: ${{ steps.resolve.outputs.caller_sha }}
-    steps:
-      - name: Resolve caller SHA on the default branch
-        # We resolve the commit SHA of the caller workflow file on
-        # the default branch — NOT the file blob SHA (which is what
-        # /contents returns), and NOT the PR head (which is
-        # untrusted). The commit SHA lets the gate `actions/checkout`
-        # at `ref: <commit_sha>` and pull the gate's Python files
-        # at the exact trusted revision.
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          caller_sha=$(gh api \
-            "repos/$GITHUB_REPOSITORY/commits?path=.github/workflows/skeptic-gate-caller.yml&sha=main&per_page=1" \
-            --jq '.[0].sha')
-          if ! echo "$caller_sha" | grep -qE '^[0-9a-f]{40}$'; then
-            echo "[skeptic-caller] FATAL: resolved caller SHA is not 40-hex: $caller_sha"
-            exit 1
-          fi
-          echo "caller_sha=$caller_sha" >> "$GITHUB_OUTPUT"
-          echo "[skeptic-caller] resolved caller SHA=$caller_sha (gate will be pinned to this ref)"
-
-  call-skeptic-gate:
-    name: Call SHA-bound skeptic gate
-    needs: resolve-caller-sha
-    # Reusable-workflow invocation MUST live at the job level; the
-    # `uses:` ref MUST be a static literal (no expressions). We
-    # pin to this caller's own commit SHA on the default branch.
-    uses: jleechanorg/dark-factory/.github/workflows/skeptic-gate.yml@4e23f30266ee63d51b194b5a8a02eea0d38b7a7a
-    with:
-      pr_number: ${{ github.event.pull_request.number || inputs.pr_number }}
-      pr_sha: ${{ github.event.pull_request.head.sha || inputs.pr_sha }}
-      # Forward the server-resolved SHA so the gate can refuse to
-      # run if its checkout disagrees. For workflow_dispatch the
-      # gate derives trusted_code_sha from the workflow ref itself,
-      # so we pass an empty string and the gate's server-side
-      # resolution takes over (see gate workflow line 230-246).
-      trusted_code_sha: ${{ needs.resolve-caller-sha.outputs.caller_sha || '' }}
-<<<<<<< HEAD
-      # r3 (issue #386): forward contract source. Pull from PR
-      # body `bead:` label (preferred — auto-detected per PR) or
-      # fall back to dispatch inputs.
-      bead_id: ${{ inputs.bead_id }}
-      contract_file: ${{ inputs.contract_file }}
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
     secrets:
       github_token: ${{ secrets.GITHUB_TOKEN }}

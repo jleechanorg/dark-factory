@@ -86,20 +86,14 @@ def _valid_pass_output(identity: str = "codex", *, with_contract_echo: bool = Tr
         f"HEAD_COMMIT_VERIFIED: {head}\n"
     )
     if with_contract_echo:
-<<<<<<< HEAD
-=======
         # r10 (issue #386): prior_findings are now enforced, so the
         # fixture output must also emit PRIOR_FINDING: lines for each
         # prior finding on the contract.
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
         base += (
             "CONTRACT_ECHO:\n"
             "ITEM: A1 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1\n"
             "ITEM: A2 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:2\n"
-<<<<<<< HEAD
-=======
             "PRIOR_FINDING: r2 cursor-agent VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1\n"
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
         )
     return base
 
