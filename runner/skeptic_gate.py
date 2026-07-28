@@ -57,10 +57,6 @@ Public surface
 - `build_prompt(...)`                — pure string assembly. No judgment
                                        calls — the reviewer is the one
                                        that judges the diff.
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
 - `BeadContract` / `AcceptanceItem` / `PriorFinding` — the durable
                                        input to the contract-echo step
                                        (issue #386).
@@ -72,9 +68,6 @@ Public surface
                                        (`ADDRESSED file:line` /
                                        `NOT-ADDRESSED` / `N-A` with
                                        reason) from the reviewer's
-<<<<<<< HEAD
-                                       `CONTRACT_ECHO:` block.
-=======
                                        `CONTRACT_ECHO:` block. Also
                                        extracts `PRIOR_FINDING:` lines
                                        (issue #386 r10) when the
@@ -82,7 +75,6 @@ Public surface
                                        a reviewer cannot return PASS
                                        while silently skipping the
                                        bead author's prior findings.
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
 - `evaluate_contract_echo(report, contract)` — fail-closed check:
                                        every acceptance item must be
                                        `ADDRESSED` or `N-A`. Any
@@ -109,11 +101,6 @@ Public surface
                                        that the gate enforces even when
                                        the prior-finding text was
                                        prompt-only in earlier rounds.
-<<<<<<< HEAD
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
 
 ZFC compliance
 --------------
@@ -130,25 +117,11 @@ diff.
 
 from __future__ import annotations
 
-<<<<<<< HEAD
-<<<<<<< HEAD
 import json
 import os
 import re
 from dataclasses import dataclass, field
 from typing import List, Literal, Optional, Tuple, Union
-=======
-import re
-from dataclasses import dataclass
-from typing import List, Literal, Optional, Tuple
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
-import json
-import os
-import re
-from dataclasses import dataclass, field
-from typing import List, Literal, Optional, Tuple, Union
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
 
 
 # Unique HTML marker used by the GitHub comment upsert logic. Any prior
@@ -200,10 +173,6 @@ class ParsedVerdict:
     other than the headline four is missing in the reviewer's output,
     `parse_verdict` returns `None` rather than producing a partial
     `ParsedVerdict`.
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
 
     The execution-evidence fields (`test_run_evidence`,
     `lint_run_evidence`, `grep_cites`, `head_commit_verified`) are the
@@ -212,11 +181,6 @@ class ParsedVerdict:
     the call sites cited in the diff is rejected at parse time. They
     are stored as parsed structures (or `None` on absence — which the
     contract requires never happens for a valid verdict).
-<<<<<<< HEAD
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     """
 
     verdict: Literal["PASS", "FAIL"]
@@ -226,10 +190,6 @@ class ParsedVerdict:
     reason: str
     reviewer_identity: str  # the model that emitted the verdict
     raw_excerpt: str
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     # Execution-evidence fields (issue #384):
     test_run_evidence: Optional["ParsedTestRun"] = None
     lint_run_evidence: Optional["ParsedLintRun"] = None
@@ -273,11 +233,6 @@ class ParsedLintRun:
     tool: str
     errors: int
     warnings: int
-<<<<<<< HEAD
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
 
 
 @dataclass(frozen=True)
@@ -309,10 +264,6 @@ class SkepticResult:
 
 
 # ---------------------------------------------------------------------------
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
 # Contract-echo types (issue #386)
 # ---------------------------------------------------------------------------
 #
@@ -412,11 +363,6 @@ class ContractEchoReport:
     the reviewer cited unknown IDs or omitted items. `evaluate_contract_echo`
     cross-references this against the contract to determine which
     items are unaddressed.
-<<<<<<< HEAD
-    """
-
-    items: Tuple[ContractEchoItem, ...]
-=======
 
     `prior_findings` carries the reviewer's verdict on each
     `PriorFinding` (r3, issue #386 gap 7 P2). When the contract
@@ -426,7 +372,6 @@ class ContractEchoReport:
 
     items: Tuple[ContractEchoItem, ...]
     prior_findings: Tuple["PriorFindingEcho", ...] = ()
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
 
 
 @dataclass(frozen=True)
@@ -465,11 +410,6 @@ class PriorFindingEcho:
 
 
 # ---------------------------------------------------------------------------
-<<<<<<< HEAD
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
 # Anchored, case-insensitive, multi-match-detecting regexes
 # ---------------------------------------------------------------------------
 #
@@ -501,10 +441,6 @@ _IDENTITY_RE = re.compile(
     re.MULTILINE | re.IGNORECASE,
 )
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
 # ---------------------------------------------------------------------------
 # Execution-evidence regexes (issue #384)
 # ---------------------------------------------------------------------------
@@ -542,20 +478,11 @@ _HEAD_COMMIT_VERIFIED_RE = re.compile(
     re.MULTILINE | re.IGNORECASE,
 )
 
-<<<<<<< HEAD
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
 # Field-name regexes used by the no-prose check. A field line MUST
 # consist only of "<FIELD>: <value>" with nothing else on the line.
 # Case-insensitive to match the per-field regexes (Verdict: Pass is OK).
 _FIELD_LINE_RE = re.compile(r"^[A-Z_]+\s*:.*$", re.MULTILINE | re.IGNORECASE)
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
 # Required execution-evidence fields (issue #384). The deterministic
 # gate refuses to honor a verdict that does not include all four —
 # pattern-matched PASS verdicts slipped vacuous regression tests and
@@ -567,489 +494,6 @@ EXECUTION_EVIDENCE_FIELDS = (
     "HEAD_COMMIT_VERIFIED",
 )
 
-<<<<<<< HEAD
-
-# ---------------------------------------------------------------------------
-# Contract-echo regex (issue #386)
-# ---------------------------------------------------------------------------
-#
-# A per-item verdict line looks like:
-#   ITEM: A1 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:42
-#   ITEM: A2 VERDICT: NOT-ADDRESSED REASON: omitted from diff
-#   ITEM: A3 VERDICT: N-A REASON: not applicable this round
-#
-# The line is anchored at start-of-line (re.MULTILINE) and the
-# verdict token is restricted to the three known values. The cite
-# is a file:line; the reason is free text. Each line is one
-# item — no chained semicolon-separated items (parity with
-# `GREP_CITES`).
-
-CONTRACT_ECHO_HEADER_RE = re.compile(
-    r"^\s*CONTRACT_ECHO\s*:\s*$",
-    re.MULTILINE | re.IGNORECASE,
-)
-CONTRACT_ECHO_LINE_RE = re.compile(
-    r"^\s*ITEM\s*:\s*(?P<id>[A-Za-z0-9._\-]+)\s+"
-    r"VERDICT\s*:\s*(?P<verdict>ADDRESSED|NOT-ADDRESSED|N-A)\s+"
-    r"(?:CITE\s*:\s*(?P<cite>[^\s\n][^\n]*?)|REASON\s*:\s*(?P<reason>[^\n]+?))"
-    r"\s*$",
-    re.MULTILINE | re.IGNORECASE,
-)
-
-
-# ---------------------------------------------------------------------------
-# Contract-echo loader (issue #386)
-# ---------------------------------------------------------------------------
-
-
-def load_bead_contract(source: Union[str, os.PathLike, dict, BeadContract]) -> BeadContract:
-    """Load a `BeadContract` from a dict, a JSON file path, or pass-through.
-
-    Acceptable inputs:
-      - `BeadContract`   — returned unchanged.
-      - `dict`           — the in-memory shape callers wire into the gate.
-      - `str` / Path     — path to a JSON file on disk; the file is read
-                          and parsed. A non-existent file is a hard
-                          error (we never silently fabricate a contract).
-
-    Validation:
-      - `id` is required and non-empty.
-      - `description` defaults to empty string.
-      - `prior_findings` is optional (defaults to empty).
-      - `acceptance_items` MUST be non-empty — without items the
-        contract-echo step has nothing to verify per-item against.
-      - Duplicate `acceptance_items` IDs are rejected (per-item
-        verdicts would not be uniquely addressable).
-
-    Reject anything that isn't a dict / path / BeadContract — a
-    stringified JSON literal in argv is a known injection surface.
-    """
-    if isinstance(source, BeadContract):
-        return source
-    if isinstance(source, dict):
-        data = source
-    elif isinstance(source, (str, os.PathLike)):
-        path = os.fspath(source)
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.loads(fh.read())
-    else:
-        raise TypeError(
-            f"load_bead_contract: source must be dict, path, or BeadContract; "
-            f"got {type(source).__name__}"
-        )
-
-    if not isinstance(data, dict):
-        raise TypeError(
-            f"load_bead_contract: parsed contract must be a JSON object; "
-            f"got {type(data).__name__}"
-        )
-
-    bead_id = str(data.get("id") or "").strip()
-    if not bead_id:
-        raise ValueError("load_bead_contract: 'id' is required and must be non-empty")
-
-    description = str(data.get("description") or "")
-
-    raw_notes = data.get("notes")
-    if raw_notes is None:
-        notes: Tuple[str, ...] = ()
-    elif isinstance(raw_notes, list):
-        notes = tuple(str(n) for n in raw_notes)
-    elif isinstance(raw_notes, str):
-        notes = (raw_notes,)
-    else:
-        raise TypeError(
-            "load_bead_contract: 'notes' must be a string or list of strings"
-        )
-
-    raw_prior = data.get("prior_findings") or []
-    if not isinstance(raw_prior, list):
-        raise TypeError("load_bead_contract: 'prior_findings' must be a list")
-    prior_findings: List[PriorFinding] = []
-    for pf in raw_prior:
-        if not isinstance(pf, dict):
-            raise TypeError(
-                f"load_bead_contract: prior_finding must be a dict; got {type(pf).__name__}"
-            )
-        prior_findings.append(
-            PriorFinding(
-                source=str(pf.get("source") or "").strip(),
-                text=str(pf.get("text") or "").strip(),
-            )
-        )
-
-    raw_items = data.get("acceptance_items") or []
-    if not isinstance(raw_items, list):
-        raise TypeError("load_bead_contract: 'acceptance_items' must be a list")
-    if not raw_items:
-        raise ValueError(
-            "load_bead_contract: 'acceptance_items' must be non-empty — the "
-            "contract-echo step requires per-item verdicts and an empty list "
-            "has nothing to verify against"
-        )
-    seen_ids = set()
-    acceptance_items: List[AcceptanceItem] = []
-    for it in raw_items:
-        if not isinstance(it, dict):
-            raise TypeError(
-                f"load_bead_contract: acceptance_item must be a dict; got {type(it).__name__}"
-            )
-        item_id = str(it.get("id") or "").strip()
-        if not item_id:
-            raise ValueError("load_bead_contract: acceptance_item.id is required")
-        if item_id in seen_ids:
-            raise ValueError(
-                f"load_bead_contract: duplicate acceptance_item.id={item_id!r}"
-            )
-        seen_ids.add(item_id)
-        acceptance_items.append(
-            AcceptanceItem(
-                id=item_id,
-                text=str(it.get("text") or "").strip(),
-                required=bool(it.get("required") or False),
-            )
-        )
-
-    return BeadContract(
-        id=bead_id,
-        description=description,
-        notes=notes,
-        prior_findings=tuple(prior_findings),
-        acceptance_items=tuple(acceptance_items),
-    )
-
-
-def _br_show_json(bead_id: str, br_bin: str = "br") -> str:
-    """Subprocess wrapper around `br show <bead_id> --json`.
-
-    Returns stdout as a JSON string. The single source of truth
-    for the bead — used by `load_bead_contract_from_bead` to
-    materialise a `BeadContract` from the live bead source instead
-    of a hand-authored contract file.
-
-    Exposed at module level so tests can monkeypatch this without
-    spawning a real `br` subprocess. The function is intentionally
-    a thin subprocess wrapper — fail-closed on any error so the
-    caller never receives a fabricated contract (issue #386 r3,
-    gap 2).
-    """
-    import subprocess
-
-    proc = subprocess.run(
-        [br_bin, "show", "--json", bead_id],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"_br_show_json: br show --json {bead_id!r} failed "
-            f"(rc={proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}"
-        )
-    return proc.stdout
-
-
-def load_bead_contract_from_bead(
-    bead_id: str, br_bin: str = "br"
-) -> BeadContract:
-    """Load a `BeadContract` directly from the live bead source.
-
-    Closes r3 gap 2: production was hand-authoring contracts and
-    depending on `--contract-file` only. This reader pulls the
-    bead's actual `description`, `notes`, `prior_findings`, and
-    `acceptance_items` from `br show --json <id>` and feeds them
-    through `load_bead_contract` for the same validation.
-
-    Field mapping (the bead JSON shape is documented in
-    `~/.claude/docs/beads.md`):
-      - `description` (str)  -> description
-      - `notes` (str|list)   -> notes
-      - `prior_findings`     -> prior_findings (the bead author
-                                embeds these as `[ {source, text} ]`
-                                in the bead's notes JSON block;
-                                absent `prior_findings` is allowed
-                                and falls back to the most-recent
-                                contract-echo report's unaddressed
-                                items cached at
-                                `.cache/contract_echo/<bead>.json`)
-      - `acceptance_items`  -> acceptance_items; the bead JSON
-                                uses `id` / `text` / `required`
-                                keys per item, matching the
-                                contract-echo format.
-
-    Subprocess and parse errors raise so callers fail closed —
-    never silently fabricate a contract. Tests stub
-    `_br_show_json` rather than spawning `br`.
-    """
-    raw = _br_show_json(bead_id, br_bin=br_bin)
-    payload = json.loads(raw)
-    payload.setdefault("id", bead_id)
-    return load_bead_contract(payload)
-
-
-# ---------------------------------------------------------------------------
-# Contract-echo parser (issue #386)
-# ---------------------------------------------------------------------------
-
-
-def _strip_contract_echo_block(output: str) -> str:
-    """Remove the `CONTRACT_ECHO:` block from a reviewer output so the
-    10-field `parse_verdict` can run on the remainder.
-
-    The block is at the END of the output (after the 10 structured
-    fields). The header line (`CONTRACT_ECHO:`) is dropped, every
-    `ITEM:` line is dropped, and any blank lines immediately around
-    the block are normalized. If the block is not present, the
-    output is returned unchanged (so the function is safe to call
-    regardless of whether a contract was supplied).
-    """
-    if not isinstance(output, str):
-        return output
-    header_match = CONTRACT_ECHO_HEADER_RE.search(output)
-    if not header_match:
-        return output
-    head_part = output[: header_match.start()]
-    after = output[header_match.end():]
-    kept_after: List[str] = []
-    for raw_line in after.splitlines():
-        stripped = raw_line.strip()
-        if stripped.startswith("ITEM:"):
-            continue
-        kept_after.append(raw_line)
-    out = head_part.rstrip("\n") + "\n" + "\n".join(kept_after).rstrip() + "\n"
-    return out
-
-
-def parse_contract_echo(
-    output: object, contract: BeadContract
-) -> Optional[ContractEchoReport]:
-    """Extract a `ContractEchoReport` from a reviewer's free-form stdout.
-
-    The expected block format is:
-
-        CONTRACT_ECHO:
-        ITEM: <id> VERDICT: <ADDRESSED|NOT-ADDRESSED|N-A> CITE: <file:line>
-        ITEM: <id> VERDICT: <N-A> REASON: <free text>
-        ...
-
-    The block MUST be present (one or more `ITEM:` lines) for the
-    output to be considered. A reviewer that omits the block has
-    not addressed the contract — the caller should treat the
-    resulting `None` as every item NOT-ADDRESSED.
-
-    Per-item rules:
-      - `ADDRESSED` requires a `CITE:` value matching the
-        `file:line` pattern (a path followed by `:NUMBER`).
-      - `N-A` and `NOT-ADDRESSED` require a `REASON:` value (no
-        empty justification).
-      - Items whose ID is not on the contract are kept in the
-        report (caller decides what to do) but the unknown ID
-        still counts as the contract item being unaddressed.
-    """
-    if not isinstance(output, str):
-        return None
-    if not isinstance(contract, BeadContract):
-        return None
-
-    # Locate the CONTRACT_ECHO: header line, then walk forward and
-    # collect the immediately-following `ITEM:` lines. We stop at the
-    # first non-blank, non-ITEM line (the strict no-prose contract
-    # the gate enforces elsewhere — anything after the block is
-    # considered out-of-block and ignored).
-    header_match = CONTRACT_ECHO_HEADER_RE.search(output)
-    if not header_match:
-        return None
-    after = output[header_match.end():]
-    item_lines: List[str] = []
-    for raw_line in after.splitlines():
-        stripped = raw_line.strip()
-        if not stripped:
-            # Blank lines are allowed within the block.
-            continue
-        if not stripped.startswith("ITEM:"):
-            # Out-of-block content; stop walking.
-            break
-        item_lines.append(raw_line)
-    if not item_lines:
-        return None
-
-    items: List[ContractEchoItem] = []
-    for raw_line in item_lines:
-        line = raw_line.strip()
-        if not line:
-            continue
-        m = CONTRACT_ECHO_LINE_RE.match(line)
-        if m is None:
-            # An unparseable line in the contract-echo block: the
-            # reviewer emitted something we cannot interpret. Per
-            # the strict no-prose contract the gate enforces for
-            # the headline verdict, we reject the whole block
-            # rather than guess.
-            return None
-        item_id = m.group("id")
-        verdict_token = m.group("verdict").upper()
-        cite = (m.group("cite") or "").strip()
-        reason = (m.group("reason") or "").strip()
-
-        if verdict_token == "ADDRESSED":
-            if not cite:
-                return None
-            if not re.match(r"^[\w./\-]+:\d+$", cite):
-                return None
-        else:
-            # N-A or NOT-ADDRESSED — reason is required.
-            if not reason:
-                return None
-
-        items.append(
-            ContractEchoItem(
-                id=item_id,
-                verdict=verdict_token,  # type: ignore[arg-type]
-                cite=cite,
-                reason=reason,
-            )
-        )
-
-    if not items:
-        return None
-    return ContractEchoReport(items=tuple(items))
-
-
-# ---------------------------------------------------------------------------
-# Contract-echo evaluator (issue #386 — the headline invariant)
-# ---------------------------------------------------------------------------
-
-
-def evaluate_contract_echo(
-    report: Optional[ContractEchoReport],
-    contract: BeadContract,
-    report_prior_findings: Optional[Tuple["PriorFindingEcho", ...]] = None,
-) -> ContractEchoVerdictResult:
-    """Check that every acceptance item is ADDRESSED or N-A (with caveats).
-
-    - `ADDRESSED` (with a `CITE:` file:line): the reviewer claims the
-      diff addresses this item; we trust the reviewer on the cite
-      (we don't second-guess the file:line — the executor evidence
-      contract in `parse_verdict` is what backs the claim).
-    - `N-A` (with a `REASON:`): the reviewer says the item is not
-      applicable this round; this counts as a pass IF the reason is
-      non-empty AND the item is not `required=True`. An empty
-      `N-A` reason is rejected at parse time (see
-      `parse_contract_echo`), so by the time we get here, a
-      `N-A` item is always with a reason. r3 (gap 5): if the item
-      is `required=True`, `N-A` is treated as unaddressed —
-      the bead author says "this MUST be done", so the reviewer
-      cannot opt out.
-    - `NOT-ADDRESSED` (with a `REASON:`): the reviewer flags the
-      item as unaddressed; we surface it verbatim in
-      `unaddressed_items` and `constraint`.
-    - Missing item (the reviewer's report does not contain the
-      item's ID): the item is unaddressed — the reviewer did not
-      cover it.
-    - `report is None` (no `CONTRACT_ECHO:` block at all): every
-      contract item is unaddressed.
-
-    Prior findings (r3, gap 7 P2): when `report_prior_findings` is
-    supplied, every `PriorFinding` listed in the contract must be
-    covered (ADDRESSED or N-A). Uncovered prior findings are
-    surfaced in `unaddressed_prior_findings` and appended to
-    `constraint` verbatim. Prior findings are prompt-only when
-    `report_prior_findings=None` (preserves r2 behavior on
-    contracts whose bead did not opt into prior-finding
-    enforcement).
-
-    The `constraint` string carries the unaddressed items VERBATIM
-    (the bead author's text, not a paraphrase) so the next roll's
-    worker reads the exact problem. This is the headline invariant
-    of issue #386: constraint extraction MUST carry the
-    unaddressed items verbatim.
-    """
-    if not isinstance(contract, BeadContract):
-        return ContractEchoVerdictResult(ok=False, constraint="contract is not a BeadContract")
-
-    # Build a lookup: item_id -> per-item verdict emitted by the reviewer.
-    emitted: dict = {}
-    if report is not None:
-        for it in report.items:
-            # First-write-wins on duplicate IDs; subsequent writes
-            # for the same ID are ignored. The strict no-duplicate
-            # invariant is on the contract side (load_bead_contract).
-            emitted.setdefault(it.id, it)
-
-    unaddressed: List[AcceptanceItem] = []
-    for item in contract.acceptance_items:
-        verdict_item = emitted.get(item.id)
-        if verdict_item is None:
-            unaddressed.append(item)
-            continue
-        if verdict_item.verdict == "ADDRESSED":
-            continue
-        if verdict_item.verdict == "N-A":
-            # Reason is required at parse time; defensively re-check.
-            if not verdict_item.reason:
-                unaddressed.append(item)
-                continue
-            # r3 gap 5: required items cannot be N-A'd away.
-            if item.required:
-                unaddressed.append(item)
-                continue
-            continue
-        # NOT-ADDRESSED or anything else: unaddressed.
-        unaddressed.append(item)
-
-    unaddressed_prior: List[PriorFinding] = []
-    if report_prior_findings is not None:
-        emitted_pf = {pf.source: pf for pf in report_prior_findings}
-        for pf in contract.prior_findings:
-            verdict_pf = emitted_pf.get(pf.source)
-            if verdict_pf is None:
-                unaddressed_prior.append(pf)
-                continue
-            if verdict_pf.verdict == "ADDRESSED":
-                continue
-            if verdict_pf.verdict == "N-A" and verdict_pf.reason:
-                continue
-            unaddressed_prior.append(pf)
-
-    if not unaddressed and not unaddressed_prior:
-        return ContractEchoVerdictResult(
-            ok=True,
-            unaddressed_items=(),
-            constraint="",
-            unaddressed_prior_findings=(),
-        )
-
-    # Build the constraint string with the unaddressed items'
-    # VERBATIM text. The worker's next-roll input MUST read the
-    # exact problem the bead author wrote.
-    lines = [
-        f"Contract-echo gate: {len(unaddressed)} acceptance item(s) NOT-ADDRESSED.",
-        "These items must be addressed in the next roll. The text below is "
-        "verbatim from the bead author's contract — do not paraphrase:",
-        "",
-    ]
-    for item in unaddressed:
-        required_marker = " [REQUIRED]" if item.required else ""
-        lines.append(f"- {item.id}{required_marker}: {item.text}")
-    if unaddressed_prior:
-        lines.append("")
-        lines.append(
-            f"Prior findings NOT-ADDRESSED: {len(unaddressed_prior)} "
-            "(verbatim from prior-round reviewer / CodeRabbit etc.):"
-        )
-        for pf in unaddressed_prior:
-            lines.append(f"- {pf.source}: {pf.text}")
-    return ContractEchoVerdictResult(
-        ok=False,
-        unaddressed_items=tuple(unaddressed),
-        constraint="\n".join(lines),
-        unaddressed_prior_findings=tuple(unaddressed_prior),
-    )
-
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
 
 # ---------------------------------------------------------------------------
 # Contract-echo regex (issue #386)
@@ -1599,10 +1043,6 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
 
     **Strict no-prose contract** (per post-audit comment 4953064910):
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     - 10 required fields, each MUST appear EXACTLY ONCE on its own line:
       `VERDICT`, `HEAD_SHA`, `REPO`, `PR_NUMBER`, `REASON`, `IDENTITY`,
       `TEST_RUN_EVIDENCE`, `LINT_RUN_EVIDENCE`, `GREP_CITES`,
@@ -1610,36 +1050,15 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
       (issue #384) prove the reviewer actually executed the repo's
       tests+lint+grep on the PR HEAD, rather than pattern-matching
       the diff alone.
-<<<<<<< HEAD
     - The output MUST consist ONLY of:
         - up to one comment line (e.g. a leading `# reviewer: codex`)
         - the 10 contract fields, each on its own line
-=======
-    - 6 required fields, each MUST appear EXACTLY ONCE on its own line:
-      `VERDICT`, `HEAD_SHA`, `REPO`, `PR_NUMBER`, `REASON`, `IDENTITY`.
-    - The output MUST consist ONLY of:
-        - up to one comment line (e.g. a leading `# reviewer: codex`)
-        - the 6 contract fields, each on its own line
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
-    - The output MUST consist ONLY of:
-        - up to one comment line (e.g. a leading `# reviewer: codex`)
-        - the 10 contract fields, each on its own line
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
         - any number of blank lines
       No Markdown code blocks, no extra prose, no second VERDICT line
       smuggled inside a triple-backtick fence.
     - Any field appearing more than once → reject (anti-injection).
     - Any required field missing → reject (fail-closed).
-<<<<<<< HEAD
-<<<<<<< HEAD
     - The 10 lines themselves MUST be the ONLY non-blank lines (no
-=======
-    - The 6 lines themselves MUST be the ONLY non-blank lines (no
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
-    - The 10 lines themselves MUST be the ONLY non-blank lines (no
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
       trailing prose, no surrounding commentary).
 
     A reviewer that wraps the contract in a Markdown code block
@@ -1671,24 +1090,10 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
             continue
         if re.match(r"^[A-Z_]+\s*:", stripped, re.IGNORECASE):
             field_lines += 1
-<<<<<<< HEAD
-<<<<<<< HEAD
             # Track the field name so we can enforce EXACTLY 10 distinct
             # contract fields. Per post-audit comment 4953116428, the
             # previous version accepted a 7th field. Now any 11th field
             # (or duplicate of any of the 10) → reject.
-=======
-            # Track the field name so we can enforce EXACTLY 6 distinct
-            # contract fields. Per post-audit comment 4953116428, the
-            # previous version accepted a 7th field. Now any 7th field
-            # (or duplicate of any of the 6) → reject.
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
-            # Track the field name so we can enforce EXACTLY 10 distinct
-            # contract fields. Per post-audit comment 4953116428, the
-            # previous version accepted a 7th field. Now any 11th field
-            # (or duplicate of any of the 10) → reject.
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
             field_name_match = re.match(r"^([A-Z_]+)\s*:", stripped, re.IGNORECASE)
             if field_name_match:
                 fname = field_name_match.group(1).upper()
@@ -1713,20 +1118,11 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
     prs = _PR_RE.findall(output)
     reasons = _REASON_RE.findall(output)
     identities = _IDENTITY_RE.findall(output)
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     # Execution-evidence fields (issue #384):
     test_run_evidence = _TEST_RUN_EVIDENCE_RE.findall(output)
     lint_run_evidence = _LINT_RUN_EVIDENCE_RE.findall(output)
     grep_cites = _GREP_CITES_RE.findall(output)
     head_commit_verified = _HEAD_COMMIT_VERIFIED_RE.findall(output)
-<<<<<<< HEAD
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
 
     # Full-length SHA is required (40 hex chars). A reviewer that emits
     # only a short SHA hasn't fully bound its verdict.
@@ -1736,37 +1132,21 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         return None
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     # All ten required fields must be exactly one each. IDENTITY is
     # required for provenance (refuses self-review). The four
     # execution-evidence fields are required by issue #384 — a
     # verdict without them is a vacuous PASS, and the gate must
     # refuse to honor it.
-<<<<<<< HEAD
-=======
-    # All six required fields must be exactly one each. IDENTITY is
-    # required for provenance (refuses self-review).
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     if (
         len(verdicts) != 1
         or len(repos) != 1
         or len(prs) != 1
         or len(reasons) != 1
         or len(identities) != 1
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
         or len(test_run_evidence) != 1
         or len(lint_run_evidence) != 1
         or len(grep_cites) != 1
         or len(head_commit_verified) != 1
-<<<<<<< HEAD
     ):
         return None
 
@@ -1774,24 +1154,6 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
     # seen_field_names set already enforced no duplicates; here we
     # also enforce that EXACTLY 10 distinct contract fields are
     # present.
-=======
-    ):
-        return None
-
-    # Exact 6-field contract (per post-audit comment 4953116428):
-    # no 7th field allowed. The seen_field_names set already enforced
-    # no duplicates; here we also enforce that EXACTLY 6 distinct
-    # contract fields are present.
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
-    ):
-        return None
-
-    # Exact 10-field contract: no 11th field allowed. The
-    # seen_field_names set already enforced no duplicates; here we
-    # also enforce that EXACTLY 10 distinct contract fields are
-    # present.
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     expected_fields = {
         "VERDICT",
         "HEAD_SHA",
@@ -1799,19 +1161,10 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
         "PR_NUMBER",
         "REASON",
         "IDENTITY",
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
         "TEST_RUN_EVIDENCE",
         "LINT_RUN_EVIDENCE",
         "GREP_CITES",
         "HEAD_COMMIT_VERIFIED",
-<<<<<<< HEAD
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     }
     if seen_field_names != expected_fields:
         return None
@@ -1829,10 +1182,6 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
     if len(set(short_shas)) != 1:
         return None
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     # ---- Execution-evidence consistency checks (issue #384) ------------
     # A reviewer that claims PASS but reports failed>0, exit!=0, lint
     # errors>0, or an empty GREP_CITES is internally inconsistent and
@@ -1895,11 +1244,6 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
         warnings=lint_warnings,
     )
 
-<<<<<<< HEAD
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     return ParsedVerdict(
         verdict=verdict_token,  # type: ignore[arg-type]
         head_sha=sha,
@@ -1908,19 +1252,10 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
         reason=reasons[0].strip(),
         reviewer_identity=identity_token,
         raw_excerpt=output[:500],
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
         test_run_evidence=test_evidence_obj,
         lint_run_evidence=lint_evidence_obj,
         grep_cites=grep_cite_value,
         head_commit_verified=head_verified_sha,
-<<<<<<< HEAD
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     )
 
 
@@ -2213,14 +1548,7 @@ def evaluate(
     base_sha: str = "",  # kept for future use
     diff: str = "",  # kept for future use
     reviewer: str = "reviewer",
-<<<<<<< HEAD
-<<<<<<< HEAD
     contract: Optional[BeadContract] = None,
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
-    contract: Optional[BeadContract] = None,
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
 ) -> SkepticResult:
     """Decide a single reviewer's outcome from its output (or absence).
 
@@ -2260,10 +1588,6 @@ def evaluate(
             reviewer=reviewer,
         )
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
     # ---- Pre-parse: extract contract-echo block (issue #386) -----------
     # The `parse_verdict` function enforces a strict 10-field
     # no-extra-fields contract (issue #384). When a bead contract is
@@ -2306,43 +1630,6 @@ def evaluate(
                 "inconsistent with VERDICT, or extra prose/code-block "
                 "present — fail-closed)"
             )
-=======
-    parsed = parse_verdict(review_output)
-    if parsed is None:
-<<<<<<< HEAD
-        reason = (
-            "reviewer output was unparseable (one or more of "
-            "VERDICT/HEAD_SHA/REPO/PR_NUMBER/REASON/IDENTITY missing, "
-            "duplicated, or HEAD_SHA not 40 hex chars, or extra prose/"
-            "code-block present — fail-closed)"
-        )
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
-        # Diagnose the most likely failure mode for the reason. Issue
-        # #384: distinguish "execution evidence missing" from generic
-        # unparseable — evidence-free verdicts are invalid (fail-closed)
-        # and the operator/Healer needs the specific reason to triage.
-        missing_evidence = [
-            f for f in EXECUTION_EVIDENCE_FIELDS
-            if f not in review_output
-        ]
-        if missing_evidence:
-            reason = (
-                "reviewer output missing execution-evidence fields "
-                f"({', '.join(missing_evidence)}) — verdict is invalid "
-                "without proof the reviewer ran the repo's tests/lint/"
-                f"grep on the PR HEAD (issue #384)"
-            )
-        else:
-            reason = (
-                "reviewer output was unparseable (one or more of "
-                "VERDICT/HEAD_SHA/REPO/PR_NUMBER/REASON/IDENTITY/"
-                "TEST_RUN_EVIDENCE/LINT_RUN_EVIDENCE/GREP_CITES/"
-                "HEAD_COMMIT_VERIFIED missing, duplicated, "
-                "inconsistent with VERDICT, or extra prose/code-block "
-                "present — fail-closed)"
-            )
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
         body = format_comment(
             verdict="FAIL",
             head_sha=head_sha,
@@ -2388,10 +1675,6 @@ def evaluate(
             reviewer=reviewer,
         )
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
     # ---- Contract-echo enforcement (issue #386) ------------------------
     # When the gate is invoked with a `contract`, the reviewer's
     # output MUST include a valid `CONTRACT_ECHO:` block that
@@ -2402,15 +1685,6 @@ def evaluate(
     # carries the unaddressed item's VERBATIM text — the next
     # roll's worker reads the exact problem, not a paraphrase.
     if contract is not None:
-<<<<<<< HEAD
-        echo_verdict = evaluate_contract_echo(echo_report, contract)
-        if not echo_verdict.ok:
-            reason = (
-                f"contract-echo gate failed: {len(echo_verdict.unaddressed_items)} "
-                f"acceptance item(s) not addressed in the diff. The constraint "
-                f"below is verbatim from the bead author's contract and must "
-                f"be addressed in the next roll.\n\n{echo_verdict.constraint}"
-=======
         # Pass through the reviewer's prior-finding verdicts so the
         # evaluator can fail-closed when the contract has prior
         # findings that the reviewer omitted (r3, gap 7 P2). When
@@ -2441,7 +1715,6 @@ def evaluate(
                 f"finding(s) not addressed in the diff. The constraint "
                 f"below is verbatim from the bead author's contract and "
                 f"must be addressed in the next roll.\n\n{echo_verdict.constraint}"
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
             )
             body = format_comment(
                 verdict=parsed.verdict,
@@ -2462,11 +1735,6 @@ def evaluate(
                 reviewer=reviewer,
             )
 
-<<<<<<< HEAD
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
     body = format_comment(
         verdict=parsed.verdict,
         head_sha=parsed.head_sha,
@@ -2608,10 +1876,6 @@ def aggregate_results(
     primary = bound[0] if bound else None
     primary_sha = primary.parsed.head_sha if primary and primary.parsed else head_sha
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     # Execution-evidence guard (issue #384): even if a reviewer's
     # `check_state` is 'success', the verdict is invalid if the parsed
     # result is missing execution-evidence fields. A vacuous
@@ -2655,11 +1919,6 @@ def aggregate_results(
             reviewer="(aggregate)",
         )
 
-<<<<<<< HEAD
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     extras: List[str] = []
     for r in results:
         marker = "✅ PASS" if r.check_state == "success" else "❌ FAIL"
@@ -2669,20 +1928,9 @@ def aggregate_results(
         agg_verdict = "PASS"
         agg_state = "success"
         agg_reason = (
-<<<<<<< HEAD
-<<<<<<< HEAD
             f"all {len(results)} reviewers passed with execution "
             f"evidence; primary reviewer: "
             f"{primary.reviewer if primary else '(unknown)'}"
-=======
-            f"all {len(results)} reviewers passed; "
-            f"primary reviewer: {primary.reviewer if primary else '(unknown)'}"
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
-            f"all {len(results)} reviewers passed with execution "
-            f"evidence; primary reviewer: "
-            f"{primary.reviewer if primary else '(unknown)'}"
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
         )
     else:
         agg_verdict = "FAIL"
@@ -2823,16 +2071,8 @@ exact commit SHA you were shown.
 {diff}
 ```
 
-<<<<<<< HEAD
-<<<<<<< HEAD
 {contract_block}
 
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
-{contract_block}
-
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
 # Output contract — REQUIRED, no extra prose
 
 Emit EXACTLY this format, on its own lines, with the values substituted.
@@ -2845,19 +2085,10 @@ with no extra commentary or code blocks:
     PR_NUMBER: {pr_number}
     REASON: <one-sentence justification>
     IDENTITY: <codex|gemini|claude|unknown>
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     TEST_RUN_EVIDENCE: passed=<N> failed=<N> skipped=<N> exit=<N>
     LINT_RUN_EVIDENCE: tool=<name> errors=<N> warnings=<N>
     GREP_CITES: <file:line;file:line;...>
     HEAD_COMMIT_VERIFIED: <full 40-hex SHA of the local HEAD you actually exercised>
-<<<<<<< HEAD
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
 
 Rules:
 - The `HEAD_SHA` MUST be the FULL 40-character hex SHA shown above. Not
@@ -2873,10 +2104,6 @@ Rules:
 - Do not include any other text — no extra VERDICT lines, no code
   blocks containing verdict tokens, no commentary. The deterministic
   gate will reject anything that does not match this contract exactly,
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
   including outputs where any of the ten lines appears more than once.
 
 # Execution-evidence requirement (issue #384) — NOT optional
@@ -2918,10 +2145,6 @@ If the repo's test command is slow or unavailable, report the real
 result (including the failure) — do not fabricate numbers to satisfy
 the contract. A FAIL verdict with honest execution evidence is
 acceptable; a PASS verdict without evidence is not.
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
 
 # Contract-echo requirement (issue #386) — REQUIRED when a contract is provided
 
@@ -3034,17 +2257,6 @@ def _build_contract_block(contract: BeadContract) -> str:
     )
 
 
-<<<<<<< HEAD
-=======
-  including outputs where any of the six lines appears more than once.
-=======
->>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
-"""
-
-
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
 def build_prompt(
     *,
     repo: str,
@@ -3053,23 +2265,12 @@ def build_prompt(
     base_sha: str,
     diff: str,
     implementation_identity: str = "unknown",
-<<<<<<< HEAD
-<<<<<<< HEAD
     contract: Optional[BeadContract] = None,
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
-    contract: Optional[BeadContract] = None,
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
 ) -> str:
     """Assemble the prompt sent to the independent reviewer CLI.
 
     Pure string assembly — no model call, no judgment. The reviewer
     model is the one that emits the structured verdict.
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
 
     When `contract` is supplied (issue #386), a `# Bead contract`
     section is interpolated into the prompt, documenting the bead's
@@ -3085,12 +2286,6 @@ def build_prompt(
         contract_block = _build_contract_block(contract)
     else:
         contract_block = ""
-<<<<<<< HEAD
-=======
-    """
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
     return _PROMPT_TEMPLATE.format(
         repo=repo,
         pr_number=pr_number,
@@ -3098,20 +2293,11 @@ def build_prompt(
         base_sha=base_sha,
         diff=diff,
         implementation_identity=implementation_identity,
-<<<<<<< HEAD
-<<<<<<< HEAD
         contract_block=contract_block,
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
-        contract_block=contract_block,
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
     )
 
 
 __all__ = [
-<<<<<<< HEAD
-<<<<<<< HEAD
     "AcceptanceItem",
     "BeadContract",
     "COMMIT_PREFIX_TO_IDENTITY",
@@ -3128,29 +2314,6 @@ __all__ = [
     "ParsedVerdict",
     "PriorFinding",
     "PriorFindingEcho",
-=======
-=======
-    "AcceptanceItem",
-    "BeadContract",
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
-    "COMMIT_PREFIX_TO_IDENTITY",
-    "CONTRACT_ECHO_LINE_RE",
-    "ContractEchoItem",
-    "ContractEchoReport",
-    "ContractEchoVerdict",
-    "ContractEchoVerdictResult",
-    "EXECUTION_EVIDENCE_FIELDS",
-    "MARKER",
-    "ModelIdentity",
-    "ParsedLintRun",
-    "ParsedTestRun",
-    "ParsedVerdict",
-<<<<<<< HEAD
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
-    "PriorFinding",
-    "PriorFindingEcho",
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
     "REVIEWER_CLI_TO_IDENTITY",
     "ReadBackCheck",
     "SkepticResult",
@@ -3161,23 +2324,12 @@ __all__ = [
     "build_prompt",
     "comment_marker",
     "evaluate",
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
     "evaluate_contract_echo",
     "extract_implementation_identity_from_commit",
     "format_comment",
     "load_bead_contract",
     "load_bead_contract_from_bead",
     "parse_contract_echo",
-<<<<<<< HEAD
-=======
-    "extract_implementation_identity_from_commit",
-    "format_comment",
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
-=======
->>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
     "parse_verdict",
     "verify_published_comment",
     "verify_provenance",

@@ -83,7 +83,6 @@ on:
         description: "40-hex SHA the caller pinned the workflow ref to (immutable code ref)"
         required: true
         type: string
-<<<<<<< HEAD
       bead_id:
         description: "Optional bead id (e.g. 'jleechan-pq08'). When set, the gate loads the contract from `br show --json <id>` and the reviewer prompt carries the bead's notes + prior findings + acceptance items. Closes issue #386 r3 gap 3 (production workflow did not pass --contract-file). Mutually exclusive with contract_file."
         required: false
@@ -94,8 +93,6 @@ on:
         required: false
         type: string
         default: ""
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
     secrets:
       github_token:
         description: "GitHub token for posting comment + status (default: workflow-provided GITHUB_TOKEN)"
@@ -341,7 +338,6 @@ jobs:
         # calls. Now Python keeps GH_TOKEN (scoped to the workflow
         # run); only the reviewer subprocess env is sanitized via
         # runner/skeptic_gate_cli._reviewer_env.
-<<<<<<< HEAD
         #
         # Per issue #386 r3: pass `--bead-id` so the gate loads the
         # contract from `br show --json <id>` and the reviewer
@@ -352,8 +348,6 @@ jobs:
         # hand-authored contracts. If neither is set, the gate runs
         # the legacy 10-field contract (issue #384) — backwards
         # compatible.
-=======
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN || secrets.github_token }}
           PR_NUMBER: ${{ inputs.pr_number }}
@@ -365,7 +359,6 @@ jobs:
           SKEPTIC_GEMINI_BIN: ${{ env.SKEPTIC_GEMINI_BIN }}
           SKEPTIC_REVIEWER_PATH: ${{ env.SKEPTIC_REVIEWER_PATH }}
           TRUSTED_CODE_SHA: ${{ env.TRUSTED_CODE_SHA }}
-<<<<<<< HEAD
           # r3: bead-id is the preferred contract source. The caller
           # workflow forwards `inputs.bead_id` (default empty); when
           # empty, `SKEPTIC_CONTRACT_FILE` (a path to a hand-authored
@@ -386,11 +379,6 @@ jobs:
           elif [ -n "${SKEPTIC_CONTRACT_FILE:-}" ]; then
             contract_args+=(--contract-file "${SKEPTIC_CONTRACT_FILE}")
           fi
-=======
-        run: |
-          set -euo pipefail
-          export PATH="$SKEPTIC_REVIEWER_PATH"
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
           python -m runner.skeptic_gate_cli \
             --repo "$GITHUB_REPOSITORY" \
             --pr-number "${PR_NUMBER}" \
@@ -400,9 +388,5 @@ jobs:
             --expected-actor "${SKEPTIC_EXPECTED_ACTOR}" \
             --codex-bin "${SKEPTIC_CODEX_BIN}" \
             --gemini-bin "${SKEPTIC_GEMINI_BIN}" \
-<<<<<<< HEAD
             --trusted-code-sha "${TRUSTED_CODE_SHA}" \
             "${contract_args[@]}"
-=======
-            --trusted-code-sha "${TRUSTED_CODE_SHA}"
->>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
