@@ -1180,16 +1180,28 @@ impl Scm for CliScm {
         let checks: Vec<GhCheck> = serde_json::from_str(&checks_out[json_start_c..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse gh pr checks JSON: {e}"))
         })?;
+        // jleechan-mdun follow-up (2026-07-28): gate 1 (CI) must only read
+        // check-runs it OWNS. The "Evidence Gate" workflow's check-run is
+        // gate 6's territory (evidence floor / /er verdict): a fresh factory
+        // PR legitimately opens with no evidence marker, so counting that
+        // check-run's failure as CI-red made gate 1 reroll every attempt
+        // before any evidence lane could attach a bundle — observed live on
+        // PR #485 (test + daemon-tests green, Evidence Gate failure →
+        // instant reroll; no attempt could ever converge).
+        let ci_owned_checks: Vec<&GhCheck> = checks
+            .iter()
+            .filter(|c| !check_owned_by_dedicated_gate(&c.name))
+            .collect();
         let mut any_pending = false;
         let mut any_failed = false;
-        for c in &checks {
+        for c in &ci_owned_checks {
             if c.bucket == "pending" {
                 any_pending = true;
             } else if c.bucket == "fail" || c.bucket == "cancel" {
                 any_failed = true;
             }
         }
-        let ci_status = if checks.is_empty() || any_pending {
+        let ci_status = if ci_owned_checks.is_empty() || any_pending {
             "unknown".to_string()
         } else if any_failed {
             "red".to_string()
@@ -1200,7 +1212,10 @@ impl Scm for CliScm {
         let iteration_stub =
             std::env::var("DARK_FACTORY_ITERATION_STUB").as_deref() == Ok("1");
         let ci_success = ci_success_from_check_buckets(
-            &checks.iter().map(|c| c.bucket.as_str()).collect::<Vec<_>>(),
+            &ci_owned_checks
+                .iter()
+                .map(|c| c.bucket.as_str())
+                .collect::<Vec<_>>(),
             iteration_stub,
         );
 
@@ -4962,6 +4977,18 @@ impl Llm for ChainLlm {
     }
 }
 
+/// Check-run names whose verdict is owned by a dedicated gate rather than
+/// gate 1 (CI). "Evidence Gate" belongs to gate 6 (evidence floor / /er):
+/// a fresh factory PR opens with no evidence marker by construction, so
+/// letting its failing check-run turn gate 1 red rerolled every attempt
+/// before evidence could be attached (live incident 2026-07-28, PR #485).
+/// CodeRabbit / Bugbot check-runs stay in gate 1's input: they report
+/// pass/neutral buckets and their dedicated gates read reviews/comments,
+/// not check-runs.
+pub fn check_owned_by_dedicated_gate(check_name: &str) -> bool {
+    check_name.trim() == "Evidence Gate"
+}
+
 /// CI gate input for `PrSnapshot.ci_success`. Production requires every bucket
 /// to be `pass` or `skipping`; `pending` is not green. Iteration stub may treat
 /// `pending` as acceptable but never `fail`/`cancel`.
@@ -5222,6 +5249,29 @@ mod ci_bucket_tests {
     fn iteration_stub_allows_pending_not_fail() {
         assert!(ci_success_from_check_buckets(&["pass", "pending"], true));
         assert!(!ci_success_from_check_buckets(&["pass", "fail"], true));
+    }
+}
+
+#[cfg(test)]
+mod ci_dedicated_gate_ownership_tests {
+    use super::check_owned_by_dedicated_gate;
+
+    // Live incident 2026-07-28 (PR #485): a factory PR with real CI green
+    // (test + daemon-tests success) but a failing "Evidence Gate" check-run
+    // was classified ci_green=fail and instantly rerolled. Since coders open
+    // PRs without evidence markers by construction, gate 1 counting the
+    // evidence check-run made every attempt non-convergent.
+    #[test]
+    fn evidence_gate_check_run_is_owned_by_gate_6_not_ci() {
+        assert!(check_owned_by_dedicated_gate("Evidence Gate"));
+        assert!(check_owned_by_dedicated_gate(" Evidence Gate "));
+    }
+
+    #[test]
+    fn real_ci_and_review_bot_check_runs_stay_in_gate_1() {
+        for name in ["test", "daemon-tests", "CodeRabbit", "Cursor Bugbot", "notify / notify"] {
+            assert!(!check_owned_by_dedicated_gate(name), "{name} must stay in gate 1");
+        }
     }
 }
 
