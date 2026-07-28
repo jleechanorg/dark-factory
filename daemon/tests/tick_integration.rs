@@ -1974,6 +1974,80 @@ fn factory_labeled_existing_pr_second_tick_reuses_tracking_bead_without_spawn() 
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+/// jleechan-mdun: a bead that has already been adoption-attested once should
+/// NOT re-emit `EXISTING_PR_ADOPTED` on every subsequent tick. Live telemetry
+/// shows 30 attested beads re-emitting ~301k events (top ~14 beads account
+/// for ~24.8k/day), because the adoption loop unconditionally emits whether
+/// `should_adopt` was true or false. The cache lives on the overlay's
+/// `is_adopted` + `state` (no new store column needed): once the bead is
+/// Attested/Ready/HumanHeld/DispositionRequired, the telemetry is redundant
+/// because the durable overlay already records the same provenance.
+#[test]
+fn existing_pr_adoption_does_not_re_emit_telemetry_on_subsequent_ticks() {
+    let mut scm = FakeScm::new();
+    scm.prs.push(LabeledPr {
+        number: 705,
+        title: "Existing factory PR for dedup".into(),
+        body: "already has a branch".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#705".into(),
+        head_ref_name: "feature/already-open-pr-705".into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("owner/repo".into()),
+        head_repo_owner_login: Some("owner".into()),
+        head_sha: Some("sha-stub".into()),
+        updated_at_epoch: Some(1_700_000_000),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+    scm.pr_snapshots.insert(
+        705,
+        qdw_green_snapshot(
+            705,
+            vec![PrComment {
+                author: "dark-factory-er".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: 0,
+            }],
+        ),
+    );
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_existing_pr_adoption_dedup.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    run_tick(&deps, 0, 0).expect("first tick adopts PR");
+    run_tick(&deps, 1, 0).expect("second tick reuses adoption");
+    run_tick(&deps, 2, 0).expect("third tick reuses adoption");
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    let adopt_count = telemetry
+        .lines()
+        .filter(|line| line.contains("EXISTING_PR_ADOPTED"))
+        .count();
+    assert_eq!(
+        adopt_count, 1,
+        "EXISTING_PR_ADOPTED should emit exactly once per bead lifetime, got {adopt_count} emits:\n{telemetry}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 #[test]
 fn factory_labeled_existing_pr_without_session_is_not_parked_as_stalled() {
     let mut scm = FakeScm::new();
