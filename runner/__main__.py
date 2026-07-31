@@ -222,6 +222,15 @@ def main(argv: list[str] | None = None) -> int:
     args_list = list(argv) if argv is not None else list(sys.argv[1:])
     if args_list and args_list[0] == "resume":
         args_list[0] = "--resume"
+    # Dispatch the binary-owned `dark-factory review` subcommand to
+    # `runner.review_cli.main` so `./bin/dark-factory review --help`
+    # prints the review-specific arguments (--base-sha, --head-sha,
+    # --task-file, --evidence, --output-dir, --backend) rather than
+    # the top-level pipeline-runner usage. The dispatcher must run
+    # before the pipeline-runner argparse below.
+    if args_list and args_list[0] == "review":
+        from .review_cli import main as review_cli_main
+        return review_cli_main(args_list[1:])
     argv = args_list
     command = shlex.join(["dark-factory", *argv])
 

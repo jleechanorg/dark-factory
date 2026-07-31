@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import shutil
 import subprocess
 import time
@@ -77,6 +78,8 @@ class _ShadowGateReview:
     launch_error: str = ""
     started_at: float = 0.0
     backend: str = "codex"
+    prompt_is_complete: bool = False
+    json_transport: bool = False
 
 
 def _resolve_shadow_backend_env() -> str:
@@ -158,6 +161,8 @@ def _launch_shadow_gate_review(
     timeout: int,
     ctx: "Context",
     backend: str = "codex",
+    *,
+    prompt_is_complete: bool = False,
 ) -> _ShadowGateReview | None:
     import runner.handlers as _handlers_shim  # late-bound shim (see module docstring)
     """Spawn a shadow reviewer on ``backend`` (no enable-gate).
@@ -178,8 +183,18 @@ def _launch_shadow_gate_review(
     """
     if backend == "codex":
         backend = _resolve_shadow_backend_env()
-    shadow_prompt = _shadow_gate_prompt(name, prompt, expected_sha, ctx)
-    shadow = _ShadowGateReview(prompt=shadow_prompt, started_at=time.monotonic(), backend=backend)
+    shadow_prompt = prompt if prompt_is_complete else _shadow_gate_prompt(
+        name, prompt, expected_sha, ctx,
+    )
+    shadow = _ShadowGateReview(
+        prompt=shadow_prompt,
+        started_at=time.monotonic(),
+        backend=backend,
+        prompt_is_complete=prompt_is_complete,
+    )
+    if prompt_is_complete and backend != "codex":
+        shadow.launch_error = "controller review requests require codex backend"
+        return shadow
     seq = int(getattr(ctx, "_df_current_seq", getattr(ctx, "last_completed_seq", 0)))
     attempt = int(getattr(ctx, "_df_current_attempt", 1))
     node_name = str(getattr(ctx, "_df_current_node", name))
@@ -219,10 +234,23 @@ def _launch_shadow_gate_review(
     if args is None:
         shadow.launch_error = "sandbox-exec unavailable"
         return shadow
+    if prompt_is_complete and backend == "codex":
+        try:
+            args = _controller_codex_args(args)
+        except ValueError as exc:
+            shadow.launch_error = str(exc)
+            return shadow
+        shadow.json_transport = True
+    review_cwd = ctx.workdir
+    if prompt_is_complete:
+        configured_cwd = ctx.state.get("_df_controller_review_cwd")
+        if configured_cwd:
+            review_cwd = pathlib.Path(str(configured_cwd))
     try:
         shadow.proc = subprocess.Popen(
             args,
-            cwd=ctx.workdir,
+            cwd=review_cwd,
+            stdin=subprocess.PIPE if shadow.json_transport else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -241,6 +269,8 @@ def _start_shadow_gate_review(
     timeout: int,
     ctx: "Context",
     backend: str = "codex",
+    *,
+    prompt_is_complete: bool = False,
 ) -> _ShadowGateReview | None:
     """Back-compat wrapper: gate-on-enable then spawn the shadow reviewer.
 
@@ -250,7 +280,15 @@ def _start_shadow_gate_review(
     """
     if not _shadow_gate_enabled(ctx):
         return None
-    return _launch_shadow_gate_review(name, prompt, expected_sha, timeout, ctx, backend)
+    return _launch_shadow_gate_review(
+        name,
+        prompt,
+        expected_sha,
+        timeout,
+        ctx,
+        backend,
+        prompt_is_complete=prompt_is_complete,
+    )
 
 
 def _finish_shadow_gate_review(
@@ -286,13 +324,29 @@ def _finish_shadow_gate_review(
         else:
             remaining = max(1, timeout - int(time.monotonic() - shadow.started_at))
             try:
-                stdout, stderr = proc.communicate(timeout=remaining)
+                if shadow.json_transport:
+                    stdout, stderr = proc.communicate(
+                        input=shadow.prompt,
+                        timeout=remaining,
+                    )
+                else:
+                    stdout, stderr = proc.communicate(timeout=remaining)
             except subprocess.TimeoutExpired:
                 timed_out = True
                 proc.kill()
                 stdout, stderr = proc.communicate()
             returncode = str(proc.returncode if proc.returncode is not None else "")
             output = (stdout + ("\nSTDERR:\n" + stderr if stderr else "")).strip()
+            command_receipts = ()
+            transport_error = ""
+            if shadow.json_transport and not timed_out and proc.returncode == 0:
+                try:
+                    from .review_controller import parse_codex_jsonl
+
+                    output, command_receipts = parse_codex_jsonl(stdout)
+                except Exception as exc:
+                    transport_error = str(exc)
+                    output = stdout.strip()
             if timed_out and not output:
                 output = f"shadow codex gate review timed out after {timeout} seconds"
             verdict, normalized = _handlers_shim._parse_verdict(output)
@@ -301,7 +355,7 @@ def _finish_shadow_gate_review(
                 "matched" if sha_ok and observed_sha
                 else ("mismatched" if observed_sha else "missing")
             )
-            if proc.returncode != 0 or timed_out:
+            if proc.returncode != 0 or timed_out or transport_error:
                 shadow_outcome = "error"
             elif not sha_ok and normalized in {"success", "unknown"}:
                 shadow_outcome = "error"
@@ -356,6 +410,14 @@ def _finish_shadow_gate_review(
             f"{prefix}prompt_sha256": shadow.prompt_sha256,
             f"{prefix}output_path": output_path or "",
             f"{prefix}output_sha256": output_sha or "",
+            f"{prefix}command_receipts": [
+                {
+                    "command": item.command,
+                    "exit_code": item.exit_code,
+                    "output_sha256": item.output_sha256,
+                }
+                for item in command_receipts
+            ] if "command_receipts" in locals() else [],
         }
     )
     comparison = (
@@ -443,6 +505,66 @@ def _gate_subprocess_env(backend: str) -> dict[str, str]:
     return _handlers_shim._sanitized_env()
 
 
+def _build_controller_codex_transport(args: list[str]) -> list[str]:
+    """Build the concrete controller transport command for Codex review.
+
+    The controller transport is always JSON-over-stdin:
+      - complete payload on stdin (`-`), never argv positionals
+      - `codex exec --json --ephemeral --skip-git-repo-check`
+      - `--sandbox read-only`
+    Any unsupported transport mode (prompt-in-argv, bypass, write-capable
+    sandbox mode, or weaker backend) fails closed before launch.
+    """
+    prepared = list(args)
+    if not prepared:
+        raise ValueError("codex controller argv is empty")
+
+    try:
+        codex_index = next(
+            index
+            for index, value in enumerate(prepared)
+            if pathlib.Path(value).name == "codex"
+        )
+    except StopIteration as exc:
+        raise ValueError("codex executable missing from reviewer argv") from exc
+
+    codex_args = prepared[codex_index:]
+    if len(codex_args) < 3:
+        raise ValueError("codex controller command missing review payload")
+    if codex_args[1] != "exec":
+        raise ValueError("controller transport requires 'codex exec'")
+
+    for idx, value in enumerate(codex_args):
+        if value == "--dangerously-bypass-approvals-and-sandbox":
+            raise ValueError("controller transport uses unsafe codex flags")
+        if value.startswith("--sandbox="):
+            mode = value.split("=", 1)[1].strip().lower()
+            if mode != "read-only":
+                raise ValueError("controller transport requires read-only codex sandboxing")
+        elif value == "--sandbox":
+            if idx + 1 >= len(codex_args):
+                raise ValueError("codex controller command uses invalid --sandbox mode")
+            mode = codex_args[idx + 1].strip().lower()
+            if mode != "read-only":
+                raise ValueError("controller transport requires read-only codex sandboxing")
+
+    return prepared[:codex_index] + [
+        "codex",
+        "exec",
+        "--json",
+        "--ephemeral",
+        "--skip-git-repo-check",
+        "--sandbox",
+        "read-only",
+        "-",
+    ]
+
+
+def _controller_codex_args(args: list[str]) -> list[str]:
+    """Backward-compatible shim for the controller transport builder."""
+    return _build_controller_codex_transport(args)
+
+
 def _run_gate_once(
     backend: str, prompt: str, expected_sha: str, timeout: int, ctx: "Context", name: str,
     *, gate_strict: bool = False,
@@ -506,6 +628,35 @@ def _run_gate_once(
                       "reviewer_backend": reviewer_backend, "sandbox": "unavailable",
                       **prompt_meta},
         )
+    controller_requested = str(ctx.state.get("_df_controller_review_json") or "").lower() in {"true", "1", "yes", "on"}
+    if controller_requested and backend != "codex":
+        return Result(
+            outcome="error",
+            output="controller review transport requires codex backend",
+            metadata={
+                "slash_command": name,
+                "verdict": "unknown",
+                "reviewer_backend": reviewer_backend,
+                "head_sha_status": "missing",
+                "backend_missing": "true",
+                **prompt_meta,
+            },
+        )
+    controller_json = backend == "codex" and controller_requested
+    if controller_json:
+        try:
+            sub_args = _controller_codex_args(sub_args)
+        except ValueError:
+            return Result(
+                outcome="error",
+                output="controller review argv does not contain codex",
+                metadata={
+                    "slash_command": name,
+                    "verdict": "unknown",
+                    "reviewer_backend": reviewer_backend,
+                    **prompt_meta,
+                },
+            )
     shadow_review = _start_shadow_gate_review(name, prompt, expected_sha, timeout, ctx)
 
     def _finalize(result: "Result") -> "Result":
@@ -515,8 +666,12 @@ def _run_gate_once(
     # so we read agy's timeout message rather than killing it first.
     run_timeout = timeout + 30 if backend == "agy" else timeout
     try:
+        review_cwd = ctx.workdir
+        if controller_json and ctx.state.get("_df_controller_review_cwd"):
+            review_cwd = pathlib.Path(str(ctx.state["_df_controller_review_cwd"]))
         proc = subprocess.run(
-            sub_args, cwd=ctx.workdir, capture_output=True, text=True,
+            sub_args, cwd=review_cwd, capture_output=True, text=True,
+            input=prompt if controller_json else None,
             timeout=run_timeout, check=False, env=sub_env,
         )
     except subprocess.TimeoutExpired as exc:
@@ -553,12 +708,25 @@ def _run_gate_once(
                       "head_sha_status": "missing", "reviewer_backend": reviewer_backend,
                       **prompt_meta},
         ))
-    combined = proc.stdout + "\n" + proc.stderr
+    command_receipts = ()
+    review_output = proc.stdout
+    transport_error = ""
+    if controller_json and proc.returncode == 0:
+        try:
+            from .review_controller import parse_codex_jsonl
+
+            review_output, command_receipts = parse_codex_jsonl(proc.stdout)
+        except Exception as exc:
+            transport_error = str(exc)
+            review_output = proc.stdout
+    combined = review_output + "\n" + proc.stderr
     verdict, normalized = _handlers_shim._parse_verdict(combined, gate_strict=gate_strict)
     # SHA binding check comes BEFORE collapsing to pass/fail so a spoofed-pass
     # with the wrong SHA collapses to `error`, not `success`.
     sha_ok, observed_sha = _handlers_shim._verify_head_sha_echo(combined, expected_sha)
-    if proc.returncode != 0 and (verdict == "unknown" or normalized == "success"):
+    if transport_error:
+        outcome = "error"
+    elif proc.returncode != 0 and (verdict == "unknown" or normalized == "success"):
         outcome = "error"
     elif not sha_ok:
         # Spoofed PASS / unknown without a SHA echo → error. A real FAIL/PARTIAL
@@ -576,10 +744,12 @@ def _run_gate_once(
     # Build the structured receipt for the real subprocess that just ran.
     # This is what closes the regex-fabrication ceiling — the gate now binds
     # the verdict to the captured execution, not to the reviewer's narrative.
-    receipt = _build_reviewer_receipt(
-        sub_args=sub_args, proc=proc, cwd=str(ctx.workdir),
-        expected_sha=expected_sha, timeout=timeout,
-    )
+    receipt = None
+    if not controller_json:
+        receipt = _build_reviewer_receipt(
+            sub_args=sub_args, proc=proc, cwd=str(ctx.workdir),
+            expected_sha=expected_sha, timeout=timeout,
+        )
     metadata: dict[str, Any] = {
         "slash_command": name, "verdict": verdict,
         "returncode": str(proc.returncode),
@@ -592,6 +762,17 @@ def _run_gate_once(
         # Pass-through: list-valued receipt list is consumed verbatim by the
         # structured gate (_check_structured_receipt) via _MDToCtxShim.
         metadata["_reviewer_receipts"] = [receipt]
+    if controller_json:
+        metadata["_controller_command_receipts"] = [
+            {
+                "command": item.command,
+                "exit_code": item.exit_code,
+                "output_sha256": item.output_sha256,
+            }
+            for item in command_receipts
+        ]
+        if transport_error:
+            metadata["review_transport_error"] = transport_error
     # Codergen-sourced receipts (Task 2): the codergen producer stashes
     # parsed ``commands_run.md`` records into ``ctx.state`` under per-node
     # keys ``"<node>.structured_receipt"``. The reviewer gate runs in a
@@ -624,7 +805,7 @@ def _run_gate_once(
         metadata["_codergen_receipts"] = codergen_receipts
     return _finalize(Result(
         outcome=outcome,
-        output=proc.stdout,
+        output=review_output,
         metadata=metadata,
         context_updates=context_updates,
     ))

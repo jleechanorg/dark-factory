@@ -101,7 +101,9 @@ def test_check_stale_artifacts_symbol_is_removed():
 
 
 def test_unused_imports_removed_from_handler_module():
-    """pathlib, time, and hashlib were only used by the deleted detector."""
+    """`time` was only used by the deleted detector. `pathlib` (lane_output_dir +
+    neutral_cwd paths) and `hashlib` (workspace-reverify + evidence digest
+    recompute) are now legitimately used by the controller contract wiring."""
     src = Path(importlib.import_module(HANDLER_MODULE).__file__).read_text()
     tree = ast.parse(src)
 
@@ -115,7 +117,7 @@ def test_unused_imports_removed_from_handler_module():
                 imported[alias.asname or alias.name] = node.module or ""
 
     # json is still legitimately used (json.dumps for shadow_reviews).
-    for unused in ("pathlib", "time", "hashlib"):
+    for unused in ("time",):
         assert unused not in imported, (
             f"{HANDLER_MODULE} still imports {unused!r}; the deleted detector "
             "was its only consumer."

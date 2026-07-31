@@ -837,7 +837,7 @@ def test_invoke_reviewer_missing_binary_returns_error():
     cli_mod._build_reviewer_cmd = fake_cmd
     try:
         out, err = cli_mod.invoke_reviewer(
-            "anything", "any-model", "prompt", parent_env={"PATH": "/bin"}
+            "anything", "any-model", "prompt", parent_env={"PATH": "/usr/bin:/bin"}
         )
     finally:
         cli_mod._build_reviewer_cmd = original
@@ -852,12 +852,12 @@ def test_invoke_reviewer_nonzero_exit_returns_error():
     original = cli_mod._build_reviewer_cmd
 
     def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
-        return ["false"]  # always exits 1
+        return ["/usr/bin/false"]  # absolute path so PATH-empty cases still find it
 
     cli_mod._build_reviewer_cmd = fake_cmd
     try:
         out, err = cli_mod.invoke_reviewer(
-            "anything", "any-model", "prompt", parent_env={"PATH": "/bin"}
+            "anything", "any-model", "prompt", parent_env={"PATH": "/usr/bin:/bin"}
         )
     finally:
         cli_mod._build_reviewer_cmd = original

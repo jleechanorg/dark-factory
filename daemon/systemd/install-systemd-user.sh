@@ -57,13 +57,21 @@ render_unit() {
 }
 
 ensure_linger() {
-    if ! command -v loginctl >/dev/null 2>&1; then
-        echo "WARNING: loginctl not found; cannot verify user linger for boot persistence" >&2
-        return 0
-    fi
+    # Always print the dry-run loginctl commands so the installer's
+    # dry-run trace matches the test expectation, even on hosts where
+    # loginctl is not installed (e.g. macOS dev hosts). On non-dry-run
+    # hosts without loginctl, warn and skip.
     if [ "$DRY_RUN" -eq 1 ]; then
         printf '[dry-run] loginctl show-user %s -p Linger --value\n' "$INSTALL_USER"
-        printf '[dry-run] loginctl enable-linger %s # if Linger is not yes\n' "$INSTALL_USER"
+        if ! command -v loginctl >/dev/null 2>&1; then
+            printf '[dry-run] loginctl enable-linger %s # if Linger is not yes (loginctl not on PATH)\n' "$INSTALL_USER"
+        else
+            printf '[dry-run] loginctl enable-linger %s # if Linger is not yes\n' "$INSTALL_USER"
+        fi
+        return 0
+    fi
+    if ! command -v loginctl >/dev/null 2>&1; then
+        echo "WARNING: loginctl not found; cannot verify user linger for boot persistence" >&2
         return 0
     fi
     local linger
