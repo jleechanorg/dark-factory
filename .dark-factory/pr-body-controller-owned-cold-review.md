@@ -145,6 +145,8 @@ Local run evidence:
 Rejects: symlinks, non-directories, paths into any holdout root, evidence
 escapes, non-regular files, files > 1 MiB.
 
+**Evidence**: <https://gist.github.com/jleechan2015/fb3a17b7e2ea7abda1d8bbec237d2b3f> — full test run, `/advice` A1 verdict, per-instance table, and reference files.
+
 ### Files changed (cumulative across the 5 commits)
 
 ```
