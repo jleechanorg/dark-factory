@@ -111,6 +111,7 @@ from .handler_verdict import (
 from .handler_dispatch import (
     _gate_subprocess_args,
     _gate_subprocess_env,
+    _controller_codex_args,
     _run_gate_once,
     _is_gate_infra_failure,
     _DEFAULT_ADVERSARIAL_PRIORITY,
