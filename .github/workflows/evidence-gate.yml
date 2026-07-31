@@ -212,7 +212,14 @@ jobs:
               #     er_runner format) or `head <sha>` (the marker-line
               #     format). A short SHA prefix (>= 7 hex) is sufficient
               #     because the er_runner posts the full 40-char SHA.
-              c_head_sha="$(echo "$c_body" | grep -oE 'head[[:space:]]*=[[:space:]]*[0-9a-f]{7,64}|head[[:space:]]+[0-9a-f]{7,64}' | head -1 | awk '{print $NF}' | sed 's/^=//' || echo "")"
+              # jleechan-wjm2 follow-up: the previous `sed 's/^=//'` only
+              # stripped a leading `=`, not `head=`, so for the documented
+              # er_runner format (`head=<sha>`) the captured token was
+              # `head=<sha>` and the prefix-match against `current_head_sha`
+              # always failed. Strip both leading prefixes so both formats
+              # (`head=<sha>` from er_runner, `head <sha>` from the marker
+              # line) extract to the bare SHA.
+              c_head_sha="$(echo "$c_body" | grep -oE 'head[[:space:]]*=[[:space:]]*[0-9a-f]{7,64}|head[[:space:]]+[0-9a-f]{7,64}' | head -1 | awk '{print $NF}' | sed -E 's/^head=//; s/^=//' || echo "")"
               if [ -z "$c_head_sha" ] || [ -z "$current_head_sha" ]; then
                 echo "signal_a_skipped author=${c_author} verdict=${c_verdict} reason=no_head_reference current_head=${current_head_sha:-<unknown>}"
                 continue
