@@ -1448,8 +1448,13 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
 
         let existing = deps.store.load(&adopted.bead_id)?;
         let attempt = existing.as_ref().map(|o| o.attempt).unwrap_or(1);
+        // jleechan-mdun: capture the overlay state BEFORE the move into
+        // `should_adopt` (and the subsequent `unwrap_or` below) so the
+        // dedup check below can compare against the durable state of
+        // THIS tick's snapshot, not a stale or re-initialized copy.
+        let pre_adopt_state = existing.as_ref().map(|o| o.state);
         let should_adopt = !matches!(
-            existing.as_ref().map(|o| o.state),
+            pre_adopt_state,
             Some(OverlayState::Ready) | Some(OverlayState::HumanHeld)
         );
         if should_adopt {
@@ -1490,20 +1495,37 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             overlay.is_adopted = true;
             deps.store.save(&overlay)?;
         }
-        emit(
-            deps.telemetry_log,
-            &adopted.bead_id,
-            attempt,
-            OverlayState::Attested.as_str(),
-            "EXISTING_PR_ADOPTED",
-            serde_json::json!({}),
-            serde_json::json!({
-                "pr_number": adopted.pr_number,
-                "branch": adopted.head_ref_name,
-                "external_ref": adopted.external_ref,
-                "newly_created": adopted.newly_created,
-            }),
-        )?;
+        // jleechan-mdun: skip re-emit on subsequent ticks. The durable
+        // overlay row already records (pr_number, branch, external_ref,
+        // is_adopted) — emitting `EXISTING_PR_ADOPTED` every tick for an
+        // already-attested bead produced ~301k redundant telemetry events
+        // across 30 attested beads (peaks ~24.8k/day; top offender
+        // jleechan-fpca at 23,012 re-emits over 20 days). The first emit
+        // (newly_created=true) and any emit after a state transition
+        // away from Attested/Ready/HumanHeld still fire so the audit
+        // trail is preserved.
+        let already_attested = matches!(
+            pre_adopt_state,
+            Some(OverlayState::Attested)
+                | Some(OverlayState::Ready)
+                | Some(OverlayState::HumanHeld)
+        );
+        if !already_attested {
+            emit(
+                deps.telemetry_log,
+                &adopted.bead_id,
+                attempt,
+                OverlayState::Attested.as_str(),
+                "EXISTING_PR_ADOPTED",
+                serde_json::json!({}),
+                serde_json::json!({
+                    "pr_number": adopted.pr_number,
+                    "branch": adopted.head_ref_name,
+                    "external_ref": adopted.external_ref,
+                    "newly_created": adopted.newly_created,
+                }),
+            )?;
+        }
     }
 
     let (created, issue_skip_outcomes) = intake::normalize(deps.scm, deps.tracker, deps.cfg)?;

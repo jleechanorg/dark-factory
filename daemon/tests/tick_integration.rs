@@ -1974,6 +1974,196 @@ fn factory_labeled_existing_pr_second_tick_reuses_tracking_bead_without_spawn() 
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+/// jleechan-mdun: a bead that has already been adoption-attested once should
+/// NOT re-emit `EXISTING_PR_ADOPTED` on every subsequent tick. Live telemetry
+/// shows 30 attested beads re-emitting ~301k events (top ~14 beads account
+/// for ~24.8k/day), because the adoption loop unconditionally emits whether
+/// `should_adopt` was true or false. The cache lives on the overlay's
+/// `is_adopted` + `state` (no new store column needed): once the bead is
+/// Attested/Ready/HumanHeld/DispositionRequired, the telemetry is redundant
+/// because the durable overlay already records the same provenance.
+#[test]
+fn existing_pr_adoption_does_not_re_emit_telemetry_on_subsequent_ticks() {
+    let mut scm = FakeScm::new();
+    scm.prs.push(LabeledPr {
+        number: 705,
+        title: "Existing factory PR for dedup".into(),
+        body: "already has a branch".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#705".into(),
+        head_ref_name: "feature/already-open-pr-705".into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("owner/repo".into()),
+        head_repo_owner_login: Some("owner".into()),
+        head_sha: Some("sha-stub".into()),
+        updated_at_epoch: Some(1_700_000_000),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+    scm.pr_snapshots.insert(
+        705,
+        qdw_green_snapshot(
+            705,
+            vec![PrComment {
+                author: "dark-factory-er".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: 0,
+            }],
+        ),
+    );
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    // jleechan-mdun follow-up (CodeRabbit actionable #1): the previous
+    // fixed-name `afd_existing_pr_adoption_dedup.jsonl` collided across
+    // concurrent `cargo test` jobs in the same process — every parallel
+    // thread sharing `std::process::id()` would clobber the telemetry
+    // file. Match the convention at the top of this file (PID-suffixed
+    // under a dedicated per-test directory) so concurrent runs and
+    // repeated runs share no telemetry storage.
+    let telemetry_dir = std::env::temp_dir().join("afd_existing_pr_adoption_dedup");
+    std::fs::create_dir_all(&telemetry_dir).unwrap();
+    let telemetry_log = telemetry_dir.join(format!("daemon-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&telemetry_log);
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    run_tick(&deps, 0, 0).expect("first tick adopts PR");
+    run_tick(&deps, 1, 0).expect("second tick reuses adoption");
+    run_tick(&deps, 2, 0).expect("third tick reuses adoption");
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    let adopt_count = telemetry
+        .lines()
+        .filter(|line| line.contains("EXISTING_PR_ADOPTED"))
+        .count();
+    // jleechan-mdun follow-up (CodeRabbit actionable #2): the assertion
+    // message must describe what the test actually proves — repeated ticks
+    // against an already-attested overlay suppress the redundant event —
+    // not "per bead lifetime", which is a different invariant. The
+    // re-emit-after-state-transition case is covered separately by
+    // `existing_pr_adoption_re_emits_after_state_transition_away_from_attested`
+    // below.
+    assert_eq!(
+        adopt_count, 1,
+        "EXISTING_PR_ADOPTED should emit exactly once across repeated ticks while the bead stays in Attested/Ready/HumanHeld; got {adopt_count} emits:\n{telemetry}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Companion to `existing_pr_adoption_does_not_re_emit_telemetry_on_subsequent_ticks`:
+/// proves the inverse invariant — when the overlay leaves the dedup
+/// set (Attested/Ready/HumanHeld) and is re-adopted later, the next
+/// tick MUST re-emit `EXISTING_PR_ADOPTED` so the audit trail captures
+/// the transition. jleechan-mdun follow-up (CodeRabbit actionable #2).
+#[test]
+fn existing_pr_adoption_re_emits_after_state_transition_away_from_attested() {
+    use daemon::state::OverlayState;
+
+    let mut scm = FakeScm::new();
+    scm.prs.push(LabeledPr {
+        number: 706,
+        title: "Existing factory PR for transition re-emit".into(),
+        body: "already has a branch".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#706".into(),
+        head_ref_name: "feature/already-open-pr-706".into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("owner/repo".into()),
+        head_repo_owner_login: Some("owner".into()),
+        head_sha: Some("sha-stub".into()),
+        updated_at_epoch: Some(1_700_000_000),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+    scm.pr_snapshots.insert(
+        706,
+        qdw_green_snapshot(
+            706,
+            vec![PrComment {
+                author: "dark-factory-er".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: 0,
+            }],
+        ),
+    );
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_dir = std::env::temp_dir().join("afd_existing_pr_adoption_transition");
+    std::fs::create_dir_all(&telemetry_dir).unwrap();
+    let telemetry_log = telemetry_dir.join(format!("daemon-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&telemetry_log);
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    // First tick adopts the PR — overlay moves to Attested; telemetry
+    // records exactly one EXISTING_PR_ADOPTED.
+    run_tick(&deps, 0, 0).expect("first tick adopts PR");
+
+    let telemetry_after_first = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    let first_count = telemetry_after_first
+        .lines()
+        .filter(|line| line.contains("EXISTING_PR_ADOPTED"))
+        .count();
+    assert_eq!(
+        first_count, 1,
+        "first tick should emit exactly one EXISTING_PR_ADOPTED, got {first_count}:\n{telemetry_after_first}"
+    );
+
+    // Drive a state transition AWAY from the dedup set (Attested →
+    // Queued). The next tick's pre_adopt_state is therefore NOT in
+    // {Attested, Ready, HumanHeld}, so the dedup check at tick.rs:1507
+    // must NOT suppress the re-emit.
+    {
+        let mut overlays = store.overlays.borrow_mut();
+        let overlay = overlays
+            .values_mut()
+            .next()
+            .expect("first tick must have created an overlay");
+        overlay.state = OverlayState::Queued;
+    }
+
+    run_tick(&deps, 1, 0).expect("second tick after transition reuses adoption");
+
+    let telemetry_after_second = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    let second_count = telemetry_after_second
+        .lines()
+        .filter(|line| line.contains("EXISTING_PR_ADOPTED"))
+        .count();
+    assert_eq!(
+        second_count, 2,
+        "EXISTING_PR_ADOPTED must re-emit after the overlay leaves the dedup set (Attested→Queued); got {second_count} emits:\n{telemetry_after_second}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 #[test]
 fn factory_labeled_existing_pr_without_session_is_not_parked_as_stalled() {
     let mut scm = FakeScm::new();
