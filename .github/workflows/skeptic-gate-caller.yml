@@ -69,3 +69,42 @@ on:
         default: ""
     secrets:
       github_token: ${{ secrets.GITHUB_TOKEN }}
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: read
+
+jobs:
+  skeptic:
+    name: Skeptic gate (mandatory, SHA-bound)
+    # IMPLICIT PIN: this `uses:` ref is a literal 40-hex SHA — the
+    # caller's commit SHA on the default branch at the time this
+    # caller was made mandatory (bead jleechan-5n0o). GitHub Actions
+    # does NOT evaluate `${{ }}` inside a `uses:` ref, so the SHA must
+    # be a static literal. The runtime binding that the gate verifies
+    # against is forwarded via `with.trusted_code_sha`, which IS
+    # expression-evaluated and resolves to the same caller SHA.
+    #
+    # Trust posture (see skeptic-gate.md "Trust posture"):
+    #   - pull_request_target grants same-target-repo bot API access
+    #     so the gate can post comments + the `skeptic` commit status.
+    #   - The reusable-workflow call is required (not just a step)
+    #     because GitHub does not allow workflow_call inside a step.
+    #   - The gate's own "Validate trusted_code_sha" + "Verify
+    #     checked-out HEAD" steps defend against drift — even if the
+    #     SHA above is later rebased, the gate fails closed when the
+    #     checked-out HEAD disagrees with the input.
+    uses: jleechanorg/dark-factory/.github/workflows/skeptic-gate.yml@4c2d23d71fe3d0a063792bb27e99c3489f43cbc1
+    with:
+      pr_number: ${{ github.event.pull_request.number }}
+      pr_sha: ${{ github.event.pull_request.head.sha }}
+      # `github.sha` on a pull_request_target run resolves to the
+      # CALLER's commit SHA on the default branch — exactly the SHA
+      # pinned in the `uses:` ref above. The gate uses this to verify
+      # its own checkout (skeptic-gate.yml lines 297-311).
+      trusted_code_sha: ${{ github.sha }}
+      bead_id: ${{ inputs.bead_id }}
+      contract_file: ${{ inputs.contract_file }}
+    secrets:
+      github_token: ${{ secrets.GITHUB_TOKEN }}
