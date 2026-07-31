@@ -120,6 +120,116 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _path_is_symlink(path: Path) -> bool:
+    """Return True when `path` is a symbolic link (including broken ones).
+
+    ``Path.is_symlink`` returns True for symlinks that do not resolve; we must
+    reject those so a reviewer cannot be tricked into following a planted
+    symlink into the sealed holdout repo.
+    """
+    try:
+        return path.is_symlink()
+    except OSError:
+        return True
+
+
+def _resolve_strict(path: Path) -> Path:
+    """Resolve ``path`` strictly, rejecting non-existent targets."""
+    try:
+        return path.resolve(strict=True)
+    except OSError as exc:
+        raise ReviewContractError(
+            f"path does not resolve to an existing target: {path}"
+        ) from exc
+
+
+def validate_immutable_target(
+    inputs: ReviewInputs,
+    *,
+    holdout_roots: tuple[str, ...] = (),
+) -> Path:
+    """Validate that ``inputs.workspace_path`` is an immutable, in-scope target.
+
+    Rejects symlinks, non-directories, paths that resolve into any
+    ``holdout_roots`` entry, evidence paths that escape the workspace, evidence
+    files larger than the 1 MiB input ceiling, and any non-regular evidence
+    file (directories or symlinks). Returns the resolved workspace root so
+    callers can reuse the canonical path.
+
+    The model owns the *interpretation* of evidence sufficiency; this function
+    only enforces shape and digest invariants, never the meaning of any
+    command string or prompt text.
+    """
+    if not isinstance(inputs, ReviewInputs):
+        raise TypeError("inputs must be ReviewInputs")
+
+    raw_workspace = Path(inputs.workspace_path)
+    if _path_is_symlink(raw_workspace):
+        raise ReviewContractError(
+            f"workspace_path must not be a symlink: {raw_workspace}"
+        )
+    workspace = _resolve_strict(raw_workspace)
+    if _path_is_symlink(workspace) and workspace != raw_workspace:
+        # Defensive: a parent component was a symlink. Treat the final target
+        # as the resolved location, then re-check the original path.
+        raise ReviewContractError(
+            f"workspace_path resolves through a symlink: {raw_workspace}"
+        )
+    if not workspace.is_dir():
+        raise ReviewContractError(
+            f"workspace_path must be a regular directory: {workspace}"
+        )
+
+    normalized_holdouts: list[Path] = []
+    for entry in holdout_roots:
+        try:
+            resolved = Path(entry).resolve(strict=False)
+        except OSError:
+            continue
+        normalized_holdouts.append(resolved)
+    for holdout in normalized_holdouts:
+        try:
+            workspace.relative_to(holdout)
+        except ValueError:
+            continue
+        raise ReviewContractError(
+            f"workspace_path is inside a sealed holdout root: {workspace}"
+        )
+
+    for artifact in inputs.evidence:
+        if not isinstance(artifact, EvidenceArtifact):
+            raise TypeError("evidence entries must be EvidenceArtifact")
+        if artifact.size_bytes > _MAX_INPUT_BYTES:
+            raise ReviewContractError(
+                f"evidence file exceeds 1 MiB ceiling: {artifact.path}"
+            )
+        if not artifact.path:
+            raise ReviewContractError("evidence paths must be non-empty")
+        try:
+            relative = Path(artifact.path)
+        except (TypeError, ValueError) as exc:
+            raise ReviewContractError(
+                f"evidence path is not a valid relative path: {artifact.path}"
+            ) from exc
+        raw_evidence_path = workspace / relative
+        if _path_is_symlink(raw_evidence_path):
+            raise ReviewContractError(
+                f"evidence path must not be a symlink: {artifact.path}"
+            )
+        candidate = raw_evidence_path.resolve()
+        try:
+            candidate.relative_to(workspace)
+        except ValueError as exc:
+            raise ReviewContractError(
+                f"evidence path escapes the workspace: {artifact.path}"
+            ) from exc
+        if not candidate.is_file():
+            raise ReviewContractError(
+                f"evidence path is not a regular file: {artifact.path}"
+            )
+    return workspace
+
+
 def _canonical_json(value: object) -> str:
     return json.dumps(
         value,
