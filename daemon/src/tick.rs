@@ -580,6 +580,33 @@ fn kill_session_and_clear_handle(deps: &TickDeps, overlay: &mut BeadOverlay) {
     }
 }
 
+/// jleechan-7t2g: predicate extracted from the `EXISTING_PR_ADOPTED`
+/// dedup check at the original line 1507 of the slow-tier PR adoption
+/// loop. Returns `true` when the overlay's pre-adoption state is one of
+/// the three "already-attested" states (`Attested`, `Ready`,
+/// `HumanHeld`), in which case the slow tier MUST skip the
+/// `EXISTING_PR_ADOPTED` telemetry emit because the durable overlay row
+/// already records the audit trail. Returns `false` for `None`
+/// (first-time create) and for every other state, so the first emit
+/// and any emit after a state transition still fire.
+///
+/// Origin: PR #487 / bead jleechan-mdun introduced this dedup after a
+/// production incident where 30 attested beads re-emitted
+/// `EXISTING_PR_ADOPTED` on every tick (~301,553 redundant events
+/// across 20 days; top offender jleechan-fpca at 23,012 re-emits).
+/// Pinned by the inline `existing_pr_adoption_dedup_tests` module
+/// below and by `tests/tick_integration.rs::existing_pr_adoption_*`.
+pub(crate) fn should_skip_existing_pr_adoption_emit(
+    pre_adopt_state: Option<OverlayState>,
+) -> bool {
+    matches!(
+        pre_adopt_state,
+        Some(OverlayState::Attested)
+            | Some(OverlayState::Ready)
+            | Some(OverlayState::HumanHeld)
+    )
+}
+
 pub fn run_tick(
     deps: &TickDeps,
     tick_index: u64,
@@ -1504,12 +1531,12 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         // (newly_created=true) and any emit after a state transition
         // away from Attested/Ready/HumanHeld still fire so the audit
         // trail is preserved.
-        let already_attested = matches!(
-            pre_adopt_state,
-            Some(OverlayState::Attested)
-                | Some(OverlayState::Ready)
-                | Some(OverlayState::HumanHeld)
-        );
+        //
+        // jleechan-7t2g: dedup set extracted into `should_skip_existing_pr_adoption_emit`
+        // so the inline unit tests in `existing_pr_adoption_dedup_tests`
+        // can pin the predicate directly.
+        let already_attested =
+            should_skip_existing_pr_adoption_emit(pre_adopt_state);
         if !already_attested {
             emit(
                 deps.telemetry_log,
@@ -5088,6 +5115,97 @@ mod escalation_context_hash_tests {
             s,
             r#"{"a_field":"two","b_arr":[{"j":1,"k":2},{"j":2,"k":1}],"nested":{"x":null,"y":[3,2,1]},"z_field":1}"#,
             "canonical JSON must sort keys at every nesting level (RFC 8789 JCS-lite)"
+        );
+    }
+}
+
+// jleechan-7t2g: unit-test the EXISTING_PR_ADOPTED dedup invariant that
+// lives inside `run_slow_tier`. The integration test
+// `existing_pr_adoption_does_not_re_emit_telemetry_on_subsequent_ticks`
+// already pins the behavior end-to-end, but a 5-minute tick loop with five
+// trait-object fakes is heavyweight feedback for a 3-line `matches!`
+// condition. The inline tests below target the predicate directly: for
+// each `Option<OverlayState>` value, assert whether the re-emit must be
+// suppressed. This lets future edits to the dedup set fail fast in the
+// crate's own test binary instead of waiting for `tick_integration.rs`.
+#[cfg(test)]
+mod existing_pr_adoption_dedup_tests {
+    use super::should_skip_existing_pr_adoption_emit;
+    use crate::state::OverlayState;
+
+    /// States inside the dedup set: `Attested`, `Ready`, `HumanHeld`. Once
+    /// a bead has reached any of these, the durable overlay row already
+    /// records (pr_number, branch, external_ref, is_adopted); re-emitting
+    /// `EXISTING_PR_ADOPTED` every tick is what produced ~301k redundant
+    /// telemetry events across 30 attested beads (jleechan-mdun incident).
+    #[test]
+    fn suppresses_emit_for_dedup_states() {
+        for state in [OverlayState::Attested, OverlayState::Ready, OverlayState::HumanHeld] {
+            assert!(
+                should_skip_existing_pr_adoption_emit(Some(state)),
+                "overlay in {state:?} must suppress the EXISTING_PR_ADOPTED re-emit"
+            );
+        }
+    }
+
+    /// Every other overlay state (plus the `None` first-time-create path)
+    /// MUST still emit. This is the inverse-invariant companion the
+    /// integration test cannot cheaply express as a table of cases.
+    #[test]
+    fn emits_for_non_dedup_states_and_first_create() {
+        let cases = [
+            OverlayState::Queued,
+            OverlayState::Dispatching,
+            OverlayState::Dispatched,
+            OverlayState::ReRoll,
+            OverlayState::Recovery,
+            OverlayState::Redispatched,
+            OverlayState::BudgetHeld,
+            OverlayState::DispositionRequired,
+        ];
+        for state in cases {
+            assert!(
+                !should_skip_existing_pr_adoption_emit(Some(state)),
+                "overlay in {state:?} must NOT suppress the EXISTING_PR_ADOPTED re-emit"
+            );
+        }
+        // First-time create: no overlay row yet, so the first emit MUST
+        // fire (this is the audit-trail bootstrap the production incident
+        // preserved — `newly_created=true` is exactly this case).
+        assert!(
+            !should_skip_existing_pr_adoption_emit(None),
+            "first-time create (no prior overlay) must emit EXISTING_PR_ADOPTED"
+        );
+    }
+
+    /// Pin the dedup set to exactly three states. If a future edit adds a
+    /// fourth state (e.g. `BudgetHeld` joining the dedup set), this test
+    /// forces an explicit decision rather than silently changing emit
+    /// frequency.
+    #[test]
+    fn dedup_set_has_exactly_three_states() {
+        let mut dedup_states: Vec<OverlayState> = Vec::new();
+        for state in [
+            OverlayState::Queued,
+            OverlayState::Dispatching,
+            OverlayState::Dispatched,
+            OverlayState::Attested,
+            OverlayState::Ready,
+            OverlayState::ReRoll,
+            OverlayState::Recovery,
+            OverlayState::Redispatched,
+            OverlayState::BudgetHeld,
+            OverlayState::HumanHeld,
+            OverlayState::DispositionRequired,
+        ] {
+            if should_skip_existing_pr_adoption_emit(Some(state)) {
+                dedup_states.push(state);
+            }
+        }
+        assert_eq!(
+            dedup_states,
+            vec![OverlayState::Attested, OverlayState::Ready, OverlayState::HumanHeld],
+            "EXISTING_PR_ADOPTED dedup set must remain exactly Attested+Ready+HumanHeld"
         );
     }
 }
