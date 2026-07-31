@@ -19,8 +19,8 @@ from typing import Literal
 
 
 PROMPT_ID = "controller-cold-review-v1"
-CORRECTNESS_CHECK_IDS = tuple(f"C{i}" for i in range(7))
-EVIDENCE_CHECK_IDS = tuple(f"E{i}" for i in range(14))
+CORRECTNESS_CHECK_IDS = tuple(f"C{i}" for i in range(8))
+EVIDENCE_CHECK_IDS = tuple(f"E{i}" for i in range(15))
 CHECK_IDS = CORRECTNESS_CHECK_IDS + EVIDENCE_CHECK_IDS
 
 _SOURCE_ROOT = Path(__file__).resolve().parents[1]
@@ -28,7 +28,7 @@ _TEMPLATE_PATH = (
     _SOURCE_ROOT / "prompts" / "catalog" / "controller_cold_review_v1.md"
 )
 _EXPECTED_TEMPLATE_SHA256 = (
-    "a75ef7e3ce2ede4a3266d9ca5e02e9b65fa9f4eafd31e93e03a2f66d2690d414"
+    "119dc76e6509104a961723c0650fc73e7ee13b2b99e263ff335a6239a0aa1ec0"
 )
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")

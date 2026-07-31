@@ -187,7 +187,7 @@ def test_valid_response_requires_every_check_and_returns_digest():
     result = validate_review_response(response, request)
 
     assert result.verdict == "pass"
-    assert len(result.checks) == 21
+    assert len(result.checks) == 23
     assert result.status("C0") == "pass"
     assert len(result.response_sha256) == 64
 
@@ -257,9 +257,9 @@ def test_response_rejects_verdict_checklist_contradiction():
 
 def test_response_rejects_unknown_checklist_id():
     request = create_review_request(_inputs())
-    response = _response(request) + "\nE14: pass\n"
+    response = _response(request) + "\nE15: pass\n"
 
-    with pytest.raises(ReviewContractError, match="unknown checklist IDs: E14"):
+    with pytest.raises(ReviewContractError, match="unknown checklist IDs: E15"):
         validate_review_response(response, request)
 
 
