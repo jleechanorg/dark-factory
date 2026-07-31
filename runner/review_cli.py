@@ -31,6 +31,7 @@ from .review_controller import (
     parse_codex_jsonl,
     run_controller_review,
     validate_execution_receipts,
+    validate_immutable_target,
     validate_review_response,
 )
 
@@ -225,20 +226,28 @@ def main(argv: list[str] | None = None) -> int:
         except ReviewContractError:
             repository = workdir.name
 
-        request = create_review_request(
-            ReviewInputs(
-                repository=repository,
-                workspace_path=str(workdir),
-                base_sha=base_sha,
-                head_sha=head_sha,
-                tree_sha=str(before["tree_sha"]),
-                task_text=task_text,
-                diff_text=str(before["diff_text"]),
-                changed_files=tuple(before["changed_files"]),
-                evidence=evidence,
-                run_id=f"review-{int(time.time())}",
-            )
+        inputs = ReviewInputs(
+            repository=repository,
+            workspace_path=str(workdir),
+            base_sha=base_sha,
+            head_sha=head_sha,
+            tree_sha=str(before["tree_sha"]),
+            task_text=task_text,
+            diff_text=str(before["diff_text"]),
+            changed_files=tuple(before["changed_files"]),
+            evidence=evidence,
+            run_id=f"review-{int(time.time())}",
         )
+        try:
+            from .handler_sandbox import _holdout_denied_paths
+
+            holdout_roots = tuple(
+                str(path) for path in _holdout_denied_paths()
+            )
+        except Exception:
+            holdout_roots = ()
+        validate_immutable_target(inputs, holdout_roots=holdout_roots)
+        request = create_review_request(inputs)
         output_dir.mkdir(parents=True, mode=0o700, exist_ok=False)
         claimed_output = True
         prompt_path = output_dir / "prompt.txt"
