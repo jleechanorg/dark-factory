@@ -706,10 +706,162 @@ def validate_execution_receipts(
         return
 
 
+@dataclass(frozen=True, slots=True)
+class ControllerReviewResult:
+    """Typed result of one controller review lane invocation.
+
+    Captures the validated review, the parsed execution receipts, and the
+    per-lane artifact paths that the lane wrote. Both the standalone CLI and
+    the graph lane use this shape so downstream callers do not need to know
+    which path produced the review.
+    """
+
+    review: ValidatedReview
+    receipts: tuple[ExecutionReceipt, ...]
+    response_text: str
+    transport_text: str
+    output_paths: dict[str, str]
+
+
+def run_controller_review(
+    request: ReviewRequest,
+    *,
+    neutral_cwd: "pathlib.Path",
+    output_dir: "pathlib.Path",
+    transport_argv: tuple[str, ...],
+    timeout: float = 1200.0,
+) -> ControllerReviewResult:
+    """Run one controller-owned review lane and write its artifacts.
+
+    ``transport_argv`` is the full Codex review command as built by
+    ``runner.handler_dispatch._build_controller_codex_transport``. This
+    helper deliberately knows nothing about how the transport is constructed
+    — that decision is owned by the dispatch module — but it owns the
+    subprocess invocation, JSONL parsing, response + receipt validation, and
+    canonical artifact emission. Both ``runner.review_cli`` and
+    ``runner.handler_parallel_reviewer`` route through this function so they
+    cannot diverge on shape or digest handling.
+    """
+    import pathlib
+    import subprocess
+    import tempfile
+
+    if not isinstance(request, ReviewRequest):
+        raise TypeError("request must be ReviewRequest")
+
+    verify_request_integrity(request)
+    neutral_cwd = pathlib.Path(neutral_cwd).resolve()
+    output_dir = pathlib.Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
+
+    if not transport_argv:
+        raise ReviewContractError("transport_argv is empty")
+
+    prompt_text = request.prompt
+    prompt_path = output_dir / "prompt.txt"
+    envelope_path = output_dir / "envelope.json"
+    response_path = output_dir / "reviewer.output.md"
+    transport_path = output_dir / "transport.jsonl"
+    receipt_path = output_dir / "controller-receipt.json"
+    findings_path = output_dir / "findings.json"
+
+    prompt_path.write_text(prompt_text, encoding="utf-8")
+    envelope_path.write_text(request.envelope_json, encoding="utf-8")
+
+    proc = subprocess.run(
+        list(transport_argv),
+        cwd=str(neutral_cwd),
+        input=prompt_text,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    response_text = proc.stdout
+    transport_text = proc.stdout
+    response_path.write_text(response_text, encoding="utf-8")
+    transport_path.write_text(transport_text, encoding="utf-8")
+
+    response_body, receipts = parse_codex_jsonl(transport_text)
+    response_path.write_text(response_body, encoding="utf-8")
+    review = validate_review_response(response_body, request)
+    validate_execution_receipts(receipts, review)
+
+    receipt = {
+        "schema": 1,
+        "prompt_id": request.prompt_id,
+        "prompt_sha256": request.prompt_sha256,
+        "envelope_sha256": request.envelope_sha256,
+        "head_sha": request.head_sha,
+        "task_sha256": request.task_sha256,
+        "diff_sha256": request.diff_sha256,
+        "changed_files_sha256": request.changed_files_sha256,
+        "evidence_manifest_sha256": request.evidence_manifest_sha256,
+        "response_sha256": review.response_sha256,
+        "verdict": review.verdict,
+        "exit_code": proc.returncode,
+        "duration_seconds": max(0.0, float(timeout)),
+        "transport_argv": list(transport_argv),
+        "neutral_cwd": str(neutral_cwd),
+        "output_dir": str(output_dir),
+        "receipts": [
+            {
+                "command": receipt.command,
+                "exit_code": receipt.exit_code,
+                "output_sha256": receipt.output_sha256,
+            }
+            for receipt in receipts
+        ],
+        "timestamp": _utc_now_iso(),
+    }
+    receipt_path.write_text(
+        json.dumps(receipt, indent=2, sort_keys=True, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    findings_path.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "verdict": review.verdict,
+                "checks": [
+                    {"id": check_id, "status": status}
+                    for check_id, status in review.checks
+                ],
+            },
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return ControllerReviewResult(
+        review=review,
+        receipts=receipts,
+        response_text=response_body,
+        transport_text=transport_text,
+        output_paths={
+            "prompt": str(prompt_path),
+            "envelope": str(envelope_path),
+            "response": str(response_path),
+            "transport": str(transport_path),
+            "receipt": str(receipt_path),
+            "findings": str(findings_path),
+        },
+    )
+
+
+def _utc_now_iso() -> str:
+    """Return the current UTC time as an ISO-8601 string with 'Z' suffix."""
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 __all__ = [
     "CHECK_IDS",
     "CORRECTNESS_CHECK_IDS",
     "EVIDENCE_CHECK_IDS",
+    "ControllerReviewResult",
     "PROMPT_ID",
     "EvidenceArtifact",
     "ExecutionReceipt",
@@ -720,6 +872,7 @@ __all__ = [
     "build_envelope",
     "create_review_request",
     "parse_codex_jsonl",
+    "run_controller_review",
     "validate_execution_receipts",
     "validate_review_response",
     "verify_request_integrity",

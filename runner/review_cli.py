@@ -29,6 +29,7 @@ from .review_controller import (
     ReviewInputs,
     create_review_request,
     parse_codex_jsonl,
+    run_controller_review,
     validate_execution_receipts,
     validate_review_response,
 )
