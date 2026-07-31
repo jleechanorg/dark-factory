@@ -1,0 +1,52 @@
+digraph ControllerReviewImmutableTargetSlice {
+  graph [goal="Enforce immutable, read-only target at request creation + reverify post-review"]
+  start [shape=Mdiamond]
+  exit  [shape=Msquare]
+
+  implement [
+    type="codergen"
+    backend="codex"
+    prompt="@.dark-factory/slice-immutable-target.md"
+    timeout=600
+  ]
+
+  test [
+    type="tool"
+    command="./.venv/bin/python -m pytest -p no:cacheprovider tests/test_immutable_target.py tests/test_review_controller.py"
+    validation=true
+    timeout=180
+  ]
+
+  holdout [
+    type="holdout_eval"
+    feature="hello"
+    validation=true
+    timeout=300
+  ]
+
+  review [
+    type="gate_er"
+    prompt="@.dark-factory/review-immutable-target.md"
+    backend_priority="minimax,agy,claude-sonnet,codex"
+    prefer_adversarial="true"
+    timeout=300
+  ]
+
+  fix [
+    type="codergen"
+    backend="codex"
+    prompt="@.dark-factory/slice-immutable-target.md"
+    max_visits="2"
+    timeout=600
+  ]
+
+  start -> implement
+  implement -> test
+  test -> holdout [condition="outcome=success"]
+  test -> fix [condition="outcome!=success"]
+  holdout -> review [condition="outcome=success"]
+  holdout -> fix [condition="outcome!=success"]
+  review -> exit [condition="outcome=success"]
+  review -> fix [condition="outcome!=success"]
+  fix -> test
+}
