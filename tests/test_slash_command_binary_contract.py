@@ -1,8 +1,169 @@
 """Regression guards for the binary-first slash-command contract."""
 from __future__ import annotations
 
+import json
+import os
 import pathlib
 import re
+import subprocess
+
+
+def _install_fake_runner_python(home: pathlib.Path, call_log: pathlib.Path) -> None:
+    (home / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
+    call_log.write_text("", encoding="utf-8")
+    fake_python = home / ".venv" / "bin" / "python"
+    fake_python.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        "import os\n"
+        "import pathlib\n"
+        "import sys\n"
+        "\n"
+        "log_path = pathlib.Path(os.environ['DF_FAKE_RUNNER_CALL_LOG'])\n"
+        "log_path.parent.mkdir(parents=True, exist_ok=True)\n"
+        "with log_path.open('a', encoding='utf-8') as handle:\n"
+        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
+        "\n"
+        "if len(sys.argv) >= 3 and sys.argv[1] == '-m':\n"
+        "    module = sys.argv[2]\n"
+        "    args = sys.argv[3:]\n"
+        "    if module == 'runner.preflight':\n"
+        "        if '--json' in sys.argv:\n"
+        "            print('{}')\n"
+        "        raise SystemExit(0)\n"
+        "\n"
+        "    if module == 'runner._merge_train':\n"
+        "        raise SystemExit(0)\n"
+        "\n"
+        "    if module == 'runner':\n"
+        "        if args and args[0] == 'review':\n"
+        "            rc = int(os.environ.get('DF_FAKE_REVIEW_RETURN', '0'))\n"
+        "            raise SystemExit(rc)\n"
+        "        if 'review' in args:\n"
+        "            # Simulate a broken review invocation when the wrapper injects\n"
+        "            # positional flags ahead of the review subcommand.\n"
+        "            raise SystemExit(3)\n"
+        "        raise SystemExit(0)\n"
+        "\n"
+        "    if module == 'runner.panic_hook':\n"
+        "        panic_root = pathlib.Path.home() / '.dark-factory' / 'panics'\n"
+        "        panic_root.mkdir(parents=True, exist_ok=True)\n"
+        "        (panic_root / 'wrapper-review-panic.txt').write_text('panic', encoding='utf-8')\n"
+        "        raise SystemExit(0)\n"
+        "\n"
+        "raise SystemExit(0)\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+
+
+def _read_fake_runner_calls(call_log: pathlib.Path) -> list[list[str]]:
+    if not call_log.exists():
+        return []
+    return [json.loads(line)["argv"] for line in call_log.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _run_installed_wrapper(binary_args: list[str], *, workdir: pathlib.Path, review_return: int = 0) -> tuple[subprocess.CompletedProcess[str], pathlib.Path]:
+    fake_home = workdir / "fake_home"
+    fake_home.mkdir(parents=True, exist_ok=True)
+    call_log = fake_home / "fake-runner-calls.jsonl"
+    _install_fake_runner_python(fake_home, call_log)
+    env = os.environ.copy()
+    env["HOME"] = str(fake_home)
+    env["DARK_FACTORY_HOME"] = str(fake_home)
+    env["DF_FAKE_RUNNER_CALL_LOG"] = str(call_log)
+    env["DF_FAKE_REVIEW_RETURN"] = str(review_return)
+    result = subprocess.run(
+        [str(ROOT / "bin" / "dark-factory"), *binary_args],
+        cwd=workdir,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    return result, call_log
+
+
+def test_dark_factory_review_invocation_does_not_inject_workdir_before_review(tmp_path: pathlib.Path) -> None:
+    workdir = tmp_path
+    task_file = workdir / "task.md"
+    output_dir = workdir / "review-output"
+    task_file.write_text("run a controller review", encoding="utf-8")
+    output_dir.mkdir(exist_ok=True)
+
+    result, call_log = _run_installed_wrapper(
+        [
+            "review",
+            "--base-sha",
+            "a" * 40,
+            "--head-sha",
+            "b" * 40,
+            "--task-file",
+            str(task_file),
+            "--output-dir",
+            str(output_dir),
+        ],
+        workdir=workdir,
+    )
+
+    assert result.returncode == 0
+    calls = _read_fake_runner_calls(call_log)
+    runner_calls = [call for call in calls if call[:2] == ["-m", "runner"]]
+    assert len(runner_calls) == 1
+    assert runner_calls[0][2] == "review"
+    assert "--workdir" not in runner_calls[0][3:]
+    assert not any(call[:2] == ["-m", "runner._merge_train"] for call in calls)
+
+
+def test_dark_factory_pipeline_paths_still_take_merge_train_lock(tmp_path: pathlib.Path) -> None:
+    workdir = tmp_path
+    result, call_log = _run_installed_wrapper(
+        ["--pipeline", "benchmarks/attractor-spec-review/pipelines/review_main.dot", "--goal", "ci"],
+        workdir=workdir,
+    )
+
+    assert result.returncode == 0
+    calls = _read_fake_runner_calls(call_log)
+    assert any(call[:2] == ["-m", "runner._merge_train"] for call in calls)
+    runner_calls = [call for call in calls if call[:2] == ["-m", "runner"]]
+    assert runner_calls[0][2:] == [
+        "--workdir",
+        str(workdir),
+        "--pipeline",
+        "benchmarks/attractor-spec-review/pipelines/review_main.dot",
+        "--goal",
+        "ci",
+    ]
+
+
+def test_dark_factory_review_failure_does_not_create_panic_artifact(tmp_path: pathlib.Path) -> None:
+    workdir = tmp_path
+    task_file = workdir / "task.md"
+    output_dir = workdir / "review-output-fail"
+    task_file.write_text("run a controller review", encoding="utf-8")
+
+    result, call_log = _run_installed_wrapper(
+        [
+            "review",
+            "--base-sha",
+            "a" * 40,
+            "--head-sha",
+            "b" * 40,
+            "--task-file",
+            str(task_file),
+            "--output-dir",
+            str(output_dir),
+        ],
+        workdir=workdir,
+        review_return=2,
+    )
+
+    assert result.returncode == 2
+    calls = _read_fake_runner_calls(call_log)
+    assert any(call[:2] == ["-m", "runner"] and call[2] == "review" for call in calls)
+    assert not any(call[:2] == ["-m", "runner._merge_train"] for call in calls)
+    assert not any(call[:2] == ["-m", "runner.panic_hook"] for call in calls)
+    fake_home = workdir / "fake_home"
+    assert not (fake_home / ".dark-factory" / "panics").exists()
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 COMMANDS_DIR = ROOT / ".claude" / "commands"
@@ -133,8 +294,73 @@ def test_f_defaults_reviewer_calibration_on() -> None:
         "--reviewer-calibration=false",
         "## Reviewer calibration",
         "evidence/<run-id>/reviewer-calibration/",
-        "codex exec --yolo -m gpt-5.3-codex-spark",
-        "Do not claim delegated subagents underperformed raw Codex unless",
+        "dark-factory review \\",
+        "--workdir <repo>",
+        "--base-sha <full-40-hex-sha>",
+        "--head-sha <full-40-hex-sha>",
+        "--task-file <path>",
+        "--output-dir <dir>",
+        "--backend <backend>",
+        "controller-receipt.json",
+        "SHA-256 of the controller receipt",
+        "prompt SHA-256",
+        "envelope SHA-256",
+        "`prompt.txt` is a binary-emitted audit capture, not an authority file",
     )
     missing = [phrase for phrase in required_phrases if phrase not in skill_text]
     assert not missing, "dark-factory/SKILL.md missing reviewer calibration contract: " + ", ".join(missing)
+
+
+def test_reviewer_contract_is_binary_owned_and_vendor_neutral() -> None:
+    paths = (
+        SKILLS_DIR / "dark-factory" / "SKILL.md",
+        SKILLS_DIR / "reviewer-calibration" / "SKILL.md",
+        ROOT / ".claude" / "workflows" / "dark-factory.md",
+    )
+    required_command_parts = (
+        "dark-factory review \\",
+        "--workdir",
+        "--base-sha",
+        "--head-sha",
+        "--task-file",
+        "--output-dir",
+        "--backend",
+    )
+    forbidden = (
+        "codex exec --yolo -m ",
+        "codex exec --yolo --skip-git-repo-check",
+        "claude --print --dangerously-skip-permissions /skeptic",
+        'ADVERSARIAL_REVIEWER="${ADVERSARIAL_REVIEWER:-codex}"',
+    )
+    violations: list[str] = []
+    for path in paths:
+        text = path.read_text()
+        missing = [part for part in required_command_parts if part not in text]
+        if missing:
+            violations.append(f"{path}: missing binary review command parts {missing}")
+        for phrase in forbidden:
+            if phrase in text:
+                violations.append(f"{path}: contains raw/vendor-pinned reviewer command {phrase!r}")
+    assert not violations, "Reviewer authority must remain binary-owned:\n  " + "\n  ".join(violations)
+
+
+def test_reviewer_contract_requires_digest_bound_controller_receipt() -> None:
+    texts = (
+        _skill("dark-factory"),
+        _skill("reviewer-calibration"),
+        (ROOT / ".claude" / "workflows" / "dark-factory.md").read_text(),
+    )
+    required = (
+        "controller receipt",
+        "prompt",
+        "envelope",
+        "digest",
+        "base",
+        "head",
+    )
+    for text in texts:
+        lowered = text.lower()
+        missing = [term for term in required if term not in lowered]
+        assert not missing, f"review controller receipt contract missing {missing}"
+    assert "prompt.txt` is a binary-emitted audit capture" in texts[0]
+    assert "`prompt.txt` is a binary-emitted audit capture only" in texts[1]
