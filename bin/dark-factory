@@ -7,6 +7,10 @@ set -euo pipefail
 
 # Capture original CLI arguments before trap overwrites $@
 _ORIGINAL_ARGV=("$@")
+__DF_IS_REVIEW=0
+if [[ "$#" -gt 0 && "$1" == "review" ]]; then
+  __DF_IS_REVIEW=1
+fi
 
 # ---------------------------------------------------------------------------
 # Top-level panic hook — writes a crash artifact on any non-zero exit
@@ -22,6 +26,9 @@ _ORIGINAL_ARGV=("$@")
 __df_panic_fired=0
 __df_panic_collect() {
   local rc="$1" line="$2"
+  if [[ "${__DF_IS_REVIEW}" -eq 1 && "${rc}" -ne 0 ]]; then
+    exit "${rc}"
+  fi
   if [[ "${rc}" -ne 0 && "${__df_panic_fired}" -eq 0 && -n "${VENV_PYTHON:-}" && -x "${VENV_PYTHON}" ]]; then
     __df_panic_fired=1
     # Best-effort: never let the panic hook itself cause a second
@@ -119,64 +126,66 @@ fi
 env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
   "${VENV_PYTHON}" -m runner._agy_safe >/dev/null 2>&1 || true
 
-# Resolve the effective workdir the same way the runner will see it:
-# explicit --workdir <PATH> wins, otherwise the script's cwd. This
-# value becomes the merge_train lock key so a second invocation
-# against the SAME workdir (regardless of which cwd it was launched
-# from) hard-stops with rc=3.
-__DF_LOCK_TARGET="${TARGET_WORKDIR}"
-__DF_ARG_LOCK_PREV=""
-for __df_arg in "$@"; do
-  if [[ "${__DF_ARG_LOCK_PREV}" == "--workdir" && -n "${__df_arg}" ]]; then
-    __DF_LOCK_TARGET="${__df_arg}"
-  fi
-  # Handle --workdir=/path format
-  if [[ "${__df_arg}" == --workdir=* ]]; then
-    __DF_LOCK_TARGET="${__df_arg#--workdir=}"
-  fi
-  __DF_ARG_LOCK_PREV="${__df_arg}"
-done
-# Normalize to canonical absolute path to ensure equivalent directories
-# map to the same lock key (resolves symlinks, relative paths, ~)
-if [[ -d "${__DF_LOCK_TARGET}" ]]; then
-  __DF_LOCK_TARGET="$(cd "${__DF_LOCK_TARGET}" && pwd -P)"
-fi
-
-# merge_train acquire: claim the per-target-repo lock so a second
-# concurrent dark-factory invocation against the same workdir
-# hard-stops here with rc=3. The EXIT trap (set above) releases
-# on every exit path. Run id is timestamp+pid so two simultaneous
-# wrappers do not collide.
-__DF_LOCK_RUN_ID="df-$(date +%s%N)-$$"
-if ! env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
-    "${VENV_PYTHON}" -m runner._merge_train acquire \
-    --target "${__DF_LOCK_TARGET}" --run-id "${__DF_LOCK_RUN_ID}" \
-    >/dev/null 2>&1; then
-  # Re-run the acquire non-silently so we can show the holder on stderr.
-  # If this succeeds (holder released between attempts), proceed normally.
-  if env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
-      "${VENV_PYTHON}" -m runner._merge_train acquire \
-      --target "${__DF_LOCK_TARGET}" --run-id "${__DF_LOCK_RUN_ID}" >&2; then
-    : # Lock acquired on retry, continue to runner
-  else
-    echo "ERROR: another dark-factory run is editing ${__DF_LOCK_TARGET}" >&2
-    # Clear the run_id so the EXIT trap's release is a no-op.
-    __DF_LOCK_RUN_ID=""
-    exit 3
-  fi
-fi
-
-has_workdir=0
-for arg in "$@"; do
-  if [[ "${arg}" == "--workdir" ]]; then
-    has_workdir=1
-    break
-  fi
-done
-
 args=("$@")
-if [[ "${has_workdir}" -eq 0 ]]; then
-  args=(--workdir "${TARGET_WORKDIR}" "$@")
+if [[ "${__DF_IS_REVIEW}" -ne 1 ]]; then
+  # Resolve the effective workdir the same way the runner will see it:
+  # explicit --workdir <PATH> wins, otherwise the script's cwd. This
+  # value becomes the merge_train lock key so a second invocation
+  # against the SAME workdir (regardless of which cwd it was launched
+  # from) hard-stops with rc=3.
+  __DF_LOCK_TARGET="${TARGET_WORKDIR}"
+  __DF_ARG_LOCK_PREV=""
+  for __df_arg in "$@"; do
+    if [[ "${__DF_ARG_LOCK_PREV}" == "--workdir" && -n "${__df_arg}" ]]; then
+      __DF_LOCK_TARGET="${__df_arg}"
+    fi
+    # Handle --workdir=/path format
+    if [[ "${__df_arg}" == --workdir=* ]]; then
+      __DF_LOCK_TARGET="${__df_arg#--workdir=}"
+    fi
+    __DF_ARG_LOCK_PREV="${__df_arg}"
+  done
+  # Normalize to canonical absolute path to ensure equivalent directories
+  # map to the same lock key (resolves symlinks, relative paths, ~)
+  if [[ -d "${__DF_LOCK_TARGET}" ]]; then
+    __DF_LOCK_TARGET="$(cd "${__DF_LOCK_TARGET}" && pwd -P)"
+  fi
+
+  # merge_train acquire: claim the per-target-repo lock so a second
+  # concurrent dark-factory invocation against the same workdir
+  # hard-stops here with rc=3. The EXIT trap (set above) releases
+  # on every exit path. Run id is timestamp+pid so two simultaneous
+  # wrappers do not collide.
+  __DF_LOCK_RUN_ID="df-$(date +%s%N)-$$"
+  if ! env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
+      "${VENV_PYTHON}" -m runner._merge_train acquire \
+      --target "${__DF_LOCK_TARGET}" --run-id "${__DF_LOCK_RUN_ID}" \
+      >/dev/null 2>&1; then
+    # Re-run the acquire non-silently so we can show the holder on stderr.
+    # If this succeeds (holder released between attempts), proceed normally.
+    if env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
+        "${VENV_PYTHON}" -m runner._merge_train acquire \
+        --target "${__DF_LOCK_TARGET}" --run-id "${__DF_LOCK_RUN_ID}" >&2; then
+      : # Lock acquired on retry, continue to runner
+    else
+      echo "ERROR: another dark-factory run is editing ${__DF_LOCK_TARGET}" >&2
+      # Clear the run_id so the EXIT trap's release is a no-op.
+      __DF_LOCK_RUN_ID=""
+      exit 3
+    fi
+  fi
+
+  has_workdir=0
+  for arg in "$@"; do
+    if [[ "${arg}" == "--workdir" ]]; then
+      has_workdir=1
+      break
+    fi
+  done
+
+  if [[ "${has_workdir}" -eq 0 ]]; then
+    args=(--workdir "${TARGET_WORKDIR}" "$@")
+  fi
 fi
 
 # NOTE: do NOT use ``exec`` here — that would replace the bash shell

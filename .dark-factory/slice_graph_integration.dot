@@ -1,0 +1,52 @@
+digraph ControllerReviewGraphIntegrationSlice {
+  graph [goal="Centralize CLI+graph controller path; per-lane distinct cwd/output dir; opt-in pipelines"]
+  start [shape=Mdiamond]
+  exit  [shape=Msquare]
+
+  implement [
+    type="codergen"
+    backend="codex"
+    prompt="@.dark-factory/slice-graph-integration.md"
+    timeout=600
+  ]
+
+  test [
+    type="tool"
+    command="./.venv/bin/python -m pytest -p no:cacheprovider tests/test_graph_controller_integration.py tests/test_immutable_target.py tests/test_review_controller.py tests/test_review_cli.py tests/test_gate_subprocess_dispatch.py tests/test_parallel_codex_reviewer.py tests/test_prompt_substitution_audit.py tests/test_level5_pipelines.py"
+    validation=true
+    timeout=240
+  ]
+
+  holdout [
+    type="holdout_eval"
+    feature="hello"
+    validation=true
+    timeout=300
+  ]
+
+  review [
+    type="gate_er"
+    prompt="@.dark-factory/review-graph-integration.md"
+    backend_priority="minimax,agy,claude-sonnet,codex"
+    prefer_adversarial="true"
+    timeout=300
+  ]
+
+  fix [
+    type="codergen"
+    backend="codex"
+    prompt="@.dark-factory/slice-graph-integration.md"
+    max_visits="2"
+    timeout=600
+  ]
+
+  start -> implement
+  implement -> test
+  test -> holdout [condition="outcome=success"]
+  test -> fix [condition="outcome!=success"]
+  holdout -> review [condition="outcome=success"]
+  holdout -> fix [condition="outcome!=success"]
+  review -> exit [condition="outcome=success"]
+  review -> fix [condition="outcome!=success"]
+  fix -> test
+}

@@ -172,18 +172,19 @@ and `git diff` shows changes scoped to the files enumerated in `plan.md`
 **Goal of this phase:** Run the hard-tier gates against the implement
 phase's diff. The hard tier is:
 1. CXDB continuity check (every node from Phase 2–4 has a row)
-2. `gate_er` — adversarial cross-vendor evidence review (the real merge bar)
-3. `gate_skeptic` — independent verification with inverted incentive to
-   find gaps
-4. `gate_adversarial_reviewer` — second vendor's cold review of the diff
+2. `gate_er` — controller-owned independent evidence review
+3. reviewer calibration — a second available backend reviewing the identical
+   controller-bound envelope
 
-These gates map cleanly to `pipelines/factory/gates.dot` with the
-`gate_code_standards` slot repurposed for `gate_skeptic` (the
-`gates.dot` graph calls `/code_standards`; this workflow overrides that
-node's prompt via a feature-specific `pipelines/factory/level5_gates.dot`
-that the user can wire in their repo, OR by post-processing: run
-`gates.dot` then `gate_skeptic` and `gate_adversarial_reviewer` as
-separate follow-up phases).
+The graph gate and terminal calibration lanes must use the binary-owned review
+controller. This workflow never writes reviewer prompts and never invokes a
+vendor reviewer CLI directly.
+
+> **Controller v1 backend scope:** Codex only, via `codex exec --json
+> --ephemeral --skip-git-repo-check --sandbox read-only`. The full prompt is
+> sent on stdin. The reviewer cannot write the target. Exit codes: `0`
+> valid pass, `2` valid fail, `1` invalid / infra. Do not advertise other
+> backends for the controller until they have an equivalent safe adapter.
 
 ```bash
 cd "$TARGET_REPO"
@@ -196,29 +197,30 @@ dark-factory \
   --feature "$FEATURE" \
   --cxdb "$CXDB"
 
-# 5b. Skeptic gate (independent verification agent)
-SKEPTIC_VERDICT_FILE="$HOME/.dark-factory/skeptic-${FEATURE}.json"
-claude --print --dangerously-skip-permissions /skeptic \
-  --goal "Verify the dark-factory run for feature ${FEATURE} (CXDB: ${CXDB}, HEAD: ${IMPLEMENT_HEAD:-HEAD}). Find any gap between the spec, the plan, the implementation, and the holdouts. Verdict must be PASS or FAIL with cited evidence." \
-  > "$SKEPTIC_VERDICT_FILE" 2>&1
+# 5b. Controller-owned calibration review.
+# The task file contains task/PR data only, never reviewer instructions.
+dark-factory review \
+  --workdir "$TARGET_REPO" \
+  --base-sha "$(git merge-base HEAD origin/main)" \
+  --head-sha "$(git rev-parse HEAD)" \
+  --task-file "${FEATURE_SPEC_PATH:-specs/$FEATURE.md}" \
+  --output-dir "$HOME/.dark-factory/reviews/$FEATURE/$(git rev-parse HEAD)/$BACKEND" \
+  --backend "$BACKEND"
 
-# 5c. Adversarial reviewer (second vendor — codex if coder was claude, or vice versa)
-ADVERSARIAL_REVIEWER="${ADVERSARIAL_REVIEWER:-codex}"
-case "$ADVERSARIAL_REVIEWER" in
-  codex)
-    codex exec --yolo --skip-git-repo-check "Review the diff at HEAD ${IMPLEMENT_HEAD:-HEAD} in $TARGET_REPO. Feature: ${FEATURE}. Cite specific lines. Verdict: pass|fail." \
-      > "$HOME/.dark-factory/adversarial-${FEATURE}.md" 2>&1
-    ;;
-  agy)
-    agy --print --dangerously-skip-permissions "Review the diff at HEAD ${IMPLEMENT_HEAD:-HEAD} in $TARGET_REPO. Feature: ${FEATURE}. Cite specific lines. Verdict: pass|fail." \
-      > "$HOME/.dark-factory/adversarial-${FEATURE}.md" 2>&1
-    ;;
-esac
+# Default-on calibration: when another independent backend is installed, run
+# the identical command with only these transport/output arguments changed:
+#   --output-dir <separate-controller-output-dir>
+#   --backend <independent-backend>
 ```
 
-**Pass criterion:** All three gates exited `success`. The skeptic verdict
-file's last line parses to `verdict: pass`. The adversarial reviewer's
-verdict parses to `pass`.
+**Pass criterion:** The graph gates and required controller review exited
+`success`. Each accepted lane has a controller receipt whose prompt,
+envelope, base, head, task, response, and backend bindings verify. When the
+second calibration backend is available, both lanes must be compared from
+those receipts, with the receipt, prompt, and envelope SHA-256 digests recorded
+in the comparison. A skill/workflow-authored `prompt.txt`, missing receipt,
+digest mismatch, stale SHA, or nonzero controller exit is inconclusive and
+cannot satisfy the hard tier.
 
 **On failure:** proceed to Phase 6 (fix loop).
 
@@ -326,5 +328,5 @@ will run.
   **invalid** and rerun.
 - If `--backend echo` was used, label the run as a wiring smoke, not a
   real validation.
-- The Phase 5 hard tier (CXDB + /er + skeptic + adversarial_reviewer) is
+- The Phase 5 hard tier (CXDB + /er + controller-owned calibrated review) is
   the merge-confidence bar. Passing Phase 4 tests alone is not.
