@@ -294,25 +294,47 @@ Whatever is left after flag parsing is the **goal description**.
 run. Treat the flag as present unless the user explicitly passes
 `--reviewer-calibration=false`.
 
-Calibration compares at least:
-- the factory/in-graph reviewer outcome when the selected DOT has one;
-- a raw terminal mirror review via `codex exec --yolo -m gpt-5.3-codex-spark`;
-- a delegated reviewer/subagent outcome when available in the current session.
+Calibration routes every backend through the binary-owned controller
+command:
 
-All reviewers receive the same frozen envelope: target repo, target PR or
-work item, head SHA, base SHA, diff, PR/task text, evidence paths, test logs,
-factory run ID, and the exact shared review prompt. Store outputs under:
+```bash
+dark-factory review \
+  --workdir <repo> \
+  --base-sha <full-40-hex-sha> \
+  --head-sha <full-40-hex-sha> \
+  --task-file <path> \
+  --output-dir <dir> \
+  --backend <backend>
+```
+
+`dark-factory review` owns the static prompt, canonical envelope, backend
+dispatch, response validation, and `controller-receipt.json`. The
+selected backend supplies transport only; do not author reviewer
+instructions, do not inline prompts, do not pass vendor CLI flags. The
+controller binds `prompt SHA-256`, `envelope SHA-256`, `task SHA-256`,
+`diff SHA-256`, `changed-files SHA-256`, and `evidence-manifest SHA-256`
+in the controller receipt so calibration lanes can hash the receipt
+itself for provenance.
+
+Each accepted lane must expose a controller receipt digest containing
+the prompt SHA-256, envelope SHA-256, task SHA-256, diff SHA-256,
+changed-files SHA-256, evidence-manifest SHA-256, head SHA, base SHA,
+and the response's own response SHA-256 digest. Hashing the
+`controller-receipt.json` file itself gives a stable SHA-256 digest for
+the controller receipt.
+
+`prompt.txt` is a binary-emitted audit capture, not an authority file.
+The static authority lives in `prompts/catalog/controller_cold_review_v1.md`
+and is bound by its SHA-256 of the controller receipt.
 
 ```text
 evidence/<run-id>/reviewer-calibration/
-  envelope.json
-  prompt.txt
-  raw-codex.output.md
-  raw-codex.findings.json
-  subagent.output.md
-  subagent.findings.json
-  factory-reviewer.output.md
-  factory-reviewer.findings.json
+  <backend>/
+    controller-receipt.json
+    envelope.json
+    prompt.txt
+    reviewer.output.md
+    findings.json
   comparison.json
   adjudication.md
 ```

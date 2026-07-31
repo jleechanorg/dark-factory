@@ -222,6 +222,17 @@ def test_ao_subprocess_inherits_sanitized_env(monkeypatch, tmp_path):
     monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", "/secret/holdouts")
     monkeypatch.setenv("HOLDOUT_TOKEN", "secret-token")
 
+    # The fake /secret/holdouts path must not raise on sandbox setup; mock
+    # the holdout-path resolver to a real-looking directory so the
+    # `_sandboxed_args` call inside `_codergen` completes and the test can
+    # observe the sanitized env vars that reach the subprocess.
+    fake_holdouts = tmp_path / "fake-holdouts"
+    fake_holdouts.mkdir()
+    monkeypatch.setattr(
+        "runner.handler_sandbox._holdouts_repo_path",
+        lambda: fake_holdouts,
+    )
+
     captured: dict[str, dict[str, str]] = {}
 
     class _FakeCompleted:

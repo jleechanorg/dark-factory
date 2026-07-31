@@ -1,2 +1,2 @@
 #!/bin/sh
-GIT_LFS_VERB=post-merge . "$(dirname "$0")/_git-lfs-hook.sh" "$@"
+GIT_LFS_VERB=post-merge . "${0%/*}/_git-lfs-hook.sh" "$@"

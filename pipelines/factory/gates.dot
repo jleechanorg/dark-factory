@@ -23,6 +23,7 @@ digraph gates {
     adversarial_reviewer [
         type="parallel_reviewer",
         label="Adversarial reviewer (primary + N shadows, density-enforced)",
+        review_contract="cold-review-v1",
         prompt="@prompts/slim/review_phase5_shadow.md",
         backend_priority="minimax,agy,codex,claude-sonnet",
         prefer_adversarial="true",

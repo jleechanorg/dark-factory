@@ -852,7 +852,7 @@ def test_invoke_reviewer_nonzero_exit_returns_error():
     original = cli_mod._build_reviewer_cmd
 
     def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
-        return ["false"]  # always exits 1
+        return ["/usr/bin/false"]  # absolute path so PATH-empty cases still find it
 
     cli_mod._build_reviewer_cmd = fake_cmd
     try:

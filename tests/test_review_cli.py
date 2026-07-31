@@ -32,14 +32,24 @@ def _repo(tmp_path):
 
 
 def _valid_response(prompt: str) -> str:
+    keys = (
+        "PROMPT_ID",
+        "PROMPT_SHA256",
+        "ENVELOPE_SHA256",
+        "HEAD_SHA",
+        "TASK_SHA256",
+        "DIFF_SHA256",
+        "CHANGED_FILES_SHA256",
+        "EVIDENCE_MANIFEST_SHA256",
+    )
     values = {}
-    for key in ("PROMPT_ID", "PROMPT_SHA256", "ENVELOPE_SHA256", "HEAD_SHA"):
+    for key in keys:
         match = re.search(rf"^{key}: (\S+)$", prompt, re.MULTILINE)
-        assert match
+        assert match, f"prompt is missing required binding line: {key}"
         values[key] = match.group(1)
     return "\n".join(
         [
-            *(f"{key}: {values[key]}" for key in values),
+            *(f"{key}: {values[key]}" for key in keys),
             "VERDICT: pass",
             *(f"{check_id}: pass" for check_id in CHECK_IDS),
             "",
