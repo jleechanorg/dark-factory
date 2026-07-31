@@ -7,6 +7,8 @@ import hashlib
 import re
 import subprocess
 
+import pytest
+
 from runner.review_cli import main
 from runner.review_controller import CHECK_IDS
 
@@ -235,3 +237,20 @@ def test_review_command_rejects_dirty_workspace_before_backend(
 
     assert rc == 1
     assert launched is False
+
+
+def test_main_entrypoint_dispatches_review_subcommand(capsys):
+    """runner.__main__.main(["review", "--help"]) dispatches to review_cli.main."""
+    from runner.__main__ import main as runner_main
+
+    with pytest.raises(SystemExit) as exc_info:
+        runner_main(["review", "--help"])
+
+    assert exc_info.value.code == 0
+    captured = capsys.readouterr()
+    assert "--base-sha" in captured.out
+    assert "--head-sha" in captured.out
+    assert "--task-file" in captured.out
+    assert "--output-dir" in captured.out
+    assert "--backend" in captured.out
+

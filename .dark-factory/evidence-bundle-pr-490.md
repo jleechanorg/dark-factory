@@ -1,3 +1,14 @@
+# Evidence bundle — PR #490 + PR #497 (controller-owned cold review contract v1, dispatch fix)
+
+PR #490 (MERGED at b08d64f4): controller-owned cold review contract (v1, Codex-only)
+PR #497 (OPEN): follow-up dispatch fix — restores `dark-factory review` subcommand
+in runner/__main__.py:main() so ./bin/dark-factory review --help prints the
+review-specific arguments.
+
+The previous evidence bundle (covering PR #490) follows below for reference.
+
+---
+
 # Evidence bundle — PR #490 (feat/controller-owned-cold-review, head 8a22ea61b)
 
 ## Summary
