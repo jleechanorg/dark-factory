@@ -15,7 +15,7 @@ from .engine import run
 from .handlers import Context
 from .panic_hook import PANIC_EXIT_CODE
 from .parser import Graph, parse, validate_pipeline
-from .paths import resolve_factory_path, resolve_pipeline_path
+from .paths import resolve_pipeline_path
 
 _PANIC_DIR = pathlib.Path.home() / ".dark-factory" / "panics"
 
@@ -218,8 +218,57 @@ def _write_evidence_bundle(
     )
 
 
+def _run_controller_command(argv: list[str]) -> int:
+    """Dispatch ``dark-factory controller <subcommand> ...``.
+
+    Only ``inspect`` is supported in this slice. It is purely diagnostic —
+    it never executes actions, never issues a trusted receipt, never claims
+    ownership, and always returns JSON with ``execution_enabled=false``.
+    """
+    if not argv or argv[0] != "inspect":
+        sys.stderr.write(
+            "usage: dark-factory controller inspect --workdir DIR --profile slim|feature\n"
+        )
+        return 2
+
+    parser = argparse.ArgumentParser(prog="dark-factory controller inspect")
+    parser.add_argument(
+        "--workdir",
+        type=pathlib.Path,
+        default=pathlib.Path.cwd(),
+    )
+    parser.add_argument(
+        "--profile",
+        choices=["slim", "feature"],
+        required=True,
+    )
+    args = parser.parse_args(argv[1:])
+
+    from .controller_contract import ContractError, inspect as contract_inspect
+
+    try:
+        print(contract_inspect(workdir=args.workdir, profile=args.profile))
+        return 0
+    except ContractError as exc:
+        # Fail-closed deterministic JSON; no model call, no execution.
+        payload = {
+            "status": "fail",
+            "profile": args.profile,
+            "execution_enabled": False,
+            "error": str(exc),
+        }
+        print(json.dumps(payload, sort_keys=True, indent=2))
+        return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     args_list = list(argv) if argv is not None else list(sys.argv[1:])
+    # ``controller <subcommand> ...`` is a v1-only inspect path. It dispatches
+    # out before the legacy argparse tree to preserve every existing
+    # invocation form (legacy pipelines, ``--resume``, ``--preflight``).
+    if args_list and args_list[0] == "controller":
+        return _run_controller_command(args_list[1:])
+
     if args_list and args_list[0] == "resume":
         args_list[0] = "--resume"
     argv = args_list
