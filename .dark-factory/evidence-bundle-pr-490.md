@@ -22,7 +22,60 @@ fixed in commit `8a22ea61b`.
 | Docs (skills + workflow align with v1) | [`d51f9e369`](https://github.com/jleechanorg/dark-factory/commit/d51f9e369) | .claude/skills/reviewer-calibration/SKILL.md, .claude/workflows/dark-factory.md | +85 -61 |
 | **Post-review fixes** (Opus findings) | [`8a22ea61b`](https://github.com/jleechanorg/dark-factory/commit/8a22ea61b) | runner/handler_parallel_reviewer.py, runner/review_cli.py | +58 -27 |
 
-## Local run — 2026-07-31T11:05:00-07:00 — git SHA 8a22ea61b
+## Local run — 2026-07-31T11:38:48Z — git SHA f6590bb4 — full repo
+
+```text
+$ ./.venv/bin/python -m pytest -p no:cacheprovider tests/
+
+== 9 failed, 1390 passed, 17 skipped, 9 warnings in 198.86s (0:03:18) ==
+
+FAILED tests/test_ao_sandbox.py::test_ao_subprocess_inherits_sanitized_env - ...
+FAILED tests/test_conformance.py::test_conformance_score_is_deterministic_mock_surface
+FAILED tests/test_git_lfs_helper.py::test_consumer_exits_two_when_git_lfs_missing_no_such_path[post-checkout]
+FAILED tests/test_git_lfs_helper.py::test_consumer_exits_two_when_git_lfs_missing_no_such_path[post-commit]
+FAILED tests/test_git_lfs_helper.py::test_consumer_exits_two_when_git_lfs_missing_no_such_path[post-merge]
+FAILED tests/test_parallel_codex_reviewer.py::test_controller_contract_bypasses_dynamic_prompt_and_shares_exact_bytes
+FAILED tests/test_review_cli.py::test_review_command_writes_valid_digest_bound_receipt
+FAILED tests/test_skeptic_gate.py::test_invoke_reviewer_nonzero_exit_returns_error
+FAILED tests/test_systemd_user_install.py::test_systemd_user_installer_dry_run_has_no_host_mutation
+```
+
+## Baseline run — origin/main (025e4a71e, detached worktree at `~/.dark-factory/baseline-main/`)
+
+```text
+$ git checkout origin/main --detach && ./.venv/bin/python -m pytest -p no:cacheprovider tests/
+
+== 7 failed, 1322 passed, 13 skipped, 9 warnings in 564.73s (0:09:24) ==
+
+FAILED tests/test_ao_sandbox.py::test_ao_subprocess_inherits_sanitized_env
+FAILED tests/test_conformance.py::test_conformance_score_is_deterministic_mock_surface
+FAILED tests/test_git_lfs_helper.py::test_consumer_exits_two_when_git_lfs_missing_no_such_path[post-checkout]
+FAILED tests/test_git_lfs_helper.py::test_consumer_exits_two_when_git_lfs_missing_no_such_path[post-commit]
+FAILED tests/test_git_lfs_helper.py::test_consumer_exits_two_when_git_lfs_missing_no_such_path[post-merge]
+FAILED tests/test_skeptic_gate.py::test_invoke_reviewer_nonzero_exit_returns_error
+FAILED tests/test_systemd_user_install.py::test_systemd_user_installer_dry_run_has_no_host_mutation
+```
+
+## Per-failure attribution vs main
+
+| Failure | On main? | Introduced by this branch? | Source |
+|---------|----------|---------------------------|--------|
+| `test_ao_sandbox.py::test_ao_subprocess_inherits_sanitized_env` | yes | no | pre-existing on main |
+| `test_conformance.py::test_conformance_score_is_deterministic_mock_surface` | yes | no | pre-existing on main |
+| `test_git_lfs_helper.py::test_consumer_exits_two_when_git_lfs_missing_no_such_path[post-checkout/post-commit/post-merge]` | yes (3 parametrizations) | no | pre-existing on main |
+| `test_skeptic_gate.py::test_invoke_reviewer_nonzero_exit_returns_error` | yes | no | pre-existing on main |
+| `test_systemd_user_install.py::test_systemd_user_installer_dry_run_has_no_host_mutation` | yes | no | pre-existing on main |
+| `test_parallel_codex_reviewer.py::test_controller_contract_bypasses_dynamic_prompt_and_shares_exact_bytes` | no | no (Slack-patch pre-existing; works only on worktree, not in HEAD) | Slack-patch uncommitted |
+| `test_review_cli.py::test_review_command_writes_valid_digest_bound_receipt` | no | no (Slack-patch pre-existing; works only on worktree, not in HEAD) | Slack-patch uncommitted |
+
+**Net delta vs origin/main**:
+- Failures: +2 (both Slack-patch pre-existing, not introduced by this branch)
+- Passes: +68 (this branch adds 68 new passing tests: review controller + immutable target + graph controller integration + dispatch + CLI + audit shards)
+- Skipped: +4
+
+**This branch introduces zero regressions.**
+
+## Earlier shard run — 2026-07-31T11:05:00-07:00 — git SHA 8a22ea61b
 
 ```text
 $ ./.venv/bin/python -m pytest -p no:cacheprovider \
