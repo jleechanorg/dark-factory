@@ -46,6 +46,26 @@ ALLOWED_TOP_LEVEL_KEYS = frozenset(
     {"schema_version", "controller_api_version", "actions", "controller", "profiles"}
 )
 
+# Kind → compatible receipt_class set. Anything else is a contract violation.
+KIND_RECEIPT_CLASSES: dict[str, frozenset[str]] = {
+    "tool": frozenset({"test"}),
+    "holdout_eval": frozenset({"behavioral_proof"}),
+    "slash": frozenset({"evidence", "independent_review"}),
+}
+
+# Required ordered receipt-class sequence per profile stage. Validated after
+# expanding the profile's action list so action IDs can be renamed as long as
+# each declared action declares the required class.
+PROFILE_RECEIPT_SEQUENCE: dict[str, dict[str, tuple[str, ...]]] = {
+    "slim": {
+        "verify": ("test", "behavioral_proof", "evidence", "independent_review"),
+    },
+    "feature": {
+        "prove": ("test", "behavioral_proof", "evidence"),
+        "review": ("independent_review",),
+    },
+}
+
 DISALLOWED_TOKEN_RE = re.compile(r"[$`|;&<>\n\r\\]|/bin/sh|/bin/bash|\\$\\{")
 
 SLIM_NODES = {
@@ -131,7 +151,13 @@ def _check_node(node: Node, name: str, spec: Mapping[str, Any]) -> None:
             )
     for key in ("max_visits", "max_retries"):
         if key in spec:
-            actual = int(str(node.attrs.get(key) or 0))
+            raw = node.attrs.get(key)
+            try:
+                actual = int(str(raw or 0))
+            except (TypeError, ValueError) as exc:
+                raise ContractError(
+                    f"node {name!r}: {key}={raw!r} is not a valid integer"
+                ) from exc
             if actual != spec[key]:
                 raise ContractError(
                     f"node {name!r}: {key} must be {spec[key]}, got {actual}"
@@ -142,6 +168,30 @@ def _check_node(node: Node, name: str, spec: Mapping[str, Any]) -> None:
             raise ContractError(
                 f"node {name!r}: prefer_adversarial must be "
                 f"{spec['prefer_adversarial']!r}, got {actual!r}"
+            )
+
+
+def _validate_receipt_sequence(
+    profile: str,
+    plan: list[dict[str, str]] | dict[str, list[dict[str, str]]],
+    actions: Mapping[str, dict[str, Any]],
+) -> None:
+    """Enforce the per-profile ordered receipt-class contract."""
+    expected_by_stage = PROFILE_RECEIPT_SEQUENCE[profile]
+    stages: list[tuple[str, list[dict[str, str]]]] = (
+        [("verify", plan)] if isinstance(plan, list) else list(plan.items())
+    )
+    for stage, entries in stages:
+        sequence = tuple(actions[entry["action_id"]]["receipt_class"] for entry in entries)
+        required = expected_by_stage.get(stage)
+        if required is None:
+            raise ContractError(
+                f"[profiles.{profile}].{stage}: profile stage is not approved for v1"
+            )
+        if sequence != required:
+            raise ContractError(
+                f"[profiles.{profile}].{stage}: receipt_class sequence "
+                f"{sequence!r} must equal {required!r} in order"
             )
 
 
@@ -189,6 +239,12 @@ def _validate_actions(
             raise ContractError(
                 f"actions.{action_id}.receipt_class={receipt_class!r} "
                 f"must be in {sorted(ALLOWED_RECEIPT_CLASSES)}"
+            )
+        compatible = KIND_RECEIPT_CLASSES[kind]
+        if receipt_class not in compatible:
+            raise ContractError(
+                f"actions.{action_id}.receipt_class={receipt_class!r} is incompatible "
+                f"with kind={kind!r}; expected one of {sorted(compatible)}"
             )
         timeout = raw.get("timeout_seconds")
         if not isinstance(timeout, int) or timeout <= 0:
@@ -313,7 +369,15 @@ def inspect(workdir: str | pathlib.Path, profile: str) -> str:
     if not pipeline_path.is_file():
         raise ContractError(f"pipeline not found: {pipeline_path}")
 
-    raw = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+    try:
+        raw = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as exc:
+        raise ContractError(f"manifest TOML parse error: {exc}") from exc
+    except OSError as exc:
+        raise ContractError(f"manifest read error: {exc}") from exc
+    except ValueError as exc:
+        raise ContractError(f"manifest parse error: {exc}") from exc
+
     unknown_top = sorted(set(raw) - ALLOWED_TOP_LEVEL_KEYS)
     if unknown_top:
         raise ContractError(f"unknown top-level manifest keys: {unknown_top}")
@@ -335,16 +399,12 @@ def inspect(workdir: str | pathlib.Path, profile: str) -> str:
         raise ContractError(f"profile {profile!r} not declared in [profiles]")
 
     plan = _expand_profile_actions(profile, profiles[profile], set(actions.keys()))
-    # Validate the plan only references known actions.
-    if isinstance(plan, list):
-        for entry in plan:
-            entry["action_id"]  # already string-validated above
-    else:
-        for stage_entries in plan.values():
-            for entry in stage_entries:
-                entry["action_id"]  # already string-validated
+    _validate_receipt_sequence(profile, plan, actions)
 
-    topology_nodes = _validate_graph(pipeline_path, profile)
+    try:
+        topology_nodes = _validate_graph(pipeline_path, profile)
+    except ValueError as exc:
+        raise ContractError(f"pipeline parse error: {exc}") from exc
 
     payload = {
         "manifest_path": str(manifest_path),

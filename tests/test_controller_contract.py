@@ -326,3 +326,167 @@ def test_cli_dispatch_succeeds_on_valid_slim_repo(tmp_path: pathlib.Path) -> Non
     assert payload["status"] == "pass"
     assert payload["profile"] == "slim"
     assert payload["execution_enabled"] is False
+
+
+def _run_cli(workdir: pathlib.Path, *, profile: str = "slim",
+             manifest: str = VALID_MANIFEST, dot: str = SLIM_DOT) -> subprocess.CompletedProcess[str]:
+    """Invoke the controller inspect subcommand and return the completed process."""
+    repo_root = pathlib.Path(__file__).resolve().parent.parent
+    _write_repo(workdir, profile, manifest, dot)
+    return subprocess.run(
+        [sys.executable, "-m", "runner", "controller", "inspect",
+         "--workdir", str(workdir), "--profile", profile],
+        cwd=str(repo_root), capture_output=True, text=True, check=False, timeout=30,
+    )
+
+
+@pytest.mark.parametrize("bad_max_retries", ["true", "1.5"])
+def test_dot_max_retries_translates_to_contract_error(
+    tmp_path: pathlib.Path, bad_max_retries: str,
+) -> None:
+    from runner import controller_contract
+    bad_dot = SLIM_DOT.replace(
+        'max_visits="2", max_retries="0"',
+        f'max_visits="2", max_retries="{bad_max_retries}"',
+    )
+    _write_repo(tmp_path, "slim", VALID_MANIFEST, bad_dot)
+    with pytest.raises(controller_contract.ContractError, match="max_retries"):
+        controller_contract.inspect(workdir=tmp_path, profile="slim")
+
+
+@pytest.mark.parametrize("bad_max_retries", ["true", "1.5"])
+def test_cli_dot_max_retries_fail_closed_no_traceback(
+    tmp_path: pathlib.Path, bad_max_retries: str,
+) -> None:
+    bad_dot = SLIM_DOT.replace(
+        'max_visits="2", max_retries="0"',
+        f'max_visits="2", max_retries="{bad_max_retries}"',
+    )
+    proc = _run_cli(tmp_path, dot=bad_dot)
+    assert proc.returncode == 2 and proc.stderr == "", (proc.stdout, proc.stderr)
+    payload = json.loads(proc.stdout)
+    assert payload["status"] == "fail"
+    assert payload["profile"] == "slim"
+    assert payload["execution_enabled"] is False
+    assert "max_retries" in payload["error"]
+
+
+def test_malformed_toml_translates_to_contract_error(tmp_path: pathlib.Path) -> None:
+    from runner import controller_contract
+    bad = VALID_MANIFEST.replace(
+        "[actions.test]\nkind = \"tool\"",
+        "[actions.test  # missing closing bracket\nkind = \"tool\"",
+    )
+    _write_repo(tmp_path, "slim", bad, SLIM_DOT)
+    with pytest.raises(controller_contract.ContractError, match="TOML"):
+        controller_contract.inspect(workdir=tmp_path, profile="slim")
+
+
+def test_cli_malformed_toml_fail_closed_no_traceback(tmp_path: pathlib.Path) -> None:
+    bad = VALID_MANIFEST.replace(
+        "[actions.test]\nkind = \"tool\"",
+        "[actions.test  # missing closing bracket\nkind = \"tool\"",
+    )
+    proc = _run_cli(tmp_path, manifest=bad)
+    assert proc.returncode == 2 and proc.stderr == "", (proc.stdout, proc.stderr)
+    payload = json.loads(proc.stdout)
+    assert payload["status"] == "fail" and payload["execution_enabled"] is False
+    assert payload["profile"] == "slim"
+
+
+def test_cli_pass_output_is_byte_for_byte_deterministic(tmp_path: pathlib.Path) -> None:
+    """Repeated CLI calls on identical inputs produce identical stdout."""
+    outs = [_run_cli(tmp_path).stdout for _ in range(3)]
+    assert outs[0] == outs[1] == outs[2]
+
+
+def test_inspect_rejects_reviewer_with_test_class(tmp_path: pathlib.Path) -> None:
+    """Stage-required sequence: reviewer's receipt_class must be independent_review."""
+    from runner import controller_contract
+    bad = VALID_MANIFEST.replace(
+        'receipt_class = "independent_review"', 'receipt_class = "test"', 1,
+    )
+    _write_repo(tmp_path, "slim", bad, SLIM_DOT)
+    with pytest.raises(controller_contract.ContractError, match="receipt_class"):
+        controller_contract.inspect(workdir=tmp_path, profile="slim")
+
+
+def test_inspect_rejects_swapped_holdout_class(tmp_path: pathlib.Path) -> None:
+    """Ordered sequence: holdout action must declare behavioral_proof, not evidence."""
+    from runner import controller_contract
+    bad = VALID_MANIFEST.replace(
+        'kind = "holdout_eval"\ntimeout_seconds = 600\nreceipt_class = "behavioral_proof"',
+        'kind = "holdout_eval"\ntimeout_seconds = 600\nreceipt_class = "evidence"',
+    )
+    _write_repo(tmp_path, "slim", bad, SLIM_DOT)
+    with pytest.raises(controller_contract.ContractError, match="receipt_class"):
+        controller_contract.inspect(workdir=tmp_path, profile="slim")
+
+
+def test_inspect_accepts_alternate_action_ids_with_required_classes(tmp_path: pathlib.Path) -> None:
+    """Alternate action IDs preserve the required ordered receipt_class sequence."""
+    from runner import controller_contract
+    alt = (
+        VALID_MANIFEST
+        .replace("[actions.test]", "[actions.alpha_test]")
+        .replace("argv = [\"./run_tests.sh\"]", "argv = [\"./alpha.sh\"]")
+        .replace("[actions.holdout]", "[actions.beta_holdout]")
+        .replace("[actions.evidence]", "[actions.gamma_evidence]")
+        .replace("[actions.review]", "[actions.delta_review]")
+        .replace(
+            "verify = [\"test\", \"holdout\", \"evidence\", \"review\"]",
+            "verify = [\"alpha_test\", \"beta_holdout\", \"gamma_evidence\", \"delta_review\"]",
+        )
+    )
+    _write_repo(tmp_path, "slim", alt, SLIM_DOT)
+    payload = json.loads(controller_contract.inspect(workdir=tmp_path, profile="slim"))
+    plan = payload["action_plan"]
+    assert [a["action_id"] for a in plan] == [
+        "alpha_test", "beta_holdout", "gamma_evidence", "delta_review",
+    ]
+    assert [a["receipt_class"] for a in plan] == [
+        "test", "behavioral_proof", "evidence", "independent_review",
+    ]
+
+
+def test_inspect_rejects_feature_review_with_test_class(tmp_path: pathlib.Path) -> None:
+    """Feature review stage must reference an action with receipt_class=independent_review."""
+    from runner import controller_contract
+    bad = (
+        VALID_MANIFEST
+        .replace(
+            'receipt_class = "independent_review"', 'receipt_class = "test"', 1,
+        )
+        .replace(
+            '[profiles.slim]\nverify = ["test", "holdout", "evidence", "review"]\nrepair_passes = 1\n\n',
+            "",
+        )
+    )
+    _write_repo(tmp_path, "feature", bad, FEATURE_DOT)
+    with pytest.raises(controller_contract.ContractError, match="receipt_class"):
+        controller_contract.inspect(workdir=tmp_path, profile="feature")
+
+
+def test_inspect_rejects_tool_with_independent_review_class(tmp_path: pathlib.Path) -> None:
+    """Kind→class compatibility: tool actions cannot emit independent_review."""
+    from runner import controller_contract
+    bad = VALID_MANIFEST.replace(
+        'kind = "tool"\nargv = ["./run_tests.sh"]\ncwd = "."\ntimeout_seconds = 600\nreceipt_class = "test"',
+        'kind = "tool"\nargv = ["./run_tests.sh"]\ncwd = "."\ntimeout_seconds = 600\nreceipt_class = "independent_review"',
+        1,
+    )
+    _write_repo(tmp_path, "slim", bad, SLIM_DOT)
+    with pytest.raises(controller_contract.ContractError, match="receipt_class"):
+        controller_contract.inspect(workdir=tmp_path, profile="slim")
+
+
+def test_inspect_rejects_holdout_eval_with_test_class(tmp_path: pathlib.Path) -> None:
+    """Kind→class compatibility: holdout_eval actions cannot emit test."""
+    from runner import controller_contract
+    bad = VALID_MANIFEST.replace(
+        'kind = "holdout_eval"\ntimeout_seconds = 600\nreceipt_class = "behavioral_proof"',
+        'kind = "holdout_eval"\ntimeout_seconds = 600\nreceipt_class = "test"',
+    )
+    _write_repo(tmp_path, "slim", bad, SLIM_DOT)
+    with pytest.raises(controller_contract.ContractError, match="receipt_class"):
+        controller_contract.inspect(workdir=tmp_path, profile="slim")
