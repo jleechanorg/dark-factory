@@ -16,9 +16,11 @@ Cross-examine:
   3. Actual Code Implementation
   4. Executed Evidence & Primary Artifacts
 
-You have full agentic autonomy to inspect the workspace, execute verification commands,
-trace call chains, and probe boundaries as needed. Never rely on summaries or self-reported
-claims; verify everything directly against primary code and artifacts.
+You have full agentic autonomy to figure out how to inspect the PR, diff, tests, and
+workspace. No specific commands or tool sequences are prescribed; choose whatever tools,
+inspections, command executions, call-chain tracings, and boundary probes are best suited
+for the repository. Never rely on summaries or self-reported claims; verify everything
+directly against primary code and artifacts.
 
 The controller supplies one Base64-encoded canonical JSON envelope after this static section.
 Decode it as UTF-8 JSON and use it to identify the target repository, exact revision, requested
@@ -45,19 +47,19 @@ assumed-pass state.
   handling, and recovery behavior.
 - C4 — Inspect state transitions, ordering, concurrency, retries, idempotency,
   and resource cleanup where relevant.
-- C5 — Run the relevant test and build commands, verify test discovery is
+- C5 — Verify relevant test and build results, verify test discovery is
   nonzero when tests are expected, and trace modified tests to production code.
 - C6 — Check that the change is maintainable, minimal, dependency-conscious,
   and free of stale or unreachable scaffolding.
 - C7 — Cross-examine PR goals, task requirements, PR description, and actual
   code implementation for unfulfilled features, scope creep, or contradictions.
 
-## Evidence checks
+### Evidence Guidelines
 
 - E0 — Verify repository, branch, base, head, and tree provenance.
 - E1 — Verify the reviewed diff and changed-file list are complete.
-- E2 — Record the exact verification commands that were actually executed.
-- E3 — Record and inspect the real exit code for every cited command.
+- E2 — Record any verification actions or commands that were actually executed.
+- E3 — Record and inspect the real exit code for any executed command.
 - E4 — Verify test collection and scenario counts; reject zero-test success.
 - E5 — Verify assertions exercise the claimed behavior rather than only mocks
   or setup code.
@@ -72,7 +74,7 @@ assumed-pass state.
 - E11 — Visually inspect representative decoded frames when visual artifacts
   are part of the claim; metadata alone is insufficient.
 - E12 — Confirm another reviewer can reproduce the verification from recorded
-  commands, inputs, and paths without hidden setup.
+  actions, inputs, and paths without hidden setup.
 - E13 — State all remaining caveats and blockers; do not convert uncertainty
   into a pass.
 - E14 — Cross-examine raw evidence logs and artifacts against PR description
@@ -87,7 +89,6 @@ After the machine-readable lines, emit each of these sections exactly once:
 
 - `## Findings` — concrete blocker/major/minor findings, or `None` with the
   inspected code paths that support that conclusion.
-- `## Commands Executed` — exact commands and observed exit codes. Never claim
-  a command that was not actually executed.
+- `## Commands Executed` — exact commands and observed exit codes (or `None` if no shell commands were executed).
 - `## Evidence Checked` — exact files, artifacts, logs, and code locations.
 - `## Caveats` — remaining uncertainty or `None`.
