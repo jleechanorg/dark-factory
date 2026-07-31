@@ -737,6 +737,105 @@ def _simulate_signal_b_decision(
     return "PASS"
 
 
+# jleechan-wjm2: regression test for the head-SHA extraction regex bug.
+#
+# The Evidence Gate workflow extracts the declared head SHA from /er
+# verdict comments. The extraction accepts BOTH of these formats:
+#
+#   1. er_runner format:  "head=<sha>"      (head SHA right after `=`)
+#   2. marker-line form: "head <sha>"      (space between `head` and SHA)
+#
+# The previous sed `'s/^=//'` only stripped a leading `=`, so the er_runner
+# format captured `head=<sha>` (with the `head=` prefix retained) and the
+# prefix-match against the current PR head always failed. The live
+# incident: drive-PR-#487 on 2026-07-31 had to fall back to the space
+# format because `head=<sha>` would never match.
+#
+# This test guards both formats against future regression by asserting the
+# extraction regex+awk+sed pipeline produces the bare SHA in each case.
+
+
+def _simulate_head_sha_extraction(comment_body: str) -> str:
+    """Mirror the head-SHA extraction step in `evidence-gate.yml:215` via the
+    actual bash pipeline (avoids re-implementing POSIX grep -E semantics in
+    Python where `[[:space:]]` is not a recognised class).
+
+    Equivalent of:
+        echo "$c_body" | grep -oE 'head[[:space:]]*=[[:space:]]*[0-9a-f]{7,64}|head[[:space:]]+[0-9a-f]{7,64}' | head -1 | awk '{print $NF}' | sed -E 's/^head=//; s/^=//'
+    """
+    import subprocess
+
+    script = (
+        "grep -oE 'head[[:space:]]*=[[:space:]]*[0-9a-f]{7,64}"
+        "|head[[:space:]]+[0-9a-f]{7,64}'"
+        " | head -1 | awk '{print $NF}' | sed -E 's/^head=//; s/^=//'"
+    )
+    proc = subprocess.run(
+        ["bash", "-c", script],
+        input=comment_body,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    return proc.stdout.rstrip("\n")
+
+
+def test_evidence_gate_extracts_head_sha_with_equals_format() -> None:
+    """Regression: the er_runner format `head=<sha>` MUST extract to the
+    bare SHA (jleechan-wjm2). Previously the extraction kept the `head=`
+    prefix and the gate failed."""
+    sha = "00eaae8a2017fd1399a9d57519dd67218dae8deb"
+    body = f"🤖 **[dark-factory /er]** Evidence review verdict: ``` /er PASS ``` head={sha}"
+    extracted = _simulate_head_sha_extraction(body)
+    assert extracted == sha, (
+        f"head=<sha> format must extract to bare SHA, got {extracted!r}; "
+        f"the Evidence Gate would have compared `head={sha}` against "
+        f"`{sha}` and failed. (jleechan-wjm2)"
+    )
+
+
+def test_evidence_gate_extracts_head_sha_with_space_format() -> None:
+    """The marker-line format `head <sha>` MUST also extract to the bare SHA
+    (the workaround used to drive PR #487 on 2026-07-31)."""
+    sha = "00eaae8a2017fd1399a9d57519dd67218dae8deb"
+    body = f"🤖 **[dark-factory /er]** Evidence review verdict: ``` /er PASS ``` head {sha}"
+    extracted = _simulate_head_sha_extraction(body)
+    assert extracted == sha, (
+        f"head <sha> format must extract to bare SHA, got {extracted!r} "
+        f"(jleechan-wjm2)"
+    )
+
+
+def test_evidence_gate_workflow_uses_head_equals_strip() -> None:
+    """The evidence-gate.yml workflow file MUST contain the fixed sed
+    expression that strips the `head=` prefix (jleechan-wjm2)."""
+    text = _verdict_step_text(_load_workflow())
+    # Accept any of the forms that strip the leading `head=` prefix:
+    #   - sed -E 's/^head=//; s/^=//'
+    #   - sed 's/^head=//; s/^=//'
+    #   - sed 's/^head=//'
+    # The OLD form `sed 's/^=//'` (without head= strip) is what caused
+    # the bug; ensure it has been replaced.
+    has_strip_head = bool(
+        re.search(r"sed\s+(?:-E\s+)?['\"]?s/\^head=|s/\^head=", text)
+    )
+    assert has_strip_head, (
+        "evidence-gate.yml head-SHA extraction sed must strip the `head=` "
+        "prefix; the previous `sed 's/^=//'` form retained it and broke "
+        "Signal A for /er comments in `head=<sha>` format. (jleechan-wjm2)"
+    )
+    # Sanity: the broken single-strip form must NOT appear without the
+    # head= companion strip.
+    bare_equals_strip = bool(re.search(r"sed\s+(?:-E\s+)?['\"]?s/\^=//['\"]?", text))
+    has_head_equals_strip = bool(re.search(r"sed\s+(?:-E\s+)?['\"]?s/\^head=//", text))
+    if bare_equals_strip and not has_head_equals_strip:
+        raise AssertionError(
+            "evidence-gate.yml still uses bare `sed 's/^=//'` without "
+            "stripping `head=` — the documented er_runner format "
+            "(`head=<sha>`) will fail to match. (jleechan-wjm2)"
+        )
+
+
 @pytest.mark.parametrize(
     "files,pr,repo,declared,current,expected",
     [
