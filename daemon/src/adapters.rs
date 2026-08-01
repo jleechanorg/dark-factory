@@ -1222,7 +1222,6 @@ impl Scm for CliScm {
         let ci_owned_checks: Vec<&GhCheck> = filtered_checks
             .iter()
             .filter(|c| !check_owned_by_dedicated_gate(&c.name))
-            .copied()
             .collect();
         let mut any_pending = false;
         let mut any_failed = false;
