@@ -3,7 +3,7 @@
 **Issue**: [#501 fix(daemon): af-tick refuses to run when local checkout is on detached HEAD](https://github.com/jleechanorg/dark-factory/issues/501)  
 **Branch**: `factory/jleechan-501-detached-head`  
 **Base**: `origin/main`  
-**Generated**: 2026-08-01T13:45:00-07:00  
+**Generated**: 2026-08-01T13:47:00-07:00  
 
 ---
 
@@ -21,13 +21,17 @@ This change widens the branch check:
 
 ## 2. Test-Driven Development (TDD) Cycle
 
-We added two new test cases to `tests/scripts/test_factory_af_tick_drift_gate.sh`:
+We added three new test cases to `tests/scripts/test_factory_af_tick_drift_gate.sh`:
 * **Case 6**: Verifies that a detached HEAD pointing to the `main` commit passes the drift gate.
 * **Case 7**: Verifies that a detached HEAD pointing to a different commit (e.g. an earlier init commit) is refused with exit code `10`.
+* **Case 8**: Verifies that a detached HEAD pointing to the `origin/main` commit passes the drift gate even when the local `main` branch has diverged/differs from `origin/main`.
 
-### Red Phase (Failing Case 6)
+### Red Phase (Failing Case 6 & 8)
 ```
 FAIL: drift gate should pass on detached HEAD pointing to main commit. Output: factory-af-tick: REFUSING TICK — checkout at /tmp/test-af-tick-drift.nz9I8H/work is on branch '<detached HEAD>', not main...
+RC=10
+
+FAIL: drift gate should pass on detached HEAD pointing to origin/main when local main differs. Output: factory-af-tick: REFUSING TICK — checkout at /tmp/test-af-tick-drift.nz9I8H/work is on branch '<detached HEAD>', not main...
 RC=10
 ```
 
@@ -35,7 +39,8 @@ RC=10
 ```
 PASS: drift gate passes on detached HEAD pointing to main commit
 PASS: drift gate refuses (rc=10) on detached HEAD pointing to a different commit
-=== RESULTS: 11 passed, 0 failed ===
+PASS: drift gate passes on detached HEAD pointing to origin/main even when local main differs
+=== RESULTS: 12 passed, 0 failed ===
 ```
 
 ---

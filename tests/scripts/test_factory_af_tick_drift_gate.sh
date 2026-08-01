@@ -250,6 +250,34 @@ esac
 # Restore to main for any subsequent tests
 (cd "$WORK" && git checkout -q main)
 
+# Case 8: detached HEAD pointing to origin/main commit while local main points to a different commit -> gate passes.
+(
+    cd "$WORK"
+    git checkout -q main
+    # Make a new commit on local main to make it different from origin/main
+    echo "local main diverged" >> f.txt
+    git commit -q -a -m "local main diff"
+    # Detach HEAD at origin/main commit
+    git checkout -q --detach origin/main
+)
+out="$(run_drift_block "$WORK")"
+case "$out" in
+    *GATE_PASSED*RC=0*|*RC=0*GATE_PASSED*)
+        echo "PASS: drift gate passes on detached HEAD pointing to origin/main even when local main differs"
+        PASS=$((PASS + 1))
+        ;;
+    *)
+        echo "FAIL: drift gate should pass on detached HEAD pointing to origin/main when local main differs. Output: $out"
+        FAIL=$((FAIL + 1))
+        ;;
+esac
+# Restore to main, reset it to origin/main for cleanliness
+(
+    cd "$WORK"
+    git checkout -q main
+    git reset --hard -q origin/main
+)
+
 # ---------------------------------------------------------------------------
 # The production launchd plist must never set AFD_SKIP_DRIFT_CHECK (the
 # opt-out is for local/dev invocation only).
