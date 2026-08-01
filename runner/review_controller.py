@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -22,6 +23,28 @@ PROMPT_ID = "controller-cold-review-v1"
 CORRECTNESS_CHECK_IDS = tuple(f"C{i}" for i in range(8))
 EVIDENCE_CHECK_IDS = tuple(f"E{i}" for i in range(15))
 CHECK_IDS = CORRECTNESS_CHECK_IDS + EVIDENCE_CHECK_IDS
+
+
+def _stub_mode_requested() -> bool:
+    """Return True if a stub-mode env var is set, regardless of CI status.
+
+    The controller contract is fail-closed: a PASS verdict requires real LLM
+    calls and real CI gating. Stub-mode env vars indicate the caller is
+    driving iteration ceilings with synthetic responses; a PASS verdict under
+    those conditions would falsely transition a bead to READY without real
+    verification. Refuse the PASS verdict here so the state machine never
+    records it.
+
+    Pair this check with the daemon-side ``env_guard::stub_mode_allowed``
+    gate (PR #498) which is the FIRST line of defence: the daemon refuses to
+    honor the env vars outside CI. This controller check is the SECOND line:
+    even if a future regression disables the daemon gate, the controller
+    itself cannot return PASS under stub-mode env vars.
+    """
+    return (
+        os.environ.get("DARK_FACTORY_ITERATION_STUB") == "1"
+        or os.environ.get("DARK_FACTORY_FAKE_LLM") == "1"
+    )
 
 _SOURCE_ROOT = Path(__file__).resolve().parents[1]
 _TEMPLATE_PATH = (
@@ -786,6 +809,16 @@ def run_controller_review(
     response_path.write_text(response_body, encoding="utf-8")
     review = validate_review_response(response_body, request)
     validate_execution_receipts(receipts, review)
+
+    # Second line of defence against stub-mode leakage: refuse a PASS verdict
+    # if a stub-mode env var is set, regardless of CI status. A real PASS
+    # requires real LLM + real CI; under stub mode the verdict is synthetic.
+    if review.verdict == "pass" and _stub_mode_requested():
+        raise ReviewContractError(
+            "controller refuses PASS verdict under stub-mode env vars "
+            "(DARK_FACTORY_ITERATION_STUB=1 or DARK_FACTORY_FAKE_LLM=1); "
+            "stub mode drives iteration ceilings and cannot transition to READY"
+        )
 
     receipt = {
         "schema": 1,
