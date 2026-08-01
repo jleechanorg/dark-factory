@@ -1203,9 +1203,8 @@ mod tests {
         let _env_guard = NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let socket_name = format!(
-            "dark-factory-notify-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            "df-abs-{}",
+            std::process::id()
         );
         let address = SocketAddr::from_abstract_name(socket_name.as_bytes()).unwrap();
         let listener = UnixDatagram::bind_addr(&address).unwrap();
