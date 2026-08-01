@@ -1170,10 +1170,9 @@ mod tests {
 
         let _env_guard = NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-        let socket_path = std::env::temp_dir().join(format!(
-            "dark-factory-notify-{}-{}.sock",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+        let socket_path = std::path::PathBuf::from(format!(
+            "/tmp/df-notify-{}.sock",
+            std::process::id()
         ));
         let _ = std::fs::remove_file(&socket_path);
         let listener = UnixDatagram::bind(&socket_path).unwrap();
