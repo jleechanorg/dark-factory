@@ -489,14 +489,6 @@ pub trait StateStore {
     ) -> Result<bool, DaemonError> {
         Ok(false)
     }
-=======
-    /// Clear `attempt_started_at` (set NULL) — called on every
-    /// HUMAN_HELD transition and inside `recover_human_held`. Default
-    /// no-op for fakes that don't persist this column.
-    fn clear_attempt_started_at(&self, _bead_id: &str) -> Result<(), DaemonError> {
-        Ok(())
-    }
->>>>>>> b6d14700f9 ([antig] fix(daemon): attempt-scoped autonomy timebox — stamp attempt_started_at at dispatch reservation)
 }
 
 /// `StateStore` impl against `~/.dark-factory/daemon-cxdb.sqlite` (WAL mode,
@@ -989,7 +981,6 @@ impl SqliteStateStore {
         Ok(())
     }
 
-<<<<<<< HEAD
     /// Idempotent migration for the `held_recheck_after` column (bead
     /// jleechan-zaga / issue #348 r3). Same probe-then-`ALTER` pattern as
     /// `ensure_reroll_deferral_count_column`. Nullable (NULL = "re-assess
@@ -1241,7 +1232,9 @@ impl SqliteStateStore {
             // next open; surface the original error either way.
             let _ = conn.execute_batch("ROLLBACK");
             return Err(tool_err("ensure_disposition_required_state: rebuild", e));
-=======
+        }
+        Ok(())
+    }
     /// Idempotent migration for the `attempt_started_at` column (bead
     /// bze8.3: redispatch must not inherit elapsed autonomy from prior
     /// attempts). Same probe-then-`ALTER` pattern as
@@ -1268,7 +1261,6 @@ impl SqliteStateStore {
                 [],
             )
             .map_err(|e| tool_err("ensure_attempt_started_at_column: add column", e))?;
->>>>>>> b6d14700f9 ([antig] fix(daemon): attempt-scoped autonomy timebox — stamp attempt_started_at at dispatch reservation)
         }
         Ok(())
     }
@@ -2450,6 +2442,7 @@ mod tests {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         };
         s.save(&o).unwrap();
         // Unset by default.
@@ -2596,6 +2589,7 @@ mod tests {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         };
         s.save(&o).expect("DISPOSITION_REQUIRED must persist after open-time migration");
         let got = s.load("held-bead").unwrap().unwrap();
@@ -3800,6 +3794,7 @@ mod tests {
                 pre_session_head_sha: None,
                 park_reason: Some("unmapped_repo".to_string()),
                 target_repo: None,
+                attempt_started_at: None,
             },
         );
         overlays.insert(
@@ -3819,6 +3814,7 @@ mod tests {
                 pre_session_head_sha: None,
                 park_reason: Some("session_stalled".to_string()),
                 target_repo: Some("owner/repo".to_string()),
+                attempt_started_at: None,
             },
         );
         for overlay in overlays.values() {
@@ -4347,7 +4343,6 @@ mod tests {
         assert_eq!(h_after.autonomy_secs, 10299);
     }
 
-<<<<<<< HEAD
     // 1s2q-escalation-dedup: the escalation_ledger migration + dedup logic.
 
     #[test]

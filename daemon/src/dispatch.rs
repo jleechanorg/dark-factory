@@ -1932,6 +1932,7 @@ mod tests {
                 // `cfg.target_repo` and the bead would silently dispatch
                 // into the wrong repo.
                 target_repo: None,
+                attempt_started_at: None,
             })
             .unwrap();
         let cfg = cfg();
@@ -2034,6 +2035,7 @@ mod tests {
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: None,
+                attempt_started_at: None,
             })
             .unwrap();
         // Add a [repos.*] entry for the bead's resolved repo so dispatch
@@ -2108,6 +2110,7 @@ mod tests {
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: None,
+                attempt_started_at: None,
             })
             .unwrap();
         let mut cfg = cfg();
@@ -2183,6 +2186,7 @@ mod tests {
                 // without it, dispatch would park with `unmapped_target_repo`
                 // (the Stage B failure mode), not dispatch.
                 target_repo: Some("someorg/other-repo".to_string()),
+                attempt_started_at: None,
             })
             .unwrap();
         let cfg = cfg();
