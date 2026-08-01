@@ -2210,7 +2210,6 @@ fn test_reroll_close_pr_uses_bead_resolved_repo_not_cfg_target_repo() {
         spawn_failure_count: 0,
         pre_session_head_sha: None,
         park_reason: None,
-        attempt_started_at: None,
         target_repo: Some("jleechanorg/dark-factory".into()),
         attempt_started_at: None,
     };
@@ -2341,7 +2340,6 @@ fn test_reroll_recovers_from_stale_local_remote_branch_on_retry() {
         spawn_failure_count: 0,
         pre_session_head_sha: None,
         park_reason: None,
-        attempt_started_at: None,
         target_repo: None,
         attempt_started_at: None,
     };
@@ -2493,7 +2491,6 @@ fn test_reroll_close_pr_already_merged_is_tolerated_as_successful_supersede() {
         spawn_failure_count: 0,
         pre_session_head_sha: None,
         park_reason: None,
-        attempt_started_at: None,
         target_repo: None,
         attempt_started_at: None,
     };

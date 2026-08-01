@@ -274,7 +274,6 @@ fn sqlite_dispatch_guarantee_queued_bead_dispatched_despite_escalation_backlog()
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            attempt_started_at: None,
             target_repo: Some("owner/repo".to_string()),
             attempt_started_at: None,
         })
@@ -359,7 +358,6 @@ fn sqlite_escalation_dedup_tick_level_identical_payload_suppressed_changed_conte
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            attempt_started_at: None,
             target_repo: Some("owner/repo".to_string()),
             attempt_started_at: None,
         })
