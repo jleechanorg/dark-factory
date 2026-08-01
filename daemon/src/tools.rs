@@ -381,10 +381,16 @@ pub fn resolve_worktree_path(ao_project: &str, branch: &str) -> std::path::PathB
     if home.is_empty() {
         return std::path::PathBuf::from("/");
     }
-    std::path::PathBuf::from(home)
-        .join(".agent-orchestrator")
-        .join(ao_project)
-        .join(branch)
+    let base = std::path::PathBuf::from(&home);
+    let p1 = base.join(".agent-orchestrator").join(ao_project).join(branch);
+    if p1.exists() {
+        return p1;
+    }
+    let p2 = base.join(".worktrees").join(ao_project).join(branch);
+    if p2.exists() {
+        return p2;
+    }
+    p1
 }
 
 #[cfg(test)]
