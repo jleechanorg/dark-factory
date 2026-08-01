@@ -8,7 +8,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
-HOOKS_DIR="$REPO_ROOT/.git/hooks"
+HOOKS_DIR="$(git rev-parse --git-path hooks)"
 HOOK_FILE="$HOOKS_DIR/pre-commit"
 
 mkdir -p "$HOOKS_DIR"
