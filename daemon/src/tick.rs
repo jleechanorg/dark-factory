@@ -2633,26 +2633,17 @@ fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, DaemonError> 
             &["exec", "--yolo", "--skip-git-repo-check", prompt],
             REVIEWER_TIMEOUT_SECS,
         ),
-        "claude" => {
-            let home = std::env::var("HOME").unwrap_or_default();
-            let nvm_claude = format!("{}/.nvm/versions/node/v22.22.0/bin/claude", home);
-            let claude_bin = if std::path::Path::new(&nvm_claude).exists() {
-                nvm_claude
-            } else {
-                "claude".to_string()
-            };
-            run_tool(
-                &claude_bin,
-                &[
-                    "--print",
-                    "--dangerously-skip-permissions",
-                    "--setting-sources",
-                    "",
-                    prompt,
-                ],
-                REVIEWER_TIMEOUT_SECS,
-            )
-        }
+        "claude" => run_tool(
+            "claude",
+            &[
+                "--print",
+                "--dangerously-skip-permissions",
+                "--setting-sources",
+                "",
+                prompt,
+            ],
+            REVIEWER_TIMEOUT_SECS,
+        ),
         "agy" => run_tool(
             "agy",
             &["--print", "--dangerously-skip-permissions", prompt],

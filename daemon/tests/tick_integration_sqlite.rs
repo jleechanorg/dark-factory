@@ -246,6 +246,7 @@ fn sqlite_dispatch_guarantee_queued_bead_dispatched_despite_escalation_backlog()
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: Some("owner/repo".to_string()),
+                attempt_started_at: None,
             })
             .unwrap();
     }
@@ -274,6 +275,7 @@ fn sqlite_dispatch_guarantee_queued_bead_dispatched_despite_escalation_backlog()
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: Some("owner/repo".to_string()),
+            attempt_started_at: None,
         })
         .unwrap();
 
@@ -357,6 +359,7 @@ fn sqlite_escalation_dedup_tick_level_identical_payload_suppressed_changed_conte
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: Some("owner/repo".to_string()),
+            attempt_started_at: None,
         })
         .unwrap();
 

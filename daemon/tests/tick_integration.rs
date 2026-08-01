@@ -2076,6 +2076,7 @@ fn existing_pr_adoption_does_not_re_emit_telemetry_on_subsequent_ticks() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
+        vendor_health: None,
     };
 
     run_tick(&deps, 0, 0).expect("first tick adopts PR");
@@ -2158,6 +2159,7 @@ fn existing_pr_adoption_re_emits_after_state_transition_away_from_attested() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
+        vendor_health: None,
     };
 
     // First tick adopts the PR — overlay moves to Attested; telemetry
@@ -3133,6 +3135,7 @@ fn disposition_required_bead_resumes_when_gates_go_green() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            attempt_started_at: None,
             target_repo: None,
         })
         .unwrap();
@@ -3222,6 +3225,7 @@ fn disposition_required_bead_in_cooldown_is_skipped_without_scm_call() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            attempt_started_at: None,
             target_repo: None,
         })
         .unwrap();
@@ -3312,6 +3316,7 @@ fn disposition_required_reassessment_error_preserves_hold_provenance() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            attempt_started_at: None,
             target_repo: None,
         })
         .unwrap();
@@ -4741,6 +4746,7 @@ fn permanent_gh_error_marks_escalation_undeliverable_and_never_retries() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            attempt_started_at: None,
             target_repo: None,
         },
     );
@@ -8208,6 +8214,7 @@ fn cross_model_reviewer_cursor_agent_falls_back_and_emits_review_degraded() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            attempt_started_at: None,
             target_repo: None,
         },
     );
@@ -8450,6 +8457,7 @@ fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            attempt_started_at: None,
             target_repo: None,
         },
     );
@@ -10138,6 +10146,7 @@ fn autonomy_timebox_park_kills_associated_ao_session_and_clears_handle() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            attempt_started_at: None,
             target_repo: None,
         },
     );
@@ -10225,6 +10234,7 @@ fn coder_silent_park_kills_associated_ao_session_and_clears_handle() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            attempt_started_at: None,
             target_repo: None,
         },
     );
@@ -10312,6 +10322,7 @@ fn session_branch_mismatch_park_kills_associated_ao_session_and_clears_handle() 
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            attempt_started_at: None,
             target_repo: None,
         },
     );
@@ -10411,6 +10422,7 @@ fn autonomy_timebox_park_retains_handle_when_stop_fails() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            attempt_started_at: None,
             target_repo: None,
         },
     );
@@ -10485,6 +10497,7 @@ fn adopted_branch_history_rewrite_park_kills_associated_ao_session() {
             spawn_failure_count: 0,
             pre_session_head_sha: Some("aaaaaaaaaaaaaaaa".into()),
             park_reason: None,
+            attempt_started_at: None,
             target_repo: None,
         },
     );
@@ -10708,6 +10721,7 @@ fn slow_tier_dispatched_branch_mismatch_re_resolves_stale_pr_number() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            attempt_started_at: None,
             target_repo: None,
         })
         .unwrap();
@@ -10860,6 +10874,7 @@ fn slow_tier_dispatched_branch_mismatch_no_op_when_pr_number_already_matches() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            attempt_started_at: None,
             target_repo: None,
         })
         .unwrap();
@@ -10975,6 +10990,7 @@ fn slow_tier_dispatched_branch_mismatch_clears_stale_pr_number_when_branch_has_n
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            attempt_started_at: None,
             target_repo: None,
         })
         .unwrap();
@@ -11094,6 +11110,7 @@ fn slow_tier_pre_gate_validation_re_resolves_when_stored_pr_no_longer_open() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            attempt_started_at: None,
             target_repo: None,
         })
         .unwrap();
@@ -11224,6 +11241,7 @@ fn transient_pr_number_reresolve_error_keeps_dispatched_no_promotion() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            attempt_started_at: None,
             target_repo: None,
         })
         .unwrap();
@@ -11315,6 +11333,7 @@ fn pre_gate_no_open_pr_demotes_attested_to_dispatched_and_resumes() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            attempt_started_at: None,
             target_repo: None,
         })
         .unwrap();
@@ -11439,6 +11458,7 @@ fn evidence_bead(store: &FakeStateStore, scm: &mut FakeScm, bead_id: &str, pr: u
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            attempt_started_at: None,
             target_repo: None,
         })
         .unwrap();
@@ -11628,6 +11648,7 @@ fn rln6_evidence_head_stale_fast_rejects_with_one_shot_comment() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
+            vendor_health: None,
         },
         1,
         0,
@@ -11695,6 +11716,7 @@ fn rln6_evidence_head_stale_fast_rejects_with_one_shot_comment() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
+            vendor_health: None,
         },
         1,
         0,
@@ -11767,6 +11789,7 @@ fn rln6_v2_evidence_head_stale_emits_gate_assessment_before_fast_reject() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
+            vendor_health: None,
         },
         1,
         0,
@@ -11857,6 +11880,7 @@ fn rln6_v2_evidence_head_stale_does_not_persist_sentinel_on_comment_failure() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
+            vendor_health: None,
         },
         1,
         0,
@@ -11898,6 +11922,7 @@ fn rln6_v2_evidence_head_stale_does_not_persist_sentinel_on_comment_failure() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
+            vendor_health: None,
         },
         1,
         0,
@@ -11978,6 +12003,7 @@ fn rln6_v2_evidence_head_stale_sentinel_resets_on_new_mismatch_tuple() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
+            vendor_health: None,
         },
         1,
         0,
@@ -12022,6 +12048,7 @@ fn rln6_v2_evidence_head_stale_sentinel_resets_on_new_mismatch_tuple() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
+            vendor_health: None,
         },
         1,
         0,
@@ -12066,6 +12093,7 @@ fn rln6_v2_evidence_head_stale_sentinel_resets_on_new_mismatch_tuple() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
+            vendor_health: None,
         },
         1,
         0,
@@ -12264,6 +12292,7 @@ fn msmq_verifier_skips_reassessment_when_reroll_deferred() {
         spawn_failure_count: 0,
         pre_session_head_sha: None,
         park_reason: None,
+        attempt_started_at: None,
         target_repo: Some("owner/repo".into()),
     };
     store.save(&overlay).unwrap();
@@ -12547,6 +12576,7 @@ fn dispatch_guarantee_queued_bead_dispatched_despite_escalation_backlog() {
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: Some("owner/repo".to_string()),
+                attempt_started_at: None,
             })
             .unwrap();
     }
@@ -12576,6 +12606,7 @@ fn dispatch_guarantee_queued_bead_dispatched_despite_escalation_backlog() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            attempt_started_at: None,
             target_repo: Some("owner/repo".to_string()),
         })
         .unwrap();
@@ -12689,6 +12720,7 @@ fn escalation_dedup_tick_level_identical_payload_suppressed_changed_context_re_e
         spawn_failure_count: 0,
         pre_session_head_sha: None,
         park_reason: None,
+        attempt_started_at: None,
         target_repo: Some("owner/repo".to_string()),
     }).unwrap();
 
@@ -12799,10 +12831,6 @@ fn escalation_dedup_tick_level_identical_payload_suppressed_changed_context_re_e
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
-<<<<<<< HEAD
-=======
->>>>>>> 5d6c86b771 (claude/fable: fix(daemon): re-resolve stale pr_number from branch on drift detection)
-=======
 
 // ----------------------------------------------------------------------------
 // Bead jleechan-jsby (r2): end-to-end integration test that drives the
@@ -12924,6 +12952,7 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
         spawn_failure_count: 0,
         pre_session_head_sha: None,
         park_reason: None,
+        attempt_started_at: None,
         target_repo: None,
     };
     store.save(&overlay).unwrap();
@@ -13138,7 +13167,6 @@ fn vendor_health_ledger_ci_pending_with_capped_vendor_skips_wait() {
             ci_status: "pending".into(),
             coderabbit_status: "unknown".into(),
             ci_pending: true,
-        bugbot_pending: false,
             head_committed_epoch: 0,
             bugbot_pending: false,
         },
@@ -13213,4 +13241,3 @@ fn vendor_health_ledger_ci_pending_with_capped_vendor_skips_wait() {
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
->>>>>>> 95659ec1ca (claude/fable: feat(daemon): wire vendor-health ledger to production tick path (bead jleechan-jsby r2))
