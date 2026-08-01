@@ -79,7 +79,7 @@ path = "src/lib.rs"
     run(Command::new("git").current_dir(&root).args(["init", "-q", "-b", "main"]));
     run(Command::new("git")
         .current_dir(&root)
-        .args(["config", "user.email", "test@example.com"]));
+        .args(["config", "user.email", "jleechan2015@users.noreply.github.com"]));
     run(Command::new("git")
         .current_dir(&root)
         .args(["config", "user.name", "test"]));

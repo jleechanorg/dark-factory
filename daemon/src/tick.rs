@@ -29,6 +29,7 @@ use crate::tools::{Bead, Llm, PrHeadBranch, Scm, SessionId, Sessions, Tracker, V
 use crate::verifier::{self, PrEvidence};
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Mutex;
 
 /// Everything one `run_tick` call needs: the five tool-boundary trait objects,
 /// config, state store, and the telemetry log path. Bundled into one struct so
@@ -43,6 +44,16 @@ pub struct TickDeps<'a> {
     pub vcs: &'a dyn Vcs,
     pub cfg: &'a Config,
     pub telemetry_log: &'a Path,
+    /// Bead jleechan-jsby (r2): process-wide vendor-health ledger the
+    /// fast tier MUTATES on every assessment (acceptance criterion 1:
+    /// the ledger must be populated, not just consulted). Wrapped in
+    /// `Mutex` so the daemon's poll loop's `--once` and concurrent
+    /// tick callers can share one instance — the r1 PR #459 had no
+    /// ledger field here at all and the in-tick `PrEvidence` was
+    /// constructed with a fresh empty ledger, so the waiver path
+    /// never executed. Optional so existing test sites that don't
+    /// exercise the ledger can pass `None` (pre-r1 behavior preserved).
+    pub vendor_health: Option<&'a Mutex<crate::vendor_health::VendorHealthLedger>>,
 }
 
 /// Summary counters returned by `run_tick`, mirrored into the `TICK` telemetry
@@ -1248,6 +1259,68 @@ pub fn run_tick(
     )?;
 
     Ok(summary)
+}
+
+/// Bead jleechan-jsby (r2): emit a `VENDOR_WAIVED` event on the
+/// Healthy/Capped -> Capped edge so operators can see when a vendor
+/// was auto-escalated. The wire format matches
+/// `vendor_health::EVT_WAIVED` (mirrored in `factory-overlay.sh` and
+/// the CXDB consumers). The `compensating_required` context key
+/// names the documented trust floor (skeptic + /er + cross-model) so
+/// audits can grep the JSONL for the substitution rule.
+fn emit_vendor_waived(
+    deps: &TickDeps,
+    bead_id: &str,
+    vendor: crate::vendor_health::Vendor,
+    attempt: u32,
+) -> Result<(), DaemonError> {
+    use crate::vendor_health::Vendor;
+    let (vendor_name, waiver_token) = match vendor {
+        Vendor::CodeRabbit => ("coderabbit", "coderabbit:waived_vendor_unavailable"),
+        Vendor::Bugbot => ("bugbot", "bugbot:waived_vendor_unavailable"),
+    };
+    emit(
+        deps.telemetry_log,
+        bead_id,
+        attempt,
+        OverlayState::Attested.as_str(),
+        crate::vendor_health::EVT_WAIVED,
+        serde_json::json!({}),
+        serde_json::json!({
+            "vendor": vendor_name,
+            "waiver_token": waiver_token,
+            "compensating_required": "skeptic_pass+er_pass+cross_model",
+        }),
+    )
+}
+
+/// Bead jleechan-jsby (r2): emit a `VENDOR_RECOVERED` event on the
+/// Capped -> Healthy edge so operators can see when a vendor came
+/// back online (subscription reset, quota cleared, etc.). The wire
+/// format matches `vendor_health::EVT_RECOVERED`.
+fn emit_vendor_recovered(
+    deps: &TickDeps,
+    bead_id: &str,
+    vendor: crate::vendor_health::Vendor,
+    attempt: u32,
+) -> Result<(), DaemonError> {
+    use crate::vendor_health::Vendor;
+    let (vendor_name, waiver_token) = match vendor {
+        Vendor::CodeRabbit => ("coderabbit", "coderabbit:waived_vendor_unavailable"),
+        Vendor::Bugbot => ("bugbot", "bugbot:waived_vendor_unavailable"),
+    };
+    emit(
+        deps.telemetry_log,
+        bead_id,
+        attempt,
+        OverlayState::Attested.as_str(),
+        crate::vendor_health::EVT_RECOVERED,
+        serde_json::json!({}),
+        serde_json::json!({
+            "vendor": vendor_name,
+            "waiver_token": waiver_token,
+        }),
+    )
 }
 
 /// jleechan-gib: automated HUMAN_HELD exit (Rust port of shell
@@ -2560,26 +2633,17 @@ fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, DaemonError> 
             &["exec", "--yolo", "--skip-git-repo-check", prompt],
             REVIEWER_TIMEOUT_SECS,
         ),
-        "claude" => {
-            let home = std::env::var("HOME").unwrap_or_default();
-            let nvm_claude = format!("{}/.nvm/versions/node/v22.22.0/bin/claude", home);
-            let claude_bin = if std::path::Path::new(&nvm_claude).exists() {
-                nvm_claude
-            } else {
-                "claude".to_string()
-            };
-            run_tool(
-                &claude_bin,
-                &[
-                    "--print",
-                    "--dangerously-skip-permissions",
-                    "--setting-sources",
-                    "",
-                    prompt,
-                ],
-                REVIEWER_TIMEOUT_SECS,
-            )
-        }
+        "claude" => run_tool(
+            "claude",
+            &[
+                "--print",
+                "--dangerously-skip-permissions",
+                "--setting-sources",
+                "",
+                prompt,
+            ],
+            REVIEWER_TIMEOUT_SECS,
+        ),
         "agy" => run_tool(
             "agy",
             &["--print", "--dangerously-skip-permissions", prompt],
@@ -2638,23 +2702,66 @@ fn skeptic_verdict_to_line(v: &verifier::SkepticVerdict) -> String {
     }
 }
 
-fn skeptic_evidence(
-    deps: &TickDeps,
+/// jleechan-8s2p (phase 2): build the Stage-1 skeptic prompt.
+///
+/// Extracted from `skeptic_evidence` so the prompt body is directly
+/// unit-testable without standing up the subprocess dispatch path.
+/// Two constraints drove the extraction:
+///
+/// 1. The reviewer subprocess (`dispatch_reviewer`) runs
+///    `codex exec` / `claude --print` with no cwd override, so `gh`
+///    commands the reviewer issues without an explicit `--repo`
+///    default to whatever repo the daemon process's own cwd happens
+///    to be checked out as. The prompt embeds `repo` (the bead's OWN
+///    resolved repo, `overlay.repo(cfg)` at the call site) plus
+///    explicit `--repo` flags, mirroring `er_runner::build_er_prompt`,
+///    so the reviewer queries the RIGHT repo regardless of daemon cwd.
+///
+/// 2. jleechan-8s2p (the r6 reviewer's P2 finding): the waived-vendor
+///    context MUST be in the prompt BEFORE the skeptic LLM is
+///    dispatched. Otherwise the skeptic sees a capped vendor still
+///    pending on `gh pr checks`, can fail/warn solely on that signal,
+///    and `compensating_coverage_green` then refuses the waiver
+///    because the required skeptic `Pass` was never obtainable. The
+///    earlier code only copied the vendor ledger into `PrEvidence`
+///    AFTER the skeptic had already responded, so the prompt and the
+///    waiver logic disagreed about whether the vendor check mattered.
+///    Each Capped vendor's canonical waiver token (e.g.
+///    `bugbot:waived_vendor_unavailable`) is now embedded directly in
+///    the prompt with explicit "do not fail on a waived vendor
+///    check" guidance.
+fn build_skeptic_prompt(
     bead_id: &str,
     pr: u64,
     repo: &str,
-    snapshot: &crate::tools::PrSnapshot,
-) -> Result<PrEvidence, DaemonError> {
-    // jleechan-9xrs Stage D: the reviewer subprocess (`dispatch_reviewer`)
-    // runs `codex exec` / `claude --print` with no cwd override, so `gh`
-    // commands the reviewer issues without an explicit `--repo` default to
-    // whatever repo the daemon process's own cwd happens to be checked out
-    // as. Embedding `repo` (the bead's OWN resolved repo, `overlay.repo(cfg)`
-    // at the call site) plus explicit `--repo` flags — mirroring
-    // `er_runner::build_er_prompt` — makes the reviewer query the RIGHT repo
-    // regardless of daemon cwd, instead of silently reviewing PR #{pr} in
-    // whatever repo happened to be checked out.
-    let prompt = format!(
+    vendor_health: &crate::vendor_health::VendorHealthLedger,
+) -> String {
+    use crate::vendor_health::Vendor;
+    use crate::vendor_health::VendorHealth;
+
+    let mut vendor_waiver_block = String::new();
+    for vendor in [Vendor::CodeRabbit, Vendor::Bugbot] {
+        match vendor_health.health(vendor) {
+            VendorHealth::Capped { observations, since_epoch } => {
+                vendor_waiver_block.push_str(&format!(
+                    "\nVENDOR WAIVER CONTEXT\n\
+                     The {vendor_name} check is structurally unavailable on this PR \
+                     (cap observations: {obs_count}, first observed at epoch {since}). \
+                     Treat a pending or missing {vendor_name} check as waived, NOT as \
+                     a fail signal — the vendor cannot deliver a review and the bead's \
+                     compensating coverage (skeptic pass + /er pass + cross-model) is \
+                     the substitute trust floor. Waiver token: {waiver_token}",
+                    vendor_name = vendor.as_str(),
+                    obs_count = observations.len(),
+                    since = since_epoch,
+                    waiver_token = vendor.waiver_token(),
+                ));
+            }
+            VendorHealth::Healthy => {}
+        }
+    }
+
+    format!(
         "You are the Stage-1 Skeptic gate for an autonomous coding factory.\n\
          Review bead {bead_id}'s PR #{pr} in repo {repo} end-to-end (diff, \
          evidence, tests) and judge whether it is ready to merge:\n\
@@ -2662,8 +2769,27 @@ fn skeptic_evidence(
            gh pr view {pr} --repo {repo} --json body,comments\n\
            gh pr checks {pr} --repo {repo}\n\
          Respond with exactly one line of the form:\n\
-         pass|warn <note>|fail <reason>",
-    );
+         pass|warn <note>|fail <reason>{vendor_waiver_block}",
+    )
+}
+
+fn skeptic_evidence(
+    deps: &TickDeps,
+    bead_id: &str,
+    pr: u64,
+    repo: &str,
+    snapshot: &crate::tools::PrSnapshot,
+    vendor_health: crate::vendor_health::VendorHealthLedger,
+) -> Result<PrEvidence, DaemonError> {
+    // jleechan-9xrs Stage D: the reviewer subprocess (`dispatch_reviewer`)
+    // jleechan-8s2p (phase 2): the waived-vendor context is now part
+    // of the prompt BEFORE the skeptic LLM is dispatched. Building
+    // the prompt in a dedicated helper (`build_skeptic_prompt`)
+    // keeps the dispatch loop readable and makes the prompt content
+    // directly unit-testable (was previously buried inside
+    // `skeptic_evidence`, which is private and has heavy
+    // subprocess side effects).
+    let prompt = build_skeptic_prompt(bead_id, pr, repo, &vendor_health);
 
     let coder_agent = std::env::var("DARK_FACTORY_CODER_DEFAULT")
         .or_else(|_| std::env::var("DARK_FACTORY_REVIEWER_DEFAULT"))
@@ -2948,6 +3074,14 @@ fn skeptic_evidence(
         review_degraded,
         // Set in the fast tier from the canonical evidence marker (#323).
         evidence_gist_status: verifier::EvidenceGistStatus::NotProvided,
+        // Bead jleechan-jsby (r2): the vendor-health ledger is now
+        // POPULATED in the fast tier (acceptance criterion 1) — the
+        // r1 PR #459 was rejected because the field was constructed
+        // empty here and never written. The caller passes the
+        // process-wide ledger (or `Default::default()` for the
+        // Stage-1 mock-llm test-repo lane), and this function simply
+        // forwards it to `verifier::assess` via `PrEvidence`.
+        vendor_health,
         // Bead jleechan-ijod / issue #387 (r5): the runtime vacuous-test
         // detector only runs in the production-adjacent fast tier (which
         // has the SCM/git context to derive the diff); Stage 1's mock-llm
@@ -3788,19 +3922,148 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             }
         };
         if snapshot.ci_pending {
-            emit(
-                deps.telemetry_log,
-                bead_id,
-                overlay.attempt,
-                OverlayState::Attested.as_str(),
-                "VERIFICATION_PENDING",
-                serde_json::json!({}),
-                serde_json::json!({"message": "CI checks are still running (in progress), waiting for completion"}),
-            )?;
-            continue;
+            // Bead jleechan-jsby (r2): the operator guidance r2 #3
+            // requires the CI-wait to "exclude or timeout the
+            // CodeRabbit commit-status context once all check-runs are
+            // complete (this wedged beads jtg8/jsby itself)". The
+            // current snapshot's `ci_pending=true` flag is the only
+            // signal we have; when at least one tracked vendor is
+            // showing a structured cap marker, the "ci pending" check
+            // is the vendor's commit-status context, not a real CI
+            // wait — skip the wait and proceed to the gate
+            // assessment so the ledger can observe the cap.
+            let vendor_capped = deps
+                .vendor_health
+                .and_then(|m| m.lock().ok())
+                .map(|_l| {
+                    verifier::detect_vendor_cap(&snapshot)
+                })
+                .unwrap_or(false);
+            if !vendor_capped {
+                emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    "VERIFICATION_PENDING",
+                    serde_json::json!({}),
+                    serde_json::json!({"message": "CI checks are still running (in progress), waiting for completion"}),
+                )?;
+                continue;
+            }
         }
 
-        let mut evidence = match skeptic_evidence(deps, bead_id, pr, &repo, &snapshot) {
+        // Bead jleechan-jsby (r2): populate the vendor-health ledger
+        // BEFORE the gate assessment. The r1 PR #459 was rejected
+        // because the field was constructed fresh-and-empty here. The
+        // r2 path:
+        //   1. Clones the process-wide ledger (cheap; the cap VecDeque
+        //      is bounded and the type is `Clone`).
+        //   2. Records cap observations for each capped vendor via
+        //      `record_cap_observations_from_snapshot` (ZFC: STRUCTURED
+        //      snapshot fields only, no keyword matching).
+        //   3. Detects recovery via `detect_vendor_recovery` and clears
+        //      the ledger entries on the Waived -> Healthy edge,
+        //      emitting VENDOR_RECOVERED telemetry.
+        //   4. Emits VENDOR_WAIVED on the Healthy -> Capped edge so
+        //      operators can see the auto-escalation event.
+        //
+        // When `deps.vendor_health` is `None` (Stage-1 test-repo lane
+        // or an integration test that does not exercise the ledger),
+        // we use a fresh empty ledger — the pre-r1 behavior preserved.
+        let mut vendor_health = deps
+            .vendor_health
+            .and_then(|m| m.lock().ok().map(|l| l.clone()))
+            .unwrap_or_default();
+        // Cap flag from the snapshot — STRUCTURED inputs only.
+        let cap_observed = verifier::detect_vendor_cap(&snapshot);
+        let mut recently_waived = Vec::new();
+        let mut recently_recovered = Vec::new();
+        if let Some(ledger_mutex) = deps.vendor_health {
+            if let Ok(now) = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+            {
+                if let Ok(mut ledger) = ledger_mutex.lock() {
+                    // Copy the ledger so the per-tick evidence carries
+                    // the pre-record state (the verifier reads the
+                    // ledger's `health()` to decide the waiver, and
+                    // the recorded observations must be visible to
+                    // that read).
+                    *ledger = vendor_health.clone();
+                    if cap_observed {
+                        // Record one observation per capped vendor.
+                        // The N-of-M detector in `ledger.health` keys
+                        // on distinct bead_ids, so the SAME bead
+                        // observing caps every tick is one signal, not
+                        // N — the test integration requires 3 distinct
+                        // beads to escalate.
+                        let beads: Vec<(crate::vendor_health::Vendor,)> = vec![
+                            (crate::vendor_health::Vendor::CodeRabbit,),
+                            (crate::vendor_health::Vendor::Bugbot,),
+                        ];
+                        for (vendor,) in beads {
+                            let is_capped =
+                                verifier::detect_vendor_cap_for(&snapshot, vendor);
+                            if is_capped && !ledger.health(vendor).is_capped() {
+                                ledger.record_cap(crate::vendor_health::CapObservation {
+                                    vendor,
+                                    source: crate::vendor_health::CapSource::UnknownGateRepeated,
+                                    bead_id: bead_id.to_string(),
+                                    pr_number: pr,
+                                    ts_epoch: now,
+                                    note: format!("ci_pending={} coderabbit_status={}", snapshot.ci_pending, snapshot.coderabbit_status),
+                                });
+                                if ledger.health(vendor).is_capped() {
+                                    recently_waived.push(vendor);
+                                }
+                            }
+                        }
+                    }
+                    // Recovery: clear the vendor if the snapshot is
+                    // clean. `detect_vendor_recovery` keys on
+                    // STRUCTURED fields only.
+                    let recovered =
+                        verifier::detect_vendor_recovery(&snapshot, &ledger);
+                    let prev_was_capped: Vec<crate::vendor_health::Vendor> = vec![
+                        crate::vendor_health::Vendor::CodeRabbit,
+                        crate::vendor_health::Vendor::Bugbot,
+                    ]
+                    .into_iter()
+                    .filter(|v| {
+                        // Only emit VENDOR_RECOVERED if the ledger was
+                        // Capped BEFORE this assessment (not on a
+                        // never-capped vendor).
+                        vendor_health.health(*v).is_capped()
+                    })
+                    .collect();
+                    for v in &recovered {
+                        ledger.clear(*v);
+                        if prev_was_capped.contains(v) {
+                            recently_recovered.push(*v);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Emit VENDOR_WAIVED telemetry on the Healthy -> Capped edge.
+        for vendor in &recently_waived {
+            let _ = emit_vendor_waived(deps, bead_id, *vendor, overlay.attempt);
+        }
+        // Emit VENDOR_RECOVERED telemetry on the Capped -> Healthy edge.
+        for vendor in &recently_recovered {
+            let _ = emit_vendor_recovered(deps, bead_id, *vendor, overlay.attempt);
+        }
+        // Refresh the local `vendor_health` from the ledger (the
+        // post-record state) so the gate sees the updated cap state.
+        if let Some(ledger_mutex) = deps.vendor_health {
+            if let Ok(ledger) = ledger_mutex.lock() {
+                vendor_health = ledger.clone();
+            }
+        }
+
+        let mut evidence = match skeptic_evidence(deps, bead_id, pr, &repo, &snapshot, vendor_health) {
             Ok(e) => e,
             Err(e) => {
                 let _ = emit(
@@ -5255,6 +5518,156 @@ mod existing_pr_adoption_dedup_tests {
             dedup_states,
             vec![OverlayState::Attested, OverlayState::Ready, OverlayState::HumanHeld],
             "EXISTING_PR_ADOPTED dedup set must remain exactly Attested+Ready+HumanHeld"
+        );
+    }
+}
+
+// jleechan-8s2p (phase 2): the waived-vendor context MUST land in the
+// skeptic prompt BEFORE the LLM is dispatched. Otherwise the skeptic
+// sees the capped vendor still pending on `gh pr checks`, fails/warns
+// solely on that signal, and `compensating_coverage_green` refuses the
+// waiver because the required skeptic `Pass` was never obtainable —
+// the ledger is copied into `PrEvidence` AFTER the skeptic has already
+// responded, so the prompt and the waiver logic disagree about
+// whether the vendor check matters.
+#[cfg(test)]
+mod skeptic_prompt_vendor_waiver_tests {
+    use super::build_skeptic_prompt;
+    use crate::vendor_health::{
+        CapObservation, CapSource, Vendor, VendorHealthLedger,
+    };
+
+    fn capped_ledger(vendor: Vendor, bead_prefix: &str) -> VendorHealthLedger {
+        let mut ledger = VendorHealthLedger::new();
+        for ts in 1..=3 {
+            ledger.record_cap(CapObservation {
+                vendor,
+                source: CapSource::UnknownGateRepeated,
+                bead_id: format!("{bead_prefix}-{ts}"),
+                pr_number: ts,
+                ts_epoch: ts,
+                note: "test fixture".into(),
+            });
+        }
+        ledger
+    }
+
+    /// The skeptic prompt must embed the canonical Bugbot waiver token
+    /// when Bugbot is Capped, so the LLM is told that a pending Bugbot
+    /// check is a WAIVER (compensating coverage substitutes), NOT a
+    /// fail signal. Without this block the skeptic can fail a lane
+    /// purely on a capped vendor's pending check, blocking the
+    /// waiver that `compensating_coverage_green` would otherwise
+    /// issue — exactly the r6 P2 finding.
+    #[test]
+    fn skeptic_prompt_contains_bugbot_waiver_token_when_bugbot_capped() {
+        let ledger = capped_ledger(Vendor::Bugbot, "bead-bugbot");
+        let prompt = build_skeptic_prompt("bead-x", 123, "owner/repo", &ledger);
+
+        assert!(
+            prompt.contains("bugbot:waived_vendor_unavailable"),
+            "skeptic prompt must carry the canonical Bugbot waiver token when Bugbot is Capped; \
+             without it the LLM treats a pending Bugbot check as a fail signal and the \
+             compensating-coverage waiver can never fire. Got:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("VENDOR WAIVER CONTEXT"),
+            "skeptic prompt must have an explicit waiver-context header so the LLM recognises \
+             the block as authoritative guidance, not just a stray token. Got:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("Treat a pending or missing bugbot check as waived"),
+            "skeptic prompt must contain the explicit 'treat pending as waived' directive; \
+             a bare token would not change the LLM's behaviour. Got:\n{prompt}"
+        );
+    }
+
+    /// Symmetric guarantee for CodeRabbit — the prompt must surface a
+    /// CodeRabbit waiver block whenever CodeRabbit is Capped. The
+    /// waiver substitution is meaningless if the LLM is told one
+    /// vendor's waiver rule but not the other's.
+    #[test]
+    fn skeptic_prompt_contains_coderabbit_waiver_token_when_coderabbit_capped() {
+        let ledger = capped_ledger(Vendor::CodeRabbit, "bead-cr");
+        let prompt = build_skeptic_prompt("bead-x", 124, "owner/repo", &ledger);
+
+        assert!(
+            prompt.contains("coderabbit:waived_vendor_unavailable"),
+            "skeptic prompt must carry the canonical CodeRabbit waiver token when CodeRabbit is Capped; \
+             Got:\n{prompt}"
+        );
+    }
+
+    /// When both vendors are Capped, both waiver tokens land in the
+    /// prompt. (The most common production case is one vendor at a
+    /// time, but a coordinated outage can hit both; the prompt must
+    /// not silently drop the second one.)
+    #[test]
+    fn skeptic_prompt_contains_both_waiver_tokens_when_both_capped() {
+        let mut ledger = capped_ledger(Vendor::CodeRabbit, "bead-cr");
+        for ts in 4..=6 {
+            ledger.record_cap(CapObservation {
+                vendor: Vendor::Bugbot,
+                source: CapSource::VendorReportedCap,
+                bead_id: format!("bead-bb-{ts}"),
+                pr_number: ts,
+                ts_epoch: ts,
+                note: "test fixture".into(),
+            });
+        }
+        let prompt = build_skeptic_prompt("bead-x", 125, "owner/repo", &ledger);
+
+        assert!(
+            prompt.contains("coderabbit:waived_vendor_unavailable"),
+            "CodeRabbit waiver token must be present"
+        );
+        assert!(
+            prompt.contains("bugbot:waived_vendor_unavailable"),
+            "Bugbot waiver token must be present"
+        );
+    }
+
+    /// When neither vendor is Capped, the prompt has NO waiver
+    /// context — a Healthy vendor has nothing to waive. A stale
+    /// waiver block would mislead the LLM into ignoring a real
+    /// vendor verdict.
+    #[test]
+    fn skeptic_prompt_has_no_waiver_block_when_no_vendor_capped() {
+        let ledger = VendorHealthLedger::new();
+        let prompt = build_skeptic_prompt("bead-x", 126, "owner/repo", &ledger);
+
+        assert!(
+            !prompt.contains("VENDOR WAIVER CONTEXT"),
+            "Healthy ledger must not produce a waiver block; the LLM would otherwise \
+             ignore a real vendor verdict. Got:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("waived_vendor_unavailable"),
+            "Healthy ledger must not surface any waiver token. Got:\n{prompt}"
+        );
+    }
+
+    /// The base prompt (Stage-1 skeptic instruction, gh commands,
+    /// verdict grammar) must remain unchanged by the waiver-context
+    /// injection. Only the suffix changes; the body must still
+    /// instruct the LLM to inspect `gh pr checks` and reply with the
+    /// pass|warn|fail grammar. This pins the contract that the
+    /// waiver-context injection is a PURE ADDITION.
+    #[test]
+    fn skeptic_prompt_base_unaffected_by_waiver_block() {
+        let ledger = capped_ledger(Vendor::Bugbot, "bead-bb");
+        let prompt = build_skeptic_prompt("bead-x", 127, "owner/repo", &ledger);
+
+        assert!(
+            prompt.contains("You are the Stage-1 Skeptic gate for an autonomous coding factory."),
+            "base Stage-1 role line must remain"
+        );
+        assert!(prompt.contains("gh pr diff 127 --repo owner/repo"));
+        assert!(prompt.contains("gh pr view 127 --repo owner/repo --json body,comments"));
+        assert!(prompt.contains("gh pr checks 127 --repo owner/repo"));
+        assert!(
+            prompt.contains("pass|warn <note>|fail <reason>"),
+            "verdict grammar must remain in the base prompt"
         );
     }
 }

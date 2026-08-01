@@ -377,6 +377,7 @@ fn test_reroll_routes_vcs_ops_through_bead_repo_for_cross_repo_bead() {
         // daemon's default repo is `jleechanorg/worldarchitect.ai`, the
         // bead's reroll target repo is something else.
         target_repo: Some("jleechanorg/other-repo".into()),
+        attempt_started_at: None,
     };
     store.save(&bead).unwrap();
 
@@ -500,6 +501,7 @@ fn test_tick_stage2_integration() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
+        vendor_health: None,
     };
 
     // --- Tick 1: Intake -> Route -> Dispatch ---
@@ -538,6 +540,7 @@ fn test_tick_stage2_integration() {
             ci_status: "red".to_string(),
             coderabbit_status: "green".to_string(),
             ci_pending: false,
+        bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -582,6 +585,7 @@ fn test_tick_stage2_integration() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
+        vendor_health: None,
     };
 
     // --- Tick 2: assess gates (fails) -> execute re-roll -> spec mutation -> recovery -> redispatched ---
@@ -2207,6 +2211,7 @@ fn test_reroll_close_pr_uses_bead_resolved_repo_not_cfg_target_repo() {
         pre_session_head_sha: None,
         park_reason: None,
         target_repo: Some("jleechanorg/dark-factory".into()),
+        attempt_started_at: None,
     };
     store.save(&bead).unwrap();
 
@@ -2336,6 +2341,7 @@ fn test_reroll_recovers_from_stale_local_remote_branch_on_retry() {
         pre_session_head_sha: None,
         park_reason: None,
         target_repo: None,
+        attempt_started_at: None,
     };
     store.save(&bead).unwrap();
 
@@ -2486,6 +2492,7 @@ fn test_reroll_close_pr_already_merged_is_tolerated_as_successful_supersede() {
         pre_session_head_sha: None,
         park_reason: None,
         target_repo: None,
+        attempt_started_at: None,
     };
     store.save(&bead).unwrap();
 

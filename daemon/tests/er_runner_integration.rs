@@ -343,6 +343,7 @@ fn all_green_snapshot(pr: u64) -> PrSnapshot {
         ci_status: "green".into(),
         coderabbit_status: "green".into(),
         ci_pending: false,
+        bugbot_pending: false,
         head_committed_epoch: 0,
     }
 }
@@ -387,6 +388,7 @@ fn drive_one_tick(
             vcs: &VcsMock,
             cfg,
             telemetry_log,
+            vendor_health: None,
         },
         0,
         0,

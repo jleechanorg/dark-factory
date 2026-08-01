@@ -310,6 +310,9 @@ pub fn snapshot_with_comments(pr: u64, comments: Vec<PrComment>) -> PrSnapshot {
         ci_status: "green".into(),
         coderabbit_status: "green".into(),
         ci_pending: false,
+        // jleechan-8s2p: test helper. All-green profile by definition
+        // has Bugbot reviewed clean — no outage, no error comments.
+        bugbot_pending: false,
         head_committed_epoch: 0,
     }
 }
@@ -613,6 +616,7 @@ mod tests {
             vcs: &V,
             cfg,
             telemetry_log: std::path::Path::new("/tmp/afd_er_runner_unit_test.jsonl"),
+        vendor_health: None,
         }
     }
 

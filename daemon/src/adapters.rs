@@ -913,6 +913,15 @@ impl Scm for CliScm {
                         ci_status,
                         coderabbit_status,
                         ci_pending: false,
+                        // jleechan-8s2p: offline cache path — Bugbot
+                        // outage state was not serialised before phase 2;
+                        // default to false (no outage known) so the
+                        // detector cannot accidentally fire on stale
+                        // cache hits. Test fixtures that need
+                        // bugbot_pending=true write a fresh snapshot via
+                        // `all_green_snapshot` + mutation, not the
+                        // offline cache.
+                        bugbot_pending: false,
                         head_committed_epoch: snap.head_committed_epoch.unwrap_or(0),
                     });
                 }
@@ -1180,15 +1189,37 @@ impl Scm for CliScm {
         let checks: Vec<GhCheck> = serde_json::from_str(&checks_out[json_start_c..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse gh pr checks JSON: {e}"))
         })?;
+        // jleechan-8s2p (phase 2): derive Bugbot's OUTAGE signal from the
+        // RAW `checks` array, BEFORE the cap-filter pass below. The
+        // filter drops a Capped vendor's check, which would otherwise
+        // hide the pending Bugbot from the snapshot and make the
+        // waiver path still unreachable even with the detector fix.
+        //
+        // Bugbot outage = a check run whose name matches Bugbot AND
+        // whose bucket is "pending" (the check has not yet produced
+        // pass/fail). Bugbot's review-comment surface (`error_count`)
+        // is a separate axis and does NOT participate in this signal.
+        let bugbot_pending = checks
+            .iter()
+            .any(|c| c.name.to_lowercase().contains("bugbot") && c.bucket == "pending");
+        let mut filtered_checks = Vec::new();
+        for c in &checks {
+            let name_lower = c.name.to_lowercase();
+            if name_lower.contains("coderabbit")
+                && crate::vendor_health::is_global_vendor_capped(crate::vendor_health::Vendor::CodeRabbit)
+            {
+                continue;
+            }
+            if name_lower.contains("bugbot")
+                && crate::vendor_health::is_global_vendor_capped(crate::vendor_health::Vendor::Bugbot)
+            {
+                continue;
+            }
+            filtered_checks.push(c.clone());
+        }
         // jleechan-mdun follow-up (2026-07-28): gate 1 (CI) must only read
-        // check-runs it OWNS. The "Evidence Gate" workflow's check-run is
-        // gate 6's territory (evidence floor / /er verdict): a fresh factory
-        // PR legitimately opens with no evidence marker, so counting that
-        // check-run's failure as CI-red made gate 1 reroll every attempt
-        // before any evidence lane could attach a bundle — observed live on
-        // PR #485 (test + daemon-tests green, Evidence Gate failure →
-        // instant reroll; no attempt could ever converge).
-        let ci_owned_checks: Vec<&GhCheck> = checks
+        // check-runs it OWNS.
+        let ci_owned_checks: Vec<&GhCheck> = filtered_checks
             .iter()
             .filter(|c| !check_owned_by_dedicated_gate(&c.name))
             .collect();
@@ -1374,6 +1405,7 @@ impl Scm for CliScm {
             ci_status,
             coderabbit_status,
             ci_pending,
+            bugbot_pending,
             head_committed_epoch,
         };
         {
@@ -5527,6 +5559,16 @@ mod chain_llm_fallback_argv_tests {
 #[cfg(test)]
 mod pr_snapshot_checks_fetch_failure_tests {
     use super::CliScm;
+
+    /// r6: dedicated mutex used by `capped_vendor_excluded_from_ci_success_and_status`
+    /// and `capped_bugbot_excluded_from_ci_success_and_status` to
+    /// serialise the cap-record / cap-clear / snapshot-read sequence
+    /// across the two peer tests. Cannot use `env_lock()` here
+    /// because `run_pr_snapshot_with_fake_gh` acquires `env_lock()`
+    /// internally, and re-entering it would self-deadlock. This
+    /// mutex is module-local to the test module so it has no
+    /// contention with any production code path.
+    static CAP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     use crate::errors::DaemonError;
     use crate::tools::Scm;
     use std::os::unix::fs::PermissionsExt;
@@ -5571,6 +5613,8 @@ if [ "$1" = "pr" ] && [ "$2" = "checks" ]; then
   case "${GH_TEST_PRIMARY_CHECKS:-}" in
     fail) echo "gh: GraphQL API rate limit already exceeded" >&2; exit 1 ;;
     badjson) echo "not json"; exit 0 ;;
+    coderabbit_pending) echo '[{"state":"SUCCESS","bucket":"pass","name":"build"},{"state":"PENDING","bucket":"pending","name":"CodeRabbit"}]'; exit 0 ;;
+    bugbot_pending) echo '[{"state":"SUCCESS","bucket":"pass","name":"build"},{"state":"PENDING","bucket":"pending","name":"Bugbot"}]'; exit 0 ;;
     *) echo "[]"; exit 0 ;;
   esac
 fi
@@ -5761,6 +5805,169 @@ exit 1
         );
         assert!(snapshot.ci_pending);
         assert_eq!(snapshot.ci_status, "unknown");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capped_vendor_excluded_from_ci_success_and_status() {
+        use crate::vendor_health::{Vendor, CapObservation, CapSource, VendorHealthLedger};
+        use std::sync::{Arc, Mutex};
+
+        // r6: hold the dedicated `CAP_TEST_LOCK` across the entire
+        // test body (not just inside `run_pr_snapshot_with_fake_gh`)
+        // so the peer Bugbot regression test cannot clear our caps
+        // between our step-2 record and step-3 assertion when Rust
+        // runs the lib-test suite in parallel.
+        let _test_lock = CAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // r6: switch from `set_global_ledger` (OnceLock no-op after
+        // first call) to `get_or_init` so the peer Bugbot regression
+        // test can share the same global ledger instead of being
+        // silently no-op'd by a populated OnceLock.
+        let global: Arc<Mutex<VendorHealthLedger>> = crate::vendor_health::GLOBAL_LEDGER
+            .get_or_init(|| Arc::new(Mutex::new(VendorHealthLedger::new())))
+            .clone();
+
+        // Clean baseline for BOTH vendors so the Bugbot peer's
+        // leftover caps cannot leak into step 1.
+        global.lock().unwrap().clear(Vendor::CodeRabbit);
+        global.lock().unwrap().clear(Vendor::Bugbot);
+
+        // 1. Without being capped, pending CodeRabbit makes CI success false and status unknown
+        let result = run_pr_snapshot_with_fake_gh("not_capped", "coderabbit_pending", "fail", 44);
+        let snapshot = result.expect("pr_snapshot must succeed");
+        assert!(!snapshot.ci_success);
+        assert!(snapshot.ci_pending);
+        assert_eq!(snapshot.ci_status, "unknown");
+
+        // 2. Set CodeRabbit as capped (mutate the shared global ledger).
+        {
+            let mut guard = global.lock().unwrap();
+            for ts in 1..=3 {
+                guard.record_cap(CapObservation {
+                    vendor: Vendor::CodeRabbit,
+                    source: CapSource::UnknownGateRepeated,
+                    bead_id: format!("bead-{}", ts),
+                    pr_number: 44,
+                    ts_epoch: ts,
+                    note: "test fixture".into(),
+                });
+            }
+        }
+
+        // 3. With CodeRabbit capped, the pending CodeRabbit check is excluded, making CI green
+        let result = run_pr_snapshot_with_fake_gh("capped", "coderabbit_pending", "fail", 44);
+        let snapshot = result.expect("pr_snapshot must succeed");
+        assert!(snapshot.ci_success);
+        assert!(!snapshot.ci_pending);
+        assert_eq!(snapshot.ci_status, "green");
+
+        // Clean up BOTH vendors so any subsequent test (including
+        // the Bugbot peer, if re-ordered) starts from a clean slate.
+        global.lock().unwrap().clear(Vendor::CodeRabbit);
+        global.lock().unwrap().clear(Vendor::Bugbot);
+    }
+
+    /// r6 regression: the collapsible_if clippy fix collapsed the
+    /// nested `if name_lower.contains(...) { if is_global_vendor_capped(...) }`
+    /// into a single `if cond1 && cond2 { continue; }` for BOTH
+    /// CodeRabbit and Bugbot. This test pins the Bugbot side so a future
+    /// refactor of the collapsed if (e.g. extracting a helper, inverting
+    /// the predicate) cannot silently regress Bugbot filter behaviour.
+    ///
+    /// Test-isolation note: `set_global_ledger` is a `OnceLock.set`,
+    /// so it can only populate the global slot ONCE for the whole
+    /// test binary. The matching CodeRabbit-side test
+    /// (`capped_vendor_excluded_from_ci_success_and_status`) is the
+    /// canonical populator; this Bugbot-side test relies on the
+    /// shared `Arc<Mutex<VendorHealthLedger>>` already being installed.
+    ///
+    /// Because Rust runs tests in alphabetical order within a single
+    /// binary by default, this test (`capped_bugbot_…`) runs BEFORE
+    /// the CodeRabbit peer (`capped_vendor_…`). We therefore CANNOT
+    /// call `set_global_ledger` (it would either succeed and prevent
+    /// the peer test from installing its own ledger, or be a no-op and
+    /// leave no global state at all). Instead we install a fresh
+    /// ledger exactly once for the whole binary via
+    /// `OnceLock::get_or_init`, and both peer tests mutate that
+    /// shared ledger in place through `record_cap` / `clear`. Any
+    /// leftover caps are cleared at exit so neither peer test's
+    /// baseline state is poisoned by the other.
+    ///
+    /// The env/lock guard is held across the entire test body so the
+    /// peer CodeRabbit test cannot interleave its `clear(Vendor::CodeRabbit)`
+    /// between our step-2 record and step-3 assertion when Rust runs
+    /// the lib-test suite in parallel.
+    #[test]
+    #[cfg(unix)]
+    fn capped_bugbot_excluded_from_ci_success_and_status() {
+        use crate::vendor_health::{Vendor, CapObservation, CapSource, VendorHealthLedger};
+        use std::sync::{Arc, Mutex};
+
+        // Hold the dedicated `CAP_TEST_LOCK` across the entire test
+        // body so the peer CodeRabbit test cannot interleave its
+        // `clear` calls against our cap-record window when Rust runs
+        // the lib-test suite in parallel. We use a dedicated mutex
+        // (not `env_lock`) because `run_pr_snapshot_with_fake_gh`
+        // already acquires `env_lock` internally; re-entering would
+        // self-deadlock.
+        let _test_lock = CAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Install the global ledger exactly once for this test binary.
+        // `OnceLock::get_or_init` is the only safe way to populate it
+        // from more than one test without poisoning the peer's
+        // `set_global_ledger` call.
+        let global: Arc<Mutex<VendorHealthLedger>> = crate::vendor_health::GLOBAL_LEDGER
+            .get_or_init(|| Arc::new(Mutex::new(VendorHealthLedger::new())))
+            .clone();
+
+        // Clean baseline for BOTH vendors so any leftover cap from a
+        // prior test cannot leak into step 1.
+        global.lock().unwrap().clear(Vendor::CodeRabbit);
+        global.lock().unwrap().clear(Vendor::Bugbot);
+
+        // 1. Without being capped, pending Bugbot makes CI success false and status unknown
+        let result = run_pr_snapshot_with_fake_gh("not_capped_bugbot", "bugbot_pending", "fail", 45);
+        let snapshot = result.expect("pr_snapshot must succeed");
+        assert!(!snapshot.ci_success);
+        assert!(snapshot.ci_pending);
+        assert_eq!(snapshot.ci_status, "unknown");
+
+        // 2. Mark Bugbot as capped (mutate the shared global ledger in place).
+        {
+            let mut guard = global.lock().unwrap();
+            for ts in 1..=3 {
+                guard.record_cap(CapObservation {
+                    vendor: Vendor::Bugbot,
+                    source: CapSource::UnknownGateRepeated,
+                    bead_id: format!("bead-bugbot-{}", ts),
+                    pr_number: 45,
+                    ts_epoch: ts,
+                    note: "test fixture".into(),
+                });
+            }
+        }
+
+        // 3. With Bugbot capped, the pending Bugbot check is excluded, making CI green
+        let result = run_pr_snapshot_with_fake_gh("capped_bugbot", "bugbot_pending", "fail", 45);
+        let snapshot = result.expect("pr_snapshot must succeed");
+        assert!(
+            snapshot.ci_success,
+            "Bugbot-capped PR must report ci_success=true (cap filter dropped the pending Bugbot check)"
+        );
+        assert!(!snapshot.ci_pending);
+        assert_eq!(snapshot.ci_status, "green");
+
+        // Clean up BOTH vendors so the shared global ledger is left
+        // in a state where the CodeRabbit peer test (and any
+        // subsequent test) can install its own vendor caps without
+        // residue from this test polluting the global snapshot.
+        global.lock().unwrap().clear(Vendor::Bugbot);
+        global.lock().unwrap().clear(Vendor::CodeRabbit);
     }
 }
 

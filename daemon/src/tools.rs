@@ -187,6 +187,20 @@ pub struct PrSnapshot {
     pub ci_status: String,
     pub coderabbit_status: String,
     pub ci_pending: bool,
+    /// jleechan-8s2p (phase 2): structured `bugbot_pending` field
+    /// paralleling `coderabbit_status`. True iff Bugbot's check run is
+    /// in a PENDING state on this snapshot — i.e. Bugbot has not yet
+    /// reviewed the PR (outage / stuck / fair-use cap). The previous
+    /// detector keyed on `bugbot_error_count > 0`, which is the
+    /// FAILURE signal (Bugbot ran and produced error comments), NOT
+    /// the OUTAGE signal. That made the Bugbot waiver path
+    /// unreachable in production: real outages produce
+    /// `error_count == 0`, so the predicate never returned true and
+    /// the ledger never recorded a cap observation. The waiver must
+    /// NEVER substitute for a real Bugbot RED verdict — that is still
+    /// handled by the `> 0` branch in the BugbotClean gate. This
+    /// field is the structural-unavailability signal only.
+    pub bugbot_pending: bool,
     /// Unix epoch (seconds) of the head commit's committer date, or 0 when
     /// unknown. jleechan-nplh: the freshness floor for `/er` verdict
     /// comments — a verdict older than this predates the code it claims to
