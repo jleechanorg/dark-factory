@@ -16,9 +16,11 @@ from runner.review_controller import (
     ExecutionReceipt,
     ReviewContractError,
     ReviewInputs,
+    _stub_mode_requested,
     build_envelope,
     create_review_request,
     parse_codex_jsonl,
+    run_controller_review,
     validate_execution_receipts,
     validate_review_response,
     verify_request_integrity,
@@ -445,3 +447,159 @@ def test_command_shape_boundaries_do_not_depend_on_regex_classification():
         ),
     )
     validate_execution_receipts(receipts, validated)
+
+
+# -----------------------------------------------------------------------------
+# Stub-mode refusal (PR #499 follow-up to PR #498 daemon gate)
+# -----------------------------------------------------------------------------
+
+
+def test_stub_mode_requested_returns_false_when_no_env_vars_set(monkeypatch):
+    """Baseline: with no stub env vars set, the helper returns False."""
+    monkeypatch.delenv("DARK_FACTORY_ITERATION_STUB", raising=False)
+    monkeypatch.delenv("DARK_FACTORY_FAKE_LLM", raising=False)
+    assert _stub_mode_requested() is False
+
+
+def test_stub_mode_requested_returns_true_when_iteration_stub_set(monkeypatch):
+    monkeypatch.delenv("DARK_FACTORY_FAKE_LLM", raising=False)
+    monkeypatch.setenv("DARK_FACTORY_ITERATION_STUB", "1")
+    assert _stub_mode_requested() is True
+
+
+def test_stub_mode_requested_returns_true_when_fake_llm_set(monkeypatch):
+    monkeypatch.delenv("DARK_FACTORY_ITERATION_STUB", raising=False)
+    monkeypatch.setenv("DARK_FACTORY_FAKE_LLM", "1")
+    assert _stub_mode_requested() is True
+
+
+def test_stub_mode_requested_treats_other_values_as_unset(monkeypatch):
+    """Only literal '1' activates stub mode. Other values ('true', 'yes', '0') are inert."""
+    monkeypatch.delenv("DARK_FACTORY_FAKE_LLM", raising=False)
+    monkeypatch.setenv("DARK_FACTORY_ITERATION_STUB", "true")
+    assert _stub_mode_requested() is False
+    monkeypatch.setenv("DARK_FACTORY_ITERATION_STUB", "yes")
+    assert _stub_mode_requested() is False
+    monkeypatch.setenv("DARK_FACTORY_ITERATION_STUB", "0")
+    assert _stub_mode_requested() is False
+
+
+def test_run_controller_review_refuses_pass_under_iteration_stub(monkeypatch, tmp_path):
+    """A PASS verdict under DARK_FACTORY_ITERATION_STUB=1 must raise fail-closed.
+
+    The controller refuses to record a PASS verdict when stub-mode env vars
+    are set, regardless of CI status. This is the second line of defence
+    after the daemon-side env_guard gate (PR #498).
+    """
+    import subprocess as subprocess_module
+
+    monkeypatch.setenv("DARK_FACTORY_ITERATION_STUB", "1")
+    monkeypatch.delenv("DARK_FACTORY_FAKE_LLM", raising=False)
+
+    request = create_review_request(_inputs())
+    response = _response(request)  # default verdict="pass"
+    raw_jsonl = json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": response}})
+
+    class _FakeProc:
+        returncode = 0
+        stdout = raw_jsonl
+        stderr = ""
+
+    monkeypatch.setattr(subprocess_module, "run", lambda *a, **kw: _FakeProc())
+
+    output_dir = tmp_path / "out"
+    with pytest.raises(ReviewContractError, match="refuses PASS verdict under stub-mode"):
+        run_controller_review(
+            request,
+            neutral_cwd=tmp_path,
+            output_dir=output_dir,
+            transport_argv=("fake", "codex"),
+            timeout=10.0,
+        )
+
+
+def test_run_controller_review_refuses_pass_under_fake_llm(monkeypatch, tmp_path):
+    """Same as above but with DARK_FACTORY_FAKE_LLM=1."""
+    import subprocess as subprocess_module
+
+    monkeypatch.delenv("DARK_FACTORY_ITERATION_STUB", raising=False)
+    monkeypatch.setenv("DARK_FACTORY_FAKE_LLM", "1")
+
+    request = create_review_request(_inputs())
+    response = _response(request)
+    raw_jsonl = json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": response}})
+
+    class _FakeProc:
+        returncode = 0
+        stdout = raw_jsonl
+        stderr = ""
+
+    monkeypatch.setattr(subprocess_module, "run", lambda *a, **kw: _FakeProc())
+
+    output_dir = tmp_path / "out"
+    with pytest.raises(ReviewContractError, match="refuses PASS verdict under stub-mode"):
+        run_controller_review(
+            request,
+            neutral_cwd=tmp_path,
+            output_dir=output_dir,
+            transport_argv=("fake", "codex"),
+            timeout=10.0,
+        )
+
+
+def test_run_controller_review_allows_pass_without_stub_env(monkeypatch, tmp_path):
+    """Sanity: with no stub env vars, a PASS verdict is accepted (no regression)."""
+    import subprocess as subprocess_module
+
+    monkeypatch.delenv("DARK_FACTORY_ITERATION_STUB", raising=False)
+    monkeypatch.delenv("DARK_FACTORY_FAKE_LLM", raising=False)
+
+    request = create_review_request(_inputs())
+    response = _response(request)
+    raw_jsonl = json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": response}})
+
+    class _FakeProc:
+        returncode = 0
+        stdout = raw_jsonl
+        stderr = ""
+
+    monkeypatch.setattr(subprocess_module, "run", lambda *a, **kw: _FakeProc())
+
+    output_dir = tmp_path / "out"
+    result = run_controller_review(
+        request,
+        neutral_cwd=tmp_path,
+        output_dir=output_dir,
+        transport_argv=("fake", "codex"),
+        timeout=10.0,
+    )
+    assert result.review.verdict == "pass"
+
+
+def test_run_controller_review_allows_fail_under_stub_env(monkeypatch, tmp_path):
+    """FAIL verdicts are not blocked by the stub-mode gate — only PASS is."""
+    import subprocess as subprocess_module
+
+    monkeypatch.setenv("DARK_FACTORY_ITERATION_STUB", "1")
+    monkeypatch.delenv("DARK_FACTORY_FAKE_LLM", raising=False)
+
+    request = create_review_request(_inputs())
+    response = _response(request, verdict="fail", failed="C0")
+    raw_jsonl = json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": response}})
+
+    class _FakeProc:
+        returncode = 0
+        stdout = raw_jsonl
+        stderr = ""
+
+    monkeypatch.setattr(subprocess_module, "run", lambda *a, **kw: _FakeProc())
+
+    output_dir = tmp_path / "out"
+    result = run_controller_review(
+        request,
+        neutral_cwd=tmp_path,
+        output_dir=output_dir,
+        transport_argv=("fake", "codex"),
+        timeout=10.0,
+    )
+    assert result.review.verdict == "fail"
