@@ -1209,8 +1209,11 @@ impl Scm for CliScm {
             "green".to_string()
         };
 
-        let iteration_stub =
-            std::env::var("DARK_FACTORY_ITERATION_STUB").as_deref() == Ok("1");
+        // Stub mode is gated to CI: requires GITHUB_ACTIONS=true AND
+        // DARK_FACTORY_CI_ALLOW_STUB=1. A local server with stray stub env
+        // vars cannot enable iteration stub. See daemon/src/env_guard.rs.
+        let iteration_stub = crate::env_guard::stub_mode_allowed()
+            && std::env::var("DARK_FACTORY_ITERATION_STUB").as_deref() == Ok("1");
         let ci_success = ci_success_from_check_buckets(
             &ci_owned_checks
                 .iter()

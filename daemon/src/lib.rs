@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 pub mod config;
+pub mod env_guard;
 pub mod constraints;
 pub mod reroll;
 pub mod dispatch;
