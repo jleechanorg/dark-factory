@@ -99,7 +99,6 @@ fn one_full_tick_cycle_keeps_unknown_only_gate_attested() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         0,
         0,
@@ -166,7 +165,6 @@ fn one_full_tick_cycle_keeps_unknown_only_gate_attested() {
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
             ci_pending: false,
-        bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -185,7 +183,6 @@ fn one_full_tick_cycle_keeps_unknown_only_gate_attested() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         1,
         0,
@@ -336,7 +333,6 @@ fn run_tick_rejects_non_stage_1_or_2_config() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     let err =
@@ -385,7 +381,6 @@ fn run_tick_never_calls_dispatch_when_router_parses_no_verdict() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     let summary =
@@ -487,7 +482,6 @@ fn run_tick_emits_dispatched_only_for_actual_dispatch_successes() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         0,
         0,
@@ -596,7 +590,6 @@ fn test_autonomy_increment_and_timebox_envelope() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     // Run tick with 300 seconds (5 minutes) elapsed
@@ -662,7 +655,6 @@ fn test_autonomy_budget_warning_crossing() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     // Run tick with 60 seconds elapsed (new autonomy_secs = 810, crossing 800)
@@ -726,7 +718,6 @@ fn test_wedge_detection_dispatched_coder_silent() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     // Run tick
@@ -813,7 +804,6 @@ fn test_wedge_detection_dispatched_coder_silent_saved_by_transcript_activity() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     let summary = run_tick(&deps, 1, 10).unwrap();
@@ -903,7 +893,6 @@ fn test_wedge_detection_dispatched_coder_silent_stale_transcript_still_parks() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     let summary = run_tick(&deps, 1, 10).unwrap();
@@ -975,7 +964,6 @@ fn test_dispatch_integrity_sweep_parks_session_branch_mismatch() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     let summary = run_tick(&deps, 1, 1).unwrap();
@@ -1097,7 +1085,6 @@ fn test_dispatch_integrity_sweep_leaves_matching_branch_alone() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     let summary = run_tick(&deps, 1, 1).unwrap();
@@ -1174,7 +1161,6 @@ fn test_dispatch_integrity_sweep_detects_force_push_on_adopted_branch() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     let summary = run_tick(&deps, 1, 1).unwrap();
@@ -1255,7 +1241,6 @@ fn test_dispatch_integrity_sweep_allows_fast_forward_adopted_commit() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     let _summary = run_tick(&deps, 1, 1).unwrap();
@@ -1330,7 +1315,6 @@ fn test_wedge_detection_attested_session_stalled() {
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
             ci_pending: false,
-        bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -1351,7 +1335,6 @@ fn test_wedge_detection_attested_session_stalled() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     // Run tick. With the dispatch-scheduling-guarantee ordering
@@ -1451,7 +1434,6 @@ fn test_wedge_detection_attested_session_not_stalled_if_remote_ahead() {
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
             ci_pending: false,
-        bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -1483,7 +1465,6 @@ fn test_wedge_detection_attested_session_not_stalled_if_remote_ahead() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     let summary = run_tick(&deps, 1, 10).unwrap();
@@ -1558,7 +1539,6 @@ fn test_wedge_detection_still_parks_when_local_matches_remote() {
             head_sha: same_sha.clone(),
             updated_at_epoch: now_epoch - 2000,
             ci_pending: false,
-        bugbot_pending: false,
             head_committed_epoch: 0,
             ci_success: true,
             mergeable: true,
@@ -1591,7 +1571,6 @@ fn test_wedge_detection_still_parks_when_local_matches_remote() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     let summary = run_tick(&deps, 1, 10).unwrap();
@@ -1656,7 +1635,6 @@ fn test_wedge_detection_still_parks_when_local_is_ahead_of_remote() {
             head_sha: "remote-head-stale".into(),
             updated_at_epoch: now_epoch - 2000,
             ci_pending: false,
-        bugbot_pending: false,
             head_committed_epoch: 0,
             ci_success: true,
             mergeable: true,
@@ -1693,7 +1671,6 @@ fn test_wedge_detection_still_parks_when_local_is_ahead_of_remote() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     let summary = run_tick(&deps, 1, 10).unwrap();
@@ -1774,7 +1751,6 @@ fn test_wedge_detection_still_parks_when_branches_have_diverged() {
             head_sha: "remote-head-diverged".into(),
             updated_at_epoch: now_epoch - 2000,
             ci_pending: false,
-        bugbot_pending: false,
             head_committed_epoch: 0,
             ci_success: true,
             mergeable: true,
@@ -1812,7 +1788,6 @@ fn test_wedge_detection_still_parks_when_branches_have_diverged() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     let summary = run_tick(&deps, 1, 10).unwrap();
@@ -1890,7 +1865,6 @@ fn factory_labeled_existing_pr_is_adopted_and_verified_without_spawn() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         0,
         0,
@@ -1976,7 +1950,6 @@ fn factory_labeled_existing_pr_second_tick_reuses_tracking_bead_without_spawn() 
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     let first = run_tick(&deps, 0, 0).expect("first tick adopts PR");
@@ -2076,7 +2049,6 @@ fn existing_pr_adoption_does_not_re_emit_telemetry_on_subsequent_ticks() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     run_tick(&deps, 0, 0).expect("first tick adopts PR");
@@ -2159,7 +2131,6 @@ fn existing_pr_adoption_re_emits_after_state_transition_away_from_attested() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     // First tick adopts the PR — overlay moves to Attested; telemetry
@@ -2247,7 +2218,6 @@ fn factory_labeled_existing_pr_without_session_is_not_parked_as_stalled() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     run_tick(&deps, 0, 0).expect("first tick adopts PR");
@@ -2328,7 +2298,6 @@ fn factory_labeled_pr_branch_collision_is_refused_without_stealing_mapping() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         0,
         0,
@@ -2417,7 +2386,6 @@ fn fork_labeled_pr_never_registers_branch_at_tick_level() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         0,
         0,
@@ -2517,7 +2485,6 @@ fn adopted_non_green_pr_parks_human_held_with_v1_escalation() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         0,
         0,
@@ -2629,7 +2596,6 @@ fn adopted_red_pr_stage2_reroll_spawns_remediation_session_leaves_pr_open() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         0,
         0,
@@ -2772,7 +2738,6 @@ fn adopted_red_pr_stage2_reroll_spawn_failure_parks_human_held_with_escalation()
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         0,
         0,
@@ -2894,7 +2859,6 @@ fn adopted_red_pr_structural_only_red_gates_holds_disposition_required_not_rerol
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         0,
         0,
@@ -3037,7 +3001,6 @@ fn adopted_red_pr_mixed_red_gates_still_rerolls() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         0,
         0,
@@ -3154,7 +3117,6 @@ fn disposition_required_bead_resumes_when_gates_go_green() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         1,
         0,
@@ -3253,7 +3215,6 @@ fn disposition_required_bead_in_cooldown_is_skipped_without_scm_call() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         1,
         0,
@@ -3337,7 +3298,6 @@ fn disposition_required_reassessment_error_preserves_hold_provenance() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         1,
         0,
@@ -3389,7 +3349,6 @@ fn disposition_required_reassessment_error_preserves_hold_provenance() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         2,
         0,
@@ -3460,7 +3419,6 @@ fn test_manual_bead_input_auto_queued_and_dispatched() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     // Run tick 1: should detect manual bead in tracker, see no overlay,
@@ -3534,7 +3492,6 @@ fn drive_existing_pr_bead_dispatches_onto_pr_head_branch_not_generated_branch() 
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     let summary = run_tick(&deps, 0, 0).expect("tick should succeed");
@@ -3629,7 +3586,6 @@ fn bead_with_external_ref_but_no_open_pr_falls_back_to_generated_branch() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     let summary = run_tick(&deps, 0, 0).expect("tick should succeed");
@@ -3690,7 +3646,6 @@ fn drive_pr_bead_with_fork_head_falls_back_to_generated_branch_not_fork_head() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     let summary = run_tick(&deps, 0, 0).expect("tick should succeed");
@@ -3762,7 +3717,6 @@ fn remote_credentials_never_reach_tick_telemetry_or_escalation_comments() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         0,
         0,
@@ -3855,7 +3809,6 @@ fn manual_bead_adoption_never_calls_create_bead_or_fabricates_external_ref() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     let summary = run_tick(&deps, 0, 0).expect("tick should succeed");
@@ -3929,7 +3882,6 @@ fn newly_intaken_bead_dispatch_uses_real_tracker_title() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         0,
         0,
@@ -4026,7 +3978,6 @@ fn drive_existing_pr_pending_ci_does_not_reach_ready() {
             ci_status: "unknown".into(),
             coderabbit_status: "approved".into(),
             ci_pending: true,
-        bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -4044,7 +3995,6 @@ fn drive_existing_pr_pending_ci_does_not_reach_ready() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         1,
         0,
@@ -4121,7 +4071,6 @@ fn drive_existing_pr_failed_ci_parks_human_held() {
             ci_status: "red".into(),
             coderabbit_status: "approved".into(),
             ci_pending: false,
-        bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -4139,7 +4088,6 @@ fn drive_existing_pr_failed_ci_parks_human_held() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         1,
         0,
@@ -4204,7 +4152,6 @@ fn recover_human_held_requeues_queued_bead_with_attempt_below_max() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         // tick_index=1 with fast_tick_secs==slow_tick_secs==60 means
         // the slow tier fires (ratio=1, every tick), which is where
@@ -4317,7 +4264,6 @@ fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         1,
         0,
@@ -4380,7 +4326,6 @@ fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         2,
         0,
@@ -4473,7 +4418,6 @@ fn adopted_pr_that_never_goes_green_escalates_at_recovery_cap_and_dedups() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     // Tick 0: adopt the labeled PR (real intake path — creates the bead,
@@ -4669,7 +4613,6 @@ fn capped_human_held_comment_failure_retries_before_recording_escalation() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     let summary = run_tick(&deps, 1, 0).expect("comment failure should not abort tick");
@@ -4767,7 +4710,6 @@ fn permanent_gh_error_marks_escalation_undeliverable_and_never_retries() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     // Tick 1: permanent error → one ESCALATION_UNDELIVERABLE, terminal mark set.
@@ -4900,7 +4842,6 @@ fn capped_human_held_candidate_lookup_failure_retries_before_recording_escalatio
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     // Tick 1: under the dispatch-scheduling-guarantee ordering, `run_slow_tier`
@@ -5009,7 +4950,6 @@ fn capped_human_held_missing_comment_target_records_local_escalation_fallback() 
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     let summary = run_tick(&deps, 1, 0).expect("missing target should not abort tick");
@@ -5115,7 +5055,6 @@ fn er_runner_capped_unknown_only_gate_report_escalates_and_parks_at_recovery_cap
             ci_status: "green".into(),
             coderabbit_status: "green".into(),
             ci_pending: false,
-        bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -5133,7 +5072,6 @@ fn er_runner_capped_unknown_only_gate_report_escalates_and_parks_at_recovery_cap
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         0,
         0,
@@ -5188,7 +5126,6 @@ fn er_runner_capped_unknown_only_gate_report_escalates_and_parks_at_recovery_cap
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         1,
         0,
@@ -5273,7 +5210,6 @@ fn er_runner_capped_unknown_only_comment_failure_retries_before_parking() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     let summary = run_tick(&deps, 0, 0).expect("comment failure should not abort tick");
@@ -5377,7 +5313,6 @@ fn attested_ci_pending_does_not_bump_autonomy_secs() {
             ci_status: "unknown".into(),
             coderabbit_status: "approved".into(),
             ci_pending: true,
-        bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -5403,7 +5338,6 @@ fn attested_ci_pending_does_not_bump_autonomy_secs() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         1,
         // Pretend 600s elapsed since the last tick; ci_pending must freeze the clock.
@@ -5482,7 +5416,6 @@ fn attested_ci_pending_does_not_timebox_park() {
             ci_status: "unknown".into(),
             coderabbit_status: "approved".into(),
             ci_pending: true,
-        bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -5508,7 +5441,6 @@ fn attested_ci_pending_does_not_timebox_park() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         1,
         600, // 10-minute tick; ci_pending=true means clock should NOT advance
@@ -5592,7 +5524,6 @@ fn non_green_bead_reenters_loop_via_automated_human_held_exit() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         // slow-tier-due (ratio=1, every tick fires both tiers)
         1,
@@ -5699,7 +5630,6 @@ fn attested_ci_not_pending_does_bump_autonomy_secs() {
             ci_status: "success".into(),
             coderabbit_status: "approved".into(),
             ci_pending: false,
-        bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -5725,7 +5655,6 @@ fn attested_ci_not_pending_does_bump_autonomy_secs() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         1,
         300,
@@ -5818,7 +5747,6 @@ fn qdw_per_bead_isolation_snapshot_failure_does_not_abort_fast_tier() {
             ci_status: "green".into(),
             coderabbit_status: "green".into(),
             ci_pending: false,
-            bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -5839,7 +5767,6 @@ fn qdw_per_bead_isolation_snapshot_failure_does_not_abort_fast_tier() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         0,
         0,
@@ -5998,7 +5925,6 @@ fn qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead() {
             ci_status: "green".into(),
             coderabbit_status: "green".into(),
             ci_pending: false,
-            bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -6017,7 +5943,6 @@ fn qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         // elapsed_secs=1 (non-zero) so the pre-fix `Err=>false` path
         // would have bumped autonomy_secs to timebox and parked the
@@ -6365,7 +6290,6 @@ fn qdw_green_snapshot(pr: u64, comments: Vec<PrComment>) -> PrSnapshot {
         ci_status: "green".into(),
         coderabbit_status: "green".into(),
         ci_pending: false,
-        bugbot_pending: false,
         head_committed_epoch: 0,
     }
 }
@@ -6474,7 +6398,6 @@ fn qdw_post_er_refetch_failure_skips_bead_without_false_park() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         0,
         0,
@@ -6632,7 +6555,6 @@ fn qdw_assess_refetch_failure_stays_attested_and_never_closes_pr() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         0,
         0,
@@ -6942,7 +6864,6 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
             ci_status: "green".into(),
             coderabbit_status: "green".into(),
             ci_pending: false,
-            bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -6963,7 +6884,6 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         1,
         0,
@@ -7136,7 +7056,6 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
             ci_status: "green".into(),
             coderabbit_status: "green".into(),
             ci_pending: false,
-            bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -7157,7 +7076,6 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         1,
         0,
@@ -7337,7 +7255,6 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
             ci_status: "green".into(),
             coderabbit_status: "green".into(),
             ci_pending: false,
-            bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -7358,7 +7275,6 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         1,
         0,
@@ -7533,7 +7449,6 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
             ci_status: "green".into(),
             coderabbit_status: "green".into(),
             ci_pending: false,
-            bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -7552,7 +7467,6 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         1,
         0,
@@ -7821,7 +7735,6 @@ fn cross_repo_bead_verification_loop_uses_its_own_repo_not_cfg_target_repo() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         1,
         0,
@@ -8050,7 +7963,6 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
             ci_status: "green".into(),
             coderabbit_status: "green".into(),
             ci_pending: false,
-            bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -8071,7 +7983,6 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         1,
         0,
@@ -8251,7 +8162,6 @@ fn cross_model_reviewer_cursor_agent_falls_back_and_emits_review_degraded() {
             ci_status: "green".into(),
             coderabbit_status: "green".into(),
             ci_pending: false,
-            bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -8272,7 +8182,6 @@ fn cross_model_reviewer_cursor_agent_falls_back_and_emits_review_degraded() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         1,
         0,
@@ -8494,7 +8403,6 @@ fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
             ci_status: "green".into(),
             coderabbit_status: "green".into(),
             ci_pending: false,
-            bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -8515,7 +8423,6 @@ fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         1,
         0,
@@ -8629,7 +8536,6 @@ fn transient_spawn_failures_below_cap_stay_retriable_and_do_not_park() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     // Three consecutive transient spawn failures — well under the cap
@@ -8720,7 +8626,6 @@ fn transient_spawn_retry_cap_exceeded_parks_human_held_with_escalation() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     // Tick 0: intake creates + routes the bead, then dispatch attempts
@@ -8899,7 +8804,6 @@ fn spawn_failure_count_resets_after_a_successful_dispatch() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     for tick_index in 0..2u64 {
@@ -8985,7 +8889,6 @@ fn deferred_spawn_backpressure_never_increments_counter_or_parks_across_repeated
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     for tick_index in 0..N {
@@ -9107,7 +9010,6 @@ fn mixed_batch_deferred_backpressure_and_genuine_transient_failures_are_independ
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     // Ticks 0..=14: fifteen consecutive cycles. Bead A must stay QUEUED with
@@ -9298,7 +9200,6 @@ fn earlier_candidate_create_bead_error_does_not_silence_later_candidate_matching
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     let summary = run_tick(&deps, 0, 0).expect(
@@ -9510,7 +9411,6 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         0,
         0,
@@ -9727,7 +9627,6 @@ fn run_slow_tier_pr_existence_probe_targets_bead_own_repo_not_global_cfg() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         0,
         0,
@@ -9829,7 +9728,6 @@ fn run_slow_tier_pr_existence_probe_unchanged_for_single_repo_legacy_bead() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         0,
         0,
@@ -9935,7 +9833,6 @@ fn seed_attested_red_ci_bead(
             ci_status: "red".to_string(),
             coderabbit_status: "green".to_string(),
             ci_pending: false,
-            bugbot_pending: false,
             head_committed_epoch: now.saturating_sub(60),
         },
     );
@@ -9975,7 +9872,6 @@ fn tick_parks_human_held_on_permanent_reroll_error() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         1,
         0,
@@ -10039,7 +9935,6 @@ fn tick_deferred_reroll_stays_attested_and_reselects_next_tick() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     let summary1 = run_tick(&deps, 1, 0).expect("tick 1 should succeed");
@@ -10164,7 +10059,6 @@ fn autonomy_timebox_park_kills_associated_ao_session_and_clears_handle() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     let summary = run_tick(&deps, 1, 100).expect("tick should succeed");
@@ -10258,7 +10152,6 @@ fn coder_silent_park_kills_associated_ao_session_and_clears_handle() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     let summary = run_tick(&deps, 1, 10).expect("tick should succeed");
@@ -10345,7 +10238,6 @@ fn session_branch_mismatch_park_kills_associated_ao_session_and_clears_handle() 
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     let summary = run_tick(&deps, 1, 10).expect("tick should succeed");
@@ -10440,7 +10332,6 @@ fn autonomy_timebox_park_retains_handle_when_stop_fails() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     let summary = run_tick(&deps, 1, 100).expect("tick should succeed");
@@ -10525,7 +10416,6 @@ fn adopted_branch_history_rewrite_park_kills_associated_ao_session() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     let summary = run_tick(&deps, 1, 10).expect("tick should succeed");
@@ -10612,7 +10502,6 @@ fn run_tick_emits_parked_human_held_for_unmapped_repo_dispatch_failure() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         0,
         0,
@@ -10756,7 +10645,6 @@ fn slow_tier_dispatched_branch_mismatch_re_resolves_stale_pr_number() {
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
             ci_pending: false,
-            bugbot_pending: false,
             head_committed_epoch: now.saturating_sub(60),
         },
     );
@@ -10773,7 +10661,6 @@ fn slow_tier_dispatched_branch_mismatch_re_resolves_stale_pr_number() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     let summary = run_tick(&deps, 1, 0).expect("tick should succeed");
@@ -10914,7 +10801,6 @@ fn slow_tier_dispatched_branch_mismatch_no_op_when_pr_number_already_matches() {
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
             ci_pending: false,
-            bugbot_pending: false,
             head_committed_epoch: now.saturating_sub(60),
         },
     );
@@ -10931,7 +10817,6 @@ fn slow_tier_dispatched_branch_mismatch_no_op_when_pr_number_already_matches() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
     let _ = run_tick(&deps, 1, 0).expect("tick should succeed");
     let body = std::fs::read_to_string(&telemetry_log).unwrap();
@@ -11015,7 +10900,6 @@ fn slow_tier_dispatched_branch_mismatch_clears_stale_pr_number_when_branch_has_n
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     let _ = run_tick(&deps, 1, 0).expect("tick should succeed");
@@ -11151,7 +11035,6 @@ fn slow_tier_pre_gate_validation_re_resolves_when_stored_pr_no_longer_open() {
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
             ci_pending: false,
-            bugbot_pending: false,
             head_committed_epoch: now.saturating_sub(60),
         },
     );
@@ -11168,7 +11051,6 @@ fn slow_tier_pre_gate_validation_re_resolves_when_stored_pr_no_longer_open() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     let _ = run_tick(&deps, 1, 0).expect("tick should succeed");
@@ -11263,7 +11145,6 @@ fn transient_pr_number_reresolve_error_keeps_dispatched_no_promotion() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         1,
         0,
@@ -11357,7 +11238,6 @@ fn pre_gate_no_open_pr_demotes_attested_to_dispatched_and_resumes() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         1,
         0,
@@ -11411,7 +11291,6 @@ fn pre_gate_no_open_pr_demotes_attested_to_dispatched_and_resumes() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
         },
         2,
         0,
@@ -11505,7 +11384,7 @@ fn evidence_gate_verified_gist_reaches_ready() {
     let telemetry_log = std::env::temp_dir().join("afd_yoqy_ev_ok.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
     let summary = run_tick(
-        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log, vendor_health: None },
+        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log },
         1, 0,
     )
     .expect("tick must not error");
@@ -11543,7 +11422,7 @@ fn evidence_gate_empty_gist_fails_closed_not_ready() {
     let telemetry_log = std::env::temp_dir().join("afd_yoqy_ev_empty.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
     let summary = run_tick(
-        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log, vendor_health: None },
+        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log },
         1, 0,
     )
     .expect("tick must not error");
@@ -11586,7 +11465,7 @@ fn evidence_gate_head_mismatch_fails_closed() {
     let telemetry_log = std::env::temp_dir().join("afd_yoqy_ev_stale.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
     run_tick(
-        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log, vendor_health: None },
+        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log },
         1, 0,
     )
     .expect("tick must not error");
@@ -11648,7 +11527,6 @@ fn rln6_evidence_head_stale_fast_rejects_with_one_shot_comment() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-            vendor_health: None,
         },
         1,
         0,
@@ -11716,7 +11594,6 @@ fn rln6_evidence_head_stale_fast_rejects_with_one_shot_comment() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-            vendor_health: None,
         },
         1,
         0,
@@ -11789,7 +11666,6 @@ fn rln6_v2_evidence_head_stale_emits_gate_assessment_before_fast_reject() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-            vendor_health: None,
         },
         1,
         0,
@@ -11880,7 +11756,6 @@ fn rln6_v2_evidence_head_stale_does_not_persist_sentinel_on_comment_failure() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-            vendor_health: None,
         },
         1,
         0,
@@ -11922,7 +11797,6 @@ fn rln6_v2_evidence_head_stale_does_not_persist_sentinel_on_comment_failure() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-            vendor_health: None,
         },
         1,
         0,
@@ -12003,7 +11877,6 @@ fn rln6_v2_evidence_head_stale_sentinel_resets_on_new_mismatch_tuple() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-            vendor_health: None,
         },
         1,
         0,
@@ -12048,7 +11921,6 @@ fn rln6_v2_evidence_head_stale_sentinel_resets_on_new_mismatch_tuple() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-            vendor_health: None,
         },
         1,
         0,
@@ -12093,7 +11965,6 @@ fn rln6_v2_evidence_head_stale_sentinel_resets_on_new_mismatch_tuple() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-            vendor_health: None,
         },
         1,
         0,
@@ -12146,7 +12017,7 @@ fn evidence_gate_incomplete_marker_fails_closed() {
     let telemetry_log = std::env::temp_dir().join("afd_yoqy_ev_incomplete.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
     run_tick(
-        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log, vendor_health: None },
+        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log },
         1, 0,
     ).expect("tick must not error");
     assert_ne!(
@@ -12189,7 +12060,7 @@ fn evidence_gate_transient_gist_error_is_pending_not_red() {
     let telemetry_log = std::env::temp_dir().join("afd_yoqy_ev_transient.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
     run_tick(
-        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log, vendor_health: None },
+        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log },
         1, 0,
     ).expect("tick must not error");
     // Not READY (evidence unknown), but NOT parked/rerolled — stays ATTESTED to retry.
@@ -12272,7 +12143,6 @@ fn msmq_verifier_skips_reassessment_when_reroll_deferred() {
         ci_status: "red".into(),
         coderabbit_status: "green".into(),
         ci_pending: false,
-        bugbot_pending: false,
         head_committed_epoch: fresh_epoch.saturating_sub(120),
     };
     scm.pr_snapshots.insert(901, snap.clone());
@@ -12312,7 +12182,6 @@ fn msmq_verifier_skips_reassessment_when_reroll_deferred() {
     let deps = TickDeps {
         scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm,
         store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     // ---- Tick 1: reroll_deferral_count=0 → full gate assessment fires.
@@ -12423,7 +12292,7 @@ fn jleechan328_gate_assessment_emits_head_sha_for_exact_head_binding() {
     let telemetry_log = std::env::temp_dir().join("afd_yoqy_headbind.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
     let summary = run_tick(
-        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log, vendor_health: None },
+        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log },
         1, 0,
     )
     .expect("tick must not error");
@@ -12506,7 +12375,7 @@ fn jleechan328_gate_assessment_emits_operator_disposition_round_trip() {
         let telemetry_log = std::env::temp_dir().join(format!("afd_yoqy_disp_{disposition}.jsonl"));
         let _ = std::fs::remove_file(&telemetry_log);
         let summary = run_tick(
-            &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log, vendor_health: None },
+            &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log },
             1, 0,
         )
         .expect("tick must not error");
@@ -12626,7 +12495,6 @@ fn dispatch_guarantee_queued_bead_dispatched_despite_escalation_backlog() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     // Run one tick. Under the new ordering, `run_slow_tier` (dispatch) runs
@@ -12739,7 +12607,6 @@ fn escalation_dedup_tick_level_identical_payload_suppressed_changed_context_re_e
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
     };
 
     // ── Tick 1: first escalation → ESCALATION_REQUIRED emitted ──
@@ -12827,416 +12694,6 @@ fn escalation_dedup_tick_level_identical_payload_suppressed_changed_context_re_e
         escalation_required_count, 2,
         "tick 3: ESCALATION_REQUIRED must re-emit after context change; \
          total count across ticks 1+2+3 should be 2; got: {escalation_required_count}"
-    );
-
-    let _ = std::fs::remove_file(&telemetry_log);
-}
-
-// ----------------------------------------------------------------------------
-// Bead jleechan-jsby (r2): end-to-end integration test that drives the
-// production tick path with a capped-vendor fake. The r1 PR #459 was
-// rejected because the `VendorHealthLedger` was never populated — the
-// `skeptic_evidence` function constructed a fresh empty ledger and the
-// fast tier never wrote to it. This test drives `run_tick` end-to-end
-// against a `FakeScm` that returns a CodeRabbit "unknown" status from
-// `pr_snapshot`, asserting that:
-//
-//   1. Three consecutive ticks with the same `bead_id` produce the
-//      cap observation, but the N-of-M detector requires DISTINCT
-//      bead_ids. So we drive three DIFFERENT beads (each with their
-//      own capped snapshot) to cross the threshold.
-//   2. After the threshold, the `VendorHealth::Capped` state is
-//      visible to `verifier::assess` (the existing r1 logic
-//      substitutes the gate to `Waived` when compensating coverage is
-//      green).
-//   3. The integration test passes on the r2 codebase and FAILS on
-//      the r1 codebase (the r1 ledger is empty, so `health()`
-//      returns `Healthy` and the waiver never fires).
-//
-// Acceptance criteria for r2 per the operator guidance: the production
-// tick path now records observations on every assessment, and the
-// VENDOR_WAIVED telemetry fires on the auto-escalation edge.
-#[test]
-fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
-    use std::sync::Mutex;
-
-    use daemon::vendor_health::VendorHealthLedger;
-    use daemon::vendor_health::EVT_WAIVED;
-
-    let mut scm = FakeScm::new();
-    let tracker = FakeTracker::new();
-    let sessions = FakeSessions::new();
-    let llm = FakeLlm::new();
-    let store = FakeStateStore::new();
-    let cfg = test_cfg();
-    let vcs = FakeVcs::new();
-    let telemetry_dir = std::env::temp_dir().join("afd_vendor_waiver_r2_test");
-    let _ = std::fs::remove_dir_all(&telemetry_dir);
-    std::fs::create_dir_all(&telemetry_dir).unwrap();
-    let telemetry_log = telemetry_dir.join(format!("daemon-{}.jsonl", std::process::id()));
-    let _ = std::fs::remove_file(&telemetry_log);
-
-    let ledger = Mutex::new(VendorHealthLedger::new());
-
-    // Stage a CAPPED PR snapshot: CodeRabbit status "unknown" +
-    // coderabbit_approved=false. This is the canonical "vendor
-    // structurally unavailable" marker (per
-    // `verifier::detect_vendor_cap_for`).
-    fn capped_snapshot(pr: u64) -> PrSnapshot {
-        PrSnapshot {
-            pr_number: pr,
-            ci_success: true,
-            mergeable: true,
-            coderabbit_approved: false,
-            bugbot_error_count: 0,
-            unresolved_thread_count: Some(0),
-            head_sha: format!("sha-{pr}"),
-            body: String::new(),
-            comments: Vec::new(),
-            files: Vec::new(),
-            updated_at_epoch: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            ci_status: "green".into(),
-            coderabbit_status: "unknown".into(),
-            ci_pending: false,
-            bugbot_pending: false,
-            head_committed_epoch: 0,
-        }
-    }
-
-    // Three distinct beads, each with a capped snapshot. The N-of-M
-    // detector requires 3 distinct bead_ids to flip the vendor to
-    // Capped. We script the FakeScm to return the same capped
-    // snapshot for any PR.
-    for pr in 101..=103 {
-        scm.pr_snapshots.insert(pr, capped_snapshot(pr));
-        scm.pr_numbers_for_branch.insert(
-            ("owner/repo".into(), format!("factory/test-bead-{pr}")),
-            Some(pr),
-        );
-        scm.open_pr_head_refs.insert(
-            ("owner/repo".into(), pr),
-            PrHeadBranch::SameRepo(format!("factory/test-bead-{pr}")),
-        );
-    }
-
-    // Drive 3 ticks, each one carrying a DIFFERENT bead_id through the
-    // gate-assessment path. The simplest way to do this is to script
-    // the FakeScm to return one labelled PR per tick and run
-    // `run_tick` 3 times. The detection mechanism is the same as for
-    // empty-attested beads: each tick calls record_cap() with the
-    // bead's bead_id.
-    for pr in 101..=103 {
-        // Configure the FakeScm to return this PR's labelled snapshot.
-        // The minimal smoke is: ensure the snapshot is fetched, then
-        // verify the ledger's count after the tick.
-        let _ = scm.pr_snapshots.entry(pr).or_insert_with(|| capped_snapshot(pr));
-    }
-
-    // Insert one bead manually to drive the fast tier's gate assessment.
-    use daemon::state::{BeadOverlay, OverlayState};
-    let bead_id = "test-bead-101";
-    let overlay = BeadOverlay {
-        bead_id: bead_id.to_string(),
-        state: OverlayState::Attested,
-        attempt: 1,
-        reroll_count: 0,
-        autonomy_secs: 0,
-        spend_usd: 0.0,
-        pr_number: Some(101),
-        branch: Some("factory/test-bead-101".to_string()),
-        session_id: None,
-        is_adopted: false,
-        spawn_failure_count: 0,
-        pre_session_head_sha: None,
-        park_reason: None,
-        attempt_started_at: None,
-        target_repo: None,
-    };
-    store.save(&overlay).unwrap();
-    store.register_branch(bead_id, "factory/test-bead-101").unwrap();
-
-    *llm.response.borrow_mut() = Some(Ok("pass".into()));
-
-    // ── Tick 1: assessment with capped snapshot. The fast tier
-    //     records an observation for `bead_id`. Counter increments. ──
-    run_tick(
-        &TickDeps {
-            scm: &scm,
-            tracker: &tracker,
-            sessions: &sessions,
-            llm: &llm,
-            store: &store,
-            vcs: &vcs,
-            cfg: &cfg,
-            telemetry_log: &telemetry_log,
-            vendor_health: Some(&ledger),
-        },
-        0,
-        0,
-    )
-    .expect("tick 1 should succeed");
-
-    let after_tick1 = {
-        let l = ledger.lock().unwrap();
-        l.observation_count(daemon::vendor_health::Vendor::CodeRabbit)
-    };
-    assert_eq!(
-        after_tick1, 1,
-        "tick 1 must record an observation; got {after_tick1}"
-    );
-
-    // ── Tick 2: same bead with a NEW bead_id. The N-of-M detector
-    //     requires distinct bead_ids, so we simulate a fresh bead
-    //     reaching the gate. The first bead is still in the registry,
-    //     so this tick will record observations for both beads — the
-    //     count will jump to 2 (the new bead_id is the 2nd distinct
-    //     one). Move the first bead to HumanHeld so it doesn't
-    //     re-record on subsequent ticks. ──
-    let mut overlay1 = store.load(bead_id).unwrap().unwrap();
-    overlay1.state = OverlayState::HumanHeld;
-    store.save(&overlay1).unwrap();
-
-    let bead_id_2 = "test-bead-102";
-    let overlay2 = BeadOverlay {
-        bead_id: bead_id_2.to_string(),
-        state: OverlayState::Attested,
-        attempt: 1,
-        reroll_count: 0,
-        autonomy_secs: 0,
-        spend_usd: 0.0,
-        pr_number: Some(102),
-        branch: Some("factory/test-bead-102".to_string()),
-        session_id: None,
-        is_adopted: false,
-        spawn_failure_count: 0,
-        pre_session_head_sha: None,
-        park_reason: None,
-        target_repo: None,
-        attempt_started_at: None,
-    };
-    store.save(&overlay2).unwrap();
-    store.register_branch(bead_id_2, "factory/test-bead-102").unwrap();
-    run_tick(
-        &TickDeps {
-            scm: &scm,
-            tracker: &tracker,
-            sessions: &sessions,
-            llm: &llm,
-            store: &store,
-            vcs: &vcs,
-            cfg: &cfg,
-            telemetry_log: &telemetry_log,
-            vendor_health: Some(&ledger),
-        },
-        1,
-        0,
-    )
-    .expect("tick 2 should succeed");
-
-    let after_tick2 = {
-        let l = ledger.lock().unwrap();
-        l.observation_count(daemon::vendor_health::Vendor::CodeRabbit)
-    };
-    assert_eq!(
-        after_tick2, 2,
-        "tick 2 must record a 2nd observation for the new bead_id; got {after_tick2}"
-    );
-
-    // ── Tick 3: third distinct bead. The N-of-M detector (>= 3
-    //     distinct beads) flips the vendor to Capped and emits
-    //     VENDOR_WAIVED. ──
-    let bead_id_3 = "test-bead-103";
-    let overlay3 = BeadOverlay {
-        bead_id: bead_id_3.to_string(),
-        state: OverlayState::Attested,
-        attempt: 1,
-        reroll_count: 0,
-        autonomy_secs: 0,
-        spend_usd: 0.0,
-        pr_number: Some(103),
-        branch: Some("factory/test-bead-103".to_string()),
-        session_id: None,
-        is_adopted: false,
-        spawn_failure_count: 0,
-        pre_session_head_sha: None,
-        park_reason: None,
-        target_repo: None,
-        attempt_started_at: None,
-    };
-    store.save(&overlay3).unwrap();
-    store.register_branch(bead_id_3, "factory/test-bead-103").unwrap();
-    // Move bead 2 to HumanHeld so it doesn't re-record on tick 3.
-    let mut overlay2 = store.load(bead_id_2).unwrap().unwrap();
-    overlay2.state = OverlayState::HumanHeld;
-    store.save(&overlay2).unwrap();
-    run_tick(
-        &TickDeps {
-            scm: &scm,
-            tracker: &tracker,
-            sessions: &sessions,
-            llm: &llm,
-            store: &store,
-            vcs: &vcs,
-            cfg: &cfg,
-            telemetry_log: &telemetry_log,
-            vendor_health: Some(&ledger),
-        },
-        2,
-        0,
-    )
-    .expect("tick 3 should succeed");
-
-    let after_tick3 = {
-        let l = ledger.lock().unwrap();
-        l.health(daemon::vendor_health::Vendor::CodeRabbit)
-    };
-    assert!(
-        after_tick3.is_capped(),
-        "after 3 distinct capped beads the ledger MUST be Capped; got {after_tick3:?}"
-    );
-
-    // VENDOR_WAIVED telemetry must have been emitted on the
-    // Healthy -> Capped edge.
-    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
-    let waived_count = log.matches(EVT_WAIVED).count();
-    assert!(
-        waived_count >= 1,
-        "VENDOR_WAIVED telemetry must have been emitted on the auto-escalation edge; got {waived_count} lines:\n{log}"
-    );
-    assert!(
-        log.contains("coderabbit:waived_vendor_unavailable"),
-        "VENDOR_WAIVED telemetry must contain the canonical waiver token; log:\n{log}"
-    );
-
-    let _ = std::fs::remove_file(&telemetry_log);
-}
-
-// ----------------------------------------------------------------------------
-// Bead jleechan-jsby (r2): CI-wait timeout. When the snapshot has
-// `ci_pending=true` AND at least one tracked vendor is showing a cap
-// marker, the fast tier MUST skip the CI-wait and proceed to the gate
-// assessment. The pre-r2 code emitted `VERIFICATION_PENDING` and
-// `continue`d, leaving the bead stuck (the live 2026-07-22 incident
-// that parked jtg8 and jsby themselves).
-#[test]
-fn vendor_health_ledger_ci_pending_with_capped_vendor_skips_wait() {
-    use std::sync::Mutex;
-
-    use daemon::vendor_health::VendorHealthLedger;
-    use daemon::state::{BeadOverlay, OverlayState};
-
-    let mut scm = FakeScm::new();
-    let tracker = FakeTracker::new();
-    let sessions = FakeSessions::new();
-    let llm = FakeLlm::new();
-    let store = FakeStateStore::new();
-    let cfg = test_cfg();
-    let vcs = FakeVcs::new();
-    let telemetry_dir = std::env::temp_dir().join("afd_vendor_waiver_ciwait_test");
-    let _ = std::fs::remove_dir_all(&telemetry_dir);
-    std::fs::create_dir_all(&telemetry_dir).unwrap();
-    let telemetry_log = telemetry_dir.join(format!("daemon-{}.jsonl", std::process::id()));
-    let _ = std::fs::remove_file(&telemetry_log);
-
-    let ledger = Mutex::new(VendorHealthLedger::new());
-
-    // Capped snapshot: CodeRabbit status "unknown" + ci_pending=true.
-    // The pre-r2 wait path would emit `VERIFICATION_PENDING` and
-    // continue. The r2 path detects the cap marker and proceeds.
-    let pr = 200;
-    scm.pr_snapshots.insert(
-        pr,
-        PrSnapshot {
-            pr_number: pr,
-            ci_success: true,
-            mergeable: true,
-            coderabbit_approved: false,
-            bugbot_error_count: 0,
-            unresolved_thread_count: Some(0),
-            head_sha: "sha-200".into(),
-            body: String::new(),
-            comments: Vec::new(),
-            files: Vec::new(),
-            updated_at_epoch: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            ci_status: "pending".into(),
-            coderabbit_status: "unknown".into(),
-            ci_pending: true,
-            head_committed_epoch: 0,
-            bugbot_pending: false,
-        },
-    );
-
-    let bead_id = "ci-wait-bead";
-    let overlay = BeadOverlay {
-        bead_id: bead_id.to_string(),
-        state: OverlayState::Attested,
-        attempt: 1,
-        reroll_count: 0,
-        autonomy_secs: 0,
-        spend_usd: 0.0,
-        pr_number: Some(pr),
-        branch: Some("factory/ci-wait-bead".to_string()),
-        session_id: None,
-        is_adopted: false,
-        spawn_failure_count: 0,
-        pre_session_head_sha: None,
-        park_reason: None,
-        target_repo: None,
-        attempt_started_at: None,
-    };
-    store.save(&overlay).unwrap();
-    store.register_branch(bead_id, "factory/ci-wait-bead").unwrap();
-    scm.pr_numbers_for_branch.insert(
-        ("owner/repo".into(), "factory/ci-wait-bead".to_string()),
-        Some(pr),
-    );
-    scm.open_pr_head_refs.insert(
-        ("owner/repo".into(), pr),
-        PrHeadBranch::SameRepo("factory/ci-wait-bead".to_string()),
-    );
-
-    *llm.response.borrow_mut() = Some(Ok("pass".into()));
-
-    let summary = run_tick(
-        &TickDeps {
-            scm: &scm,
-            tracker: &tracker,
-            sessions: &sessions,
-            llm: &llm,
-            store: &store,
-            vcs: &vcs,
-            cfg: &cfg,
-            telemetry_log: &telemetry_log,
-            vendor_health: Some(&ledger),
-        },
-        0,
-        0,
-    )
-    .expect("tick should succeed");
-
-    // The gate assessment MUST run. Pre-r2, `ci_pending=true` would
-    // emit VERIFICATION_PENDING and continue; the bead would never
-    // be assessed. With r2, the cap marker bypasses the wait, so
-    // `gates_assessed` is exactly 1.
-    assert_eq!(
-        summary.gates_assessed, 1,
-        "ci_pending=true with a capped vendor MUST proceed to gate assessment; got {summary:?}"
-    );
-
-    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
-    assert!(
-        !log.contains("VERIFICATION_PENDING"),
-        "VERIFICATION_PENDING must NOT be emitted when the cap marker is present; log:\n{log}"
-    );
-    assert!(
-        log.contains("GATE_ASSESSMENT"),
-        "GATE_ASSESSMENT must be emitted when the cap marker bypasses the wait; log:\n{log}"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
