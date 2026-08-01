@@ -1,5 +1,14 @@
 name: CI
 
+# Stub-mode policy: DARK_FACTORY_CI_ALLOW_STUB=1 is intentionally NOT set
+# globally. The default real-mode jobs (test, daemon-tests) must run without
+# stub-mode so a regression that accidentally enables stub-mode cannot ship
+# as a green CI. The dedicated `stub-gate-smoke` job below proves the
+# env_guard::stub_mode_allowed() two-key gate fires correctly in CI; only
+# future iteration-ceiling reproducer jobs that genuinely need stub-mode
+# behaviour should set `DARK_FACTORY_CI_ALLOW_STUB=1`. See PR #498 (daemon
+# gate) and PR #499 (controller gate) for the full contract.
+
 on:
   push:
     branches: [main]
@@ -77,3 +86,105 @@ jobs:
       - name: cargo clippy (deny warnings)
         working-directory: daemon
         run: cargo clippy -- -D warnings
+
+  stub-gate-smoke:
+    # Proves the env_guard::stub_mode_allowed() two-key gate fires correctly
+    # in CI (GITHUB_ACTIONS=true is auto-set by GitHub Actions). This is the
+    # only job that opts in to stub-mode. Default jobs above MUST NOT set
+    # DARK_FACTORY_CI_ALLOW_STUB so a regression cannot accidentally enable
+    # stub-mode for the full test suite.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      DARK_FACTORY_CI_ALLOW_STUB: "1"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: cargo test env_guard (CI gate fires when both keys present)
+        working-directory: daemon
+        run: cargo test --lib env_guard::tests::ci_with_both_env_vars_returns_true
+
+      - name: cargo test env_guard (CI gate rejects partial keys)
+        # Defensive: with DARK_FACTORY_CI_ALLOW_STUB but no GITHUB_ACTIONS, the
+        # gate must still reject. We simulate the absence of GITHUB_ACTIONS by
+        # unsetting it for this step.
+        working-directory: daemon
+        env:
+          GITHUB_ACTIONS:
+        run: |
+          unset GITHUB_ACTIONS
+          cargo test --lib \
+            env_guard::tests::only_github_actions_is_not_enough \
+            env_guard::tests::only_allow_stub_is_not_enough
+
+  stub-gate-smoke:
+    # Proves the env_guard::stub_mode_allowed() two-key gate fires correctly
+    # in CI (GITHUB_ACTIONS=true is auto-set by GitHub Actions). This is the
+    # only job that opts in to stub-mode. Default jobs above MUST NOT set
+    # DARK_FACTORY_CI_ALLOW_STUB so a regression cannot accidentally enable
+    # stub-mode for the full test suite.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      DARK_FACTORY_CI_ALLOW_STUB: "1"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: cargo test env_guard (CI gate fires when both keys present)
+        working-directory: daemon
+        run: cargo test --lib env_guard::tests::ci_with_both_env_vars_returns_true
+
+      - name: cargo test env_guard (CI gate rejects partial keys)
+        # Defensive: with DARK_FACTORY_CI_ALLOW_STUB but no GITHUB_ACTIONS, the
+        # gate must still reject. We simulate the absence of GITHUB_ACTIONS by
+        # unsetting it for this step.
+        working-directory: daemon
+        env:
+          GITHUB_ACTIONS:
+        run: |
+          unset GITHUB_ACTIONS
+          cargo test --lib \
+            env_guard::tests::only_github_actions_is_not_enough \
+            env_guard::tests::only_allow_stub_is_not_enough
+
+  stub-gate-smoke:
+    # Proves the env_guard::stub_mode_allowed() two-key gate fires correctly
+    # in CI (GITHUB_ACTIONS=true is auto-set by GitHub Actions). This is the
+    # only job that opts in to stub-mode. Default jobs above MUST NOT set
+    # DARK_FACTORY_CI_ALLOW_STUB so a regression cannot accidentally enable
+    # stub-mode for the full test suite.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      DARK_FACTORY_CI_ALLOW_STUB: "1"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: cargo test env_guard (CI gate fires when both keys present)
+        working-directory: daemon
+        run: cargo test --lib env_guard::tests::ci_with_both_env_vars_returns_true
+
+      - name: cargo test env_guard (CI gate rejects partial keys)
+        # Defensive: with DARK_FACTORY_CI_ALLOW_STUB but no GITHUB_ACTIONS, the
+        # gate must still reject. We simulate the absence of GITHUB_ACTIONS by
+        # unsetting it for this step.
+        working-directory: daemon
+        env:
+          GITHUB_ACTIONS:
+        run: |
+          unset GITHUB_ACTIONS
+          cargo test --lib \
+            env_guard::tests::only_github_actions_is_not_enough \
+            env_guard::tests::only_allow_stub_is_not_enough
