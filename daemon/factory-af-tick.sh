@@ -139,8 +139,21 @@ cd "$ROOT"
 if [ "${AFD_SKIP_DRIFT_CHECK:-0}" != "1" ]; then
     current_branch="$(git branch --show-current 2>/dev/null || true)"
     if [ "$current_branch" != "main" ]; then
-        echo "factory-af-tick: REFUSING TICK — checkout at $ROOT is on branch '${current_branch:-<detached HEAD>}', not main. The daemon must run from main; switch back with 'git checkout main' or set AFD_SKIP_DRIFT_CHECK=1 for local dev runs." >&2
-        exit 10
+        is_detached_main=0
+        if [ -z "$current_branch" ]; then
+            local_sha="$(git rev-parse HEAD 2>/dev/null || true)"
+            main_sha="$(git rev-parse refs/heads/main 2>/dev/null || true)"
+            origin_main_sha="$(git rev-parse refs/remotes/origin/main 2>/dev/null || true)"
+            if [ -n "$local_sha" ]; then
+                if [ "$local_sha" = "$main_sha" ] || [ "$local_sha" = "$origin_main_sha" ]; then
+                    is_detached_main=1
+                fi
+            fi
+        fi
+        if [ "$is_detached_main" -ne 1 ]; then
+            echo "factory-af-tick: REFUSING TICK — checkout at $ROOT is on branch '${current_branch:-<detached HEAD>}', not main. The daemon must run from main; switch back with 'git checkout main' or set AFD_SKIP_DRIFT_CHECK=1 for local dev runs." >&2
+            exit 10
+        fi
     fi
 
     if ! git diff --quiet HEAD -- 2>/dev/null || ! git diff --quiet --cached HEAD -- 2>/dev/null; then

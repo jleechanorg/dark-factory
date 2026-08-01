@@ -207,6 +207,49 @@ case "$out" in
         ;;
 esac
 
+# Case 6: detached HEAD pointing to the same commit as main (in sync with origin) -> gate passes.
+(
+    cd "$WORK"
+    git checkout -q main
+    # Ensure it is in sync with origin/main
+    git reset --hard -q origin/main
+    # Detach HEAD at the main commit
+    git checkout -q --detach HEAD
+)
+out="$(run_drift_block "$WORK")"
+case "$out" in
+    *GATE_PASSED*RC=0*|*RC=0*GATE_PASSED*)
+        echo "PASS: drift gate passes on detached HEAD pointing to main commit"
+        PASS=$((PASS + 1))
+        ;;
+    *)
+        echo "FAIL: drift gate should pass on detached HEAD pointing to main commit. Output: $out"
+        FAIL=$((FAIL + 1))
+        ;;
+esac
+
+# Case 7: detached HEAD pointing to a different commit -> gate refuses with rc=10.
+(
+    cd "$WORK"
+    # Detach HEAD at a different commit (e.g. the first commit, which is behind origin/main)
+    # The first commit is local_sha of the init commit
+    init_sha="$(git --git-dir="$ORIGIN" rev-list --max-parents=0 HEAD 2>/dev/null || true)"
+    git checkout -q --detach "$init_sha"
+)
+out="$(run_drift_block "$WORK")"
+case "$out" in
+    *"REFUSING TICK"*RC=10*)
+        echo "PASS: drift gate refuses (rc=10) on detached HEAD pointing to a different commit"
+        PASS=$((PASS + 1))
+        ;;
+    *)
+        echo "FAIL: drift gate should refuse (rc=10) on detached HEAD pointing to a different commit. Output: $out"
+        FAIL=$((FAIL + 1))
+        ;;
+esac
+# Restore to main for any subsequent tests
+(cd "$WORK" && git checkout -q main)
+
 # ---------------------------------------------------------------------------
 # The production launchd plist must never set AFD_SKIP_DRIFT_CHECK (the
 # opt-out is for local/dev invocation only).
