@@ -236,11 +236,33 @@ Whatever is left after flag parsing is the **goal description**.
 
 ### Steps
 
+Before Steps 1–2, define this resolver. It preserves an explicit
+`DARK_FACTORY_HOME`; otherwise it resolves the `dark-factory` binary selected
+from `PATH`, follows symlinks, derives its repository root, and exports that
+same source for pipeline and prompt resolution:
+
+```bash
+resolve_dark_factory_home() {
+  if [ -z "${DARK_FACTORY_HOME:-}" ]; then
+    DARK_FACTORY_BIN="$(command -v dark-factory 2>/dev/null)" || {
+      echo "ERROR: dark-factory is not on PATH; run ./install.sh first"
+      return 1
+    }
+    DARK_FACTORY_BIN="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$DARK_FACTORY_BIN")" || {
+      echo "ERROR: unable to resolve the installed dark-factory binary"
+      return 1
+    }
+    DARK_FACTORY_HOME="$(cd "$(dirname "$DARK_FACTORY_BIN")/.." && pwd -P)" || return 1
+  fi
+  export DARK_FACTORY_HOME
+}
+```
+
 1. **Verify binary install**. The factory runs via the **`dark-factory` binary**
    (not `python -m runner` from source). Check:
    ```bash
-   export DARK_FACTORY_HOME="${DARK_FACTORY_HOME:-$HOME/projects/dark-factory}"
    export PATH="$HOME/.local/bin:$PATH"
+   resolve_dark_factory_home || exit 1
    command -v dark-factory && dark-factory --help 2>/dev/null || true
    test -x "$DARK_FACTORY_HOME/bin/dark-factory" || {
      echo "ERROR: run $DARK_FACTORY_HOME/install.sh first"
@@ -252,7 +274,7 @@ Whatever is left after flag parsing is the **goal description**.
 
 2. **Environment**:
    ```bash
-   export DARK_FACTORY_HOME="${DARK_FACTORY_HOME:-$HOME/projects/dark-factory}"
+   resolve_dark_factory_home || exit 1
    export DARK_FACTORY_HOLDOUTS="${DARK_FACTORY_HOLDOUTS:-$HOME/projects/dark-factory-holdouts}"
    export PATH="$HOME/.local/bin:$PATH"
    ```
@@ -358,7 +380,6 @@ required line means the run is unproven and must be reported as such:
 # CLI backend: <detected-or-override> (source: <BASH_FUNC_X%%|explicit --backend|default>)
 # Literal command run:
 cd /Users/jleechan/projects/<target-repo>
-DARK_FACTORY_HOME=~/projects/dark-factory \
 DARK_FACTORY_HOLDOUTS=~/projects/dark-factory-holdouts \
 PATH="$HOME/.local/bin:$PATH" \
 dark-factory \

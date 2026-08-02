@@ -311,6 +311,21 @@ def test_f_defaults_reviewer_calibration_on() -> None:
     assert not missing, "dark-factory/SKILL.md missing reviewer calibration contract: " + ", ".join(missing)
 
 
+def test_f_resolves_factory_home_from_the_installed_binary() -> None:
+    """The /f skill must not route a PATH-selected binary to a stale checkout."""
+    skill_text = _skill("dark-factory")
+    required = (
+        'if [ -z "${DARK_FACTORY_HOME:-}" ]; then',
+        'DARK_FACTORY_BIN="$(command -v dark-factory 2>/dev/null)"',
+        "os.path.realpath(sys.argv[1])",
+        'DARK_FACTORY_HOME="$(cd "$(dirname "$DARK_FACTORY_BIN")/.." && pwd -P)"',
+        "export DARK_FACTORY_HOME",
+    )
+    missing = [phrase for phrase in required if phrase not in skill_text]
+    assert not missing, "dark-factory/SKILL.md missing installed-binary home resolver: " + ", ".join(missing)
+    assert "DARK_FACTORY_HOME=~/projects/dark-factory" not in skill_text
+
+
 def test_reviewer_contract_is_binary_owned_and_vendor_neutral() -> None:
     paths = (
         SKILLS_DIR / "dark-factory" / "SKILL.md",
