@@ -8,12 +8,9 @@ import pathlib
 
 def factory_home() -> pathlib.Path | None:
     raw = os.environ.get("DARK_FACTORY_HOME", "").strip()
-    if raw:
-        return pathlib.Path(raw).expanduser().resolve()
-    repo_root = pathlib.Path(__file__).parent.parent.resolve()
-    if (repo_root / "pipelines").exists() or (repo_root / "prompts").exists():
-        return repo_root
-    return None
+    if not raw:
+        return None
+    return pathlib.Path(raw).expanduser().resolve()
 
 
 def resolve_factory_path(path: pathlib.Path) -> pathlib.Path:
