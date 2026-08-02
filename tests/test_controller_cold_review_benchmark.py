@@ -12,10 +12,19 @@ import pytest
 
 from benchmarks.scripts.run_controller_cold_review import (
     BenchmarkError,
+    FREEFORM_PROMPTS,
+    MANUAL_OBSERVATION_PROMPT,
+    MANUAL_OBSERVATION_SOURCE,
+    SCREEN_CASE_IDS,
+    SCREEN_VARIANTS,
     build_blinded_plan,
+    build_manual_observation_plan,
+    build_screen_plan,
     commit_claim_snapshot,
     load_manifest,
+    render_manual_observation_prompt,
     run_benchmark,
+    run_screen,
     validate_case,
 )
 from runner.review_controller import ControllerReviewResult, ValidatedReview
@@ -27,6 +36,25 @@ from benchmarks.scripts.check_boundary import (
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "benchmarks/controller-cold-review/cases.json"
+
+
+EXPECTED_TRACEABILITY_PROMPT = (
+    "Review this PR independently. Cross-check its design docs, goals and tenets, "
+    "and PR description against the actual code and production paths and the "
+    "executed evidence. Find every actionable defect and keep reviewing the whole "
+    "change after the first finding. Report each finding as a separate bullet with "
+    "an exact `path/to/file:L123` reference and explain which design goal, tenet, "
+    "description claim, code behavior, or evidence claim it violates."
+)
+EXPECTED_ADVERSARIAL_PROMPT = (
+    "Try to prove this PR is wrong. Cross-check the design docs, goals and tenets, "
+    "PR description, actual production code paths and consumers, and executed "
+    "evidence for contradictions, omissions, false-green tests, and unverified "
+    "claims. Keep attacking independent failure modes after every finding until "
+    "the entire change has been examined. Report each actionable defect as a "
+    "separate bullet with an exact `path/to/file:L123` reference and the "
+    "contradicted claim or evidence."
+)
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -157,6 +185,359 @@ def test_blinded_plan_pairs_identical_controls_and_hides_contract_identity():
             if row["case_id"] == case_id
         }
         assert contracts == {"cold-review-v1", "cold-review-v2"}
+
+
+def test_screen_plan_has_three_blinded_variants_with_identical_controls():
+    manifest = load_manifest(MANIFEST)
+    cases = [case for case in manifest["cases"] if case["id"] in SCREEN_CASE_IDS]
+
+    public, private = build_screen_plan(
+        cases,
+        seed=20260802,
+        model="gpt-5.6-luna",
+        reasoning_effort="high",
+        timeout_seconds=900,
+    )
+
+    assert SCREEN_VARIANTS == (
+        "control-v2",
+        "freeform-traceability",
+        "freeform-adversarial",
+    )
+    assert FREEFORM_PROMPTS == {
+        "freeform-traceability": EXPECTED_TRACEABILITY_PROMPT,
+        "freeform-adversarial": EXPECTED_ADVERSARIAL_PROMPT,
+    }
+    assert len(public["runs"]) == 9
+    assert len(private["arms"]) == 9
+    assert "freeform" not in json.dumps(public).lower()
+    assert "cold-review-v2" not in json.dumps(public).lower()
+    for case in cases:
+        runs = [row for row in public["runs"] if row["case_id"] == case["id"]]
+        assert [row["arm"] for row in runs] == ["arm-1", "arm-2", "arm-3"]
+        assert len({json.dumps(row["controls"], sort_keys=True) for row in runs}) == 1
+        assert len({json.dumps(row["input_order"]) for row in runs}) == 1
+        variants = {
+            row["review_variant"]
+            for row in private["arms"]
+            if row["case_id"] == case["id"]
+        }
+        assert variants == set(SCREEN_VARIANTS)
+    assert build_screen_plan(
+        cases,
+        seed=20260802,
+        model="gpt-5.6-luna",
+        reasoning_effort="high",
+        timeout_seconds=900,
+    ) == (public, private)
+
+
+def test_manual_observation_is_separate_and_preserves_prompt_bytes():
+    manifest = load_manifest(MANIFEST)
+    cases = [case for case in manifest["cases"] if case["id"] in SCREEN_CASE_IDS]
+    public, private = build_screen_plan(
+        cases,
+        seed=20260802,
+        model="gpt-5.6-luna",
+        reasoning_effort="high",
+        timeout_seconds=900,
+    )
+
+    observation = build_manual_observation_plan(
+        cases,
+        model="gpt-5.6-luna",
+        reasoning_effort="high",
+        timeout_seconds=900,
+    )
+
+    assert len(observation["runs"]) == 3
+    assert observation["observational"] is True
+    assert observation["eligible_for_advancement"] is False
+    assert observation["source"] == MANUAL_OBSERVATION_SOURCE
+    assert all(row["observational"] is True for row in observation["runs"])
+    assert all(row["eligible_for_advancement"] is False for row in observation["runs"])
+    assert "manual" not in json.dumps(private["arms"]).lower()
+    assert len(public["runs"]) == 9
+
+    first_url = "https://github.com/jleechanorg/worldarchitect.ai/pull/8603"
+    second_url = "https://github.com/jleechanorg/worldarchitect.ai/pull/8612"
+    first = render_manual_observation_prompt(first_url)
+    second = render_manual_observation_prompt(second_url)
+    assert first == MANUAL_OBSERVATION_PROMPT.format(pr_url=first_url)
+    assert second == MANUAL_OBSERVATION_PROMPT.format(pr_url=second_url)
+    assert first.replace(first_url, "{pr_url}") == MANUAL_OBSERVATION_PROMPT
+    assert second.replace(second_url, "{pr_url}") == MANUAL_OBSERVATION_PROMPT
+
+
+def _fake_validated_control_review(request, *, neutral_cwd, output_dir, **_kwargs):
+    output_dir.mkdir(parents=True)
+    response = (
+        "## Findings\nControl narrative.\n"
+        "## Commands Executed\nNone.\n"
+        "## Evidence Checked\nDiff.\n## Caveats\nNone.\n"
+    )
+    paths = {}
+    for name, filename in {
+        "prompt": "prompt.txt",
+        "envelope": "envelope.json",
+        "response": "reviewer.output.md",
+        "transport": "transport.jsonl",
+        "receipt": "controller-receipt.json",
+        "findings": "findings.json",
+    }.items():
+        paths[name] = output_dir / filename
+    paths["prompt"].write_text(request.prompt)
+    paths["envelope"].write_text(request.envelope_json)
+    paths["response"].write_text(response)
+    paths["transport"].write_text('{"type":"turn.completed"}\n')
+    paths["findings"].write_text("{}\n")
+    paths["receipt"].write_text(
+        json.dumps(
+            {
+                "duration_seconds": 0.25,
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+            }
+        )
+    )
+    return ControllerReviewResult(
+        review=ValidatedReview(
+            verdict="fail",
+            checks=(),
+            response_sha256=hashlib.sha256(response.encode()).hexdigest(),
+        ),
+        receipts=(),
+        response_text=response,
+        transport_text=paths["transport"].read_text(),
+        output_paths={key: str(path) for key, path in paths.items()},
+    )
+
+
+def test_run_screen_uses_raw_freeform_transport_and_transcript_bundles(
+    tmp_path, monkeypatch
+):
+    repo, case = _fixture_case(tmp_path)
+    manifest = {
+        "schema": 1,
+        "repository": "https://github.com/jleechanorg/worldarchitect.ai",
+        "input_order": list(("task", "diff", "changed_files", "evidence")),
+        "cases": [case],
+    }
+    output = tmp_path / "screen-output"
+    completed = []
+    real_run = subprocess.run
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", "/sealed/do-not-leak")
+    monkeypatch.setenv("CUSTOM_HOLDOUT_SENTINEL", "secret")
+    monkeypatch.setattr(
+        "benchmarks.scripts.run_controller_cold_review._gate_subprocess_args",
+        lambda *args, **kwargs: ["codex", "exec", "PROMPT"],
+    )
+    monkeypatch.setattr(
+        "benchmarks.scripts.run_controller_cold_review.run_controller_review",
+        _fake_validated_control_review,
+    )
+
+    def fake_run(args, **kwargs):
+        if args and args[0] == "git":
+            return real_run(args, **kwargs)
+        completed.append((args, kwargs))
+        raw = "\n".join(
+            (
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {"type": "agent_message", "text": "Raw finding."},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "turn.completed",
+                        "usage": {"input_tokens": 12, "output_tokens": 7},
+                    }
+                ),
+            )
+        ) + "\n"
+        return subprocess.CompletedProcess(args, 0, stdout=raw, stderr="")
+
+    monkeypatch.setattr(
+        "benchmarks.scripts.run_controller_cold_review.subprocess.run", fake_run
+    )
+
+    run_screen(
+        manifest,
+        case_ids=[case["id"]],
+        repo=repo,
+        output_dir=output,
+        seed=20260802,
+        model="gpt-5.6-luna",
+        reasoning_effort="high",
+        timeout_seconds=900,
+        workers=1,
+    )
+
+    assert len(completed) == 2
+    for _args, kwargs in completed:
+        assert Path(kwargs["cwd"]).parts[-3] == "neutral"
+        assert kwargs["env"].get("DARK_FACTORY_HOLDOUTS") is None
+        assert kwargs["env"].get("CUSTOM_HOLDOUT_SENTINEL") is None
+        assert "PROMPT_ID:" not in kwargs["input"]
+        assert "BEGIN_CONTROLLER_ENVELOPE_BASE64" in kwargs["input"]
+    for arm in ("arm-1", "arm-2", "arm-3"):
+        bundle = json.loads((output / f"blinded-{arm}-bundle.json").read_text())
+        assert bundle["schema_version"] == "cold-review-transcript-run-v1"
+        assert set(bundle["cases"][0]) == {
+            "case_id", "base_sha", "head_sha", "diff", "diff_sha256",
+            "case_sha256", "transcript", "transcript_sha256", "metrics",
+        }
+    freeform_records = [
+        json.loads(path.read_text())
+        for path in (output / "raw").glob("*/*/run-record.json")
+        if json.loads(path.read_text())["review_variant"].startswith("freeform-")
+    ]
+    assert len(freeform_records) == 2
+    assert all(record["prompt_sha256"] for record in freeform_records)
+    assert all(record["envelope_sha256"] for record in freeform_records)
+    assert all(record["transport_sha256"] for record in freeform_records)
+
+
+@pytest.mark.parametrize(
+    ("returncode", "usage", "error"),
+    ((7, {"input_tokens": 1}, "exited with 7"), (0, None, "usage")),
+)
+def test_run_screen_fails_closed_and_preserves_receipt(
+    tmp_path, monkeypatch, returncode, usage, error
+):
+    repo, case = _fixture_case(tmp_path)
+    manifest = {
+        "schema": 1,
+        "repository": "https://github.com/jleechanorg/worldarchitect.ai",
+        "input_order": list(("task", "diff", "changed_files", "evidence")),
+        "cases": [case],
+    }
+    output = tmp_path / "invalid-screen"
+    real_run = subprocess.run
+    monkeypatch.setattr(
+        "benchmarks.scripts.run_controller_cold_review._gate_subprocess_args",
+        lambda *args, **kwargs: ["codex", "exec", "PROMPT"],
+    )
+    monkeypatch.setattr(
+        "benchmarks.scripts.run_controller_cold_review.run_controller_review",
+        _fake_validated_control_review,
+    )
+
+    def fake_run(args, **kwargs):
+        if args and args[0] == "git":
+            return real_run(args, **kwargs)
+        events = [
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "Raw finding."},
+            }
+        ]
+        if usage is not None:
+            events.append({"type": "turn.completed", "usage": usage})
+        raw = "\n".join(json.dumps(event) for event in events) + "\n"
+        return subprocess.CompletedProcess(args, returncode, stdout=raw, stderr="boom")
+
+    monkeypatch.setattr(
+        "benchmarks.scripts.run_controller_cold_review.subprocess.run", fake_run
+    )
+
+    with pytest.raises(BenchmarkError, match=error):
+        run_screen(
+            manifest,
+            case_ids=[case["id"]],
+            repo=repo,
+            output_dir=output,
+            seed=20260802,
+            model="gpt-5.6-luna",
+            reasoning_effort="high",
+            timeout_seconds=900,
+            workers=1,
+        )
+
+    receipts = list((output / "raw").glob("*/*/controller-receipt.json"))
+    assert receipts
+    assert "exit_code" in json.loads(receipts[-1].read_text())
+
+
+def test_manual_observation_runs_after_screen_and_stays_outside_arm_map(
+    tmp_path, monkeypatch
+):
+    repo, case = _fixture_case(tmp_path)
+    manifest = {
+        "schema": 1,
+        "repository": "https://github.com/jleechanorg/worldarchitect.ai",
+        "input_order": list(("task", "diff", "changed_files", "evidence")),
+        "cases": [case],
+    }
+    output = tmp_path / "observational-screen"
+    prompts = []
+    monkeypatch.setattr(
+        "benchmarks.scripts.run_controller_cold_review._gate_subprocess_args",
+        lambda *args, **kwargs: ["codex", "exec", "PROMPT"],
+    )
+    monkeypatch.setattr(
+        "benchmarks.scripts.run_controller_cold_review.run_controller_review",
+        _fake_validated_control_review,
+    )
+
+    def fake_raw(_inputs, *, prompt, output_dir, **_kwargs):
+        prompts.append(prompt)
+        output_dir.mkdir(parents=True)
+        paths = {}
+        for name, filename in {
+            "prompt": "prompt.txt",
+            "envelope": "envelope.json",
+            "transport": "transport.jsonl",
+            "response": "reviewer.output.md",
+            "receipt": "controller-receipt.json",
+        }.items():
+            path = output_dir / filename
+            path.write_text(prompt if name in ("prompt", "response") else "{}\n")
+            paths[name] = path
+        receipt = {
+            "duration_seconds": 0.1,
+            "usage": {"input_tokens": 3, "output_tokens": 2},
+        }
+        paths["receipt"].write_text(json.dumps(receipt))
+        return {"transcript": prompt, "receipt": receipt, "paths": paths}
+
+    monkeypatch.setattr(
+        "benchmarks.scripts.run_controller_cold_review._run_raw_freeform_review",
+        fake_raw,
+    )
+
+    run_screen(
+        manifest,
+        case_ids=[case["id"]],
+        repo=repo,
+        output_dir=output,
+        seed=20260802,
+        model="gpt-5.6-luna",
+        reasoning_effort="high",
+        timeout_seconds=900,
+        workers=1,
+        include_manual_observation=True,
+    )
+
+    assert set(prompts[:2]) == set(FREEFORM_PROMPTS.values())
+    assert prompts[-1] == render_manual_observation_prompt(
+        "https://github.com/jleechanorg/worldarchitect.ai/pull/1"
+    )
+    private = json.loads((output / "private-arm-map.json").read_text())
+    assert "manual" not in json.dumps(private).lower()
+    observation = json.loads((output / "manual-observation-bundle.json").read_text())
+    assert observation["schema_version"] == "cold-review-transcript-run-v1"
+    assert observation["observational"] is True
+    assert observation["eligible_for_advancement"] is False
+    assert observation["source"] == MANUAL_OBSERVATION_SOURCE
+    receipt_path = next(
+        (output / "manual-observation/raw").glob("*/controller-receipt.json")
+    )
+    receipt = json.loads(receipt_path.read_text())
+    assert receipt["observational"] is True
+    assert receipt["eligible_for_advancement"] is False
+    assert receipt["source"] == MANUAL_OBSERVATION_SOURCE
 
 
 def test_run_preserves_raw_artifacts_and_writes_digest_bound_arm_records(
