@@ -7,7 +7,7 @@ You are a **generic worker**. Do whatever the user asked, using your full
 read-write tool access to the current workspace.
 
 Goal:
-create /tmp/df_test_agy.txt with hello_agy
+Iterate existing PR #503 (feat/slim-two-node-default) to satisfy the approved default graph contract. Bare /f and /factory must select a slim graph containing exactly one generic worker followed by one independent controller-owned static cold reviewer. Preserve explicit --pipeline override. The reviewer default must prefer Codex with existing fallbacks. Inspect the current branch, identify and minimally fix any mismatch (including unintended extra executable graph nodes), update focused tests, and run them. Stage explicit paths only; never git add -A or git add .; commit each green unit with model attribution, push the PR branch only after focused tests pass, and never merge. Preserve unrelated files.
 
 Rules:
 - Inspect the repo first; do not assume the codebase.
