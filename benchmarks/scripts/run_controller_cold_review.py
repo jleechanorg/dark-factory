@@ -489,6 +489,7 @@ def _fail_on_evaluator_prompt_identity(
     transcript: str,
     *,
     receipt_path: str | pathlib.Path,
+    receipt_bindings: dict | None = None,
 ) -> None:
     """Fail closed when any evaluator-facing transcript echoes arm identity."""
     folded = transcript.casefold()
@@ -508,6 +509,7 @@ def _fail_on_evaluator_prompt_identity(
         {
             "failure_class": "prompt_identity_echo",
             "echoed_prompt_identity": identity,
+            **(receipt_bindings or {}),
         }
     )
     path.write_text(
@@ -1082,6 +1084,7 @@ def run_screen(
             _fail_on_evaluator_prompt_identity(
                 transcript,
                 receipt_path=result.output_paths["receipt"],
+                receipt_bindings=run_bindings,
             )
             artifact_paths = {
                 name: pathlib.Path(path)

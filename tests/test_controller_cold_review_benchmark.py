@@ -849,8 +849,14 @@ def test_control_narrative_identity_echo_fails_closed_with_raw_receipt(
         if json.loads(path.read_text()).get("failure_class")
         == "prompt_identity_echo"
     ]
+    plan_sha = hashlib.sha256((output / "run-plan.json").read_bytes()).hexdigest()
+    map_sha = hashlib.sha256(
+        (output / "private-arm-map.json").read_bytes()
+    ).hexdigest()
     assert receipts
     assert all(receipt["echoed_prompt_identity"] == identity for receipt in receipts)
+    assert all(receipt["public_plan_sha256"] == plan_sha for receipt in receipts)
+    assert all(receipt["private_arm_map_sha256"] == map_sha for receipt in receipts)
     assert any(
         identity in path.read_text()
         for path in (output / "raw").glob("*/*/reviewer.output.md")
