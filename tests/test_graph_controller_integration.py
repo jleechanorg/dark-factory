@@ -15,6 +15,8 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Iterable
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from runner.review_controller import (
     EvidenceArtifact,
@@ -92,6 +94,72 @@ class SharedHelperTests(unittest.TestCase):
 
         src = Path(review_cli.__file__).read_text()
         self.assertIn("run_controller_review", src)
+
+    def test_parallel_handler_passes_explicit_v2_contract_to_request_builder(self) -> None:
+        """Graph selection is explicit and reaches the shared request seam."""
+        from conftest import make_node
+        from runner.handler_core import Context, Result
+        from runner.handler_parallel_reviewer import _parallel_reviewer
+
+        node = make_node(
+            name="review",
+            type="parallel_reviewer",
+            backend="codex",
+            review_contract="cold-review-v2",
+        )
+        ctx = Context(goal="review", workdir=Path.cwd(), backend="codex", run_id="test")
+        captured: list[str] = []
+
+        def build_request(_node, _ctx, _sha, review_contract):
+            captured.append(review_contract)
+            return SimpleNamespace(prompt="bound prompt", prompt_id="controller-cold-review-v2")
+
+        with (
+            patch("runner.handlers._worktree_head_sha", return_value="a" * 40),
+            patch("runner.handler_parallel_reviewer._controller_review_request", side_effect=build_request),
+            patch("runner.handler_parallel_reviewer._resolve_gate_backend", return_value=("codex", {})),
+            patch("runner.handler_parallel_reviewer._run_primary_review", return_value=Result()),
+            patch("runner.handler_parallel_reviewer._record_primary_output", side_effect=lambda *args: args[2]),
+            patch("runner.handler_parallel_reviewer._contract_adjusted_result", side_effect=lambda result, *args, **kwargs: result),
+        ):
+            result = _parallel_reviewer(node, ctx)
+
+        self.assertEqual(captured, ["cold-review-v2"])
+        self.assertEqual(result.outcome, "success")
+
+    def test_handler_records_v2_gate_metadata_without_prose_interpretation(self) -> None:
+        from runner.handler_core import Context, Result
+        from runner.handler_parallel_reviewer import _contract_adjusted_result
+
+        request = SimpleNamespace(
+            review_contract="cold-review-v2",
+            prompt_id="controller-cold-review-v2",
+            prompt_sha256="a" * 64,
+            envelope_sha256="b" * 64,
+        )
+        validated = SimpleNamespace(
+            response_sha256="c" * 64,
+            verdict="pass",
+            checks=(
+                ("CLAIMS", "pass"),
+                ("RUNTIME", "pass"),
+                ("EVIDENCE", "pass"),
+                ("ADVERSARIAL", "pass"),
+            ),
+        )
+        ctx = Context(goal="review", workdir=Path.cwd(), backend="codex")
+
+        with (
+            patch("runner.handler_parallel_reviewer._verify_controller_workspace"),
+            patch("runner.review_controller.validate_review_response", return_value=validated),
+            patch("runner.review_controller.validate_execution_receipts"),
+        ):
+            result = _contract_adjusted_result(Result(output="untrusted prose"), request, ctx, lane="primary")
+
+        self.assertEqual(result.metadata["review_contract"], "cold-review-v2")
+        self.assertEqual(result.metadata["verdict"], "pass")
+        for gate_id in ("claims", "runtime", "evidence", "adversarial"):
+            self.assertEqual(result.metadata[f"review_gate_{gate_id}"], "pass")
 
 
 class PerLaneIsolationTests(unittest.TestCase):

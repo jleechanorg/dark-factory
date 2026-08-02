@@ -251,7 +251,12 @@ def _controller_evidence(node: "Node", ctx: "Context") -> tuple:
     return tuple(artifacts)
 
 
-def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
+def _controller_review_request(
+    node: "Node",
+    ctx: "Context",
+    expected_sha: str,
+    review_contract: str,
+):
     """Build the source-owned request; graph/goal content remains envelope data."""
     from .review_controller import (
         ReviewContractError,
@@ -329,7 +334,7 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
         validate_immutable_target(inputs, holdout_roots=holdout_roots)
     except ReviewContractError as exc:
         raise ValueError(f"controller review target is not immutable: {exc}") from exc
-    return create_review_request(inputs)
+    return create_review_request(inputs, review_contract=review_contract)
 
 
 def _holdout_root_strings() -> list[str]:
@@ -421,7 +426,8 @@ def _contract_adjusted_result(
     metadata = dict(result.metadata or {})
     metadata.update(
         {
-            "review_contract": request.prompt_id,
+            "review_contract": request.review_contract,
+            "review_prompt_id": request.prompt_id,
             "review_prompt_payload_sha256": request.prompt_sha256,
             "review_envelope_sha256": request.envelope_sha256,
         }
@@ -443,6 +449,7 @@ def _contract_adjusted_result(
     except ReviewContractError as exc:
         metadata["review_contract_status"] = "invalid"
         metadata["review_contract_gap"] = str(exc)
+        metadata["review_contract_invalid_reason"] = str(exc)
         metadata["verdict"] = "fail"
         return Result(
             outcome="failure",
@@ -454,6 +461,9 @@ def _contract_adjusted_result(
         )
     metadata["review_contract_status"] = "valid"
     metadata["review_response_sha256"] = validated.response_sha256
+    for gate_id, status in validated.checks:
+        if gate_id in {"CLAIMS", "RUNTIME", "EVIDENCE", "ADVERSARIAL"}:
+            metadata[f"review_gate_{gate_id.lower()}"] = status
     metadata["verdict"] = validated.verdict
     return Result(
         outcome="success" if validated.verdict == "pass" else "failure",
@@ -658,14 +668,19 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     review_contract = str(node.attrs.get("review_contract") or "").strip()
     request = None
     if review_contract:
-        if review_contract != "cold-review-v1":
+        if review_contract not in ("cold-review-v1", "cold-review-v2"):
             return Result(
                 outcome="error",
                 output=f"unknown controller review contract: {review_contract}",
                 metadata={"review_contract_status": "unknown"},
             )
         try:
-            request = _controller_review_request(node, ctx, expected_sha)
+            request = _controller_review_request(
+                node,
+                ctx,
+                expected_sha,
+                review_contract,
+            )
         except Exception as exc:
             return Result(
                 outcome="error",

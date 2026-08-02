@@ -12,6 +12,7 @@ import pytest
 from runner.review_controller import (
     CHECK_IDS,
     PROMPT_ID,
+    V2_GATE_IDS,
     EvidenceArtifact,
     ExecutionReceipt,
     ReviewContractError,
@@ -77,6 +78,169 @@ def _response(request, *, verdict: str = "pass", failed: str | None = None) -> s
         "None.",
     ]
     return "\n".join(lines)
+
+
+def _v2_request(tmp_path, monkeypatch):
+    """Build a v2 request against a test-owned static authority fixture."""
+    import hashlib
+    import runner.review_controller as controller
+
+    template = tmp_path / "controller_cold_review_v2.md"
+    template.write_text(
+        "\n".join(
+            (
+                "# Controller-Owned Cold Review v2",
+                "- CLAIMS",
+                "- RUNTIME",
+                "- EVIDENCE",
+                "- ADVERSARIAL",
+            )
+        ),
+        encoding="utf-8",
+    )
+    contract = replace(
+        controller.REVIEW_CONTRACTS["cold-review-v2"],
+        template_path=template,
+        expected_template_sha256=hashlib.sha256(template.read_bytes()).hexdigest(),
+    )
+    monkeypatch.setitem(controller.REVIEW_CONTRACTS, "cold-review-v2", contract)
+    return create_review_request(_inputs(), review_contract="cold-review-v2")
+
+
+def _v2_response(request, *, failed: str | None = None) -> str:
+    gates = {
+        gate_id: ("fail" if gate_id == failed else "pass")
+        for gate_id in V2_GATE_IDS
+    }
+    return "\n".join(
+        (
+            f"PROMPT_ID: {request.prompt_id}",
+            f"PROMPT_SHA256: {request.prompt_sha256}",
+            f"ENVELOPE_SHA256: {request.envelope_sha256}",
+            f"HEAD_SHA: {request.head_sha}",
+            f"TASK_SHA256: {request.task_sha256}",
+            f"DIFF_SHA256: {request.diff_sha256}",
+            f"CHANGED_FILES_SHA256: {request.changed_files_sha256}",
+            f"EVIDENCE_MANIFEST_SHA256: {request.evidence_manifest_sha256}",
+            *(f"{gate_id}: {gates[gate_id]}" for gate_id in V2_GATE_IDS),
+            "",
+            "## Findings",
+            "No material defect found.",
+            "## Commands Executed",
+            "`python -m pytest` — exit code 0.",
+            "## Evidence Checked",
+            "Bound diff and manifest.",
+            "## Caveats",
+            "None.",
+        )
+    )
+
+
+def test_v2_valid_pass_derives_verdict_from_all_four_gates(tmp_path, monkeypatch):
+    request = _v2_request(tmp_path, monkeypatch)
+
+    result = validate_review_response(_v2_response(request), request)
+
+    assert request.prompt_id == "controller-cold-review-v2"
+    assert result.verdict == "pass"
+    assert result.checks == tuple((gate_id, "pass") for gate_id in V2_GATE_IDS)
+
+
+@pytest.mark.parametrize("failed_gate", V2_GATE_IDS)
+def test_v2_each_failed_gate_derives_fail(tmp_path, monkeypatch, failed_gate):
+    request = _v2_request(tmp_path, monkeypatch)
+
+    result = validate_review_response(_v2_response(request, failed=failed_gate), request)
+
+    assert result.verdict == "fail"
+    assert result.status(failed_gate) == "fail"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        (lambda response: response.replace("CLAIMS: pass\n", "", 1), "CLAIMS exactly once"),
+        (lambda response: response.replace("RUNTIME: pass\n", "RUNTIME: pass\nRUNTIME: pass\n", 1), "RUNTIME exactly once"),
+        (lambda response: response + "\nUNKNOWN: pass\n", "unknown response fields: UNKNOWN"),
+        (lambda response: response.replace("EVIDENCE: pass", "EVIDENCE: PASS", 1), "EVIDENCE must be lowercase pass or fail"),
+        (lambda response: response + "\nC0: pass\n", "unknown response fields: C0"),
+        (lambda response: response + "\nE14: pass\n", "unknown response fields: E14"),
+        (lambda response: response + "\nVERDICT: pass\n", "unknown response fields: VERDICT"),
+        (lambda response: response.replace("## Caveats\n", "", 1), "## Caveats exactly once"),
+        (lambda response: response + "\n## Findings\nRepeated.\n", "## Findings exactly once"),
+    ),
+)
+def test_v2_rejects_non_contract_fields_and_malformed_shape(
+    tmp_path, monkeypatch, mutation, message
+):
+    request = _v2_request(tmp_path, monkeypatch)
+
+    with pytest.raises(ReviewContractError, match=message):
+        validate_review_response(mutation(_v2_response(request)), request)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("PROMPT_ID", "controller-cold-review-v1"),
+        ("PROMPT_SHA256", "0" * 64),
+        ("ENVELOPE_SHA256", "1" * 64),
+        ("HEAD_SHA", "2" * 40),
+        ("TASK_SHA256", "3" * 64),
+        ("DIFF_SHA256", "4" * 64),
+        ("CHANGED_FILES_SHA256", "5" * 64),
+        ("EVIDENCE_MANIFEST_SHA256", "6" * 64),
+    ),
+)
+def test_v2_rejects_each_tampered_binding(tmp_path, monkeypatch, field, replacement):
+    request = _v2_request(tmp_path, monkeypatch)
+    response = _v2_response(request).replace(
+        f"{field}: {getattr(request, field.lower())}",
+        f"{field}: {replacement}",
+        1,
+    )
+
+    with pytest.raises(ReviewContractError, match=f"{field} binding mismatch"):
+        validate_review_response(response, request)
+
+
+def test_v1_and_v2_responses_are_version_scoped(tmp_path, monkeypatch):
+    v1_request = create_review_request(_inputs())
+    v2_request = _v2_request(tmp_path, monkeypatch)
+
+    with pytest.raises(ReviewContractError):
+        validate_review_response(_response(v1_request), v2_request)
+    with pytest.raises(ReviewContractError):
+        validate_review_response(_v2_response(v2_request), v1_request)
+
+
+def test_v2_pass_is_refused_under_stub_mode(monkeypatch, tmp_path):
+    import subprocess as subprocess_module
+
+    monkeypatch.setenv("DARK_FACTORY_ITERATION_STUB", "1")
+    monkeypatch.delenv("DARK_FACTORY_FAKE_LLM", raising=False)
+    request = _v2_request(tmp_path, monkeypatch)
+    raw_jsonl = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": _v2_response(request)},
+        }
+    )
+
+    class _FakeProc:
+        returncode = 0
+        stdout = raw_jsonl
+        stderr = ""
+
+    monkeypatch.setattr(subprocess_module, "run", lambda *a, **kw: _FakeProc())
+    with pytest.raises(ReviewContractError, match="refuses PASS verdict under stub-mode"):
+        run_controller_review(
+            request,
+            neutral_cwd=tmp_path,
+            output_dir=tmp_path / "out",
+            transport_argv=("fake", "codex"),
+            timeout=10.0,
+        )
 
 
 def test_template_is_source_root_pinned_not_cwd(tmp_path, monkeypatch):

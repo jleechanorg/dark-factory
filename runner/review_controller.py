@@ -20,9 +20,11 @@ from typing import Literal
 
 
 PROMPT_ID = "controller-cold-review-v1"
+V2_PROMPT_ID = "controller-cold-review-v2"
 CORRECTNESS_CHECK_IDS = tuple(f"C{i}" for i in range(8))
 EVIDENCE_CHECK_IDS = tuple(f"E{i}" for i in range(15))
 CHECK_IDS = CORRECTNESS_CHECK_IDS + EVIDENCE_CHECK_IDS
+V2_GATE_IDS = ("CLAIMS", "RUNTIME", "EVIDENCE", "ADVERSARIAL")
 
 
 def _stub_mode_requested() -> bool:
@@ -50,16 +52,27 @@ _SOURCE_ROOT = Path(__file__).resolve().parents[1]
 _TEMPLATE_PATH = (
     _SOURCE_ROOT / "prompts" / "catalog" / "controller_cold_review_v1.md"
 )
+_V2_TEMPLATE_PATH = (
+    _SOURCE_ROOT / "prompts" / "catalog" / "controller_cold_review_v2.md"
+)
 _EXPECTED_TEMPLATE_SHA256 = (
     "8c061f886836da61d44c32dc18a461af504b5f1180f63ac4e970e20dacfc3f91"
 )
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _FIELD_RE = re.compile(
-    r"^(PROMPT_ID|PROMPT_SHA256|ENVELOPE_SHA256|HEAD_SHA|TASK_SHA256|"
-    r"DIFF_SHA256|CHANGED_FILES_SHA256|EVIDENCE_MANIFEST_SHA256|VERDICT|[CE]\d+):"
-    r"[ \t]*(\S+)[ \t]*$",
+    r"^([A-Z][A-Z0-9_]*):[ \t]*(\S+)[ \t]*$",
     re.MULTILINE,
+)
+_RESPONSE_BINDING_IDS = (
+    "PROMPT_ID",
+    "PROMPT_SHA256",
+    "ENVELOPE_SHA256",
+    "HEAD_SHA",
+    "TASK_SHA256",
+    "DIFF_SHA256",
+    "CHANGED_FILES_SHA256",
+    "EVIDENCE_MANIFEST_SHA256",
 )
 _REQUIRED_RESPONSE_SECTIONS = (
     "## Findings",
@@ -72,6 +85,41 @@ _MAX_INPUT_BYTES = 1024 * 1024
 
 class ReviewContractError(ValueError):
     """The review request or response violated the controller contract."""
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewContract:
+    """One immutable, explicitly selected controller response contract."""
+
+    name: str
+    prompt_id: str
+    template_path: Path
+    expected_template_sha256: str | None
+    check_ids: tuple[str, ...]
+    model_verdict_required: bool
+
+
+REVIEW_CONTRACTS = {
+    "cold-review-v1": ReviewContract(
+        name="cold-review-v1",
+        prompt_id=PROMPT_ID,
+        template_path=_TEMPLATE_PATH,
+        expected_template_sha256=_EXPECTED_TEMPLATE_SHA256,
+        check_ids=CHECK_IDS,
+        model_verdict_required=True,
+    ),
+    "cold-review-v2": ReviewContract(
+        name="cold-review-v2",
+        prompt_id=V2_PROMPT_ID,
+        template_path=_V2_TEMPLATE_PATH,
+        # The v2 prompt is owned by its separate prompt partition. Its exact
+        # digest remains bound into every request and receipt once that source
+        # file is present; unlike v1, this partition must not invent its pin.
+        expected_template_sha256=None,
+        check_ids=V2_GATE_IDS,
+        model_verdict_required=False,
+    ),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +151,7 @@ class ReviewInputs:
 class ReviewRequest:
     """Complete controller-owned request ready for a reviewer lane."""
 
+    review_contract: str
     prompt_id: str
     prompt_sha256: str
     template_sha256: str
@@ -276,13 +325,24 @@ def _require_digest(name: str, value: str) -> str:
     return normalized
 
 
-def _load_static_template() -> tuple[str, str]:
-    """Load and validate the source-root-pinned static authority."""
+def _resolve_review_contract(review_contract: str) -> ReviewContract:
+    """Return one known contract; selection is never inferred from response text."""
+    if not isinstance(review_contract, str):
+        raise TypeError("review_contract must be a string")
     try:
-        resolved = _TEMPLATE_PATH.resolve(strict=True)
+        return REVIEW_CONTRACTS[review_contract]
+    except KeyError as exc:
+        raise ReviewContractError(f"unknown controller review contract: {review_contract}") from exc
+
+
+def _load_static_template(contract: ReviewContract) -> tuple[str, str]:
+    """Load and validate the source-root-pinned static authority."""
+    template_path = _TEMPLATE_PATH if contract.name == "cold-review-v1" else contract.template_path
+    try:
+        resolved = template_path.resolve(strict=True)
     except OSError as exc:
         raise ReviewContractError(f"cold-review template unavailable: {exc}") from exc
-    if resolved != _TEMPLATE_PATH:
+    if resolved != template_path:
         raise ReviewContractError("cold-review template must not be a symlink")
     try:
         raw = resolved.read_bytes()
@@ -290,12 +350,15 @@ def _load_static_template() -> tuple[str, str]:
     except (OSError, UnicodeDecodeError) as exc:
         raise ReviewContractError(f"cold-review template is unreadable: {exc}") from exc
     observed_digest = _sha256(raw)
-    if observed_digest != _EXPECTED_TEMPLATE_SHA256:
+    if (
+        contract.expected_template_sha256 is not None
+        and observed_digest != contract.expected_template_sha256
+    ):
         raise ReviewContractError(
             "cold-review template digest does not match the controller pin"
         )
 
-    for check_id in CHECK_IDS:
+    for check_id in contract.check_ids:
         count = len(re.findall(rf"(?m)^- {re.escape(check_id)}\b", text))
         if count != 1:
             raise ReviewContractError(
@@ -383,7 +446,12 @@ def _normalized_inputs(inputs: ReviewInputs) -> ReviewInputs:
     )
 
 
-def _build_envelope(inputs: ReviewInputs, *, template_sha256: str) -> str:
+def _build_envelope(
+    inputs: ReviewInputs,
+    *,
+    contract: ReviewContract,
+    template_sha256: str,
+) -> str:
     normalized = _normalized_inputs(inputs)
     template_digest = _require_digest("template_sha256", template_sha256)
     changed_files = list(normalized.changed_files)
@@ -400,7 +468,7 @@ def _build_envelope(inputs: ReviewInputs, *, template_sha256: str) -> str:
     payload = {
         "schema": 1,
         "prompt": {
-            "id": PROMPT_ID,
+            "id": contract.prompt_id,
             "template_sha256": template_digest,
         },
         "target": {
@@ -433,17 +501,35 @@ def _build_envelope(inputs: ReviewInputs, *, template_sha256: str) -> str:
     return _canonical_json(payload)
 
 
-def build_envelope(inputs: ReviewInputs) -> str:
+def build_envelope(
+    inputs: ReviewInputs,
+    *,
+    review_contract: str = "cold-review-v1",
+) -> str:
     """Return canonical JSON bound to the source-owned static template."""
-    _, template_sha256 = _load_static_template()
-    return _build_envelope(inputs, template_sha256=template_sha256)
+    contract = _resolve_review_contract(review_contract)
+    _, template_sha256 = _load_static_template(contract)
+    return _build_envelope(
+        inputs,
+        contract=contract,
+        template_sha256=template_sha256,
+    )
 
 
-def create_review_request(inputs: ReviewInputs) -> ReviewRequest:
+def create_review_request(
+    inputs: ReviewInputs,
+    *,
+    review_contract: str = "cold-review-v1",
+) -> ReviewRequest:
     """Build the immutable envelope, static authority, and response contract."""
+    contract = _resolve_review_contract(review_contract)
     normalized = _normalized_inputs(inputs)
-    template, template_sha256 = _load_static_template()
-    envelope_json = _build_envelope(normalized, template_sha256=template_sha256)
+    template, template_sha256 = _load_static_template(contract)
+    envelope_json = _build_envelope(
+        normalized,
+        contract=contract,
+        template_sha256=template_sha256,
+    )
     envelope_payload = json.loads(envelope_json)
     envelope_digests = envelope_payload["digests"]
     envelope_sha256 = _sha256(envelope_json.encode("utf-8"))
@@ -458,14 +544,17 @@ def create_review_request(inputs: ReviewInputs) -> ReviewRequest:
         + "\nEND_CONTROLLER_ENVELOPE_BASE64\n"
     )
     prompt_sha256 = _sha256(prompt_payload.encode("utf-8"))
-    checklist_lines = "\n".join(f"{check_id}: <pass|fail>" for check_id in CHECK_IDS)
+    checklist_lines = "\n".join(
+        f"{check_id}: <pass|fail>" for check_id in contract.check_ids
+    )
+    verdict_line = "VERDICT: <pass|fail>\n" if contract.model_verdict_required else ""
     prompt = (
         prompt_payload
         + "\n## Exact response contract\n\n"
         + "Emit each machine line below exactly once, with the bound values "
         + "unchanged. Use lowercase `pass` or `fail` only. After these lines, "
         + "provide concise findings and exact evidence checked.\n\n"
-        + f"PROMPT_ID: {PROMPT_ID}\n"
+        + f"PROMPT_ID: {contract.prompt_id}\n"
         + f"PROMPT_SHA256: {prompt_sha256}\n"
         + f"ENVELOPE_SHA256: {envelope_sha256}\n"
         + f"HEAD_SHA: {normalized.head_sha}\n"
@@ -474,12 +563,13 @@ def create_review_request(inputs: ReviewInputs) -> ReviewRequest:
         + f"CHANGED_FILES_SHA256: {envelope_digests['changed_files_sha256']}\n"
         + f"EVIDENCE_MANIFEST_SHA256: "
         + f"{envelope_digests['evidence_manifest_sha256']}\n"
-        + "VERDICT: <pass|fail>\n"
+        + verdict_line
         + checklist_lines
         + "\n"
     )
     return ReviewRequest(
-        prompt_id=PROMPT_ID,
+        review_contract=contract.name,
+        prompt_id=contract.prompt_id,
         prompt_sha256=prompt_sha256,
         template_sha256=template_sha256,
         envelope_sha256=envelope_sha256,
@@ -498,9 +588,10 @@ def verify_request_integrity(request: ReviewRequest) -> None:
     """Fail if any request field no longer matches the source-owned request."""
     if not isinstance(request, ReviewRequest):
         raise TypeError("request must be ReviewRequest")
-    template, template_sha256 = _load_static_template()
+    contract = _resolve_review_contract(request.review_contract)
+    template, template_sha256 = _load_static_template(contract)
     del template  # Loading also validates the current source-owned checklist.
-    if request.prompt_id != PROMPT_ID:
+    if request.prompt_id != contract.prompt_id:
         raise ReviewContractError("request prompt_id mismatch")
     if request.template_sha256 != template_sha256:
         raise ReviewContractError("request template digest mismatch")
@@ -515,7 +606,7 @@ def verify_request_integrity(request: ReviewRequest) -> None:
     if not isinstance(envelope, dict):
         raise ReviewContractError("request envelope must be a JSON object")
     if envelope.get("prompt") != {
-        "id": PROMPT_ID,
+        "id": contract.prompt_id,
         "template_sha256": template_sha256,
     }:
         raise ReviewContractError("request envelope prompt binding mismatch")
@@ -564,7 +655,8 @@ def verify_request_integrity(request: ReviewRequest) -> None:
                     for item in envelope["evidence"]
                 ),
                 run_id=envelope.get("run_id", ""),
-            )
+            ),
+            review_contract=contract.name,
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ReviewContractError("request envelope schema is invalid") from exc
@@ -576,7 +668,7 @@ def validate_review_response(
     response: str,
     request: ReviewRequest,
 ) -> ValidatedReview:
-    """Validate exact bindings and the complete strict pass/fail checklist."""
+    """Validate exact bindings and the selected strict pass/fail contract."""
     verify_request_integrity(request)
     if not isinstance(response, str) or not response.strip():
         raise ReviewContractError("review response must be non-empty text")
@@ -585,17 +677,11 @@ def validate_review_response(
     for key, value in _FIELD_RE.findall(response):
         fields.setdefault(key, []).append(value)
 
+    contract = _resolve_review_contract(request.review_contract)
     required = (
-        "PROMPT_ID",
-        "PROMPT_SHA256",
-        "ENVELOPE_SHA256",
-        "HEAD_SHA",
-        "TASK_SHA256",
-        "DIFF_SHA256",
-        "CHANGED_FILES_SHA256",
-        "EVIDENCE_MANIFEST_SHA256",
-        "VERDICT",
-        *CHECK_IDS,
+        *_RESPONSE_BINDING_IDS,
+        *(("VERDICT",) if contract.model_verdict_required else ()),
+        *contract.check_ids,
     )
     for key in required:
         count = len(fields.get(key, ()))
@@ -603,14 +689,18 @@ def validate_review_response(
             raise ReviewContractError(
                 f"response must contain {key} exactly once; found {count}"
             )
-    unknown_checks = sorted(
-        key
-        for key in fields
-        if re.fullmatch(r"[CE]\d+", key) and key not in CHECK_IDS
-    )
-    if unknown_checks:
+    allowed_fields = set(required)
+    unknown_fields = sorted(key for key in fields if key not in allowed_fields)
+    if unknown_fields:
+        if contract.name == "cold-review-v1" and all(
+            re.fullmatch(r"[CE]\d+", key) for key in unknown_fields
+        ):
+            raise ReviewContractError(
+                "response contains unknown checklist IDs: "
+                + ", ".join(unknown_fields)
+            )
         raise ReviewContractError(
-            f"response contains unknown checklist IDs: {', '.join(unknown_checks)}"
+            f"response contains unknown response fields: {', '.join(unknown_fields)}"
         )
     for section in _REQUIRED_RESPONSE_SECTIONS:
         count = len(re.findall(rf"(?m)^{re.escape(section)}[ \t]*$", response))
@@ -633,11 +723,8 @@ def validate_review_response(
         if fields[key][0] != expected:
             raise ReviewContractError(f"response {key} binding mismatch")
 
-    verdict = fields["VERDICT"][0]
-    if verdict not in ("pass", "fail"):
-        raise ReviewContractError("VERDICT must be lowercase pass or fail")
     checks: list[tuple[str, Literal["pass", "fail"]]] = []
-    for check_id in CHECK_IDS:
+    for check_id in contract.check_ids:
         status = fields[check_id][0]
         if status not in ("pass", "fail"):
             raise ReviewContractError(
@@ -645,10 +732,16 @@ def validate_review_response(
             )
         checks.append((check_id, status))
     expected_verdict = "pass" if all(status == "pass" for _, status in checks) else "fail"
-    if verdict != expected_verdict:
-        raise ReviewContractError(
-            f"VERDICT must be {expected_verdict} for the reported checklist"
-        )
+    if contract.model_verdict_required:
+        verdict = fields["VERDICT"][0]
+        if verdict not in ("pass", "fail"):
+            raise ReviewContractError("VERDICT must be lowercase pass or fail")
+        if verdict != expected_verdict:
+            raise ReviewContractError(
+                f"VERDICT must be {expected_verdict} for the reported checklist"
+            )
+    else:
+        verdict = expected_verdict
     return ValidatedReview(
         verdict=verdict,
         checks=tuple(checks),
@@ -822,6 +915,7 @@ def run_controller_review(
 
     receipt = {
         "schema": 1,
+        "review_contract": request.review_contract,
         "prompt_id": request.prompt_id,
         "prompt_sha256": request.prompt_sha256,
         "envelope_sha256": request.envelope_sha256,
@@ -855,6 +949,7 @@ def run_controller_review(
         json.dumps(
             {
                 "schema": 1,
+                "review_contract": request.review_contract,
                 "verdict": review.verdict,
                 "checks": [
                     {"id": check_id, "status": status}
@@ -894,11 +989,15 @@ __all__ = [
     "CHECK_IDS",
     "CORRECTNESS_CHECK_IDS",
     "EVIDENCE_CHECK_IDS",
+    "REVIEW_CONTRACTS",
     "ControllerReviewResult",
     "PROMPT_ID",
+    "V2_GATE_IDS",
+    "V2_PROMPT_ID",
     "EvidenceArtifact",
     "ExecutionReceipt",
     "ReviewContractError",
+    "ReviewContract",
     "ReviewInputs",
     "ReviewRequest",
     "ValidatedReview",
