@@ -1,0 +1,162 @@
+{
+  "schema": 1,
+  "repository": "https://github.com/jleechanorg/worldarchitect.ai",
+  "input_order": ["task", "diff", "changed_files", "evidence"],
+  "cases": [
+    {
+      "id": "wa-8603-r1",
+      "pr": 8603,
+      "revision": 1,
+      "base_sha": "1c30660378d0f69d93f35efa9b5558a826ff29d6",
+      "head_sha": "c983f3295f9869708048f0a262ae7e506ebe9460",
+      "tree_sha": "0ff80ae07ff632e540028a92f50bbbae0e678c07",
+      "diff_sha256": "e195dc6ca4c0a85100cfc1c10f042c381dd491e7a9b3e4a5cddab6e5307e8261",
+      "changed_files": [
+        "docs/superpowers/plans/2026-07-25-npc-roster-visibility-pr1.md",
+        "docs/superpowers/specs/2026-07-25-npc-identity-dedupe-design.md",
+        "mvp_site/llm_service.py",
+        "mvp_site/prompts/master_directive.md",
+        "mvp_site/prompts/narrative_system_instruction.md",
+        "mvp_site/prompts/planning_protocol.md",
+        "mvp_site/tests/test_end2end/test_entity_tracking_roster_e2e.py",
+        "mvp_site/tests/test_entity_tracking_identity.py",
+        "testing_mcp/test_npc_roster_visibility.py"
+      ],
+      "changed_files_sha256": "882bd49cb041203850ee9e1b26790793d3c94e8613bac7dd80eb57afe006a4fc",
+      "task_snapshot_kind": "git-commit-claims-v1",
+      "task_sha256": "e506f6826101007c2d19ae3077d345e66c47d5d8c6018c61494b9c1de398ec1f",
+      "evidence": [],
+      "evidence_manifest_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "id": "wa-8611-r1",
+      "pr": 8611,
+      "revision": 1,
+      "base_sha": "49ef83a79a3ce63931764006bff9360d560bd22b",
+      "head_sha": "68c51307b63a553e316d7d5b47e521aa0b57e06d",
+      "tree_sha": "587ba20311202a3eadfff02e4f6b05b7f6732341",
+      "diff_sha256": "14b95e3a450014f97755c8b924e9c10ea0984e75dc6112493e733f4edc1453bd",
+      "changed_files": [
+        "mvp_site/prompts/god_mode_instruction.md",
+        "mvp_site/prompts/living_world_instruction.md",
+        "mvp_site/tests/test_god_mode_directive_precedence_served_prompt.py"
+      ],
+      "changed_files_sha256": "1599709c773c12fa7246c0f75c5da8a9cc9f4ebb59b8f05d70d092887fbb6971",
+      "task_snapshot_kind": "git-commit-claims-v1",
+      "task_sha256": "2baeb02f1dc21cd068e556d173814165e928a18d3f15593fa1c8a2dc9581c219",
+      "evidence": [],
+      "evidence_manifest_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "id": "wa-8612-r1",
+      "pr": 8612,
+      "revision": 1,
+      "base_sha": "49ef83a79a3ce63931764006bff9360d560bd22b",
+      "head_sha": "ab4a5609682cd018c4bf07a18e7180fd14278065",
+      "tree_sha": "70a4b3c90e50e00c2b08b4872895e17b81aba1f3",
+      "diff_sha256": "c95fcbc8814e8b05fb449070fc3f561191d6c7db8de8d7976d1b6263c18d1de0",
+      "changed_files": [
+        "mvp_site/prompts/game_state_instruction.md",
+        "mvp_site/prompts/narrative_lite_system_instruction.md",
+        "mvp_site/prompts/relationship_instruction.md",
+        "mvp_site/prompts/reputation_instruction.md",
+        "mvp_site/schemas/prompt_tool_contracts.json",
+        "mvp_site/tests/test_agents.py",
+        "mvp_site/tests/test_npc_agreement_propagation_and_input_honesty.py"
+      ],
+      "changed_files_sha256": "2d690260666f2fe2081e7c28406f4f35b7a649fbde47cdafbb6d73c4f087ca0f",
+      "task_snapshot_kind": "git-commit-claims-v1",
+      "task_sha256": "3b828ba8e5c11f67a35304a657b7b0e1c0a00ffbe0904856d26f1d92986f68b1",
+      "evidence": [],
+      "evidence_manifest_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "id": "wa-8612-r2",
+      "pr": 8612,
+      "revision": 2,
+      "base_sha": "49ef83a79a3ce63931764006bff9360d560bd22b",
+      "head_sha": "6ddc63ef8cf010dcbb5c4007662e44e8e517ba2e",
+      "tree_sha": "a6d4f320b53ee9532b763ac508cfb75d0c254516",
+      "diff_sha256": "b72d07ff49cab2d9730d501052187856d9821d81d9e56639b5263ea45641a24a",
+      "changed_files": [
+        "mvp_site/context_compaction.py",
+        "mvp_site/prompts/game_state_instruction.md",
+        "mvp_site/prompts/god_mode_instruction.md",
+        "mvp_site/prompts/narrative_lite_system_instruction.md",
+        "mvp_site/prompts/relationship_instruction.md",
+        "mvp_site/prompts/reputation_instruction.md",
+        "mvp_site/prompts/shared/grievance_debt_append_only_contract.md",
+        "mvp_site/prompts/shared/npc_data_not_structured_input_contract.md",
+        "mvp_site/schemas/prompt_tool_contracts.json",
+        "mvp_site/tests/test_agents.py",
+        "mvp_site/tests/test_compression_lever1.py",
+        "mvp_site/tests/test_npc_agreement_propagation_and_input_honesty.py",
+        "mvp_site/tests/test_prompts.py",
+        "testing_mcp/.ci-synchronize-trigger-20260728",
+        "testing_mcp/.ci-synchronize-trigger-20260728-2",
+        "testing_mcp/test_grievance_append_only_narrative_variant_pr8612.py",
+        "testing_mcp/test_npc_field_fixes_real_llm_evidence_pr8612.py"
+      ],
+      "changed_files_sha256": "38b0dac13d7c4018c7d8e5988a4ced4c9e84910902dd2c0e4222e35188ce31b8",
+      "task_snapshot_kind": "git-commit-claims-v1",
+      "task_sha256": "fd923dd4ef0a7f8f4fabcd32dfa50a6e89e57363084fc8133c5eba9be042a3e3",
+      "evidence": [],
+      "evidence_manifest_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "id": "wa-8613-r1",
+      "pr": 8613,
+      "revision": 1,
+      "base_sha": "49ef83a79a3ce63931764006bff9360d560bd22b",
+      "head_sha": "1574463e809360a7b816b0ab729e2a8a6cf46aa1",
+      "tree_sha": "316ec6761a5da155af9d67407e57b070c3b80d73",
+      "diff_sha256": "c0c6e793dc4ecf751dbfba8d04a3ec4bfa5a26ba3f419f0e6c0af8d01ebd25f9",
+      "changed_files": [
+        "testing_mcp/lib/evidence_utils.py",
+        "testing_mcp/test_evidence_utils_unit.py"
+      ],
+      "changed_files_sha256": "8687799657284c1424575f6513719d6e4104ee293c0c16f4b374609b97ecf60d",
+      "task_snapshot_kind": "git-commit-claims-v1",
+      "task_sha256": "a7b635142c9e63bf8edfebd3dbe233a6a26a52a36fe0189ac494a898c67204a5",
+      "evidence": [],
+      "evidence_manifest_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "id": "wa-8613-r2",
+      "pr": 8613,
+      "revision": 2,
+      "base_sha": "49ef83a79a3ce63931764006bff9360d560bd22b",
+      "head_sha": "a471c9a56ad19b7058ab49d591c468e151a9593d",
+      "tree_sha": "e0cd0d2f797cc9d1a732565826e17f42ffc299d4",
+      "diff_sha256": "f1782bcbfd7e310616cf812aa408e22e89d851fea4529fc6ed7530c3de83cb07",
+      "changed_files": [
+        "testing_mcp/lib/base_test.py",
+        "testing_mcp/lib/evidence_utils.py",
+        "testing_mcp/test_evidence_utils_unit.py"
+      ],
+      "changed_files_sha256": "849b728498a2b6f0e806c798b8b77e18d2295dee2a0efb86d24ba43751955132",
+      "task_snapshot_kind": "git-commit-claims-v1",
+      "task_sha256": "2e203768615c62674c3b8ae22127cbf34ceef96f078159c0c2523c6c3030c908",
+      "evidence": [],
+      "evidence_manifest_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "id": "wa-8618-r1",
+      "pr": 8618,
+      "revision": 1,
+      "base_sha": "8ebea4b0dbd26461e1788eea9b41b8b3ca79606a",
+      "head_sha": "08c9252c8a872b0b9ffc52a2f2864e55b325a1f4",
+      "tree_sha": "30f7f85ae703ad34d42a0b8bfeb033c988411785",
+      "diff_sha256": "7ce9f55577a833a34ebbca26bef31393d677a6eb2cf6e3e7abc3c143054fba86",
+      "changed_files": [
+        ".github/workflows/green-gate.yml",
+        "tests/test_workflow_runner_policy.py"
+      ],
+      "changed_files_sha256": "2396e0696c2244d841117e4dcfc8737fd4dba41412b511fd932784ed656bd986",
+      "task_snapshot_kind": "git-commit-claims-v1",
+      "task_sha256": "3d0ecf717e3926eb50966a96189345d34189b1d124ed5fbcaf40d8f60cdabec6",
+      "evidence": [],
+      "evidence_manifest_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    }
+  ]
+}

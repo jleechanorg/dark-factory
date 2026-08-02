@@ -29,6 +29,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 PUBLIC_GLOBS = [
     "benchmarks/**/*.md",
     "benchmarks/**/*.dot",
+    "benchmarks/**/*.json",
+    "benchmarks/scripts/*.py",
     "benchmarks/**/prompts/*.md",
     "docs/plans/*.md",
 ]
@@ -56,7 +58,13 @@ def public_files() -> list[pathlib.Path]:
     files: set[pathlib.Path] = set()
     for pattern in PUBLIC_GLOBS:
         files.update(ROOT.glob(pattern))
-    return sorted(path for path in files if path.is_file() and path.name != "README.md")
+    return sorted(
+        path
+        for path in files
+        if path.is_file()
+        and path.name != "README.md"
+        and path.resolve() != pathlib.Path(__file__).resolve()
+    )
 
 
 def check_legacy_snippets() -> list[str]:
@@ -167,6 +175,26 @@ def check_sealed_not_in_specs() -> list[str]:
     return failures
 
 
+def check_cold_review_public_surfaces() -> list[str]:
+    """Keep scorer truth out of the public recall manifest and driver."""
+    failures: list[str] = []
+    paths = (
+        ROOT / "benchmarks/controller-cold-review/cases.json",
+        ROOT / "benchmarks/scripts/run_controller_cold_review.py",
+    )
+    forbidden = ("review_url", "expected_find", "severity", "rubric")
+    for path in paths:
+        if not path.is_file():
+            continue
+        text = path.read_text(errors="replace").lower()
+        for snippet in forbidden:
+            if snippet in text:
+                failures.append(
+                    f"{path.relative_to(ROOT)} leaks sealed scorer field {snippet!r}"
+                )
+    return failures
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -178,6 +206,7 @@ def main() -> int:
     failures.extend(check_agent_facing_dirs())
     failures.extend(check_no_holdouts_dir())
     failures.extend(check_sealed_not_in_specs())
+    failures.extend(check_cold_review_public_surfaces())
 
     if failures:
         print("\n".join(failures), file=sys.stderr)

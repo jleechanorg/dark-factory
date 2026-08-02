@@ -505,7 +505,12 @@ def _gate_subprocess_env(backend: str) -> dict[str, str]:
     return _handlers_shim._sanitized_env()
 
 
-def _build_controller_codex_transport(args: list[str]) -> list[str]:
+def _build_controller_codex_transport(
+    args: list[str],
+    *,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+) -> list[str]:
     """Build the concrete controller transport command for Codex review.
 
     The controller transport is always JSON-over-stdin:
@@ -548,6 +553,17 @@ def _build_controller_codex_transport(args: list[str]) -> list[str]:
             if mode != "read-only":
                 raise ValueError("controller transport requires read-only codex sandboxing")
 
+    pinned: list[str] = []
+    if model is not None:
+        model = model.strip()
+        if not model or any(char in model for char in "\r\n"):
+            raise ValueError("controller model must be a non-empty single line")
+        pinned.extend(("--model", model))
+    if reasoning_effort is not None:
+        if reasoning_effort not in ("minimal", "low", "medium", "high", "xhigh"):
+            raise ValueError("controller reasoning_effort is invalid")
+        pinned.extend(("-c", f"model_reasoning_effort={reasoning_effort}"))
+
     return prepared[:codex_index] + [
         "codex",
         "exec",
@@ -556,6 +572,7 @@ def _build_controller_codex_transport(args: list[str]) -> list[str]:
         "--skip-git-repo-check",
         "--sandbox",
         "read-only",
+        *pinned,
         "-",
     ]
 

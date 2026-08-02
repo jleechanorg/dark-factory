@@ -284,6 +284,44 @@ def test_controller_codex_args_builds_stdin_transport():
     ]
 
 
+def test_controller_codex_transport_pins_model_and_reasoning():
+    """A/B callers can hold model and reasoning constant in the real argv."""
+    from runner.handler_dispatch import _build_controller_codex_transport
+
+    transformed = _build_controller_codex_transport(
+        ["codex", "exec", "PROMPT"],
+        model="gpt-5.6-terra",
+        reasoning_effort="high",
+    )
+
+    assert transformed == [
+        "codex",
+        "exec",
+        "--json",
+        "--ephemeral",
+        "--skip-git-repo-check",
+        "--sandbox",
+        "read-only",
+        "--model",
+        "gpt-5.6-terra",
+        "-c",
+        "model_reasoning_effort=high",
+        "-",
+    ]
+
+
+@pytest.mark.parametrize("reasoning", ("", "extreme", "HIGH"))
+def test_controller_codex_transport_rejects_invalid_reasoning(reasoning):
+    from runner.handler_dispatch import _build_controller_codex_transport
+
+    with pytest.raises(ValueError, match="reasoning_effort"):
+        _build_controller_codex_transport(
+            ["codex", "exec", "PROMPT"],
+            model="gpt-5.6-terra",
+            reasoning_effort=reasoning,
+        )
+
+
 def test_controller_codex_args_rejects_non_codex_command():
     """Unsupported backend command builders must fail closed."""
     from runner.handler_dispatch import _controller_codex_args

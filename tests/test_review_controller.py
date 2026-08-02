@@ -141,6 +141,12 @@ def _v2_request(tmp_path, monkeypatch):
     return create_review_request(_inputs(), review_contract="cold-review-v2")
 
 
+def test_checked_in_v2_template_builds_a_real_request():
+    request = create_review_request(_inputs(), review_contract="cold-review-v2")
+
+    assert request.prompt_id == "controller-cold-review-v2"
+
+
 def _v2_response(request, *, failed: str | None = None) -> str:
     gates = {
         gate_id: ("fail" if gate_id == failed else "pass")
@@ -900,6 +906,82 @@ def test_run_controller_review_allows_plain_text_fail_without_receipts(
     assert result.review.verdict == "fail"
     assert result.receipts == ()
     assert result.response_text == response
+
+
+def test_run_controller_review_records_actual_latency_usage_and_sanitized_env(
+    monkeypatch, tmp_path
+):
+    """Receipts expose measured A/B cost without leaking holdout environment."""
+    import subprocess as subprocess_module
+    import runner.review_controller as controller
+
+    monkeypatch.delenv("DARK_FACTORY_ITERATION_STUB", raising=False)
+    monkeypatch.delenv("DARK_FACTORY_FAKE_LLM", raising=False)
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", "/secret/holdouts")
+    request = create_review_request(_inputs())
+    response = _response(request)
+    raw_jsonl = "\n".join(
+        (
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "command_execution",
+                        "command": "python -m pytest -q",
+                        "exit_code": 0,
+                        "aggregated_output": "24 passed",
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "turn.completed",
+                    "usage": {
+                        "input_tokens": 123,
+                        "cached_input_tokens": 45,
+                        "output_tokens": 67,
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": response},
+                }
+            ),
+        )
+    )
+    observed = {}
+
+    class _FakeProc:
+        returncode = 0
+        stdout = raw_jsonl
+        stderr = ""
+
+    def fake_run(*args, **kwargs):
+        observed["env"] = kwargs.get("env")
+        return _FakeProc()
+
+    monotonic = iter((10.0, 12.75))
+    monkeypatch.setattr(subprocess_module, "run", fake_run)
+    monkeypatch.setattr(controller.time, "monotonic", lambda: next(monotonic))
+
+    result = run_controller_review(
+        request,
+        neutral_cwd=tmp_path,
+        output_dir=tmp_path / "measured",
+        transport_argv=("fake", "codex"),
+        timeout=999.0,
+    )
+
+    receipt = json.loads(Path(result.output_paths["receipt"]).read_text())
+    assert receipt["duration_seconds"] == 2.75
+    assert receipt["usage"] == {
+        "cached_input_tokens": 45,
+        "input_tokens": 123,
+        "output_tokens": 67,
+    }
+    assert "DARK_FACTORY_HOLDOUTS" not in observed["env"]
 
 
 def test_run_controller_review_allows_fail_under_stub_env(monkeypatch, tmp_path):

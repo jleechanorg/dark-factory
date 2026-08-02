@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
@@ -360,11 +361,12 @@ def _load_static_template(contract: ReviewContract) -> tuple[str, str]:
         )
 
     for check_id in contract.check_ids:
-        if contract.name == "cold-review-v2":
-            declaration_pattern = rf"(?m)^- `{re.escape(check_id)}` — .+$"
-        else:
-            declaration_pattern = rf"(?m)^- {re.escape(check_id)}\b"
-        count = len(re.findall(declaration_pattern, text))
+        definition = (
+            rf"(?m)^- (?:{re.escape(check_id)}\b|`{re.escape(check_id)}`(?:[ \t]|$))"
+            if contract.name == "cold-review-v2"
+            else rf"(?m)^- {re.escape(check_id)}\b"
+        )
+        count = len(re.findall(definition, text))
         if count != 1:
             raise ReviewContractError(
                 f"static template must define {check_id} exactly once; found {count}"
@@ -809,6 +811,32 @@ def parse_codex_jsonl(raw: str) -> tuple[str, tuple[ExecutionReceipt, ...]]:
     return response, tuple(receipts)
 
 
+def parse_codex_usage(raw: str) -> dict[str, int]:
+    """Return the final numeric Codex usage record without inventing zeros."""
+    usage: dict[str, int] = {}
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") != "turn.completed":
+            continue
+        candidate = event.get("usage")
+        if not isinstance(candidate, dict):
+            continue
+        usage = {
+            key: value
+            for key, value in candidate.items()
+            if isinstance(key, str)
+            and isinstance(value, int)
+            and not isinstance(value, bool)
+            and value >= 0
+        }
+    return usage
+
+
 def validate_execution_receipts(
     receipts: tuple[ExecutionReceipt, ...],
     review: ValidatedReview,
@@ -905,6 +933,9 @@ def run_controller_review(
     prompt_path.write_text(prompt_text, encoding="utf-8")
     envelope_path.write_text(request.envelope_json, encoding="utf-8")
 
+    from .handler_sandbox import _sanitized_env
+
+    started_at = time.monotonic()
     proc = subprocess.run(
         list(transport_argv),
         cwd=str(neutral_cwd),
@@ -913,8 +944,9 @@ def run_controller_review(
         text=True,
         timeout=timeout,
         check=False,
-        env=transport_env,
+        env=transport_env if transport_env is not None else _sanitized_env(),
     )
+    duration_seconds = max(0.0, time.monotonic() - started_at)
     response_text = proc.stdout
     transport_text = proc.stdout
     response_path.write_text(response_text, encoding="utf-8")
@@ -932,7 +964,8 @@ def run_controller_review(
         "changed_files_sha256": request.changed_files_sha256,
         "evidence_manifest_sha256": request.evidence_manifest_sha256,
         "exit_code": proc.returncode,
-        "duration_seconds": max(0.0, float(timeout)),
+        "duration_seconds": round(duration_seconds, 6),
+        "usage": parse_codex_usage(transport_text),
         "transport_argv": list(transport_argv),
         "neutral_cwd": str(neutral_cwd),
         "output_dir": str(output_dir),
@@ -1040,6 +1073,7 @@ __all__ = [
     "build_envelope",
     "create_review_request",
     "parse_codex_jsonl",
+    "parse_codex_usage",
     "run_controller_review",
     "validate_execution_receipts",
     "validate_review_response",
