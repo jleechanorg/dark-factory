@@ -28,11 +28,8 @@ from .review_controller import (
     ReviewContractError,
     ReviewInputs,
     create_review_request,
-    parse_codex_jsonl,
     run_controller_review,
-    validate_execution_receipts,
     validate_immutable_target,
-    validate_review_response,
 )
 
 
@@ -197,6 +194,11 @@ def _parser() -> argparse.ArgumentParser:
         choices=["codex", "claude", "agy", "minimax", "claude-sonnet"],
         default="codex",
     )
+    parser.add_argument(
+        "--review-contract",
+        choices=["cold-review-v1", "cold-review-v2"],
+        default="cold-review-v1",
+    )
     parser.add_argument("--timeout", type=int, default=1200)
     return parser
 
@@ -247,18 +249,9 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             holdout_roots = ()
         validate_immutable_target(inputs, holdout_roots=holdout_roots)
-        request = create_review_request(inputs)
-        output_dir.mkdir(parents=True, mode=0o700, exist_ok=False)
-        claimed_output = True
-        prompt_path = output_dir / "prompt.txt"
-        envelope_path = output_dir / "envelope.json"
-        response_path = output_dir / "reviewer.output.md"
-        transport_path = output_dir / "transport.jsonl"
-        receipt_path = output_dir / "controller-receipt.json"
-        prompt_bytes = request.prompt.encode("utf-8")
-        envelope_bytes = request.envelope_json.encode("utf-8")
-        _write_atomic(prompt_path, prompt_bytes)
-        _write_atomic(envelope_path, envelope_bytes)
+        request = create_review_request(
+            inputs, review_contract=args.review_contract
+        )
 
         ctx = Context(
             goal="controller-owned cold review",
@@ -275,57 +268,31 @@ def main(argv: list[str] | None = None) -> int:
             raise ReviewContractError(
                 f"review backend could not be launched: {args.backend}"
             )
-        stdin_text = None
-        transport_is_jsonl = args.backend == "codex"
-        if transport_is_jsonl:
+        if args.backend == "codex":
             try:
                 command = _controller_codex_args(command)
             except ValueError as exc:
                 raise ReviewContractError(
                     "codex review command did not contain the codex executable"
                 ) from exc
-            stdin_text = request.prompt
-        proc = subprocess.run(
-            command,
-            cwd=output_dir,
-            capture_output=True,
-            text=True,
-            input=stdin_text,
-            timeout=args.timeout,
-            check=False,
-            env=_gate_subprocess_env(args.backend),
-        )
-        raw_transport = proc.stdout
-        command_receipts = ()
-        response = proc.stdout.strip()
-        parse_error = ""
-        if transport_is_jsonl and proc.returncode == 0:
-            try:
-                response, command_receipts = parse_codex_jsonl(raw_transport)
-            except ReviewContractError as exc:
-                response = ""
-                parse_error = str(exc)
-        response_bytes = response.encode("utf-8")
-        _write_atomic(response_path, response_bytes)
-        if transport_is_jsonl:
-            _write_atomic(transport_path, raw_transport.encode("utf-8"))
 
-        contract_error = parse_error
-        verdict = "invalid"
-        response_sha256 = _sha256(response_bytes)
-        if proc.returncode == 0 and not contract_error:
-            try:
-                validated = validate_review_response(response, request)
-                validate_execution_receipts(command_receipts, validated)
-                verdict = validated.verdict
-                response_sha256 = validated.response_sha256
-            except ReviewContractError as exc:
-                contract_error = str(exc)
-        elif proc.returncode != 0:
-            contract_error = f"review backend exited with {proc.returncode}"
+        # The controller owns transport execution, response/receipt validation,
+        # and the canonical artifact set for both CLI and graph review lanes.
+        claimed_output = True
+        result = run_controller_review(
+            request,
+            neutral_cwd=output_dir,
+            output_dir=output_dir,
+            transport_argv=tuple(command),
+            transport_env=_gate_subprocess_env(args.backend),
+            transport_is_jsonl=args.backend == "codex",
+            timeout=args.timeout,
+        )
 
         after = _snapshot(workdir, base_sha, head_sha)
         _verify_evidence(workdir, evidence)
+        contract_error = ""
+        verdict = result.review.verdict
         if (
             before["head_sha"] != after["head_sha"]
             or before["tree_sha"] != after["tree_sha"]
@@ -334,39 +301,43 @@ def main(argv: list[str] | None = None) -> int:
             contract_error = "reviewed repository changed during cold review"
             verdict = "invalid"
 
+        receipt_path = output_dir / "controller-receipt.json"
+        shared_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        backend_returncode = shared_receipt["exit_code"]
+        if backend_returncode != 0:
+            contract_error = f"review backend exited with {backend_returncode}"
+            verdict = "invalid"
+        prompt_bytes = request.prompt.encode("utf-8")
         receipt = {
             "schema": 1,
             "status": "valid" if not contract_error else "invalid",
             "verdict": verdict,
             "contract_error": contract_error,
             "backend": args.backend,
-            "backend_returncode": proc.returncode,
+            "backend_returncode": backend_returncode,
             "base_sha": base_sha,
             "head_sha": head_sha,
             "tree_sha": before["tree_sha"],
             "diff_sha256": before["diff_sha256"],
+            "review_contract": request.review_contract,
             "prompt_id": request.prompt_id,
             "prompt_sha256": _sha256(prompt_bytes),
             "prompt_payload_sha256": request.prompt_sha256,
             "envelope_sha256": request.envelope_sha256,
-            "response_sha256": response_sha256,
-            "transport_sha256": (
-                _sha256(raw_transport.encode("utf-8"))
-                if transport_is_jsonl
-                else ""
-            ),
+            "response_sha256": result.review.response_sha256,
+            "transport_sha256": _sha256(result.transport_text.encode("utf-8")),
             "command_receipts": [
                 {
                     "command": item.command,
                     "exit_code": item.exit_code,
                     "output_sha256": item.output_sha256,
                 }
-                for item in command_receipts
+                for item in result.receipts
             ],
-            "prompt_path": prompt_path.name,
-            "envelope_path": envelope_path.name,
-            "response_path": response_path.name,
-            "transport_path": transport_path.name if transport_is_jsonl else "",
+            "prompt_path": "prompt.txt",
+            "envelope_path": "envelope.json",
+            "response_path": "reviewer.output.md",
+            "transport_path": "transport.jsonl",
         }
         _write_atomic(
             receipt_path,
@@ -384,6 +355,19 @@ def main(argv: list[str] | None = None) -> int:
             "contract_error": f"{type(exc).__name__}: {exc}",
         }
         if claimed_output:
+            try:
+                existing_receipt = json.loads(
+                    (output_dir / "controller-receipt.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                backend_returncode = existing_receipt.get("exit_code")
+                if isinstance(backend_returncode, int) and not isinstance(
+                    backend_returncode, bool
+                ):
+                    payload["backend_returncode"] = backend_returncode
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                pass
             try:
                 _write_atomic(
                     output_dir / "controller-receipt.json",

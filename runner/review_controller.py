@@ -58,12 +58,16 @@ _V2_TEMPLATE_PATH = (
 _EXPECTED_TEMPLATE_SHA256 = (
     "8c061f886836da61d44c32dc18a461af504b5f1180f63ac4e970e20dacfc3f91"
 )
+_EXPECTED_V2_TEMPLATE_SHA256 = (
+    "64da2a81ce2b713f96c3137c76465c7b24466d94f9baa6b9c568ce3f9f1391f8"
+)
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _FIELD_RE = re.compile(
     r"^([A-Z][A-Z0-9_]*):[ \t]*(\S+)[ \t]*$",
     re.MULTILINE,
 )
+_MACHINE_LINE_CANDIDATE_RE = re.compile(r"^[ \t]*[A-Z][^:\r\n]*:")
 _RESPONSE_BINDING_IDS = (
     "PROMPT_ID",
     "PROMPT_SHA256",
@@ -112,10 +116,7 @@ REVIEW_CONTRACTS = {
         name="cold-review-v2",
         prompt_id=V2_PROMPT_ID,
         template_path=_V2_TEMPLATE_PATH,
-        # The v2 prompt is owned by its separate prompt partition. Its exact
-        # digest remains bound into every request and receipt once that source
-        # file is present; unlike v1, this partition must not invent its pin.
-        expected_template_sha256=None,
+        expected_template_sha256=_EXPECTED_V2_TEMPLATE_SHA256,
         check_ids=V2_GATE_IDS,
         model_verdict_required=False,
     ),
@@ -677,8 +678,18 @@ def validate_review_response(
     if not isinstance(response, str) or not response.strip():
         raise ReviewContractError("review response must be non-empty text")
 
+    findings_heading = re.search(r"(?m)^## Findings[ \t]*$", response)
+    machine_block = response[: findings_heading.start()] if findings_heading else response
     fields: dict[str, list[str]] = {}
-    for key, value in _FIELD_RE.findall(response):
+    for line in machine_block.splitlines():
+        if not _MACHINE_LINE_CANDIDATE_RE.match(line):
+            continue
+        match = _FIELD_RE.fullmatch(line)
+        if match is None:
+            raise ReviewContractError(
+                "malformed machine-readable response line"
+            )
+        key, value = match.groups()
         fields.setdefault(key, []).append(value)
 
     contract = _resolve_review_contract(request.review_contract)
@@ -822,8 +833,10 @@ def validate_execution_receipts(
             raise ReviewContractError(
                 f"command receipt has invalid output digest: {receipt.command}"
             )
-    if not receipts:
-        return
+    if review.verdict == "pass" and not receipts:
+        raise ReviewContractError(
+            "PASS requires at least one validated executed-command receipt"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -849,6 +862,8 @@ def run_controller_review(
     neutral_cwd: "pathlib.Path",
     output_dir: "pathlib.Path",
     transport_argv: tuple[str, ...],
+    transport_env: dict[str, str] | None = None,
+    transport_is_jsonl: bool = True,
     timeout: float = 1200.0,
 ) -> ControllerReviewResult:
     """Run one controller-owned review lane and write its artifacts.
@@ -857,8 +872,10 @@ def run_controller_review(
     ``runner.handler_dispatch._build_controller_codex_transport``. This
     helper deliberately knows nothing about how the transport is constructed
     — that decision is owned by the dispatch module — but it owns the
-    subprocess invocation, JSONL parsing, response + receipt validation, and
-    canonical artifact emission. Both ``runner.review_cli`` and
+    subprocess invocation, transport parsing, response + receipt validation,
+    and canonical artifact emission. ``transport_is_jsonl`` keeps the Codex
+    event stream as the default while allowing shared plain-text transports.
+    Both ``runner.review_cli`` and
     ``runner.handler_parallel_reviewer`` route through this function so they
     cannot diverge on shape or digest handling.
     """
@@ -896,13 +913,42 @@ def run_controller_review(
         text=True,
         timeout=timeout,
         check=False,
+        env=transport_env,
     )
     response_text = proc.stdout
     transport_text = proc.stdout
     response_path.write_text(response_text, encoding="utf-8")
     transport_path.write_text(transport_text, encoding="utf-8")
 
-    response_body, receipts = parse_codex_jsonl(transport_text)
+    receipt = {
+        "schema": 1,
+        "review_contract": request.review_contract,
+        "prompt_id": request.prompt_id,
+        "prompt_sha256": request.prompt_sha256,
+        "envelope_sha256": request.envelope_sha256,
+        "head_sha": request.head_sha,
+        "task_sha256": request.task_sha256,
+        "diff_sha256": request.diff_sha256,
+        "changed_files_sha256": request.changed_files_sha256,
+        "evidence_manifest_sha256": request.evidence_manifest_sha256,
+        "exit_code": proc.returncode,
+        "duration_seconds": max(0.0, float(timeout)),
+        "transport_argv": list(transport_argv),
+        "neutral_cwd": str(neutral_cwd),
+        "output_dir": str(output_dir),
+        "timestamp": _utc_now_iso(),
+    }
+    if proc.returncode != 0:
+        receipt_path.write_text(
+            json.dumps(receipt, indent=2, sort_keys=True, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        raise ReviewContractError(f"review transport exited with {proc.returncode}")
+
+    if transport_is_jsonl:
+        response_body, receipts = parse_codex_jsonl(transport_text)
+    else:
+        response_body, receipts = transport_text, ()
     response_path.write_text(response_body, encoding="utf-8")
     review = validate_review_response(response_body, request)
     validate_execution_receipts(receipts, review)
@@ -917,34 +963,20 @@ def run_controller_review(
             "stub mode drives iteration ceilings and cannot transition to READY"
         )
 
-    receipt = {
-        "schema": 1,
-        "review_contract": request.review_contract,
-        "prompt_id": request.prompt_id,
-        "prompt_sha256": request.prompt_sha256,
-        "envelope_sha256": request.envelope_sha256,
-        "head_sha": request.head_sha,
-        "task_sha256": request.task_sha256,
-        "diff_sha256": request.diff_sha256,
-        "changed_files_sha256": request.changed_files_sha256,
-        "evidence_manifest_sha256": request.evidence_manifest_sha256,
-        "response_sha256": review.response_sha256,
-        "verdict": review.verdict,
-        "exit_code": proc.returncode,
-        "duration_seconds": max(0.0, float(timeout)),
-        "transport_argv": list(transport_argv),
-        "neutral_cwd": str(neutral_cwd),
-        "output_dir": str(output_dir),
-        "receipts": [
-            {
-                "command": receipt.command,
-                "exit_code": receipt.exit_code,
-                "output_sha256": receipt.output_sha256,
-            }
-            for receipt in receipts
-        ],
-        "timestamp": _utc_now_iso(),
-    }
+    receipt.update(
+        {
+            "response_sha256": review.response_sha256,
+            "verdict": review.verdict,
+            "receipts": [
+                {
+                    "command": receipt.command,
+                    "exit_code": receipt.exit_code,
+                    "output_sha256": receipt.output_sha256,
+                }
+                for receipt in receipts
+            ],
+        }
+    )
     receipt_path.write_text(
         json.dumps(receipt, indent=2, sort_keys=True, ensure_ascii=False),
         encoding="utf-8",

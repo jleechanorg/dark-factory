@@ -6,11 +6,12 @@ import json
 import hashlib
 import re
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
 from runner.review_cli import main
-from runner.review_controller import CHECK_IDS
+from runner.review_controller import CHECK_IDS, ReviewContractError
 
 
 def _repo(tmp_path):
@@ -139,6 +140,7 @@ def test_review_command_writes_valid_digest_bound_receipt(tmp_path, monkeypatch,
     receipt = json.loads((output / "controller-receipt.json").read_text())
     assert receipt["status"] == "valid"
     assert receipt["verdict"] == "pass"
+    assert receipt["review_contract"] == "cold-review-v1"
     assert receipt["head_sha"] == head
     assert len(receipt["prompt_sha256"]) == 64
     assert len(receipt["prompt_payload_sha256"]) == 64
@@ -157,6 +159,224 @@ def test_review_command_writes_valid_digest_bound_receipt(tmp_path, monkeypatch,
     assert (output / "envelope.json").is_file()
     assert (output / "reviewer.output.md").is_file()
     assert json.loads(capsys.readouterr().out)["status"] == "valid"
+
+
+def test_review_command_routes_explicit_v2_contract_to_shared_controller(
+    tmp_path, monkeypatch
+):
+    repo, base, head = _repo(tmp_path)
+    task = tmp_path / "task.md"
+    task.write_text("Review the behavior change.", encoding="utf-8")
+    captured = []
+
+    monkeypatch.setattr(
+        "runner.review_cli._gate_subprocess_args",
+        lambda backend, prompt, ctx, timeout: ["codex", "exec", prompt],
+    )
+
+    def fake_run_controller_review(request, **kwargs):
+        captured.append((request, kwargs))
+        output_dir = kwargs["output_dir"]
+        output_dir.mkdir()
+        (output_dir / "controller-receipt.json").write_text(
+            json.dumps({"exit_code": 0}), encoding="utf-8"
+        )
+        return SimpleNamespace(
+            review=SimpleNamespace(verdict="pass", response_sha256="a" * 64),
+            receipts=(),
+            transport_text="",
+            output_paths={},
+        )
+
+    monkeypatch.setattr(
+        "runner.review_cli.run_controller_review", fake_run_controller_review
+    )
+
+    rc = main(
+        [
+            "--workdir",
+            str(repo),
+            "--base-sha",
+            base,
+            "--head-sha",
+            head,
+            "--task-file",
+            str(task),
+            "--output-dir",
+            str(tmp_path / "review-output"),
+            "--review-contract",
+            "cold-review-v2",
+        ]
+    )
+
+    assert rc == 0
+    assert len(captured) == 1
+    request, kwargs = captured[0]
+    assert request.review_contract == "cold-review-v2"
+    assert request.prompt_id == "controller-cold-review-v2"
+    assert kwargs["neutral_cwd"] == tmp_path / "review-output"
+    assert kwargs["transport_argv"][:3] == ("codex", "exec", "--json")
+    assert kwargs["transport_is_jsonl"] is True
+
+
+def test_review_command_preserves_non_codex_backend_and_sanitized_env(
+    tmp_path, monkeypatch
+):
+    repo, base, head = _repo(tmp_path)
+    task = tmp_path / "task.md"
+    task.write_text("Review the behavior change.", encoding="utf-8")
+    output = tmp_path / "review-output"
+    captured = []
+    transport_env = {"ANTHROPIC_BASE_URL": "https://api.minimax.io/anthropic"}
+
+    monkeypatch.setattr(
+        "runner.review_cli._gate_subprocess_args",
+        lambda backend, prompt, ctx, timeout: ["claude", "--print", prompt],
+    )
+    monkeypatch.setattr(
+        "runner.review_cli._gate_subprocess_env",
+        lambda backend: transport_env,
+    )
+
+    def fake_run_controller_review(request, **kwargs):
+        captured.append((request, kwargs))
+        output_dir = kwargs["output_dir"]
+        output_dir.mkdir()
+        (output_dir / "controller-receipt.json").write_text(
+            json.dumps({"exit_code": 0}), encoding="utf-8"
+        )
+        return SimpleNamespace(
+            review=SimpleNamespace(verdict="pass", response_sha256="a" * 64),
+            receipts=(),
+            transport_text="",
+            output_paths={},
+        )
+
+    monkeypatch.setattr(
+        "runner.review_cli.run_controller_review", fake_run_controller_review
+    )
+
+    rc = main(
+        [
+            "--workdir",
+            str(repo),
+            "--base-sha",
+            base,
+            "--head-sha",
+            head,
+            "--task-file",
+            str(task),
+            "--output-dir",
+            str(output),
+            "--backend",
+            "minimax",
+        ]
+    )
+
+    assert rc == 0
+    assert len(captured) == 1
+    _, kwargs = captured[0]
+    assert kwargs["transport_argv"] == ("claude", "--print", captured[0][0].prompt)
+    assert kwargs["transport_env"] is transport_env
+    assert kwargs["transport_is_jsonl"] is False
+
+
+def test_review_command_preserves_shared_error_backend_returncode(
+    tmp_path, monkeypatch
+):
+    repo, base, head = _repo(tmp_path)
+    task = tmp_path / "task.md"
+    task.write_text("Review the behavior change.", encoding="utf-8")
+    output = tmp_path / "review-output"
+
+    monkeypatch.setattr(
+        "runner.review_cli._gate_subprocess_args",
+        lambda backend, prompt, ctx, timeout: ["codex", "exec", prompt],
+    )
+
+    def fake_run_controller_review(request, **kwargs):
+        output_dir = kwargs["output_dir"]
+        output_dir.mkdir()
+        (output_dir / "controller-receipt.json").write_text(
+            json.dumps({"exit_code": 17}), encoding="utf-8"
+        )
+        raise ReviewContractError("review backend exited with 17")
+
+    monkeypatch.setattr(
+        "runner.review_cli.run_controller_review", fake_run_controller_review
+    )
+
+    rc = main(
+        [
+            "--workdir",
+            str(repo),
+            "--base-sha",
+            base,
+            "--head-sha",
+            head,
+            "--task-file",
+            str(task),
+            "--output-dir",
+            str(output),
+        ]
+    )
+
+    assert rc == 1
+    receipt = json.loads((output / "controller-receipt.json").read_text())
+    assert receipt["status"] == "invalid"
+    assert receipt["backend_returncode"] == 17
+
+
+def test_review_command_treats_nonzero_shared_backend_exit_as_invalid(
+    tmp_path, monkeypatch
+):
+    repo, base, head = _repo(tmp_path)
+    task = tmp_path / "task.md"
+    task.write_text("Review the behavior change.", encoding="utf-8")
+    output = tmp_path / "review-output"
+
+    monkeypatch.setattr(
+        "runner.review_cli._gate_subprocess_args",
+        lambda backend, prompt, ctx, timeout: ["codex", "exec", prompt],
+    )
+
+    def fake_run_controller_review(request, **kwargs):
+        output_dir = kwargs["output_dir"]
+        output_dir.mkdir()
+        (output_dir / "controller-receipt.json").write_text(
+            json.dumps({"exit_code": 9}), encoding="utf-8"
+        )
+        return SimpleNamespace(
+            review=SimpleNamespace(verdict="pass", response_sha256="a" * 64),
+            receipts=(),
+            transport_text="",
+            output_paths={},
+        )
+
+    monkeypatch.setattr(
+        "runner.review_cli.run_controller_review", fake_run_controller_review
+    )
+
+    rc = main(
+        [
+            "--workdir",
+            str(repo),
+            "--base-sha",
+            base,
+            "--head-sha",
+            head,
+            "--task-file",
+            str(task),
+            "--output-dir",
+            str(output),
+        ]
+    )
+
+    assert rc == 1
+    receipt = json.loads((output / "controller-receipt.json").read_text())
+    assert receipt["status"] == "invalid"
+    assert receipt["verdict"] == "invalid"
+    assert receipt["contract_error"] == "review backend exited with 9"
 
 
 def test_review_command_fails_closed_on_unstructured_response(
@@ -253,4 +473,4 @@ def test_main_entrypoint_dispatches_review_subcommand(capsys):
     assert "--task-file" in captured.out
     assert "--output-dir" in captured.out
     assert "--backend" in captured.out
-
+    assert "--review-contract" in captured.out
