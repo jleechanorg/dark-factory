@@ -12,6 +12,7 @@ import pytest
 
 from benchmarks.scripts.run_controller_cold_review import (
     BenchmarkError,
+    DEFAULT_WORKERS,
     FREEFORM_PROMPTS,
     MANUAL_OBSERVATION_PROMPT,
     MANUAL_OBSERVATION_SOURCE,
@@ -350,6 +351,7 @@ def _fake_validated_control_review(request, *, neutral_cwd, output_dir, **_kwarg
     output_dir.mkdir(parents=True)
     response = (
         "PROMPT_ID: controller-cold-review-v2\n"
+        "HEAD_SHA: bound-control-head\n"
         "## Findings\nControl narrative.\n"
         "## Commands Executed\nNone.\n"
         "## Evidence Checked\nDiff.\n## Caveats\nNone.\n"
@@ -475,7 +477,11 @@ def test_run_screen_uses_raw_freeform_transport_and_transcript_bundles(
         for arm in ("arm-1", "arm-2", "arm-3")
         for case in json.loads((output / f"blinded-{arm}-bundle.json").read_text())["cases"]
     ]
-    assert sum(text.startswith("PROMPT_ID: controller-cold-review-v2") for text in transcripts) == 3
+    control_transcripts = [text for text in transcripts if "Control narrative." in text]
+    assert len(control_transcripts) == 3
+    assert all("controller-cold-review-v2" not in text for text in control_transcripts)
+    assert all(text.startswith("HEAD_SHA: bound-control-head\n") for text in control_transcripts)
+    assert all("## Findings\nControl narrative." in text for text in control_transcripts)
     freeform_records = [
         json.loads(path.read_text())
         for path in (output / "raw").glob("*/*/run-record.json")
@@ -611,6 +617,92 @@ def test_run_screen_preserves_timeout_and_launch_failure_receipts(
         assert any(path.read_text() == partial for path in transport_paths)
 
 
+@pytest.mark.parametrize("failure", ("timeout", "launch"))
+def test_control_arm_preserves_timeout_and_launch_failure_receipts(
+    tmp_path, monkeypatch, failure
+):
+    repo, manifest = _fixture_screen(tmp_path)
+    output = tmp_path / f"control-{failure}-screen"
+    real_run = subprocess.run
+    partial = "partial validated-control transport\n"
+    monkeypatch.setattr(
+        "benchmarks.scripts.run_controller_cold_review._gate_subprocess_args",
+        lambda *args, **kwargs: ["codex", "exec", "PROMPT"],
+    )
+
+    def failed_control(*_args, **_kwargs):
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(
+                ["codex"],
+                SCREEN_TIMEOUT_SECONDS,
+                output=partial,
+                stderr="partial control stderr",
+            )
+        raise OSError("control launch failed")
+
+    def successful_raw(args, **kwargs):
+        if args and args[0] == "git":
+            return real_run(args, **kwargs)
+        raw = "\n".join(
+            (
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {"type": "agent_message", "text": "Raw finding."},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "turn.completed",
+                        "usage": {"input_tokens": 4, "output_tokens": 2},
+                    }
+                ),
+            )
+        ) + "\n"
+        return subprocess.CompletedProcess(args, 0, stdout=raw, stderr="")
+
+    monkeypatch.setattr(
+        "benchmarks.scripts.run_controller_cold_review.run_controller_review",
+        failed_control,
+    )
+    monkeypatch.setattr(
+        "benchmarks.scripts.run_controller_cold_review.subprocess.run",
+        successful_raw,
+    )
+
+    with pytest.raises(BenchmarkError, match=f"control review transport {failure}"):
+        run_screen(
+            manifest,
+            case_ids=list(SCREEN_CASE_IDS),
+            repo=repo,
+            output_dir=output,
+            seed=20260802,
+            model=SCREEN_MODEL,
+            reasoning_effort=SCREEN_REASONING_EFFORT,
+            timeout_seconds=SCREEN_TIMEOUT_SECONDS,
+            workers=SCREEN_WORKERS,
+        )
+
+    plan_sha = hashlib.sha256((output / "run-plan.json").read_bytes()).hexdigest()
+    map_sha = hashlib.sha256(
+        (output / "private-arm-map.json").read_bytes()
+    ).hexdigest()
+    receipts = [
+        json.loads(path.read_text())
+        for path in (output / "raw").glob("*/*/controller-receipt.json")
+        if json.loads(path.read_text()).get("failure_class") == failure
+    ]
+    assert receipts
+    assert all(receipt["review_contract"] == "cold-review-v2" for receipt in receipts)
+    assert all(receipt["public_plan_sha256"] == plan_sha for receipt in receipts)
+    assert all(receipt["private_arm_map_sha256"] == map_sha for receipt in receipts)
+    if failure == "timeout":
+        assert any(
+            path.read_text() == partial
+            for path in (output / "raw").glob("*/*/transport.jsonl")
+        )
+
+
 def test_screen_concurrency_is_measured_at_live_reviewer_call_seam(
     tmp_path, monkeypatch
 ):
@@ -684,6 +776,7 @@ def test_screen_concurrency_is_measured_at_live_reviewer_call_seam(
     concurrency = json.loads((output / "concurrency.json").read_text())
     assert concurrency == {
         "measurement": "live-reviewer-calls",
+        "observed_max_calls": SCREEN_WORKERS,
         "observed_max_cases": SCREEN_WORKERS,
         "requested_workers": SCREEN_WORKERS,
     }
@@ -695,6 +788,8 @@ def test_manual_observation_runs_after_screen_and_stays_outside_arm_map(
     repo, manifest = _fixture_screen(tmp_path)
     output = tmp_path / "observational-screen"
     prompts = []
+    observation_barrier = threading.Barrier(SCREEN_WORKERS)
+    tracker_ids = set()
     monkeypatch.setattr(
         "benchmarks.scripts.run_controller_cold_review._gate_subprocess_args",
         lambda *args, **kwargs: ["codex", "exec", "PROMPT"],
@@ -705,27 +800,39 @@ def test_manual_observation_runs_after_screen_and_stays_outside_arm_map(
     )
 
     def fake_raw(
-        _inputs, *, prompt, output_dir, receipt_bindings=None, **_kwargs
+        _inputs,
+        *,
+        prompt,
+        output_dir,
+        receipt_bindings=None,
+        call_tracker=None,
+        tracker_phase="screen",
+        **_kwargs,
     ):
         prompts.append(prompt)
-        output_dir.mkdir(parents=True)
-        paths = {}
-        for name, filename in {
-            "prompt": "prompt.txt",
-            "envelope": "envelope.json",
-            "transport": "transport.jsonl",
-            "response": "reviewer.output.md",
-            "receipt": "controller-receipt.json",
-        }.items():
-            path = output_dir / filename
-            path.write_text(prompt if name in ("prompt", "response") else "{}\n")
-            paths[name] = path
-        receipt = {
-            "duration_seconds": 0.1,
-            "usage": {"input_tokens": 3, "output_tokens": 2},
-            **(receipt_bindings or {}),
-        }
-        paths["receipt"].write_text(json.dumps(receipt))
+        assert call_tracker is not None
+        tracker_ids.add(id(call_tracker))
+        with call_tracker.track(tracker_phase):
+            if tracker_phase == "manual-observation":
+                observation_barrier.wait(timeout=5)
+            output_dir.mkdir(parents=True)
+            paths = {}
+            for name, filename in {
+                "prompt": "prompt.txt",
+                "envelope": "envelope.json",
+                "transport": "transport.jsonl",
+                "response": "reviewer.output.md",
+                "receipt": "controller-receipt.json",
+            }.items():
+                path = output_dir / filename
+                path.write_text(prompt if name in ("prompt", "response") else "{}\n")
+                paths[name] = path
+            receipt = {
+                "duration_seconds": 0.1,
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+                **(receipt_bindings or {}),
+            }
+            paths["receipt"].write_text(json.dumps(receipt))
         return {"transcript": prompt, "receipt": receipt, "paths": paths}
 
     monkeypatch.setattr(
@@ -747,6 +854,7 @@ def test_manual_observation_runs_after_screen_and_stays_outside_arm_map(
     )
 
     assert len(prompts) == 9
+    assert len(tracker_ids) == 1
     assert all(prompt in FREEFORM_PROMPTS.values() for prompt in prompts[:6])
     assert set(prompts[6:]) == {
         render_manual_observation_prompt(
@@ -768,6 +876,23 @@ def test_manual_observation_runs_after_screen_and_stays_outside_arm_map(
     assert receipt["observational"] is True
     assert receipt["eligible_for_advancement"] is False
     assert receipt["source"] == MANUAL_OBSERVATION_SOURCE
+    observation_plan_sha = hashlib.sha256(
+        (output / "manual-observation-plan.json").read_bytes()
+    ).hexdigest()
+    assert receipt["manual_observation_plan_sha256"] == observation_plan_sha
+    record_path = next((output / "manual-observation/raw").glob("*/run-record.json"))
+    record = json.loads(record_path.read_text())
+    assert record["manual_observation_plan_sha256"] == observation_plan_sha
+    assert observation["manual_observation_plan_sha256"] == observation_plan_sha
+    observation_concurrency = json.loads(
+        (output / "manual-observation-concurrency.json").read_text()
+    )
+    assert observation_concurrency == {
+        "measurement": "live-reviewer-calls",
+        "observed_max_calls": SCREEN_WORKERS,
+        "observed_max_cases": SCREEN_WORKERS,
+        "requested_workers": SCREEN_WORKERS,
+    }
 
 
 def test_screen_cli_reports_selected_case_count(tmp_path, monkeypatch, capsys):
@@ -790,8 +915,6 @@ def test_screen_cli_reports_selected_case_count(tmp_path, monkeypatch, capsys):
             "--output", str(tmp_path / "screen"),
             "--model", SCREEN_MODEL,
             "--reasoning-effort", SCREEN_REASONING_EFFORT,
-            "--timeout", str(SCREEN_TIMEOUT_SECONDS),
-            "--workers", str(SCREEN_WORKERS),
             *[
                 value
                 for case_id in SCREEN_CASE_IDS
@@ -802,6 +925,8 @@ def test_screen_cli_reports_selected_case_count(tmp_path, monkeypatch, capsys):
 
     assert rc == 0
     assert captured["case_ids"] == list(SCREEN_CASE_IDS)
+    assert captured["timeout_seconds"] == SCREEN_TIMEOUT_SECONDS
+    assert captured["workers"] == SCREEN_WORKERS
     assert json.loads(capsys.readouterr().out) == {
         "status": "valid",
         "cases": len(SCREEN_CASE_IDS),
@@ -831,6 +956,34 @@ def test_non_screen_commands_reject_screen_only_flags(
 
     assert main(args) == 1
     assert error in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_run_cli_retains_legacy_timeout_and_worker_defaults(
+    tmp_path, monkeypatch, capsys
+):
+    captured = {}
+    manifest = load_manifest(MANIFEST)
+    monkeypatch.setattr(
+        "benchmarks.scripts.run_controller_cold_review.load_manifest",
+        lambda _path: manifest,
+    )
+    monkeypatch.setattr(
+        "benchmarks.scripts.run_controller_cold_review.run_benchmark",
+        lambda *args, **kwargs: captured.update(kwargs),
+    )
+
+    assert main(
+        [
+            "run",
+            "--manifest", str(MANIFEST),
+            "--repo", str(tmp_path),
+            "--output", str(tmp_path / "run"),
+            "--model", "gpt-5.6-terra",
+        ]
+    ) == 0
+    assert captured["timeout_seconds"] == 1200
+    assert captured["workers"] == DEFAULT_WORKERS
+    assert json.loads(capsys.readouterr().out)["cases"] == len(manifest["cases"])
 
 
 def test_run_preserves_raw_artifacts_and_writes_digest_bound_arm_records(

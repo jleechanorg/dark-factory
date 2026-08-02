@@ -469,6 +469,16 @@ def _narrative_transcript(response: str) -> str:
     return transcript
 
 
+def _blinded_control_transcript(response: str) -> str:
+    """Remove only the validated model-owned identity line; preserve all else."""
+    identity = "PROMPT_ID: controller-cold-review-v2"
+    lines = response.splitlines(keepends=True)
+    matches = [line for line in lines if line.rstrip("\r\n") == identity]
+    if len(matches) != 1:
+        raise BenchmarkError("control response must contain exactly one prompt identity")
+    return "".join(line for line in lines if line.rstrip("\r\n") != identity)
+
+
 def _file_digest(path: str | pathlib.Path) -> str:
     return _sha256(pathlib.Path(path).read_bytes())
 
@@ -511,23 +521,35 @@ class _LiveReviewerCalls:
     def __init__(self) -> None:
         self._active = 0
         self._maximum = 0
+        self._active_by_phase: dict[str, int] = {}
+        self._maximum_by_phase: dict[str, int] = {}
         self._lock = threading.Lock()
 
     @contextmanager
-    def track(self):
+    def track(self, phase: str = "screen"):
         with self._lock:
             self._active += 1
             self._maximum = max(self._maximum, self._active)
+            self._active_by_phase[phase] = self._active_by_phase.get(phase, 0) + 1
+            self._maximum_by_phase[phase] = max(
+                self._maximum_by_phase.get(phase, 0),
+                self._active_by_phase[phase],
+            )
         try:
             yield
         finally:
             with self._lock:
                 self._active -= 1
+                self._active_by_phase[phase] -= 1
 
     @property
     def maximum(self) -> int:
         with self._lock:
             return self._maximum
+
+    def maximum_for(self, phase: str) -> int:
+        with self._lock:
+            return self._maximum_by_phase.get(phase, 0)
 
 
 def _controller_transport(
@@ -647,6 +669,7 @@ def _run_raw_freeform_review(
     reasoning_effort: str,
     timeout_seconds: int,
     call_tracker: _LiveReviewerCalls | None = None,
+    tracker_phase: str = "screen",
     receipt_bindings: dict | None = None,
 ) -> dict:
     """Execute one unparsed transcript call and preserve its bound artifacts."""
@@ -687,7 +710,11 @@ def _run_raw_freeform_review(
         "neutral_cwd": str(neutral_cwd.resolve()),
         **(receipt_bindings or {}),
     }
-    tracker_context = call_tracker.track() if call_tracker is not None else nullcontext()
+    tracker_context = (
+        call_tracker.track(tracker_phase)
+        if call_tracker is not None
+        else nullcontext()
+    )
     started_at = time.monotonic()
     try:
         with tracker_context:
@@ -795,6 +822,115 @@ def _run_raw_freeform_review(
     }
 
 
+def _failure_text(value: str | bytes | None) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value or ""
+
+
+def _preserve_control_failure(
+    request,
+    *,
+    output_dir: pathlib.Path,
+    neutral_cwd: pathlib.Path,
+    argv: list[str],
+    duration_seconds: float,
+    failure_class: str,
+    stdout: str | bytes | None,
+    stderr: str | bytes | None,
+    receipt_bindings: dict,
+) -> None:
+    """Persist a failed validated-control attempt before surfacing the error."""
+    output_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    stdout_text = _failure_text(stdout)
+    stderr_text = _failure_text(stderr)
+    paths = {
+        "prompt": output_dir / "prompt.txt",
+        "envelope": output_dir / "envelope.json",
+        "transport": output_dir / "transport.jsonl",
+        "stderr": output_dir / "transport.stderr.txt",
+        "receipt": output_dir / "controller-receipt.json",
+    }
+    paths["prompt"].write_text(request.prompt, encoding="utf-8")
+    paths["envelope"].write_text(request.envelope_json, encoding="utf-8")
+    paths["transport"].write_text(stdout_text, encoding="utf-8")
+    paths["stderr"].write_text(stderr_text, encoding="utf-8")
+    envelope = json.loads(request.envelope_json)
+    receipt = {
+        "schema": 1,
+        "attempt_id": envelope.get("run_id", ""),
+        "review_contract": request.review_contract,
+        "prompt_id": request.prompt_id,
+        "prompt_sha256": request.prompt_sha256,
+        "envelope_sha256": request.envelope_sha256,
+        "head_sha": request.head_sha,
+        "task_sha256": request.task_sha256,
+        "diff_sha256": request.diff_sha256,
+        "changed_files_sha256": request.changed_files_sha256,
+        "evidence_manifest_sha256": request.evidence_manifest_sha256,
+        "exit_code": None,
+        "failure_class": failure_class,
+        "duration_seconds": round(duration_seconds, 6),
+        "usage": parse_codex_usage(stdout_text),
+        "transport_argv": argv,
+        "neutral_cwd": str(neutral_cwd.resolve()),
+        "transport_sha256": _sha256(stdout_text.encode()),
+        "stderr_sha256": _sha256(stderr_text.encode()),
+        **receipt_bindings,
+    }
+    paths["receipt"].write_text(
+        json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
+def _run_screen_control_review(
+    request,
+    *,
+    neutral_cwd: pathlib.Path,
+    output_dir: pathlib.Path,
+    argv: list[str],
+    timeout_seconds: int,
+    call_tracker: _LiveReviewerCalls,
+    receipt_bindings: dict,
+):
+    started_at = time.monotonic()
+    try:
+        with call_tracker.track("screen"):
+            return run_controller_review(
+                request,
+                neutral_cwd=neutral_cwd,
+                output_dir=output_dir,
+                transport_argv=tuple(argv),
+                timeout=timeout_seconds,
+            )
+    except subprocess.TimeoutExpired as exc:
+        _preserve_control_failure(
+            request,
+            output_dir=output_dir,
+            neutral_cwd=neutral_cwd,
+            argv=argv,
+            duration_seconds=max(0.0, time.monotonic() - started_at),
+            failure_class="timeout",
+            stdout=exc.stdout if exc.stdout is not None else exc.output,
+            stderr=exc.stderr,
+            receipt_bindings=receipt_bindings,
+        )
+        raise BenchmarkError("control review transport timeout") from exc
+    except OSError as exc:
+        _preserve_control_failure(
+            request,
+            output_dir=output_dir,
+            neutral_cwd=neutral_cwd,
+            argv=argv,
+            duration_seconds=max(0.0, time.monotonic() - started_at),
+            failure_class="launch",
+            stdout="",
+            stderr=str(exc),
+            receipt_bindings=receipt_bindings,
+        )
+        raise BenchmarkError(f"control review transport launch failed: {exc}") from exc
+
+
 def run_screen(
     manifest: dict,
     *,
@@ -888,20 +1024,21 @@ def run_screen(
                 reasoning_effort=reasoning_effort,
                 timeout_seconds=timeout_seconds,
             )
-            with call_tracker.track():
-                result = run_controller_review(
-                    request,
-                    neutral_cwd=neutral,
-                    output_dir=raw_dir,
-                    transport_argv=tuple(argv),
-                    timeout=timeout_seconds,
-                )
+            result = _run_screen_control_review(
+                request,
+                neutral_cwd=neutral,
+                output_dir=raw_dir,
+                argv=argv,
+                timeout_seconds=timeout_seconds,
+                call_tracker=call_tracker,
+                receipt_bindings=run_bindings,
+            )
             receipt = json.loads(
                 pathlib.Path(result.output_paths["receipt"]).read_text()
             )
             if not receipt.get("usage"):
                 raise BenchmarkError("control review transport emitted no usage record")
-            transcript = result.response_text
+            transcript = _blinded_control_transcript(result.response_text)
             artifact_paths = {
                 name: pathlib.Path(path)
                 for name, path in result.output_paths.items()
@@ -962,10 +1099,12 @@ def run_screen(
             reasoning_effort=reasoning_effort,
             timeout_seconds=timeout_seconds,
         )
-        (output_dir / "manual-observation-plan.json").write_text(
+        observation_plan_path = output_dir / "manual-observation-plan.json"
+        observation_plan_path.write_text(
             json.dumps(observation_plan, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+        manual_observation_plan_sha256 = _file_digest(observation_plan_path)
 
         def run_observation(case: dict, worktree: pathlib.Path) -> dict:
             case_id = case["id"]
@@ -981,6 +1120,7 @@ def run_screen(
                 "eligible_for_advancement": False,
                 "source": dict(MANUAL_OBSERVATION_SOURCE),
                 "rendered_prompt_sha256": _sha256(prompt.encode()),
+                "manual_observation_plan_sha256": manual_observation_plan_sha256,
             }
             raw = _run_raw_freeform_review(
                 replace(inputs, run_id=f"{case_id}-manual-observation"),
@@ -990,6 +1130,8 @@ def run_screen(
                 model=model,
                 reasoning_effort=reasoning_effort,
                 timeout_seconds=timeout_seconds,
+                call_tracker=call_tracker,
+                tracker_phase="manual-observation",
                 receipt_bindings=observation_bindings,
             )
             record = {
@@ -1019,6 +1161,23 @@ def run_screen(
             workers=workers,
             run_case=run_observation,
         )
+        (output_dir / "manual-observation-concurrency.json").write_text(
+            json.dumps(
+                {
+                    "measurement": "live-reviewer-calls",
+                    "observed_max_calls": call_tracker.maximum_for(
+                        "manual-observation"
+                    ),
+                    "observed_max_cases": call_tracker.maximum_for(
+                        "manual-observation"
+                    ),
+                    "requested_workers": workers,
+                },
+                indent=2,
+                sort_keys=True,
+            ) + "\n",
+            encoding="utf-8",
+        )
 
     _write_arm_bundles(
         output_dir=output_dir,
@@ -1038,6 +1197,7 @@ def run_screen(
             "source": dict(MANUAL_OBSERVATION_SOURCE),
             "public_plan_sha256": public_plan_sha256,
             "private_arm_map_sha256": private_arm_map_sha256,
+            "manual_observation_plan_sha256": manual_observation_plan_sha256,
             "cases": [observations_by_case[case["id"]] for case in cases],
         }
         (output_dir / "manual-observation-bundle.json").write_text(
@@ -1048,7 +1208,8 @@ def run_screen(
         json.dumps(
             {
                 "measurement": "live-reviewer-calls",
-                "observed_max_cases": call_tracker.maximum,
+                "observed_max_calls": call_tracker.maximum_for("screen"),
+                "observed_max_cases": call_tracker.maximum_for("screen"),
                 "requested_workers": workers,
             },
             indent=2,
@@ -1227,8 +1388,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=86038618)
     parser.add_argument("--model")
     parser.add_argument("--reasoning-effort", default="high")
-    parser.add_argument("--timeout", type=int, default=1200)
-    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+    parser.add_argument("--timeout", type=int)
+    parser.add_argument("--workers", type=int)
     parser.add_argument("--case-id", action="append", default=[])
     parser.add_argument("--include-manual-observation", action="store_true")
     return parser
@@ -1255,8 +1416,8 @@ def main(argv: list[str] | None = None) -> int:
                 seed=args.seed,
                 model=args.model,
                 reasoning_effort=args.reasoning_effort,
-                timeout_seconds=args.timeout,
-                workers=args.workers,
+                timeout_seconds=args.timeout if args.timeout is not None else 1200,
+                workers=args.workers if args.workers is not None else DEFAULT_WORKERS,
             )
         elif args.command == "screen":
             if args.output is None or not args.model:
@@ -1275,8 +1436,14 @@ def main(argv: list[str] | None = None) -> int:
                 seed=args.seed,
                 model=args.model,
                 reasoning_effort=args.reasoning_effort,
-                timeout_seconds=args.timeout,
-                workers=args.workers,
+                timeout_seconds=(
+                    args.timeout
+                    if args.timeout is not None
+                    else SCREEN_TIMEOUT_SECONDS
+                ),
+                workers=(
+                    args.workers if args.workers is not None else SCREEN_WORKERS
+                ),
                 include_manual_observation=args.include_manual_observation,
             )
             selected_case_count = len(SCREEN_CASE_IDS)
