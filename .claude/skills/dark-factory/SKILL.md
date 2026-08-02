@@ -64,7 +64,6 @@ echoed in the run evidence.
 | `pipelines/slim/minimal_feature.dot` | explore → plan → implement → test → review → holdout → gates → exit | Full production pipeline from scratch with a holdout |
 | `pipelines/slim/minimal_pr.dot` | explore → plan → implement → test → review → holdout → gates → exit | Slim in-flight PR iteration loop with parameterized tests (Holdout-always policy; requires `--feature <name>` for the holdout) |
 
-You can also write your own `.dot` and pass it via `--pipeline`.
 | `pipelines/factory/level5_feature.dot` | full reference pipeline | Full Level-5 reference pipeline with hard-tier gates wired in |
 | **dynamic DOT via binary** | binary-owned graph builder | A static graph can't express the needed phase/fanout; the binary saves/echoes the generated graph in run evidence |
 | **no pipeline** | — | Docs-only / test-only / config-only PRs have no behavioral surface for the holdout to grade — say so and stop |
@@ -208,6 +207,9 @@ When `--pipeline` is a short name (no `/` or `.dot`), expand under
 | `minimal_pr` | `pipelines/slim/minimal_pr.dot` |
 | `review_slim` | `benchmarks/attractor-spec-review/pipelines/review_slim.dot` |
 | `review_full` | `benchmarks/attractor-spec-review/pipelines/review_full.dot` |
+| `spec_gen` | `pipelines/slim/spec_gen.dot` |
+| `bug_fix` | `pipelines/bug_fix.dot` |
+| `level5_feature` | `pipelines/factory/level5_feature.dot` |
 
 ### Default graph when `--pipeline` is omitted
 
@@ -229,9 +231,6 @@ through to a heavyweight pipeline.
 The default is the user's standing rule (set 2026-08-02): **slim two-node
 is the default; custom graphs are explicit opt-in.** This applies to all
 `/f` invocations across this repo.
-| `spec_gen` | `pipelines/slim/spec_gen.dot` |
-| `bug_fix` | `pipelines/bug_fix.dot` |
-| `level5_feature` | `pipelines/factory/level5_feature.dot` |
 
 ### Arg parsing
 

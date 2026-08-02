@@ -346,10 +346,18 @@ def main(argv: list[str] | None = None) -> int:
         if not args.pipeline:
             p.error("the following arguments are required: --pipeline")
 
+        pipeline_specified = any(
+            arg == "--pipeline" or arg.startswith("--pipeline=") for arg in argv
+        )
+        if not pipeline_specified and not args.resume:
+            target_pipeline = pathlib.Path("pipelines/slim/two_node.dot")
+        else:
+            target_pipeline = args.pipeline
+
         # --workdir defaults to cwd in the argparse setup above; the resolver
         # uses it to also look up <workdir>/dark-factory/pipelines/<name> for
         # bare-filename --pipeline values (target-repo subdir convention).
-        pipeline_path = resolve_pipeline_path(args.pipeline, workdir=args.workdir)
+        pipeline_path = resolve_pipeline_path(target_pipeline, workdir=args.workdir)
 
         if args.preflight:
             graph, diagnostics = validate_pipeline(pipeline_path)

@@ -82,3 +82,29 @@ def test_dark_factory_default_pipeline_file_exists_in_factory_home() -> None:
         f"$DARK_FACTORY_HOME/pipelines/slim/two_node.dot; got {expected} "
         f"(does not exist)."
     )
+
+
+def test_omitted_pipeline_bypasses_colliding_workdir_two_node_dot(tmp_path: pathlib.Path) -> None:
+    """When --pipeline is omitted, dark-factory must resolve the canonical
+    $DARK_FACTORY_HOME/pipelines/slim/two_node.dot even if a colliding
+    `two_node.dot` exists in the target workdir."""
+    from runner.paths import factory_home, resolve_pipeline_path
+
+    home = factory_home()
+    if home is None:
+        import pytest
+        pytest.skip("DARK_FACTORY_HOME is not set")
+
+    # Create a dummy colliding two_node.dot in tmp_path
+    colliding = tmp_path / "two_node.dot"
+    colliding.write_text("digraph colliding { start -> exit }", encoding="utf-8")
+
+    # Omitted pipeline resolves via `pipelines/slim/two_node.dot`
+    target_pipeline = pathlib.Path("pipelines/slim/two_node.dot")
+    resolved = resolve_pipeline_path(target_pipeline, workdir=tmp_path)
+
+    canonical_expected = (home / "pipelines" / "slim" / "two_node.dot").resolve()
+    assert resolved == canonical_expected, (
+        f"Omitted --pipeline must resolve canonical {canonical_expected}, got {resolved}"
+    )
+
