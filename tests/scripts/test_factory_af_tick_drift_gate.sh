@@ -97,13 +97,14 @@ run_drift_block() {
 # Fixture: bare origin + working clone, both on main.
 ORIGIN="$SCRATCH_DIR/origin.git"
 git init -q --bare "$ORIGIN"
+git -C "$ORIGIN" symbolic-ref HEAD refs/heads/main
 WORK="$SCRATCH_DIR/work"
 git clone -q "$ORIGIN" "$WORK"
 (
     cd "$WORK"
     git config user.email test@test.com
     git config user.name test
-    git checkout -q -b main 2>/dev/null || git checkout -q main
+    git checkout -q -b main 2>/dev/null || true
     echo x > f.txt
     git add f.txt
     git commit -q -m init
