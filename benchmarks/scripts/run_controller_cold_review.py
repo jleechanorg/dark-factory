@@ -42,6 +42,12 @@ from runner.review_controller import (
 
 
 CONTRACTS = ("cold-review-v1", "cold-review-v2")
+EVALUATOR_FORBIDDEN_PROMPT_IDENTITIES = (
+    "controller-cold-review-v2",
+    "controller-cold-review-v1",
+    "cold-review-v2",
+    "cold-review-v1",
+)
 SCREEN_CASE_IDS = ("wa-8603-r1", "wa-8612-r2", "wa-8613-r1")
 SCREEN_MODEL = "gpt-5.6-luna"
 SCREEN_REASONING_EFFORT = "high"
@@ -479,6 +485,39 @@ def _blinded_control_transcript(response: str) -> str:
     return "".join(line for line in lines if line.rstrip("\r\n") != identity)
 
 
+def _fail_on_evaluator_prompt_identity(
+    transcript: str,
+    *,
+    receipt_path: str | pathlib.Path,
+) -> None:
+    """Fail closed when any evaluator-facing transcript echoes arm identity."""
+    folded = transcript.casefold()
+    identity = next(
+        (
+            candidate
+            for candidate in EVALUATOR_FORBIDDEN_PROMPT_IDENTITIES
+            if candidate in folded
+        ),
+        None,
+    )
+    if identity is None:
+        return
+    path = pathlib.Path(receipt_path)
+    receipt = json.loads(path.read_text(encoding="utf-8"))
+    receipt.update(
+        {
+            "failure_class": "prompt_identity_echo",
+            "echoed_prompt_identity": identity,
+        }
+    )
+    path.write_text(
+        json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    raise BenchmarkError(
+        f"evaluator transcript exposes prompt identity: {identity}"
+    )
+
+
 def _file_digest(path: str | pathlib.Path) -> str:
     return _sha256(pathlib.Path(path).read_bytes())
 
@@ -808,6 +847,7 @@ def _run_raw_freeform_review(
     receipt_path.write_text(
         json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
+    _fail_on_evaluator_prompt_identity(transcript, receipt_path=receipt_path)
     return {
         "transcript": transcript,
         "receipt": receipt,
@@ -1039,6 +1079,10 @@ def run_screen(
             if not receipt.get("usage"):
                 raise BenchmarkError("control review transport emitted no usage record")
             transcript = _blinded_control_transcript(result.response_text)
+            _fail_on_evaluator_prompt_identity(
+                transcript,
+                receipt_path=result.output_paths["receipt"],
+            )
             artifact_paths = {
                 name: pathlib.Path(path)
                 for name, path in result.output_paths.items()

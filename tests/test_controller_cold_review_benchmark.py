@@ -21,6 +21,7 @@ from benchmarks.scripts.run_controller_cold_review import (
     SCREEN_REASONING_EFFORT,
     SCREEN_TIMEOUT_SECONDS,
     SCREEN_WORKERS,
+    _run_raw_freeform_review,
     SCREEN_VARIANTS,
     build_blinded_plan,
     build_manual_observation_plan,
@@ -701,6 +702,159 @@ def test_control_arm_preserves_timeout_and_launch_failure_receipts(
             path.read_text() == partial
             for path in (output / "raw").glob("*/*/transport.jsonl")
         )
+
+
+@pytest.mark.parametrize(
+    ("prompt", "identity"),
+    (
+        (FREEFORM_PROMPTS["freeform-traceability"], "cold-review-v2"),
+        (FREEFORM_PROMPTS["freeform-adversarial"], "controller-cold-review-v1"),
+        (
+            MANUAL_OBSERVATION_PROMPT.format(
+                pr_url="https://github.com/jleechanorg/worldarchitect.ai/pull/8328"
+            ),
+            "cold-review-v1",
+        ),
+    ),
+)
+def test_raw_evaluator_transcripts_fail_closed_on_prompt_identity_echo(
+    tmp_path, monkeypatch, prompt, identity
+):
+    repo, case = _fixture_case(tmp_path)
+    inputs = validate_case(repo, case)
+    neutral = tmp_path / "neutral"
+    neutral.mkdir()
+    output = tmp_path / "raw-review"
+    monkeypatch.setattr(
+        "benchmarks.scripts.run_controller_cold_review._gate_subprocess_args",
+        lambda *args, **kwargs: ["codex", "exec", "PROMPT"],
+    )
+
+    def echoed_identity(args, **_kwargs):
+        transcript = f"Finding text echoes {identity} in ordinary prose."
+        raw = "\n".join(
+            (
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {"type": "agent_message", "text": transcript},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "turn.completed",
+                        "usage": {"input_tokens": 4, "output_tokens": 2},
+                    }
+                ),
+            )
+        ) + "\n"
+        return subprocess.CompletedProcess(args, 0, stdout=raw, stderr="")
+
+    monkeypatch.setattr(
+        "benchmarks.scripts.run_controller_cold_review.subprocess.run",
+        echoed_identity,
+    )
+
+    with pytest.raises(BenchmarkError, match="prompt identity"):
+        _run_raw_freeform_review(
+            inputs,
+            prompt=prompt,
+            neutral_cwd=neutral,
+            output_dir=output,
+            model=SCREEN_MODEL,
+            reasoning_effort=SCREEN_REASONING_EFFORT,
+            timeout_seconds=SCREEN_TIMEOUT_SECONDS,
+        )
+
+    receipt = json.loads((output / "controller-receipt.json").read_text())
+    assert receipt["failure_class"] == "prompt_identity_echo"
+    assert receipt["echoed_prompt_identity"] == identity
+    assert identity in (output / "reviewer.output.md").read_text()
+    assert identity in (output / "transport.jsonl").read_text()
+
+
+def test_control_narrative_identity_echo_fails_closed_with_raw_receipt(
+    tmp_path, monkeypatch
+):
+    repo, manifest = _fixture_screen(tmp_path)
+    output = tmp_path / "control-identity-screen"
+    real_run = subprocess.run
+    identity = "cold-review-v2"
+    monkeypatch.setattr(
+        "benchmarks.scripts.run_controller_cold_review._gate_subprocess_args",
+        lambda *args, **kwargs: ["codex", "exec", "PROMPT"],
+    )
+
+    def echoing_control(request, *, neutral_cwd, output_dir, **kwargs):
+        result = _fake_validated_control_review(
+            request, neutral_cwd=neutral_cwd, output_dir=output_dir, **kwargs
+        )
+        response = result.response_text.replace(
+            "Control narrative.", f"Control narrative echoes {identity}."
+        )
+        Path(result.output_paths["response"]).write_text(response)
+        return ControllerReviewResult(
+            review=result.review,
+            receipts=result.receipts,
+            response_text=response,
+            transport_text=result.transport_text,
+            output_paths=result.output_paths,
+        )
+
+    def clean_raw(args, **kwargs):
+        if args and args[0] == "git":
+            return real_run(args, **kwargs)
+        raw = "\n".join(
+            (
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {"type": "agent_message", "text": "Clean raw finding."},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "turn.completed",
+                        "usage": {"input_tokens": 4, "output_tokens": 2},
+                    }
+                ),
+            )
+        ) + "\n"
+        return subprocess.CompletedProcess(args, 0, stdout=raw, stderr="")
+
+    monkeypatch.setattr(
+        "benchmarks.scripts.run_controller_cold_review.run_controller_review",
+        echoing_control,
+    )
+    monkeypatch.setattr(
+        "benchmarks.scripts.run_controller_cold_review.subprocess.run", clean_raw,
+    )
+
+    with pytest.raises(BenchmarkError, match="prompt identity"):
+        run_screen(
+            manifest,
+            case_ids=list(SCREEN_CASE_IDS),
+            repo=repo,
+            output_dir=output,
+            seed=20260802,
+            model=SCREEN_MODEL,
+            reasoning_effort=SCREEN_REASONING_EFFORT,
+            timeout_seconds=SCREEN_TIMEOUT_SECONDS,
+            workers=SCREEN_WORKERS,
+        )
+
+    receipts = [
+        json.loads(path.read_text())
+        for path in (output / "raw").glob("*/*/controller-receipt.json")
+        if json.loads(path.read_text()).get("failure_class")
+        == "prompt_identity_echo"
+    ]
+    assert receipts
+    assert all(receipt["echoed_prompt_identity"] == identity for receipt in receipts)
+    assert any(
+        identity in path.read_text()
+        for path in (output / "raw").glob("*/*/reviewer.output.md")
+    )
 
 
 def test_screen_concurrency_is_measured_at_live_reviewer_call_seam(
