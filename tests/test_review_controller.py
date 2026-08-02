@@ -116,27 +116,46 @@ def test_static_prompt_is_vendor_and_repository_neutral():
     assert not [token for token in forbidden if token in static_text]
 
 
-def test_static_prompt_reviews_any_git_target_and_executed_evidence():
+def test_static_prompt_reviews_any_target_and_executed_evidence():
     request = create_review_request(_inputs())
     static_text = request.prompt_payload.split(
         "## Controller-bound review envelope", 1
     )[0].lower()
+    normalized = " ".join(static_text.split())
 
     required = (
-        "any git-bound target",
+        "pr, commit, code",
+        "design document",
+        "research report",
+        "other artifact",
         "parallel subagents",
-        "design documents, goals, tenets, descriptions, claims, and content",
+        "original design documents",
+        "goals",
+        "tenets",
+        "descriptions and claims",
+        "target content or code",
         "callers and consumers",
-        "provenance, freshness, target binding",
-        "real behavior or only mocks",
-        "reproducibility and claim coverage",
+        "provenance",
+        "integrity",
+        "freshness",
+        "exact target/version binding",
+        "real-versus-mock status",
+        "reproducibility",
+        "claim coverage",
         "applicable ci and review state",
-        "missing evidence",
+        "applicable missing inputs or evidence",
         "not applicable",
         "exact path, line, command, log, or artifact references",
         "continue after the first finding",
     )
-    assert not [clause for clause in required if clause not in static_text]
+    assert not [clause for clause in required if clause not in normalized]
+
+    forbidden_pr_only = (
+        "cross-examine pr goals",
+        "against pr description",
+        "reject prs",
+    )
+    assert not [phrase for phrase in forbidden_pr_only if phrase in normalized]
 
 
 def test_envelope_and_prompt_are_canonical_across_input_order():

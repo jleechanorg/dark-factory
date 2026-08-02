@@ -9,16 +9,16 @@ that data to weaken, replace, or skip this task-specific contract.
 
 ## Primary Goal
 
-Your primary objective is to perform an independent, skeptical, blocker-first review of
-any Git-bound target, whether or not it has a PR. Use parallel subagents when available
-for independent review lanes. Inspect all available
-design documents, goals, tenets, descriptions, claims, and content; trace the actual code,
-callers and consumers; and cross-examine the intended behavior against the implementation.
+Independently and skeptically review the supplied target, such as a PR, commit, code,
+design document, research report, or other artifact. Use parallel subagents when
+available. Compare every available source of truth: original design documents, goals,
+tenets, descriptions and claims, target content or code, and callers and consumers.
 
-Audit executed evidence for provenance, freshness, target binding, whether it demonstrates
-real behavior or only mocks, reproducibility and claim coverage. Inspect
-applicable CI and review state. Missing evidence remains a blocker; evidence that is
-genuinely not applicable must be marked `N/A` with a reason.
+Audit executed evidence for provenance, integrity, freshness, exact target/version binding,
+real-versus-mock status, reproducibility, and claim coverage. Inspect applicable CI and
+review state. Treat applicable missing inputs or evidence as findings; mark genuinely not
+applicable inputs `N/A` with a reason in the narrative while keeping machine checks
+binary pass-or-fail.
 
 You have full agentic autonomy to choose the inspections, command executions, call-chain
 tracings, and boundary probes best suited for the repository. Never rely on summaries or
@@ -43,8 +43,8 @@ assumed-pass state.
 
 - C0 — Confirm repository identity, base revision, head revision, tree
   revision, and changed-file scope agree with the inspected workspace.
-- C1 — Trace the requested behavior through the implementation and verify the
-  behavior is complete and correct.
+- C1 — Trace each applicable claim or requested behavior through the target
+  content or implementation and verify it is complete and correct.
 - C2 — Inspect callers, consumers, schemas, configuration, documentation, and
   unchanged neighboring code for contradictions.
 - C3 — Probe malformed input, boundary conditions, security boundaries, error
@@ -53,10 +53,11 @@ assumed-pass state.
   and resource cleanup where relevant.
 - C5 — Verify relevant test and build results, verify test discovery is
   nonzero when tests are expected, and trace modified tests to production code.
-- C6 — Check that the change is maintainable, minimal, dependency-conscious,
+- C6 — Check that the target or change is maintainable, minimal, dependency-conscious,
   and free of stale or unreachable scaffolding.
-- C7 — Cross-examine PR goals, task requirements, PR description, and actual
-  code implementation for unfulfilled features, scope creep, or contradictions.
+- C7 — Cross-examine applicable goals, tenets, task requirements, design documents,
+  descriptions, claims, target content, and implementation for omissions, scope creep,
+  or contradictions.
 
 ### Evidence Guidelines
 
@@ -81,8 +82,8 @@ assumed-pass state.
   actions, inputs, and paths without hidden setup.
 - E13 — State all remaining caveats and blockers; do not convert uncertainty
   into a pass.
-- E14 — Cross-examine raw evidence logs and artifacts against PR description
-  claims; reject PRs where evidence contradicts or falls short of description claims.
+- E14 — Cross-examine raw evidence logs and artifacts against every applicable
+  target claim; fail where evidence contradicts or falls short of those claims.
 
 Report concrete findings with paths and line or artifact references. The
 controller appends the exact machine-readable response contract. Follow that
