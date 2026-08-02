@@ -1,7 +1,7 @@
 # Controller Cold Review v2: Maximum-Recall Contract
 
 **Date:** 2026-08-01
-**Status:** Proposed — implementation requires owner approval
+**Status:** Approved
 **Bead:** `jleechan-gcwh.1`
 
 ## Decision
@@ -291,7 +291,7 @@ separate removal decision is approved.
 
 ## Approval gate
 
-No production prompt, parser, pipeline, benchmark, or rollout implementation
-starts from this document until the owner marks the design `Approved`. Approval
-confirms the four gate definitions, controller-derived verdict, evaluation
-thresholds, and v1 rollback boundary.
+The owner's 2026-08-01 instruction to execute all six Beads `jleechan-gcwh.1`
+through `jleechan-gcwh.6` approved this design. Approval confirms the four gate
+definitions, controller-derived verdict, evaluation thresholds, and v1 rollback
+boundary.
