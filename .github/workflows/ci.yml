@@ -67,6 +67,10 @@ jobs:
         # step runs.
         run: |
           set -u
+          if [ "$(uname -s)" != "Linux" ]; then
+            echo "Not Linux ($(uname -s)) — skipping Linux libpython3.13.so soname fix."
+            exit 0
+          fi
           # 1) Resolve the toolchain ROOT directory WITHOUT invoking python3.
           # `pythonLocation` (set by actions/setup-python v5) points at the
           # toolchain ROOT (e.g. /home/runner/_work/_tool/Python/3.13.14/arm64),
