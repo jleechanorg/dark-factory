@@ -183,6 +183,14 @@ def test_bug_fix_prompt_has_test_path() -> None:
     )
 
 
+@pytest.mark.parametrize("version", ("v1", "v2"))
+def test_controller_review_prompts_are_allowlisted_without_goal(version: str) -> None:
+    """Controller review templates receive task text through their envelope."""
+    relpath = f"prompts/catalog/controller_cold_review_{version}.md"
+    assert "${goal}" not in _read_prompt(relpath)
+    assert relpath in PROMPTS_WITHOUT_GOAL_OK
+
+
 # ---------------------------------------------------------------------------
 # Cross-prompt invariants
 # ---------------------------------------------------------------------------

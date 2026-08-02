@@ -133,12 +133,11 @@ USER_SET_KEYS: dict[str, str] = {
 PROMPTS_WITHOUT_GOAL_OK: frozenset[str] = frozenset({
     "prompts/codergen.md",
     "prompts/bug_fix/fix.md",
-    # The controller review prompt is bound to a static, source-owned
-    # contract — its only goal is to grade the controller-bound diff
-    # against the C0–C6 / E0–E13 checklist. The contract's task text
-    # arrives via the controller-bound envelope (Base64), not via
-    # ${goal}, so the prompt itself does not need ${goal}.
+    # Controller review prompts are static, source-owned contracts.
+    # Their task text arrives via the controller-bound Base64 envelope,
+    # not via ${goal}, so the templates do not need ${goal}.
     "prompts/catalog/controller_cold_review_v1.md",
+    "prompts/catalog/controller_cold_review_v2.md",
 })
 
 
