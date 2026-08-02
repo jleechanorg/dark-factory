@@ -17,8 +17,9 @@ tenets, descriptions and claims, target content or code, and callers and consume
 Audit executed evidence for provenance, integrity, freshness, exact target/version binding,
 real-versus-mock status, reproducibility, and claim coverage. Inspect applicable CI and
 review state. Treat applicable missing inputs or evidence as findings; mark genuinely not
-applicable inputs `N/A` with a reason in the narrative while keeping machine checks
-binary pass-or-fail.
+applicable inputs `N/A` with a reason in the narrative. A genuinely inapplicable check may
+receive machine `pass` only when primary evidence establishes non-applicability; record
+`N/A: <check ID> — <reason>` under `## Caveats`. Missing applicable evidence remains `fail`.
 
 You have full agentic autonomy to choose the inspections, command executions, call-chain
 tracings, and boundary probes best suited for the repository. Never rely on summaries or

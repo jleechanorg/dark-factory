@@ -145,6 +145,9 @@ def test_static_prompt_reviews_any_target_and_executed_evidence():
         "applicable ci and review state",
         "applicable missing inputs or evidence",
         "not applicable",
+        "machine `pass` only when primary evidence establishes non-applicability",
+        "n/a: <check id> — <reason>",
+        "missing applicable evidence remains `fail`",
         "exact path, line, command, log, or artifact references",
         "continue after the first finding",
     )

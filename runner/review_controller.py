@@ -51,7 +51,7 @@ _TEMPLATE_PATH = (
     _SOURCE_ROOT / "prompts" / "catalog" / "controller_cold_review_v1.md"
 )
 _EXPECTED_TEMPLATE_SHA256 = (
-    "0b0717f7f6f4f3056d0cbe67513c6ec029e6010d4064209f7c6fd7fe23b84e6d"
+    "e3944fdf28dd01f18dc8480ee08f84c5e4714f9dcdb1f0232b61db2f435a92cf"
 )
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
