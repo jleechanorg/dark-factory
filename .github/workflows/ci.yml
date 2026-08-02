@@ -122,53 +122,11 @@ jobs:
             else
               echo "Versioned symlink ${SO_DIR}/${VERSIONED} already exists"
             fi
-            # 4b) tests/test_*.py subprocess calls (test_subprocess_fail_exit_code,
-            #     test_subprocess_emits_valid_json, test_cli_subprocess_emits_exact_message,
-            #     test_module_runnable_as_python_m_runner, …) invoke
-            #     sys.executable with an explicit `env=` argument that
-            #     intentionally strips LD_LIBRARY_PATH. The fix at step (4)
-            #     above + the LD_LIBRARY_PATH export do not reach those
-            #     subprocesses. The remaining mechanism is to install a tiny
-            #     `python3` shim at `$TOOLCHAIN_ROOT/bin/python3` that execs
-            #     the original toolchain binary with `LD_PRELOAD` set to the
-            #     link-time `libpython3.13.so`. Force-loading libpython via
-            #     LD_PRELOAD satisfies the python binary's libpython3.13.so.1.0
-            #     soname reference regardless of LD_LIBRARY_PATH inheritance.
-            #
-            #     The shim is installed ONLY if a real toolchain `python3`
-            #     exists at the expected location. It backs up the original
-            #     binary first so the failure mode is reversible if the
-            #     shell that runs the step misbehaves.
-            SHIM_REAL="$TOOLCHAIN_ROOT/bin/python3.real"
-            for SHIM_NAME in python3 python; do
-              SHIM_BIN="$TOOLCHAIN_ROOT/bin/$SHIM_NAME"
-              if [ -e "$SHIM_REAL" ]; then
-                # Real binary is already preserved by an earlier iteration.
-                # Install (or refresh) the shim that execs it with LD_PRELOAD.
-                if [ "$SHIM_BIN" = "$SHIM_REAL" ]; then
-                  continue
-                fi
-                printf '#!/usr/bin/env bash\nexec env LD_PRELOAD="%s" "%s" "$@"\n' \
-                  "$SO_PATH" "$SHIM_REAL" > "$SHIM_BIN"
-                chmod +x "$SHIM_BIN"
-                echo "Installed shim: $SHIM_BIN -> exec $SHIM_REAL with LD_PRELOAD=$SO_PATH"
-              elif [ -x "$SHIM_BIN" ]; then
-                # First iteration: preserve the real binary then shim it.
-                mv "$SHIM_BIN" "$SHIM_REAL"
-                printf '#!/usr/bin/env bash\nexec env LD_PRELOAD="%s" "%s" "$@"\n' \
-                  "$SO_PATH" "$SHIM_REAL" > "$SHIM_BIN"
-                chmod +x "$SHIM_BIN"
-                echo "Installed shim: $SHIM_BIN -> exec $SHIM_REAL with LD_PRELOAD=$SO_PATH"
-              else
-                echo "::warning::No toolchain python at $SHIM_BIN — skipping shim for that name."
-              fi
-            done
-            # 5) Self-test: invoke the toolchain `python3 -c 'import sys'` NOW,
-            #    before the test step, so a remaining rc=127 surfaces as a
-            #    step-level error here instead of failing the entire pytest
-            #    run (which would mask the real cause).
-            echo "Self-test: $SHIM_BIN -c 'import sys; sys.exit(0)'"
-            "$SHIM_BIN" -c 'import sys; sys.exit(0)'
+            # 5) Self-test: invoke the toolchain python3 NOW, before the test step,
+            # so a remaining rc=127 surfaces as a step-level error here.
+            PY_TEST="$TOOLCHAIN_ROOT/bin/python3"
+            echo "Self-test: $PY_TEST -c 'import sys; sys.exit(0)'"
+            "$PY_TEST" -c 'import sys; sys.exit(0)'
             rc=$?
             if [ "$rc" -ne 0 ]; then
               echo "::error::subprocess python3 still fails after symlink fix (rc=$rc). libpython is not loadable."
