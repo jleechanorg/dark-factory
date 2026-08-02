@@ -66,8 +66,6 @@ def _ao_wait_idle(
     deadline = time.monotonic() + timeout
     consecutive = 0
     status_cmd = ["ao", "status", "--json"]
-    if project:
-        status_cmd = ["ao", "status", "-p", project, "--json"]
     while time.monotonic() < deadline:
         proc = subprocess.run(
             status_cmd,

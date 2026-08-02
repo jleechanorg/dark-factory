@@ -680,7 +680,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         agent = ctx.state.get("ao.agent", "claude-code")
         session = ctx.state.get("ao.session")
         if not session:
-            spawn_args = ["ao", "spawn", prompt_text, "-p", project, "--agent", agent]
+            spawn_args = ["ao", "spawn", prompt_text, "--project", project, "--agent", agent]
             spawn_args = _handlers_shim._sandboxed_args(spawn_args)
             if spawn_args is None:
                 return _finalize(Result(outcome="failure", output="sandbox-exec unavailable"))
