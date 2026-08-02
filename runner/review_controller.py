@@ -359,7 +359,11 @@ def _load_static_template(contract: ReviewContract) -> tuple[str, str]:
         )
 
     for check_id in contract.check_ids:
-        count = len(re.findall(rf"(?m)^- {re.escape(check_id)}\b", text))
+        if contract.name == "cold-review-v2":
+            declaration_pattern = rf"(?m)^- `{re.escape(check_id)}` — .+$"
+        else:
+            declaration_pattern = rf"(?m)^- {re.escape(check_id)}\b"
+        count = len(re.findall(declaration_pattern, text))
         if count != 1:
             raise ReviewContractError(
                 f"static template must define {check_id} exactly once; found {count}"

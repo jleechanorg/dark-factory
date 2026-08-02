@@ -49,6 +49,14 @@ def _inputs() -> ReviewInputs:
     )
 
 
+def test_v2_request_loads_repository_markdown_authority():
+    request = create_review_request(_inputs(), review_contract="cold-review-v2")
+
+    assert request.prompt_id == "controller-cold-review-v2"
+    assert request.template_sha256
+    assert all(f"- `{gate_id}`" in request.prompt_payload for gate_id in V2_GATE_IDS)
+
+
 def _response(request, *, verdict: str = "pass", failed: str | None = None) -> str:
     statuses = {
         check_id: ("fail" if check_id == failed else "pass")
@@ -90,10 +98,10 @@ def _v2_request(tmp_path, monkeypatch):
         "\n".join(
             (
                 "# Controller-Owned Cold Review v2",
-                "- CLAIMS",
-                "- RUNTIME",
-                "- EVIDENCE",
-                "- ADVERSARIAL",
+                "- `CLAIMS` — every material claim is covered",
+                "- `RUNTIME` — relevant runtime paths are covered",
+                "- `EVIDENCE` — primary evidence is sufficient",
+                "- `ADVERSARIAL` — relevant counterexamples are covered",
             )
         ),
         encoding="utf-8",
