@@ -16,6 +16,9 @@ This is a low-cost screening experiment. It cannot authorize rollout or support
 a statistically strong claim that one prompt is better. A competitive short
 prompt must advance to the complete seven-snapshot sealed benchmark.
 
+Separately, replay the strongest recovered manually typed fresh-window request
+as an observational reference. It is not a fourth screen arm and cannot advance.
+
 ## Non-goals
 
 - Do not change production pipelines or their v1 selector.
@@ -23,6 +26,8 @@ prompt must advance to the complete seven-snapshot sealed benchmark.
 - Do not add keyword scoring, heuristic defect classification, or application
   code that judges finding semantics.
 - Do not treat a nine-call result as rollout evidence.
+- Do not treat the historical fresh-window result or its replay as prompt-only
+  causal evidence.
 
 ## Arms
 
@@ -55,6 +60,41 @@ or machine response contract in the model-visible prompt. The immutable target
 revision and input digests remain controller-owned run metadata outside the
 prompt response.
 
+## Observational fresh-window replay (not an arm)
+
+After the three-arm screen finishes, run one separate fresh Codex invocation per
+case using this recovered prompt. Substitute only the literal PR URL; preserve
+all other bytes, including the trailing space after `PR`, the two-space URL
+indent, blank line, capitalization, and wording:
+
+```python
+MANUAL_OBSERVATION_PROMPT = (
+    "review this PR \n"
+    "  ${pr_url}\n\n"
+    "PR original design vs PR desc vs goals vs evidence vs code use subagents"
+)
+```
+
+Record this replay separately with:
+
+```yaml
+observational: true
+eligible_for_advancement: false
+source_thread_id: 019fa184-b3ba-7da1-976a-a6bd83c58533
+source_rollout_path: /Users/jleechan/.codex/sessions/2026/07/26/rollout-2026-07-26T20-00-56-019fa184-b3ba-7da1-976a-a6bd83c58533.jsonl
+source_rollout_line: 9
+source_prompt_utf8_bytes: 150
+source_prompt_sha256: 74e09b7cebfcb3fed630f7a9085c984b04e04726cc29a89ed23029d9a2a6bcb3
+```
+
+The historical outcome is observational rather than prompt-only evidence. The
+typed request explicitly invoked subagents, and the resulting workflow used
+repository policies, live GitHub inspection, tools, and parallel reviewers. Its
+findings therefore reflect the complete fresh-window workflow, not just these
+150 prompt bytes. The replay measures whether that workflow-shaped request is a
+useful reference under the current harness; it does not join the randomized
+screen, affect its metrics, or establish causality.
+
 ## Screening cases
 
 Use three immutable historical snapshots from the existing public manifest:
@@ -83,10 +123,14 @@ holdouts repository and never enter reviewer prompts.
 - Sanitize holdout paths and variables from every reviewer environment.
 - Preserve raw transport output, complete transcript, usage, latency, exit code,
   input digests, prompt digest, and target head for every call.
+- Run the three observational calls only after all nine randomized screen calls
+  complete, using fresh invocations and the same case inputs and reviewer
+  controls. Do not interleave them with the randomized arms.
 
 The screen is nine calls total: three cases times three arms. It measures a
 single sample per case and arm, so run-to-run variance remains an explicit
-limitation.
+limitation. The three later observational calls are reported as a separate
+replay and do not change the screen call count.
 
 ## Blinding and semantic scoring
 
@@ -124,6 +168,11 @@ Report per case and aggregate, for every arm:
 The result report may reveal arm identities only after all judgments are bound
 to transcript and case digests.
 
+Judge and score the observational bundle with the same transcript-native
+semantic process only after the three screen-arm judgments are bound. Preserve
+`observational: true` and `eligible_for_advancement: false` through scoring and
+report its metrics in a separate section, never as a fourth arm.
+
 ## Failure rules
 
 A call is invalid if its transport exits nonzero, its transcript is missing, its
@@ -151,6 +200,9 @@ when all of the following hold:
 Ties advance rather than being declared wins. Multiple free-form arms may
 advance. No arm becomes production-eligible from this screen.
 
+The observational replay is categorically excluded from this rule regardless
+of its score.
+
 ## Required artifacts
 
 - immutable run plan and case manifest;
@@ -161,6 +213,9 @@ advance. No arm becomes production-eligible from this screen.
 - digest-bound evaluator judgments;
 - per-case and aggregate score output; and
 - a deblinded comparison that states the screen limitations.
+- separate observational replay plan, receipts, transcript bundle, judgment,
+  score, and comparison section carrying both non-eligibility flags and source
+  provenance.
 
 ## Implementation boundary after approval
 
@@ -170,6 +225,10 @@ separate from the production `run_controller_review` validation path. Reuse the
 sealed semantic judge contract where possible, adding a transcript-native
 judgment schema only if the current finding-list schema cannot represent
 free-form output without heuristic parsing.
+
+Implement the observational replay as an optional, separately labeled use of
+the same raw free-form execution path. It must not be inserted into
+`SCREEN_VARIANTS`, randomized with the arms, or considered by advancement code.
 
 Implementation must include unit tests for arm randomization, identical inputs,
 environment sanitization, transcript binding, invalid-run handling, semantic

@@ -4,6 +4,8 @@
 
 **Goal:** Extend the existing cold-review benchmark to run and sealed-score a blinded three-arm screen comparing current v2 with two short free-form prompts.
 
+**Observational addendum:** After the approved screen, replay the byte-preserved PR-8328 fresh-window request once per case as a separately labeled, non-advancing observation. It is not a fourth arm and does not change the nine-call screen.
+
 **Architecture:** Reuse `benchmarks/scripts/run_controller_cold_review.py` for immutable inputs, detached worktrees, Codex transport, arm randomization, concurrency, and artifacts. Add an experiment-only raw-transcript path for free-form arms while leaving production controller validation unchanged. Extend the existing sealed scorer with a transcript-native judgment schema in which a blinded model owns finding extraction and semantic matching; deterministic code validates bindings and computes metrics only.
 
 **Tech Stack:** Python 3.13, stdlib `argparse`/`subprocess`/`concurrent.futures`, pytest, Codex JSONL transport, existing dark-factory public benchmark and sealed holdout scorer.
@@ -13,6 +15,7 @@
 - Production pipelines and their v1 selector remain unchanged.
 - Use exactly these cases: `wa-8603-r1`, `wa-8612-r2`, `wa-8613-r1`.
 - Use exactly three arms: current pinned v2, free-form traceability, and free-form adversarial.
+- Preserve the exact three-arm variant set and nine-call screen. The manual replay is separate, with `observational: true` and `eligible_for_advancement: false` everywhere it is recorded.
 - Reviewer model is `gpt-5.6-luna`, reasoning effort `high`, timeout `900`, and case workers `3` for all arms.
 - Arms are serial within each case; the three cases run concurrently with observed concurrency recorded.
 - Free-form responses have no gates, verdict line, JSON schema, or machine response contract.
@@ -20,6 +23,7 @@
 - Sealed rubric content never enters public files, reviewer prompts, or public artifacts.
 - Invalid transport or binding attempts are preserved and never silently retried in place.
 - Every commit message includes CLI and model attribution.
+- The manual replay substitutes only its literal PR URL. Its historical result includes subagent, policy, GitHub, and tool effects, so report it as workflow-shaped observational evidence rather than prompt-only causal evidence.
 
 ---
 
@@ -34,6 +38,7 @@
 - Produces: `build_screen_plan(cases, *, seed, model, reasoning_effort, timeout_seconds) -> tuple[dict, dict]`.
 - Produces: `run_screen(manifest, *, case_ids, repo, output_dir, seed, model, reasoning_effort, timeout_seconds, workers) -> None`.
 - Produces: three `cold-review-transcript-run-v1` blinded bundles named `blinded-arm-1-bundle.json` through `blinded-arm-3-bundle.json`.
+- Optionally produces one separate `cold-review-transcript-run-v1` observational bundle plus a plan/receipt carrying `observational: true`, `eligible_for_advancement: false`, and the exact historical provenance. This bundle is not included in `private["arms"]` or the randomized screen plan.
 
 - [ ] **Step 1: Write RED tests for exact arms, prompts, controls, and randomization**
 
@@ -89,6 +94,31 @@ FREEFORM_PROMPTS = {
 
 Copy the exact four-sentence prompt bodies from `docs/superpowers/specs/2026-08-02-free-form-cold-review-screen-design.md`; do not paraphrase them.
 
+Also define the observational prompt as a byte-preserved template outside
+`SCREEN_VARIANTS`:
+
+```python
+MANUAL_OBSERVATION_PROMPT = (
+    "review this PR \n"
+    "  {pr_url}\n\n"
+    "PR original design vs PR desc vs goals vs evidence vs code use subagents"
+)
+MANUAL_OBSERVATION_SOURCE = {
+    "observational": True,
+    "eligible_for_advancement": False,
+    "source_thread_id": "019fa184-b3ba-7da1-976a-a6bd83c58533",
+    "source_rollout_path": "/Users/jleechan/.codex/sessions/2026/07/26/rollout-2026-07-26T20-00-56-019fa184-b3ba-7da1-976a-a6bd83c58533.jsonl",
+    "source_rollout_line": 9,
+    "source_prompt_utf8_bytes": 150,
+    "source_prompt_sha256": "74e09b7cebfcb3fed630f7a9085c984b04e04726cc29a89ed23029d9a2a6bcb3",
+}
+```
+
+Add a test proving `build_screen_plan` still emits exactly nine runs and three
+arms, while the optional observation plan is a separate three-case collection
+with both non-eligibility flags. Assert that rendering changes only the source
+URL bytes and preserves the rest of the prompt exactly.
+
 - [ ] **Step 4: Run the plan test and verify GREEN**
 
 Run the Step 2 command. Expected: PASS.
@@ -134,6 +164,13 @@ For the control arm, continue using `create_review_request(..., review_contract=
 
 Do not add a shared abstraction unless a second caller needs it. Do not change `run_controller_review` to allow unvalidated production responses.
 
+The optional manual observation is the second caller for the raw free-form
+executor. Reuse that executor after all screen calls finish rather than adding a
+fourth `review_variant`. Use a fresh Codex invocation per case, the identical
+case envelope and controls, and a separate observation plan, receipt, and
+bundle. Preserve the source provenance and rendered prompt digest. Do not expose
+the observation to arm randomization, the private arm map, or advancement code.
+
 The three-arm bundle contains complete transcripts and no application-derived findings or verdict:
 
 ```python
@@ -152,7 +189,7 @@ entry = {
 
 - [ ] **Step 8: Add CLI selection without creating another runner**
 
-Add `screen` to the existing command choices and repeatable `--case-id`. `screen` requires exactly the three approved case IDs, explicit `--model`, and a new output directory. Existing `validate` and `run` semantics remain unchanged.
+Add `screen` to the existing command choices and repeatable `--case-id`. `screen` requires exactly the three approved case IDs, explicit `--model`, and a new output directory. Add optional `--include-manual-observation`; without it, `screen` remains exactly the approved nine calls. With it, run the three observational fresh invocations only after the screen completes. Existing `validate` and `run` semantics remain unchanged.
 
 - [ ] **Step 9: Run public benchmark tests and boundary checks**
 
@@ -270,6 +307,7 @@ git commit -m "[codex/gpt-5.6-terra] feat: score free-form review transcripts"
 **Interfaces:**
 - Consumes: the public `screen` command, three opaque bundles, sealed rubric, and transcript scorer.
 - Produces: three judgment JSON files, three score JSON files, a deblinded comparison, and a Bead update.
+- Produces when requested: one separate observational judgment and score plus a non-causal comparison section that is never considered for advancement.
 
 - [ ] **Step 1: Verify both repositories and exact heads**
 
@@ -298,14 +336,24 @@ Use a fresh output directory and recorded seed:
   --model gpt-5.6-luna \
   --reasoning-effort high \
   --timeout 900 \
-  --workers 3
+  --workers 3 \
+  --include-manual-observation
 ```
 
 Sample live process counts and verify `concurrency.json` records `observed_max_cases: 3`.
+Verify the receipt shows the nine randomized screen calls completed before any
+of the three fresh-window observational calls began. Verify the observation
+plan carries `observational: true`, `eligible_for_advancement: false`, exact
+thread/rollout provenance, and a rendered prompt digest per case.
 
 - [ ] **Step 3: Dispatch three blinded transcript judges in parallel**
 
 Dispatch Luna/Terra judge subagents with disjoint opaque bundle paths. Each judge may read only its bundle, the sealed rubric, and the transcript scorer schema. It must not read the private arm map, prompts, sibling bundles, raw artifacts, or production variant identities. Each writes `cold-review-transcript-judgments-v1` JSON and asserts `blind_to_prompt_identity: true`.
+
+Bind and finish all three screen-arm judgments before dispatching a separate
+judge for the observational bundle. The observational judge follows the same
+semantic schema, but its output remains labeled non-eligible and cannot alter a
+screen-arm judgment.
 
 - [ ] **Step 4: Score each opaque arm and persist results**
 
@@ -315,17 +363,36 @@ python3 evaluator/cold_review_recall.py --bundle <arm-bundle> --judgments <arm-j
 
 Run from `/Users/jleechan/projects/worktree_cold_review_holdouts`. Any scorer exit `2` invalidates the screen. Exit `1` records a known-P0/P1 false PASS and prevents advancement.
 
+Score the observational bundle separately after the three screen scores exist.
+Its exit status and metrics are reported, but never invalidate an otherwise
+valid randomized screen or enter advancement arithmetic; infrastructure or
+binding failure makes only the observation invalid.
+
 - [ ] **Step 5: Deblind only after all judgments and scores are bound**
 
 Read the private arm map after all three score files exist. Produce a comparison with per-case and aggregate recall, false PASS, unsupported findings, invalids, tokens, and latency for the named variants. Apply the advancement rule exactly as written in the approved design; ties advance but are not wins.
+
+Append a separate observational section only after applying the screen
+advancement rule. Include its metrics, source provenance, both non-eligibility
+flags, and the explicit limitation that the historical workflow used subagents,
+repository policy, live GitHub inspection, and tools, so the result is not
+prompt-only causal evidence.
 
 - [ ] **Step 6: Independently review the run artifacts**
 
 Terra reviews binding equality, arm-order randomization, model/control equality, concurrency proof, judge blinding, score completeness, and absence of sealed leakage. Luna reviews metric arithmetic and advancement-rule application. Any disagreement is reported rather than averaged away.
 
+Both audits also assert that the observation never entered `SCREEN_VARIANTS`,
+arm randomization, the private arm map, or advancement arithmetic, and that its
+three calls started only after the nine screen calls completed.
+
 - [ ] **Step 7: Record the result in Beads**
 
 Use `br update jleechan-gcwh.5 --notes ...` with run path, exact heads, prompt digests, score digests, metrics, advancement decision, limitations, and next step. Keep `.5` open unless the full seven-snapshot acceptance criteria are met. Keep `.6` blocked and production on v1.
+
+Record observational metrics under a separate heading with
+`observational=true`, `eligible_for_advancement=false`, source thread/rollout
+provenance, and the workflow-confounding limitation.
 
 - [ ] **Step 8: Commit and push tracker state**
 
