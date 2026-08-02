@@ -53,7 +53,9 @@ assumed-pass state.
 - C1 — Trace each applicable claim or requested behavior through the target
   content or implementation and verify it is complete and correct.
 - C2 — Inspect callers, consumers, schemas, configuration, documentation, and
-  unchanged neighboring code for contradictions.
+  unchanged neighboring code for contradictions. For versioned interfaces or
+  review contracts, verify backward compatibility and fail-closed parsing at
+  the actual caller or CLI integration boundary.
 - C3 — Probe malformed input, boundary conditions, security boundaries, error
   handling, and recovery behavior.
 - C4 — Inspect state transitions, ordering, concurrency, retries, idempotency,
