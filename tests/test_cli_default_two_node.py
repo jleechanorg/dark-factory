@@ -108,3 +108,14 @@ def test_omitted_pipeline_bypasses_colliding_workdir_two_node_dot(tmp_path: path
         f"Omitted --pipeline must resolve canonical {canonical_expected}, got {resolved}"
     )
 
+
+def test_factory_home_fallback_when_env_unset(monkeypatch) -> None:
+    """When DARK_FACTORY_HOME is unset, factory_home() falls back to repo root."""
+    from runner.paths import factory_home
+
+    monkeypatch.delenv("DARK_FACTORY_HOME", raising=False)
+    home = factory_home()
+    assert home is not None, "factory_home() must not be None in repo checkout when DARK_FACTORY_HOME is unset"
+    assert (home / "pipelines" / "slim" / "two_node.dot").exists()
+
+
