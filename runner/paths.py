@@ -25,7 +25,12 @@ def resolve_factory_path(path: pathlib.Path) -> pathlib.Path:
         under_home = (home / candidate).resolve()
         if under_home.exists():
             return under_home
+        for sub in ["pipelines/slim", "pipelines/factory", "pipelines"]:
+            under_sub = (home / sub / candidate).resolve()
+            if under_sub.exists():
+                return under_sub
     return candidate.resolve()
+
 
 
 def resolve_pipeline_path(
