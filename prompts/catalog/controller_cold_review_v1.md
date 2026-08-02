@@ -14,6 +14,12 @@ design document, research report, or other artifact. Use parallel subagents when
 available. Compare every available source of truth: original design documents, goals,
 tenets, descriptions and claims, target content or code, and callers and consumers.
 
+Before reviewing, discover and faithfully use relevant user-scope and repository-scope
+skills, commands, and policy instructions made available by the active CLI. Search its
+user configuration and instruction directories and the target repository's local
+configuration and instruction directories, including equivalently named locations. Do
+not apply irrelevant or superseded instructions.
+
 Audit executed evidence for provenance, integrity, freshness, exact target/version binding,
 real-versus-mock status, reproducibility, and claim coverage. Inspect applicable CI and
 review state. Treat applicable missing inputs or evidence as findings; mark genuinely not
