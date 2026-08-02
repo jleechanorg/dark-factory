@@ -242,7 +242,19 @@ def main(argv: list[str] | None = None) -> int:
     evidence_staging_dir = None
     try:
         p = argparse.ArgumentParser(prog="dark-factory")
-        p.add_argument("--pipeline", type=pathlib.Path)
+        p.add_argument(
+            "--pipeline",
+            type=pathlib.Path,
+            default=pathlib.Path("two_node.dot"),
+            help=(
+                "Pipeline `.dot` to run. Defaults to the slim two-node graph "
+                "(`two_node.dot`) — a generic worker + static Codex cold "
+                "reviewer — which is the standing rule for /f and /factory "
+                "invocations (set 2026-08-02). Pass a short name (e.g. "
+                "`gates`, `minimal_feature`, `bug_fix`) or an absolute path "
+                "to opt into a richer pipeline."
+            ),
+        )
         p.add_argument("--goal")
         p.add_argument("--workdir", type=pathlib.Path, default=pathlib.Path.cwd())
         p.add_argument("--preflight", action="store_true", help="Validate pipeline and emit diagnostics, then exit.")

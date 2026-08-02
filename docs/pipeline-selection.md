@@ -1,13 +1,22 @@
 # Pipeline selection
 
-**Do not default every run to one `.dot` file.** Pick the graph that matches the
-task. If the user passes `--pipeline`, use it. Otherwise classify the goal first
-(see `factory-spec` skill Step 0: greenfield vs brownfield).
+**The slim two-node graph is the new default for `/f` and `/factory`
+(set 2026-08-02).** The runner's `--pipeline` argparse default is
+`two_node.dot`, so a bare `dark-factory …` invocation (no `--pipeline`)
+dispatches `pipelines/slim/two_node.dot` — a generic worker plus a
+static Codex cold-reviewer. Operators opt into richer pipelines by
+passing `--pipeline <name>` explicitly. Custom dot graphs are always
+expressible via `--pipeline /absolute/path/to/your.dot`.
+
+The "auto-select from the goal" rule that previously lived in the
+factory skill is retired. The slim two-node shape is the new default
+across the board.
 
 ## Decision table
 
 | Task | Pipeline | Notes |
 |------|----------|-------|
+| **Default `/f` / `/factory` invocation** | **`pipelines/slim/two_node.dot`** | Generic worker + static Codex cold reviewer + bounded fix loop. The user-stated default since 2026-08-02. |
 | Wiring smoke / install verify | `pipelines/factory/hello.dot` | `--backend echo`; explore → plan → implement → holdout → fix (max 3) → exit |
 | New feature, full production loop | `pipelines/slim/minimal_feature.dot` | explore → plan → test → review → holdout → gates |
 | New feature, minimal loop | `pipelines/factory/hello.dot` | plan → implement → holdout → fix |

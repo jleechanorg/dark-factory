@@ -57,13 +57,14 @@ echoed in the run evidence.
 
 | `.dot` file | Flow | When to use |
 |-------------|------|-------------|
+| **`pipelines/slim/two_node.dot`** ⭐ default | worker → cold_reviewer (codex priority) → exit | **Default for `/f` and `/factory`** when no `--pipeline` is passed. Generic worker handles any user goal; static Codex cold-reviewer prompt gates it. Use this when the task fits the "do the thing, then a cold reviewer checks it" shape. |
 | `pipelines/factory/hello.dot` | plan → implement → holdout → fix-loop → exit | Add a new feature with a holdout scenario |
 | `pipelines/factory/gates.dot` | start → holdout → /es → /er → /code_standards → exit | Validate an already-implemented diff (Attractor-style 4-gate harness as `.dot`) |
 | `pipelines/factory/pr_gates.dot` | start → holdout → /es → /er → /code_standards → exit | Validate an already-implemented in-flight PR diff (Holdout-always policy; requires `--feature <name>` for the holdout) |
 | `pipelines/slim/minimal_feature.dot` | explore → plan → implement → test → review → holdout → gates → exit | Full production pipeline from scratch with a holdout |
 | `pipelines/slim/minimal_pr.dot` | explore → plan → implement → test → review → holdout → gates → exit | Slim in-flight PR iteration loop with parameterized tests (Holdout-always policy; requires `--feature <name>` for the holdout) |
-| `pipelines/slim/spec_gen.dot` | spec-only generation | The LLM decided `/fs` is needed first — STOP and recommend running it before any other pipeline |
-| `pipelines/bug_fix.dot` | red → green → refactor | TDD bug fix with red/green discipline |
+
+You can also write your own `.dot` and pass it via `--pipeline`.
 | `pipelines/factory/level5_feature.dot` | full reference pipeline | Full Level-5 reference pipeline with hard-tier gates wired in |
 | **dynamic DOT via binary** | binary-owned graph builder | A static graph can't express the needed phase/fanout; the binary saves/echoes the generated graph in run evidence |
 | **no pipeline** | — | Docs-only / test-only / config-only PRs have no behavioral surface for the holdout to grade — say so and stop |
@@ -199,6 +200,7 @@ When `--pipeline` is a short name (no `/` or `.dot`), expand under
 
 | Short name | Path |
 |------------|------|
+| `two_node` | `pipelines/slim/two_node.dot` |
 | `gates` | `pipelines/factory/gates.dot` |
 | `hello` | `pipelines/factory/hello.dot` |
 | `pr_gates` | `pipelines/factory/pr_gates.dot` |
@@ -206,6 +208,27 @@ When `--pipeline` is a short name (no `/` or `.dot`), expand under
 | `minimal_pr` | `pipelines/slim/minimal_pr.dot` |
 | `review_slim` | `benchmarks/attractor-spec-review/pipelines/review_slim.dot` |
 | `review_full` | `benchmarks/attractor-spec-review/pipelines/review_full.dot` |
+
+### Default graph when `--pipeline` is omitted
+
+When the user invokes `/f` or `/factory` with no `--pipeline` flag, the
+runner dispatches `pipelines/slim/two_node.dot` by default — exactly two
+productive nodes (a generic `worker` codergen + a `cold_reviewer` gate_er
+that runs the static Codex cold-reviewer prompt), plus a bounded fix
+loop. The cold reviewer uses the canonical
+`backend_priority="codex,minimax,agy,claude-sonnet"` queue with
+`prefer_adversarial=true` so the reviewer is a different vendor from
+the worker whenever possible.
+
+To opt into a richer pipeline, pass an explicit `--pipeline <name>`. To
+roll your own (e.g. a custom slim or feature shape), pass
+`--pipeline /absolute/path/to/your.dot`. Custom dot graphs always win
+over the default — there is no scenario where `/f` will silently fall
+through to a heavyweight pipeline.
+
+The default is the user's standing rule (set 2026-08-02): **slim two-node
+is the default; custom graphs are explicit opt-in.** This applies to all
+`/f` invocations across this repo.
 | `spec_gen` | `pipelines/slim/spec_gen.dot` |
 | `bug_fix` | `pipelines/bug_fix.dot` |
 | `level5_feature` | `pipelines/factory/level5_feature.dot` |
@@ -214,10 +237,14 @@ When `--pipeline` is a short name (no `/` or `.dot`), expand under
 
 Honor these flags inside `$ARGUMENTS`:
 
-- `--pipeline <name>` — short name (`gates`, `hello`, `pr_gates`, `minimal_pr`,
-  `minimal_feature`, `review_slim`, `review_full`) or path to a `.dot`. If
-  omitted, **auto-select from the goal** (Step 0c above) — never blindly default
-  to `gates.dot` or `minimal_feature.dot`.
+- `--pipeline <name>` — short name (`two_node`, `gates`, `hello`, `pr_gates`,
+  `minimal_pr`, `minimal_feature`, `review_slim`, `review_full`) or path to a
+  `.dot`. If omitted, the runner dispatches the slim two-node default graph
+  (`pipelines/slim/two_node.dot`) — a generic worker + static Codex cold
+  reviewer — for every `/f` and `/factory` invocation. To opt into the
+  heavyweight pipelines (gates / minimal_feature / etc.) pass an explicit
+  `--pipeline <name>`. The previous "auto-select from the goal" behavior is
+  retired; the slim two-node shape is the new default across the board.
 - `--feature <name>` — holdout feature. Required when the pipeline includes a
   `holdout_eval` node, but never default it blindly: pass it only after
   confirming `~/projects/dark-factory-holdouts/holdouts/<name>/` actually

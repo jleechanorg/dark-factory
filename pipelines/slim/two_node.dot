@@ -1,0 +1,80 @@
+// pipelines/slim/two_node.dot
+//
+// Default graph for `/f` (and `/factory`). Exactly two nodes:
+//   worker         — generic codergen; light prompt; does whatever the user asked.
+//   cold_reviewer  — gate_er that runs the static Codex cold-reviewer prompt
+//                    (prompts/slim/cold_reviewer.md — DO NOT EDIT; this prompt
+//                    is the canonical cold reviewer contract for slim runs).
+//
+// Wiring:
+//   start -> worker -> cold_reviewer -> exit                (on success)
+//                          \-> worker                        (on failure, bounded)
+//
+// Backend routing:
+//   - worker          honors the run-level --backend (the coder tier the user
+//                     chose; default = whatever /f's Step 0.5 detector picks).
+//   - cold_reviewer   uses backend_priority="codex,minimax,agy,claude-sonnet"
+//                     and prefer_adversarial="true" so the reviewer is a
+//                     different vendor from the worker whenever possible. The
+//                     queue is the same priority list already documented in
+//                     docs/pipeline-selection.md; no new backend table here.
+//
+// Failure semantics:
+//   - cold_reviewer is goal_gate=true. On success the run exits.
+//   - On a real fail/partial verdict the runner routes back to worker via the
+//     fix loop (max_visits=3). The cold reviewer is the merge-confidence bar;
+//     no separate evidence gate in this minimal graph.
+//   - Worker is the only repairable node (max_visits=2 on cold_reviewer would
+//     loop on the reviewer; max_visits=3 on the fix back-edge is the bounded
+//     repair budget per factory design).
+
+digraph SlimTwoNode {
+    graph [
+        goal="Generic worker does the user's task; static Codex cold reviewer gates it. Slim default for /f."
+        rankdir=LR
+        label="SlimTwoNode (default /f graph)"
+    ]
+
+    start  [shape=Mdiamond, label="Start"]
+    exit   [shape=Msquare,  label="Exit"]
+
+    worker [
+        type="codergen",
+        label="Generic Worker",
+        class="worker",
+        prompt="@prompts/slim/worker.md",
+        max_retries=2,
+        timeout=600
+    ]
+
+    cold_reviewer [
+        type="gate_er",
+        label="Cold Reviewer (static Codex prompt)",
+        class="review",
+        prompt="@prompts/slim/cold_reviewer.md",
+        backend_priority="codex,minimax,agy,claude-sonnet",
+        prefer_adversarial="true",
+        goal_gate=true,
+        timeout=600
+    ]
+
+    fix [
+        type="codergen",
+        label="Fix & Iterate",
+        class="fix",
+        prompt="@prompts/slim/fix.md",
+        max_retries=2,
+        max_visits="3",
+        no_progress_max="2",
+        timeout=600
+    ]
+
+    start -> worker
+    worker -> cold_reviewer [condition="outcome=success"]
+    worker -> fix          [condition="outcome!=success"]
+
+    cold_reviewer -> exit [condition="outcome=success"]
+    cold_reviewer -> fix  [condition="outcome!=success"]
+
+    fix -> worker
+}
