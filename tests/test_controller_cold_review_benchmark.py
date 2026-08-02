@@ -16,12 +16,17 @@ from benchmarks.scripts.run_controller_cold_review import (
     MANUAL_OBSERVATION_PROMPT,
     MANUAL_OBSERVATION_SOURCE,
     SCREEN_CASE_IDS,
+    SCREEN_MODEL,
+    SCREEN_REASONING_EFFORT,
+    SCREEN_TIMEOUT_SECONDS,
+    SCREEN_WORKERS,
     SCREEN_VARIANTS,
     build_blinded_plan,
     build_manual_observation_plan,
     build_screen_plan,
     commit_claim_snapshot,
     load_manifest,
+    main,
     render_manual_observation_prompt,
     run_benchmark,
     run_screen,
@@ -102,6 +107,22 @@ def _fixture_case(tmp_path: Path):
         "evidence_manifest_sha256": hashlib.sha256(b"[]").hexdigest(),
     }
     return repo, case
+
+
+def _fixture_screen(tmp_path: Path):
+    repo, template = _fixture_case(tmp_path)
+    cases = []
+    for case_id, pr in zip(SCREEN_CASE_IDS, (8603, 8612, 8613), strict=True):
+        case = dict(template)
+        case["id"] = case_id
+        case["pr"] = pr
+        cases.append(case)
+    return repo, {
+        "schema": 1,
+        "repository": "https://github.com/jleechanorg/worldarchitect.ai",
+        "input_order": list(("task", "diff", "changed_files", "evidence")),
+        "cases": cases,
+    }
 
 
 def test_public_manifest_pins_five_prs_and_seven_review_revisions():
@@ -232,6 +253,49 @@ def test_screen_plan_has_three_blinded_variants_with_identical_controls():
     ) == (public, private)
 
 
+@pytest.mark.parametrize(
+    ("case_ids", "model", "reasoning_effort", "timeout_seconds", "error"),
+    (
+        (SCREEN_CASE_IDS[:2], SCREEN_MODEL, SCREEN_REASONING_EFFORT, SCREEN_TIMEOUT_SECONDS, "case"),
+        (SCREEN_CASE_IDS, "gpt-5.6-terra", SCREEN_REASONING_EFFORT, SCREEN_TIMEOUT_SECONDS, "model"),
+        (SCREEN_CASE_IDS, SCREEN_MODEL, "medium", SCREEN_TIMEOUT_SECONDS, "reasoning"),
+        (SCREEN_CASE_IDS, SCREEN_MODEL, SCREEN_REASONING_EFFORT, 1200, "timeout"),
+    ),
+)
+def test_screen_plan_rejects_noncanonical_protocol(
+    case_ids, model, reasoning_effort, timeout_seconds, error
+):
+    manifest = load_manifest(MANIFEST)
+    cases = [case for case in manifest["cases"] if case["id"] in case_ids]
+
+    with pytest.raises(BenchmarkError, match=error):
+        build_screen_plan(
+            cases,
+            seed=20260802,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            timeout_seconds=timeout_seconds,
+        )
+
+
+def test_run_screen_rejects_noncanonical_worker_count(tmp_path):
+    manifest = load_manifest(MANIFEST)
+
+    with pytest.raises(BenchmarkError, match="workers"):
+        run_screen(
+            manifest,
+            case_ids=list(SCREEN_CASE_IDS),
+            repo=tmp_path,
+            output_dir=tmp_path / "never-created",
+            seed=20260802,
+            model=SCREEN_MODEL,
+            reasoning_effort=SCREEN_REASONING_EFFORT,
+            timeout_seconds=SCREEN_TIMEOUT_SECONDS,
+            workers=1,
+        )
+    assert not (tmp_path / "never-created").exists()
+
+
 def test_manual_observation_is_separate_and_preserves_prompt_bytes():
     manifest = load_manifest(MANIFEST)
     cases = [case for case in manifest["cases"] if case["id"] in SCREEN_CASE_IDS]
@@ -267,11 +331,25 @@ def test_manual_observation_is_separate_and_preserves_prompt_bytes():
     assert second == MANUAL_OBSERVATION_PROMPT.format(pr_url=second_url)
     assert first.replace(first_url, "{pr_url}") == MANUAL_OBSERVATION_PROMPT
     assert second.replace(second_url, "{pr_url}") == MANUAL_OBSERVATION_PROMPT
+    historical = render_manual_observation_prompt(
+        "https://github.com/jleechanorg/worldarchitect.ai/pull/8328"
+    )
+    assert len(historical.encode("utf-8")) == 150
+    assert hashlib.sha256(historical.encode("utf-8")).hexdigest() == (
+        "74e09b7cebfcb3fed630f7a9085c984b04e04726cc29a89ed23029d9a2a6bcb3"
+    )
+    assert len(historical.encode("utf-8")) == MANUAL_OBSERVATION_SOURCE[
+        "source_prompt_utf8_bytes"
+    ]
+    assert hashlib.sha256(historical.encode("utf-8")).hexdigest() == (
+        MANUAL_OBSERVATION_SOURCE["source_prompt_sha256"]
+    )
 
 
 def _fake_validated_control_review(request, *, neutral_cwd, output_dir, **_kwargs):
     output_dir.mkdir(parents=True)
     response = (
+        "PROMPT_ID: controller-cold-review-v2\n"
         "## Findings\nControl narrative.\n"
         "## Commands Executed\nNone.\n"
         "## Evidence Checked\nDiff.\n## Caveats\nNone.\n"
@@ -315,13 +393,7 @@ def _fake_validated_control_review(request, *, neutral_cwd, output_dir, **_kwarg
 def test_run_screen_uses_raw_freeform_transport_and_transcript_bundles(
     tmp_path, monkeypatch
 ):
-    repo, case = _fixture_case(tmp_path)
-    manifest = {
-        "schema": 1,
-        "repository": "https://github.com/jleechanorg/worldarchitect.ai",
-        "input_order": list(("task", "diff", "changed_files", "evidence")),
-        "cases": [case],
-    }
+    repo, manifest = _fixture_screen(tmp_path)
     output = tmp_path / "screen-output"
     completed = []
     real_run = subprocess.run
@@ -364,17 +436,17 @@ def test_run_screen_uses_raw_freeform_transport_and_transcript_bundles(
 
     run_screen(
         manifest,
-        case_ids=[case["id"]],
+        case_ids=list(SCREEN_CASE_IDS),
         repo=repo,
         output_dir=output,
         seed=20260802,
         model="gpt-5.6-luna",
         reasoning_effort="high",
         timeout_seconds=900,
-        workers=1,
+        workers=SCREEN_WORKERS,
     )
 
-    assert len(completed) == 2
+    assert len(completed) == 6
     for _args, kwargs in completed:
         assert Path(kwargs["cwd"]).parts[-3] == "neutral"
         assert kwargs["env"].get("DARK_FACTORY_HOLDOUTS") is None
@@ -384,19 +456,45 @@ def test_run_screen_uses_raw_freeform_transport_and_transcript_bundles(
     for arm in ("arm-1", "arm-2", "arm-3"):
         bundle = json.loads((output / f"blinded-{arm}-bundle.json").read_text())
         assert bundle["schema_version"] == "cold-review-transcript-run-v1"
+        assert set(bundle) == {
+            "schema_version", "run_id", "public_plan_sha256",
+            "private_arm_map_sha256", "cases",
+        }
+        assert bundle["public_plan_sha256"] == hashlib.sha256(
+            (output / "run-plan.json").read_bytes()
+        ).hexdigest()
+        assert bundle["private_arm_map_sha256"] == hashlib.sha256(
+            (output / "private-arm-map.json").read_bytes()
+        ).hexdigest()
         assert set(bundle["cases"][0]) == {
             "case_id", "base_sha", "head_sha", "diff", "diff_sha256",
             "case_sha256", "transcript", "transcript_sha256", "metrics",
         }
+    transcripts = [
+        case["transcript"]
+        for arm in ("arm-1", "arm-2", "arm-3")
+        for case in json.loads((output / f"blinded-{arm}-bundle.json").read_text())["cases"]
+    ]
+    assert sum(text.startswith("PROMPT_ID: controller-cold-review-v2") for text in transcripts) == 3
     freeform_records = [
         json.loads(path.read_text())
         for path in (output / "raw").glob("*/*/run-record.json")
         if json.loads(path.read_text())["review_variant"].startswith("freeform-")
     ]
-    assert len(freeform_records) == 2
+    assert len(freeform_records) == 6
     assert all(record["prompt_sha256"] for record in freeform_records)
     assert all(record["envelope_sha256"] for record in freeform_records)
     assert all(record["transport_sha256"] for record in freeform_records)
+    assert all(
+        record["public_plan_sha256"]
+        == hashlib.sha256((output / "run-plan.json").read_bytes()).hexdigest()
+        for record in freeform_records
+    )
+    assert all(
+        record["private_arm_map_sha256"]
+        == hashlib.sha256((output / "private-arm-map.json").read_bytes()).hexdigest()
+        for record in freeform_records
+    )
 
 
 @pytest.mark.parametrize(
@@ -406,13 +504,7 @@ def test_run_screen_uses_raw_freeform_transport_and_transcript_bundles(
 def test_run_screen_fails_closed_and_preserves_receipt(
     tmp_path, monkeypatch, returncode, usage, error
 ):
-    repo, case = _fixture_case(tmp_path)
-    manifest = {
-        "schema": 1,
-        "repository": "https://github.com/jleechanorg/worldarchitect.ai",
-        "input_order": list(("task", "diff", "changed_files", "evidence")),
-        "cases": [case],
-    }
+    repo, manifest = _fixture_screen(tmp_path)
     output = tmp_path / "invalid-screen"
     real_run = subprocess.run
     monkeypatch.setattr(
@@ -445,14 +537,14 @@ def test_run_screen_fails_closed_and_preserves_receipt(
     with pytest.raises(BenchmarkError, match=error):
         run_screen(
             manifest,
-            case_ids=[case["id"]],
+            case_ids=list(SCREEN_CASE_IDS),
             repo=repo,
             output_dir=output,
             seed=20260802,
             model="gpt-5.6-luna",
             reasoning_effort="high",
             timeout_seconds=900,
-            workers=1,
+            workers=SCREEN_WORKERS,
         )
 
     receipts = list((output / "raw").glob("*/*/controller-receipt.json"))
@@ -460,16 +552,147 @@ def test_run_screen_fails_closed_and_preserves_receipt(
     assert "exit_code" in json.loads(receipts[-1].read_text())
 
 
+@pytest.mark.parametrize("failure", ("timeout", "launch"))
+def test_run_screen_preserves_timeout_and_launch_failure_receipts(
+    tmp_path, monkeypatch, failure
+):
+    repo, manifest = _fixture_screen(tmp_path)
+    output = tmp_path / f"{failure}-screen"
+    real_run = subprocess.run
+    partial = '{"type":"item.completed","item":{"type":"agent_message","text":"partial"}}\n'
+    monkeypatch.setattr(
+        "benchmarks.scripts.run_controller_cold_review._gate_subprocess_args",
+        lambda *args, **kwargs: ["codex", "exec", "PROMPT"],
+    )
+    monkeypatch.setattr(
+        "benchmarks.scripts.run_controller_cold_review.run_controller_review",
+        _fake_validated_control_review,
+    )
+
+    def fake_run(args, **kwargs):
+        if args and args[0] == "git":
+            return real_run(args, **kwargs)
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(
+                args,
+                SCREEN_TIMEOUT_SECONDS,
+                output=partial,
+                stderr="timed out with partial stderr",
+            )
+        raise OSError("codex launch failed")
+
+    monkeypatch.setattr(
+        "benchmarks.scripts.run_controller_cold_review.subprocess.run", fake_run
+    )
+
+    with pytest.raises(BenchmarkError, match= failure):
+        run_screen(
+            manifest,
+            case_ids=list(SCREEN_CASE_IDS),
+            repo=repo,
+            output_dir=output,
+            seed=20260802,
+            model=SCREEN_MODEL,
+            reasoning_effort=SCREEN_REASONING_EFFORT,
+            timeout_seconds=SCREEN_TIMEOUT_SECONDS,
+            workers=SCREEN_WORKERS,
+        )
+
+    receipts = [
+        json.loads(path.read_text())
+        for path in (output / "raw").glob("*/*/controller-receipt.json")
+        if json.loads(path.read_text()).get("failure_class") == failure
+    ]
+    assert receipts
+    assert all(receipt["attempt_id"] for receipt in receipts)
+    transport_paths = list((output / "raw").glob("*/*/transport.jsonl"))
+    assert transport_paths
+    if failure == "timeout":
+        assert any(path.read_text() == partial for path in transport_paths)
+
+
+def test_screen_concurrency_is_measured_at_live_reviewer_call_seam(
+    tmp_path, monkeypatch
+):
+    repo, manifest = _fixture_screen(tmp_path)
+    output = tmp_path / "concurrent-screen"
+    real_run = subprocess.run
+    barrier = threading.Barrier(SCREEN_WORKERS)
+    seen_cases = set()
+    seen_lock = threading.Lock()
+    monkeypatch.setattr(
+        "benchmarks.scripts.run_controller_cold_review._gate_subprocess_args",
+        lambda *args, **kwargs: ["codex", "exec", "PROMPT"],
+    )
+
+    def rendezvous(neutral_cwd):
+        case_id = Path(neutral_cwd).parts[-2]
+        with seen_lock:
+            first = case_id not in seen_cases
+            seen_cases.add(case_id)
+        if first:
+            barrier.wait(timeout=5)
+
+    def fake_control(request, *, neutral_cwd, output_dir, **kwargs):
+        rendezvous(neutral_cwd)
+        return _fake_validated_control_review(
+            request, neutral_cwd=neutral_cwd, output_dir=output_dir, **kwargs
+        )
+
+    def fake_run(args, **kwargs):
+        if args and args[0] == "git":
+            return real_run(args, **kwargs)
+        rendezvous(kwargs["cwd"])
+        raw = "\n".join(
+            (
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {"type": "agent_message", "text": "Raw finding."},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "turn.completed",
+                        "usage": {"input_tokens": 4, "output_tokens": 2},
+                    }
+                ),
+            )
+        ) + "\n"
+        return subprocess.CompletedProcess(args, 0, stdout=raw, stderr="")
+
+    monkeypatch.setattr(
+        "benchmarks.scripts.run_controller_cold_review.run_controller_review",
+        fake_control,
+    )
+    monkeypatch.setattr(
+        "benchmarks.scripts.run_controller_cold_review.subprocess.run", fake_run,
+    )
+
+    run_screen(
+        manifest,
+        case_ids=list(SCREEN_CASE_IDS),
+        repo=repo,
+        output_dir=output,
+        seed=20260802,
+        model=SCREEN_MODEL,
+        reasoning_effort=SCREEN_REASONING_EFFORT,
+        timeout_seconds=SCREEN_TIMEOUT_SECONDS,
+        workers=SCREEN_WORKERS,
+    )
+
+    concurrency = json.loads((output / "concurrency.json").read_text())
+    assert concurrency == {
+        "measurement": "live-reviewer-calls",
+        "observed_max_cases": SCREEN_WORKERS,
+        "requested_workers": SCREEN_WORKERS,
+    }
+
+
 def test_manual_observation_runs_after_screen_and_stays_outside_arm_map(
     tmp_path, monkeypatch
 ):
-    repo, case = _fixture_case(tmp_path)
-    manifest = {
-        "schema": 1,
-        "repository": "https://github.com/jleechanorg/worldarchitect.ai",
-        "input_order": list(("task", "diff", "changed_files", "evidence")),
-        "cases": [case],
-    }
+    repo, manifest = _fixture_screen(tmp_path)
     output = tmp_path / "observational-screen"
     prompts = []
     monkeypatch.setattr(
@@ -481,7 +704,9 @@ def test_manual_observation_runs_after_screen_and_stays_outside_arm_map(
         _fake_validated_control_review,
     )
 
-    def fake_raw(_inputs, *, prompt, output_dir, **_kwargs):
+    def fake_raw(
+        _inputs, *, prompt, output_dir, receipt_bindings=None, **_kwargs
+    ):
         prompts.append(prompt)
         output_dir.mkdir(parents=True)
         paths = {}
@@ -498,6 +723,7 @@ def test_manual_observation_runs_after_screen_and_stays_outside_arm_map(
         receipt = {
             "duration_seconds": 0.1,
             "usage": {"input_tokens": 3, "output_tokens": 2},
+            **(receipt_bindings or {}),
         }
         paths["receipt"].write_text(json.dumps(receipt))
         return {"transcript": prompt, "receipt": receipt, "paths": paths}
@@ -509,21 +735,25 @@ def test_manual_observation_runs_after_screen_and_stays_outside_arm_map(
 
     run_screen(
         manifest,
-        case_ids=[case["id"]],
+        case_ids=list(SCREEN_CASE_IDS),
         repo=repo,
         output_dir=output,
         seed=20260802,
         model="gpt-5.6-luna",
         reasoning_effort="high",
         timeout_seconds=900,
-        workers=1,
+        workers=SCREEN_WORKERS,
         include_manual_observation=True,
     )
 
-    assert set(prompts[:2]) == set(FREEFORM_PROMPTS.values())
-    assert prompts[-1] == render_manual_observation_prompt(
-        "https://github.com/jleechanorg/worldarchitect.ai/pull/1"
-    )
+    assert len(prompts) == 9
+    assert all(prompt in FREEFORM_PROMPTS.values() for prompt in prompts[:6])
+    assert set(prompts[6:]) == {
+        render_manual_observation_prompt(
+            f"https://github.com/jleechanorg/worldarchitect.ai/pull/{pr}"
+        )
+        for pr in (8603, 8612, 8613)
+    }
     private = json.loads((output / "private-arm-map.json").read_text())
     assert "manual" not in json.dumps(private).lower()
     observation = json.loads((output / "manual-observation-bundle.json").read_text())
@@ -538,6 +768,69 @@ def test_manual_observation_runs_after_screen_and_stays_outside_arm_map(
     assert receipt["observational"] is True
     assert receipt["eligible_for_advancement"] is False
     assert receipt["source"] == MANUAL_OBSERVATION_SOURCE
+
+
+def test_screen_cli_reports_selected_case_count(tmp_path, monkeypatch, capsys):
+    captured = {}
+    manifest = load_manifest(MANIFEST)
+    monkeypatch.setattr(
+        "benchmarks.scripts.run_controller_cold_review.load_manifest",
+        lambda _path: manifest,
+    )
+    monkeypatch.setattr(
+        "benchmarks.scripts.run_controller_cold_review.run_screen",
+        lambda *args, **kwargs: captured.update(kwargs),
+    )
+
+    rc = main(
+        [
+            "screen",
+            "--manifest", str(MANIFEST),
+            "--repo", str(tmp_path),
+            "--output", str(tmp_path / "screen"),
+            "--model", SCREEN_MODEL,
+            "--reasoning-effort", SCREEN_REASONING_EFFORT,
+            "--timeout", str(SCREEN_TIMEOUT_SECONDS),
+            "--workers", str(SCREEN_WORKERS),
+            *[
+                value
+                for case_id in SCREEN_CASE_IDS
+                for value in ("--case-id", case_id)
+            ],
+        ]
+    )
+
+    assert rc == 0
+    assert captured["case_ids"] == list(SCREEN_CASE_IDS)
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "valid",
+        "cases": len(SCREEN_CASE_IDS),
+    }
+
+
+@pytest.mark.parametrize(
+    ("command", "extra_flag", "error"),
+    (
+        ("validate", ("--case-id", SCREEN_CASE_IDS[0]), "--case-id"),
+        ("validate", ("--include-manual-observation",), "--include-manual-observation"),
+        ("run", ("--case-id", SCREEN_CASE_IDS[0]), "--case-id"),
+        ("run", ("--include-manual-observation",), "--include-manual-observation"),
+    ),
+)
+def test_non_screen_commands_reject_screen_only_flags(
+    tmp_path, capsys, command, extra_flag, error
+):
+    args = [
+        command,
+        "--manifest", str(MANIFEST),
+        "--repo", str(tmp_path),
+        *extra_flag,
+    ]
+    if command == "run":
+        args.extend(("--output", str(tmp_path / "run"), "--model", "gpt-5.6-terra"))
+
+    assert main(args) == 1
+    assert error in json.loads(capsys.readouterr().out)["error"]
 
 
 def test_run_preserves_raw_artifacts_and_writes_digest_bound_arm_records(

@@ -16,7 +16,7 @@ import sys
 import tempfile
 import threading
 import time
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import replace
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -43,6 +43,10 @@ from runner.review_controller import (
 
 CONTRACTS = ("cold-review-v1", "cold-review-v2")
 SCREEN_CASE_IDS = ("wa-8603-r1", "wa-8612-r2", "wa-8613-r1")
+SCREEN_MODEL = "gpt-5.6-luna"
+SCREEN_REASONING_EFFORT = "high"
+SCREEN_TIMEOUT_SECONDS = 900
+SCREEN_WORKERS = 3
 SCREEN_VARIANTS = (
     "control-v2",
     "freeform-traceability",
@@ -336,6 +340,12 @@ def build_screen_plan(
     timeout_seconds: int,
 ) -> tuple[dict, dict]:
     """Build the randomized three-arm screen without public variant labels."""
+    _validate_screen_protocol(
+        cases,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        timeout_seconds=timeout_seconds,
+    )
     return _build_variant_plan(
         cases,
         variants=SCREEN_VARIANTS,
@@ -345,6 +355,30 @@ def build_screen_plan(
         reasoning_effort=reasoning_effort,
         timeout_seconds=timeout_seconds,
     )
+
+
+def _validate_screen_protocol(
+    cases: list[dict],
+    *,
+    model: str,
+    reasoning_effort: str,
+    timeout_seconds: int,
+    workers: int | None = None,
+) -> None:
+    if tuple(case.get("id") for case in cases) != SCREEN_CASE_IDS:
+        raise BenchmarkError("screen requires the exact canonical case order")
+    if model != SCREEN_MODEL:
+        raise BenchmarkError(f"screen model must be {SCREEN_MODEL}")
+    if reasoning_effort != SCREEN_REASONING_EFFORT:
+        raise BenchmarkError(
+            f"screen reasoning_effort must be {SCREEN_REASONING_EFFORT}"
+        )
+    if timeout_seconds != SCREEN_TIMEOUT_SECONDS:
+        raise BenchmarkError(
+            f"screen timeout_seconds must be {SCREEN_TIMEOUT_SECONDS}"
+        )
+    if workers is not None and workers != SCREEN_WORKERS:
+        raise BenchmarkError(f"screen workers must be {SCREEN_WORKERS}")
 
 
 def render_manual_observation_prompt(pr_url: str) -> str:
@@ -364,12 +398,12 @@ def build_manual_observation_plan(
     timeout_seconds: int,
 ) -> dict:
     """Build a non-randomized, categorically non-advancing observation plan."""
-    if not model.strip():
-        raise BenchmarkError("model is required")
-    if reasoning_effort not in ("minimal", "low", "medium", "high", "xhigh"):
-        raise BenchmarkError("reasoning_effort is invalid")
-    if timeout_seconds <= 0:
-        raise BenchmarkError("timeout_seconds must be positive")
+    _validate_screen_protocol(
+        cases,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        timeout_seconds=timeout_seconds,
+    )
     controls = {
         "model": model,
         "reasoning_effort": reasoning_effort,
@@ -471,6 +505,126 @@ def _case_sha256(case: dict) -> str:
     )
 
 
+class _LiveReviewerCalls:
+    """Measure overlap only while a reviewer transport is actually running."""
+
+    def __init__(self) -> None:
+        self._active = 0
+        self._maximum = 0
+        self._lock = threading.Lock()
+
+    @contextmanager
+    def track(self):
+        with self._lock:
+            self._active += 1
+            self._maximum = max(self._maximum, self._active)
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._active -= 1
+
+    @property
+    def maximum(self) -> int:
+        with self._lock:
+            return self._maximum
+
+
+def _controller_transport(
+    prompt: str,
+    *,
+    worktree: pathlib.Path,
+    goal: str,
+    model: str,
+    reasoning_effort: str,
+    timeout_seconds: int,
+) -> list[str]:
+    ctx = Context(goal=goal, workdir=worktree, backend="codex")
+    base_argv = _gate_subprocess_args("codex", prompt, ctx, timeout_seconds)
+    if base_argv is None:
+        raise BenchmarkError("codex read-only sandbox transport is unavailable")
+    return _build_controller_codex_transport(
+        base_argv,
+        model=model,
+        reasoning_effort=reasoning_effort,
+    )
+
+
+def _execute_case_jobs(
+    *,
+    repo: pathlib.Path,
+    cases: list[dict],
+    worktree_root: pathlib.Path,
+    workers: int,
+    run_case,
+) -> dict[str, dict]:
+    """Own detached worktrees and bounded case concurrency for all modes."""
+    if workers <= 0:
+        raise BenchmarkError("workers must be positive")
+    results: dict[str, dict] = {}
+    with ExitStack() as stack:
+        worktrees = {
+            case["id"]: stack.enter_context(
+                _detached_worktree(
+                    repo,
+                    worktree_root / case["id"],
+                    case["head_sha"],
+                )
+            )
+            for case in cases
+        }
+        max_workers = min(workers, len(cases))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                case["id"]: pool.submit(run_case, case, worktrees[case["id"]])
+                for case in cases
+            }
+            for case in cases:
+                results[case["id"]] = futures[case["id"]].result()
+    return results
+
+
+def _execute_serial_arms(
+    case: dict,
+    worktree: pathlib.Path,
+    runs: list[dict],
+    execute_arm,
+) -> dict[str, dict]:
+    """Validate once, run arms serially, and revalidate after every reviewer."""
+    inputs = validate_case(worktree, case)
+    entries: dict[str, dict] = {}
+    for run in runs:
+        entries[run["arm"]] = execute_arm(case, inputs, run, worktree)
+        validate_case(worktree, case)
+    return entries
+
+
+def _artifact_digest_fields(paths: dict[str, str | pathlib.Path]) -> dict[str, str]:
+    return {f"{name}_sha256": _file_digest(path) for name, path in paths.items()}
+
+
+def _write_arm_bundles(
+    *,
+    output_dir: pathlib.Path,
+    arms: tuple[str, ...],
+    schema_version: str,
+    seed: int,
+    cases: list[dict],
+    entries_by_case: dict[str, dict[str, dict]],
+    metadata: dict | None = None,
+) -> None:
+    for arm in arms:
+        bundle = {
+            "schema_version": schema_version,
+            "run_id": f"seed-{seed}-{arm}",
+            **(metadata or {}),
+            "cases": [entries_by_case[case["id"]][arm] for case in cases],
+        }
+        (output_dir / f"blinded-{arm}-bundle.json").write_text(
+            json.dumps(bundle, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+
 def _raw_freeform_prompt(prompt: str, envelope_json: str) -> str:
     envelope_b64 = base64.b64encode(envelope_json.encode("utf-8")).decode("ascii")
     return (
@@ -492,27 +646,25 @@ def _run_raw_freeform_review(
     model: str,
     reasoning_effort: str,
     timeout_seconds: int,
+    call_tracker: _LiveReviewerCalls | None = None,
+    receipt_bindings: dict | None = None,
 ) -> dict:
     """Execute one unparsed transcript call and preserve its bound artifacts."""
     request = create_review_request(inputs, review_contract="cold-review-v2")
     prompt_text = _raw_freeform_prompt(prompt, request.envelope_json)
-    ctx = Context(
+    argv = _controller_transport(
+        prompt_text,
+        worktree=pathlib.Path(inputs.workspace_path),
         goal="controller cold-review transcript screen",
-        workdir=pathlib.Path(inputs.workspace_path),
-        backend="codex",
-    )
-    base_argv = _gate_subprocess_args("codex", prompt_text, ctx, timeout_seconds)
-    if base_argv is None:
-        raise BenchmarkError("codex read-only sandbox transport is unavailable")
-    argv = _build_controller_codex_transport(
-        base_argv,
         model=model,
         reasoning_effort=reasoning_effort,
+        timeout_seconds=timeout_seconds,
     )
     output_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
     prompt_path = output_dir / "prompt.txt"
     envelope_path = output_dir / "envelope.json"
     transport_path = output_dir / "transport.jsonl"
+    stderr_path = output_dir / "transport.stderr.txt"
     response_path = output_dir / "reviewer.output.md"
     receipt_path = output_dir / "controller-receipt.json"
     prompt_path.write_text(prompt_text, encoding="utf-8")
@@ -520,25 +672,9 @@ def _run_raw_freeform_review(
 
     from runner.handler_sandbox import _sanitized_env
 
-    started_at = time.monotonic()
-    try:
-        proc = subprocess.run(
-            argv,
-            cwd=str(neutral_cwd.resolve()),
-            input=prompt_text,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            check=False,
-            env=_sanitized_env(),
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise BenchmarkError(f"free-form review transport failed: {exc}") from exc
-    duration_seconds = max(0.0, time.monotonic() - started_at)
-    transport_path.write_text(proc.stdout, encoding="utf-8")
-    usage = parse_codex_usage(proc.stdout)
     receipt = {
         "schema": 1,
+        "attempt_id": inputs.run_id,
         "review_contract": None,
         "prompt_sha256": _sha256(prompt_text.encode()),
         "envelope_sha256": request.envelope_sha256,
@@ -547,13 +683,80 @@ def _run_raw_freeform_review(
         "diff_sha256": request.diff_sha256,
         "changed_files_sha256": request.changed_files_sha256,
         "evidence_manifest_sha256": request.evidence_manifest_sha256,
-        "exit_code": proc.returncode,
-        "duration_seconds": round(duration_seconds, 6),
-        "usage": usage,
         "transport_argv": argv,
         "neutral_cwd": str(neutral_cwd.resolve()),
-        "stderr_sha256": _sha256(proc.stderr.encode()),
+        **(receipt_bindings or {}),
     }
+    tracker_context = call_tracker.track() if call_tracker is not None else nullcontext()
+    started_at = time.monotonic()
+    try:
+        with tracker_context:
+            proc = subprocess.run(
+                argv,
+                cwd=str(neutral_cwd.resolve()),
+                input=prompt_text,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                check=False,
+                env=_sanitized_env(),
+            )
+    except subprocess.TimeoutExpired as exc:
+        duration_seconds = max(0.0, time.monotonic() - started_at)
+        stdout = exc.stdout if exc.stdout is not None else exc.output
+        stderr = exc.stderr or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        stdout = stdout or ""
+        transport_path.write_text(stdout, encoding="utf-8")
+        stderr_path.write_text(stderr, encoding="utf-8")
+        receipt.update(
+            {
+                "exit_code": None,
+                "failure_class": "timeout",
+                "duration_seconds": round(duration_seconds, 6),
+                "usage": parse_codex_usage(stdout),
+                "stderr_sha256": _sha256(stderr.encode()),
+                "transport_sha256": _sha256(stdout.encode()),
+            }
+        )
+        receipt_path.write_text(
+            json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        raise BenchmarkError("free-form review transport timeout") from exc
+    except OSError as exc:
+        duration_seconds = max(0.0, time.monotonic() - started_at)
+        transport_path.write_text("", encoding="utf-8")
+        stderr_path.write_text(str(exc), encoding="utf-8")
+        receipt.update(
+            {
+                "exit_code": None,
+                "failure_class": "launch",
+                "duration_seconds": round(duration_seconds, 6),
+                "usage": {},
+                "stderr_sha256": _sha256(str(exc).encode()),
+                "transport_sha256": _sha256(b""),
+            }
+        )
+        receipt_path.write_text(
+            json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        raise BenchmarkError(f"free-form review transport launch failed: {exc}") from exc
+    duration_seconds = max(0.0, time.monotonic() - started_at)
+    transport_path.write_text(proc.stdout, encoding="utf-8")
+    stderr_path.write_text(proc.stderr, encoding="utf-8")
+    usage = parse_codex_usage(proc.stdout)
+    receipt.update(
+        {
+            "exit_code": proc.returncode,
+            "duration_seconds": round(duration_seconds, 6),
+            "usage": usage,
+            "stderr_sha256": _sha256(proc.stderr.encode()),
+            "transport_sha256": _sha256(proc.stdout.encode()),
+        }
+    )
     receipt_path.write_text(
         json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -585,6 +788,7 @@ def _run_raw_freeform_review(
             "prompt": prompt_path,
             "envelope": envelope_path,
             "transport": transport_path,
+            "stderr": stderr_path,
             "response": response_path,
             "receipt": receipt_path,
         },
@@ -605,15 +809,20 @@ def run_screen(
     include_manual_observation: bool = False,
 ) -> None:
     """Run three blinded transcript arms, then an optional manual observation."""
-    if workers <= 0:
-        raise BenchmarkError("workers must be positive")
-    if not case_ids or len(case_ids) != len(set(case_ids)):
-        raise BenchmarkError("screen case IDs must be non-empty and unique")
+    if len(case_ids) != len(SCREEN_CASE_IDS) or set(case_ids) != set(SCREEN_CASE_IDS):
+        raise BenchmarkError("screen requires exactly the canonical case IDs")
     available = {case["id"]: case for case in manifest["cases"]}
-    missing = [case_id for case_id in case_ids if case_id not in available]
+    missing = [case_id for case_id in SCREEN_CASE_IDS if case_id not in available]
     if missing:
         raise BenchmarkError(f"screen case IDs are missing: {', '.join(missing)}")
-    cases = [available[case_id] for case_id in case_ids]
+    cases = [available[case_id] for case_id in SCREEN_CASE_IDS]
+    _validate_screen_protocol(
+        cases,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        timeout_seconds=timeout_seconds,
+        workers=workers,
+    )
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=False)
     public_plan, private_plan = build_screen_plan(
@@ -623,20 +832,26 @@ def run_screen(
         reasoning_effort=reasoning_effort,
         timeout_seconds=timeout_seconds,
     )
-    (output_dir / "run-plan.json").write_text(
+    public_plan_path = output_dir / "run-plan.json"
+    private_map_path = output_dir / "private-arm-map.json"
+    public_plan_path.write_text(
         json.dumps(public_plan, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-    (output_dir / "private-arm-map.json").write_text(
+    private_map_path.write_text(
         json.dumps(private_plan, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    public_plan_sha256 = _file_digest(public_plan_path)
+    private_arm_map_sha256 = _file_digest(private_map_path)
     variant_map = {
         (row["case_id"], row["arm"]): row["review_variant"]
         for row in private_plan["arms"]
     }
-    active_cases = 0
-    observed_max_cases = 0
-    active_lock = threading.Lock()
+    call_tracker = _LiveReviewerCalls()
+    run_bindings = {
+        "public_plan_sha256": public_plan_sha256,
+        "private_arm_map_sha256": private_arm_map_sha256,
+    }
 
     def bundle_entry(case: dict, inputs: ReviewInputs, transcript: str, receipt: dict) -> dict:
         return {
@@ -651,208 +866,169 @@ def run_screen(
             "metrics": _token_metrics(receipt),
         }
 
-    def run_case(case: dict, worktree_path: pathlib.Path) -> dict[str, dict]:
-        nonlocal active_cases, observed_max_cases
-        with active_lock:
-            active_cases += 1
-            observed_max_cases = max(observed_max_cases, active_cases)
-        try:
-            case_id = case["id"]
-            inputs = validate_case(worktree_path, case)
-            entries: dict[str, dict] = {}
-            for run in (row for row in public_plan["runs"] if row["case_id"] == case_id):
-                arm = run["arm"]
-                variant = variant_map[(case_id, arm)]
-                raw_dir = output_dir / "raw" / case_id / arm
-                if variant == "control-v2":
-                    request = create_review_request(
-                        replace(inputs, run_id=f"{case_id}-{arm}"),
-                        review_contract="cold-review-v2",
-                    )
-                    ctx = Context(
-                        goal="controller cold-review transcript screen",
-                        workdir=worktree_path,
-                        backend="codex",
-                    )
-                    base_argv = _gate_subprocess_args(
-                        "codex", request.prompt, ctx, timeout_seconds
-                    )
-                    if base_argv is None:
-                        raise BenchmarkError(
-                            "codex read-only sandbox transport is unavailable"
-                        )
-                    argv = _build_controller_codex_transport(
-                        base_argv,
-                        model=model,
-                        reasoning_effort=reasoning_effort,
-                    )
-                    neutral = output_dir / "neutral" / case_id / arm
-                    neutral.mkdir(parents=True, exist_ok=False)
-                    result = run_controller_review(
-                        request,
-                        neutral_cwd=neutral,
-                        output_dir=raw_dir,
-                        transport_argv=tuple(argv),
-                        timeout=timeout_seconds,
-                    )
-                    receipt = json.loads(
-                        pathlib.Path(result.output_paths["receipt"]).read_text()
-                    )
-                    if not receipt.get("usage"):
-                        raise BenchmarkError(
-                            "control review transport emitted no usage record"
-                        )
-                    transcript = _narrative_transcript(result.response_text)
-                    artifact_paths = {
-                        name: pathlib.Path(path)
-                        for name, path in result.output_paths.items()
-                        if name in ("prompt", "envelope", "transport", "response", "receipt")
-                    }
-                else:
-                    neutral = output_dir / "neutral" / case_id / arm
-                    neutral.mkdir(parents=True, exist_ok=False)
-                    raw = _run_raw_freeform_review(
-                        replace(inputs, run_id=f"{case_id}-{arm}"),
-                        prompt=FREEFORM_PROMPTS[variant],
-                        neutral_cwd=neutral,
-                        output_dir=raw_dir,
-                        model=model,
-                        reasoning_effort=reasoning_effort,
-                        timeout_seconds=timeout_seconds,
-                    )
-                    transcript = raw["transcript"]
-                    receipt = raw["receipt"]
-                    artifact_paths = raw["paths"]
-                record = {
-                    "schema": "cold-review-transcript-raw-v1",
-                    "case_id": case_id,
-                    "arm": arm,
-                    "review_variant": variant,
-                    "case_sha256": _case_sha256(case),
-                    "task_sha256": case["task_sha256"],
-                    "diff_sha256": case["diff_sha256"],
-                    "changed_files_sha256": case["changed_files_sha256"],
-                    "evidence_manifest_sha256": case["evidence_manifest_sha256"],
-                    "controls": run["controls"],
-                    "input_order": run["input_order"],
-                }
-                for name, path in artifact_paths.items():
-                    record[f"{name}_sha256"] = _file_digest(path)
-                (raw_dir / "run-record.json").write_text(
-                    json.dumps(record, indent=2, sort_keys=True) + "\n",
-                    encoding="utf-8",
-                )
-                entries[arm] = bundle_entry(case, inputs, transcript, receipt)
-                validate_case(worktree_path, case)
-            return entries
-        finally:
-            with active_lock:
-                active_cases -= 1
-
-    entries_by_case: dict[str, dict[str, dict]] = {}
-    observations_by_case: dict[str, dict] = {}
-    with ExitStack() as stack:
-        worktrees = {
-            case["id"]: stack.enter_context(
-                _detached_worktree(
-                    repo,
-                    output_dir / "worktrees" / case["id"],
-                    case["head_sha"],
-                )
+    def execute_screen_arm(
+        case: dict, inputs: ReviewInputs, run: dict, worktree: pathlib.Path
+    ) -> dict:
+        case_id = case["id"]
+        arm = run["arm"]
+        variant = variant_map[(case_id, arm)]
+        raw_dir = output_dir / "raw" / case_id / arm
+        neutral = output_dir / "neutral" / case_id / arm
+        neutral.mkdir(parents=True, exist_ok=False)
+        if variant == "control-v2":
+            request = create_review_request(
+                replace(inputs, run_id=f"{case_id}-{arm}"),
+                review_contract="cold-review-v2",
             )
-            for case in cases
-        }
-        max_workers = min(workers, len(cases))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {
-                case["id"]: pool.submit(run_case, case, worktrees[case["id"]])
-                for case in cases
-            }
-            for case in cases:
-                entries_by_case[case["id"]] = futures[case["id"]].result()
-
-        if include_manual_observation:
-            observation_plan = build_manual_observation_plan(
-                cases,
+            argv = _controller_transport(
+                request.prompt,
+                worktree=worktree,
+                goal="controller cold-review transcript screen",
                 model=model,
                 reasoning_effort=reasoning_effort,
                 timeout_seconds=timeout_seconds,
             )
-            (output_dir / "manual-observation-plan.json").write_text(
-                json.dumps(observation_plan, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
-
-            def run_observation(case: dict) -> dict:
-                case_id = case["id"]
-                inputs = validate_case(worktrees[case_id], case)
-                pr_url = f"{manifest['repository']}/pull/{case['pr']}"
-                prompt = render_manual_observation_prompt(pr_url)
-                neutral = output_dir / "manual-observation" / "neutral" / case_id
-                neutral.mkdir(parents=True, exist_ok=False)
-                raw_dir = output_dir / "manual-observation" / "raw" / case_id
-                raw = _run_raw_freeform_review(
-                    replace(inputs, run_id=f"{case_id}-manual-observation"),
-                    prompt=prompt,
+            with call_tracker.track():
+                result = run_controller_review(
+                    request,
                     neutral_cwd=neutral,
                     output_dir=raw_dir,
-                    model=model,
-                    reasoning_effort=reasoning_effort,
-                    timeout_seconds=timeout_seconds,
+                    transport_argv=tuple(argv),
+                    timeout=timeout_seconds,
                 )
-                raw["receipt"].update(
-                    {
-                        "observational": True,
-                        "eligible_for_advancement": False,
-                        "source": dict(MANUAL_OBSERVATION_SOURCE),
-                        "rendered_prompt_sha256": _sha256(prompt.encode()),
-                    }
-                )
-                raw["paths"]["receipt"].write_text(
-                    json.dumps(raw["receipt"], indent=2, sort_keys=True) + "\n",
-                    encoding="utf-8",
-                )
-                record = {
-                    "schema": "cold-review-transcript-raw-v1",
-                    "case_id": case_id,
-                    "observation": "manual-fresh-window",
-                    "observational": True,
-                    "eligible_for_advancement": False,
-                    "source": dict(MANUAL_OBSERVATION_SOURCE),
-                    "rendered_prompt_sha256": _sha256(prompt.encode()),
-                    "case_sha256": _case_sha256(case),
-                    "task_sha256": case["task_sha256"],
-                    "diff_sha256": case["diff_sha256"],
-                    "changed_files_sha256": case["changed_files_sha256"],
-                    "evidence_manifest_sha256": case["evidence_manifest_sha256"],
-                    "controls": observation_plan["runs"][0]["controls"],
-                    "input_order": list(INPUT_ORDER),
-                }
-                for name, path in raw["paths"].items():
-                    record[f"{name}_sha256"] = _file_digest(path)
-                (raw_dir / "run-record.json").write_text(
-                    json.dumps(record, indent=2, sort_keys=True) + "\n",
-                    encoding="utf-8",
-                )
-                validate_case(worktrees[case_id], case)
-                return bundle_entry(case, inputs, raw["transcript"], raw["receipt"])
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-                futures = {
-                    case["id"]: pool.submit(run_observation, case) for case in cases
-                }
-                for case in cases:
-                    observations_by_case[case["id"]] = futures[case["id"]].result()
-
-    for arm in ("arm-1", "arm-2", "arm-3"):
-        bundle = {
-            "schema_version": "cold-review-transcript-run-v1",
-            "run_id": f"seed-{seed}-{arm}",
-            "cases": [entries_by_case[case["id"]][arm] for case in cases],
+            receipt = json.loads(
+                pathlib.Path(result.output_paths["receipt"]).read_text()
+            )
+            if not receipt.get("usage"):
+                raise BenchmarkError("control review transport emitted no usage record")
+            transcript = result.response_text
+            artifact_paths = {
+                name: pathlib.Path(path)
+                for name, path in result.output_paths.items()
+                if name in ("prompt", "envelope", "transport", "response", "receipt")
+            }
+        else:
+            raw = _run_raw_freeform_review(
+                replace(inputs, run_id=f"{case_id}-{arm}"),
+                prompt=FREEFORM_PROMPTS[variant],
+                neutral_cwd=neutral,
+                output_dir=raw_dir,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                timeout_seconds=timeout_seconds,
+                call_tracker=call_tracker,
+                receipt_bindings=run_bindings,
+            )
+            transcript = raw["transcript"]
+            receipt = raw["receipt"]
+            artifact_paths = raw["paths"]
+        record = {
+            "schema": "cold-review-transcript-raw-v1",
+            "case_id": case_id,
+            "arm": arm,
+            "review_variant": variant,
+            **run_bindings,
+            "case_sha256": _case_sha256(case),
+            "task_sha256": case["task_sha256"],
+            "diff_sha256": case["diff_sha256"],
+            "changed_files_sha256": case["changed_files_sha256"],
+            "evidence_manifest_sha256": case["evidence_manifest_sha256"],
+            "controls": run["controls"],
+            "input_order": run["input_order"],
+            **_artifact_digest_fields(artifact_paths),
         }
-        (output_dir / f"blinded-{arm}-bundle.json").write_text(
-            json.dumps(bundle, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        (raw_dir / "run-record.json").write_text(
+            json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
+        return bundle_entry(case, inputs, transcript, receipt)
+
+    def run_screen_case(case: dict, worktree: pathlib.Path) -> dict[str, dict]:
+        runs = [row for row in public_plan["runs"] if row["case_id"] == case["id"]]
+        return _execute_serial_arms(case, worktree, runs, execute_screen_arm)
+
+    entries_by_case = _execute_case_jobs(
+        repo=repo,
+        cases=cases,
+        worktree_root=output_dir / "worktrees",
+        workers=workers,
+        run_case=run_screen_case,
+    )
+
+    observations_by_case: dict[str, dict] = {}
+    if include_manual_observation:
+        observation_plan = build_manual_observation_plan(
+            cases,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            timeout_seconds=timeout_seconds,
+        )
+        (output_dir / "manual-observation-plan.json").write_text(
+            json.dumps(observation_plan, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        def run_observation(case: dict, worktree: pathlib.Path) -> dict:
+            case_id = case["id"]
+            inputs = validate_case(worktree, case)
+            pr_url = f"{manifest['repository']}/pull/{case['pr']}"
+            prompt = render_manual_observation_prompt(pr_url)
+            neutral = output_dir / "manual-observation" / "neutral" / case_id
+            neutral.mkdir(parents=True, exist_ok=False)
+            raw_dir = output_dir / "manual-observation" / "raw" / case_id
+            observation_bindings = {
+                **run_bindings,
+                "observational": True,
+                "eligible_for_advancement": False,
+                "source": dict(MANUAL_OBSERVATION_SOURCE),
+                "rendered_prompt_sha256": _sha256(prompt.encode()),
+            }
+            raw = _run_raw_freeform_review(
+                replace(inputs, run_id=f"{case_id}-manual-observation"),
+                prompt=prompt,
+                neutral_cwd=neutral,
+                output_dir=raw_dir,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                timeout_seconds=timeout_seconds,
+                receipt_bindings=observation_bindings,
+            )
+            record = {
+                "schema": "cold-review-transcript-raw-v1",
+                "case_id": case_id,
+                "observation": "manual-fresh-window",
+                **observation_bindings,
+                "case_sha256": _case_sha256(case),
+                "task_sha256": case["task_sha256"],
+                "diff_sha256": case["diff_sha256"],
+                "changed_files_sha256": case["changed_files_sha256"],
+                "evidence_manifest_sha256": case["evidence_manifest_sha256"],
+                "controls": observation_plan["runs"][0]["controls"],
+                "input_order": list(INPUT_ORDER),
+                **_artifact_digest_fields(raw["paths"]),
+            }
+            (raw_dir / "run-record.json").write_text(
+                json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            validate_case(worktree, case)
+            return bundle_entry(case, inputs, raw["transcript"], raw["receipt"])
+
+        observations_by_case = _execute_case_jobs(
+            repo=repo,
+            cases=cases,
+            worktree_root=output_dir / "manual-observation" / "worktrees",
+            workers=workers,
+            run_case=run_observation,
+        )
+
+    _write_arm_bundles(
+        output_dir=output_dir,
+        arms=("arm-1", "arm-2", "arm-3"),
+        schema_version="cold-review-transcript-run-v1",
+        seed=seed,
+        cases=cases,
+        entries_by_case=entries_by_case,
+        metadata=run_bindings,
+    )
     if include_manual_observation:
         observation_bundle = {
             "schema_version": "cold-review-transcript-run-v1",
@@ -860,6 +1036,8 @@ def run_screen(
             "observational": True,
             "eligible_for_advancement": False,
             "source": dict(MANUAL_OBSERVATION_SOURCE),
+            "public_plan_sha256": public_plan_sha256,
+            "private_arm_map_sha256": private_arm_map_sha256,
             "cases": [observations_by_case[case["id"]] for case in cases],
         }
         (output_dir / "manual-observation-bundle.json").write_text(
@@ -868,7 +1046,11 @@ def run_screen(
         )
     (output_dir / "concurrency.json").write_text(
         json.dumps(
-            {"observed_max_cases": observed_max_cases, "requested_workers": workers},
+            {
+                "measurement": "live-reviewer-calls",
+                "observed_max_cases": call_tracker.maximum,
+                "requested_workers": workers,
+            },
             indent=2,
             sort_keys=True,
         ) + "\n",
@@ -905,169 +1087,128 @@ def run_benchmark(
     (output_dir / "private-arm-map.json").write_text(
         json.dumps(arm_map, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-    cases = {case["id"]: case for case in manifest["cases"]}
+    cases = list(manifest["cases"])
     mapping = {
         (row["case_id"], row["arm"]): row["review_contract"]
         for row in arm_map["arms"]
     }
-    active_cases = 0
-    observed_max_cases = 0
-    active_lock = threading.Lock()
+    call_tracker = _LiveReviewerCalls()
 
-    def run_case(case_id: str, worktree_path: pathlib.Path) -> dict[str, dict]:
-        nonlocal active_cases, observed_max_cases
-        with active_lock:
-            active_cases += 1
-            observed_max_cases = max(observed_max_cases, active_cases)
-        try:
-            case = cases[case_id]
-            inputs = validate_case(worktree_path, case)
-            bundle_entries: dict[str, dict] = {}
-            case_runs = [
-                run for run in public_plan["runs"] if run["case_id"] == case_id
-            ]
-            for run in case_runs:
-                contract = mapping[(case_id, run["arm"])]
-                request = create_review_request(
-                    replace(inputs, run_id=f"{case_id}-{run['arm']}"),
-                    review_contract=contract,
-                )
-                ctx = Context(
-                    goal="controller cold-review benchmark",
-                    workdir=worktree_path,
-                    backend="codex",
-                )
-                base_argv = _gate_subprocess_args(
-                    "codex", request.prompt, ctx, timeout_seconds
-                )
-                if base_argv is None:
-                    raise BenchmarkError(
-                        "codex read-only sandbox transport is unavailable"
-                    )
-                argv = _build_controller_codex_transport(
-                    base_argv,
-                    model=model,
-                    reasoning_effort=reasoning_effort,
-                )
-                neutral = output_dir / "neutral" / case_id / run["arm"]
-                neutral.mkdir(parents=True)
-                raw_dir = output_dir / "raw" / case_id / run["arm"]
-                result = run_controller_review(
-                    request,
-                    neutral_cwd=neutral,
-                    output_dir=raw_dir,
-                    transport_argv=tuple(argv),
-                    timeout=timeout_seconds,
-                )
-                receipt = json.loads(
-                    pathlib.Path(result.output_paths["receipt"]).read_text()
-                )
-                transcript = _narrative_transcript(result.response_text)
-                findings_text = _findings_only(result.response_text)
-                findings = [] if not findings_text else [{
-                    "observed_id": f"obs-{_sha256(findings_text.encode())[:16]}",
-                    "text": findings_text,
-                }]
-                case_digest_input = {
-                    "case_id": case_id,
-                    "base_sha": case["base_sha"],
-                    "head_sha": case["head_sha"],
-                    "diff_sha256": case["diff_sha256"],
-                }
-                record = {
-                    "schema": "cold-review-raw-v1",
-                    "case_id": case_id,
-                    "arm": run["arm"],
-                    "review_contract": contract,
-                    "case_sha256": _sha256(_canonical(case_digest_input).encode()),
-                    "task_sha256": case["task_sha256"],
-                    "controls": run["controls"],
-                    "input_order": run["input_order"],
-                }
-                for artifact in (
-                    "prompt", "envelope", "response", "transport", "receipt", "findings"
-                ):
-                    record[f"{artifact}_sha256"] = _file_digest(
-                        result.output_paths[artifact]
-                    )
-                (raw_dir / "run-record.json").write_text(
-                    json.dumps(record, indent=2, sort_keys=True) + "\n",
-                    encoding="utf-8",
-                )
-                blinded = {
-                    "schema": 1,
-                    "case_id": case_id,
-                    "arm": run["arm"],
-                    "verdict": result.review.verdict,
-                    "findings": findings_text,
-                    "response_sha256": result.review.response_sha256,
-                    "duration_seconds": receipt["duration_seconds"],
-                    "usage": receipt.get("usage", {}),
-                    "head_sha": case["head_sha"],
-                    "diff_sha256": case["diff_sha256"],
-                }
-                blinded_dir = output_dir / "blinded" / case_id
-                blinded_dir.mkdir(parents=True, exist_ok=True)
-                (blinded_dir / f"{run['arm']}.json").write_text(
-                    json.dumps(blinded, indent=2, sort_keys=True) + "\n",
-                    encoding="utf-8",
-                )
-                bundle_entries[run["arm"]] = {
-                    "case_id": case_id,
-                    "base_sha": case["base_sha"],
-                    "head_sha": case["head_sha"],
-                    "diff_sha256": case["diff_sha256"],
-                    "case_sha256": record["case_sha256"],
-                    "diff": inputs.diff_text,
-                    "transcript": transcript,
-                    "transcript_sha256": _sha256(transcript.encode()),
-                    "review_verdict": result.review.verdict.upper(),
-                    "findings": [
-                        {"id": item["observed_id"], "text": item["text"]}
-                        for item in findings
-                    ],
-                    "metrics": _token_metrics(receipt),
-                }
-                validate_case(worktree_path, case)
-            return bundle_entries
-        finally:
-            with active_lock:
-                active_cases -= 1
-
-    entries_by_case: dict[str, dict[str, dict]] = {}
-    with ExitStack() as stack:
-        worktrees = {
-            case_id: stack.enter_context(
-                _detached_worktree(
-                    repo,
-                    output_dir / "worktrees" / case_id,
-                    case["head_sha"],
-                )
-            )
-            for case_id, case in cases.items()
-        }
-        max_workers = min(workers, len(cases))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {
-                case_id: pool.submit(run_case, case_id, worktrees[case_id])
-                for case_id in cases
-            }
-            for case_id in cases:
-                entries_by_case[case_id] = futures[case_id].result()
-
-    for arm in ("arm-1", "arm-2"):
-        bundle = {
-            "schema_version": "cold-review-run-v1",
-            "run_id": f"seed-{seed}-{arm}",
-            "cases": [entries_by_case[case_id][arm] for case_id in cases],
-        }
-        (output_dir / f"blinded-{arm}-bundle.json").write_text(
-            json.dumps(bundle, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    def execute_benchmark_arm(
+        case: dict, inputs: ReviewInputs, run: dict, worktree: pathlib.Path
+    ) -> dict:
+        case_id = case["id"]
+        arm = run["arm"]
+        contract = mapping[(case_id, arm)]
+        request = create_review_request(
+            replace(inputs, run_id=f"{case_id}-{arm}"),
+            review_contract=contract,
         )
+        argv = _controller_transport(
+            request.prompt,
+            worktree=worktree,
+            goal="controller cold-review benchmark",
+            model=model,
+            reasoning_effort=reasoning_effort,
+            timeout_seconds=timeout_seconds,
+        )
+        neutral = output_dir / "neutral" / case_id / arm
+        neutral.mkdir(parents=True)
+        raw_dir = output_dir / "raw" / case_id / arm
+        with call_tracker.track():
+            result = run_controller_review(
+                request,
+                neutral_cwd=neutral,
+                output_dir=raw_dir,
+                transport_argv=tuple(argv),
+                timeout=timeout_seconds,
+            )
+        receipt = json.loads(pathlib.Path(result.output_paths["receipt"]).read_text())
+        transcript = _narrative_transcript(result.response_text)
+        findings_text = _findings_only(result.response_text)
+        findings = [] if not findings_text else [{
+            "observed_id": f"obs-{_sha256(findings_text.encode())[:16]}",
+            "text": findings_text,
+        }]
+        record = {
+            "schema": "cold-review-raw-v1",
+            "case_id": case_id,
+            "arm": arm,
+            "review_contract": contract,
+            "case_sha256": _case_sha256(case),
+            "task_sha256": case["task_sha256"],
+            "controls": run["controls"],
+            "input_order": run["input_order"],
+            **_artifact_digest_fields(
+                {
+                    name: result.output_paths[name]
+                    for name in (
+                        "prompt", "envelope", "response", "transport", "receipt",
+                        "findings",
+                    )
+                }
+            ),
+        }
+        (raw_dir / "run-record.json").write_text(
+            json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        blinded = {
+            "schema": 1,
+            "case_id": case_id,
+            "arm": arm,
+            "verdict": result.review.verdict,
+            "findings": findings_text,
+            "response_sha256": result.review.response_sha256,
+            "duration_seconds": receipt["duration_seconds"],
+            "usage": receipt.get("usage", {}),
+            "head_sha": case["head_sha"],
+            "diff_sha256": case["diff_sha256"],
+        }
+        blinded_dir = output_dir / "blinded" / case_id
+        blinded_dir.mkdir(parents=True, exist_ok=True)
+        (blinded_dir / f"{arm}.json").write_text(
+            json.dumps(blinded, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        return {
+            "case_id": case_id,
+            "base_sha": case["base_sha"],
+            "head_sha": case["head_sha"],
+            "diff_sha256": case["diff_sha256"],
+            "case_sha256": record["case_sha256"],
+            "diff": inputs.diff_text,
+            "transcript": transcript,
+            "transcript_sha256": _sha256(transcript.encode()),
+            "review_verdict": result.review.verdict.upper(),
+            "findings": [
+                {"id": item["observed_id"], "text": item["text"]}
+                for item in findings
+            ],
+            "metrics": _token_metrics(receipt),
+        }
+
+    def run_benchmark_case(case: dict, worktree: pathlib.Path) -> dict[str, dict]:
+        runs = [row for row in public_plan["runs"] if row["case_id"] == case["id"]]
+        return _execute_serial_arms(case, worktree, runs, execute_benchmark_arm)
+
+    entries_by_case = _execute_case_jobs(
+        repo=repo,
+        cases=cases,
+        worktree_root=output_dir / "worktrees",
+        workers=workers,
+        run_case=run_benchmark_case,
+    )
+    _write_arm_bundles(
+        output_dir=output_dir,
+        arms=("arm-1", "arm-2"),
+        schema_version="cold-review-run-v1",
+        seed=seed,
+        cases=cases,
+        entries_by_case=entries_by_case,
+    )
     (output_dir / "concurrency.json").write_text(
         json.dumps(
             {
-                "observed_max_cases": observed_max_cases,
+                "observed_max_cases": call_tracker.maximum,
                 "requested_workers": workers,
             },
             indent=2,
@@ -1097,6 +1238,13 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         manifest = load_manifest(args.manifest)
+        selected_case_count = len(manifest["cases"])
+        if args.command != "screen" and args.case_id:
+            raise BenchmarkError("--case-id is valid only with screen")
+        if args.command != "screen" and args.include_manual_observation:
+            raise BenchmarkError(
+                "--include-manual-observation is valid only with screen"
+            )
         if args.command == "run":
             if args.output is None or not args.model:
                 raise BenchmarkError("run requires --output and explicit --model")
@@ -1131,13 +1279,14 @@ def main(argv: list[str] | None = None) -> int:
                 workers=args.workers,
                 include_manual_observation=args.include_manual_observation,
             )
+            selected_case_count = len(SCREEN_CASE_IDS)
         else:
             with tempfile.TemporaryDirectory(prefix="cold-review-validate-") as temp:
                 for case in manifest["cases"]:
                     path = pathlib.Path(temp) / case["id"]
                     with _detached_worktree(args.repo.resolve(), path, case["head_sha"]):
                         validate_case(path, case)
-        print(json.dumps({"status": "valid", "cases": len(manifest["cases"])}))
+        print(json.dumps({"status": "valid", "cases": selected_case_count}))
         return 0
     except (BenchmarkError, OSError, UnicodeError) as exc:
         print(json.dumps({"status": "invalid", "error": str(exc)}))
