@@ -8792,9 +8792,17 @@ fn transient_spawn_retry_cap_exceeded_parks_human_held_with_escalation() {
         OverlayState::Queued,
         "bead is parked then recovered to QUEUED in the same tick under the new ordering"
     );
+    // G12 retry-backoff-bleed-into-global-suppression: recovery now resets
+    // `spawn_failure_count` to 0 (production state.rs UPDATE + fake
+    // recover_human_held both) so the recovered bead gets a fresh 15-retry
+    // budget on its next dispatch. Previously the counter stayed at
+    // `MAX_TRANSIENT_SPAWN_RETRY + 1` across recovery, so the bead re-parked
+    // immediately on the next dispatch and bled into the global
+    // `MAX_HUMAN_HELD_RECOVERY_ATTEMPT` cap.
     assert_eq!(
-        capped_overlay.spawn_failure_count,
-        MAX_TRANSIENT_SPAWN_RETRY + 1
+        capped_overlay.spawn_failure_count, 0,
+        "G12 fix: recovery must reset the per-bead retry counter so it doesn't bleed \
+         into the global recovery attempt cap"
     );
 
     let escalation_comment_count = |tracker: &FakeTracker| {
@@ -8828,12 +8836,12 @@ fn transient_spawn_retry_cap_exceeded_parks_human_held_with_escalation() {
     );
 
     // Tick 16: dedup check. `run_slow_tier` runs first — the QUEUED bead
-    // (recovered at the end of tick 15) is dispatched again, spawn fails
-    // again, and because `spawn_failure_count` was NOT reset by recovery
-    // (still > 15) the dispatch path re-parks HUMAN_HELD immediately rather
-    // than granting a fresh 15-retry budget. Then `run_recovery_step`
-    // requeues it to QUEUED again. `escalation_already_recorded` must
-    // prevent a second escalation comment.
+    // (recovered at the end of tick 15 with spawn_failure_count reset to 0
+    // by the G12 fix) is dispatched again, spawn fails transiently, and
+    // `spawn_failure_count` increments back to 1 (well below the cap).
+    // The bead stays QUEUED at this tick — no re-park, no second
+    // escalation. `escalation_already_recorded` keeps the dedup guard
+    // intact for the original cap-exceeded escalation.
     let summary_dedup = run_tick(&deps, 16, 0).expect("dedup tick should succeed");
     assert_eq!(
         summary_dedup.beads_escalated, 0,
@@ -8849,9 +8857,114 @@ fn transient_spawn_retry_cap_exceeded_parks_human_held_with_escalation() {
     assert_eq!(
         final_overlay.state,
         OverlayState::Queued,
-        "a bead whose spawn is permanently broken is re-parked by dispatch then requeued by \
-         recovery each tick — it never silently disappears, and the one-time escalation comment \
-         above is the human-visible signal"
+        "G12 fix: after recovery resets the per-bead counter, the recovered bead stays QUEUED \
+         on the next tick — only one transient failure has accrued, well under the cap. \
+         The one-time escalation comment above remains the human-visible signal."
+    );
+    assert_eq!(
+        final_overlay.spawn_failure_count, 1,
+        "G12 fix: recovered bead's per-bead counter starts fresh at 0 and accumulates normally \
+         on subsequent transient failures"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// G12 retry-backoff-bleed-into-global-suppression: when a bead is recovered
+/// from HUMAN_HELD with park_reason `transient_spawn_retry_cap_exceeded`, the
+/// per-bead `spawn_failure_count` counter (which gates spawn retries against
+/// the per-bead `MAX_TRANSIENT_SPAWN_RETRY` cap of 15) MUST be reset to 0
+/// alongside the `attempt++`. Without this reset, the recovered bead gets
+/// re-dispatched in the very next tick with `spawn_failure_count` still > 15
+/// and IMMEDIATELY re-park — burning one global recovery slot (out of the
+/// `MAX_HUMAN_HELD_RECOVERY_ATTEMPT = 10` cap in `run_recovery_step`) per tick
+/// on a single stuck bead. With 20 hot beads all hitting the transient spawn
+/// retry cap simultaneously (the G12 trigger event), one bad bead's counter
+/// consumes 10 global recovery slots in 10 ticks, leaving the other 19 to
+/// either starve or share the remaining budget.
+///
+/// The fix is to make `recover_human_held` clear `spawn_failure_count = 0` in
+/// the same UPDATE statement that increments `attempt` — the per-bead retry
+/// backoff is isolated to the bead's queue slot, and the global recovery
+/// attempt cap remains a separate, bounded value.
+#[test]
+fn g12_recover_human_held_resets_spawn_failure_count_for_transient_retry_cap_parks() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+    let cfg = test_cfg();
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_g12_recover_resets_spawn_failure_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    // Pre-seed a HUMAN_HELD bead parked on transient_spawn_retry_cap_exceeded
+    // with spawn_failure_count already above the per-bead cap (16 > 15) and
+    // attempt well below the global recovery cap (5 < 10). No issue is
+    // pushed to FakeScm so intake creates nothing — we only exercise the
+    // recovery sweep.
+    store.overlays.borrow_mut().insert(
+        "bead-g12".into(),
+        BeadOverlay {
+            bead_id: "bead-g12".into(),
+            state: OverlayState::HumanHeld,
+            attempt: 5,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/bead-g12-r5".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 16,
+            pre_session_head_sha: None,
+            park_reason: Some("transient_spawn_retry_cap_exceeded".into()),
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        vendor_health: None,
+        },
+        1,
+        0,
+    )
+    .expect("tick should succeed");
+    assert_eq!(
+        summary.beads_recovered_from_held, 1,
+        "the pre-seeded transient-retry-cap park must be recovered once"
+    );
+
+    let overlay = store.load("bead-g12").unwrap().unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::Queued,
+        "recovered bead must be requeued to QUEUED"
+    );
+    assert_eq!(
+        overlay.attempt, 6,
+        "attempt must increment by 1 (global recovery counter advances)"
+    );
+    assert_eq!(
+        overlay.spawn_failure_count, 0,
+        "G12 fix: the per-bead retry backoff counter MUST reset to 0 on recovery \
+         from transient_spawn_retry_cap_exceeded — otherwise the bead re-parks \
+         immediately on the next dispatch and bleeds into the global \
+         MAX_HUMAN_HELD_RECOVERY_ATTEMPT cap"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
@@ -9181,7 +9294,14 @@ fn mixed_batch_deferred_backpressure_and_genuine_transient_failures_are_independ
         OverlayState::Queued,
         "bead B is parked then recovered to QUEUED in the same tick under the new ordering"
     );
-    assert_eq!(b_final.spawn_failure_count, MAX_TRANSIENT_SPAWN_RETRY + 1);
+    // G12 retry-backoff-bleed-into-global-suppression: recovery resets the
+    // per-bead retry counter so bead B gets a fresh 15-retry budget on the
+    // next dispatch rather than re-parking immediately.
+    assert_eq!(
+        b_final.spawn_failure_count, 0,
+        "G12 fix: recovered bead's per-bead counter resets to 0 (was MAX_TRANSIENT_SPAWN_RETRY + 1 \
+         before the fix — which bled into the global recovery attempt cap)"
+    );
 
     let escalation_comment_count_for =
         |tracker: &FakeTracker, external_ref: &str, bead_id: &str| {

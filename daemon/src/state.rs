@@ -1658,10 +1658,27 @@ impl StateStore for SqliteStateStore {
         let mut stmt = self
             .conn
             .prepare(
+                // G12 retry-backoff-bleed-into-global-suppression fix:
+                // `spawn_failure_count` is the per-bead retry backoff counter
+                // (gates dispatch against `MAX_TRANSIENT_SPAWN_RETRY`). When
+                // a bead is recovered from HUMAN_HELD, it gets a fresh
+                // dispatch attempt — the prior retry count no longer reflects
+                // the bead's CURRENT queue slot's transient-error streak.
+                // Without this reset, a bead parked on
+                // `transient_spawn_retry_cap_exceeded` (16+ consecutive
+                // transient spawn failures) would be requeued with the
+                // counter still > 15 and IMMEDIATELY re-park on the very
+                // next dispatch, burning one global recovery slot (out of
+                // `MAX_HUMAN_HELD_RECOVERY_ATTEMPT = 10`) per tick on the
+                // same stuck bead instead of letting the per-bead backoff
+                // govern that queue slot independently. Resetting here
+                // isolates the per-bead backoff to the queue slot and keeps
+                // the global recovery attempt cap as the separate, bounded
+                // value the operator tunes.
                 "UPDATE bead_overlay \
              SET state = 'QUEUED', attempt = attempt + 1, autonomy_secs = 0, \
                  pr_number = NULL, session_id = NULL, park_reason = NULL, \
-                 attempt_started_at = NULL, updated_at = ?1 \
+                 spawn_failure_count = 0, attempt_started_at = NULL, updated_at = ?1 \
              WHERE state = 'HUMAN_HELD' \
                AND attempt < ?2 \
                AND session_id IS NULL \
