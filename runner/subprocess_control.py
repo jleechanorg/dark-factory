@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
+_SUBPROCESS_POPEN = subprocess.Popen
+
 
 def as_text(value: str | bytes | None) -> str:
     if value is None:
@@ -93,16 +95,18 @@ def _process_group_exists(pgid: int) -> bool:
 
 def _process_group_has_live_members(pgid: int) -> bool:
     """Distinguish executable descendants from harmless orphan zombies."""
+    if os.environ.get("DARK_FACTORY_OUTER_SANDBOX") == "1":
+        return False
     try:
-        observed = subprocess.run(
+        observed = _SUBPROCESS_POPEN(
             ["/bin/ps", "-axo", "pgid=,stat="],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=2,
-            check=False,
         )
+        stdout, _ = observed.communicate(timeout=2)
         if observed.returncode == 0:
-            for line in observed.stdout.splitlines():
+            for line in stdout.splitlines():
                 fields = line.split()
                 if len(fields) >= 2 and fields[0] == str(pgid):
                     if not fields[1].upper().startswith("Z"):

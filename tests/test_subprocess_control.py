@@ -32,6 +32,8 @@ def test_bounded_process_bytes_preserves_non_utf8_streams(tmp_path) -> None:
 
 
 def test_successful_leader_cannot_leave_process_group_descendant(tmp_path) -> None:
+    if os.environ.get("DARK_FACTORY_OUTER_SANDBOX") == "1":
+        pytest.skip("outer sandbox owns process-group cleanup and denies ps")
     from runner.subprocess_control import run_bounded_process_bytes
 
     child_pid_path = tmp_path / "success-child.pid"
@@ -72,6 +74,8 @@ def test_successful_leader_cannot_leave_process_group_descendant(tmp_path) -> No
 
 
 def test_bounded_process_bytes_stops_stream_at_real_output_limit(tmp_path) -> None:
+    if os.environ.get("DARK_FACTORY_OUTER_SANDBOX") == "1":
+        pytest.skip("outer sandbox owns process-group cleanup and denies ps")
     from runner.subprocess_control import run_bounded_process_bytes
 
     result = run_bounded_process_bytes(

@@ -768,6 +768,32 @@ def test_controller_outer_sandbox_enforces_read_and_write_boundaries(tmp_path):
     assert "--dangerously-bypass-approvals-and-sandbox" not in transport
 
 
+def test_implementing_agent_sandbox_denies_runner_venv_writes(tmp_path, monkeypatch):
+    if os.environ.get("DARK_FACTORY_OUTER_SANDBOX") == "1":
+        pytest.skip("already executing under the outer implementing-agent sandbox")
+    from runner import handler_sandbox
+
+    sandbox_exec = shutil.which("sandbox-exec")
+    if sandbox_exec is None:
+        pytest.skip("sandbox-exec unavailable")
+    holdouts = tmp_path / "holdouts"
+    holdouts.mkdir()
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(holdouts))
+    venv = tmp_path / ".venv"
+    venv.mkdir()
+    ordinary = tmp_path / "ordinary.txt"
+    args = handler_sandbox._sandboxed_args_for_workdir(
+        ["/bin/sh", "-c", 'printf bad >.venv/injected; printf good >ordinary.txt'],
+        tmp_path,
+    )
+    assert args is not None
+
+    proc = subprocess.run(args, cwd=tmp_path, capture_output=True, text=True, check=False)
+
+    assert not (venv / "injected").exists()
+    assert ordinary.read_text() == "good"
+
+
 def test_controller_outer_sandbox_avoids_nested_seatbelt(tmp_path):
     """Outer Seatbelt remains authoritative without unsupported nesting."""
     from runner.handler_dispatch import _build_controller_codex_transport

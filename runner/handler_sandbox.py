@@ -177,7 +177,10 @@ def _sealed_benchmark_doc_paths(workdir: "Union[pathlib.Path, str, None]") -> li
     return sorted(paths, key=lambda p: str(p))
 
 
-def _build_sandbox_profile(extra_denied_paths: list[pathlib.Path]) -> str:
+def _build_sandbox_profile(
+    extra_denied_paths: list[pathlib.Path],
+    extra_write_denied_paths: list[pathlib.Path] | None = None,
+) -> str:
     """Compose a sandbox-exec profile that denies holdouts + extra paths.
 
     Each extra path gets a file-read* + file-write* deny on its absolute
@@ -191,6 +194,9 @@ def _build_sandbox_profile(extra_denied_paths: list[pathlib.Path]) -> str:
     for path in extra_denied_paths:
         escaped = str(path).replace("\\", "\\\\").replace('"', '\\"')
         denies.append(f'(deny file-read* (subpath "{escaped}"))')
+        denies.append(f'(deny file-write* (subpath "{escaped}"))')
+    for path in extra_write_denied_paths or []:
+        escaped = str(path).replace("\\", "\\\\").replace('"', '\\"')
         denies.append(f'(deny file-write* (subpath "{escaped}"))')
     deny_rules = "\n".join(denies)
     return f"""
@@ -356,6 +362,8 @@ def _verify_darwin_sandbox_exec() -> bool:
     process lifetime.
     """
     global _darwin_sandbox_exec_verified
+    if os.environ.get("DARK_FACTORY_OUTER_SANDBOX") == "1":
+        return True
     if _darwin_sandbox_exec_verified is not None:
         return _darwin_sandbox_exec_verified
     sandbox_exec = shutil.which("sandbox-exec")
@@ -445,7 +453,14 @@ def _sandboxed_args_for_workdir(
         if sandbox_exec is None:
             return None
         sealed_docs = _sealed_benchmark_doc_paths(workdir)
-        profile = _build_sandbox_profile(sealed_docs)
+        write_denied: list[pathlib.Path] = []
+        if workdir:
+            candidate = pathlib.Path(workdir)
+            if candidate.is_absolute() and ".." not in candidate.parts:
+                venv = candidate / ".venv"
+                if venv.is_dir() and not venv.is_symlink():
+                    write_denied.append(venv.resolve())
+        profile = _build_sandbox_profile(sealed_docs, write_denied)
         return [sandbox_exec, "-p", profile] + args
     if sys.platform.startswith("linux"):
         sealed_docs = _sealed_benchmark_doc_paths(workdir)

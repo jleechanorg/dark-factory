@@ -605,6 +605,9 @@ def _operator_verify(node: "Node", ctx: "Context") -> Result:
     final_head = ""
     commands = (*_OPERATOR_BUILTINS, *manifest.commands, _OPERATOR_FINAL_HEAD)
     env = _handlers_shim._sanitized_env()
+    runner_python = str(pathlib.Path(sys.executable).resolve())
+    if sys.executable != runner_python:
+        env["__PYVENV_LAUNCHER__"] = sys.executable
     try:
         snapshot_context = (
             _trusted_operator_snapshot(workdir, trusted_manifest_head, raw_dir)
@@ -616,6 +619,7 @@ def _operator_verify(node: "Node", ctx: "Context") -> Result:
                 try:
                     execution = command
                     command_cwd = workdir
+                    execution_env = env
                     if command in manifest.commands and command.lane == "worker_safe":
                         wrapped = _handlers_shim._sandboxed_args_for_workdir(
                             list(command.effective_argv), workdir
@@ -627,6 +631,7 @@ def _operator_verify(node: "Node", ctx: "Context") -> Result:
                             command.lane, command.timeout_seconds, command.classification,
                             (*command.transform_chain, "worker-holdout-sandbox"),
                         )
+                        execution_env = {**env, "DARK_FACTORY_OUTER_SANDBOX": "1"}
                     elif command in manifest.commands and command.lane == "operator_unwrapped":
                         command_cwd = trusted_snapshot
                         execution = OperatorCommand(
@@ -639,7 +644,7 @@ def _operator_verify(node: "Node", ctx: "Context") -> Result:
                         execution.effective_argv,
                         cwd=command_cwd,
                         timeout=command.timeout_seconds,
-                        env=env,
+                        env=execution_env,
                         max_output_bytes=_OPERATOR_RAW_STREAM_MAX_BYTES,
                     )
                     duration_ms = max(0, (time.monotonic_ns() - started) // 1_000_000)

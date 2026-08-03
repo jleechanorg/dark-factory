@@ -297,7 +297,8 @@ operator_verification:
     )
     assert calls[-1][0] == ("/usr/bin/git", "rev-parse", "HEAD")
     assert all(call[1]["cwd"] == tmp_path.resolve() for call in calls)
-    assert all(call[1]["env"] == {"SAFE": "1"} for call in calls)
+    assert all(call[1]["env"]["SAFE"] == "1" for call in calls)
+    assert all(call[1]["env"]["__PYVENV_LAUNCHER__"] == sys.executable for call in calls)
 
     receipt_path = tmp_path / "evidence" / "operator-verification.json"
     receipt = json.loads(receipt_path.read_text())
