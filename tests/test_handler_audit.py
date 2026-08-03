@@ -239,6 +239,67 @@ operator_verification:
     assert status["stdout"]["size_bytes"] == 0
 
 
+@pytest.mark.parametrize("backend", ["echo", "mock_llm"])
+def test_operator_verify_synthesizes_cost_free_receipt_fixture(
+    tmp_path: pathlib.Path, monkeypatch, backend: str
+) -> None:
+    import runner.handlers  # noqa: F401
+    import runner.handler_audit as ha
+    from runner.handler_core import Context
+    from runner.parser import Node
+
+    monkeypatch.setattr(
+        ha,
+        "run_bounded_process_bytes",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("echo/mock must not launch project commands")
+        ),
+    )
+    ctx = Context(goal="cost-free", workdir=tmp_path, backend=backend, run_id="echo")
+    ctx.state["target_head_sha"] = "b" * 40
+
+    result = ha._operator_verify(
+        Node(name="operator_verify", attrs={"type": "operator_verify"}), ctx
+    )
+
+    assert result.outcome == "success"
+    receipt = json.loads(
+        (tmp_path / "evidence" / "operator-verification.json").read_text()
+    )
+    assert receipt["schema_version"] == 2
+    assert receipt["target_head_sha"] == "b" * 40
+    assert receipt["synthetic"] is True
+    assert receipt["commands"] == []
+
+
+def test_repository_operator_manifest_has_exact_sandbox_split() -> None:
+    import runner.handlers  # noqa: F401
+    import runner.handler_audit as ha
+
+    manifest = ha._load_operator_manifest(ROOT)
+    assert [command.id for command in manifest.commands] == [
+        "worker-safe-targeted",
+        "operator-unwrapped-six",
+    ]
+    worker, operator = manifest.commands
+    assert worker.lane == "worker_safe"
+    assert operator.lane == "operator_unwrapped"
+    expected_nodes = [
+        "tests/test_cli_fallbacks.py::test_controller_outer_sandbox_enforces_read_and_write_boundaries",
+        "tests/test_cli_fallbacks.py::test_controller_outer_sandbox_avoids_nested_seatbelt",
+        "tests/test_cli_fallbacks.py::test_controller_protects_linked_git_metadata_and_artifact_lane",
+        "tests/test_ao_sandbox.py::test_fake_ao_shim_cannot_read_holdouts_under_sandbox",
+        "tests/test_hardening.py::test_tool_handler_tolerates_bad_timeout",
+        "tests/test_hardening.py::test_visible_all_nodes_benchmark_has_no_embedded_holdout_contract",
+    ]
+    assert [arg.removeprefix("--deselect=") for arg in worker.argv if arg.startswith("--deselect=")] == expected_nodes
+    assert list(operator.argv[2:]) == expected_nodes
+    assert [(item.id, item.classification) for item in manifest.exclusions] == [
+        ("bounded-conformance", "excluded"),
+        ("private-self-hosted-runner", "excluded"),
+    ]
+
+
 def test_default_probe_list_is_vendor_neutral():
     import runner.handlers  # noqa: F401
     from runner.handler_audit import DEFAULT_EVIDENCE_FILENAMES

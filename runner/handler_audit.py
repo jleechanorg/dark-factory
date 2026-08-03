@@ -377,6 +377,45 @@ def _load_operator_manifest(workdir: pathlib.Path) -> OperatorManifest:
 def _operator_verify(node: "Node", ctx: "Context") -> Result:
     """Run exact post-worker verification outside the worker sandbox."""
     workdir = pathlib.Path(ctx.workdir).resolve()
+    if ctx.backend in {"echo", "mock_llm"}:
+        target_head = str(ctx.state.get("target_head_sha") or "0" * 40).lower()
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", target_head):
+            target_head = "0" * 40
+        receipt = {
+            "schema_version": 2,
+            "target_head_sha": target_head,
+            "source_head_after": target_head,
+            "manifest": {"path": None, "sha256": None, "schema_version": 1},
+            "commands": [],
+            "exclusions": [],
+            "outcome": "success",
+            "failure_type": None,
+            "synthetic": True,
+        }
+        receipt_path = workdir / "evidence" / "operator-verification.json"
+        try:
+            _write_operator_receipt(receipt_path, receipt)
+            receipt_sha = _validate_operator_receipt(receipt_path, target_head)
+        except Exception as exc:
+            return Result(
+                outcome="error",
+                output=f"operator verification fixture failed closed: {type(exc).__name__}",
+                metadata={"error_type": "receipt_validation"},
+            )
+        return Result(
+            outcome="success",
+            output="operator verification success; synthetic receipt fixture",
+            metadata={
+                "receipt_path": "evidence/operator-verification.json",
+                "receipt_sha256": receipt_sha,
+                "target_head_sha": target_head,
+                "command_count": "0",
+                "synthetic": "true",
+            },
+            context_updates={
+                "operator_verification_receipt": "evidence/operator-verification.json"
+            },
+        )
     try:
         manifest = _load_operator_manifest(workdir)
         manifest_sha = hashlib.sha256(manifest.raw_bytes).hexdigest()
