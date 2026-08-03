@@ -489,6 +489,51 @@ pub trait StateStore {
     ) -> Result<bool, DaemonError> {
         Ok(false)
     }
+
+    // -----------------------------------------------------------------
+    // jleechan-31sv (G11 startup-intake-without-forced-dispatch):
+    // the slow-tier intake sweep walks `list_active_overlays` and emits
+    // a `DISPATCH_REQUEST` event for each ATTESTED bead that wasn't
+    // already seen in the previous slow tick. The three methods below
+    // back that growth-only dedup with a tiny on-disk table. Default
+    // impls are no-ops so test fakes don't have to wire SQLite.
+    // -----------------------------------------------------------------
+
+    /// Return `true` if a `DISPATCH_REQUEST` event for `bead_id` was
+    /// already emitted at-or-after `cutoff_epoch`. Default no-op
+    /// returns `false` (never suppress), so production `SqliteStateStore`
+    /// is the only impl that actually dedups.
+    fn dispatch_request_already_emitted(
+        &self,
+        _bead_id: &str,
+        _cutoff_epoch: u64,
+    ) -> Result<bool, DaemonError> {
+        Ok(false)
+    }
+
+    /// Record that a `DISPATCH_REQUEST` event was just emitted for
+    /// `bead_id` at `now_epoch`. Default no-op for fakes that don't
+    /// persist the dedup table.
+    fn record_dispatch_request_emit(
+        &self,
+        _bead_id: &str,
+        _now_epoch: u64,
+    ) -> Result<(), DaemonError> {
+        Ok(())
+    }
+
+    /// Drop any dedup rows whose `bead_id` is NOT in
+    /// `keep_set`. Called at the end of every slow-tick intake sweep
+    /// so a bead that has left `ATTESTED` and later re-enters
+    /// `ATTESTED` (e.g. after a successful reroll) is treated as
+    /// freshly-observed growth and re-emits its `DISPATCH_REQUEST`.
+    /// Default no-op for fakes.
+    fn prune_dispatch_request_seen_outside(
+        &self,
+        _keep_set: &std::collections::HashSet<String>,
+    ) -> Result<(), DaemonError> {
+        Ok(())
+    }
 }
 
 /// `StateStore` impl against `~/.dark-factory/daemon-cxdb.sqlite` (WAL mode,
@@ -704,6 +749,7 @@ impl SqliteStateStore {
         Self::ensure_claimed_by_columns(&conn)?;
         Self::ensure_peer_claims_table(&conn)?;
         Self::ensure_attempt_started_at_column(&conn)?;
+        Self::ensure_dispatch_request_seen_table(&conn)?;
         Ok(Self { conn })
     }
 
@@ -1262,6 +1308,28 @@ impl SqliteStateStore {
             )
             .map_err(|e| tool_err("ensure_attempt_started_at_column: add column", e))?;
         }
+        Ok(())
+    }
+
+    /// jleechan-31sv (G11): tiny dedup table that lets the slow-tier
+    /// intake sweep emit a `DISPATCH_REQUEST` for each ATTESTED bead
+    /// at most once per "epoch" of growth — matches the
+    /// remediation_hint in fe-audit.sh:192 ("STATE=ATTESTED rows
+    /// accumulate beyond the previous tick's snapshot"). The pair
+    /// `(bead_id)` is unique; the `last_emitted_epoch` is updated
+    /// each time `record_dispatch_request_emit` runs so a future
+    /// re-emit (e.g. after the bead re-enters ATTESTED post-reroll)
+    /// can re-arm by pruning via
+    /// `prune_dispatch_request_seen_outside`.
+    fn ensure_dispatch_request_seen_table(conn: &Connection) -> Result<(), DaemonError> {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS dispatch_request_seen (\
+                 bead_id TEXT PRIMARY KEY, \
+                 last_emitted_epoch INTEGER NOT NULL\
+             )",
+            [],
+        )
+        .map_err(|e| tool_err("ensure_dispatch_request_seen_table: create", e))?;
         Ok(())
     }
 
@@ -2310,6 +2378,76 @@ impl StateStore for SqliteStateStore {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
             Err(e) => Err(tool_err("claim_blocks_dispatch", e)),
         }
+    }
+
+    // ----- jleechan-31sv (G11 startup-intake-without-forced-dispatch) -----
+
+    fn dispatch_request_already_emitted(
+        &self,
+        bead_id: &str,
+        cutoff_epoch: u64,
+    ) -> Result<bool, DaemonError> {
+        let row: Result<Option<i64>, rusqlite::Error> = self
+            .conn
+            .query_row(
+                "SELECT last_emitted_epoch FROM dispatch_request_seen \
+                 WHERE bead_id = ?1",
+                params![bead_id],
+                |row| row.get(0),
+            );
+        match row {
+            Ok(Some(epoch)) => Ok((epoch as u64) >= cutoff_epoch),
+            Ok(None) => Ok(false),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(e) => Err(tool_err("dispatch_request_already_emitted", e)),
+        }
+    }
+
+    fn record_dispatch_request_emit(
+        &self,
+        bead_id: &str,
+        now_epoch: u64,
+    ) -> Result<(), DaemonError> {
+        self.conn
+            .execute(
+                "INSERT INTO dispatch_request_seen (bead_id, last_emitted_epoch) \
+                 VALUES (?1, ?2) \
+                 ON CONFLICT(bead_id) DO UPDATE SET last_emitted_epoch = excluded.last_emitted_epoch",
+                params![bead_id, now_epoch as i64],
+            )
+            .map_err(|e| tool_err("record_dispatch_request_emit", e))?;
+        Ok(())
+    }
+
+    fn prune_dispatch_request_seen_outside(
+        &self,
+        keep_set: &std::collections::HashSet<String>,
+    ) -> Result<(), DaemonError> {
+        // Cheap-and-correct: pull every row and delete those not in the
+        // keep set. The table is bounded by the number of ATTESTED
+        // beads in flight at any one time (typically <50), so a full
+        // scan is fine and avoids the placeholder-shape problem of an
+        // `IN (...)` query with an unknown number of values.
+        let mut stmt = self
+            .conn
+            .prepare("SELECT bead_id FROM dispatch_request_seen")
+            .map_err(|e| tool_err("prune_dispatch_request_seen_outside: select", e))?;
+        let ids: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .map_err(|e| tool_err("prune_dispatch_request_seen_outside: map", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+        for id in ids {
+            if !keep_set.contains(&id) {
+                self.conn
+                    .execute(
+                        "DELETE FROM dispatch_request_seen WHERE bead_id = ?1",
+                        params![id],
+                    )
+                    .map_err(|e| tool_err("prune_dispatch_request_seen_outside: delete", e))?;
+            }
+        }
+        Ok(())
     }
 }
 

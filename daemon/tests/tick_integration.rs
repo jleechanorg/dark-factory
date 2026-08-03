@@ -13241,3 +13241,144 @@ fn vendor_health_ledger_ci_pending_with_capped_vendor_skips_wait() {
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+// ===========================================================================
+// Bead jleechan-31sv: G11 startup-intake-without-forced-dispatch. The
+// fe-audit G11 check (fe-audit.sh + fe_audit_query.py) flags beads that
+// emit lifecycleState=ATTESTED without ever emitting lifecycleState=DISPATCHED
+// in the lookback. Restart cycles can leave beads in ATTESTED with the
+// original TASK_DISPATCHED event missing from daemon.jsonl — a crash
+// between the `state=Dispatched` save (dispatch.rs:724) and the telemetry
+// emit (tick.rs:2553) drops the only DISPATCHED record, and the G11 audit
+// then false-files a factory-labeled bead. The remediation_hint in
+// fe-audit.sh:192 says: "Intake sweep must enqueue a DISPATCH_REQUEST
+// event whenever STATE=ATTESTED rows accumulate beyond the previous
+// tick's snapshot."
+//
+// This test pins that guarantee at the daemon-tick boundary: a
+// pre-existing ATTESTED bead that the slow tier observes (i.e. it
+// appears in `list_active_overlays`) MUST produce a `DISPATCH_REQUEST`
+// telemetry event for that bead before the tick returns. The
+// lifecycleState of that event is the same `DISPATCHED` family the G11
+// `g11_dispatched` query already tracks, so the audit pairing succeeds
+// without a separate query.
+//
+// Red phase: this test currently fails because the slow tier's
+// active_overlay loop emits BEAD_SNAPSHOT_TRANSIENT_ERROR /
+// BUDGET_WARNING / etc. for ATTESTED rows but never a `DISPATCH_REQUEST`
+// follow-up. After the fix lands, the assertion below passes and the
+// G11 audit pairing is closed.
+// ===========================================================================
+#[test]
+fn slow_tier_emits_dispatch_request_for_observed_attested_beads() {
+    use daemon::state::OverlayState;
+
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    // 1h timebox so the seeded ATTESTED bead survives the tick (not parked).
+    cfg.autonomy_timebox_secs = 3600;
+    let vcs = FakeVcs::new();
+
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    scm.remote_branches
+        .insert("factory/g11-bead-r1".into(), Some(now_epoch));
+
+    // Pre-seed a single ATTESTED bead with a PR whose ci_pending=false
+    // (so the bead is observed by the active_overlay loop, not skipped
+    // via SnapshotUnavailable) and mergeable=true (so the wedge loop
+    // stays out of the park / kill paths).
+    store.overlays.borrow_mut().insert(
+        "g11-bead".into(),
+        BeadOverlay {
+            bead_id: "g11-bead".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(7100),
+            branch: Some("factory/g11-bead-r1".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+    scm.pr_snapshots.insert(
+        7100,
+        PrSnapshot {
+            pr_number: 7100,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "abc".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: now_epoch,
+            ci_status: "success".into(),
+            coderabbit_status: "approved".into(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+    store
+        .branches
+        .borrow_mut()
+        .push("factory/g11-bead-r1".into());
+    store
+        .branch_beads
+        .borrow_mut()
+        .insert("factory/g11-bead-r1".into(), "g11-bead".into());
+
+    let telemetry_log = std::env::temp_dir().join("afd_g11_dispatch_request.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let _summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        // tick_index=0 forces the slow tier to be due (ratio=1, slow_tick_secs==fast_tick_secs).
+        0,
+        0,
+    )
+    .expect("tick should succeed");
+
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+
+    // The intake-sweep emission MUST land a `DISPATCH_REQUEST` event for
+    // the observed ATTESTED bead, with lifecycleState in the DISPATCHED
+    // family that `g11_dispatched` already tracks. This is the contract
+    // the G11 audit pairing depends on; without it the audit false-fires.
+    assert!(
+        log.contains("\"eventType\":\"DISPATCH_REQUEST\""),
+        "slow tier must emit a DISPATCH_REQUEST event for ATTESTED beads it observes; log:\n{log}"
+    );
+    assert!(
+        log.contains("\"beadId\":\"g11-bead\""),
+        "DISPATCH_REQUEST must reference the observed ATTESTED bead id; log:\n{log}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}

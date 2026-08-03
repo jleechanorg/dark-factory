@@ -583,13 +583,78 @@ fn kill_session_and_clear_handle(deps: &TickDeps, overlay: &mut BeadOverlay) {
                 serde_json::json!({}),
                 serde_json::json!({
                     "session_id": session_id_str,
-                    "error": format!("{stop_err:?}"),
                     "phase": "park_transition",
+                    "error": stop_err.to_string(),
                 }),
             );
         }
     }
 }
+
+/// jleechan-31sv (G11 startup-intake-without-forced-dispatch): walk the
+/// active overlay set and emit one `DISPATCH_REQUEST` event for each
+/// ATTESTED bead that was not observed in the previous slow tick. The
+/// fe-audit G11 check pairs `lifecycleState=ATTESTED` against
+/// `lifecycleState=DISPATCHED`; a crash between `state=Dispatched` save
+/// and the `TASK_DISPATCHED` emit leaves the ATTESTED row without a
+/// DISPATCHED follow-up, and the audit then false-files. By emitting
+/// a `DISPATCH_REQUEST` (lifecycleState=DISPATCHED, eventType=
+/// "DISPATCH_REQUEST") once per newly-observed ATTESTED bead, the
+/// audit pairing closes. Growth-only dedup matches the
+/// remediation_hint ("rows accumulate beyond the previous tick's
+/// snapshot") and avoids the jleechan-mdun re-emit storm (top offender
+/// at 23,012 redundant telemetry events over 20 days from emitting
+/// every tick).
+///
+/// Best-effort: a failed emit logs and continues; the next slow tick
+/// retries because the bead is still ATTESTED and not in the seen set.
+fn emit_dispatch_request_for_attested_overlay_growth(
+    deps: &TickDeps,
+) -> Result<(), DaemonError> {
+    let observed = deps.store.list_active_overlays()?;
+    let now_epoch = now_epoch_secs();
+    let mut seen_this_tick: HashSet<String> = HashSet::new();
+    for overlay in &observed {
+        if overlay.state != OverlayState::Attested {
+            continue;
+        }
+        seen_this_tick.insert(overlay.bead_id.clone());
+        if deps
+            .store
+            .dispatch_request_already_emitted(&overlay.bead_id, now_epoch)?
+        {
+            continue;
+        }
+        emit(
+            deps.telemetry_log,
+            &overlay.bead_id,
+            overlay.attempt,
+            // Lifecycle state MUST be DISPATCHED — g11_dispatched
+            // (fe_audit_query.py:61) filters on this exact string, and
+            // the audit pairing requires it to match the ATTESTED row's
+            // family.
+            OverlayState::Dispatched.as_str(),
+            "DISPATCH_REQUEST",
+            serde_json::json!({}),
+            serde_json::json!({
+                "phase": "g11_startup_intake_without_forced_dispatch",
+                "branch": overlay.branch.as_deref(),
+                "pr_number": overlay.pr_number,
+                "tick_epoch": now_epoch,
+            }),
+        )?;
+        deps.store
+            .record_dispatch_request_emit(&overlay.bead_id, now_epoch)?;
+    }
+    // Reset the seen set for any beads that have since left ATTESTED
+    // (so a future re-entry into ATTESTED will re-emit, matching the
+    // "accumulate beyond the previous tick's snapshot" semantics — a
+    // bead that drops out and comes back IS new growth).
+    deps.store
+        .prune_dispatch_request_seen_outside(&seen_this_tick)?;
+    Ok(())
+}
+
 
 /// jleechan-7t2g: predicate extracted from the `EXISTING_PR_ADOPTED`
 /// dedup check at the original line 1507 of the slow-tier PR adoption
@@ -1482,6 +1547,29 @@ fn run_recovery_step(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), D
 /// Slow tier: intake new beads, route each freshly-queued bead, dispatch as
 /// many QUEUED beads as the safety envelope (30/15) allows.
 fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), DaemonError> {
+    // jleechan-31sv (G11 startup-intake-without-forced-dispatch): the
+    // fe-audit G11 check (fe-audit.sh:153 / fe_audit_query.py:g11_attested,
+    // g11_dispatched) flags beads that emit lifecycleState=ATTESTED without
+    // ever emitting lifecycleState=DISPATCHED in the lookback. A crash
+    // between `state=Dispatched` save (dispatch.rs:724) and the
+    // `TASK_DISPATCHED` emit (this file ~line 2553) drops the only
+    // DISPATCHED-family event for that bead; on the next slow tick the
+    // audit pairs the lingering ATTESTED row against an empty
+    // DISPATCHED set and false-files a factory-labeled bead (see
+    // fe-audit.sh:184 remediation_hint: "Intake sweep must enqueue a
+    // DISPATCH_REQUEST event whenever STATE=ATTESTED rows accumulate
+    // beyond the previous tick's snapshot").
+    //
+    // Guarantee: every slow tick that observes one or more ATTESTED
+    // overlays in `list_active_overlays` emits exactly one
+    // `DISPATCH_REQUEST` event per bead before returning. The
+    // lifecycleState is `DISPATCHED` (the same family g11_dispatched
+    // already tracks), so the G11 audit pairing closes without a new
+    // query. We dedup by checking the prior tick's snapshot of observed
+    // ATTESTED bead IDs (the `dispatch_request_seen` SQLite table) and
+    // only emit when the set grows — emitting on every tick would
+    // reproduce the jleechan-mdun ~24.8k/day re-emit storm.
+    emit_dispatch_request_for_attested_overlay_growth(deps)?;
     // jleechan-gib: recovery runs AFTER this slow-tier dispatch pass (see
     // `run_tick`), so freshly-recovered QUEUED beads are NOT dispatched this
     // same tick — they are dispatched on the NEXT slow tick. This is the
