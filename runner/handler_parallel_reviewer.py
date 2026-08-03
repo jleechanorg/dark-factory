@@ -148,6 +148,7 @@ def _run_controller_primary(
         "review_contract": request.prompt_id,
         "review_prompt_payload_sha256": request.prompt_sha256,
         "review_envelope_sha256": request.envelope_sha256,
+        "fallback_used": "false",
     }
     if backend != "codex":
         return Result(
@@ -187,8 +188,8 @@ def _run_controller_primary(
             transport_argv=transport_argv,
             transport_env=_gate_subprocess_env(backend),
             timeout=timeout,
+            pre_acceptance_check=lambda: _verify_controller_workspace(ctx, request),
         )
-        _verify_controller_workspace(ctx, request)
     except subprocess.TimeoutExpired as exc:
         return Result(
             outcome="error",
@@ -1000,6 +1001,7 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
                 "verdict": "echo:" + str(hint),
                 "reviewer_backend": str(ctx.backend),
                 "parallel_reviewer": "echo",
+                **({"fallback_used": "false"} if review_contract else {}),
             },
         )
     target_dir = _handlers_shim._target_worktree(ctx)
@@ -1011,7 +1013,10 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
             return Result(
                 outcome="error",
                 output=f"unknown controller review contract: {review_contract}",
-                metadata={"review_contract_status": "unknown"},
+                metadata={
+                    "review_contract_status": "unknown",
+                    "fallback_used": "false",
+                },
             )
         try:
             request = _controller_review_request(node, ctx, expected_sha)
@@ -1023,6 +1028,7 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
                 metadata={
                     "review_contract": review_contract,
                     "review_contract_status": "build_error",
+                    "fallback_used": "false",
                 },
             )
         visit_seq = int(
@@ -1058,7 +1064,7 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
 
     # Determine shadow lanes BEFORE running primary so Popen launches happen
     # before primary (and before any communicate()). True concurrency.
-    shadow_backends = _parse_shadow_backends(ctx)
+    shadow_backends = [] if request is not None else _parse_shadow_backends(ctx)
     shadows = []
     if shadow_backends:
         for b in shadow_backends:
@@ -1071,7 +1077,7 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
                 backend=b,
                 prompt_is_complete=request is not None,
             ))
-    elif _shadow_codex_review_enabled(ctx):
+    elif request is None and _shadow_codex_review_enabled(ctx):
         s = _start_shadow_gate_review(
             node.name,
             prompt,
@@ -1106,6 +1112,8 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     attempt = int(getattr(ctx, "_df_current_attempt", 1))
     primary = _record_primary_output(node.name, attempt, primary, seq, ctx)
     primary.metadata.update(backend_meta)
+    if request is not None:
+        primary.metadata["fallback_used"] = "false"
     if not shadows:
         # Bug 2 fix: Ensure outcome and verdict are consistent. A contradictory
         # verdict (e.g., outcome=failure with verdict=pass) can occur when stale

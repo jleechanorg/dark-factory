@@ -162,8 +162,11 @@ class SharedHelperTests(unittest.TestCase):
                         "item": {"type": "agent_message", "text": response},
                     }
                 )
+                real_run = subprocess.run
 
                 def _fake_transport(command, **run_kwargs):
+                    if command and command[0] == "git":
+                        return real_run(command, **run_kwargs)
                     calls.append({"command": command, **run_kwargs})
                     return subprocess.CompletedProcess(command, 0, transport, "")
 
@@ -296,8 +299,11 @@ class SharedHelperTests(unittest.TestCase):
                         },
                     }
                 )
+                real_run = subprocess.run
 
                 def _fake_transport(command, **run_kwargs):
+                    if command and command[0] == "git":
+                        return real_run(command, **run_kwargs)
                     return subprocess.CompletedProcess(command, 0, transport, "")
 
                 with patch("runner.review_controller.subprocess.run", _fake_transport):
@@ -332,6 +338,281 @@ class SharedHelperTests(unittest.TestCase):
             self.assertNotEqual(output_dirs[0], output_dirs[1])
             for directory in output_dirs:
                 self.assertTrue((directory / "controller-receipt.json").is_file())
+
+    def test_controller_mutation_leaves_no_accepted_artifacts(self) -> None:
+        """Post-review mutation must fail before receipt/findings acceptance."""
+        from unittest.mock import patch
+
+        from runner.handler_core import Context
+        from runner.handler_parallel_reviewer import _parallel_reviewer
+        from runner.parser import Node
+        from runner.review_controller import run_controller_review as canonical_run
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            repo = _init_clean_repo(tmp)
+            node = Node(
+                name="cold_reviewer",
+                attrs={
+                    "review_contract": "cold-review-v1",
+                    "backend_priority": "codex",
+                    "timeout": 1200,
+                },
+            )
+            ctx = Context(
+                goal="reject a reviewer-mutated target",
+                workdir=repo,
+                backend="codex",
+                run_id=f"graph-mutation-{tmp.name}",
+            )
+
+            def _canonical_mutating_transport(request, **kwargs):
+                response = _valid_response(request)
+                transport = json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {"type": "agent_message", "text": response},
+                    }
+                )
+                target = Path(
+                    json.loads(request.envelope_json)["target"]["workspace_path"]
+                )
+                real_run = subprocess.run
+
+                def _fake_transport(command, **run_kwargs):
+                    if command and command[0] == "git":
+                        return real_run(command, **run_kwargs)
+                    (target / "README.md").write_text(
+                        "mutated during review\n", encoding="utf-8"
+                    )
+                    return subprocess.CompletedProcess(command, 0, transport, "")
+
+                with patch("runner.review_controller.subprocess.run", _fake_transport):
+                    return canonical_run(request, **kwargs)
+
+            with patch(
+                "runner.handler_parallel_reviewer._resolve_gate_backend",
+                return_value=("codex", {"reviewer_backend_resolution": "test"}),
+            ), patch(
+                "runner.handler_parallel_reviewer._gate_subprocess_args",
+                return_value=["codex", "exec", "--yolo", "unused-prompt"],
+            ), patch(
+                "runner.review_controller.run_controller_review",
+                side_effect=_canonical_mutating_transport,
+            ):
+                result = _parallel_reviewer(node, ctx)
+
+            lane_dir = Path(ctx.state["_df_controller_review_lane_dirs"]["primary"])
+            self.assertEqual(result.outcome, "failure", result)
+            self.assertIn("reviewed workspace is not clean", result.output)
+            self.assertFalse((lane_dir / "controller-receipt.json").exists())
+            self.assertFalse((lane_dir / "findings.json").exists())
+
+    def test_controller_contract_suppresses_ambient_shadows(self) -> None:
+        """Controller-owned review is exactly one lane despite ambient flags."""
+        from unittest.mock import patch
+
+        from runner.handler_core import Context, Result
+        from runner.handler_parallel_reviewer import _parallel_reviewer
+        from runner.parser import Node
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            repo = _init_clean_repo(tmp)
+            node = Node(
+                name="cold_reviewer",
+                attrs={
+                    "review_contract": "cold-review-v1",
+                    "backend_priority": "codex",
+                    "timeout": 1200,
+                },
+            )
+            ctx = Context(
+                goal="run exactly one controller lane",
+                workdir=repo,
+                backend="codex",
+                run_id=f"graph-no-shadows-{tmp.name}",
+            )
+            ctx.state["_df_shadow_backends"] = "codex,minimax"
+            ctx.state["_df_shadow_codex_review"] = "true"
+
+            with patch(
+                "runner.handler_parallel_reviewer._resolve_gate_backend",
+                return_value=("codex", {"reviewer_backend_resolution": "test"}),
+            ), patch(
+                "runner.handler_parallel_reviewer._run_controller_primary",
+                return_value=Result(
+                    outcome="success",
+                    output="controller pass",
+                    metadata={"verdict": "pass", "fallback_used": "false"},
+                ),
+            ), patch(
+                "runner.handler_parallel_reviewer._launch_shadow_gate_review",
+                side_effect=AssertionError("controller must suppress shadow backends"),
+            ), patch(
+                "runner.handler_parallel_reviewer._start_shadow_gate_review",
+                side_effect=AssertionError("controller must suppress legacy shadow"),
+            ):
+                result = _parallel_reviewer(node, ctx)
+
+            self.assertEqual(result.outcome, "success", result)
+            self.assertNotIn("parallel_reviewer_shadow_backends", result.metadata)
+            self.assertEqual(ctx.state["_df_shadow_backends"], "codex,minimax")
+            self.assertEqual(ctx.state["_df_shadow_codex_review"], "true")
+
+    def test_every_controller_primary_result_declares_no_fallback(self) -> None:
+        """Early, error, invalid, PASS, and FAIL controller results are explicit."""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from runner.handler_core import Context
+        from runner.handler_parallel_reviewer import _run_controller_primary
+        from runner.review_controller import ControllerTransportError
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            repo = _init_clean_repo(tmp)
+            request = _build_request(repo)
+            ctx = Context(goal="controller branches", workdir=repo, backend="codex")
+            ctx.state["_df_controller_review_cwd"] = str(tmp / "neutral")
+            ctx.state["_df_controller_review_lane_dirs"] = {
+                "primary": str(tmp / "primary")
+            }
+
+            results = [
+                _run_controller_primary(request, 1200, ctx, "cold_reviewer", "agy")
+            ]
+            with patch(
+                "runner.handler_parallel_reviewer._gate_subprocess_args",
+                return_value=None,
+            ):
+                results.append(
+                    _run_controller_primary(
+                        request, 1200, ctx, "cold_reviewer", "codex"
+                    )
+                )
+            with patch(
+                "runner.handler_parallel_reviewer._gate_subprocess_args",
+                return_value=["codex", "exec", "prompt"],
+            ), patch(
+                "runner.handler_parallel_reviewer._controller_codex_args",
+                side_effect=ValueError("bad controller argv"),
+            ):
+                results.append(
+                    _run_controller_primary(
+                        request, 1200, ctx, "cold_reviewer", "codex"
+                    )
+                )
+
+            branch_results = (
+                subprocess.TimeoutExpired(["codex"], 1200),
+                ControllerTransportError("transport failed"),
+                ReviewContractError("invalid review"),
+                SimpleNamespace(
+                    review=SimpleNamespace(verdict="pass", response_sha256="a" * 64),
+                    response_text="pass",
+                    output_paths={
+                        "receipt": "receipt",
+                        "response": "response",
+                        "findings": "findings",
+                        "transport": "transport",
+                    },
+                ),
+                SimpleNamespace(
+                    review=SimpleNamespace(verdict="fail", response_sha256="b" * 64),
+                    response_text="fail",
+                    output_paths={
+                        "receipt": "receipt",
+                        "response": "response",
+                        "findings": "findings",
+                        "transport": "transport",
+                    },
+                ),
+            )
+            with patch(
+                "runner.handler_parallel_reviewer._gate_subprocess_args",
+                return_value=["codex", "exec", "prompt"],
+            ), patch(
+                "runner.handler_parallel_reviewer._controller_codex_args",
+                return_value=["codex", "exec", "-"],
+            ), patch(
+                "runner.handler_parallel_reviewer._verify_controller_workspace"
+            ):
+                for controller_result in branch_results:
+                    with patch(
+                        "runner.review_controller.run_controller_review",
+                        side_effect=(
+                            controller_result
+                            if isinstance(controller_result, BaseException)
+                            else None
+                        ),
+                        return_value=(
+                            None
+                            if isinstance(controller_result, BaseException)
+                            else controller_result
+                        ),
+                    ):
+                        results.append(
+                            _run_controller_primary(
+                                request, 1200, ctx, "cold_reviewer", "codex"
+                            )
+                        )
+
+            self.assertEqual(
+                [result.outcome for result in results],
+                ["error", "error", "error", "error", "error", "failure", "success", "failure"],
+            )
+            for result in results:
+                self.assertEqual(result.metadata.get("fallback_used"), "false", result)
+
+    def test_controller_early_results_declare_no_fallback(self) -> None:
+        """Echo fixture, unknown contract, and build errors are explicit."""
+        from unittest.mock import patch
+
+        from runner.handler_core import Context
+        from runner.handler_parallel_reviewer import _parallel_reviewer
+        from runner.parser import Node
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            repo = _init_clean_repo(tmp)
+            echo_ctx = Context(goal="echo", workdir=repo, backend="echo")
+            echo_ctx.state.update(
+                {
+                    "cold_reviewer.outcome": "success",
+                    "_df_test_allow_echo_controller_fixture": "true",
+                }
+            )
+            echo_result = _parallel_reviewer(
+                Node(
+                    name="cold_reviewer",
+                    attrs={"review_contract": "cold-review-v1"},
+                ),
+                echo_ctx,
+            )
+
+            codex_ctx = Context(goal="controller", workdir=repo, backend="codex")
+            unknown_result = _parallel_reviewer(
+                Node(
+                    name="cold_reviewer",
+                    attrs={"review_contract": "unknown-contract"},
+                ),
+                codex_ctx,
+            )
+            with patch(
+                "runner.handler_parallel_reviewer._controller_review_request",
+                side_effect=ValueError("cannot build"),
+            ):
+                build_result = _parallel_reviewer(
+                    Node(
+                        name="cold_reviewer",
+                        attrs={"review_contract": "cold-review-v1"},
+                    ),
+                    codex_ctx,
+                )
+
+            for result in (echo_result, unknown_result, build_result):
+                self.assertEqual(result.metadata.get("fallback_used"), "false", result)
 
 
 class PerLaneIsolationTests(unittest.TestCase):

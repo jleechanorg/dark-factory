@@ -17,7 +17,7 @@ import re
 import subprocess
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal, Mapping
+from typing import Callable, Literal, Mapping
 
 
 PROMPT_ID = "controller-cold-review-v1"
@@ -907,6 +907,7 @@ def run_controller_review(
     transport_argv: tuple[str, ...],
     transport_env: Mapping[str, str] | None = None,
     timeout: float = 1200.0,
+    pre_acceptance_check: Callable[[], None] | None = None,
 ) -> ControllerReviewResult:
     """Run one controller-owned review lane and write its artifacts.
 
@@ -915,7 +916,9 @@ def run_controller_review(
     helper deliberately knows nothing about how the transport is constructed
     — that decision is owned by the dispatch module — but it owns the
     subprocess invocation, JSONL parsing, response + receipt validation, and
-    canonical artifact emission. Both ``runner.review_cli`` and
+    canonical artifact emission. ``pre_acceptance_check`` runs after response
+    validation but before accepted receipt/findings artifacts are written.
+    Both ``runner.review_cli`` and
     ``runner.handler_parallel_reviewer`` route through this function so they
     cannot diverge on shape or digest handling.
     """
@@ -985,6 +988,9 @@ def run_controller_review(
             "(DARK_FACTORY_ITERATION_STUB=1 or DARK_FACTORY_FAKE_LLM=1); "
             "stub mode drives iteration ceilings and cannot transition to READY"
         )
+
+    if pre_acceptance_check is not None:
+        pre_acceptance_check()
 
     receipt = {
         "schema": 1,
