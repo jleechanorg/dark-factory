@@ -224,17 +224,18 @@ def run(
     """
     history: list = []
     resumed = _persist._load_checkpoint(resume) if resume is not None else None
+    from .handler_audit import _operator_verify as canonical_operator_verify
+    operator_nodes = [
+        node for node in graph.nodes.values()
+        if str(node.attrs.get("type", "")) == "operator_verify"
+    ]
     requires_operator_trust = (
         ctx.backend not in {"echo", "mock_llm"}
-        and any(str(node.attrs.get("type", "")) == "operator_verify" for node in graph.nodes.values())
+        and any(resolve(node) is canonical_operator_verify for node in operator_nodes)
     )
     if ctx.workdir is not None:
-        from .handler_audit import _controller_trust_head
-
-        try:
-            canonical_trust = _controller_trust_head(pathlib.Path(ctx.workdir))
-        except (OSError, subprocess.SubprocessError, UnicodeError, ValueError):
-            canonical_trust = ""
+        from .handler_audit import _controller_trust_head, _validate_controller_trust_head
+        root = pathlib.Path(ctx.workdir)
         if resumed is not None:
             checkpoint_trust = {
                 str(record.metadata.get("_df_controller_trust_head") or "")
@@ -244,10 +245,19 @@ def run(
                 raise ValueError("checkpoint lacks consistent controller trust metadata")
             if "" not in checkpoint_trust and len(checkpoint_trust) == 1:
                 restored_trust = checkpoint_trust.pop()
-                if not canonical_trust or restored_trust != canonical_trust:
+                try:
+                    _validate_controller_trust_head(root, restored_trust)
+                except (OSError, subprocess.SubprocessError, UnicodeError, ValueError) as exc:
+                    raise ValueError("checkpoint controller trust is invalid") from exc
+                explicit_trust = os.environ.get("DARK_FACTORY_OPERATOR_TRUST_HEAD", "").strip().lower()
+                if explicit_trust and restored_trust != explicit_trust:
                     raise ValueError("checkpoint controller trust does not match controller input")
                 ctx.state["_df_controller_trust_head"] = restored_trust
         else:
+            try:
+                canonical_trust = _controller_trust_head(root)
+            except (OSError, subprocess.SubprocessError, UnicodeError, ValueError):
+                canonical_trust = ""
             if requires_operator_trust and not canonical_trust:
                 raise ValueError("operator graph requires controller-supplied trust metadata")
             if canonical_trust:

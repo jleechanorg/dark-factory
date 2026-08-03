@@ -113,9 +113,8 @@ def _target_provenance(workdir: pathlib.Path) -> tuple[str, str]:
     return head, digest.hexdigest()
 
 
-def _controller_trust_head(workdir: pathlib.Path) -> str:
+def _validate_controller_trust_head(workdir: pathlib.Path, trust: str) -> str:
     root = workdir.resolve()
-    trust = os.environ.get("DARK_FACTORY_OPERATOR_TRUST_HEAD", "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", trust):
         raise ValueError("controller-supplied operator trust HEAD is required")
     subprocess.run(
@@ -127,6 +126,18 @@ def _controller_trust_head(workdir: pathlib.Path) -> str:
         cwd=root, capture_output=True, check=True, timeout=30,
     )
     return trust
+
+
+def _controller_trust_head(workdir: pathlib.Path) -> str:
+    root = workdir.resolve()
+    explicit = os.environ.get("DARK_FACTORY_OPERATOR_TRUST_HEAD", "").strip().lower()
+    if explicit:
+        return _validate_controller_trust_head(root, explicit)
+    upstream = subprocess.run(
+        ["/usr/bin/git", "rev-parse", "--verify", "@{u}^{commit}"],
+        cwd=root, capture_output=True, check=True, timeout=30,
+    ).stdout.strip().decode("ascii", errors="strict").lower()
+    return _validate_controller_trust_head(root, upstream)
 
 
 def _reject_unknown_keys(value: dict, allowed: frozenset[str], label: str) -> None:
@@ -644,6 +655,7 @@ def _operator_verify(node: "Node", ctx: "Context") -> Result:
         trusted_manifest_head = str(ctx.state.get("_df_controller_trust_head") or "")
         if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", trusted_manifest_head):
             raise ValueError("operator verification lacks trusted run-initial HEAD")
+        _validate_controller_trust_head(workdir, trusted_manifest_head)
         entry_head, entry_workspace = _target_provenance(workdir)
         manifest = _load_operator_manifest(workdir)
         if manifest.policy_sha256 != _CANONICAL_OPERATOR_POLICY_SHA256:
