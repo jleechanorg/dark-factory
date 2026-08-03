@@ -61,6 +61,7 @@ _OPERATOR_EXECUTABLE_ALLOWLIST = frozenset({"/usr/bin/git"})
 _OPERATOR_ID_RE = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
 _OPERATOR_RAW_STREAM_MAX_BYTES = 8 << 20
 _OPERATOR_RECEIPT_MAX_BYTES = 1 << 20
+_CANONICAL_OPERATOR_POLICY_SHA256 = "cc60a010a0fd7e425db00c367049ff2f4dbebf0c6ac1272ca2006d77a2b54614"
 
 _OPERATOR_BUILTINS: tuple[OperatorCommand, ...] = ()  # populated after dataclass declaration
 
@@ -91,6 +92,16 @@ def _target_provenance(workdir: pathlib.Path) -> tuple[str, str]:
         digest.update(len(result.stdout).to_bytes(8, "big"))
         digest.update(result.stdout)
     return head, digest.hexdigest()
+
+
+def _controller_trust_head(workdir: pathlib.Path) -> str:
+    trust = subprocess.run(
+        ["/usr/bin/git", "merge-base", "HEAD", "origin/main"],
+        cwd=workdir.resolve(), capture_output=True, check=True, timeout=30,
+    ).stdout.strip().decode("ascii", errors="strict").lower()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", trust):
+        raise ValueError("controller trust HEAD is malformed")
+    return trust
 
 
 def _reject_unknown_keys(value: dict, allowed: frozenset[str], label: str) -> None:
@@ -146,6 +157,7 @@ class OperatorManifest:
     exclusions: tuple[OperatorExclusion, ...]
     path: pathlib.Path
     raw_bytes: bytes
+    policy_sha256: str = ""
 
 
 @contextlib.contextmanager
@@ -527,7 +539,13 @@ def _load_operator_manifest(
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("operator exclusion reason is required")
         exclusions.append(OperatorExclusion(exclusion_id, "excluded", reason.strip()))
-    return OperatorManifest(1, tuple(commands), exclusions, manifest_path, raw)
+    policy_encoded = json.dumps(
+        operator, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return OperatorManifest(
+        1, tuple(commands), exclusions, manifest_path, raw,
+        hashlib.sha256(policy_encoded).hexdigest(),
+    )
 
 
 def _operator_verify(node: "Node", ctx: "Context") -> Result:
@@ -575,11 +593,13 @@ def _operator_verify(node: "Node", ctx: "Context") -> Result:
             },
         )
     try:
-        trusted_manifest_head = str(ctx.state.get("_df_run_initial_head") or "")
+        trusted_manifest_head = str(ctx.state.get("_df_controller_trust_head") or "")
         if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", trusted_manifest_head):
             raise ValueError("operator verification lacks trusted run-initial HEAD")
         entry_head, entry_workspace = _target_provenance(workdir)
-        manifest = _load_operator_manifest(workdir, trusted_head=trusted_manifest_head)
+        manifest = _load_operator_manifest(workdir)
+        if manifest.policy_sha256 != _CANONICAL_OPERATOR_POLICY_SHA256:
+            raise ValueError("operator verification policy is not controller-canonical")
         manifest_sha = hashlib.sha256(manifest.raw_bytes).hexdigest()
         visit = 1 + sum(
             1 for item in ctx.history if item.get("node") == node.name

@@ -34,6 +34,10 @@ def test_run_captures_target_provenance_before_first_node(tmp_path, monkeypatch)
         ["/usr/bin/git", "rev-parse", "HEAD"], cwd=tmp_path, check=True,
         capture_output=True, text=True,
     ).stdout.strip()
+    subprocess.run(
+        ["/usr/bin/git", "update-ref", "refs/remotes/origin/main", expected_head],
+        cwd=tmp_path, check=True,
+    )
     dot = tmp_path / "provenance.dot"
     dot.write_text(
         "digraph provenance { start [shape=Mdiamond] observe [type=observe] "
@@ -49,8 +53,64 @@ def test_run_captures_target_provenance_before_first_node(tmp_path, monkeypatch)
     monkeypatch.setitem(TYPE_REGISTRY, "observe", observe)
     run(parse(dot), Context(goal="provenance", workdir=tmp_path, backend="echo"))
 
-    assert observed["_df_run_initial_head"] == expected_head
-    assert len(observed["_df_run_initial_workspace_sha256"]) == 64
+    assert observed["_df_controller_trust_head"] == expected_head
+    assert "_df_run_initial_workspace_sha256" not in observed
+
+
+def test_resume_preserves_original_controller_trust_after_worker_commit(
+    tmp_path, monkeypatch
+):
+    subprocess.run(["/usr/bin/git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["/usr/bin/git", "config", "user.email", "jleechan2015@users.noreply.github.com"], cwd=tmp_path, check=True)
+    subprocess.run(["/usr/bin/git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    (tmp_path / "tracked.txt").write_text("trusted\n")
+    subprocess.run(["/usr/bin/git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["/usr/bin/git", "commit", "-qm", "trusted"], cwd=tmp_path, check=True)
+    trusted = subprocess.run(["/usr/bin/git", "rev-parse", "HEAD"], cwd=tmp_path, check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(["/usr/bin/git", "update-ref", "refs/remotes/origin/main", trusted], cwd=tmp_path, check=True)
+    (tmp_path / "tracked.txt").write_text("worker\n")
+    subprocess.run(["/usr/bin/git", "commit", "-qam", "worker"], cwd=tmp_path, check=True)
+    worker_head = subprocess.run(["/usr/bin/git", "rev-parse", "HEAD"], cwd=tmp_path, check=True, capture_output=True, text=True).stdout.strip()
+    dot = tmp_path / "resume_trust.dot"
+    dot.write_text(
+        "digraph resume_trust { start [shape=Mdiamond] worker [type=codergen] "
+        "observe [type=observe] exit [shape=Msquare] "
+        "start -> worker -> observe -> exit }",
+        encoding="utf-8",
+    )
+    checkpoint = tmp_path / "checkpoint.json"
+    checkpoint.write_text(json.dumps([{
+        "node": "worker", "outcome": "success", "ts": 1,
+        "output_preview": "done",
+        "metadata": {"_df_controller_trust_head": trusted},
+    }]))
+    observed = {}
+    def observe(node, ctx):
+        observed.update(ctx.state)
+        return Result(outcome="success")
+    monkeypatch.setitem(TYPE_REGISTRY, "observe", observe)
+
+    run(parse(dot), Context(goal="resume trust", workdir=tmp_path, backend="echo"), resume=checkpoint)
+
+    assert observed["_df_controller_trust_head"] == trusted
+    assert observed["_df_controller_trust_head"] != worker_head
+
+
+def test_resume_fails_closed_without_controller_trust_metadata(tmp_path):
+    dot = tmp_path / "resume_missing_trust.dot"
+    dot.write_text(
+        "digraph resume_missing_trust { start [shape=Mdiamond] worker [type=codergen] "
+        "exit [shape=Msquare] start -> worker -> exit }",
+        encoding="utf-8",
+    )
+    checkpoint = tmp_path / "checkpoint.json"
+    checkpoint.write_text(json.dumps([{
+        "node": "worker", "outcome": "success", "ts": 1,
+        "output_preview": "done", "metadata": {},
+    }]))
+
+    with pytest.raises(ValueError, match="controller trust"):
+        run(parse(dot), Context(goal="resume trust", workdir=ROOT, backend="echo"), resume=checkpoint)
 
 
 @pytest.mark.parametrize(
@@ -318,6 +378,10 @@ def test_engine_resume_from_checkpoint(tmp_path):
         '}\n'
     )
     checkpoint = tmp_path / "checkpoint.json"
+    trust = subprocess.run(
+        ["/usr/bin/git", "merge-base", "HEAD", "origin/main"], cwd=ROOT,
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
     checkpoint.write_text(
         json.dumps(
             [
@@ -326,14 +390,14 @@ def test_engine_resume_from_checkpoint(tmp_path):
                     "outcome": "success",
                     "ts": 0.0,
                     "output_preview": "start",
-                    "metadata": {},
+                    "metadata": {"_df_controller_trust_head": trust},
                 },
                 {
                     "node": "one",
                     "outcome": "success",
                     "ts": 0.0,
                     "output_preview": "one",
-                    "metadata": {},
+                    "metadata": {"_df_controller_trust_head": trust},
                 },
             ]
         )

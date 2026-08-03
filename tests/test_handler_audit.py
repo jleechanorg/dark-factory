@@ -47,11 +47,16 @@ def _write_operator_manifest(tmp_path: pathlib.Path, body: str) -> pathlib.Path:
 
 def _prime_operator_test(ha, monkeypatch, ctx, head: str, snapshot: pathlib.Path) -> None:
     real_loader = ha._load_operator_manifest
-    ctx.state["_df_run_initial_head"] = head
+    ctx.state["_df_controller_trust_head"] = head
     monkeypatch.setattr(ha, "_target_provenance", lambda workdir: (head, "f" * 64))
+    monkeypatch.setattr(ha, "_controller_trust_head", lambda workdir: head)
+    def load_test_manifest(workdir, trusted_head=None):
+        manifest = real_loader(workdir)
+        monkeypatch.setattr(ha, "_CANONICAL_OPERATOR_POLICY_SHA256", manifest.policy_sha256)
+        return manifest
     monkeypatch.setattr(
         ha, "_load_operator_manifest",
-        lambda workdir, trusted_head=None: real_loader(workdir),
+        load_test_manifest,
     )
     monkeypatch.setattr(
         ha, "_trusted_operator_snapshot",
@@ -155,6 +160,53 @@ def test_operator_manifest_can_be_pinned_to_trusted_commit(tmp_path: pathlib.Pat
 
     assert manifest.commands[0].id == "pinned"
     assert manifest.raw_bytes != path.read_bytes()
+
+
+def test_operator_verify_rejects_fresh_manifest_python_code_execution(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    import subprocess
+    subprocess.run(["/usr/bin/git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["/usr/bin/git", "config", "user.email", "jleechan2015@users.noreply.github.com"], cwd=tmp_path, check=True)
+    subprocess.run(["/usr/bin/git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    _write_operator_manifest(
+        tmp_path,
+        """operator_verification:
+  schema_version: 1
+  commands:
+    - id: malicious
+      argv: ["@runner-python", -c, "open('owned','w').write('bad')"]
+      lane: operator_unwrapped
+      timeout_seconds: 30
+      classification: required
+  exclusions: []
+""",
+    )
+    subprocess.run(["/usr/bin/git", "add", ".dark-factory/evidence.yaml"], cwd=tmp_path, check=True)
+    subprocess.run(["/usr/bin/git", "commit", "-qm", "malicious policy"], cwd=tmp_path, check=True)
+    head = subprocess.run(["/usr/bin/git", "rev-parse", "HEAD"], cwd=tmp_path, check=True, capture_output=True, text=True).stdout.strip()
+    import runner.handlers  # noqa: F401
+    import runner.handler_audit as ha
+    from runner.handler_core import Context
+    from runner.parser import Node
+
+    called = False
+    def forbidden(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("malicious policy reached execution")
+
+    monkeypatch.setattr(ha, "run_bounded_process_bytes", forbidden)
+    monkeypatch.setattr(ha, "_operator_log_root", lambda: tmp_path / "private")
+    ctx = Context(goal="reject malicious policy", workdir=tmp_path, backend="codex", run_id="malicious")
+    ctx.state["_df_controller_trust_head"] = head
+
+    result = ha._operator_verify(Node(name="operator_verify", attrs={"type": "operator_verify"}), ctx)
+
+    assert result.outcome == "error"
+    assert result.metadata["error_type"] == "operator_setup"
+    assert called is False
+    assert not (tmp_path / "owned").exists()
 
 
 @pytest.mark.parametrize(

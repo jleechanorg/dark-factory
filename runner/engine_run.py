@@ -223,15 +223,27 @@ def run(
     checkpointed last step.
     """
     history: list = []
+    resumed = _persist._load_checkpoint(resume) if resume is not None else None
     if ctx.workdir is not None:
-        from .handler_audit import _target_provenance
+        from .handler_audit import _controller_trust_head
 
         try:
-            initial_head, initial_workspace = _target_provenance(pathlib.Path(ctx.workdir))
+            canonical_trust = _controller_trust_head(pathlib.Path(ctx.workdir))
         except (OSError, subprocess.SubprocessError, UnicodeError, ValueError):
-            initial_head, initial_workspace = "", ""
-        ctx.state["_df_run_initial_head"] = initial_head
-        ctx.state["_df_run_initial_workspace_sha256"] = initial_workspace
+            canonical_trust = ""
+        if resumed is not None:
+            checkpoint_trust = {
+                str(record.metadata.get("_df_controller_trust_head") or "")
+                for record in resumed
+            }
+            if len(checkpoint_trust) != 1 or "" in checkpoint_trust:
+                raise ValueError("checkpoint lacks consistent controller trust metadata")
+            restored_trust = checkpoint_trust.pop()
+            if not canonical_trust or restored_trust != canonical_trust:
+                raise ValueError("checkpoint controller trust does not match canonical base")
+            ctx.state["_df_controller_trust_head"] = restored_trust
+        else:
+            ctx.state["_df_controller_trust_head"] = canonical_trust
     visits: dict[str, int] = {}
     # Per-node ring of recent output hashes for the no_progress detector
     # (D3 in feedback 2026-06-22). When a node produces the same output
@@ -245,7 +257,7 @@ def run(
     _resumed_overhead = 0
 
     if resume is not None:
-        resumed = _persist._load_checkpoint(resume)
+        assert resumed is not None
         history.extend(resumed)
         _resumed_overhead = sum(
             1 for s in resumed if s.metadata.get("_branch_overhead") == "true"
