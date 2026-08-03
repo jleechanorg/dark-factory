@@ -831,7 +831,14 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     import runner.handlers as _handlers_shim  # late-bound shim for monkeypatched helpers
     review_contract = str(node.attrs.get("review_contract") or "").strip()
     preseeded_outcome = f"{node.name}.outcome" in ctx.state
-    if ctx.backend in ("echo", "mock_llm") and (not review_contract or preseeded_outcome):
+    explicit_controller_echo_fixture = (
+        preseeded_outcome
+        and str(ctx.state.get("_df_test_allow_echo_controller_fixture") or "").strip().lower()
+        in {"true", "1", "yes", "on"}
+    )
+    if ctx.backend in ("echo", "mock_llm") and (
+        not review_contract or explicit_controller_echo_fixture
+    ):
         hint = ctx.state.get(f"{node.name}.outcome", "success")
         return Result(
             outcome=hint,

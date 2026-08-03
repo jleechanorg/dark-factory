@@ -465,7 +465,7 @@ class ControllerSnapshotTests(unittest.TestCase):
         self.assertEqual(seen, ["codex"])
 
     def test_controller_contract_allows_explicitly_preseeded_echo_fixture(self) -> None:
-        """Tests can still opt into deterministic echo with a reviewer outcome seed."""
+        """Tests can explicitly opt into deterministic controller echo."""
         from runner.handler_core import Context
         from runner.handler_parallel_reviewer import _parallel_reviewer
         from runner.parser import Node
@@ -473,11 +473,112 @@ class ControllerSnapshotTests(unittest.TestCase):
         node = Node(name="cold_reviewer", attrs={"review_contract": "cold-review-v1"})
         ctx = Context(goal="fixture", workdir=self.repo, backend="echo")
         ctx.state["cold_reviewer.outcome"] = "success"
+        ctx.state["_df_test_allow_echo_controller_fixture"] = "true"
 
         result = _parallel_reviewer(node, ctx)
 
         self.assertEqual(result.outcome, "success")
         self.assertEqual(result.metadata["reviewer_backend"], "echo")
+
+    def test_controller_contract_rejects_unmarked_preseeded_echo_outcome(self) -> None:
+        """An inherited outcome key alone cannot turn a controller into echo."""
+        from unittest.mock import patch
+
+        from runner.handler_core import Context, Result
+        from runner.handler_parallel_reviewer import _parallel_reviewer
+        from runner.parser import Node
+
+        (self.repo / "README.md").write_text("worker output\n")
+        seen: list[str] = []
+
+        def _fake_primary(prompt, expected_sha, timeout, ctx, node_name, backend, **kwargs):
+            seen.append(backend)
+            return Result(
+                outcome="success",
+                output="controller response",
+                metadata={"reviewer_backend": backend, "verdict": "pass"},
+            )
+
+        node = Node(
+            name="cold_reviewer",
+            attrs={"review_contract": "cold-review-v1", "backend_priority": "codex"},
+        )
+        ctx = Context(goal="review worker output", workdir=self.repo, backend="echo")
+        ctx.state["cold_reviewer.outcome"] = "success"
+        with patch("runner.handler_parallel_reviewer._run_primary_review", _fake_primary), patch(
+            "runner.handler_parallel_reviewer._contract_adjusted_result",
+            lambda result, request, ctx, **kwargs: result,
+        ):
+            result = _parallel_reviewer(node, ctx)
+
+        self.assertEqual(result.outcome, "success")
+        self.assertEqual(seen, ["codex"])
+        self.assertEqual(result.metadata["reviewer_backend"], "codex")
+
+    def test_cli_echo_two_node_cold_reviewer_never_inherits_worker_outcome(self) -> None:
+        """The real CLI path keeps cold-review-v1 on Codex under --backend echo."""
+        from unittest.mock import patch
+
+        from runner import __main__ as cli
+        from runner.handler_core import Result
+        from runner.handlers import TYPE_REGISTRY
+
+        (self.repo / "README.md").write_text("worker output\n")
+        checkpoint = self.tmp / "checkpoint.json"
+        bundle = self.tmp / "evidence"
+        seen: list[str] = []
+
+        def _worker_with_inherited_reviewer_outcome(node, ctx):
+            return Result(
+                outcome="success",
+                output="worker completed",
+                context_updates={"cold_reviewer.outcome": "success"},
+            )
+
+        def _fake_primary(prompt, expected_sha, timeout, ctx, node_name, backend, **kwargs):
+            seen.append(backend)
+            return Result(
+                outcome="success",
+                output="controller response",
+                metadata={"reviewer_backend": backend, "verdict": "pass"},
+            )
+
+        with patch.dict(TYPE_REGISTRY, {"codergen": _worker_with_inherited_reviewer_outcome}), patch(
+            "runner.handler_parallel_reviewer._run_primary_review", _fake_primary
+        ), patch(
+            "runner.handler_parallel_reviewer._contract_adjusted_result",
+            lambda result, request, ctx, **kwargs: result,
+        ):
+            rc = cli.main(
+                [
+                    "--pipeline",
+                    str(Path(__file__).parent.parent / "pipelines/slim/two_node.dot"),
+                    "--workdir",
+                    str(self.repo),
+                    "--goal",
+                    "E2E smoke only: validate controller transport selection.",
+                    "--backend",
+                    "echo",
+                    "--max-steps",
+                    "4",
+                    "--checkpoint",
+                    str(checkpoint),
+                    "--evidence-bundle",
+                    str(bundle),
+                    "--state",
+                    "_df_shadow_codex_review=false",
+                    "--no-perf-log",
+                ]
+            )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen, ["codex"])
+        cold_reviewer = next(
+            record for record in json.loads(checkpoint.read_text())
+            if record["node"] == "cold_reviewer"
+        )
+        self.assertEqual(cold_reviewer["metadata"]["reviewer_backend"], "codex")
+        self.assertNotIn("echo parallel reviewer", cold_reviewer["output_preview"])
 
 
 def replace_evidence(
