@@ -320,6 +320,33 @@ class ControllerSnapshotTests(unittest.TestCase):
         self.assertFalse((snapshot / ".dark-factory" / "agy-task-worker.md").exists())
         self.assertEqual(_git(snapshot, "rev-parse", "HEAD").strip(), request.head_sha)
 
+    def test_worker_task_artifact_only_uses_clean_noop_review_snapshot(self) -> None:
+        """A transport-only worker result still receives an immutable no-op review."""
+        from runner.handler_core import Context
+        from runner.handler_parallel_reviewer import _controller_review_request
+        from runner.parser import Node
+        from runner.review_controller import verify_request_integrity
+
+        task_dir = self.repo / ".dark-factory"
+        task_dir.mkdir()
+        (task_dir / "agy-task-worker.md").write_text("runner task artifact\n")
+
+        request = _controller_review_request(
+            Node(name="cold_reviewer", attrs={}),
+            Context(goal="review no-op worker output", workdir=self.repo),
+            _git(self.repo, "rev-parse", "HEAD").strip(),
+        )
+        envelope = json.loads(request.envelope_json)
+        snapshot = Path(envelope["target"]["workspace_path"])
+
+        verify_request_integrity(request)
+        self.assertNotEqual(snapshot, self.repo)
+        self.assertEqual(_git(snapshot, "status", "--porcelain=v1"), "")
+        self.assertFalse((snapshot / ".dark-factory" / "agy-task-worker.md").exists())
+        self.assertEqual(_git(snapshot, "rev-parse", "HEAD").strip(), request.head_sha)
+        self.assertEqual(envelope["snapshots"]["diff"]["text"], "")
+        self.assertEqual(envelope["snapshots"]["changed_files"], [])
+
     def test_declared_evidence_is_bound_without_copying_unrelated_ignored_files(self) -> None:
         """Snapshot includes declared evidence, but not unrelated ignored runtime data."""
         from runner.handler_core import Context
@@ -515,8 +542,8 @@ class ControllerSnapshotTests(unittest.TestCase):
         self.assertEqual(seen, ["codex"])
         self.assertEqual(result.metadata["reviewer_backend"], "codex")
 
-    def test_cli_echo_two_node_cold_reviewer_never_inherits_worker_outcome(self) -> None:
-        """The real CLI path keeps cold-review-v1 on Codex under --backend echo."""
+    def test_cli_echo_two_node_runs_one_controller_reviewer_by_default(self) -> None:
+        """The default two-node runtime runs only the primary Codex controller."""
         from unittest.mock import patch
 
         from runner import __main__ as cli
@@ -527,6 +554,7 @@ class ControllerSnapshotTests(unittest.TestCase):
         checkpoint = self.tmp / "checkpoint.json"
         bundle = self.tmp / "evidence"
         seen: list[str] = []
+        shadow_launches: list[str] = []
 
         def _worker_with_inherited_reviewer_outcome(node, ctx):
             return Result(
@@ -548,6 +576,9 @@ class ControllerSnapshotTests(unittest.TestCase):
         ), patch(
             "runner.handler_parallel_reviewer._contract_adjusted_result",
             lambda result, request, ctx, **kwargs: result,
+        ), patch(
+            "runner.handler_parallel_reviewer._start_shadow_gate_review",
+            lambda *args, **kwargs: shadow_launches.append("shadow"),
         ):
             rc = cli.main(
                 [
@@ -565,14 +596,13 @@ class ControllerSnapshotTests(unittest.TestCase):
                     str(checkpoint),
                     "--evidence-bundle",
                     str(bundle),
-                    "--state",
-                    "_df_shadow_codex_review=false",
                     "--no-perf-log",
                 ]
             )
 
         self.assertEqual(rc, 0)
         self.assertEqual(seen, ["codex"])
+        self.assertEqual(shadow_launches, [])
         cold_reviewer = next(
             record for record in json.loads(checkpoint.read_text())
             if record["node"] == "cold_reviewer"

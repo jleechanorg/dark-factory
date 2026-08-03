@@ -391,29 +391,28 @@ def _controller_snapshot(
                     staged_evidence.stderr.strip()
                     or "could not stage declared controller evidence"
                 )
-        if not _git_output(snapshot, "status", "--porcelain=v1", allow_empty=True):
-            raise ValueError("controller review requires a non-empty worker diff")
-        committed = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(snapshot),
-                "-c",
-                "user.name=dark-factory-controller",
-                "-c",
-                "user.email=dark-factory-controller@localhost",
-                "commit",
-                "--no-verify",
-                "-m",
-                "dark-factory controller snapshot [codex/gpt-5.6-luna]",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-        if committed.returncode != 0:
-            raise ValueError(committed.stderr.strip() or "could not commit controller snapshot")
+        if _git_output(snapshot, "status", "--porcelain=v1", allow_empty=True):
+            committed = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(snapshot),
+                    "-c",
+                    "user.name=dark-factory-controller",
+                    "-c",
+                    "user.email=dark-factory-controller@localhost",
+                    "commit",
+                    "--no-verify",
+                    "-m",
+                    "dark-factory controller snapshot [codex/gpt-5.6-luna]",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if committed.returncode != 0:
+                raise ValueError(committed.stderr.strip() or "could not commit controller snapshot")
         return snapshot, _git_output(snapshot, "rev-parse", "HEAD^{commit}").lower()
     except Exception:
         subprocess.run(
@@ -483,8 +482,6 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
         allow_empty=True,
     )
     changed = changed_text.splitlines()
-    if not changed:
-        raise ValueError("controller review requires a non-empty committed diff")
     try:
         repository = _git_output(workdir, "config", "--get", "remote.origin.url")
     except ValueError:
