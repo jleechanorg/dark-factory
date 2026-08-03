@@ -31,13 +31,17 @@ still take effect.
 from __future__ import annotations
 
 import os
+import pathlib
 import shutil
 import subprocess
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
-import runner.handlers as _handlers_shim
+# ``runner.handlers`` re-imports symbols from this module at module load
+# (TYPE_REGISTRY registration), so importing it eagerly here would form a
+# cycle. Use the lazy ``import runner.handlers as _handlers_shim`` shim
+# inside each consumer function (see PR #503 fix).
 
 from .handler_core import Result
 
@@ -137,6 +141,7 @@ def _launch_shadow_gate_review(
     ctx: "Context",
     backend: str = "codex",
 ) -> _ShadowGateReview | None:
+    import runner.handlers as _handlers_shim  # late-bound shim
     """Spawn a shadow reviewer on ``backend`` (no enable-gate).
 
     This is the generalized spawn body; callers must perform their own
@@ -238,6 +243,7 @@ def _finish_shadow_gate_review(
     timeout: int,
     ctx: "Context",
 ) -> "Result":
+    import runner.handlers as _handlers_shim  # late-bound shim
     if shadow is None:
         return result
 
@@ -363,6 +369,7 @@ def _finish_shadow_gate_review(
 
 
 def _gate_subprocess_args(backend: str, prompt: str, ctx: "Context", timeout: int) -> Optional[list[str]]:
+    import runner.handlers as _handlers_shim  # late-bound shim
     """Build the sandboxed argv for a *reviewer* gate on the given backend.
 
     Supported backends:
@@ -404,6 +411,7 @@ def _gate_subprocess_args(backend: str, prompt: str, ctx: "Context", timeout: in
 
 
 def _gate_subprocess_env(backend: str) -> dict[str, str]:
+    import runner.handlers as _handlers_shim  # late-bound shim
     """Env overrides for a reviewer-gate subprocess on ``backend``.
 
     For ``minimax`` the Claude CLI must route through the minimax Anthropic-
@@ -417,10 +425,89 @@ def _gate_subprocess_env(backend: str) -> dict[str, str]:
     return _handlers_shim._sanitized_env()
 
 
+def _controller_codex_args(args: list[str]) -> list[str]:
+    """Build the controller Codex transport argv.
+
+    Preserves any ``sandbox-exec -p ...`` wrapper prefix and inserts the
+    controller transport flags (``--json --ephemeral --skip-git-repo-check
+    --sandbox read-only``) while replacing the prompt positional with
+    ``-`` (stdin). Fails closed on unsafe transport options so the
+    controller never launches a write-capable Codex subprocess.
+    """
+    prepared = list(args)
+    if not prepared:
+        raise ValueError("codex controller argv is empty")
+
+    # Locate the codex binary within the argv (skip any sandbox-exec wrapper).
+    try:
+        codex_index = next(
+            index
+            for index, value in enumerate(prepared)
+            if pathlib.Path(value).name == "codex"
+        )
+    except StopIteration as exc:
+        raise ValueError("codex executable missing from reviewer argv") from exc
+
+    codex_args = prepared[codex_index:]
+    if len(codex_args) < 3:
+        raise ValueError("codex controller command missing review payload")
+    if codex_args[1] != "exec":
+        raise ValueError("controller transport requires 'codex exec'")
+
+    # Validate transport safety before reconstructing the argv.
+    for idx, value in enumerate(codex_args):
+        if value == "--dangerously-bypass-approvals-and-sandbox":
+            raise ValueError("controller transport uses unsafe codex flags")
+        if value.startswith("--sandbox="):
+            mode = value.split("=", 1)[1].strip().lower()
+            if mode != "read-only":
+                raise ValueError("controller transport requires read-only codex sandboxing")
+        elif value == "--sandbox":
+            if idx + 1 >= len(codex_args):
+                raise ValueError("codex controller command uses invalid --sandbox mode")
+            mode = codex_args[idx + 1].strip().lower()
+            if mode != "read-only":
+                raise ValueError("controller transport requires read-only codex sandboxing")
+
+    # Preserve everything up to and including "codex exec".
+    prefix = prepared[:codex_index + 2]
+
+    # Strip transport flags we replace and the original prompt positional.
+    codex_tail = codex_args[2:]
+    safe_tail: list[str] = []
+    skip_next = False
+    for idx, value in enumerate(codex_tail):
+        if skip_next:
+            skip_next = False
+            continue
+        if value in ("--yolo", "--json", "--ephemeral", "--skip-git-repo-check"):
+            continue
+        if value == "--sandbox":
+            skip_next = True
+            continue
+        if value.startswith("--sandbox="):
+            continue
+        # Drop the original trailing prompt positional (last non-flag arg).
+        if idx == len(codex_tail) - 1 and not value.startswith("-"):
+            continue
+        safe_tail.append(value)
+
+    return prefix + [
+        "--json",
+        "--ephemeral",
+        "--skip-git-repo-check",
+        "--sandbox",
+        "read-only",
+        *safe_tail,
+        "-",
+    ]
+
+
 def _run_gate_once(
     backend: str, prompt: str, expected_sha: str, timeout: int, ctx: "Context", name: str,
     *, gate_strict: bool = False,
 ) -> "Result":
+    import runner.handlers as _handlers_shim  # late-bound shim
     """Run one reviewer-gate attempt on ``backend`` and classify the result.
 
     SHA binding, verdict parsing, and infra-vs-real-failure classification are
@@ -624,6 +711,7 @@ def _resolve_adversarial_backend(
     priority: list[str] | None,
     ctx: "Context",
 ) -> tuple[str, dict[str, str]]:
+    import runner.handlers as _handlers_shim  # late-bound shim
     """Pick the first installed backend from the adversarial priority queue.
 
     Resolution order:

@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import pathlib
 import sys
+import pytest
 
 ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
@@ -156,6 +157,292 @@ def test_execute_gate_writes_exact_prompt_sidecar(tmp_path, monkeypatch):
     assert result.metadata["llm_prompt_sha256"]
     events = [line for line in ctx.event_log_path.read_text().splitlines() if line.strip()]
     assert any('"event": "node_prompt"' in line and '"node": "evidence"' in line for line in events)
+
+
+def test_complete_controller_prompt_is_not_rewrapped_for_shadow(tmp_path, monkeypatch):
+    """Controller-owned review bytes must be identical in every reviewer lane."""
+    from runner.handlers import Context as HCtx
+    from runner.handler_dispatch import _launch_shadow_gate_review
+
+    seen: list[list[str]] = []
+
+    class _FakePopen:
+        pid = 123
+        returncode = 0
+
+        def __init__(self, cmd, **kwargs):
+            seen.append(cmd)
+
+    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr("runner.handler_dispatch.shutil.which", lambda name: "/usr/bin/codex")
+    monkeypatch.setattr("runner.handler_dispatch.subprocess.Popen", _FakePopen)
+    ctx = HCtx(goal="untrusted goal", workdir=tmp_path, backend="codex")
+
+    prompt = "CONTROLLER-OWNED COMPLETE PROMPT"
+    shadow = _launch_shadow_gate_review(
+        "adversarial_reviewer",
+        prompt,
+        "a" * 40,
+        300,
+        ctx,
+        prompt_is_complete=True,
+    )
+
+    assert shadow is not None
+    assert shadow.prompt_is_complete is True
+    assert shadow.prompt == prompt
+    assert shadow.json_transport is True
+    assert seen
+    assert seen[0][-1] == "-"
+    assert "--json" in seen[0]
+    assert "--ephemeral" in seen[0]
+    assert "--sandbox" in seen[0]
+    assert "read-only" in seen[0]
+    assert "--yolo" not in seen[0]
+    assert "--dangerously-bypass-approvals-and-sandbox" not in seen[0]
+    assert "--ignore-user-config" not in seen[0]
+    assert "--ephemeral" in seen[0]
+    assert "Normal gate prompt for comparison" not in " ".join(seen[0])
+
+
+def test_launch_shadow_gate_review_uses_controller_cwd_and_sanitized_env(tmp_path, monkeypatch):
+    """Controller-complete shadow launch must run from neutral cwd and
+    sanitized environment."""
+    from runner.handlers import Context as HCtx
+    from runner.handler_dispatch import _launch_shadow_gate_review
+
+    observed: dict[str, object] = {}
+
+    class _FakePopen:
+        pid = 321
+        returncode = 0
+
+        def __init__(self, cmd, **kwargs):
+            observed["cwd"] = kwargs.get("cwd")
+            observed["env"] = kwargs.get("env", {})
+
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", "/secret/holdouts")
+    monkeypatch.setenv("MY_HOLDOUT_SECRET", "sealed")
+    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr("runner.handler_dispatch.shutil.which", lambda name: "/usr/bin/codex")
+    monkeypatch.setattr("runner.handler_dispatch.subprocess.Popen", _FakePopen)
+    monkeypatch.setattr(
+        "runner.handlers._get_claude_executable",
+        lambda: "claude",
+    )
+
+    neutral = tmp_path / "controller-cwd"
+    neutral.mkdir()
+    ctx = HCtx(goal="review", workdir=tmp_path / "target", backend="codex")
+    ctx.state["_df_controller_review_cwd"] = str(neutral)
+
+    review = _launch_shadow_gate_review(
+        "adversarial_reviewer",
+        "COMPLETE REVIEW PROMPT",
+        "a" * 40,
+        300,
+        ctx,
+        prompt_is_complete=True,
+    )
+
+    assert review is not None
+    assert review.prompt_is_complete is True
+    assert review.json_transport is True
+    assert observed.get("cwd") == neutral
+    env = observed.get("env", {})
+    assert isinstance(env, dict)
+    assert "DARK_FACTORY_HOLDOUTS" not in env
+    assert "MY_HOLDOUT_SECRET" not in env
+
+
+def test_controller_codex_args_builds_stdin_transport():
+    """Controller transport must use JSON transport on stdin and a neutral cwd."""
+    from runner.handler_dispatch import _controller_codex_args
+    argv = [
+        "sandbox-exec",
+        "-p",
+        "(version 1)\n(allow default)",
+        "codex",
+        "exec",
+        "--skip-git-repo-check",
+        "PROMPT",
+    ]
+    transformed = _controller_codex_args(argv)
+    assert transformed[-1] == "-"
+    assert transformed == [
+        "sandbox-exec",
+        "-p",
+        "(version 1)\n(allow default)",
+        "codex",
+        "exec",
+        "--json",
+        "--ephemeral",
+        "--skip-git-repo-check",
+        "--sandbox",
+        "read-only",
+        "-",
+    ]
+
+
+def test_controller_codex_args_rejects_non_codex_command():
+    """Unsupported backend command builders must fail closed."""
+    from runner.handler_dispatch import _controller_codex_args
+    with pytest.raises(ValueError, match="codex executable"):
+        _controller_codex_args(["claude", "--print", "PROMPT"])
+
+
+def test_controller_codex_args_rejects_unsafe_transport_options():
+    """Unsafe Codex transport options must fail closed before launch."""
+    from runner.handler_dispatch import _controller_codex_args
+
+    legacy = _controller_codex_args([
+        "codex",
+        "exec",
+        "--yolo",
+        "--skip-git-repo-check",
+        "PROMPT",
+    ])
+    assert "--yolo" not in legacy
+
+    with pytest.raises(ValueError, match="unsafe codex flags"):
+        _controller_codex_args([
+            "codex",
+            "exec",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "PROMPT",
+        ])
+    with pytest.raises(ValueError, match="read-only"):
+        _controller_codex_args([
+            "codex",
+            "exec",
+            "--sandbox",
+            "read-write",
+            "PROMPT",
+        ])
+    with pytest.raises(ValueError, match="read-only"):
+        _controller_codex_args([
+            "codex",
+            "exec",
+            "--sandbox=read-write",
+            "PROMPT",
+        ])
+
+
+def test_launch_shadow_gate_review_rejects_complete_controller_prompt_non_codex_backend(
+    tmp_path, monkeypatch
+):
+    """Controller-owned prompt lanes must be codex-only, never other backends."""
+    from runner.handlers import Context as HCtx
+    from runner.handler_dispatch import _launch_shadow_gate_review
+
+    class _FakePopen:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("shadow controller launch must fail closed")
+
+    monkeypatch.setattr("runner.handler_dispatch.shutil.which", lambda name: "/usr/bin/codex")
+    monkeypatch.setattr("runner.handler_dispatch.subprocess.Popen", _FakePopen)
+    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+
+    ctx = HCtx(goal="test", workdir=tmp_path, backend="claude")
+    review = _launch_shadow_gate_review(
+        "gate",
+        "COMPLETE CONTROLLER PROMPT",
+        "a" * 40,
+        300,
+        ctx,
+        backend="claude",
+        prompt_is_complete=True,
+    )
+
+    assert review is not None
+    assert review.proc is None
+    assert review.launch_error
+    assert "codex backend" in review.launch_error.lower()
+
+
+def test_execute_gate_uses_controller_codex_transport(tmp_path, monkeypatch):
+    """Controller-JSON review transport must send prompt via stdin from neutral cwd."""
+    import subprocess as _sp
+    import json
+    from runner.handlers import _execute_gate, Context as HCtx
+
+    fake_sha = "f" * 40
+    observed: dict[str, object] = {}
+
+    def _fake_run(cmd, **kwargs):
+        observed["cmd"] = cmd
+        observed["input"] = kwargs.get("input")
+        observed["cwd"] = kwargs.get("cwd")
+        observed["env"] = kwargs.get("env", {})
+        transport = json.dumps({
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": f"head_sha: {fake_sha}\nverdict: pass\n",
+            },
+        }) + "\n"
+        return _sp.CompletedProcess(
+            cmd,
+            0,
+            stdout=transport,
+            stderr="",
+        )
+
+    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", "/secret/holdouts")
+    monkeypatch.setenv("MY_HOLDOUT_SECRET", "sealed")
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    neutral = tmp_path / "controller-cwd"
+    neutral.mkdir()
+    ctx = HCtx(goal="test", workdir=tmp_path / "target", backend="claude", run_id="controller")
+    ctx.state["_df_controller_review_json"] = "true"
+    ctx.state["_df_controller_review_cwd"] = str(neutral)
+
+    result = _execute_gate("PROMPT", fake_sha, 300, ctx, "gate_er", "codex")
+
+    assert result.outcome == "success"
+    assert observed["input"] == "PROMPT"
+    assert observed["cwd"] == neutral
+    cmd = observed["cmd"]
+    assert isinstance(cmd, list)
+    assert cmd[-1] == "-"
+    assert "--json" in cmd
+    assert "--ephemeral" in cmd
+    assert "--sandbox" in cmd
+    assert "read-only" in cmd
+    assert "--skip-git-repo-check" in cmd
+    assert "--yolo" not in cmd
+    env = observed.get("env", {})
+    assert isinstance(env, dict)
+    assert "DARK_FACTORY_HOLDOUTS" not in env
+    assert "MY_HOLDOUT_SECRET" not in env
+
+
+def test_execute_gate_rejects_controller_request_for_non_codex_backend(
+    tmp_path, monkeypatch
+):
+    """Controller transport must be codex-only and fail before subprocess launch."""
+    import subprocess as _sp
+    from runner.handlers import _execute_gate, Context as HCtx
+
+    fake_sha = "a" * 40
+    launched: list[list[str]] = []
+
+    def _fake_run(cmd, **kwargs):
+        launched.append(cmd)
+        return _sp.CompletedProcess(cmd, 0, stdout=f"head_sha: {fake_sha}\nverdict: pass\n")
+
+    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    ctx = HCtx(goal="test", workdir=tmp_path, backend="codex")
+    ctx.state["_df_controller_review_json"] = "true"
+
+    result = _execute_gate("PROMPT", fake_sha, 300, ctx, "gate_er", "claude")
+
+    assert result.outcome == "error"
+    assert not launched
+    assert "requires codex backend" in result.output
 
 
 def test_execute_gate_runs_parallel_codex_shadow_review(tmp_path, monkeypatch):
