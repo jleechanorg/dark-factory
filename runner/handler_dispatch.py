@@ -267,6 +267,8 @@ def _launch_shadow_gate_review(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             start_new_session=True,
             env=_gate_subprocess_env(backend),
         )

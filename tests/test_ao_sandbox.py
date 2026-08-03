@@ -67,6 +67,7 @@ def test_codergen_ao_spawn_args_are_sandboxed(monkeypatch, tmp_path):
             # Provide a valid SESSION= line so the handler proceeds past parsing.
             self.stdout = "SESSION=fake-session\nWorktree: /tmp/fake-worktree\n"
             self.stderr = ""
+            self.timed_out = False
 
     def _fake_run(args, **kwargs):
         captured.setdefault("calls", []).append(list(args))
@@ -79,6 +80,10 @@ def test_codergen_ao_spawn_args_are_sandboxed(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(subprocess, "run", _fake_run)
     monkeypatch.setattr("runner.handlers.subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_codergen.run_bounded_process", _fake_run)
+    fake_holdouts = tmp_path / "dark-factory-holdouts"
+    fake_holdouts.mkdir()
+    monkeypatch.setattr("runner.handler_sandbox._holdouts_repo_path", lambda: fake_holdouts)
 
     node = _make_ao_node()
     ctx = Context(goal="test", workdir=tmp_path, backend="ao")
@@ -87,7 +92,7 @@ def test_codergen_ao_spawn_args_are_sandboxed(monkeypatch, tmp_path):
     result = _codergen(node, ctx)
 
     assert "calls" in captured and captured["calls"], "subprocess.run was not invoked"
-    spawn_argv = captured["calls"][0]
+    spawn_argv = next(call for call in captured["calls"] if "ao" in call and "spawn" in call)
     assert spawn_argv[0].endswith("sandbox-exec"), (
         f"first arg should be sandbox-exec, got {spawn_argv[:3]!r}"
     )
@@ -114,6 +119,7 @@ def test_codergen_ao_send_args_are_sandboxed(monkeypatch, tmp_path):
             self.returncode = 0
             self.stdout = ""
             self.stderr = ""
+            self.timed_out = False
 
     def _fake_run(args, **kwargs):
         captured.setdefault("calls", []).append(list(args))
@@ -124,6 +130,10 @@ def test_codergen_ao_send_args_are_sandboxed(monkeypatch, tmp_path):
         lambda *a, **kw: "ready",
     )
     monkeypatch.setattr("runner.handlers.subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_codergen.run_bounded_process", _fake_run)
+    fake_holdouts = tmp_path / "dark-factory-holdouts"
+    fake_holdouts.mkdir()
+    monkeypatch.setattr("runner.handler_sandbox._holdouts_repo_path", lambda: fake_holdouts)
 
     node = _make_ao_node()
     ctx = Context(goal="test", workdir=tmp_path, backend="ao")
@@ -134,7 +144,7 @@ def test_codergen_ao_send_args_are_sandboxed(monkeypatch, tmp_path):
     result = _codergen(node, ctx)
 
     assert captured["calls"], "subprocess.run was not invoked"
-    send_argv = captured["calls"][0]
+    send_argv = next(call for call in captured["calls"] if "ao" in call and "send" in call)
     assert send_argv[0].endswith("sandbox-exec")
     assert send_argv[1] == "-p"
     assert "dark-factory-holdouts" in send_argv[2]
@@ -240,6 +250,7 @@ def test_ao_subprocess_inherits_sanitized_env(monkeypatch, tmp_path):
             self.returncode = 0
             self.stdout = "SESSION=fake\n"
             self.stderr = ""
+            self.timed_out = False
 
     def _fake_run(args, **kwargs):
         captured["env"] = dict(kwargs.get("env") or {})
@@ -250,6 +261,7 @@ def test_ao_subprocess_inherits_sanitized_env(monkeypatch, tmp_path):
         lambda *a, **kw: "ready",
     )
     monkeypatch.setattr("runner.handlers.subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_codergen.run_bounded_process", _fake_run)
 
     node = _make_ao_node()
     ctx = Context(goal="test", workdir=tmp_path, backend="ao")

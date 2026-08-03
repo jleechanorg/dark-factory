@@ -10,6 +10,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 from conftest import make_node  # noqa: E402
 from runner.handlers import Context, _codergen  # noqa: E402
+from runner.subprocess_control import BoundedProcessResult  # noqa: E402
 
 
 class _FakePopen:
@@ -71,7 +72,18 @@ def test_review_codergen_runs_parallel_codex_shadow_review(tmp_path, monkeypatch
             args, 0, stdout="primary reviewer says pass\n", stderr=""
         )
 
+    def _fake_bounded(args, **kwargs):
+        completed = _fake_run(args, **kwargs)
+        return BoundedProcessResult(
+            args=tuple(args),
+            returncode=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+            timed_out=False,
+        )
+
     monkeypatch.setattr("runner.handler_codergen.subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_codergen.run_bounded_process", _fake_bounded)
 
     result = _codergen(node, ctx)
 

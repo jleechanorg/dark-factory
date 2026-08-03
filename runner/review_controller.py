@@ -81,6 +81,10 @@ class ReviewContractError(ValueError):
 class ControllerTransportError(RuntimeError):
     """The controller review transport failed before a response was reviewable."""
 
+    def __init__(self, message: str, *, timed_out: bool = False) -> None:
+        super().__init__(message)
+        self.timed_out = timed_out
+
 
 @dataclass(frozen=True, slots=True)
 class EvidenceArtifact:
@@ -971,7 +975,8 @@ def run_controller_review(
     if getattr(proc, "timed_out", False):
         diagnostic = (proc.stdout + ("\nSTDERR:\n" + proc.stderr if proc.stderr else "")).strip()
         raise ControllerTransportError(
-            diagnostic or f"controller review transport timed out after {timeout} seconds"
+            diagnostic or f"controller review transport timed out after {timeout} seconds",
+            timed_out=True,
         )
 
     if proc.returncode != 0:

@@ -423,11 +423,13 @@ def test_ao_spawn_is_launched_through_holdout_sandbox(monkeypatch, tmp_path):
             returncode = 0
             stdout = "SESSION=session-1\nWorktree: /tmp/ao-worktree\n"
             stderr = ""
+            timed_out = False
 
         return Proc()
 
     monkeypatch.setattr(handlers_mod, "_sandboxed_args", fake_sandbox)
     monkeypatch.setattr(handlers_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr("runner.handler_codergen.run_bounded_process", fake_run)
     monkeypatch.setattr(handlers_mod, "_ao_wait_idle", lambda *args, **kwargs: "ready")
 
     ctx = Context(goal="t", workdir=tmp_path, backend="ao", state={"ao.project": "dark-factory"})
@@ -453,11 +455,13 @@ def test_ao_send_is_launched_through_holdout_sandbox(monkeypatch, tmp_path):
             returncode = 0
             stdout = ""
             stderr = ""
+            timed_out = False
 
         return Proc()
 
     monkeypatch.setattr(handlers_mod, "_sandboxed_args", fake_sandbox)
     monkeypatch.setattr(handlers_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr("runner.handler_codergen.run_bounded_process", fake_run)
     monkeypatch.setattr(handlers_mod, "_ao_wait_idle", lambda *args, **kwargs: "ready")
 
     ctx = Context(

@@ -19,6 +19,18 @@ def as_text(value: str | bytes | None) -> str:
     return value
 
 
+def _merge_output(current: str | bytes | None, later: str | bytes | None) -> str:
+    current_text = as_text(current)
+    later_text = as_text(later)
+    if not later_text or later_text == current_text:
+        return current_text
+    if later_text.startswith(current_text):
+        return later_text
+    if current_text.endswith(later_text):
+        return current_text
+    return current_text + later_text
+
+
 @dataclass(frozen=True, slots=True)
 class BoundedProcessResult:
     args: tuple[str, ...]
@@ -63,14 +75,15 @@ def finish_bounded_process(
             stdout, stderr = proc.communicate(input=input_text, timeout=timeout)
     except subprocess.TimeoutExpired as initial_timeout:
         timed_out = True
-        stdout, stderr = initial_timeout.stdout, initial_timeout.stderr
+        stdout, stderr = as_text(initial_timeout.stdout), as_text(initial_timeout.stderr)
         _signal_process_group(pgid, signal.SIGTERM)
         deadline = time.monotonic() + max(0.0, terminate_grace)
         try:
             drained_stdout, drained_stderr = proc.communicate(timeout=terminate_grace)
             stdout, stderr = drained_stdout, drained_stderr
-        except subprocess.TimeoutExpired:
-            pass
+        except subprocess.TimeoutExpired as cleanup_timeout:
+            stdout = _merge_output(stdout, cleanup_timeout.stdout)
+            stderr = _merge_output(stderr, cleanup_timeout.stderr)
         except Exception:
             pass
         while _process_group_exists(pgid) and time.monotonic() < deadline:
@@ -84,10 +97,8 @@ def finish_bounded_process(
             if final_stderr is not None:
                 stderr = final_stderr
         except subprocess.TimeoutExpired as final_timeout:
-            if stdout is None:
-                stdout = final_timeout.stdout
-            if stderr is None:
-                stderr = final_timeout.stderr
+            stdout = _merge_output(stdout, final_timeout.stdout)
+            stderr = _merge_output(stderr, final_timeout.stderr)
         except Exception:
             pass
     return BoundedProcessResult(

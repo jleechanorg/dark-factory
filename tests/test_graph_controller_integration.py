@@ -18,6 +18,7 @@ from typing import Iterable
 
 from runner.review_controller import (
     CHECK_IDS,
+    ControllerTransportError,
     EvidenceArtifact,
     ReviewContractError,
     ReviewInputs,
@@ -253,7 +254,9 @@ class SharedHelperTests(unittest.TestCase):
                 return_value=["codex", "exec", "--yolo", "unused-prompt"],
             ), patch(
                 "runner.review_controller.run_controller_review",
-                side_effect=subprocess.TimeoutExpired(["codex"], 1200),
+                side_effect=ControllerTransportError(
+                    "controller timed out", timed_out=True
+                ),
             ), patch(
                 "runner.handler_parallel_reviewer._run_primary_review",
                 side_effect=AssertionError("legacy gate executor must not run"),
@@ -507,7 +510,7 @@ class SharedHelperTests(unittest.TestCase):
                 )
 
             branch_results = (
-                subprocess.TimeoutExpired(["codex"], 1200),
+                ControllerTransportError("transport timed out", timed_out=True),
                 ControllerTransportError("transport failed"),
                 ReviewContractError("invalid review"),
                 SimpleNamespace(

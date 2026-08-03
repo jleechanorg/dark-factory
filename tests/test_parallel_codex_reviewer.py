@@ -104,6 +104,7 @@ def test_parallel_reviewer_runs_both_lanes_and_logs_distinct_outputs(tmp_path, m
     monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda wd: expected_sha)
     monkeypatch.setattr("runner.handler_dispatch.shutil.which", lambda name: "/usr/bin/codex")
     monkeypatch.setattr("runner.handler_dispatch.subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _fake_run)
     monkeypatch.setattr("runner.handler_dispatch.subprocess.Popen", _ShadowPopen)
 
     result = _parallel_reviewer(node, ctx)
@@ -159,6 +160,7 @@ def test_parallel_reviewer_maps_shadow_errors_to_error(tmp_path, monkeypatch):
     monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda wd: expected_sha)
     monkeypatch.setattr("runner.handler_dispatch.shutil.which", lambda name: "/usr/bin/codex")
     monkeypatch.setattr("runner.handler_dispatch.subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _fake_run)
     monkeypatch.setattr("runner.handler_dispatch.subprocess.Popen", _ShadowPopen)
 
     result = _parallel_reviewer(node, ctx)
@@ -180,6 +182,7 @@ def test_parallel_reviewer_launches_all_shadows_before_awaiting(tmp_path, monkey
 
     class _ShadowPopen:
         _pid = 30000
+        pid = 30000
 
         def __init__(self, args, **kwargs):
             call_log.append(f"popen:{args[0]}")
@@ -204,6 +207,7 @@ def test_parallel_reviewer_launches_all_shadows_before_awaiting(tmp_path, monkey
     monkeypatch.setattr("runner.handlers._get_claude_executable", lambda: "claude")
     monkeypatch.setattr("runner.handler_dispatch.shutil.which", lambda name: "/usr/bin/" + str(name))
     monkeypatch.setattr("runner.handler_dispatch.subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _fake_run)
     monkeypatch.setattr("runner.handler_dispatch.subprocess.Popen", _ShadowPopen)
 
     result = _parallel_reviewer(node, ctx)
@@ -229,6 +233,8 @@ def test_parallel_reviewer_one_shadow_real_fail_maps_to_failure_not_error(tmp_pa
     expected_sha = "d" * 40
 
     class _ShadowPopen:
+        pid = 30001
+
         def __init__(self, args, **kwargs):
             self.args = args
             self.returncode = 0  # clean exit -> real verdict, not infra error
@@ -253,6 +259,7 @@ def test_parallel_reviewer_one_shadow_real_fail_maps_to_failure_not_error(tmp_pa
     monkeypatch.setattr("runner.handlers._get_claude_executable", lambda: "claude")
     monkeypatch.setattr("runner.handler_dispatch.shutil.which", lambda name: "/usr/bin/" + str(name))
     monkeypatch.setattr("runner.handler_dispatch.subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _fake_run)
     monkeypatch.setattr("runner.handler_dispatch.subprocess.Popen", _ShadowPopen)
 
     result = _parallel_reviewer(node, ctx)

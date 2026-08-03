@@ -217,13 +217,14 @@ def _run_controller_primary(
             },
         )
     except (ControllerTransportError, OSError) as exc:
+        timed_out = isinstance(exc, ControllerTransportError) and exc.timed_out
         return Result(
             outcome="error",
             output=f"controller review transport failed: {exc}",
             metadata={
                 **metadata,
                 "review_contract_status": "transport_error",
-                "timed_out": "false",
+                "timed_out": "true" if timed_out else "false",
                 "verdict": "unknown",
             },
         )

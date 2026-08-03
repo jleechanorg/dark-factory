@@ -49,7 +49,7 @@ EXPECTED_CODER_OUTCOME = {
     "claude": "failure",    # caught by `except Exception` (line 535)
     "codex": "error",       # caught by `except Exception` (line 583)
     "agy": "error",         # Popen is protected (bead jleechan-c5q)
-    "ao": "failure",        # caught by `except Exception` (line 352/445)
+    "ao": "error",          # terminal transport failure
 }
 
 EXPECTED_GATE_BACKEND_MISSING_OUTCOME = {
@@ -277,7 +277,7 @@ def test_agy_coder_missing_panics_unprotected(monkeypatch, tmp_path):
 
 
 def test_ao_coder_missing_sandbox_present_returns_failure(monkeypatch, tmp_path):
-    """ao missing (sandbox-exec present) → ``Result(outcome="failure", ...)``
+    """ao missing (sandbox-exec present) → terminal ``Result(outcome="error", ...)``
     via the ``except Exception as exc:`` at line 352 (``ao spawn`` branch).
 
     Audit-table row: ao | failure | YES (via Exception) | NO.
@@ -300,8 +300,8 @@ def test_ao_coder_missing_sandbox_present_returns_failure(monkeypatch, tmp_path)
 
     result = _codergen(_node("ao", name="ao_spawn"), ctx)
 
-    assert result.outcome == "failure", (
-        f"expected failure on missing ao, got {result.outcome!r}: {result.output!r}"
+    assert result.outcome == "error", (
+        f"expected error on missing ao, got {result.outcome!r}: {result.output!r}"
     )
     assert "ao spawn failed" in result.output
     assert result.metadata.get("backend_missing") != "true"

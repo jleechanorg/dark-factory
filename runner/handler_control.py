@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 import runner.handlers as _handlers_shim
 
 from .handler_core import Result
+from .subprocess_control import run_bounded_process
 
 if TYPE_CHECKING:
     from .parser import Node
@@ -194,31 +195,11 @@ def _tool(node: "Node", ctx: "Context") -> "Result":
     if args is None:
         return Result(outcome="failure", output="sandbox-exec unavailable")
     try:
-        proc = subprocess.run(
+        proc = run_bounded_process(
             args,
             cwd=cwd,
-            capture_output=True,
-            text=True,
             timeout=timeout,
-            check=False,
             env=_handlers_shim._sanitized_env(),
-        )
-    except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout or ""
-        stderr = exc.stderr or ""
-        combined = (stdout + ("\nSTDERR:\n" + stderr if stderr else "")).strip()
-        output_text = combined or f"tool command timed out after {timeout} seconds"
-        if goal_gate:
-            _record_test_failure_state(ctx, cmd=cmd, rc="", output=output_text)
-        return Result(
-            outcome="failure",
-            output=output_text,
-            metadata={
-                "command": cmd,
-                "timeout": str(timeout),
-                "timed_out": "true",
-                "returncode": "",
-            },
         )
     except Exception as exc:
         output_text = f"tool command failed: {exc}"
@@ -232,6 +213,21 @@ def _tool(node: "Node", ctx: "Context") -> "Result":
                 "timed_out": "false",
                 "timeout": str(timeout),
                 "returncode": "",
+            },
+        )
+    if proc.timed_out:
+        combined = (proc.stdout + ("\nSTDERR:\n" + proc.stderr if proc.stderr else "")).strip()
+        output_text = combined or f"tool command timed out after {timeout} seconds"
+        if goal_gate:
+            _record_test_failure_state(ctx, cmd=cmd, rc=str(proc.returncode), output=output_text)
+        return Result(
+            outcome="error",
+            output=output_text,
+            metadata={
+                "command": cmd,
+                "timeout": str(timeout),
+                "timed_out": "true",
+                "returncode": str(proc.returncode),
             },
         )
     outcome = "success" if proc.returncode == 0 else "failure"

@@ -248,6 +248,8 @@ def _start_shadow_codex_review(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             start_new_session=True,
             env=_handlers_shim._sanitized_env(),
         )
@@ -672,33 +674,15 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                 return _finalize(Result(outcome="failure", output="sandbox-exec unavailable"))
             ao_spawn_timeout = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "300"), 300)
             try:
-                proc = subprocess.run(
+                proc = run_bounded_process(
                     spawn_args,
                     cwd=ctx.workdir,
-                    capture_output=True,
-                    text=True,
                     timeout=ao_spawn_timeout,
-                    check=False,
                     env=_handlers_shim._sanitized_env(),
                 )
-            except subprocess.TimeoutExpired as exc:
-                stdout = exc.stdout or ""
-                stderr = exc.stderr or ""
-                return _finalize(Result(
-                    outcome="failure",
-                    output=(stdout + ("\nSTDERR:\n" + stderr if stderr else "")).strip()
-                    or f"ao spawn timed out after {ao_spawn_timeout} seconds",
-                    metadata={
-                        "session": "",
-                        "activity": "timeout",
-                        "timed_out": "true",
-                        "timeout": str(ao_spawn_timeout),
-                        "returncode": "",
-                    },
-                ))
             except Exception as exc:
                 return _finalize(Result(
-                    outcome="failure",
+                    outcome="error",
                     output=f"ao spawn failed: {exc}",
                     metadata={
                         "session": "",
@@ -706,6 +690,19 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                         "timed_out": "false",
                         "timeout": str(ao_spawn_timeout),
                         "returncode": "",
+                    },
+                ))
+            if proc.timed_out:
+                return _finalize(Result(
+                    outcome="error",
+                    output=(proc.stdout + ("\nSTDERR:\n" + proc.stderr if proc.stderr else "")).strip()
+                    or f"ao spawn timed out after {ao_spawn_timeout} seconds",
+                    metadata={
+                        "session": "",
+                        "activity": "timeout",
+                        "timed_out": "true",
+                        "timeout": str(ao_spawn_timeout),
+                        "returncode": str(proc.returncode),
                     },
                 ))
             if proc.returncode != 0:
@@ -768,33 +765,15 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         if send_args is None:
             return _finalize(Result(outcome="failure", output="sandbox-exec unavailable"))
         try:
-            proc = subprocess.run(
+            proc = run_bounded_process(
                 send_args,
                 cwd=ctx.workdir,
-                capture_output=True,
-                text=True,
                 timeout=ao_send_timeout + 120,
-                check=False,
                 env=_handlers_shim._sanitized_env(),
             )
-        except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout or ""
-            stderr = exc.stderr or ""
-            return _finalize(Result(
-                outcome="failure",
-                output=(stdout + ("\nSTDERR:\n" + stderr if stderr else "")).strip()
-                or f"ao send timed out after {ao_send_timeout} seconds",
-                metadata={
-                    "session": session,
-                    "activity": "timeout",
-                    "timed_out": "true",
-                    "timeout": str(ao_send_timeout),
-                    "returncode": "",
-                },
-            ))
         except Exception as exc:
             return _finalize(Result(
-                outcome="failure",
+                outcome="error",
                 output=f"ao send failed: {exc}",
                 metadata={
                     "session": session,
@@ -802,6 +781,19 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                     "timed_out": "false",
                     "timeout": str(ao_send_timeout),
                     "returncode": "",
+                },
+            ))
+        if proc.timed_out:
+            return _finalize(Result(
+                outcome="error",
+                output=(proc.stdout + ("\nSTDERR:\n" + proc.stderr if proc.stderr else "")).strip()
+                or f"ao send timed out after {ao_send_timeout} seconds",
+                metadata={
+                    "session": session,
+                    "activity": "timeout",
+                    "timed_out": "true",
+                    "timeout": str(ao_send_timeout),
+                    "returncode": str(proc.returncode),
                 },
             ))
         if proc.returncode != 0:
