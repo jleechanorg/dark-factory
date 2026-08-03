@@ -2333,9 +2333,10 @@ fn factory_labeled_pr_branch_collision_is_refused_without_stealing_mapping() {
         0,
         0,
     )
-    .expect("branch collision should escalate without failing the tick");
+    .expect("branch collision should be silently dropped without failing the tick");
 
-    assert_eq!(summary.beads_escalated, 1);
+    // Branch collision is now a silent SKIPPED_DUPLICATE_BEAD drop, not an escalation.
+    assert_eq!(summary.beads_escalated, 0, "collision must be dropped, not escalated");
     assert_eq!(
         store
             .bead_id_for_branch("factory/existing-bead-r1")
@@ -2349,13 +2350,14 @@ fn factory_labeled_pr_branch_collision_is_refused_without_stealing_mapping() {
         "refused adoption must not create an overlay for the colliding PR; overlay={refused_overlay:?}, calls={:?}",
         store.calls.borrow()
     );
+    // Silent-drop: no escalation comment is posted on the PR (unlike the old HUMAN_HELD path).
     let tracker_calls = tracker.calls.borrow();
     assert!(
-        tracker_calls.iter().any(|call| {
+        !tracker_calls.iter().any(|call| {
             call.contains("comment_external(owner/repo#704")
-                && call.contains("already registered to bead `existing-bead`")
+                && call.contains("already registered to bead")
         }),
-        "collision must be escalated on the original PR: {tracker_calls:?}"
+        "silent-drop must not post an escalation comment: {tracker_calls:?}"
     );
     let store_calls = store.calls.borrow();
     assert!(

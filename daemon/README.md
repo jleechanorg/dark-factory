@@ -90,7 +90,7 @@ journalctl --user -u ai.dark-factory.daemon.service -n 100 --no-pager
 The installer builds `daemon/target/release/daemon`, renders
 `ai.dark-factory.daemon.service`, verifies user lingering for boot persistence,
 then runs `systemctl --user enable --now`. The unit uses `Type=notify`,
-`Restart=on-failure`, and `WatchdogSec=7200s`; the daemon sends `READY=1`
+`Restart=on-failure`, and `WatchdogSec=600`; the daemon sends `READY=1`
 after startup and `WATCHDOG=1` after each classified tick. Use `--dry-run` to
 inspect commands without mutating the host, `--render-only` to print the
 rendered unit, and `--uninstall` to disable and remove it.

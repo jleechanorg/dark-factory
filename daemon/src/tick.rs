@@ -1543,6 +1543,26 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         if let Some(owner) = deps.store.bead_id_for_branch(&adopted.head_ref_name)? {
             if owner != adopted.bead_id {
                 let owner_live = deps.store.load(&owner)?.is_some();
+                if owner_live {
+                    let ctx = serde_json::json!({
+                        "reason": "adoption_branch_collision",
+                        "branch": adopted.head_ref_name,
+                        "registered_bead": owner,
+                        "registered_bead_live": true,
+                        "external_ref": adopted.external_ref,
+                    });
+                    emit(
+                        deps.telemetry_log,
+                        &adopted.bead_id,
+                        1,
+                        "CANCELLED/DUPLICATE",
+                        "SKIPPED_DUPLICATE_BEAD",
+                        serde_json::json!({}),
+                        ctx,
+                    )?;
+                    continue;
+                }
+
                 let comment_body = format!(
                     "🤖 **[dark-factory]** Escalation required: refusing factory PR adoption for branch `{}` because it is already registered to bead `{}`. Branch-key stealing is not allowed; please use a unique same-repo branch.",
                     adopted.head_ref_name, owner
@@ -1554,7 +1574,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     "reason": "adoption_branch_collision",
                     "branch": adopted.head_ref_name,
                     "registered_bead": owner,
-                    "registered_bead_live": owner_live,
+                    "registered_bead_live": false,
                     "external_ref": adopted.external_ref,
                 });
                 let now_epoch = now_epoch_secs();
