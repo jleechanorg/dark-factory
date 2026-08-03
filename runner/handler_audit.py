@@ -114,12 +114,18 @@ def _target_provenance(workdir: pathlib.Path) -> tuple[str, str]:
 
 
 def _controller_trust_head(workdir: pathlib.Path) -> str:
-    trust = subprocess.run(
-        ["/usr/bin/git", "merge-base", "HEAD", "origin/main"],
-        cwd=workdir.resolve(), capture_output=True, check=True, timeout=30,
-    ).stdout.strip().decode("ascii", errors="strict").lower()
+    root = workdir.resolve()
+    trust = os.environ.get("DARK_FACTORY_OPERATOR_TRUST_HEAD", "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", trust):
-        raise ValueError("controller trust HEAD is malformed")
+        raise ValueError("controller-supplied operator trust HEAD is required")
+    subprocess.run(
+        ["/usr/bin/git", "cat-file", "-e", f"{trust}^{{commit}}"],
+        cwd=root, capture_output=True, check=True, timeout=30,
+    )
+    subprocess.run(
+        ["/usr/bin/git", "merge-base", "--is-ancestor", trust, "HEAD"],
+        cwd=root, capture_output=True, check=True, timeout=30,
+    )
     return trust
 
 

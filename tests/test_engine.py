@@ -51,6 +51,8 @@ def test_run_captures_target_provenance_before_first_node(tmp_path, monkeypatch)
         return Result(outcome="success")
 
     monkeypatch.setitem(TYPE_REGISTRY, "observe", observe)
+    import runner.handler_audit as handler_audit
+    monkeypatch.setattr(handler_audit, "_controller_trust_head", lambda workdir: expected_head)
     run(parse(dot), Context(goal="provenance", workdir=tmp_path, backend="echo"))
 
     assert observed["_df_controller_trust_head"] == expected_head
@@ -74,8 +76,8 @@ def test_resume_preserves_original_controller_trust_after_worker_commit(
     dot = tmp_path / "resume_trust.dot"
     dot.write_text(
         "digraph resume_trust { start [shape=Mdiamond] worker [type=codergen] "
-        "observe [type=observe] exit [shape=Msquare] "
-        "start -> worker -> observe -> exit }",
+        "observe [type=observe] operator [type=operator_verify] exit [shape=Msquare] "
+        "start -> worker -> observe -> operator -> exit }",
         encoding="utf-8",
     )
     checkpoint = tmp_path / "checkpoint.json"
@@ -89,18 +91,33 @@ def test_resume_preserves_original_controller_trust_after_worker_commit(
         observed.update(ctx.state)
         return Result(outcome="success")
     monkeypatch.setitem(TYPE_REGISTRY, "observe", observe)
+    monkeypatch.setitem(TYPE_REGISTRY, "operator_verify", lambda node, ctx: Result(outcome="success"))
+    import runner.handler_audit as handler_audit
+    monkeypatch.setattr(handler_audit, "_controller_trust_head", lambda workdir: trusted)
 
-    run(parse(dot), Context(goal="resume trust", workdir=tmp_path, backend="echo"), resume=checkpoint)
+    run(parse(dot), Context(goal="resume trust", workdir=tmp_path, backend="codex"), resume=checkpoint)
 
     assert observed["_df_controller_trust_head"] == trusted
     assert observed["_df_controller_trust_head"] != worker_head
+
+    checkpoint.write_text(json.dumps([{
+        "node": "worker", "outcome": "success", "ts": 1,
+        "output_preview": "done",
+        "metadata": {"_df_controller_trust_head": worker_head},
+    }]))
+    with pytest.raises(ValueError, match="controller trust"):
+        run(
+            parse(dot),
+            Context(goal="tampered resume trust", workdir=tmp_path, backend="codex"),
+            resume=checkpoint,
+        )
 
 
 def test_resume_fails_closed_without_controller_trust_metadata(tmp_path):
     dot = tmp_path / "resume_missing_trust.dot"
     dot.write_text(
         "digraph resume_missing_trust { start [shape=Mdiamond] worker [type=codergen] "
-        "exit [shape=Msquare] start -> worker -> exit }",
+        "operator [type=operator_verify] exit [shape=Msquare] start -> worker -> operator -> exit }",
         encoding="utf-8",
     )
     checkpoint = tmp_path / "checkpoint.json"
@@ -110,7 +127,7 @@ def test_resume_fails_closed_without_controller_trust_metadata(tmp_path):
     }]))
 
     with pytest.raises(ValueError, match="controller trust"):
-        run(parse(dot), Context(goal="resume trust", workdir=ROOT, backend="echo"), resume=checkpoint)
+        run(parse(dot), Context(goal="resume trust", workdir=ROOT, backend="codex"), resume=checkpoint)
 
 
 @pytest.mark.parametrize(
@@ -378,10 +395,6 @@ def test_engine_resume_from_checkpoint(tmp_path):
         '}\n'
     )
     checkpoint = tmp_path / "checkpoint.json"
-    trust = subprocess.run(
-        ["/usr/bin/git", "merge-base", "HEAD", "origin/main"], cwd=ROOT,
-        check=True, capture_output=True, text=True,
-    ).stdout.strip()
     checkpoint.write_text(
         json.dumps(
             [
@@ -390,14 +403,14 @@ def test_engine_resume_from_checkpoint(tmp_path):
                     "outcome": "success",
                     "ts": 0.0,
                     "output_preview": "start",
-                    "metadata": {"_df_controller_trust_head": trust},
+                    "metadata": {},
                 },
                 {
                     "node": "one",
                     "outcome": "success",
                     "ts": 0.0,
                     "output_preview": "one",
-                    "metadata": {"_df_controller_trust_head": trust},
+                    "metadata": {},
                 },
             ]
         )

@@ -224,6 +224,10 @@ def run(
     """
     history: list = []
     resumed = _persist._load_checkpoint(resume) if resume is not None else None
+    requires_operator_trust = (
+        ctx.backend not in {"echo", "mock_llm"}
+        and any(str(node.attrs.get("type", "")) == "operator_verify" for node in graph.nodes.values())
+    )
     if ctx.workdir is not None:
         from .handler_audit import _controller_trust_head
 
@@ -236,14 +240,18 @@ def run(
                 str(record.metadata.get("_df_controller_trust_head") or "")
                 for record in resumed
             }
-            if len(checkpoint_trust) != 1 or "" in checkpoint_trust:
+            if requires_operator_trust and (len(checkpoint_trust) != 1 or "" in checkpoint_trust):
                 raise ValueError("checkpoint lacks consistent controller trust metadata")
-            restored_trust = checkpoint_trust.pop()
-            if not canonical_trust or restored_trust != canonical_trust:
-                raise ValueError("checkpoint controller trust does not match canonical base")
-            ctx.state["_df_controller_trust_head"] = restored_trust
+            if "" not in checkpoint_trust and len(checkpoint_trust) == 1:
+                restored_trust = checkpoint_trust.pop()
+                if not canonical_trust or restored_trust != canonical_trust:
+                    raise ValueError("checkpoint controller trust does not match controller input")
+                ctx.state["_df_controller_trust_head"] = restored_trust
         else:
-            ctx.state["_df_controller_trust_head"] = canonical_trust
+            if requires_operator_trust and not canonical_trust:
+                raise ValueError("operator graph requires controller-supplied trust metadata")
+            if canonical_trust:
+                ctx.state["_df_controller_trust_head"] = canonical_trust
     visits: dict[str, int] = {}
     # Per-node ring of recent output hashes for the no_progress detector
     # (D3 in feedback 2026-06-22). When a node produces the same output
