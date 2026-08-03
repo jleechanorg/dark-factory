@@ -74,9 +74,9 @@ def resolve_pipeline_path(
     ----------
     name:
         The value passed to ``--pipeline`` — either a path (with separators
-        or a ``.dot`` extension) or a bare filename. Bare filenames are
-        Known extensionless aliases resolve canonically first. Other bare
-        filenames are matched against the target-repo subdir convention
+        or a ``.dot`` extension) or a bare filename. Known extensionless
+        aliases resolve canonically first; other bare filenames are matched
+        against the target-repo subdir convention
         before falling through to the factory home.
     workdir:
         Target repository workdir (``--workdir`` / cwd). When ``None`` the
