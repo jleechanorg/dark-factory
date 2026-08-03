@@ -815,12 +815,12 @@ def test_implementing_agent_sandbox_denies_controller_private_trust_operations(
     outside = tmp_path / "outside.txt"
     outside.write_text("outside\n", encoding="utf-8")
     monkeypatch.setattr(
-        handler_sandbox, "_controller_private_root", lambda: controller_root
+        handler_sandbox, "_controller_private_root", lambda: trust_root
     )
     probe = (
         'test ! -e "$DF_TRUST_ROOT/registry.json" || exit 81; '
         'test ! -r "$DF_TRUST_ROOT/registry.json" || exit 82; '
-        'test "$(/bin/ls "$DF_CONTROLLER_ROOT" 2>/dev/null)" = "" || exit 83; '
+        'test "$(/bin/ls "$DF_TRUST_ROOT" 2>/dev/null)" = "" || exit 83; '
         'printf bad >"$DF_TRUST_ROOT/injected" 2>/dev/null && exit 84; '
         '/bin/mv "$DF_OUTSIDE" "$DF_TRUST_ROOT/moved" 2>/dev/null && exit 85; '
         '/bin/mv "$DF_TRUST_FILE" "$DF_OUTSIDE.moved" 2>/dev/null && exit 86; '

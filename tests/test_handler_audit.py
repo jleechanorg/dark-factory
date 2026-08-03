@@ -274,7 +274,7 @@ def test_custom_target_manifest_survives_fresh_resume_and_ignores_worker_policy(
         "target-head", "git-head-final",
     ]
     assert "worker-code" not in json.dumps(receipt)
-    assert not (controller_root / "operator-trust" / "registry.json").exists()
+    assert not (controller_root / "registry.json").exists()
 
 
 def test_operator_verify_rejects_fresh_manifest_python_code_execution(

@@ -95,7 +95,7 @@ _SEALED_BENCHMARK_DOC_NAMES = ("README.md", "DESIGN.md", "SCORING.md", "SCENARIO
 
 def _controller_private_root() -> pathlib.Path:
     """Stable root that implementing-agent processes must never observe."""
-    return pathlib.Path.home() / ".dark-factory"
+    return pathlib.Path.home() / ".dark-factory" / "operator-trust"
 
 
 def _sanitized_env() -> dict[str, str]:

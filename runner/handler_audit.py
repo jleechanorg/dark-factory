@@ -603,7 +603,7 @@ def _load_operator_manifest(
 
 
 def _operator_trust_registry_dir() -> pathlib.Path:
-    return _sandbox._controller_private_root() / "operator-trust"
+    return _sandbox._controller_private_root()
 
 
 def _operator_trust_checkpoint_key(checkpoint: pathlib.Path) -> str:

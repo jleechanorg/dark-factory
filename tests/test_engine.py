@@ -115,7 +115,7 @@ def test_automatic_resume_rejects_checkpoint_or_private_trust_tampering(
     subprocess.run(["/usr/bin/git", "commit", "-qam", "worker"], cwd=tmp_path, check=True)
     worker_head = subprocess.run(["/usr/bin/git", "rev-parse", "HEAD"], cwd=tmp_path, check=True, capture_output=True, text=True).stdout.strip()
     registry_path = (
-        tmp_path / "controller-private" / "operator-trust" / "registry.json"
+        tmp_path / "controller-private" / "registry.json"
     )
     if tamper == "checkpoint-all-records":
         for record in records:
