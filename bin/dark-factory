@@ -71,16 +71,41 @@ if [[ ! -x "${VENV_PYTHON}" ]]; then
   exit 1
 fi
 
-# Extract --backend value from argv (default: echo) without disturbing
-# the rest of the argument list. Cheap linear scan is fine — bash only.
+# Extract the backend and the effective default-shadow setting without
+# disturbing argv. The Python CLI defaults the shadow reviewer to true;
+# an explicit state override is the supported no-Codex configuration.
 PREFLIGHT_BACKEND="${DARK_FACTORY_BACKEND:-}"
+PREFLIGHT_SHADOW_CODEX="true"
 prev=""
 for arg in "$@"; do
   if [[ "${prev}" == "--backend" ]]; then
     PREFLIGHT_BACKEND="${arg}"
-    break
+  elif [[ "${prev}" == "--state" ]]; then
+    case "${arg}" in
+      _df_shadow_codex_review=false|_df_shadow_codex_review=0|_df_shadow_codex_review=no|_df_shadow_codex_review=off)
+        PREFLIGHT_SHADOW_CODEX="false"
+        ;;
+      _df_shadow_codex_review=true|_df_shadow_codex_review=1|_df_shadow_codex_review=yes|_df_shadow_codex_review=on)
+        PREFLIGHT_SHADOW_CODEX="true"
+        ;;
+    esac
   fi
-  prev="${arg}"
+  case "${arg}" in
+    --backend=*)
+      PREFLIGHT_BACKEND="${arg#--backend=}"
+      ;;
+    --state=_df_shadow_codex_review=false|--state=_df_shadow_codex_review=0|--state=_df_shadow_codex_review=no|--state=_df_shadow_codex_review=off)
+      PREFLIGHT_SHADOW_CODEX="false"
+      ;;
+    --state=_df_shadow_codex_review=true|--state=_df_shadow_codex_review=1|--state=_df_shadow_codex_review=yes|--state=_df_shadow_codex_review=on)
+      PREFLIGHT_SHADOW_CODEX="true"
+      ;;
+  esac
+  if [[ "${arg}" == --state=* ]]; then
+    prev=""
+  else
+    prev="${arg}"
+  fi
 done
 PREFLIGHT_BACKEND="${PREFLIGHT_BACKEND:-echo}"
 
@@ -93,7 +118,8 @@ PREFLIGHT_RC=0
 PREFLIGHT_JSON="$(
   env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
     "${VENV_PYTHON}" -m runner.preflight \
-    --backend "${PREFLIGHT_BACKEND}" --json 2>/dev/null
+    --backend "${PREFLIGHT_BACKEND}" \
+    --shadow-codex "${PREFLIGHT_SHADOW_CODEX}" --json 2>/dev/null
 )" || PREFLIGHT_RC=$?
 
 if [[ "${PREFLIGHT_RC}" -eq 2 ]]; then

@@ -7,9 +7,9 @@ status consumable by callers and humans.
 
 States
 ------
-- ``pass``  configured backend is present (or backend is ``echo``)
+- ``pass``  configured backend and every enabled Codex lane are present
 - ``warn``  configured backend missing but at least one other CLI present
-- ``fail``  zero non-echo backends reachable — hard-stop with exit 2
+- ``fail``  a required Codex lane is invalid, or zero non-echo backends are reachable
 
 Exit codes
 ----------
@@ -68,7 +68,12 @@ def _probe(name: str) -> Optional[str]:
     return _shutil.which(name)
 
 
-def preflight_check(backend: str, workdir: pathlib.Path | None = None) -> dict:
+def preflight_check(
+    backend: str,
+    workdir: pathlib.Path | None = None,
+    *,
+    shadow_codex: bool = True,
+) -> dict:
     """Probe the configured backend and alternates; return structured status.
 
     Parameters
@@ -80,6 +85,10 @@ def preflight_check(backend: str, workdir: pathlib.Path | None = None) -> dict:
         Reserved for future per-workdir probing. Currently unused; included
         in the API so the signature matches the spec and the bash wrapper
         can pass ``--workdir`` if it ever wants to.
+    shadow_codex:
+        Whether the runner configuration enables the default Codex shadow
+        reviewer. When true, Codex runtime skew is fatal before launch even
+        when another backend is primary.
 
     Returns
     -------
@@ -144,7 +153,8 @@ def preflight_check(backend: str, workdir: pathlib.Path | None = None) -> dict:
         }
 
     # Determine status.
-    if backend == "codex" and not configured_present:
+    codex_required = backend == "codex" or shadow_codex
+    if codex_required and codex_error:
         status = "fail"
     elif backend == "echo" or configured_present:
         status = "pass"
@@ -188,6 +198,8 @@ def preflight_check(backend: str, workdir: pathlib.Path | None = None) -> dict:
 
     if backend == "codex" and codex_error:
         message = f"codex runtime rejected: {codex_error}"
+    elif shadow_codex and codex_error:
+        message = f"shadow Codex runtime rejected: {codex_error}"
     elif status == "pass":
         if backend == "echo":
             message = "echo backend: always available"
@@ -204,6 +216,7 @@ def preflight_check(backend: str, workdir: pathlib.Path | None = None) -> dict:
         "status": status,
         "configured": backend,
         "configured_ok": configured_present,
+        "shadow_codex": shadow_codex,
         "backends": backends,
         "transitive": transitive,
         "fallback_recommendation": fallback,
@@ -229,13 +242,23 @@ def main(argv: list[str] | None = None) -> int:
         help="Reserved for future per-workdir probing",
     )
     p.add_argument(
+        "--shadow-codex",
+        choices=("true", "false"),
+        default="true",
+        help="Whether the default Codex shadow reviewer is enabled (default: true)",
+    )
+    p.add_argument(
         "--json",
         action="store_true",
         help="Emit JSON to stdout (default: human-readable summary)",
     )
     args = p.parse_args(argv)
 
-    result = preflight_check(args.backend, args.workdir)
+    result = preflight_check(
+        args.backend,
+        args.workdir,
+        shadow_codex=args.shadow_codex == "true",
+    )
 
     if args.json:
         json.dump(result, sys.stdout, indent=2, sort_keys=True)
