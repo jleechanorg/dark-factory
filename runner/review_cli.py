@@ -1,9 +1,9 @@
-"""Binary-owned cold-review command.
+"""Binary-owned canonical Codex-only cold-review command.
 
 This command freezes repository inputs, builds the source-owned review
-contract, runs one existing reviewer backend, validates the response, and
-writes a digest-bound receipt. The caller selects inputs and backend; it
-cannot supply or replace the review authority.
+contract, runs the canonical Codex transport, validates the response, and
+writes a digest-bound receipt. The caller selects inputs only; it cannot
+supply a backend or replace the review authority.
 """
 
 from __future__ import annotations
@@ -211,8 +211,10 @@ def main(argv: list[str] | None = None) -> int:
     else:
         parser.error("--output-dir must be outside the reviewed workspace")
     claimed_output = False
+    bound_base_sha: str | None = None
     try:
         base_sha = _full_revision(workdir, args.base_sha)
+        bound_base_sha = base_sha
         head_sha = _full_revision(workdir, args.head_sha)
         _require_review_range(workdir, base_sha, head_sha)
         before = _snapshot(workdir, base_sha, head_sha)
@@ -260,7 +262,10 @@ def main(argv: list[str] | None = None) -> int:
         if command is None:
             raise ReviewContractError("codex review backend could not be launched")
         try:
-            command = _controller_codex_args(command)
+            command = _controller_codex_args(
+                command,
+                read_only_paths=(workdir,),
+            )
         except ValueError as exc:
             raise ReviewContractError(
                 "codex review command did not contain the codex executable"
@@ -298,6 +303,7 @@ def main(argv: list[str] | None = None) -> int:
                 "status": "valid",
                 "contract_error": "",
                 "backend": "codex",
+                "fallback_used": False,
                 "backend_returncode": 0,
                 "base_sha": base_sha,
                 "tree_sha": before["tree_sha"],
@@ -323,6 +329,19 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(receipt, indent=2, sort_keys=True))
         return 0 if result.review.verdict == "pass" else 2
+    except FileExistsError as exc:
+        payload = {
+            "schema": 1,
+            "status": "invalid",
+            "verdict": "invalid",
+            "backend": "codex",
+            "fallback_used": False,
+            "contract_error": f"{type(exc).__name__}: {exc}",
+        }
+        if bound_base_sha is not None:
+            payload["base_sha"] = bound_base_sha
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 1
     except (
         ControllerTransportError,
         OSError,
@@ -334,8 +353,12 @@ def main(argv: list[str] | None = None) -> int:
             "schema": 1,
             "status": "invalid",
             "verdict": "invalid",
+            "backend": "codex",
+            "fallback_used": False,
             "contract_error": f"{type(exc).__name__}: {exc}",
         }
+        if bound_base_sha is not None:
+            payload["base_sha"] = bound_base_sha
         if claimed_output:
             try:
                 _write_atomic(

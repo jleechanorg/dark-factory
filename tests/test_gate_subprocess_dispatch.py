@@ -267,19 +267,23 @@ def test_controller_codex_args_builds_stdin_transport():
         "--skip-git-repo-check",
         "PROMPT",
     ]
-    transformed = _controller_codex_args(argv)
+    transformed = _controller_codex_args(
+        argv,
+        read_only_paths=("/reviewed/source",),
+    )
     assert transformed[-1] == "-"
     assert transformed == [
         "sandbox-exec",
         "-p",
-        "(version 1)\n(allow default)",
+        "(version 1)\n(allow default)\n"
+        '(deny file-write* (subpath "/reviewed/source"))\n',
         "codex",
         "exec",
         "--json",
         "--ephemeral",
         "--skip-git-repo-check",
         "--sandbox",
-        "read-only",
+        "danger-full-access",
         "-",
     ]
 

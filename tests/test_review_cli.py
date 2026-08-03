@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import pathlib
 import re
 import subprocess
 from unittest.mock import patch
@@ -140,6 +141,8 @@ def test_review_command_writes_valid_digest_bound_receipt(tmp_path, monkeypatch,
     receipt = json.loads((output / "controller-receipt.json").read_text())
     assert receipt["status"] == "valid"
     assert receipt["verdict"] == "pass"
+    assert receipt["fallback_used"] is False
+    assert receipt["backend"] == "codex"
     assert receipt["head_sha"] == head
     assert len(receipt["prompt_sha256"]) == 64
     assert len(receipt["prompt_payload_sha256"]) == 64
@@ -238,6 +241,48 @@ def test_review_command_accepts_only_canonical_codex_backend():
         )
 
 
+def test_review_command_never_overwrites_unclaimed_output_receipt(
+    tmp_path, monkeypatch
+):
+    """A failed output-directory ownership claim preserves every existing byte."""
+    repo, base, head = _repo(tmp_path)
+    task = tmp_path / "task.md"
+    task.write_text("Review the behavior change.", encoding="utf-8")
+    output = tmp_path / "already-owned"
+    output.mkdir()
+    receipt = output / "controller-receipt.json"
+    sentinel = b'{"owner":"another-run","status":"valid"}\n'
+    receipt.write_bytes(sentinel)
+
+    monkeypatch.setattr(
+        "runner.review_cli._gate_subprocess_args",
+        lambda backend, prompt, ctx, timeout: ["codex", "exec", prompt],
+    )
+
+    rc = main(
+        [
+            "--workdir",
+            str(repo),
+            "--base-sha",
+            base,
+            "--head-sha",
+            head,
+            "--task-file",
+            str(task),
+            "--output-dir",
+            str(output),
+            "--backend",
+            "codex",
+        ]
+    )
+
+    assert rc == 1
+    assert receipt.read_bytes() == sentinel
+    assert sorted(path.name for path in output.iterdir()) == [
+        "controller-receipt.json"
+    ]
+
+
 def test_review_command_fails_closed_on_unstructured_response(
     tmp_path, monkeypatch
 ):
@@ -277,7 +322,25 @@ def test_review_command_fails_closed_on_unstructured_response(
     assert rc == 1
     receipt = json.loads((output / "controller-receipt.json").read_text())
     assert receipt["status"] == "invalid"
+    assert receipt["fallback_used"] is False
+    assert receipt["backend"] == "codex"
+    assert receipt["base_sha"] == base
     assert "invalid JSONL" in receipt["contract_error"]
+
+
+def test_review_skills_describe_one_canonical_codex_controller_lane():
+    root = pathlib.Path(__file__).resolve().parents[1]
+    dark_factory = (root / ".claude/skills/dark-factory/SKILL.md").read_text()
+    calibration = (
+        root / ".claude/skills/reviewer-calibration/SKILL.md"
+    ).read_text()
+
+    for text in (dark_factory, calibration):
+        assert "canonical Codex-only" in text
+        assert "--backend <backend>" not in text
+        assert "each available reviewer backend" not in text
+    assert "ordinary graph shadow" in dark_factory
+    assert "ordinary graph shadow" in calibration
 
 
 def test_review_command_rejects_dirty_workspace_before_backend(

@@ -116,6 +116,20 @@ def test_resolve_pipeline_falls_through_to_factory_home(tmp_path, monkeypatch):
     assert resolved == home_pipeline.resolve()
 
 
+def test_resolve_documented_pipeline_short_name(tmp_path, monkeypatch):
+    """Documented names resolve deterministically without requiring `.dot`."""
+    home = tmp_path / "factory_home"
+    pipeline = _write(home / "pipelines" / "slim" / "minimal_feature.dot")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    monkeypatch.setenv("DARK_FACTORY_HOME", str(home))
+
+    resolved = resolve_pipeline_path("minimal_feature", workdir=tmp_path)
+
+    assert resolved == pipeline.resolve()
+
+
 def test_resolve_pipeline_no_match_returns_resolved_candidate(tmp_path, monkeypatch):
     """Final fallback is the same as resolve_factory_path: return a resolved
     path even if nothing matches (the caller will fail-closed with a clear

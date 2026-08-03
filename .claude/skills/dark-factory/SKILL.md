@@ -283,8 +283,8 @@ resolve_dark_factory_home() {
 run. Treat the flag as present unless the user explicitly passes
 `--reviewer-calibration=false`.
 
-Calibration routes every backend through the binary-owned controller
-command:
+Calibration uses one canonical Codex-only controller lane through the
+binary-owned command:
 
 ```bash
 dark-factory review \
@@ -293,13 +293,12 @@ dark-factory review \
   --head-sha <full-40-hex-sha> \
   --task-file <path> \
   --output-dir <dir> \
-  --backend <backend>
+  --backend codex
 ```
 
-`dark-factory review` owns the static prompt, canonical envelope, backend
-dispatch, response validation, and `controller-receipt.json`. The
-selected backend supplies transport only; do not author reviewer
-instructions, do not inline prompts, do not pass vendor CLI flags. The
+`dark-factory review` owns the static prompt, canonical envelope, Codex
+transport, response validation, and `controller-receipt.json`. Do not author
+reviewer instructions, inline prompts, or pass vendor CLI flags. The
 controller binds `prompt SHA-256`, `envelope SHA-256`, `task SHA-256`,
 `diff SHA-256`, `changed-files SHA-256`, and `evidence-manifest SHA-256`
 in the controller receipt so calibration lanes can hash the receipt
@@ -318,21 +317,21 @@ and is bound by its SHA-256 of the controller receipt.
 
 ```text
 evidence/<run-id>/reviewer-calibration/
-  <backend>/
+  codex/
     controller-receipt.json
     envelope.json
     prompt.txt
     reviewer.output.md
     findings.json
-  comparison.json
-  adjudication.md
+  audit.json
 ```
 
-Do not claim delegated subagents underperformed raw Codex unless the same
-envelope and prompt were reviewed at the same SHA and raw Codex found a
-later-confirmed blocker the delegated reviewer missed. If calibration is
-disabled, the final response must say `Reviewer calibration: disabled` and
-give the explicit reason.
+This controller contract is distinct from ordinary graph shadow review.
+Ordinary graph shadow lanes may still compare independent reviewers for
+non-controller nodes, but a controller-owned review suppresses ambient
+shadows so only its canonical Codex receipt can determine the outcome. If
+calibration is disabled, the final response must say
+`Reviewer calibration: disabled` and give the explicit reason.
 
 The `gate_er` priority queue is `codex > minimax > agy > claude-sonnet` by
 default; passing `--backend claude` for the run itself does not change how
@@ -351,7 +350,7 @@ DARK_FACTORY_HOLDOUTS=~/projects/dark-factory-holdouts \
 PATH="$HOME/.local/bin:$PATH" \
 dark-factory \
   --goal "<echo of $ARGUMENTS>" \
-  --backend <backend> \
+  --backend <detected-or-override> \
   --cxdb ~/.dark-factory/cxdb.sqlite
 # Run ID: <id>
 # CXDB SHA: <sha>

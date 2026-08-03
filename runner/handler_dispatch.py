@@ -46,7 +46,7 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 from .handler_core import Result
 
@@ -236,7 +236,10 @@ def _launch_shadow_gate_review(
         return shadow
     if prompt_is_complete and backend == "codex":
         try:
-            args = _controller_codex_args(args)
+            args = _controller_codex_args(
+                args,
+                read_only_paths=(ctx.workdir,),
+            )
         except ValueError as exc:
             shadow.launch_error = str(exc)
             return shadow
@@ -505,13 +508,20 @@ def _gate_subprocess_env(backend: str) -> dict[str, str]:
     return _handlers_shim._sanitized_env()
 
 
-def _build_controller_codex_transport(args: list[str]) -> list[str]:
+def _build_controller_codex_transport(
+    args: list[str],
+    *,
+    read_only_paths: Iterable[os.PathLike[str] | str] = (),
+) -> list[str]:
     """Build the concrete controller transport command for Codex review.
 
     The controller transport is always JSON-over-stdin:
       - complete payload on stdin (`-`), never argv positionals
       - `codex exec --json --ephemeral --skip-git-repo-check`
-      - `--sandbox read-only`
+      - one authoritative macOS Seatbelt wrapper with reviewed-path write denies
+      - inner Codex `danger-full-access` only under that outer wrapper, avoiding
+        unsupported nested Seatbelt application
+      - inner Codex `read-only` on platforms without an outer `sandbox-exec`
     Any unsupported transport mode (prompt-in-argv, bypass, write-capable
     sandbox mode, or weaker backend) fails closed before launch.
     """
@@ -548,9 +558,34 @@ def _build_controller_codex_transport(args: list[str]) -> list[str]:
             if mode != "read-only":
                 raise ValueError("controller transport requires read-only codex sandboxing")
 
-    # Preserve the outer OS sandbox, including its sealed-path deny profile,
-    # while replacing only the inner Codex invocation with the controller's
-    # stdin/JSON/read-only contract.
+    outer_seatbelt = (
+        codex_index >= 3
+        and pathlib.Path(prepared[0]).name == "sandbox-exec"
+        and prepared[1] == "-p"
+    )
+    sandbox_mode = "read-only"
+    if outer_seatbelt:
+        resolved_paths = tuple(
+            dict.fromkeys(
+                pathlib.Path(path).expanduser().resolve(strict=False)
+                for path in read_only_paths
+            )
+        )
+        if not resolved_paths:
+            raise ValueError(
+                "controller outer sandbox requires reviewed read-only paths"
+            )
+        write_denies = []
+        for path in resolved_paths:
+            escaped = str(path).replace("\\", "\\\\").replace('"', '\\"')
+            write_denies.append(
+                f'(deny file-write* (subpath "{escaped}"))'
+            )
+        prepared[2] = prepared[2].rstrip() + "\n" + "\n".join(write_denies) + "\n"
+        sandbox_mode = "danger-full-access"
+
+    # Preserve the outer sealed-read boundary. On macOS it also owns target
+    # write denial, so Codex must not attempt a second Seatbelt sandbox.
     return prepared[:codex_index] + [
         prepared[codex_index],
         "exec",
@@ -558,15 +593,22 @@ def _build_controller_codex_transport(args: list[str]) -> list[str]:
         "--ephemeral",
         "--skip-git-repo-check",
         "--sandbox",
-        "read-only",
+        sandbox_mode,
         "-",
     ]
 
 
 
-def _controller_codex_args(args: list[str]) -> list[str]:
+def _controller_codex_args(
+    args: list[str],
+    *,
+    read_only_paths: Iterable[os.PathLike[str] | str] = (),
+) -> list[str]:
     """Backward-compatible shim for the controller transport builder."""
-    return _build_controller_codex_transport(args)
+    return _build_controller_codex_transport(
+        args,
+        read_only_paths=read_only_paths,
+    )
 
 
 def _run_gate_once(
@@ -651,7 +693,10 @@ def _run_gate_once(
     controller_json = backend == "codex" and controller_requested
     if controller_json:
         try:
-            sub_args = _controller_codex_args(sub_args)
+            sub_args = _controller_codex_args(
+                sub_args,
+                read_only_paths=(ctx.workdir,),
+            )
         except ValueError:
             return Result(
                 outcome="error",

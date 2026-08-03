@@ -1,12 +1,12 @@
 ---
 name: reviewer-calibration
-description: "Run matched A/B reviewer calibration for /f through the binary-owned review controller, using digest-bound prompts, envelopes, and receipts."
+description: "Use when auditing the canonical Codex-only /f controller receipt against one frozen target."
 ---
 
 # Reviewer Calibration
 
-Use this skill when `/f`, `/factory`, or a PR/work-item review needs to compare
-independent reviewer backends against one frozen target.
+Use this skill when `/f`, `/factory`, or a PR/work-item review must prove that
+the canonical Codex-only controller reviewed one frozen target.
 
 ## Rule
 
@@ -14,9 +14,9 @@ Calibration is default-on for real `/f` runs. Treat
 `--reviewer-calibration=true` as present unless the user explicitly passes
 `--reviewer-calibration=false` and gives a reason.
 
-Do not claim one reviewer underperformed another unless controller receipts
-prove both reviewed the same frozen base/head pair, task digest, prompt digest,
-and envelope digest.
+This is a receipt-integrity audit of one controller-owned Codex review, not a
+multi-backend comparison. Do not substitute another backend or author review
+instructions outside the controller.
 
 ## Frozen Envelope
 
@@ -31,7 +31,7 @@ Create a task file containing only the untrusted PR/work-item text. Determine:
 - evidence artifact paths and hashes
 - test log paths and hashes
 - factory `run_id`
-- output directory for each backend lane
+- Codex lane output directory
 
 Do not create reviewer instructions. The controller constructs and binds the
 diff, changed files, task snapshot, evidence metadata, static prompt, and exact
@@ -39,7 +39,7 @@ response contract.
 
 ## Controller command
 
-Run each available reviewer backend through this exact binary-owned interface:
+Run this exact binary-owned interface:
 
 ```bash
 dark-factory review \
@@ -48,12 +48,12 @@ dark-factory review \
   --head-sha <full-40-hex-sha> \
   --task-file <path> \
   --output-dir <dir> \
-  --backend <backend>
+  --backend codex
 ```
 
-The backend selects transport only. Do not add model names, inline prompts, or
-vendor CLI flags. Factory/in-graph results may be compared only when their
-controller receipt proves the same bindings.
+Do not add model names, inline prompts, or vendor CLI flags. The ordinary graph shadow
+review is separate: non-controller graph nodes may use independent
+shadow reviewers, while controller-owned review suppresses ambient shadows.
 
 ## Artifacts
 
@@ -61,14 +61,13 @@ The binary, not this skill, writes each lane directory:
 
 ```text
 evidence/<run-id>/reviewer-calibration/
-  <backend>/
+  codex/
     controller-receipt.json
     envelope.json
     prompt.txt
     reviewer.output.md
     findings.json
-  comparison.json
-  adjudication.md
+  audit.json
 ```
 
 `prompt.txt` is a binary-emitted audit capture only. It is not prompt
@@ -81,14 +80,14 @@ Before using a lane, require `controller-receipt.json` to bind:
 - controller prompt ID and prompt SHA-256;
 - envelope SHA-256 and task/diff snapshot digests;
 - exact base SHA and head SHA;
-- backend identity, exit status, and response SHA-256.
+- backend identity (`codex`), `fallback_used=false`, exit status, and response
+  SHA-256.
 
 Recompute the emitted `prompt.txt` and `envelope.json` SHA-256 digests and
 compare them to the receipt. Record the controller receipt file's own SHA-256
-in `comparison.json`. A missing receipt/digest, mismatch, nonzero controller
-exit, or stale SHA makes that lane `inconclusive`. If a backend is unavailable,
-record `unavailable` in `comparison.json`; do not fabricate a replacement
-result.
+in `audit.json`. A missing receipt or digest, mismatch, nonzero controller
+exit, stale SHA, backend other than Codex, or fallback makes the result
+`inconclusive`.
 
 ## Finding Schema
 
@@ -96,7 +95,7 @@ Each reviewer should return JSON plus free-form text:
 
 ```json
 {
-  "reviewer": "<controller backend>",
+  "reviewer": "codex",
   "target_head_sha": "...",
   "verdict": "blockers|no_blockers|inconclusive",
   "findings": [
@@ -113,32 +112,14 @@ Each reviewer should return JSON plus free-form text:
 }
 ```
 
-## Adjudication
-
-A finding is confirmed only if one of these is true:
-
-- the user confirms it;
-- the PR/work item changes to fix it;
-- CI/test/review evidence later proves it;
-- another independent reviewer confirms it with exact evidence.
-
-Classify reviewer deltas:
-
-- `confirmed_miss`: reviewer A missed a later-confirmed blocker found by reviewer B.
-- `unconfirmed_delta`: reviewers disagree, but no ground truth exists yet.
-- `false_positive`: reviewer claimed a blocker later disproven by evidence.
-
 ## Final /f Output
 
 Include:
 
 ```text
 Reviewer calibration: enabled <artifact-path>
-Raw Codex verdict: <...>
-Delegated reviewer verdict: <...>
-Factory reviewer verdict: <...|unavailable>
-Agreement: <yes|no|partial>
-Confirmed gap: <pending|yes|no>
+Canonical Codex verdict: <...>
+Receipt audit: <valid|inconclusive>
 ```
 
 If disabled:

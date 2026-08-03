@@ -752,6 +752,9 @@ def test_controller_receipt_uses_measured_monotonic_duration(monkeypatch, tmp_pa
 
     receipt = json.loads((output_dir / "controller-receipt.json").read_text())
     assert receipt["duration_seconds"] == 2.75
+    assert receipt["fallback_used"] is False
+    assert receipt["backend"] == "codex"
+    assert receipt["base_sha"] == "a" * 40
 
 
 def test_run_controller_review_rejects_nonzero_transport_exit(monkeypatch, tmp_path):

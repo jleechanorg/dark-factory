@@ -134,6 +134,7 @@ class ReviewRequest:
     envelope_json: str
     prompt_payload: str
     prompt: str
+    base_sha: str
     head_sha: str
     task_sha256: str
     diff_sha256: str
@@ -628,6 +629,7 @@ def create_review_request(inputs: ReviewInputs) -> ReviewRequest:
         envelope_json=envelope_json,
         prompt_payload=prompt_payload,
         prompt=prompt,
+        base_sha=normalized.base_sha,
         head_sha=normalized.head_sha,
         task_sha256=envelope_digests["task_sha256"],
         diff_sha256=envelope_digests["diff_sha256"],
@@ -664,6 +666,8 @@ def verify_request_integrity(request: ReviewRequest) -> None:
     target = envelope.get("target")
     if not isinstance(target, dict) or target.get("head_sha") != request.head_sha:
         raise ReviewContractError("request envelope head binding mismatch")
+    if target.get("base_sha") != request.base_sha:
+        raise ReviewContractError("request envelope base binding mismatch")
     if not isinstance(envelope.get("digests"), dict):
         raise ReviewContractError("request envelope schema is invalid")
     request_digests = envelope["digests"]
@@ -997,9 +1001,12 @@ def run_controller_review(
 
     receipt = {
         "schema": 1,
+        "backend": "codex",
+        "fallback_used": False,
         "prompt_id": request.prompt_id,
         "prompt_sha256": request.prompt_sha256,
         "envelope_sha256": request.envelope_sha256,
+        "base_sha": request.base_sha,
         "head_sha": request.head_sha,
         "task_sha256": request.task_sha256,
         "diff_sha256": request.diff_sha256,

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 
@@ -612,11 +613,136 @@ def test_controller_codex_transport_preserves_outer_sandbox_exec():
         "--skip-git-repo-check",
         "prompt text",
     ]
-    transport = _build_controller_codex_transport(sandboxed_argv)
+    reviewed_source = pathlib.Path("/reviewed/source")
+    transport = _build_controller_codex_transport(
+        sandboxed_argv,
+        read_only_paths=(reviewed_source,),
+    )
 
-    assert transport[:3] == sandboxed_argv[:3]
+    assert transport[:2] == sandboxed_argv[:2]
     assert "dark-factory-holdouts" in transport[2]
+    assert f'(deny file-write* (subpath "{reviewed_source}"))' in transport[2]
     assert transport[3] == "/usr/local/bin/codex"
     assert transport[4] == "exec"
     assert "--sandbox" in transport
-    assert "read-only" in transport
+    assert "danger-full-access" in transport
+
+
+def test_controller_outer_sandbox_enforces_read_and_write_boundaries(tmp_path):
+    """One outer wrapper denies sealed reads and immutable-target writes."""
+    from runner.handler_dispatch import _build_controller_codex_transport
+
+    sandbox_exec = shutil.which("sandbox-exec")
+    if sandbox_exec is None:
+        pytest.skip("sandbox-exec unavailable")
+
+    denied_dir = tmp_path / "synthetic-denied"
+    denied_dir.mkdir()
+    denied_file = denied_dir / "secret.txt"
+    denied_file.write_text("synthetic-secret\n", encoding="utf-8")
+    allowed_file = tmp_path / "allowed.txt"
+    allowed_file.write_text("allowed-marker\n", encoding="utf-8")
+    source_dir = tmp_path / "reviewed-source"
+    source_dir.mkdir()
+    snapshot_dir = tmp_path / "reviewed-snapshot"
+    snapshot_dir.mkdir()
+    fake_codex = tmp_path / "codex"
+    fake_codex.write_text(
+        "#!/bin/sh\n"
+        'if /bin/cat "$DF_SYNTHETIC_DENIED" >/dev/null 2>/dev/null; then\n'
+        "  exit 90\n"
+        "fi\n"
+        'if printf changed >"$DF_REVIEWED_SOURCE/write.txt" 2>/dev/null; then\n'
+        "  exit 92\n"
+        "fi\n"
+        'if printf changed >"$DF_REVIEWED_SNAPSHOT/write.txt" 2>/dev/null; then\n'
+        "  exit 93\n"
+        "fi\n"
+        '/bin/cat "$DF_SYNTHETIC_ALLOWED" || exit 91\n'
+        "printf 'controller-invoked\\n'\n",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    profile = (
+        "(version 1)\n"
+        "(allow default)\n"
+        f'(deny file-read* (subpath "{denied_dir}"))'
+    )
+    transport = _build_controller_codex_transport(
+        [sandbox_exec, "-p", profile, str(fake_codex), "exec", "prompt"],
+        read_only_paths=(source_dir, snapshot_dir),
+    )
+
+    proc = subprocess.run(
+        transport,
+        input="bounded synthetic probe",
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "DF_SYNTHETIC_DENIED": str(denied_file),
+            "DF_SYNTHETIC_ALLOWED": str(allowed_file),
+            "DF_REVIEWED_SOURCE": str(source_dir),
+            "DF_REVIEWED_SNAPSHOT": str(snapshot_dir),
+        },
+        timeout=10,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.splitlines() == ["allowed-marker", "controller-invoked"]
+    assert "synthetic-secret" not in proc.stdout
+    assert not (source_dir / "write.txt").exists()
+    assert not (snapshot_dir / "write.txt").exists()
+    assert "--sandbox" in transport and "danger-full-access" in transport
+    assert "--dangerously-bypass-approvals-and-sandbox" not in transport
+
+
+def test_controller_outer_sandbox_avoids_nested_seatbelt(tmp_path):
+    """Outer Seatbelt remains authoritative without unsupported nesting."""
+    from runner.handler_dispatch import _build_controller_codex_transport
+
+    sandbox_exec = shutil.which("sandbox-exec")
+    if sandbox_exec is None:
+        pytest.skip("sandbox-exec unavailable")
+
+    denied_dir = tmp_path / "synthetic-denied"
+    denied_dir.mkdir()
+    fake_codex = tmp_path / "codex"
+    fake_codex.write_text(
+        "#!/bin/sh\n"
+        'case " $* " in\n'
+        '  *" --sandbox read-only "*)\n'
+        '    exec "$DF_SANDBOX_EXEC" -p "(version 1)(allow default)" /usr/bin/true\n'
+        "    ;;\n"
+        '  *" --sandbox danger-full-access "*)\n'
+        "    exec /usr/bin/true\n"
+        "    ;;\n"
+        "  *) exit 92 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    profile = (
+        "(version 1)\n"
+        "(allow default)\n"
+        f'(deny file-read* (subpath "{denied_dir}"))'
+    )
+    transport = _build_controller_codex_transport(
+        [sandbox_exec, "-p", profile, str(fake_codex), "exec", "prompt"],
+        read_only_paths=(tmp_path / "reviewed-source",),
+    )
+
+    proc = subprocess.run(
+        transport,
+        input="bounded nested-seatbelt probe",
+        capture_output=True,
+        text=True,
+        env={**os.environ, "DF_SANDBOX_EXEC": sandbox_exec},
+        timeout=10,
+        check=False,
+    )
+
+    assert "--sandbox" in transport and "danger-full-access" in transport
+    assert proc.returncode == 0, proc.stderr
+    assert "sandbox_apply" not in proc.stderr

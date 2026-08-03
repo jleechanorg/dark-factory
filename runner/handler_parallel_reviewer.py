@@ -136,6 +136,8 @@ def _run_controller_primary(
     backend: str,
 ) -> Result:
     """Adapt a graph controller lane to the canonical executor."""
+    import runner.handlers as _handlers_shim
+
     from .review_controller import (
         ControllerTransportError,
         ReviewContractError,
@@ -167,8 +169,17 @@ def _run_controller_primary(
                 "sandbox": "unavailable",
             },
         )
+    target = json.loads(request.envelope_json)["target"]
     try:
-        transport_argv = tuple(_controller_codex_args(args))
+        transport_argv = tuple(
+            _controller_codex_args(
+                args,
+                read_only_paths=(
+                    _handlers_shim._target_worktree(ctx),
+                    pathlib.Path(str(target["workspace_path"])),
+                ),
+            )
+        )
     except ValueError as exc:
         return Result(
             outcome="error",
