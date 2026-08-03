@@ -20,6 +20,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Literal, Mapping
 
+from .subprocess_control import run_bounded_process
+
 
 PROMPT_ID = "controller-cold-review-v1"
 CORRECTNESS_CHECK_IDS = tuple(f"C{i}" for i in range(8))
@@ -928,7 +930,6 @@ def run_controller_review(
     cannot diverge on shape or digest handling.
     """
     import pathlib
-    import subprocess
     import tempfile
 
     if not isinstance(request, ReviewRequest):
@@ -954,14 +955,11 @@ def run_controller_review(
     envelope_path.write_text(request.envelope_json, encoding="utf-8")
 
     transport_started = time.monotonic()
-    proc = subprocess.run(
+    proc = run_bounded_process(
         list(transport_argv),
         cwd=str(neutral_cwd),
-        input=prompt_text,
-        capture_output=True,
-        text=True,
+        input_text=prompt_text,
         timeout=timeout,
-        check=False,
         env=dict(transport_env) if transport_env is not None else None,
     )
     transport_duration = max(0.0, time.monotonic() - transport_started)
@@ -969,6 +967,12 @@ def run_controller_review(
     transport_text = proc.stdout
     response_path.write_text(response_text, encoding="utf-8")
     transport_path.write_text(transport_text, encoding="utf-8")
+
+    if getattr(proc, "timed_out", False):
+        diagnostic = (proc.stdout + ("\nSTDERR:\n" + proc.stderr if proc.stderr else "")).strip()
+        raise ControllerTransportError(
+            diagnostic or f"controller review transport timed out after {timeout} seconds"
+        )
 
     if proc.returncode != 0:
         raise ControllerTransportError(

@@ -165,6 +165,27 @@ def test_g1_violator_has_g1_violation_only():
     assert g1.message  # non-empty
 
 
+def test_g1_allows_only_explicit_terminal_error_exit_from_producer(tmp_path):
+    terminal = tmp_path / "terminal_error.dot"
+    terminal.write_text(
+        'digraph terminal {\n'
+        '  start [shape=Mdiamond]\n'
+        '  worker [type="codergen"]\n'
+        '  reviewer [type="parallel_reviewer"]\n'
+        '  exit [shape=Msquare]\n'
+        '  start -> worker\n'
+        '  worker -> reviewer [condition="outcome=success"]\n'
+        '  worker -> exit [condition="outcome=error"]\n'
+        '  reviewer -> exit [condition="outcome=success"]\n'
+        '}\n'
+    )
+    bypass = tmp_path / "reviewable_failure.dot"
+    bypass.write_text(terminal.read_text().replace("outcome=error", "outcome=failure"))
+
+    assert not any(v.kind == "G1" for v in graph_audit.audit_graph(terminal))
+    assert any(v.kind == "G1" for v in graph_audit.audit_graph(bypass))
+
+
 def test_g2_violator_has_g2_violation_only():
     violations = graph_audit.audit_graph(FIXTURES / "g2_violator.dot")
     kinds = [v.kind for v in violations]

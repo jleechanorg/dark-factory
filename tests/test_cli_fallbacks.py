@@ -143,8 +143,22 @@ def _patched_run_raises(monkeypatch, *, target: str, exc: BaseException):
             raise exc
         return _fake_completed(args, returncode=0, stdout="", stderr="")
 
+    def _fake_bounded(args, **kwargs):
+        from runner.subprocess_control import BoundedProcessResult
+
+        completed = _fake_run(args, **kwargs)
+        return BoundedProcessResult(
+            args=tuple(str(part) for part in args),
+            returncode=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+            timed_out=False,
+        )
+
     monkeypatch.setattr("runner.handlers.subprocess.run", _fake_run)
     monkeypatch.setattr("runner.handler_codergen.subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_codergen.run_bounded_process", _fake_bounded)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _fake_bounded)
     monkeypatch.setattr("subprocess.run", _fake_run)
 
 
@@ -223,6 +237,27 @@ def test_codex_coder_missing_returns_clean_error(monkeypatch, tmp_path):
     )
     assert "codex backend error" in result.output
     assert result.metadata.get("backend_missing") != "true"
+
+
+def test_codex_missing_fixture_cannot_launch_real_process(monkeypatch, tmp_path):
+    _disable_sandbox(monkeypatch)
+    _patched_run_raises(
+        monkeypatch,
+        target="codex",
+        exc=FileNotFoundError(2, "No such file or directory: codex"),
+    )
+
+    def _forbid_popen(*args, **kwargs):
+        raise AssertionError("test fixture attempted a real subprocess launch")
+
+    monkeypatch.setattr("runner.subprocess_control.subprocess.Popen", _forbid_popen)
+    result = _codergen(
+        _node("codex"),
+        Context(goal="t", workdir=tmp_path, backend="codex"),
+    )
+
+    assert result.outcome == "error"
+    assert "codex backend error" in result.output
 
 
 def test_agy_coder_missing_panics_unprotected(monkeypatch, tmp_path):
@@ -338,6 +373,7 @@ def test_gate_per_backend_missing_sets_backend_missing_metadata(monkeypatch, tmp
 
         monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: list(a))
         monkeypatch.setattr("subprocess.run", _fake_run)
+        monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _fake_run)
         monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda p: fake_sha)
 
         ctx = Context(goal="t", workdir=tmp_path, backend="claude")
@@ -400,6 +436,7 @@ def test_reviewer_gate_priority_queue_with_codex_missing_picks_codex(monkeypatch
 
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: list(a))
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _fake_run)
     monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda p: fake_sha)
 
     node = _Node(
@@ -467,6 +504,7 @@ def test_reviewer_gate_priority_queue_all_uninstalled_falls_through(monkeypatch,
 
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: list(a))
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _fake_run)
     monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda p: fake_sha)
 
     # Use a non-claude-routed last entry (agy) so the fallback fires.
@@ -512,6 +550,7 @@ def test_reviewer_gate_agy_missing_falls_back_to_claude_cleanly(monkeypatch, tmp
 
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: list(a))
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _fake_run)
     monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda p: fake_sha)
 
     ctx = Context(goal="t", workdir=tmp_path, backend="claude")
@@ -541,6 +580,7 @@ def test_reviewer_gate_all_backends_missing_tags_infra_failure(monkeypatch, tmp_
 
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: list(a))
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _fake_run)
     monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda p: fake_sha)
 
     # Use a single-backend explicit case so we don't depend on probe

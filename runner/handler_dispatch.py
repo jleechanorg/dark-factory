@@ -49,6 +49,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 from .handler_core import Result
+from .subprocess_control import finish_bounded_process, run_bounded_process
 
 if TYPE_CHECKING:
     from .parser import Node
@@ -335,18 +336,13 @@ def _finish_shadow_gate_review(
             head_sha_status = "missing"
         else:
             remaining = max(1, timeout - int(time.monotonic() - shadow.started_at))
-            try:
-                if shadow.json_transport:
-                    stdout, stderr = proc.communicate(
-                        input=shadow.prompt,
-                        timeout=remaining,
-                    )
-                else:
-                    stdout, stderr = proc.communicate(timeout=remaining)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                proc.kill()
-                stdout, stderr = proc.communicate()
+            bounded = finish_bounded_process(
+                proc,
+                timeout=remaining,
+                input_text=shadow.prompt if shadow.json_transport else None,
+            )
+            stdout, stderr = bounded.stdout, bounded.stderr
+            timed_out = bounded.timed_out
             returncode = str(proc.returncode if proc.returncode is not None else "")
             output = (stdout + ("\nSTDERR:\n" + stderr if stderr else "")).strip()
             command_receipts = ()
@@ -771,29 +767,13 @@ def _run_gate_once(
     # so we read agy's timeout message rather than killing it first.
     run_timeout = timeout + 30 if backend == "agy" else timeout
     try:
-        proc = subprocess.run(
-            sub_args, cwd=review_cwd, capture_output=True, text=True,
-            input=prompt if controller_json else None,
-            timeout=run_timeout, check=False, env=sub_env,
+        proc = run_bounded_process(
+            sub_args,
+            cwd=review_cwd,
+            input_text=prompt if controller_json else None,
+            timeout=run_timeout,
+            env=sub_env,
         )
-    except subprocess.TimeoutExpired as exc:
-        # TimeoutExpired carries bytes for stdout/stderr even when the run
-        # used text=True — coerce before concatenating.
-        def _as_text(v: "str | bytes | None") -> str:
-            if v is None:
-                return ""
-            if isinstance(v, bytes):
-                return v.decode("utf-8", errors="replace")
-            return v
-
-        combined = _as_text(exc.stdout) + "\n" + _as_text(exc.stderr)
-        return _finalize(Result(
-            outcome="failure",
-            output=combined.strip() or f"gate {name} timed out after {run_timeout}s",
-            metadata={"slash_command": name, "verdict": "unknown",
-                      "head_sha_status": "missing", "timed_out": "true",
-                      "reviewer_backend": reviewer_backend, **prompt_meta},
-        ))
     except FileNotFoundError as exc:
         return _finalize(Result(
             outcome="error",
@@ -809,6 +789,15 @@ def _run_gate_once(
             metadata={"slash_command": name, "verdict": "unknown",
                       "head_sha_status": "missing", "reviewer_backend": reviewer_backend,
                       **prompt_meta},
+        ))
+    if getattr(proc, "timed_out", False):
+        combined = proc.stdout + "\n" + proc.stderr
+        return _finalize(Result(
+            outcome="error",
+            output=combined.strip() or f"gate {name} timed out after {run_timeout}s",
+            metadata={"slash_command": name, "verdict": "unknown",
+                      "head_sha_status": "missing", "timed_out": "true",
+                      "reviewer_backend": reviewer_backend, **prompt_meta},
         ))
     command_receipts = ()
     review_output = proc.stdout

@@ -250,6 +250,25 @@ def _is_outcome_failure_condition(condition: Optional[str]) -> bool:
     return False
 
 
+def _is_terminal_error_condition(condition: Optional[str]) -> bool:
+    """True only for the simple, explicit ``outcome = error`` branch."""
+    if not condition:
+        return False
+    tokens = _tokenize_condition(condition)
+    if tokens is None:
+        return False
+    cleaned = [(kind, value) for kind, value in tokens if kind != "SPACE"]
+    if len(cleaned) != 3:
+        return False
+    lhs, op, rhs = cleaned
+    return (
+        lhs == ("WORD", "outcome")
+        and op == ("EQ", "=")
+        and rhs[0] in ("WORD", "STRING")
+        and rhs[1] == "error"
+    )
+
+
 # ---------------------------------------------------------------------------
 # G1: path-without-reviewer detection.
 #
@@ -346,6 +365,8 @@ def _dfs_witness(
         return
     for edge in outgoing:
         dst = edge.dst
+        if is_exit_node(graph.nodes[dst]) and _is_terminal_error_condition(edge.condition):
+            continue
         # Cycle / re-visit guard: do not descend into a node already on
         # the current path. (max_visits-style bounds are runtime
         # concerns; here we only need to avoid infinite recursion.)

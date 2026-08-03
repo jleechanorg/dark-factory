@@ -32,6 +32,7 @@ def test_execute_gate_codex_infra_failure_falls_back_to_claude(tmp_path, monkeyp
 
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _fake_run)
 
     ctx = HCtx(goal="test", workdir=tmp_path, backend="claude")
     result = _execute_gate("PROMPT", fake_sha, 300, ctx, "evidence", "codex")
@@ -67,6 +68,7 @@ def test_execute_gate_codex_infra_failure_falls_back_to_agy(tmp_path, monkeypatc
 
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _fake_run)
 
     ctx = HCtx(goal="test", workdir=tmp_path, backend="claude")
     result = _execute_gate("PROMPT", fake_sha, 300, ctx, "evidence", "codex")
@@ -100,6 +102,7 @@ def test_execute_gate_codex_real_fail_not_retried(tmp_path, monkeypatch):
 
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _fake_run)
 
     ctx = HCtx(goal="test", workdir=tmp_path, backend="claude")
     result = _execute_gate("PROMPT", fake_sha, 300, ctx, "evidence", "codex")
@@ -125,11 +128,12 @@ def test_execute_gate_tags_infra_failure_when_all_backends_die(tmp_path, monkeyp
 
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _fake_run)
 
     ctx = HCtx(goal="test", workdir=tmp_path, backend="claude")
     result = _execute_gate("PROMPT", fake_sha, 300, ctx, "evidence", "codex")
 
-    assert result.outcome == "failure"
+    assert result.outcome == "error"
     assert result.metadata["verdict"] == "infra_failure"
     assert result.metadata["fallback_used"] == "true"
     assert result.metadata["fallback_from"] == "codex"

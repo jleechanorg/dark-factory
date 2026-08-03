@@ -170,7 +170,7 @@ class SharedHelperTests(unittest.TestCase):
                     calls.append({"command": command, **run_kwargs})
                     return subprocess.CompletedProcess(command, 0, transport, "")
 
-                with patch("runner.review_controller.subprocess.run", _fake_transport):
+                with patch("runner.review_controller.run_bounded_process", _fake_transport):
                     return canonical_run(request, **kwargs)
 
             with patch.dict(
@@ -306,7 +306,7 @@ class SharedHelperTests(unittest.TestCase):
                         return real_run(command, **run_kwargs)
                     return subprocess.CompletedProcess(command, 0, transport, "")
 
-                with patch("runner.review_controller.subprocess.run", _fake_transport):
+                with patch("runner.review_controller.run_bounded_process", _fake_transport):
                     return canonical_run(request, **kwargs)
 
             ctx = Context(
@@ -387,7 +387,7 @@ class SharedHelperTests(unittest.TestCase):
                     )
                     return subprocess.CompletedProcess(command, 0, transport, "")
 
-                with patch("runner.review_controller.subprocess.run", _fake_transport):
+                with patch("runner.review_controller.run_bounded_process", _fake_transport):
                     return canonical_run(request, **kwargs)
 
             with patch(

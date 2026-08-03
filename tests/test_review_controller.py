@@ -5,6 +5,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
+import subprocess
+import sys
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -619,7 +622,7 @@ def test_run_controller_review_refuses_pass_under_iteration_stub(monkeypatch, tm
         stdout = raw_jsonl
         stderr = ""
 
-    monkeypatch.setattr(subprocess_module, "run", lambda *a, **kw: _FakeProc())
+    monkeypatch.setattr("runner.review_controller.run_bounded_process", lambda *a, **kw: _FakeProc())
 
     output_dir = tmp_path / "out"
     with pytest.raises(ReviewContractError, match="refuses PASS verdict under stub-mode"):
@@ -648,7 +651,7 @@ def test_run_controller_review_refuses_pass_under_fake_llm(monkeypatch, tmp_path
         stdout = raw_jsonl
         stderr = ""
 
-    monkeypatch.setattr(subprocess_module, "run", lambda *a, **kw: _FakeProc())
+    monkeypatch.setattr("runner.review_controller.run_bounded_process", lambda *a, **kw: _FakeProc())
 
     output_dir = tmp_path / "out"
     with pytest.raises(ReviewContractError, match="refuses PASS verdict under stub-mode"):
@@ -677,7 +680,7 @@ def test_run_controller_review_allows_pass_without_stub_env(monkeypatch, tmp_pat
         stdout = raw_jsonl
         stderr = ""
 
-    monkeypatch.setattr(subprocess_module, "run", lambda *a, **kw: _FakeProc())
+    monkeypatch.setattr("runner.review_controller.run_bounded_process", lambda *a, **kw: _FakeProc())
 
     output_dir = tmp_path / "out"
     result = run_controller_review(
@@ -706,7 +709,7 @@ def test_run_controller_review_allows_fail_under_stub_env(monkeypatch, tmp_path)
         stdout = raw_jsonl
         stderr = ""
 
-    monkeypatch.setattr(subprocess_module, "run", lambda *a, **kw: _FakeProc())
+    monkeypatch.setattr("runner.review_controller.run_bounded_process", lambda *a, **kw: _FakeProc())
 
     output_dir = tmp_path / "out"
     result = run_controller_review(
@@ -739,7 +742,7 @@ def test_controller_receipt_uses_measured_monotonic_duration(monkeypatch, tmp_pa
 
     ticks = iter((100.0, 102.75))
     monkeypatch.setattr(time, "monotonic", lambda: next(ticks))
-    monkeypatch.setattr(subprocess_module, "run", lambda *a, **kw: _FakeProc())
+    monkeypatch.setattr("runner.review_controller.run_bounded_process", lambda *a, **kw: _FakeProc())
 
     output_dir = tmp_path / "measured"
     run_controller_review(
@@ -768,8 +771,7 @@ def test_run_controller_review_rejects_nonzero_transport_exit(monkeypatch, tmp_p
     )
 
     monkeypatch.setattr(
-        subprocess_module,
-        "run",
+        "runner.review_controller.run_bounded_process",
         lambda *args, **kwargs: subprocess_module.CompletedProcess(
             args[0], 17, raw_jsonl, "transport crashed"
         ),
@@ -783,3 +785,42 @@ def test_run_controller_review_rejects_nonzero_transport_exit(monkeypatch, tmp_p
             transport_argv=("fake", "codex"),
             timeout=10.0,
         )
+
+
+def test_controller_timeout_kills_real_child_tree(tmp_path):
+    request = create_review_request(_inputs())
+    child_pid_path = tmp_path / "controller-child.pid"
+    child_code = (
+        "import signal,time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "time.sleep(30)"
+    )
+    parent_code = (
+        "import subprocess,sys,time\n"
+        f"child=subprocess.Popen([sys.executable,'-c',{child_code!r}], "
+        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        f"open({str(child_pid_path)!r},'w').write(str(child.pid))\n"
+        "print('controller partial output', flush=True)\n"
+        "time.sleep(30)\n"
+    )
+
+    with pytest.raises(ControllerTransportError, match="controller partial output"):
+        run_controller_review(
+            request,
+            neutral_cwd=tmp_path,
+            output_dir=tmp_path / "timeout-output",
+            transport_argv=(sys.executable, "-c", parent_code),
+            timeout=0.2,
+        )
+
+    child_pid = int(child_pid_path.read_text())
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        subprocess.run(["kill", "-KILL", str(child_pid)], check=False)
+        raise AssertionError(f"controller grandchild {child_pid} survived cleanup")

@@ -63,7 +63,7 @@ the full empirical distribution and the citation.
 
 from __future__ import annotations
 
-from .subprocess_control import run_bounded_process
+from .subprocess_control import finish_bounded_process, run_bounded_process
 
 import json
 import os
@@ -286,19 +286,9 @@ def _finish_shadow_codex_review(
             verdict = "unknown"
         else:
             remaining = max(1, timeout_s - int(time.monotonic() - shadow.started_at))
-            try:
-                stdout, stderr = proc.communicate(timeout=remaining)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                    stdout, stderr = proc.communicate(timeout=5)
-                except Exception:
-                    try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except Exception:
-                        pass
-                    stdout, stderr = proc.communicate()
+            bounded = finish_bounded_process(proc, timeout=remaining)
+            stdout, stderr = bounded.stdout, bounded.stderr
+            timed_out = bounded.timed_out
             returncode = str(proc.returncode if proc.returncode is not None else "")
             output = (stdout + ("\nSTDERR:\n" + stderr if stderr else "")).strip()
             if timed_out and not output:
@@ -1051,7 +1041,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         return _finalize(Result(outcome="failure", output=f"unknown backend {backend!r}"))
 
     output = proc.stdout + ("\nSTDERR:\n" + proc.stderr if proc.stderr else "")
-    outcome = "success" if proc.returncode == 0 else "failure"
+    outcome = "success" if proc.returncode == 0 else "error"
     if backend == "agy" and output.strip().startswith("Error: timed out waiting for response"):
         outcome = "failure"
     wall_ms = int((time.monotonic() - _start_ts) * 1000)

@@ -133,9 +133,9 @@ def test_two_node_dot_retries_only_reviewer_authored_failures() -> None:
     }
     assert worker_edges == {
         ("cold_reviewer", "outcome=success"),
-        ("worker", "outcome=failure"),
         ("exit", "outcome=error"),
     }
+    assert int(graph.nodes["worker"].attrs["max_retries"]) == 0
 
 
 def test_two_node_worker_error_exits_without_retry_or_review(tmp_path, monkeypatch) -> None:
@@ -158,6 +158,31 @@ def test_two_node_worker_error_exits_without_retry_or_review(tmp_path, monkeypat
 
     assert calls == {"worker": 1, "reviewer": 0}
     assert [record.node for record in history] == ["start", "worker", "exit"]
+
+
+def test_two_node_worker_failure_exits_without_retry_or_review(tmp_path, monkeypatch) -> None:
+    calls = {"worker": 0, "reviewer": 0}
+
+    def worker(node, ctx):
+        calls["worker"] += 1
+        return Result(outcome="failure", output="worker failed")
+
+    def reviewer(node, ctx):
+        calls["reviewer"] += 1
+        return Result(outcome="success", output="must not run")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "codergen", worker)
+    monkeypatch.setitem(TYPE_REGISTRY, "parallel_reviewer", reviewer)
+    history = run(
+        parse(ROOT / _PIPELINE),
+        Context(goal="worker failure", workdir=tmp_path, backend="echo"),
+    )
+
+    assert calls == {"worker": 1, "reviewer": 0}
+    assert len(
+        [record for record in history if record.node == "worker" and record.outcome == "failure"]
+    ) == 1
+    assert history[-1].outcome == "stuck"
 
 
 def test_two_node_dot_cold_reviewer_uses_only_its_supported_transport() -> None:

@@ -66,3 +66,42 @@ def test_bounded_process_timeout_kills_and_reaps_grandchild(tmp_path) -> None:
     else:
         subprocess.run(["kill", "-KILL", str(child_pid)], check=False)
         raise AssertionError(f"grandchild {child_pid} survived bounded cleanup")
+
+
+def test_bounded_process_kills_term_ignoring_grandchild_after_pipes_close(tmp_path) -> None:
+    from runner.subprocess_control import run_bounded_process
+
+    child_pid_path = tmp_path / "detached-child.pid"
+    child_code = (
+        "import signal,time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "time.sleep(30)"
+    )
+    parent_code = (
+        "import subprocess,sys,time\n"
+        f"child=subprocess.Popen([sys.executable,'-c',{child_code!r}], "
+        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        f"open({str(child_pid_path)!r},'w').write(str(child.pid))\n"
+        "print('ready', flush=True)\n"
+        "time.sleep(30)\n"
+    )
+
+    result = run_bounded_process(
+        [sys.executable, "-c", parent_code],
+        cwd=tmp_path,
+        timeout=0.2,
+        terminate_grace=0.2,
+    )
+
+    assert result.timed_out is True
+    child_pid = int(child_pid_path.read_text())
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        subprocess.run(["kill", "-KILL", str(child_pid)], check=False)
+        raise AssertionError(f"closed-pipe grandchild {child_pid} survived cleanup")

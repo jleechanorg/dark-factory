@@ -111,6 +111,7 @@ def test_execute_gate_runs_codex_subprocess_when_priority_resolves_codex(
 
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _fake_run)
     ctx = HCtx(goal="test", workdir=tmp_path, backend="claude")
     result = _execute_gate("PROMPT", fake_sha, 300, ctx, "evidence", "codex")
     assert result.outcome == "success"
@@ -142,6 +143,7 @@ def test_execute_gate_writes_exact_prompt_sidecar(tmp_path, monkeypatch):
 
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _fake_run)
     ctx = HCtx(goal="test", workdir=tmp_path, backend="claude", run_id="promptlog1")
     ctx.event_log_path = tmp_path / "events.jsonl"
     setattr(ctx, "_df_current_seq", 7)
@@ -383,7 +385,7 @@ def test_execute_gate_uses_controller_codex_transport(tmp_path, monkeypatch):
 
     def _fake_run(cmd, **kwargs):
         observed["cmd"] = cmd
-        observed["input"] = kwargs.get("input")
+        observed["input"] = kwargs.get("input_text")
         observed["cwd"] = kwargs.get("cwd")
         observed["env"] = kwargs.get("env", {})
         transport = json.dumps({
@@ -404,6 +406,7 @@ def test_execute_gate_uses_controller_codex_transport(tmp_path, monkeypatch):
     monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", "/secret/holdouts")
     monkeypatch.setenv("MY_HOLDOUT_SECRET", "sealed")
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _fake_run)
 
     protected_calls = []
 
@@ -462,6 +465,7 @@ def test_execute_gate_rejects_controller_request_for_non_codex_backend(
 
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _fake_run)
     ctx = HCtx(goal="test", workdir=tmp_path, backend="codex")
     ctx.state["_df_controller_review_json"] = "true"
 
@@ -513,6 +517,7 @@ def test_execute_gate_runs_parallel_codex_shadow_review(tmp_path, monkeypatch):
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
     monkeypatch.setattr("runner.handler_dispatch.shutil.which", lambda name: "/usr/bin/codex")
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _fake_run)
     monkeypatch.setattr("runner.handler_dispatch.subprocess.Popen", _FakePopen)
     ctx = HCtx(goal="test", workdir=tmp_path, backend="claude", run_id="gateshadow1")
     ctx.state["_df_shadow_codex_review"] = "true"
@@ -565,6 +570,7 @@ def test_execute_gate_runs_minimax_with_correct_env(monkeypatch, tmp_path):
 
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _fake_run)
     ctx = HCtx(goal="test", workdir=tmp_path, backend="claude")
     result = _execute_gate("PROMPT", fake_sha, 300, ctx, "evidence", "minimax")
     assert result.outcome == "success"

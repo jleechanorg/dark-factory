@@ -37,7 +37,7 @@ digraph SlimTwoNode {
         label="Generic Worker",
         class="worker",
         prompt="@prompts/slim/worker.md",
-        max_retries=2,
+        max_retries=0,
         max_visits="3",
         timeout=600
     ]
@@ -55,7 +55,6 @@ digraph SlimTwoNode {
 
     start -> worker
     worker -> cold_reviewer [condition="outcome=success"]
-    worker -> worker        [condition="outcome=failure"]
     worker -> exit          [condition="outcome=error"]
 
     cold_reviewer -> exit   [condition="outcome=success"]
