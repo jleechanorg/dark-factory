@@ -47,6 +47,7 @@ digraph SlimTwoNode {
         class="review",
         review_contract="cold-review-v1",
         backend_priority="codex",
+        evidence_paths="evidence/worker-verification.json",
         goal_gate=true,
         timeout=600
     ]

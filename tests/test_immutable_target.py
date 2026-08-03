@@ -557,6 +557,23 @@ class ControllerSnapshotTests(unittest.TestCase):
         shadow_launches: list[str] = []
 
         def _worker_with_inherited_reviewer_outcome(node, ctx):
+            receipt = ctx.workdir / "evidence" / "worker-verification.json"
+            receipt.parent.mkdir()
+            receipt.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "target_head_sha": _git(self.repo, "rev-parse", "HEAD").strip(),
+                        "goal": ctx.goal,
+                        "changed_files": ["README.md"],
+                        "commands": [],
+                        "not_applicable": {
+                            "reason": "E2E controller transport mock",
+                            "primary_inspection_commands": [],
+                        },
+                    }
+                )
+            )
             return Result(
                 outcome="success",
                 output="worker completed",

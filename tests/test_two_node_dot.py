@@ -47,6 +47,7 @@ _SUBPROCESS_NODE_TYPES = frozenset(
 )
 
 _PIPELINE = "pipelines/slim/two_node.dot"
+_WORKER_PROMPT = "prompts/slim/worker.md"
 _EXPECTED_TIMEOUT_S = 600
 
 
@@ -137,3 +138,30 @@ def test_two_node_dot_cold_reviewer_controller_binding() -> None:
     from runner.review_controller import PROMPT_ID, _TEMPLATE_PATH
     assert PROMPT_ID == "controller-cold-review-v1"
     assert _TEMPLATE_PATH.exists()
+
+
+def test_two_node_dot_binds_the_worker_verification_receipt() -> None:
+    """The default cold reviewer receives the worker's declared evidence file."""
+    reviewer = parse(ROOT / _PIPELINE).nodes["cold_reviewer"]
+    assert reviewer.attrs.get("evidence_paths") == "evidence/worker-verification.json"
+
+
+def test_worker_prompt_requires_a_bounded_structured_verification_receipt() -> None:
+    """Every default worker must provide reproducible, non-fabricated review data."""
+    prompt = (ROOT / _WORKER_PROMPT).read_text()
+    assert "evidence/worker-verification.json" in prompt
+    assert "1 MiB" in prompt
+    for field in (
+        "schema_version",
+        "target_head_sha",
+        "goal",
+        "changed_files",
+        "commands",
+        "not_applicable",
+        "cwd",
+        "exit_code",
+        "stdout",
+        "stderr",
+    ):
+        assert field in prompt
+    assert "Do not fabricate" in prompt
