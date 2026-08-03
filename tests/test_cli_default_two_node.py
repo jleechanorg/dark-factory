@@ -128,5 +128,3 @@ def test_docs_and_skill_instructions_agree_on_two_node_default() -> None:
     if agents_file.exists():
         agents_text = agents_file.read_text(encoding="utf-8")
         assert "two_node" in agents_text
-
-
