@@ -108,3 +108,25 @@ def test_omitted_pipeline_bypasses_colliding_workdir_two_node_dot(tmp_path: path
         f"Omitted --pipeline must resolve canonical {canonical_expected}, got {resolved}"
     )
 
+
+def test_docs_and_skill_instructions_agree_on_two_node_default() -> None:
+    """Authoritative .claude slash-command skill instructions and README must agree
+    that omitted --pipeline defaults to `two_node.dot`."""
+    skill_file = ROOT / ".claude" / "skills" / "dark-factory" / "SKILL.md"
+    readme_file = ROOT / "README.md"
+    agents_file = ROOT / "AGENTS.md"
+
+    if skill_file.exists():
+        skill_text = skill_file.read_text(encoding="utf-8")
+        assert "two_node" in skill_text
+        assert "defaults to" in skill_text or "default" in skill_text
+
+    if readme_file.exists():
+        readme_text = readme_file.read_text(encoding="utf-8")
+        assert "two_node" in readme_text
+
+    if agents_file.exists():
+        agents_text = agents_file.read_text(encoding="utf-8")
+        assert "two_node" in agents_text
+
+

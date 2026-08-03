@@ -40,6 +40,7 @@ _SUBPROCESS_NODE_TYPES = frozenset(
         "gate_er",
         "gate_code_standards",
         "human_gate",
+        "parallel_reviewer",
         "agy",
         "ao",
     }
@@ -76,8 +77,9 @@ def test_two_node_dot_parses_and_has_expected_topology() -> None:
     # Worker and cold_reviewer are the only goal-producing nodes.
     assert g.nodes["worker"].attrs.get("type") == "codergen"
     assert g.nodes["worker"].attrs.get("class") == "worker"
-    assert g.nodes["cold_reviewer"].attrs.get("type") == "gate_er"
+    assert g.nodes["cold_reviewer"].attrs.get("type") == "parallel_reviewer"
     assert g.nodes["cold_reviewer"].attrs.get("class") == "review"
+    assert g.nodes["cold_reviewer"].attrs.get("review_contract") == "cold-review-v1"
 
 
 def test_two_node_dot_declares_timeout_on_every_subprocess_node() -> None:
@@ -139,17 +141,18 @@ def test_two_node_dot_cold_reviewer_uses_codex_priority_queue() -> None:
     )
 
 
-def test_two_node_dot_cold_reviewer_prompt_is_static() -> None:
-    """The cold_reviewer must point at the static Codex cold-reviewer prompt.
+def test_two_node_dot_cold_reviewer_controller_binding() -> None:
+    """The cold_reviewer must bind to the SHA-pinned controller cold-review-v1 prompt contract.
 
-    The user contract: "Cold reviewer is the static codex prompt we cannot
-    change." This test pins the prompt reference so a future refactor that
-    accidentally swaps it for `prompts/slim/review.md` (the heavier
-    G4/G5 five-step procedure) is caught.
+    This pins the requirement: use the existing SHA-pinned cold-review-v1
+    controller execution path (prompts/catalog/controller_cold_review_v1.md)
+    rather than any divergent prompt copy.
     """
     g = parse(ROOT / _PIPELINE)
-    prompt = g.nodes["cold_reviewer"].attrs.get("prompt", "")
-    assert prompt == "@prompts/slim/cold_reviewer.md", (
-        f"cold_reviewer prompt must be @prompts/slim/cold_reviewer.md "
-        f"(the static cold-reviewer contract); got {prompt!r}"
+    contract = g.nodes["cold_reviewer"].attrs.get("review_contract", "")
+    assert contract == "cold-review-v1", (
+        f"cold_reviewer review_contract must be cold-review-v1; got {contract!r}"
     )
+    from runner.review_controller import PROMPT_ID, _TEMPLATE_PATH
+    assert PROMPT_ID == "controller-cold-review-v1"
+    assert _TEMPLATE_PATH.exists()

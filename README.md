@@ -148,9 +148,7 @@ dark-factory \
 df-healer --cxdb ~/.dark-factory/cxdb.sqlite
 ```
 
-> **Pick the `.dot` for the task — do not default every run to one pipeline.** See
-> [Example Projects](#-example-projects-at-a-glance), the [Pipeline Catalog](#-pipeline-catalog),
-> and the full decision table in [docs/pipeline-selection.md](docs/pipeline-selection.md).
+> **When `--pipeline` is omitted, `/f` and `/factory` default to `pipelines/slim/two_node.dot`.** Pass `--pipeline <name>` to opt into non-default pipelines. See [Example Projects](#-example-projects-at-a-glance), the [Pipeline Catalog](#-pipeline-catalog), and the full decision table in [docs/pipeline-selection.md](docs/pipeline-selection.md).
 
 ---
 
@@ -450,7 +448,7 @@ dark-factory/
 
 ## ⭐ Recommended default: Agent Orchestrator (AO) with Antigravity
 
-For day-to-day work, the factory runs with the `--backend ao` default (configured to use the `--ao-agent antigravity` plugin to route headlessly through the Antigravity CLI, but swappable to other agents like `--ao-agent claude-code`). **Pick the `.dot` for the task** — do not default every run to a single pipeline. The full decision table is [docs/pipeline-selection.md](docs/pipeline-selection.md); the common picks:
+For day-to-day work, the factory runs with the `--backend ao` default (configured to use the `--ao-agent antigravity` plugin to route headlessly through the Antigravity CLI, but swappable to other agents like `--ao-agent claude-code`). When `--pipeline` is omitted, `/f` and `/factory` default to `pipelines/slim/two_node.dot` (generic worker + controller cold reviewer); pass explicit `--pipeline <name>` to opt into non-default pipelines. The full decision table is [docs/pipeline-selection.md](docs/pipeline-selection.md); the common picks:
 
 | Task | Pipeline |
 |------|----------|

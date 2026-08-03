@@ -886,7 +886,8 @@ def _probe_backend_installed(name: str) -> bool:
     existing ``subprocess.run(timeout=...)`` envelope in ``_run_gate_once`` to
     catch the hang, but the probe itself uses a 5s ceiling.
     """
-    bin_path = shutil.which(name)
+    bin_name = "claude" if name == "claude-sonnet" else name
+    bin_path = shutil.which(bin_name)
     if not bin_path:
         return False
     try:

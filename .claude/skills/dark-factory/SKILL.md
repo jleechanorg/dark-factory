@@ -70,12 +70,12 @@ echoed in the run evidence.
 
 You can also write your own `.dot` and pass it via `--pipeline`.
 
-## How to invoke this skill
+### How to invoke this skill
 
 The user types `/f $ARGUMENTS` (or `/factory $ARGUMENTS`). Parse the
-arguments and run the steps below. **Do not default to a single pipeline** —
-select the graph that matches the task (see **Pipeline selection** below)
-unless the user passed `--pipeline`.
+arguments and run the steps below. When `--pipeline` is omitted, `/f` and
+`/factory` default to `two_node` (`pipelines/slim/two_node.dot`). Non-default
+pipelines require explicit opt-in via `--pipeline <name>`.
 
 ### Step 0a — Auto-route PR-mode vs feature-mode (applies to `/f` and `/factory`; `/f-pr` skips this and forces PR-mode)
 
@@ -180,17 +180,9 @@ hardcoded default (`claude`). Always echo the detected backend + source in
 the proof block (see **Output contract**). If `--backend` was passed
 explicitly, note the override rather than the raw detection.
 
-### Step 0c — Select pipeline (mandatory when `--pipeline` omitted)
+### Step 0c — Pipeline selection
 
-1. Read the goal and apply **factory-spec Step 0** (greenfield vs brownfield).
-2. Choose a pipeline from
-   [docs/pipeline-selection.md](../../../docs/pipeline-selection.md) (or the table in
-   **Available pipelines** below).
-3. **Tell the user** which pipeline you chose and why before running.
-4. If brownfield replace/delete: encode delete-first rules in the goal; do not
-   use a greenfield additive pipeline by default.
-
-If `$ARGUMENTS` already contains `--pipeline`, skip auto-selection.
+When `--pipeline` is omitted, the runner dispatches `pipelines/slim/two_node.dot` by default. To opt into a non-default pipeline (such as `gates`, `minimal_feature`, `review_slim`, etc.), pass explicit `--pipeline <name>`.
 
 ### Short-name expansion
 

@@ -2,9 +2,8 @@
 //
 // Default graph for `/f` (and `/factory`). Exactly two productive nodes:
 //   worker         — generic codergen; light prompt; does whatever the user asked.
-//   cold_reviewer  — gate_er that runs the static Codex cold-reviewer prompt
-//                    (prompts/slim/cold_reviewer.md — DO NOT EDIT; this prompt
-//                    is the canonical cold reviewer contract for slim runs).
+//   cold_reviewer  — controller-owned cold reviewer using the SHA-pinned
+//                    cold-review-v1 execution path (prompts/catalog/controller_cold_review_v1.md).
 //
 // Wiring:
 //   start -> worker -> cold_reviewer -> exit                (on success)
@@ -13,11 +12,10 @@
 // Backend routing:
 //   - worker          honors the run-level --backend (the coder tier the user
 //                     chose; default = whatever /f's Step 0.5 detector picks).
-//   - cold_reviewer   uses backend_priority="codex,minimax,agy,claude-sonnet"
-//                     and prefer_adversarial="true" so the reviewer is a
-//                     different vendor from the worker whenever possible. The
-//                     queue is the same priority list already documented in
-//                     docs/pipeline-selection.md; no new backend table here.
+//   - cold_reviewer   uses review_contract="cold-review-v1" and
+//                     backend_priority="codex,minimax,agy,claude-sonnet"
+//                     with prefer_adversarial="true" so the reviewer is a
+//                     different vendor from the worker whenever possible.
 //
 // Failure semantics:
 //   - cold_reviewer is goal_gate=true. On success the run exits.
@@ -26,7 +24,7 @@
 
 digraph SlimTwoNode {
     graph [
-        goal="Generic worker does the user's task; static Codex cold reviewer gates it. Slim default for /f."
+        goal="Generic worker does the user's task; controller-owned cold-review-v1 reviewer gates it. Slim default for /f."
         rankdir=LR
         label="SlimTwoNode (default /f graph)"
     ]
@@ -45,10 +43,10 @@ digraph SlimTwoNode {
     ]
 
     cold_reviewer [
-        type="gate_er",
-        label="Cold Reviewer (static Codex prompt)",
+        type="parallel_reviewer",
+        label="Cold Reviewer (controller cold-review-v1)",
         class="review",
-        prompt="@prompts/slim/cold_reviewer.md",
+        review_contract="cold-review-v1",
         backend_priority="codex,minimax,agy,claude-sonnet",
         prefer_adversarial="true",
         goal_gate=true,
