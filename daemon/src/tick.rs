@@ -1923,6 +1923,38 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     let _ = deps.tracker.comment_external(ext_ref, &comment_body);
                 }
             }
+            Err(other) if other.is_transient() => {
+                // jleechan-issue-510: per-bead isolation, mirroring the
+                // jleechan-cq8r / jleechan-qdw patterns elsewhere in this
+                // file. A single bead's transient routing failure (e.g.
+                // LLM rate limit or subprocess timeout) must NOT abort the
+                // whole slow-tier pass — doing so would propagate Err(transient)
+                // up to `run_tick`, hit `classify_tick_result` in main.rs,
+                // and increment `consecutive_failures`, which exponentially
+                // backs off the poll loop and STARVES every OTHER bead in the
+                // fleet. Catch the transient here, emit per-bead telemetry so
+                // operators can see the failure on its own, and continue with
+                // the next bead. The bead itself is re-selected on the next
+                // tick's intake pass (its overlay was never written past
+                // `attempt_started_at`/`QUEUED`); the LLM/subprocess path will
+                // either succeed or hit the same transient next tick, at which
+                // point the slow-tier intake surface still keeps trying. This
+                // matches the existing `BEAD_SNAPSHOT_TRANSIENT_ERROR` and
+                // `BEAD_PROCESSING_TRANSIENT_ERROR` discipline used for other
+                // per-bead transient paths.
+                let _ = emit(
+                    deps.telemetry_log,
+                    &bead.id,
+                    overlay.attempt,
+                    OverlayState::Queued.as_str(),
+                    "BEAD_PROCESSING_TRANSIENT_ERROR",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "phase": "routing",
+                        "error": format!("{other:?}"),
+                    }),
+                );
+            }
             Err(other) => return Err(other),
         }
     }

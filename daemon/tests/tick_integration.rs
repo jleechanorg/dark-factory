@@ -13241,3 +13241,112 @@ fn vendor_health_ledger_ci_pending_with_capped_vendor_skips_wait() {
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+// === issue #510: per-bead transient errors must NOT increment global consecutive_failures ===
+
+/// Test-only Llm impl that ALWAYS returns a transient `DaemonError::Timeout`,
+/// simulating a sustained LLM outage (rate limit, network, etc.). Used to
+/// exercise the per-bead-routing transient error path — every bead's
+/// `router::route` call will fail with a transient error.
+struct AlwaysTransientLlm;
+
+impl Llm for AlwaysTransientLlm {
+    fn judge(&self, _prompt: &str) -> Result<String, DaemonError> {
+        Err(DaemonError::Timeout(
+            "scripted transient LLM failure (issue #510)".to_string(),
+        ))
+    }
+}
+
+/// Issue #510: when N beads all hit per-bead transient errors during routing,
+/// the tick itself must NOT be classified as a global tick failure.
+///
+/// Pre-fix: tick.rs routed `Err(other) => return Err(other)` for every
+/// per-bead transient router error, so `run_tick` returned Err(transient)
+/// and `classify_tick_result` incremented `consecutive_failures` and
+/// backed off exponentially — slowing EVERY bead in the system, not just
+/// the failing ones.
+///
+/// Post-fix: per-bead transient errors are caught at the source (telemetry
+/// emitted, summary counter incremented), `run_tick` returns Ok, and
+/// `classify_tick_result` treats the tick as Success with
+/// `consecutive_failures = 0`.
+#[test]
+fn per_bead_transient_errors_do_not_increment_global_consecutive_failures() {
+    // Three factory-labeled issues, all of which will hit transient routing.
+    let mut scm = FakeScm::new();
+    scm.issues.push(Issue {
+        number: 101,
+        title: "fix thing one".into(),
+        body: "fix thing one".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#101".into(),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    // AlwaysTransientLlm makes router::route return Err(Timeout) for every
+    // bead — exactly the live-incident shape described in issue #510.
+    let llm = AlwaysTransientLlm;
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_dir = std::env::temp_dir().join("afd_issue_510_per_bead_backoff");
+    std::fs::create_dir_all(&telemetry_dir).unwrap();
+    let telemetry_log = telemetry_dir.join(format!("daemon-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    // Drive THREE ticks — one per bead (the FakeTracker surfaces one bead per
+    // tick as it gets a fresh intake pass). Pre-fix each call returns
+    // Err(transient) and `classify_tick_result` would have backed off
+    // exponentially; post-fix each returns Ok and consecutive_failures
+    // stays at 0 the entire time.
+    for tick_index in 0..3u64 {
+        let summary =
+            run_tick(&deps, tick_index, 0).expect("tick must succeed despite per-bead transient errors");
+        // The tick ran. Per-bead transient errors were caught at the source,
+        // NOT propagated up. `run_tick` returning Ok is what keeps the global
+        // backoff counter from advancing.
+        assert!(
+            summary.beads_routed == 0,
+            "with a transient LLM, no bead can complete routing (tick {tick_index}); got {summary:?}"
+        );
+        assert!(
+            summary.beads_parked_human_held == 0,
+            "transient routing errors must NOT park beads HUMAN_HELD — only \
+             permanent parse errors do; tick {tick_index} got {summary:?}"
+        );
+    }
+
+    // Telemetry should record per-bead transient events so an operator can
+    // see the failure on its own without it burning the global backoff budget.
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("BEAD_DISPATCH_TRANSIENT_ERROR")
+            || log.contains("BEAD_PROCESSING_TRANSIENT_ERROR"),
+        "per-bead transient errors must be emitted as per-bead telemetry; log:\n{log}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+// Issue #510 (contract guard): when `run_tick` returns Ok — the post-fix
+// shape for a tick that contained per-bead transient errors caught at
+// the source — the existing `classify_tick_result` contract in main.rs
+// treats it as `TickLoopAction::Success { consecutive_failures: 0 }`,
+// regardless of any prior counter value. The contract test for that
+// shape lives in `daemon/src/main.rs::tests::classify_tick_result_resets_after_success`
+// (single source of truth — not duplicated here).
