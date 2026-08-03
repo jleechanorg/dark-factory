@@ -197,3 +197,67 @@ def test_live_timeout_lanes_use_bounded_helper_as_terminal_error(
     assert result.metadata["timed_out"] == "true"
     assert "partial stdout" in result.output
     assert "partial stderr" in result.output
+
+
+def test_ao_wait_idle_filters_status_by_project(monkeypatch, tmp_path) -> None:
+    from runner.handlers import _ao_wait_idle
+    from runner.subprocess_control import BoundedProcessResult
+
+    observed: dict[str, object] = {}
+
+    def fake_bounded(args, **kwargs):
+        observed["args"] = list(args)
+        observed["timeout"] = kwargs["timeout"]
+        return BoundedProcessResult(
+            args=tuple(args),
+            returncode=0,
+            stdout='[{"name":"session-1","activity":"exited"}]',
+            stderr="",
+            timed_out=False,
+        )
+
+    ticks = iter((100.0, 101.0))
+    monkeypatch.setattr("runner.handler_ao.time.monotonic", lambda: next(ticks))
+    monkeypatch.setattr("runner.handler_ao.run_bounded_process", fake_bounded)
+
+    result = _ao_wait_idle(
+        "session-1", tmp_path, timeout=300, project="project-7"
+    )
+
+    assert result == "exited"
+    assert observed["args"] == ["ao", "status", "-p", "project-7", "--json"]
+    assert observed["timeout"] == 180
+
+
+def test_ao_wait_idle_clamps_poll_and_sleep_to_remaining_deadline(
+    monkeypatch, tmp_path
+) -> None:
+    from runner.handlers import _ao_wait_idle
+    from runner.subprocess_control import BoundedProcessResult
+
+    poll_timeouts: list[float] = []
+    sleeps: list[float] = []
+
+    def fake_bounded(args, **kwargs):
+        poll_timeouts.append(kwargs["timeout"])
+        return BoundedProcessResult(
+            args=tuple(args),
+            returncode=0,
+            stdout='[{"name":"session-1","activity":"active"}]',
+            stderr="",
+            timed_out=False,
+        )
+
+    ticks = iter((100.0, 101.0, 103.0, 105.0))
+    monkeypatch.setattr("runner.handler_ao.time.monotonic", lambda: next(ticks))
+    monkeypatch.setattr("runner.handler_ao.time.sleep", sleeps.append)
+    monkeypatch.setattr("runner.handler_ao.run_bounded_process", fake_bounded)
+
+    result = _ao_wait_idle(
+        "session-1", tmp_path, timeout=5, poll_interval=10
+    )
+
+    assert result == "timeout"
+    assert poll_timeouts == [4.0]
+    assert sleeps == [2.0]
+    assert all(value > 0 for value in poll_timeouts)

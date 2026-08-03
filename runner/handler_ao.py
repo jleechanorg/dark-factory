@@ -67,12 +67,18 @@ def _ao_wait_idle(
     """
     deadline = time.monotonic() + timeout
     consecutive = 0
-    status_cmd = ["ao", "status", "--json"]
-    while time.monotonic() < deadline:
+    status_cmd = ["ao", "status"]
+    if project:
+        status_cmd.extend(["-p", project])
+    status_cmd.append("--json")
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return "timeout"
         proc = run_bounded_process(
             status_cmd,
             cwd=workdir,
-            timeout=180,
+            timeout=min(180, remaining),
             env=_handlers_shim._sanitized_env(),
         )
         if proc.timed_out:
@@ -83,10 +89,11 @@ def _ao_wait_idle(
                 return activity
             if activity == "ready":
                 consecutive += 1
-                last_terminal = "ready"
                 if consecutive >= stable_reads:
                     return "ready"
             else:
                 consecutive = 0
-        time.sleep(poll_interval)
-    return "timeout"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return "timeout"
+        time.sleep(min(poll_interval, remaining))
