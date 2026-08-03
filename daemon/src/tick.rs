@@ -5091,6 +5091,89 @@ fn record_escalation(deps: &TickDeps, bead_id: &str, reason: &str) -> Result<(),
 /// `post_scm_comment_by_bead_id` below.
 const MISSING_SCM_TARGET_ERROR_MARKER: &str = "no SCM comment target found";
 
+/// Substring markers that identify a GitHub "issue has too many comments" error.
+/// When `comment_external` fails with this class of error, the daemon
+/// auto-creates an overflow issue and retries rather than parking HUMAN_HELD.
+/// (issue #507)
+const GITHUB_COMMENT_LIMIT_MARKERS: &[&str] = &[
+    "2500 comments",
+    "Commenting is disabled",
+];
+
+/// Returns true when `err` is the GitHub "issue has too many comments" error.
+fn is_github_comment_limit_error(err: &DaemonError) -> bool {
+    let msg = format!("{err:?}");
+    GITHUB_COMMENT_LIMIT_MARKERS
+        .iter()
+        .any(|marker| msg.contains(marker))
+}
+
+/// Create a new overflow escalation issue on GitHub (issue #507).
+/// Returns the new issue's `owner/repo#N` ext_ref string on success.
+fn create_overflow_escalation_issue(
+    deps: &TickDeps,
+    bead_id: &str,
+    original_ext_ref: &str,
+) -> Result<String, DaemonError> {
+    // Parse repo from original_ext_ref ("owner/repo#N" or "owner/repo#issue-N")
+    let repo = if let Some(idx) = original_ext_ref.find('#') {
+        &original_ext_ref[..idx]
+    } else {
+        return Err(DaemonError::Config(format!(
+            "cannot parse repo from ext_ref {original_ext_ref}"
+        )));
+    };
+    let title = format!("[dark-factory] Escalation overflow for bead {bead_id} (original: {original_ext_ref})");
+    let body = format!(
+        "Overflow escalation target.\n\nOriginal issue `{original_ext_ref}` hit GitHub's 2500-comment limit.\n\nBead: `{bead_id}`"
+    );
+    // Write body to a temp file to avoid shell escaping issues
+    let tmp = format!("/tmp/overflow_issue_body_{bead_id}.md");
+    std::fs::write(&tmp, &body).map_err(|e| {
+        DaemonError::Config(format!("write overflow body: {e}"))
+    })?;
+    let out = std::process::Command::new("gh")
+        .args([
+            "issue",
+            "create",
+            "--repo",
+            repo,
+            "--title",
+            &title,
+            "--label",
+            "factory",
+            "--body-file",
+            &tmp,
+        ])
+        .output()
+        .map_err(|e| DaemonError::Tool {
+            tool: format!("gh issue create: {e}"),
+            rc: -1,
+            stderr: String::new(),
+        })?;
+    let _ = std::fs::remove_file(&tmp);
+    if !out.status.success() {
+        return Err(DaemonError::Tool {
+            tool: "gh issue create".to_string(),
+            rc: out.status.code().unwrap_or(-1),
+            stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+        });
+    }
+    // gh outputs the new issue URL, e.g. https://github.com/owner/repo/issues/123
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // Convert URL to ext_ref format: owner/repo#123
+    let new_ext_ref = url
+        .trim_start_matches("https://github.com/")
+        .replacen("/issues/", "#", 1);
+    if new_ext_ref.contains('#') {
+        Ok(new_ext_ref)
+    } else {
+        Err(DaemonError::Config(format!(
+            "unexpected gh issue create output: {url}"
+        )))
+    }
+}
+
 /// Distinguishes a permanently-missing SCM comment target from a transient
 /// tracker/API failure (network error, rate limit, etc). Transient failures
 /// come back as whatever error variant the underlying `Tracker` call
@@ -5218,18 +5301,60 @@ fn post_scm_comment_by_bead_id(
             // stage closes). `overlay` is already loaded here, so
             // `overlay.repo(cfg)` is free.
             let ext_ref = format!("{}#{}", overlay.repo(deps.cfg), pr);
-            return deps.tracker.comment_external(&ext_ref, body);
+            return post_scm_comment_with_overflow_retry(deps, bead_id, &ext_ref, body);
         }
     }
     let candidates = deps.tracker.fetch_candidates()?;
     if let Some(bead) = candidates.iter().find(|b| b.id == bead_id) {
         if let Some(ref ext_ref) = bead.external_ref {
-            return deps.tracker.comment_external(ext_ref, body);
+            return post_scm_comment_with_overflow_retry(deps, bead_id, ext_ref, body);
         }
     }
     Err(DaemonError::Config(format!(
         "no SCM comment target found for bead {bead_id}"
     )))
+}
+
+/// issue #507: post a comment to `ext_ref`, automatically creating an overflow
+/// issue and retrying there if the primary target has hit the GitHub 2500-comment
+/// limit. Never parks HUMAN_HELD just because a comment channel is full.
+fn post_scm_comment_with_overflow_retry(
+    deps: &TickDeps,
+    bead_id: &str,
+    ext_ref: &str,
+    body: &str,
+) -> Result<(), DaemonError> {
+    match deps.tracker.comment_external(ext_ref, body) {
+        Ok(()) => Ok(()),
+        Err(err) if is_github_comment_limit_error(&err) => {
+            // Primary target is full — create an overflow issue and retry once.
+            match create_overflow_escalation_issue(deps, bead_id, ext_ref) {
+                Ok(overflow_ref) => {
+                    emit(
+                        deps.telemetry_log,
+                        bead_id,
+                        0,
+                        "system",
+                        "ESCALATION_OVERFLOW_ISSUE_CREATED",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "original_ref": ext_ref,
+                            "overflow_ref": overflow_ref,
+                        }),
+                    )
+                    .ok(); // non-fatal telemetry
+                    deps.tracker.comment_external(&overflow_ref, body)
+                }
+                Err(create_err) => {
+                    // Can't create overflow issue either — return combined error.
+                    Err(DaemonError::Config(format!(
+                        "comment limit on {ext_ref} and overflow creation failed: {create_err:?}"
+                    )))
+                }
+            }
+        }
+        Err(other) => Err(other),
+    }
 }
 
 #[cfg(test)]
