@@ -81,6 +81,12 @@ def _is_quota_error(text: str) -> bool:
     the detector works regardless of which provider surfaces the message.
     """
     t = (text or "").lower()
+    # 429 is anchored with a leading space (" 429") so token counts,
+    # RFC numbers, and other unrelated numerics do not falsely trigger
+    # the quota fallback. Real HTTP 429 status lines look like
+    # "HTTP/1.1 429 Too Many Requests" or "status: 429" / "status code
+    # 429" / "Error 429:" — all of which have a space immediately
+    # before the 429 token.
     return any(
         s in t
         for s in (
@@ -88,7 +94,7 @@ def _is_quota_error(text: str) -> bool:
             "rate limit exceeded",
             "quota exceeded",
             "out of quota",
-            "429",
+            " 429",
         )
     )
 
