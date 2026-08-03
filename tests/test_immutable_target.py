@@ -469,21 +469,15 @@ class ControllerSnapshotTests(unittest.TestCase):
                     _git(source, "rev-parse", "HEAD").strip(),
                 )
 
-    def test_controller_contract_does_not_inherit_worker_echo_backend(self) -> None:
-        """A two-node controller gate resolves Codex even when its worker used echo."""
+    def test_controller_contract_honors_cost_free_echo_backend(self) -> None:
+        """Echo wiring smoke never launches the real controller transport."""
         from unittest.mock import patch
 
-        from runner.handler_core import Context, Result
+        from runner.handler_core import Context
         from runner.handler_parallel_reviewer import _parallel_reviewer
         from runner.parser import Node
 
         (self.repo / "README.md").write_text("worker output\n")
-        seen: list[str] = []
-
-        def _fake_primary(request, timeout, ctx, node_name, backend):
-            seen.append(backend)
-            return Result(outcome="success", output="controller response")
-
         node = Node(
             name="cold_reviewer",
             attrs={
@@ -492,14 +486,17 @@ class ControllerSnapshotTests(unittest.TestCase):
             },
         )
         ctx = Context(goal="review worker output", workdir=self.repo, backend="echo")
-        with patch("runner.handler_parallel_reviewer._run_controller_primary", _fake_primary):
+        with patch(
+            "runner.handler_parallel_reviewer._run_controller_primary",
+            side_effect=AssertionError("echo must not launch controller transport"),
+        ):
             result = _parallel_reviewer(node, ctx)
 
         self.assertEqual(result.outcome, "success")
-        self.assertEqual(seen, ["codex"])
+        self.assertEqual(result.metadata["reviewer_backend"], "echo")
 
-    def test_controller_contract_allows_explicitly_preseeded_echo_fixture(self) -> None:
-        """Tests can explicitly opt into deterministic controller echo."""
+    def test_controller_contract_allows_preseeded_echo_outcome(self) -> None:
+        """Echo uses the ordinary seeded-outcome wiring contract."""
         from runner.handler_core import Context
         from runner.handler_parallel_reviewer import _parallel_reviewer
         from runner.parser import Node
@@ -507,47 +504,38 @@ class ControllerSnapshotTests(unittest.TestCase):
         node = Node(name="cold_reviewer", attrs={"review_contract": "cold-review-v1"})
         ctx = Context(goal="fixture", workdir=self.repo, backend="echo")
         ctx.state["cold_reviewer.outcome"] = "success"
-        ctx.state["_df_test_allow_echo_controller_fixture"] = "true"
 
         result = _parallel_reviewer(node, ctx)
 
         self.assertEqual(result.outcome, "success")
         self.assertEqual(result.metadata["reviewer_backend"], "echo")
 
-    def test_controller_contract_rejects_unmarked_preseeded_echo_outcome(self) -> None:
-        """An inherited outcome key alone cannot turn a controller into echo."""
+    def test_controller_contract_preserves_preseeded_echo_failure(self) -> None:
+        """A seeded echo failure remains a cost-free deterministic failure."""
         from unittest.mock import patch
 
-        from runner.handler_core import Context, Result
+        from runner.handler_core import Context
         from runner.handler_parallel_reviewer import _parallel_reviewer
         from runner.parser import Node
 
         (self.repo / "README.md").write_text("worker output\n")
-        seen: list[str] = []
-
-        def _fake_primary(request, timeout, ctx, node_name, backend):
-            seen.append(backend)
-            return Result(
-                outcome="success",
-                output="controller response",
-                metadata={"reviewer_backend": backend, "verdict": "pass"},
-            )
-
         node = Node(
             name="cold_reviewer",
             attrs={"review_contract": "cold-review-v1", "backend_priority": "codex"},
         )
         ctx = Context(goal="review worker output", workdir=self.repo, backend="echo")
-        ctx.state["cold_reviewer.outcome"] = "success"
-        with patch("runner.handler_parallel_reviewer._run_controller_primary", _fake_primary):
+        ctx.state["cold_reviewer.outcome"] = "failure"
+        with patch(
+            "runner.handler_parallel_reviewer._run_controller_primary",
+            side_effect=AssertionError("echo must not launch controller transport"),
+        ):
             result = _parallel_reviewer(node, ctx)
 
-        self.assertEqual(result.outcome, "success")
-        self.assertEqual(seen, ["codex"])
-        self.assertEqual(result.metadata["reviewer_backend"], "codex")
+        self.assertEqual(result.outcome, "failure")
+        self.assertEqual(result.metadata["reviewer_backend"], "echo")
 
-    def test_cli_echo_two_node_runs_one_controller_reviewer_by_default(self) -> None:
-        """The default two-node runtime runs only the primary Codex controller."""
+    def test_cli_echo_two_node_never_launches_controller_transport(self) -> None:
+        """The documented echo wiring smoke is cost-free end to end."""
         from unittest.mock import patch
 
         from runner import __main__ as cli
@@ -619,14 +607,14 @@ class ControllerSnapshotTests(unittest.TestCase):
             )
 
         self.assertEqual(rc, 0)
-        self.assertEqual(seen, ["codex"])
+        self.assertEqual(seen, [])
         self.assertEqual(shadow_launches, [])
         cold_reviewer = next(
             record for record in json.loads(checkpoint.read_text())
             if record["node"] == "cold_reviewer"
         )
-        self.assertEqual(cold_reviewer["metadata"]["reviewer_backend"], "codex")
-        self.assertNotIn("echo parallel reviewer", cold_reviewer["output_preview"])
+        self.assertEqual(cold_reviewer["metadata"]["reviewer_backend"], "echo")
+        self.assertIn("echo parallel reviewer", cold_reviewer["output_preview"])
 
 
 def replace_evidence(
