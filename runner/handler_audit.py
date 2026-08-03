@@ -745,7 +745,7 @@ def _restore_operator_run_trust(
     try:
         with _locked_operator_trust_registry(create=False) as directory_fd:
             registry = _read_operator_trust_registry(directory_fd, required=True)
-    except FileNotFoundError as exc:
+    except OSError as exc:
         raise ValueError("private operator trust registry is missing") from exc
     record = registry["records"].get(checkpoint_key)
     if record is None:

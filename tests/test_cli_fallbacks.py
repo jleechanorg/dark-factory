@@ -798,7 +798,27 @@ def test_implementing_agent_sandbox_denies_controller_private_trust_operations(
     tmp_path, monkeypatch
 ):
     if os.environ.get("DARK_FACTORY_OUTER_SANDBOX") == "1":
-        pytest.skip("already executing under the outer implementing-agent sandbox")
+        trust_root = pathlib.Path.home() / ".dark-factory" / "operator-trust"
+        probe = trust_root / f"worker-probe-{os.getpid()}"
+        proc = subprocess.run(
+            [
+                "/bin/sh", "-c",
+                'test ! -r "$DF_TRUST_ROOT/registry.json" || exit 81; '
+                '/bin/ls "$DF_TRUST_ROOT" >/dev/null 2>&1 && exit 82; '
+                'printf bad >"$DF_PROBE" 2>/dev/null && exit 83; exit 0',
+            ],
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "DF_TRUST_ROOT": str(trust_root),
+                "DF_PROBE": str(probe),
+            },
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert not probe.exists()
+        return
     from runner import handler_sandbox
 
     sandbox_exec = shutil.which("sandbox-exec")
