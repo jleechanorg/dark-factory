@@ -130,6 +130,24 @@ def test_resolve_documented_pipeline_short_name(tmp_path, monkeypatch):
     assert resolved == pipeline.resolve()
 
 
+def test_canonical_short_name_alias_precedes_same_named_workdir_file(
+    tmp_path, monkeypatch
+):
+    """Known extensionless aliases are deterministic across target repos."""
+    home = tmp_path / "factory_home"
+    canonical = _write(home / "pipelines" / "slim" / "minimal_feature.dot")
+    local_collision = _write(tmp_path / "minimal_feature")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    monkeypatch.setenv("DARK_FACTORY_HOME", str(home))
+
+    resolved = resolve_pipeline_path("minimal_feature", workdir=tmp_path)
+
+    assert resolved == canonical.resolve()
+    assert resolved != local_collision.resolve()
+
+
 def test_resolve_pipeline_no_match_returns_resolved_candidate(tmp_path, monkeypatch):
     """Final fallback is the same as resolve_factory_path: return a resolved
     path even if nothing matches (the caller will fail-closed with a clear

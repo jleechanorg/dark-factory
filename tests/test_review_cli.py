@@ -341,6 +341,9 @@ def test_review_skills_describe_one_canonical_codex_controller_lane():
         assert "each available reviewer backend" not in text
     assert "ordinary graph shadow" in dark_factory
     assert "ordinary graph shadow" in calibration
+    assert "VERDICT: pass|fail" in calibration
+    assert "transport.jsonl" in calibration
+    assert '"verdict": "blockers|no_blockers|inconclusive"' not in calibration
 
 
 def test_review_command_rejects_dirty_workspace_before_backend(

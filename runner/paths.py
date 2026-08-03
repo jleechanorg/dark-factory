@@ -57,22 +57,27 @@ def resolve_pipeline_path(
     Resolution order (first match wins):
 
     1. Absolute path → returned as resolved.
-    2. ``<workdir>/<name>`` if it exists (operator is already in the target
+    2. A documented extensionless short name maps to its canonical factory
+       pipeline before target-repository lookups. This makes names such as
+       ``minimal_feature`` deterministic even when a target repo contains a
+       colliding file.
+    3. ``<workdir>/<name>`` if it exists (operator is already in the target
        repo and the file lives at a normal relative path).
-    3. ``<workdir>/dark-factory/pipelines/<name>`` **when `name` is a bare
+    4. ``<workdir>/dark-factory/pipelines/<name>`` **when `name` is a bare
        filename** (no path separators) — this is the target-repo
        `dark-factory/pipelines/*.dot` convention that lets a downstream repo
        ship its own repo-specific graphs (e.g. ones that hardcode that
        repo's slash commands) without leaking them into dark-factory itself.
-    4. Delegate to :func:`resolve_factory_path` (cwd → ``$DARK_FACTORY_HOME``).
+    5. Delegate to :func:`resolve_factory_path` (cwd → ``$DARK_FACTORY_HOME``).
 
     Parameters
     ----------
     name:
         The value passed to ``--pipeline`` — either a path (with separators
         or a ``.dot`` extension) or a bare filename. Bare filenames are
-        matched against the target-repo subdir convention **before** falling
-        through to the factory home.
+        Known extensionless aliases resolve canonically first. Other bare
+        filenames are matched against the target-repo subdir convention
+        before falling through to the factory home.
     workdir:
         Target repository workdir (``--workdir`` / cwd). When ``None`` the
         current process cwd is used.

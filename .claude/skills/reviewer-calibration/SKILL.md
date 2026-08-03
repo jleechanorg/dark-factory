@@ -65,6 +65,7 @@ evidence/<run-id>/reviewer-calibration/
     controller-receipt.json
     envelope.json
     prompt.txt
+    transport.jsonl
     reviewer.output.md
     findings.json
   audit.json
@@ -89,28 +90,15 @@ in `audit.json`. A missing receipt or digest, mismatch, nonzero controller
 exit, stale SHA, backend other than Codex, or fallback makes the result
 `inconclusive`.
 
-## Finding Schema
+## Response contract
 
-Each reviewer should return JSON plus free-form text:
-
-```json
-{
-  "reviewer": "codex",
-  "target_head_sha": "...",
-  "verdict": "blockers|no_blockers|inconclusive",
-  "findings": [
-    {
-      "severity": "blocker|major|minor",
-      "claim": "...",
-      "file": "...",
-      "line": 123,
-      "evidence": "...",
-      "repro_or_reason": "..."
-    }
-  ],
-  "confidence": "high|medium|low"
-}
-```
+The controller appends the exact digest-bound machine lines to the static
+catalog prompt. Follow those emitted lines literally; this skill does not
+duplicate their changing bound values. The verdict line has the canonical
+shape `VERDICT: pass|fail`, followed by the controller-owned C0-C7 and E0-E14
+`pass|fail` lines and the narrative sections defined by
+`prompts/catalog/controller_cold_review_v1.md`. Do not emit the former JSON
+`blockers|no_blockers|inconclusive` schema.
 
 ## Final /f Output
 
