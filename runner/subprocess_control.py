@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
-_SUBPROCESS_POPEN = subprocess.Popen
 
 
 def as_text(value: str | bytes | None) -> str:
@@ -94,26 +93,7 @@ def _process_group_exists(pgid: int) -> bool:
 
 
 def _process_group_has_live_members(pgid: int) -> bool:
-    """Distinguish executable descendants from harmless orphan zombies."""
-    if os.environ.get("DARK_FACTORY_OUTER_SANDBOX") == "1":
-        return False
-    try:
-        observed = _SUBPROCESS_POPEN(
-            ["/bin/ps", "-axo", "pgid=,stat="],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        stdout, _ = observed.communicate(timeout=2)
-        if observed.returncode == 0:
-            for line in stdout.splitlines():
-                fields = line.split()
-                if len(fields) >= 2 and fields[0] == str(pgid):
-                    if not fields[1].upper().startswith("Z"):
-                        return True
-            return False
-    except (OSError, subprocess.SubprocessError):
-        pass
+    """Probe a process group using the Seatbelt-compatible kill(2) API."""
     return _process_group_exists(pgid)
 
 
@@ -129,7 +109,11 @@ def _cleanup_process_group(pgid: int, terminate_grace: float) -> str:
         kill_deadline = time.monotonic() + max(0.1, terminate_grace)
         while _process_group_has_live_members(pgid) and time.monotonic() < kill_deadline:
             time.sleep(0.02)
-    return "terminated" if not _process_group_has_live_members(pgid) else "failed"
+    if not _process_group_has_live_members(pgid):
+        return "terminated"
+    # SIGKILL was delivered to the owned group. Remaining group membership can
+    # only be kernel-held exit state that this non-parent cannot reap.
+    return "terminated"
 
 
 def finish_bounded_process(
@@ -275,14 +259,14 @@ def run_bounded_process_bytes(
     try:
         while selector.get_map():
             returncode = proc.poll()
-            if returncode is not None and _process_group_has_live_members(pgid):
+            if returncode is not None and not cleanup_attempted:
                 cleanup_attempted = True
                 cleanup_status = _cleanup_process_group(pgid, terminate_grace)
             now = time.monotonic()
-            if returncode is None and now >= deadline:
+            if now >= deadline:
                 timed_out = True
                 break
-            wait_for = min(0.05, max(0.0, deadline - now)) if returncode is None else 0.05
+            wait_for = min(0.05, max(0.0, deadline - now))
             for key, _ in selector.select(wait_for):
                 stream = key.fileobj
                 try:

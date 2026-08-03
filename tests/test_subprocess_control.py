@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -32,8 +33,6 @@ def test_bounded_process_bytes_preserves_non_utf8_streams(tmp_path) -> None:
 
 
 def test_successful_leader_cannot_leave_process_group_descendant(tmp_path) -> None:
-    if os.environ.get("DARK_FACTORY_OUTER_SANDBOX") == "1":
-        pytest.skip("outer sandbox owns process-group cleanup and denies ps")
     from runner.subprocess_control import run_bounded_process_bytes
 
     child_pid_path = tmp_path / "success-child.pid"
@@ -58,15 +57,15 @@ def test_successful_leader_cannot_leave_process_group_descendant(tmp_path) -> No
     )
 
     child_pid = int(child_pid_path.read_text())
-    status = subprocess.run(
-        ["/bin/ps", "-o", "stat=", "-p", str(child_pid)],
-        capture_output=True,
-        text=True,
-        check=False,
-    ).stdout.strip()
-    child_alive = bool(status and not status.upper().startswith("Z"))
-    if child_alive:
-        subprocess.run(["kill", "-KILL", str(child_pid)], check=False)
+    deadline = time.monotonic() + 3
+    child_alive = True
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            child_alive = False
+            break
+        time.sleep(0.05)
     assert result.returncode == 0
     assert result.timed_out is False
     assert child_alive is False
@@ -74,8 +73,6 @@ def test_successful_leader_cannot_leave_process_group_descendant(tmp_path) -> No
 
 
 def test_bounded_process_bytes_stops_stream_at_real_output_limit(tmp_path) -> None:
-    if os.environ.get("DARK_FACTORY_OUTER_SANDBOX") == "1":
-        pytest.skip("outer sandbox owns process-group cleanup and denies ps")
     from runner.subprocess_control import run_bounded_process_bytes
 
     result = run_bounded_process_bytes(
@@ -93,6 +90,36 @@ def test_bounded_process_bytes_stops_stream_at_real_output_limit(tmp_path) -> No
     assert result.output_overflowed is True
     assert len(result.stdout) == 1024
     assert result.stderr == b""
+    assert result.process_group_cleanup == "terminated"
+
+
+def test_successful_leader_with_descendant_held_pipe_returns_by_deadline(tmp_path, monkeypatch) -> None:
+    from runner.subprocess_control import run_bounded_process_bytes
+    monkeypatch.setenv("DARK_FACTORY_OUTER_SANDBOX", "1")
+
+    child_code = "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"
+    parent_code = (
+        "import subprocess,sys\n"
+        f"subprocess.Popen([sys.executable,'-c',{child_code!r}])\n"
+        "print('leader complete', flush=True)\n"
+    )
+    previous = signal.getsignal(signal.SIGALRM)
+    def hung(signum, frame):
+        raise AssertionError("descendant-held pipe exceeded hard test deadline")
+    signal.signal(signal.SIGALRM, hung)
+    signal.setitimer(signal.ITIMER_REAL, 3)
+    started = time.monotonic()
+    try:
+        result = run_bounded_process_bytes(
+            [sys.executable, "-c", parent_code], cwd=tmp_path,
+            timeout=0.3, terminate_grace=0.2,
+        )
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+    assert time.monotonic() - started < 2
+    assert result.stdout.startswith(b"leader complete")
     assert result.process_group_cleanup == "terminated"
 
 
