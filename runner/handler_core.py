@@ -19,6 +19,7 @@ Owns:
 from __future__ import annotations
 
 import json
+import pathlib
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -151,6 +152,29 @@ def _gate_strict_flag(node: "Node") -> bool:
     if isinstance(raw, int) and raw == 1:
         return True
     return False
+
+
+def _target_worktree(ctx: "Context") -> pathlib.Path:
+    """Return the validated target worktree for worker diff and controller review.
+
+    Prefers `ctx.state["ao.worktree"]` when it is an absolute, non-traversing
+    path to an existing directory; otherwise falls back to `ctx.workdir`.
+    """
+    if hasattr(ctx, "state") and isinstance(ctx.state, dict):
+        ao_wt = ctx.state.get("ao.worktree")
+        if ao_wt:
+            ao_path = pathlib.Path(str(ao_wt))
+            if (
+                ao_path.is_absolute()
+                and ".." not in ao_path.parts
+                and ao_path.is_dir()
+            ):
+                return ao_path.resolve()
+    try:
+        return pathlib.Path(ctx.workdir).resolve()
+    except (AttributeError, TypeError):
+        return pathlib.Path(".").resolve()
+
 
 
 def _start(node: Node, ctx: Context) -> Result:

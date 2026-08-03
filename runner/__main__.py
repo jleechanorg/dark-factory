@@ -242,7 +242,19 @@ def main(argv: list[str] | None = None) -> int:
     evidence_staging_dir = None
     try:
         p = argparse.ArgumentParser(prog="dark-factory")
-        p.add_argument("--pipeline", type=pathlib.Path)
+        p.add_argument(
+            "--pipeline",
+            type=pathlib.Path,
+            default=pathlib.Path("two_node.dot"),
+            help=(
+                "Pipeline `.dot` to run. Defaults to the slim two-node graph "
+                "(`two_node.dot`) — a generic worker + static Codex cold "
+                "reviewer — which is the standing rule for /f and /factory "
+                "invocations (set 2026-08-02). Pass a short name (e.g. "
+                "`gates`, `minimal_feature`, `bug_fix`) or an absolute path "
+                "to opt into a richer pipeline."
+            ),
+        )
         p.add_argument("--goal")
         p.add_argument("--workdir", type=pathlib.Path, default=pathlib.Path.cwd())
         p.add_argument("--preflight", action="store_true", help="Validate pipeline and emit diagnostics, then exit.")
@@ -261,6 +273,11 @@ def main(argv: list[str] | None = None) -> int:
             "--ao-agent",
             default="antigravity",
             help="AO agent plugin to use when --backend ao (default: claude-code).",
+        )
+        p.add_argument(
+            "--agy-agent",
+            default="gemini-3.6-flash-high",
+            help="AGY agent to use when --backend agy (default: gemini-3.6-flash-high).",
         )
         p.add_argument("--checkpoint", type=pathlib.Path, default=None)
         p.add_argument("--resume", type=pathlib.Path, default=None, help="Resume from a prior checkpoint file.")
@@ -334,10 +351,18 @@ def main(argv: list[str] | None = None) -> int:
         if not args.pipeline:
             p.error("the following arguments are required: --pipeline")
 
+        pipeline_specified = any(
+            arg == "--pipeline" or arg.startswith("--pipeline=") for arg in argv
+        )
+        if not pipeline_specified and not args.resume:
+            target_pipeline = pathlib.Path("pipelines/slim/two_node.dot")
+        else:
+            target_pipeline = args.pipeline
+
         # --workdir defaults to cwd in the argparse setup above; the resolver
         # uses it to also look up <workdir>/dark-factory/pipelines/<name> for
         # bare-filename --pipeline values (target-repo subdir convention).
-        pipeline_path = resolve_pipeline_path(args.pipeline, workdir=args.workdir)
+        pipeline_path = resolve_pipeline_path(target_pipeline, workdir=args.workdir)
 
         if args.preflight:
             graph, diagnostics = validate_pipeline(pipeline_path)
@@ -406,6 +431,8 @@ def main(argv: list[str] | None = None) -> int:
                 p.error("--backend ao requires --ao-project")
             ctx.state["ao.project"] = args.ao_project
             ctx.state["ao.agent"] = args.ao_agent
+        if args.agy_agent:
+            ctx.state["agy.agent"] = args.agy_agent
         if args.ao_session:
             ctx.state["ao.session"] = args.ao_session
         if args.ao_worktree:

@@ -495,23 +495,17 @@ def _codergen_workdir(ctx: "Context") -> "Path | str | None":
     """Resolve the worktree the coder ran in.
 
     Prefers ``ctx.state["ao.worktree"]`` when it is an absolute, non-traversing
-    path to an existing directory (defense in depth against a forged/stale
-    value); otherwise falls back to ``ctx.workdir``. Shared by ``_stash_diff``
-    and ``_stash_codergen_receipt`` so both target the same tree.
+    path to an existing directory; otherwise falls back to ``ctx.workdir``.
+    Delegates to canonical ``_target_worktree`` helper.
     """
-    ao_wt = ctx.state.get("ao.worktree")
-    if ao_wt:
-        ao_path = pathlib.Path(str(ao_wt))
-        if (
-            ao_path.is_absolute()
-            and ".." not in ao_path.parts
-            and ao_path.is_dir()
-        ):
-            return str(ao_wt)
     try:
-        return ctx.workdir
-    except AttributeError:
-        return None
+        return str(_handlers_shim._target_worktree(ctx))
+    except Exception:
+        try:
+            return ctx.workdir
+        except AttributeError:
+            return None
+
 
 
 def _parse_commands_run_md(text: str) -> list[tuple[str, int]]:
@@ -680,7 +674,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         agent = ctx.state.get("ao.agent", "claude-code")
         session = ctx.state.get("ao.session")
         if not session:
-            spawn_args = ["ao", "spawn", prompt_text, "-p", project, "--agent", agent]
+            spawn_args = ["ao", "spawn", "--prompt", prompt_text, "--project", project, "--harness", agent]
             spawn_args = _handlers_shim._sandboxed_args(spawn_args)
             if spawn_args is None:
                 return _finalize(Result(outcome="failure", output="sandbox-exec unavailable"))
@@ -963,6 +957,13 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             ))
     elif backend == "agy":
         timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "600"), 600)
+        agent_name = (
+            node.attrs.get("agy_agent")
+            or node.attrs.get("agent")
+            or ctx.state.get("agy.agent")
+            or ctx.state.get("agy_agent")
+            or "gemini-3.6-flash-high"
+        )
         task_dir = ctx.workdir / ".dark-factory"
         task_dir.mkdir(parents=True, exist_ok=True)
         task_file = task_dir / f"agy-task-{node.name}.md"
@@ -987,6 +988,8 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         )
         args = _handlers_shim._sandboxed_args_for_workdir([
             "agy",
+            "--agent",
+            str(agent_name),
             "--add-dir",
             str(ctx.workdir),
             "--dangerously-skip-permissions",
@@ -1011,7 +1014,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             return _finalize(Result(
                 outcome="error",
                 output=f"agy backend not found: {exc}",
-                metadata={"returncode": "127", "backend_missing": "true"},
+                metadata={"returncode": "127", "backend_missing": "true", "agy_agent": str(agent_name)},
             ))
         try:
             stdout, stderr = proc.communicate(timeout=timeout_s + 30)
@@ -1028,7 +1031,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             output = stdout + ("\nSTDERR:\n" + stderr if stderr else "")
             wall_ms = int((time.monotonic() - _start_ts) * 1000)
             metrics = _handlers_shim._codergen_metrics(stdout, stderr, wall_ms)
-            meta = {"returncode": str(proc.returncode if proc.returncode is not None else ""), "timed_out": "true"}
+            meta = {"returncode": str(proc.returncode if proc.returncode is not None else ""), "timed_out": "true", "agy_agent": str(agent_name)}
             meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
             return _finalize(Result(
                 outcome="failure",
@@ -1041,7 +1044,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             outcome = "failure"
         wall_ms = int((time.monotonic() - _start_ts) * 1000)
         metrics = _handlers_shim._codergen_metrics(stdout, stderr, wall_ms)
-        meta = {"returncode": str(proc.returncode)}
+        meta = {"returncode": str(proc.returncode), "agy_agent": str(agent_name)}
         meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
         if outcome == "success":
             _stash_diff(node, ctx)

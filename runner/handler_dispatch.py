@@ -548,16 +548,43 @@ def _build_controller_codex_transport(args: list[str]) -> list[str]:
             if mode != "read-only":
                 raise ValueError("controller transport requires read-only codex sandboxing")
 
-    return prepared[:codex_index] + [
-        "codex",
-        "exec",
+    # Construct transport: preserve any `sandbox-exec -p ...` wrapper
+    # prefix from the original argv, then append the controller transport
+    # flags after `codex exec`. Stripping the wrapper would lose the
+    # seatbelt profile and trigger nested sandbox_apply failures on macOS.
+    prefix = prepared[:codex_index + 2]
+
+    # Filter out old transport flags and the original prompt positional
+    # before appending the canonical controller flags.
+    codex_tail = codex_args[2:]
+    safe_tail: list[str] = []
+    skip_next = False
+    for idx, value in enumerate(codex_tail):
+        if skip_next:
+            skip_next = False
+            continue
+        if value in ("--yolo", "--json", "--ephemeral", "--skip-git-repo-check"):
+            continue
+        if value == "--sandbox":
+            skip_next = True
+            continue
+        if value.startswith("--sandbox="):
+            continue
+        # Drop the original trailing prompt positional (last non-flag arg).
+        if idx == len(codex_tail) - 1 and not value.startswith("-"):
+            continue
+        safe_tail.append(value)
+
+    return prefix + [
         "--json",
         "--ephemeral",
         "--skip-git-repo-check",
         "--sandbox",
         "read-only",
+        *safe_tail,
         "-",
     ]
+
 
 
 def _controller_codex_args(args: list[str]) -> list[str]:
@@ -622,12 +649,14 @@ def _run_gate_once(
     sub_env = _gate_subprocess_env(backend)
     if sub_args is None:
         return Result(
-            outcome="failure",
+            outcome="error",
             output="sandbox-exec unavailable",
             metadata={"slash_command": name, "verdict": "unknown",
                       "reviewer_backend": reviewer_backend, "sandbox": "unavailable",
+                      "backend_missing": "true",
                       **prompt_meta},
         )
+
     controller_requested = str(ctx.state.get("_df_controller_review_json") or "").lower() in {"true", "1", "yes", "on"}
     if controller_requested and backend != "codex":
         return Result(
@@ -886,7 +915,8 @@ def _probe_backend_installed(name: str) -> bool:
     existing ``subprocess.run(timeout=...)`` envelope in ``_run_gate_once`` to
     catch the hang, but the probe itself uses a 5s ceiling.
     """
-    bin_path = shutil.which(name)
+    bin_name = "claude" if name == "claude-sonnet" else name
+    bin_path = shutil.which(bin_name)
     if not bin_path:
         return False
     try:
@@ -905,6 +935,8 @@ def _probe_backend_installed(name: str) -> bool:
 def _resolve_adversarial_backend(
     priority: list[str] | None,
     ctx: "Context",
+    *,
+    controller_review: bool = False,
 ) -> tuple[str, dict[str, str]]:
     import runner.handlers as _handlers_shim  # late-bound shim
     """Pick the first installed backend from the adversarial priority queue.
@@ -938,19 +970,17 @@ def _resolve_adversarial_backend(
     skipped: list[str] = []
     resolved: str | None = None
     for name in priority:
+        if controller_review and name != "codex":
+            skipped.append(f"{name}(no_controller_transport)")
+            continue
         if _handlers_shim._probe_backend_installed(name):
             resolved = name
             break
         skipped.append(name)
 
-    # Fall through to the last entry even if uninstalled (the gate machinery
-    # will report backend_missing=true, which is a real infra failure that
-    # _execute_gate can route to claude on agy, or surface honestly otherwise).
-    # This keeps "nothing installed" honest: the resolver still returns a
-    # named backend so the gate runs, the gate's missing-binary path fires,
-    # and the operator sees the full skip list in metadata.
+    # Fall through to codex for controller review or last entry if uninstalled
     if resolved is None:
-        resolved = priority[-1] if priority else _DEFAULT_ADVERSARIAL_PRIORITY[-1]
+        resolved = "codex" if controller_review else (priority[-1] if priority else _DEFAULT_ADVERSARIAL_PRIORITY[-1])
 
     meta = {
         "adversarial_priority": ",".join(priority),
@@ -958,6 +988,7 @@ def _resolve_adversarial_backend(
         "adversarial_skipped": ",".join(skipped),
     }
     return resolved, meta
+
 
 
 def _resolve_gate_backend(node: "Node", ctx: "Context") -> tuple[str, dict[str, str]]:
@@ -1027,7 +1058,9 @@ def _resolve_gate_backend(node: "Node", ctx: "Context") -> tuple[str, dict[str, 
             # priority so every entry gets a real ``which``/``--version`` probe.
             if not priority:
                 priority = list(_DEFAULT_ADVERSARIAL_PRIORITY)
-            resolved, pq_meta = _resolve_adversarial_backend(priority, ctx)
+            controller_review = bool(node.attrs.get("review_contract")) or str(ctx.state.get("_df_controller_review_json") or "").lower() in {"true", "1", "yes", "on"}
+            resolved, pq_meta = _resolve_adversarial_backend(priority, ctx, controller_review=controller_review)
+
             ctx.state[prior_key] = resolved
             pq_meta["prefer_adversarial"] = "true" if prefer_adversarial else "false"
             pq_meta["reviewer_backend_resolution"] = "priority_queue"

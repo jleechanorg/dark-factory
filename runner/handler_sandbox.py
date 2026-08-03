@@ -344,6 +344,45 @@ def _linux_sandbox_prefix(denied_paths: "list[pathlib.Path]") -> "Optional[list[
     return [env_bin, f"LD_PRELOAD={lib}", f"DENY_PATHS={joined}"]
 
 
+_darwin_sandbox_exec_verified: "Optional[bool]" = None
+
+
+def _verify_darwin_sandbox_exec() -> bool:
+    """Test whether sandbox-exec can apply profiles on this macOS host.
+
+    When executing inside an existing sandbox (e.g., Antigravity agent CLI),
+    sandbox-exec fails with code 71 (`sandbox-exec: sandbox_apply: Operation not permitted`).
+    This canary check runs a minimal sandbox profile and caches the result for the
+    process lifetime.
+    """
+    global _darwin_sandbox_exec_verified
+    if _darwin_sandbox_exec_verified is not None:
+        return _darwin_sandbox_exec_verified
+    sandbox_exec = shutil.which("sandbox-exec")
+    if sandbox_exec is None:
+        _darwin_sandbox_exec_verified = False
+        return False
+    true_bin = shutil.which("true") or "/usr/bin/true"
+    try:
+        proc = subprocess.run(
+            [sandbox_exec, "-p", "(version 1)\n(allow default)", true_bin],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        _darwin_sandbox_exec_verified = proc.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        _darwin_sandbox_exec_verified = False
+    return bool(_darwin_sandbox_exec_verified)
+
+
+def _reset_darwin_sandbox_verification_cache_for_tests() -> None:
+    """Test-only: clear the process-lifetime macOS sandbox verification cache."""
+    global _darwin_sandbox_exec_verified
+    _darwin_sandbox_exec_verified = None
+
+
 def _sandboxed_args(args: list[str]) -> Optional[list[str]]:
     """Prepend the platform sandbox wrapper with the legacy holdout deny rules.
 
@@ -360,6 +399,8 @@ def _sandboxed_args(args: list[str]) -> Optional[list[str]]:
     if os.environ.get("DISABLE_SANDBOX"):
         return args
     if sys.platform == "darwin":
+        if not _verify_darwin_sandbox_exec():
+            return None
         sandbox_exec = shutil.which("sandbox-exec")
         if sandbox_exec is None:
             return None
@@ -399,6 +440,8 @@ def _sandboxed_args_for_workdir(
     if os.environ.get("DISABLE_SANDBOX"):
         return args
     if sys.platform == "darwin":
+        if not _verify_darwin_sandbox_exec():
+            return None
         sandbox_exec = shutil.which("sandbox-exec")
         if sandbox_exec is None:
             return None
@@ -412,3 +455,4 @@ def _sandboxed_args_for_workdir(
             return None
         return prefix + args
     return None
+

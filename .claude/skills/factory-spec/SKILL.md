@@ -141,14 +141,11 @@ graph, CXDB, logs, and evidence envelope — same reasoning as `/f`.
 
 ## Pipeline selection (mandatory before `/f` or `/factory`)
 
-Full decision table:
-`~/projects/dark-factory/docs/pipeline-selection.md`
-
-**Do not default every run to one `.dot`.** If the user did not pass `--pipeline`,
-classify the goal (Step 0 below) and pick from this quick guide:
+When `--pipeline` is omitted, `/f` and `/factory` default to `two_node` (`pipelines/slim/two_node.dot`). To opt into a non-default pipeline, pass explicit `--pipeline <name>`.
 
 | Task | Pipeline |
 |------|----------|
+| **Default `/f` / `/factory` invocation** | `pipelines/slim/two_node.dot` (generic worker + controller cold reviewer) |
 | **Create a reviewed spec (main + attractor)** | `pipelines/slim/spec_gen.dot` ← `/fs` create mode (default) |
 | **Create only the main spec** | `pipelines/slim/spec_gen.dot` ← `/fs --skip-attractor` |
 | Smoke / wiring | `pipelines/factory/hello.dot` |
@@ -160,8 +157,8 @@ classify the goal (Step 0 below) and pick from this quick guide:
 | Spec review full (legacy attractor) | `benchmarks/attractor-spec-review/pipelines/review_full.dot` |
 | Brownfield replace/delete | custom goal + delete-first rules; often `minimal_feature.dot` or custom `.dot` |
 
-Short names for `--pipeline`: `spec_gen`, `gates`, `hello`, `pr_gates`, `minimal_pr`,
-`minimal_feature`, `review_slim`, `review_full`.
+Short names for `--pipeline`: `two_node`, `spec_gen`, `gates`, `hello`, `pr_gates`,
+`minimal_pr`, `minimal_feature`, `review_slim`, `review_full`.
 
 **Repo-specific pipelines (target-repo subdir convention):** graphs that
 hardcode the target repo's own slash commands or repo-specific review
