@@ -45,10 +45,10 @@ def _init_clean_repo(tmp: Path) -> Path:
     _git(repo, "config", "user.email", "jleechan2015@users.noreply.github.com")
     _git(repo, "config", "user.name", "ci")
     (repo / "README.md").write_text("hello\n")
-    evidence = repo / "evidence" / "worker-verification.json"
+    evidence = repo / "evidence" / "operator-verification.json"
     evidence.parent.mkdir()
-    evidence.write_text('{"schema_version": 1}\n')
-    _git(repo, "add", "README.md", "evidence/worker-verification.json")
+    evidence.write_text('{"schema_version": 2}\n')
+    _git(repo, "add", "README.md", "evidence/operator-verification.json")
     _git(repo, "commit", "-q", "-m", "init")
     _git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
     return repo
@@ -240,13 +240,16 @@ class SharedHelperTests(unittest.TestCase):
                 worker_calls.append(node.name)
                 return Result(outcome="success", output="worker complete")
 
+            def _operator(node, ctx):
+                return Result(outcome="success", output="operator fixture")
+
             ctx = Context(
                 goal="review the exact target",
                 workdir=repo,
                 backend="codex",
                 run_id=f"graph-timeout-{tmp.name}",
             )
-            with patch.dict(TYPE_REGISTRY, {"codergen": _worker}), patch(
+            with patch.dict(TYPE_REGISTRY, {"codergen": _worker, "operator_verify": _operator}), patch(
                 "runner.handler_parallel_reviewer._resolve_gate_backend",
                 return_value=("codex", {"reviewer_backend_resolution": "test"}),
             ), patch(
@@ -290,6 +293,9 @@ class SharedHelperTests(unittest.TestCase):
                 worker_calls.append(node.name)
                 return Result(outcome="success", output="worker complete")
 
+            def _operator(node, ctx):
+                return Result(outcome="success", output="operator fixture")
+
             def _canonical_sequence(request, **kwargs):
                 output_dirs.append(Path(kwargs["output_dir"]))
                 verdict = "fail" if len(output_dirs) == 1 else "pass"
@@ -318,7 +324,7 @@ class SharedHelperTests(unittest.TestCase):
                 backend="codex",
                 run_id=f"graph-retry-{tmp.name}",
             )
-            with patch.dict(TYPE_REGISTRY, {"codergen": _worker}), patch(
+            with patch.dict(TYPE_REGISTRY, {"codergen": _worker, "operator_verify": _operator}), patch(
                 "runner.handler_parallel_reviewer._resolve_gate_backend",
                 return_value=("codex", {"reviewer_backend_resolution": "test"}),
             ), patch(

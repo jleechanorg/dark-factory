@@ -434,6 +434,142 @@ def test_receipt_validation_rejects_structural_tampering(
         )
 
 
+def _run_fake_operator(
+    tmp_path: pathlib.Path,
+    monkeypatch,
+    results,
+    *,
+    after_call=None,
+    patch_raw_write=None,
+):
+    tool = tmp_path / "tools" / "fake-pytest"
+    tool.parent.mkdir(parents=True)
+    tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    tool.chmod(0o700)
+    manifest = _write_operator_manifest(
+        tmp_path,
+        """\
+operator_verification:
+  schema_version: 1
+  commands:
+    - id: probe
+      argv: [tools/fake-pytest]
+      lane: operator_unwrapped
+      timeout_seconds: 30
+      classification: required
+  exclusions: []
+""",
+    )
+    import runner.handlers  # noqa: F401
+    import runner.handler_audit as ha
+    from runner.handler_core import Context
+    from runner.parser import Node
+
+    sequence = iter(results)
+    calls = 0
+
+    def fake_bounded(args, **kwargs):
+        nonlocal calls
+        calls += 1
+        result = next(sequence)
+        if after_call is not None:
+            after_call(calls, manifest)
+        return result
+
+    monkeypatch.setattr(ha, "run_bounded_process_bytes", fake_bounded)
+    monkeypatch.setattr(ha, "_operator_log_root", lambda: tmp_path / "private")
+    monkeypatch.setattr(ha._handlers_shim, "_sanitized_env", lambda: {})
+    if patch_raw_write is not None:
+        patch_raw_write(ha, monkeypatch)
+    ctx = Context(goal="fail closed", workdir=tmp_path, backend="codex", run_id="fail")
+    return ha._operator_verify(
+        Node(name="operator_verify", attrs={"type": "operator_verify"}), ctx
+    )
+
+
+def test_operator_verify_fails_closed_on_source_and_manifest_drift(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    from runner.subprocess_control import BoundedProcessBytesResult
+
+    head = b"1" * 40 + b"\n"
+    changed = b"2" * 40 + b"\n"
+    ok = lambda output=b"": BoundedProcessBytesResult(("fake",), 0, output, b"", False)
+    source_result = _run_fake_operator(
+        tmp_path / "source",
+        monkeypatch,
+        [ok(head), ok(), ok(), ok(), ok(), ok(changed)],
+    )
+    assert source_result.outcome == "error"
+    assert source_result.metadata["error_type"] == "source_head_drift"
+
+    def drift_after_head(call, manifest):
+        if call == 1:
+            manifest.write_text(manifest.read_text() + "\n# drift\n", encoding="utf-8")
+
+    manifest_result = _run_fake_operator(
+        tmp_path / "manifest",
+        monkeypatch,
+        [ok(head)],
+        after_call=drift_after_head,
+    )
+    assert manifest_result.outcome == "error"
+    assert manifest_result.metadata["error_type"] == "ValueError"
+
+
+def test_operator_verify_fails_closed_on_timeout_oversize_and_raw_write_failure(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    import runner.handler_audit as ha
+    from runner.subprocess_control import BoundedProcessBytesResult
+
+    head = b"3" * 40 + b"\n"
+    ok = lambda output=b"": BoundedProcessBytesResult(("fake",), 0, output, b"", False)
+    timeout = BoundedProcessBytesResult(("fake",), -15, b"partial", b"", True)
+    timeout_result = _run_fake_operator(
+        tmp_path / "timeout",
+        monkeypatch,
+        [ok(head), ok(), ok(), ok(), timeout],
+    )
+    assert timeout_result.outcome == "error"
+    assert timeout_result.metadata["error_type"] == "timeout"
+
+    nonzero = BoundedProcessBytesResult(("fake",), 2, b"", b"failed", False)
+    nonzero_result = _run_fake_operator(
+        tmp_path / "nonzero",
+        monkeypatch,
+        [ok(head), ok(), ok(), ok(), nonzero],
+    )
+    assert nonzero_result.outcome == "failure"
+    assert nonzero_result.metadata["error_type"] == "nonzero_exit"
+
+    oversized = ok(b"x" * (ha._OPERATOR_RAW_STREAM_MAX_BYTES + 1))
+    oversize_result = _run_fake_operator(
+        tmp_path / "oversize",
+        monkeypatch,
+        [ok(head), ok(), ok(), ok(), oversized],
+    )
+    assert oversize_result.outcome == "error"
+
+    def fail_raw_write(module, mp):
+        real_write = module._write_private_bytes
+
+        def guarded(path, data):
+            if "05-probe.stdout" in path.name:
+                raise OSError("simulated raw-log write failure")
+            return real_write(path, data)
+
+        mp.setattr(module, "_write_private_bytes", guarded)
+
+    write_result = _run_fake_operator(
+        tmp_path / "write",
+        monkeypatch,
+        [ok(head), ok(), ok(), ok(), ok()],
+        patch_raw_write=fail_raw_write,
+    )
+    assert write_result.outcome == "error"
+
+
 def test_default_probe_list_is_vendor_neutral():
     import runner.handlers  # noqa: F401
     from runner.handler_audit import DEFAULT_EVIDENCE_FILENAMES
