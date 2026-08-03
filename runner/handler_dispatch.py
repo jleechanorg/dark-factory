@@ -1147,7 +1147,7 @@ def _resolve_gate_backend(node: "Node", ctx: "Context") -> tuple[str, dict[str, 
             # ``claude-sonnet`` — that would skip probing codex / minimax /
             # agy in the default queue and silently collapse cross-vendor
             # review back onto Anthropic. Fall back to the full default
-            # priority so every entry gets a real ``which``/``--version`` probe.
+            # priority so every entry gets its configured availability probe.
             if not priority:
                 priority = list(_DEFAULT_ADVERSARIAL_PRIORITY)
             controller_review = bool(node.attrs.get("review_contract")) or str(ctx.state.get("_df_controller_review_json") or "").lower() in {"true", "1", "yes", "on"}
