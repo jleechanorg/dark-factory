@@ -16,16 +16,21 @@ Owns:
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import pathlib
+import re
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import runner.handlers as _handlers_shim
 
 from .handler_core import Result, _gate_strict_flag
+from .subprocess_control import BoundedProcessBytesResult, run_bounded_process_bytes
 
 if TYPE_CHECKING:
     from .parser import Node
@@ -43,6 +48,472 @@ DEFAULT_EVIDENCE_FILENAMES: tuple[str, ...] = (
     "llm_responses.jsonl",
     "evidence.jsonl",
 )
+
+_OPERATOR_MANIFEST_MAX_BYTES = 1 << 20
+_OPERATOR_TIMEOUT_MIN_SECONDS = 5
+_OPERATOR_TIMEOUT_MAX_SECONDS = 1800
+_OPERATOR_LANES = frozenset({"worker_safe", "operator_unwrapped"})
+_OPERATOR_CLASSIFICATIONS = frozenset({"required"})
+_OPERATOR_EXECUTABLE_ALLOWLIST = frozenset({"/usr/bin/git"})
+_OPERATOR_ID_RE = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
+_OPERATOR_RAW_STREAM_MAX_BYTES = 8 << 20
+_OPERATOR_RECEIPT_MAX_BYTES = 1 << 20
+
+_OPERATOR_BUILTINS: tuple[OperatorCommand, ...] = ()  # populated after dataclass declaration
+
+
+def _reject_unknown_keys(value: dict, allowed: frozenset[str], label: str) -> None:
+    unknown = set(value) - allowed
+    if unknown:
+        raise ValueError(f"{label} has unknown keys: {sorted(unknown)}")
+
+
+def _operator_executable(workdir: pathlib.Path, raw: str) -> str:
+    if "\0" in raw:
+        raise ValueError("operator executable contains NUL")
+    candidate = pathlib.Path(raw)
+    if candidate.is_absolute():
+        if raw not in _OPERATOR_EXECUTABLE_ALLOWLIST:
+            raise ValueError("operator executable is not an exact allowlist entry")
+        if candidate.is_symlink() or not candidate.is_file() or not os.access(candidate, os.X_OK):
+            raise ValueError("allowlisted operator executable is unavailable")
+        return raw
+
+    if ".." in candidate.parts:
+        raise ValueError("operator executable escapes the target worktree")
+    root = workdir.resolve()
+    lexical = root / candidate
+    current = root
+    for part in candidate.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError("operator executable path contains a symlink")
+    resolved = lexical.resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("operator executable escapes the target worktree") from exc
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise ValueError("operator executable must be a regular executable inside the worktree")
+    return str(resolved)
+
+
+@dataclass(frozen=True, slots=True)
+class OperatorCommand:
+    id: str
+    argv: tuple[str, ...]
+    lane: str
+    timeout_seconds: int
+    classification: str
+
+
+@dataclass(frozen=True, slots=True)
+class OperatorExclusion:
+    id: str
+    classification: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class OperatorManifest:
+    schema_version: int
+    commands: tuple[OperatorCommand, ...]
+    exclusions: tuple[OperatorExclusion, ...]
+    path: pathlib.Path
+    raw_bytes: bytes
+
+
+_OPERATOR_BUILTINS = (
+    OperatorCommand(
+        "git-head",
+        ("/usr/bin/git", "rev-parse", "HEAD"),
+        "operator_unwrapped",
+        30,
+        "required",
+    ),
+    OperatorCommand(
+        "git-diff-names",
+        ("/usr/bin/git", "diff", "--name-only", "origin/main..HEAD"),
+        "operator_unwrapped",
+        30,
+        "required",
+    ),
+    OperatorCommand(
+        "git-diff-check",
+        ("/usr/bin/git", "diff", "--check", "origin/main..HEAD"),
+        "operator_unwrapped",
+        30,
+        "required",
+    ),
+    OperatorCommand(
+        "git-status",
+        ("/usr/bin/git", "status", "--porcelain=v1"),
+        "operator_unwrapped",
+        30,
+        "required",
+    ),
+)
+_OPERATOR_FINAL_HEAD = OperatorCommand(
+    "git-head-final",
+    ("/usr/bin/git", "rev-parse", "HEAD"),
+    "operator_unwrapped",
+    30,
+    "required",
+)
+
+
+def _operator_log_root() -> pathlib.Path:
+    return pathlib.Path.home() / ".dark-factory" / "operator-verification"
+
+
+def _safe_operator_component(raw: str, fallback: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw).strip("._")
+    return normalized[:80] or fallback
+
+
+def _private_directory(path: pathlib.Path) -> None:
+    if path.is_symlink():
+        raise OSError(f"private operator path is a symlink: {path}")
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.chmod(0o700)
+
+
+def _write_private_bytes(path: pathlib.Path, data: bytes) -> None:
+    if path.is_symlink():
+        raise OSError(f"private operator log is a symlink: {path}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except Exception:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _stream_reference(path: pathlib.Path, data: bytes) -> dict[str, object]:
+    return {
+        "path": str(path),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "size_bytes": len(data),
+    }
+
+
+def _command_receipt(
+    command: OperatorCommand,
+    result: BoundedProcessBytesResult,
+    *,
+    cwd: pathlib.Path,
+    duration_ms: int,
+    stdout_path: pathlib.Path,
+    stderr_path: pathlib.Path,
+) -> dict[str, object]:
+    argv = list(command.argv)
+    return {
+        "id": command.id,
+        "lane": command.lane,
+        "classification": command.classification,
+        "requested_argv": argv,
+        "effective_argv": argv,
+        "transform_chain": [],
+        "cwd": str(cwd),
+        "exit_code": result.returncode,
+        "timed_out": result.timed_out,
+        "duration_ms": duration_ms,
+        "stdout": _stream_reference(stdout_path, result.stdout),
+        "stderr": _stream_reference(stderr_path, result.stderr),
+    }
+
+
+def _write_operator_receipt(path: pathlib.Path, receipt: dict[str, object]) -> str:
+    encoded = (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    if len(encoded) > _OPERATOR_RECEIPT_MAX_BYTES:
+        raise ValueError("operator verification receipt exceeds size bound")
+    if path.is_symlink() or path.parent.is_symlink():
+        raise OSError("operator verification receipt path is a symlink")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    if temp.exists() or temp.is_symlink():
+        temp.unlink()
+    _write_private_bytes(temp, encoded)
+    os.replace(temp, path)
+    path.chmod(0o600)
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_operator_receipt(path: pathlib.Path, expected_head: str) -> str:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("operator verification receipt is missing or a symlink")
+    encoded = path.read_bytes()
+    if len(encoded) > _OPERATOR_RECEIPT_MAX_BYTES:
+        raise ValueError("operator verification receipt exceeds size bound")
+    receipt = json.loads(encoded)
+    if receipt.get("schema_version") != 2 or receipt.get("target_head_sha") != expected_head:
+        raise ValueError("operator verification receipt/head mismatch")
+    for command in receipt.get("commands", []):
+        if command.get("requested_argv") != command.get("effective_argv"):
+            raise ValueError("operator verification argv mismatch")
+        if command.get("transform_chain") != []:
+            raise ValueError("operator verification transform chain is not empty")
+        for stream_name in ("stdout", "stderr"):
+            reference = command.get(stream_name, {})
+            raw_path = pathlib.Path(str(reference.get("path", "")))
+            if raw_path.is_symlink() or not raw_path.is_file():
+                raise ValueError("operator verification raw log is missing or a symlink")
+            data = raw_path.read_bytes()
+            if len(data) != reference.get("size_bytes"):
+                raise ValueError("operator verification raw-log size mismatch")
+            if hashlib.sha256(data).hexdigest() != reference.get("sha256"):
+                raise ValueError("operator verification raw-log digest mismatch")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _load_operator_manifest(workdir: pathlib.Path) -> OperatorManifest:
+    manifest_path = workdir / ".dark-factory" / "evidence.yaml"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise ValueError("operator verification manifest is missing or a symlink")
+    raw = manifest_path.read_bytes()
+    if len(raw) > _OPERATOR_MANIFEST_MAX_BYTES:
+        raise ValueError("operator verification manifest exceeds size bound")
+    import yaml
+
+    try:
+        data = yaml.safe_load(raw) or {}
+    except yaml.YAMLError as exc:
+        raise ValueError("operator verification manifest is malformed YAML") from exc
+    if not isinstance(data, dict):
+        raise ValueError("operator verification manifest must be a mapping")
+    _reject_unknown_keys(data, frozenset({"aliases", "operator_verification"}), "manifest")
+    operator = data.get("operator_verification") if isinstance(data, dict) else None
+    if not isinstance(operator, dict) or operator.get("schema_version") != 1:
+        raise ValueError("operator_verification schema_version must be 1")
+    _reject_unknown_keys(
+        operator,
+        frozenset({"schema_version", "commands", "exclusions"}),
+        "operator_verification",
+    )
+    raw_commands = operator.get("commands")
+    if not isinstance(raw_commands, list) or not raw_commands:
+        raise ValueError("operator_verification commands must be a non-empty list")
+
+    commands: list[OperatorCommand] = []
+    seen_ids: set[str] = set()
+    for entry in raw_commands:
+        if not isinstance(entry, dict):
+            raise ValueError("operator command must be a mapping")
+        _reject_unknown_keys(
+            entry,
+            frozenset({"id", "argv", "lane", "timeout_seconds", "classification"}),
+            "operator command",
+        )
+        command_id = entry.get("id")
+        if not isinstance(command_id, str) or not _OPERATOR_ID_RE.fullmatch(command_id):
+            raise ValueError("operator command id is invalid")
+        if command_id in seen_ids:
+            raise ValueError("operator verification ids must be unique")
+        seen_ids.add(command_id)
+        argv = entry.get("argv") if isinstance(entry, dict) else None
+        if (
+            not isinstance(argv, list)
+            or not argv
+            or not all(isinstance(v, str) and v and "\0" not in v for v in argv)
+        ):
+            raise ValueError("operator command argv must be a non-empty string array")
+        lane = entry.get("lane")
+        if lane not in _OPERATOR_LANES:
+            raise ValueError("operator command lane is invalid")
+        classification = entry.get("classification")
+        if classification not in _OPERATOR_CLASSIFICATIONS:
+            raise ValueError("operator command classification is invalid")
+        timeout = entry.get("timeout_seconds")
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, int)
+            or not _OPERATOR_TIMEOUT_MIN_SECONDS <= timeout <= _OPERATOR_TIMEOUT_MAX_SECONDS
+        ):
+            raise ValueError("operator command timeout is outside the bounded range")
+        commands.append(
+            OperatorCommand(
+                id=command_id,
+                argv=(_operator_executable(workdir, argv[0]), *argv[1:]),
+                lane=lane,
+                timeout_seconds=timeout,
+                classification=classification,
+            )
+        )
+
+    raw_exclusions = operator.get("exclusions", [])
+    if not isinstance(raw_exclusions, list):
+        raise ValueError("operator exclusions must be a list")
+    exclusions: list[OperatorExclusion] = []
+    for entry in raw_exclusions:
+        if not isinstance(entry, dict):
+            raise ValueError("operator exclusion must be a mapping")
+        _reject_unknown_keys(
+            entry, frozenset({"id", "classification", "reason"}), "operator exclusion"
+        )
+        exclusion_id = entry.get("id")
+        if not isinstance(exclusion_id, str) or not _OPERATOR_ID_RE.fullmatch(exclusion_id):
+            raise ValueError("operator exclusion id is invalid")
+        if exclusion_id in seen_ids:
+            raise ValueError("operator verification ids must be unique")
+        seen_ids.add(exclusion_id)
+        if entry.get("classification") != "excluded":
+            raise ValueError("operator exclusion classification must be excluded")
+        reason = entry.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("operator exclusion reason is required")
+        exclusions.append(OperatorExclusion(exclusion_id, "excluded", reason.strip()))
+    return OperatorManifest(1, tuple(commands), exclusions, manifest_path, raw)
+
+
+def _operator_verify(node: "Node", ctx: "Context") -> Result:
+    """Run exact post-worker verification outside the worker sandbox."""
+    workdir = pathlib.Path(ctx.workdir).resolve()
+    try:
+        manifest = _load_operator_manifest(workdir)
+        manifest_sha = hashlib.sha256(manifest.raw_bytes).hexdigest()
+        visit = 1 + sum(
+            1 for item in ctx.history if item.get("node") == node.name
+        )
+        raw_dir = (
+            _operator_log_root()
+            / _safe_operator_component(str(ctx.run_id or "adhoc"), "adhoc")
+            / _safe_operator_component(node.name, "operator_verify")
+            / str(visit)
+        )
+        _private_directory(raw_dir)
+    except Exception as exc:
+        return Result(
+            outcome="error",
+            output=f"operator verification setup failed: {type(exc).__name__}",
+            metadata={"error_type": "operator_setup"},
+        )
+
+    receipt_commands: list[dict[str, object]] = []
+    failure_outcome = "success"
+    failure_type = ""
+    target_head = ""
+    final_head = ""
+    commands = (*_OPERATOR_BUILTINS, *manifest.commands, _OPERATOR_FINAL_HEAD)
+    env = _handlers_shim._sanitized_env()
+
+    for index, command in enumerate(commands, start=1):
+        try:
+            if manifest.path.read_bytes() != manifest.raw_bytes:
+                raise ValueError("operator verification manifest drifted during execution")
+            started = time.monotonic_ns()
+            result = run_bounded_process_bytes(
+                command.argv,
+                cwd=workdir,
+                timeout=command.timeout_seconds,
+                env=env,
+            )
+            duration_ms = max(0, (time.monotonic_ns() - started) // 1_000_000)
+            if (
+                len(result.stdout) > _OPERATOR_RAW_STREAM_MAX_BYTES
+                or len(result.stderr) > _OPERATOR_RAW_STREAM_MAX_BYTES
+            ):
+                raise ValueError("operator verification output exceeded size bound")
+            stdout_path = raw_dir / f"{index:02d}-{command.id}.stdout.bin"
+            stderr_path = raw_dir / f"{index:02d}-{command.id}.stderr.bin"
+            _write_private_bytes(stdout_path, result.stdout)
+            _write_private_bytes(stderr_path, result.stderr)
+            receipt_commands.append(
+                _command_receipt(
+                    command,
+                    result,
+                    cwd=workdir,
+                    duration_ms=duration_ms,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                )
+            )
+            if command.id == "git-head":
+                target_head = result.stdout.decode("ascii", errors="strict").strip().lower()
+                if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", target_head):
+                    raise ValueError("operator verification target HEAD is malformed")
+            elif command.id == "git-head-final":
+                final_head = result.stdout.decode("ascii", errors="strict").strip().lower()
+            if result.timed_out:
+                failure_outcome = "error"
+                failure_type = "timeout"
+                break
+            if result.returncode != 0:
+                failure_outcome = "failure"
+                failure_type = "nonzero_exit"
+                break
+        except Exception as exc:
+            failure_outcome = "error"
+            failure_type = type(exc).__name__
+            break
+
+    if failure_outcome == "success" and final_head != target_head:
+        failure_outcome = "error"
+        failure_type = "source_head_drift"
+    if failure_outcome == "success":
+        try:
+            if manifest.path.read_bytes() != manifest.raw_bytes:
+                failure_outcome = "error"
+                failure_type = "manifest_drift"
+        except OSError:
+            failure_outcome = "error"
+            failure_type = "manifest_drift"
+
+    receipt = {
+        "schema_version": 2,
+        "target_head_sha": target_head,
+        "source_head_after": final_head,
+        "manifest": {
+            "path": str(manifest.path),
+            "sha256": manifest_sha,
+            "schema_version": manifest.schema_version,
+        },
+        "commands": receipt_commands,
+        "exclusions": [
+            {
+                "id": item.id,
+                "classification": item.classification,
+                "reason": item.reason,
+            }
+            for item in manifest.exclusions
+        ],
+        "outcome": failure_outcome,
+        "failure_type": failure_type or None,
+    }
+    receipt_path = workdir / "evidence" / "operator-verification.json"
+    try:
+        _write_operator_receipt(receipt_path, receipt)
+        receipt_sha = _validate_operator_receipt(receipt_path, target_head)
+    except Exception as exc:
+        return Result(
+            outcome="error",
+            output=f"operator verification receipt failed closed: {type(exc).__name__}",
+            metadata={"error_type": "receipt_validation"},
+        )
+
+    return Result(
+        outcome=failure_outcome,
+        output=(
+            f"operator verification {failure_outcome}; receipt="
+            "evidence/operator-verification.json"
+        ),
+        metadata={
+            "receipt_path": "evidence/operator-verification.json",
+            "receipt_sha256": receipt_sha,
+            "target_head_sha": target_head,
+            "command_count": str(len(receipt_commands)),
+            "error_type": failure_type,
+        },
+        context_updates={"operator_verification_receipt": "evidence/operator-verification.json"},
+    )
 
 
 def _load_evidence_aliases(workdir: pathlib.Path) -> list[str]:
