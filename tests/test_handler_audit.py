@@ -209,6 +209,27 @@ def test_operator_verify_rejects_fresh_manifest_python_code_execution(
     assert not (tmp_path / "owned").exists()
 
 
+def test_target_provenance_hashes_untracked_file_contents(tmp_path: pathlib.Path) -> None:
+    import subprocess
+    subprocess.run(["/usr/bin/git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["/usr/bin/git", "config", "user.email", "jleechan2015@users.noreply.github.com"], cwd=tmp_path, check=True)
+    subprocess.run(["/usr/bin/git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    (tmp_path / "tracked.txt").write_text("tracked\n")
+    subprocess.run(["/usr/bin/git", "add", "tracked.txt"], cwd=tmp_path, check=True)
+    subprocess.run(["/usr/bin/git", "commit", "-qm", "tracked"], cwd=tmp_path, check=True)
+    import runner.handlers  # noqa: F401
+    import runner.handler_audit as ha
+
+    untracked = tmp_path / "payload.bin"
+    untracked.write_bytes(b"first-content")
+    first_head, first_workspace = ha._target_provenance(tmp_path)
+    untracked.write_bytes(b"second-content")
+    second_head, second_workspace = ha._target_provenance(tmp_path)
+
+    assert first_head == second_head
+    assert first_workspace != second_workspace
+
+
 @pytest.mark.parametrize(
     "mutated",
     [
@@ -489,6 +510,55 @@ def test_private_log_write_stays_bound_to_open_directory_after_path_swap(
 
     assert (moved / "stream.bin").read_bytes() == b"sealed"
     assert not (attacker / "stream.bin").exists()
+
+
+def test_receipt_publication_stays_bound_to_open_parent_after_path_swap(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    import runner.handlers  # noqa: F401
+    import runner.handler_audit as ha
+
+    parent = tmp_path / "evidence"
+    parent.mkdir()
+    moved = tmp_path / "moved-evidence"
+    attacker = tmp_path / "attacker"
+    attacker.mkdir()
+    receipt_path = parent / "operator-verification.json"
+    receipt = {"schema_version": 2, "target_head_sha": "a" * 40, "commands": []}
+    real_replace = os.replace
+    swapped = False
+    def swap_then_replace(*args, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            parent.rename(moved)
+            parent.symlink_to(attacker, target_is_directory=True)
+        return real_replace(*args, **kwargs)
+    monkeypatch.setattr(os, "replace", swap_then_replace)
+
+    ha._write_operator_receipt(receipt_path, receipt)
+
+    assert (moved / receipt_path.name).is_file()
+    assert not (attacker / receipt_path.name).exists()
+
+
+def test_receipt_validation_rejects_symlinked_receipt_parent(
+    tmp_path: pathlib.Path,
+) -> None:
+    import runner.handlers  # noqa: F401
+    import runner.handler_audit as ha
+
+    real_parent = tmp_path / "real"
+    real_parent.mkdir()
+    receipt = {"schema_version": 2, "target_head_sha": "b" * 40, "commands": []}
+    (real_parent / "operator-verification.json").write_text(json.dumps(receipt))
+    linked_parent = tmp_path / "linked"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+
+    with pytest.raises((OSError, ValueError)):
+        ha._validate_operator_receipt(
+            linked_parent / "operator-verification.json", "b" * 40
+        )
 
 
 def test_receipt_validation_rejects_symlinked_raw_log_parent(

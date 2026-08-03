@@ -91,6 +91,25 @@ def _target_provenance(workdir: pathlib.Path) -> tuple[str, str]:
         )
         digest.update(len(result.stdout).to_bytes(8, "big"))
         digest.update(result.stdout)
+    untracked = subprocess.run(
+        (
+            "/usr/bin/git", "ls-files", "--others", "--exclude-standard", "-z",
+            "--", ".", ":(exclude)evidence/operator-verification.json",
+        ),
+        cwd=root, capture_output=True, check=True, timeout=30,
+    ).stdout.split(b"\0")
+    untracked_paths = [
+        value.decode("utf-8", errors="surrogateescape")
+        for value in untracked if value
+    ]
+    for offset in range(0, len(untracked_paths), 128):
+        chunk = untracked_paths[offset:offset + 128]
+        content_hashes = subprocess.run(
+            ["/usr/bin/git", "hash-object", "--no-filters", "--", *chunk],
+            cwd=root, capture_output=True, check=True, timeout=30,
+        ).stdout
+        digest.update(len(content_hashes).to_bytes(8, "big"))
+        digest.update(content_hashes)
     return head, digest.hexdigest()
 
 
@@ -243,7 +262,7 @@ def _private_directory(path: pathlib.Path) -> None:
     os.close(fd)
 
 
-def _open_private_directory(path: pathlib.Path) -> int:
+def _open_private_directory(path: pathlib.Path, *, create: bool = True) -> int:
     absolute = path.expanduser()
     if not absolute.is_absolute():
         raise OSError("private operator path must be absolute")
@@ -253,10 +272,11 @@ def _open_private_directory(path: pathlib.Path) -> int:
     current_fd = os.open("/", directory_flags)
     try:
         for part in absolute.parts[1:]:
-            try:
-                os.mkdir(part, 0o700, dir_fd=current_fd)
-            except FileExistsError:
-                pass
+            if create:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=current_fd)
+                except FileExistsError:
+                    pass
             next_fd = os.open(part, directory_flags, dir_fd=current_fd)
             os.close(current_fd)
             current_fd = next_fd
@@ -295,6 +315,30 @@ def _write_private_bytes(path: pathlib.Path, data: bytes) -> None:
         os.close(directory_fd)
 
 
+def _read_private_bytes_at(directory_fd: int, name: str, max_bytes: int) -> bytes:
+    if pathlib.PurePath(name).name != name or name in {"", ".", ".."}:
+        raise OSError("private file name must be one component")
+    file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    file_fd = os.open(name, file_flags, dir_fd=directory_fd)
+    try:
+        metadata = os.fstat(file_fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > max_bytes:
+            raise ValueError("private file is invalid")
+        chunks: list[bytes] = []
+        size = 0
+        while size <= max_bytes:
+            chunk = os.read(file_fd, min(65536, max_bytes + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        if size > max_bytes:
+            raise ValueError("private file exceeds size bound")
+        return b"".join(chunks)
+    finally:
+        os.close(file_fd)
+
+
 def _read_private_bytes_beneath(
     private_root: pathlib.Path, path: pathlib.Path, max_bytes: int
 ) -> bytes:
@@ -315,23 +359,7 @@ def _read_private_bytes_beneath(
             next_fd = os.open(part, directory_flags, dir_fd=directory_fd)
             os.close(directory_fd)
             directory_fd = next_fd
-        file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        file_fd = os.open(relative.parts[-1], file_flags, dir_fd=directory_fd)
-        try:
-            metadata = os.fstat(file_fd)
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > max_bytes:
-                raise ValueError("operator verification raw log is invalid")
-            data = b""
-            while len(data) <= max_bytes:
-                chunk = os.read(file_fd, min(65536, max_bytes + 1 - len(data)))
-                if not chunk:
-                    break
-                data += chunk
-            if len(data) > max_bytes:
-                raise ValueError("operator verification raw log exceeds size bound")
-            return data
-        finally:
-            os.close(file_fd)
+        return _read_private_bytes_at(directory_fd, relative.parts[-1], max_bytes)
     finally:
         os.close(directory_fd)
 
@@ -375,15 +403,25 @@ def _write_operator_receipt(path: pathlib.Path, receipt: dict[str, object]) -> s
     encoded = (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode("utf-8")
     if len(encoded) > _OPERATOR_RECEIPT_MAX_BYTES:
         raise ValueError("operator verification receipt exceeds size bound")
-    if path.is_symlink() or path.parent.is_symlink():
-        raise OSError("operator verification receipt path is a symlink")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    if temp.exists() or temp.is_symlink():
-        temp.unlink()
-    _write_private_bytes(temp, encoded)
-    os.replace(temp, path)
-    path.chmod(0o600)
+    directory_fd = _open_private_directory(path.parent)
+    temp_name = f".{path.name}.{os.getpid()}.tmp"
+    try:
+        try:
+            os.unlink(temp_name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        _write_private_bytes_at(directory_fd, temp_name, encoded)
+        os.replace(
+            temp_name, path.name,
+            src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+    finally:
+        try:
+            os.unlink(temp_name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        os.close(directory_fd)
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -393,9 +431,13 @@ def _validate_operator_receipt(
     *,
     expected_receipt: dict[str, object] | None = None,
 ) -> str:
-    if path.is_symlink() or not path.is_file():
-        raise ValueError("operator verification receipt is missing or a symlink")
-    encoded = path.read_bytes()
+    directory_fd = _open_private_directory(path.parent, create=False)
+    try:
+        encoded = _read_private_bytes_at(
+            directory_fd, path.name, _OPERATOR_RECEIPT_MAX_BYTES
+        )
+    finally:
+        os.close(directory_fd)
     if len(encoded) > _OPERATOR_RECEIPT_MAX_BYTES:
         raise ValueError("operator verification receipt exceeds size bound")
     receipt = json.loads(encoded)
