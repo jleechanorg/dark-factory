@@ -31,6 +31,67 @@ def test_bounded_process_bytes_preserves_non_utf8_streams(tmp_path) -> None:
     assert result.stderr == b"err\x80\n"
 
 
+def test_successful_leader_cannot_leave_process_group_descendant(tmp_path) -> None:
+    from runner.subprocess_control import run_bounded_process_bytes
+
+    child_pid_path = tmp_path / "success-child.pid"
+    child_code = (
+        "import signal,time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "time.sleep(30)"
+    )
+    parent_code = (
+        "import subprocess,sys\n"
+        f"child=subprocess.Popen([sys.executable,'-c',{child_code!r}], "
+        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        f"open({str(child_pid_path)!r},'w').write(str(child.pid))\n"
+        "print('leader complete', flush=True)\n"
+    )
+
+    result = run_bounded_process_bytes(
+        [sys.executable, "-c", parent_code],
+        cwd=tmp_path,
+        timeout=5,
+        terminate_grace=0.2,
+    )
+
+    child_pid = int(child_pid_path.read_text())
+    status = subprocess.run(
+        ["/bin/ps", "-o", "stat=", "-p", str(child_pid)],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    child_alive = bool(status and not status.upper().startswith("Z"))
+    if child_alive:
+        subprocess.run(["kill", "-KILL", str(child_pid)], check=False)
+    assert result.returncode == 0
+    assert result.timed_out is False
+    assert child_alive is False
+    assert result.process_group_cleanup == "terminated"
+
+
+def test_bounded_process_bytes_stops_stream_at_real_output_limit(tmp_path) -> None:
+    from runner.subprocess_control import run_bounded_process_bytes
+
+    result = run_bounded_process_bytes(
+        [
+            sys.executable,
+            "-c",
+            "import os,time; os.write(1, b'x' * (4 * 1024 * 1024)); time.sleep(30)",
+        ],
+        cwd=tmp_path,
+        timeout=5,
+        terminate_grace=0.2,
+        max_output_bytes=1024,
+    )
+
+    assert result.output_overflowed is True
+    assert len(result.stdout) == 1024
+    assert result.stderr == b""
+    assert result.process_group_cleanup == "terminated"
+
+
 def test_finish_bounded_process_decodes_timeout_byte_streams() -> None:
     from runner.subprocess_control import finish_bounded_process
 

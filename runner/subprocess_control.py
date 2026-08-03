@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import selectors
 import signal
 import subprocess
 import time
@@ -58,6 +59,8 @@ class BoundedProcessResult:
     stdout: str
     stderr: str
     timed_out: bool
+    process_group_cleanup: str = "not_required"
+    output_overflowed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +70,8 @@ class BoundedProcessBytesResult:
     stdout: bytes
     stderr: bytes
     timed_out: bool
+    process_group_cleanup: str = "not_required"
+    output_overflowed: bool = False
 
 
 def _signal_process_group(pgid: int, sig: signal.Signals) -> None:
@@ -86,6 +91,43 @@ def _process_group_exists(pgid: int) -> bool:
     return True
 
 
+def _process_group_has_live_members(pgid: int) -> bool:
+    """Distinguish executable descendants from harmless orphan zombies."""
+    try:
+        observed = subprocess.run(
+            ["/bin/ps", "-axo", "pgid=,stat="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        if observed.returncode == 0:
+            for line in observed.stdout.splitlines():
+                fields = line.split()
+                if len(fields) >= 2 and fields[0] == str(pgid):
+                    if not fields[1].upper().startswith("Z"):
+                        return True
+            return False
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return _process_group_exists(pgid)
+
+
+def _cleanup_process_group(pgid: int, terminate_grace: float) -> str:
+    if not _process_group_has_live_members(pgid):
+        return "not_required"
+    _signal_process_group(pgid, signal.SIGTERM)
+    deadline = time.monotonic() + max(0.0, terminate_grace)
+    while _process_group_has_live_members(pgid) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    if _process_group_has_live_members(pgid):
+        _signal_process_group(pgid, signal.SIGKILL)
+        kill_deadline = time.monotonic() + max(0.1, terminate_grace)
+        while _process_group_has_live_members(pgid) and time.monotonic() < kill_deadline:
+            time.sleep(0.02)
+    return "terminated" if not _process_group_has_live_members(pgid) else "failed"
+
+
 def finish_bounded_process(
     proc: subprocess.Popen,
     *,
@@ -97,6 +139,7 @@ def finish_bounded_process(
 ) -> BoundedProcessResult | BoundedProcessBytesResult:
     """Communicate within ``timeout`` and always reap the whole process group."""
     timed_out = False
+    cleanup_attempted = False
     pgid = int(process_group_id if process_group_id is not None else proc.pid)
     try:
         if input_text is None:
@@ -105,6 +148,7 @@ def finish_bounded_process(
             stdout, stderr = proc.communicate(input=input_text, timeout=timeout)
     except subprocess.TimeoutExpired as initial_timeout:
         timed_out = True
+        cleanup_attempted = True
         if preserve_bytes:
             stdout, stderr = as_bytes(initial_timeout.stdout), as_bytes(initial_timeout.stderr)
         else:
@@ -142,6 +186,9 @@ def finish_bounded_process(
                 stderr = _merge_output(stderr, final_timeout.stderr)
         except Exception:
             pass
+    cleanup_status = _cleanup_process_group(pgid, terminate_grace)
+    if cleanup_attempted and cleanup_status == "not_required":
+        cleanup_status = "terminated"
     result_type = BoundedProcessBytesResult if preserve_bytes else BoundedProcessResult
     return result_type(
         args=tuple(str(part) for part in getattr(proc, "args", ())),
@@ -149,6 +196,7 @@ def finish_bounded_process(
         stdout=as_bytes(stdout) if preserve_bytes else as_text(stdout),
         stderr=as_bytes(stderr) if preserve_bytes else as_text(stderr),
         timed_out=timed_out,
+        process_group_cleanup=cleanup_status,
     )
 
 
@@ -189,8 +237,11 @@ def run_bounded_process_bytes(
     timeout: float,
     env: Mapping[str, str] | None = None,
     terminate_grace: float = 5.0,
+    max_output_bytes: int = 8 << 20,
 ) -> BoundedProcessBytesResult:
-    """Run an exact argv while preserving stdout/stderr bytes losslessly."""
+    """Run exact argv with lossless, incrementally bounded byte streams."""
+    if max_output_bytes < 1:
+        raise ValueError("max_output_bytes must be positive")
     proc = subprocess.Popen(
         list(args),
         cwd=cwd,
@@ -200,12 +251,83 @@ def run_bounded_process_bytes(
         start_new_session=True,
         env=dict(env) if env is not None else None,
     )
-    result = finish_bounded_process(
-        proc,
-        timeout=timeout,
-        terminate_grace=terminate_grace,
-        process_group_id=proc.pid,
-        preserve_bytes=True,
+    pgid = proc.pid
+    deadline = time.monotonic() + max(0.0, timeout)
+    selector = selectors.DefaultSelector()
+    streams = {
+        proc.stdout: bytearray(),
+        proc.stderr: bytearray(),
+    }
+    for stream in streams:
+        if stream is None:
+            continue
+        os.set_blocking(stream.fileno(), False)
+        selector.register(stream, selectors.EVENT_READ)
+
+    timed_out = False
+    overflowed = False
+    cleanup_attempted = False
+    cleanup_status = "not_required"
+    try:
+        while selector.get_map():
+            returncode = proc.poll()
+            if returncode is not None and _process_group_has_live_members(pgid):
+                cleanup_attempted = True
+                cleanup_status = _cleanup_process_group(pgid, terminate_grace)
+            now = time.monotonic()
+            if returncode is None and now >= deadline:
+                timed_out = True
+                break
+            wait_for = min(0.05, max(0.0, deadline - now)) if returncode is None else 0.05
+            for key, _ in selector.select(wait_for):
+                stream = key.fileobj
+                try:
+                    chunk = os.read(stream.fileno(), 64 * 1024)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(stream)
+                    continue
+                buffer = streams[stream]
+                remaining = max_output_bytes - len(buffer)
+                if len(chunk) > remaining:
+                    if remaining > 0:
+                        buffer.extend(chunk[:remaining])
+                    overflowed = True
+                    break
+                buffer.extend(chunk)
+            if overflowed:
+                break
+
+        if timed_out or overflowed:
+            cleanup_attempted = True
+            cleanup_status = _cleanup_process_group(pgid, terminate_grace)
+        elif proc.poll() is not None and _process_group_has_live_members(pgid):
+            cleanup_attempted = True
+            cleanup_status = _cleanup_process_group(pgid, terminate_grace)
+        try:
+            proc.wait(timeout=max(0.1, terminate_grace))
+        except subprocess.TimeoutExpired:
+            cleanup_attempted = True
+            cleanup_status = _cleanup_process_group(pgid, terminate_grace)
+            try:
+                proc.wait(timeout=max(0.1, terminate_grace))
+            except subprocess.TimeoutExpired:
+                pass
+    finally:
+        selector.close()
+        for stream in streams:
+            if stream is not None:
+                stream.close()
+
+    if cleanup_attempted and cleanup_status == "not_required":
+        cleanup_status = "terminated"
+    return BoundedProcessBytesResult(
+        args=tuple(str(part) for part in getattr(proc, "args", ())),
+        returncode=int(proc.returncode if proc.returncode is not None else -1),
+        stdout=bytes(streams.get(proc.stdout, b"")),
+        stderr=bytes(streams.get(proc.stderr, b"")),
+        timed_out=timed_out,
+        process_group_cleanup=cleanup_status,
+        output_overflowed=overflowed,
     )
-    assert isinstance(result, BoundedProcessBytesResult)
-    return result
