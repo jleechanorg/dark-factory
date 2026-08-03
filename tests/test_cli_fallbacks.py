@@ -91,6 +91,36 @@ def _fake_completed(args, *, returncode: int = 0, stdout: str = "", stderr: str 
     return subprocess.CompletedProcess(args, returncode, stdout=stdout, stderr=stderr)
 
 
+def test_codex_worker_timeout_with_byte_diagnostics_is_terminal_error(tmp_path, monkeypatch):
+    """TimeoutExpired may carry bytes despite ``text=True``; never crash decoding it."""
+    from runner.subprocess_control import BoundedProcessResult
+
+    _disable_sandbox(monkeypatch)
+
+    def _timeout(*args, **kwargs):
+        return BoundedProcessResult(
+            args=("codex",),
+            returncode=-15,
+            stdout="partial stdout\n",
+            stderr="partial stderr\n",
+            timed_out=True,
+        )
+
+    monkeypatch.setattr("runner.handler_codergen.run_bounded_process", _timeout)
+    result = _codergen(
+        _Node(
+            name="worker",
+            attrs={"type": "codergen", "backend": "codex", "timeout": "1"},
+        ),
+        Context(goal="test timeout", workdir=tmp_path, backend="codex"),
+    )
+
+    assert result.outcome == "error"
+    assert result.metadata["timed_out"] == "true"
+    assert "partial stdout" in result.output
+    assert "partial stderr" in result.output
+
+
 def _first_arg_matches(args, target: str) -> bool:
     """True when ``args[0]`` resolves to ``target`` by basename OR by
     substring match (so a faked ``/nonexistent/claude-binary-for-test``

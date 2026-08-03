@@ -63,6 +63,8 @@ the full empirical distribution and the citation.
 
 from __future__ import annotations
 
+from .subprocess_control import run_bounded_process
+
 import json
 import os
 import pathlib
@@ -922,29 +924,13 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             return _finalize(Result(outcome="failure", output="sandbox-exec unavailable"))
         timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1800"), 1800)
         try:
-            proc = subprocess.run(
+            proc = run_bounded_process(
                 args,
                 cwd=ctx.workdir,
-                capture_output=True,
-                text=True,
                 timeout=timeout_s,
-                check=False,
-                input="",
+                input_text="",
                 env=_handlers_shim._sanitized_env(),
             )
-        except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout or ""
-            stderr = exc.stderr or ""
-            return _finalize(Result(
-                outcome="failure",
-                output=(stdout + ("\nSTDERR:\n" + stderr if stderr else "")).strip()
-                or f"codex backend timed out after {timeout_s} seconds",
-                metadata={
-                    "timed_out": "true",
-                    "timeout": str(timeout_s),
-                    "returncode": "",
-                },
-            ))
         except Exception as exc:
             return _finalize(Result(
                 outcome="error",
@@ -953,6 +939,17 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                     "timed_out": "false",
                     "timeout": str(timeout_s),
                     "returncode": "",
+                },
+            ))
+        if proc.timed_out:
+            return _finalize(Result(
+                outcome="error",
+                output=(proc.stdout + ("\nSTDERR:\n" + proc.stderr if proc.stderr else "")).strip()
+                or f"codex backend timed out after {timeout_s} seconds",
+                metadata={
+                    "timed_out": "true",
+                    "timeout": str(timeout_s),
+                    "returncode": str(proc.returncode),
                 },
             ))
     elif backend == "agy":

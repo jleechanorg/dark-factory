@@ -55,7 +55,8 @@ digraph SlimTwoNode {
 
     start -> worker
     worker -> cold_reviewer [condition="outcome=success"]
-    worker -> worker        [condition="outcome!=success"]
+    worker -> worker        [condition="outcome=failure"]
+    worker -> exit          [condition="outcome=error"]
 
     cold_reviewer -> exit   [condition="outcome=success"]
     cold_reviewer -> worker [condition="outcome=failure"]

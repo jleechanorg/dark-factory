@@ -126,7 +126,11 @@ def _run_with_retries(handler, node: Node, ctx: Context, graph, input_logger=Non
         if input_meta:
             last.metadata = {**input_meta, **last.metadata}
         results.append(last)
-        if _successful_for_node(node, last) or attempts >= max_retries:
+        if (
+            _successful_for_node(node, last)
+            or _classify_outcome(last.outcome) == "error"
+            or attempts >= max_retries
+        ):
             break
         attempts += 1
     retries = str(len(results) - 1)

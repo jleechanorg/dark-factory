@@ -24,6 +24,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from conftest import ROOT  # noqa: E402, F811
 
 from runner.parser import parse  # noqa: E402
+from runner.engine import run  # noqa: E402
+from runner.handlers import Context, Result, TYPE_REGISTRY  # noqa: E402
 
 
 # Every node type that can run a subprocess in dark-factory. Must stay
@@ -126,6 +128,36 @@ def test_two_node_dot_retries_only_reviewer_authored_failures() -> None:
         ("worker", "outcome=failure"),
         ("exit", "outcome=error"),
     }
+    worker_edges = {
+        (edge.dst, edge.condition) for edge in graph.outgoing("worker")
+    }
+    assert worker_edges == {
+        ("cold_reviewer", "outcome=success"),
+        ("worker", "outcome=failure"),
+        ("exit", "outcome=error"),
+    }
+
+
+def test_two_node_worker_error_exits_without_retry_or_review(tmp_path, monkeypatch) -> None:
+    calls = {"worker": 0, "reviewer": 0}
+
+    def worker(node, ctx):
+        calls["worker"] += 1
+        return Result(outcome="error", output="terminal timeout")
+
+    def reviewer(node, ctx):
+        calls["reviewer"] += 1
+        return Result(outcome="success", output="must not run")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "codergen", worker)
+    monkeypatch.setitem(TYPE_REGISTRY, "parallel_reviewer", reviewer)
+    history = run(
+        parse(ROOT / _PIPELINE),
+        Context(goal="worker error", workdir=tmp_path, backend="echo"),
+    )
+
+    assert calls == {"worker": 1, "reviewer": 0}
+    assert [record.node for record in history] == ["start", "worker", "exit"]
 
 
 def test_two_node_dot_cold_reviewer_uses_only_its_supported_transport() -> None:

@@ -23,6 +23,47 @@ from runner.handlers import Context, Result, TYPE_REGISTRY  # noqa: E402
 from runner.parser import parse  # noqa: E402
 
 
+@pytest.mark.parametrize(
+    ("outcomes", "expected_calls", "expected_outcome"),
+    [
+        (["failure", "success"], 2, "success"),
+        (["error", "success"], 1, "error"),
+    ],
+)
+def test_node_retries_failure_but_never_terminal_error(
+    tmp_path, outcomes, expected_calls, expected_outcome
+):
+    dot = tmp_path / "retry_contract.dot"
+    dot.write_text(
+        'digraph retry_contract {\n'
+        '  start [shape=Mdiamond]\n'
+        '  worker [type="codergen", max_retries="2"]\n'
+        '  exit [shape=Msquare]\n'
+        '  start -> worker -> exit\n'
+        '}\n'
+    )
+    calls: list[str] = []
+
+    def fake_worker(node, ctx):
+        outcome = outcomes[len(calls)]
+        calls.append(outcome)
+        return Result(outcome=outcome, output=outcome)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setitem(TYPE_REGISTRY, "codergen", fake_worker)
+    try:
+        history = run(
+            parse(dot),
+            Context(goal="retry contract", workdir=tmp_path, backend="echo"),
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert len(calls) == expected_calls
+    worker_records = [record for record in history if record.node == "worker"]
+    assert worker_records[-1].outcome == expected_outcome
+
+
 def test_parser_round_trip():
     g = parse(_pipeline("hello.dot"))
     assert g.name == "hello"
