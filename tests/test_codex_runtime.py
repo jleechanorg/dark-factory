@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -15,12 +16,54 @@ PINNED_VERSION = "0.146.0"
 NODE_VERSION = "v22.22.0"
 
 
+def _release_model() -> dict:
+    """ModelInfo serialized by the official rust-v0.146.0 test fixture.
+
+    Source: openai/codex@e363b08, codex-rs/app-server/tests/common/models_cache.rs
+    and codex-rs/protocol/src/openai_models.rs. The omitted
+    supports_reasoning_summary_parameter field is the valid default-true form.
+    """
+    return {
+        "slug": "fake-model",
+        "display_name": "Fake model",
+        "description": "release-authentic fixture",
+        "supported_reasoning_levels": [
+            {"effort": "medium", "description": "Balanced reasoning"}
+        ],
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": True,
+        "priority": 0,
+        "additional_speed_tiers": [],
+        "service_tiers": [],
+        "availability_nux": None,
+        "upgrade": None,
+        "base_instructions": "base instructions",
+        "include_skills_usage_instructions": False,
+        "default_reasoning_summary": "auto",
+        "support_verbosity": False,
+        "default_verbosity": None,
+        "apply_patch_tool_type": None,
+        "web_search_tool_type": "text",
+        "truncation_policy": {"mode": "bytes", "limit": 10_000},
+        "supports_parallel_tool_calls": False,
+        "supports_image_detail_original": False,
+        "effective_context_window_percent": 95,
+        "experimental_supported_tools": [],
+        "input_modalities": ["text", "image"],
+        "supports_search_tool": False,
+        "use_responses_lite": False,
+    }
+
+
 def _write_runtime(
     home: Path,
     *,
     package_version: str = PINNED_VERSION,
     cache_version: str = PINNED_VERSION,
-    include_reasoning_summaries: bool = True,
+    model_overrides: dict | None = None,
+    omit_model_fields: tuple[str, ...] = (),
+    cache_overrides: dict | None = None,
 ) -> tuple[Path, Path, Path]:
     package_root = (
         home
@@ -51,13 +94,21 @@ def _write_runtime(
     executable.parent.mkdir(parents=True)
     executable.symlink_to(Path("../lib/node_modules/@openai/codex/bin/codex.js"))
 
-    model = {"slug": "fake-model"}
-    if include_reasoning_summaries:
-        model["supports_reasoning_summaries"] = True
+    model = deepcopy(_release_model())
+    model.update(model_overrides or {})
+    for field in omit_model_fields:
+        model.pop(field, None)
+    cache_payload = {
+        "fetched_at": "2026-08-03T00:00:00Z",
+        "etag": None,
+        "client_version": cache_version,
+        "models": [model],
+    }
+    cache_payload.update(cache_overrides or {})
     cache = home / ".codex" / "models_cache.json"
     cache.parent.mkdir()
     cache.write_text(
-        json.dumps({"client_version": cache_version, "models": [model]}),
+        json.dumps(cache_payload),
         encoding="utf-8",
     )
     return executable, package_root / "package.json", cache
@@ -81,18 +132,16 @@ def test_aligned_fixture_resolves_one_absolute_node22_executable(tmp_path: Path)
 
 
 @pytest.mark.parametrize(
-    ("package_version", "cache_version", "include_field", "match"),
+    ("package_version", "cache_version", "match"),
     [
-        ("0.144.5", PINNED_VERSION, True, "installed Codex version"),
-        (PINNED_VERSION, "0.144.5", True, "cache client_version"),
-        (PINNED_VERSION, PINNED_VERSION, False, "supports_reasoning_summaries"),
+        ("0.144.5", PINNED_VERSION, "installed Codex version"),
+        (PINNED_VERSION, "0.144.5", "cache client_version"),
     ],
 )
 def test_skew_rejects_without_changing_cache(
     tmp_path: Path,
     package_version: str,
     cache_version: str,
-    include_field: bool,
     match: str,
 ) -> None:
     from runner.codex_runtime import CodexRuntimeError, resolve_codex_runtime
@@ -101,7 +150,6 @@ def test_skew_rejects_without_changing_cache(
         tmp_path,
         package_version=package_version,
         cache_version=cache_version,
-        include_reasoning_summaries=include_field,
     )
     before_bytes = cache.read_bytes()
     before_stat = cache.stat()
@@ -116,6 +164,71 @@ def test_skew_rejects_without_changing_cache(
     after_stat = cache.stat()
     assert cache.read_bytes() == before_bytes
     assert after_stat.st_mtime_ns == before_stat.st_mtime_ns
+
+
+@pytest.mark.parametrize(
+    ("runtime_kwargs", "match"),
+    [
+        ({"cache_overrides": {"fetched_at": None}}, "fetched_at"),
+        ({"cache_overrides": {"fetched_at": "not-rfc3339"}}, "fetched_at"),
+        ({"omit_model_fields": ("display_name",)}, "display_name"),
+        (
+            {"model_overrides": {"supports_reasoning_summary_parameter": "yes"}},
+            "supports_reasoning_summary_parameter",
+        ),
+    ],
+)
+def test_release_cache_schema_rejects_invalid_shapes_without_mutation(
+    tmp_path: Path, runtime_kwargs: dict, match: str
+) -> None:
+    from runner.codex_runtime import CodexRuntimeError, resolve_codex_runtime
+
+    _, _, cache = _write_runtime(tmp_path, **runtime_kwargs)
+    before = cache.read_bytes()
+
+    with pytest.raises(CodexRuntimeError, match=match):
+        resolve_codex_runtime(
+            home=tmp_path,
+            cache_path=cache,
+            competing_package_paths=(),
+        )
+
+    assert cache.read_bytes() == before
+
+
+def test_obsolete_minimal_cache_shape_is_rejected(tmp_path: Path) -> None:
+    from runner.codex_runtime import CodexRuntimeError, resolve_codex_runtime
+
+    _, _, cache = _write_runtime(
+        tmp_path,
+        cache_overrides={
+            "models": [
+                {"slug": "old-model", "supports_reasoning_summaries": True}
+            ]
+        },
+    )
+
+    with pytest.raises(CodexRuntimeError, match="display_name"):
+        resolve_codex_runtime(
+            home=tmp_path,
+            cache_path=cache,
+            competing_package_paths=(),
+        )
+
+
+def test_explicit_false_reasoning_summary_parameter_is_valid(tmp_path: Path) -> None:
+    from runner.codex_runtime import resolve_codex_runtime
+
+    _, _, cache = _write_runtime(
+        tmp_path,
+        model_overrides={"supports_reasoning_summary_parameter": False},
+    )
+
+    assert resolve_codex_runtime(
+        home=tmp_path,
+        cache_path=cache,
+        competing_package_paths=(),
+    ).version == PINNED_VERSION
 
 
 def test_competing_package_skew_rejects(tmp_path: Path) -> None:
@@ -279,7 +392,8 @@ from pathlib import Path
 
 cache = json.loads((Path.home() / ".codex/models_cache.json").read_text())
 assert cache["client_version"] == "0.146.0"
-assert all(isinstance(model["supports_reasoning_summaries"], bool) for model in cache["models"])
+assert all(isinstance(model["display_name"], str) for model in cache["models"])
+assert all("supports_reasoning_summaries" not in model for model in cache["models"])
 prompt = sys.stdin.read() if "-" in sys.argv else sys.argv[-1]
 if "--json" not in sys.argv:
     print("worker-ok")

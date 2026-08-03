@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
@@ -14,7 +15,48 @@ PINNED_CODEX_VERSION = "0.146.0"
 PINNED_NODE_VERSION = "v22.22.0"
 _PACKAGE_RELATIVE = Path("lib/node_modules/@openai/codex")
 _EXECUTABLE_RELATIVE = Path("bin/codex")
-_REQUIRED_MODEL_FIELDS = {"supports_reasoning_summaries": bool}
+_REQUIRED_MODEL_FIELDS = {
+    "slug": str,
+    "display_name": str,
+    "description": (str, type(None)),
+    "supported_reasoning_levels": list,
+    "shell_type": str,
+    "visibility": str,
+    "supported_in_api": bool,
+    "priority": int,
+    "additional_speed_tiers": list,
+    "service_tiers": list,
+    "availability_nux": (dict, type(None)),
+    "upgrade": (dict, type(None)),
+    "base_instructions": str,
+    "include_skills_usage_instructions": bool,
+    "default_reasoning_summary": str,
+    "support_verbosity": bool,
+    "default_verbosity": (str, type(None)),
+    "apply_patch_tool_type": (str, type(None)),
+    "web_search_tool_type": str,
+    "truncation_policy": dict,
+    "supports_parallel_tool_calls": bool,
+    "supports_image_detail_original": bool,
+    "effective_context_window_percent": int,
+    "experimental_supported_tools": list,
+    "input_modalities": list,
+    "supports_search_tool": bool,
+    "use_responses_lite": bool,
+}
+_OPTIONAL_MODEL_FIELDS = {
+    "default_reasoning_level": (str, type(None)),
+    "default_service_tier": (str, type(None)),
+    "model_messages": (dict, type(None)),
+    "supports_reasoning_summary_parameter": bool,
+    "context_window": (int, type(None)),
+    "max_context_window": (int, type(None)),
+    "auto_compact_token_limit": (int, type(None)),
+    "comp_hash": (str, type(None)),
+    "auto_review_model_override": (str, type(None)),
+    "tool_mode": (str, type(None)),
+    "multi_agent_version": (str, type(None)),
+}
 
 
 class CodexRuntimeError(RuntimeError):
@@ -59,6 +101,21 @@ def _validate_cache(cache_path: Path) -> None:
             "Codex models cache client_version mismatch: "
             f"expected {PINNED_CODEX_VERSION}, got {client_version!r} at {cache_path}"
         )
+    fetched_at = cache.get("fetched_at")
+    if not isinstance(fetched_at, str):
+        raise CodexRuntimeError(
+            f"Codex models cache requires fetched_at as RFC3339 text at {cache_path}"
+        )
+    try:
+        parsed_fetched_at = datetime.fromisoformat(fetched_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise CodexRuntimeError(
+            f"Codex models cache fetched_at is not RFC3339 at {cache_path}"
+        ) from exc
+    if parsed_fetched_at.tzinfo is None:
+        raise CodexRuntimeError(
+            f"Codex models cache fetched_at must include a timezone at {cache_path}"
+        )
     models = cache.get("models")
     if not isinstance(models, list) or not models:
         raise CodexRuntimeError(f"Codex models cache has incompatible models schema at {cache_path}")
@@ -68,11 +125,29 @@ def _validate_cache(cache_path: Path) -> None:
                 f"Codex models cache model {index} is not an object at {cache_path}"
             )
         for field, expected_type in _REQUIRED_MODEL_FIELDS.items():
-            if not isinstance(model.get(field), expected_type):
+            if field not in model or not _matches_json_type(model[field], expected_type):
                 raise CodexRuntimeError(
                     f"Codex models cache model {index} requires {field} "
-                    f"as {expected_type.__name__} at {cache_path}"
+                    f"as {_type_name(expected_type)} at {cache_path}"
                 )
+        for field, expected_type in _OPTIONAL_MODEL_FIELDS.items():
+            if field in model and not _matches_json_type(model[field], expected_type):
+                raise CodexRuntimeError(
+                    f"Codex models cache model {index} requires optional {field} "
+                    f"as {_type_name(expected_type)} when present at {cache_path}"
+                )
+
+
+def _matches_json_type(value: object, expected_type: type | tuple[type, ...]) -> bool:
+    allowed = expected_type if isinstance(expected_type, tuple) else (expected_type,)
+    if int in allowed and bool not in allowed and isinstance(value, bool):
+        return False
+    return isinstance(value, allowed)
+
+
+def _type_name(expected_type: type | tuple[type, ...]) -> str:
+    allowed = expected_type if isinstance(expected_type, tuple) else (expected_type,)
+    return " or ".join(item.__name__ for item in allowed)
 
 
 def _default_competing_package_paths() -> tuple[Path, ...]:
