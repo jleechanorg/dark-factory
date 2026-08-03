@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 import sys
 from hashlib import sha256
@@ -411,6 +412,7 @@ def _write_sync_fakes(
     codex_exit: int = 0,
     codex_output: str = "CODEX_RUNTIME_READY",
     refresh_cache: bool = True,
+    node_version: str = NODE_VERSION,
 ) -> tuple[Path, bytes]:
     _, _, cache = _write_runtime(
         home,
@@ -430,8 +432,29 @@ def _write_sync_fakes(
     (home / "desired-cache.json").write_bytes(desired_cache)
     node_root = home / ".nvm" / "versions" / "node" / NODE_VERSION
     package_json = node_root / "lib/node_modules/@openai/codex/package.json"
-    npm = node_root / "bin/npm"
-    npm.write_text(
+    events = home / "sync-events.jsonl"
+    node = node_root / "bin/node"
+    node.write_text(
+        f"""#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+events = Path({str(events)!r})
+if sys.argv[1:] == ["--version"]:
+    with events.open("a") as stream:
+        stream.write(json.dumps({{"tool": "node_version", "argv": sys.argv[1:]}}) + "\\n")
+    print({node_version!r})
+    raise SystemExit(0)
+os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+""",
+        encoding="utf-8",
+    )
+    node.chmod(0o755)
+    npm_cli = node_root / "lib/node_modules/npm/bin/npm-cli.js"
+    npm_cli.parent.mkdir(parents=True, exist_ok=True)
+    npm_cli.write_text(
         f"""#!/usr/bin/env python3
 import json
 import os
@@ -446,6 +469,8 @@ Path({str(package_json)!r}).write_text(json.dumps({{"name": "@openai/codex", "ve
 """,
         encoding="utf-8",
     )
+    npm = node_root / "bin/npm"
+    npm.write_text("#!/usr/bin/env node\nraise SystemExit(99)\n", encoding="utf-8")
     npm.chmod(0o755)
     codex = node_root / "lib/node_modules/@openai/codex/bin/codex.js"
     codex.write_text(
@@ -500,14 +525,19 @@ def test_sync_uses_exact_node22_tools_backs_up_first_and_validates(
 
     home = tmp_path / "home"
     cache, before_cache = _write_sync_fakes(home)
+    checkout_tmp = tmp_path / "checkout" / "tmp"
+    (checkout_tmp.parent / ".git").mkdir(parents=True)
+    checkout_tmp.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("TMPDIR", str(checkout_tmp))
     monkeypatch.setenv("OPENAI_API_KEY", "must-not-appear-in-evidence")
 
     evidence = sync_codex_runtime(home=home, competing_package_paths=())
 
     node_root = home / ".nvm" / "versions" / "node" / NODE_VERSION
     events = [json.loads(line) for line in (home / "sync-events.jsonl").read_text().splitlines()]
-    assert events[0] == {
+    assert events[0] == {"tool": "node_version", "argv": ["--version"]}
+    assert events[1] == {
         "tool": "npm",
         "argv": [
             "install",
@@ -518,16 +548,22 @@ def test_sync_uses_exact_node22_tools_backs_up_first_and_validates(
         ],
         "backup_count": 1,
     }
-    assert events[1]["tool"] == "codex"
-    assert events[1]["argv"] == [
+    assert events[2]["tool"] == "codex"
+    assert events[2]["argv"] == [
         "exec",
         "--sandbox",
         "read-only",
         "--skip-git-repo-check",
         "CODEX_RUNTIME_READY",
     ]
-    assert Path(events[1]["cwd"]).parent == Path("/tmp") or "dark-factory-codex-runtime-" in events[1]["cwd"]
-    assert "login" not in events[1]["argv"]
+    startup_cwd = Path(events[2]["cwd"])
+    assert startup_cwd.is_relative_to(home / ".dark-factory/tmp/codex-runtime")
+    assert not startup_cwd.is_relative_to(checkout_tmp.parent)
+    assert evidence["temporary_workdir"] == str(startup_cwd)
+    assert stat.S_IMODE(
+        (home / ".dark-factory/tmp/codex-runtime").stat().st_mode
+    ) == 0o700
+    assert "login" not in events[2]["argv"]
     backup = Path(evidence["backup_path"])
     assert backup.read_bytes() == before_cache
     assert cache.read_bytes() == (home / "desired-cache.json").read_bytes()
@@ -542,13 +578,184 @@ def test_sync_uses_exact_node22_tools_backs_up_first_and_validates(
         "sha256": sha256(cache.read_bytes()).hexdigest(),
         "client_version": PINNED_VERSION,
     }
-    assert evidence["subprocesses"]["npm_install"]["argv"][0] == str(node_root / "bin/npm")
+    assert evidence["subprocesses"]["node_version"]["argv"] == [
+        str(node_root / "bin/node"),
+        "--version",
+    ]
+    assert evidence["subprocesses"]["npm_install"]["argv"][:2] == [
+        str(node_root / "bin/node"),
+        str(node_root / "lib/node_modules/npm/bin/npm-cli.js"),
+    ]
     assert evidence["subprocesses"]["codex_startup"]["argv"][0] == str(node_root / "bin/codex")
     assert evidence["subprocesses"]["codex_startup"]["timeout_seconds"] == 120
     assert evidence["readiness_token"] == "CODEX_RUNTIME_READY"
     assert evidence["resolver"]["status"] == "pass"
     assert evidence["resolver"]["version"] == PINNED_VERSION
     assert "must-not-appear-in-evidence" not in json.dumps(evidence)
+
+
+def test_sync_never_falls_back_to_ambient_node(tmp_path: Path, monkeypatch) -> None:
+    from runner.codex_runtime import CodexRuntimeSyncError, sync_codex_runtime
+
+    home = tmp_path / "home"
+    _write_sync_fakes(home)
+    (home / ".nvm/versions/node" / NODE_VERSION / "bin/node").unlink()
+    ambient_bin = tmp_path / "ambient-bin"
+    ambient_bin.mkdir()
+    ambient_marker = tmp_path / "ambient-node-ran"
+    ambient_node = ambient_bin / "node"
+    ambient_node.write_text(
+        f"#!/bin/sh\ntouch {ambient_marker}\nexit 0\n",
+        encoding="utf-8",
+    )
+    ambient_node.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{ambient_bin}:{os.environ['PATH']}")
+
+    with pytest.raises(CodexRuntimeSyncError) as caught:
+        sync_codex_runtime(home=home, competing_package_paths=())
+
+    assert caught.value.evidence["phase"] == "preflight"
+    assert "canonical Node" in caught.value.evidence["error"]
+    assert not ambient_marker.exists()
+    assert caught.value.evidence["backup_path"] is None
+
+
+def test_sync_rejects_wrong_canonical_node_version_before_backup(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from runner.codex_runtime import CodexRuntimeSyncError, sync_codex_runtime
+
+    home = tmp_path / "home"
+    _write_sync_fakes(home, node_version="v24.0.0")
+
+    with pytest.raises(CodexRuntimeSyncError) as caught:
+        sync_codex_runtime(home=home, competing_package_paths=())
+
+    assert caught.value.evidence["phase"] == "preflight"
+    assert "Node version mismatch" in caught.value.evidence["error"]
+    assert caught.value.evidence["backup_path"] is None
+    assert not (home / ".dark-factory/backups/codex-runtime").exists()
+
+
+def test_sync_rejects_runtime_tempdir_inside_git_worktree(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from runner.codex_runtime import CodexRuntimeSyncError, sync_codex_runtime
+
+    checkout = tmp_path / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    home = checkout / "home"
+    _, before_cache = _write_sync_fakes(home)
+
+    with pytest.raises(CodexRuntimeSyncError) as caught:
+        sync_codex_runtime(home=home, competing_package_paths=())
+
+    evidence = caught.value.evidence
+    assert evidence["phase"] == "codex_tempdir"
+    assert "Git worktree" in evidence["error"]
+    assert Path(evidence["backup_path"]).read_bytes() == before_cache
+    events = [json.loads(line) for line in (home / "sync-events.jsonl").read_text().splitlines()]
+    assert [event["tool"] for event in events] == ["node_version", "npm"]
+
+
+def test_sync_structures_runtime_tempdir_creation_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from runner import codex_runtime
+
+    home = tmp_path / "home"
+    _, before_cache = _write_sync_fakes(home)
+
+    def _fail_create(*args, **kwargs):
+        raise OSError("fixture create denied")
+
+    monkeypatch.setattr(codex_runtime, "_create_runtime_tempdir", _fail_create)
+
+    with pytest.raises(codex_runtime.CodexRuntimeSyncError) as caught:
+        codex_runtime.sync_codex_runtime(home=home, competing_package_paths=())
+
+    evidence = caught.value.evidence
+    assert evidence["phase"] == "codex_tempdir"
+    assert "fixture create denied" in evidence["error"]
+    assert Path(evidence["backup_path"]).read_bytes() == before_cache
+    assert evidence["package_version"]["after"] == PINNED_VERSION
+
+
+@pytest.mark.parametrize("codex_exit", [0, 7])
+def test_sync_structures_cleanup_failure_without_masking_primary_error(
+    tmp_path: Path, monkeypatch, codex_exit: int
+) -> None:
+    from runner import codex_runtime
+
+    home = tmp_path / "home"
+    _, before_cache = _write_sync_fakes(home, codex_exit=codex_exit)
+
+    def _fail_cleanup(path):
+        raise OSError("fixture cleanup denied")
+
+    monkeypatch.setattr(codex_runtime, "_cleanup_runtime_tempdir", _fail_cleanup)
+
+    with pytest.raises(codex_runtime.CodexRuntimeSyncError) as caught:
+        codex_runtime.sync_codex_runtime(home=home, competing_package_paths=())
+
+    evidence = caught.value.evidence
+    expected_phase = "codex_tempdir_cleanup" if codex_exit == 0 else "codex_startup"
+    assert evidence["phase"] == expected_phase
+    assert "fixture cleanup denied" in (
+        evidence["error"] if codex_exit == 0 else evidence["cleanup_error"]
+    )
+    assert Path(evidence["backup_path"]).read_bytes() == before_cache
+
+
+def test_backup_is_private_unique_and_retries_collision(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from runner import codex_runtime
+
+    home = tmp_path / "home"
+    _, _, cache = _write_runtime(home)
+    backup_dir = home / ".dark-factory/backups/codex-runtime"
+    backup_dir.mkdir(parents=True, mode=0o700)
+    collision = backup_dir / "models_cache.collision.json"
+    collision.write_bytes(b"keep-me")
+    unique = backup_dir / "models_cache.unique.json"
+    candidates = iter((collision, unique))
+    monkeypatch.setattr(codex_runtime, "_backup_candidate", lambda _: next(candidates))
+
+    backup = codex_runtime._backup_cache(cache, home)
+
+    assert backup == unique
+    assert collision.read_bytes() == b"keep-me"
+    assert backup.read_bytes() == cache.read_bytes()
+    assert stat.S_IMODE(backup.stat().st_mode) == 0o600
+    assert stat.S_IMODE(backup_dir.stat().st_mode) == 0o700
+
+
+@pytest.mark.parametrize("unsafe_kind", ["permissions", "symlink"])
+def test_sync_rejects_unsafe_backup_directory(
+    tmp_path: Path, monkeypatch, unsafe_kind: str
+) -> None:
+    from runner.codex_runtime import CodexRuntimeSyncError, sync_codex_runtime
+
+    home = tmp_path / "home"
+    _write_sync_fakes(home)
+    backup_dir = home / ".dark-factory/backups/codex-runtime"
+    if unsafe_kind == "permissions":
+        backup_dir.mkdir(parents=True)
+        backup_dir.chmod(0o755)
+    else:
+        backup_dir.parent.mkdir(parents=True)
+        target = tmp_path / "redirected-backups"
+        target.mkdir()
+        backup_dir.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(CodexRuntimeSyncError) as caught:
+        sync_codex_runtime(home=home, competing_package_paths=())
+
+    assert caught.value.evidence["phase"] == "backup"
+    assert unsafe_kind in caught.value.evidence["error"].lower() or "private" in caught.value.evidence["error"].lower()
+    events = [json.loads(line) for line in (home / "sync-events.jsonl").read_text().splitlines()]
+    assert [event["tool"] for event in events] == ["node_version"]
 
 
 @pytest.mark.parametrize(
@@ -595,6 +802,12 @@ def test_sync_reports_timeout_and_preserves_backup(tmp_path: Path, monkeypatch) 
     _, _, cache = _write_runtime(home)
     before_cache = cache.read_bytes()
     node_root = home / ".nvm" / "versions" / "node" / NODE_VERSION
+    node = node_root / "bin/node"
+    node.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    node.chmod(0o755)
+    npm_cli = node_root / "lib/node_modules/npm/bin/npm-cli.js"
+    npm_cli.parent.mkdir(parents=True)
+    npm_cli.write_text("fixture", encoding="utf-8")
     npm = node_root / "bin/npm"
     npm.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     npm.chmod(0o755)
@@ -602,7 +815,9 @@ def test_sync_reports_timeout_and_preserves_backup(tmp_path: Path, monkeypatch) 
 
     def _bounded(args, *, timeout, **kwargs):
         calls.append((list(args), timeout))
-        if len(calls) == 1:
+        if list(args) == [str(node), "--version"]:
+            return BoundedProcessResult(tuple(args), 0, f"{NODE_VERSION}\n", "", False)
+        if list(args)[:2] == [str(node), str(npm_cli)]:
             return BoundedProcessResult(tuple(args), 0, "", "", False)
         return BoundedProcessResult(tuple(args), -1, "", "", True)
 
@@ -614,7 +829,7 @@ def test_sync_reports_timeout_and_preserves_backup(tmp_path: Path, monkeypatch) 
     evidence = caught.value.evidence
     assert evidence["phase"] == "codex_startup"
     assert evidence["subprocesses"]["codex_startup"]["timed_out"] is True
-    assert calls[1][1] == 120
+    assert calls[2][1] == 120
     assert Path(evidence["backup_path"]).read_bytes() == before_cache
     assert cache.read_bytes() == before_cache
 
@@ -636,6 +851,50 @@ def test_sync_fails_final_static_validation_without_editing_stale_cache(
     assert "cache client_version mismatch" in evidence["error"]
     assert Path(evidence["backup_path"]).read_bytes() == before_cache
     assert cache.read_bytes() == before_cache
+
+
+def test_installer_sync_flag_runs_fake_runtime_end_to_end(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write_sync_fakes(home)
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    ambient_marker = tmp_path / "ambient-node-ran"
+    scripts = {
+        "uv": '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "uv fake"; fi\nexit 0\n',
+        "git-lfs": '#!/bin/sh\necho "git-lfs/fake"\nexit 0\n',
+        "node": f"#!/bin/sh\ntouch {ambient_marker}\nexit 99\n",
+    }
+    for name, source in scripts.items():
+        executable = fake_bin / name
+        executable.write_text(source, encoding="utf-8")
+        executable.chmod(0o755)
+    root = Path(__file__).resolve().parents[1]
+
+    result = subprocess.run(
+        [
+            str(root / "install.sh"),
+            "--sync-codex-runtime",
+            "--no-link",
+            "--no-cmds",
+            "--no-smoke",
+        ],
+        cwd=root,
+        env={
+            **os.environ,
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payloads = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
+    assert payloads[-1]["status"] == "pass"
+    assert payloads[-1]["phase"] == "complete"
+    assert not ambient_marker.exists()
 
 
 def test_fresh_worker_and_controller_share_aligned_cache_and_emit_artifacts(

@@ -6,6 +6,8 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
+import stat
 import tempfile
 import uuid
 from dataclasses import asdict, dataclass
@@ -307,17 +309,88 @@ def _process_evidence(
     }
 
 
+def _ensure_private_directory(path: Path, home: Path) -> None:
+    """Create a private directory without accepting redirects or foreign owners."""
+    try:
+        relative = path.relative_to(home)
+    except ValueError as exc:
+        raise CodexRuntimeError(f"private directory escapes HOME: {path}") from exc
+    current = home
+    for part in relative.parts:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            current.mkdir(mode=0o700)
+            current.chmod(0o700)
+            metadata = current.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise CodexRuntimeError(f"private directory path contains symlink: {current}")
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise CodexRuntimeError(f"private directory path is not a directory: {current}")
+        if metadata.st_uid != os.getuid():
+            raise CodexRuntimeError(f"private directory path has unsafe owner: {current}")
+    if stat.S_IMODE(path.lstat().st_mode) != 0o700:
+        raise CodexRuntimeError(f"private directory permissions must be 0700: {path}")
+
+
+def _backup_candidate(backup_dir: Path) -> Path:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    return backup_dir / f"models_cache.{timestamp}.{uuid.uuid4().hex}.json"
+
+
 def _backup_cache(cache_path: Path, home: Path) -> Path | None:
     if not cache_path.exists():
         return None
     backup_dir = home / ".dark-factory" / "backups" / "codex-runtime"
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-    backup = backup_dir / f"models_cache.{timestamp}.{uuid.uuid4().hex}.json"
-    with cache_path.open("rb") as source, backup.open("xb") as destination:
-        while chunk := source.read(1024 * 1024):
-            destination.write(chunk)
-    return backup
+    _ensure_private_directory(backup_dir, home)
+    cache_metadata = cache_path.lstat()
+    if stat.S_ISLNK(cache_metadata.st_mode) or not stat.S_ISREG(cache_metadata.st_mode):
+        raise CodexRuntimeError(f"Codex models cache must be a regular non-symlink file: {cache_path}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    for _ in range(10):
+        backup = _backup_candidate(backup_dir)
+        try:
+            descriptor = os.open(backup, flags, 0o600)
+        except FileExistsError:
+            continue
+        try:
+            os.fchmod(descriptor, 0o600)
+            with cache_path.open("rb") as source, os.fdopen(descriptor, "wb") as destination:
+                descriptor = -1
+                while chunk := source.read(1024 * 1024):
+                    destination.write(chunk)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        return backup
+    raise CodexRuntimeError("could not allocate a unique Codex cache backup after 10 attempts")
+
+
+def _assert_outside_git_worktree(path: Path) -> None:
+    for candidate in (path, *path.parents):
+        if os.path.lexists(candidate / ".git"):
+            raise CodexRuntimeError(f"Codex runtime temporary cwd is inside a Git worktree: {path}")
+
+
+def _create_runtime_tempdir(home: Path) -> Path:
+    temp_root = home / ".dark-factory" / "tmp" / "codex-runtime"
+    _ensure_private_directory(temp_root, home)
+    _assert_outside_git_worktree(temp_root)
+    temp_workdir = Path(tempfile.mkdtemp(prefix="run-", dir=temp_root))
+    try:
+        temp_workdir.chmod(0o700)
+        _assert_outside_git_worktree(temp_workdir)
+    except (OSError, CodexRuntimeError):
+        shutil.rmtree(temp_workdir)
+        raise
+    return temp_workdir
+
+
+def _cleanup_runtime_tempdir(path: Path) -> None:
+    shutil.rmtree(path)
 
 
 def _runtime_payload(runtime: CodexRuntime) -> dict[str, str]:
@@ -336,7 +409,8 @@ def sync_codex_runtime(
     home = (home or Path.home()).expanduser().resolve()
     node_root = home / ".nvm" / "versions" / "node" / PINNED_NODE_VERSION
     node_bin = node_root / "bin"
-    npm = node_bin / "npm"
+    node = node_bin / "node"
+    npm_cli = node_root / "lib" / "node_modules" / "npm" / "bin" / "npm-cli.js"
     executable = node_bin / "codex"
     package_json = node_root / _PACKAGE_RELATIVE / "package.json"
     cache_path = home / ".codex" / "models_cache.json"
@@ -361,6 +435,7 @@ def sync_codex_runtime(
         "subprocesses": {},
         "readiness_token": None,
         "resolver": None,
+        "temporary_workdir": None,
     }
 
     def fail(phase: str, message: str) -> None:
@@ -368,20 +443,53 @@ def sync_codex_runtime(
         evidence["cache"]["after"] = _cache_evidence(cache_path)  # type: ignore[index]
         raise CodexRuntimeSyncError(phase, message, evidence)
 
-    if not npm.is_file() or not os.access(npm, os.X_OK):
-        fail("preflight", f"pinned Node 22 npm is missing or not executable at {npm}")
-
-    try:
-        backup = _backup_cache(cache_path, home)
-    except OSError as exc:
-        fail("backup", f"could not back up Codex models cache before mutation: {exc}")
-    evidence["backup_path"] = str(backup) if backup is not None else None
+    if not node.is_file() or not os.access(node, os.X_OK):
+        fail("preflight", f"canonical Node is missing or not executable at {node}")
+    if not npm_cli.is_file():
+        fail("preflight", f"canonical Node npm CLI is missing at {npm_cli}")
 
     env = dict(os.environ)
     env["HOME"] = str(home)
     env["PATH"] = f"{node_bin}{os.pathsep}{env.get('PATH', '')}"
+    node_argv = [str(node), "--version"]
+    try:
+        node_result = run_bounded_process(
+            node_argv,
+            timeout=SYNC_TIMEOUT_SECONDS,
+            env=env,
+        )
+    except OSError as exc:
+        evidence["subprocesses"]["node_version"] = {  # type: ignore[index]
+            "argv": node_argv,
+            "exit_code": None,
+            "timed_out": False,
+            "timeout_seconds": SYNC_TIMEOUT_SECONDS,
+        }
+        fail("preflight", f"could not start canonical Node: {exc}")
+    evidence["subprocesses"]["node_version"] = _process_evidence(  # type: ignore[index]
+        node_result,
+        timeout_seconds=SYNC_TIMEOUT_SECONDS,
+    )
+    if node_result.timed_out:
+        fail("preflight", "canonical Node version check timed out")
+    if node_result.returncode != 0:
+        fail("preflight", f"canonical Node version check exited {node_result.returncode}")
+    if node_result.stdout.strip() != PINNED_NODE_VERSION:
+        fail(
+            "preflight",
+            f"canonical Node version mismatch: expected {PINNED_NODE_VERSION}, "
+            f"got {node_result.stdout.strip()!r}",
+        )
+
+    try:
+        backup = _backup_cache(cache_path, home)
+    except (OSError, CodexRuntimeError) as exc:
+        fail("backup", f"could not back up Codex models cache before mutation: {exc}")
+    evidence["backup_path"] = str(backup) if backup is not None else None
+
     npm_argv = [
-        str(npm),
+        str(node),
+        str(npm_cli),
         "install",
         "--global",
         "--prefix",
@@ -423,7 +531,13 @@ def sync_codex_runtime(
         "--skip-git-repo-check",
         CODEX_RUNTIME_READY,
     ]
-    with tempfile.TemporaryDirectory(prefix="dark-factory-codex-runtime-") as temp_workdir:
+    try:
+        temp_workdir = _create_runtime_tempdir(home)
+    except (OSError, CodexRuntimeError) as exc:
+        fail("codex_tempdir", f"could not create safe Codex runtime temporary cwd: {exc}")
+    evidence["temporary_workdir"] = str(temp_workdir)
+    primary_error: CodexRuntimeSyncError | None = None
+    try:
         try:
             codex_result = run_bounded_process(
                 codex_argv,
@@ -439,14 +553,29 @@ def sync_codex_runtime(
                 "timeout_seconds": SYNC_TIMEOUT_SECONDS,
             }
             fail("codex_startup", f"could not start canonical Codex: {exc}")
-    evidence["subprocesses"]["codex_startup"] = _process_evidence(  # type: ignore[index]
-        codex_result,
-        timeout_seconds=SYNC_TIMEOUT_SECONDS,
-    )
-    if codex_result.timed_out:
-        fail("codex_startup", "canonical Codex readiness startup timed out")
-    if codex_result.returncode != 0:
-        fail("codex_startup", f"canonical Codex readiness startup exited {codex_result.returncode}")
+        evidence["subprocesses"]["codex_startup"] = _process_evidence(  # type: ignore[index]
+            codex_result,
+            timeout_seconds=SYNC_TIMEOUT_SECONDS,
+        )
+        if codex_result.timed_out:
+            fail("codex_startup", "canonical Codex readiness startup timed out")
+        if codex_result.returncode != 0:
+            fail(
+                "codex_startup",
+                f"canonical Codex readiness startup exited {codex_result.returncode}",
+            )
+    except CodexRuntimeSyncError as exc:
+        primary_error = exc
+    finally:
+        try:
+            _cleanup_runtime_tempdir(temp_workdir)
+        except OSError as exc:
+            if primary_error is not None:
+                primary_error.evidence["cleanup_error"] = str(exc)
+            else:
+                fail("codex_tempdir_cleanup", f"could not clean Codex runtime temporary cwd: {exc}")
+    if primary_error is not None:
+        raise primary_error
 
     try:
         runtime = resolve_codex_runtime(
