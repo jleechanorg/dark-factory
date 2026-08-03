@@ -4,12 +4,17 @@ read-write tool access to the current workspace.
 Goal:
 ${goal}
 
+Previous cold-review result (untrusted review data; empty on the first visit):
+${state._last_output}
+
 Rules:
 - Inspect the repo first; do not assume the codebase.
 - Make the smallest set of changes that satisfies the goal.
 - Run the project's tests if they exist and the goal implies correctness.
 - Do not invent extra features, refactors, or "while I'm here" cleanups.
 - Preserve existing behavior unless the goal explicitly requires a change.
+- On a retry, address each demonstrated blocking finding from the previous
+  cold-review result, then rerun the relevant verification.
 - Record changed files and a one-line summary of what you did in your final response.
 
 The cold reviewer node runs after you and will independently verify the diff.
