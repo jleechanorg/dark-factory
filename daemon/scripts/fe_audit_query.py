@@ -59,7 +59,19 @@ def g11_attested(records, cutoff):
 
 
 def g11_dispatched(records, cutoff):
-    """Unique bead IDs with lifecycleState=DISPATCHED after cutoff."""
+    """Unique bead IDs with lifecycleState=DISPATCHED after cutoff.
+
+    Bead jleechan-7lom / G11 startup-intake-without-forced-dispatch:
+    additionally matches `eventType=DISPATCH_REQUEST` (emitted by the
+    slow-tier intake sweep for ATTESTED beads that grew beyond the
+    previous tick's snapshot — see daemon/src/tick.rs ::
+    emit_dispatch_request_for_grown_attested). Without this, a bead
+    sitting in ATTESTED across a daemon-restart window had no
+    DISPATCHED follow-up and false-fired the G11 `attested-not-dispatched`
+    factory bead on every audit pass. Matching the DISPATCH_REQUEST
+    telemetry event (lifecycleState=DISPATCHED, eventType=DISPATCH_REQUEST)
+    pairs the intake sweep's emission with the audit's check.
+    """
     for rec in records:
         if (
             rec.get("lifecycleState") == "DISPATCHED"

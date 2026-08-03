@@ -1217,6 +1217,12 @@ pub struct FakeStateStore {
     /// exercise the dedup + terminal-marking paths without a real SQLite DB.
     pub escalation_ledger:
         RefCell<HashMap<(String, String), EscalationLedgerEntry>>,
+    /// Bead jleechan-7lom / G11 startup-intake-without-forced-dispatch:
+    /// per-bead `dispatch_request_seen` snapshot (mirrors the SQLite table)
+    /// so the fake can drive the growth-only dedup path the same way the
+    /// production daemon does. Empty by default — pre-fix behavior was
+    /// "never emitted", so the first post-fix slow tick emits fresh.
+    pub dispatch_request_seen: RefCell<HashMap<String, u64>>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -1582,6 +1588,48 @@ impl StateStore for FakeStateStore {
             .entry((bead_id.to_string(), reason.to_string()))
             .or_default();
         entry.terminal = true;
+        Ok(())
+    }
+
+    fn dispatch_request_already_emitted(&self, bead_id: &str) -> Result<bool, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("dispatch_request_already_emitted({bead_id})"));
+        Ok(self
+            .dispatch_request_seen
+            .borrow()
+            .contains_key(bead_id))
+    }
+
+    fn record_dispatch_request_emit(
+        &self,
+        bead_id: &str,
+        now_epoch: u64,
+    ) -> Result<(), DaemonError> {
+        self.calls.borrow_mut().push(format!(
+            "record_dispatch_request_emit({bead_id},{now_epoch})"
+        ));
+        self.dispatch_request_seen
+            .borrow_mut()
+            .insert(bead_id.to_string(), now_epoch);
+        Ok(())
+    }
+
+    fn prune_dispatch_request_seen_outside(
+        &self,
+        current_attested_ids: &[String],
+    ) -> Result<(), DaemonError> {
+        self.calls.borrow_mut().push(format!(
+            "prune_dispatch_request_seen_outside({} ids)",
+            current_attested_ids.len()
+        ));
+        let keep: std::collections::HashSet<&str> = current_attested_ids
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        self.dispatch_request_seen
+            .borrow_mut()
+            .retain(|bid, _| keep.contains(bid.as_str()));
         Ok(())
     }
 }

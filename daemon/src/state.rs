@@ -489,6 +489,39 @@ pub trait StateStore {
     ) -> Result<bool, DaemonError> {
         Ok(false)
     }
+
+    /// Bead jleechan-7lom / G11 startup-intake-without-forced-dispatch:
+    /// has a `DISPATCH_REQUEST` telemetry emission already been recorded
+    /// for `bead_id`? True iff the slow-tier intake sweep should suppress
+    /// a duplicate emit because the bead's previous ATTESTED presence is
+    /// already in the snapshot. Default `Ok(false)` so fakes that don't
+    /// exercise the growth-only dedup path see the "always emit" behavior.
+    fn dispatch_request_already_emitted(&self, _bead_id: &str) -> Result<bool, DaemonError> {
+        Ok(false)
+    }
+
+    /// Record a `DISPATCH_REQUEST` telemetry emission for `bead_id` at
+    /// `now_epoch`. Idempotent on `(bead_id)` — overwrites the timestamp
+    /// on a re-record so a re-entry after a HUMAN_HELD round trip
+    /// (`prune_dispatch_request_seen_outside`) gets a fresh slot. Default
+    /// no-op for fakes that don't persist the snapshot.
+    fn record_dispatch_request_emit(&self, _bead_id: &str, _now_epoch: u64) -> Result<(), DaemonError> {
+        Ok(())
+    }
+
+    /// Drop snapshot rows for beads that are NO LONGER in the live
+    /// ATTESTED set (bead jleechan-7lom: re-arm after a bead leaves
+    /// ATTESTED so a future re-entry is treated as fresh growth and
+    /// re-emits a `DISPATCH_REQUEST`). `current_attested_ids` is the
+    /// authoritative set the slow tier just queried from
+    /// `list_active_overlays` — anything NOT in that set is pruned.
+    /// Default no-op for fakes that don't persist the snapshot.
+    fn prune_dispatch_request_seen_outside(
+        &self,
+        _current_attested_ids: &[String],
+    ) -> Result<(), DaemonError> {
+        Ok(())
+    }
 }
 
 /// `StateStore` impl against `~/.dark-factory/daemon-cxdb.sqlite` (WAL mode,
@@ -703,6 +736,7 @@ impl SqliteStateStore {
         Self::ensure_escalation_ledger_terminal_column(&conn)?;
         Self::ensure_claimed_by_columns(&conn)?;
         Self::ensure_peer_claims_table(&conn)?;
+        Self::ensure_dispatch_request_seen_table(&conn)?;
         Self::ensure_attempt_started_at_column(&conn)?;
         Ok(Self { conn })
     }
@@ -728,6 +762,7 @@ impl SqliteStateStore {
         Self::ensure_escalation_ledger_terminal_column(&conn)?;
         Self::ensure_claimed_by_columns(&conn)?;
         Self::ensure_peer_claims_table(&conn)?;
+        Self::ensure_dispatch_request_seen_table(&conn)?;
         Self::ensure_attempt_started_at_column(&conn)?;
         Ok(Self { conn })
     }
@@ -794,6 +829,36 @@ impl SqliteStateStore {
                  )",
             )
             .map_err(|e| tool_err("ensure_peer_claims_table: create", e))?;
+        }
+        Ok(())
+    }
+
+    /// Bead jleechan-7lom / G11 startup-intake-without-forced-dispatch.
+    /// Idempotent migration for the `dispatch_request_seen` snapshot table.
+    /// Records `bead_id` of every bead for which the slow-tier intake sweep
+    /// already emitted a `DISPATCH_REQUEST` telemetry event so a follow-up
+    /// sweep can suppress duplicate emissions while the bead stays
+    /// ATTESTED — and prune the row once the bead leaves the ATTESTED set
+    /// so a future re-entry is treated as fresh growth and re-emits.
+    /// Probes `sqlite_master` then `CREATE TABLE IF NOT EXISTS` — same
+    /// idempotent pattern as `ensure_peer_claims_table`.
+    fn ensure_dispatch_request_seen_table(conn: &Connection) -> Result<(), DaemonError> {
+        let has_table: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'dispatch_request_seen'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_dispatch_request_seen_table: probe", e))?;
+        if !has_table {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS dispatch_request_seen (\
+                   bead_id     TEXT PRIMARY KEY,\
+                   emitted_at  INTEGER NOT NULL\
+                 )",
+            )
+            .map_err(|e| tool_err("ensure_dispatch_request_seen_table: create", e))?;
         }
         Ok(())
     }
@@ -2311,6 +2376,85 @@ impl StateStore for SqliteStateStore {
             Err(e) => Err(tool_err("claim_blocks_dispatch", e)),
         }
     }
+
+    fn dispatch_request_already_emitted(&self, bead_id: &str) -> Result<bool, DaemonError> {
+        // Same legacy-DB tolerance as `er_runner_attempt` /
+        // `reroll_deferral_count`: a "no such table" error means the
+        // migration hasn't run yet on a pre-#514 daemon. The default
+        // behavior is "never emitted" so the first post-migration slow
+        // tick emits a fresh snapshot for every currently-ATTESTED bead
+        // (the exact behavior the G11 fix wants — the gap being closed
+        // is precisely "no DISPATCH_REQUEST ever emitted for these
+        // beads").
+        let row: Result<i64, rusqlite::Error> = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM dispatch_request_seen WHERE bead_id = ?1",
+                params![bead_id],
+                |row| row.get(0),
+            );
+        match row {
+            Ok(count) => Ok(count > 0),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(e) if no_such_table(&e) => Ok(false),
+            Err(e) => Err(tool_err("dispatch_request_already_emitted", e)),
+        }
+    }
+
+    fn record_dispatch_request_emit(
+        &self,
+        bead_id: &str,
+        now_epoch: u64,
+    ) -> Result<(), DaemonError> {
+        // UPSERT — overwrite the timestamp on re-record so a re-entry
+        // after `prune_dispatch_request_seen_outside` gets a fresh slot.
+        let res = self.conn.execute(
+            "INSERT INTO dispatch_request_seen (bead_id, emitted_at) VALUES (?1, ?2) \
+             ON CONFLICT(bead_id) DO UPDATE SET emitted_at = excluded.emitted_at",
+            params![bead_id, now_epoch as i64],
+        );
+        match res {
+            Ok(_) => Ok(()),
+            Err(e) if no_such_table(&e) => Ok(()),
+            Err(e) => Err(tool_err("record_dispatch_request_emit", e)),
+        }
+    }
+
+    fn prune_dispatch_request_seen_outside(
+        &self,
+        current_attested_ids: &[String],
+    ) -> Result<(), DaemonError> {
+        // SQLite parameter cap is 999 — `current_attested_ids` is the
+        // ATTESTED set from `list_active_overlays` which is normally a
+        // handful of beads; if the daemon ever hits the cap we'll chunk
+        // it in a follow-up. Today this is a single batched DELETE.
+        if current_attested_ids.is_empty() {
+            // No ATTESTED beads — drop the entire snapshot so any
+            // future re-entry starts fresh.
+            let res = self.conn.execute("DELETE FROM dispatch_request_seen", []);
+            return match res {
+                Ok(_) => Ok(()),
+                Err(e) if no_such_table(&e) => Ok(()),
+                Err(e) => Err(tool_err("prune_dispatch_request_seen_outside", e)),
+            };
+        }
+        let placeholders = std::iter::repeat_n("?", current_attested_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "DELETE FROM dispatch_request_seen WHERE bead_id NOT IN ({placeholders})"
+        );
+        let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(current_attested_ids.len());
+        for id in current_attested_ids {
+            params_vec.push(id);
+        }
+        let res = self.conn.execute(&sql, params_vec.as_slice());
+        match res {
+            Ok(_) => Ok(()),
+            Err(e) if no_such_table(&e) => Ok(()),
+            Err(e) => Err(tool_err("prune_dispatch_request_seen_outside", e)),
+        }
+    }
 }
 
 /// True when `err` is the SQLite "no such column" schema-mismatch signal.
@@ -2319,6 +2463,14 @@ impl StateStore for SqliteStateStore {
 /// the JSON parsers in tools.rs use for `find('{')` fallback.
 fn no_such_column(err: &rusqlite::Error) -> bool {
     err.to_string().to_lowercase().contains("no such column")
+}
+
+/// True when `err` is the SQLite "no such table" schema-mismatch signal.
+/// Sister helper to `no_such_column` for callers that probe tables created
+/// by post-release migrations (e.g. `dispatch_request_seen` for bead
+/// jleechan-7lom). Same stringification rationale.
+fn no_such_table(err: &rusqlite::Error) -> bool {
+    err.to_string().to_lowercase().contains("no such table")
 }
 
 #[cfg(test)]

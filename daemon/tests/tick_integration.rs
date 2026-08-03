@@ -13241,3 +13241,97 @@ fn vendor_health_ledger_ci_pending_with_capped_vendor_skips_wait() {
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+// ---------------------------------------------------------------------------
+// G11 startup-intake-without-forced-dispatch (bead jleechan-7lom)
+// ---------------------------------------------------------------------------
+//
+// Regression test: when the slow-tier intake sweep observes an ATTESTED bead
+// in `list_active_overlays()` that has grown beyond the previous tick's
+// snapshot, it must emit a `DISPATCH_REQUEST` telemetry event so the G11
+// fe-audit (daemon/scripts/fe-audit.sh:153) stops false-firing the
+// `attested-not-dispatched` factory bead. The pre-fix code path never
+// emitted any telemetry for a bead lingering in ATTESTED across a slow-tier
+// restart window, so `g11_dispatched` (fe_audit_query.py:61) saw zero
+// DISPATCHED follow-up events for that bead and filed a G11 bead per
+// G11 audit pass.
+//
+// The test pins the contract at the smallest surface that exposes the gap:
+// it pre-seeds an ATTESTED overlay in the FakeStateStore (the prior
+// snapshot is empty), calls the new slow-tier helper, and asserts the
+// telemetry log contains a `DISPATCH_REQUEST` event for the bead. Without
+// the helper, this test cannot compile (RED). With the helper
+// implemented, the event appears (GREEN).
+
+#[test]
+fn slow_tier_intake_emits_dispatch_request_for_grown_attested_bead() {
+    use daemon::state::{BeadOverlay, OverlayState};
+    use std::path::PathBuf;
+
+    let store = FakeStateStore::new();
+    let telemetry_dir = std::env::temp_dir().join("afd_g11_intake_test");
+    std::fs::create_dir_all(&telemetry_dir).unwrap();
+    let telemetry_log: PathBuf = telemetry_dir.join(format!("daemon-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    // Pre-seed: a bead that has been ATTESTED long enough that the prior
+    // tick's snapshot MUST have included it. The previous tick's snapshot
+    // is empty (no recorded prior dispatch-request emissions), so any
+    // ATTESTED bead in the current `list_active_overlays` set is by
+    // definition "growth" relative to the snapshot.
+    let overlay = BeadOverlay {
+        bead_id: "jleechan-attested-grown".into(),
+        state: OverlayState::Attested,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 0,
+        spend_usd: 0.0,
+        pr_number: Some(9001),
+        branch: Some("factory/jleechan-attested-grown-r1".into()),
+        session_id: None,
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: None,
+        attempt_started_at: None,
+    };
+    store.save(&overlay).expect("pre-seed save");
+
+    // RED assertion: the helper does not exist yet, so this call fails
+    // to compile. Once `emit_dispatch_request_for_grown_attested` lands,
+    // the telemetry log must contain a `DISPATCH_REQUEST` event for
+    // the pre-seeded bead with `lifecycleState=DISPATCHED`.
+    daemon::tick::emit_dispatch_request_for_grown_attested(&store, &telemetry_log)
+        .expect("helper should succeed");
+
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("\"eventType\":\"DISPATCH_REQUEST\""),
+        "DISPATCH_REQUEST telemetry event must be emitted for the grown ATTESTED bead; got log:\n{log}"
+    );
+    assert!(
+        log.contains("\"beadId\":\"jleechan-attested-grown\""),
+        "DISPATCH_REQUEST event must be tagged with the pre-seeded bead id; got log:\n{log}"
+    );
+    assert!(
+        log.contains("\"lifecycleState\":\"DISPATCHED\""),
+        "DISPATCH_REQUEST event must carry lifecycleState=DISPATCHED so fe_audit_query.g11_dispatched matches it; got log:\n{log}"
+    );
+
+    // Idempotency: a second call with no state change must NOT re-emit
+    // (growth-only dedup — without it, every slow tick re-files a G11
+    // factory bead for the same ATTESTED set, which was the
+    // jleechan-mdun re-emit storm the design calls out).
+    let before_len = log.lines().count();
+    daemon::tick::emit_dispatch_request_for_grown_attested(&store, &telemetry_log)
+        .expect("second helper call should succeed");
+    let log2 = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert_eq!(
+        log2.lines().count(),
+        before_len,
+        "second call must NOT re-emit when the ATTESTED set has not grown; got log:\n{log2}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}

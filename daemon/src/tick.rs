@@ -1479,10 +1479,80 @@ fn run_recovery_step(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), D
     Ok(())
 }
 
+/// Bead jleechan-7lom / G11 startup-intake-without-forced-dispatch.
+///
+/// Emit one `DISPATCH_REQUEST` telemetry event (with `lifecycleState =
+/// DISPATCHED`) for every ATTESTED bead in the current active overlay set
+/// that is NOT already recorded in the `dispatch_request_seen` snapshot.
+/// This closes the G11 fe-audit (daemon/scripts/fe-audit.sh:153) gap where
+/// a bead sitting in ATTESTED with no `TASK_DISPATCHED` follow-up event
+/// would false-fire the `attested-not-dispatched` factory bead on every
+/// audit pass — the `g11_dispatched` query (fe_audit_query.py:61) now
+/// matches `DISPATCH_REQUEST` lifecycleState in the same lookback, so a
+/// single emission is enough to suppress the G11 finding for the full
+/// REFILE_COOLDOWN_HOURS window.
+///
+/// Growth-only dedup: the `dispatch_request_seen` table remembers every
+/// bead we've already emitted for, so a second call with no state
+/// change is a no-op (avoids the jleechan-mdun re-emit storm). Beads that
+/// leave the ATTESTED set between ticks have their snapshot row pruned
+/// at the end so a future re-entry (post-reroll) is treated as fresh
+/// growth and re-emits.
+///
+/// Public so `daemon/tests/tick_integration.rs` can drive the helper
+/// directly without going through the full slow-tier wiring.
+pub fn emit_dispatch_request_for_grown_attested(
+    store: &dyn crate::state::StateStore,
+    telemetry_log: &Path,
+) -> Result<(), DaemonError> {
+    let active_overlays = store.list_active_overlays()?;
+    let current_attested_ids: Vec<String> = active_overlays
+        .iter()
+        .filter(|o| o.state == crate::state::OverlayState::Attested)
+        .map(|o| o.bead_id.clone())
+        .collect();
+    if current_attested_ids.is_empty() {
+        // Nothing to do — also drop the snapshot so a future re-entry
+        // starts fresh.
+        store.prune_dispatch_request_seen_outside(&[])?;
+        return Ok(());
+    }
+    let mut emitted_count: u32 = 0;
+    for bead_id in &current_attested_ids {
+        if store.dispatch_request_already_emitted(bead_id)? {
+            continue;
+        }
+        let now_epoch = now_epoch_secs();
+        emit(
+            telemetry_log,
+            bead_id,
+            1,
+            crate::state::OverlayState::Dispatched.as_str(),
+            "DISPATCH_REQUEST",
+            serde_json::json!({}),
+            serde_json::json!({
+                "event": "intake_dispatch_request",
+                "reason": "attested_growth_without_dispatch_followup",
+            }),
+        )?;
+        store.record_dispatch_request_emit(bead_id, now_epoch)?;
+        emitted_count += 1;
+    }
+    // Re-arm beads that left ATTESTED so a future re-entry emits fresh.
+    store.prune_dispatch_request_seen_outside(&current_attested_ids)?;
+    if emitted_count > 0 {
+        eprintln!(
+            "auto-factory daemon: G11 intake sweep emitted {emitted_count} DISPATCH_REQUEST event(s) for grown ATTESTED beads"
+        );
+    }
+    Ok(())
+}
+
 /// Slow tier: intake new beads, route each freshly-queued bead, dispatch as
 /// many QUEUED beads as the safety envelope (30/15) allows.
 fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), DaemonError> {
     // jleechan-gib: recovery runs AFTER this slow-tier dispatch pass (see
+    // `run_tick`), so freshly-recovered QUEUED beads are NOT dispatched this
     // `run_tick`), so freshly-recovered QUEUED beads are NOT dispatched this
     // same tick — they are dispatched on the NEXT slow tick. This is the
     // required dispatch-scheduling guarantee: already-QUEUED beads (from prior
@@ -1535,6 +1605,15 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     for outcome in &pr_skip_outcomes {
         emit_intake_outcome(deps.telemetry_log, outcome)?;
     }
+
+    // Bead jleechan-7lom / G11 startup-intake-without-forced-dispatch:
+    // emit a DISPATCH_REQUEST event for every ATTESTED bead that has
+    // grown beyond the previous tick's snapshot so the G11 fe-audit
+    // (fe-audit.sh:153) does not false-fire on a bead sitting in ATTESTED
+    // across a daemon restart window. The growth-only dedup keeps the
+    // re-emit count bounded to actual growth (one row per bead per
+    // re-entry into the ATTESTED set).
+    emit_dispatch_request_for_grown_attested(deps.store, deps.telemetry_log)?;
     for adopted in pr_adoptions {
         pr_intake_bead_ids.insert(adopted.bead_id.clone());
         if adopted.newly_created {
