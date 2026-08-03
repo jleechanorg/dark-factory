@@ -234,21 +234,30 @@ def _launch_shadow_gate_review(
     if args is None:
         shadow.launch_error = "sandbox-exec unavailable"
         return shadow
-    if prompt_is_complete and backend == "codex":
-        try:
-            args = _controller_codex_args(
-                args,
-                read_only_paths=(ctx.workdir,),
-            )
-        except ValueError as exc:
-            shadow.launch_error = str(exc)
-            return shadow
-        shadow.json_transport = True
     review_cwd = ctx.workdir
     if prompt_is_complete:
         configured_cwd = ctx.state.get("_df_controller_review_cwd")
         if configured_cwd:
             review_cwd = pathlib.Path(str(configured_cwd))
+    if prompt_is_complete and backend == "codex":
+        try:
+            lane_dirs = ctx.state.get("_df_controller_review_lane_dirs")
+            output_dir = (
+                pathlib.Path(str(lane_dirs["primary"]))
+                if isinstance(lane_dirs, dict) and lane_dirs.get("primary")
+                else review_cwd
+            )
+            args = _controller_codex_args(
+                args,
+                read_only_paths=_controller_protected_paths(
+                    (_handlers_shim._target_worktree(ctx),),
+                    output_dir=output_dir,
+                ),
+            )
+        except ValueError as exc:
+            shadow.launch_error = str(exc)
+            return shadow
+        shadow.json_transport = True
     try:
         shadow.proc = subprocess.Popen(
             args,
@@ -724,11 +733,23 @@ def _run_gate_once(
             },
         )
     controller_json = backend == "codex" and controller_requested
+    review_cwd = ctx.workdir
+    if controller_json and ctx.state.get("_df_controller_review_cwd"):
+        review_cwd = pathlib.Path(str(ctx.state["_df_controller_review_cwd"]))
     if controller_json:
         try:
+            lane_dirs = ctx.state.get("_df_controller_review_lane_dirs")
+            output_dir = (
+                pathlib.Path(str(lane_dirs["primary"]))
+                if isinstance(lane_dirs, dict) and lane_dirs.get("primary")
+                else review_cwd
+            )
             sub_args = _controller_codex_args(
                 sub_args,
-                read_only_paths=(ctx.workdir,),
+                read_only_paths=_controller_protected_paths(
+                    (_handlers_shim._target_worktree(ctx),),
+                    output_dir=output_dir,
+                ),
             )
         except ValueError:
             return Result(
@@ -750,9 +771,6 @@ def _run_gate_once(
     # so we read agy's timeout message rather than killing it first.
     run_timeout = timeout + 30 if backend == "agy" else timeout
     try:
-        review_cwd = ctx.workdir
-        if controller_json and ctx.state.get("_df_controller_review_cwd"):
-            review_cwd = pathlib.Path(str(ctx.state["_df_controller_review_cwd"]))
         proc = subprocess.run(
             sub_args, cwd=review_cwd, capture_output=True, text=True,
             input=prompt if controller_json else None,

@@ -857,6 +857,98 @@ def test_controller_protects_linked_git_metadata_and_artifact_lane(tmp_path):
     assert not (common_dir / "reviewer-write").exists()
     assert not (output_dir / "reviewer-write").exists()
     assert not (output_dir / "reviewer-link").exists()
+
+    external = tmp_path / "external-replacement"
+    external.mkdir()
+    root_probe = tmp_path / "codex-root-probe" / "codex"
+    root_probe.parent.mkdir()
+    root_probe.write_text(
+        "#!/bin/sh\n"
+        'if [ "$DF_MODE" = rename ]; then\n'
+        '  if /bin/mv "$DF_TARGET" "$DF_MOVED" 2>/dev/null; then\n'
+        "    printf 'root-rename-bypass\\n'\n"
+        "    exit 90\n"
+        "  fi\n"
+        "  printf 'root-rename-denied\\n'\n"
+        "  exit 0\n"
+        "fi\n"
+        'if /bin/ln -s "$DF_EXTERNAL" "$DF_TARGET" 2>/dev/null; then\n'
+        "  printf 'root-replacement-bypass\\n'\n"
+        "  exit 91\n"
+        "fi\n"
+        "printf 'root-replacement-denied\\n'\n",
+        encoding="utf-8",
+    )
+    root_probe.chmod(0o755)
+    root_transport = _build_controller_codex_transport(
+        [
+            sandbox_exec,
+            "-p",
+            "(version 1)\n(allow default)",
+            str(root_probe),
+            "exec",
+            "prompt",
+        ],
+        read_only_paths=protected,
+    )
+    root_results = {}
+    for label, target in (
+        ("output", output_dir),
+        ("source", reviewed),
+        ("git_dir", git_dir),
+        ("git_common_dir", common_dir),
+    ):
+        moved = target.with_name(target.name + "-reviewer-moved")
+        rename_result = subprocess.run(
+            root_transport,
+            input=f"bounded {label} root-rename probe",
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "DF_MODE": "rename",
+                "DF_TARGET": str(target),
+                "DF_MOVED": str(moved),
+                "DF_EXTERNAL": str(external),
+            },
+            timeout=10,
+            check=False,
+        )
+        if moved.exists() and not target.exists():
+            moved.rename(target)
+
+        target.rename(moved)
+        replacement_result = subprocess.run(
+            root_transport,
+            input=f"bounded {label} root-replacement probe",
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "DF_MODE": "replace",
+                "DF_TARGET": str(target),
+                "DF_MOVED": str(moved),
+                "DF_EXTERNAL": str(external),
+            },
+            timeout=10,
+            check=False,
+        )
+        if target.is_symlink():
+            target.unlink()
+        moved.rename(target)
+        root_results[label] = (rename_result, replacement_result)
+
+    assert {
+        label: tuple((result.returncode, result.stdout.strip()) for result in results)
+        for label, results in root_results.items()
+    } == {
+        label: (
+            (0, "root-rename-denied"),
+            (0, "root-replacement-denied"),
+        )
+        for label in ("output", "source", "git_dir", "git_common_dir")
+    }
+    assert all(not path.is_symlink() for path in (output_dir, reviewed, git_dir, common_dir))
     (output_dir / "controller-receipt.json").write_text("accepted\n")
     assert (output_dir / "controller-receipt.json").read_text() == "accepted\n"
 

@@ -344,6 +344,7 @@ def test_review_skills_describe_one_canonical_codex_controller_lane():
     assert "VERDICT: pass|fail" in calibration
     assert "transport.jsonl" in calibration
     assert '"verdict": "blockers|no_blockers|inconclusive"' not in calibration
+    assert "The auditor, not the review binary, writes `audit.json`" in calibration
 
 
 def test_review_command_rejects_dirty_workspace_before_backend(

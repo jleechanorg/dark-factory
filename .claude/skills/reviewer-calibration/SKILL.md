@@ -68,8 +68,10 @@ evidence/<run-id>/reviewer-calibration/
     transport.jsonl
     reviewer.output.md
     findings.json
-  audit.json
 ```
+
+The auditor, not the review binary, writes `audit.json` after recomputing and
+comparing the binary-owned receipt and artifact digests.
 
 `prompt.txt` is a binary-emitted audit capture only. It is not prompt
 authority. Never author it in a skill/workflow, copy it from the target repo,

@@ -176,6 +176,10 @@ def test_complete_controller_prompt_is_not_rewrapped_for_shadow(tmp_path, monkey
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
     monkeypatch.setattr("runner.handler_dispatch.shutil.which", lambda name: "/usr/bin/codex")
     monkeypatch.setattr("runner.handler_dispatch.subprocess.Popen", _FakePopen)
+    monkeypatch.setattr(
+        "runner.handler_dispatch._controller_protected_paths",
+        lambda reviewed_paths, *, output_dir: tuple(reviewed_paths) + (output_dir,),
+    )
     ctx = HCtx(goal="untrusted goal", workdir=tmp_path, backend="codex")
 
     prompt = "CONTROLLER-OWNED COMPLETE PROMPT"
@@ -226,6 +230,10 @@ def test_launch_shadow_gate_review_uses_controller_cwd_and_sanitized_env(tmp_pat
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
     monkeypatch.setattr("runner.handler_dispatch.shutil.which", lambda name: "/usr/bin/codex")
     monkeypatch.setattr("runner.handler_dispatch.subprocess.Popen", _FakePopen)
+    monkeypatch.setattr(
+        "runner.handler_dispatch._controller_protected_paths",
+        lambda reviewed_paths, *, output_dir: tuple(reviewed_paths) + (output_dir,),
+    )
     monkeypatch.setattr(
         "runner.handlers._get_claude_executable",
         lambda: "claude",
@@ -397,9 +405,23 @@ def test_execute_gate_uses_controller_codex_transport(tmp_path, monkeypatch):
     monkeypatch.setenv("MY_HOLDOUT_SECRET", "sealed")
     monkeypatch.setattr("subprocess.run", _fake_run)
 
+    protected_calls = []
+
+    def _protected_paths(reviewed_paths, *, output_dir):
+        reviewed = tuple(pathlib.Path(path).resolve() for path in reviewed_paths)
+        output = pathlib.Path(output_dir).resolve()
+        protected_calls.append((reviewed, output))
+        return reviewed + (output,)
+
+    monkeypatch.setattr(
+        "runner.handler_dispatch._controller_protected_paths",
+        _protected_paths,
+    )
     neutral = tmp_path / "controller-cwd"
     neutral.mkdir()
-    ctx = HCtx(goal="test", workdir=tmp_path / "target", backend="claude", run_id="controller")
+    target = tmp_path / "target"
+    target.mkdir()
+    ctx = HCtx(goal="test", workdir=target, backend="claude", run_id="controller")
     ctx.state["_df_controller_review_json"] = "true"
     ctx.state["_df_controller_review_cwd"] = str(neutral)
 
@@ -421,6 +443,7 @@ def test_execute_gate_uses_controller_codex_transport(tmp_path, monkeypatch):
     assert isinstance(env, dict)
     assert "DARK_FACTORY_HOLDOUTS" not in env
     assert "MY_HOLDOUT_SECRET" not in env
+    assert protected_calls == [((target.resolve(),), neutral.resolve())]
 
 
 def test_execute_gate_rejects_controller_request_for_non_codex_backend(
