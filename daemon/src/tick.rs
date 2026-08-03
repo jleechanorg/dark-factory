@@ -5095,7 +5095,7 @@ const MISSING_SCM_TARGET_ERROR_MARKER: &str = "no SCM comment target found";
 /// Create a new overflow escalation issue on GitHub (issue #507).
 /// Returns the new issue's `owner/repo#N` ext_ref string on success.
 fn create_overflow_escalation_issue(
-    deps: &TickDeps,
+    _deps: &TickDeps,
     bead_id: &str,
     original_ext_ref: &str,
 ) -> Result<String, DaemonError> {
