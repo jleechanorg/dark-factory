@@ -469,24 +469,23 @@ raise SystemExit({codex_exit})
     return cache, before_cache
 
 
-def test_default_runtime_cli_is_read_only_and_sync_is_explicit(tmp_path: Path) -> None:
+def test_default_runtime_cli_is_read_only_and_sync_is_explicit(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    from runner import codex_runtime
+
     home = tmp_path / "home"
     _, package_json, cache = _write_runtime(home)
     package_before = package_json.read_bytes()
     cache_before = cache.read_bytes()
     root = Path(__file__).resolve().parents[1]
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(codex_runtime, "_default_competing_package_paths", lambda: ())
 
-    result = subprocess.run(
-        [sys.executable, "-m", "runner.codex_runtime", "--json"],
-        cwd=root,
-        env={**os.environ, "HOME": str(home), "PYTHONPATH": str(root)},
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    returncode = codex_runtime.main(["--json"])
 
-    assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)["status"] == "pass"
+    assert returncode == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "pass"
     assert package_json.read_bytes() == package_before
     assert cache.read_bytes() == cache_before
     installer = (root / "install.sh").read_text(encoding="utf-8")
