@@ -432,6 +432,53 @@ class ControllerSnapshotTests(unittest.TestCase):
                     _git(source, "rev-parse", "HEAD").strip(),
                 )
 
+    def test_controller_contract_does_not_inherit_worker_echo_backend(self) -> None:
+        """A two-node controller gate resolves Codex even when its worker used echo."""
+        from unittest.mock import patch
+
+        from runner.handler_core import Context, Result
+        from runner.handler_parallel_reviewer import _parallel_reviewer
+        from runner.parser import Node
+
+        (self.repo / "README.md").write_text("worker output\n")
+        seen: list[str] = []
+
+        def _fake_primary(prompt, expected_sha, timeout, ctx, node_name, backend, **kwargs):
+            seen.append(backend)
+            return Result(outcome="success", output="controller response")
+
+        node = Node(
+            name="cold_reviewer",
+            attrs={
+                "review_contract": "cold-review-v1",
+                "backend_priority": "codex",
+            },
+        )
+        ctx = Context(goal="review worker output", workdir=self.repo, backend="echo")
+        with patch("runner.handler_parallel_reviewer._run_primary_review", _fake_primary), patch(
+            "runner.handler_parallel_reviewer._contract_adjusted_result",
+            lambda result, request, ctx, **kwargs: result,
+        ):
+            result = _parallel_reviewer(node, ctx)
+
+        self.assertEqual(result.outcome, "success")
+        self.assertEqual(seen, ["codex"])
+
+    def test_controller_contract_allows_explicitly_preseeded_echo_fixture(self) -> None:
+        """Tests can still opt into deterministic echo with a reviewer outcome seed."""
+        from runner.handler_core import Context
+        from runner.handler_parallel_reviewer import _parallel_reviewer
+        from runner.parser import Node
+
+        node = Node(name="cold_reviewer", attrs={"review_contract": "cold-review-v1"})
+        ctx = Context(goal="fixture", workdir=self.repo, backend="echo")
+        ctx.state["cold_reviewer.outcome"] = "success"
+
+        result = _parallel_reviewer(node, ctx)
+
+        self.assertEqual(result.outcome, "success")
+        self.assertEqual(result.metadata["reviewer_backend"], "echo")
+
 
 def replace_evidence(
     inputs: ReviewInputs, evidence: tuple[EvidenceArtifact, ...]

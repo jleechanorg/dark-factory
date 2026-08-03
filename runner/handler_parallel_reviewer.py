@@ -829,7 +829,9 @@ class _MDToCtxShim:
 def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     """Run parallel reviewer lanes and pass combined evidence downstream."""
     import runner.handlers as _handlers_shim  # late-bound shim for monkeypatched helpers
-    if ctx.backend in ("echo", "mock_llm"):
+    review_contract = str(node.attrs.get("review_contract") or "").strip()
+    preseeded_outcome = f"{node.name}.outcome" in ctx.state
+    if ctx.backend in ("echo", "mock_llm") and (not review_contract or preseeded_outcome):
         hint = ctx.state.get(f"{node.name}.outcome", "success")
         return Result(
             outcome=hint,
@@ -843,7 +845,6 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
         )
     target_dir = _handlers_shim._target_worktree(ctx)
     expected_sha = _handlers_shim._worktree_head_sha(target_dir)
-    review_contract = str(node.attrs.get("review_contract") or "").strip()
 
     request = None
     if review_contract:
