@@ -82,6 +82,28 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// Extract the offender path from an AO workspace-worktree rejection message.
+///
+/// Agent-orchestrator's workspace-worktree plugin formats the error as
+/// `Found existing worktree for orchestrator branch "<branch>" at "<path>",
+/// but it is outside AO-managed worktree directories. Reuse it manually or
+/// remove it and try again.`. The `<path>` is wrapped in double quotes and
+/// followed by a comma; we anchor on the literal `at "` substring so the
+/// parser does not pick up the branch name (which appears earlier in the
+/// same line, also inside quotes) or any other path-shaped token a future
+/// error variant might introduce. Returns `None` when the substring is
+/// missing or the path cannot be located — the caller treats that as a
+/// non-phantom failure and falls through to the existing HUMAN_HELD
+/// parking path.
+fn parse_phantom_worktree_path(stderr: &str) -> Option<String> {
+    let after_at = stderr.split("at \"").nth(1)?;
+    let path = after_at.split('"').next()?;
+    if path.is_empty() || !path.starts_with('/') {
+        return None;
+    }
+    Some(path.to_string())
+}
+
 fn emit_telemetry(
     log_path: &Path,
     bead_id: &str,
@@ -1168,7 +1190,55 @@ fn execute_adopted(
     bead.pre_session_head_sha = Some(pre_session_sha.clone());
     deps.store.save(bead)?;
 
-    match deps.sessions.spawn(&spec) {
+    let mut spawn_result = deps.sessions.spawn(&spec);
+
+    // Bead jleechan-#505: AO's workspace-worktree plugin rejects spawn when
+    // a stale worktree for the same branch lives outside the directories AO
+    // manages ("Found existing worktree for orchestrator branch <branch>
+    // at <path>, but it is outside AO-managed worktree directories...").
+    // Without intervention the daemon parks the bead HUMAN_HELD with reason
+    // `AdoptedSpawnFailed`, but the offending path is reproducible: prune
+    // the project's git worktree list and remove the directory on disk
+    // (if it survived), then retry spawn once. Emit a dedicated
+    // PHANTOM_WORKTREE_PRUNED telemetry event on auto-recovery so the
+    // auto-fix is observable in the daemon's event log. Only escalate to
+    // HUMAN_HELD if the retry still fails.
+    if let Err(DaemonError::Tool { ref stderr, .. }) = spawn_result {
+        if let Some(phantom_path) = parse_phantom_worktree_path(stderr) {
+            // `target_repo` is `jleechanorg/worldarchitect.ai` for every
+            // adopted bead dispatched by this daemon; the local check-out
+            // is the conventional sibling of `~/projects/dark-factory`.
+            // `git worktree prune` needs the local repo as cwd because the
+            // worktree list is per-repo.
+            const TARGET_REPO_LOCAL_PATH: &str = "/home/jleechan/projects/worldarchitect.ai";
+            let _ = crate::tools::run_tool_in_dir(
+                "git",
+                &["worktree", "prune"],
+                TARGET_REPO_LOCAL_PATH,
+                30,
+            );
+            if std::path::Path::new(&phantom_path).exists() {
+                let _ = std::fs::remove_dir_all(&phantom_path);
+            }
+            spawn_result = deps.sessions.spawn(&spec);
+            if spawn_result.is_ok() {
+                emit_telemetry(
+                    deps.telemetry_log,
+                    &bead.bead_id,
+                    bead.attempt,
+                    bead.state.as_str(),
+                    "PHANTOM_WORKTREE_PRUNED",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "branch": branch,
+                        "phantom_path": phantom_path,
+                    }),
+                )?;
+            }
+        }
+    }
+
+    match spawn_result {
         Ok(session_id) => {
             bead.attempt = next_attempt;
             bead.reroll_count += 1;
@@ -1253,5 +1323,42 @@ fn execute_adopted(
                 "failed to spawn a remediation coder session on adopted branch {branch}: {e}"
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_phantom_worktree_path;
+
+    #[test]
+    fn phantom_worktree_path_extracts_offender_path() {
+        let stderr = "[dark-factory AO bridge] Found existing worktree for orchestrator branch \"feat/x\" at \"/home/jleechan/projects/worldarchitect.ai-wt-12345\", but it is outside AO-managed worktree directories. Reuse it manually or remove it and try again.";
+        assert_eq!(
+            parse_phantom_worktree_path(stderr).as_deref(),
+            Some("/home/jleechan/projects/worldarchitect.ai-wt-12345"),
+        );
+    }
+
+    #[test]
+    fn phantom_worktree_path_rejects_unrelated_stderr() {
+        // A genuine spawn failure (not the phantom-worktree case) must NOT
+        // produce a phantom path; the daemon's only reliable recovery is
+        // to leave the original error alone and fall through to
+        // HUMAN_HELD.
+        let stderr = "[dark-factory AO bridge] spawn rejected: 30 active sessions >= cap (30)";
+        assert_eq!(parse_phantom_worktree_path(stderr), None);
+    }
+
+    #[test]
+    fn phantom_worktree_path_rejects_branch_token() {
+        // The branch name is also wrapped in quotes ("branch \"feat/x\" at
+        // \"/path\""). The parser must anchor on `at "` so it does not
+        // pick up the branch name when its value happens to start with
+        // a forward slash.
+        let stderr = "[dark-factory AO bridge] Found existing worktree for orchestrator branch \"/bad-branch\" at \"/home/jleechan/projects/worldarchitect.ai-wt-1\", but it is outside AO-managed worktree directories.";
+        assert_eq!(
+            parse_phantom_worktree_path(stderr).as_deref(),
+            Some("/home/jleechan/projects/worldarchitect.ai-wt-1"),
+        );
     }
 }
