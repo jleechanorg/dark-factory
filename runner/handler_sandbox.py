@@ -142,7 +142,11 @@ def _holdouts_repo_path() -> pathlib.Path:
 def _holdout_denied_paths() -> list[pathlib.Path]:
     paths = {_holdouts_repo_path()}
     paths.add((pathlib.Path.home() / "projects" / "dark-factory-holdouts").resolve())
-    paths.add(_controller_private_root().resolve())
+    return sorted(paths, key=lambda p: str(p))
+
+
+def _implementing_agent_denied_paths() -> list[pathlib.Path]:
+    paths = {*_holdout_denied_paths(), _controller_private_root().resolve()}
     return sorted(paths, key=lambda p: str(p))
 
 
@@ -193,7 +197,7 @@ def _build_sandbox_profile(
     path so the deny applies to the operator-only doc file.
     """
     denies: list[str] = []
-    for path in _holdout_denied_paths():
+    for path in _implementing_agent_denied_paths():
         escaped = str(path).replace("\\", "\\\\").replace('"', '\\"')
         denies.append(f'(deny file-read* (subpath "{escaped}"))')
         denies.append(f'(deny file-write* (subpath "{escaped}"))')
@@ -421,7 +425,7 @@ def _sandboxed_args(args: list[str]) -> Optional[list[str]]:
         profile = _build_sandbox_profile([])
         return [sandbox_exec, "-p", profile] + args
     if sys.platform.startswith("linux"):
-        prefix = _linux_sandbox_prefix(_holdout_denied_paths())
+        prefix = _linux_sandbox_prefix(_implementing_agent_denied_paths())
         if prefix is None:
             return None
         return prefix + args
@@ -470,7 +474,7 @@ def _sandboxed_args_for_workdir(
         return [sandbox_exec, "-p", profile] + args
     if sys.platform.startswith("linux"):
         sealed_docs = _sealed_benchmark_doc_paths(workdir)
-        prefix = _linux_sandbox_prefix(_holdout_denied_paths() + sealed_docs)
+        prefix = _linux_sandbox_prefix(_implementing_agent_denied_paths() + sealed_docs)
         if prefix is None:
             return None
         return prefix + args
