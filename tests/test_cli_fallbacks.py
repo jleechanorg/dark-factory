@@ -555,10 +555,8 @@ def test_target_worktree_ao_worktree_review_binding(tmp_path):
 
 
 def test_controller_review_codex_unavailable_fails_closed(monkeypatch, tmp_path):
-    """When codex is unavailable for controller cold review, the resolver/gate
-    fails closed with backend_missing='true' rather than claiming an installed
-    fallback that lacks a compatible controller transport."""
-    from runner.handlers import _resolve_gate_backend, _run_gate_once
+    """Controller review has no non-Codex fallback transport to advertise."""
+    from runner.handlers import Result, _execute_gate, _resolve_gate_backend
 
     _disable_sandbox(monkeypatch)
     monkeypatch.setattr(
@@ -570,21 +568,34 @@ def test_controller_review_codex_unavailable_fails_closed(monkeypatch, tmp_path)
         name="cold_reviewer",
         attrs={
             "review_contract": "cold-review-v1",
-            "backend_priority": "codex,minimax,agy,claude-sonnet",
+            "backend_priority": "codex",
         },
     )
     ctx = Context(goal="test fallback", workdir=tmp_path, backend="claude")
     resolved, meta = _resolve_gate_backend(node, ctx)
 
     assert resolved == "codex"
-    assert "minimax(no_controller_transport)" in meta["adversarial_skipped"]
+    assert meta["adversarial_priority"] == "codex"
 
-    # Executing non-codex under controller review produces an error
+    attempts: list[str] = []
+
+    def _missing_controller_transport(backend, *args, **kwargs):
+        attempts.append(backend)
+        return Result(
+            outcome="error",
+            output="codex unavailable",
+            metadata={"backend_missing": "true", "verdict": "unknown"},
+        )
+
+    monkeypatch.setattr(
+        "runner.handler_dispatch._run_gate_once", _missing_controller_transport
+    )
     ctx.state["_df_controller_review_json"] = "true"
-    result = _run_gate_once("agy", "PROMPT", "0" * 40, 300, ctx, "cold_reviewer")
+    result = _execute_gate("PROMPT", "0" * 40, 300, ctx, "cold_reviewer", "codex")
+
     assert result.outcome == "error"
-    assert result.metadata["backend_missing"] == "true"
-    assert "requires codex backend" in result.output
+    assert result.metadata["verdict"] == "infra_failure"
+    assert attempts == ["codex"]
 
 
 def test_controller_codex_transport_strips_outer_sandbox_exec():
@@ -610,4 +621,3 @@ def test_controller_codex_transport_strips_outer_sandbox_exec():
     assert "--sandbox" in transport
     assert "read-only" in transport
     assert transport[0] != "/usr/bin/sandbox-exec"
-

@@ -223,4 +223,3 @@ def test_adversarial_priority_falls_back_to_claude_when_others_unavailable(monke
     assert resolved == "claude-sonnet"
     assert meta["adversarial_resolved"] == "claude-sonnet"
     assert meta["adversarial_skipped"] == "codex,minimax,agy"
-

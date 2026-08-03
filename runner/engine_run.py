@@ -177,6 +177,8 @@ def _run_single_node(
             ctx.state["_last_node"] = node.name
             ctx.state["_last_outcome"] = attempt.outcome
             ctx.state["_last_output"] = attempt.output
+            if str(node.attrs.get("class", "")).strip().lower() == "review":
+                ctx.state["_last_review_feedback"] = attempt.output
             
             # Surface Coder Handoff section + verdict token (P5)
             verdict = attempt.metadata.get("verdict")

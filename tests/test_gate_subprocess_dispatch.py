@@ -270,9 +270,6 @@ def test_controller_codex_args_builds_stdin_transport():
     transformed = _controller_codex_args(argv)
     assert transformed[-1] == "-"
     assert transformed == [
-        "sandbox-exec",
-        "-p",
-        "(version 1)\n(allow default)",
         "codex",
         "exec",
         "--json",

@@ -110,37 +110,6 @@ def test_execute_gate_codex_real_fail_not_retried(tmp_path, monkeypatch):
     assert os.path.basename(seen[0][0]) == "codex"
 
 
-def test_execute_gate_controller_codex_infra_failure_is_returned_unchanged(
-    tmp_path, monkeypatch,
-):
-    """Cold-review Codex transport failures never enter generic fallback."""
-    from runner.handler_core import Result
-    from runner.handlers import _execute_gate, Context as HCtx
-
-    calls: list[str] = []
-    original = Result(
-        outcome="error",
-        output="codex transport unavailable",
-        metadata={"verdict": "unknown", "backend_missing": "true"},
-    )
-
-    def fake_run_gate_once(backend, *_args, **_kwargs):
-        calls.append(backend)
-        return original
-
-    monkeypatch.setattr(
-        "runner.handler_dispatch._run_gate_once", fake_run_gate_once,
-    )
-    ctx = HCtx(goal="test controller fallback", workdir=tmp_path, backend="codex")
-    ctx.state["_df_controller_review_json"] = "true"
-
-    result = _execute_gate("PROMPT", "c" * 40, 300, ctx, "cold_reviewer", "codex")
-
-    assert result is original
-    assert calls == ["codex"]
-    assert result.metadata == {"verdict": "unknown", "backend_missing": "true"}
-
-
 def test_execute_gate_tags_infra_failure_when_all_backends_die(tmp_path, monkeypatch):
     """codex times out AND the claude fallback times out → verdict: infra_failure,
     so the operator can tell 'no reviewer ever graded the diff' from a real FAIL."""
