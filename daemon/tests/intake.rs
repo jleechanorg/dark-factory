@@ -3,10 +3,11 @@
 // before intake.rs has any real implementation.
 mod common;
 
-use common::{FakeScm, FakeTracker};
+use common::{FakeScm, FakeStateStore, FakeTracker};
 use daemon::config::Config;
 use daemon::errors::DaemonError;
 use daemon::intake::{self, IntakeVerdict};
+use daemon::state::{BeadOverlay, OverlayState};
 use daemon::tools::{Bead, Issue, LabeledPr, Permission, PrSnapshot, Scm};
 
 fn test_cfg() -> Config {
@@ -1158,5 +1159,269 @@ fn intake_metrics_gh_call_count_counts_real_subprocesses() {
         "gh_call_count must equal the number of real subprocess invocations, \
          including REST fallback per-PR pulls; got {}",
         outcome.metrics.gh_call_count
+    );
+}
+
+// G11 startup-intake-without-forced-dispatch =================================
+//
+// When the daemon restarts (or a slow-tick cycle otherwise stalls the
+// dispatch path for an ATTESTED bead), the bead sits in STATE=ATTESTED with
+// no follow-up DISPATCH_REQUEST event, so /af's "stuck" monitor (G11 in
+// `daemon/scripts/fe-audit.sh`) keeps flagging the same bead indefinitely and
+// remediation never fires. The intake sweep MUST emit a `DISPATCH_REQUEST`
+// event for every ATTESTED bead that hasn't already had one emitted this
+// process — once per stuck bead per daemon lifetime. Restarting the daemon
+// is intended to re-emit (the in-process dedup set resets) so the beacon
+// surfaces on every restart, which is exactly the visibility this gap fix
+// is meant to restore.
+//
+// TDD red tests — written BEFORE the new `enqueue_attested_dispatch_requests`
+// function exists. Both tests must fail to compile (function not found)
+// until the GREEN implementation lands.
+
+/// Helper: seed a `FakeStateStore` overlay row and a `FakeTracker` candidate
+/// for one ATTESTED bead. Mirrors the `BeadOverlay` field set that
+/// `run_slow_tier`'s adoption branch persists today, so the test exercises
+/// the same overlay shape the production path produces.
+fn seed_attested_bead(store: &FakeStateStore, tracker: &FakeTracker, bead_id: &str) {
+    store.overlays.borrow_mut().insert(
+        bead_id.to_string(),
+        BeadOverlay {
+            bead_id: bead_id.to_string(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(42),
+            branch: Some(format!("factory/{bead_id}-r1")),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: Some("owner/repo".into()),
+            attempt_started_at: None,
+        },
+    );
+    tracker.candidates.borrow_mut().push(Bead {
+        id: bead_id.to_string(),
+        title: bead_id.to_string(),
+        description: String::new(),
+        notes: String::new(),
+        file_tree_summary: String::new(),
+        external_ref: Some(format!("owner/repo#{bead_id}")),
+    });
+}
+
+/// Read the telemetry log and return every event whose `eventType` matches
+/// `needle`. Used to assert that exactly the right number of
+/// `DISPATCH_REQUEST` events were emitted without depending on the daemon's
+/// internal call log (which is private to `FakeStateStore`).
+fn read_event_types(log_path: &std::path::Path) -> Vec<String> {
+    let body = std::fs::read_to_string(log_path).unwrap_or_default();
+    body.lines()
+        .filter_map(|line| {
+            let v: serde_json::Value = serde_json::from_str(line).ok()?;
+            v.get("eventType")
+                .and_then(|e| e.as_str())
+                .map(|s| s.to_string())
+        })
+        .collect()
+}
+
+#[test]
+fn intake_sweep_emits_dispatch_request_for_each_attested_bead() {
+    // Use bead IDs unique to this test so concurrent test execution (the
+    // default for `cargo test`) cannot pollute our dedup-set. The set is
+    // process-wide by design — restarting the daemon is the only
+    // legitimate reset — so isolation must come from the test inputs
+    // themselves, not from `clear_dispatch_request_emitted_for_test`.
+    let dir = std::env::temp_dir().join("afd_g11_test_emit");
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("daemon.jsonl");
+    let _ = std::fs::remove_file(&log);
+
+    let store = FakeStateStore::new();
+    let tracker = FakeTracker::new();
+    // Seed three ATTESTED beads with IDs unique to this test (prefix
+    // "emit-…") so concurrent execution of the other intake_sweep tests
+    // — which use their own prefixes — cannot collide on the dedup set.
+    seed_attested_bead(&store, &tracker, "emit-jleechan-fujh");
+    seed_attested_bead(&store, &tracker, "emit-jleechan-h77m");
+    seed_attested_bead(&store, &tracker, "emit-jleechan-hosd");
+
+    let emitted = intake::enqueue_attested_dispatch_requests(
+        tracker.candidates.borrow().as_slice(),
+        &store,
+        &log,
+    )
+    .expect("enqueue_attested_dispatch_requests must succeed");
+
+    assert_eq!(
+        emitted, 3,
+        "intake sweep must emit exactly one DISPATCH_REQUEST per ATTESTED bead; got {emitted}"
+    );
+
+    let event_types = read_event_types(&log);
+    let dispatch_request_count = event_types
+        .iter()
+        .filter(|e| e.as_str() == "DISPATCH_REQUEST")
+        .count();
+    assert_eq!(
+        dispatch_request_count, 3,
+        "telemetry log must carry exactly 3 DISPATCH_REQUEST events; got: {event_types:?}"
+    );
+
+    // Every emitted event MUST reference one of the seeded bead IDs in its
+    // `beadId` field — the G11 fix is meant to make stuck beads visible to
+    // /af remediation, and a beacon with empty bead IDs would be invisible.
+    let body = std::fs::read_to_string(&log).unwrap_or_default();
+    let mut found_beads: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in body.lines() {
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if v.get("eventType").and_then(|e| e.as_str()) == Some("DISPATCH_REQUEST") {
+            if let Some(b) = v.get("beadId").and_then(|b| b.as_str()) {
+                found_beads.insert(b.to_string());
+            }
+        }
+    }
+    for expected in ["emit-jleechan-fujh", "emit-jleechan-h77m", "emit-jleechan-hosd"] {
+        assert!(
+            found_beads.contains(expected),
+            "DISPATCH_REQUEST for {expected} missing from telemetry log; found: {found_beads:?}"
+        );
+    }
+}
+
+#[test]
+fn intake_sweep_does_not_emit_for_non_attested_states() {
+    let dir = std::env::temp_dir().join("afd_g11_test_non_attested");
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("daemon.jsonl");
+    let _ = std::fs::remove_file(&log);
+
+    let store = FakeStateStore::new();
+    let tracker = FakeTracker::new();
+
+    // Seed three beads in three distinct non-ATTESTED overlay states. None
+    // of these are "stuck in ATTESTED" — they are actively moving through
+    // the dispatcher — and the intake sweep MUST NOT emit a
+    // DISPATCH_REQUEST for any of them. Bead IDs are prefixed "na-…" so
+    // concurrent execution of the other intake_sweep tests cannot collide
+    // on the process-wide dedup set (which would matter only if any of
+    // these seeded IDs matched a bead id used by another test, but the
+    // prefix makes the collision impossible).
+    for (bead_id, state) in [
+        ("na-bead-queued", OverlayState::Queued),
+        ("na-bead-dispatching", OverlayState::Dispatching),
+        ("na-bead-dispatched", OverlayState::Dispatched),
+    ] {
+        store.overlays.borrow_mut().insert(
+            bead_id.to_string(),
+            BeadOverlay {
+                bead_id: bead_id.to_string(),
+                state,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("owner/repo".into()),
+                attempt_started_at: None,
+            },
+        );
+        tracker.candidates.borrow_mut().push(Bead {
+            id: bead_id.to_string(),
+            title: bead_id.to_string(),
+            description: String::new(),
+            notes: String::new(),
+            file_tree_summary: String::new(),
+            external_ref: None,
+        });
+    }
+
+    let emitted = intake::enqueue_attested_dispatch_requests(
+        tracker.candidates.borrow().as_slice(),
+        &store,
+        &log,
+    )
+    .expect("enqueue_attested_dispatch_requests must succeed");
+
+    assert_eq!(
+        emitted, 0,
+        "intake sweep must emit zero DISPATCH_REQUEST events for non-ATTESTED beads; got {emitted}"
+    );
+
+    let event_types = read_event_types(&log);
+    assert!(
+        event_types.iter().all(|e| e != "DISPATCH_REQUEST"),
+        "telemetry log must carry zero DISPATCH_REQUEST events for non-ATTESTED beads; got: {event_types:?}"
+    );
+}
+
+/// Bead jleechan-7lom acceptance: re-running the intake sweep on the SAME
+/// ATTESTED set within one daemon process must NOT re-emit a
+/// `DISPATCH_REQUEST` for a bead that already has one. The dedup must be
+/// process-local (the daemon's in-memory set) — restarting the daemon
+/// intentionally re-emits, so /af's G11 monitor can see each restart cycle
+/// as a fresh signal. Without this dedup, the beacon would fire on every
+/// slow tick (~every 60s default), flooding `daemon.jsonl` and drowning
+/// the actual signal.
+#[test]
+fn intake_sweep_dedupes_dispatch_request_within_one_process() {
+    let dir = std::env::temp_dir().join("afd_g11_test_dedup");
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("daemon.jsonl");
+    let _ = std::fs::remove_file(&log);
+
+    let store = FakeStateStore::new();
+    let tracker = FakeTracker::new();
+    // Bead IDs prefixed "dedup-…" so this test cannot race with the other
+    // two intake_sweep tests on the process-wide dedup set (which is
+    // intentionally persistent across calls within one daemon lifetime —
+    // see the G11 module doc).
+    seed_attested_bead(&store, &tracker, "dedup-jleechan-fujh");
+    seed_attested_bead(&store, &tracker, "dedup-jleechan-h77m");
+
+    // First sweep emits one DISPATCH_REQUEST per ATTESTED bead (2 events).
+    let first = intake::enqueue_attested_dispatch_requests(
+        tracker.candidates.borrow().as_slice(),
+        &store,
+        &log,
+    )
+    .expect("first sweep must succeed");
+    assert_eq!(first, 2, "first sweep must emit for both ATTESTED beads");
+
+    // Second sweep on the SAME ATTESTED set within the same process must
+    // emit ZERO additional events. This is the "accumulate beyond the
+    // previous tick's snapshot" gating that prevents beacon flood.
+    let second = intake::enqueue_attested_dispatch_requests(
+        tracker.candidates.borrow().as_slice(),
+        &store,
+        &log,
+    )
+    .expect("second sweep must succeed");
+    assert_eq!(
+        second, 0,
+        "second sweep within the same process must NOT re-emit (process-local dedup); got {second}"
+    );
+
+    let dispatch_request_count = read_event_types(&log)
+        .iter()
+        .filter(|e| e.as_str() == "DISPATCH_REQUEST")
+        .count();
+    assert_eq!(
+        dispatch_request_count, 2,
+        "telemetry log must carry exactly the 2 first-sweep events; got {dispatch_request_count}"
     );
 }

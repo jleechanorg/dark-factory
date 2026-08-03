@@ -10,7 +10,8 @@
 //! the AO session's credentials").
 use crate::config::Config;
 use crate::errors::DaemonError;
-use crate::tools::{LabeledPr, Permission, Scm, Tracker};
+use crate::state::OverlayState;
+use crate::tools::{Bead, LabeledPr, Permission, Scm, Tracker};
 
 const FACTORY_LABEL: &str = "factory";
 
@@ -959,6 +960,176 @@ pub fn normalize_labeled_prs(
     }
 
     Ok((intakes, outcomes))
+}
+
+// G11 startup-intake-without-forced-dispatch =================================
+//
+// Bead jleechan-7lom closes the G11 gap flagged by
+// `daemon/scripts/fe-audit.sh` (the audit's `observed_attested_no_dispatch_count`
+// was 21 over a 24h lookback on 2026-08-02). When the daemon restarts — or a
+// slow-tick cycle otherwise stalls the dispatch path for an ATTESTED bead —
+// the bead sits in STATE=ATTESTED with no follow-up DISPATCH_REQUEST event,
+// so /af's "stuck" monitor keeps flagging the same bead indefinitely and
+// remediation never fires.
+//
+// The intake sweep emits a `DISPATCH_REQUEST` event for every ATTESTED bead
+// that hasn't already had one emitted this process — exactly one per stuck
+// bead per daemon lifetime. Restarting the daemon intentionally re-emits
+// (the in-process dedup set resets) so the beacon surfaces on every restart,
+// which is exactly the visibility this gap fix is meant to restore. The
+// dedup MUST be process-local (not a SQLite column) to avoid expanding
+// schema scope for what is observability-only telemetry — see the upstream
+// task description's "Work only within the task's scope" rule.
+//
+// ZFC note: the function does NOT inspect, classify, or rank the ATTESTED
+// rows; it only emits the canonical beacon for each one. The slow tier
+// already maintains `state == ATTESTED` as the authoritative "PR exists,
+// under verification" classification — we just mirror that into telemetry
+// here.
+
+/// Process-local dedup set: bead IDs we have already emitted a
+/// `DISPATCH_REQUEST` for in this daemon process. Resets on every daemon
+/// restart by design — see the module doc above. Wrapped in `Mutex` because
+/// `run_slow_tier` may invoke this from any thread the runner schedules.
+/// `OnceLock` because `HashSet::new` is not a const fn on stable Rust, so
+/// we cannot use a plain `static` initializer.
+static DISPATCH_REQUEST_EMITTED: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::OnceLock::new();
+
+fn dispatch_request_emitted_set() -> &'static std::sync::Mutex<
+    std::collections::HashSet<String>,
+> {
+    DISPATCH_REQUEST_EMITTED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Test-only helper: clear the process-local dedup set so unit tests can
+/// exercise the first-emit path even when an earlier test in the same
+/// process already emitted for the same bead id. Always compiled (so
+/// integration tests under `daemon/tests/` can reach it via
+/// `daemon::intake::clear_dispatch_request_emitted_for_test`) but named
+/// `_for_test` and documented as test-only — production callers MUST NOT
+/// invoke this; a daemon restart is the only legitimate reset. We can't
+/// gate it behind `#[cfg(test)]` because integration tests in
+/// `daemon/tests/` are compiled against the lib's *non*-test profile, so
+/// the gate would hide the symbol entirely from them.
+pub fn clear_dispatch_request_emitted_for_test() {
+    if let Some(mutex) = DISPATCH_REQUEST_EMITTED.get() {
+        if let Ok(mut set) = mutex.lock() {
+            set.clear();
+        }
+    }
+}
+
+/// Walk the slow tier's tracker candidates, emit one `DISPATCH_REQUEST`
+/// telemetry event for every ATTESTED overlay that hasn't already had one
+/// emitted this process, and return the number of events written. Beads in
+/// any other overlay state are silently skipped — the dispatch path owns
+/// those transitions, not the intake sweep.
+///
+/// `candidates` is the same slice `tick::run_slow_tier` passes to the
+/// routing/dispatch phase (i.e. `tracker.fetch_candidates()`'s current
+/// snapshot). `store` is the durable overlay store; `telemetry_log` is the
+/// daemon's `daemon.jsonl` path. Returns `Ok(n)` on success where `n` is
+/// the count of events written, or `Err(DaemonError)` only on a real I/O
+/// failure from `emit` or `store.load`.
+pub fn enqueue_attested_dispatch_requests(
+    candidates: &[Bead],
+    store: &dyn crate::state::StateStore,
+    telemetry_log: &std::path::Path,
+) -> Result<u32, DaemonError> {
+    let mut emitted_count: u32 = 0;
+    let mut emitted_set = dispatch_request_emitted_set()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for bead in candidates {
+        // Process-local dedup: skip any bead we've already emitted for this
+        // daemon lifetime. The lock above is held for the whole loop so
+        // two concurrent invocations serialize cleanly; on contention, the
+        // second caller sees the first caller's writes and produces zero
+        // new events, which is the correct (idempotent) outcome.
+        if emitted_set.contains(&bead.id) {
+            continue;
+        }
+        let overlay = match store.load(&bead.id) {
+            Ok(Some(o)) => o,
+            Ok(None) => continue,
+            Err(e) => return Err(e),
+        };
+        if overlay.state != OverlayState::Attested {
+            continue;
+        }
+        let attempt = overlay.attempt;
+        crate::telemetry::emit(
+            telemetry_log,
+            &crate::telemetry::TelemetryEvent {
+                timestamp: now_iso8601_intake(),
+                bead_id: bead.id.clone(),
+                attempt_id: attempt,
+                lifecycle_state: OverlayState::Attested.as_str().to_string(),
+                event_type: "DISPATCH_REQUEST".to_string(),
+                metrics: serde_json::json!({}),
+                context: serde_json::json!({
+                    "reason": "attested_no_dispatch_follow_up",
+                    "pr_number": overlay.pr_number,
+                    "branch": overlay.branch,
+                    "target_repo": overlay.target_repo,
+                }),
+            },
+        )?;
+        emitted_set.insert(bead.id.clone());
+        emitted_count += 1;
+    }
+    Ok(emitted_count)
+}
+
+/// Local ISO-8601 timestamp formatter used by `enqueue_attested_dispatch_requests`.
+/// Duplicated from `tick::now_iso8601` (each module keeps its own helper —
+/// matches the existing duplication pattern in this crate). Returns RFC-3339
+/// UTC (`2026-08-02T19:51:00Z`) so the daemon.jsonl lines stay parser-
+/// compatible with every other telemetry event the daemon writes.
+fn now_iso8601_intake() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Days from 1970-01-01 to the start of each year (Gregorian, proleptic).
+    let mut year = 1970i64;
+    let mut remaining_days = (secs / 86_400) as i64;
+    loop {
+        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        let year_days = if leap { 366 } else { 365 };
+        if remaining_days < year_days {
+            break;
+        }
+        remaining_days -= year_days;
+        year += 1;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let month_days = if leap {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut month = 1;
+    let mut remaining_in_year = remaining_days;
+    for &days in &month_days {
+        if remaining_in_year < days {
+            break;
+        }
+        remaining_in_year -= days;
+        month += 1;
+    }
+    let day = remaining_in_year + 1;
+    let secs_today = secs % 86_400;
+    let hour = secs_today / 3600;
+    let minute = (secs_today % 3600) / 60;
+    let second = secs_today % 60;
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year, month, day, hour, minute, second
+    )
 }
 
 #[cfg(test)]
