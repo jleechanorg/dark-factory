@@ -116,6 +116,13 @@ pub struct TickSummary {
     /// full reroll cycle by the fast-rejection path" without re-deriving
     /// from telemetry.
     pub gates_assessed_fast_rejected: usize,
+    /// jleechan-7yf0 / issue #506: beads whose adoption collided with a
+    /// LIVE sibling bead's branch and were parked as `Cancelled` instead
+    /// of escalated to `HUMAN_HELD`. Counted separately from
+    /// `beads_escalated` so operators can see "live-bead collisions that
+    /// the daemon auto-resolved" apart from "real escalations needing
+    /// triage" in the per-tick TICK summary.
+    pub beads_skipped_duplicate: usize,
 }
 
 /// Bounded retry cap for the automated HUMAN_HELD exit. Matches the shell
@@ -1543,26 +1550,79 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         if let Some(owner) = deps.store.bead_id_for_branch(&adopted.head_ref_name)? {
             if owner != adopted.bead_id {
                 let owner_live = deps.store.load(&owner)?.is_some();
+                // jleechan-7yf0 / issue #506: when the collision is with a
+                // LIVE sibling bead, the daemon can fully resolve the
+                // situation itself — the live bead keeps driving the
+                // branch and the duplicate is parked as `Cancelled` with a
+                // durable `park_reason` linking it to the owner. There is
+                // no operator-visible blocker (the live bead is making
+                // progress), so emitting `HUMAN_HELD` for this case
+                // generated a stream of spurious escalations that the
+                // operator had to triage against an outcome that needed
+                // no human input. We only do the silent dedup when the
+                // owner is LIVE; when `registered_bead_live=false` the
+                // branch_registry maps to a bead that's no longer in the
+                // store — that's a real data-integrity condition (orphan
+                // registry row) that warrants human review, so we keep
+                // the prior `HUMAN_HELD` escalation path for that case.
                 if owner_live {
-                    let ctx = serde_json::json!({
-                        "reason": "adoption_branch_collision",
+                    // jleechan-7yf0: `Cancelled` overlay carries the
+                    // minimum information needed to understand the dedup
+                    // decision later: the live owner (so `grep <owner>
+                    // daemon.jsonl` finds this line) and the branch
+                    // (so an operator can audit branch→bead ownership).
+                    // `park_reason` is the canonical place to record
+                    // `recovery` reasons; the `recover_human_held`
+                    // filters exclude non-HUMAN_HELD states so this
+                    // string is never read by the recovery path — it's
+                    // purely audit-context for humans reading the row
+                    // directly. `attempt=1` because the duplicate was
+                    // just created and never dispatched. `is_adopted=true`
+                    // because the bead only exists via the adoption
+                    // path (factory-fabricated branches never hit
+                    // this code — their collisions are detected earlier).
+                    let target_repo = intake::resolve_target_repo(
+                        "",
+                        Some(adopted.external_ref.as_str()),
+                    );
+                    let cancelled_overlay = BeadOverlay {
+                        bead_id: adopted.bead_id.clone(),
+                        state: OverlayState::Cancelled,
+                        attempt: 1,
+                        reroll_count: 0,
+                        autonomy_secs: 0,
+                        spend_usd: 0.0,
+                        pr_number: Some(adopted.pr_number),
+                        branch: Some(adopted.head_ref_name.clone()),
+                        session_id: None,
+                        is_adopted: true,
+                        spawn_failure_count: 0,
+                        pre_session_head_sha: None,
+                        park_reason: Some(format!(
+                            "adoption_branch_collision_live_owner:{owner}"
+                        )),
+                        target_repo,
+                        attempt_started_at: None,
+                    };
+                    deps.store.save(&cancelled_overlay)?;
+                    let skipped_ctx = serde_json::json!({
+                        "duplicate_bead": adopted.bead_id,
+                        "live_bead": owner,
                         "branch": adopted.head_ref_name,
-                        "registered_bead": owner,
-                        "registered_bead_live": true,
                         "external_ref": adopted.external_ref,
                     });
                     emit(
                         deps.telemetry_log,
                         &adopted.bead_id,
                         1,
-                        "CANCELLED/DUPLICATE",
+                        OverlayState::Cancelled.as_str(),
                         "SKIPPED_DUPLICATE_BEAD",
                         serde_json::json!({}),
-                        ctx,
+                        skipped_ctx,
                     )?;
+                    summary.beads_skipped_duplicate += 1;
                     continue;
                 }
-
                 let comment_body = format!(
                     "🤖 **[dark-factory]** Escalation required: refusing factory PR adoption for branch `{}` because it is already registered to bead `{}`. Branch-key stealing is not allowed; please use a unique same-repo branch.",
                     adopted.head_ref_name, owner

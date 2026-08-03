@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS bead_overlay (
   bead_id       TEXT PRIMARY KEY,
   state         TEXT NOT NULL CHECK (state IN
                   ('QUEUED','DISPATCHING','DISPATCHED','ATTESTED','READY','RE_ROLL','RECOVERY',
-                   'REDISPATCHED','BUDGET_HELD','HUMAN_HELD','DISPOSITION_REQUIRED')),
+                   'REDISPATCHED','BUDGET_HELD','HUMAN_HELD','DISPOSITION_REQUIRED','CANCELLED')),
   attempt       INTEGER NOT NULL DEFAULT 1,   -- r<n> counter
   reroll_count  INTEGER NOT NULL DEFAULT 0,
   autonomy_secs INTEGER NOT NULL DEFAULT 0,   -- cumulative; nothing automated resets it
