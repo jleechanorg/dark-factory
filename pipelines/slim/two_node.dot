@@ -13,9 +13,8 @@
 //   - worker          honors the run-level --backend (the coder tier the user
 //                     chose; default = whatever /f's Step 0.5 detector picks).
 //   - cold_reviewer   uses review_contract="cold-review-v1" and
-//                     backend_priority="codex,minimax,agy,claude-sonnet"
-//                     with prefer_adversarial="true" so the reviewer is a
-//                     different vendor from the worker whenever possible.
+//                     backend_priority="codex" because the controller has
+//                     a receipt-capable transport only for Codex.
 //
 // Failure semantics:
 //   - cold_reviewer is goal_gate=true. On success the run exits.
@@ -47,8 +46,7 @@ digraph SlimTwoNode {
         label="Cold Reviewer (controller cold-review-v1)",
         class="review",
         review_contract="cold-review-v1",
-        backend_priority="codex,minimax,agy,claude-sonnet",
-        prefer_adversarial="true",
+        backend_priority="codex",
         goal_gate=true,
         timeout=600
     ]

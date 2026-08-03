@@ -9,6 +9,7 @@ catch mutations between request creation and lane return.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import tempfile
@@ -266,6 +267,58 @@ class PostReviewReverifyTests(unittest.TestCase):
 
         with self.assertRaises(ReviewContractError):
             _verify_controller_workspace(ctx, request)  # type: ignore[arg-type]
+
+    def test_post_review_clean_workspace_passes(self) -> None:
+        """A clean, unchanged controller target remains valid after review."""
+        request = create_review_request(_base_inputs(self.repo, self.holdouts))
+
+        class _FakeCtx:
+            def __init__(self, workdir: Path) -> None:
+                self.workdir = workdir
+
+        from runner.handler_parallel_reviewer import _verify_controller_workspace
+
+        _verify_controller_workspace(_FakeCtx(self.repo), request)  # type: ignore[arg-type]
+
+
+class ControllerSnapshotTests(unittest.TestCase):
+    """Worker output must be reviewed through a clean frozen Git target."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.repo = _init_clean_repo(self.tmp)
+        _git(self.repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_worker_task_artifact_uses_clean_frozen_review_snapshot(self) -> None:
+        """A worker's task file cannot block or enter the controller review target."""
+        from runner.handler_core import Context
+        from runner.handler_parallel_reviewer import _controller_review_request
+        from runner.parser import Node
+
+        (self.repo / "README.md").write_text("worker change\n")
+        task_dir = self.repo / ".dark-factory"
+        task_dir.mkdir()
+        (task_dir / "agy-task-worker.md").write_text("runner task artifact\n")
+
+        request = _controller_review_request(
+            Node(name="cold_reviewer", attrs={}),
+            Context(goal="review worker output", workdir=self.repo),
+            _git(self.repo, "rev-parse", "HEAD").strip(),
+        )
+        envelope = json.loads(request.envelope_json)
+        snapshot = Path(envelope["target"]["workspace_path"])
+
+        self.assertNotEqual(snapshot, self.repo)
+        self.assertTrue((self.repo / ".dark-factory" / "agy-task-worker.md").exists())
+        self.assertNotEqual(_git(self.repo, "status", "--porcelain=v1"), "")
+        self.assertEqual(_git(snapshot, "status", "--porcelain=v1"), "")
+        self.assertEqual((snapshot / "README.md").read_text(), "worker change\n")
+        self.assertFalse((snapshot / ".dark-factory" / "agy-task-worker.md").exists())
+        self.assertEqual(_git(snapshot, "rev-parse", "HEAD").strip(), request.head_sha)
 
 
 def replace_evidence(

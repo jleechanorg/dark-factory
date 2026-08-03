@@ -110,34 +110,15 @@ def test_two_node_dot_declares_timeout_on_every_subprocess_node() -> None:
     )
 
 
-def test_two_node_dot_cold_reviewer_uses_codex_priority_queue() -> None:
-    """The cold_reviewer node must use the canonical adversarial priority queue
-    `codex > minimax > agy > claude-sonnet` (or a strict superset) and pin
-    prefer_adversarial=true so the reviewer is a different vendor from the
-    worker whenever possible.
-
-    This is the user-stated contract: "Default reviewer is codex with all the
-    fallback CLI the repo already has."
-    """
+def test_two_node_dot_cold_reviewer_uses_only_its_supported_transport() -> None:
+    """Cold-review-v1 advertises only Codex, its sole receipt-capable transport."""
     g = parse(ROOT / _PIPELINE)
     reviewer = g.nodes["cold_reviewer"]
     priority = reviewer.attrs.get("backend_priority", "")
-    # The list is comma-separated; we require codex to be first.
     entries = [p.strip() for p in str(priority).split(",") if p.strip()]
-    assert entries, (
-        "cold_reviewer must declare backend_priority (got empty)"
-    )
-    assert entries[0] == "codex", (
-        f"cold_reviewer backend_priority must lead with codex; got {entries!r}"
-    )
-    assert "minimax" in entries, (
-        f"cold_reviewer backend_priority must include minimax in the fallback "
-        f"chain; got {entries!r}"
-    )
-    # prefer_adversarial is stored as a string by the parser; compare loosely.
-    prefer = str(reviewer.attrs.get("prefer_adversarial", "")).lower()
-    assert prefer in {"true", "1", "yes"}, (
-        f"cold_reviewer must declare prefer_adversarial=true; got {prefer!r}"
+    assert entries == ["codex"], (
+        "cold-review-v1 must not advertise minimax/agy/claude fallbacks: "
+        "the controller has no compatible receipt transport for them"
     )
 
 

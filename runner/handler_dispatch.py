@@ -1093,7 +1093,12 @@ def _execute_gate(
     """
     result = _run_gate_once(backend, prompt, expected_sha, timeout, ctx, name, gate_strict=gate_strict)
 
+    controller_requested = str(ctx.state.get("_df_controller_review_json") or "").lower() in {"true", "1", "yes", "on"}
     if _is_gate_infra_failure(result):
+        if controller_requested:
+            result.metadata["verdict"] = "infra_failure"
+            result.metadata.setdefault("fallback_used", "false")
+            return result
         fallback_backends = []
         if backend not in ("agy", "claude", "claude-sonnet"):
             fallback_backends.append("agy")
