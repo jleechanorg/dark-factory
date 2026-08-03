@@ -31,6 +31,39 @@ def test_gate_subprocess_args_routes_codex_to_codex_cli(monkeypatch):
     assert "claude" not in os.path.basename(argv[0])
 
 
+def test_gate_runtime_resolution_error_is_structured_and_starts_no_process(
+    tmp_path, monkeypatch
+):
+    from runner import codex_runtime
+    from runner.handler_core import Context
+    from runner.handler_dispatch import _run_gate_once
+
+    def _skew(requested=None):
+        raise codex_runtime.CodexRuntimeError("cache schema mismatch")
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("runtime skew must stop before subprocess launch")
+
+    monkeypatch.setattr(codex_runtime, "resolve_codex_executable", _skew)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _forbidden)
+    ctx = Context(goal="test", workdir=tmp_path, backend="codex")
+
+    result = _run_gate_once(
+        "codex",
+        "review",
+        "a" * 40,
+        30,
+        ctx,
+        "gate_code_standards",
+    )
+
+    assert result.outcome == "error"
+    assert "Codex runtime unavailable" in result.output
+    assert "cache schema mismatch" in result.output
+    assert result.metadata["backend_missing"] == "true"
+    assert result.metadata["head_sha_status"] == "missing"
+
+
 def test_gate_subprocess_args_routes_claude_sonnet_to_claude_cli(monkeypatch):
     """backend='claude-sonnet' → argv starts with `claude --print` (not agy)."""
     from runner.handlers import _gate_subprocess_args, Context as HCtx

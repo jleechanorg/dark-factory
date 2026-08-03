@@ -12,8 +12,8 @@ Owns:
   * `_DEFAULT_ADVERSARIAL_PRIORITY` — default queue
     ``["codex", "minimax", "agy", "claude-sonnet"]``.
   * `_parse_priority_env` — parse ``DARK_FACTORY_ADVERSARIAL_PRIORITY``.
-  * `_probe_backend_installed` — ``which <name>`` + ``<name> --version`` with
-    5s ceiling.
+  * `_probe_backend_installed` — static canonical validation for Codex and
+    ``which`` lookup for other reviewer CLIs; never executes a version probe.
   * `_resolve_adversarial_backend` — pick first installed from priority
     queue; metadata audit.
   * `_resolve_gate_backend` — resolve node-level priority OR explicit backend
@@ -713,7 +713,21 @@ def _run_gate_once(
             )
     except Exception:
         prompt_meta = {}
-    sub_args = _gate_subprocess_args(backend, prompt, ctx, timeout)
+    try:
+        sub_args = _gate_subprocess_args(backend, prompt, ctx, timeout)
+    except codex_runtime.CodexRuntimeError as exc:
+        return Result(
+            outcome="error",
+            output=f"gate {name} Codex runtime unavailable: {exc}",
+            metadata={
+                "slash_command": name,
+                "verdict": "unknown",
+                "reviewer_backend": reviewer_backend,
+                "head_sha_status": "missing",
+                "backend_missing": "true",
+                **prompt_meta,
+            },
+        )
     sub_env = _gate_subprocess_env(backend)
     if sub_args is None:
         return Result(

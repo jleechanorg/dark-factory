@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 
+from . import codex_runtime
 from .handler_core import Result
 
 """Parallel reviewer handler.
@@ -246,7 +247,18 @@ def _run_controller_primary(
             output="controller review transport requires codex backend",
             metadata={**metadata, "review_contract_status": "transport_error"},
         )
-    args = _gate_subprocess_args(backend, request.prompt, ctx, timeout)
+    try:
+        args = _gate_subprocess_args(backend, request.prompt, ctx, timeout)
+    except codex_runtime.CodexRuntimeError as exc:
+        return Result(
+            outcome="error",
+            output=f"controller Codex runtime unavailable: {exc}",
+            metadata={
+                **metadata,
+                "review_contract_status": "transport_error",
+                "backend_missing": "true",
+            },
+        )
     if args is None:
         return Result(
             outcome="error",

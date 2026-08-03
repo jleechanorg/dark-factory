@@ -53,6 +53,54 @@ def test_parallel_reviewer_is_registered_as_validation_and_read_only_branch_type
     assert "parallel_reviewer" in _READ_ONLY_BRANCH_TYPES
 
 
+def test_controller_runtime_resolution_error_is_structured_and_starts_no_process(
+    tmp_path, monkeypatch
+):
+    from runner import codex_runtime
+    from runner.handler_parallel_reviewer import _run_controller_primary
+    from runner.review_controller import ReviewInputs, create_review_request
+
+    def _skew(requested=None):
+        raise codex_runtime.CodexRuntimeError("cache schema mismatch")
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("runtime skew must stop before controller transport")
+
+    monkeypatch.setattr(codex_runtime, "resolve_codex_executable", _skew)
+    monkeypatch.setattr(
+        "runner.review_controller.run_controller_review",
+        _forbidden,
+    )
+    request = create_review_request(
+        ReviewInputs(
+            repository="fixture/repo",
+            workspace_path=str(tmp_path),
+            base_sha="0" * 40,
+            head_sha="1" * 40,
+            tree_sha="2" * 40,
+            task_text="task",
+            diff_text="diff",
+            changed_files=("file.py",),
+            run_id="fixture-run",
+        )
+    )
+    ctx = _mock_ctx(tmp_path)
+
+    result = _run_controller_primary(
+        request,
+        timeout=30,
+        ctx=ctx,
+        node_name="review",
+        backend="codex",
+    )
+
+    assert result.outcome == "error"
+    assert "Codex runtime unavailable" in result.output
+    assert "cache schema mismatch" in result.output
+    assert result.metadata["backend_missing"] == "true"
+    assert result.metadata["review_contract_status"] == "transport_error"
+
+
 def test_production_pipelines_do_not_use_raw_codex_exec_reviewer_tools():
     """Reviewer CLIs must be first-class typed nodes, not opaque tool commands."""
     offenders: list[str] = []
