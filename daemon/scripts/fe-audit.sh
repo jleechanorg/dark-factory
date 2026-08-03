@@ -159,9 +159,19 @@ ATTESTED_IDS="${ATTESTED_IDS:-}"
 DISPATCHED_IDS="$(python3 "$QUERY_PY" g11_dispatched "$LOG_FILE" "$CUTOFF_ISO" 2>/dev/null)" || DISPATCHED_IDS=""
 DISPATCHED_IDS="${DISPATCHED_IDS:-}"
 
-# Find beads in ATTESTED that have NO dispatch follow-up.
-# Sort explicitly because comm requires lexically sorted input.
-STUCK_BEADS="$(comm -23 <(printf '%s\n' "$ATTESTED_IDS" | sort -u) <(printf '%s\n' "$DISPATCHED_IDS" | sort -u) || true)"
+# Subtract beads that have legitimately escalated to HUMAN_HELD — those
+# are parked for operator action (branch-conflict recovery limit, external
+# blocker, etc.) per the dispatch-health triage flow, NOT stuck. Without
+# this subtraction, every legitimate HOLD fires a phantom factory-labeled
+# bead that /af dutifully re-dispatches, reproducing the 2026-08-01
+# phantom-dispatch cluster (74wt/lwte/z284/bze8.4).
+HUMAN_HELD_IDS="$(python3 "$QUERY_PY" g11_human_held "$LOG_FILE" "$CUTOFF_ISO" 2>/dev/null)" || HUMAN_HELD_IDS=""
+HUMAN_HELD_IDS="${HUMAN_HELD_IDS:-}"
+
+# Find beads in ATTESTED that have NO dispatch follow-up AND have NOT
+# legitimately escalated to HUMAN_HELD. Sort explicitly because comm
+# requires lexically sorted input.
+STUCK_BEADS="$(comm -23 <(printf '%s\n' "$ATTESTED_IDS" | sort -u) <(printf '%s\n' "$DISPATCHED_IDS" | sort -u) | comm -23 - <(printf '%s\n' "$HUMAN_HELD_IDS" | sort -u) || true)"
 STUCK_COUNT=0
 if [ -n "$STUCK_BEADS" ]; then
     STUCK_COUNT="$(echo "$STUCK_BEADS" | wc -l | tr -d ' ')"

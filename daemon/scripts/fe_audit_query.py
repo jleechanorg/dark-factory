@@ -70,6 +70,27 @@ def g11_dispatched(records, cutoff):
                 yield bid
 
 
+def g11_human_held(records, cutoff):
+    """Unique bead IDs with lifecycleState=HUMAN_HELD after cutoff.
+
+    A bead that has legitimately escalated to HUMAN_HELD (branch-conflict
+    recovery limit, external-dep blocker, etc.) is NOT stuck — it's parked
+    for operator action per the dispatch-health triage flow. The G11 audit
+    subtracts this set from ATTESTED so legitimate holds do not generate
+    phantom factory-labeled beads that /af would re-dispatch against
+    already-handled work (cf. phantom-dispatch cluster 74wt/lwte/z284/
+    bze8.4 from 2026-08-01).
+    """
+    for rec in records:
+        if (
+            rec.get("lifecycleState") == "HUMAN_HELD"
+            and rec.get("timestamp", "") >= cutoff
+        ):
+            bid = rec.get("beadId", "")
+            if bid:
+                yield bid
+
+
 def g12_transient(records, cutoff, threshold):
     """Lines: '<count> <beadId>' for beads with >= threshold transient errors."""
     counter = Counter()
@@ -125,6 +146,9 @@ def main():
             print(bid)
     elif query == "g11_dispatched":
         for bid in sorted(set(g11_dispatched(records, cutoff))):
+            print(bid)
+    elif query == "g11_human_held":
+        for bid in sorted(set(g11_human_held(records, cutoff))):
             print(bid)
     elif query == "g12_transient":
         for line in g12_transient(records, cutoff, threshold):
