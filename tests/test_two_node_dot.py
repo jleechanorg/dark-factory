@@ -140,6 +140,20 @@ def test_two_node_dot_cold_reviewer_controller_binding() -> None:
     assert _TEMPLATE_PATH.exists()
 
 
+def test_two_node_dot_reviewer_has_no_target_authored_prompt_and_docs_agree() -> None:
+    """The slim graph cannot override its controller-owned reviewer contract."""
+    reviewer = parse(ROOT / _PIPELINE).nodes["cold_reviewer"]
+    assert "prompt" not in reviewer.attrs
+    assert reviewer.attrs.get("type") == "parallel_reviewer"
+    assert reviewer.attrs.get("review_contract") == "cold-review-v1"
+    assert reviewer.attrs.get("backend_priority") == "codex"
+    skill = (ROOT / ".claude/skills/dark-factory/SKILL.md").read_text()
+    assert "controller-owned `cold-review-v1`" in skill
+    assert '`type="parallel_reviewer"`' in skill
+    assert '`backend_priority="codex"`' in skill
+    assert not (ROOT / "prompts/slim/cold_reviewer.md").exists()
+
+
 def test_two_node_dot_binds_the_worker_verification_receipt() -> None:
     """The default cold reviewer receives the worker's declared evidence file."""
     reviewer = parse(ROOT / _PIPELINE).nodes["cold_reviewer"]
@@ -165,3 +179,18 @@ def test_worker_prompt_requires_a_bounded_structured_verification_receipt() -> N
     ):
         assert field in prompt
     assert "Do not fabricate" in prompt
+
+
+def test_worker_prompt_renders_untrusted_reviewer_feedback_only_on_retry() -> None:
+    from runner.handler_core import Context
+    from runner.handler_render import _render_prompt
+
+    worker = parse(ROOT / _PIPELINE).nodes["worker"]
+    ctx = Context(goal="repair the controller", workdir=ROOT, backend="echo")
+    first_attempt = _render_prompt(worker, ctx)
+    assert "(no prior reviewer feedback)" in first_attempt
+
+    ctx.state["_last_review_feedback"] = "Finding: bind the snapshot lineage."
+    retry_attempt = _render_prompt(worker, ctx)
+    assert "Finding: bind the snapshot lineage." in retry_attempt
+    assert "${state._last_review_feedback}" not in retry_attempt

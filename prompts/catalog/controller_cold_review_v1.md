@@ -80,7 +80,12 @@ assumed-pass state.
 - E7 — Confirm every cited artifact exists and is readable.
 - E8 — Recompute and compare artifact digests where the envelope provides them.
 - E9 — Verify evidence freshness against the bound head and relevant production
-  files.
+  files. When `evidence_origin` is present, a receipt whose `target_head_sha`
+  equals its controller-attested `source_head_sha` is fresh only as
+  source-head evidence when the snapshot lineage and evidence manifest/digests
+  match. It is not evidence generated at the derived snapshot head. Do not
+  treat that receipt as proof for product changes in `snapshot_delta` beyond
+  the declared evidence; those product changes require their own evidence.
 - E10 — Search raw output and logs for failures, contradictions, skipped work,
   and unexpected fallbacks.
 - E11 — Visually inspect representative decoded frames when visual artifacts

@@ -57,7 +57,7 @@ echoed in the run evidence.
 
 | `.dot` file | Flow | When to use |
 |-------------|------|-------------|
-| **`pipelines/slim/two_node.dot`** ⭐ default | worker → cold_reviewer (codex priority) → exit | **Default for `/f` and `/factory`** when no `--pipeline` is passed. Generic worker handles any user goal; static Codex cold-reviewer prompt gates it. Use this when the task fits the "do the thing, then a cold reviewer checks it" shape. |
+| **`pipelines/slim/two_node.dot`** ⭐ default | worker → controller-owned `cold-review-v1` → exit | **Default for `/f` and `/factory`** when no `--pipeline` is passed. Generic worker handles any user goal; its `type="parallel_reviewer"` gate uses controller-owned `cold-review-v1` with Codex-only `backend_priority="codex"`. |
 | `pipelines/factory/hello.dot` | plan → implement → holdout → fix-loop → exit | Add a new feature with a holdout scenario |
 | `pipelines/factory/gates.dot` | start → holdout → /es → /er → /code_standards → exit | Validate an already-implemented diff (Attractor-style 4-gate harness as `.dot`) |
 | `pipelines/factory/pr_gates.dot` | start → holdout → /es → /er → /code_standards → exit | Validate an already-implemented in-flight PR diff (Holdout-always policy; requires `--feature <name>` for the holdout) |
@@ -207,12 +207,10 @@ When `--pipeline` is a short name (no `/` or `.dot`), expand under
 
 When the user invokes `/f` or `/factory` with no `--pipeline` flag, the
 runner dispatches `pipelines/slim/two_node.dot` by default — exactly two
-productive nodes (a generic `worker` codergen + a `cold_reviewer` gate_er
-that runs the static Codex cold-reviewer prompt), plus a bounded fix
-loop. The cold reviewer uses the canonical
-`backend_priority="codex,minimax,agy,claude-sonnet"` queue with
-`prefer_adversarial=true` so the reviewer is a different vendor from
-the worker whenever possible.
+productive nodes (a generic `worker` codergen + a `cold_reviewer`
+`type="parallel_reviewer"` gate), plus a bounded fix loop. The cold reviewer
+uses the controller-owned `cold-review-v1` contract and its only
+receipt-capable transport, `backend_priority="codex"`.
 
 To opt into a richer pipeline, pass an explicit `--pipeline <name>`. To
 roll your own (e.g. a custom slim or feature shape), pass

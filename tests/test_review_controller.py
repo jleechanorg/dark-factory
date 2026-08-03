@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -13,6 +14,8 @@ from runner.review_controller import (
     CHECK_IDS,
     PROMPT_ID,
     EvidenceArtifact,
+    EvidenceDelta,
+    EvidenceOrigin,
     ExecutionReceipt,
     ReviewContractError,
     ReviewInputs,
@@ -167,6 +170,17 @@ def test_static_prompt_reviews_any_target_and_executed_evidence():
     assert not [phrase for phrase in forbidden_pr_only if phrase in normalized]
 
 
+def test_static_prompt_limits_source_head_receipts_for_derived_evidence() -> None:
+    static_text = create_review_request(_inputs()).prompt_payload.split(
+        "## Controller-bound review envelope", 1
+    )[0]
+    normalized = " ".join(static_text.split())
+    assert "evidence_origin" in normalized
+    assert "source-head evidence" in normalized
+    assert "not evidence generated at the derived snapshot head" in normalized
+    assert "product changes in `snapshot_delta` beyond the declared evidence" in normalized
+
+
 def test_envelope_and_prompt_are_canonical_across_input_order():
     first = create_review_request(_inputs())
     reordered = replace(
@@ -231,6 +245,50 @@ def test_envelope_binds_template_target_snapshots_and_evidence():
             "size_bytes": 12,
         }
     ]
+
+
+def test_derived_evidence_origin_is_bound_and_tamper_evident():
+    origin = EvidenceOrigin(
+        source_head_sha="b" * 40,
+        snapshot_parent_sha="b" * 40,
+        snapshot_delta=(
+            EvidenceDelta(status="A", path="evidence/test.log"),
+            EvidenceDelta(status="M", path="module.py"),
+        ),
+    )
+    request = create_review_request(replace(_inputs(), evidence_origin=origin))
+    envelope = json.loads(request.envelope_json)
+
+    assert envelope["evidence_origin"] == {
+        "source_head_sha": "b" * 40,
+        "snapshot_parent_sha": "b" * 40,
+        "snapshot_delta": [
+            {"status": "A", "path": "evidence/test.log"},
+            {"status": "M", "path": "module.py"},
+        ],
+    }
+    verify_request_integrity(request)
+
+    envelope["evidence_origin"]["snapshot_delta"][1]["path"] = "other.py"
+    tampered_json = json.dumps(envelope, sort_keys=True, separators=(",", ":"))
+    tampered = replace(
+        request,
+        envelope_json=tampered_json,
+        envelope_sha256=hashlib.sha256(tampered_json.encode()).hexdigest(),
+    )
+    with pytest.raises(ReviewContractError):
+        verify_request_integrity(tampered)
+
+
+def test_derived_evidence_origin_rejects_wrong_parent_declaration():
+    origin = EvidenceOrigin(
+        source_head_sha="a" * 40,
+        snapshot_parent_sha="b" * 40,
+        snapshot_delta=(EvidenceDelta(status="A", path="evidence/test.log"),),
+    )
+
+    with pytest.raises(ReviewContractError, match="snapshot parent"):
+        create_review_request(replace(_inputs(), evidence_origin=origin))
 
 
 def test_valid_response_requires_every_check_and_returns_digest():

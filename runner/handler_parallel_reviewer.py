@@ -60,6 +60,7 @@ from .handler_dispatch import (
     _parse_priority_env,
     _start_shadow_gate_review,
 )
+from .review_controller import EvidenceDelta, EvidenceOrigin
 
 if TYPE_CHECKING:
     from .handler_core import Context
@@ -274,7 +275,7 @@ def _controller_snapshot(
     source: pathlib.Path,
     expected_sha: str,
     declared_evidence: tuple[str, ...],
-) -> tuple[pathlib.Path, str]:
+) -> tuple[pathlib.Path, str, EvidenceOrigin | None]:
     """Freeze dirty worker output into a clean detached Git worktree for review.
 
     Worker nodes may leave implementation changes uncommitted, while controller
@@ -293,7 +294,7 @@ def _controller_snapshot(
         allow_empty=True,
     )
     if not source_status and not declared_evidence:
-        return source, observed_head
+        return source, observed_head, None
 
     snapshot_root = pathlib.Path.home() / ".dark-factory" / "controller-snapshots"
     snapshot_root.mkdir(parents=True, exist_ok=True)
@@ -378,6 +379,7 @@ def _controller_snapshot(
         )
         if staged.returncode != 0:
             raise ValueError(staged.stderr.strip() or "could not stage controller snapshot")
+
         if declared_evidence:
             staged_evidence = subprocess.run(
                 ["git", "-C", str(snapshot), "add", "-f", "--", *declared_evidence],
@@ -413,7 +415,35 @@ def _controller_snapshot(
             )
             if committed.returncode != 0:
                 raise ValueError(committed.stderr.strip() or "could not commit controller snapshot")
-        return snapshot, _git_output(snapshot, "rev-parse", "HEAD^{commit}").lower()
+        snapshot_head = _git_output(snapshot, "rev-parse", "HEAD^{commit}").lower()
+        if snapshot_head == observed_head:
+            return snapshot, snapshot_head, None
+        snapshot_parent = _git_output(snapshot, "rev-parse", "HEAD^").lower()
+        if snapshot_parent != observed_head:
+            raise ValueError("controller snapshot parent changed")
+        raw_delta = _git_output(
+            snapshot,
+            "diff",
+            "--name-status",
+            "--no-renames",
+            "-z",
+            f"{observed_head}..{snapshot_head}",
+            allow_empty=True,
+        )
+        fields = raw_delta.split("\0")
+        if fields and fields[-1] == "":
+            fields.pop()
+        if len(fields) % 2:
+            raise ValueError("controller snapshot delta is malformed")
+        delta = tuple(
+            EvidenceDelta(status=fields[index], path=pathlib.PurePosixPath(fields[index + 1]).as_posix())
+            for index in range(0, len(fields), 2)
+        )
+        return snapshot, snapshot_head, EvidenceOrigin(
+            source_head_sha=observed_head,
+            snapshot_parent_sha=snapshot_parent,
+            snapshot_delta=delta,
+        )
     except Exception:
         subprocess.run(
             ["git", "-C", str(source), "worktree", "remove", "--force", str(snapshot)],
@@ -461,7 +491,7 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
         validate_immutable_target(source_inputs, holdout_roots=holdout_roots)
     except ReviewContractError as exc:
         raise ValueError(f"controller review source is not immutable: {exc}") from exc
-    workdir, expected_sha = _controller_snapshot(
+    workdir, expected_sha, evidence_origin = _controller_snapshot(
         source_workdir, expected_sha, declared_evidence
     )
     base_sha = _git_output(workdir, "merge-base", "origin/main", expected_sha)
@@ -506,6 +536,7 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
         diff_text=diff_text,
         changed_files=tuple(changed),
         evidence=_controller_evidence(node, ctx, workdir),
+        evidence_origin=evidence_origin,
         run_id=str(ctx.run_id or ""),
     )
     try:

@@ -298,6 +298,7 @@ class ControllerSnapshotTests(unittest.TestCase):
         from runner.handler_core import Context
         from runner.handler_parallel_reviewer import _controller_review_request
         from runner.parser import Node
+        from runner.review_controller import verify_request_integrity
 
         (self.repo / "README.md").write_text("worker change\n")
         task_dir = self.repo / ".dark-factory"
@@ -319,6 +320,15 @@ class ControllerSnapshotTests(unittest.TestCase):
         self.assertEqual((snapshot / "README.md").read_text(), "worker change\n")
         self.assertFalse((snapshot / ".dark-factory" / "agy-task-worker.md").exists())
         self.assertEqual(_git(snapshot, "rev-parse", "HEAD").strip(), request.head_sha)
+        self.assertEqual(
+            envelope["evidence_origin"],
+            {
+                "source_head_sha": _git(self.repo, "rev-parse", "HEAD").strip(),
+                "snapshot_parent_sha": _git(self.repo, "rev-parse", "HEAD").strip(),
+                "snapshot_delta": [{"status": "M", "path": "README.md"}],
+            },
+        )
+        verify_request_integrity(request)
 
     def test_worker_task_artifact_only_uses_clean_noop_review_snapshot(self) -> None:
         """A transport-only worker result still receives an immutable no-op review."""
