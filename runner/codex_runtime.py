@@ -81,6 +81,14 @@ class CodexRuntimeSyncError(CodexRuntimeError):
         self.evidence = evidence
 
 
+class _CodexRuntimeTempdirError(CodexRuntimeError):
+    """Preserve a tempdir primary error plus a secondary cleanup error."""
+
+    def __init__(self, primary_error: Exception, cleanup_error: OSError) -> None:
+        super().__init__(str(primary_error))
+        self.cleanup_error = str(cleanup_error)
+
+
 @dataclass(frozen=True)
 class CodexRuntime:
     executable: Path
@@ -340,13 +348,14 @@ def _backup_candidate(backup_dir: Path) -> Path:
 
 
 def _backup_cache(cache_path: Path, home: Path) -> Path | None:
-    if not cache_path.exists():
+    try:
+        cache_metadata = cache_path.lstat()
+    except FileNotFoundError:
         return None
-    backup_dir = home / ".dark-factory" / "backups" / "codex-runtime"
-    _ensure_private_directory(backup_dir, home)
-    cache_metadata = cache_path.lstat()
     if stat.S_ISLNK(cache_metadata.st_mode) or not stat.S_ISREG(cache_metadata.st_mode):
         raise CodexRuntimeError(f"Codex models cache must be a regular non-symlink file: {cache_path}")
+    backup_dir = home / ".dark-factory" / "backups" / "codex-runtime"
+    _ensure_private_directory(backup_dir, home)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -383,8 +392,11 @@ def _create_runtime_tempdir(home: Path) -> Path:
     try:
         temp_workdir.chmod(0o700)
         _assert_outside_git_worktree(temp_workdir)
-    except (OSError, CodexRuntimeError):
-        shutil.rmtree(temp_workdir)
+    except (OSError, CodexRuntimeError) as primary_error:
+        try:
+            _cleanup_runtime_tempdir(temp_workdir)
+        except OSError as cleanup_error:
+            raise _CodexRuntimeTempdirError(primary_error, cleanup_error) from primary_error
         raise
     return temp_workdir
 
@@ -534,6 +546,8 @@ def sync_codex_runtime(
     try:
         temp_workdir = _create_runtime_tempdir(home)
     except (OSError, CodexRuntimeError) as exc:
+        if isinstance(exc, _CodexRuntimeTempdirError):
+            evidence["cleanup_error"] = exc.cleanup_error
         fail("codex_tempdir", f"could not create safe Codex runtime temporary cwd: {exc}")
     evidence["temporary_workdir"] = str(temp_workdir)
     primary_error: CodexRuntimeSyncError | None = None

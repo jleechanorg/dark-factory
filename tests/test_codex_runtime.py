@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -681,6 +682,37 @@ def test_sync_structures_runtime_tempdir_creation_failure(
     assert evidence["package_version"]["after"] == PINNED_VERSION
 
 
+def test_sync_preserves_internal_tempdir_primary_error_when_cleanup_also_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from runner import codex_runtime
+
+    home = tmp_path / "home"
+    _, before_cache = _write_sync_fakes(home)
+    validations = 0
+
+    def _fail_child_validation(path):
+        nonlocal validations
+        validations += 1
+        if validations == 2:
+            raise codex_runtime.CodexRuntimeError("fixture primary worktree validation")
+
+    def _fail_internal_cleanup(path):
+        raise OSError("fixture secondary cleanup")
+
+    monkeypatch.setattr(codex_runtime, "_assert_outside_git_worktree", _fail_child_validation)
+    monkeypatch.setattr(codex_runtime.shutil, "rmtree", _fail_internal_cleanup)
+
+    with pytest.raises(codex_runtime.CodexRuntimeSyncError) as caught:
+        codex_runtime.sync_codex_runtime(home=home, competing_package_paths=())
+
+    evidence = caught.value.evidence
+    assert evidence["phase"] == "codex_tempdir"
+    assert "fixture primary worktree validation" in evidence["error"]
+    assert "fixture secondary cleanup" in evidence["cleanup_error"]
+    assert Path(evidence["backup_path"]).read_bytes() == before_cache
+
+
 @pytest.mark.parametrize("codex_exit", [0, 7])
 def test_sync_structures_cleanup_failure_without_masking_primary_error(
     tmp_path: Path, monkeypatch, codex_exit: int
@@ -729,6 +761,30 @@ def test_backup_is_private_unique_and_retries_collision(
     assert backup.read_bytes() == cache.read_bytes()
     assert stat.S_IMODE(backup.stat().st_mode) == 0o600
     assert stat.S_IMODE(backup_dir.stat().st_mode) == 0o700
+
+
+def test_sync_rejects_dangling_cache_symlink_before_mutation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from runner.codex_runtime import CodexRuntimeSyncError, sync_codex_runtime
+
+    home = tmp_path / "home"
+    cache, _ = _write_sync_fakes(home)
+    cache.unlink()
+    dangling_target = tmp_path / "missing-cache-target.json"
+    cache.symlink_to(dangling_target)
+
+    with pytest.raises(CodexRuntimeSyncError) as caught:
+        sync_codex_runtime(home=home, competing_package_paths=())
+
+    evidence = caught.value.evidence
+    assert evidence["phase"] == "backup"
+    assert "symlink" in evidence["error"].lower()
+    assert evidence["backup_path"] is None
+    assert cache.is_symlink()
+    assert not dangling_target.exists()
+    events = [json.loads(line) for line in (home / "sync-events.jsonl").read_text().splitlines()]
+    assert [event["tool"] for event in events] == ["node_version"]
 
 
 @pytest.mark.parametrize("unsafe_kind", ["permissions", "symlink"])
@@ -856,6 +912,19 @@ def test_sync_fails_final_static_validation_without_editing_stale_cache(
 def test_installer_sync_flag_runs_fake_runtime_end_to_end(tmp_path: Path) -> None:
     home = tmp_path / "home"
     _write_sync_fakes(home)
+    source_root = Path(__file__).resolve().parents[1]
+    fixture_root = tmp_path / "installer-fixture"
+    (fixture_root / "runner").mkdir(parents=True)
+    (fixture_root / "bin").mkdir()
+    (fixture_root / ".venv").symlink_to(source_root / ".venv", target_is_directory=True)
+    for source in ("__init__.py", "codex_runtime.py", "subprocess_control.py"):
+        shutil.copy2(source_root / "runner" / source, fixture_root / "runner" / source)
+    shutil.copy2(source_root / "install.sh", fixture_root / "install.sh")
+    (fixture_root / "requirements.lock").write_text("", encoding="utf-8")
+    for name in ("dark-factory", "df-healer", "df-validate"):
+        executable = fixture_root / "bin" / name
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
     ambient_marker = tmp_path / "ambient-node-ran"
@@ -868,17 +937,15 @@ def test_installer_sync_flag_runs_fake_runtime_end_to_end(tmp_path: Path) -> Non
         executable = fake_bin / name
         executable.write_text(source, encoding="utf-8")
         executable.chmod(0o755)
-    root = Path(__file__).resolve().parents[1]
-
     result = subprocess.run(
         [
-            str(root / "install.sh"),
+            str(fixture_root / "install.sh"),
             "--sync-codex-runtime",
             "--no-link",
             "--no-cmds",
             "--no-smoke",
         ],
-        cwd=root,
+        cwd=fixture_root,
         env={
             **os.environ,
             "HOME": str(home),
@@ -895,6 +962,7 @@ def test_installer_sync_flag_runs_fake_runtime_end_to_end(tmp_path: Path) -> Non
     assert payloads[-1]["status"] == "pass"
     assert payloads[-1]["phase"] == "complete"
     assert not ambient_marker.exists()
+    assert not (fixture_root / ".git").exists()
 
 
 def test_fresh_worker_and_controller_share_aligned_cache_and_emit_artifacts(
