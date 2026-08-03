@@ -57,8 +57,12 @@ def test_run_captures_target_provenance_before_first_node(tmp_path, monkeypatch)
     assert "_df_run_initial_workspace_sha256" not in observed
 
 
-def test_automatic_resume_rejects_worker_rewriting_every_checkpoint_trust_value(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    "tamper",
+    ["checkpoint-all-records", "private-missing", "private-malformed", "private-policy"],
+)
+def test_automatic_resume_rejects_checkpoint_or_private_trust_tampering(
+    tmp_path, monkeypatch, tamper
 ):
     from runner import handler_sandbox
 
@@ -110,9 +114,25 @@ def test_automatic_resume_rejects_worker_rewriting_every_checkpoint_trust_value(
     (tmp_path / "tracked.txt").write_text("worker\n")
     subprocess.run(["/usr/bin/git", "commit", "-qam", "worker"], cwd=tmp_path, check=True)
     worker_head = subprocess.run(["/usr/bin/git", "rev-parse", "HEAD"], cwd=tmp_path, check=True, capture_output=True, text=True).stdout.strip()
-    for record in records:
-        record.setdefault("metadata", {})["_df_controller_trust_head"] = worker_head
-    checkpoint.write_text(json.dumps(records), encoding="utf-8")
+    registry_path = (
+        tmp_path / "controller-private" / "operator-trust" / "registry.json"
+    )
+    if tamper == "checkpoint-all-records":
+        for record in records:
+            record.setdefault("metadata", {})["_df_controller_trust_head"] = worker_head
+        checkpoint.write_text(json.dumps(records), encoding="utf-8")
+    elif tamper == "private-missing":
+        checkpoint.write_text(json.dumps(records), encoding="utf-8")
+        registry_path.unlink()
+    elif tamper == "private-malformed":
+        checkpoint.write_text(json.dumps(records), encoding="utf-8")
+        registry_path.write_text("{", encoding="utf-8")
+    else:
+        checkpoint.write_text(json.dumps(records), encoding="utf-8")
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        record = next(iter(registry["records"].values()))
+        record["policy_sha256"] = "0" * 64
+        registry_path.write_text(json.dumps(registry), encoding="utf-8")
     launched = []
     import runner.handler_audit as handler_audit
     monkeypatch.setattr(
