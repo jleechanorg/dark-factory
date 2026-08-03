@@ -1,0 +1,61 @@
+// pipelines/slim/two_node.dot
+//
+// Default graph for `/f` (and `/factory`). Exactly two productive nodes:
+//   worker         — generic codergen; light prompt; does whatever the user asked.
+//   cold_reviewer  — controller-owned cold reviewer using the SHA-pinned
+//                    cold-review-v1 execution path (prompts/catalog/controller_cold_review_v1.md).
+//
+// Wiring:
+//   start -> worker -> cold_reviewer -> exit                (on success)
+//                          \-> worker                        (on failure, bounded max_visits=3)
+//
+// Backend routing:
+//   - worker          honors the run-level --backend (the coder tier the user
+//                     chose; default = whatever /f's Step 0.5 detector picks).
+//   - cold_reviewer   uses review_contract="cold-review-v1" and
+//                     backend_priority="codex" because the controller has
+//                     a receipt-capable transport only for Codex.
+//
+// Failure semantics:
+//   - cold_reviewer is goal_gate=true. On success the run exits.
+//   - On a real fail/partial verdict the runner routes back to worker directly.
+//     Worker handles iteration (max_visits=3). No separate fix node in this graph.
+
+digraph SlimTwoNode {
+    graph [
+        goal="Generic worker does the user's task; controller-owned cold-review-v1 reviewer gates it. Slim default for /f."
+        rankdir=LR
+        label="SlimTwoNode (default /f graph)"
+    ]
+
+    start  [shape=Mdiamond, label="Start"]
+    exit   [shape=Msquare,  label="Exit"]
+
+    worker [
+        type="codergen",
+        label="Generic Worker",
+        class="worker",
+        prompt="@prompts/slim/worker.md",
+        max_retries=2,
+        max_visits="3",
+        timeout=600
+    ]
+
+    cold_reviewer [
+        type="parallel_reviewer",
+        label="Cold Reviewer (controller cold-review-v1)",
+        class="review",
+        review_contract="cold-review-v1",
+        backend_priority="codex",
+        evidence_paths="evidence/worker-verification.json",
+        goal_gate=true,
+        timeout=600
+    ]
+
+    start -> worker
+    worker -> cold_reviewer [condition="outcome=success"]
+    worker -> worker        [condition="outcome!=success"]
+
+    cold_reviewer -> exit   [condition="outcome=success"]
+    cold_reviewer -> worker [condition="outcome!=success"]
+}

@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
@@ -51,7 +52,7 @@ _TEMPLATE_PATH = (
     _SOURCE_ROOT / "prompts" / "catalog" / "controller_cold_review_v1.md"
 )
 _EXPECTED_TEMPLATE_SHA256 = (
-    "20300676020eeec3ff9d1dc3d151f4950c1853a0f8cdc16fcd6b308acf3d610a"
+    "cedb0b23f2aeab8a9c84b6e04eac11673af5c966a691a075bfedaa9493c5ae3d"
 )
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -84,6 +85,23 @@ class EvidenceArtifact:
 
 
 @dataclass(frozen=True, slots=True)
+class EvidenceDelta:
+    """One controller-computed path entry in a derived evidence snapshot."""
+
+    status: str
+    path: str
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceOrigin:
+    """Lineage for a snapshot that adds declared evidence to a worker head."""
+
+    source_head_sha: str
+    snapshot_parent_sha: str
+    snapshot_delta: tuple[EvidenceDelta, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ReviewInputs:
     """Typed, untrusted inputs bound into a canonical review envelope."""
 
@@ -96,6 +114,7 @@ class ReviewInputs:
     diff_text: str
     changed_files: tuple[str, ...] = ()
     evidence: tuple[EvidenceArtifact, ...] = ()
+    evidence_origin: EvidenceOrigin | None = None
     run_id: str = ""
 
 
@@ -186,7 +205,8 @@ def validate_immutable_target(
     if not isinstance(inputs, ReviewInputs):
         raise TypeError("inputs must be ReviewInputs")
 
-    raw_workspace = Path(inputs.workspace_path)
+    normalized = _normalized_inputs(inputs)
+    raw_workspace = Path(normalized.workspace_path)
     if _path_is_symlink(raw_workspace):
         raise ReviewContractError(
             f"workspace_path must not be a symlink: {raw_workspace}"
@@ -219,7 +239,7 @@ def validate_immutable_target(
             f"workspace_path is inside a sealed holdout root: {workspace}"
         )
 
-    for artifact in inputs.evidence:
+    for artifact in normalized.evidence:
         if not isinstance(artifact, EvidenceArtifact):
             raise TypeError("evidence entries must be EvidenceArtifact")
         if artifact.size_bytes > _MAX_INPUT_BYTES:
@@ -250,6 +270,13 @@ def validate_immutable_target(
             raise ReviewContractError(
                 f"evidence path is not a regular file: {artifact.path}"
             )
+    if normalized.evidence_origin is not None:
+        validate_evidence_origin(
+            workspace,
+            head_sha=normalized.head_sha,
+            evidence=normalized.evidence,
+            origin=normalized.evidence_origin,
+        )
     return workspace
 
 
@@ -371,6 +398,43 @@ def _normalized_inputs(inputs: ReviewInputs) -> ReviewInputs:
             )
         )
 
+    origin = inputs.evidence_origin
+    if origin is not None:
+        if not isinstance(origin, EvidenceOrigin):
+            raise TypeError("evidence_origin must be EvidenceOrigin")
+        source_head_sha = _require_sha("evidence_origin source_head_sha", origin.source_head_sha)
+        snapshot_parent_sha = _require_sha(
+            "evidence_origin snapshot_parent_sha", origin.snapshot_parent_sha
+        )
+        if snapshot_parent_sha != source_head_sha:
+            raise ReviewContractError(
+                "evidence_origin snapshot parent must equal the source head"
+            )
+        if not origin.snapshot_delta:
+            raise ReviewContractError("evidence_origin snapshot_delta must be non-empty")
+        normalized_delta: list[EvidenceDelta] = []
+        seen_delta_paths: set[str] = set()
+        for entry in origin.snapshot_delta:
+            if not isinstance(entry, EvidenceDelta):
+                raise TypeError("evidence_origin snapshot_delta entries must be EvidenceDelta")
+            status = str(entry.status).strip()
+            if not re.fullmatch(r"[A-Z][0-9]*", status):
+                raise ReviewContractError("evidence_origin delta status is invalid")
+            path = str(entry.path).strip()
+            relative = Path(path)
+            if not path or relative.is_absolute() or ".." in relative.parts:
+                raise ReviewContractError("evidence_origin delta path is invalid")
+            normalized_path = relative.as_posix()
+            if normalized_path in seen_delta_paths:
+                raise ReviewContractError("evidence_origin snapshot_delta has duplicate paths")
+            seen_delta_paths.add(normalized_path)
+            normalized_delta.append(EvidenceDelta(status=status, path=normalized_path))
+        origin = EvidenceOrigin(
+            source_head_sha=source_head_sha,
+            snapshot_parent_sha=snapshot_parent_sha,
+            snapshot_delta=tuple(normalized_delta),
+        )
+
     return replace(
         inputs,
         repository=repository,
@@ -380,7 +444,71 @@ def _normalized_inputs(inputs: ReviewInputs) -> ReviewInputs:
         tree_sha=_require_sha("tree_sha", inputs.tree_sha),
         changed_files=changed_files,
         evidence=tuple(normalized_evidence),
+        evidence_origin=origin,
     )
+
+
+def validate_evidence_origin(
+    workspace: Path,
+    *,
+    head_sha: str,
+    evidence: tuple[EvidenceArtifact, ...],
+    origin: EvidenceOrigin,
+) -> None:
+    """Verify controller-derived evidence lineage against the frozen Git target."""
+    normalized_head = _require_sha("head_sha", head_sha)
+    normalized_origin = _normalized_inputs(
+        ReviewInputs(
+            repository="evidence-origin-validation",
+            workspace_path=str(workspace),
+            base_sha=normalized_head,
+            head_sha=normalized_head,
+            tree_sha="0" * 40,
+            task_text="",
+            diff_text="",
+            evidence=evidence,
+            evidence_origin=origin,
+        )
+    ).evidence_origin
+    assert normalized_origin is not None
+
+    def git(*args: str) -> str:
+        proc = subprocess.run(
+            ["git", "-C", str(workspace), *args],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if proc.returncode != 0:
+            detail = proc.stderr.strip() or proc.stdout.strip() or "no output"
+            raise ReviewContractError(f"evidence-origin git {' '.join(args)} failed: {detail}")
+        return proc.stdout.rstrip("\n")
+
+    observed_head = git("rev-parse", "HEAD^{commit}").lower()
+    if observed_head != normalized_head:
+        raise ReviewContractError("evidence_origin snapshot head does not equal target head")
+    observed_parent = git("rev-parse", "HEAD^").lower()
+    if observed_parent != normalized_origin.source_head_sha:
+        raise ReviewContractError("evidence_origin snapshot parent does not equal source head")
+    raw_delta = git(
+        "diff",
+        "--name-status",
+        "--no-renames",
+        "-z",
+        f"{normalized_origin.source_head_sha}..{normalized_head}",
+    )
+    fields = raw_delta.split("\0")
+    if fields and fields[-1] == "":
+        fields.pop()
+    if len(fields) % 2:
+        raise ReviewContractError("evidence_origin git delta is malformed")
+    observed_delta = tuple(
+        EvidenceDelta(status=fields[index], path=Path(fields[index + 1]).as_posix())
+        for index in range(0, len(fields), 2)
+    )
+    if observed_delta != normalized_origin.snapshot_delta:
+        raise ReviewContractError("evidence_origin snapshot delta does not match target")
 
 
 def _build_envelope(inputs: ReviewInputs, *, template_sha256: str) -> str:
@@ -430,6 +558,15 @@ def _build_envelope(inputs: ReviewInputs, *, template_sha256: str) -> str:
         },
         "run_id": normalized.run_id,
     }
+    if normalized.evidence_origin is not None:
+        payload["evidence_origin"] = {
+            "source_head_sha": normalized.evidence_origin.source_head_sha,
+            "snapshot_parent_sha": normalized.evidence_origin.snapshot_parent_sha,
+            "snapshot_delta": [
+                {"status": entry.status, "path": entry.path}
+                for entry in normalized.evidence_origin.snapshot_delta
+            ],
+        }
     return _canonical_json(payload)
 
 
@@ -562,6 +699,18 @@ def verify_request_integrity(request: ReviewRequest) -> None:
                         sha256=item["sha256"],
                     )
                     for item in envelope["evidence"]
+                ),
+                evidence_origin=(
+                    EvidenceOrigin(
+                        source_head_sha=envelope["evidence_origin"]["source_head_sha"],
+                        snapshot_parent_sha=envelope["evidence_origin"]["snapshot_parent_sha"],
+                        snapshot_delta=tuple(
+                            EvidenceDelta(status=item["status"], path=item["path"])
+                            for item in envelope["evidence_origin"]["snapshot_delta"]
+                        ),
+                    )
+                    if "evidence_origin" in envelope
+                    else None
                 ),
                 run_id=envelope.get("run_id", ""),
             )
@@ -897,6 +1046,8 @@ __all__ = [
     "ControllerReviewResult",
     "PROMPT_ID",
     "EvidenceArtifact",
+    "EvidenceDelta",
+    "EvidenceOrigin",
     "ExecutionReceipt",
     "ReviewContractError",
     "ReviewInputs",
@@ -907,6 +1058,7 @@ __all__ = [
     "parse_codex_jsonl",
     "run_controller_review",
     "validate_execution_receipts",
+    "validate_evidence_origin",
     "validate_review_response",
     "verify_request_integrity",
 ]

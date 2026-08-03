@@ -4,6 +4,7 @@ import hashlib
 import json
 import pathlib
 import re
+import shutil
 
 """Parallel reviewer handler.
 
@@ -16,6 +17,7 @@ behavior is aligned with existing lanes (`_resolve_gate_backend`,
 """
 
 _LANE_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+_CONTROLLER_TASK_ARTIFACT_RE = re.compile(r"^\.dark-factory/agy-task-[^/]+\.md$")
 
 
 def lane_output_dir(neutral_cwd: pathlib.Path, lane: str) -> pathlib.Path:
@@ -30,6 +32,7 @@ def lane_output_dir(neutral_cwd: pathlib.Path, lane: str) -> pathlib.Path:
 
 
 import subprocess
+import tempfile
 from typing import TYPE_CHECKING
 
 # Import collaborators from their source modules directly. Importing
@@ -57,6 +60,7 @@ from .handler_dispatch import (
     _parse_priority_env,
     _start_shadow_gate_review,
 )
+from .review_controller import EvidenceDelta, EvidenceOrigin
 
 if TYPE_CHECKING:
     from .handler_core import Context
@@ -209,10 +213,8 @@ def _git_output(
     return proc.stdout.strip()
 
 
-def _controller_evidence(node: "Node", ctx: "Context") -> tuple:
-    """Return a typed, per-file evidence manifest for readable declared files."""
-    from .review_controller import EvidenceArtifact
-
+def _controller_evidence_paths(node: "Node", ctx: "Context") -> tuple[str, ...]:
+    """Return declared evidence paths after validating their relative shape."""
     raw = ctx.state.get("evidence_paths") or node.attrs.get("evidence_paths") or ""
     if isinstance(raw, str):
         if raw.startswith("[") and raw.endswith("]"):
@@ -227,12 +229,30 @@ def _controller_evidence(node: "Node", ctx: "Context") -> tuple:
     else:
         raise ValueError("evidence_paths must be a list or comma-separated string")
 
-    artifacts = []
-    root = ctx.workdir.resolve()
+    paths: list[str] = []
     for value in values:
         rel = str(value).strip()
         if not rel:
             continue
+        relative = pathlib.PurePosixPath(rel)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"declared evidence escapes the workspace: {rel}")
+        paths.append(relative.as_posix())
+    return tuple(paths)
+
+
+def _controller_evidence(
+    node: "Node", ctx: "Context", root: pathlib.Path | None = None
+) -> tuple:
+    """Return a typed, per-file evidence manifest for readable declared files."""
+    from .review_controller import EvidenceArtifact
+
+    artifacts = []
+    if root is None:
+        import runner.handlers as _handlers_shim
+
+        root = _handlers_shim._target_worktree(ctx)
+    for rel in _controller_evidence_paths(node, ctx):
         path = (root / rel).resolve()
         try:
             path.relative_to(root)
@@ -251,6 +271,190 @@ def _controller_evidence(node: "Node", ctx: "Context") -> tuple:
     return tuple(artifacts)
 
 
+def _controller_snapshot(
+    source: pathlib.Path,
+    expected_sha: str,
+    declared_evidence: tuple[str, ...],
+) -> tuple[pathlib.Path, str, EvidenceOrigin | None]:
+    """Freeze dirty worker output into a clean detached Git worktree for review.
+
+    Worker nodes may leave implementation changes uncommitted, while controller
+    review binds its SHA/tree/diff evidence to a clean immutable target. The
+    detached commit supplies that target without changing the worker checkout.
+    Runner-created AGY task files are transport artifacts, not product output.
+    """
+    observed_head = _git_output(source, "rev-parse", "HEAD^{commit}").lower()
+    if observed_head != expected_sha.lower():
+        raise ValueError("controller review target head changed before snapshot")
+    source_status = _git_output(
+        source,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        allow_empty=True,
+    )
+    if not source_status and not declared_evidence:
+        return source, observed_head, None
+
+    snapshot_root = pathlib.Path.home() / ".dark-factory" / "controller-snapshots"
+    snapshot_root.mkdir(parents=True, exist_ok=True)
+    snapshot = pathlib.Path(tempfile.mkdtemp(prefix="snapshot-", dir=snapshot_root))
+    snapshot.rmdir()
+    add = subprocess.run(
+        ["git", "-C", str(source), "worktree", "add", "--detach", str(snapshot), observed_head],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if add.returncode != 0:
+        raise ValueError(add.stderr.strip() or "could not create controller snapshot")
+    try:
+        diff_text = _git_output(
+            source,
+            "diff",
+            "--no-ext-diff",
+            "--binary",
+            "HEAD",
+            allow_empty=True,
+        )
+        if diff_text:
+            applied = subprocess.run(
+                ["git", "-C", str(snapshot), "apply", "--binary"],
+                input=diff_text + "\n",
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if applied.returncode != 0:
+                raise ValueError(applied.stderr.strip() or "could not apply worker diff")
+
+        normal_untracked = _git_output(
+            source,
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            allow_empty=True,
+        )
+        copied: set[str] = set()
+
+        def _copy_source_file(raw_path: str, *, declared: bool) -> None:
+            relative = pathlib.PurePosixPath(raw_path)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError(f"unsafe worker path: {raw_path}")
+            normalized = relative.as_posix()
+            if _CONTROLLER_TASK_ARTIFACT_RE.fullmatch(normalized):
+                if declared:
+                    raise ValueError(f"declared evidence is a runner task artifact: {normalized}")
+                return
+            if normalized in copied:
+                return
+            source_path = source.joinpath(*relative.parts)
+            resolved_source = source_path.resolve()
+            try:
+                resolved_source.relative_to(source)
+            except ValueError as exc:
+                raise ValueError(f"worker path escapes the workspace: {normalized}") from exc
+            if source_path.is_symlink() or not source_path.is_file():
+                raise ValueError(f"worker path is not a regular file: {normalized}")
+            destination = snapshot.joinpath(*relative.parts)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_path, destination)
+            copied.add(normalized)
+
+        for raw_path in normal_untracked.split("\0"):
+            if raw_path:
+                _copy_source_file(raw_path, declared=False)
+        for evidence_path in declared_evidence:
+            _copy_source_file(evidence_path, declared=True)
+
+        staged = subprocess.run(
+            ["git", "-C", str(snapshot), "add", "--all"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if staged.returncode != 0:
+            raise ValueError(staged.stderr.strip() or "could not stage controller snapshot")
+
+        if declared_evidence:
+            staged_evidence = subprocess.run(
+                ["git", "-C", str(snapshot), "add", "-f", "--", *declared_evidence],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if staged_evidence.returncode != 0:
+                raise ValueError(
+                    staged_evidence.stderr.strip()
+                    or "could not stage declared controller evidence"
+                )
+        if _git_output(snapshot, "status", "--porcelain=v1", allow_empty=True):
+            committed = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(snapshot),
+                    "-c",
+                    "user.name=dark-factory-controller",
+                    "-c",
+                    "user.email=dark-factory-controller@localhost",
+                    "commit",
+                    "--no-verify",
+                    "-m",
+                    "dark-factory controller snapshot [codex/gpt-5.6-luna]",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if committed.returncode != 0:
+                raise ValueError(committed.stderr.strip() or "could not commit controller snapshot")
+        snapshot_head = _git_output(snapshot, "rev-parse", "HEAD^{commit}").lower()
+        if snapshot_head == observed_head:
+            return snapshot, snapshot_head, None
+        snapshot_parent = _git_output(snapshot, "rev-parse", "HEAD^").lower()
+        if snapshot_parent != observed_head:
+            raise ValueError("controller snapshot parent changed")
+        raw_delta = _git_output(
+            snapshot,
+            "diff",
+            "--name-status",
+            "--no-renames",
+            "-z",
+            f"{observed_head}..{snapshot_head}",
+            allow_empty=True,
+        )
+        fields = raw_delta.split("\0")
+        if fields and fields[-1] == "":
+            fields.pop()
+        if len(fields) % 2:
+            raise ValueError("controller snapshot delta is malformed")
+        delta = tuple(
+            EvidenceDelta(status=fields[index], path=pathlib.PurePosixPath(fields[index + 1]).as_posix())
+            for index in range(0, len(fields), 2)
+        )
+        return snapshot, snapshot_head, EvidenceOrigin(
+            source_head_sha=observed_head,
+            snapshot_parent_sha=snapshot_parent,
+            snapshot_delta=delta,
+        )
+    except Exception:
+        subprocess.run(
+            ["git", "-C", str(source), "worktree", "remove", "--force", str(snapshot)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        raise
+
+
 def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
     """Build the source-owned request; graph/goal content remains envelope data."""
     from .review_controller import (
@@ -260,16 +464,36 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
         validate_immutable_target,
     )
 
-    workdir = ctx.workdir.resolve()
-    status = _git_output(
-        workdir,
-        "status",
-        "--porcelain=v1",
-        "--untracked-files=all",
-        allow_empty=True,
+    import runner.handlers as _handlers_shim
+
+    source_workdir = _handlers_shim._target_worktree(ctx)
+    declared_evidence = _controller_evidence_paths(node, ctx)
+    try:
+        holdout_roots = tuple(
+            str(pathlib.Path(root).resolve(strict=False))
+            for root in _holdout_root_strings()
+        )
+    except Exception:
+        holdout_roots = ()
+    source_inputs = ReviewInputs(
+        repository=source_workdir.name,
+        workspace_path=str(source_workdir),
+        base_sha=expected_sha,
+        head_sha=expected_sha,
+        tree_sha=_git_output(source_workdir, "rev-parse", f"{expected_sha}^{{tree}}"),
+        task_text="",
+        diff_text="",
+        changed_files=(),
+        evidence=_controller_evidence(node, ctx, source_workdir),
+        run_id=str(ctx.run_id or ""),
     )
-    if status:
-        raise ValueError("controller review requires a clean workspace")
+    try:
+        validate_immutable_target(source_inputs, holdout_roots=holdout_roots)
+    except ReviewContractError as exc:
+        raise ValueError(f"controller review source is not immutable: {exc}") from exc
+    workdir, expected_sha, evidence_origin = _controller_snapshot(
+        source_workdir, expected_sha, declared_evidence
+    )
     base_sha = _git_output(workdir, "merge-base", "origin/main", expected_sha)
     tree_sha = _git_output(workdir, "rev-parse", f"{expected_sha}^{{tree}}")
     diff_text = _git_output(
@@ -288,8 +512,6 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
         allow_empty=True,
     )
     changed = changed_text.splitlines()
-    if not changed:
-        raise ValueError("controller review requires a non-empty committed diff")
     try:
         repository = _git_output(workdir, "config", "--get", "remote.origin.url")
     except ValueError:
@@ -297,8 +519,6 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
 
     dynamic_focus = ""
     if node.prompt_ref:
-        import runner.handlers as _handlers_shim
-
         dynamic_focus = _handlers_shim._render_prompt(node, ctx)
     task_text = ctx.goal
     if dynamic_focus:
@@ -315,16 +535,10 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
         task_text=task_text,
         diff_text=diff_text,
         changed_files=tuple(changed),
-        evidence=_controller_evidence(node, ctx),
+        evidence=_controller_evidence(node, ctx, workdir),
+        evidence_origin=evidence_origin,
         run_id=str(ctx.run_id or ""),
     )
-    try:
-        holdout_roots = tuple(
-            str(pathlib.Path(root).resolve(strict=False))
-            for root in _holdout_root_strings()
-        )
-    except Exception:
-        holdout_roots = ()
     try:
         validate_immutable_target(inputs, holdout_roots=holdout_roots)
     except ReviewContractError as exc:
@@ -346,8 +560,9 @@ def _verify_controller_workspace(ctx: "Context", request) -> None:
     envelope = json.loads(request.envelope_json)
     target = envelope["target"]
     snapshots = envelope["snapshots"]
-    workdir = ctx.workdir.resolve()
+    workdir = pathlib.Path(str(target["workspace_path"])).resolve()
     status = subprocess.run(
+
         [
             "git",
             "-C",
@@ -642,7 +857,16 @@ class _MDToCtxShim:
 def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     """Run parallel reviewer lanes and pass combined evidence downstream."""
     import runner.handlers as _handlers_shim  # late-bound shim for monkeypatched helpers
-    if ctx.backend in ("echo", "mock_llm"):
+    review_contract = str(node.attrs.get("review_contract") or "").strip()
+    preseeded_outcome = f"{node.name}.outcome" in ctx.state
+    explicit_controller_echo_fixture = (
+        preseeded_outcome
+        and str(ctx.state.get("_df_test_allow_echo_controller_fixture") or "").strip().lower()
+        in {"true", "1", "yes", "on"}
+    )
+    if ctx.backend in ("echo", "mock_llm") and (
+        not review_contract or explicit_controller_echo_fixture
+    ):
         hint = ctx.state.get(f"{node.name}.outcome", "success")
         return Result(
             outcome=hint,
@@ -654,8 +878,9 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
                 "parallel_reviewer": "echo",
             },
         )
-    expected_sha = _handlers_shim._worktree_head_sha(ctx.workdir)
-    review_contract = str(node.attrs.get("review_contract") or "").strip()
+    target_dir = _handlers_shim._target_worktree(ctx)
+    expected_sha = _handlers_shim._worktree_head_sha(target_dir)
+
     request = None
     if review_contract:
         if review_contract != "cold-review-v1":
@@ -666,6 +891,7 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
             )
         try:
             request = _controller_review_request(node, ctx, expected_sha)
+            expected_sha = request.head_sha
         except Exception as exc:
             return Result(
                 outcome="error",

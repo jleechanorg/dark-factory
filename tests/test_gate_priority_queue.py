@@ -192,3 +192,34 @@ def test_adversarial_priority_pinned_across_visits(monkeypatch):
         f"cross-visit pin broken: re-visit must return pinned backend, got {second!r}"
     )
     assert second_meta["reviewer_backend_resolution"] == "priority_queue"
+
+
+def test_probe_backend_installed_maps_claude_sonnet_to_claude() -> None:
+    """_probe_backend_installed("claude-sonnet") must probe the standard `claude` binary."""
+    from runner.handlers import _probe_backend_installed
+    # When `claude` is installed on PATH (as in this environment), probing
+    # "claude-sonnet" must return True.
+    import shutil
+    if shutil.which("claude"):
+        assert _probe_backend_installed("claude-sonnet") is True
+
+
+def test_adversarial_priority_falls_back_to_claude_when_others_unavailable(monkeypatch) -> None:
+    """When codex, minimax, agy are unavailable, reviewer priority falls back to claude-sonnet (which probes claude)."""
+    from runner.handlers import (
+        _resolve_adversarial_backend,
+        Context as HCtx,
+    )
+
+    ctx = HCtx(goal="test", workdir=pathlib.Path("/tmp"), backend="ao")
+    monkeypatch.setattr(
+        "runner.handlers._probe_backend_installed",
+        lambda name: name == "claude-sonnet",
+    )
+
+    resolved, meta = _resolve_adversarial_backend(
+        ["codex", "minimax", "agy", "claude-sonnet"], ctx
+    )
+    assert resolved == "claude-sonnet"
+    assert meta["adversarial_resolved"] == "claude-sonnet"
+    assert meta["adversarial_skipped"] == "codex,minimax,agy"
