@@ -117,11 +117,7 @@ dot -Tpng pipelines/factory/gates.dot -o gates.png
 Prefer **`dark-factory`** / **`df-healer`** on PATH for `/f` and `/factory`.
 Legacy dev-only: `.venv/bin/python -m runner ...` from `$DARK_FACTORY_HOME`.
 
-## Pipeline selection
-
-**Pick the `.dot` for the task** — see [docs/pipeline-selection.md](docs/pipeline-selection.md).
-Do not default every `/f` or `/factory` run to the same graph. Classify greenfield
-vs brownfield (factory-spec Step 0) when `--pipeline` is omitted.
+When `--pipeline` is omitted, `/f` and `/factory` default to `pipelines/slim/two_node.dot` (generic worker + controller cold reviewer). Pass explicit `--pipeline <name>` to opt into non-default pipelines (see [docs/pipeline-selection.md](docs/pipeline-selection.md)).
 
 ## Architecture
 

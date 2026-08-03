@@ -181,17 +181,15 @@ def test_subprocess_emits_valid_json(tmp_path):
     assert payload["configured"] == "echo"
 
 
-def test_subprocess_fail_exit_code():
+def test_subprocess_fail_exit_code(tmp_path):
     """Subprocess exit code 2 on hard-stop, regardless of JSON flag.
 
-    Force-fail by stripping PATH so no probed CLI resolves. We pass
-    a minimal PATH containing only /usr/bin (for python) and unset any
-    user-specific bins.
+    Force-fail by setting PATH to an empty directory so no probed CLI resolves.
     """
     import os
 
     sanitized_env = {
-        "PATH": "/usr/bin:/bin",
+        "PATH": str(tmp_path),
         "HOME": os.environ.get("HOME", "/tmp"),
         "PYTHONPATH": str(
             pathlib.Path(__file__).resolve().parent.parent

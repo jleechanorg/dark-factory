@@ -137,8 +137,7 @@ source. Run from the **target repo** cwd; pipelines resolve from `$DARK_FACTORY_
 
 ### Pipeline selection
 
-Pick the graph for the task ([docs/pipeline-selection.md](docs/pipeline-selection.md)).
-Do not always use `minimal_feature.dot` or `gates.dot` by default.
+When `--pipeline` is omitted, `/f` and `/factory` default to `pipelines/slim/two_node.dot` (generic worker + controller cold reviewer). Pass explicit `--pipeline <name>` to opt into non-default pipelines (see [docs/pipeline-selection.md](docs/pipeline-selection.md)).
 
 | Task | Pipeline |
 |------|----------|
