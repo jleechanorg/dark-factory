@@ -598,16 +598,14 @@ def test_controller_review_codex_unavailable_fails_closed(monkeypatch, tmp_path)
     assert attempts == ["codex"]
 
 
-def test_controller_codex_transport_strips_outer_sandbox_exec():
-    """_build_controller_codex_transport must strip any outer sandbox-exec prefix
-    so `codex exec --sandbox read-only` runs natively without triggering nested
-    seatbelt sandbox_apply failures on macOS."""
+def test_controller_codex_transport_preserves_outer_sandbox_exec():
+    """Controller Codex stays inside the sealed-path-denying outer sandbox."""
     from runner.handler_dispatch import _build_controller_codex_transport
 
     sandboxed_argv = [
         "/usr/bin/sandbox-exec",
         "-p",
-        "(version 1)",
+        '(version 1)\n(deny file-read* (subpath "/sealed/dark-factory-holdouts"))',
         "/usr/local/bin/codex",
         "exec",
         "--yolo",
@@ -616,8 +614,9 @@ def test_controller_codex_transport_strips_outer_sandbox_exec():
     ]
     transport = _build_controller_codex_transport(sandboxed_argv)
 
-    assert transport[0] == "codex"
-    assert transport[1] == "exec"
+    assert transport[:3] == sandboxed_argv[:3]
+    assert "dark-factory-holdouts" in transport[2]
+    assert transport[3] == "/usr/local/bin/codex"
+    assert transport[4] == "exec"
     assert "--sandbox" in transport
     assert "read-only" in transport
-    assert transport[0] != "/usr/bin/sandbox-exec"

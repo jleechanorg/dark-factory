@@ -386,6 +386,7 @@ def main(argv: list[str] | None = None) -> int:
                 p.error(f"--state requires KEY=VALUE format, got: {kv!r}")
             k, v = kv.split("=", 1)
             initial_state[k] = v
+        initial_state.setdefault("_df_shadow_codex_review", "true")
         if args.feature:
             initial_state["feature"] = args.feature
         missing_feature_nodes = _missing_holdout_feature_nodes(graph, initial_state)

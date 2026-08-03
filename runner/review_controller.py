@@ -15,6 +15,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Literal, Mapping
@@ -948,6 +949,7 @@ def run_controller_review(
     prompt_path.write_text(prompt_text, encoding="utf-8")
     envelope_path.write_text(request.envelope_json, encoding="utf-8")
 
+    transport_started = time.monotonic()
     proc = subprocess.run(
         list(transport_argv),
         cwd=str(neutral_cwd),
@@ -958,6 +960,7 @@ def run_controller_review(
         check=False,
         env=dict(transport_env) if transport_env is not None else None,
     )
+    transport_duration = max(0.0, time.monotonic() - transport_started)
     response_text = proc.stdout
     transport_text = proc.stdout
     response_path.write_text(response_text, encoding="utf-8")
@@ -1005,7 +1008,7 @@ def run_controller_review(
         "response_sha256": review.response_sha256,
         "verdict": review.verdict,
         "exit_code": proc.returncode,
-        "duration_seconds": max(0.0, float(timeout)),
+        "duration_seconds": transport_duration,
         "transport_argv": list(transport_argv),
         "neutral_cwd": str(neutral_cwd),
         "output_dir": str(output_dir),

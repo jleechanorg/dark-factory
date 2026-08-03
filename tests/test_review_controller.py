@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -716,6 +717,41 @@ def test_run_controller_review_allows_fail_under_stub_env(monkeypatch, tmp_path)
         timeout=10.0,
     )
     assert result.review.verdict == "fail"
+
+
+def test_controller_receipt_uses_measured_monotonic_duration(monkeypatch, tmp_path):
+    """Receipt duration is elapsed transport time, never the configured budget."""
+    import subprocess as subprocess_module
+
+    request = create_review_request(_inputs())
+    response = _response(request)
+    raw_jsonl = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": response},
+        }
+    )
+
+    class _FakeProc:
+        returncode = 0
+        stdout = raw_jsonl
+        stderr = ""
+
+    ticks = iter((100.0, 102.75))
+    monkeypatch.setattr(time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(subprocess_module, "run", lambda *a, **kw: _FakeProc())
+
+    output_dir = tmp_path / "measured"
+    run_controller_review(
+        request,
+        neutral_cwd=tmp_path,
+        output_dir=output_dir,
+        transport_argv=("fake", "codex"),
+        timeout=321.0,
+    )
+
+    receipt = json.loads((output_dir / "controller-receipt.json").read_text())
+    assert receipt["duration_seconds"] == 2.75
 
 
 def test_run_controller_review_rejects_nonzero_transport_exit(monkeypatch, tmp_path):

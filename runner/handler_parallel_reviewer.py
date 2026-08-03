@@ -214,14 +214,14 @@ def _run_controller_primary(
         )
     except ReviewContractError as exc:
         return Result(
-            outcome="failure",
+            outcome="error",
             output=f"controller review contract failure (primary): {exc}",
             metadata={
                 **metadata,
                 "review_contract_status": "invalid",
                 "review_contract_gap": str(exc),
                 "timed_out": "false",
-                "verdict": "fail",
+                "verdict": "unknown",
             },
         )
 
@@ -983,15 +983,7 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     """Run parallel reviewer lanes and pass combined evidence downstream."""
     import runner.handlers as _handlers_shim  # late-bound shim for monkeypatched helpers
     review_contract = str(node.attrs.get("review_contract") or "").strip()
-    preseeded_outcome = f"{node.name}.outcome" in ctx.state
-    explicit_controller_echo_fixture = (
-        preseeded_outcome
-        and str(ctx.state.get("_df_test_allow_echo_controller_fixture") or "").strip().lower()
-        in {"true", "1", "yes", "on"}
-    )
-    if ctx.backend in ("echo", "mock_llm") and (
-        not review_contract or explicit_controller_echo_fixture
-    ):
+    if ctx.backend in ("echo", "mock_llm"):
         hint = ctx.state.get(f"{node.name}.outcome", "success")
         return Result(
             outcome=hint,

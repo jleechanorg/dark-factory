@@ -6,6 +6,7 @@ import json
 import hashlib
 import re
 import subprocess
+from unittest.mock import patch
 
 import pytest
 
@@ -159,6 +160,84 @@ def test_review_command_writes_valid_digest_bound_receipt(tmp_path, monkeypatch,
     assert json.loads(capsys.readouterr().out)["status"] == "valid"
 
 
+def test_review_command_delegates_to_canonical_executor_once(
+    tmp_path, monkeypatch, capsys
+):
+    """The CLI freezes inputs, then uses the shared controller executor once."""
+    from runner.review_controller import run_controller_review as canonical_run
+
+    repo, base, head = _repo(tmp_path)
+    task = tmp_path / "task.md"
+    task.write_text("Review the behavior change.", encoding="utf-8")
+    output = tmp_path / "canonical-output"
+    real_run = subprocess.run
+
+    monkeypatch.setattr(
+        "runner.review_cli._gate_subprocess_args",
+        lambda backend, prompt, ctx, timeout: ["codex", "exec", prompt],
+    )
+
+    def fake_run(command, **kwargs):
+        if command[0] == "git":
+            return real_run(command, **kwargs)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=_valid_transport(kwargs["input"]),
+            stderr="",
+        )
+
+    monkeypatch.setattr("runner.review_cli.subprocess.run", fake_run)
+    calls = []
+
+    def canonical_spy(request, **kwargs):
+        calls.append((request, kwargs))
+        return canonical_run(request, **kwargs)
+
+    with patch("runner.review_cli.run_controller_review", canonical_spy):
+        rc = main(
+            [
+                "--workdir",
+                str(repo),
+                "--base-sha",
+                base,
+                "--head-sha",
+                head,
+                "--task-file",
+                str(task),
+                "--output-dir",
+                str(output),
+                "--backend",
+                "codex",
+            ]
+        )
+
+    assert rc == 0
+    assert len(calls) == 1
+    assert calls[0][1]["output_dir"] == output.resolve()
+    assert json.loads(capsys.readouterr().out)["verdict"] == "pass"
+
+
+def test_review_command_accepts_only_canonical_codex_backend():
+    from runner.review_cli import _parser
+
+    with pytest.raises(SystemExit):
+        _parser().parse_args(
+            [
+                "--base-sha",
+                "a" * 40,
+                "--head-sha",
+                "b" * 40,
+                "--task-file",
+                "task.md",
+                "--output-dir",
+                "out",
+                "--backend",
+                "claude",
+            ]
+        )
+
+
 def test_review_command_fails_closed_on_unstructured_response(
     tmp_path, monkeypatch
 ):
@@ -253,4 +332,3 @@ def test_main_entrypoint_dispatches_review_subcommand(capsys):
     assert "--task-file" in captured.out
     assert "--output-dir" in captured.out
     assert "--backend" in captured.out
-

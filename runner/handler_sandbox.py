@@ -413,7 +413,6 @@ def _sandboxed_args(args: list[str]) -> Optional[list[str]]:
         return prefix + args
     return None
 
-
 def _sandboxed_args_for_workdir(
     args: list[str], workdir: "Union[pathlib.Path, str, None]"
 ) -> Optional[list[str]]:
@@ -455,4 +454,3 @@ def _sandboxed_args_for_workdir(
             return None
         return prefix + args
     return None
-

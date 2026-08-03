@@ -403,7 +403,9 @@ class SharedHelperTests(unittest.TestCase):
                 result = _parallel_reviewer(node, ctx)
 
             lane_dir = Path(ctx.state["_df_controller_review_lane_dirs"]["primary"])
-            self.assertEqual(result.outcome, "failure", result)
+            self.assertEqual(result.outcome, "error", result)
+            self.assertEqual(result.metadata["review_contract_status"], "invalid")
+            self.assertEqual(result.metadata["verdict"], "unknown")
             self.assertIn("reviewed workspace is not clean", result.output)
             self.assertFalse((lane_dir / "controller-receipt.json").exists())
             self.assertFalse((lane_dir / "findings.json").exists())
@@ -560,10 +562,52 @@ class SharedHelperTests(unittest.TestCase):
 
             self.assertEqual(
                 [result.outcome for result in results],
-                ["error", "error", "error", "error", "error", "failure", "success", "failure"],
+                ["error", "error", "error", "error", "error", "error", "success", "failure"],
             )
             for result in results:
                 self.assertEqual(result.metadata.get("fallback_used"), "false", result)
+
+    def test_controller_contract_errors_are_terminal_errors(self) -> None:
+        """Invalid controller output never masquerades as reviewer-authored FAIL."""
+        from unittest.mock import patch
+
+        from runner.handler_core import Context
+        from runner.handler_parallel_reviewer import _run_controller_primary
+
+        contract_gaps = (
+            "review response must be non-empty text",
+            "controller refuses PASS verdict under stub-mode env vars",
+            "command receipt has invalid output digest",
+            "reviewed workspace tree changed",
+        )
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            repo = _init_clean_repo(tmp)
+            request = _build_request(repo)
+            ctx = Context(goal="controller errors", workdir=repo, backend="codex")
+            ctx.state["_df_controller_review_cwd"] = str(tmp / "neutral")
+            ctx.state["_df_controller_review_lane_dirs"] = {
+                "primary": str(tmp / "primary")
+            }
+            for gap in contract_gaps:
+                with self.subTest(gap=gap), patch(
+                    "runner.handler_parallel_reviewer._gate_subprocess_args",
+                    return_value=["codex", "exec", "prompt"],
+                ), patch(
+                    "runner.handler_parallel_reviewer._controller_codex_args",
+                    return_value=["codex", "exec", "-"],
+                ), patch(
+                    "runner.review_controller.run_controller_review",
+                    side_effect=ReviewContractError(gap),
+                ):
+                    result = _run_controller_primary(
+                        request, 1200, ctx, "cold_reviewer", "codex"
+                    )
+
+                self.assertEqual(result.outcome, "error", result)
+                self.assertEqual(result.metadata["review_contract_status"], "invalid")
+                self.assertEqual(result.metadata["verdict"], "unknown")
+                self.assertEqual(result.metadata["fallback_used"], "false")
 
     def test_controller_early_results_declare_no_fallback(self) -> None:
         """Echo fixture, unknown contract, and build errors are explicit."""
@@ -577,19 +621,24 @@ class SharedHelperTests(unittest.TestCase):
             tmp = Path(raw_tmp)
             repo = _init_clean_repo(tmp)
             echo_ctx = Context(goal="echo", workdir=repo, backend="echo")
-            echo_ctx.state.update(
-                {
-                    "cold_reviewer.outcome": "success",
-                    "_df_test_allow_echo_controller_fixture": "true",
-                }
-            )
-            echo_result = _parallel_reviewer(
-                Node(
-                    name="cold_reviewer",
-                    attrs={"review_contract": "cold-review-v1"},
-                ),
-                echo_ctx,
-            )
+            echo_ctx.state["cold_reviewer.outcome"] = "success"
+            with patch(
+                "runner.handler_parallel_reviewer._controller_review_request",
+                side_effect=AssertionError("echo must not build a controller request"),
+            ), patch(
+                "runner.handler_parallel_reviewer._run_controller_primary",
+                side_effect=AssertionError("echo must not launch controller transport"),
+            ):
+                echo_result = _parallel_reviewer(
+                    Node(
+                        name="cold_reviewer",
+                        attrs={"review_contract": "cold-review-v1"},
+                    ),
+                    echo_ctx,
+                )
+
+            self.assertEqual(echo_result.outcome, "success", echo_result)
+            self.assertEqual(echo_result.metadata["parallel_reviewer"], "echo")
 
             codex_ctx = Context(goal="controller", workdir=repo, backend="codex")
             unknown_result = _parallel_reviewer(

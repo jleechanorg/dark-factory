@@ -548,11 +548,11 @@ def _build_controller_codex_transport(args: list[str]) -> list[str]:
             if mode != "read-only":
                 raise ValueError("controller transport requires read-only codex sandboxing")
 
-    # Construct transport starting with `codex` binary, stripping any outer
-    # `sandbox-exec` wrapper so `codex exec --sandbox read-only` runs natively
-    # without triggering nested seatbelt sandbox_apply failures on macOS.
-    return [
-        "codex",
+    # Preserve the outer OS sandbox, including its sealed-path deny profile,
+    # while replacing only the inner Codex invocation with the controller's
+    # stdin/JSON/read-only contract.
+    return prepared[:codex_index] + [
+        prepared[codex_index],
         "exec",
         "--json",
         "--ephemeral",

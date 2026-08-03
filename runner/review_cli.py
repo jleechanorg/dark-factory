@@ -24,15 +24,13 @@ from .handler_dispatch import (
     _gate_subprocess_env,
 )
 from .review_controller import (
+    ControllerTransportError,
     EvidenceArtifact,
     ReviewContractError,
     ReviewInputs,
     create_review_request,
-    parse_codex_jsonl,
     run_controller_review,
-    validate_execution_receipts,
     validate_immutable_target,
-    validate_review_response,
 )
 
 
@@ -194,7 +192,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=pathlib.Path, required=True)
     parser.add_argument(
         "--backend",
-        choices=["codex", "claude", "agy", "minimax", "claude-sonnet"],
+        choices=["codex"],
         default="codex",
     )
     parser.add_argument("--timeout", type=int, default=1200)
@@ -248,135 +246,90 @@ def main(argv: list[str] | None = None) -> int:
             holdout_roots = ()
         validate_immutable_target(inputs, holdout_roots=holdout_roots)
         request = create_review_request(inputs)
-        output_dir.mkdir(parents=True, mode=0o700, exist_ok=False)
-        claimed_output = True
-        prompt_path = output_dir / "prompt.txt"
-        envelope_path = output_dir / "envelope.json"
-        response_path = output_dir / "reviewer.output.md"
-        transport_path = output_dir / "transport.jsonl"
-        receipt_path = output_dir / "controller-receipt.json"
-        prompt_bytes = request.prompt.encode("utf-8")
-        envelope_bytes = request.envelope_json.encode("utf-8")
-        _write_atomic(prompt_path, prompt_bytes)
-        _write_atomic(envelope_path, envelope_bytes)
-
         ctx = Context(
             goal="controller-owned cold review",
             workdir=workdir,
-            backend=args.backend,
+            backend="codex",
         )
         command = _gate_subprocess_args(
-            args.backend,
+            "codex",
             request.prompt,
             ctx,
             args.timeout,
         )
         if command is None:
+            raise ReviewContractError("codex review backend could not be launched")
+        try:
+            command = _controller_codex_args(command)
+        except ValueError as exc:
             raise ReviewContractError(
-                f"review backend could not be launched: {args.backend}"
-            )
-        stdin_text = None
-        transport_is_jsonl = args.backend == "codex"
-        if transport_is_jsonl:
-            try:
-                command = _controller_codex_args(command)
-            except ValueError as exc:
+                "codex review command did not contain the codex executable"
+            ) from exc
+
+        def _verify_post_review_state() -> None:
+            after = _snapshot(workdir, base_sha, head_sha)
+            _verify_evidence(workdir, evidence)
+            if (
+                before["head_sha"] != after["head_sha"]
+                or before["tree_sha"] != after["tree_sha"]
+                or before["diff_sha256"] != after["diff_sha256"]
+            ):
                 raise ReviewContractError(
-                    "codex review command did not contain the codex executable"
-                ) from exc
-            stdin_text = request.prompt
-        proc = subprocess.run(
-            command,
-            cwd=output_dir,
-            capture_output=True,
-            text=True,
-            input=stdin_text,
+                    "reviewed repository changed during cold review"
+                )
+
+        claimed_output = True
+        result = run_controller_review(
+            request,
+            neutral_cwd=output_dir.parent,
+            output_dir=output_dir,
+            transport_argv=tuple(command),
+            transport_env=_gate_subprocess_env("codex"),
             timeout=args.timeout,
-            check=False,
-            env=_gate_subprocess_env(args.backend),
+            pre_acceptance_check=_verify_post_review_state,
         )
-        raw_transport = proc.stdout
-        command_receipts = ()
-        response = proc.stdout.strip()
-        parse_error = ""
-        if transport_is_jsonl and proc.returncode == 0:
-            try:
-                response, command_receipts = parse_codex_jsonl(raw_transport)
-            except ReviewContractError as exc:
-                response = ""
-                parse_error = str(exc)
-        response_bytes = response.encode("utf-8")
-        _write_atomic(response_path, response_bytes)
-        if transport_is_jsonl:
-            _write_atomic(transport_path, raw_transport.encode("utf-8"))
-
-        contract_error = parse_error
-        verdict = "invalid"
-        response_sha256 = _sha256(response_bytes)
-        if proc.returncode == 0 and not contract_error:
-            try:
-                validated = validate_review_response(response, request)
-                validate_execution_receipts(command_receipts, validated)
-                verdict = validated.verdict
-                response_sha256 = validated.response_sha256
-            except ReviewContractError as exc:
-                contract_error = str(exc)
-        elif proc.returncode != 0:
-            contract_error = f"review backend exited with {proc.returncode}"
-
-        after = _snapshot(workdir, base_sha, head_sha)
-        _verify_evidence(workdir, evidence)
-        if (
-            before["head_sha"] != after["head_sha"]
-            or before["tree_sha"] != after["tree_sha"]
-            or before["diff_sha256"] != after["diff_sha256"]
-        ):
-            contract_error = "reviewed repository changed during cold review"
-            verdict = "invalid"
-
-        receipt = {
-            "schema": 1,
-            "status": "valid" if not contract_error else "invalid",
-            "verdict": verdict,
-            "contract_error": contract_error,
-            "backend": args.backend,
-            "backend_returncode": proc.returncode,
-            "base_sha": base_sha,
-            "head_sha": head_sha,
-            "tree_sha": before["tree_sha"],
-            "diff_sha256": before["diff_sha256"],
-            "prompt_id": request.prompt_id,
-            "prompt_sha256": _sha256(prompt_bytes),
-            "prompt_payload_sha256": request.prompt_sha256,
-            "envelope_sha256": request.envelope_sha256,
-            "response_sha256": response_sha256,
-            "transport_sha256": (
-                _sha256(raw_transport.encode("utf-8"))
-                if transport_is_jsonl
-                else ""
-            ),
-            "command_receipts": [
-                {
-                    "command": item.command,
-                    "exit_code": item.exit_code,
-                    "output_sha256": item.output_sha256,
-                }
-                for item in command_receipts
-            ],
-            "prompt_path": prompt_path.name,
-            "envelope_path": envelope_path.name,
-            "response_path": response_path.name,
-            "transport_path": transport_path.name if transport_is_jsonl else "",
-        }
+        receipt_path = pathlib.Path(result.output_paths["receipt"])
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        # Preserve the established CLI receipt aliases while the execution,
+        # validation, and canonical artifacts remain owned by the shared
+        # controller executor.
+        receipt.update(
+            {
+                "status": "valid",
+                "contract_error": "",
+                "backend": "codex",
+                "backend_returncode": 0,
+                "base_sha": base_sha,
+                "tree_sha": before["tree_sha"],
+                "prompt_payload_sha256": request.prompt_sha256,
+                "transport_sha256": _sha256(result.transport_text.encode("utf-8")),
+                "command_receipts": [
+                    {
+                        "command": item.command,
+                        "exit_code": item.exit_code,
+                        "output_sha256": item.output_sha256,
+                    }
+                    for item in result.receipts
+                ],
+                "prompt_path": pathlib.Path(result.output_paths["prompt"]).name,
+                "envelope_path": pathlib.Path(result.output_paths["envelope"]).name,
+                "response_path": pathlib.Path(result.output_paths["response"]).name,
+                "transport_path": pathlib.Path(result.output_paths["transport"]).name,
+            }
+        )
         _write_atomic(
             receipt_path,
             (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode("utf-8"),
         )
         print(json.dumps(receipt, indent=2, sort_keys=True))
-        if contract_error:
-            return 1
-        return 0 if verdict == "pass" else 2
-    except (OSError, UnicodeError, subprocess.TimeoutExpired, ReviewContractError) as exc:
+        return 0 if result.review.verdict == "pass" else 2
+    except (
+        ControllerTransportError,
+        OSError,
+        UnicodeError,
+        subprocess.TimeoutExpired,
+        ReviewContractError,
+    ) as exc:
         payload = {
             "schema": 1,
             "status": "invalid",

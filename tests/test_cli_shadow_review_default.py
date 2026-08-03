@@ -22,7 +22,7 @@ def _pipeline(tmp_path: pathlib.Path) -> pathlib.Path:
     return dot
 
 
-def test_cli_leaves_shadow_codex_review_disabled_by_default(tmp_path, monkeypatch, capsys):
+def test_cli_enables_ordinary_shadow_codex_review_by_default(tmp_path, monkeypatch, capsys):
     from runner import __main__ as cli
 
     seen = {}
@@ -51,7 +51,7 @@ def test_cli_leaves_shadow_codex_review_disabled_by_default(tmp_path, monkeypatc
     ])
 
     assert rc == 0
-    assert "_df_shadow_codex_review" not in seen["state"]
+    assert seen["state"]["_df_shadow_codex_review"] == "true"
     capsys.readouterr()
 
 
