@@ -179,6 +179,7 @@ from .handler_parallel_reviewer import (
 
 # Evidence audit gate + git/gh helpers.
 from .handler_audit import (
+    _operator_verify,
     _git_config_origin_url,
     _git_merge_base,
     _git_diff_stat,
@@ -223,6 +224,7 @@ TYPE_REGISTRY: "dict[str, Handler]" = {
     "gate_green": _gate_green,
     "gate_audit": _gate_audit,
     "gate_evidence_audit": _gate_audit,
+    "operator_verify": _operator_verify,
     "parallel": _parallel_fanout,       # fan-out type (type=parallel)
     "join": _join_handler,              # fan-in type (type=join)
     "parallel_reviewer": _parallel_reviewer,

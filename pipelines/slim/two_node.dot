@@ -2,11 +2,12 @@
 //
 // Default graph for `/f` (and `/factory`). Exactly two productive nodes:
 //   worker         — generic codergen; light prompt; does whatever the user asked.
+//   operator_verify — deterministic runner-owned verification; not an LLM role.
 //   cold_reviewer  — controller-owned cold reviewer using the SHA-pinned
 //                    cold-review-v1 execution path (prompts/catalog/controller_cold_review_v1.md).
 //
 // Wiring:
-//   start -> worker -> cold_reviewer -> exit                (on success)
+//   start -> worker -> operator_verify -> cold_reviewer -> exit (on success)
 //                          \-> worker                        (on reviewer failure, bounded max_visits=3)
 //                          \-> exit                          (on infrastructure error, terminal non-success)
 //
@@ -42,20 +43,31 @@ digraph SlimTwoNode {
         timeout=600
     ]
 
+    operator_verify [
+        type="operator_verify",
+        label="Operator Verification",
+        class="infrastructure",
+        timeout=1800
+    ]
+
     cold_reviewer [
         type="parallel_reviewer",
         label="Cold Reviewer (controller cold-review-v1)",
         class="review",
         review_contract="cold-review-v1",
         backend_priority="codex",
-        evidence_paths="evidence/worker-verification.json",
+        evidence_paths="evidence/operator-verification.json",
         goal_gate=true,
         timeout=1200
     ]
 
     start -> worker
-    worker -> cold_reviewer [condition="outcome=success"]
-    worker -> exit          [condition="outcome=error"]
+    worker -> operator_verify [condition="outcome=success"]
+    worker -> exit            [condition="outcome=error"]
+
+    operator_verify -> cold_reviewer [condition="outcome=success"]
+    operator_verify -> exit          [condition="outcome=failure"]
+    operator_verify -> exit          [condition="outcome=error"]
 
     cold_reviewer -> exit   [condition="outcome=success"]
     cold_reviewer -> worker [condition="outcome=failure"]

@@ -186,6 +186,39 @@ def test_g1_allows_only_explicit_terminal_error_exit_from_producer(tmp_path):
     assert any(v.kind == "G1" for v in graph_audit.audit_graph(bypass))
 
 
+def test_g1_allows_operator_gate_failure_exit_but_not_success_bypass(tmp_path):
+    terminal = _write_dot(
+        tmp_path,
+        "operator_terminal.dot",
+        """
+        digraph terminal {
+            start [shape=Mdiamond]
+            worker [type="codergen"]
+            operator [type="operator_verify"]
+            reviewer [type="parallel_reviewer"]
+            exit [shape=Msquare]
+            start -> worker
+            worker -> operator [condition="outcome=success"]
+            operator -> reviewer [condition="outcome=success"]
+            operator -> exit [condition="outcome=failure"]
+            operator -> exit [condition="outcome=error"]
+            reviewer -> exit [condition="outcome=success"]
+        }
+        """,
+    )
+    bypass = _write_dot(
+        tmp_path,
+        "operator_bypass.dot",
+        terminal.read_text().replace(
+            'operator -> exit [condition="outcome=failure"]',
+            'operator -> exit [condition="outcome=success"]',
+        ),
+    )
+
+    assert not any(v.kind == "G1" for v in graph_audit.audit_graph(terminal))
+    assert any(v.kind == "G1" for v in graph_audit.audit_graph(bypass))
+
+
 def test_g2_violator_has_g2_violation_only():
     violations = graph_audit.audit_graph(FIXTURES / "g2_violator.dot")
     kinds = [v.kind for v in violations]

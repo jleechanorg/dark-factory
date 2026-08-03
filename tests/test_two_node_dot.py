@@ -43,6 +43,7 @@ _SUBPROCESS_NODE_TYPES = frozenset(
         "gate_code_standards",
         "human_gate",
         "parallel_reviewer",
+        "operator_verify",
         "agy",
         "ao",
     }
@@ -52,6 +53,7 @@ _PIPELINE = "pipelines/slim/two_node.dot"
 _WORKER_PROMPT = "prompts/slim/worker.md"
 _EXPECTED_TIMEOUTS_S = {
     "worker": 600,
+    "operator_verify": 1800,
     "cold_reviewer": 1200,
 }
 
@@ -76,13 +78,15 @@ def test_two_node_dot_parses_and_has_expected_topology() -> None:
     g = parse(ROOT / _PIPELINE)
     names = set(g.nodes.keys())
     # Top-level anchor nodes + the two productive nodes.
-    assert names == {"start", "worker", "cold_reviewer", "exit"}, (
-        f"two_node.dot must have exactly start/worker/cold_reviewer/exit; "
+    assert names == {"start", "worker", "operator_verify", "cold_reviewer", "exit"}, (
+        f"two_node.dot must have exactly start/worker/operator_verify/cold_reviewer/exit; "
         f"got {sorted(names)}"
     )
     # Worker and cold_reviewer are the only goal-producing nodes.
     assert g.nodes["worker"].attrs.get("type") == "codergen"
     assert g.nodes["worker"].attrs.get("class") == "worker"
+    assert g.nodes["operator_verify"].attrs.get("type") == "operator_verify"
+    assert g.nodes["operator_verify"].attrs.get("class") == "infrastructure"
     assert g.nodes["cold_reviewer"].attrs.get("type") == "parallel_reviewer"
     assert g.nodes["cold_reviewer"].attrs.get("class") == "review"
     assert g.nodes["cold_reviewer"].attrs.get("review_contract") == "cold-review-v1"
@@ -132,7 +136,15 @@ def test_two_node_dot_retries_only_reviewer_authored_failures() -> None:
         (edge.dst, edge.condition) for edge in graph.outgoing("worker")
     }
     assert worker_edges == {
+        ("operator_verify", "outcome=success"),
+        ("exit", "outcome=error"),
+    }
+    operator_edges = {
+        (edge.dst, edge.condition) for edge in graph.outgoing("operator_verify")
+    }
+    assert operator_edges == {
         ("cold_reviewer", "outcome=success"),
+        ("exit", "outcome=failure"),
         ("exit", "outcome=error"),
     }
     assert int(graph.nodes["worker"].attrs["max_retries"]) == 0
@@ -185,6 +197,75 @@ def test_two_node_worker_failure_exits_without_retry_or_review(tmp_path, monkeyp
     assert history[-1].outcome == "stuck"
 
 
+def test_two_node_operator_failure_exits_without_cold_review(tmp_path, monkeypatch) -> None:
+    calls = {"worker": 0, "operator": 0, "reviewer": 0}
+
+    def worker(node, ctx):
+        calls["worker"] += 1
+        return Result(outcome="success", output="worker complete")
+
+    def operator(node, ctx):
+        calls["operator"] += 1
+        return Result(outcome="failure", output="deterministic check failed")
+
+    def reviewer(node, ctx):
+        calls["reviewer"] += 1
+        return Result(outcome="success", output="must not run")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "codergen", worker)
+    monkeypatch.setitem(TYPE_REGISTRY, "operator_verify", operator)
+    monkeypatch.setitem(TYPE_REGISTRY, "parallel_reviewer", reviewer)
+    history = run(
+        parse(ROOT / _PIPELINE),
+        Context(goal="operator failure", workdir=tmp_path, backend="echo"),
+    )
+
+    assert calls == {"worker": 1, "operator": 1, "reviewer": 0}
+    assert [record.node for record in history] == [
+        "start",
+        "worker",
+        "operator_verify",
+        "exit",
+    ]
+
+
+def test_reviewer_retry_reexecutes_operator_after_worker(tmp_path, monkeypatch) -> None:
+    calls = {"worker": 0, "operator": 0, "reviewer": 0}
+
+    def worker(node, ctx):
+        calls["worker"] += 1
+        return Result(outcome="success", output=f"worker {calls['worker']}")
+
+    def operator(node, ctx):
+        calls["operator"] += 1
+        return Result(outcome="success", output=f"operator {calls['operator']}")
+
+    def reviewer(node, ctx):
+        calls["reviewer"] += 1
+        outcome = "failure" if calls["reviewer"] == 1 else "success"
+        return Result(outcome=outcome, output=f"reviewer {outcome}")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "codergen", worker)
+    monkeypatch.setitem(TYPE_REGISTRY, "operator_verify", operator)
+    monkeypatch.setitem(TYPE_REGISTRY, "parallel_reviewer", reviewer)
+    history = run(
+        parse(ROOT / _PIPELINE),
+        Context(goal="retry worker", workdir=tmp_path, backend="echo"),
+    )
+
+    assert calls == {"worker": 2, "operator": 2, "reviewer": 2}
+    assert [record.node for record in history] == [
+        "start",
+        "worker",
+        "operator_verify",
+        "cold_reviewer",
+        "worker",
+        "operator_verify",
+        "cold_reviewer",
+        "exit",
+    ]
+
+
 def test_two_node_dot_cold_reviewer_uses_only_its_supported_transport() -> None:
     """Cold-review-v1 advertises only Codex, its sole receipt-capable transport."""
     g = parse(ROOT / _PIPELINE)
@@ -228,31 +309,34 @@ def test_two_node_dot_reviewer_has_no_target_authored_prompt_and_docs_agree() ->
     assert not (ROOT / "prompts/slim/cold_reviewer.md").exists()
 
 
-def test_two_node_dot_binds_the_worker_verification_receipt() -> None:
-    """The default cold reviewer receives the worker's declared evidence file."""
+def test_two_node_dot_binds_runner_owned_operator_receipt() -> None:
+    """The default cold reviewer receives runner-owned operator evidence."""
     reviewer = parse(ROOT / _PIPELINE).nodes["cold_reviewer"]
-    assert reviewer.attrs.get("evidence_paths") == "evidence/worker-verification.json"
+    assert reviewer.attrs.get("evidence_paths") == "evidence/operator-verification.json"
 
 
-def test_worker_prompt_requires_a_bounded_structured_verification_receipt() -> None:
-    """Every default worker must provide reproducible, non-fabricated review data."""
+def test_worker_prompt_does_not_author_authoritative_execution_evidence() -> None:
+    """The model may self-test, but the runner owns execution evidence."""
     prompt = (ROOT / _WORKER_PROMPT).read_text()
-    assert "evidence/worker-verification.json" in prompt
-    assert "1 MiB" in prompt
-    for field in (
-        "schema_version",
-        "target_head_sha",
-        "goal",
-        "changed_files",
-        "commands",
-        "not_applicable",
-        "cwd",
-        "exit_code",
-        "stdout",
-        "stderr",
-    ):
-        assert field in prompt
-    assert "Do not fabricate" in prompt
+    assert "evidence/worker-verification.json" not in prompt
+    assert '"schema_version": 1' not in prompt
+    assert "write a canonical verification receipt" not in prompt
+    assert "Run the project's tests" in prompt
+
+
+def test_operator_verify_is_registered_and_not_productive() -> None:
+    from runner import graph_audit
+
+    graph = parse(ROOT / _PIPELINE)
+    operator = graph.nodes["operator_verify"]
+    assert "operator_verify" in TYPE_REGISTRY
+    assert graph_audit._is_code_producing(operator) is False
+    productive = [
+        node.name
+        for node in graph.nodes.values()
+        if graph_audit._is_code_producing(node) or graph_audit._is_reviewer(node)
+    ]
+    assert productive == ["worker", "cold_reviewer"]
 
 
 def test_worker_prompt_renders_untrusted_reviewer_feedback_only_on_retry() -> None:

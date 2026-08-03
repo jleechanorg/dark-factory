@@ -269,6 +269,25 @@ def _is_terminal_error_condition(condition: Optional[str]) -> bool:
     )
 
 
+def _is_terminal_operator_condition(condition: Optional[str]) -> bool:
+    """True for an explicit deterministic-gate failure/error exit."""
+    if not condition:
+        return False
+    tokens = _tokenize_condition(condition)
+    if tokens is None:
+        return False
+    cleaned = [(kind, value) for kind, value in tokens if kind != "SPACE"]
+    if len(cleaned) != 3:
+        return False
+    lhs, op, rhs = cleaned
+    return (
+        lhs == ("WORD", "outcome")
+        and op == ("EQ", "=")
+        and rhs[0] in ("WORD", "STRING")
+        and rhs[1] in {"failure", "error"}
+    )
+
+
 # ---------------------------------------------------------------------------
 # G1: path-without-reviewer detection.
 #
@@ -366,6 +385,12 @@ def _dfs_witness(
     for edge in outgoing:
         dst = edge.dst
         if is_exit_node(graph.nodes[dst]) and _is_terminal_error_condition(edge.condition):
+            continue
+        if (
+            _resolved_type_label(node) == "operator_verify"
+            and is_exit_node(graph.nodes[dst])
+            and _is_terminal_operator_condition(edge.condition)
+        ):
             continue
         # Cycle / re-visit guard: do not descend into a node already on
         # the current path. (max_visits-style bounds are runtime
