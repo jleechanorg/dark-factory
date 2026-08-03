@@ -87,15 +87,27 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// Agent-orchestrator's workspace-worktree plugin formats the error as
 /// `Found existing worktree for orchestrator branch "<branch>" at "<path>",
 /// but it is outside AO-managed worktree directories. Reuse it manually or
-/// remove it and try again.`. The `<path>` is wrapped in double quotes and
-/// followed by a comma; we anchor on the literal `at "` substring so the
-/// parser does not pick up the branch name (which appears earlier in the
-/// same line, also inside quotes) or any other path-shaped token a future
-/// error variant might introduce. Returns `None` when the substring is
-/// missing or the path cannot be located — the caller treats that as a
-/// non-phantom failure and falls through to the existing HUMAN_HELD
-/// parking path.
+/// remove it and try again.`. Two anchors are required:
+///
+/// 1. The full canonical phrase `"outside AO-managed worktree directories"`
+///    must be present in the stderr — this is what distinguishes the
+///    workspace-worktree rejection from every other AO spawn failure
+///    (`at "` alone is far too loose: any other tool error containing a
+///    quoted path could be misparsed and lead the auto-recovery branch to
+///    run `git worktree prune` + `rm -rf` on the wrong thing).
+/// 2. We then anchor on the literal `at "` substring to extract the path
+///    between the surrounding double quotes; this avoids picking up the
+///    branch name (which appears earlier in the same line, also inside
+///    quotes) or any other path-shaped token a future error variant might
+///    introduce.
+///
+/// Returns `None` when either anchor is missing or the path cannot be
+/// located — the caller treats that as a non-phantom failure and falls
+/// through to the existing HUMAN_HELD parking path.
 fn parse_phantom_worktree_path(stderr: &str) -> Option<String> {
+    if !stderr.contains("outside AO-managed worktree directories") {
+        return None;
+    }
     let after_at = stderr.split("at \"").nth(1)?;
     let path = after_at.split('"').next()?;
     if path.is_empty() || !path.starts_with('/') {
@@ -1172,6 +1184,25 @@ fn execute_adopted(
             push_remote: "origin".to_string(),
         }
     });
+    // Derive the local check-out of the routed repo from the bead's
+    // `owner/repo` (the same string passed to `SpawnSpec::repo` below).
+    // Convention is `$HOME/projects/<repo-basename>` — e.g.
+    // `jleechanorg/worldarchitect.ai` -> `~/projects/worldarchitect.ai`
+    // — the same layout `resolve_holdouts_path_or_fail` uses for the
+    // holdouts sibling. Computed here (before `adopted_repo` is moved into
+    // `SpawnSpec::repo`) so the auto-recovery branch in the spawn-failure
+    // handler below has a value to assert against and to pass to
+    // `git worktree prune`. We do NOT hardcode `worldarchitect.ai`: a bead
+    // routed to a different repo would otherwise prune a worktree list
+    // that has nothing to do with the actual AO error.
+    let local_repo_path = {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let repo_basename = adopted_repo
+            .rsplit_once('/')
+            .map(|(_, basename)| basename)
+            .unwrap_or(adopted_repo.as_str());
+        format!("{home}/projects/{repo_basename}")
+    };
     let spec = SpawnSpec {
         bead_id: bead.bead_id.clone(),
         branch: branch.clone(),
@@ -1205,17 +1236,23 @@ fn execute_adopted(
     // HUMAN_HELD if the retry still fails.
     if let Err(DaemonError::Tool { ref stderr, .. }) = spawn_result {
         if let Some(phantom_path) = parse_phantom_worktree_path(stderr) {
-            // `target_repo` is `jleechanorg/worldarchitect.ai` for every
-            // adopted bead dispatched by this daemon; the local check-out
-            // is the conventional sibling of `~/projects/dark-factory`.
-            // `git worktree prune` needs the local repo as cwd because the
-            // worktree list is per-repo.
-            const TARGET_REPO_LOCAL_PATH: &str = "/home/jleechan/projects/worldarchitect.ai";
+            // `local_repo_path` was derived from `bead.repo(cfg)` above
+            // (before the `SpawnSpec` construction moved it).
             let _ = crate::tools::run_tool_in_dir(
                 "git",
                 &["worktree", "prune"],
-                TARGET_REPO_LOCAL_PATH,
+                &local_repo_path,
                 30,
+            );
+            // Defense in depth: even though `parse_phantom_worktree_path`
+            // now anchors on `"outside AO-managed worktree directories"`,
+            // refuse to `rm -rf` anything outside the routed repo's local
+            // check-out. A future plugin message change or parser bug
+            // would otherwise let an unrelated path leak into this
+            // branch and be deleted silently.
+            assert!(
+                phantom_path.starts_with(&local_repo_path),
+                "phantom path {phantom_path:?} outside repo {local_repo_path:?} — refusing destructive rm"
             );
             if std::path::Path::new(&phantom_path).exists() {
                 let _ = std::fs::remove_dir_all(&phantom_path);
@@ -1346,6 +1383,18 @@ mod tests {
         // to leave the original error alone and fall through to
         // HUMAN_HELD.
         let stderr = "[dark-factory AO bridge] spawn rejected: 30 active sessions >= cap (30)";
+        assert_eq!(parse_phantom_worktree_path(stderr), None);
+    }
+
+    #[test]
+    fn phantom_worktree_path_rejects_at_substring_without_phrase() {
+        // F2 anchor tightening: a stderr that contains `at "` but is NOT
+        // the canonical workspace-worktree rejection message (missing the
+        // "outside AO-managed worktree directories" phrase) must NOT
+        // produce a phantom path. Before the anchor tighten, the loose
+        // `at "` anchor alone would have parsed this and routed the
+        // auto-recovery branch at the wrong target.
+        let stderr = "[dark-factory AO bridge] spawn failed: AO refused session at \"/tmp/whatever\", please retry";
         assert_eq!(parse_phantom_worktree_path(stderr), None);
     }
 
