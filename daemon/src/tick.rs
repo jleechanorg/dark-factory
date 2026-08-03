@@ -5091,22 +5091,6 @@ fn record_escalation(deps: &TickDeps, bead_id: &str, reason: &str) -> Result<(),
 /// `post_scm_comment_by_bead_id` below.
 const MISSING_SCM_TARGET_ERROR_MARKER: &str = "no SCM comment target found";
 
-/// Substring markers that identify a GitHub "issue has too many comments" error.
-/// When `comment_external` fails with this class of error, the daemon
-/// auto-creates an overflow issue and retries rather than parking HUMAN_HELD.
-/// (issue #507)
-const GITHUB_COMMENT_LIMIT_MARKERS: &[&str] = &[
-    "2500 comments",
-    "Commenting is disabled",
-];
-
-/// Returns true when `err` is the GitHub "issue has too many comments" error.
-fn is_github_comment_limit_error(err: &DaemonError) -> bool {
-    let msg = format!("{err:?}");
-    GITHUB_COMMENT_LIMIT_MARKERS
-        .iter()
-        .any(|marker| msg.contains(marker))
-}
 
 /// Create a new overflow escalation issue on GitHub (issue #507).
 /// Returns the new issue's `owner/repo#N` ext_ref string on success.
@@ -5127,11 +5111,12 @@ fn create_overflow_escalation_issue(
     let body = format!(
         "Overflow escalation target.\n\nOriginal issue `{original_ext_ref}` hit GitHub's 2500-comment limit.\n\nBead: `{bead_id}`"
     );
-    // Write body to a temp file to avoid shell escaping issues
-    let tmp = format!("/tmp/overflow_issue_body_{bead_id}.md");
+    // Use pid+bead_id suffix to avoid race if two ticks hit this path concurrently.
+    let tmp = format!("/tmp/overflow_issue_body_{}_{bead_id}.md", std::process::id());
     std::fs::write(&tmp, &body).map_err(|e| {
         DaemonError::Config(format!("write overflow body: {e}"))
     })?;
+    // Use --json url -q .url for stable, parseable output (no title slug in URL).
     let out = std::process::Command::new("gh")
         .args([
             "issue",
@@ -5144,6 +5129,10 @@ fn create_overflow_escalation_issue(
             "factory",
             "--body-file",
             &tmp,
+            "--json",
+            "url",
+            "-q",
+            ".url",
         ])
         .output()
         .map_err(|e| DaemonError::Tool {
@@ -5326,7 +5315,7 @@ fn post_scm_comment_with_overflow_retry(
 ) -> Result<(), DaemonError> {
     match deps.tracker.comment_external(ext_ref, body) {
         Ok(()) => Ok(()),
-        Err(err) if is_github_comment_limit_error(&err) => {
+        Err(err) if err.is_github_comment_limit() => {
             // Primary target is full — create an overflow issue and retry once.
             match create_overflow_escalation_issue(deps, bead_id, ext_ref) {
                 Ok(overflow_ref) => {
