@@ -146,6 +146,18 @@ def test_explicit_no_codex_configuration_preserves_other_primary(
     assert result["message"] == "claude: ok"
 
 
+@pytest.mark.parametrize("backend", ["echo", "mock_llm"])
+def test_builtin_backend_suppresses_default_shadow_codex_requirement(
+    backend, which_none
+):
+    """Built-in non-LLM backends never launch the default Codex shadow."""
+    result = preflight.preflight_check(backend)
+
+    assert result["configured_ok"] is True
+    assert result["status"] == "pass"
+    assert result["shadow_codex"] is False
+
+
 def test_zero_backends_available_returns_fail(monkeypatch, which_none):
     """All probed CLIs missing => status=fail, exit code 2."""
     result = preflight.preflight_check("claude", shadow_codex=False)

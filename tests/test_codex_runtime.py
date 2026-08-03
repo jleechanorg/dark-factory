@@ -400,7 +400,7 @@ def test_installer_and_wrapper_use_static_codex_runtime_diagnostics() -> None:
     assert "-m runner.codex_runtime --json" in installer
     assert "-m runner.preflight" in wrapper
     assert 'PREFLIGHT_SHADOW_CODEX="true"' in wrapper
-    assert '_df_shadow_codex_review=false' in wrapper
+    assert "__df_apply_shadow_state" in wrapper
     assert '--shadow-codex "${PREFLIGHT_SHADOW_CODEX}"' in wrapper
 
 

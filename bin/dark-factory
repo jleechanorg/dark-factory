@@ -76,29 +76,40 @@ fi
 # an explicit state override is the supported no-Codex configuration.
 PREFLIGHT_BACKEND="${DARK_FACTORY_BACKEND:-}"
 PREFLIGHT_SHADOW_CODEX="true"
+__df_apply_shadow_state() {
+  local assignment="$1"
+  local value=""
+  case "${assignment}" in
+    _df_shadow_codex_review=*)
+      value="${assignment#*=}"
+      ;;
+    *)
+      return
+      ;;
+  esac
+  value="$(printf '%s' "${value}" | tr '[:upper:]' '[:lower:]')"
+  case "${value}" in
+    false|0|no|off)
+      PREFLIGHT_SHADOW_CODEX="false"
+      ;;
+    true|1|yes|on)
+      PREFLIGHT_SHADOW_CODEX="true"
+      ;;
+  esac
+}
 prev=""
 for arg in "$@"; do
   if [[ "${prev}" == "--backend" ]]; then
     PREFLIGHT_BACKEND="${arg}"
   elif [[ "${prev}" == "--state" ]]; then
-    case "${arg}" in
-      _df_shadow_codex_review=false|_df_shadow_codex_review=0|_df_shadow_codex_review=no|_df_shadow_codex_review=off)
-        PREFLIGHT_SHADOW_CODEX="false"
-        ;;
-      _df_shadow_codex_review=true|_df_shadow_codex_review=1|_df_shadow_codex_review=yes|_df_shadow_codex_review=on)
-        PREFLIGHT_SHADOW_CODEX="true"
-        ;;
-    esac
+    __df_apply_shadow_state "${arg}"
   fi
   case "${arg}" in
     --backend=*)
       PREFLIGHT_BACKEND="${arg#--backend=}"
       ;;
-    --state=_df_shadow_codex_review=false|--state=_df_shadow_codex_review=0|--state=_df_shadow_codex_review=no|--state=_df_shadow_codex_review=off)
-      PREFLIGHT_SHADOW_CODEX="false"
-      ;;
-    --state=_df_shadow_codex_review=true|--state=_df_shadow_codex_review=1|--state=_df_shadow_codex_review=yes|--state=_df_shadow_codex_review=on)
-      PREFLIGHT_SHADOW_CODEX="true"
+    --state=*)
+      __df_apply_shadow_state "${arg#--state=}"
       ;;
   esac
   if [[ "${arg}" == --state=* ]]; then
@@ -108,6 +119,11 @@ for arg in "$@"; do
   fi
 done
 PREFLIGHT_BACKEND="${PREFLIGHT_BACKEND:-echo}"
+case "${PREFLIGHT_BACKEND}" in
+  echo|mock_llm)
+    PREFLIGHT_SHADOW_CODEX="false"
+    ;;
+esac
 
 # Preflight: probe the configured backend and warn-or-fail before
 # we hand off to the Python runner. Best-effort: if preflight itself

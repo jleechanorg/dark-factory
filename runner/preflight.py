@@ -34,7 +34,8 @@ from . import codex_runtime
 
 # Backends we probe. ``echo`` is always considered available — it is
 # the no-LLM fallback built into the runner.
-PROBED_BACKENDS = ("claude", "codex", "agy", "ao", "echo")
+BUILTIN_BACKENDS = ("echo", "mock_llm")
+PROBED_BACKENDS = ("claude", "codex", "agy", "ao", *BUILTIN_BACKENDS)
 
 # Transitive deps: if a backend is configured, also check these.
 # Currently only ``ao`` requires ``sandbox-exec`` (macOS seatbelt).
@@ -119,11 +120,11 @@ def preflight_check(
     # but still appears in the report so the caller can see what was
     # asked for.
     known = backend in PROBED_BACKENDS
-    configured_present = (backend == "echo") or _backend_path(backend) is not None
+    configured_present = backend in BUILTIN_BACKENDS or _backend_path(backend) is not None
 
     backends: dict[str, dict] = {}
     for name in PROBED_BACKENDS:
-        if name == "echo":
+        if name in BUILTIN_BACKENDS:
             backends[name] = {"ok": True, "path": None, "hint": None}
             continue
         path = _backend_path(name)
@@ -153,15 +154,18 @@ def preflight_check(
         }
 
     # Determine status.
+    shadow_codex = shadow_codex and backend not in BUILTIN_BACKENDS
     codex_required = backend == "codex" or shadow_codex
     if codex_required and codex_error:
         status = "fail"
-    elif backend == "echo" or configured_present:
+    elif backend in BUILTIN_BACKENDS or configured_present:
         status = "pass"
     else:
         # At least one non-echo backend present AND all transitive deps OK?
         any_alt = any(
-            info["ok"] for name, info in backends.items() if name != "echo"
+            info["ok"]
+            for name, info in backends.items()
+            if name not in BUILTIN_BACKENDS
         )
         deps_ok = all(info["ok"] for info in transitive.values())
         if any_alt and deps_ok:
@@ -171,7 +175,9 @@ def preflight_check(
             # (warn) or zero reachables (fail). Distinguish by looking at
             # non-echo availability.
             any_non_echo = any(
-                info["ok"] for name, info in backends.items() if name != "echo"
+                info["ok"]
+                for name, info in backends.items()
+                if name not in BUILTIN_BACKENDS
             )
             if any_non_echo:
                 # We have a non-echo CLI but its transitive dep is missing —
@@ -184,8 +190,8 @@ def preflight_check(
     # Pick fallback: first available in priority order. If the configured
     # backend is present, prefer it; otherwise pick the first FALLBACK_PRIORITY
     # entry that resolves.
-    if backend == "echo" or configured_present:
-        fallback = backend if backend == "echo" else backend
+    if backend in BUILTIN_BACKENDS or configured_present:
+        fallback = backend
     else:
         fallback = "echo"
         for cand in FALLBACK_PRIORITY:
@@ -201,8 +207,8 @@ def preflight_check(
     elif shadow_codex and codex_error:
         message = f"shadow Codex runtime rejected: {codex_error}"
     elif status == "pass":
-        if backend == "echo":
-            message = "echo backend: always available"
+        if backend in BUILTIN_BACKENDS:
+            message = f"{backend} backend: always available"
         else:
             message = f"{backend}: ok"
     elif status == "warn":

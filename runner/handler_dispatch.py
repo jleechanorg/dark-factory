@@ -994,13 +994,11 @@ def _parse_priority_env(raw: str) -> list[str]:
 
 
 def _probe_backend_installed(name: str) -> bool:
-    """True when ``<name>`` is on PATH and responds to ``--version``.
+    """True when the named reviewer backend passes its availability probe.
 
-    The probe is intentionally cheap (which + a quick --version) so that the
-    resolver can be called from gate dispatch without adding noticeable
-    latency. A backend that hangs on --version would block; we rely on the
-    existing ``subprocess.run(timeout=...)`` envelope in ``_run_gate_once`` to
-    catch the hang, but the probe itself uses a 5s ceiling.
+    Codex uses the static canonical runtime/package/cache resolver and never
+    launches a process. Other backends retain the cheap ``which`` plus bounded
+    ``--version`` probe; their subprocess probe has a 5s ceiling.
     """
     if name == "codex":
         try:
@@ -1040,8 +1038,9 @@ def _resolve_adversarial_backend(
       2. ``DARK_FACTORY_ADVERSARIAL_PRIORITY`` env var, comma-separated.
       3. ``_DEFAULT_ADVERSARIAL_PRIORITY`` (the dark-factory default).
 
-    Each entry is probed (``which <name>`` + ``<name> --version``); the first
-    one that responds is returned. The returned tuple is
+    Each entry is probed; Codex uses static canonical runtime validation while
+    other backends use ``which`` plus a bounded ``--version`` call. The first
+    available entry is returned. The returned tuple is
     ``(backend_name, metadata)`` where ``metadata`` records the priority
     list, the resolved backend, and the entries that were skipped because
     they are not installed. The metadata is meant to be merged into the gate

@@ -7,6 +7,8 @@ import pathlib
 import re
 import subprocess
 
+import pytest
+
 
 def _install_fake_runner_python(home: pathlib.Path, call_log: pathlib.Path) -> None:
     (home / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
@@ -133,6 +135,57 @@ def test_dark_factory_pipeline_paths_still_take_merge_train_lock(tmp_path: pathl
         "--goal",
         "ci",
     ]
+
+
+@pytest.mark.parametrize("backend", ["echo", "mock_llm"])
+def test_wrapper_suppresses_shadow_codex_preflight_for_builtin_backends(
+    tmp_path: pathlib.Path, backend: str
+) -> None:
+    result, call_log = _run_installed_wrapper(
+        ["--backend", backend, "--goal", "fixture"],
+        workdir=tmp_path,
+    )
+
+    assert result.returncode == 0
+    calls = _read_fake_runner_calls(call_log)
+    preflight = next(call for call in calls if call[:2] == ["-m", "runner.preflight"])
+    assert preflight[preflight.index("--shadow-codex") + 1] == "false"
+
+
+def test_wrapper_keeps_default_shadow_codex_preflight_for_claude(
+    tmp_path: pathlib.Path,
+) -> None:
+    result, call_log = _run_installed_wrapper(
+        ["--backend", "claude", "--goal", "fixture"],
+        workdir=tmp_path,
+    )
+
+    assert result.returncode == 0
+    calls = _read_fake_runner_calls(call_log)
+    preflight = next(call for call in calls if call[:2] == ["-m", "runner.preflight"])
+    assert preflight[preflight.index("--shadow-codex") + 1] == "true"
+
+
+@pytest.mark.parametrize(
+    "state_args",
+    [
+        ["--state", "_df_shadow_codex_review=FALSE"],
+        ["--state=_df_shadow_codex_review=No"],
+        ["--state", "_df_shadow_codex_review=OFF"],
+    ],
+)
+def test_wrapper_normalizes_shadow_disable_state_like_runtime(
+    tmp_path: pathlib.Path, state_args: list[str]
+) -> None:
+    result, call_log = _run_installed_wrapper(
+        ["--backend", "claude", *state_args, "--goal", "fixture"],
+        workdir=tmp_path,
+    )
+
+    assert result.returncode == 0
+    calls = _read_fake_runner_calls(call_log)
+    preflight = next(call for call in calls if call[:2] == ["-m", "runner.preflight"])
+    assert preflight[preflight.index("--shadow-codex") + 1] == "false"
 
 
 def test_dark_factory_review_failure_does_not_create_panic_artifact(tmp_path: pathlib.Path) -> None:
