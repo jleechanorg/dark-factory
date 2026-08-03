@@ -416,6 +416,60 @@ def test_receipt_validation_rejects_raw_logs_outside_private_root(
         ha._validate_operator_receipt(receipt_path, "c" * 40)
 
 
+def test_private_log_write_stays_bound_to_open_directory_after_path_swap(
+    tmp_path: pathlib.Path,
+) -> None:
+    import runner.handlers  # noqa: F401
+    import runner.handler_audit as ha
+
+    raw_dir = tmp_path / "private" / "run"
+    directory_fd = ha._open_private_directory(raw_dir)
+    moved = raw_dir.with_name("moved")
+    attacker = tmp_path / "attacker"
+    attacker.mkdir()
+    raw_dir.rename(moved)
+    raw_dir.symlink_to(attacker, target_is_directory=True)
+    try:
+        ha._write_private_bytes_at(directory_fd, "stream.bin", b"sealed")
+    finally:
+        os.close(directory_fd)
+
+    assert (moved / "stream.bin").read_bytes() == b"sealed"
+    assert not (attacker / "stream.bin").exists()
+
+
+def test_receipt_validation_rejects_symlinked_raw_log_parent(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    import runner.handlers  # noqa: F401
+    import runner.handler_audit as ha
+
+    private_root = tmp_path / "private"
+    real_parent = private_root / "real"
+    real_parent.mkdir(parents=True)
+    raw = real_parent / "stream.bin"
+    raw.write_bytes(b"sealed")
+    (private_root / "linked").symlink_to(real_parent, target_is_directory=True)
+    digest = __import__("hashlib").sha256(b"sealed").hexdigest()
+    receipt = {
+        "schema_version": 2,
+        "target_head_sha": "c" * 40,
+        "commands": [{
+            "requested_argv": ["/usr/bin/git", "status"],
+            "effective_argv": ["/usr/bin/git", "status"],
+            "transform_chain": [],
+            "stdout": {"path": str(private_root / "linked" / "stream.bin"), "sha256": digest, "size_bytes": 6},
+            "stderr": {"path": str(private_root / "linked" / "stream.bin"), "sha256": digest, "size_bytes": 6},
+        }],
+    }
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    monkeypatch.setattr(ha, "_operator_log_root", lambda: private_root)
+
+    with pytest.raises((OSError, ValueError)):
+        ha._validate_operator_receipt(receipt_path, "c" * 40)
+
+
 def test_sensitive_binary_output_is_confined_to_private_raw_log(
     tmp_path: pathlib.Path, monkeypatch
 ) -> None:

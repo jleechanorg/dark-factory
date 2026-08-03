@@ -23,6 +23,7 @@ import pathlib
 import re
 import contextlib
 import tempfile
+import stat
 import subprocess
 import sys
 import time
@@ -226,19 +227,41 @@ def _safe_operator_component(raw: str, fallback: str) -> str:
 
 
 def _private_directory(path: pathlib.Path) -> None:
-    if path.is_symlink():
-        raise OSError(f"private operator path is a symlink: {path}")
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path.chmod(0o700)
+    fd = _open_private_directory(path)
+    os.close(fd)
 
 
-def _write_private_bytes(path: pathlib.Path, data: bytes) -> None:
-    if path.is_symlink():
-        raise OSError(f"private operator log is a symlink: {path}")
+def _open_private_directory(path: pathlib.Path) -> int:
+    absolute = path.expanduser()
+    if not absolute.is_absolute():
+        raise OSError("private operator path must be absolute")
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+    current_fd = os.open("/", directory_flags)
+    try:
+        for part in absolute.parts[1:]:
+            try:
+                os.mkdir(part, 0o700, dir_fd=current_fd)
+            except FileExistsError:
+                pass
+            next_fd = os.open(part, directory_flags, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        os.fchmod(current_fd, 0o700)
+        return current_fd
+    except Exception:
+        os.close(current_fd)
+        raise
+
+
+def _write_private_bytes_at(directory_fd: int, name: str, data: bytes) -> None:
+    if pathlib.PurePath(name).name != name or name in {"", ".", ".."}:
+        raise OSError("private operator log name must be one component")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    fd = os.open(path, flags, 0o600)
+    fd = os.open(name, flags, 0o600, dir_fd=directory_fd)
     try:
         with os.fdopen(fd, "wb") as stream:
             stream.write(data)
@@ -246,10 +269,59 @@ def _write_private_bytes(path: pathlib.Path, data: bytes) -> None:
             os.fsync(stream.fileno())
     except Exception:
         try:
-            path.unlink()
+            os.unlink(name, dir_fd=directory_fd)
         except OSError:
             pass
         raise
+
+
+def _write_private_bytes(path: pathlib.Path, data: bytes) -> None:
+    directory_fd = _open_private_directory(path.parent)
+    try:
+        _write_private_bytes_at(directory_fd, path.name, data)
+    finally:
+        os.close(directory_fd)
+
+
+def _read_private_bytes_beneath(
+    private_root: pathlib.Path, path: pathlib.Path, max_bytes: int
+) -> bytes:
+    root = private_root.expanduser()
+    candidate = path.expanduser()
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("operator verification raw log escapes private root") from exc
+    if not relative.parts:
+        raise ValueError("operator verification raw log path is invalid")
+    directory_fd = _open_private_directory(root)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+    try:
+        for part in relative.parts[:-1]:
+            next_fd = os.open(part, directory_flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        file_fd = os.open(relative.parts[-1], file_flags, dir_fd=directory_fd)
+        try:
+            metadata = os.fstat(file_fd)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > max_bytes:
+                raise ValueError("operator verification raw log is invalid")
+            data = b""
+            while len(data) <= max_bytes:
+                chunk = os.read(file_fd, min(65536, max_bytes + 1 - len(data)))
+                if not chunk:
+                    break
+                data += chunk
+            if len(data) > max_bytes:
+                raise ValueError("operator verification raw log exceeds size bound")
+            return data
+        finally:
+            os.close(file_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def _stream_reference(path: pathlib.Path, data: bytes) -> dict[str, object]:
@@ -319,7 +391,7 @@ def _validate_operator_receipt(
         raise ValueError("operator verification receipt/head mismatch")
     if expected_receipt is not None and receipt != expected_receipt:
         raise ValueError("operator verification receipt was tampered after creation")
-    private_root = _operator_log_root().resolve()
+    private_root = _operator_log_root().expanduser()
     for command in receipt.get("commands", []):
         requested = command.get("requested_argv")
         effective = command.get("effective_argv")
@@ -333,13 +405,9 @@ def _validate_operator_receipt(
         for stream_name in ("stdout", "stderr"):
             reference = command.get(stream_name, {})
             raw_path = pathlib.Path(str(reference.get("path", "")))
-            try:
-                raw_path.resolve().relative_to(private_root)
-            except ValueError as exc:
-                raise ValueError("operator verification raw log escapes private root") from exc
-            if raw_path.is_symlink() or not raw_path.is_file():
-                raise ValueError("operator verification raw log is missing or a symlink")
-            data = raw_path.read_bytes()
+            data = _read_private_bytes_beneath(
+                private_root, raw_path, _OPERATOR_RAW_STREAM_MAX_BYTES
+            )
             if len(data) != reference.get("size_bytes"):
                 raise ValueError("operator verification raw-log size mismatch")
             if hashlib.sha256(data).hexdigest() != reference.get("sha256"):
