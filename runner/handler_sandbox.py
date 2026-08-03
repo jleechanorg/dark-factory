@@ -455,4 +455,3 @@ def _sandboxed_args_for_workdir(
             return None
         return prefix + args
     return None
-

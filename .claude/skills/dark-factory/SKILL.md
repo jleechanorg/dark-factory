@@ -29,21 +29,23 @@ pipeline; use `/h` when you want an interactive in-session loop.
 
 | Command | Behavior |
 |---------|----------|
-| `/f` | Generic worker followed by the fixed controller-owned Codex reviewer |
+| `/f` | Full loop, auto-routes PR-mode vs feature-mode (Step 0a below) |
 | `/factory` | Alias for `/f`, identical behavior |
-| `/f-pr` | Explicit PR-mode entry point |
+| `/f-pr` | Explicit PR-mode entry point (skips auto-route, always PR-mode) |
 | `/fs` | Spec-generation entry point; runs `pipelines/slim/spec_gen.dot` or a binary-owned dynamic spec graph — run this first when the goal needs a spec |
 
 This skill file is the single source of truth for the binary-first contract;
 `.claude/commands/f.md` is the canonical command entry point, with `/factory`
-and `/f-pr` as thin aliases.
+and `/f-pr` as thin aliases so auto-detect behavior stays identical across
+entry points.
 
 **What "binary-first" bans**: an in-Claude prose-only workflow that claims a
 factory run without a logged binary invocation is not a valid run — see
-**Honesty rules** below. Every default run preserves the generic worker,
-controller-owned Codex cold reviewer, bounded retry loop, and exit summary.
-Spec generation, holdouts, extra evidence gates, calibration, shadows, PR
-routing, and dynamic graphs run only when the user explicitly requests them.
+**Honesty rules** below. Every default run must preserve required default
+nodes or their graph-level equivalents: plan/spec producer, independent
+review, bounded fix loop, evidence gates, and exit summary. Dynamic graph
+generation is valid only when the generated/selected DOT graph is saved or
+echoed in the run evidence.
 
 ## Repos
 
@@ -55,7 +57,7 @@ routing, and dynamic graphs run only when the user explicitly requests them.
 
 | `.dot` file | Flow | When to use |
 |-------------|------|-------------|
-| **`pipelines/slim/two_node.dot`** ⭐ default | worker → cold_reviewer (fixed Codex) → exit | **Default for `/f` and `/factory`** when no `--pipeline` is passed. Generic worker handles any user goal; the controller-owned Codex cold-review contract gates it. Use this when the task fits the "do the thing, then a cold reviewer checks it" shape. |
+| **`pipelines/slim/two_node.dot`** ⭐ default | worker → controller-owned `cold-review-v1` → exit | **Default for `/f` and `/factory`** when no `--pipeline` is passed. Generic worker handles any user goal; its `type="parallel_reviewer"` gate uses controller-owned `cold-review-v1` with Codex-only `backend_priority="codex"`. |
 | `pipelines/factory/hello.dot` | plan → implement → holdout → fix-loop → exit | Add a new feature with a holdout scenario |
 | `pipelines/factory/gates.dot` | start → holdout → /es → /er → /code_standards → exit | Validate an already-implemented diff (Attractor-style 4-gate harness as `.dot`) |
 | `pipelines/factory/pr_gates.dot` | start → holdout → /es → /er → /code_standards → exit | Validate an already-implemented in-flight PR diff (Holdout-always policy; requires `--feature <name>` for the holdout) |
@@ -71,14 +73,28 @@ You can also write your own `.dot` and pass it via `--pipeline`.
 ### How to invoke this skill
 
 The user types `/f $ARGUMENTS` (or `/factory $ARGUMENTS`). Parse the
-arguments and run the steps below. Do not inspect or route based on PR state
-unless the user invokes `/f-pr`. When `--pipeline` is omitted, `/f` and
+arguments and run the steps below. When `--pipeline` is omitted, `/f` and
 `/factory` default to `two_node` (`pipelines/slim/two_node.dot`). Non-default
 pipelines require explicit opt-in via `--pipeline <name>`.
 
+### Step 0a — Auto-route PR-mode vs feature-mode (applies to `/f` and `/factory`; `/f-pr` skips this and forces PR-mode)
+
+Run once before dispatch:
+
+```bash
+gh pr list --head "$(git rev-parse --abbrev-ref HEAD)" \
+  --json number,title,state,isDraft,additions,deletions,changedFiles,baseRefName,headRefName,labels
+echo "$ARGUMENTS"
+```
+
+Reasoning (LLM, not rules):
+- **No open PR** → feature-mode (new work).
+- **Open PR exists** AND goal relates to it → PR-mode (drive the existing PR to green).
+- **Open PR exists** AND goal is unrelated → **ask the user** which mode they meant. Do not silently route.
+
 ### `/f-pr` — explicit PR-mode entry point
 
-`/f-pr` always runs PR-mode. Use the LLM to **read the
+`/f-pr` skips Step 0a and always runs PR-mode. Use the LLM to **read the
 PR's actual context and pick the right pipeline** — this is a reasoning
 task, not a deterministic rule table (no `if is_draft then X`, no
 `if labels contains 'bug' then bug_fix.dot`, no keyword-routing).
@@ -191,10 +207,10 @@ When `--pipeline` is a short name (no `/` or `.dot`), expand under
 
 When the user invokes `/f` or `/factory` with no `--pipeline` flag, the
 runner dispatches `pipelines/slim/two_node.dot` by default — exactly two
-productive nodes (a generic `worker` codergen + a `cold_reviewer` gate_er
-that runs the controller-owned, digest-pinned Codex cold-review contract),
-plus a bounded fix loop. The cold reviewer is fixed to Codex: fallback model
-selection and extra shadow reviewers are explicit opt-ins, never defaults.
+productive nodes (a generic `worker` codergen + a `cold_reviewer`
+`type="parallel_reviewer"` gate), plus a bounded fix loop. The cold reviewer
+uses the controller-owned `cold-review-v1` contract and its only
+receipt-capable transport, `backend_priority="codex"`.
 
 To opt into a richer pipeline, pass an explicit `--pipeline <name>`. To
 roll your own (e.g. a custom slim or feature shape), pass
@@ -236,22 +252,24 @@ Whatever is left after flag parsing is the **goal description**.
 
 ### Steps
 
-Before Steps 1–2, define this resolver. It resolves the `dark-factory` binary
-selected from `PATH`, follows symlinks, derives its repository root, and
-overwrites ambient `DARK_FACTORY_HOME` so the installed controller owns
-pipeline and prompt resolution:
+Before Steps 1–2, define this resolver. It preserves an explicit
+`DARK_FACTORY_HOME`; otherwise it resolves the `dark-factory` binary selected
+from `PATH`, follows symlinks, derives its repository root, and exports that
+same source for pipeline and prompt resolution:
 
 ```bash
 resolve_dark_factory_home() {
-  DARK_FACTORY_BIN="$(command -v dark-factory 2>/dev/null)" || {
-    echo "ERROR: dark-factory is not on PATH; run ./install.sh first"
-    return 1
-  }
-  DARK_FACTORY_BIN="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$DARK_FACTORY_BIN")" || {
-    echo "ERROR: unable to resolve the installed dark-factory binary"
-    return 1
-  }
-  DARK_FACTORY_HOME="$(cd "$(dirname "$DARK_FACTORY_BIN")/.." && pwd -P)" || return 1
+  if [ -z "${DARK_FACTORY_HOME:-}" ]; then
+    DARK_FACTORY_BIN="$(command -v dark-factory 2>/dev/null)" || {
+      echo "ERROR: dark-factory is not on PATH; run ./install.sh first"
+      return 1
+    }
+    DARK_FACTORY_BIN="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$DARK_FACTORY_BIN")" || {
+      echo "ERROR: unable to resolve the installed dark-factory binary"
+      return 1
+    }
+    DARK_FACTORY_HOME="$(cd "$(dirname "$DARK_FACTORY_BIN")/.." && pwd -P)" || return 1
+  fi
   export DARK_FACTORY_HOME
 }
 ```
@@ -282,14 +300,13 @@ resolve_dark_factory_home() {
    ```bash
    cd "<TARGET_REPO>"   # e.g. the product repo being built
    dark-factory \
+     --pipeline pipelines/<PATH_TO_DOT>.dot \
      --goal "<GOAL>" \
      --backend <BACKEND> \
+     --feature <FEATURE> \
      --cxdb <CXDB_PATH> \
      --state <KEY>=<VALUE>
    ```
-
-   Add `--pipeline`, `--feature`, or extra state only when the user explicitly
-   requests the corresponding non-default behavior.
 
 4. **Surface the verdict**. The last line of stdout is a JSON summary with
    `final_outcome`, `pipeline`, `goal`, `steps`, `trace`. Report:
@@ -309,11 +326,11 @@ resolve_dark_factory_home() {
    `~/projects/dark-factory-holdouts/holdouts/<feature>/` — only the
    PASS/FAIL verdict per scenario name leaked back.
 
-## Reviewer calibration (explicit opt-in)
+## Reviewer calibration (default on)
 
-Run calibration lanes only when the user explicitly passes
-`--reviewer-calibration=true`. A bare `/f` already has one controller-owned
-Codex cold-review node and must not add calibration or shadow reviewers.
+`--reviewer-calibration=true` is the default for every real `/f`/`/factory`
+run. Treat the flag as present unless the user explicitly passes
+`--reviewer-calibration=false`.
 
 Calibration routes every backend through the binary-owned controller
 command:
@@ -362,8 +379,9 @@ evidence/<run-id>/reviewer-calibration/
 
 Do not claim delegated subagents underperformed raw Codex unless the same
 envelope and prompt were reviewed at the same SHA and raw Codex found a
-later-confirmed blocker the delegated reviewer missed. If calibration was not
-requested, do not add calibration fields to the final response.
+later-confirmed blocker the delegated reviewer missed. If calibration is
+disabled, the final response must say `Reviewer calibration: disabled` and
+give the explicit reason.
 
 The `gate_er` priority queue is `codex > minimax > agy > claude-sonnet` by
 default; passing `--backend claude` for the run itself does not change how

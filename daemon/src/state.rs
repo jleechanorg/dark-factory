@@ -39,25 +39,6 @@ pub enum OverlayState {
     /// structural — the daemon could never have reached all_green on
     /// any attempt number).
     DispositionRequired,
-    /// Bead jleechan-7yf0 / issue #506: terminal state for a duplicate
-    /// bead whose branch is already registered to a live sibling bead
-    /// (`adoption_branch_collision` with `registered_bead_live=true`).
-    /// Replaces the prior `HUMAN_HELD` escalation, which generated
-    /// spurious operator escalations for an outcome that is fully
-    /// resolvable by the daemon itself: the live bead continues driving
-    /// its branch and the duplicate bead is parked here with a
-    /// `park_reason` recording the live owner and branch, so the
-    /// `dispatch` loop's `state == QUEUED || REDISPATCHED` predicate
-    /// (which excludes this state) skips re-dispatch forever. Distinct
-    /// from `HumanHeld` because there is NO operator-visible blocker —
-    /// the live bead is making progress; the duplicate is just a no-op
-    /// shim. Distinct from `DispositionRequired` because there is no
-    /// gate-condition to recover on; once cancelled, the duplicate stays
-    /// cancelled for its lifetime. Telemetry emits a single
-    /// `SKIPPED_DUPLICATE_BEAD` event with `{duplicate_bead, live_bead,
-    /// branch}` context — `grep` the JSONL by either bead id and the
-    /// line is self-explanatory.
-    Cancelled,
 }
 
 impl OverlayState {
@@ -75,7 +56,6 @@ impl OverlayState {
             OverlayState::BudgetHeld => "BUDGET_HELD",
             OverlayState::HumanHeld => "HUMAN_HELD",
             OverlayState::DispositionRequired => "DISPOSITION_REQUIRED",
-            OverlayState::Cancelled => "CANCELLED",
         }
     }
 
@@ -97,7 +77,6 @@ impl OverlayState {
             "BUDGET_HELD" => Ok(OverlayState::BudgetHeld),
             "HUMAN_HELD" => Ok(OverlayState::HumanHeld),
             "DISPOSITION_REQUIRED" => Ok(OverlayState::DispositionRequired),
-            "CANCELLED" => Ok(OverlayState::Cancelled),
             other => Err(DaemonError::Parse(format!(
                 "unknown overlay state: {other}"
             ))),
@@ -720,7 +699,6 @@ impl SqliteStateStore {
         Self::ensure_held_recheck_after_column(&conn)?;
         Self::ensure_last_er_evidence_hash_column(&conn)?;
         Self::ensure_disposition_required_state(&conn)?;
-        Self::ensure_cancelled_state(&conn)?;
         Self::ensure_escalation_ledger_table(&conn)?;
         Self::ensure_escalation_ledger_terminal_column(&conn)?;
         Self::ensure_claimed_by_columns(&conn)?;
@@ -746,7 +724,6 @@ impl SqliteStateStore {
         Self::ensure_held_recheck_after_column(&conn)?;
         Self::ensure_last_er_evidence_hash_column(&conn)?;
         Self::ensure_disposition_required_state(&conn)?;
-        Self::ensure_cancelled_state(&conn)?;
         Self::ensure_escalation_ledger_table(&conn)?;
         Self::ensure_escalation_ledger_terminal_column(&conn)?;
         Self::ensure_claimed_by_columns(&conn)?;
@@ -1152,7 +1129,7 @@ impl SqliteStateStore {
         bead_id TEXT PRIMARY KEY, \
         state TEXT NOT NULL CHECK (state IN \
             ('QUEUED','DISPATCHING','DISPATCHED','ATTESTED','READY','RE_ROLL','RECOVERY',\
-             'REDISPATCHED','BUDGET_HELD','HUMAN_HELD','DISPOSITION_REQUIRED','CANCELLED')), \
+             'REDISPATCHED','BUDGET_HELD','HUMAN_HELD','DISPOSITION_REQUIRED')), \
         attempt INTEGER NOT NULL DEFAULT 1, \
         reroll_count INTEGER NOT NULL DEFAULT 0, \
         autonomy_secs INTEGER NOT NULL DEFAULT 0, \
@@ -1255,84 +1232,6 @@ impl SqliteStateStore {
             // next open; surface the original error either way.
             let _ = conn.execute_batch("ROLLBACK");
             return Err(tool_err("ensure_disposition_required_state: rebuild", e));
-        }
-        Ok(())
-    }
-    /// Bead jleechan-7yf0 / issue #506: migrate the `bead_overlay.state`
-    /// CHECK constraint to allow `'CANCELLED'`. Same probe-then-rebuild
-    /// dance as `ensure_disposition_required_state` (SQLite has no
-    /// `ALTER TABLE … DROP/ALTER CONSTRAINT`; the only portable path is
-    /// the documented create-copy-drop-rename). The rebuild target DDL
-    /// (`REBUILD_TABLE_DDL`) is the single canonical schema that
-    /// supersedes both migrations: any older live DB that already
-    /// migrated to support `DISPOSITION_REQUIRED` but pre-dates this
-    /// migration's `'CANCELLED'` probe now rebuilds to the full set
-    /// (the rebuild is idempotent — same target DDL, same column list).
-    /// Idempotent: a DB that already accepts `'CANCELLED'` returns
-    /// early at the probe.
-    fn ensure_cancelled_state(conn: &Connection) -> Result<(), DaemonError> {
-        // Probe: is `CANCELLED` already accepted by the live CHECK?
-        // Same always-rollback savepoint pattern as
-        // `ensure_disposition_required_state`.
-        conn.execute_batch("SAVEPOINT cnl_probe")
-            .map_err(|e| tool_err("ensure_cancelled_state: savepoint", e))?;
-        let probe = conn.execute(
-            "INSERT INTO bead_overlay (bead_id, state, updated_at) \
-             VALUES ('__cnl_migration_probe__', 'CANCELLED', '')",
-            [],
-        );
-        conn.execute_batch("ROLLBACK TO cnl_probe; RELEASE cnl_probe")
-            .map_err(|e| tool_err("ensure_cancelled_state: rollback probe", e))?;
-        let needs_migration = match probe {
-            Ok(_) => false,
-            Err(ref e) if e.to_string().to_ascii_lowercase().contains("check constraint") => true,
-            Err(e) => {
-                return Err(tool_err("ensure_cancelled_state: probe", e));
-            }
-        };
-        if !needs_migration {
-            return Ok(());
-        }
-
-        // Same copy-by-name pattern as `ensure_disposition_required_state`.
-        let mut live_cols: std::collections::HashSet<String> = std::collections::HashSet::new();
-        {
-            let mut stmt = conn
-                .prepare("SELECT name FROM pragma_table_info('bead_overlay')")
-                .map_err(|e| tool_err("ensure_cancelled_state: pragma prepare", e))?;
-            let rows = stmt
-                .query_map([], |row| row.get::<_, String>(0))
-                .map_err(|e| tool_err("ensure_cancelled_state: pragma query", e))?;
-            for name in rows {
-                live_cols.insert(
-                    name.map_err(|e| tool_err("ensure_cancelled_state: pragma row", e))?,
-                );
-            }
-        }
-        let copy_cols: Vec<&str> = Self::BEAD_OVERLAY_COLUMNS
-            .iter()
-            .copied()
-            .filter(|c| live_cols.contains(*c))
-            .collect();
-        let col_list = copy_cols.join(", ");
-
-        // Temp table name differs from the disposition migration so a
-        // subsequent rebuild (e.g. a future state addition) doesn't
-        // collide with a half-orphaned predecessor table from a
-        // previously-failed migration on the same `open()` call.
-        let batch = format!(
-            "BEGIN IMMEDIATE;\n\
-             {create};\n\
-             INSERT INTO bead_overlay_cancelled_migrated ({cols}) SELECT {cols} FROM bead_overlay;\n\
-             DROP TABLE bead_overlay;\n\
-             ALTER TABLE bead_overlay_cancelled_migrated RENAME TO bead_overlay;\n\
-             COMMIT;",
-            create = Self::REBUILD_TABLE_DDL,
-            cols = col_list,
-        );
-        if let Err(e) = conn.execute_batch(&batch) {
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(tool_err("ensure_cancelled_state: rebuild", e));
         }
         Ok(())
     }
@@ -2467,25 +2366,10 @@ mod tests {
             1,
             "only set_human_hold_reason may directly assign Some"
         );
-        // jleechan-7yf0 / issue #506: ONE production constructor
-        // (`tick::run_slow_tier`'s `adoption_branch_collision_live_owner`
-        // path) constructs a `Cancelled` overlay with a literal
-        // `park_reason: Some(...)`. The typed `HumanHoldReason` policy
-        // intentionally does NOT cover non-HumanHeld park states, so
-        // we count this single known exception here rather than
-        // widening the typed policy to a state (Cancelled) with only
-        // one production call site — adding a typed policy for a
-        // single-use prefix is premature abstraction that would have
-        // to be revised if a second Cancelled-reason prefix ever
-        // appears. Bump this count and update the comment if/when a
-        // second production constructor sets `park_reason: Some(...)`
-        // for a non-HumanHeld state.
         assert_eq!(
             production_code.matches("park_reason:Some").count(),
-            1,
-            "production constructors must not bypass the typed policy \
-             (one known exception: tick::run_slow_tier's Cancelled \
-             adoption_branch_collision_live_owner overlay)"
+            0,
+            "production constructors must not bypass the typed policy"
         );
         assert_eq!(
             production_code.matches("park_reason='").count(),
