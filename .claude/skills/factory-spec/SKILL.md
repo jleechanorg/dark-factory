@@ -169,11 +169,10 @@ through to `$DARK_FACTORY_HOME/pipelines/`, so an operator in the target
 repo can pass `--pipeline my_repo_lane.dot` and the runner finds it
 locally.
 
-**When `--pipeline` is omitted (auto-select path),** `/f` and `/factory`
-list the contents of `<workdir>/dark-factory/pipelines/` **before**
-falling back to the built-in decision table, so repo-specific graphs
-surface in the auto-select output. The convention is therefore
-discoverable, not just documentable.
+Repo-specific pipelines are explicit opt-ins: pass
+`--pipeline my_repo_lane.dot`. When `--pipeline` is omitted, `/f` and
+`/factory` always use the built-in two-node default rather than selecting a
+graph from the target or goal.
 
 Execution command (from target repo cwd):
 

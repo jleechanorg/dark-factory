@@ -58,6 +58,48 @@ def test_dark_factory_defaults_pipeline_to_two_node_dot() -> None:
     )
 
 
+def test_omitted_pipeline_keeps_the_literal_command_pipeline_free(
+    monkeypatch, tmp_path: pathlib.Path
+) -> None:
+    """The binary records the command the operator actually supplied.
+
+    The two-node graph is selected internally when ``--pipeline`` is omitted;
+    the proof command must not pretend the operator explicitly selected it.
+    """
+    from runner import __main__ as cli
+    from runner.engine_persist import StepRecord
+
+    captured: dict[str, str] = {}
+
+    def _capture_bundle(**kwargs) -> None:
+        captured["command"] = kwargs["command"]
+
+    monkeypatch.setattr(
+        cli,
+        "run",
+        lambda *args, **kwargs: [
+            StepRecord(node="exit", outcome="success", ts=0.0, output_preview="done")
+        ],
+    )
+    monkeypatch.setattr(cli, "_write_evidence_bundle", _capture_bundle)
+
+    rc = cli.main(
+        [
+            "--goal",
+            "review this design document against its evidence",
+            "--workdir",
+            str(tmp_path),
+            "--backend",
+            "echo",
+            "--no-perf-log",
+        ]
+    )
+
+    assert rc == 0
+    assert "--pipeline" not in captured["command"]
+    assert captured["command"].startswith("dark-factory --goal ")
+
+
 def test_dark_factory_default_pipeline_file_exists_in_factory_home() -> None:
     """The slim two-node default graph must live at
     ``$DARK_FACTORY_HOME/pipelines/slim/two_node.dot`` — that's where
@@ -118,5 +160,13 @@ def test_authoritative_skill_instructions_agree_on_two_node_default() -> None:
 
     if skill_file.exists():
         skill_text = skill_file.read_text(encoding="utf-8")
+        normalized_skill_text = " ".join(skill_text.split())
+        assert "any reviewable target" in skill_text
         assert "two_node" in skill_text
-        assert "defaults to" in skill_text or "default" in skill_text
+        assert "The previous \"auto-select from the goal\" behavior is retired" in normalized_skill_text
+        for stale_instruction in (
+            "plan/spec producer, independent\nreview, bounded fix loop, evidence gates",
+            "Docs-only / test-only / config-only PRs have no behavioral surface",
+            "If no pipeline fits (e.g. docs-only PR), **say so and stop**",
+        ):
+            assert stale_instruction not in skill_text, stale_instruction

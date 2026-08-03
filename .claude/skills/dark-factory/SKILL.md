@@ -29,23 +29,21 @@ pipeline; use `/h` when you want an interactive in-session loop.
 
 | Command | Behavior |
 |---------|----------|
-| `/f` | Full loop, auto-routes PR-mode vs feature-mode (Step 0a below) |
+| `/f` | Review any reviewable target with the default two-node graph |
 | `/factory` | Alias for `/f`, identical behavior |
-| `/f-pr` | Explicit PR-mode entry point (skips auto-route, always PR-mode) |
-| `/fs` | Spec-generation entry point; runs `pipelines/slim/spec_gen.dot` or a binary-owned dynamic spec graph — run this first when the goal needs a spec |
+| `/f-pr` | `/f` with PR context; it still uses the default unless `--pipeline` is explicit |
+| `/fs` | Explicit spec-generation entry point using `pipelines/slim/spec_gen.dot` |
 
 This skill file is the single source of truth for the binary-first contract;
 `.claude/commands/f.md` is the canonical command entry point, with `/factory`
-and `/f-pr` as thin aliases so auto-detect behavior stays identical across
-entry points.
+and `/f-pr` as thin aliases.
 
 **What "binary-first" bans**: an in-Claude prose-only workflow that claims a
 factory run without a logged binary invocation is not a valid run — see
-**Honesty rules** below. Every default run must preserve required default
-nodes or their graph-level equivalents: plan/spec producer, independent
-review, bounded fix loop, evidence gates, and exit summary. Dynamic graph
-generation is valid only when the generated/selected DOT graph is saved or
-echoed in the run evidence.
+**Honesty rules** below. The default is exactly the checked-in two-node graph;
+only an explicit `--pipeline` selects a different graph. Dynamic graph
+generation is valid only when selected explicitly and saved or echoed in the
+run evidence.
 
 ## Repos
 
@@ -66,7 +64,6 @@ echoed in the run evidence.
 
 | `pipelines/factory/level5_feature.dot` | full reference pipeline | Full Level-5 reference pipeline with hard-tier gates wired in |
 | **dynamic DOT via binary** | binary-owned graph builder | A static graph can't express the needed phase/fanout; the binary saves/echoes the generated graph in run evidence |
-| **no pipeline** | — | Docs-only / test-only / config-only PRs have no behavioral surface for the holdout to grade — say so and stop |
 
 You can also write your own `.dot` and pass it via `--pipeline`.
 
@@ -77,61 +74,13 @@ arguments and run the steps below. When `--pipeline` is omitted, `/f` and
 `/factory` default to `two_node` (`pipelines/slim/two_node.dot`). Non-default
 pipelines require explicit opt-in via `--pipeline <name>`.
 
-### Step 0a — Auto-route PR-mode vs feature-mode (applies to `/f` and `/factory`; `/f-pr` skips this and forces PR-mode)
+### Step 0a — Target context
 
-Run once before dispatch:
-
-```bash
-gh pr list --head "$(git rev-parse --abbrev-ref HEAD)" \
-  --json number,title,state,isDraft,additions,deletions,changedFiles,baseRefName,headRefName,labels
-echo "$ARGUMENTS"
-```
-
-Reasoning (LLM, not rules):
-- **No open PR** → feature-mode (new work).
-- **Open PR exists** AND goal relates to it → PR-mode (drive the existing PR to green).
-- **Open PR exists** AND goal is unrelated → **ask the user** which mode they meant. Do not silently route.
-
-### `/f-pr` — explicit PR-mode entry point
-
-`/f-pr` skips Step 0a and always runs PR-mode. Use the LLM to **read the
-PR's actual context and pick the right pipeline** — this is a reasoning
-task, not a deterministic rule table (no `if is_draft then X`, no
-`if labels contains 'bug' then bug_fix.dot`, no keyword-routing).
-
-1. **Resolve the PR number**: from `$ARGUMENTS` if present, else
-   `gh pr list --head "$(git rev-parse --abbrev-ref HEAD)" --json number --jq '.[0].number'`,
-   else ask the user.
-2. **Read PR context as facts, not routing rules**:
-   ```bash
-   gh pr view <N> --json number,title,state,isDraft,additions,deletions,changedFiles,baseRefName,headRefName,body,files,labels
-   gh pr view <N> --json statusCheckRollup
-   gh pr diff <N> --name-only
-   gh pr view <N> --comments   # optional
-   ls specs/ roadmap*/ docs/design/ 2>/dev/null   # optional
-   ```
-3. **Reason about**: what kind of work this is (new feature / bug fix /
-   refactor / docs / test-only / infra — from diff+body+files, never
-   pre-bucketed by label alone); whether a spec already covers the
-   change (if so, `/fs` is skippable — deciding `/fs` is needed first
-   and stopping is a valid terminal state, do not force a run); holdout
-   eligibility (pass `--feature <name>` only if
-   `~/projects/dark-factory-holdouts/holdouts/<feature>/` actually
-   exists — never invent one); and what evidence mix (`/es` + `/er` +
-   `/code_standards` minimum, `holdout_eval` for behavior-grade) the
-   pipeline needs to deliver without over-running.
-4. Pick the pipeline from **Available pipelines** above using that
-   reasoning, pick the backend (`echo` for wiring smoke; `claude` unless
-   the PR's reviewer queue or `gate_er` priority queue says otherwise),
-   then construct, show, and run the command — same shape as Step 0c
-   below but `cd` into the PR's target repo, not `dark-factory`.
-5. Report the verdict per **Output contract** below.
-
-`/f-pr` honesty rules (in addition to the shared ones under **Honesty
-rules**): the `gate_er` priority queue (`codex > minimax > agy >
-claude-sonnet`) still resolves the reviewer even when `--backend claude`
-was passed for the run itself — passing `--backend claude` does not mean
-`gate_er` uses claude by default.
+Read the target the user named: a PR, commit, code path, design document,
+research report, or executed evidence. Context improves the worker's review;
+it does not select a pipeline. `/f-pr` may additionally fetch the PR body,
+diff, CI state, and review threads, but it runs the same default graph unless
+the user explicitly supplies `--pipeline`.
 
 ### Step 0b — Auto-detect CLI backend
 
@@ -206,11 +155,12 @@ When `--pipeline` is a short name (no `/` or `.dot`), expand under
 ### Default graph when `--pipeline` is omitted
 
 When the user invokes `/f` or `/factory` with no `--pipeline` flag, the
-runner dispatches `pipelines/slim/two_node.dot` by default — exactly two
-productive nodes (a generic `worker` codergen + a `cold_reviewer`
-`type="parallel_reviewer"` gate), plus a bounded fix loop. The cold reviewer
-uses the controller-owned `cold-review-v1` contract and its only
-receipt-capable transport, `backend_priority="codex"`.
+runner dispatches `pipelines/slim/two_node.dot` for **any reviewable target**:
+a commit, code, PR, design document, research report, or evidence bundle.
+It has exactly two productive nodes (a generic `worker` codergen + a
+`cold_reviewer` `type="parallel_reviewer"` gate). The cold reviewer uses the
+controller-owned `cold-review-v1` contract and its only receipt-capable
+transport, `backend_priority="codex"`.
 
 To opt into a richer pipeline, pass an explicit `--pipeline <name>`. To
 roll your own (e.g. a custom slim or feature shape), pass
@@ -295,18 +245,19 @@ resolve_dark_factory_home() {
    export PATH="$HOME/.local/bin:$PATH"
    ```
 
-3. **Run the pipeline** from the **target repo** (implementation workdir = cwd).
-   Pipelines and prompts resolve from `$DARK_FACTORY_HOME`; code changes land in cwd:
+3. **Run the pipeline** from the target directory (the review workdir = cwd).
+   Pipelines and prompts resolve from `$DARK_FACTORY_HOME`:
    ```bash
-   cd "<TARGET_REPO>"   # e.g. the product repo being built
+   cd "<TARGET_DIRECTORY>"
    dark-factory \
-     --pipeline pipelines/<PATH_TO_DOT>.dot \
      --goal "<GOAL>" \
      --backend <BACKEND> \
-     --feature <FEATURE> \
      --cxdb <CXDB_PATH> \
      --state <KEY>=<VALUE>
    ```
+   This omitted `--pipeline` command is the default. Add `--pipeline <name>`
+   only when the user explicitly opts into a different graph; add
+   `--feature <name>` only when that explicit graph requires a real holdout.
 
 4. **Surface the verdict**. The last line of stdout is a JSON summary with
    `final_outcome`, `pipeline`, `goal`, `steps`, `trace`. Report:
@@ -399,10 +350,8 @@ cd /Users/jleechan/projects/<target-repo>
 DARK_FACTORY_HOLDOUTS=~/projects/dark-factory-holdouts \
 PATH="$HOME/.local/bin:$PATH" \
 dark-factory \
-  --pipeline <chosen-or-generated-dot> \
   --goal "<echo of $ARGUMENTS>" \
   --backend <backend> \
-  --feature <feature-if-any> \
   --cxdb ~/.dark-factory/cxdb.sqlite
 # Run ID: <id>
 # CXDB SHA: <sha>
@@ -443,14 +392,11 @@ To add a new sealed-holdout feature `foo`:
 - Do not claim a factory run based on an in-Claude workflow, `Skill()` call,
   or prose summary. The only valid proof is an actual `dark-factory` binary
   invocation plus the proof block above.
-- If the LLM decided `/fs` is needed first, **say so and stop** — do not
-  silently fall through to `gates.dot` and pretend the PR is green.
-- If no pipeline fits (e.g. docs-only PR), **say so and stop** — do not
-  silently fall through to a holdout-bearing pipeline.
+- Review documentation, tests, configuration, and evidence with the default
+  graph too; mark a non-applicable check in the worker receipt rather than
+  refusing to run.
 - Do not invent `--feature` values. If there's no holdout directory at
   `~/projects/dark-factory-holdouts/holdouts/<feature>/`, don't pass `--feature`.
-- When the goal is unrelated to the open PR (Step 0a), **ask the user** which
-  mode they meant. Do not silently route to PR-mode for unrelated work.
 - When the fix loop exhausts (3 attempts), surface the diagnosis verbatim and
   **stop** — do not auto-merge.
 
