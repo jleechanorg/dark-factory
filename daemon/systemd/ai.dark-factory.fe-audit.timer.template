@@ -1,0 +1,16 @@
+[Unit]
+Description=Schedule ai.dark-factory.fe-audit.service daily at 03:00 local (G10-G13 audit feeder for /af)
+# Mirrors the launchd plist `ai.dark-factory.fe-audit` cadence (03:00
+# daily). 03:00 chosen because it's a maintenance window, not urgent, and
+# runs before any operator-driven morning work so findings are queued by
+# the time the operator logs on.
+Documentation=https://github.com/jleechanorg/dark-factory
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+RandomizedDelaySec=60
+Unit=ai.dark-factory.fe-audit.service
+
+[Install]
+WantedBy=timers.target
