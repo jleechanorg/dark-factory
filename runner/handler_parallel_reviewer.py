@@ -52,7 +52,10 @@ from .handler_core import _gate_strict_flag
 # module (imports nothing from handlers), so this creates no import cycle.
 from .handler_verdict import _enforce_outcome_verdict_consistency  # noqa: F401
 from .handler_dispatch import (
+    _controller_codex_args,
     _finish_shadow_gate_review,
+    _gate_subprocess_args,
+    _gate_subprocess_env,
     _is_gate_infra_failure,
     _resolve_gate_backend,
     _execute_gate,
@@ -123,6 +126,127 @@ def _run_primary_review(
             ctx.state["_df_shadow_codex_review"] = prior_shadow_flag
 
     return result
+
+
+def _run_controller_primary(
+    request,
+    timeout: int,
+    ctx: "Context",
+    node_name: str,
+    backend: str,
+) -> Result:
+    """Adapt a graph controller lane to the canonical executor."""
+    from .review_controller import (
+        ControllerTransportError,
+        ReviewContractError,
+        run_controller_review,
+    )
+
+    metadata = {
+        "slash_command": node_name,
+        "reviewer_backend": backend,
+        "review_contract": request.prompt_id,
+        "review_prompt_payload_sha256": request.prompt_sha256,
+        "review_envelope_sha256": request.envelope_sha256,
+    }
+    if backend != "codex":
+        return Result(
+            outcome="error",
+            output="controller review transport requires codex backend",
+            metadata={**metadata, "review_contract_status": "transport_error"},
+        )
+    args = _gate_subprocess_args(backend, request.prompt, ctx, timeout)
+    if args is None:
+        return Result(
+            outcome="error",
+            output="controller review transport is unavailable",
+            metadata={
+                **metadata,
+                "review_contract_status": "transport_error",
+                "sandbox": "unavailable",
+            },
+        )
+    try:
+        transport_argv = tuple(_controller_codex_args(args))
+    except ValueError as exc:
+        return Result(
+            outcome="error",
+            output=f"controller review transport construction failed: {exc}",
+            metadata={**metadata, "review_contract_status": "transport_error"},
+        )
+
+    neutral_cwd = pathlib.Path(str(ctx.state["_df_controller_review_cwd"]))
+    output_dir = pathlib.Path(
+        ctx.state["_df_controller_review_lane_dirs"]["primary"]
+    )
+    try:
+        controller_result = run_controller_review(
+            request,
+            neutral_cwd=neutral_cwd,
+            output_dir=output_dir,
+            transport_argv=transport_argv,
+            transport_env=_gate_subprocess_env(backend),
+            timeout=timeout,
+        )
+        _verify_controller_workspace(ctx, request)
+    except subprocess.TimeoutExpired as exc:
+        return Result(
+            outcome="error",
+            output=f"controller review transport timed out after {timeout} seconds: {exc}",
+            metadata={
+                **metadata,
+                "review_contract_status": "transport_error",
+                "timed_out": "true",
+                "verdict": "unknown",
+            },
+        )
+    except (ControllerTransportError, OSError) as exc:
+        return Result(
+            outcome="error",
+            output=f"controller review transport failed: {exc}",
+            metadata={
+                **metadata,
+                "review_contract_status": "transport_error",
+                "timed_out": "false",
+                "verdict": "unknown",
+            },
+        )
+    except ReviewContractError as exc:
+        return Result(
+            outcome="failure",
+            output=f"controller review contract failure (primary): {exc}",
+            metadata={
+                **metadata,
+                "review_contract_status": "invalid",
+                "review_contract_gap": str(exc),
+                "timed_out": "false",
+                "verdict": "fail",
+            },
+        )
+
+    review = controller_result.review
+    output_paths = controller_result.output_paths
+    return Result(
+        outcome="success" if review.verdict == "pass" else "failure",
+        output=controller_result.response_text,
+        metadata={
+            **metadata,
+            "review_contract_status": "valid",
+            "review_response_sha256": review.response_sha256,
+            "verdict": review.verdict,
+            "head_sha_status": "matched",
+            "timed_out": "false",
+            "controller_receipt_path": output_paths["receipt"],
+            "reviewer_output_path": output_paths["response"],
+            "findings_path": output_paths["findings"],
+            "transport_output_path": output_paths["transport"],
+        },
+        context_updates=(
+            {"_last_validated_head_sha": request.head_sha}
+            if review.verdict == "pass"
+            else {}
+        ),
+    )
 
 
 def _record_primary_output(
@@ -901,13 +1025,17 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
                     "review_contract_status": "build_error",
                 },
             )
+        visit_seq = int(
+            getattr(ctx, "_df_current_seq", getattr(ctx, "last_completed_seq", 0))
+        )
+        visit_attempt = int(getattr(ctx, "_df_current_attempt", 1))
         neutral_cwd = (
             pathlib.Path.home()
             / ".dark-factory"
             / "controller-reviews"
             / str(ctx.run_id or "adhoc")
             / node.name
-            / str(int(getattr(ctx, "_df_current_attempt", 1)))
+            / f"{visit_seq}-{visit_attempt}"
         )
         neutral_cwd.mkdir(parents=True, exist_ok=True)
         ctx.state["_df_controller_review_cwd"] = str(neutral_cwd)
@@ -955,10 +1083,15 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
         if s:
             shadows.append(s)
 
-    prior_controller_json = ctx.state.get("_df_controller_review_json")
     if request is not None:
-        ctx.state["_df_controller_review_json"] = "true"
-    try:
+        primary = _run_controller_primary(
+            request,
+            timeout,
+            ctx,
+            node.name,
+            backend,
+        )
+    else:
         primary = _run_primary_review(
             prompt,
             expected_sha,
@@ -968,24 +1101,11 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
             backend,
             gate_strict=gate_strict,
         )
-    finally:
-        if prior_controller_json is None:
-            ctx.state.pop("_df_controller_review_json", None)
-        else:
-            ctx.state["_df_controller_review_json"] = prior_controller_json
 
     seq = int(getattr(ctx, "_df_current_seq", getattr(ctx, "last_completed_seq", 0)))
     attempt = int(getattr(ctx, "_df_current_attempt", 1))
     primary = _record_primary_output(node.name, attempt, primary, seq, ctx)
     primary.metadata.update(backend_meta)
-    if request is not None:
-        primary = _contract_adjusted_result(
-            primary,
-            request,
-            ctx,
-            lane="primary",
-        )
-
     if not shadows:
         # Bug 2 fix: Ensure outcome and verdict are consistent. A contradictory
         # verdict (e.g., outcome=failure with verdict=pass) can occur when stale

@@ -48,7 +48,10 @@ _SUBPROCESS_NODE_TYPES = frozenset(
 
 _PIPELINE = "pipelines/slim/two_node.dot"
 _WORKER_PROMPT = "prompts/slim/worker.md"
-_EXPECTED_TIMEOUT_S = 600
+_EXPECTED_TIMEOUTS_S = {
+    "worker": 600,
+    "cold_reviewer": 1200,
+}
 
 
 def _normalise_timeout(value: object) -> int | None:
@@ -85,7 +88,7 @@ def test_two_node_dot_parses_and_has_expected_topology() -> None:
 
 def test_two_node_dot_declares_timeout_on_every_subprocess_node() -> None:
     """Every subprocess-spawning node in two_node.dot has a timeout= attribute,
-    and that timeout matches the canonical 600s used by factory/ siblings."""
+    with a 600s worker budget and a 1200s controller-review budget."""
     g = parse(ROOT / _PIPELINE)
     missing: list[tuple[str, str]] = []
     wrong_value: list[tuple[str, str, int | None]] = []
@@ -99,16 +102,30 @@ def test_two_node_dot_declares_timeout_on_every_subprocess_node() -> None:
             missing.append((name, node_type))
             continue
         actual = _normalise_timeout(node.attrs.get("timeout"))
-        if actual != _EXPECTED_TIMEOUT_S:
+        expected = _EXPECTED_TIMEOUTS_S[name]
+        if actual != expected:
             wrong_value.append((name, node_type, actual))
     assert not missing, (
         f"two_node.dot nodes must declare a timeout= to prevent indefinite "
-        f"hangs. Missing: {missing}. Use timeout={_EXPECTED_TIMEOUT_S}."
+        f"hangs. Missing: {missing}. Expected: {_EXPECTED_TIMEOUTS_S}."
     )
     assert not wrong_value, (
-        f"two_node.dot timeouts must be {_EXPECTED_TIMEOUT_S}s. "
+        f"two_node.dot timeouts must be {_EXPECTED_TIMEOUTS_S}. "
         f"Offenders: {wrong_value}."
     )
+
+
+def test_two_node_dot_retries_only_reviewer_authored_failures() -> None:
+    """Infrastructure errors terminate through exit instead of rerunning worker."""
+    graph = parse(ROOT / _PIPELINE)
+    reviewer_edges = {
+        (edge.dst, edge.condition) for edge in graph.outgoing("cold_reviewer")
+    }
+    assert reviewer_edges == {
+        ("exit", "outcome=success"),
+        ("worker", "outcome=failure"),
+        ("exit", "outcome=error"),
+    }
 
 
 def test_two_node_dot_cold_reviewer_uses_only_its_supported_transport() -> None:

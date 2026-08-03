@@ -480,7 +480,7 @@ class ControllerSnapshotTests(unittest.TestCase):
         (self.repo / "README.md").write_text("worker output\n")
         seen: list[str] = []
 
-        def _fake_primary(prompt, expected_sha, timeout, ctx, node_name, backend, **kwargs):
+        def _fake_primary(request, timeout, ctx, node_name, backend):
             seen.append(backend)
             return Result(outcome="success", output="controller response")
 
@@ -492,10 +492,7 @@ class ControllerSnapshotTests(unittest.TestCase):
             },
         )
         ctx = Context(goal="review worker output", workdir=self.repo, backend="echo")
-        with patch("runner.handler_parallel_reviewer._run_primary_review", _fake_primary), patch(
-            "runner.handler_parallel_reviewer._contract_adjusted_result",
-            lambda result, request, ctx, **kwargs: result,
-        ):
+        with patch("runner.handler_parallel_reviewer._run_controller_primary", _fake_primary):
             result = _parallel_reviewer(node, ctx)
 
         self.assertEqual(result.outcome, "success")
@@ -528,7 +525,7 @@ class ControllerSnapshotTests(unittest.TestCase):
         (self.repo / "README.md").write_text("worker output\n")
         seen: list[str] = []
 
-        def _fake_primary(prompt, expected_sha, timeout, ctx, node_name, backend, **kwargs):
+        def _fake_primary(request, timeout, ctx, node_name, backend):
             seen.append(backend)
             return Result(
                 outcome="success",
@@ -542,10 +539,7 @@ class ControllerSnapshotTests(unittest.TestCase):
         )
         ctx = Context(goal="review worker output", workdir=self.repo, backend="echo")
         ctx.state["cold_reviewer.outcome"] = "success"
-        with patch("runner.handler_parallel_reviewer._run_primary_review", _fake_primary), patch(
-            "runner.handler_parallel_reviewer._contract_adjusted_result",
-            lambda result, request, ctx, **kwargs: result,
-        ):
+        with patch("runner.handler_parallel_reviewer._run_controller_primary", _fake_primary):
             result = _parallel_reviewer(node, ctx)
 
         self.assertEqual(result.outcome, "success")
@@ -590,7 +584,7 @@ class ControllerSnapshotTests(unittest.TestCase):
                 context_updates={"cold_reviewer.outcome": "success"},
             )
 
-        def _fake_primary(prompt, expected_sha, timeout, ctx, node_name, backend, **kwargs):
+        def _fake_primary(request, timeout, ctx, node_name, backend):
             seen.append(backend)
             return Result(
                 outcome="success",
@@ -599,10 +593,7 @@ class ControllerSnapshotTests(unittest.TestCase):
             )
 
         with patch.dict(TYPE_REGISTRY, {"codergen": _worker_with_inherited_reviewer_outcome}), patch(
-            "runner.handler_parallel_reviewer._run_primary_review", _fake_primary
-        ), patch(
-            "runner.handler_parallel_reviewer._contract_adjusted_result",
-            lambda result, request, ctx, **kwargs: result,
+            "runner.handler_parallel_reviewer._run_controller_primary", _fake_primary
         ), patch(
             "runner.handler_parallel_reviewer._start_shadow_gate_review",
             lambda *args, **kwargs: shadow_launches.append("shadow"),

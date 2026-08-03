@@ -7,7 +7,8 @@
 //
 // Wiring:
 //   start -> worker -> cold_reviewer -> exit                (on success)
-//                          \-> worker                        (on failure, bounded max_visits=3)
+//                          \-> worker                        (on reviewer failure, bounded max_visits=3)
+//                          \-> exit                          (on infrastructure error, terminal non-success)
 //
 // Backend routing:
 //   - worker          honors the run-level --backend (the coder tier the user
@@ -49,7 +50,7 @@ digraph SlimTwoNode {
         backend_priority="codex",
         evidence_paths="evidence/worker-verification.json",
         goal_gate=true,
-        timeout=600
+        timeout=1200
     ]
 
     start -> worker
@@ -57,5 +58,6 @@ digraph SlimTwoNode {
     worker -> worker        [condition="outcome!=success"]
 
     cold_reviewer -> exit   [condition="outcome=success"]
-    cold_reviewer -> worker [condition="outcome!=success"]
+    cold_reviewer -> worker [condition="outcome=failure"]
+    cold_reviewer -> exit   [condition="outcome=error"]
 }

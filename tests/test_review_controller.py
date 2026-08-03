@@ -12,6 +12,7 @@ import pytest
 
 from runner.review_controller import (
     CHECK_IDS,
+    ControllerTransportError,
     PROMPT_ID,
     EvidenceArtifact,
     EvidenceDelta,
@@ -715,3 +716,31 @@ def test_run_controller_review_allows_fail_under_stub_env(monkeypatch, tmp_path)
         timeout=10.0,
     )
     assert result.review.verdict == "fail"
+
+
+def test_run_controller_review_rejects_nonzero_transport_exit(monkeypatch, tmp_path):
+    """A nonzero transport is infrastructure failure, even with response text."""
+    import subprocess as subprocess_module
+
+    request = create_review_request(_inputs())
+    response = _response(request)
+    raw_jsonl = json.dumps(
+        {"type": "item.completed", "item": {"type": "agent_message", "text": response}}
+    )
+
+    monkeypatch.setattr(
+        subprocess_module,
+        "run",
+        lambda *args, **kwargs: subprocess_module.CompletedProcess(
+            args[0], 17, raw_jsonl, "transport crashed"
+        ),
+    )
+
+    with pytest.raises(ControllerTransportError, match="exited with 17"):
+        run_controller_review(
+            request,
+            neutral_cwd=tmp_path,
+            output_dir=tmp_path / "out-nonzero",
+            transport_argv=("fake", "codex"),
+            timeout=10.0,
+        )

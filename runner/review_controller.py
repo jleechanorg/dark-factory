@@ -17,7 +17,7 @@ import re
 import subprocess
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Mapping
 
 
 PROMPT_ID = "controller-cold-review-v1"
@@ -73,6 +73,10 @@ _MAX_INPUT_BYTES = 1024 * 1024
 
 class ReviewContractError(ValueError):
     """The review request or response violated the controller contract."""
+
+
+class ControllerTransportError(RuntimeError):
+    """The controller review transport failed before a response was reviewable."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -901,6 +905,7 @@ def run_controller_review(
     neutral_cwd: "pathlib.Path",
     output_dir: "pathlib.Path",
     transport_argv: tuple[str, ...],
+    transport_env: Mapping[str, str] | None = None,
     timeout: float = 1200.0,
 ) -> ControllerReviewResult:
     """Run one controller-owned review lane and write its artifacts.
@@ -948,13 +953,25 @@ def run_controller_review(
         text=True,
         timeout=timeout,
         check=False,
+        env=dict(transport_env) if transport_env is not None else None,
     )
     response_text = proc.stdout
     transport_text = proc.stdout
     response_path.write_text(response_text, encoding="utf-8")
     transport_path.write_text(transport_text, encoding="utf-8")
 
-    response_body, receipts = parse_codex_jsonl(transport_text)
+    if proc.returncode != 0:
+        raise ControllerTransportError(
+            f"controller review transport exited with {proc.returncode}: "
+            f"{proc.stderr.strip()}"
+        )
+
+    try:
+        response_body, receipts = parse_codex_jsonl(transport_text)
+    except ReviewContractError as exc:
+        raise ControllerTransportError(
+            f"controller review transport returned invalid JSONL: {exc}"
+        ) from exc
     response_path.write_text(response_body, encoding="utf-8")
     review = validate_review_response(response_body, request)
     validate_execution_receipts(receipts, review)
@@ -1044,6 +1061,7 @@ __all__ = [
     "CORRECTNESS_CHECK_IDS",
     "EVIDENCE_CHECK_IDS",
     "ControllerReviewResult",
+    "ControllerTransportError",
     "PROMPT_ID",
     "EvidenceArtifact",
     "EvidenceDelta",
