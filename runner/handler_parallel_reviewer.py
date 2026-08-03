@@ -292,7 +292,7 @@ def _controller_snapshot(
         "--untracked-files=all",
         allow_empty=True,
     )
-    if not source_status:
+    if not source_status and not declared_evidence:
         return source, observed_head
 
     snapshot_root = pathlib.Path.home() / ".dark-factory" / "controller-snapshots"
@@ -378,6 +378,19 @@ def _controller_snapshot(
         )
         if staged.returncode != 0:
             raise ValueError(staged.stderr.strip() or "could not stage controller snapshot")
+        if declared_evidence:
+            staged_evidence = subprocess.run(
+                ["git", "-C", str(snapshot), "add", "-f", "--", *declared_evidence],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if staged_evidence.returncode != 0:
+                raise ValueError(
+                    staged_evidence.stderr.strip()
+                    or "could not stage declared controller evidence"
+                )
         if not _git_output(snapshot, "status", "--porcelain=v1", allow_empty=True):
             raise ValueError("controller review requires a non-empty worker diff")
         committed = subprocess.run(
@@ -426,6 +439,29 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
 
     source_workdir = _handlers_shim._target_worktree(ctx)
     declared_evidence = _controller_evidence_paths(node, ctx)
+    try:
+        holdout_roots = tuple(
+            str(pathlib.Path(root).resolve(strict=False))
+            for root in _holdout_root_strings()
+        )
+    except Exception:
+        holdout_roots = ()
+    source_inputs = ReviewInputs(
+        repository=source_workdir.name,
+        workspace_path=str(source_workdir),
+        base_sha=expected_sha,
+        head_sha=expected_sha,
+        tree_sha=_git_output(source_workdir, "rev-parse", f"{expected_sha}^{{tree}}"),
+        task_text="",
+        diff_text="",
+        changed_files=(),
+        evidence=_controller_evidence(node, ctx, source_workdir),
+        run_id=str(ctx.run_id or ""),
+    )
+    try:
+        validate_immutable_target(source_inputs, holdout_roots=holdout_roots)
+    except ReviewContractError as exc:
+        raise ValueError(f"controller review source is not immutable: {exc}") from exc
     workdir, expected_sha = _controller_snapshot(
         source_workdir, expected_sha, declared_evidence
     )
@@ -475,13 +511,6 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
         evidence=_controller_evidence(node, ctx, workdir),
         run_id=str(ctx.run_id or ""),
     )
-    try:
-        holdout_roots = tuple(
-            str(pathlib.Path(root).resolve(strict=False))
-            for root in _holdout_root_strings()
-        )
-    except Exception:
-        holdout_roots = ()
     try:
         validate_immutable_target(inputs, holdout_roots=holdout_roots)
     except ReviewContractError as exc:

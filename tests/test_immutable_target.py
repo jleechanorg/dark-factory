@@ -373,6 +373,65 @@ class ControllerSnapshotTests(unittest.TestCase):
             },
         ])
 
+    def test_ignored_only_source_uses_filtered_snapshot_for_declared_evidence(self) -> None:
+        """Declared ignored evidence cannot make the original workspace reviewable."""
+        from runner.handler_core import Context
+        from runner.handler_parallel_reviewer import _controller_review_request
+        from runner.parser import Node
+
+        (self.repo / ".gitignore").write_text("evidence/\nruntime/\n")
+        _git(self.repo, "add", ".gitignore")
+        _git(self.repo, "commit", "-q", "-m", "ignore runtime data")
+        _git(self.repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+        evidence_dir = self.repo / "evidence"
+        evidence_dir.mkdir()
+        evidence = evidence_dir / "controller.json"
+        evidence.write_text('{"status":"ignored-only"}\n')
+        runtime_dir = self.repo / "runtime"
+        runtime_dir.mkdir()
+        (runtime_dir / "secret.txt").write_text("must not enter review snapshot\n")
+
+        request = _controller_review_request(
+            Node(name="cold_reviewer", attrs={"evidence_paths": "evidence/controller.json"}),
+            Context(goal="review ignored-only evidence", workdir=self.repo),
+            _git(self.repo, "rev-parse", "HEAD").strip(),
+        )
+        snapshot = Path(json.loads(request.envelope_json)["target"]["workspace_path"])
+
+        self.assertNotEqual(snapshot, self.repo)
+        self.assertEqual((snapshot / "evidence" / "controller.json").read_text(), evidence.read_text())
+        self.assertFalse((snapshot / "runtime" / "secret.txt").exists())
+
+    def test_holdout_ao_worktree_is_rejected_before_snapshot(self) -> None:
+        """A dirty AO worktree inside the sealed root cannot be relocated for review."""
+        from unittest.mock import patch
+
+        from runner.handler_core import Context
+        from runner.handler_parallel_reviewer import _controller_review_request
+        from runner.parser import Node
+
+        holdout = self.tmp / "sealed-holdout"
+        source = holdout / "ao-worktree"
+        source.mkdir(parents=True)
+        _git(source, "init", "-q", "--initial-branch=main")
+        _git(source, "config", "user.email", "jleechan2015@users.noreply.github.com")
+        _git(source, "config", "user.name", "ci")
+        (source / "README.md").write_text("base\n")
+        _git(source, "add", "README.md")
+        _git(source, "commit", "-q", "-m", "init")
+        _git(source, "update-ref", "refs/remotes/origin/main", "HEAD")
+        (source / "README.md").write_text("dirty holdout\n")
+
+        ctx = Context(goal="must not review holdout", workdir=self.repo)
+        ctx.state["ao.worktree"] = str(source)
+        with patch.dict(os.environ, {"DARK_FACTORY_HOLDOUTS": str(holdout)}):
+            with self.assertRaisesRegex(ValueError, "sealed holdout"):
+                _controller_review_request(
+                    Node(name="cold_reviewer", attrs={}),
+                    ctx,
+                    _git(source, "rev-parse", "HEAD").strip(),
+                )
+
 
 def replace_evidence(
     inputs: ReviewInputs, evidence: tuple[EvidenceArtifact, ...]
