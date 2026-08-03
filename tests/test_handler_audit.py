@@ -50,6 +50,7 @@ def _prime_operator_test(ha, monkeypatch, ctx, head: str, snapshot: pathlib.Path
     ctx.state["_df_controller_trust_head"] = head
     monkeypatch.setattr(ha, "_target_provenance", lambda workdir: (head, "f" * 64))
     monkeypatch.setattr(ha, "_controller_trust_head", lambda workdir: head)
+    monkeypatch.setattr(ha, "_validate_controller_trust_head", lambda workdir, value: value)
     def load_test_manifest(workdir, trusted_head=None):
         manifest = real_loader(workdir)
         monkeypatch.setattr(ha, "_CANONICAL_OPERATOR_POLICY_SHA256", manifest.policy_sha256)
