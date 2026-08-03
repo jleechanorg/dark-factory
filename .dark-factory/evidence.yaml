@@ -3,7 +3,9 @@ operator_verification:
   commands:
     - id: worker-safe-targeted
       argv:
-        - .venv/bin/pytest
+        - "@runner-python"
+        - -m
+        - pytest
         - -q
         - -o
         - pythonpath=.
@@ -36,7 +38,9 @@ operator_verification:
       classification: required
     - id: operator-unwrapped-six
       argv:
-        - .venv/bin/pytest
+        - "@runner-python"
+        - -m
+        - pytest
         - -q
         - -o
         - pythonpath=.

@@ -16,6 +16,7 @@ import json
 import os
 import pathlib
 import sys
+import contextlib
 
 import pytest
 
@@ -44,11 +45,25 @@ def _write_operator_manifest(tmp_path: pathlib.Path, body: str) -> pathlib.Path:
     return manifest
 
 
+def _prime_operator_test(ha, monkeypatch, ctx, head: str, snapshot: pathlib.Path) -> None:
+    real_loader = ha._load_operator_manifest
+    ctx.state["_df_run_initial_head"] = head
+    monkeypatch.setattr(ha, "_target_provenance", lambda workdir: (head, "f" * 64))
+    monkeypatch.setattr(
+        ha, "_load_operator_manifest",
+        lambda workdir, trusted_head=None: real_loader(workdir),
+    )
+    monkeypatch.setattr(
+        ha, "_trusted_operator_snapshot",
+        lambda *args: contextlib.nullcontext(snapshot),
+    )
+    monkeypatch.setattr(
+        ha._handlers_shim, "_sandboxed_args_for_workdir",
+        lambda args, workdir: ["/sandbox-exec", *args],
+    )
+
+
 def test_operator_manifest_loads_only_exact_argv_entries(tmp_path: pathlib.Path) -> None:
-    tool = tmp_path / "tools" / "fake-pytest"
-    tool.parent.mkdir()
-    tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    tool.chmod(0o700)
     _write_operator_manifest(
         tmp_path,
         """\
@@ -56,7 +71,7 @@ operator_verification:
   schema_version: 1
   commands:
     - id: worker-targeted
-      argv: [tools/fake-pytest, -q, tests/test_one.py]
+      argv: ["@runner-python", -m, pytest, -q, tests/test_one.py]
       lane: worker_safe
       timeout_seconds: 60
       classification: required
@@ -68,19 +83,78 @@ operator_verification:
     )
 
     import runner.handlers  # noqa: F401
+    import runner.handlers  # noqa: F401
     import runner.handler_audit as ha
 
     manifest = ha._load_operator_manifest(tmp_path)
 
     assert manifest.schema_version == 1
-    assert manifest.commands[0].argv == (
-        str(tool.resolve()),
-        "-q",
-        "tests/test_one.py",
+    assert manifest.commands[0].requested_argv == (
+        "@runner-python", "-m", "pytest", "-q", "tests/test_one.py"
     )
+    assert manifest.commands[0].effective_argv == (
+        str(pathlib.Path(sys.executable).resolve()),
+        "-m", "pytest", "-q", "tests/test_one.py",
+    )
+    assert manifest.commands[0].transform_chain == ("@runner-python",)
     assert manifest.commands[0].lane == "worker_safe"
     assert manifest.exclusions[0].classification == "excluded"
-    assert os.access(manifest.commands[0].argv[0], os.X_OK)
+    assert os.access(manifest.commands[0].effective_argv[0], os.X_OK)
+
+
+def test_operator_manifest_rejects_worktree_executable(tmp_path: pathlib.Path) -> None:
+    tool = tmp_path / "tools" / "fake-pytest"
+    tool.parent.mkdir()
+    tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    tool.chmod(0o700)
+    _write_operator_manifest(
+        tmp_path,
+        """operator_verification:
+  schema_version: 1
+  commands:
+    - id: mutable
+      argv: [tools/fake-pytest]
+      lane: operator_unwrapped
+      timeout_seconds: 30
+      classification: required
+  exclusions: []
+""",
+    )
+    import runner.handler_audit as ha
+
+    with pytest.raises(ValueError, match="runner-owned"):
+        ha._load_operator_manifest(tmp_path)
+
+
+def test_operator_manifest_can_be_pinned_to_trusted_commit(tmp_path: pathlib.Path) -> None:
+    subprocess = __import__("subprocess")
+    subprocess.run(["/usr/bin/git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["/usr/bin/git", "config", "user.email", "jleechan2015@users.noreply.github.com"], cwd=tmp_path, check=True)
+    subprocess.run(["/usr/bin/git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    path = _write_operator_manifest(
+        tmp_path,
+        """operator_verification:
+  schema_version: 1
+  commands:
+    - id: pinned
+      argv: ["@runner-python", -m, pytest, -q]
+      lane: worker_safe
+      timeout_seconds: 30
+      classification: required
+  exclusions: []
+""",
+    )
+    subprocess.run(["/usr/bin/git", "add", ".dark-factory/evidence.yaml"], cwd=tmp_path, check=True)
+    subprocess.run(["/usr/bin/git", "commit", "-qm", "manifest"], cwd=tmp_path, check=True)
+    head = subprocess.run(["/usr/bin/git", "rev-parse", "HEAD"], cwd=tmp_path, check=True, capture_output=True, text=True).stdout.strip()
+    path.write_text("operator_verification: malicious\n", encoding="utf-8")
+    import runner.handlers  # noqa: F401
+    import runner.handler_audit as ha
+
+    manifest = ha._load_operator_manifest(tmp_path, trusted_head=head)
+
+    assert manifest.commands[0].id == "pinned"
+    assert manifest.raw_bytes != path.read_bytes()
 
 
 @pytest.mark.parametrize(
@@ -161,7 +235,7 @@ operator_verification:
   schema_version: 1
   commands:
     - id: worker-targeted
-      argv: [tools/fake-pytest, -q, tests/test_one.py]
+      argv: ["@runner-python", -m, pytest, -q, tests/test_one.py]
       lane: worker_safe
       timeout_seconds: 60
       classification: required
@@ -204,6 +278,7 @@ operator_verification:
         run_id="run-1",
     )
     ctx._df_current_attempt = 1
+    _prime_operator_test(ha, monkeypatch, ctx, head, tmp_path / "trusted")
 
     result = ha._operator_verify(
         Node(name="operator_verify", attrs={"type": "operator_verify"}), ctx
@@ -216,7 +291,10 @@ operator_verification:
         ("/usr/bin/git", "diff", "--check", "origin/main..HEAD"),
         ("/usr/bin/git", "status", "--porcelain=v1"),
     ]
-    assert calls[4][0] == (str(tool.resolve()), "-q", "tests/test_one.py")
+    assert calls[4][0] == (
+        "/sandbox-exec", str(pathlib.Path(sys.executable).resolve()),
+        "-m", "pytest", "-q", "tests/test_one.py",
+    )
     assert calls[-1][0] == ("/usr/bin/git", "rev-parse", "HEAD")
     assert all(call[1]["cwd"] == tmp_path.resolve() for call in calls)
     assert all(call[1]["env"] == {"SAFE": "1"} for call in calls)
@@ -237,6 +315,10 @@ operator_verification:
     assert status["requested_argv"] == status["effective_argv"]
     assert status["transform_chain"] == []
     assert status["stdout"]["size_bytes"] == 0
+    worker = receipt["commands"][4]
+    assert worker["requested_argv"][0] == "@runner-python"
+    assert worker["effective_argv"][0] == "/sandbox-exec"
+    assert worker["transform_chain"] == ["@runner-python", "worker-holdout-sandbox"]
 
 
 @pytest.mark.parametrize("backend", ["echo", "mock_llm"])
@@ -293,9 +375,9 @@ def test_repository_operator_manifest_has_exact_sandbox_split() -> None:
         "tests/test_hardening.py::test_visible_all_nodes_benchmark_has_no_embedded_holdout_contract",
     ]
     assert [arg.removeprefix("--deselect=") for arg in worker.argv if arg.startswith("--deselect=")] == expected_nodes
-    assert list(worker.argv[1:4]) == ["-q", "-o", "pythonpath=."]
-    assert list(operator.argv[1:4]) == ["-q", "-o", "pythonpath=."]
-    assert list(operator.argv[4:]) == expected_nodes
+    assert list(worker.requested_argv[:6]) == ["@runner-python", "-m", "pytest", "-q", "-o", "pythonpath=."]
+    assert list(operator.requested_argv[:6]) == ["@runner-python", "-m", "pytest", "-q", "-o", "pythonpath=."]
+    assert list(operator.requested_argv[6:]) == expected_nodes
     assert [(item.id, item.classification) for item in manifest.exclusions] == [
         ("bounded-conformance", "excluded"),
         ("private-self-hosted-runner", "excluded"),
@@ -348,7 +430,7 @@ operator_verification:
   schema_version: 1
   commands:
     - id: secret-probe
-      argv: [tools/fake-pytest]
+      argv: ["@runner-python", -m, pytest]
       lane: operator_unwrapped
       timeout_seconds: 30
       classification: required
@@ -376,6 +458,7 @@ operator_verification:
     monkeypatch.setattr(ha, "_operator_log_root", lambda: raw_root)
     monkeypatch.setattr(ha._handlers_shim, "_sanitized_env", lambda: {})
     ctx = Context(goal="redact", workdir=tmp_path, backend="codex", run_id="secret")
+    _prime_operator_test(ha, monkeypatch, ctx, head.decode().strip(), tmp_path / "trusted")
     result = ha._operator_verify(
         Node(name="operator_verify", attrs={"type": "operator_verify"}), ctx
     )
@@ -455,7 +538,7 @@ operator_verification:
   schema_version: 1
   commands:
     - id: probe
-      argv: [tools/fake-pytest]
+      argv: ["@runner-python", -m, pytest]
       lane: operator_unwrapped
       timeout_seconds: 30
       classification: required
@@ -484,12 +567,14 @@ operator_verification:
     if patch_raw_write is not None:
         patch_raw_write(ha, monkeypatch)
     ctx = Context(goal="fail closed", workdir=tmp_path, backend="codex", run_id="fail")
+    initial_head = results[0].stdout.decode().strip()
+    _prime_operator_test(ha, monkeypatch, ctx, initial_head, tmp_path / "trusted")
     return ha._operator_verify(
         Node(name="operator_verify", attrs={"type": "operator_verify"}), ctx
     )
 
 
-def test_operator_verify_fails_closed_on_source_and_manifest_drift(
+def test_operator_verify_fails_closed_on_source_and_workspace_drift(
     tmp_path: pathlib.Path, monkeypatch
 ) -> None:
     from runner.subprocess_control import BoundedProcessBytesResult
@@ -505,18 +590,23 @@ def test_operator_verify_fails_closed_on_source_and_manifest_drift(
     assert source_result.outcome == "error"
     assert source_result.metadata["error_type"] == "source_head_drift"
 
+    import runner.handler_audit as ha
+
     def drift_after_head(call, manifest):
         if call == 1:
-            manifest.write_text(manifest.read_text() + "\n# drift\n", encoding="utf-8")
+            monkeypatch.setattr(
+                ha, "_target_provenance",
+                lambda workdir: (head.decode().strip(), "e" * 64),
+            )
 
-    manifest_result = _run_fake_operator(
-        tmp_path / "manifest",
+    workspace_result = _run_fake_operator(
+        tmp_path / "workspace",
         monkeypatch,
-        [ok(head)],
+        [ok(head), ok(), ok(), ok(), ok(), ok(head)],
         after_call=drift_after_head,
     )
-    assert manifest_result.outcome == "error"
-    assert manifest_result.metadata["error_type"] == "ValueError"
+    assert workspace_result.outcome == "error"
+    assert workspace_result.metadata["error_type"] == "workspace_drift"
 
 
 def test_operator_verify_fails_closed_on_timeout_oversize_and_raw_write_failure(
@@ -545,13 +635,29 @@ def test_operator_verify_fails_closed_on_timeout_oversize_and_raw_write_failure(
     assert nonzero_result.outcome == "failure"
     assert nonzero_result.metadata["error_type"] == "nonzero_exit"
 
-    oversized = ok(b"x" * (ha._OPERATOR_RAW_STREAM_MAX_BYTES + 1))
+    oversized = BoundedProcessBytesResult(
+        ("fake",), -15, b"bounded", b"", False,
+        process_group_cleanup="terminated", output_overflowed=True,
+    )
     oversize_result = _run_fake_operator(
         tmp_path / "oversize",
         monkeypatch,
         [ok(head), ok(), ok(), ok(), oversized],
     )
     assert oversize_result.outcome == "error"
+    assert oversize_result.metadata["error_type"] == "output_overflow"
+
+    cleanup_failed = BoundedProcessBytesResult(
+        ("fake",), 0, b"", b"", False,
+        process_group_cleanup="failed",
+    )
+    cleanup_result = _run_fake_operator(
+        tmp_path / "cleanup",
+        monkeypatch,
+        [ok(head), ok(), ok(), ok(), cleanup_failed],
+    )
+    assert cleanup_result.outcome == "error"
+    assert cleanup_result.metadata["error_type"] == "process_group_cleanup"
 
     def fail_raw_write(module, mp):
         real_write = module._write_private_bytes
@@ -586,7 +692,7 @@ operator_verification:
   schema_version: 1
   commands:
     - id: secret-probe
-      argv: [tools/fake-pytest]
+      argv: ["@runner-python", -m, pytest]
       lane: operator_unwrapped
       timeout_seconds: 30
       classification: required
@@ -637,6 +743,7 @@ digraph OperatorSecret {
         cxdb_path=cxdb,
         event_log_path=events,
     )
+    _prime_operator_test(ha, monkeypatch, ctx, head.decode().strip(), tmp_path / "trusted")
     graph = parse(graph_path)
     history = run(graph, ctx, checkpoint=checkpoint)
     bundle = tmp_path / "bundle"

@@ -223,6 +223,15 @@ def run(
     checkpointed last step.
     """
     history: list = []
+    if ctx.workdir is not None:
+        from .handler_audit import _target_provenance
+
+        try:
+            initial_head, initial_workspace = _target_provenance(pathlib.Path(ctx.workdir))
+        except (OSError, subprocess.SubprocessError, UnicodeError, ValueError):
+            initial_head, initial_workspace = "", ""
+        ctx.state["_df_run_initial_head"] = initial_head
+        ctx.state["_df_run_initial_workspace_sha256"] = initial_workspace
     visits: dict[str, int] = {}
     # Per-node ring of recent output hashes for the no_progress detector
     # (D3 in feedback 2026-06-22). When a node produces the same output

@@ -23,6 +23,36 @@ from runner.handlers import Context, Result, TYPE_REGISTRY  # noqa: E402
 from runner.parser import parse  # noqa: E402
 
 
+def test_run_captures_target_provenance_before_first_node(tmp_path, monkeypatch):
+    subprocess.run(["/usr/bin/git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["/usr/bin/git", "config", "user.email", "jleechan2015@users.noreply.github.com"], cwd=tmp_path, check=True)
+    subprocess.run(["/usr/bin/git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    (tmp_path / "tracked.txt").write_text("initial\n", encoding="utf-8")
+    subprocess.run(["/usr/bin/git", "add", "tracked.txt"], cwd=tmp_path, check=True)
+    subprocess.run(["/usr/bin/git", "commit", "-qm", "initial"], cwd=tmp_path, check=True)
+    expected_head = subprocess.run(
+        ["/usr/bin/git", "rev-parse", "HEAD"], cwd=tmp_path, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    dot = tmp_path / "provenance.dot"
+    dot.write_text(
+        "digraph provenance { start [shape=Mdiamond] observe [type=observe] "
+        "exit [shape=Msquare] start -> observe -> exit }",
+        encoding="utf-8",
+    )
+    observed = {}
+
+    def observe(node, ctx):
+        observed.update(ctx.state)
+        return Result(outcome="success")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "observe", observe)
+    run(parse(dot), Context(goal="provenance", workdir=tmp_path, backend="echo"))
+
+    assert observed["_df_run_initial_head"] == expected_head
+    assert len(observed["_df_run_initial_workspace_sha256"]) == 64
+
+
 @pytest.mark.parametrize(
     ("outcomes", "expected_calls", "expected_outcome"),
     [

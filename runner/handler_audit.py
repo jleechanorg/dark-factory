@@ -21,6 +21,8 @@ import json
 import os
 import pathlib
 import re
+import contextlib
+import tempfile
 import subprocess
 import sys
 import time
@@ -62,13 +64,41 @@ _OPERATOR_RECEIPT_MAX_BYTES = 1 << 20
 _OPERATOR_BUILTINS: tuple[OperatorCommand, ...] = ()  # populated after dataclass declaration
 
 
+def _target_provenance(workdir: pathlib.Path) -> tuple[str, str]:
+    """Return trusted HEAD plus a deterministic target-workspace fingerprint."""
+    root = workdir.resolve()
+    head = subprocess.run(
+        ["/usr/bin/git", "rev-parse", "HEAD"],
+        cwd=root,
+        capture_output=True,
+        check=True,
+        timeout=30,
+    ).stdout.strip().decode("ascii", errors="strict").lower()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
+        raise ValueError("target HEAD is malformed")
+    pathspec = ("--", ".", ":(exclude)evidence/operator-verification.json")
+    commands = (
+        ("/usr/bin/git", "status", "--porcelain=v1", "-z", "--untracked-files=all", *pathspec),
+        ("/usr/bin/git", "diff", "--binary", "HEAD", *pathspec),
+        ("/usr/bin/git", "diff", "--binary", "--cached", "HEAD", *pathspec),
+    )
+    digest = hashlib.sha256()
+    for argv in commands:
+        result = subprocess.run(
+            argv, cwd=root, capture_output=True, check=True, timeout=30
+        )
+        digest.update(len(result.stdout).to_bytes(8, "big"))
+        digest.update(result.stdout)
+    return head, digest.hexdigest()
+
+
 def _reject_unknown_keys(value: dict, allowed: frozenset[str], label: str) -> None:
     unknown = set(value) - allowed
     if unknown:
         raise ValueError(f"{label} has unknown keys: {sorted(unknown)}")
 
 
-def _operator_executable(workdir: pathlib.Path, raw: str) -> str:
+def _operator_executable(workdir: pathlib.Path, raw: str) -> tuple[str, tuple[str, ...]]:
     if "\0" in raw:
         raise ValueError("operator executable contains NUL")
     candidate = pathlib.Path(raw)
@@ -77,34 +107,28 @@ def _operator_executable(workdir: pathlib.Path, raw: str) -> str:
             raise ValueError("operator executable is not an exact allowlist entry")
         if candidate.is_symlink() or not candidate.is_file() or not os.access(candidate, os.X_OK):
             raise ValueError("allowlisted operator executable is unavailable")
-        return raw
-
-    if ".." in candidate.parts:
-        raise ValueError("operator executable escapes the target worktree")
-    root = workdir.resolve()
-    lexical = root / candidate
-    current = root
-    for part in candidate.parts:
-        current = current / part
-        if current.is_symlink():
-            raise ValueError("operator executable path contains a symlink")
-    resolved = lexical.resolve()
-    try:
-        resolved.relative_to(root)
-    except ValueError as exc:
-        raise ValueError("operator executable escapes the target worktree") from exc
-    if not resolved.is_file() or not os.access(resolved, os.X_OK):
-        raise ValueError("operator executable must be a regular executable inside the worktree")
-    return str(resolved)
+        return raw, ()
+    if raw == "@runner-python":
+        executable = pathlib.Path(sys.executable).resolve()
+        if executable.is_symlink() or not executable.is_file() or not os.access(executable, os.X_OK):
+            raise ValueError("runner Python executable is unavailable")
+        return str(executable), ("@runner-python",)
+    raise ValueError("operator executable must be a runner-owned token or exact allowlist entry")
 
 
 @dataclass(frozen=True, slots=True)
 class OperatorCommand:
     id: str
-    argv: tuple[str, ...]
+    requested_argv: tuple[str, ...]
+    effective_argv: tuple[str, ...]
     lane: str
     timeout_seconds: int
     classification: str
+    transform_chain: tuple[str, ...] = ()
+
+    @property
+    def argv(self) -> tuple[str, ...]:
+        return self.effective_argv
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,9 +147,35 @@ class OperatorManifest:
     raw_bytes: bytes
 
 
+@contextlib.contextmanager
+def _trusted_operator_snapshot(
+    workdir: pathlib.Path, trusted_head: str, parent: pathlib.Path
+):
+    snapshot = pathlib.Path(tempfile.mkdtemp(prefix="trusted-snapshot-", dir=parent))
+    snapshot.rmdir()
+    subprocess.run(
+        ["/usr/bin/git", "worktree", "add", "--detach", str(snapshot), trusted_head],
+        cwd=workdir,
+        capture_output=True,
+        check=True,
+        timeout=60,
+    )
+    try:
+        yield snapshot
+    finally:
+        subprocess.run(
+            ["/usr/bin/git", "worktree", "remove", "--force", str(snapshot)],
+            cwd=workdir,
+            capture_output=True,
+            check=False,
+            timeout=60,
+        )
+
+
 _OPERATOR_BUILTINS = (
     OperatorCommand(
         "git-head",
+        ("/usr/bin/git", "rev-parse", "HEAD"),
         ("/usr/bin/git", "rev-parse", "HEAD"),
         "operator_unwrapped",
         30,
@@ -134,12 +184,14 @@ _OPERATOR_BUILTINS = (
     OperatorCommand(
         "git-diff-names",
         ("/usr/bin/git", "diff", "--name-only", "origin/main..HEAD"),
+        ("/usr/bin/git", "diff", "--name-only", "origin/main..HEAD"),
         "operator_unwrapped",
         30,
         "required",
     ),
     OperatorCommand(
         "git-diff-check",
+        ("/usr/bin/git", "diff", "--check", "origin/main..HEAD"),
         ("/usr/bin/git", "diff", "--check", "origin/main..HEAD"),
         "operator_unwrapped",
         30,
@@ -148,6 +200,7 @@ _OPERATOR_BUILTINS = (
     OperatorCommand(
         "git-status",
         ("/usr/bin/git", "status", "--porcelain=v1"),
+        ("/usr/bin/git", "status", "--porcelain=v1"),
         "operator_unwrapped",
         30,
         "required",
@@ -155,6 +208,7 @@ _OPERATOR_BUILTINS = (
 )
 _OPERATOR_FINAL_HEAD = OperatorCommand(
     "git-head-final",
+    ("/usr/bin/git", "rev-parse", "HEAD"),
     ("/usr/bin/git", "rev-parse", "HEAD"),
     "operator_unwrapped",
     30,
@@ -215,17 +269,18 @@ def _command_receipt(
     stdout_path: pathlib.Path,
     stderr_path: pathlib.Path,
 ) -> dict[str, object]:
-    argv = list(command.argv)
     return {
         "id": command.id,
         "lane": command.lane,
         "classification": command.classification,
-        "requested_argv": argv,
-        "effective_argv": argv,
-        "transform_chain": [],
+        "requested_argv": list(command.requested_argv),
+        "effective_argv": list(command.effective_argv),
+        "transform_chain": list(command.transform_chain),
         "cwd": str(cwd),
         "exit_code": result.returncode,
         "timed_out": result.timed_out,
+        "output_overflowed": result.output_overflowed,
+        "process_group_cleanup": result.process_group_cleanup,
         "duration_ms": duration_ms,
         "stdout": _stream_reference(stdout_path, result.stdout),
         "stderr": _stream_reference(stderr_path, result.stderr),
@@ -266,10 +321,15 @@ def _validate_operator_receipt(
         raise ValueError("operator verification receipt was tampered after creation")
     private_root = _operator_log_root().resolve()
     for command in receipt.get("commands", []):
-        if command.get("requested_argv") != command.get("effective_argv"):
-            raise ValueError("operator verification argv mismatch")
-        if command.get("transform_chain") != []:
-            raise ValueError("operator verification transform chain is not empty")
+        requested = command.get("requested_argv")
+        effective = command.get("effective_argv")
+        transforms = command.get("transform_chain")
+        if not isinstance(requested, list) or not requested:
+            raise ValueError("operator verification requested argv is invalid")
+        if not isinstance(effective, list) or not effective:
+            raise ValueError("operator verification effective argv is invalid")
+        if requested != effective and not transforms:
+            raise ValueError("operator verification argv transform is missing")
         for stream_name in ("stdout", "stderr"):
             reference = command.get(stream_name, {})
             raw_path = pathlib.Path(str(reference.get("path", "")))
@@ -287,11 +347,24 @@ def _validate_operator_receipt(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _load_operator_manifest(workdir: pathlib.Path) -> OperatorManifest:
+def _load_operator_manifest(
+    workdir: pathlib.Path, *, trusted_head: str | None = None
+) -> OperatorManifest:
     manifest_path = workdir / ".dark-factory" / "evidence.yaml"
-    if manifest_path.is_symlink() or not manifest_path.is_file():
-        raise ValueError("operator verification manifest is missing or a symlink")
-    raw = manifest_path.read_bytes()
+    if trusted_head is None:
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            raise ValueError("operator verification manifest is missing or a symlink")
+        raw = manifest_path.read_bytes()
+    else:
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", trusted_head):
+            raise ValueError("trusted manifest commit is malformed")
+        raw = subprocess.run(
+            ["/usr/bin/git", "show", f"{trusted_head}:.dark-factory/evidence.yaml"],
+            cwd=workdir,
+            capture_output=True,
+            check=True,
+            timeout=30,
+        ).stdout
     if len(raw) > _OPERATOR_MANIFEST_MAX_BYTES:
         raise ValueError("operator verification manifest exceeds size bound")
     import yaml
@@ -351,13 +424,16 @@ def _load_operator_manifest(workdir: pathlib.Path) -> OperatorManifest:
             or not _OPERATOR_TIMEOUT_MIN_SECONDS <= timeout <= _OPERATOR_TIMEOUT_MAX_SECONDS
         ):
             raise ValueError("operator command timeout is outside the bounded range")
+        executable, transform_chain = _operator_executable(workdir, argv[0])
         commands.append(
             OperatorCommand(
                 id=command_id,
-                argv=(_operator_executable(workdir, argv[0]), *argv[1:]),
+                requested_argv=tuple(argv),
+                effective_argv=(executable, *argv[1:]),
                 lane=lane,
                 timeout_seconds=timeout,
                 classification=classification,
+                transform_chain=transform_chain,
             )
         )
 
@@ -431,7 +507,11 @@ def _operator_verify(node: "Node", ctx: "Context") -> Result:
             },
         )
     try:
-        manifest = _load_operator_manifest(workdir)
+        trusted_manifest_head = str(ctx.state.get("_df_run_initial_head") or "")
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", trusted_manifest_head):
+            raise ValueError("operator verification lacks trusted run-initial HEAD")
+        entry_head, entry_workspace = _target_provenance(workdir)
+        manifest = _load_operator_manifest(workdir, trusted_head=trusted_manifest_head)
         manifest_sha = hashlib.sha256(manifest.raw_bytes).hexdigest()
         visit = 1 + sum(
             1 for item in ctx.history if item.get("node") == node.name
@@ -457,68 +537,94 @@ def _operator_verify(node: "Node", ctx: "Context") -> Result:
     final_head = ""
     commands = (*_OPERATOR_BUILTINS, *manifest.commands, _OPERATOR_FINAL_HEAD)
     env = _handlers_shim._sanitized_env()
+    try:
+        snapshot_context = (
+            _trusted_operator_snapshot(workdir, trusted_manifest_head, raw_dir)
+            if any(item.lane == "operator_unwrapped" for item in manifest.commands)
+            else contextlib.nullcontext(workdir)
+        )
+        with snapshot_context as trusted_snapshot:
+            for index, command in enumerate(commands, start=1):
+                try:
+                    execution = command
+                    command_cwd = workdir
+                    if command in manifest.commands and command.lane == "worker_safe":
+                        wrapped = _handlers_shim._sandboxed_args_for_workdir(
+                            list(command.effective_argv), workdir
+                        )
+                        if wrapped is None:
+                            raise RuntimeError("operator worker-safe sandbox unavailable")
+                        execution = OperatorCommand(
+                            command.id, command.requested_argv, tuple(wrapped),
+                            command.lane, command.timeout_seconds, command.classification,
+                            (*command.transform_chain, "worker-holdout-sandbox"),
+                        )
+                    elif command in manifest.commands and command.lane == "operator_unwrapped":
+                        command_cwd = trusted_snapshot
+                        execution = OperatorCommand(
+                            command.id, command.requested_argv, command.effective_argv,
+                            command.lane, command.timeout_seconds, command.classification,
+                            (*command.transform_chain, "trusted-run-initial-snapshot"),
+                        )
+                    started = time.monotonic_ns()
+                    result = run_bounded_process_bytes(
+                        execution.effective_argv,
+                        cwd=command_cwd,
+                        timeout=command.timeout_seconds,
+                        env=env,
+                        max_output_bytes=_OPERATOR_RAW_STREAM_MAX_BYTES,
+                    )
+                    duration_ms = max(0, (time.monotonic_ns() - started) // 1_000_000)
+                    stdout_path = raw_dir / f"{index:02d}-{command.id}.stdout.bin"
+                    stderr_path = raw_dir / f"{index:02d}-{command.id}.stderr.bin"
+                    _write_private_bytes(stdout_path, result.stdout)
+                    _write_private_bytes(stderr_path, result.stderr)
+                    receipt_commands.append(
+                        _command_receipt(
+                            execution, result, cwd=command_cwd,
+                            duration_ms=duration_ms, stdout_path=stdout_path,
+                            stderr_path=stderr_path,
+                        )
+                    )
+                    if command.id == "git-head":
+                        target_head = result.stdout.decode("ascii", errors="strict").strip().lower()
+                        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", target_head):
+                            raise ValueError("operator verification target HEAD is malformed")
+                    elif command.id == "git-head-final":
+                        final_head = result.stdout.decode("ascii", errors="strict").strip().lower()
+                    if result.output_overflowed:
+                        failure_outcome, failure_type = "error", "output_overflow"
+                        break
+                    if result.process_group_cleanup == "failed":
+                        failure_outcome, failure_type = "error", "process_group_cleanup"
+                        break
+                    if result.timed_out:
+                        failure_outcome, failure_type = "error", "timeout"
+                        break
+                    if result.returncode != 0:
+                        failure_outcome, failure_type = "failure", "nonzero_exit"
+                        break
+                except Exception as exc:
+                    failure_outcome, failure_type = "error", type(exc).__name__
+                    break
+    except Exception as exc:
+        failure_outcome, failure_type = "error", type(exc).__name__
 
-    for index, command in enumerate(commands, start=1):
-        try:
-            if manifest.path.read_bytes() != manifest.raw_bytes:
-                raise ValueError("operator verification manifest drifted during execution")
-            started = time.monotonic_ns()
-            result = run_bounded_process_bytes(
-                command.argv,
-                cwd=workdir,
-                timeout=command.timeout_seconds,
-                env=env,
-            )
-            duration_ms = max(0, (time.monotonic_ns() - started) // 1_000_000)
-            if (
-                len(result.stdout) > _OPERATOR_RAW_STREAM_MAX_BYTES
-                or len(result.stderr) > _OPERATOR_RAW_STREAM_MAX_BYTES
-            ):
-                raise ValueError("operator verification output exceeded size bound")
-            stdout_path = raw_dir / f"{index:02d}-{command.id}.stdout.bin"
-            stderr_path = raw_dir / f"{index:02d}-{command.id}.stderr.bin"
-            _write_private_bytes(stdout_path, result.stdout)
-            _write_private_bytes(stderr_path, result.stderr)
-            receipt_commands.append(
-                _command_receipt(
-                    command,
-                    result,
-                    cwd=workdir,
-                    duration_ms=duration_ms,
-                    stdout_path=stdout_path,
-                    stderr_path=stderr_path,
-                )
-            )
-            if command.id == "git-head":
-                target_head = result.stdout.decode("ascii", errors="strict").strip().lower()
-                if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", target_head):
-                    raise ValueError("operator verification target HEAD is malformed")
-            elif command.id == "git-head-final":
-                final_head = result.stdout.decode("ascii", errors="strict").strip().lower()
-            if result.timed_out:
-                failure_outcome = "error"
-                failure_type = "timeout"
-                break
-            if result.returncode != 0:
-                failure_outcome = "failure"
-                failure_type = "nonzero_exit"
-                break
-        except Exception as exc:
-            failure_outcome = "error"
-            failure_type = type(exc).__name__
-            break
-
+    if failure_outcome == "success" and target_head != entry_head:
+        failure_outcome = "error"
+        failure_type = "source_head_drift"
     if failure_outcome == "success" and final_head != target_head:
         failure_outcome = "error"
         failure_type = "source_head_drift"
     if failure_outcome == "success":
         try:
-            if manifest.path.read_bytes() != manifest.raw_bytes:
+            after_head, after_workspace = _target_provenance(workdir)
+            if after_head != entry_head or after_workspace != entry_workspace:
                 failure_outcome = "error"
-                failure_type = "manifest_drift"
-        except OSError:
+                failure_type = "workspace_drift"
+        except (OSError, subprocess.SubprocessError, UnicodeError, ValueError):
             failure_outcome = "error"
-            failure_type = "manifest_drift"
+            failure_type = "workspace_provenance"
 
     receipt = {
         "schema_version": 2,
