@@ -13,6 +13,7 @@ effects); the slim graph itself is pinned by tests/test_two_node_dot.py.
 from __future__ import annotations
 
 import pathlib
+import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).parent.parent
@@ -214,3 +215,29 @@ def test_tracked_command_and_installer_surfaces_publish_two_node_default() -> No
     assert "any reviewable target" in default_example
     assert "--pipeline" not in default_example
     assert "--feature" not in default_example
+
+
+def test_installer_generated_pre_commit_hook_is_exactly_ignored() -> None:
+    """The installer-owned hook stays executable without dirtying git status."""
+    generated_hook = ".githooks/pre-commit"
+    ignored = subprocess.run(
+        ["git", "check-ignore", "--no-index", "--verbose", "--", generated_hook],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert ignored.returncode == 0, ignored.stderr
+    assert f":{generated_hook}\t{generated_hook}" in ignored.stdout
+
+    tracked_hook = subprocess.run(
+        ["git", "check-ignore", "--no-index", "--", ".githooks/pre-push"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert tracked_hook.returncode == 1, (
+        "Only the generated pre-commit hook may be ignored; tracked hook "
+        f"coverage must remain visible. stdout={tracked_hook.stdout!r}"
+    )
