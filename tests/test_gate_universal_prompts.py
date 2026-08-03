@@ -46,6 +46,7 @@ def test_gate_es_uses_universal_prompt_when_local_es_md_absent(tmp_path, monkeyp
     monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda p: fake_sha)
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _fake_run)
 
     result = _gate_es(node, ctx)
     assert result.outcome == "success"
@@ -88,6 +89,7 @@ def test_gate_code_standards_uses_universal_prompt_when_local_file_absent(tmp_pa
     monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda p: fake_sha)
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _fake_run)
 
     result = _gate_code_standards(node, ctx)
     assert result.outcome == "success"
@@ -139,6 +141,7 @@ def test_custom_prompt_gate_appends_coder_handoff_contract(tmp_path, monkeypatch
     monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda p: fake_sha)
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _fake_run)
 
     result = _run_custom_prompt_gate(node, ctx, "gate_er")
 

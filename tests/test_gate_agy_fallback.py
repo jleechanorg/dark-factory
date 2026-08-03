@@ -46,6 +46,7 @@ def test_gate_er_runs_agy_when_backend_agy(tmp_path, monkeypatch):
     monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda p: fake_sha)
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _fake_run)
 
     result = _gate_er(node, ctx)
 
@@ -77,6 +78,7 @@ def test_gate_agy_falls_back_to_claude_on_infra_failure(tmp_path, monkeypatch):
     monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda p: fake_sha)
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _fake_run)
 
     result = _gate_er(node, ctx)
 
@@ -108,6 +110,7 @@ def test_gate_agy_real_fail_verdict_not_retried(tmp_path, monkeypatch):
     monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda p: fake_sha)
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _fake_run)
 
     result = _gate_er(node, ctx)
 
@@ -144,6 +147,7 @@ def test_gate_er_falls_back_to_claude_on_agy_infra_failure(tmp_path, monkeypatch
     monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda p: fake_sha)
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _fake_run)
 
     result = _gate_er(node, ctx)
     assert result.outcome == "success"
@@ -176,6 +180,7 @@ def test_gate_er_does_not_fall_back_on_real_agy_verdict(tmp_path, monkeypatch):
     monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda p: fake_sha)
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _fake_run)
 
     result = _gate_er(node, ctx)
     assert result.outcome == "failure"

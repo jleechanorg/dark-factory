@@ -69,6 +69,7 @@ def test_gate_slash_materializes_user_scope_command(tmp_path, monkeypatch):
     monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda p: fake_sha)
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _fake_run)
 
     ctx = HCtx(goal="test", workdir=workdir, backend="claude")
     result = _gate_slash(_slash_node("zfc"), ctx)
@@ -101,6 +102,7 @@ def test_gate_slash_runs_named_command(tmp_path, monkeypatch):
     monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda p: fake_sha)
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", _fake_run)
 
     ctx = HCtx(goal="test", workdir=tmp_path, backend="claude")
     result = _gate_slash(_slash_node("zfc"), ctx)

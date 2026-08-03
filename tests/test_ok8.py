@@ -33,6 +33,7 @@ def test_gate_net_loc_success(tmp_path, monkeypatch):
         return _sp.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", mock_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", mock_run)
 
     result = _gate_net_loc(node, ctx)
     assert result.outcome == "success"
@@ -53,6 +54,7 @@ def test_gate_net_loc_failure(tmp_path, monkeypatch):
         return _sp.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", mock_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", mock_run)
 
     result = _gate_net_loc(node, ctx)
     assert result.outcome == "failure"
@@ -73,6 +75,7 @@ def test_gate_net_loc_binary_and_empty(tmp_path, monkeypatch):
         return _sp.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", mock_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", mock_run)
 
     result = _gate_net_loc(node, ctx)
     assert result.outcome == "success"
@@ -94,6 +97,7 @@ def test_gate_dead_code_pass(tmp_path, monkeypatch):
     monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda p: fake_sha)
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
     monkeypatch.setattr("subprocess.run", mock_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", mock_run)
 
     result = _gate_dead_code(node, ctx)
     assert result.outcome == "success"
@@ -114,6 +118,7 @@ def test_gate_dead_code_fail(tmp_path, monkeypatch):
     monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda p: fake_sha)
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
     monkeypatch.setattr("subprocess.run", mock_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", mock_run)
 
     result = _gate_dead_code(node, ctx)
     assert result.outcome == "failure"

@@ -62,6 +62,7 @@ def test_gate_audit_contract(monkeypatch, tmp_path):
         return FakeProcSuccess()
 
     monkeypatch.setattr("subprocess.run", fake_subprocess_run)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", fake_subprocess_run)
     ctx.state["target_pr"] = "123"
 
     # 3. Unresolved reviews test
@@ -83,6 +84,7 @@ def test_gate_audit_contract(monkeypatch, tmp_path):
             stderr = ""
         return FakeProcSuccess()
     monkeypatch.setattr("subprocess.run", fake_subprocess_run_approved)
+    monkeypatch.setattr("runner.handler_dispatch.run_bounded_process", fake_subprocess_run_approved)
 
     # 4. Replacement work with warn verdict test
     ctx.state["diff_summary"] = "5 files changed, 10 insertions(+), 50 deletions(-)" # net negative delta -> replacement
