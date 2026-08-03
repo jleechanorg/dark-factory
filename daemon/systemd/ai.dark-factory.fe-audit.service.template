@@ -1,0 +1,30 @@
+[Unit]
+Description=Dark Factory /factory-evolve daemon telemetry audit (G10-G13 feeder for /af)
+Documentation=https://github.com/jleechanorg/dark-factory
+# Phase 2.5 of the /factory-evolve skill (see ~/.claude/skills/factory-evolve/SKILL.md).
+# Runs fe-audit.sh which reads ~/Library/Logs/dark-factory/daemon.jsonl,
+# fires beads for any G10/G11/G12/G13 finding, and lets the always-on
+# ai.dark-factory.daemon.service dispatch them via /af.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@REPO@
+ExecStart=/bin/bash @HOME@/.hermes/scripts/systemd-wrapper.sh @REPO@/daemon/scripts/fe-audit.sh
+# Strip shell-exported GitHub tokens so keyring auth wins (PR #206).
+UnsetEnvironment=GITHUB_TOKEN GH_TOKEN
+# Pulls in HERMES_SLACK_BOT_TOKEN + ANTHROPIC_API_KEY from the 0600 file
+# at ~/.config/systemd/user/jleechanbrain-deploy-tokens.conf. The leading
+# `-` makes the file optional — unit starts even if it doesn't exist yet.
+EnvironmentFile=-@HOME@/.config/systemd/user/jleechanbrain-deploy-tokens.conf
+# Audit should never run more than 10 minutes; daemon.jsonl can be 13M+.
+TimeoutStartSec=600
+# Do NOT set Restart= for Type=oneshot timers — the timer fires it again
+# on its own cadence. Restart=on-failure would re-run inside the same
+# OnCalendar slot, violating the ThrottleInterval contract.
+StandardOutput=append:@HOME@/Library/Logs/dark-factory/fe-audit.log
+StandardError=append:@HOME@/Library/Logs/dark-factory/fe-audit.err.log
+
+[Install]
+WantedBy=default.target
