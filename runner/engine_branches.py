@@ -49,6 +49,7 @@ def _clone_context(ctx: Context) -> Context:
         git_ctx=getattr(ctx, "git_ctx", None),
         perf_run=getattr(ctx, "perf_run", None),
         last_completed_seq=getattr(ctx, "last_completed_seq", 0),
+        _operator_trust=dict(getattr(ctx, "_operator_trust", {})),
     )
 
 

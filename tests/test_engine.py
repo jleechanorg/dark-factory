@@ -59,59 +59,77 @@ def test_run_captures_target_provenance_before_first_node(tmp_path, monkeypatch)
     assert "_df_run_initial_workspace_sha256" not in observed
 
 
-def test_resume_preserves_original_controller_trust_after_worker_commit(
+def test_automatic_resume_rejects_worker_rewriting_every_checkpoint_trust_value(
     tmp_path, monkeypatch
 ):
+    from runner import handler_sandbox
+
+    monkeypatch.setattr(
+        handler_sandbox,
+        "_controller_private_root",
+        lambda: tmp_path / "controller-private",
+    )
     subprocess.run(["/usr/bin/git", "init", "-q"], cwd=tmp_path, check=True)
     subprocess.run(["/usr/bin/git", "config", "user.email", "jleechan2015@users.noreply.github.com"], cwd=tmp_path, check=True)
     subprocess.run(["/usr/bin/git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    manifest = tmp_path / ".dark-factory" / "evidence.yaml"
+    manifest.parent.mkdir()
+    manifest.write_text(
+        """operator_verification:
+  schema_version: 1
+  commands:
+    - id: target-status
+      argv: [/usr/bin/git, status, --porcelain=v1]
+      lane: operator_unwrapped
+      timeout_seconds: 30
+      classification: required
+  exclusions: []
+""",
+        encoding="utf-8",
+    )
     (tmp_path / "tracked.txt").write_text("trusted\n")
     subprocess.run(["/usr/bin/git", "add", "."], cwd=tmp_path, check=True)
     subprocess.run(["/usr/bin/git", "commit", "-qm", "trusted"], cwd=tmp_path, check=True)
     trusted = subprocess.run(["/usr/bin/git", "rev-parse", "HEAD"], cwd=tmp_path, check=True, capture_output=True, text=True).stdout.strip()
-    subprocess.run(["/usr/bin/git", "update-ref", "refs/remotes/origin/main", trusted], cwd=tmp_path, check=True)
-    monkeypatch.setenv("DARK_FACTORY_OPERATOR_TRUST_HEAD", trusted)
-    (tmp_path / "tracked.txt").write_text("worker\n")
-    subprocess.run(["/usr/bin/git", "commit", "-qam", "worker"], cwd=tmp_path, check=True)
-    worker_head = subprocess.run(["/usr/bin/git", "rev-parse", "HEAD"], cwd=tmp_path, check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(["/usr/bin/git", "branch", "trusted-base", trusted], cwd=tmp_path, check=True)
+    subprocess.run(["/usr/bin/git", "branch", "--set-upstream-to=trusted-base"], cwd=tmp_path, check=True, capture_output=True)
     dot = tmp_path / "resume_trust.dot"
     dot.write_text(
-        "digraph resume_trust { start [shape=Mdiamond] worker [type=codergen] "
-        "observe [type=observe] operator [type=operator_verify] exit [shape=Msquare] "
-        "start -> worker -> observe -> operator -> exit }",
+        "digraph resume_trust { start [shape=Mdiamond] "
+        "operator [type=operator_verify] exit [shape=Msquare] "
+        "start -> operator -> exit }",
         encoding="utf-8",
     )
     checkpoint = tmp_path / "checkpoint.json"
-    checkpoint.write_text(json.dumps([{
-        "node": "worker", "outcome": "success", "ts": 1,
-        "output_preview": "done",
-        "metadata": {"_df_controller_trust_head": trusted},
-    }]))
-    observed = {}
-    def observe(node, ctx):
-        observed.update(ctx.state)
-        return Result(outcome="success")
-    monkeypatch.setitem(TYPE_REGISTRY, "observe", observe)
-    monkeypatch.setitem(TYPE_REGISTRY, "operator_verify", lambda node, ctx: Result(outcome="success"))
+    run(
+        parse(dot),
+        Context(goal="create automatic trust", workdir=tmp_path, backend="codex"),
+        checkpoint=checkpoint,
+        max_steps=1,
+    )
+    records = json.loads(checkpoint.read_text(encoding="utf-8"))
+    records = records[:1]
+    (tmp_path / "tracked.txt").write_text("worker\n")
+    subprocess.run(["/usr/bin/git", "commit", "-qam", "worker"], cwd=tmp_path, check=True)
+    worker_head = subprocess.run(["/usr/bin/git", "rev-parse", "HEAD"], cwd=tmp_path, check=True, capture_output=True, text=True).stdout.strip()
+    for record in records:
+        record.setdefault("metadata", {})["_df_controller_trust_head"] = worker_head
+    checkpoint.write_text(json.dumps(records), encoding="utf-8")
+    launched = []
     import runner.handler_audit as handler_audit
-    monkeypatch.setattr(handler_audit, "_controller_trust_head", lambda workdir: trusted)
+    monkeypatch.setattr(
+        handler_audit,
+        "run_bounded_process_bytes",
+        lambda *args, **kwargs: launched.append(args) or pytest.fail("process launched"),
+    )
 
-    run(parse(dot), Context(goal="resume trust", workdir=tmp_path, backend="codex"), resume=checkpoint)
-
-    assert observed["_df_controller_trust_head"] == trusted
-    assert observed["_df_controller_trust_head"] != worker_head
-
-    checkpoint.write_text(json.dumps([{
-        "node": "worker", "outcome": "success", "ts": 1,
-        "output_preview": "done",
-        "metadata": {"_df_controller_trust_head": worker_head},
-    }]))
-    with pytest.raises(ValueError, match="controller trust"):
+    with pytest.raises(ValueError, match="private operator trust"):
         run(
             parse(dot),
-            Context(goal="tampered resume trust", workdir=tmp_path, backend="codex"),
+            Context(goal="automatic tamper", workdir=tmp_path, backend="codex"),
             resume=checkpoint,
         )
+    assert launched == []
 
 
 def test_fresh_operator_run_anchors_to_upstream_not_local_worker_head(tmp_path):

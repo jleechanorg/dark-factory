@@ -55,6 +55,7 @@ class Context:
     git_ctx: Optional["GitContext"] = None
     perf_run: Optional["PerfRun"] = None
     last_completed_seq: int = 0
+    _operator_trust: dict[str, str] = field(default_factory=dict, repr=False)
 
 
 _TIMEOUT_MIN_SECONDS = 5

@@ -17,10 +17,12 @@ Owns:
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import os
 import pathlib
 import re
+import secrets
 import contextlib
 import tempfile
 import stat
@@ -33,6 +35,7 @@ from typing import TYPE_CHECKING, Optional
 import runner.handlers as _handlers_shim
 
 from .handler_core import Result, _gate_strict_flag
+from . import handler_sandbox as _sandbox
 from .subprocess_control import BoundedProcessBytesResult, run_bounded_process_bytes
 
 if TYPE_CHECKING:
@@ -61,7 +64,7 @@ _OPERATOR_EXECUTABLE_ALLOWLIST = frozenset({"/usr/bin/git"})
 _OPERATOR_ID_RE = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
 _OPERATOR_RAW_STREAM_MAX_BYTES = 8 << 20
 _OPERATOR_RECEIPT_MAX_BYTES = 1 << 20
-_CANONICAL_OPERATOR_POLICY_SHA256 = "cc60a010a0fd7e425db00c367049ff2f4dbebf0c6ac1272ca2006d77a2b54614"
+_OPERATOR_TRUST_REGISTRY_MAX_BYTES = 1 << 20
 
 _OPERATOR_BUILTINS: tuple[OperatorCommand, ...] = ()  # populated after dataclass declaration
 
@@ -332,6 +335,22 @@ def _write_private_bytes(path: pathlib.Path, data: bytes) -> None:
         os.close(directory_fd)
 
 
+def _replace_private_bytes_at(directory_fd: int, name: str, data: bytes) -> None:
+    temp_name = f".{name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    try:
+        _write_private_bytes_at(directory_fd, temp_name, data)
+        os.replace(
+            temp_name, name,
+            src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+    finally:
+        try:
+            os.unlink(temp_name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+
+
 def _read_private_bytes_at(directory_fd: int, name: str, max_bytes: int) -> bytes:
     if pathlib.PurePath(name).name != name or name in {"", ".", ".."}:
         raise OSError("private file name must be one component")
@@ -339,7 +358,11 @@ def _read_private_bytes_at(directory_fd: int, name: str, max_bytes: int) -> byte
     file_fd = os.open(name, file_flags, dir_fd=directory_fd)
     try:
         metadata = os.fstat(file_fd)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > max_bytes:
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size > max_bytes
+        ):
             raise ValueError("private file is invalid")
         chunks: list[bytes] = []
         size = 0
@@ -421,23 +444,9 @@ def _write_operator_receipt(path: pathlib.Path, receipt: dict[str, object]) -> s
     if len(encoded) > _OPERATOR_RECEIPT_MAX_BYTES:
         raise ValueError("operator verification receipt exceeds size bound")
     directory_fd = _open_private_directory(path.parent)
-    temp_name = f".{path.name}.{os.getpid()}.tmp"
     try:
-        try:
-            os.unlink(temp_name, dir_fd=directory_fd)
-        except FileNotFoundError:
-            pass
-        _write_private_bytes_at(directory_fd, temp_name, encoded)
-        os.replace(
-            temp_name, path.name,
-            src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
-        )
-        os.fsync(directory_fd)
+        _replace_private_bytes_at(directory_fd, path.name, encoded)
     finally:
-        try:
-            os.unlink(temp_name, dir_fd=directory_fd)
-        except FileNotFoundError:
-            pass
         os.close(directory_fd)
     return hashlib.sha256(encoded).hexdigest()
 
@@ -607,6 +616,193 @@ def _load_operator_manifest(
     )
 
 
+def _operator_trust_registry_dir() -> pathlib.Path:
+    return _sandbox._controller_private_root() / "operator-trust"
+
+
+def _operator_trust_checkpoint_key(checkpoint: pathlib.Path) -> str:
+    absolute = pathlib.Path(
+        os.path.abspath(os.path.expanduser(os.fspath(checkpoint)))
+    )
+    return hashlib.sha256(os.fsencode(absolute)).hexdigest()
+
+
+def _require_operator_trust_isolation() -> None:
+    if sys.platform != "darwin" or not _sandbox._verify_darwin_sandbox_exec():
+        raise ValueError(
+            "private operator trust requires kernel-enforced implementing-agent isolation"
+        )
+
+
+@contextlib.contextmanager
+def _locked_operator_trust_registry(*, create: bool):
+    directory_fd = _open_private_directory(
+        _operator_trust_registry_dir(), create=create
+    )
+    lock_flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        lock_fd = os.open("registry.lock", lock_flags, 0o600, dir_fd=directory_fd)
+        try:
+            os.fchmod(lock_fd, 0o600)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            yield directory_fd
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _read_operator_trust_registry(
+    directory_fd: int, *, required: bool
+) -> dict[str, object]:
+    try:
+        encoded = _read_private_bytes_at(
+            directory_fd, "registry.json", _OPERATOR_TRUST_REGISTRY_MAX_BYTES
+        )
+    except FileNotFoundError:
+        if required:
+            raise ValueError("private operator trust registry is missing")
+        return {"schema_version": 1, "records": {}}
+    try:
+        registry = json.loads(encoded)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("private operator trust registry is malformed") from exc
+    if (
+        not isinstance(registry, dict)
+        or set(registry) != {"schema_version", "records"}
+        or registry.get("schema_version") != 1
+        or not isinstance(registry.get("records"), dict)
+    ):
+        raise ValueError("private operator trust registry schema is invalid")
+    return registry
+
+
+def _write_operator_trust_registry(
+    directory_fd: int, registry: dict[str, object]
+) -> None:
+    encoded = (json.dumps(registry, sort_keys=True) + "\n").encode("utf-8")
+    if len(encoded) > _OPERATOR_TRUST_REGISTRY_MAX_BYTES:
+        raise ValueError("private operator trust registry exceeds size bound")
+    _replace_private_bytes_at(directory_fd, "registry.json", encoded)
+
+
+def _validate_operator_trust_record(
+    workdir: pathlib.Path,
+    checkpoint_key: str,
+    record: object,
+) -> dict[str, str]:
+    if not isinstance(record, dict) or set(record) != {
+        "schema_version", "nonce", "checkpoint_key", "trust_head", "policy_sha256"
+    }:
+        raise ValueError("private operator trust record schema is invalid")
+    trust_head = str(record.get("trust_head") or "")
+    policy_sha256 = str(record.get("policy_sha256") or "")
+    nonce = str(record.get("nonce") or "")
+    if (
+        record.get("schema_version") != 1
+        or record.get("checkpoint_key") != checkpoint_key
+        or not re.fullmatch(r"[0-9a-f]{32}", nonce)
+        or not re.fullmatch(r"[0-9a-f]{64}", policy_sha256)
+    ):
+        raise ValueError("private operator trust record is invalid")
+    try:
+        _validate_controller_trust_head(workdir, trust_head)
+        manifest = _load_operator_manifest(workdir, trusted_head=trust_head)
+    except (OSError, subprocess.SubprocessError, UnicodeError, ValueError) as exc:
+        raise ValueError("private operator trust source is invalid") from exc
+    if manifest.policy_sha256 != policy_sha256:
+        raise ValueError("private operator trust policy mismatch")
+    explicit = os.environ.get("DARK_FACTORY_OPERATOR_TRUST_HEAD", "").strip().lower()
+    if explicit and explicit != trust_head:
+        raise ValueError("private operator trust does not match controller input")
+    return {
+        "trust_head": trust_head,
+        "policy_sha256": policy_sha256,
+        "nonce": nonce,
+    }
+
+
+def _create_operator_run_trust(
+    workdir: pathlib.Path, checkpoint: pathlib.Path
+) -> dict[str, str]:
+    _require_operator_trust_isolation()
+    root = workdir.resolve()
+    trust_head = _controller_trust_head(root)
+    manifest = _load_operator_manifest(root, trusted_head=trust_head)
+    checkpoint_key = _operator_trust_checkpoint_key(checkpoint)
+    record = {
+        "schema_version": 1,
+        "nonce": secrets.token_hex(16),
+        "checkpoint_key": checkpoint_key,
+        "trust_head": trust_head,
+        "policy_sha256": manifest.policy_sha256,
+    }
+    with _locked_operator_trust_registry(create=True) as directory_fd:
+        registry = _read_operator_trust_registry(directory_fd, required=False)
+        records = dict(registry["records"])
+        records[checkpoint_key] = record
+        registry["records"] = records
+        _write_operator_trust_registry(directory_fd, registry)
+    return _validate_operator_trust_record(root, checkpoint_key, record)
+
+
+def _restore_operator_run_trust(
+    workdir: pathlib.Path, checkpoint: pathlib.Path
+) -> dict[str, str]:
+    _require_operator_trust_isolation()
+    root = workdir.resolve()
+    checkpoint_key = _operator_trust_checkpoint_key(checkpoint)
+    try:
+        with _locked_operator_trust_registry(create=False) as directory_fd:
+            registry = _read_operator_trust_registry(directory_fd, required=True)
+    except FileNotFoundError as exc:
+        raise ValueError("private operator trust registry is missing") from exc
+    record = registry["records"].get(checkpoint_key)
+    if record is None:
+        raise ValueError("private operator trust record is missing")
+    return _validate_operator_trust_record(root, checkpoint_key, record)
+
+
+def _copy_operator_run_trust(
+    checkpoint: pathlib.Path, trust: dict[str, str]
+) -> None:
+    checkpoint_key = _operator_trust_checkpoint_key(checkpoint)
+    record = {
+        "schema_version": 1,
+        "nonce": secrets.token_hex(16),
+        "checkpoint_key": checkpoint_key,
+        "trust_head": trust["trust_head"],
+        "policy_sha256": trust["policy_sha256"],
+    }
+    with _locked_operator_trust_registry(create=True) as directory_fd:
+        registry = _read_operator_trust_registry(directory_fd, required=False)
+        records = dict(registry["records"])
+        records[checkpoint_key] = record
+        registry["records"] = records
+        _write_operator_trust_registry(directory_fd, registry)
+
+
+def _remove_operator_run_trust(checkpoint: pathlib.Path) -> None:
+    checkpoint_key = _operator_trust_checkpoint_key(checkpoint)
+    try:
+        with _locked_operator_trust_registry(create=False) as directory_fd:
+            registry = _read_operator_trust_registry(directory_fd, required=True)
+            records = dict(registry["records"])
+            records.pop(checkpoint_key, None)
+            registry["records"] = records
+            if records:
+                _write_operator_trust_registry(directory_fd, registry)
+            else:
+                try:
+                    os.unlink("registry.json", dir_fd=directory_fd)
+                    os.fsync(directory_fd)
+                except FileNotFoundError:
+                    pass
+    except (FileNotFoundError, ValueError):
+        return
+
+
 def _operator_verify(node: "Node", ctx: "Context") -> Result:
     """Run exact post-worker verification outside the worker sandbox."""
     workdir = pathlib.Path(ctx.workdir).resolve()
@@ -652,14 +848,18 @@ def _operator_verify(node: "Node", ctx: "Context") -> Result:
             },
         )
     try:
-        trusted_manifest_head = str(ctx.state.get("_df_controller_trust_head") or "")
+        private_trust = dict(getattr(ctx, "_operator_trust", {}))
+        trusted_manifest_head = str(private_trust.get("trust_head") or "")
+        expected_policy_sha256 = str(private_trust.get("policy_sha256") or "")
         if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", trusted_manifest_head):
-            raise ValueError("operator verification lacks trusted run-initial HEAD")
+            raise ValueError("operator verification lacks private run trust")
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_policy_sha256):
+            raise ValueError("operator verification lacks private policy trust")
         _validate_controller_trust_head(workdir, trusted_manifest_head)
         entry_head, entry_workspace = _target_provenance(workdir)
-        manifest = _load_operator_manifest(workdir)
-        if manifest.policy_sha256 != _CANONICAL_OPERATOR_POLICY_SHA256:
-            raise ValueError("operator verification policy is not controller-canonical")
+        manifest = _load_operator_manifest(workdir, trusted_head=trusted_manifest_head)
+        if manifest.policy_sha256 != expected_policy_sha256:
+            raise ValueError("operator verification policy differs from private trust")
         manifest_sha = hashlib.sha256(manifest.raw_bytes).hexdigest()
         visit = 1 + sum(
             1 for item in ctx.history if item.get("node") == node.name

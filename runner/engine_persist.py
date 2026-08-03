@@ -186,7 +186,7 @@ def _append_record(
     output: str,
     metadata: Optional[dict[str, str]] = None,
 ) -> int:
-    trust_head = str(ctx.state.get("_df_controller_trust_head") or "")
+    trust_head = str(getattr(ctx, "_operator_trust", {}).get("trust_head") or "")
     if trust_head:
         record.metadata = {
             **record.metadata,

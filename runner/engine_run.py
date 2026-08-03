@@ -224,6 +224,8 @@ def run(
     """
     history: list = []
     resumed = _persist._load_checkpoint(resume) if resume is not None else None
+    if resume is not None and checkpoint is None:
+        checkpoint = resume
     from .handler_audit import _operator_verify as canonical_operator_verify
     operator_nodes = [
         node for node in graph.nodes.values()
@@ -233,35 +235,22 @@ def run(
         ctx.backend not in {"echo", "mock_llm"}
         and any(resolve(node) is canonical_operator_verify for node in operator_nodes)
     )
-    if ctx.workdir is not None:
-        from .handler_audit import _controller_trust_head, _validate_controller_trust_head
+    operator_trust_checkpoints: list[pathlib.Path] = []
+    if ctx.workdir is not None and resumed is not None and requires_operator_trust:
+        from .handler_audit import _restore_operator_run_trust
         root = pathlib.Path(ctx.workdir)
-        if resumed is not None:
-            checkpoint_trust = {
-                str(record.metadata.get("_df_controller_trust_head") or "")
-                for record in resumed
-            }
-            if requires_operator_trust and (len(checkpoint_trust) != 1 or "" in checkpoint_trust):
-                raise ValueError("checkpoint lacks consistent controller trust metadata")
-            if "" not in checkpoint_trust and len(checkpoint_trust) == 1:
-                restored_trust = checkpoint_trust.pop()
-                try:
-                    _validate_controller_trust_head(root, restored_trust)
-                except (OSError, subprocess.SubprocessError, UnicodeError, ValueError) as exc:
-                    raise ValueError("checkpoint controller trust is invalid") from exc
-                explicit_trust = os.environ.get("DARK_FACTORY_OPERATOR_TRUST_HEAD", "").strip().lower()
-                if explicit_trust and restored_trust != explicit_trust:
-                    raise ValueError("checkpoint controller trust does not match controller input")
-                ctx.state["_df_controller_trust_head"] = restored_trust
-        else:
-            try:
-                canonical_trust = _controller_trust_head(root)
-            except (OSError, subprocess.SubprocessError, UnicodeError, ValueError):
-                canonical_trust = ""
-            if requires_operator_trust and not canonical_trust:
-                raise ValueError("operator graph requires controller-supplied trust metadata")
-            if canonical_trust:
-                ctx.state["_df_controller_trust_head"] = canonical_trust
+        assert resume is not None
+        private_trust = _restore_operator_run_trust(root, resume)
+        checkpoint_trust = {
+            str(record.metadata.get("_df_controller_trust_head") or "")
+            for record in resumed
+        }
+        if len(checkpoint_trust) != 1 or "" in checkpoint_trust:
+            raise ValueError("checkpoint lacks consistent controller trust metadata")
+        if checkpoint_trust != {private_trust["trust_head"]}:
+            raise ValueError("checkpoint controller trust differs from private operator trust")
+        ctx._operator_trust = private_trust
+        operator_trust_checkpoints.append(resume)
     visits: dict[str, int] = {}
     # Per-node ring of recent output hashes for the no_progress detector
     # (D3 in feedback 2026-06-22). When a node produces the same output
@@ -353,6 +342,22 @@ def run(
 
     if checkpoint is None and ctx.run_id is not None:
         checkpoint = pathlib.Path.home() / ".dark-factory" / "runs" / ctx.run_id / "checkpoint.json"
+
+    if requires_operator_trust:
+        from .handler_audit import (
+            _copy_operator_run_trust,
+            _create_operator_run_trust,
+        )
+        if checkpoint is None or ctx.workdir is None:
+            raise ValueError("operator graph requires an addressable private trust record")
+        if resumed is None:
+            ctx._operator_trust = _create_operator_run_trust(
+                pathlib.Path(ctx.workdir), checkpoint
+            )
+            operator_trust_checkpoints.append(checkpoint)
+        elif checkpoint not in operator_trust_checkpoints:
+            _copy_operator_run_trust(checkpoint, ctx._operator_trust)
+            operator_trust_checkpoints.append(checkpoint)
 
     perf_root = getattr(ctx, "perf_log_root", None)
     if perf_root is not None and ctx.run_id is not None:
@@ -1137,5 +1142,9 @@ def run(
                 log.close()
             except OSError:
                 pass
+        if ended_at_exit and operator_trust_checkpoints:
+            from .handler_audit import _remove_operator_run_trust
+            for trust_checkpoint in operator_trust_checkpoints:
+                _remove_operator_run_trust(trust_checkpoint)
 
     return history
