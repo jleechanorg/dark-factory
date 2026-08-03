@@ -32,9 +32,12 @@ from .handler_core import (
     _TIMEOUT_MIN_SECONDS,
     _TIMEOUT_MAX_SECONDS,
     _coerce_timeout,
+    _gate_strict_flag,
+    _target_worktree,
     _start,
     _exit,
 )
+
 
 # Sandbox + env helpers.
 from .handler_sandbox import (
@@ -52,7 +55,10 @@ from .handler_sandbox import (
     _verify_linux_preload_denies,
     _linux_sandbox_prefix,
     _reset_linux_preload_verification_cache_for_tests,
+    _verify_darwin_sandbox_exec,
+    _reset_darwin_sandbox_verification_cache_for_tests,
 )
+
 
 # AO backend helpers.
 from .handler_ao import (

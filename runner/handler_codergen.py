@@ -495,23 +495,17 @@ def _codergen_workdir(ctx: "Context") -> "Path | str | None":
     """Resolve the worktree the coder ran in.
 
     Prefers ``ctx.state["ao.worktree"]`` when it is an absolute, non-traversing
-    path to an existing directory (defense in depth against a forged/stale
-    value); otherwise falls back to ``ctx.workdir``. Shared by ``_stash_diff``
-    and ``_stash_codergen_receipt`` so both target the same tree.
+    path to an existing directory; otherwise falls back to ``ctx.workdir``.
+    Delegates to canonical ``_target_worktree`` helper.
     """
-    ao_wt = ctx.state.get("ao.worktree")
-    if ao_wt:
-        ao_path = pathlib.Path(str(ao_wt))
-        if (
-            ao_path.is_absolute()
-            and ".." not in ao_path.parts
-            and ao_path.is_dir()
-        ):
-            return str(ao_wt)
     try:
-        return ctx.workdir
-    except AttributeError:
-        return None
+        return str(_handlers_shim._target_worktree(ctx))
+    except Exception:
+        try:
+            return ctx.workdir
+        except AttributeError:
+            return None
+
 
 
 def _parse_commands_run_md(text: str) -> list[tuple[str, int]]:

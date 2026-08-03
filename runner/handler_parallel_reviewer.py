@@ -228,8 +228,9 @@ def _controller_evidence(node: "Node", ctx: "Context") -> tuple:
         raise ValueError("evidence_paths must be a list or comma-separated string")
 
     artifacts = []
-    root = ctx.workdir.resolve()
+    root = _handlers_shim._target_worktree(ctx)
     for value in values:
+
         rel = str(value).strip()
         if not rel:
             continue
@@ -260,8 +261,9 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
         validate_immutable_target,
     )
 
-    workdir = ctx.workdir.resolve()
+    workdir = _handlers_shim._target_worktree(ctx)
     status = _git_output(
+
         workdir,
         "status",
         "--porcelain=v1",
@@ -346,8 +348,9 @@ def _verify_controller_workspace(ctx: "Context", request) -> None:
     envelope = json.loads(request.envelope_json)
     target = envelope["target"]
     snapshots = envelope["snapshots"]
-    workdir = ctx.workdir.resolve()
+    workdir = _handlers_shim._target_worktree(ctx)
     status = subprocess.run(
+
         [
             "git",
             "-C",
@@ -654,8 +657,10 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
                 "parallel_reviewer": "echo",
             },
         )
-    expected_sha = _handlers_shim._worktree_head_sha(ctx.workdir)
+    target_dir = _handlers_shim._target_worktree(ctx)
+    expected_sha = _handlers_shim._worktree_head_sha(target_dir)
     review_contract = str(node.attrs.get("review_contract") or "").strip()
+
     request = None
     if review_contract:
         if review_contract != "cold-review-v1":

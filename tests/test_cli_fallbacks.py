@@ -534,3 +534,80 @@ def test_reviewer_gate_all_backends_missing_tags_infra_failure(monkeypatch, tmp_
     # Both backends were attempted.
     assert "codex" in seen
     assert "claude" in seen
+
+
+def test_target_worktree_ao_worktree_review_binding(tmp_path):
+    """AO worker writes to `ao.worktree`; target worktree resolver must bind
+    `_target_worktree(ctx)` to `ao.worktree` so controller review snapshots the
+    worker's target tree instead of an untouched `ctx.workdir`."""
+    from runner.handlers import _target_worktree
+
+    main_dir = tmp_path / "main_repo"
+    main_dir.mkdir()
+    ao_wt_dir = tmp_path / "ao_worktree"
+    ao_wt_dir.mkdir()
+
+    ctx = Context(goal="test ao worktree binding", workdir=main_dir)
+    assert _target_worktree(ctx) == main_dir.resolve()
+
+    ctx.state["ao.worktree"] = str(ao_wt_dir)
+    assert _target_worktree(ctx) == ao_wt_dir.resolve()
+
+
+def test_controller_review_codex_unavailable_fails_closed(monkeypatch, tmp_path):
+    """When codex is unavailable for controller cold review, the resolver/gate
+    fails closed with backend_missing='true' rather than claiming an installed
+    fallback that lacks a compatible controller transport."""
+    from runner.handlers import _resolve_gate_backend, _run_gate_once
+
+    _disable_sandbox(monkeypatch)
+    monkeypatch.setattr(
+        "runner.handlers._probe_backend_installed",
+        lambda name: name in ("agy", "minimax", "claude-sonnet"),
+    )
+
+    node = _Node(
+        name="cold_reviewer",
+        attrs={
+            "review_contract": "cold-review-v1",
+            "backend_priority": "codex,minimax,agy,claude-sonnet",
+        },
+    )
+    ctx = Context(goal="test fallback", workdir=tmp_path, backend="claude")
+    resolved, meta = _resolve_gate_backend(node, ctx)
+
+    assert resolved == "codex"
+    assert "minimax(no_controller_transport)" in meta["adversarial_skipped"]
+
+    # Executing non-codex under controller review produces an error
+    ctx.state["_df_controller_review_json"] = "true"
+    result = _run_gate_once("agy", "PROMPT", "0" * 40, 300, ctx, "cold_reviewer")
+    assert result.outcome == "error"
+    assert result.metadata["backend_missing"] == "true"
+    assert "requires codex backend" in result.output
+
+
+def test_controller_codex_transport_strips_outer_sandbox_exec():
+    """_build_controller_codex_transport must strip any outer sandbox-exec prefix
+    so `codex exec --sandbox read-only` runs natively without triggering nested
+    seatbelt sandbox_apply failures on macOS."""
+    from runner.handler_dispatch import _build_controller_codex_transport
+
+    sandboxed_argv = [
+        "/usr/bin/sandbox-exec",
+        "-p",
+        "(version 1)",
+        "/usr/local/bin/codex",
+        "exec",
+        "--yolo",
+        "--skip-git-repo-check",
+        "prompt text",
+    ]
+    transport = _build_controller_codex_transport(sandboxed_argv)
+
+    assert transport[0] == "codex"
+    assert transport[1] == "exec"
+    assert "--sandbox" in transport
+    assert "read-only" in transport
+    assert transport[0] != "/usr/bin/sandbox-exec"
+
