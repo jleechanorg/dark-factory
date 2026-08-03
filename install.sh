@@ -97,6 +97,24 @@ uv pip install --python "${PYTHON_BIN}" -r "${REQUIREMENTS_FILE}"
 echo "==> verifying import"
 "${PYTHON_BIN}" -c "import pydot, yaml; print('deps ok:', pydot.__version__)"
 
+# Diagnose the same static Codex executable/package/cache contract enforced by
+# the runtime wrapper. This is intentionally read-only: installation or cache
+# migration is an operator-owned deployment step, never an installer side
+# effect.
+echo "==> verifying pinned Codex runtime (read-only)"
+CODEX_RUNTIME_JSON=""
+CODEX_RUNTIME_RC=0
+CODEX_RUNTIME_JSON="$(
+  env PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
+    "${PYTHON_BIN}" -m runner.codex_runtime --json
+)" || CODEX_RUNTIME_RC=$?
+if [[ "${CODEX_RUNTIME_RC}" -ne 0 ]]; then
+  echo "ERROR: pinned Codex runtime contract failed; no Codex package or cache was changed." >&2
+  echo "${CODEX_RUNTIME_JSON}" >&2
+  exit "${CODEX_RUNTIME_RC}"
+fi
+echo "${CODEX_RUNTIME_JSON}"
+
 # Configure repo-local git hooks (.githooks/) so the pre-push graph-audit
 # guard fires before any push. Mirrors the .github/workflows/ci.yml:35
 # step locally. Setting core.hooksPath is local-only (.git/config), so
