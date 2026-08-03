@@ -1,6 +1,6 @@
 // pipelines/slim/two_node.dot
 //
-// Default graph for `/f` (and `/factory`). Exactly two nodes:
+// Default graph for `/f` (and `/factory`). Exactly two productive nodes:
 //   worker         — generic codergen; light prompt; does whatever the user asked.
 //   cold_reviewer  — gate_er that runs the static Codex cold-reviewer prompt
 //                    (prompts/slim/cold_reviewer.md — DO NOT EDIT; this prompt
@@ -8,7 +8,7 @@
 //
 // Wiring:
 //   start -> worker -> cold_reviewer -> exit                (on success)
-//                          \-> worker                        (on failure, bounded)
+//                          \-> worker                        (on failure, bounded max_visits=3)
 //
 // Backend routing:
 //   - worker          honors the run-level --backend (the coder tier the user
@@ -21,12 +21,8 @@
 //
 // Failure semantics:
 //   - cold_reviewer is goal_gate=true. On success the run exits.
-//   - On a real fail/partial verdict the runner routes back to worker via the
-//     fix loop (max_visits=3). The cold reviewer is the merge-confidence bar;
-//     no separate evidence gate in this minimal graph.
-//   - Worker is the only repairable node (max_visits=2 on cold_reviewer would
-//     loop on the reviewer; max_visits=3 on the fix back-edge is the bounded
-//     repair budget per factory design).
+//   - On a real fail/partial verdict the runner routes back to worker directly.
+//     Worker handles iteration (max_visits=3). No separate fix node in this graph.
 
 digraph SlimTwoNode {
     graph [
@@ -44,6 +40,7 @@ digraph SlimTwoNode {
         class="worker",
         prompt="@prompts/slim/worker.md",
         max_retries=2,
+        max_visits="3",
         timeout=600
     ]
 
@@ -58,23 +55,10 @@ digraph SlimTwoNode {
         timeout=600
     ]
 
-    fix [
-        type="codergen",
-        label="Fix & Iterate",
-        class="fix",
-        prompt="@prompts/slim/fix.md",
-        max_retries=2,
-        max_visits="3",
-        no_progress_max="2",
-        timeout=600
-    ]
-
     start -> worker
     worker -> cold_reviewer [condition="outcome=success"]
-    worker -> fix          [condition="outcome!=success"]
+    worker -> worker        [condition="outcome!=success"]
 
-    cold_reviewer -> exit [condition="outcome=success"]
-    cold_reviewer -> fix  [condition="outcome!=success"]
-
-    fix -> worker
+    cold_reviewer -> exit   [condition="outcome=success"]
+    cold_reviewer -> worker [condition="outcome!=success"]
 }

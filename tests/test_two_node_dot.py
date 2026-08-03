@@ -61,16 +61,16 @@ def _normalise_timeout(value: object) -> int | None:
 
 def test_two_node_dot_parses_and_has_expected_topology() -> None:
     """The default `/f` graph parses cleanly and exposes exactly two productive
-    nodes (worker + cold_reviewer), plus start/exit anchors and a fix loop.
+    nodes (worker + cold_reviewer), plus start/exit anchors. No third fix node.
 
     This test pins the contract: any future PR that adds or removes nodes
     from two_node.dot must update this assertion deliberately.
     """
     g = parse(ROOT / _PIPELINE)
     names = set(g.nodes.keys())
-    # Top-level anchor nodes + the two productive nodes + fix loop.
-    assert names == {"start", "worker", "cold_reviewer", "fix", "exit"}, (
-        f"two_node.dot must have exactly start/worker/cold_reviewer/fix/exit; "
+    # Top-level anchor nodes + the two productive nodes.
+    assert names == {"start", "worker", "cold_reviewer", "exit"}, (
+        f"two_node.dot must have exactly start/worker/cold_reviewer/exit; "
         f"got {sorted(names)}"
     )
     # Worker and cold_reviewer are the only goal-producing nodes.
