@@ -663,7 +663,24 @@ fn run(args: Args) -> Result<(), DaemonError> {
             TickLoopAction::Success {
                 consecutive_failures: _,
             } => {
-                std::thread::sleep(std::time::Duration::from_secs(cfg.fast_tick_secs));
+                let sleep_secs = if attempt.tick_index == 0 {
+                    let _ = daemon::telemetry::emit(
+                        deps.telemetry_log,
+                        &daemon::telemetry::TelemetryEvent {
+                            timestamp: daemon::state::now_iso8601(),
+                            bead_id: "system".to_string(),
+                            attempt_id: 0,
+                            lifecycle_state: "N/A".to_string(),
+                            event_type: "STARTUP_DISPATCH_PASS".to_string(),
+                            metrics: serde_json::json!({}),
+                            context: serde_json::json!({}),
+                        },
+                    );
+                    std::cmp::min(cfg.fast_tick_secs, 20)
+                } else {
+                    cfg.fast_tick_secs
+                };
+                std::thread::sleep(std::time::Duration::from_secs(sleep_secs));
             }
             TickLoopAction::TransientBackoff {
                 consecutive_failures: _,
