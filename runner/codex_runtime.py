@@ -3,16 +3,23 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import tempfile
+import uuid
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
+
+from runner.subprocess_control import BoundedProcessResult, run_bounded_process
 
 
 PINNED_CODEX_VERSION = "0.146.0"
 PINNED_NODE_VERSION = "v22.22.0"
+CODEX_RUNTIME_READY = "CODEX_RUNTIME_READY"
+SYNC_TIMEOUT_SECONDS = 120
 _PACKAGE_RELATIVE = Path("lib/node_modules/@openai/codex")
 _EXECUTABLE_RELATIVE = Path("bin/codex")
 _REQUIRED_MODEL_FIELDS = {
@@ -61,6 +68,15 @@ _OPTIONAL_MODEL_FIELDS = {
 
 class CodexRuntimeError(RuntimeError):
     """The installed Codex executable, metadata, or shared cache is unsafe."""
+
+
+class CodexRuntimeSyncError(CodexRuntimeError):
+    """An opt-in runtime deployment failed without automatic rollback."""
+
+    def __init__(self, phase: str, message: str, evidence: dict[str, object]) -> None:
+        super().__init__(message)
+        evidence.update(status="fail", phase=phase, error=message)
+        self.evidence = evidence
 
 
 @dataclass(frozen=True)
@@ -251,10 +267,227 @@ def resolve_codex_executable(requested: str | Path | None = None) -> str:
     return str(runtime.executable)
 
 
+def _package_version_evidence(package_json: Path) -> str | None:
+    if not package_json.exists():
+        return None
+    try:
+        return _package_version(package_json, "canonical Codex package metadata")
+    except CodexRuntimeError:
+        return None
+
+
+def _cache_evidence(cache_path: Path) -> dict[str, str | None]:
+    if not cache_path.exists():
+        return {"sha256": None, "client_version": None}
+    try:
+        cache_bytes = cache_path.read_bytes()
+    except OSError:
+        return {"sha256": None, "client_version": None}
+    client_version = None
+    try:
+        payload = json.loads(cache_bytes)
+        if isinstance(payload, dict) and isinstance(payload.get("client_version"), str):
+            client_version = payload["client_version"]
+    except (UnicodeError, json.JSONDecodeError):
+        pass
+    return {
+        "sha256": hashlib.sha256(cache_bytes).hexdigest(),
+        "client_version": client_version,
+    }
+
+
+def _process_evidence(
+    result: BoundedProcessResult, *, timeout_seconds: int
+) -> dict[str, object]:
+    return {
+        "argv": list(result.args),
+        "exit_code": result.returncode,
+        "timed_out": result.timed_out,
+        "timeout_seconds": timeout_seconds,
+    }
+
+
+def _backup_cache(cache_path: Path, home: Path) -> Path | None:
+    if not cache_path.exists():
+        return None
+    backup_dir = home / ".dark-factory" / "backups" / "codex-runtime"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    backup = backup_dir / f"models_cache.{timestamp}.{uuid.uuid4().hex}.json"
+    with cache_path.open("rb") as source, backup.open("xb") as destination:
+        while chunk := source.read(1024 * 1024):
+            destination.write(chunk)
+    return backup
+
+
+def _runtime_payload(runtime: CodexRuntime) -> dict[str, str]:
+    return {
+        "status": "pass",
+        **{key: str(value) for key, value in asdict(runtime).items()},
+    }
+
+
+def sync_codex_runtime(
+    *,
+    home: Path | None = None,
+    competing_package_paths: Iterable[Path] | None = None,
+) -> dict[str, object]:
+    """Opt in to the pinned npm install, Codex-owned cache refresh, and validation."""
+    home = (home or Path.home()).expanduser().resolve()
+    node_root = home / ".nvm" / "versions" / "node" / PINNED_NODE_VERSION
+    node_bin = node_root / "bin"
+    npm = node_bin / "npm"
+    executable = node_bin / "codex"
+    package_json = node_root / _PACKAGE_RELATIVE / "package.json"
+    cache_path = home / ".codex" / "models_cache.json"
+    competitors = (
+        tuple(competing_package_paths)
+        if competing_package_paths is not None
+        else _default_competing_package_paths()
+    )
+    evidence: dict[str, object] = {
+        "status": "pending",
+        "phase": "preflight",
+        "backup_path": None,
+        "package_version": {
+            "before": _package_version_evidence(package_json),
+            "after": None,
+        },
+        "cache": {
+            "path": str(cache_path),
+            "before": _cache_evidence(cache_path),
+            "after": None,
+        },
+        "subprocesses": {},
+        "readiness_token": None,
+        "resolver": None,
+    }
+
+    def fail(phase: str, message: str) -> None:
+        evidence["package_version"]["after"] = _package_version_evidence(package_json)  # type: ignore[index]
+        evidence["cache"]["after"] = _cache_evidence(cache_path)  # type: ignore[index]
+        raise CodexRuntimeSyncError(phase, message, evidence)
+
+    if not npm.is_file() or not os.access(npm, os.X_OK):
+        fail("preflight", f"pinned Node 22 npm is missing or not executable at {npm}")
+
+    try:
+        backup = _backup_cache(cache_path, home)
+    except OSError as exc:
+        fail("backup", f"could not back up Codex models cache before mutation: {exc}")
+    evidence["backup_path"] = str(backup) if backup is not None else None
+
+    env = dict(os.environ)
+    env["HOME"] = str(home)
+    env["PATH"] = f"{node_bin}{os.pathsep}{env.get('PATH', '')}"
+    npm_argv = [
+        str(npm),
+        "install",
+        "--global",
+        "--prefix",
+        str(node_root),
+        f"@openai/codex@{PINNED_CODEX_VERSION}",
+    ]
+    try:
+        npm_result = run_bounded_process(
+            npm_argv,
+            timeout=SYNC_TIMEOUT_SECONDS,
+            env=env,
+        )
+    except OSError as exc:
+        evidence["subprocesses"]["npm_install"] = {  # type: ignore[index]
+            "argv": npm_argv,
+            "exit_code": None,
+            "timed_out": False,
+            "timeout_seconds": SYNC_TIMEOUT_SECONDS,
+        }
+        fail("npm_install", f"could not start pinned Node 22 npm: {exc}")
+    evidence["subprocesses"]["npm_install"] = _process_evidence(  # type: ignore[index]
+        npm_result,
+        timeout_seconds=SYNC_TIMEOUT_SECONDS,
+    )
+    if npm_result.timed_out:
+        fail("npm_install", "pinned Codex npm install timed out")
+    if npm_result.returncode != 0:
+        fail("npm_install", f"pinned Codex npm install exited {npm_result.returncode}")
+    if _package_version_evidence(package_json) != PINNED_CODEX_VERSION:
+        fail("npm_validation", "npm install did not produce the pinned Codex package version")
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        fail("npm_validation", f"npm install did not produce executable {executable}")
+
+    codex_argv = [
+        str(executable),
+        "exec",
+        "--sandbox",
+        "read-only",
+        "--skip-git-repo-check",
+        CODEX_RUNTIME_READY,
+    ]
+    with tempfile.TemporaryDirectory(prefix="dark-factory-codex-runtime-") as temp_workdir:
+        try:
+            codex_result = run_bounded_process(
+                codex_argv,
+                cwd=temp_workdir,
+                timeout=SYNC_TIMEOUT_SECONDS,
+                env=env,
+            )
+        except OSError as exc:
+            evidence["subprocesses"]["codex_startup"] = {  # type: ignore[index]
+                "argv": codex_argv,
+                "exit_code": None,
+                "timed_out": False,
+                "timeout_seconds": SYNC_TIMEOUT_SECONDS,
+            }
+            fail("codex_startup", f"could not start canonical Codex: {exc}")
+    evidence["subprocesses"]["codex_startup"] = _process_evidence(  # type: ignore[index]
+        codex_result,
+        timeout_seconds=SYNC_TIMEOUT_SECONDS,
+    )
+    if codex_result.timed_out:
+        fail("codex_startup", "canonical Codex readiness startup timed out")
+    if codex_result.returncode != 0:
+        fail("codex_startup", f"canonical Codex readiness startup exited {codex_result.returncode}")
+
+    try:
+        runtime = resolve_codex_runtime(
+            home=home,
+            cache_path=cache_path,
+            competing_package_paths=competitors,
+        )
+    except CodexRuntimeError as exc:
+        fail("final_validation", str(exc))
+    evidence["resolver"] = _runtime_payload(runtime)
+    if codex_result.stdout.strip() != CODEX_RUNTIME_READY:
+        fail("readiness", "canonical Codex did not return the exact readiness token")
+
+    evidence["status"] = "pass"
+    evidence["phase"] = "complete"
+    evidence["readiness_token"] = CODEX_RUNTIME_READY
+    evidence["package_version"]["after"] = runtime.version  # type: ignore[index]
+    evidence["cache"]["after"] = _cache_evidence(cache_path)  # type: ignore[index]
+    return evidence
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--sync", action="store_true")
     args = parser.parse_args(argv)
+    if args.sync:
+        try:
+            payload = sync_codex_runtime()
+        except CodexRuntimeSyncError as exc:
+            payload = exc.evidence
+            if args.json:
+                print(json.dumps(payload, sort_keys=True))
+            else:
+                print(f"Codex runtime sync FAIL ({payload['phase']}): {exc}")
+            return 2
+        if args.json:
+            print(json.dumps(payload, sort_keys=True))
+        else:
+            print(f"Codex runtime sync PASS: {payload['resolver']}")
+        return 0
     try:
         runtime = resolve_codex_runtime()
     except CodexRuntimeError as exc:
@@ -264,7 +497,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(f"Codex runtime FAIL: {exc}")
         return 2
-    payload = {"status": "pass", **{key: str(value) for key, value in asdict(runtime).items()}}
+    payload = _runtime_payload(runtime)
     if args.json:
         print(json.dumps(payload, sort_keys=True))
     else:

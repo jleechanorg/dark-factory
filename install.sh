@@ -10,6 +10,7 @@
 #   ./install.sh --no-smoke   # install only, skip smoke run
 #   ./install.sh --no-link    # skip ~/.local/bin symlinks
 #   ./install.sh --no-cmds    # skip ~/.claude/ commands+skills symlinks
+#   ./install.sh --sync-codex-runtime  # opt in to pinned Codex install/cache refresh
 #
 # Requires: uv on PATH (https://docs.astral.sh/uv/)
 
@@ -25,6 +26,7 @@ CLEAR=0
 SMOKE=1
 LINK=1
 CMDS=1
+SYNC_CODEX_RUNTIME=0
 
 usage() {
   sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
@@ -36,6 +38,7 @@ while [[ $# -gt 0 ]]; do
     --no-smoke) SMOKE=0; shift ;;
     --no-link) LINK=0; shift ;;
     --no-cmds) CMDS=0; shift ;;
+    --sync-codex-runtime) SYNC_CODEX_RUNTIME=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -98,18 +101,26 @@ echo "==> verifying import"
 "${PYTHON_BIN}" -c "import pydot, yaml; print('deps ok:', pydot.__version__)"
 
 # Diagnose the same static Codex executable/package/cache contract enforced by
-# the runtime wrapper. This is intentionally read-only: installation or cache
-# migration is an operator-owned deployment step, never an installer side
-# effect.
-echo "==> verifying pinned Codex runtime (read-only)"
+# the runtime wrapper. Package/cache mutation requires the explicit sync flag.
+CODEX_RUNTIME_ARGS=(--json)
+if [[ "${SYNC_CODEX_RUNTIME}" -eq 1 ]]; then
+  echo "==> syncing pinned Codex runtime (explicit opt-in)"
+  CODEX_RUNTIME_ARGS+=(--sync)
+else
+  echo "==> verifying pinned Codex runtime (read-only)"
+fi
 CODEX_RUNTIME_JSON=""
 CODEX_RUNTIME_RC=0
 CODEX_RUNTIME_JSON="$(
   env PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
-    "${PYTHON_BIN}" -m runner.codex_runtime --json
+    "${PYTHON_BIN}" -m runner.codex_runtime "${CODEX_RUNTIME_ARGS[@]}"
 )" || CODEX_RUNTIME_RC=$?
 if [[ "${CODEX_RUNTIME_RC}" -ne 0 ]]; then
-  echo "ERROR: pinned Codex runtime contract failed; no Codex package or cache was changed." >&2
+  if [[ "${SYNC_CODEX_RUNTIME}" -eq 1 ]]; then
+    echo "ERROR: pinned Codex runtime sync failed; inspect its phase and backup_path evidence." >&2
+  else
+    echo "ERROR: pinned Codex runtime contract failed; no Codex package or cache was changed." >&2
+  fi
   echo "${CODEX_RUNTIME_JSON}" >&2
   exit "${CODEX_RUNTIME_RC}"
 fi

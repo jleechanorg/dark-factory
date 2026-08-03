@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+from hashlib import sha256
 from copy import deepcopy
 from pathlib import Path
 
@@ -397,11 +398,245 @@ def test_installer_and_wrapper_use_static_codex_runtime_diagnostics() -> None:
     installer = (root / "install.sh").read_text(encoding="utf-8")
     wrapper = (root / "bin" / "dark-factory").read_text(encoding="utf-8")
 
-    assert "-m runner.codex_runtime --json" in installer
+    assert '-m runner.codex_runtime "${CODEX_RUNTIME_ARGS[@]}"' in installer
     assert "-m runner.preflight" in wrapper
     assert 'PREFLIGHT_SHADOW_CODEX="true"' in wrapper
     assert "__df_apply_shadow_state" in wrapper
     assert '--shadow-codex "${PREFLIGHT_SHADOW_CODEX}"' in wrapper
+
+
+def _write_sync_fakes(
+    home: Path,
+    *,
+    codex_exit: int = 0,
+    codex_output: str = "CODEX_RUNTIME_READY",
+    refresh_cache: bool = True,
+) -> tuple[Path, bytes]:
+    _, _, cache = _write_runtime(
+        home,
+        package_version="0.144.5",
+        cache_version="0.144.5",
+    )
+    before_cache = cache.read_bytes()
+    desired_cache = json.dumps(
+        {
+            "fetched_at": "2026-08-03T00:00:00Z",
+            "etag": None,
+            "client_version": PINNED_VERSION,
+            "models": [_release_model()],
+        },
+        separators=(",", ":"),
+    ).encode()
+    (home / "desired-cache.json").write_bytes(desired_cache)
+    node_root = home / ".nvm" / "versions" / "node" / NODE_VERSION
+    package_json = node_root / "lib/node_modules/@openai/codex/package.json"
+    npm = node_root / "bin/npm"
+    npm.write_text(
+        f"""#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+home = Path(os.environ["HOME"])
+backups = list((home / ".dark-factory/backups/codex-runtime").glob("models_cache.*.json"))
+with (home / "sync-events.jsonl").open("a") as stream:
+    stream.write(json.dumps({{"tool": "npm", "argv": sys.argv[1:], "backup_count": len(backups)}}) + "\\n")
+Path({str(package_json)!r}).write_text(json.dumps({{"name": "@openai/codex", "version": "{PINNED_VERSION}", "bin": {{"codex": "bin/codex.js"}}}}))
+""",
+        encoding="utf-8",
+    )
+    npm.chmod(0o755)
+    codex = node_root / "lib/node_modules/@openai/codex/bin/codex.js"
+    codex.write_text(
+        f"""#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+home = Path(os.environ["HOME"])
+with (home / "sync-events.jsonl").open("a") as stream:
+    stream.write(json.dumps({{"tool": "codex", "argv": sys.argv[1:], "cwd": os.getcwd()}}) + "\\n")
+if {refresh_cache!r}:
+    (home / ".codex/models_cache.json").write_bytes((home / "desired-cache.json").read_bytes())
+print({codex_output!r})
+raise SystemExit({codex_exit})
+""",
+        encoding="utf-8",
+    )
+    codex.chmod(0o755)
+    return cache, before_cache
+
+
+def test_default_runtime_cli_is_read_only_and_sync_is_explicit(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _, package_json, cache = _write_runtime(home)
+    package_before = package_json.read_bytes()
+    cache_before = cache.read_bytes()
+    root = Path(__file__).resolve().parents[1]
+
+    result = subprocess.run(
+        [sys.executable, "-m", "runner.codex_runtime", "--json"],
+        cwd=root,
+        env={**os.environ, "HOME": str(home), "PYTHONPATH": str(root)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["status"] == "pass"
+    assert package_json.read_bytes() == package_before
+    assert cache.read_bytes() == cache_before
+    installer = (root / "install.sh").read_text(encoding="utf-8")
+    assert "--sync-codex-runtime" in installer
+    assert 'CODEX_RUNTIME_ARGS+=(--sync)' in installer
+
+
+def test_sync_uses_exact_node22_tools_backs_up_first_and_validates(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from runner.codex_runtime import sync_codex_runtime
+
+    home = tmp_path / "home"
+    cache, before_cache = _write_sync_fakes(home)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-appear-in-evidence")
+
+    evidence = sync_codex_runtime(home=home, competing_package_paths=())
+
+    node_root = home / ".nvm" / "versions" / "node" / NODE_VERSION
+    events = [json.loads(line) for line in (home / "sync-events.jsonl").read_text().splitlines()]
+    assert events[0] == {
+        "tool": "npm",
+        "argv": [
+            "install",
+            "--global",
+            "--prefix",
+            str(node_root),
+            f"@openai/codex@{PINNED_VERSION}",
+        ],
+        "backup_count": 1,
+    }
+    assert events[1]["tool"] == "codex"
+    assert events[1]["argv"] == [
+        "exec",
+        "--sandbox",
+        "read-only",
+        "--skip-git-repo-check",
+        "CODEX_RUNTIME_READY",
+    ]
+    assert Path(events[1]["cwd"]).parent == Path("/tmp") or "dark-factory-codex-runtime-" in events[1]["cwd"]
+    assert "login" not in events[1]["argv"]
+    backup = Path(evidence["backup_path"])
+    assert backup.read_bytes() == before_cache
+    assert cache.read_bytes() == (home / "desired-cache.json").read_bytes()
+    assert evidence["status"] == "pass"
+    assert evidence["phase"] == "complete"
+    assert evidence["package_version"] == {"before": "0.144.5", "after": PINNED_VERSION}
+    assert evidence["cache"]["before"] == {
+        "sha256": sha256(before_cache).hexdigest(),
+        "client_version": "0.144.5",
+    }
+    assert evidence["cache"]["after"] == {
+        "sha256": sha256(cache.read_bytes()).hexdigest(),
+        "client_version": PINNED_VERSION,
+    }
+    assert evidence["subprocesses"]["npm_install"]["argv"][0] == str(node_root / "bin/npm")
+    assert evidence["subprocesses"]["codex_startup"]["argv"][0] == str(node_root / "bin/codex")
+    assert evidence["subprocesses"]["codex_startup"]["timeout_seconds"] == 120
+    assert evidence["readiness_token"] == "CODEX_RUNTIME_READY"
+    assert evidence["resolver"]["status"] == "pass"
+    assert evidence["resolver"]["version"] == PINNED_VERSION
+    assert "must-not-appear-in-evidence" not in json.dumps(evidence)
+
+
+@pytest.mark.parametrize(
+    ("codex_exit", "codex_output", "phase"),
+    [
+        (7, "CODEX_RUNTIME_READY", "codex_startup"),
+        (0, "NOT_READY", "readiness"),
+    ],
+)
+def test_sync_fails_closed_without_rollback_on_codex_error(
+    tmp_path: Path,
+    monkeypatch,
+    codex_exit: int,
+    codex_output: str,
+    phase: str,
+) -> None:
+    from runner.codex_runtime import CodexRuntimeSyncError, sync_codex_runtime
+
+    home = tmp_path / "home"
+    cache, before_cache = _write_sync_fakes(
+        home,
+        codex_exit=codex_exit,
+        codex_output=codex_output,
+    )
+    monkeypatch.setenv("HOME", str(home))
+
+    with pytest.raises(CodexRuntimeSyncError) as caught:
+        sync_codex_runtime(home=home, competing_package_paths=())
+
+    evidence = caught.value.evidence
+    assert evidence["status"] == "fail"
+    assert evidence["phase"] == phase
+    assert Path(evidence["backup_path"]).read_bytes() == before_cache
+    assert cache.read_bytes() == (home / "desired-cache.json").read_bytes()
+    assert evidence["subprocesses"]["codex_startup"]["exit_code"] == codex_exit
+    assert evidence["subprocesses"]["codex_startup"]["timed_out"] is False
+
+
+def test_sync_reports_timeout_and_preserves_backup(tmp_path: Path, monkeypatch) -> None:
+    from runner import codex_runtime
+    from runner.subprocess_control import BoundedProcessResult
+
+    home = tmp_path / "home"
+    _, _, cache = _write_runtime(home)
+    before_cache = cache.read_bytes()
+    node_root = home / ".nvm" / "versions" / "node" / NODE_VERSION
+    npm = node_root / "bin/npm"
+    npm.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    npm.chmod(0o755)
+    calls: list[tuple[list[str], float]] = []
+
+    def _bounded(args, *, timeout, **kwargs):
+        calls.append((list(args), timeout))
+        if len(calls) == 1:
+            return BoundedProcessResult(tuple(args), 0, "", "", False)
+        return BoundedProcessResult(tuple(args), -1, "", "", True)
+
+    monkeypatch.setattr(codex_runtime, "run_bounded_process", _bounded)
+
+    with pytest.raises(codex_runtime.CodexRuntimeSyncError) as caught:
+        codex_runtime.sync_codex_runtime(home=home, competing_package_paths=())
+
+    evidence = caught.value.evidence
+    assert evidence["phase"] == "codex_startup"
+    assert evidence["subprocesses"]["codex_startup"]["timed_out"] is True
+    assert calls[1][1] == 120
+    assert Path(evidence["backup_path"]).read_bytes() == before_cache
+    assert cache.read_bytes() == before_cache
+
+
+def test_sync_fails_final_static_validation_without_editing_stale_cache(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from runner.codex_runtime import CodexRuntimeSyncError, sync_codex_runtime
+
+    home = tmp_path / "home"
+    cache, before_cache = _write_sync_fakes(home, refresh_cache=False)
+    monkeypatch.setenv("HOME", str(home))
+
+    with pytest.raises(CodexRuntimeSyncError) as caught:
+        sync_codex_runtime(home=home, competing_package_paths=())
+
+    evidence = caught.value.evidence
+    assert evidence["phase"] == "final_validation"
+    assert "cache client_version mismatch" in evidence["error"]
+    assert Path(evidence["backup_path"]).read_bytes() == before_cache
+    assert cache.read_bytes() == before_cache
 
 
 def test_fresh_worker_and_controller_share_aligned_cache_and_emit_artifacts(
