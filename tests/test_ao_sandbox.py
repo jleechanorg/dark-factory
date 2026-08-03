@@ -102,6 +102,7 @@ def test_codergen_ao_spawn_args_are_sandboxed(monkeypatch, tmp_path):
         "sandbox profile is missing the holdouts deny rule"
     )
     assert "(deny file-read*" in spawn_argv[2]
+    assert str(pathlib.Path.home() / ".dark-factory" / "operator-trust") in spawn_argv[2]
     # The real `ao spawn` argv must follow the sandbox wrapper.
     assert "ao" in spawn_argv and "spawn" in spawn_argv
     assert result.outcome == "success"
@@ -149,6 +150,7 @@ def test_codergen_ao_send_args_are_sandboxed(monkeypatch, tmp_path):
     assert send_argv[1] == "-p"
     assert "dark-factory-holdouts" in send_argv[2]
     assert "(deny file-read*" in send_argv[2]
+    assert str(pathlib.Path.home() / ".dark-factory" / "operator-trust") in send_argv[2]
     assert "ao" in send_argv and "send" in send_argv
     assert result.outcome == "success"
 
