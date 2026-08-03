@@ -635,6 +635,22 @@ fn run(args: Args) -> Result<(), DaemonError> {
             now.duration_since(last_tick_time).as_secs()
         });
 
+        let _ = systemd_notify("WATCHDOG=1\n");
+        let _ = daemon::telemetry::emit(
+            deps.telemetry_log,
+            &daemon::telemetry::TelemetryEvent {
+                timestamp: daemon::state::now_iso8601(),
+                bead_id: "system".to_string(),
+                attempt_id: 0,
+                lifecycle_state: "LIVENESS_WATCHDOG_PING".to_string(),
+                event_type: "LIVENESS_WATCHDOG_PING".to_string(),
+                metrics: serde_json::json!({}),
+                context: serde_json::json!({
+                    "tick_index": attempt.tick_index,
+                }),
+            },
+        );
+
         let action = classify_tick_result(
             run_tick(&deps, attempt.tick_index, attempt.elapsed_secs),
             cfg.fast_tick_secs,
