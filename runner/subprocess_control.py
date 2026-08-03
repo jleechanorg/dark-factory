@@ -19,6 +19,14 @@ def as_text(value: str | bytes | None) -> str:
     return value
 
 
+def as_bytes(value: str | bytes | None) -> bytes:
+    if value is None:
+        return b""
+    if isinstance(value, bytes):
+        return value
+    return value.encode("utf-8")
+
+
 def _merge_output(current: str | bytes | None, later: str | bytes | None) -> str:
     current_text = as_text(current)
     later_text = as_text(later)
@@ -31,12 +39,33 @@ def _merge_output(current: str | bytes | None, later: str | bytes | None) -> str
     return current_text + later_text
 
 
+def _merge_output_bytes(current: str | bytes | None, later: str | bytes | None) -> bytes:
+    current_bytes = as_bytes(current)
+    later_bytes = as_bytes(later)
+    if not later_bytes or later_bytes == current_bytes:
+        return current_bytes
+    if later_bytes.startswith(current_bytes):
+        return later_bytes
+    if current_bytes.endswith(later_bytes):
+        return current_bytes
+    return current_bytes + later_bytes
+
+
 @dataclass(frozen=True, slots=True)
 class BoundedProcessResult:
     args: tuple[str, ...]
     returncode: int
     stdout: str
     stderr: str
+    timed_out: bool
+
+
+@dataclass(frozen=True, slots=True)
+class BoundedProcessBytesResult:
+    args: tuple[str, ...]
+    returncode: int
+    stdout: bytes
+    stderr: bytes
     timed_out: bool
 
 
@@ -64,7 +93,8 @@ def finish_bounded_process(
     input_text: str | None = None,
     terminate_grace: float = 5.0,
     process_group_id: int | None = None,
-) -> BoundedProcessResult:
+    preserve_bytes: bool = False,
+) -> BoundedProcessResult | BoundedProcessBytesResult:
     """Communicate within ``timeout`` and always reap the whole process group."""
     timed_out = False
     pgid = int(process_group_id if process_group_id is not None else proc.pid)
@@ -75,15 +105,22 @@ def finish_bounded_process(
             stdout, stderr = proc.communicate(input=input_text, timeout=timeout)
     except subprocess.TimeoutExpired as initial_timeout:
         timed_out = True
-        stdout, stderr = as_text(initial_timeout.stdout), as_text(initial_timeout.stderr)
+        if preserve_bytes:
+            stdout, stderr = as_bytes(initial_timeout.stdout), as_bytes(initial_timeout.stderr)
+        else:
+            stdout, stderr = as_text(initial_timeout.stdout), as_text(initial_timeout.stderr)
         _signal_process_group(pgid, signal.SIGTERM)
         deadline = time.monotonic() + max(0.0, terminate_grace)
         try:
             drained_stdout, drained_stderr = proc.communicate(timeout=terminate_grace)
             stdout, stderr = drained_stdout, drained_stderr
         except subprocess.TimeoutExpired as cleanup_timeout:
-            stdout = _merge_output(stdout, cleanup_timeout.stdout)
-            stderr = _merge_output(stderr, cleanup_timeout.stderr)
+            if preserve_bytes:
+                stdout = _merge_output_bytes(stdout, cleanup_timeout.stdout)
+                stderr = _merge_output_bytes(stderr, cleanup_timeout.stderr)
+            else:
+                stdout = _merge_output(stdout, cleanup_timeout.stdout)
+                stderr = _merge_output(stderr, cleanup_timeout.stderr)
         except Exception:
             pass
         while _process_group_exists(pgid) and time.monotonic() < deadline:
@@ -97,15 +134,20 @@ def finish_bounded_process(
             if final_stderr is not None:
                 stderr = final_stderr
         except subprocess.TimeoutExpired as final_timeout:
-            stdout = _merge_output(stdout, final_timeout.stdout)
-            stderr = _merge_output(stderr, final_timeout.stderr)
+            if preserve_bytes:
+                stdout = _merge_output_bytes(stdout, final_timeout.stdout)
+                stderr = _merge_output_bytes(stderr, final_timeout.stderr)
+            else:
+                stdout = _merge_output(stdout, final_timeout.stdout)
+                stderr = _merge_output(stderr, final_timeout.stderr)
         except Exception:
             pass
-    return BoundedProcessResult(
+    result_type = BoundedProcessBytesResult if preserve_bytes else BoundedProcessResult
+    return result_type(
         args=tuple(str(part) for part in getattr(proc, "args", ())),
         returncode=int(proc.returncode if proc.returncode is not None else -1),
-        stdout=as_text(stdout),
-        stderr=as_text(stderr),
+        stdout=as_bytes(stdout) if preserve_bytes else as_text(stdout),
+        stderr=as_bytes(stderr) if preserve_bytes else as_text(stderr),
         timed_out=timed_out,
     )
 
@@ -138,3 +180,32 @@ def run_bounded_process(
         terminate_grace=terminate_grace,
         process_group_id=proc.pid,
     )
+
+
+def run_bounded_process_bytes(
+    args: Sequence[str],
+    *,
+    cwd: str | Path | None = None,
+    timeout: float,
+    env: Mapping[str, str] | None = None,
+    terminate_grace: float = 5.0,
+) -> BoundedProcessBytesResult:
+    """Run an exact argv while preserving stdout/stderr bytes losslessly."""
+    proc = subprocess.Popen(
+        list(args),
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+        env=dict(env) if env is not None else None,
+    )
+    result = finish_bounded_process(
+        proc,
+        timeout=timeout,
+        terminate_grace=terminate_grace,
+        process_group_id=proc.pid,
+        preserve_bytes=True,
+    )
+    assert isinstance(result, BoundedProcessBytesResult)
+    return result

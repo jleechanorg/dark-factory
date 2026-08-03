@@ -8,6 +8,29 @@ import time
 import pytest
 
 
+def test_bounded_process_bytes_preserves_non_utf8_streams(tmp_path) -> None:
+    from runner.subprocess_control import run_bounded_process_bytes
+
+    result = run_bounded_process_bytes(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os; "
+                "os.write(1, b'out\\x00\\xff'); "
+                "os.write(2, b'err\\x80\\n')"
+            ),
+        ],
+        cwd=tmp_path,
+        timeout=5,
+    )
+
+    assert result.returncode == 0
+    assert result.timed_out is False
+    assert result.stdout == b"out\x00\xff"
+    assert result.stderr == b"err\x80\n"
+
+
 def test_finish_bounded_process_decodes_timeout_byte_streams() -> None:
     from runner.subprocess_control import finish_bounded_process
 
