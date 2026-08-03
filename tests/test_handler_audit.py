@@ -572,6 +572,85 @@ def test_operator_verify_fails_closed_on_timeout_oversize_and_raw_write_failure(
     assert write_result.outcome == "error"
 
 
+def test_sensitive_output_stays_out_of_checkpoint_cxdb_and_bundle(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    tool = tmp_path / "tools" / "fake-pytest"
+    tool.parent.mkdir()
+    tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    tool.chmod(0o700)
+    _write_operator_manifest(
+        tmp_path,
+        """\
+operator_verification:
+  schema_version: 1
+  commands:
+    - id: secret-probe
+      argv: [tools/fake-pytest]
+      lane: operator_unwrapped
+      timeout_seconds: 30
+      classification: required
+  exclusions: []
+""",
+    )
+    graph_path = tmp_path / "operator.dot"
+    graph_path.write_text(
+        """\
+digraph OperatorSecret {
+  start [shape=Mdiamond]
+  operator_verify [type="operator_verify"]
+  exit [shape=Msquare]
+  start -> operator_verify
+  operator_verify -> exit [condition="outcome=success"]
+  operator_verify -> exit [condition="outcome=error"]
+}
+""",
+        encoding="utf-8",
+    )
+
+    import runner.handlers  # noqa: F401
+    import runner.handler_audit as ha
+    from runner.engine import run
+    from runner.evidence import write_bundle
+    from runner.handler_core import Context
+    from runner.parser import parse
+    from runner.subprocess_control import BoundedProcessBytesResult
+
+    head = b"4" * 40 + b"\n"
+    secret = b"SENTINEL-NO-PUBLIC-SURFACE\x00\xff"
+    outputs = iter([head, b"changed.py\n", b"", b"", secret, head])
+
+    def fake_bounded(args, **kwargs):
+        return BoundedProcessBytesResult(tuple(args), 0, next(outputs), b"", False)
+
+    raw_root = tmp_path / "private"
+    monkeypatch.setattr(ha, "run_bounded_process_bytes", fake_bounded)
+    monkeypatch.setattr(ha, "_operator_log_root", lambda: raw_root)
+    monkeypatch.setattr(ha._handlers_shim, "_sanitized_env", lambda: {})
+    checkpoint = tmp_path / "checkpoint.json"
+    cxdb = tmp_path / "cxdb.sqlite"
+    events = tmp_path / "events.jsonl"
+    ctx = Context(
+        goal="secret confinement",
+        workdir=tmp_path,
+        backend="codex",
+        cxdb_path=cxdb,
+        event_log_path=events,
+    )
+    graph = parse(graph_path)
+    history = run(graph, ctx, checkpoint=checkpoint)
+    bundle = tmp_path / "bundle"
+    write_bundle(bundle, cxdb, str(ctx.run_id), graph_path, graph, tmp_path, event_log_path=events)
+
+    receipt = tmp_path / "evidence" / "operator-verification.json"
+    public_files = [checkpoint, cxdb, events, receipt, *bundle.rglob("*")]
+    assert secret not in json.dumps(ctx.state, sort_keys=True).encode()
+    assert all(secret not in record.output_preview.encode() for record in history)
+    assert all(not path.is_file() or secret not in path.read_bytes() for path in public_files)
+    raw_matches = [path for path in raw_root.rglob("*.stdout.bin") if path.read_bytes() == secret]
+    assert len(raw_matches) == 1
+
+
 def test_default_probe_list_is_vendor_neutral():
     import runner.handlers  # noqa: F401
     from runner.handler_audit import DEFAULT_EVIDENCE_FILENAMES
