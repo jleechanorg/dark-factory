@@ -746,3 +746,131 @@ def test_controller_outer_sandbox_avoids_nested_seatbelt(tmp_path):
     assert "--sandbox" in transport and "danger-full-access" in transport
     assert proc.returncode == 0, proc.stderr
     assert "sandbox_apply" not in proc.stderr
+
+
+def test_controller_protects_linked_git_metadata_and_artifact_lane(tmp_path):
+    """The outer boundary owns linked Git metadata and controller artifacts."""
+    from runner.handler_dispatch import (
+        _build_controller_codex_transport,
+        _controller_protected_paths,
+    )
+
+    sandbox_exec = shutil.which("sandbox-exec")
+    if sandbox_exec is None:
+        pytest.skip("sandbox-exec unavailable")
+
+    source = tmp_path / "source"
+    source.mkdir()
+    subprocess.run(["git", "-C", str(source), "init", "-q"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(source),
+            "config",
+            "user.email",
+            "jleechan2015@users.noreply.github.com",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(source), "config", "user.name", "test"],
+        check=True,
+    )
+    (source / "tracked.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(source), "add", "tracked.txt"], check=True)
+    subprocess.run(["git", "-C", str(source), "commit", "-qm", "base"], check=True)
+    reviewed = tmp_path / "linked-review"
+    subprocess.run(
+        ["git", "-C", str(source), "worktree", "add", "--detach", str(reviewed), "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    git_dir = pathlib.Path(
+        subprocess.run(
+            ["git", "-C", str(reviewed), "rev-parse", "--git-dir"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    ).resolve()
+    common_dir = pathlib.Path(
+        subprocess.run(
+            ["git", "-C", str(reviewed), "rev-parse", "--git-common-dir"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    ).resolve()
+    output_dir = tmp_path / "controller-artifacts"
+    output_dir.mkdir()
+    allowed_file = tmp_path / "allowed.txt"
+    allowed_file.write_text("allowed-marker\n", encoding="utf-8")
+    fake_codex = tmp_path / "codex"
+    fake_codex.write_text(
+        "#!/bin/sh\n"
+        'if printf changed >"$DF_GIT_DIR/reviewer-write" 2>/dev/null; then exit 90; fi\n'
+        'if printf changed >"$DF_COMMON_DIR/reviewer-write" 2>/dev/null; then exit 91; fi\n'
+        'if printf changed >"$DF_OUTPUT/reviewer-write" 2>/dev/null; then exit 92; fi\n'
+        'if /bin/ln -s "$DF_ALLOWED" "$DF_OUTPUT/reviewer-link" 2>/dev/null; then exit 93; fi\n'
+        '/bin/cat "$DF_GIT_DIR/HEAD" >/dev/null || exit 94\n'
+        '/bin/cat "$DF_ALLOWED"\n',
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    protected = _controller_protected_paths((reviewed,), output_dir=output_dir)
+    transport = _build_controller_codex_transport(
+        [
+            sandbox_exec,
+            "-p",
+            "(version 1)\n(allow default)",
+            str(fake_codex),
+            "exec",
+            "prompt",
+        ],
+        read_only_paths=protected,
+    )
+
+    assert git_dir in protected
+    assert common_dir in protected
+    assert output_dir.resolve() in protected
+    proc = subprocess.run(
+        transport,
+        input="bounded linked-worktree probe",
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "DF_GIT_DIR": str(git_dir),
+            "DF_COMMON_DIR": str(common_dir),
+            "DF_OUTPUT": str(output_dir),
+            "DF_ALLOWED": str(allowed_file),
+        },
+        timeout=10,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "allowed-marker\n"
+    assert not (git_dir / "reviewer-write").exists()
+    assert not (common_dir / "reviewer-write").exists()
+    assert not (output_dir / "reviewer-write").exists()
+    assert not (output_dir / "reviewer-link").exists()
+    (output_dir / "controller-receipt.json").write_text("accepted\n")
+    assert (output_dir / "controller-receipt.json").read_text() == "accepted\n"
+
+
+def test_controller_protected_paths_deduplicate_ordinary_repo_metadata(tmp_path):
+    """An ordinary repository with one Git/common dir yields unique real paths."""
+    from runner.handler_dispatch import _controller_protected_paths
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    output_dir = tmp_path / "output"
+
+    protected = _controller_protected_paths((repo,), output_dir=output_dir)
+
+    assert protected.count((repo / ".git").resolve()) == 1
+    assert len(protected) == len(set(protected))

@@ -20,6 +20,7 @@ import time
 from .handler_core import Context
 from .handler_dispatch import (
     _controller_codex_args,
+    _controller_protected_paths,
     _gate_subprocess_args,
     _gate_subprocess_env,
 )
@@ -264,7 +265,10 @@ def main(argv: list[str] | None = None) -> int:
         try:
             command = _controller_codex_args(
                 command,
-                read_only_paths=(workdir,),
+                read_only_paths=_controller_protected_paths(
+                    (workdir,),
+                    output_dir=output_dir,
+                ),
             )
         except ValueError as exc:
             raise ReviewContractError(

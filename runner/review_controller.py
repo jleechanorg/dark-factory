@@ -1029,11 +1029,12 @@ def run_controller_review(
         ],
         "timestamp": _utc_now_iso(),
     }
-    receipt_path.write_text(
+    _write_atomic_artifact(
+        receipt_path,
         json.dumps(receipt, indent=2, sort_keys=True, ensure_ascii=False),
-        encoding="utf-8",
     )
-    findings_path.write_text(
+    _write_atomic_artifact(
+        findings_path,
         json.dumps(
             {
                 "schema": 1,
@@ -1047,7 +1048,6 @@ def run_controller_review(
             sort_keys=True,
             ensure_ascii=False,
         ),
-        encoding="utf-8",
     )
     return ControllerReviewResult(
         review=review,
@@ -1063,6 +1063,26 @@ def run_controller_review(
             "findings": str(findings_path),
         },
     )
+
+
+def _write_atomic_artifact(path: "pathlib.Path", text: str) -> None:
+    """Atomically replace one parent-owned artifact without following symlinks."""
+    import os
+    import pathlib
+    import tempfile
+
+    path = pathlib.Path(path)
+    fd, temp_name = tempfile.mkstemp(prefix=".controller-", dir=path.parent)
+    temp_path = pathlib.Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
 
 
 def _utc_now_iso() -> str:

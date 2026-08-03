@@ -53,6 +53,7 @@ from .handler_core import _gate_strict_flag
 from .handler_verdict import _enforce_outcome_verdict_consistency  # noqa: F401
 from .handler_dispatch import (
     _controller_codex_args,
+    _controller_protected_paths,
     _finish_shadow_gate_review,
     _gate_subprocess_args,
     _gate_subprocess_env,
@@ -170,13 +171,19 @@ def _run_controller_primary(
             },
         )
     target = json.loads(request.envelope_json)["target"]
+    output_dir = pathlib.Path(
+        ctx.state["_df_controller_review_lane_dirs"]["primary"]
+    )
     try:
         transport_argv = tuple(
             _controller_codex_args(
                 args,
-                read_only_paths=(
-                    _handlers_shim._target_worktree(ctx),
-                    pathlib.Path(str(target["workspace_path"])),
+                read_only_paths=_controller_protected_paths(
+                    (
+                        _handlers_shim._target_worktree(ctx),
+                        pathlib.Path(str(target["workspace_path"])),
+                    ),
+                    output_dir=output_dir,
                 ),
             )
         )
@@ -188,9 +195,6 @@ def _run_controller_primary(
         )
 
     neutral_cwd = pathlib.Path(str(ctx.state["_df_controller_review_cwd"]))
-    output_dir = pathlib.Path(
-        ctx.state["_df_controller_review_lane_dirs"]["primary"]
-    )
     try:
         controller_result = run_controller_review(
             request,

@@ -508,6 +508,39 @@ def _gate_subprocess_env(backend: str) -> dict[str, str]:
     return _handlers_shim._sanitized_env()
 
 
+def _controller_protected_paths(
+    reviewed_paths: Iterable[os.PathLike[str] | str],
+    *,
+    output_dir: os.PathLike[str] | str,
+) -> tuple[pathlib.Path, ...]:
+    """Return real reviewed, Git-metadata, and artifact paths to protect."""
+    protected: list[pathlib.Path] = []
+    for reviewed_path in reviewed_paths:
+        reviewed = pathlib.Path(reviewed_path).expanduser().resolve(strict=True)
+        protected.append(reviewed)
+        for flag in ("--git-dir", "--git-common-dir"):
+            proc = subprocess.run(
+                ["git", "-C", str(reviewed), "rev-parse", flag],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if proc.returncode != 0 or not proc.stdout.strip():
+                raise ValueError(
+                    f"controller could not resolve {flag} for {reviewed}: "
+                    f"{proc.stderr.strip()}"
+                )
+            metadata = pathlib.Path(proc.stdout.strip()).expanduser()
+            if not metadata.is_absolute():
+                metadata = reviewed / metadata
+            protected.append(metadata.resolve(strict=True))
+    protected.append(
+        pathlib.Path(output_dir).expanduser().resolve(strict=False)
+    )
+    return tuple(dict.fromkeys(protected))
+
+
 def _build_controller_codex_transport(
     args: list[str],
     *,
