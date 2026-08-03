@@ -58,7 +58,10 @@ def test_review_codergen_runs_parallel_codex_shadow_review(tmp_path, monkeypatch
     ctx.state["_last_changed_files"] = "- demo.py"
     ctx.state["_df_shadow_codex_review"] = "true"
 
-    monkeypatch.setattr("runner.handler_codergen.shutil.which", lambda name: "/usr/bin/codex")
+    monkeypatch.setattr(
+        "runner.codex_runtime.resolve_codex_executable",
+        lambda: "/test-fixtures/.nvm/versions/node/v22.22.0/bin/codex",
+    )
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda args: args)
     monkeypatch.setattr("runner.handlers._sandboxed_args_for_workdir", lambda args, workdir: args)
     monkeypatch.setattr("runner.handlers._sanitized_env", lambda: {})
@@ -67,7 +70,8 @@ def test_review_codergen_runs_parallel_codex_shadow_review(tmp_path, monkeypatch
     def _fake_run(args, **kwargs):
         if args and args[0] == "git":
             return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
-        assert args[:4] == ["codex", "exec", "--yolo", "--skip-git-repo-check"]
+        assert pathlib.Path(args[0]).name == "codex"
+        assert args[1:4] == ["exec", "--yolo", "--skip-git-repo-check"]
         return subprocess.CompletedProcess(
             args, 0, stdout="primary reviewer says pass\n", stderr=""
         )

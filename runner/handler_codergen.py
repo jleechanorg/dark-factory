@@ -70,7 +70,6 @@ import os
 import pathlib
 import re
 import signal
-import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -79,6 +78,7 @@ from typing import TYPE_CHECKING
 
 import runner.handlers as _handlers_shim
 
+from . import codex_runtime
 from .handler_core import Result
 
 if TYPE_CHECKING:
@@ -227,12 +227,14 @@ def _start_shadow_codex_review(
     except Exception:
         pass
 
-    if shutil.which("codex") is None:
-        shadow.launch_error = "codex executable not found"
+    try:
+        codex_executable = codex_runtime.resolve_codex_executable()
+    except codex_runtime.CodexRuntimeError as exc:
+        shadow.launch_error = str(exc)
         return shadow
 
     args = _handlers_shim._sandboxed_args_for_workdir([
-        "codex",
+        codex_executable,
         "exec",
         "--yolo",
         "--skip-git-repo-check",
@@ -898,8 +900,12 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             _stash_codergen_receipt(node, ctx)
         return _finalize(Result(outcome=outcome, output=output, metadata=meta))
     elif backend == "codex":
+        try:
+            codex_executable = codex_runtime.resolve_codex_executable()
+        except codex_runtime.CodexRuntimeError as exc:
+            return _finalize(Result(outcome="error", output=f"codex backend error: {exc}"))
         args = _handlers_shim._sandboxed_args_for_workdir(
-            ["codex", "exec", "--yolo", "--skip-git-repo-check", prompt_text],
+            [codex_executable, "exec", "--yolo", "--skip-git-repo-check", prompt_text],
             ctx.workdir,
         )
         if args is None:

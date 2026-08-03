@@ -49,6 +49,7 @@ import sys
 import time
 from typing import List, Optional, Tuple
 
+from runner import codex_runtime
 from runner.skeptic_gate import (
     MARKER,
     BeadContract,
@@ -479,8 +480,13 @@ def _build_reviewer_cmd(
     workflow's PATH is reduced to a minimal set).
     """
     if reviewer == "codex":
+        resolved_codex = codex_bin or codex_runtime.resolve_codex_executable()
+        if not pathlib.Path(resolved_codex).is_absolute():
+            raise codex_runtime.CodexRuntimeError(
+                f"explicit Codex executable must be absolute: {resolved_codex}"
+            )
         cmd = [
-            codex_bin or "codex",
+            resolved_codex,
             "exec",
             "--sandbox",
             "read-only",

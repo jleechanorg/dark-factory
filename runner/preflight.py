@@ -29,6 +29,8 @@ import shutil
 import sys
 from typing import Optional
 
+from . import codex_runtime
+
 
 # Backends we probe. ``echo`` is always considered available — it is
 # the no-LLM fallback built into the runner.
@@ -93,22 +95,33 @@ def preflight_check(backend: str, workdir: pathlib.Path | None = None) -> dict:
     workdir = workdir or pathlib.Path.cwd()
     del workdir  # currently unused; keep the parameter for future expansion
 
+    try:
+        codex = codex_runtime.resolve_codex_runtime()
+        codex_path: Optional[str] = str(codex.executable)
+        codex_error = ""
+    except codex_runtime.CodexRuntimeError as exc:
+        codex_path = None
+        codex_error = str(exc)
+
+    def _backend_path(name: str) -> Optional[str]:
+        return codex_path if name == "codex" else _probe(name)
+
     # Normalize: a backend we don't know about is treated as missing
     # but still appears in the report so the caller can see what was
     # asked for.
     known = backend in PROBED_BACKENDS
-    configured_present = (backend == "echo") or _probe(backend) is not None
+    configured_present = (backend == "echo") or _backend_path(backend) is not None
 
     backends: dict[str, dict] = {}
     for name in PROBED_BACKENDS:
         if name == "echo":
             backends[name] = {"ok": True, "path": None, "hint": None}
             continue
-        path = _probe(name)
+        path = _backend_path(name)
         backends[name] = {
             "ok": path is not None,
             "path": path,
-            "hint": None if path else HINTS.get(name),
+            "hint": None if path else (codex_error if name == "codex" else HINTS.get(name)),
         }
 
     # Include the configured backend in the report even if it's an
@@ -131,7 +144,9 @@ def preflight_check(backend: str, workdir: pathlib.Path | None = None) -> dict:
         }
 
     # Determine status.
-    if backend == "echo" or configured_present:
+    if backend == "codex" and not configured_present:
+        status = "fail"
+    elif backend == "echo" or configured_present:
         status = "pass"
     else:
         # At least one non-echo backend present AND all transitive deps OK?
@@ -171,7 +186,9 @@ def preflight_check(backend: str, workdir: pathlib.Path | None = None) -> dict:
                 fallback = cand
                 break
 
-    if status == "pass":
+    if backend == "codex" and codex_error:
+        message = f"codex runtime rejected: {codex_error}"
+    elif status == "pass":
         if backend == "echo":
             message = "echo backend: always available"
         else:

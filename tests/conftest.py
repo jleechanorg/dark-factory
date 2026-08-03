@@ -88,3 +88,12 @@ def _declare_test_environment() -> None:
     # found" for `@pipelines/_base.dot`. Set it to the install root (parent of
     # this conftest).
     os.environ.setdefault("DARK_FACTORY_HOME", str(ROOT))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_codex_executable_from_live_install(monkeypatch) -> None:
+    """Launcher unit tests never depend on or execute the operator's Codex."""
+    from runner import codex_runtime
+
+    fake = "/test-fixtures/.nvm/versions/node/v22.22.0/bin/codex"
+    monkeypatch.setattr(codex_runtime, "resolve_codex_executable", lambda: fake)

@@ -82,13 +82,13 @@ def test_configured_backend_present_returns_pass(monkeypatch, which_all_present)
     assert result["fallback_recommendation"] == "claude"
 
 
-def test_configured_backend_missing_others_available_returns_warn(
+def test_configured_codex_runtime_skew_fails_closed_even_with_fallback(
     monkeypatch, which_claude_only
 ):
-    """Configured (codex) missing but claude present => status=warn, exit 0."""
+    """Configured Codex skew is fatal even when another CLI is available."""
     result = preflight.preflight_check("codex")
 
-    assert result["status"] == "warn"
+    assert result["status"] == "fail"
     assert result["configured"] == "codex"
     assert result["configured_ok"] is False
     assert result["backends"]["claude"]["ok"] is True
@@ -97,8 +97,8 @@ def test_configured_backend_missing_others_available_returns_warn(
     # FALLBACK_PRIORITY = ("codex", "claude", "agy", "ao", "echo").
     # codex is missing and excluded; first present is claude.
     assert result["fallback_recommendation"] == "claude"
-    # Exit code 0 for warn
-    assert preflight.main(["--backend", "codex", "--json"]) == 0
+    # Codex skew must stop the wrapper before a subprocess launch.
+    assert preflight.main(["--backend", "codex", "--json"]) == 2
 
 
 def test_zero_backends_available_returns_fail(monkeypatch, which_none):

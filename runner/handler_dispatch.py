@@ -48,6 +48,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterable, Optional
 
+from . import codex_runtime
 from .handler_core import Result
 from .subprocess_control import finish_bounded_process, run_bounded_process
 
@@ -227,10 +228,17 @@ def _launch_shadow_gate_review(
             )
     except Exception:
         pass
-    probe_bin = "codex" if backend == "codex" else ("agy" if backend == "agy" else _handlers_shim._get_claude_executable())
-    if shutil.which(probe_bin) is None:
-        shadow.launch_error = f"{backend} executable not found"
-        return shadow
+    if backend == "codex":
+        try:
+            codex_runtime.resolve_codex_executable()
+        except codex_runtime.CodexRuntimeError as exc:
+            shadow.launch_error = str(exc)
+            return shadow
+    else:
+        probe_bin = "agy" if backend == "agy" else _handlers_shim._get_claude_executable()
+        if shutil.which(probe_bin) is None:
+            shadow.launch_error = f"{backend} executable not found"
+            return shadow
     args = _gate_subprocess_args(backend, shadow_prompt, ctx, timeout)
     if args is None:
         shadow.launch_error = "sandbox-exec unavailable"
@@ -489,8 +497,9 @@ def _gate_subprocess_args(backend: str, prompt: str, ctx: "Context", timeout: in
             prompt,
         ])
     if backend == "codex":
+        codex_executable = codex_runtime.resolve_codex_executable()
         return _handlers_shim._sandboxed_args([
-            "codex", "exec", "--yolo", "--skip-git-repo-check", prompt,
+            codex_executable, "exec", "--yolo", "--skip-git-repo-check", prompt,
         ])
     # ``claude-sonnet`` (priority-queue name), bare ``claude`` (run-level
     # default), and any other claude-routed backend → Anthropic Claude CLI.
@@ -979,6 +988,12 @@ def _probe_backend_installed(name: str) -> bool:
     existing ``subprocess.run(timeout=...)`` envelope in ``_run_gate_once`` to
     catch the hang, but the probe itself uses a 5s ceiling.
     """
+    if name == "codex":
+        try:
+            codex_runtime.resolve_codex_executable()
+        except codex_runtime.CodexRuntimeError:
+            return False
+        return True
     bin_name = "claude" if name == "claude-sonnet" else name
     bin_path = shutil.which(bin_name)
     if not bin_path:

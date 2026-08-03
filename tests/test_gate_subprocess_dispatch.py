@@ -530,7 +530,8 @@ def test_execute_gate_runs_parallel_codex_shadow_review(tmp_path, monkeypatch):
 
     assert result.outcome == "failure"
     assert popen_cmds
-    assert popen_cmds[0][:4] == ["codex", "exec", "--yolo", "--skip-git-repo-check"]
+    assert pathlib.Path(popen_cmds[0][0]).name == "codex"
+    assert popen_cmds[0][1:4] == ["exec", "--yolo", "--skip-git-repo-check"]
     assert "## Parallel Codex Gate Review" in result.output
     assert "artifact missing from bundle" in result.output
     assert result.metadata["shadow_codex_gate_review"] == "true"
