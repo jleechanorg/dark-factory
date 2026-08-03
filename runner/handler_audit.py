@@ -248,7 +248,12 @@ def _write_operator_receipt(path: pathlib.Path, receipt: dict[str, object]) -> s
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _validate_operator_receipt(path: pathlib.Path, expected_head: str) -> str:
+def _validate_operator_receipt(
+    path: pathlib.Path,
+    expected_head: str,
+    *,
+    expected_receipt: dict[str, object] | None = None,
+) -> str:
     if path.is_symlink() or not path.is_file():
         raise ValueError("operator verification receipt is missing or a symlink")
     encoded = path.read_bytes()
@@ -257,6 +262,9 @@ def _validate_operator_receipt(path: pathlib.Path, expected_head: str) -> str:
     receipt = json.loads(encoded)
     if receipt.get("schema_version") != 2 or receipt.get("target_head_sha") != expected_head:
         raise ValueError("operator verification receipt/head mismatch")
+    if expected_receipt is not None and receipt != expected_receipt:
+        raise ValueError("operator verification receipt was tampered after creation")
+    private_root = _operator_log_root().resolve()
     for command in receipt.get("commands", []):
         if command.get("requested_argv") != command.get("effective_argv"):
             raise ValueError("operator verification argv mismatch")
@@ -265,6 +273,10 @@ def _validate_operator_receipt(path: pathlib.Path, expected_head: str) -> str:
         for stream_name in ("stdout", "stderr"):
             reference = command.get(stream_name, {})
             raw_path = pathlib.Path(str(reference.get("path", "")))
+            try:
+                raw_path.resolve().relative_to(private_root)
+            except ValueError as exc:
+                raise ValueError("operator verification raw log escapes private root") from exc
             if raw_path.is_symlink() or not raw_path.is_file():
                 raise ValueError("operator verification raw log is missing or a symlink")
             data = raw_path.read_bytes()
@@ -395,7 +407,9 @@ def _operator_verify(node: "Node", ctx: "Context") -> Result:
         receipt_path = workdir / "evidence" / "operator-verification.json"
         try:
             _write_operator_receipt(receipt_path, receipt)
-            receipt_sha = _validate_operator_receipt(receipt_path, target_head)
+            receipt_sha = _validate_operator_receipt(
+                receipt_path, target_head, expected_receipt=receipt
+            )
         except Exception as exc:
             return Result(
                 outcome="error",
@@ -530,7 +544,9 @@ def _operator_verify(node: "Node", ctx: "Context") -> Result:
     receipt_path = workdir / "evidence" / "operator-verification.json"
     try:
         _write_operator_receipt(receipt_path, receipt)
-        receipt_sha = _validate_operator_receipt(receipt_path, target_head)
+        receipt_sha = _validate_operator_receipt(
+            receipt_path, target_head, expected_receipt=receipt
+        )
     except Exception as exc:
         return Result(
             outcome="error",

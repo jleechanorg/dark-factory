@@ -300,6 +300,140 @@ def test_repository_operator_manifest_has_exact_sandbox_split() -> None:
     ]
 
 
+def test_receipt_validation_rejects_raw_logs_outside_private_root(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    import runner.handlers  # noqa: F401
+    import runner.handler_audit as ha
+
+    private_root = tmp_path / "approved"
+    private_root.mkdir()
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"secret")
+    digest = __import__("hashlib").sha256(b"secret").hexdigest()
+    receipt = {
+        "schema_version": 2,
+        "target_head_sha": "c" * 40,
+        "commands": [
+            {
+                "requested_argv": ["/usr/bin/git", "status"],
+                "effective_argv": ["/usr/bin/git", "status"],
+                "transform_chain": [],
+                "stdout": {"path": str(outside), "sha256": digest, "size_bytes": 6},
+                "stderr": {"path": str(outside), "sha256": digest, "size_bytes": 6},
+            }
+        ],
+    }
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    monkeypatch.setattr(ha, "_operator_log_root", lambda: private_root)
+
+    with pytest.raises(ValueError, match="private root"):
+        ha._validate_operator_receipt(receipt_path, "c" * 40)
+
+
+def test_sensitive_binary_output_is_confined_to_private_raw_log(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    tool = tmp_path / "tools" / "fake-pytest"
+    tool.parent.mkdir()
+    tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    tool.chmod(0o700)
+    _write_operator_manifest(
+        tmp_path,
+        """\
+operator_verification:
+  schema_version: 1
+  commands:
+    - id: secret-probe
+      argv: [tools/fake-pytest]
+      lane: operator_unwrapped
+      timeout_seconds: 30
+      classification: required
+  exclusions: []
+""",
+    )
+
+    import runner.handlers  # noqa: F401
+    import runner.handler_audit as ha
+    from runner.handler_core import Context
+    from runner.parser import Node
+    from runner.subprocess_control import BoundedProcessBytesResult
+
+    head = b"d" * 40 + b"\n"
+    secret = b"SENTINEL-RAW-SECRET\x00\xff\n"
+    outputs = iter(
+        [head, b"changed.py\n", b"", b"", secret, head]
+    )
+
+    def fake_bounded(args, **kwargs):
+        return BoundedProcessBytesResult(tuple(args), 0, next(outputs), b"", False)
+
+    raw_root = tmp_path / "private"
+    monkeypatch.setattr(ha, "run_bounded_process_bytes", fake_bounded)
+    monkeypatch.setattr(ha, "_operator_log_root", lambda: raw_root)
+    monkeypatch.setattr(ha._handlers_shim, "_sanitized_env", lambda: {})
+    ctx = Context(goal="redact", workdir=tmp_path, backend="codex", run_id="secret")
+    result = ha._operator_verify(
+        Node(name="operator_verify", attrs={"type": "operator_verify"}), ctx
+    )
+
+    assert result.outcome == "success"
+    receipt_path = tmp_path / "evidence" / "operator-verification.json"
+    receipt_bytes = receipt_path.read_bytes()
+    public_projection = (
+        receipt_bytes
+        + result.output.encode()
+        + json.dumps(result.metadata).encode()
+        + json.dumps(result.context_updates).encode()
+        + json.dumps(ctx.state).encode()
+    )
+    assert b"SENTINEL-RAW-SECRET" not in public_projection
+    command = json.loads(receipt_bytes)["commands"][4]
+    raw_path = pathlib.Path(command["stdout"]["path"])
+    assert raw_path.read_bytes() == secret
+    assert command["stdout"]["size_bytes"] == len(secret)
+    assert command["stdout"]["sha256"] == __import__("hashlib").sha256(secret).hexdigest()
+    assert raw_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_receipt_validation_rejects_structural_tampering(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    import runner.handlers  # noqa: F401
+    import runner.handler_audit as ha
+
+    raw_root = tmp_path / "private"
+    raw_root.mkdir()
+    raw = raw_root / "stream.bin"
+    raw.write_bytes(b"")
+    empty_digest = __import__("hashlib").sha256(b"").hexdigest()
+    expected = {
+        "schema_version": 2,
+        "target_head_sha": "e" * 40,
+        "commands": [
+            {
+                "id": "git-status",
+                "requested_argv": ["/usr/bin/git", "status", "--porcelain=v1"],
+                "effective_argv": ["/usr/bin/git", "status", "--porcelain=v1"],
+                "transform_chain": [],
+                "stdout": {"path": str(raw), "sha256": empty_digest, "size_bytes": 0},
+                "stderr": {"path": str(raw), "sha256": empty_digest, "size_bytes": 0},
+            }
+        ],
+    }
+    tampered = json.loads(json.dumps(expected))
+    tampered["commands"] = []
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_text(json.dumps(tampered), encoding="utf-8")
+    monkeypatch.setattr(ha, "_operator_log_root", lambda: raw_root)
+
+    with pytest.raises(ValueError, match="tampered"):
+        ha._validate_operator_receipt(
+            receipt_path, "e" * 40, expected_receipt=expected
+        )
+
+
 def test_default_probe_list_is_vendor_neutral():
     import runner.handlers  # noqa: F401
     from runner.handler_audit import DEFAULT_EVIDENCE_FILENAMES
