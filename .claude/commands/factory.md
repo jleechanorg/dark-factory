@@ -1,28 +1,34 @@
 ---
-description: "/factory — alias for /f; auto-routes to PR-mode when a PR is open, otherwise feature-mode"
+description: "/factory — alias for /f; review any reviewable target with the default slim two-node graph"
 type: skill
 execution_mode: immediate
 aliases: [df]
 ---
 
-# /factory — Dark Factory DOT Pipeline Runner (alias for /f)
+# /factory — Dark Factory Review (alias for /f)
 
-Identical to `/f $ARGUMENTS`. Single writer for the binary-first contract is
-`.claude/commands/f.md`; read `.claude/skills/dark-factory/SKILL.md` and
-execute it as the source of truth.
+Follow `.claude/commands/f.md`, then read
+`.claude/skills/dark-factory/SKILL.md` from the current repository when
+available or the installed `~/.claude/skills/dark-factory/SKILL.md`. The active
+CLI must discover and use the relevant installed/repository skills and
+policies. The controller prompt remains the detailed review authority.
+
+With no `--pipeline`, review any reviewable target — PR, commit, code, design
+document, research report, evidence, docs, tests, or config — using
+`pipelines/slim/two_node.dot`. The default is exactly one generic worker
+followed by exactly one controller-owned Codex cold reviewer, with no shadow
+reviewer. An explicit `--pipeline` is the only graph override.
 
 ## Usage
 
 ```
-/factory <goal>                          # auto-detect: PR-mode or feature-mode; reviewer calibration on
-/factory --pipeline gates <goal>         # explicit pipeline (skips auto-detect)
-/factory --backend echo <goal>           # dry-run wiring smoke
-/factory --feature hello <goal>          # override holdout feature key
-/factory --reviewer-calibration=false <goal>  # explicit opt-out; same as /f
+/factory <review goal>                              # default slim two-node review
+/factory --pipeline gates <goal>                   # explicit graph override
+/factory --backend echo <goal>                     # wiring smoke (no LLM)
+/factory --feature <name> --pipeline gates <goal>  # feature key for a graph that requires it
 ```
 
 ## See also
 
-- `/f` — same behavior, canonical entry point.
-- `.claude/skills/dark-factory/SKILL.md` — full contract (Step 0a/0b/0c,
-  reviewer calibration, proof-block output contract).
+- `/f` — canonical entry point with identical behavior.
+- `.claude/skills/dark-factory/SKILL.md` — detailed execution contract.

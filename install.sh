@@ -205,12 +205,10 @@ Dark Factory ready (binary install).
   export DARK_FACTORY_HOLDOUTS="\${HOME}/projects/dark-factory-holdouts"
   export PATH="\${HOME}/.local/bin:\${PATH}"
 
-  # full loop (/f default pipeline) — run from any repo; implements in cwd
+  # default review — any reviewable target; resolves pipelines/slim/two_node.dot
   dark-factory \\
-    --pipeline pipelines/slim/minimal_feature.dot \\
-    --goal "your feature" \\
+    --goal "review any reviewable target" \\
     --backend claude \\
-    --feature hello \\
     --cxdb ~/.dark-factory/cxdb.sqlite
 
   # healer

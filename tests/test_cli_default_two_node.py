@@ -170,3 +170,47 @@ def test_authoritative_skill_instructions_agree_on_two_node_default() -> None:
             "If no pipeline fits (e.g. docs-only PR), **say so and stop**",
         ):
             assert stale_instruction not in skill_text, stale_instruction
+
+
+def test_tracked_command_and_installer_surfaces_publish_two_node_default() -> None:
+    """Installed command projections must agree with the runtime default."""
+    command_paths = (
+        ROOT / ".claude" / "commands" / "f.md",
+        ROOT / ".claude" / "commands" / "factory.md",
+    )
+    required_command_contract = (
+        "any reviewable target",
+        "pipelines/slim/two_node.dot",
+        "generic worker",
+        "controller-owned codex cold reviewer",
+        "no shadow reviewer",
+        "explicit `--pipeline` is the only graph override",
+        "active cli",
+        "installed/repository skills and policies",
+        "controller prompt remains the detailed review authority",
+    )
+    stale_command_claims = (
+        "auto-routes",
+        "auto-route",
+        "auto-detect: pr-mode or feature-mode",
+        "pr-mode vs feature-mode",
+        "step 0c (pipeline select)",
+        "run first when the goal needs a spec",
+        "docs-only",
+        "if no pipeline fits",
+    )
+
+    for command_path in command_paths:
+        command_text = " ".join(command_path.read_text(encoding="utf-8").split()).lower()
+        for required_text in required_command_contract:
+            assert required_text in command_text, f"{command_path}: {required_text}"
+        for stale_text in stale_command_claims:
+            assert stale_text not in command_text, f"{command_path}: {stale_text}"
+
+    install_text = (ROOT / "install.sh").read_text(encoding="utf-8")
+    example_start = install_text.index("  # default review")
+    default_example = install_text[example_start : install_text.index("  # healer")]
+    assert "pipelines/slim/two_node.dot" in default_example
+    assert "any reviewable target" in default_example
+    assert "--pipeline" not in default_example
+    assert "--feature" not in default_example
