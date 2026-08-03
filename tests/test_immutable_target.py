@@ -50,6 +50,15 @@ def _init_clean_repo(tmp: Path) -> Path:
     return repo
 
 
+def _registered_worktrees(repo: Path) -> set[Path]:
+    """Return the exact worktree paths registered by ``repo``."""
+    return {
+        Path(line.removeprefix("worktree ")).resolve()
+        for line in _git(repo, "worktree", "list", "--porcelain").splitlines()
+        if line.startswith("worktree ")
+    }
+
+
 def _make_holdout_roots(tmp: Path) -> tuple[str, ...]:
     holdout = tmp / "holdout"
     holdout.mkdir()
@@ -289,9 +298,254 @@ class ControllerSnapshotTests(unittest.TestCase):
         self.tmp = Path(self._tmp.name)
         self.repo = _init_clean_repo(self.tmp)
         _git(self.repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+        self._snapshot_leases = []
 
     def tearDown(self) -> None:
+        for lease in reversed(self._snapshot_leases):
+            lease.close()
         self._tmp.cleanup()
+
+    def test_controller_terminal_results_close_only_their_derived_snapshot(self) -> None:
+        """PASS, FAIL, transport, and contract results release after verification."""
+        from unittest.mock import patch
+
+        from runner.handler_core import Context, Result
+        from runner.handler_parallel_reviewer import (
+            _parallel_reviewer,
+            _verify_controller_workspace,
+        )
+        from runner.parser import Node
+
+        (self.repo / "README.md").write_text("worker change\n")
+        other = self.tmp / "other-consumer"
+        _git(self.repo, "worktree", "add", "--detach", str(other), "HEAD")
+        node = Node(
+            name="cold_reviewer",
+            attrs={"review_contract": "cold-review-v1", "backend_priority": "codex"},
+        )
+        terminal_results = (
+            Result(
+                outcome="success",
+                output="controller pass",
+                metadata={"review_contract_status": "valid", "verdict": "pass"},
+            ),
+            Result(
+                outcome="failure",
+                output="controller fail",
+                metadata={"review_contract_status": "valid", "verdict": "fail"},
+            ),
+            Result(
+                outcome="error",
+                output="transport failed",
+                metadata={"review_contract_status": "transport_error", "verdict": "unknown"},
+            ),
+            Result(
+                outcome="error",
+                output="invalid response",
+                metadata={"review_contract_status": "invalid", "verdict": "unknown"},
+            ),
+        )
+
+        for terminal in terminal_results:
+            with self.subTest(status=terminal.metadata["review_contract_status"], outcome=terminal.outcome):
+                reviewed: list[Path] = []
+
+                def _primary(request, timeout, ctx, node_name, backend):
+                    snapshot = Path(json.loads(request.envelope_json)["target"]["workspace_path"])
+                    reviewed.append(snapshot)
+                    self.assertTrue(snapshot.is_dir())
+                    self.assertIn(snapshot.resolve(), _registered_worktrees(self.repo))
+                    _verify_controller_workspace(ctx, request)
+                    self.assertTrue(snapshot.is_dir(), "cleanup ran before final verification")
+                    return terminal
+
+                ctx = Context(
+                    goal="review worker output",
+                    workdir=self.repo,
+                    backend="codex",
+                    run_id=f"snapshot-terminal-{terminal.outcome}",
+                )
+                try:
+                    with patch(
+                        "runner.handler_parallel_reviewer._resolve_gate_backend",
+                        return_value=("codex", {"reviewer_backend_resolution": "test"}),
+                    ), patch(
+                        "runner.handler_parallel_reviewer._run_controller_primary",
+                        side_effect=_primary,
+                    ):
+                        result = _parallel_reviewer(node, ctx)
+
+                    self.assertEqual(result.outcome, terminal.outcome)
+                    self.assertEqual(len(reviewed), 1)
+                    self.assertFalse(reviewed[0].exists())
+                    self.assertNotIn(reviewed[0].resolve(), _registered_worktrees(self.repo))
+                    self.assertTrue(other.is_dir())
+                    self.assertIn(other.resolve(), _registered_worktrees(self.repo))
+                finally:
+                    for snapshot in reviewed:
+                        _git(
+                            self.repo,
+                            "worktree",
+                            "remove",
+                            "--force",
+                            str(snapshot),
+                            allow_empty=True,
+                        )
+
+    def test_unexpected_controller_exception_closes_snapshot_without_masking(self) -> None:
+        """An unexpected primary exception stays primary after snapshot cleanup."""
+        from unittest.mock import patch
+
+        from runner.handler_core import Context
+        from runner.handler_parallel_reviewer import _parallel_reviewer
+        from runner.parser import Node
+
+        (self.repo / "README.md").write_text("worker change\n")
+        reviewed: list[Path] = []
+
+        def _explode(request, timeout, ctx, node_name, backend):
+            reviewed.append(Path(json.loads(request.envelope_json)["target"]["workspace_path"]))
+            raise RuntimeError("primary exploded")
+
+        node = Node(name="cold_reviewer", attrs={"review_contract": "cold-review-v1"})
+        ctx = Context(goal="review worker output", workdir=self.repo, backend="codex")
+        try:
+            with patch(
+                "runner.handler_parallel_reviewer._resolve_gate_backend",
+                return_value=("codex", {}),
+            ), patch(
+                "runner.handler_parallel_reviewer._run_controller_primary",
+                side_effect=_explode,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "primary exploded"):
+                    _parallel_reviewer(node, ctx)
+
+            self.assertEqual(len(reviewed), 1)
+            self.assertFalse(reviewed[0].exists())
+            self.assertNotIn(reviewed[0].resolve(), _registered_worktrees(self.repo))
+        finally:
+            for snapshot in reviewed:
+                _git(
+                    self.repo,
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(snapshot),
+                    allow_empty=True,
+                )
+
+    def test_no_snapshot_controller_path_keeps_source_worktree(self) -> None:
+        """A clean direct review never unregisters or removes its source."""
+        from unittest.mock import patch
+
+        from runner.handler_core import Context, Result
+        from runner.handler_parallel_reviewer import _parallel_reviewer
+        from runner.parser import Node
+
+        node = Node(name="cold_reviewer", attrs={"review_contract": "cold-review-v1"})
+        ctx = Context(goal="review clean source", workdir=self.repo, backend="codex")
+
+        def _primary(request, timeout, ctx, node_name, backend):
+            self.assertEqual(
+                Path(json.loads(request.envelope_json)["target"]["workspace_path"]).resolve(),
+                self.repo.resolve(),
+            )
+            return Result(
+                outcome="success",
+                output="controller pass",
+                metadata={"review_contract_status": "valid", "verdict": "pass"},
+            )
+
+        with patch(
+            "runner.handler_parallel_reviewer._resolve_gate_backend",
+            return_value=("codex", {}),
+        ), patch(
+            "runner.handler_parallel_reviewer._run_controller_primary",
+            side_effect=_primary,
+        ):
+            result = _parallel_reviewer(node, ctx)
+
+        self.assertEqual(result.outcome, "success")
+        self.assertTrue(self.repo.is_dir())
+        self.assertIn(self.repo.resolve(), _registered_worktrees(self.repo))
+
+    def test_failed_snapshot_close_forces_error_and_lease_can_retry(self) -> None:
+        """A failed close retains primary diagnostics and does not consume the lease."""
+        from unittest.mock import patch
+
+        from runner.handler_core import Context, Result
+        from runner.handler_parallel_reviewer import (
+            _controller_review_request,
+            _parallel_reviewer,
+        )
+        from runner.parser import Node
+
+        (self.repo / "README.md").write_text("worker change\n")
+        node = Node(name="cold_reviewer", attrs={"review_contract": "cold-review-v1"})
+        ctx = Context(goal="review worker output", workdir=self.repo, backend="codex")
+        captured_leases = []
+        real_builder = _controller_review_request
+        real_run = subprocess.run
+        failed_once = False
+
+        def _capture_lease(*args, **kwargs):
+            request, lease = real_builder(*args, **kwargs)
+            captured_leases.append(lease)
+            return request, lease
+
+        def _fail_first_remove(command, **kwargs):
+            nonlocal failed_once
+            if "worktree" in command and "remove" in command and not failed_once:
+                failed_once = True
+                return subprocess.CompletedProcess(command, 1, "", "simulated close failure")
+            return real_run(command, **kwargs)
+
+        primary = Result(
+            outcome="failure",
+            output="primary reviewer findings",
+            metadata={"review_contract_status": "valid", "verdict": "fail"},
+        )
+        try:
+            with patch(
+                "runner.handler_parallel_reviewer._controller_review_request",
+                side_effect=_capture_lease,
+            ), patch(
+                "runner.handler_parallel_reviewer._resolve_gate_backend",
+                return_value=("codex", {}),
+            ), patch(
+                "runner.handler_parallel_reviewer._run_controller_primary",
+                return_value=primary,
+            ), patch(
+                "runner.handler_parallel_reviewer.subprocess.run",
+                side_effect=_fail_first_remove,
+            ):
+                result = _parallel_reviewer(node, ctx)
+
+            self.assertEqual(result.outcome, "error")
+            self.assertEqual(result.metadata["controller_snapshot_primary_outcome"], "failure")
+            self.assertEqual(
+                result.metadata["controller_snapshot_primary_output"],
+                "primary reviewer findings",
+            )
+            self.assertIn("simulated close failure", result.metadata["controller_snapshot_cleanup_error"])
+            self.assertEqual(len(captured_leases), 1)
+            snapshot = captured_leases[0].snapshot
+            self.assertTrue(snapshot.is_dir())
+            captured_leases[0].close()
+            self.assertFalse(snapshot.exists())
+            self.assertNotIn(snapshot.resolve(), _registered_worktrees(self.repo))
+        finally:
+            for lease in captured_leases:
+                snapshot = lease.snapshot
+                if snapshot is not None:
+                    _git(
+                        self.repo,
+                        "worktree",
+                        "remove",
+                        "--force",
+                        str(snapshot),
+                        allow_empty=True,
+                    )
 
     def test_worker_task_artifact_uses_clean_frozen_review_snapshot(self) -> None:
         """A worker's task file cannot block or enter the controller review target."""
@@ -305,11 +559,12 @@ class ControllerSnapshotTests(unittest.TestCase):
         task_dir.mkdir()
         (task_dir / "agy-task-worker.md").write_text("runner task artifact\n")
 
-        request = _controller_review_request(
+        request, lease = _controller_review_request(
             Node(name="cold_reviewer", attrs={}),
             Context(goal="review worker output", workdir=self.repo),
             _git(self.repo, "rev-parse", "HEAD").strip(),
         )
+        self._snapshot_leases.append(lease)
         envelope = json.loads(request.envelope_json)
         snapshot = Path(envelope["target"]["workspace_path"])
 
@@ -341,11 +596,12 @@ class ControllerSnapshotTests(unittest.TestCase):
         task_dir.mkdir()
         (task_dir / "agy-task-worker.md").write_text("runner task artifact\n")
 
-        request = _controller_review_request(
+        request, lease = _controller_review_request(
             Node(name="cold_reviewer", attrs={}),
             Context(goal="review no-op worker output", workdir=self.repo),
             _git(self.repo, "rev-parse", "HEAD").strip(),
         )
+        self._snapshot_leases.append(lease)
         envelope = json.loads(request.envelope_json)
         snapshot = Path(envelope["target"]["workspace_path"])
 
@@ -381,7 +637,7 @@ class ControllerSnapshotTests(unittest.TestCase):
         task_dir.mkdir()
         (task_dir / "agy-task-worker.md").write_text("runner task artifact\n")
 
-        request = _controller_review_request(
+        request, lease = _controller_review_request(
             Node(
                 name="cold_reviewer",
                 attrs={"evidence_paths": "evidence/controller.json,normal-evidence.json"},
@@ -389,6 +645,7 @@ class ControllerSnapshotTests(unittest.TestCase):
             Context(goal="review worker evidence", workdir=self.repo),
             _git(self.repo, "rev-parse", "HEAD").strip(),
         )
+        self._snapshot_leases.append(lease)
         envelope = json.loads(request.envelope_json)
         snapshot = Path(envelope["target"]["workspace_path"])
         bound = envelope["evidence"]
@@ -428,11 +685,12 @@ class ControllerSnapshotTests(unittest.TestCase):
         runtime_dir.mkdir()
         (runtime_dir / "secret.txt").write_text("must not enter review snapshot\n")
 
-        request = _controller_review_request(
+        request, lease = _controller_review_request(
             Node(name="cold_reviewer", attrs={"evidence_paths": "evidence/controller.json"}),
             Context(goal="review ignored-only evidence", workdir=self.repo),
             _git(self.repo, "rev-parse", "HEAD").strip(),
         )
+        self._snapshot_leases.append(lease)
         snapshot = Path(json.loads(request.envelope_json)["target"]["workspace_path"])
 
         self.assertNotEqual(snapshot, self.repo)
