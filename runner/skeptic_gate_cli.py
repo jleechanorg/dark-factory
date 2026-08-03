@@ -476,15 +476,12 @@ def _build_reviewer_cmd(
 
     `codex_bin` / `gemini_bin` allow pinning the absolute path to the
     reviewer binary (defense against mutable PATH — see post-audit
-    comment 4953064910). When empty, the bare name is used (the
-    workflow's PATH is reduced to a minimal set).
+    comment 4953064910). A Codex pin is validated as an assertion that
+    resolves to the canonical Node 22 runtime; it cannot override that
+    runtime. When empty, Codex still uses the canonical resolver.
     """
     if reviewer == "codex":
-        resolved_codex = codex_bin or codex_runtime.resolve_codex_executable()
-        if not pathlib.Path(resolved_codex).is_absolute():
-            raise codex_runtime.CodexRuntimeError(
-                f"explicit Codex executable must be absolute: {resolved_codex}"
-            )
+        resolved_codex = codex_runtime.resolve_codex_executable(codex_bin or None)
         cmd = [
             resolved_codex,
             "exec",
@@ -1095,7 +1092,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     dispatcher = VerifierDispatcher(
         cheap_reviewer="gemini", cheap_model="gemini-2.5-flash",
-        premium_reviewer="gemini", premium_model="gemini-2.5-pro"
+        premium_reviewer="gemini", premium_model="gemini-2.5-pro",
+        codex_bin=args.codex_bin,
+        gemini_bin=args.gemini_bin,
     )
     results = dispatcher.dispatch(
         rules, changed_files, diff, repo, args.pr_number, head_sha, "unknown",

@@ -222,9 +222,33 @@ def resolve_codex_runtime(
     )
 
 
-def resolve_codex_executable() -> str:
-    """Return the only executable allowed for a Dark Factory Codex process."""
-    return str(resolve_codex_runtime().executable)
+def resolve_codex_executable(requested: str | Path | None = None) -> str:
+    """Return the only executable allowed for a Dark Factory Codex process.
+
+    A caller-provided pin is an assertion, not an override: it must resolve to
+    the already validated canonical Node 22 executable and cannot weaken the
+    package/cache contract.
+    """
+    runtime = resolve_codex_runtime()
+    if requested:
+        requested_path = Path(requested)
+        if not requested_path.is_absolute():
+            raise CodexRuntimeError(
+                f"explicit Codex executable must be absolute: {requested}"
+            )
+        try:
+            requested_target = requested_path.resolve(strict=True)
+            canonical_target = runtime.executable.resolve(strict=True)
+        except OSError as exc:
+            raise CodexRuntimeError(
+                f"explicit Codex executable cannot be resolved: {requested}: {exc}"
+            ) from exc
+        if requested_target != canonical_target:
+            raise CodexRuntimeError(
+                "explicit Codex executable is not the canonical Node 22 runtime: "
+                f"requested {requested_path}, expected {runtime.executable}"
+            )
+    return str(runtime.executable)
 
 
 def main(argv: list[str] | None = None) -> int:

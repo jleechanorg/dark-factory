@@ -96,4 +96,8 @@ def _isolate_codex_executable_from_live_install(monkeypatch) -> None:
     from runner import codex_runtime
 
     fake = "/test-fixtures/.nvm/versions/node/v22.22.0/bin/codex"
-    monkeypatch.setattr(codex_runtime, "resolve_codex_executable", lambda: fake)
+    monkeypatch.setattr(
+        codex_runtime,
+        "resolve_codex_executable",
+        lambda requested=None: fake,
+    )

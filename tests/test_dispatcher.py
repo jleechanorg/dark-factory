@@ -42,5 +42,56 @@ class TestDispatcher(unittest.TestCase):
         )
 
         self.assertEqual(len(results), 2)
-        mock_invoke.assert_any_call("gemini", "gemini-2.5-flash", unittest.mock.ANY)
-        mock_invoke.assert_any_call("codex", "codex-smart", unittest.mock.ANY)
+        mock_invoke.assert_any_call(
+            "gemini",
+            "gemini-2.5-flash",
+            unittest.mock.ANY,
+            codex_bin="",
+            gemini_bin="",
+        )
+        mock_invoke.assert_any_call(
+            "codex",
+            "codex-smart",
+            unittest.mock.ANY,
+            codex_bin="",
+            gemini_bin="",
+        )
+
+    @patch("runner.skeptic_gate_cli.invoke_reviewer")
+    @patch("runner.skeptic_gate_cli.evaluate")
+    def test_dispatch_forwards_reviewer_binary_pins(self, mock_evaluate, mock_invoke):
+        mock_invoke.return_value = ("stdout_content", None)
+        mock_evaluate.return_value = MagicMock(check_state="failure")
+        rule = Rule(
+            "rule_codex",
+            "Codex Rule",
+            ["*"],
+            "premium",
+            "Desc",
+            "Prompt",
+            reviewer="codex",
+            model="",
+        )
+        dispatcher = VerifierDispatcher(
+            codex_bin="/canonical/node22/bin/codex",
+            gemini_bin="/pinned/bin/gemini",
+        )
+
+        dispatcher.dispatch(
+            [rule],
+            ["README.md"],
+            "diff_content",
+            "jleechanorg/dark-factory",
+            123,
+            "head_sha_value",
+            "base_sha_value",
+            "claude",
+        )
+
+        mock_invoke.assert_called_once_with(
+            "codex",
+            "",
+            unittest.mock.ANY,
+            codex_bin="/canonical/node22/bin/codex",
+            gemini_bin="/pinned/bin/gemini",
+        )

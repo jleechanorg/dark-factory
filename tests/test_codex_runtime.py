@@ -287,7 +287,11 @@ def test_worker_gate_shadows_controller_and_skeptic_share_one_executable(
     resolved = str(
         tmp_path / ".nvm/versions/node/v22.22.0/bin/codex"
     )
-    monkeypatch.setattr(codex_runtime, "resolve_codex_executable", lambda: resolved)
+    monkeypatch.setattr(
+        codex_runtime,
+        "resolve_codex_executable",
+        lambda requested=None: resolved,
+    )
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda args: args)
     monkeypatch.setattr(
         "runner.handlers._sandboxed_args_for_workdir", lambda args, workdir: args
@@ -352,6 +356,24 @@ def test_codex_availability_probe_is_static(tmp_path: Path, monkeypatch) -> None
 
     monkeypatch.setattr(subprocess, "run", _forbidden)
     assert _probe_backend_installed("codex") is True
+
+
+def test_skeptic_codex_override_cannot_bypass_canonical_resolver(monkeypatch) -> None:
+    from runner import codex_runtime
+    from runner.skeptic_gate_cli import _build_reviewer_cmd
+
+    requested: list[str | None] = []
+
+    def _reject_override(value=None):
+        requested.append(value)
+        raise codex_runtime.CodexRuntimeError("not the canonical Node 22 executable")
+
+    monkeypatch.setattr(codex_runtime, "resolve_codex_executable", _reject_override)
+
+    with pytest.raises(codex_runtime.CodexRuntimeError, match="canonical Node 22"):
+        _build_reviewer_cmd("codex", "", codex_bin="/tmp/untrusted-codex")
+
+    assert requested == ["/tmp/untrusted-codex"]
 
 
 def test_codex_preflight_fails_closed_on_static_runtime_skew(monkeypatch) -> None:

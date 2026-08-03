@@ -18,12 +18,21 @@ from runner import skeptic_gate_cli as _cli
 # tests/test_skeptic_gate_cli_contract_echo.py.
 
 class VerifierDispatcher:
-    def __init__(self, cheap_reviewer: str = "gemini", cheap_model: str = "gemini-2.5-flash",
-                 premium_reviewer: str = "gemini", premium_model: str = "gemini-2.5-pro"):
+    def __init__(
+        self,
+        cheap_reviewer: str = "gemini",
+        cheap_model: str = "gemini-2.5-flash",
+        premium_reviewer: str = "gemini",
+        premium_model: str = "gemini-2.5-pro",
+        codex_bin: str = "",
+        gemini_bin: str = "",
+    ):
         self.cheap_reviewer = cheap_reviewer
         self.cheap_model = cheap_model
         self.premium_reviewer = premium_reviewer
         self.premium_model = premium_model
+        self.codex_bin = codex_bin
+        self.gemini_bin = gemini_bin
 
     def match_glob(self, file_path: str, glob_pattern: str) -> bool:
         if glob_pattern == "*":
@@ -97,7 +106,13 @@ class VerifierDispatcher:
                     reviewer = self.cheap_reviewer
                     model = self.cheap_model
 
-            stdout, err = _cli.invoke_reviewer(reviewer, model, prompt)
+            stdout, err = _cli.invoke_reviewer(
+                reviewer,
+                model,
+                prompt,
+                codex_bin=self.codex_bin,
+                gemini_bin=self.gemini_bin,
+            )
             res = _cli.evaluate(
                 review_output=stdout,
                 review_error=err,
