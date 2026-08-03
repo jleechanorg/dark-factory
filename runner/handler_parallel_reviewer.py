@@ -211,6 +211,7 @@ def _git_output(
 
 def _controller_evidence(node: "Node", ctx: "Context") -> tuple:
     """Return a typed, per-file evidence manifest for readable declared files."""
+    import runner.handlers as _handlers_shim  # late-bound shim
     from .review_controller import EvidenceArtifact
 
     raw = ctx.state.get("evidence_paths") or node.attrs.get("evidence_paths") or ""
@@ -254,6 +255,7 @@ def _controller_evidence(node: "Node", ctx: "Context") -> tuple:
 
 def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
     """Build the source-owned request; graph/goal content remains envelope data."""
+    import runner.handlers as _handlers_shim  # late-bound shim
     from .review_controller import (
         ReviewContractError,
         ReviewInputs,
@@ -343,6 +345,7 @@ def _holdout_root_strings() -> list[str]:
 
 def _verify_controller_workspace(ctx: "Context", request) -> None:
     """Recompute frozen repository bindings after a reviewer lane returns."""
+    import runner.handlers as _handlers_shim  # late-bound shim
     from .review_controller import ReviewContractError
 
     envelope = json.loads(request.envelope_json)

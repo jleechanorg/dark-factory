@@ -548,17 +548,40 @@ def _build_controller_codex_transport(args: list[str]) -> list[str]:
             if mode != "read-only":
                 raise ValueError("controller transport requires read-only codex sandboxing")
 
-    # Construct transport starting with `codex` binary, stripping any outer
-    # `sandbox-exec` wrapper so `codex exec --sandbox read-only` runs natively
-    # without triggering nested seatbelt sandbox_apply failures on macOS.
-    return [
-        "codex",
-        "exec",
+    # Construct transport: preserve any `sandbox-exec -p ...` wrapper
+    # prefix from the original argv, then append the controller transport
+    # flags after `codex exec`. Stripping the wrapper would lose the
+    # seatbelt profile and trigger nested sandbox_apply failures on macOS.
+    prefix = prepared[:codex_index + 2]
+
+    # Filter out old transport flags and the original prompt positional
+    # before appending the canonical controller flags.
+    codex_tail = codex_args[2:]
+    safe_tail: list[str] = []
+    skip_next = False
+    for idx, value in enumerate(codex_tail):
+        if skip_next:
+            skip_next = False
+            continue
+        if value in ("--yolo", "--json", "--ephemeral", "--skip-git-repo-check"):
+            continue
+        if value == "--sandbox":
+            skip_next = True
+            continue
+        if value.startswith("--sandbox="):
+            continue
+        # Drop the original trailing prompt positional (last non-flag arg).
+        if idx == len(codex_tail) - 1 and not value.startswith("-"):
+            continue
+        safe_tail.append(value)
+
+    return prefix + [
         "--json",
         "--ephemeral",
         "--skip-git-repo-check",
         "--sandbox",
         "read-only",
+        *safe_tail,
         "-",
     ]
 
