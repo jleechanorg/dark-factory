@@ -51,11 +51,9 @@ def test_run_captures_target_provenance_before_first_node(tmp_path, monkeypatch)
         return Result(outcome="success")
 
     monkeypatch.setitem(TYPE_REGISTRY, "observe", observe)
-    import runner.handler_audit as handler_audit
-    monkeypatch.setattr(handler_audit, "_controller_trust_head", lambda workdir: expected_head)
     run(parse(dot), Context(goal="provenance", workdir=tmp_path, backend="echo"))
 
-    assert observed["_df_controller_trust_head"] == expected_head
+    assert "_df_controller_trust_head" not in observed
     assert "_df_run_initial_workspace_sha256" not in observed
 
 
@@ -132,10 +130,34 @@ def test_automatic_resume_rejects_worker_rewriting_every_checkpoint_trust_value(
     assert launched == []
 
 
-def test_fresh_operator_run_anchors_to_upstream_not_local_worker_head(tmp_path):
+def test_fresh_operator_run_anchors_to_upstream_not_local_worker_head(
+    tmp_path, monkeypatch
+):
+    from runner import handler_sandbox
+
+    monkeypatch.setattr(
+        handler_sandbox,
+        "_controller_private_root",
+        lambda: tmp_path / "controller-private",
+    )
     subprocess.run(["/usr/bin/git", "init", "-q"], cwd=tmp_path, check=True)
     subprocess.run(["/usr/bin/git", "config", "user.email", "jleechan2015@users.noreply.github.com"], cwd=tmp_path, check=True)
     subprocess.run(["/usr/bin/git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    manifest = tmp_path / ".dark-factory" / "evidence.yaml"
+    manifest.parent.mkdir()
+    manifest.write_text(
+        """operator_verification:
+  schema_version: 1
+  commands:
+    - id: target-status
+      argv: [/usr/bin/git, status, --porcelain=v1]
+      lane: operator_unwrapped
+      timeout_seconds: 30
+      classification: required
+  exclusions: []
+""",
+        encoding="utf-8",
+    )
     (tmp_path / "tracked.txt").write_text("trusted\n")
     subprocess.run(["/usr/bin/git", "add", "."], cwd=tmp_path, check=True)
     subprocess.run(["/usr/bin/git", "commit", "-qm", "trusted"], cwd=tmp_path, check=True)
@@ -156,8 +178,9 @@ def test_fresh_operator_run_anchors_to_upstream_not_local_worker_head(tmp_path):
 
     run(parse(dot), ctx, max_steps=1)
 
-    assert ctx.state["_df_controller_trust_head"] == trusted
-    assert ctx.state["_df_controller_trust_head"] != worker_head
+    assert ctx._operator_trust["trust_head"] == trusted
+    assert ctx._operator_trust["trust_head"] != worker_head
+    assert "_df_controller_trust_head" not in ctx.state
 
 
 def test_resume_fails_closed_without_controller_trust_metadata(tmp_path):
@@ -173,7 +196,7 @@ def test_resume_fails_closed_without_controller_trust_metadata(tmp_path):
         "output_preview": "done", "metadata": {},
     }]))
 
-    with pytest.raises(ValueError, match="controller trust"):
+    with pytest.raises(ValueError, match="private operator trust"):
         run(parse(dot), Context(goal="resume trust", workdir=ROOT, backend="codex"), resume=checkpoint)
 
 

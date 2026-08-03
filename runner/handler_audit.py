@@ -351,7 +351,13 @@ def _replace_private_bytes_at(directory_fd: int, name: str, data: bytes) -> None
             pass
 
 
-def _read_private_bytes_at(directory_fd: int, name: str, max_bytes: int) -> bytes:
+def _read_private_bytes_at(
+    directory_fd: int,
+    name: str,
+    max_bytes: int,
+    *,
+    required_mode: int | None = None,
+) -> bytes:
     if pathlib.PurePath(name).name != name or name in {"", ".", ".."}:
         raise OSError("private file name must be one component")
     file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -360,7 +366,10 @@ def _read_private_bytes_at(directory_fd: int, name: str, max_bytes: int) -> byte
         metadata = os.fstat(file_fd)
         if (
             not stat.S_ISREG(metadata.st_mode)
-            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or (
+                required_mode is not None
+                and stat.S_IMODE(metadata.st_mode) != required_mode
+            )
             or metadata.st_size > max_bytes
         ):
             raise ValueError("private file is invalid")
@@ -559,6 +568,8 @@ def _load_operator_manifest(
             or not all(isinstance(v, str) and v and "\0" not in v for v in argv)
         ):
             raise ValueError("operator command argv must be a non-empty string array")
+        if argv[0] == "@runner-python" and tuple(argv[1:3]) != ("-m", "pytest"):
+            raise ValueError("runner-owned Python token only permits pytest modules")
         lane = entry.get("lane")
         if lane not in _OPERATOR_LANES:
             raise ValueError("operator command lane is invalid")
@@ -658,7 +669,10 @@ def _read_operator_trust_registry(
 ) -> dict[str, object]:
     try:
         encoded = _read_private_bytes_at(
-            directory_fd, "registry.json", _OPERATOR_TRUST_REGISTRY_MAX_BYTES
+            directory_fd,
+            "registry.json",
+            _OPERATOR_TRUST_REGISTRY_MAX_BYTES,
+            required_mode=0o600,
         )
     except FileNotFoundError:
         if required:

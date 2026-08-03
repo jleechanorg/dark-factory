@@ -47,18 +47,25 @@ def _write_operator_manifest(tmp_path: pathlib.Path, body: str) -> pathlib.Path:
 
 def _prime_operator_test(ha, monkeypatch, ctx, head: str, snapshot: pathlib.Path) -> None:
     real_loader = ha._load_operator_manifest
-    ctx.state["_df_controller_trust_head"] = head
+    manifest = real_loader(ctx.workdir)
+    ctx._operator_trust = {
+        "trust_head": head,
+        "policy_sha256": manifest.policy_sha256,
+        "nonce": "0" * 32,
+    }
     monkeypatch.setattr(ha, "_target_provenance", lambda workdir: (head, "f" * 64))
     monkeypatch.setattr(ha, "_controller_trust_head", lambda workdir: head)
     monkeypatch.setattr(ha, "_validate_controller_trust_head", lambda workdir, value: value)
-    def load_test_manifest(workdir, trusted_head=None):
-        manifest = real_loader(workdir)
-        monkeypatch.setattr(ha, "_CANONICAL_OPERATOR_POLICY_SHA256", manifest.policy_sha256)
-        return manifest
     monkeypatch.setattr(
         ha, "_load_operator_manifest",
-        load_test_manifest,
+        lambda workdir, trusted_head=None: manifest,
     )
+    monkeypatch.setattr(
+        ha,
+        "_create_operator_run_trust",
+        lambda workdir, checkpoint: dict(ctx._operator_trust),
+    )
+    monkeypatch.setattr(ha, "_remove_operator_run_trust", lambda checkpoint: None)
     monkeypatch.setattr(
         ha, "_trusted_operator_snapshot",
         lambda *args: contextlib.nullcontext(snapshot),
@@ -200,7 +207,11 @@ def test_operator_verify_rejects_fresh_manifest_python_code_execution(
     monkeypatch.setattr(ha, "run_bounded_process_bytes", forbidden)
     monkeypatch.setattr(ha, "_operator_log_root", lambda: tmp_path / "private")
     ctx = Context(goal="reject malicious policy", workdir=tmp_path, backend="codex", run_id="malicious")
-    ctx.state["_df_controller_trust_head"] = head
+    ctx._operator_trust = {
+        "trust_head": head,
+        "policy_sha256": "0" * 64,
+        "nonce": "0" * 32,
+    }
 
     result = ha._operator_verify(Node(name="operator_verify", attrs={"type": "operator_verify"}), ctx)
 
