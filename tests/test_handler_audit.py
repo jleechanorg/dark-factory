@@ -293,7 +293,9 @@ def test_repository_operator_manifest_has_exact_sandbox_split() -> None:
         "tests/test_hardening.py::test_visible_all_nodes_benchmark_has_no_embedded_holdout_contract",
     ]
     assert [arg.removeprefix("--deselect=") for arg in worker.argv if arg.startswith("--deselect=")] == expected_nodes
-    assert list(operator.argv[2:]) == expected_nodes
+    assert list(worker.argv[1:4]) == ["-q", "-o", "pythonpath=."]
+    assert list(operator.argv[1:4]) == ["-q", "-o", "pythonpath=."]
+    assert list(operator.argv[4:]) == expected_nodes
     assert [(item.id, item.classification) for item in manifest.exclusions] == [
         ("bounded-conformance", "excluded"),
         ("private-self-hosted-runner", "excluded"),

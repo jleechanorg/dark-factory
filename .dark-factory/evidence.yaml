@@ -5,6 +5,8 @@ operator_verification:
       argv:
         - .venv/bin/pytest
         - -q
+        - -o
+        - pythonpath=.
         - tests/test_subprocess_control.py
         - tests/test_engine.py
         - tests/test_cli_fallbacks.py
@@ -36,6 +38,8 @@ operator_verification:
       argv:
         - .venv/bin/pytest
         - -q
+        - -o
+        - pythonpath=.
         - tests/test_cli_fallbacks.py::test_controller_outer_sandbox_enforces_read_and_write_boundaries
         - tests/test_cli_fallbacks.py::test_controller_outer_sandbox_avoids_nested_seatbelt
         - tests/test_cli_fallbacks.py::test_controller_protects_linked_git_metadata_and_artifact_lane
