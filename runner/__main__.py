@@ -274,6 +274,11 @@ def main(argv: list[str] | None = None) -> int:
             default="antigravity",
             help="AO agent plugin to use when --backend ao (default: claude-code).",
         )
+        p.add_argument(
+            "--agy-agent",
+            default="gemini-3.6-flash-high",
+            help="AGY agent to use when --backend agy (default: gemini-3.6-flash-high).",
+        )
         p.add_argument("--checkpoint", type=pathlib.Path, default=None)
         p.add_argument("--resume", type=pathlib.Path, default=None, help="Resume from a prior checkpoint file.")
         p.add_argument("--max-steps", type=int, default=100)
@@ -426,6 +431,8 @@ def main(argv: list[str] | None = None) -> int:
                 p.error("--backend ao requires --ao-project")
             ctx.state["ao.project"] = args.ao_project
             ctx.state["ao.agent"] = args.ao_agent
+        if args.agy_agent:
+            ctx.state["agy.agent"] = args.agy_agent
         if args.ao_session:
             ctx.state["ao.session"] = args.ao_session
         if args.ao_worktree:
