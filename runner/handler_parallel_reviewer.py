@@ -212,12 +212,8 @@ def _git_output(
     return proc.stdout.strip()
 
 
-def _controller_evidence(
-    node: "Node", ctx: "Context", root: pathlib.Path | None = None
-) -> tuple:
-    """Return a typed, per-file evidence manifest for readable declared files."""
-    from .review_controller import EvidenceArtifact
-
+def _controller_evidence_paths(node: "Node", ctx: "Context") -> tuple[str, ...]:
+    """Return declared evidence paths after validating their relative shape."""
     raw = ctx.state.get("evidence_paths") or node.attrs.get("evidence_paths") or ""
     if isinstance(raw, str):
         if raw.startswith("[") and raw.endswith("]"):
@@ -232,16 +228,30 @@ def _controller_evidence(
     else:
         raise ValueError("evidence_paths must be a list or comma-separated string")
 
+    paths: list[str] = []
+    for value in values:
+        rel = str(value).strip()
+        if not rel:
+            continue
+        relative = pathlib.PurePosixPath(rel)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"declared evidence escapes the workspace: {rel}")
+        paths.append(relative.as_posix())
+    return tuple(paths)
+
+
+def _controller_evidence(
+    node: "Node", ctx: "Context", root: pathlib.Path | None = None
+) -> tuple:
+    """Return a typed, per-file evidence manifest for readable declared files."""
+    from .review_controller import EvidenceArtifact
+
     artifacts = []
     if root is None:
         import runner.handlers as _handlers_shim
 
         root = _handlers_shim._target_worktree(ctx)
-    for value in values:
-
-        rel = str(value).strip()
-        if not rel:
-            continue
+    for rel in _controller_evidence_paths(node, ctx):
         path = (root / rel).resolve()
         try:
             path.relative_to(root)
@@ -263,6 +273,7 @@ def _controller_evidence(
 def _controller_snapshot(
     source: pathlib.Path,
     expected_sha: str,
+    declared_evidence: tuple[str, ...],
 ) -> tuple[pathlib.Path, str]:
     """Freeze dirty worker output into a clean detached Git worktree for review.
 
@@ -318,27 +329,45 @@ def _controller_snapshot(
             if applied.returncode != 0:
                 raise ValueError(applied.stderr.strip() or "could not apply worker diff")
 
-        untracked = _git_output(
+        normal_untracked = _git_output(
             source,
             "ls-files",
             "--others",
-            "--ignored",
             "--exclude-standard",
             "-z",
             allow_empty=True,
         )
-        for raw_path in untracked.split("\0"):
-            if not raw_path or _CONTROLLER_TASK_ARTIFACT_RE.fullmatch(raw_path):
-                continue
+        copied: set[str] = set()
+
+        def _copy_source_file(raw_path: str, *, declared: bool) -> None:
             relative = pathlib.PurePosixPath(raw_path)
             if relative.is_absolute() or ".." in relative.parts:
-                raise ValueError(f"unsafe untracked worker path: {raw_path}")
+                raise ValueError(f"unsafe worker path: {raw_path}")
+            normalized = relative.as_posix()
+            if _CONTROLLER_TASK_ARTIFACT_RE.fullmatch(normalized):
+                if declared:
+                    raise ValueError(f"declared evidence is a runner task artifact: {normalized}")
+                return
+            if normalized in copied:
+                return
             source_path = source.joinpath(*relative.parts)
+            resolved_source = source_path.resolve()
+            try:
+                resolved_source.relative_to(source)
+            except ValueError as exc:
+                raise ValueError(f"worker path escapes the workspace: {normalized}") from exc
             if source_path.is_symlink() or not source_path.is_file():
-                raise ValueError(f"untracked worker path is not a regular file: {raw_path}")
+                raise ValueError(f"worker path is not a regular file: {normalized}")
             destination = snapshot.joinpath(*relative.parts)
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source_path, destination)
+            copied.add(normalized)
+
+        for raw_path in normal_untracked.split("\0"):
+            if raw_path:
+                _copy_source_file(raw_path, declared=False)
+        for evidence_path in declared_evidence:
+            _copy_source_file(evidence_path, declared=True)
 
         staged = subprocess.run(
             ["git", "-C", str(snapshot), "add", "--all"],
@@ -396,7 +425,10 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
     import runner.handlers as _handlers_shim
 
     source_workdir = _handlers_shim._target_worktree(ctx)
-    workdir, expected_sha = _controller_snapshot(source_workdir, expected_sha)
+    declared_evidence = _controller_evidence_paths(node, ctx)
+    workdir, expected_sha = _controller_snapshot(
+        source_workdir, expected_sha, declared_evidence
+    )
     base_sha = _git_output(workdir, "merge-base", "origin/main", expected_sha)
     tree_sha = _git_output(workdir, "rev-parse", f"{expected_sha}^{{tree}}")
     diff_text = _git_output(

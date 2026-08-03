@@ -320,13 +320,13 @@ class ControllerSnapshotTests(unittest.TestCase):
         self.assertFalse((snapshot / ".dark-factory" / "agy-task-worker.md").exists())
         self.assertEqual(_git(snapshot, "rev-parse", "HEAD").strip(), request.head_sha)
 
-    def test_ignored_declared_evidence_is_bound_into_snapshot(self) -> None:
-        """Ignored evidence declared by the graph remains reviewable and digest-bound."""
+    def test_declared_evidence_is_bound_without_copying_unrelated_ignored_files(self) -> None:
+        """Snapshot includes declared evidence, but not unrelated ignored runtime data."""
         from runner.handler_core import Context
         from runner.handler_parallel_reviewer import _controller_review_request
         from runner.parser import Node
 
-        (self.repo / ".gitignore").write_text("evidence/\n")
+        (self.repo / ".gitignore").write_text("evidence/\nruntime/\n")
         _git(self.repo, "add", ".gitignore")
         _git(self.repo, "commit", "-q", "-m", "ignore evidence")
         _git(self.repo, "update-ref", "refs/remotes/origin/main", "HEAD")
@@ -335,12 +335,20 @@ class ControllerSnapshotTests(unittest.TestCase):
         evidence_dir.mkdir()
         evidence = evidence_dir / "controller.json"
         evidence.write_text('{"status":"pass"}\n')
+        normal_evidence = self.repo / "normal-evidence.json"
+        normal_evidence.write_text('{"status":"normal"}\n')
+        runtime_dir = self.repo / "runtime"
+        runtime_dir.mkdir()
+        (runtime_dir / "secret.txt").write_text("must not enter review snapshot\n")
         task_dir = self.repo / ".dark-factory"
         task_dir.mkdir()
         (task_dir / "agy-task-worker.md").write_text("runner task artifact\n")
 
         request = _controller_review_request(
-            Node(name="cold_reviewer", attrs={"evidence_paths": "evidence/controller.json"}),
+            Node(
+                name="cold_reviewer",
+                attrs={"evidence_paths": "evidence/controller.json,normal-evidence.json"},
+            ),
             Context(goal="review worker evidence", workdir=self.repo),
             _git(self.repo, "rev-parse", "HEAD").strip(),
         )
@@ -349,12 +357,21 @@ class ControllerSnapshotTests(unittest.TestCase):
         bound = envelope["evidence"]
 
         self.assertEqual((snapshot / "evidence" / "controller.json").read_text(), evidence.read_text())
+        self.assertEqual((snapshot / "normal-evidence.json").read_text(), normal_evidence.read_text())
         self.assertFalse((snapshot / ".dark-factory" / "agy-task-worker.md").exists())
-        self.assertEqual(bound, [{
-            "path": "evidence/controller.json",
-            "size_bytes": len(evidence.read_bytes()),
-            "sha256": _sha256(evidence.read_bytes()),
-        }])
+        self.assertFalse((snapshot / "runtime" / "secret.txt").exists())
+        self.assertEqual(bound, [
+            {
+                "path": "evidence/controller.json",
+                "size_bytes": len(evidence.read_bytes()),
+                "sha256": _sha256(evidence.read_bytes()),
+            },
+            {
+                "path": "normal-evidence.json",
+                "size_bytes": len(normal_evidence.read_bytes()),
+                "sha256": _sha256(normal_evidence.read_bytes()),
+            },
+        ])
 
 
 def replace_evidence(
