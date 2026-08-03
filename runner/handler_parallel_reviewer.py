@@ -322,6 +322,7 @@ def _controller_snapshot(
             source,
             "ls-files",
             "--others",
+            "--ignored",
             "--exclude-standard",
             "-z",
             allow_empty=True,

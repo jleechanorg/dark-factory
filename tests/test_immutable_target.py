@@ -320,6 +320,42 @@ class ControllerSnapshotTests(unittest.TestCase):
         self.assertFalse((snapshot / ".dark-factory" / "agy-task-worker.md").exists())
         self.assertEqual(_git(snapshot, "rev-parse", "HEAD").strip(), request.head_sha)
 
+    def test_ignored_declared_evidence_is_bound_into_snapshot(self) -> None:
+        """Ignored evidence declared by the graph remains reviewable and digest-bound."""
+        from runner.handler_core import Context
+        from runner.handler_parallel_reviewer import _controller_review_request
+        from runner.parser import Node
+
+        (self.repo / ".gitignore").write_text("evidence/\n")
+        _git(self.repo, "add", ".gitignore")
+        _git(self.repo, "commit", "-q", "-m", "ignore evidence")
+        _git(self.repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+        (self.repo / "README.md").write_text("worker change\n")
+        evidence_dir = self.repo / "evidence"
+        evidence_dir.mkdir()
+        evidence = evidence_dir / "controller.json"
+        evidence.write_text('{"status":"pass"}\n')
+        task_dir = self.repo / ".dark-factory"
+        task_dir.mkdir()
+        (task_dir / "agy-task-worker.md").write_text("runner task artifact\n")
+
+        request = _controller_review_request(
+            Node(name="cold_reviewer", attrs={"evidence_paths": "evidence/controller.json"}),
+            Context(goal="review worker evidence", workdir=self.repo),
+            _git(self.repo, "rev-parse", "HEAD").strip(),
+        )
+        envelope = json.loads(request.envelope_json)
+        snapshot = Path(envelope["target"]["workspace_path"])
+        bound = envelope["evidence"]
+
+        self.assertEqual((snapshot / "evidence" / "controller.json").read_text(), evidence.read_text())
+        self.assertFalse((snapshot / ".dark-factory" / "agy-task-worker.md").exists())
+        self.assertEqual(bound, [{
+            "path": "evidence/controller.json",
+            "size_bytes": len(evidence.read_bytes()),
+            "sha256": _sha256(evidence.read_bytes()),
+        }])
+
 
 def replace_evidence(
     inputs: ReviewInputs, evidence: tuple[EvidenceArtifact, ...]
