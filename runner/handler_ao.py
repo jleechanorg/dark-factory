@@ -20,6 +20,8 @@ from typing import Optional
 
 import runner.handlers as _handlers_shim
 
+from .subprocess_control import run_bounded_process
+
 
 def _ao_parse_status(stdout: str, session: str) -> str:
     """Pull a session's `activity` from `ao status --json` output.
@@ -67,15 +69,14 @@ def _ao_wait_idle(
     consecutive = 0
     status_cmd = ["ao", "status", "--json"]
     while time.monotonic() < deadline:
-        proc = subprocess.run(
+        proc = run_bounded_process(
             status_cmd,
             cwd=workdir,
-            capture_output=True,
-            text=True,
             timeout=180,
-            check=False,
             env=_handlers_shim._sanitized_env(),
         )
+        if proc.timed_out:
+            return "timeout"
         if proc.returncode == 0:
             activity = _ao_parse_status(proc.stdout, session)
             if activity in ("exited", "missing"):

@@ -138,7 +138,7 @@ def test_bounded_process_kills_term_ignoring_grandchild_after_pipes_close(tmp_pa
         raise AssertionError(f"closed-pipe grandchild {child_pid} survived cleanup")
 
 
-@pytest.mark.parametrize("lane", ["ao_spawn", "ao_send", "tool"])
+@pytest.mark.parametrize("lane", ["ao_spawn", "ao_send", "ao_status", "tool"])
 def test_live_timeout_lanes_use_bounded_helper_as_terminal_error(
     lane, tmp_path, monkeypatch
 ) -> None:
@@ -171,6 +171,16 @@ def test_live_timeout_lanes_use_bounded_helper_as_terminal_error(
             Node(name="tool", attrs={"type": "tool", "command": "echo safe", "timeout": "1"}),
             Context(goal="timeout", workdir=tmp_path, backend="echo"),
         )
+    elif lane == "ao_status":
+        from runner.handler_ao import _ao_wait_idle
+
+        monkeypatch.setattr("runner.handler_ao.run_bounded_process", fake_bounded)
+        outcome = _ao_wait_idle(
+            "existing-session", tmp_path, timeout=1, poll_interval=0
+        )
+        assert outcome == "timeout"
+        assert len(calls) == 1
+        return
     else:
         monkeypatch.setattr("runner.handler_codergen.run_bounded_process", fake_bounded)
         ctx = Context(goal="timeout", workdir=tmp_path, backend="ao")
