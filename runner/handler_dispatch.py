@@ -1114,7 +1114,18 @@ def _execute_gate(
     ``codex`` actually invokes the codex subprocess, with
     ``reviewer_backend: codex`` recorded in the result metadata.
     """
+    controller_requested = str(
+        ctx.state.get("_df_controller_review_json") or ""
+    ).lower() in {"true", "1", "yes", "on"}
     result = _run_gate_once(backend, prompt, expected_sha, timeout, ctx, name, gate_strict=gate_strict)
+
+    # The cold-review controller contract is a single, immutable Codex
+    # transport.  An infrastructure failure means no review was performed;
+    # retrying through agy/claude would silently change the authority and
+    # violate the contract.  Return the original Result untouched so callers
+    # retain the exact failure and metadata emitted by the Codex attempt.
+    if controller_requested and _is_gate_infra_failure(result):
+        return result
 
     if _is_gate_infra_failure(result):
         fallback_backends = []

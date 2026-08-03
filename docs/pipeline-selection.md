@@ -1,10 +1,9 @@
 # Pipeline selection
 
 **The slim two-node graph is the new default for `/f` and `/factory`
-(set 2026-08-02).** The runner's `--pipeline` argparse default is
-`two_node.dot`, so a bare `dark-factory …` invocation (no `--pipeline`)
-dispatches `pipelines/slim/two_node.dot` — a generic worker plus a
-static Codex cold-reviewer. Operators opt into richer pipelines by
+(set 2026-08-02).** A bare `dark-factory …` invocation (no `--pipeline`)
+dispatches the controller-owned `pipelines/slim/two_node.dot` — a generic
+worker plus a fixed Codex cold-reviewer. Operators opt into richer pipelines by
 passing `--pipeline <name>` explicitly. Custom dot graphs are always
 expressible via `--pipeline /absolute/path/to/your.dot`.
 
