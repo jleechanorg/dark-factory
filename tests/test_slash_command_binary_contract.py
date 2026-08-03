@@ -300,7 +300,7 @@ def test_f_defaults_reviewer_calibration_on() -> None:
         "--head-sha <full-40-hex-sha>",
         "--task-file <path>",
         "--output-dir <dir>",
-        "--backend <backend>",
+        "--backend codex",
         "controller-receipt.json",
         "SHA-256 of the controller receipt",
         "prompt SHA-256",
