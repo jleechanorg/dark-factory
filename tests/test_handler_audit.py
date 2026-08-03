@@ -170,6 +170,113 @@ def test_operator_manifest_can_be_pinned_to_trusted_commit(tmp_path: pathlib.Pat
     assert manifest.raw_bytes != path.read_bytes()
 
 
+def test_custom_target_manifest_survives_fresh_resume_and_ignores_worker_policy(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    import subprocess
+    import runner.handlers  # noqa: F401
+    import runner.handler_audit as ha
+    from runner import handler_sandbox
+    from runner.engine import run
+    from runner.handler_core import Context
+    from runner.parser import parse
+
+    controller_root = tmp_path.parent / f"{tmp_path.name}-controller"
+    private_logs = tmp_path.parent / f"{tmp_path.name}-operator-logs"
+    monkeypatch.setattr(
+        handler_sandbox, "_controller_private_root", lambda: controller_root
+    )
+    monkeypatch.setattr(ha, "_operator_log_root", lambda: private_logs)
+    subprocess.run(["/usr/bin/git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["/usr/bin/git", "config", "user.email", "jleechan2015@users.noreply.github.com"],
+        cwd=tmp_path,
+        check=True,
+    )
+    subprocess.run(
+        ["/usr/bin/git", "config", "user.name", "Test"], cwd=tmp_path, check=True
+    )
+    manifest = _write_operator_manifest(
+        tmp_path,
+        """operator_verification:
+  schema_version: 1
+  commands:
+    - id: target-head
+      argv: [/usr/bin/git, rev-parse, HEAD]
+      lane: operator_unwrapped
+      timeout_seconds: 30
+      classification: required
+  exclusions: []
+""",
+    )
+    (tmp_path / "product.txt").write_text("target product\n", encoding="utf-8")
+    subprocess.run(["/usr/bin/git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["/usr/bin/git", "commit", "-qm", "trusted target"], cwd=tmp_path, check=True)
+    trusted = subprocess.run(
+        ["/usr/bin/git", "rev-parse", "HEAD"], cwd=tmp_path, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    subprocess.run(["/usr/bin/git", "branch", "target-upstream", trusted], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["/usr/bin/git", "branch", "--set-upstream-to=target-upstream"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    graph_path = tmp_path / "operator.dot"
+    graph_path.write_text(
+        "digraph target { start [shape=Mdiamond] operator [type=operator_verify] "
+        "exit [shape=Msquare] start -> operator -> exit }",
+        encoding="utf-8",
+    )
+    checkpoint = tmp_path / "checkpoint.json"
+    graph = parse(graph_path)
+    run(
+        graph,
+        Context(goal="custom target fresh", workdir=tmp_path, backend="codex"),
+        checkpoint=checkpoint,
+        max_steps=1,
+    )
+    records = json.loads(checkpoint.read_text(encoding="utf-8"))[:1]
+    records[0]["metadata"]["_df_operator_policy_sha256"] = "0" * 64
+    checkpoint.write_text(json.dumps(records), encoding="utf-8")
+    manifest.write_text(
+        """operator_verification:
+  schema_version: 1
+  commands:
+    - id: worker-code
+      argv: ["@runner-python", -c, "raise SystemExit(99)"]
+      lane: operator_unwrapped
+      timeout_seconds: 30
+      classification: required
+  exclusions: []
+""",
+        encoding="utf-8",
+    )
+
+    history = run(
+        graph,
+        Context(goal="custom target resume", workdir=tmp_path, backend="codex"),
+        resume=checkpoint,
+    )
+
+    assert history[-1].node == "exit"
+    assert history[-1].outcome == "success", [
+        (item.node, item.outcome, item.output_preview, item.metadata)
+        for item in history
+    ]
+    receipt = json.loads(
+        (tmp_path / "evidence" / "operator-verification.json").read_text()
+    )
+    assert receipt["target_head_sha"] == trusted
+    assert [item["id"] for item in receipt["commands"]] == [
+        "git-head", "git-diff-names", "git-diff-check", "git-status",
+        "target-head", "git-head-final",
+    ]
+    assert "worker-code" not in json.dumps(receipt)
+    assert not (controller_root / "operator-trust" / "registry.json").exists()
+
+
 def test_operator_verify_rejects_fresh_manifest_python_code_execution(
     tmp_path: pathlib.Path, monkeypatch
 ) -> None:
@@ -372,8 +479,8 @@ operator_verification:
     assert result.outcome == "success", result.output
     assert [call[0] for call in calls[:4]] == [
         ("/usr/bin/git", "rev-parse", "HEAD"),
-        ("/usr/bin/git", "diff", "--name-only", "origin/main..HEAD"),
-        ("/usr/bin/git", "diff", "--check", "origin/main..HEAD"),
+        ("/usr/bin/git", "diff", "--name-only", f"{head}..HEAD"),
+        ("/usr/bin/git", "diff", "--check", f"{head}..HEAD"),
         ("/usr/bin/git", "status", "--porcelain=v1"),
     ]
     assert calls[4][0] == (

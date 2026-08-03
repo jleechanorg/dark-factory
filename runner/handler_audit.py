@@ -66,9 +66,6 @@ _OPERATOR_RAW_STREAM_MAX_BYTES = 8 << 20
 _OPERATOR_RECEIPT_MAX_BYTES = 1 << 20
 _OPERATOR_TRUST_REGISTRY_MAX_BYTES = 1 << 20
 
-_OPERATOR_BUILTINS: tuple[OperatorCommand, ...] = ()  # populated after dataclass declaration
-
-
 def _target_provenance(workdir: pathlib.Path) -> tuple[str, str]:
     """Return trusted HEAD plus a deterministic target-workspace fingerprint."""
     root = workdir.resolve()
@@ -224,40 +221,18 @@ def _trusted_operator_snapshot(
         )
 
 
-_OPERATOR_BUILTINS = (
-    OperatorCommand(
-        "git-head",
-        ("/usr/bin/git", "rev-parse", "HEAD"),
-        ("/usr/bin/git", "rev-parse", "HEAD"),
-        "operator_unwrapped",
-        30,
-        "required",
-    ),
-    OperatorCommand(
-        "git-diff-names",
-        ("/usr/bin/git", "diff", "--name-only", "origin/main..HEAD"),
-        ("/usr/bin/git", "diff", "--name-only", "origin/main..HEAD"),
-        "operator_unwrapped",
-        30,
-        "required",
-    ),
-    OperatorCommand(
-        "git-diff-check",
-        ("/usr/bin/git", "diff", "--check", "origin/main..HEAD"),
-        ("/usr/bin/git", "diff", "--check", "origin/main..HEAD"),
-        "operator_unwrapped",
-        30,
-        "required",
-    ),
-    OperatorCommand(
-        "git-status",
-        ("/usr/bin/git", "status", "--porcelain=v1"),
-        ("/usr/bin/git", "status", "--porcelain=v1"),
-        "operator_unwrapped",
-        30,
-        "required",
-    ),
-)
+def _operator_builtins(trusted_head: str) -> tuple[OperatorCommand, ...]:
+    trusted_range = f"{trusted_head}..HEAD"
+    argv = (
+        ("git-head", ("/usr/bin/git", "rev-parse", "HEAD")),
+        ("git-diff-names", ("/usr/bin/git", "diff", "--name-only", trusted_range)),
+        ("git-diff-check", ("/usr/bin/git", "diff", "--check", trusted_range)),
+        ("git-status", ("/usr/bin/git", "status", "--porcelain=v1")),
+    )
+    return tuple(
+        OperatorCommand(command_id, command_argv, command_argv, "operator_unwrapped", 30, "required")
+        for command_id, command_argv in argv
+    )
 _OPERATOR_FINAL_HEAD = OperatorCommand(
     "git-head-final",
     ("/usr/bin/git", "rev-parse", "HEAD"),
@@ -897,7 +872,7 @@ def _operator_verify(node: "Node", ctx: "Context") -> Result:
     failure_type = ""
     target_head = ""
     final_head = ""
-    commands = (*_OPERATOR_BUILTINS, *manifest.commands, _OPERATOR_FINAL_HEAD)
+    commands = (*_operator_builtins(trusted_manifest_head), *manifest.commands, _OPERATOR_FINAL_HEAD)
     env = _handlers_shim._sanitized_env()
     runner_python = str(pathlib.Path(sys.executable).resolve())
     if sys.executable != runner_python:
