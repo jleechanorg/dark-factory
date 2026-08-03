@@ -93,6 +93,11 @@ from typing import Optional, Union
 _SEALED_BENCHMARK_DOC_NAMES = ("README.md", "DESIGN.md", "SCORING.md", "SCENARIOS.md")
 
 
+def _controller_private_root() -> pathlib.Path:
+    """Stable root that implementing-agent processes must never observe."""
+    return pathlib.Path.home() / ".dark-factory"
+
+
 def _sanitized_env() -> dict[str, str]:
     env = {}
     for k, v in os.environ.items():
@@ -137,6 +142,7 @@ def _holdouts_repo_path() -> pathlib.Path:
 def _holdout_denied_paths() -> list[pathlib.Path]:
     paths = {_holdouts_repo_path()}
     paths.add((pathlib.Path.home() / "projects" / "dark-factory-holdouts").resolve())
+    paths.add(_controller_private_root().resolve())
     return sorted(paths, key=lambda p: str(p))
 
 

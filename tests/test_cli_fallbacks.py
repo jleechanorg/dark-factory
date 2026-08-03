@@ -794,6 +794,67 @@ def test_implementing_agent_sandbox_denies_runner_venv_writes(tmp_path, monkeypa
     assert ordinary.read_text() == "good"
 
 
+def test_implementing_agent_sandbox_denies_controller_private_trust_operations(
+    tmp_path, monkeypatch
+):
+    if os.environ.get("DARK_FACTORY_OUTER_SANDBOX") == "1":
+        pytest.skip("already executing under the outer implementing-agent sandbox")
+    from runner import handler_sandbox
+
+    sandbox_exec = shutil.which("sandbox-exec")
+    if sandbox_exec is None:
+        pytest.skip("sandbox-exec unavailable")
+    holdouts = tmp_path / "holdouts"
+    holdouts.mkdir()
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(holdouts))
+    controller_root = tmp_path / "controller-private"
+    trust_root = controller_root / "operator-trust"
+    trust_root.mkdir(parents=True)
+    trust_file = trust_root / "registry.json"
+    trust_file.write_text("sealed-trust\n", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside\n", encoding="utf-8")
+    monkeypatch.setattr(
+        handler_sandbox, "_controller_private_root", lambda: controller_root
+    )
+    probe = (
+        'test ! -e "$DF_TRUST_ROOT/registry.json" || exit 81; '
+        'test ! -r "$DF_TRUST_ROOT/registry.json" || exit 82; '
+        'test "$(/bin/ls "$DF_CONTROLLER_ROOT" 2>/dev/null)" = "" || exit 83; '
+        'printf bad >"$DF_TRUST_ROOT/injected" 2>/dev/null && exit 84; '
+        '/bin/mv "$DF_OUTSIDE" "$DF_TRUST_ROOT/moved" 2>/dev/null && exit 85; '
+        '/bin/mv "$DF_TRUST_FILE" "$DF_OUTSIDE.moved" 2>/dev/null && exit 86; '
+        '/bin/rm "$DF_TRUST_FILE" 2>/dev/null && exit 87; '
+        'printf allowed >"$DF_ALLOWED"'
+    )
+    args = handler_sandbox._sandboxed_args_for_workdir(
+        ["/bin/sh", "-c", probe], tmp_path
+    )
+    assert args is not None
+
+    proc = subprocess.run(
+        args,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "DF_CONTROLLER_ROOT": str(controller_root),
+            "DF_TRUST_ROOT": str(trust_root),
+            "DF_TRUST_FILE": str(trust_file),
+            "DF_OUTSIDE": str(outside),
+            "DF_ALLOWED": str(tmp_path / "allowed.txt"),
+        },
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert trust_file.read_text(encoding="utf-8") == "sealed-trust\n"
+    assert outside.read_text(encoding="utf-8") == "outside\n"
+    assert not (trust_root / "injected").exists()
+    assert (tmp_path / "allowed.txt").read_text(encoding="utf-8") == "allowed"
+
+
 def test_controller_outer_sandbox_avoids_nested_seatbelt(tmp_path):
     """Outer Seatbelt remains authoritative without unsupported nesting."""
     from runner.handler_dispatch import _build_controller_codex_transport
