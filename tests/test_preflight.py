@@ -188,8 +188,23 @@ def test_subprocess_fail_exit_code(tmp_path):
     """
     import os
 
+    def _is_clean_dir(d: str) -> bool:
+        p = pathlib.Path(d)
+        if not p.is_dir():
+            return False
+        for name in ("claude", "codex", "agy", "ao"):
+            if (p / name).exists():
+                return False
+        return True
+
+    clean_paths = [
+        d for d in os.environ.get("PATH", "").split(os.pathsep)
+        if _is_clean_dir(d)
+    ]
+    clean_path_str = os.pathsep.join([str(tmp_path)] + clean_paths)
+
     sanitized_env = {
-        "PATH": str(tmp_path),
+        "PATH": clean_path_str,
         "HOME": os.environ.get("HOME", "/tmp"),
         "PYTHONPATH": str(
             pathlib.Path(__file__).resolve().parent.parent
@@ -210,6 +225,6 @@ def test_subprocess_fail_exit_code(tmp_path):
         timeout=30,
         env=sanitized_env,
     )
-    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert proc.returncode == 2, f"returncode={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
     payload = json.loads(proc.stdout)
     assert payload["status"] == "fail"

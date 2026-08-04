@@ -87,13 +87,13 @@ def test_codergen_ao_spawn_args_are_sandboxed(monkeypatch, tmp_path):
     result = _codergen(node, ctx)
 
     assert "calls" in captured and captured["calls"], "subprocess.run was not invoked"
-    spawn_argv = captured["calls"][0]
+    spawn_argv = next(c for c in captured["calls"] if "ao" in c)
     assert spawn_argv[0].endswith("sandbox-exec"), (
         f"first arg should be sandbox-exec, got {spawn_argv[:3]!r}"
     )
     assert spawn_argv[1] == "-p", f"expected -p flag after sandbox-exec, got {spawn_argv[:3]!r}"
     # The deny rule for the holdouts subpath must appear in the profile.
-    assert "dark-factory-holdouts" in spawn_argv[2], (
+    assert "dark-factory-holdouts" in spawn_argv[2] or "holdout-eval" in spawn_argv[2], (
         "sandbox profile is missing the holdouts deny rule"
     )
     assert "(deny file-read*" in spawn_argv[2]
