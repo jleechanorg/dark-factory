@@ -1380,6 +1380,12 @@ impl StateStore for FakeStateStore {
                 overlay.park_reason = None;
                 overlay.pr_number = None;
                 overlay.session_id = None;
+                // G12 retry-backoff-bleed-into-global-suppression fix:
+                // mirror production's `spawn_failure_count = 0` reset on
+                // recovery. The fake must match the production contract
+                // (`state.rs::recover_human_held`'s UPDATE) so integration
+                // tests exercise the same semantics.
+                overlay.spawn_failure_count = 0;
                 recovered.push(overlay.clone());
             }
         }
