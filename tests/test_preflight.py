@@ -189,7 +189,7 @@ def test_subprocess_fail_exit_code(tmp_path):
     import os
 
     sanitized_env = {
-        "PATH": str(tmp_path),
+        "PATH": f"{tmp_path}:/usr/bin:/bin",
         "HOME": os.environ.get("HOME", "/tmp"),
         "PYTHONPATH": str(
             pathlib.Path(__file__).resolve().parent.parent
