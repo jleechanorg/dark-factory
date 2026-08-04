@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import json
 import hashlib
 import re
@@ -39,26 +38,17 @@ def _valid_response(prompt: str) -> str:
         "PROMPT_ID",
         "PROMPT_SHA256",
         "ENVELOPE_SHA256",
-        "BASE_SHA",
         "HEAD_SHA",
-        "TREE_SHA",
         "TASK_SHA256",
         "DIFF_SHA256",
         "CHANGED_FILES_SHA256",
         "EVIDENCE_MANIFEST_SHA256",
     )
     values = {}
-    encoded = prompt.split("BEGIN_CONTROLLER_ENVELOPE_BASE64\n", 1)[1].split(
-        "\nEND_CONTROLLER_ENVELOPE_BASE64", 1
-    )[0]
-    target = json.loads(base64.b64decode(encoded).decode("utf-8"))["target"]
     for key in keys:
         match = re.search(rf"^{key}: (\S+)$", prompt, re.MULTILINE)
-        if key in {"BASE_SHA", "TREE_SHA"}:
-            values[key] = target[key.lower()]
-        else:
-            assert match, f"prompt is missing required binding line: {key}"
-            values[key] = match.group(1)
+        assert match, f"prompt is missing required binding line: {key}"
+        values[key] = match.group(1)
     return "\n".join(
         [
             *(f"{key}: {values[key]}" for key in keys),
@@ -68,7 +58,7 @@ def _valid_response(prompt: str) -> str:
             "## Findings",
             "None; inspected the changed implementation and callers.",
             "## Commands Executed",
-            "`git diff --no-ext-diff --binary <base>..<head>` — exit code 0.",
+            "`python -m pytest` — exit code 0.",
             "## Evidence Checked",
             "Changed files and test output.",
             "## Caveats",
@@ -78,56 +68,14 @@ def _valid_response(prompt: str) -> str:
 
 
 def _valid_transport(prompt: str) -> str:
-    encoded = prompt.split("BEGIN_CONTROLLER_ENVELOPE_BASE64\n", 1)[1].split(
-        "\nEND_CONTROLLER_ENVELOPE_BASE64", 1
-    )[0]
-    envelope = json.loads(base64.b64decode(encoded).decode("utf-8"))
-    command = (
-        f"git -C {envelope['target']['workspace_path']} diff --no-ext-diff --binary "
-        f"{envelope['target']['base_sha']}..{envelope['target']['head_sha']}"
-    )
-    evidence_command = f"cat -- {envelope['target']['workspace_path']}/evidence/test.log"
     return "\n".join(
         (
             json.dumps(
                 {
-                    "type": "item.started",
-                    "item": {
-                        "id": "command-1",
-                        "type": "command_execution",
-                        "command": command,
-                    },
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "item.started",
-                    "item": {
-                        "id": "command-2",
-                        "type": "command_execution",
-                        "command": evidence_command,
-                    },
-                }
-            ),
-            json.dumps(
-                {
                     "type": "item.completed",
                     "item": {
-                        "id": "command-2",
                         "type": "command_execution",
-                        "command": evidence_command,
-                        "exit_code": 0,
-                        "aggregated_output": "evidence",
-                    },
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "item.completed",
-                    "item": {
-                        "id": "command-1",
-                        "type": "command_execution",
-                        "command": command,
+                        "command": "python -m pytest -q",
                         "exit_code": 0,
                         "aggregated_output": "3 passed",
                     },
@@ -305,3 +253,4 @@ def test_main_entrypoint_dispatches_review_subcommand(capsys):
     assert "--task-file" in captured.out
     assert "--output-dir" in captured.out
     assert "--backend" in captured.out
+

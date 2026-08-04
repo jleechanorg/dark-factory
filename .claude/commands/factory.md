@@ -1,5 +1,5 @@
 ---
-description: "/factory — alias for /f; defaults to one worker plus one controller-owned Codex cold reviewer"
+description: "/factory — alias for /f; auto-routes to PR-mode when a PR is open, otherwise feature-mode"
 type: skill
 execution_mode: immediate
 aliases: [df]
@@ -14,15 +14,15 @@ execute it as the source of truth.
 ## Usage
 
 ```
-/factory <goal>                          # worker + fixed Codex cold reviewer
+/factory <goal>                          # auto-detect: PR-mode or feature-mode; reviewer calibration on
 /factory --pipeline gates <goal>         # explicit pipeline (skips auto-detect)
 /factory --backend echo <goal>           # dry-run wiring smoke
 /factory --feature hello <goal>          # override holdout feature key
-/factory --reviewer-calibration=true <goal>   # explicit extra calibration lanes
+/factory --reviewer-calibration=false <goal>  # explicit opt-out; same as /f
 ```
 
 ## See also
 
 - `/f` — same behavior, canonical entry point.
-- `.claude/skills/dark-factory/SKILL.md` — full contract (fixed default,
-  explicit opt-ins, proof-block output contract).
+- `.claude/skills/dark-factory/SKILL.md` — full contract (Step 0a/0b/0c,
+  reviewer calibration, proof-block output contract).

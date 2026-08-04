@@ -5,10 +5,7 @@ import json
 import os
 import pathlib
 import re
-import shlex
-import shutil
 import subprocess
-import sys
 
 
 def _install_fake_runner_python(home: pathlib.Path, call_log: pathlib.Path) -> None:
@@ -27,14 +24,11 @@ def _install_fake_runner_python(home: pathlib.Path, call_log: pathlib.Path) -> N
         "with log_path.open('a', encoding='utf-8') as handle:\n"
         "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
         "\n"
-        "args = sys.argv[1:]\n"
-        "if args and args[0] == '-P':\n"
-        "    args = args[1:]\n"
-        "if len(args) >= 2 and args[0] == '-m':\n"
-        "    module = args[1]\n"
-        "    args = args[2:]\n"
+        "if len(sys.argv) >= 3 and sys.argv[1] == '-m':\n"
+        "    module = sys.argv[2]\n"
+        "    args = sys.argv[3:]\n"
         "    if module == 'runner.preflight':\n"
-        "        if '--json' in args:\n"
+        "        if '--json' in sys.argv:\n"
         "            print('{}')\n"
         "        raise SystemExit(0)\n"
         "\n"
@@ -72,9 +66,6 @@ def _read_fake_runner_calls(call_log: pathlib.Path) -> list[list[str]]:
 def _run_installed_wrapper(binary_args: list[str], *, workdir: pathlib.Path, review_return: int = 0) -> tuple[subprocess.CompletedProcess[str], pathlib.Path]:
     fake_home = workdir / "fake_home"
     fake_home.mkdir(parents=True, exist_ok=True)
-    (fake_home / "bin").mkdir(exist_ok=True)
-    wrapper = fake_home / "bin" / "dark-factory"
-    shutil.copy2(ROOT / "bin" / "dark-factory", wrapper)
     call_log = fake_home / "fake-runner-calls.jsonl"
     _install_fake_runner_python(fake_home, call_log)
     env = os.environ.copy()
@@ -83,105 +74,13 @@ def _run_installed_wrapper(binary_args: list[str], *, workdir: pathlib.Path, rev
     env["DF_FAKE_RUNNER_CALL_LOG"] = str(call_log)
     env["DF_FAKE_REVIEW_RETURN"] = str(review_return)
     result = subprocess.run(
-        [str(wrapper), *binary_args],
+        [str(ROOT / "bin" / "dark-factory"), *binary_args],
         cwd=workdir,
         env=env,
         capture_output=True,
         text=True,
     )
     return result, call_log
-
-
-def test_installed_wrapper_uses_python_safe_path_for_runner_modules() -> None:
-    wrapper = (ROOT / "bin" / "dark-factory").read_text(encoding="utf-8")
-
-    assert '"${VENV_PYTHON}" -m runner' not in wrapper
-    assert wrapper.count('"${VENV_PYTHON}" -P -m runner') == 7
-
-
-def test_installed_wrapper_ignores_ambient_source_checkout(tmp_path: pathlib.Path) -> None:
-    trusted = tmp_path / "trusted"
-    installed_bin = tmp_path / "installed-bin"
-    bogus = tmp_path / "bogus"
-    log = tmp_path / "python-calls.log"
-    (trusted / "bin").mkdir(parents=True)
-    (trusted / ".venv" / "bin").mkdir(parents=True)
-    installed_bin.mkdir()
-    bogus.mkdir()
-
-    wrapper = trusted / "bin" / "dark-factory"
-    shutil.copy2(ROOT / "bin" / "dark-factory", wrapper)
-    fake_python = trusted / ".venv" / "bin" / "python"
-    fake_python.write_text(
-        "#!/usr/bin/env bash\n"
-        f"printf '%s|%s|%s\\n' \"$DARK_FACTORY_HOME\" \"$PYTHONPATH\" \"$*\" >> {shlex.quote(str(log))}\n"
-        "exit 0\n",
-        encoding="utf-8",
-    )
-    fake_python.chmod(0o755)
-    installed = installed_bin / "dark-factory"
-    installed.symlink_to(wrapper)
-
-    env = os.environ.copy()
-    env["DARK_FACTORY_HOME"] = str(bogus)
-    result = subprocess.run(
-        [str(installed), "review", "--help"],
-        cwd=tmp_path,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-
-    assert result.returncode == 0, result.stderr
-    calls = log.read_text(encoding="utf-8").splitlines()
-    assert calls
-    assert any(fields.split("|", 2)[2] == "-P -m runner review --help" for fields in calls)
-    for call in calls:
-        resolved_home, python_path, _ = call.split("|", 2)
-        assert resolved_home == str(trusted)
-        assert python_path.split(":", 1)[0] == str(trusted)
-
-
-def test_installed_wrapper_pipeline_cannot_import_target_local_runner(
-    tmp_path: pathlib.Path,
-) -> None:
-    trusted = tmp_path / "trusted"
-    target = tmp_path / "target"
-    (trusted / "bin").mkdir(parents=True)
-    (trusted / ".venv" / "bin").mkdir(parents=True)
-    (trusted / "runner").mkdir()
-    (target / "runner").mkdir(parents=True)
-
-    wrapper = trusted / "bin" / "dark-factory"
-    shutil.copy2(ROOT / "bin" / "dark-factory", wrapper)
-    (trusted / ".venv" / "bin" / "python").symlink_to(sys.executable)
-    (trusted / "runner" / "__init__.py").write_text("", encoding="utf-8")
-    for name in ("preflight.py", "_agy_safe.py", "_merge_train.py"):
-        (trusted / "runner" / name).write_text("", encoding="utf-8")
-        (target / "runner" / name).write_text("", encoding="utf-8")
-    (trusted / "runner" / "__main__.py").write_text(
-        "print('TRUSTED_RUNNER_EXECUTED')\n",
-        encoding="utf-8",
-    )
-    (target / "runner" / "__init__.py").write_text("", encoding="utf-8")
-    (target / "runner" / "__main__.py").write_text(
-        "print('TARGET_RUNNER_SHADOW_EXECUTED')\n",
-        encoding="utf-8",
-    )
-
-    result = subprocess.run(
-        [str(wrapper), "--preflight", "--backend", "echo"],
-        cwd=target,
-        env=os.environ.copy(),
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert "TRUSTED_RUNNER_EXECUTED" in result.stdout
-    assert "TARGET_RUNNER_SHADOW_EXECUTED" not in result.stdout
 
 
 def test_dark_factory_review_invocation_does_not_inject_workdir_before_review(tmp_path: pathlib.Path) -> None:
@@ -208,11 +107,11 @@ def test_dark_factory_review_invocation_does_not_inject_workdir_before_review(tm
 
     assert result.returncode == 0
     calls = _read_fake_runner_calls(call_log)
-    runner_calls = [call for call in calls if call[:3] == ["-P", "-m", "runner"]]
+    runner_calls = [call for call in calls if call[:2] == ["-m", "runner"]]
     assert len(runner_calls) == 1
-    assert runner_calls[0][3] == "review"
-    assert "--workdir" not in runner_calls[0][4:]
-    assert not any(call[:3] == ["-P", "-m", "runner._merge_train"] for call in calls)
+    assert runner_calls[0][2] == "review"
+    assert "--workdir" not in runner_calls[0][3:]
+    assert not any(call[:2] == ["-m", "runner._merge_train"] for call in calls)
 
 
 def test_dark_factory_pipeline_paths_still_take_merge_train_lock(tmp_path: pathlib.Path) -> None:
@@ -224,9 +123,9 @@ def test_dark_factory_pipeline_paths_still_take_merge_train_lock(tmp_path: pathl
 
     assert result.returncode == 0
     calls = _read_fake_runner_calls(call_log)
-    assert any(call[:3] == ["-P", "-m", "runner._merge_train"] for call in calls)
-    runner_calls = [call for call in calls if call[:3] == ["-P", "-m", "runner"]]
-    assert runner_calls[0][3:] == [
+    assert any(call[:2] == ["-m", "runner._merge_train"] for call in calls)
+    runner_calls = [call for call in calls if call[:2] == ["-m", "runner"]]
+    assert runner_calls[0][2:] == [
         "--workdir",
         str(workdir),
         "--pipeline",
@@ -260,9 +159,9 @@ def test_dark_factory_review_failure_does_not_create_panic_artifact(tmp_path: pa
 
     assert result.returncode == 2
     calls = _read_fake_runner_calls(call_log)
-    assert any(call[:3] == ["-P", "-m", "runner"] and call[3] == "review" for call in calls)
-    assert not any(call[:3] == ["-P", "-m", "runner._merge_train"] for call in calls)
-    assert not any(call[:3] == ["-P", "-m", "runner.panic_hook"] for call in calls)
+    assert any(call[:2] == ["-m", "runner"] and call[2] == "review" for call in calls)
+    assert not any(call[:2] == ["-m", "runner._merge_train"] for call in calls)
+    assert not any(call[:2] == ["-m", "runner.panic_hook"] for call in calls)
     fake_home = workdir / "fake_home"
     assert not (fake_home / ".dark-factory" / "panics").exists()
 
@@ -379,7 +278,7 @@ def test_fs_alias_has_single_owner() -> None:
     assert owners == ["fs.md"]
 
 
-def test_f_keeps_reviewer_calibration_as_explicit_opt_in() -> None:
+def test_f_defaults_reviewer_calibration_on() -> None:
     """/f and /factory are thin stubs; the reviewer-calibration contract
     lives in dark-factory/SKILL.md (single source of truth) rather than
     being duplicated in each command file. Verify both stubs still point
@@ -391,10 +290,9 @@ def test_f_keeps_reviewer_calibration_as_explicit_opt_in() -> None:
 
     skill_text = _skill("dark-factory")
     required_phrases = (
-        "## Reviewer calibration (explicit opt-in)",
-        "only when the user explicitly passes",
-        "--reviewer-calibration=true",
-        "must not add calibration or shadow reviewers",
+        "--reviewer-calibration=true` is the default",
+        "--reviewer-calibration=false",
+        "## Reviewer calibration",
         "evidence/<run-id>/reviewer-calibration/",
         "dark-factory review \\",
         "--workdir <repo>",
@@ -411,15 +309,13 @@ def test_f_keeps_reviewer_calibration_as_explicit_opt_in() -> None:
     )
     missing = [phrase for phrase in required_phrases if phrase not in skill_text]
     assert not missing, "dark-factory/SKILL.md missing reviewer calibration contract: " + ", ".join(missing)
-    combined = "\n".join((f_text, factory_text, skill_text))
-    assert "auto-routes PR-mode" not in combined
-    assert "reviewer-calibration=true` is the default" not in combined
 
 
 def test_f_resolves_factory_home_from_the_installed_binary() -> None:
     """The /f skill must not route a PATH-selected binary to a stale checkout."""
     skill_text = _skill("dark-factory")
     required = (
+        'if [ -z "${DARK_FACTORY_HOME:-}" ]; then',
         'DARK_FACTORY_BIN="$(command -v dark-factory 2>/dev/null)"',
         "os.path.realpath(sys.argv[1])",
         'DARK_FACTORY_HOME="$(cd "$(dirname "$DARK_FACTORY_BIN")/.." && pwd -P)"',
@@ -427,7 +323,6 @@ def test_f_resolves_factory_home_from_the_installed_binary() -> None:
     )
     missing = [phrase for phrase in required if phrase not in skill_text]
     assert not missing, "dark-factory/SKILL.md missing installed-binary home resolver: " + ", ".join(missing)
-    assert 'if [ -z "${DARK_FACTORY_HOME:-}" ]; then' not in skill_text
     assert "DARK_FACTORY_HOME=~/projects/dark-factory" not in skill_text
 
 

@@ -47,6 +47,7 @@ _SUBPROCESS_NODE_TYPES = frozenset(
 )
 
 _PIPELINE = "pipelines/slim/two_node.dot"
+_WORKER_PROMPT = "prompts/slim/worker.md"
 _EXPECTED_TIMEOUT_S = 600
 
 
@@ -110,13 +111,16 @@ def test_two_node_dot_declares_timeout_on_every_subprocess_node() -> None:
     )
 
 
-def test_two_node_dot_cold_reviewer_is_fixed_to_codex() -> None:
-    """The default reviewer is Codex, without backend shopping or fallback."""
+def test_two_node_dot_cold_reviewer_uses_only_its_supported_transport() -> None:
+    """Cold-review-v1 advertises only Codex, its sole receipt-capable transport."""
     g = parse(ROOT / _PIPELINE)
     reviewer = g.nodes["cold_reviewer"]
-    assert reviewer.attrs.get("backend") == "codex"
-    assert "backend_priority" not in reviewer.attrs
-    assert "prefer_adversarial" not in reviewer.attrs
+    priority = reviewer.attrs.get("backend_priority", "")
+    entries = [p.strip() for p in str(priority).split(",") if p.strip()]
+    assert entries == ["codex"], (
+        "cold-review-v1 must not advertise minimax/agy/claude fallbacks: "
+        "the controller has no compatible receipt transport for them"
+    )
 
 
 def test_two_node_dot_cold_reviewer_controller_binding() -> None:
@@ -134,3 +138,59 @@ def test_two_node_dot_cold_reviewer_controller_binding() -> None:
     from runner.review_controller import PROMPT_ID, _TEMPLATE_PATH
     assert PROMPT_ID == "controller-cold-review-v1"
     assert _TEMPLATE_PATH.exists()
+
+
+def test_two_node_dot_reviewer_has_no_target_authored_prompt_and_docs_agree() -> None:
+    """The slim graph cannot override its controller-owned reviewer contract."""
+    reviewer = parse(ROOT / _PIPELINE).nodes["cold_reviewer"]
+    assert "prompt" not in reviewer.attrs
+    assert reviewer.attrs.get("type") == "parallel_reviewer"
+    assert reviewer.attrs.get("review_contract") == "cold-review-v1"
+    assert reviewer.attrs.get("backend_priority") == "codex"
+    skill = (ROOT / ".claude/skills/dark-factory/SKILL.md").read_text()
+    assert "controller-owned `cold-review-v1`" in skill
+    assert '`type="parallel_reviewer"`' in skill
+    assert '`backend_priority="codex"`' in skill
+    assert not (ROOT / "prompts/slim/cold_reviewer.md").exists()
+
+
+def test_two_node_dot_binds_the_worker_verification_receipt() -> None:
+    """The default cold reviewer receives the worker's declared evidence file."""
+    reviewer = parse(ROOT / _PIPELINE).nodes["cold_reviewer"]
+    assert reviewer.attrs.get("evidence_paths") == "evidence/worker-verification.json"
+
+
+def test_worker_prompt_requires_a_bounded_structured_verification_receipt() -> None:
+    """Every default worker must provide reproducible, non-fabricated review data."""
+    prompt = (ROOT / _WORKER_PROMPT).read_text()
+    assert "evidence/worker-verification.json" in prompt
+    assert "1 MiB" in prompt
+    for field in (
+        "schema_version",
+        "target_head_sha",
+        "goal",
+        "changed_files",
+        "commands",
+        "not_applicable",
+        "cwd",
+        "exit_code",
+        "stdout",
+        "stderr",
+    ):
+        assert field in prompt
+    assert "Do not fabricate" in prompt
+
+
+def test_worker_prompt_renders_untrusted_reviewer_feedback_only_on_retry() -> None:
+    from runner.handler_core import Context
+    from runner.handler_render import _render_prompt
+
+    worker = parse(ROOT / _PIPELINE).nodes["worker"]
+    ctx = Context(goal="repair the controller", workdir=ROOT, backend="echo")
+    first_attempt = _render_prompt(worker, ctx)
+    assert "(no prior reviewer feedback)" in first_attempt
+
+    ctx.state["_last_review_feedback"] = "Finding: bind the snapshot lineage."
+    retry_attempt = _render_prompt(worker, ctx)
+    assert "Finding: bind the snapshot lineage." in retry_attempt
+    assert "${state._last_review_feedback}" not in retry_attempt
