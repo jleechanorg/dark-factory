@@ -11,7 +11,7 @@ WorkingDirectory=@REPO@
 ExecStart=@REPO@/daemon/target/release/daemon
 Restart=on-failure
 RestartSec=10s
-WatchdogSec=600
+WatchdogSec=7200s
 KillSignal=SIGINT
 TimeoutStopSec=30s
 Environment=HOME=@HOME@

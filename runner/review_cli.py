@@ -316,11 +316,7 @@ def main(argv: list[str] | None = None) -> int:
         if proc.returncode == 0 and not contract_error:
             try:
                 validated = validate_review_response(response, request)
-                validate_execution_receipts(
-                    command_receipts,
-                    validated,
-                    request=request,
-                )
+                validate_execution_receipts(command_receipts, validated)
                 verdict = validated.verdict
                 response_sha256 = validated.response_sha256
             except ReviewContractError as exc:
