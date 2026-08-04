@@ -3,6 +3,10 @@
 *.db-journal
 *.db-shm
 *.db-wal
+# fsqlite multi-process namespace sidecars (timestamped on every br invocation,
+# not source — see daemon/src/fsqlite gate requirement that they be 0600)
+*.db-fsqlite-ns-gate
+*.db-fsqlite-ns-use
 
 # Lock files
 *.lock
