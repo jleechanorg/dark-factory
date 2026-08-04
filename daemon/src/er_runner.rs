@@ -592,6 +592,7 @@ mod tests {
             session_id: Some("s1".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,

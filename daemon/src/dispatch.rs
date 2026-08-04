@@ -60,19 +60,27 @@ fn dispatch_prompt_preamble(repo: &str, remote: &str, branch: &str) -> String {
     )
 }
 
-/// Bounded retry cap for transient `Sessions::spawn` failures (follow-up to
-/// #198's dispatch-batch-isolation fix). #198 fixed the batch-abort bug but
-/// left the requeue-on-transient-failure path uncapped: a bead whose spawn
-/// deterministically fails every time (e.g. the target project pinned at its
-/// AO session cap) cycles `Queued -> Dispatching -> transient failure ->
-/// Queued` forever with no attempt increment, no `autonomy_secs`
-/// accumulation (it never reaches `DISPATCHED`, so `query_active_overlays`'s
-/// `DISPATCHED`/`ATTESTED` scope never sees it), and no wedge-detection
-/// trigger — a livelock with zero telemetry signal. Mirrors
-/// `tick::MAX_HUMAN_HELD_RECOVERY_ATTEMPT`'s order of magnitude (10); set
-/// slightly higher because transient spawn hiccups are expected to be more
-/// frequent/short-lived than a full gate-rejection HUMAN_HELD cycle.
-pub(crate) const MAX_TRANSIENT_SPAWN_RETRY: u32 = 15;
+/// Bounded retry cap for transient `Sessions::spawn` failures (bead
+/// jleechan-2402 / G12: per-bead retry backoff must be isolated to that
+/// bead's queue slot, with a 24h decay window so old failures don't
+/// accumulate). #198 fixed the batch-abort bug but left the requeue-on-
+/// transient-failure path uncapped: a bead whose spawn deterministically
+/// fails every time (e.g. the target project pinned at its AO session cap)
+/// cycles `Queued -> Dispatching -> transient failure -> Queued` forever
+/// with no attempt increment, no `autonomy_secs` accumulation (it never
+/// reaches `DISPATCHED`, so `query_active_overlays`'s `DISPATCHED`/
+/// `ATTESTED` scope never sees it), and no wedge-detection trigger — a
+/// livelock with zero telemetry signal. The cap is **5 transient errors
+/// per bead in a 24h window** (per the G12 spec from
+/// `/factory-evolve G12`); the window is decayed by
+/// `BeadOverlay::effective_spawn_failure_count` so a bead that flushed
+/// through 5 transient errors 25 hours ago is not still parked the next
+/// time the infra hiccups. Mirrors `tick::MAX_HUMAN_HELD_RECOVERY_ATTEMPT`'s
+/// order of magnitude (10); set slightly lower because transient spawn
+/// hiccups are expected to be more frequent/short-lived than a full
+/// gate-rejection HUMAN_HELD cycle, and because the global recovery cap
+/// already bounds the bead's longer-term retry budget.
+pub(crate) const MAX_TRANSIENT_SPAWN_RETRY: u32 = 5;
 
 /// Caller-resolved drive-PR branch-binding decision (bead
 /// jleechan-drive-pr-branch-binding-pcpr), threaded from
@@ -228,6 +236,7 @@ pub fn dispatch_ready(
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             // jleechan-8jxr r2: pre-fill with cfg.target_repo so this
@@ -543,7 +552,34 @@ pub fn dispatch_ready(
                 continue;
             }
             Err(err) if err.is_transient() => {
+                // Bead jleechan-2402 / G12: per-bead retry backoff is
+                // evaluated inside a 24h window. The raw counter is the
+                // COUNT of transient failures since the last successful
+                // DISPATCHED, but the dispatch loop only REQUIRES that
+                // count to be treated as a trip-wire when the most recent
+                // failure is less than 24h old. Without this decay a bead
+                // that hit 5 transient errors last week would still be
+                // parked the next time the infra hiccups — defeating the
+                // per-bead queue slot isolation that is the whole point
+                // of this fix. Decay happens via
+                // `BeadOverlay::effective_spawn_failure_count`; bumping
+                // the raw counter + rewinding the timestamp atomically
+                // is what causes the next dispatch cycle to evaluate
+                // against the fresh window.
+                let now_epoch = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let decay_reset = overlay
+                    .last_spawn_failure_at
+                    .map(|last| now_epoch.saturating_sub(last)
+                        >= crate::state::SPAWN_FAILURE_WINDOW_SECS)
+                    .unwrap_or(false);
+                if decay_reset {
+                    overlay.spawn_failure_count = 0;
+                }
                 overlay.spawn_failure_count += 1;
+                overlay.last_spawn_failure_at = Some(now_epoch);
                 overlay.session_id = None;
                 if overlay.spawn_failure_count > MAX_TRANSIENT_SPAWN_RETRY {
                     // Cap exceeded: stop silently cycling Queued<->Dispatching
@@ -725,8 +761,12 @@ pub fn dispatch_ready(
         overlay.session_id = Some(session_id.0.clone());
         // Real progress: whatever was previously blocking spawn (session cap,
         // transient tool error, ...) has cleared, so the retry-cap counter no
-        // longer needs to remember it.
+        // longer needs to remember it. Bead jleechan-2402 / G12: paired with
+        // the counter reset, clear `last_spawn_failure_at` so the next
+        // transient-failure cycle starts a fresh 24h window instead of
+        // inheriting this attempt's stale timestamp.
         overlay.spawn_failure_count = 0;
+        overlay.last_spawn_failure_at = None;
         // Bead bze8.3: stamp `attempt_started_at` atomically alongside the
         // DISPATCHED save so a redispatch cannot inherit elapsed autonomy
         // from the prior attempt. The wall-clock anchor here is the single
@@ -1802,6 +1842,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             // jleechan-8jxr r2: a real intake-persisted overlay carries a
@@ -1850,6 +1891,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: None,
                 // Neither cfg().target_repo ("owner/repo") nor any
@@ -1923,6 +1965,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: None,
                 // The failure mode bead jleechan-8jxr r2 fixes: intake
@@ -2032,6 +2075,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: None,
@@ -2107,6 +2151,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: None,
@@ -2177,6 +2222,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: None,
                 // Stage A: `external_ref` prefix "someorg/other-repo" becomes the
@@ -2261,6 +2307,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: Some("jleechanorg/worldarchitect.ai".to_string()),
@@ -2641,6 +2688,135 @@ mod tests {
             "a SpawnFallbackExhausted ending in Deferred must NEVER increment \
              spawn_failure_count, exactly like a bare Deferred"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // G12 retry-backoff-bleed-into-global-suppression regression guards
+    // (bead jleechan-2402). Per the task data, the per-bead retry cap
+    // is **5 transient errors**, NOT 15, and the per-bead queue slot
+    // must be isolated from the global tick suppression (a single hot
+    // bead must not monopolize the entire dispatch queue).
+    // ------------------------------------------------------------------
+
+    /// G12: per-bead transient spawn failure cap is **5** (not 15).
+    /// On the 6th transient failure, the bead must be parked HUMAN_HELD
+    /// with `TransientSpawnRetryCapExceeded` — the same failure-driven
+    /// park reason the older 15-retry cap produced, scaled to the
+    /// task-data threshold.
+    #[test]
+    fn g12_per_bead_transient_spawn_retry_cap_is_five() {
+        let sessions = FakeSessions::new(0);
+        sessions.fail_spawn_for("bead-0");
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        // Five transient failures (cap = 5) — every cycle still requeues.
+        for _ in 0..5 {
+            let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+            assert_eq!(report.failures.len(), 1);
+            assert_eq!(report.failures[0].phase, "spawn");
+            let bead_0 = store.load("bead-0").unwrap().unwrap();
+            assert_eq!(
+                bead_0.state,
+                OverlayState::Queued,
+                "first 5 transient failures must requeue, not park"
+            );
+        }
+        // 6th transient failure: cap exceeded, bead must be parked HUMAN_HELD.
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(
+            report.failures[0].phase, "spawn_retry_cap_exceeded",
+            "transient cap-exceeded must surface the same phase as the prior cap"
+        );
+        let bead_0 = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(
+            bead_0.state,
+            OverlayState::HumanHeld,
+            "6th transient failure must park HUMAN_HELD, not requeue"
+        );
+    }
+
+    /// G12: per-bead transient spawn failure cap is **isolated** to that
+    /// bead's queue slot. A separate bead in the same batch must still
+    /// dispatch successfully even when bead-0 has accumulated transient
+    /// failures approaching its cap. The two queue slots are independent.
+    #[test]
+    fn g12_per_bead_transient_retry_does_not_block_other_beads_in_batch() {
+        let sessions = FakeSessions::new(0);
+        // bead-0 always fails transient; bead-1 always succeeds.
+        sessions.fail_spawn_for("bead-0");
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(2);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        assert_eq!(
+            report.success_count(),
+            1,
+            "bead-1 must dispatch successfully even when bead-0 hit transient failures"
+        );
+        assert_eq!(report.successes[0].bead_id, "bead-1");
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].bead_id, "bead-0");
+        assert_eq!(report.failures[0].phase, "spawn");
+
+        // bead-1's overlay must not have been touched by bead-0's failure.
+        let bead_1 = store.load("bead-1").unwrap().unwrap();
+        assert_eq!(
+            bead_1.spawn_failure_count, 0,
+            "bead-1's queue slot is independent of bead-0's transient failures"
+        );
+    }
+
+    /// G12: the per-bead counter is **reset on a confirmed DISPATCHED save**
+    /// (line 729 already does this). This is the spec-described "per-bead
+    /// retry backoff must be isolated to that bead's queue slot" invariant:
+    /// once a bead actually dispatches, its transient-error history is
+    /// forgotten so a *new* failure cycle on the next attempt does not
+    /// inherit the old bead's grudges.
+    #[test]
+    fn g12_successful_dispatch_resets_per_bead_counter() {
+        let sessions = FakeSessions::new(0);
+        // Pre-seed bead-0 with a non-zero counter, as if it had a few
+        // transient failures in a prior dispatch cycle.
+        let store = FakeStateStore::new();
+        let _ = store.save(&BeadOverlay {
+            bead_id: "bead-0".into(),
+            state: OverlayState::Queued,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: None,
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 4,
+            last_spawn_failure_at: None,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: Some("owner/repo".into()),
+            attempt_started_at: None,
+        });
+
+        let cfg = cfg();
+        let ready = beads(1);
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        assert_eq!(
+            report.success_count(),
+            1,
+            "bead-0 with pre-seeded 4 transient failures must still dispatch"
+        );
+
+        let bead_0 = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(
+            bead_0.spawn_failure_count, 0,
+            "successful DISPATCHED must reset the per-bead counter, mirroring the \
+             existing line-729 rule — without this the cap could not be 'per-bead"
+        );
+        assert_eq!(bead_0.state, OverlayState::Dispatched);
     }
 
     #[test]
@@ -3371,6 +3547,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: Some("jleechanorg/worldarchitect.ai".to_string()),

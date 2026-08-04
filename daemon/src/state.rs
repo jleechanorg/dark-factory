@@ -138,6 +138,18 @@ pub struct BeadOverlay {
     /// that gets auto-recovered and immediately fails to spawn again must
     /// re-trip the cap quickly rather than being granted a fresh budget).
     pub spawn_failure_count: u32,
+    /// Unix-epoch seconds of the most recent transient `Sessions::spawn`
+    /// failure for this bead (bead jleechan-2402 / G12: per-bead retry
+    /// backoff must be isolated to a 24h window so a bead that flossed
+    /// through 5 transient errors 25 hours ago is not still parked the
+    /// next time the infra hiccups). Used by
+    /// `BeadOverlay::effective_spawn_failure_count` to decay the counter
+    /// to 0 when the last failure is older than 24h. `None` means "no
+    /// transient failures yet recorded" — the counter is treated as 0
+    /// unconditionally. Reset to `None` on a confirmed `DISPATCHED` save
+    /// (paired with the `spawn_failure_count = 0` reset) so a successful
+    /// dispatch wipes the bead's transient-failure history.
+    pub last_spawn_failure_at: Option<u64>,
     /// Pre-remediation-session HEAD SHA of the adopted branch, captured by
     /// `reroll::execute_adopted` immediately before dispatching a coder
     /// session onto it (bead jleechan-tfs1 amendment: post-hoc force-push
@@ -208,6 +220,35 @@ impl BeadOverlay {
     /// time, not a call-site migration itself).
     pub fn repo<'a>(&'a self, cfg: &'a crate::config::Config) -> &'a str {
         self.target_repo.as_deref().unwrap_or(&cfg.target_repo)
+    }
+}
+
+/// G12 (bead jleechan-2402): the per-bead transient-spawn retry backoff
+/// is evaluated inside a 24-hour window. The raw `spawn_failure_count`
+/// integer is the COUNT of transient failures since the last successful
+/// `DISPATCHED`, but the dispatch loop only REQUIRES that count to be
+/// treated as a trip-wire when the most recent failure is less than
+/// 24h old. Without this decay, a bead that hit 5 transient errors
+/// last week would still be parked the next time the AO admission
+/// queue hiccups — the entire point of the per-bead queue slot
+/// (preventing one bad bead from monopolizing the global dispatch
+/// queue) is lost.
+pub(crate) const SPAWN_FAILURE_WINDOW_SECS: u64 = 24 * 60 * 60;
+
+impl BeadOverlay {
+    /// The per-bead transient-spawn failure count, decoded against the
+    /// 24h decay window. Returns `0` when the last recorded failure is
+    /// older than the window (or has never been recorded), and the raw
+    /// counter otherwise. Callers comparing against `MAX_TRANSIENT_SPAWN_RETRY`
+    /// MUST go through this helper — comparing the raw integer instead
+    /// would silently keep the bead parked long after the underlying
+    /// transient condition has cleared.
+    pub fn effective_spawn_failure_count(&self, now_epoch: u64) -> u32 {
+        match self.last_spawn_failure_at {
+            None => 0,
+            Some(last) if now_epoch.saturating_sub(last) >= SPAWN_FAILURE_WINDOW_SECS => 0,
+            Some(_) => self.spawn_failure_count,
+        }
     }
 }
 
@@ -726,6 +767,7 @@ impl SqliteStateStore {
         Self::ensure_claimed_by_columns(&conn)?;
         Self::ensure_peer_claims_table(&conn)?;
         Self::ensure_attempt_started_at_column(&conn)?;
+        Self::ensure_last_spawn_failure_at_column(&conn)?;
         Ok(Self { conn })
     }
 
@@ -752,6 +794,7 @@ impl SqliteStateStore {
         Self::ensure_claimed_by_columns(&conn)?;
         Self::ensure_peer_claims_table(&conn)?;
         Self::ensure_attempt_started_at_column(&conn)?;
+        Self::ensure_last_spawn_failure_at_column(&conn)?;
         Ok(Self { conn })
     }
 
@@ -1140,6 +1183,7 @@ impl SqliteStateStore {
         "reroll_deferral_count",
         "held_recheck_after",
         "last_er_evidence_hash",
+        "last_spawn_failure_at",
     ];
 
     /// The canonical `CREATE TABLE bead_overlay` statement (with the current
@@ -1170,7 +1214,8 @@ impl SqliteStateStore {
         target_repo TEXT, \
         reroll_deferral_count INTEGER NOT NULL DEFAULT 0, \
         held_recheck_after INTEGER, \
-        last_er_evidence_hash TEXT)";
+        last_er_evidence_hash TEXT, \
+        last_spawn_failure_at INTEGER)";
 
     /// Bead jleechan-zaga / issue #348: migrate the `bead_overlay.state` CHECK
     /// constraint to allow `'DISPOSITION_REQUIRED'`. Unlike every other
@@ -1366,6 +1411,34 @@ impl SqliteStateStore {
         Ok(())
     }
 
+    /// Idempotent migration for the `last_spawn_failure_at` column (bead
+    /// jleechan-2402 / G12: per-bead retry backoff must be isolated to a
+    /// 24h window so a bead that hit 5 transient errors 25 hours ago is
+    /// not still parked the next time the infra hiccups). Same probe-then-
+    /// `ALTER` pattern as `ensure_attempt_started_at_column`. Nullable —
+    /// every pre-existing row legitimately has no value here (the column
+    /// is stamped atomically alongside every transient-failure counter
+    /// increment in `dispatch::dispatch_ready`; `None` means "no transient
+    /// failures yet recorded" which the decay helper treats as 0).
+    fn ensure_last_spawn_failure_at_column(conn: &Connection) -> Result<(), DaemonError> {
+        let has_col: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
+                 WHERE name = 'last_spawn_failure_at'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_last_spawn_failure_at_column: pragma", e))?;
+        if !has_col {
+            conn.execute(
+                "ALTER TABLE bead_overlay ADD COLUMN last_spawn_failure_at INTEGER",
+                [],
+            )
+            .map_err(|e| tool_err("ensure_last_spawn_failure_at_column: add column", e))?;
+        }
+        Ok(())
+    }
+
     /// `is_memory` distinguishes the two `configure` call sites: `open()` (file-backed,
     /// `is_memory=false`) and `open_in_memory_with_schema()` (`is_memory=true`). WAL is a
     /// documented no-op against `:memory:` connections, so failures/non-"wal" readbacks are
@@ -1401,7 +1474,7 @@ impl SqliteStateStore {
             .prepare(
                 "SELECT bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
                  pr_number, branch, session_id, is_adopted, spawn_failure_count, pre_session_head_sha, \
-                 park_reason, target_repo, attempt_started_at \
+                 park_reason, target_repo, attempt_started_at, last_spawn_failure_at \
                  FROM bead_overlay WHERE state IN ('DISPATCHED', 'ATTESTED')",
             )
             .map_err(|e| tool_err(&format!("{op} prepare"), e))?;
@@ -1423,6 +1496,7 @@ impl SqliteStateStore {
                     row.get::<_, Option<String>>(12)?,
                     row.get::<_, Option<String>>(13)?,
                     row.get::<_, Option<i64>>(14)?,
+                    row.get::<_, Option<i64>>(15)?,
                 ))
             })
             .map_err(|e| tool_err(&format!("{op} query"), e))?;
@@ -1444,6 +1518,7 @@ impl SqliteStateStore {
                 park_reason,
                 target_repo,
                 attempt_started_at,
+                last_spawn_failure_at,
             ) = r.map_err(|e| tool_err(&format!("{op} row"), e))?;
             out.push(BeadOverlay {
                 bead_id,
@@ -1461,6 +1536,7 @@ impl SqliteStateStore {
                 park_reason,
                 target_repo,
                 attempt_started_at: attempt_started_at.map(|v| v.max(0) as u64),
+                last_spawn_failure_at: last_spawn_failure_at.map(|v| v.max(0) as u64),
             });
         }
         Ok(out)
@@ -1486,7 +1562,7 @@ impl StateStore for SqliteStateStore {
             .query_row(
                 "SELECT bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
                  pr_number, branch, session_id, is_adopted, spawn_failure_count, pre_session_head_sha, \
-                 park_reason, target_repo, attempt_started_at \
+                 park_reason, target_repo, attempt_started_at, last_spawn_failure_at \
                  FROM bead_overlay WHERE bead_id = ?1",
                 params![bead_id],
                 |row| {
@@ -1497,6 +1573,7 @@ impl StateStore for SqliteStateStore {
                     let park_reason: Option<String> = row.get(12)?;
                     let target_repo: Option<String> = row.get(13)?;
                     let attempt_started_at: Option<i64> = row.get(14)?;
+                    let last_spawn_failure_at: Option<i64> = row.get(15)?;
                     Ok((
                         state_str,
                         BeadOverlay {
@@ -1515,6 +1592,7 @@ impl StateStore for SqliteStateStore {
                             park_reason,
                             target_repo,
                             attempt_started_at: attempt_started_at.map(|v| v.max(0) as u64),
+                            last_spawn_failure_at: last_spawn_failure_at.map(|v| v.max(0) as u64),
                         },
                     ))
                 },
@@ -1532,14 +1610,15 @@ impl StateStore for SqliteStateStore {
         self.conn
             .execute(
                 "INSERT INTO bead_overlay \
-                 (bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id, updated_at, is_adopted, spawn_failure_count, pre_session_head_sha, park_reason, target_repo, attempt_started_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
+                 (bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id, updated_at, is_adopted, spawn_failure_count, pre_session_head_sha, park_reason, target_repo, attempt_started_at, last_spawn_failure_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) \
                  ON CONFLICT(bead_id) DO UPDATE SET \
                    state=excluded.state, attempt=excluded.attempt, reroll_count=excluded.reroll_count, \
                    autonomy_secs=excluded.autonomy_secs, spend_usd=excluded.spend_usd, \
                    pr_number=excluded.pr_number, branch=excluded.branch, session_id=excluded.session_id, updated_at=excluded.updated_at, \
                    is_adopted=excluded.is_adopted, spawn_failure_count=excluded.spawn_failure_count, pre_session_head_sha=excluded.pre_session_head_sha, \
-                   park_reason=excluded.park_reason, target_repo=excluded.target_repo, attempt_started_at=excluded.attempt_started_at",
+                   park_reason=excluded.park_reason, target_repo=excluded.target_repo, attempt_started_at=excluded.attempt_started_at, \
+                   last_spawn_failure_at=excluded.last_spawn_failure_at",
                 params![
                     overlay.bead_id,
                     overlay.state.as_str(),
@@ -1557,6 +1636,7 @@ impl StateStore for SqliteStateStore {
                     overlay.park_reason,
                     overlay.target_repo,
                     overlay.attempt_started_at.map(|v| v as i64),
+                    overlay.last_spawn_failure_at.map(|v| v as i64),
                 ],
             )
             .map_err(|e| tool_err("save", e))?;
@@ -1770,7 +1850,7 @@ impl StateStore for SqliteStateStore {
                     OR substr(park_reason, 1, length(?8)) = ?8) \
              RETURNING bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
                  pr_number, branch, session_id, is_adopted, spawn_failure_count, \
-                 pre_session_head_sha, park_reason, target_repo, attempt_started_at",
+                 pre_session_head_sha, park_reason, target_repo, attempt_started_at, last_spawn_failure_at",
             )
             .map_err(|e| tool_err("recover_human_held prepare", e))?;
         let rows = stmt
@@ -1802,6 +1882,7 @@ impl StateStore for SqliteStateStore {
                         row.get::<_, Option<String>>(12)?,
                         row.get::<_, Option<String>>(13)?,
                         row.get::<_, Option<i64>>(14)?,
+                        row.get::<_, Option<i64>>(15)?,
                     ))
                 },
             )
@@ -1824,6 +1905,7 @@ impl StateStore for SqliteStateStore {
                 park_reason,
                 target_repo,
                 attempt_started_at,
+                last_spawn_failure_at,
             ) = r.map_err(|e| tool_err("recover_human_held row", e))?;
             out.push(BeadOverlay {
                 bead_id,
@@ -1841,6 +1923,7 @@ impl StateStore for SqliteStateStore {
                 park_reason,
                 target_repo,
                 attempt_started_at: attempt_started_at.map(|v| v.max(0) as u64),
+                last_spawn_failure_at: last_spawn_failure_at.map(|v| v.max(0) as u64),
             });
         }
         Ok(out)
@@ -1855,7 +1938,7 @@ impl StateStore for SqliteStateStore {
             .prepare(
                 "SELECT bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
                  pr_number, branch, session_id, is_adopted, spawn_failure_count, pre_session_head_sha, \
-                 park_reason, target_repo, attempt_started_at \
+                 park_reason, target_repo, attempt_started_at, last_spawn_failure_at \
                  FROM bead_overlay WHERE state = 'HUMAN_HELD' AND attempt >= ?1",
             )
             .map_err(|e| tool_err("human_held_at_or_above_attempt prepare", e))?;
@@ -1877,6 +1960,7 @@ impl StateStore for SqliteStateStore {
                     row.get::<_, Option<String>>(12)?,
                     row.get::<_, Option<String>>(13)?,
                     row.get::<_, Option<i64>>(14)?,
+                    row.get::<_, Option<i64>>(15)?,
                 ))
             })
             .map_err(|e| tool_err("human_held_at_or_above_attempt query", e))?;
@@ -1898,6 +1982,7 @@ impl StateStore for SqliteStateStore {
                 park_reason,
                 target_repo,
                 attempt_started_at,
+                last_spawn_failure_at,
             ) = r.map_err(|e| tool_err("human_held_at_or_above_attempt row", e))?;
             out.push(BeadOverlay {
                 bead_id,
@@ -1915,6 +2000,7 @@ impl StateStore for SqliteStateStore {
                 park_reason,
                 target_repo,
                 attempt_started_at: attempt_started_at.map(|v| v.max(0) as u64),
+                last_spawn_failure_at: last_spawn_failure_at.map(|v| v.max(0) as u64),
             });
         }
         Ok(out)
@@ -2427,6 +2513,69 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    /// G12 (bead jleechan-2402): the per-bead 24h decay window. A bead
+    /// whose most recent transient failure is older than 24h must NOT be
+    /// parked on a subsequent transient error — the counter is decayed
+    /// to 0 and the fresh failure starts a new window. This is the
+    /// spec-described "per-bead retry backoff must be isolated to that
+    /// bead's queue slot / 24h window" invariant.
+    #[test]
+    fn g12_per_bead_window_decays_old_failures() {
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let stale = now_epoch - SPAWN_FAILURE_WINDOW_SECS - 1;
+
+        // 1. Counter = 5 with a stale timestamp: NOT parked by the G12 cap.
+        let overlay = BeadOverlay {
+            bead_id: "bead-0".into(),
+            state: OverlayState::Queued,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: None,
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 5,
+            last_spawn_failure_at: Some(stale),
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        };
+        assert_eq!(
+            overlay.effective_spawn_failure_count(now_epoch),
+            0,
+            "failures older than 24h must decay to 0 — the per-bead queue slot \
+             must not be monopolized by a hiccup from yesterday"
+        );
+
+        // 2. Counter = 5 with a fresh timestamp: gated by the cap.
+        let overlay = BeadOverlay {
+            last_spawn_failure_at: Some(now_epoch - 60),
+            ..overlay
+        };
+        assert_eq!(
+            overlay.effective_spawn_failure_count(now_epoch),
+            5,
+            "failures within the 24h window must be counted"
+        );
+
+        // 3. Never recorded: always 0.
+        let overlay = BeadOverlay {
+            last_spawn_failure_at: None,
+            ..overlay
+        };
+        assert_eq!(
+            overlay.effective_spawn_failure_count(now_epoch),
+            0,
+            "no recorded timestamp means no counted failures"
+        );
+    }
+
     static RECOVERY_BUSY_HANDLER_ENTERED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
@@ -2517,6 +2666,7 @@ mod tests {
             session_id: Some("sess-live".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -2555,6 +2705,7 @@ mod tests {
             session_id: None,
             is_adopted: true,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -2702,6 +2853,7 @@ mod tests {
             session_id: None,
             is_adopted: true,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -2728,6 +2880,7 @@ mod tests {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -2757,6 +2910,7 @@ mod tests {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -2796,6 +2950,7 @@ mod tests {
             session_id: Some("stale-session-id".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -2834,6 +2989,7 @@ mod tests {
             session_id: Some("known-live-session".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: Some("spawn_cleanup_failed".into()),
             target_repo: None,
@@ -2890,6 +3046,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: None,
@@ -2931,6 +3088,7 @@ mod tests {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -3502,6 +3660,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: Some("transient_spawn_retry_cap_exceeded".into()),
                 target_repo: None,
@@ -3522,6 +3681,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: None,
@@ -3542,6 +3702,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: None,
@@ -3575,6 +3736,7 @@ mod tests {
                     session_id,
                     is_adopted: false,
                     spawn_failure_count: 0,
+                    last_spawn_failure_at: None,
                     pre_session_head_sha: None,
                     park_reason,
                     target_repo: None,
@@ -3597,6 +3759,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: None,
@@ -3617,6 +3780,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: None,
@@ -3721,6 +3885,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: Some(crate::reroll::CIRCUIT_BREAKER_PARK_REASON.to_string()),
                 target_repo: None,
@@ -3741,6 +3906,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: Some("session_stalled".to_string()),
                 target_repo: None,
@@ -3820,6 +3986,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: Some("unmapped_target_repo".to_string()),
                 target_repo: Some("someorg/unrelated-repo".to_string()),
@@ -3840,6 +4007,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: Some("session_stalled".to_string()),
                 target_repo: None,
@@ -3907,6 +4075,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: Some("unmapped_repo".to_string()),
                 target_repo: None,
@@ -3927,6 +4096,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: Some("session_stalled".to_string()),
                 target_repo: Some("owner/repo".to_string()),
@@ -3990,6 +4160,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: Some("worktree_remote_mismatch".to_string()),
                 target_repo: Some("jleechanorg/worldarchitect.ai".to_string()),
@@ -4010,6 +4181,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: Some("session_stalled".to_string()),
                 target_repo: None,
@@ -4030,6 +4202,7 @@ mod tests {
                 session_id: Some("still-live-session".into()),
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: Some("spawn_cleanup_failed".to_string()),
                 target_repo: None,
@@ -4050,6 +4223,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: Some("worktree_remote_unverifiable".to_string()),
                 target_repo: None,
@@ -4070,6 +4244,7 @@ mod tests {
                 session_id: Some("still-live-wrong-branch-session".into()),
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: Some("spawn_branch_mismatch".to_string()),
                 target_repo: None,
@@ -4169,6 +4344,7 @@ mod tests {
                     session_id: None,
                     is_adopted: false,
                     spawn_failure_count: 0,
+                    last_spawn_failure_at: None,
                     pre_session_head_sha: None,
                     park_reason: None,
                     target_repo: None,
@@ -4191,6 +4367,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: Some("transient_spawn_retry_cap_exceeded".into()),
                 target_repo: None,
@@ -4244,6 +4421,7 @@ mod tests {
                     session_id: None,
                     is_adopted: false,
                     spawn_failure_count: 0,
+                    last_spawn_failure_at: None,
                     pre_session_head_sha: None,
                     park_reason: Some(park_reason),
                     target_repo: None,
@@ -4285,6 +4463,7 @@ mod tests {
             session_id: None,
             is_adopted: true,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: Some("pre-spawn-sha".into()),
             park_reason: Some(HumanHoldReason::SessionStalled.value()),
             target_repo: Some("jleechanorg/dark-factory".into()),
@@ -4388,6 +4567,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: None,
@@ -4407,6 +4587,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: None,
@@ -4426,6 +4607,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: None,
@@ -4897,6 +5079,7 @@ mod tests {
                 session_id: Some("old-session".into()),
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: None,
@@ -4917,6 +5100,7 @@ mod tests {
                 session_id: Some("fresh-session".into()),
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: None,

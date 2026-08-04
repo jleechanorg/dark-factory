@@ -1597,6 +1597,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         session_id: None,
                         is_adopted: true,
                         spawn_failure_count: 0,
+                        last_spawn_failure_at: None,
                         pre_session_head_sha: None,
                         park_reason: Some(format!(
                             "adoption_branch_collision_live_owner:{owner}"
@@ -1703,6 +1704,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 session_id: None,
                 is_adopted: true,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo,
@@ -1843,6 +1845,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo,
@@ -1923,6 +1926,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     session_id: None,
                     is_adopted: false,
                     spawn_failure_count: 0,
+                    last_spawn_failure_at: None,
                     pre_session_head_sha: None,
                     park_reason: None,
                     target_repo,
