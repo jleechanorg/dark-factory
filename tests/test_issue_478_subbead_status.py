@@ -66,6 +66,10 @@ EXPECTED_MERGED_PRS: tuple[int, ...] = (
     285,  # jleechan-t5sw / issue #284 (rg provision + env-health preflight)
     342,  # jleechan-74wt (reroll PR-close target_repo)
     435,  # bze8.1 / issue #328 (exact-head 7-green merge authority)
+    336,  # bze8.2 / issue #329 (Linux canary + SHA-bound deploy record)
+    346,  # bze8.3 / issue #330 (attempt-scoped autonomy timebox)
+    287,  # aw9y / issue #286 (pin self-hosted runner selector + drift gate)
+    503,  # jleechan-0qy / issue #122 (make two_node.dot default graph for /f and /factory)
 )
 
 
