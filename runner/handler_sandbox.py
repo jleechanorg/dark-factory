@@ -150,6 +150,11 @@ def _implementing_agent_denied_paths() -> list[pathlib.Path]:
     return sorted(paths, key=lambda p: str(p))
 
 
+def _controller_private_entry_denied_paths() -> list[pathlib.Path]:
+    trust_root = _controller_private_root().resolve()
+    return [trust_root, trust_root.parent]
+
+
 def _sealed_benchmark_doc_paths(workdir: "Union[pathlib.Path, str, None]") -> list[pathlib.Path]:
     """Enumerate the operator-only sealed docs under ``<workdir>/benchmarks/*/``.
 
@@ -201,6 +206,9 @@ def _build_sandbox_profile(
         escaped = str(path).replace("\\", "\\\\").replace('"', '\\"')
         denies.append(f'(deny file-read* (subpath "{escaped}"))')
         denies.append(f'(deny file-write* (subpath "{escaped}"))')
+    for path in _controller_private_entry_denied_paths():
+        escaped = str(path).replace("\\", "\\\\").replace('"', '\\"')
+        denies.append(f'(deny file-write* (literal "{escaped}"))')
     for path in extra_denied_paths:
         escaped = str(path).replace("\\", "\\\\").replace('"', '\\"')
         denies.append(f'(deny file-read* (subpath "{escaped}"))')

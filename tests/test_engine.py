@@ -23,6 +23,97 @@ from runner.handlers import Context, Result, TYPE_REGISTRY  # noqa: E402
 from runner.parser import parse  # noqa: E402
 
 
+def test_operator_graph_rejects_ao_before_worker_dispatch(tmp_path, monkeypatch):
+    dot = tmp_path / "operator_ao.dot"
+    dot.write_text(
+        "digraph operator_ao { start [shape=Mdiamond] worker [type=codergen] "
+        "operator [type=operator_verify] exit [shape=Msquare] "
+        "start -> worker -> operator -> exit }",
+        encoding="utf-8",
+    )
+    dispatched = []
+
+    def forbidden_worker(node, ctx):
+        dispatched.append(node.name)
+        pytest.fail("AO worker dispatched before trust-boundary rejection")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "codergen", forbidden_worker)
+
+    with pytest.raises(ValueError, match="operator.*AO|AO.*operator"):
+        run(parse(dot), Context(goal="reject AO", workdir=tmp_path, backend="ao"))
+
+    assert dispatched == []
+
+
+def test_non_operator_graph_preserves_ao_dispatch(tmp_path, monkeypatch):
+    dot = tmp_path / "ordinary_ao.dot"
+    dot.write_text(
+        "digraph ordinary_ao { start [shape=Mdiamond] worker [type=codergen] "
+        "exit [shape=Msquare] start -> worker -> exit }",
+        encoding="utf-8",
+    )
+    dispatched = []
+
+    def fake_worker(node, ctx):
+        dispatched.append((node.name, ctx.backend))
+        return Result(outcome="success")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "codergen", fake_worker)
+    run(parse(dot), Context(goal="ordinary AO", workdir=tmp_path, backend="ao"))
+
+    assert dispatched == [("worker", "ao")]
+
+
+@pytest.mark.parametrize("terminal_case", ["exit", "max_steps", "no_successor"])
+def test_terminal_resume_removes_only_owned_operator_trust(
+    tmp_path, monkeypatch, terminal_case
+):
+    import runner.handler_audit as handler_audit
+
+    dot = tmp_path / "terminal_resume.dot"
+    dot.write_text(
+        "digraph terminal_resume { start [shape=Mdiamond] "
+        "operator [type=operator_verify] orphan [type=conditional] "
+        "exit [shape=Msquare] start -> operator -> exit start -> orphan }",
+        encoding="utf-8",
+    )
+    node = {"exit": "exit", "max_steps": "start", "no_successor": "orphan"}[
+        terminal_case
+    ]
+    checkpoint = tmp_path / f"{terminal_case}.json"
+    checkpoint.write_text(json.dumps([{
+        "node": node,
+        "outcome": "success",
+        "ts": 0,
+        "output_preview": node,
+        "metadata": {"_df_controller_trust_head": "a" * 40},
+    }]), encoding="utf-8")
+    trust = {
+        "trust_head": "a" * 40,
+        "policy_sha256": "b" * 64,
+        "nonce": "c" * 32,
+    }
+    removed = []
+    monkeypatch.setattr(
+        handler_audit, "_restore_operator_run_trust", lambda workdir, path: trust
+    )
+    monkeypatch.setattr(
+        handler_audit,
+        "_remove_operator_run_trust",
+        lambda path, owner: removed.append((path, dict(owner))),
+    )
+
+    history = run(
+        parse(dot),
+        Context(goal="terminal resume", workdir=tmp_path, backend="codex"),
+        resume=checkpoint,
+        max_steps=1 if terminal_case == "max_steps" else 10,
+    )
+
+    assert [step.node for step in history] == [node]
+    assert removed == [(checkpoint, trust)]
+
+
 def test_run_captures_target_provenance_before_first_node(tmp_path, monkeypatch):
     subprocess.run(["/usr/bin/git", "init", "-q"], cwd=tmp_path, check=True)
     subprocess.run(["/usr/bin/git", "config", "user.email", "jleechan2015@users.noreply.github.com"], cwd=tmp_path, check=True)

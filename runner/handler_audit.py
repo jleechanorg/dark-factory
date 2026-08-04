@@ -730,6 +730,8 @@ def _create_operator_run_trust(
     with _locked_operator_trust_registry(create=True) as directory_fd:
         registry = _read_operator_trust_registry(directory_fd, required=False)
         records = dict(registry["records"])
+        if checkpoint_key in records:
+            raise ValueError("private operator trust checkpoint is already owned")
         records[checkpoint_key] = record
         registry["records"] = records
         _write_operator_trust_registry(directory_fd, registry)
@@ -759,7 +761,7 @@ def _copy_operator_run_trust(
     checkpoint_key = _operator_trust_checkpoint_key(checkpoint)
     record = {
         "schema_version": 1,
-        "nonce": secrets.token_hex(16),
+        "nonce": trust["nonce"],
         "checkpoint_key": checkpoint_key,
         "trust_head": trust["trust_head"],
         "policy_sha256": trust["policy_sha256"],
@@ -767,17 +769,30 @@ def _copy_operator_run_trust(
     with _locked_operator_trust_registry(create=True) as directory_fd:
         registry = _read_operator_trust_registry(directory_fd, required=False)
         records = dict(registry["records"])
+        existing = records.get(checkpoint_key)
+        if existing is not None:
+            if existing == record:
+                return
+            raise ValueError("private operator trust checkpoint is already owned")
         records[checkpoint_key] = record
         registry["records"] = records
         _write_operator_trust_registry(directory_fd, registry)
 
 
-def _remove_operator_run_trust(checkpoint: pathlib.Path) -> None:
+def _remove_operator_run_trust(
+    checkpoint: pathlib.Path, trust: dict[str, str]
+) -> None:
     checkpoint_key = _operator_trust_checkpoint_key(checkpoint)
+    nonce = str(trust.get("nonce") or "")
+    if not re.fullmatch(r"[0-9a-f]{32}", nonce):
+        return
     try:
         with _locked_operator_trust_registry(create=False) as directory_fd:
             registry = _read_operator_trust_registry(directory_fd, required=True)
             records = dict(registry["records"])
+            record = records.get(checkpoint_key)
+            if not isinstance(record, dict) or record.get("nonce") != nonce:
+                return
             records.pop(checkpoint_key, None)
             registry["records"] = records
             if records:

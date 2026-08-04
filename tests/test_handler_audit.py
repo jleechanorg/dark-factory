@@ -37,6 +37,81 @@ def _make_node(name: str = "audit_node"):
     return Node(name=name, attrs={"type": "gate_audit", "shape": "hexagon"})
 
 
+def _prime_private_registry_test(ha, monkeypatch, tmp_path: pathlib.Path) -> None:
+    policy_sha256 = "b" * 64
+    monkeypatch.setattr(
+        ha._sandbox,
+        "_controller_private_root",
+        lambda: tmp_path / "controller-private",
+    )
+    monkeypatch.setattr(ha, "_require_operator_trust_isolation", lambda: None)
+    monkeypatch.setattr(ha, "_controller_trust_head", lambda workdir: "a" * 40)
+    monkeypatch.setattr(
+        ha, "_validate_controller_trust_head", lambda workdir, value: value
+    )
+
+    class Manifest:
+        pass
+
+    manifest = Manifest()
+    manifest.policy_sha256 = policy_sha256
+    monkeypatch.setattr(
+        ha, "_load_operator_manifest", lambda workdir, trusted_head=None: manifest
+    )
+
+
+def test_operator_trust_create_never_overwrites_live_checkpoint_owner(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    import runner.handlers  # noqa: F401
+    import runner.handler_audit as ha
+
+    _prime_private_registry_test(ha, monkeypatch, tmp_path)
+    checkpoint = tmp_path / "shared-checkpoint.json"
+    first = ha._create_operator_run_trust(tmp_path, checkpoint)
+
+    with pytest.raises(ValueError, match="owned|owner|already"):
+        ha._create_operator_run_trust(tmp_path, checkpoint)
+
+    assert ha._restore_operator_run_trust(tmp_path, checkpoint) == first
+
+
+def test_operator_trust_copy_never_overwrites_different_live_owner(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    import runner.handlers  # noqa: F401
+    import runner.handler_audit as ha
+
+    _prime_private_registry_test(ha, monkeypatch, tmp_path)
+    source = tmp_path / "source.json"
+    occupied = tmp_path / "occupied.json"
+    source_owner = ha._create_operator_run_trust(tmp_path, source)
+    occupied_owner = ha._create_operator_run_trust(tmp_path, occupied)
+
+    with pytest.raises(ValueError, match="owned|owner|already"):
+        ha._copy_operator_run_trust(occupied, source_owner)
+
+    assert ha._restore_operator_run_trust(tmp_path, occupied) == occupied_owner
+
+
+def test_stale_operator_trust_cleanup_cannot_remove_reused_checkpoint_owner(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    import runner.handlers  # noqa: F401
+    import runner.handler_audit as ha
+
+    _prime_private_registry_test(ha, monkeypatch, tmp_path)
+    checkpoint = tmp_path / "reused.json"
+    old_owner = ha._create_operator_run_trust(tmp_path, checkpoint)
+    ha._remove_operator_run_trust(checkpoint, old_owner)
+    new_owner = ha._create_operator_run_trust(tmp_path, checkpoint)
+
+    ha._remove_operator_run_trust(checkpoint, old_owner)
+
+    assert new_owner["nonce"] != old_owner["nonce"]
+    assert ha._restore_operator_run_trust(tmp_path, checkpoint) == new_owner
+
+
 def _write_operator_manifest(tmp_path: pathlib.Path, body: str) -> pathlib.Path:
     manifest_dir = tmp_path / ".dark-factory"
     manifest_dir.mkdir(parents=True, exist_ok=True)
@@ -65,7 +140,9 @@ def _prime_operator_test(ha, monkeypatch, ctx, head: str, snapshot: pathlib.Path
         "_create_operator_run_trust",
         lambda workdir, checkpoint: dict(ctx._operator_trust),
     )
-    monkeypatch.setattr(ha, "_remove_operator_run_trust", lambda checkpoint: None)
+    monkeypatch.setattr(
+        ha, "_remove_operator_run_trust", lambda checkpoint, trust: None
+    )
     monkeypatch.setattr(
         ha, "_trusted_operator_snapshot",
         lambda *args: contextlib.nullcontext(snapshot),

@@ -85,6 +85,7 @@ def test_two_node_dot_parses_and_has_expected_topology() -> None:
     # Worker and cold_reviewer are the only goal-producing nodes.
     assert g.nodes["worker"].attrs.get("type") == "codergen"
     assert g.nodes["worker"].attrs.get("class") == "worker"
+    assert g.nodes["worker"].attrs.get("backend") == "codex"
     assert g.nodes["operator_verify"].attrs.get("type") == "operator_verify"
     assert g.nodes["operator_verify"].attrs.get("class") == "infrastructure"
     assert g.nodes["cold_reviewer"].attrs.get("type") == "parallel_reviewer"

@@ -875,6 +875,70 @@ def test_implementing_agent_sandbox_denies_controller_private_trust_operations(
     assert (tmp_path / "allowed.txt").read_text(encoding="utf-8") == "allowed"
 
 
+def test_implementing_agent_sandbox_denies_controller_private_parent_relocation(
+    tmp_path, monkeypatch
+):
+    if os.environ.get("DARK_FACTORY_OUTER_SANDBOX") == "1":
+        pytest.skip("requires a disposable controller-private parent")
+    from runner import handler_sandbox
+
+    sandbox_exec = shutil.which("sandbox-exec")
+    if sandbox_exec is None:
+        pytest.skip("sandbox-exec unavailable")
+    holdouts = tmp_path / "holdouts"
+    holdouts.mkdir()
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(holdouts))
+    controller_root = tmp_path / "controller-private"
+    relocated_root = tmp_path / "controller-private-relocated"
+    trust_root = controller_root / "operator-trust"
+    trust_root.mkdir(parents=True)
+    run_root = controller_root / "runs"
+    run_root.mkdir()
+    trust_file = trust_root / "registry.json"
+    trust_file.write_text("sealed-trust\n", encoding="utf-8")
+    results = tmp_path / "relocation-results.txt"
+    allowed = run_root / "normal-run-write.txt"
+    monkeypatch.setattr(
+        handler_sandbox, "_controller_private_root", lambda: trust_root
+    )
+    probe = (
+        '/bin/mv "$DF_CONTROLLER_ROOT" "$DF_RELOCATED_ROOT" 2>/dev/null || true; '
+        'if test -d "$DF_RELOCATED_ROOT"; then '
+        '  /bin/ls "$DF_RELOCATED_TRUST" >/dev/null 2>&1 && printf discovery\\n >>"$DF_RESULTS"; '
+        '  /bin/cat "$DF_RELOCATED_TRUST/registry.json" >/dev/null 2>&1 && printf read\\n >>"$DF_RESULTS"; '
+        '  printf bad >"$DF_RELOCATED_TRUST/injected" 2>/dev/null && printf write\\n >>"$DF_RESULTS"; '
+        '  /bin/rm "$DF_RELOCATED_TRUST/registry.json" 2>/dev/null && printf delete\\n >>"$DF_RESULTS"; '
+        '  /bin/mv "$DF_RELOCATED_ROOT" "$DF_CONTROLLER_ROOT" 2>/dev/null || true; '
+        'fi; printf allowed >"$DF_ALLOWED"'
+    )
+    args = handler_sandbox._sandboxed_args_for_workdir(
+        ["/bin/sh", "-c", probe], tmp_path
+    )
+    assert args is not None
+
+    proc = subprocess.run(
+        args,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "DF_CONTROLLER_ROOT": str(controller_root),
+            "DF_RELOCATED_ROOT": str(relocated_root),
+            "DF_RELOCATED_TRUST": str(relocated_root / "operator-trust"),
+            "DF_RESULTS": str(results),
+            "DF_ALLOWED": str(allowed),
+        },
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert not results.exists(), results.read_text() if results.exists() else ""
+    assert not relocated_root.exists()
+    assert trust_file.read_text(encoding="utf-8") == "sealed-trust\n"
+    assert allowed.read_text(encoding="utf-8") == "allowed"
+
+
 def test_controller_outer_sandbox_avoids_nested_seatbelt(tmp_path):
     """Outer Seatbelt remains authoritative without unsupported nesting."""
     from runner.handler_dispatch import _build_controller_codex_transport

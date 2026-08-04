@@ -235,7 +235,29 @@ def run(
         ctx.backend not in {"echo", "mock_llm"}
         and any(resolve(node) is canonical_operator_verify for node in operator_nodes)
     )
+    if requires_operator_trust:
+        ao_workers = [
+            node.name
+            for node in graph.nodes.values()
+            if str(node.attrs.get("type", "")) == "codergen"
+            and str(node.attrs.get("backend", node.attrs.get("model", ctx.backend)))
+            == "ao"
+        ]
+        if ao_workers:
+            raise ValueError(
+                "operator-trust graphs cannot dispatch AO workers because the AO "
+                "tmux server does not inherit the implementing-agent sandbox; "
+                f"use a direct backend for: {', '.join(sorted(ao_workers))}"
+            )
     operator_trust_checkpoints: list[pathlib.Path] = []
+
+    def cleanup_operator_trust() -> None:
+        if not operator_trust_checkpoints or not ctx._operator_trust:
+            return
+        from .handler_audit import _remove_operator_run_trust
+        for trust_checkpoint in operator_trust_checkpoints:
+            _remove_operator_run_trust(trust_checkpoint, ctx._operator_trust)
+
     if ctx.workdir is not None and resumed is not None and requires_operator_trust:
         from .handler_audit import _restore_operator_run_trust
         root = pathlib.Path(ctx.workdir)
@@ -278,8 +300,10 @@ def run(
             if last_node is None:
                 raise ValueError(f"checkpoint node missing from graph: {last.node!r}")
             if is_exit_node(last_node):
+                cleanup_operator_trust()
                 return history
             if len(history) - _resumed_overhead >= max_steps:
+                cleanup_operator_trust()
                 return history
             synthetic = _obs._normalized_result(Result(outcome=last.outcome))
             # Detect incomplete parallel fan-out: the fan-out step was checkpointed
@@ -295,6 +319,7 @@ def run(
                 goal_gate_node = _persist._goal_gate_target(graph, last_node, synthetic, ctx)
                 next_node = goal_gate_node or _edges._pick_next(graph, last_node, synthetic, ctx)
                 if next_node is None:
+                    cleanup_operator_trust()
                     return history
                 current = next_node
 
@@ -1143,8 +1168,6 @@ def run(
             except OSError:
                 pass
         if ended_at_exit and operator_trust_checkpoints:
-            from .handler_audit import _remove_operator_run_trust
-            for trust_checkpoint in operator_trust_checkpoints:
-                _remove_operator_run_trust(trust_checkpoint)
+            cleanup_operator_trust()
 
     return history

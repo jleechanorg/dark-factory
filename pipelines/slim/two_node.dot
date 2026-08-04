@@ -12,8 +12,8 @@
 //                          \-> exit                          (on infrastructure error, terminal non-success)
 //
 // Backend routing:
-//   - worker          honors the run-level --backend (the coder tier the user
-//                     chose; default = whatever /f's Step 0.5 detector picks).
+//   - worker          uses direct Codex so its real process inherits the
+//                     implementing-agent sandbox required by operator_verify.
 //   - cold_reviewer   uses review_contract="cold-review-v1" and
 //                     backend_priority="codex" because the controller has
 //                     a receipt-capable transport only for Codex.
@@ -37,6 +37,7 @@ digraph SlimTwoNode {
         type="codergen",
         label="Generic Worker",
         class="worker",
+        backend="codex",
         prompt="@prompts/slim/worker.md",
         max_retries=0,
         max_visits="3",
