@@ -518,3 +518,64 @@ fn sqlite_escalation_dedup_terminal_marker_survives_real_upsert() {
         "record_escalation_emit after mark_escalation_undeliverable must NOT clear terminal"
     );
 }
+
+#[test]
+fn sqlite_recover_human_held_resets_spawn_failure_count_for_transient_retry_cap_parks() {
+    // RED test for G12 retry-backoff-bleed-into-global-suppression (r3):
+    // exercise the real SqliteStateStore SQL UPDATE end-to-end so the
+    // production contract is locked in against any future regression that
+    // strips the `spawn_failure_count = 0` clause from the recovery query.
+    const MAX_TRANSIENT_SPAWN_RETRY: u32 = 15;
+    const PRIOR_SPAWN_FAILURES: u32 = MAX_TRANSIENT_SPAWN_RETRY + 1;
+
+    let store = SqliteTestStore::new();
+    store
+        .save(&BeadOverlay {
+            bead_id: "g12-sqlite-bead-r3".into(),
+            state: OverlayState::HumanHeld,
+            attempt: 2,
+            reroll_count: 0,
+            autonomy_secs: 9999,
+            spend_usd: 0.0,
+            pr_number: Some(8888),
+            branch: Some("factory/jleechan-41gk-r3".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: PRIOR_SPAWN_FAILURES,
+            pre_session_head_sha: None,
+            park_reason: Some("transient_spawn_retry_cap_exceeded".into()),
+            target_repo: None,
+            attempt_started_at: None,
+        })
+        .unwrap();
+
+    // Mirror production's recoverable-allow-list: this park reason must be
+    // recoverable, otherwise the test would fail at the recovery predicate
+    // and not actually exercise the spawn_failure_count reset. Use the same
+    // `MAX_HUMAN_HELD_RECOVERY_ATTEMPT = 10` constant tick.rs hardcodes.
+    let recovered = store.recover_human_held(10).expect("recover_human_held must succeed");
+
+    assert_eq!(recovered.len(), 1, "exactly the one transient-cap park should recover");
+    assert_eq!(recovered[0].state, OverlayState::Queued);
+    assert_eq!(
+        recovered[0].spawn_failure_count, 0,
+        "G12 retry-backoff-bleed-into-global-suppression FIX (sqlite): the \
+         production SQL UPDATE must include `spawn_failure_count = 0` so the \
+         recovered bead's next dispatch gets a fresh 15-retry budget for its \
+         queue slot. Without it, the preserved counter re-parks on the very \
+         next dispatch and burns one global recovery slot per tick."
+    );
+    assert_eq!(recovered[0].attempt, 3);
+    assert_eq!(recovered[0].park_reason, None);
+    assert_eq!(recovered[0].pr_number, None);
+    assert_eq!(recovered[0].session_id, None);
+
+    let persisted = store
+        .load("g12-sqlite-bead-r3")
+        .expect("load must succeed")
+        .expect("bead row must exist after recovery");
+    assert_eq!(
+        persisted.spawn_failure_count, 0,
+        "spawn_failure_count reset must round-trip through SqliteStateStore::save"
+    );
+}

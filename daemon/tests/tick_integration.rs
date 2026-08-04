@@ -8792,9 +8792,15 @@ fn transient_spawn_retry_cap_exceeded_parks_human_held_with_escalation() {
         OverlayState::Queued,
         "bead is parked then recovered to QUEUED in the same tick under the new ordering"
     );
+    // G12 retry-backoff-bleed-into-global-suppression fix: the recovery
+    // requeue resets the per-bead retry counter to 0 alongside the park
+    // reason. The dispatch path then bumps it on the next transient spawn
+    // failure (tick 16 below), so this assertion is `== 0` after the
+    // recovery has run in tick 15.
     assert_eq!(
-        capped_overlay.spawn_failure_count,
-        MAX_TRANSIENT_SPAWN_RETRY + 1
+        capped_overlay.spawn_failure_count, 0,
+        "G12 fix: HUMAN_HELD recovery requeues the bead with spawn_failure_count = 0 \
+         so the next dispatch gets a fresh 15-retry budget for that queue slot"
     );
 
     let escalation_comment_count = |tracker: &FakeTracker| {
@@ -8829,11 +8835,13 @@ fn transient_spawn_retry_cap_exceeded_parks_human_held_with_escalation() {
 
     // Tick 16: dedup check. `run_slow_tier` runs first — the QUEUED bead
     // (recovered at the end of tick 15) is dispatched again, spawn fails
-    // again, and because `spawn_failure_count` was NOT reset by recovery
-    // (still > 15) the dispatch path re-parks HUMAN_HELD immediately rather
-    // than granting a fresh 15-retry budget. Then `run_recovery_step`
-    // requeues it to QUEUED again. `escalation_already_recorded` must
-    // prevent a second escalation comment.
+    // again. The G12 fix means the recovered bead starts tick 16 with
+    // `spawn_failure_count = 0`, so this single failure only bumps the
+    // counter to 1 — well below the cap — and the bead simply requeues.
+    // The park + recovery still happen once per cap-exceeding failure,
+    // but escalation_already_recorded prevents a second escalation
+    // comment even though the human-visible signal has not been
+    // re-emitted.
     let summary_dedup = run_tick(&deps, 16, 0).expect("dedup tick should succeed");
     assert_eq!(
         summary_dedup.beads_escalated, 0,
@@ -9181,7 +9189,15 @@ fn mixed_batch_deferred_backpressure_and_genuine_transient_failures_are_independ
         OverlayState::Queued,
         "bead B is parked then recovered to QUEUED in the same tick under the new ordering"
     );
-    assert_eq!(b_final.spawn_failure_count, MAX_TRANSIENT_SPAWN_RETRY + 1);
+    // G12 retry-backoff-bleed-into-global-suppression fix: same recovery
+    // requeue contract — `spawn_failure_count` is reset to 0 alongside
+    // `park_reason` so the bead's per-bead queue slot gets a fresh 15-retry
+    // budget for the next dispatch instead of bleeding the prior count
+    // into the global recovery budget.
+    assert_eq!(
+        b_final.spawn_failure_count, 0,
+        "G12 fix: bead B's recovery requeue must reset spawn_failure_count = 0"
+    );
 
     let escalation_comment_count_for =
         |tracker: &FakeTracker, external_ref: &str, bead_id: &str| {
@@ -13237,6 +13253,103 @@ fn vendor_health_ledger_ci_pending_with_capped_vendor_skips_wait() {
     assert!(
         log.contains("GATE_ASSESSMENT"),
         "GATE_ASSESSMENT must be emitted when the cap marker bypasses the wait; log:\n{log}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn g12_recover_human_held_resets_spawn_failure_count_for_transient_retry_cap_parks() {
+    // RED test for G12 retry-backoff-bleed-into-global-suppression (r3):
+    // pre-seed a HUMAN_HELD bead that hit `transient_spawn_retry_cap_exceeded`
+    // (one of the 20 hot beads in the bead brief) with `spawn_failure_count`
+    // well above the cap, run one tick, and assert the recovery requeued the
+    // bead AND reset the per-bead retry counter to 0. Without the reset the
+    // next dispatch would immediately re-park on the cap, burning one global
+    // recovery slot per tick on a single stuck bead.
+    const MAX_TRANSIENT_SPAWN_RETRY: u32 = 15;
+    const PRIOR_SPAWN_FAILURES: u32 = MAX_TRANSIENT_SPAWN_RETRY + 1;
+
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+    let cfg = test_cfg();
+
+    store.overlays.borrow_mut().insert(
+        "g12-bead-r3".into(),
+        BeadOverlay {
+            bead_id: "g12-bead-r3".into(),
+            state: OverlayState::HumanHeld,
+            attempt: 2,
+            reroll_count: 0,
+            autonomy_secs: 9999,
+            spend_usd: 0.0,
+            pr_number: Some(7777),
+            branch: Some("factory/jleechan-41gk-r3".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: PRIOR_SPAWN_FAILURES,
+            pre_session_head_sha: None,
+            park_reason: Some("transient_spawn_retry_cap_exceeded".into()),
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+
+    let telemetry_log =
+        std::env::temp_dir().join("afd_g12_recover_resets_spawn_failure_count_r3.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        1,
+        0,
+    )
+    .expect("tick should succeed");
+
+    let overlay = store.load("g12-bead-r3").unwrap().unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::Queued,
+        "recover_human_held must requeue transient-retry-cap parks below MAX_HUMAN_HELD_RECOVERY_ATTEMPT"
+    );
+    assert_eq!(
+        overlay.attempt, 3,
+        "attempt++ must happen on recovery so the bead's global recovery budget is properly debited"
+    );
+    assert_eq!(
+        overlay.spawn_failure_count, 0,
+        "G12 retry-backoff-bleed-into-global-suppression FIX: per-bead retry backoff \
+         must reset to 0 on HUMAN_HELD recovery so the next dispatch gets a fresh 15-retry \
+         budget for that queue slot. A preserved counter > 15 makes the next dispatch \
+         immediately re-park on the cap, burning one global recovery slot per tick on a \
+         single stuck bead and starving every other bead's fair-share recovery budget."
+    );
+    assert_eq!(overlay.autonomy_secs, 0);
+    assert_eq!(
+        overlay.park_reason, None,
+        "park_reason must be cleared on recovery alongside spawn_failure_count"
+    );
+    assert_eq!(
+        overlay.session_id, None,
+        "session_id must remain NULL - recovery requires durably cleared sessions"
+    );
+    assert_eq!(
+        summary.beads_recovered_from_held, 1,
+        "summary counter must reflect the recovery"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
