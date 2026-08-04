@@ -194,6 +194,18 @@ impl DaemonError {
             || (lower.contains("403") && lower.contains("rate limit"))
     }
 
+    /// Detects GitHub's "issue has too many comments" error (issue #507).
+    /// Surfaces as `Tool { stderr }` from gh GraphQL or `Config(msg)` from tracker.
+    pub fn is_github_comment_limit(&self) -> bool {
+        const MARKERS: &[&str] = &["2500 comments", "Commenting is disabled"];
+        let haystack = match self {
+            DaemonError::Tool { stderr, .. } => stderr.as_str(),
+            DaemonError::Config(msg) => msg.as_str(),
+            _ => return false,
+        };
+        MARKERS.iter().any(|m| haystack.contains(m))
+    }
+
     /// Detects `br create --external-ref ...` failing because the ref is
     /// already tracked (`br`'s own uniqueness constraint on `external_ref`),
     /// e.g. `Error: Configuration error: External reference 'owner/repo#42'

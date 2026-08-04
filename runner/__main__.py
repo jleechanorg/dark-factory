@@ -18,6 +18,12 @@ from .parser import Graph, parse, validate_pipeline
 from .paths import resolve_factory_path, resolve_pipeline_path
 
 _PANIC_DIR = pathlib.Path.home() / ".dark-factory" / "panics"
+_DEFAULT_PIPELINE = (
+    pathlib.Path(__file__).resolve().parents[1]
+    / "pipelines"
+    / "slim"
+    / "two_node.dot"
+).resolve()
 
 
 def _append_event(path: pathlib.Path, payload: dict[str, str]) -> None:
@@ -245,7 +251,7 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument(
             "--pipeline",
             type=pathlib.Path,
-            default=pathlib.Path("two_node.dot"),
+            default=None,
             help=(
                 "Pipeline `.dot` to run. Defaults to the slim two-node graph "
                 "(`two_node.dot`) — a generic worker + static Codex cold "
@@ -348,21 +354,15 @@ def main(argv: list[str] | None = None) -> int:
                 args.resume = checkpoint_path
                 args.checkpoint = checkpoint_path
 
-        if not args.pipeline:
-            p.error("the following arguments are required: --pipeline")
-
-        pipeline_specified = any(
-            arg == "--pipeline" or arg.startswith("--pipeline=") for arg in argv
-        )
-        if not pipeline_specified and not args.resume:
-            target_pipeline = pathlib.Path("pipelines/slim/two_node.dot")
+        if args.pipeline is None:
+            # The default graph is controller-owned. Do not route it through
+            # the target-aware resolver: a target repo may contain a colliding
+            # pipelines/slim/two_node.dot, but cannot replace /f's default.
+            pipeline_path = _DEFAULT_PIPELINE
         else:
-            target_pipeline = args.pipeline
-
-        # --workdir defaults to cwd in the argparse setup above; the resolver
-        # uses it to also look up <workdir>/dark-factory/pipelines/<name> for
-        # bare-filename --pipeline values (target-repo subdir convention).
-        pipeline_path = resolve_pipeline_path(target_pipeline, workdir=args.workdir)
+            # Explicit selections retain target-repo short-name and path
+            # resolution so non-default pipelines remain opt-in and flexible.
+            pipeline_path = resolve_pipeline_path(args.pipeline, workdir=args.workdir)
 
         if args.preflight:
             graph, diagnostics = validate_pipeline(pipeline_path)
@@ -386,6 +386,7 @@ def main(argv: list[str] | None = None) -> int:
                 p.error(f"--state requires KEY=VALUE format, got: {kv!r}")
             k, v = kv.split("=", 1)
             initial_state[k] = v
+        initial_state.setdefault("_df_shadow_codex_review", "false")
         if args.feature:
             initial_state["feature"] = args.feature
         missing_feature_nodes = _missing_holdout_feature_nodes(graph, initial_state)

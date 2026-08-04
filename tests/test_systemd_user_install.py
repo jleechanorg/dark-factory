@@ -21,7 +21,7 @@ def test_systemd_user_unit_renders_rust_daemon_with_watchdog(tmp_path):
     assert "Type=notify\n" in rendered
     assert "NotifyAccess=main\n" in rendered
     assert "Restart=on-failure\n" in rendered
-    assert "WatchdogSec=7200s\n" in rendered
+    assert "WatchdogSec=600\n" in rendered
     assert ".npm-global/bin" in rendered
     assert ".nvm/versions/node/v22.22.0/bin" in rendered
     assert f"WorkingDirectory={ROOT}\n" in rendered

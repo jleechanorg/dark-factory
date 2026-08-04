@@ -44,6 +44,7 @@ import os
 import pathlib
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
@@ -67,6 +68,35 @@ if TYPE_CHECKING:
 # By the time any helper runs, ``runner.handlers`` is fully populated —
 # including any test monkeypatch on its attributes — and the late import
 # returns the populated module.
+
+
+def _is_quota_error(text: str) -> bool:
+    """True when a gate subprocess output looks like a model quota / rate-limit error.
+
+    Used by ``_execute_gate`` to distinguish "the primary model was rate-limited"
+    (worth retrying on a different model under the same agy CLI) from a generic
+    infrastructure failure (which falls through to the claude/MiniMax-M3 chain).
+    The match is intentionally substring-based across the canonical error
+    strings emitted by the agy CLI / Gemini / Anthropic / OpenAI gateways so
+    the detector works regardless of which provider surfaces the message.
+    """
+    t = (text or "").lower()
+    # 429 is anchored with a leading space (" 429") so token counts,
+    # RFC numbers, and other unrelated numerics do not falsely trigger
+    # the quota fallback. Real HTTP 429 status lines look like
+    # "HTTP/1.1 429 Too Many Requests" or "status: 429" / "status code
+    # 429" / "Error 429:" — all of which have a space immediately
+    # before the 429 token.
+    return any(
+        s in t
+        for s in (
+            "resource_exhausted",
+            "rate limit exceeded",
+            "quota exceeded",
+            "out of quota",
+            " 429",
+        )
+    )
 
 
 @dataclass
@@ -448,14 +478,21 @@ def _finish_shadow_gate_review(
     )
 
 
-def _gate_subprocess_args(backend: str, prompt: str, ctx: "Context", timeout: int) -> Optional[list[str]]:
+def _gate_subprocess_args(
+    backend: str, prompt: str, ctx: "Context", timeout: int,
+    *, model: Optional[str] = None,
+) -> Optional[list[str]]:
     import runner.handlers as _handlers_shim  # late-bound shim
     """Build the sandboxed argv for a *reviewer* gate on the given backend.
 
     Supported backends:
       - ``agy`` — Google Antigravity / Gemini CLI. Gets ``--add-dir`` so it
         can read the diff/evidence in the worktree but never enters planning
-        mode.
+        mode. The model is selected via ``AGY_MODEL_PRIMARY`` (default
+        ``gemini-3.6-flash``); the optional ``model`` kwarg overrides that
+        default so the quota-fallback lane in ``_execute_gate`` can request
+        a different model under the same agy CLI without re-implementing
+        argv construction.
       - ``codex`` — OpenAI Codex CLI (``codex exec --yolo``).
       - ``minimax`` — Anthropic Claude CLI routed through the minimax
         gateway (env override handled by ``_gate_subprocess_env``).
@@ -470,8 +507,10 @@ def _gate_subprocess_args(backend: str, prompt: str, ctx: "Context", timeout: in
     Returns ``None`` when sandbox-exec is unavailable.
     """
     if backend == "agy":
+        agy_model = model or os.environ.get("AGY_MODEL_PRIMARY", "gemini-3.6-flash")
         return _handlers_shim._sandboxed_args([
             "agy",
+            "--model", agy_model,
             "--add-dir", str(ctx.workdir),
             "--dangerously-skip-permissions",
             "--print-timeout", f"{timeout}s",
@@ -548,17 +587,40 @@ def _build_controller_codex_transport(args: list[str]) -> list[str]:
             if mode != "read-only":
                 raise ValueError("controller transport requires read-only codex sandboxing")
 
-    # Construct transport starting with `codex` binary, stripping any outer
-    # `sandbox-exec` wrapper so `codex exec --sandbox read-only` runs natively
-    # without triggering nested seatbelt sandbox_apply failures on macOS.
-    return [
-        "codex",
-        "exec",
+    # Construct transport: preserve any `sandbox-exec -p ...` wrapper
+    # prefix from the original argv, then append the controller transport
+    # flags after `codex exec`. Stripping the wrapper would lose the
+    # seatbelt profile and trigger nested sandbox_apply failures on macOS.
+    prefix = prepared[:codex_index + 2]
+
+    # Filter out old transport flags and the original prompt positional
+    # before appending the canonical controller flags.
+    codex_tail = codex_args[2:]
+    safe_tail: list[str] = []
+    skip_next = False
+    for idx, value in enumerate(codex_tail):
+        if skip_next:
+            skip_next = False
+            continue
+        if value in ("--yolo", "--json", "--ephemeral", "--skip-git-repo-check"):
+            continue
+        if value == "--sandbox":
+            skip_next = True
+            continue
+        if value.startswith("--sandbox="):
+            continue
+        # Drop the original trailing prompt positional (last non-flag arg).
+        if idx == len(codex_tail) - 1 and not value.startswith("-"):
+            continue
+        safe_tail.append(value)
+
+    return prefix + [
         "--json",
         "--ephemeral",
         "--skip-git-repo-check",
         "--sandbox",
         "read-only",
+        *safe_tail,
         "-",
     ]
 
@@ -571,7 +633,7 @@ def _controller_codex_args(args: list[str]) -> list[str]:
 
 def _run_gate_once(
     backend: str, prompt: str, expected_sha: str, timeout: int, ctx: "Context", name: str,
-    *, gate_strict: bool = False,
+    *, gate_strict: bool = False, model: Optional[str] = None,
 ) -> "Result":
     import runner.handlers as _handlers_shim  # late-bound shim
     """Run one reviewer-gate attempt on ``backend`` and classify the result.
@@ -583,6 +645,10 @@ def _run_gate_once(
     so the operator/CXDB can see what actually graded the diff — the
     recorded name matches the resolved priority-queue name end-to-end
     (e.g. ``codex`` means a codex subprocess really ran, not just a label).
+
+    The optional ``model`` kwarg is forwarded to ``_gate_subprocess_args``;
+    only the agy branch currently consumes it (see ``_execute_gate`` for the
+    quota-fallback lane that drives this).
     """
     # The recorded name must match the subprocess that actually ran. agy is
     # passed through as-is; minimax is recorded as ``minimax`` even though it
@@ -622,7 +688,7 @@ def _run_gate_once(
             )
     except Exception:
         prompt_meta = {}
-    sub_args = _gate_subprocess_args(backend, prompt, ctx, timeout)
+    sub_args = _gate_subprocess_args(backend, prompt, ctx, timeout, model=model)
     sub_env = _gate_subprocess_env(backend)
     if sub_args is None:
         return Result(
@@ -1080,6 +1146,15 @@ def _execute_gate(
         1. If backend is not agy and not claude/claude-sonnet, fall back to ``agy``.
         2. If backend is agy, or if the agy fallback also suffers an infra failure,
            fall back to ``claude``.
+      - When the resolved backend is ``agy`` *and* the resulting infra failure
+        looks like a model quota / rate-limit error (detected via
+        ``_is_quota_error``), retry once under the same agy CLI with the
+        configured ``AGY_MODEL_QUOTA_FALLBACK`` model (default
+        ``claude-sonnet-4-5``). This is logged to stderr as
+        ``QUOTA_FALLBACK: agy/{primary} -> agy/{fallback}`` and recorded in
+        metadata under ``quota_fallback_used``. If the quota fallback also
+        fails, execution falls through to the cross-backend fallback chain
+        below (``agy`` -> ``claude``/``minimax``).
       - A real ``fail``/``partial`` verdict from any backend is kept as-is
         (no-reviewer-shopping): only non-verdicts trigger the fallback.
       - Any result that is still an infra failure after routing carries
@@ -1091,14 +1166,57 @@ def _execute_gate(
     ``codex`` actually invokes the codex subprocess, with
     ``reviewer_backend: codex`` recorded in the result metadata.
     """
+    controller_requested = str(
+        ctx.state.get("_df_controller_review_json") or ""
+    ).lower() in {"true", "1", "yes", "on"}
     result = _run_gate_once(backend, prompt, expected_sha, timeout, ctx, name, gate_strict=gate_strict)
 
-    controller_requested = str(ctx.state.get("_df_controller_review_json") or "").lower() in {"true", "1", "yes", "on"}
+    # Quota-fallback lane: when agy hits a model quota / rate-limit, retry
+    # under the same agy CLI with the configured fallback model. Only the
+    # ``--model`` flag changes; the rest of the argv is identical. This is
+    # preferred over the cross-backend fallback (agy -> claude/MiniMax-M3)
+    # because it keeps the review on the same node-level tooling (agy uses
+    # --print + --print-timeout, which the claude CLI does not honor). The
+    # fallback is conditional on a quota-shaped error so a real fail|partial
+    # verdict is never re-shopped across models.
+    if (
+        backend == "agy"
+        and _is_gate_infra_failure(result)
+        and _is_quota_error(result.output or "")
+    ):
+        primary_model = os.environ.get("AGY_MODEL_PRIMARY", "gemini-3.6-flash")
+        fallback_model = os.environ.get("AGY_MODEL_QUOTA_FALLBACK", "claude-sonnet-4-5")
+        print(
+            f"QUOTA_FALLBACK: agy/{primary_model} -> agy/{fallback_model}",
+            file=sys.stderr,
+        )
+        quota_result = _run_gate_once(
+            backend, prompt, expected_sha, timeout, ctx, name,
+            gate_strict=gate_strict, model=fallback_model,
+        )
+        quota_result.metadata["fallback_used"] = "true"
+        quota_result.metadata["fallback_from"] = backend
+        quota_result.metadata["quota_fallback_used"] = "true"
+        quota_result.metadata["quota_fallback_from_model"] = primary_model
+        quota_result.metadata["quota_fallback_to_model"] = fallback_model
+        if not _is_gate_infra_failure(quota_result):
+            return quota_result
+        # Quota fallback also failed: fall through to the cross-backend
+        # infra-fallback chain, with the quota-fallback result as the seed
+        # so the chain reflects the most recent attempt.
+        result = quota_result
+
+    # The cold-review controller contract is a single, immutable Codex
+    # transport.  An infrastructure failure means no review was performed;
+    # retrying through agy/claude would silently change the authority and
+    # violate the contract.  Return the original Result untouched so callers
+    # retain the exact failure and metadata emitted by the Codex attempt.
+    # Note: same-CLI quota fallback (above) is permitted for controller reviews
+    # since it stays on the same agy transport — only cross-backend retry is blocked.
+    if controller_requested and _is_gate_infra_failure(result):
+        return result
+
     if _is_gate_infra_failure(result):
-        if controller_requested:
-            result.metadata["verdict"] = "infra_failure"
-            result.metadata.setdefault("fallback_used", "false")
-            return result
         fallback_backends = []
         if backend not in ("agy", "claude", "claude-sonnet"):
             fallback_backends.append("agy")

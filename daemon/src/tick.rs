@@ -116,6 +116,13 @@ pub struct TickSummary {
     /// full reroll cycle by the fast-rejection path" without re-deriving
     /// from telemetry.
     pub gates_assessed_fast_rejected: usize,
+    /// jleechan-7yf0 / issue #506: beads whose adoption collided with a
+    /// LIVE sibling bead's branch and were parked as `Cancelled` instead
+    /// of escalated to `HUMAN_HELD`. Counted separately from
+    /// `beads_escalated` so operators can see "live-bead collisions that
+    /// the daemon auto-resolved" apart from "real escalations needing
+    /// triage" in the per-tick TICK summary.
+    pub beads_skipped_duplicate: usize,
 }
 
 /// Bounded retry cap for the automated HUMAN_HELD exit. Matches the shell
@@ -1543,6 +1550,79 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         if let Some(owner) = deps.store.bead_id_for_branch(&adopted.head_ref_name)? {
             if owner != adopted.bead_id {
                 let owner_live = deps.store.load(&owner)?.is_some();
+                // jleechan-7yf0 / issue #506: when the collision is with a
+                // LIVE sibling bead, the daemon can fully resolve the
+                // situation itself — the live bead keeps driving the
+                // branch and the duplicate is parked as `Cancelled` with a
+                // durable `park_reason` linking it to the owner. There is
+                // no operator-visible blocker (the live bead is making
+                // progress), so emitting `HUMAN_HELD` for this case
+                // generated a stream of spurious escalations that the
+                // operator had to triage against an outcome that needed
+                // no human input. We only do the silent dedup when the
+                // owner is LIVE; when `registered_bead_live=false` the
+                // branch_registry maps to a bead that's no longer in the
+                // store — that's a real data-integrity condition (orphan
+                // registry row) that warrants human review, so we keep
+                // the prior `HUMAN_HELD` escalation path for that case.
+                if owner_live {
+                    // jleechan-7yf0: `Cancelled` overlay carries the
+                    // minimum information needed to understand the dedup
+                    // decision later: the live owner (so `grep <owner>
+                    // daemon.jsonl` finds this line) and the branch
+                    // (so an operator can audit branch→bead ownership).
+                    // `park_reason` is the canonical place to record
+                    // `recovery` reasons; the `recover_human_held`
+                    // filters exclude non-HUMAN_HELD states so this
+                    // string is never read by the recovery path — it's
+                    // purely audit-context for humans reading the row
+                    // directly. `attempt=1` because the duplicate was
+                    // just created and never dispatched. `is_adopted=true`
+                    // because the bead only exists via the adoption
+                    // path (factory-fabricated branches never hit
+                    // this code — their collisions are detected earlier).
+                    let target_repo = intake::resolve_target_repo(
+                        "",
+                        Some(adopted.external_ref.as_str()),
+                    );
+                    let cancelled_overlay = BeadOverlay {
+                        bead_id: adopted.bead_id.clone(),
+                        state: OverlayState::Cancelled,
+                        attempt: 1,
+                        reroll_count: 0,
+                        autonomy_secs: 0,
+                        spend_usd: 0.0,
+                        pr_number: Some(adopted.pr_number),
+                        branch: Some(adopted.head_ref_name.clone()),
+                        session_id: None,
+                        is_adopted: true,
+                        spawn_failure_count: 0,
+                        pre_session_head_sha: None,
+                        park_reason: Some(format!(
+                            "adoption_branch_collision_live_owner:{owner}"
+                        )),
+                        target_repo,
+                        attempt_started_at: None,
+                    };
+                    deps.store.save(&cancelled_overlay)?;
+                    let skipped_ctx = serde_json::json!({
+                        "duplicate_bead": adopted.bead_id,
+                        "live_bead": owner,
+                        "branch": adopted.head_ref_name,
+                        "external_ref": adopted.external_ref,
+                    });
+                    emit(
+                        deps.telemetry_log,
+                        &adopted.bead_id,
+                        1,
+                        OverlayState::Cancelled.as_str(),
+                        "SKIPPED_DUPLICATE_BEAD",
+                        serde_json::json!({}),
+                        skipped_ctx,
+                    )?;
+                    summary.beads_skipped_duplicate += 1;
+                    continue;
+                }
                 let comment_body = format!(
                     "🤖 **[dark-factory]** Escalation required: refusing factory PR adoption for branch `{}` because it is already registered to bead `{}`. Branch-key stealing is not allowed; please use a unique same-repo branch.",
                     adopted.head_ref_name, owner
@@ -1554,7 +1634,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     "reason": "adoption_branch_collision",
                     "branch": adopted.head_ref_name,
                     "registered_bead": owner,
-                    "registered_bead_live": owner_live,
+                    "registered_bead_live": false,
                     "external_ref": adopted.external_ref,
                 });
                 let now_epoch = now_epoch_secs();
@@ -1922,6 +2002,38 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 if let Some(ref ext_ref) = bead.external_ref {
                     let _ = deps.tracker.comment_external(ext_ref, &comment_body);
                 }
+            }
+            Err(other) if other.is_transient() => {
+                // jleechan-issue-510: per-bead isolation, mirroring the
+                // jleechan-cq8r / jleechan-qdw patterns elsewhere in this
+                // file. A single bead's transient routing failure (e.g.
+                // LLM rate limit or subprocess timeout) must NOT abort the
+                // whole slow-tier pass — doing so would propagate Err(transient)
+                // up to `run_tick`, hit `classify_tick_result` in main.rs,
+                // and increment `consecutive_failures`, which exponentially
+                // backs off the poll loop and STARVES every OTHER bead in the
+                // fleet. Catch the transient here, emit per-bead telemetry so
+                // operators can see the failure on its own, and continue with
+                // the next bead. The bead itself is re-selected on the next
+                // tick's intake pass (its overlay was never written past
+                // `attempt_started_at`/`QUEUED`); the LLM/subprocess path will
+                // either succeed or hit the same transient next tick, at which
+                // point the slow-tier intake surface still keeps trying. This
+                // matches the existing `BEAD_SNAPSHOT_TRANSIENT_ERROR` and
+                // `BEAD_PROCESSING_TRANSIENT_ERROR` discipline used for other
+                // per-bead transient paths.
+                let _ = emit(
+                    deps.telemetry_log,
+                    &bead.id,
+                    overlay.attempt,
+                    OverlayState::Queued.as_str(),
+                    "BEAD_PROCESSING_TRANSIENT_ERROR",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "phase": "routing",
+                        "error": format!("{other:?}"),
+                    }),
+                );
             }
             Err(other) => return Err(other),
         }
@@ -5091,6 +5203,78 @@ fn record_escalation(deps: &TickDeps, bead_id: &str, reason: &str) -> Result<(),
 /// `post_scm_comment_by_bead_id` below.
 const MISSING_SCM_TARGET_ERROR_MARKER: &str = "no SCM comment target found";
 
+
+/// Create a new overflow escalation issue on GitHub (issue #507).
+/// Returns the new issue's `owner/repo#N` ext_ref string on success.
+fn create_overflow_escalation_issue(
+    _deps: &TickDeps,
+    bead_id: &str,
+    original_ext_ref: &str,
+) -> Result<String, DaemonError> {
+    // Parse repo from original_ext_ref ("owner/repo#N" or "owner/repo#issue-N")
+    let repo = if let Some(idx) = original_ext_ref.find('#') {
+        &original_ext_ref[..idx]
+    } else {
+        return Err(DaemonError::Config(format!(
+            "cannot parse repo from ext_ref {original_ext_ref}"
+        )));
+    };
+    let title = format!("[dark-factory] Escalation overflow for bead {bead_id} (original: {original_ext_ref})");
+    let body = format!(
+        "Overflow escalation target.\n\nOriginal issue `{original_ext_ref}` hit GitHub's 2500-comment limit.\n\nBead: `{bead_id}`"
+    );
+    // Use pid+bead_id suffix to avoid race if two ticks hit this path concurrently.
+    let tmp = format!("/tmp/overflow_issue_body_{}_{bead_id}.md", std::process::id());
+    std::fs::write(&tmp, &body).map_err(|e| {
+        DaemonError::Config(format!("write overflow body: {e}"))
+    })?;
+    // Use --json url -q .url for stable, parseable output (no title slug in URL).
+    let out = std::process::Command::new("gh")
+        .args([
+            "issue",
+            "create",
+            "--repo",
+            repo,
+            "--title",
+            &title,
+            "--label",
+            "factory",
+            "--body-file",
+            &tmp,
+            "--json",
+            "url",
+            "-q",
+            ".url",
+        ])
+        .output()
+        .map_err(|e| DaemonError::Tool {
+            tool: format!("gh issue create: {e}"),
+            rc: -1,
+            stderr: String::new(),
+        })?;
+    let _ = std::fs::remove_file(&tmp);
+    if !out.status.success() {
+        return Err(DaemonError::Tool {
+            tool: "gh issue create".to_string(),
+            rc: out.status.code().unwrap_or(-1),
+            stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+        });
+    }
+    // gh outputs the new issue URL, e.g. https://github.com/owner/repo/issues/123
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // Convert URL to ext_ref format: owner/repo#123
+    let new_ext_ref = url
+        .trim_start_matches("https://github.com/")
+        .replacen("/issues/", "#", 1);
+    if new_ext_ref.contains('#') {
+        Ok(new_ext_ref)
+    } else {
+        Err(DaemonError::Config(format!(
+            "unexpected gh issue create output: {url}"
+        )))
+    }
+}
+
 /// Distinguishes a permanently-missing SCM comment target from a transient
 /// tracker/API failure (network error, rate limit, etc). Transient failures
 /// come back as whatever error variant the underlying `Tracker` call
@@ -5218,18 +5402,60 @@ fn post_scm_comment_by_bead_id(
             // stage closes). `overlay` is already loaded here, so
             // `overlay.repo(cfg)` is free.
             let ext_ref = format!("{}#{}", overlay.repo(deps.cfg), pr);
-            return deps.tracker.comment_external(&ext_ref, body);
+            return post_scm_comment_with_overflow_retry(deps, bead_id, &ext_ref, body);
         }
     }
     let candidates = deps.tracker.fetch_candidates()?;
     if let Some(bead) = candidates.iter().find(|b| b.id == bead_id) {
         if let Some(ref ext_ref) = bead.external_ref {
-            return deps.tracker.comment_external(ext_ref, body);
+            return post_scm_comment_with_overflow_retry(deps, bead_id, ext_ref, body);
         }
     }
     Err(DaemonError::Config(format!(
         "no SCM comment target found for bead {bead_id}"
     )))
+}
+
+/// issue #507: post a comment to `ext_ref`, automatically creating an overflow
+/// issue and retrying there if the primary target has hit the GitHub 2500-comment
+/// limit. Never parks HUMAN_HELD just because a comment channel is full.
+fn post_scm_comment_with_overflow_retry(
+    deps: &TickDeps,
+    bead_id: &str,
+    ext_ref: &str,
+    body: &str,
+) -> Result<(), DaemonError> {
+    match deps.tracker.comment_external(ext_ref, body) {
+        Ok(()) => Ok(()),
+        Err(err) if err.is_github_comment_limit() => {
+            // Primary target is full — create an overflow issue and retry once.
+            match create_overflow_escalation_issue(deps, bead_id, ext_ref) {
+                Ok(overflow_ref) => {
+                    emit(
+                        deps.telemetry_log,
+                        bead_id,
+                        0,
+                        "system",
+                        "ESCALATION_OVERFLOW_ISSUE_CREATED",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "original_ref": ext_ref,
+                            "overflow_ref": overflow_ref,
+                        }),
+                    )
+                    .ok(); // non-fatal telemetry
+                    deps.tracker.comment_external(&overflow_ref, body)
+                }
+                Err(create_err) => {
+                    // Can't create overflow issue either — return combined error.
+                    Err(DaemonError::Config(format!(
+                        "comment limit on {ext_ref} and overflow creation failed: {create_err:?}"
+                    )))
+                }
+            }
+        }
+        Err(other) => Err(other),
+    }
 }
 
 #[cfg(test)]

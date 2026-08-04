@@ -76,13 +76,6 @@ def _substitute_placeholders(text: str, ctx: "Context") -> str:
         # back to a key+type-only message rather than crashing or leaking
         # the value's content (jleechan-7t92).
         text = text.replace(placeholder, _serialize_state_value(k, v))
-    # The slim worker prompt uses this ordinary state placeholder to receive
-    # reviewer findings on retries. Its deterministic first-visit default
-    # prevents the start-node output from being misrepresented as feedback.
-    text = text.replace(
-        "${state._last_review_feedback}",
-        "(no prior reviewer feedback)",
-    )
     diff = ctx.state.get("_last_diff", "")
     if not diff:
         diff = "(no diff captured)"

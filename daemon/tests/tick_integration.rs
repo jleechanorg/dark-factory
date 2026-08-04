@@ -2270,7 +2270,7 @@ fn factory_labeled_existing_pr_without_session_is_not_parked_as_stalled() {
 }
 
 #[test]
-fn factory_labeled_pr_branch_collision_is_refused_without_stealing_mapping() {
+fn factory_labeled_pr_branch_collision_with_live_owner_dedups_without_human_held() {
     let mut scm = FakeScm::new();
     scm.prs.push(LabeledPr {
         number: 704,
@@ -2333,9 +2333,21 @@ fn factory_labeled_pr_branch_collision_is_refused_without_stealing_mapping() {
         0,
         0,
     )
-    .expect("branch collision should escalate without failing the tick");
+    .expect("branch collision with live owner should auto-dedup without failing the tick");
 
-    assert_eq!(summary.beads_escalated, 1);
+    // jleechan-7yf0 / issue #506: live-owner collisions are auto-resolved
+    // by parking the duplicate as `Cancelled` — no operator escalation,
+    // no PR comment, no HUMAN_HELD. The counter is `beads_skipped_duplicate`
+    // (separately tracked from `beads_escalated` so dashboards can tell
+    // "operator-visible escalation" apart from "auto-resolved duplicate").
+    assert_eq!(
+        summary.beads_escalated, 0,
+        "live-owner collision must NOT escalate to HUMAN_HELD"
+    );
+    assert_eq!(
+        summary.beads_skipped_duplicate, 1,
+        "live-owner collision must increment beads_skipped_duplicate"
+    );
     assert_eq!(
         store
             .bead_id_for_branch("factory/existing-bead-r1")
@@ -2343,19 +2355,30 @@ fn factory_labeled_pr_branch_collision_is_refused_without_stealing_mapping() {
         Some("existing-bead".into()),
         "collision must not steal the branch registry key"
     );
-    let refused_overlay = store.load("fake-bead-1").unwrap();
-    assert!(
-        refused_overlay.is_none(),
-        "refused adoption must not create an overlay for the colliding PR; overlay={refused_overlay:?}, calls={:?}",
-        store.calls.borrow()
+    let cancelled_overlay = store
+        .load("fake-bead-1")
+        .unwrap()
+        .expect("live-owner collision must save a Cancelled overlay for the duplicate bead");
+    assert_eq!(
+        cancelled_overlay.state,
+        OverlayState::Cancelled,
+        "duplicate bead must be parked as Cancelled, not the prior HUMAN_HELD"
     );
+    assert_eq!(
+        cancelled_overlay.park_reason.as_deref(),
+        Some("adoption_branch_collision_live_owner:existing-bead"),
+        "park_reason must name the live owner so operators can audit the dedup decision"
+    );
+    assert_eq!(cancelled_overlay.branch.as_deref(), Some("factory/existing-bead-r1"));
+    assert_eq!(cancelled_overlay.pr_number, Some(704));
+    assert!(cancelled_overlay.is_adopted);
     let tracker_calls = tracker.calls.borrow();
     assert!(
-        tracker_calls.iter().any(|call| {
+        !tracker_calls.iter().any(|call| {
             call.contains("comment_external(owner/repo#704")
-                && call.contains("already registered to bead `existing-bead`")
+                && call.contains("already registered to bead")
         }),
-        "collision must be escalated on the original PR: {tracker_calls:?}"
+        "live-owner collision must NOT post an operator escalation comment: {tracker_calls:?}"
     );
     let store_calls = store.calls.borrow();
     assert!(
@@ -2363,6 +2386,114 @@ fn factory_labeled_pr_branch_collision_is_refused_without_stealing_mapping() {
             .iter()
             .any(|call| call == "register_branch(fake-bead-1,factory/existing-bead-r1)"),
         "colliding adoption must not register the candidate bead: {store_calls:?}"
+    );
+    let telemetry_bytes = std::fs::read(&telemetry_log).expect("telemetry must be written");
+    let telemetry_text = String::from_utf8_lossy(&telemetry_bytes);
+    assert!(
+        telemetry_text.contains("SKIPPED_DUPLICATE_BEAD"),
+        "telemetry must contain SKIPPED_DUPLICATE_BEAD event: {telemetry_text}"
+    );
+    assert!(
+        !telemetry_text.contains("ESCALATION_REQUIRED"),
+        "live-owner collision must NOT emit ESCALATION_REQUIRED: {telemetry_text}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-7yf0 / issue #506 sibling case: when the
+/// `branch_registry` row points to a bead that's no longer in the
+/// store (`registered_bead_live=false`), that's a real
+/// data-integrity condition — the registry is out of sync with the
+/// overlay table. The daemon cannot tell whether the branch is
+/// "really" free or whether it should be considered live-by-absence;
+/// either way, the only safe action is to escalate so the operator
+/// can inspect the orphan row. This test pins the NEGATIVE branch of
+/// the live-owner dedup so a future change can't silently widen
+/// auto-dedup into the orphan-row path and skip the only signal
+/// surface that calls operator attention to registry drift.
+#[test]
+fn factory_labeled_pr_branch_collision_with_orphan_owner_still_escalates() {
+    let mut scm = FakeScm::new();
+    scm.prs.push(LabeledPr {
+        number: 805,
+        title: "Branch collision with orphan registry row".into(),
+        body: "branch_registry maps to a bead that no longer exists in the store".into(),
+        author_login: "bob".into(),
+        external_ref: "owner/repo#805".into(),
+        head_ref_name: "factory/orphan-branch-r1".into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("owner/repo".into()),
+        head_repo_owner_login: Some("owner".into()),
+        head_sha: Some("sha-stub".into()),
+        updated_at_epoch: Some(1_700_000_000),
+    });
+    scm.permissions.insert("bob".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    // Only register the branch — do NOT save an overlay for the
+    // owner bead, so `registered_bead_live` resolves to `false` at
+    // collision detection time. This is exactly the orphan-row
+    // condition.
+    store
+        .register_branch("ghost-bead", "factory/orphan-branch-r1")
+        .unwrap();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_orphan_branch_collision.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        vendor_health: None,
+        },
+        0,
+        0,
+    )
+    .expect("orphan branch_registry collision must escalate without failing the tick");
+
+    assert_eq!(
+        summary.beads_escalated, 1,
+        "orphan registry row collision MUST escalate to HUMAN_HELD"
+    );
+    assert_eq!(
+        summary.beads_skipped_duplicate, 0,
+        "orphan registry row collision must NOT take the live-owner auto-dedup path"
+    );
+    let refused_overlay = store.load("fake-bead-1").unwrap();
+    assert!(
+        refused_overlay.is_none(),
+        "orphan collision must not save a Cancelled overlay — it escalates instead; overlay={refused_overlay:?}, calls={:?}",
+        store.calls.borrow()
+    );
+    let tracker_calls = tracker.calls.borrow();
+    assert!(
+        tracker_calls.iter().any(|call| {
+            call.contains("comment_external(owner/repo#805")
+                && call.contains("already registered to bead `ghost-bead`")
+        }),
+        "orphan collision MUST escalate on the original PR: {tracker_calls:?}"
+    );
+    let telemetry_bytes = std::fs::read(&telemetry_log).expect("telemetry must be written");
+    let telemetry_text = String::from_utf8_lossy(&telemetry_bytes);
+    assert!(
+        telemetry_text.contains("ESCALATION_REQUIRED"),
+        "orphan collision MUST emit ESCALATION_REQUIRED: {telemetry_text}"
+    );
+    assert!(
+        !telemetry_text.contains("SKIPPED_DUPLICATE_BEAD"),
+        "orphan collision must NOT emit SKIPPED_DUPLICATE_BEAD: {telemetry_text}"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
@@ -13241,3 +13372,112 @@ fn vendor_health_ledger_ci_pending_with_capped_vendor_skips_wait() {
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+// === issue #510: per-bead transient errors must NOT increment global consecutive_failures ===
+
+/// Test-only Llm impl that ALWAYS returns a transient `DaemonError::Timeout`,
+/// simulating a sustained LLM outage (rate limit, network, etc.). Used to
+/// exercise the per-bead-routing transient error path — every bead's
+/// `router::route` call will fail with a transient error.
+struct AlwaysTransientLlm;
+
+impl Llm for AlwaysTransientLlm {
+    fn judge(&self, _prompt: &str) -> Result<String, DaemonError> {
+        Err(DaemonError::Timeout(
+            "scripted transient LLM failure (issue #510)".to_string(),
+        ))
+    }
+}
+
+/// Issue #510: when N beads all hit per-bead transient errors during routing,
+/// the tick itself must NOT be classified as a global tick failure.
+///
+/// Pre-fix: tick.rs routed `Err(other) => return Err(other)` for every
+/// per-bead transient router error, so `run_tick` returned Err(transient)
+/// and `classify_tick_result` incremented `consecutive_failures` and
+/// backed off exponentially — slowing EVERY bead in the system, not just
+/// the failing ones.
+///
+/// Post-fix: per-bead transient errors are caught at the source (telemetry
+/// emitted, summary counter incremented), `run_tick` returns Ok, and
+/// `classify_tick_result` treats the tick as Success with
+/// `consecutive_failures = 0`.
+#[test]
+fn per_bead_transient_errors_do_not_increment_global_consecutive_failures() {
+    // Three factory-labeled issues, all of which will hit transient routing.
+    let mut scm = FakeScm::new();
+    scm.issues.push(Issue {
+        number: 101,
+        title: "fix thing one".into(),
+        body: "fix thing one".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#101".into(),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    // AlwaysTransientLlm makes router::route return Err(Timeout) for every
+    // bead — exactly the live-incident shape described in issue #510.
+    let llm = AlwaysTransientLlm;
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_dir = std::env::temp_dir().join("afd_issue_510_per_bead_backoff");
+    std::fs::create_dir_all(&telemetry_dir).unwrap();
+    let telemetry_log = telemetry_dir.join(format!("daemon-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    // Drive THREE ticks — one per bead (the FakeTracker surfaces one bead per
+    // tick as it gets a fresh intake pass). Pre-fix each call returns
+    // Err(transient) and `classify_tick_result` would have backed off
+    // exponentially; post-fix each returns Ok and consecutive_failures
+    // stays at 0 the entire time.
+    for tick_index in 0..3u64 {
+        let summary =
+            run_tick(&deps, tick_index, 0).expect("tick must succeed despite per-bead transient errors");
+        // The tick ran. Per-bead transient errors were caught at the source,
+        // NOT propagated up. `run_tick` returning Ok is what keeps the global
+        // backoff counter from advancing.
+        assert!(
+            summary.beads_routed == 0,
+            "with a transient LLM, no bead can complete routing (tick {tick_index}); got {summary:?}"
+        );
+        assert!(
+            summary.beads_parked_human_held == 0,
+            "transient routing errors must NOT park beads HUMAN_HELD — only \
+             permanent parse errors do; tick {tick_index} got {summary:?}"
+        );
+    }
+
+    // Telemetry should record per-bead transient events so an operator can
+    // see the failure on its own without it burning the global backoff budget.
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("BEAD_DISPATCH_TRANSIENT_ERROR")
+            || log.contains("BEAD_PROCESSING_TRANSIENT_ERROR"),
+        "per-bead transient errors must be emitted as per-bead telemetry; log:\n{log}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+// Issue #510 (contract guard): when `run_tick` returns Ok — the post-fix
+// shape for a tick that contained per-bead transient errors caught at
+// the source — the existing `classify_tick_result` contract in main.rs
+// treats it as `TickLoopAction::Success { consecutive_failures: 0 }`,
+// regardless of any prior counter value. The contract test for that
+// shape lives in `daemon/src/main.rs::tests::classify_tick_result_resets_after_success`
+// (single source of truth — not duplicated here).

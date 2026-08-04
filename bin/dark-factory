@@ -37,7 +37,7 @@ __df_panic_collect() {
     local argv_json
     argv_json="$(printf '%s\0' "$0" "${_ORIGINAL_ARGV[@]}" | python3 -c 'import json,sys;data=sys.stdin.buffer.read().split(b"\x00");data=[x.decode("utf-8","replace") for x in data if x];print(json.dumps(data))' 2>/dev/null || printf '[]')"
     env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
-      "${VENV_PYTHON}" -m runner.panic_hook \
+      "${VENV_PYTHON}" -P -m runner.panic_hook \
       --exit-code "${rc}" \
       --line "${line}" \
       --bash-argv "${argv_json}" >/dev/null 2>&1 || true
@@ -52,7 +52,7 @@ __df_panic_collect() {
 __df_release_lock() {
   if [[ -n "${__DF_LOCK_RUN_ID:-}" && -n "${__DF_LOCK_TARGET:-}" && -n "${VENV_PYTHON:-}" && -x "${VENV_PYTHON}" ]]; then
     env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
-      "${VENV_PYTHON}" -m runner._merge_train release \
+      "${VENV_PYTHON}" -P -m runner._merge_train release \
       --target "${__DF_LOCK_TARGET}" --run-id "${__DF_LOCK_RUN_ID}" \
       >/dev/null 2>&1 || true
   fi
@@ -61,7 +61,9 @@ trap '__df_exit_code=$?; __df_release_lock; __df_panic_collect ${__df_exit_code}
 
 _SCRIPT_REAL="$([ -L "${BASH_SOURCE[0]}" ] && readlink -f "${BASH_SOURCE[0]}" || echo "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "${_SCRIPT_REAL}")" && pwd)"
-export DARK_FACTORY_HOME="${DARK_FACTORY_HOME:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+# The installed wrapper owns its controller checkout. Ignore ambient
+# DARK_FACTORY_HOME so a target process cannot redirect prompt/module authority.
+export DARK_FACTORY_HOME="$(cd "${SCRIPT_DIR}/.." && pwd)"
 VENV_PYTHON="${DARK_FACTORY_HOME}/.venv/bin/python"
 TARGET_WORKDIR="$(pwd)"
 
@@ -92,7 +94,7 @@ PREFLIGHT_JSON=""
 PREFLIGHT_RC=0
 PREFLIGHT_JSON="$(
   env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
-    "${VENV_PYTHON}" -m runner.preflight \
+    "${VENV_PYTHON}" -P -m runner.preflight \
     --backend "${PREFLIGHT_BACKEND}" --json 2>/dev/null
 )" || PREFLIGHT_RC=$?
 
@@ -124,7 +126,7 @@ fi
 # No-op when agy is on PATH. Stop-gap for the WIP branch's upstream
 # try/except in handlers.py.
 env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
-  "${VENV_PYTHON}" -m runner._agy_safe >/dev/null 2>&1 || true
+  "${VENV_PYTHON}" -P -m runner._agy_safe >/dev/null 2>&1 || true
 
 args=("$@")
 if [[ "${__DF_IS_REVIEW}" -ne 1 ]]; then
@@ -158,13 +160,13 @@ if [[ "${__DF_IS_REVIEW}" -ne 1 ]]; then
   # wrappers do not collide.
   __DF_LOCK_RUN_ID="df-$(date +%s%N)-$$"
   if ! env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
-      "${VENV_PYTHON}" -m runner._merge_train acquire \
+      "${VENV_PYTHON}" -P -m runner._merge_train acquire \
       --target "${__DF_LOCK_TARGET}" --run-id "${__DF_LOCK_RUN_ID}" \
       >/dev/null 2>&1; then
     # Re-run the acquire non-silently so we can show the holder on stderr.
     # If this succeeds (holder released between attempts), proceed normally.
     if env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
-        "${VENV_PYTHON}" -m runner._merge_train acquire \
+        "${VENV_PYTHON}" -P -m runner._merge_train acquire \
         --target "${__DF_LOCK_TARGET}" --run-id "${__DF_LOCK_RUN_ID}" >&2; then
       : # Lock acquired on retry, continue to runner
     else
@@ -191,4 +193,4 @@ fi
 # NOTE: do NOT use ``exec`` here — that would replace the bash shell
 # and the EXIT trap would never fire when Python exits non-zero.
 env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
-  "${VENV_PYTHON}" -m runner "${args[@]}"
+  "${VENV_PYTHON}" -P -m runner "${args[@]}"
