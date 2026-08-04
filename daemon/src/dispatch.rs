@@ -581,6 +581,17 @@ pub fn dispatch_ready(
                 overlay.spawn_failure_count += 1;
                 overlay.last_spawn_failure_at = Some(now_epoch);
                 overlay.session_id = None;
+                // The raw counter is the right comparator here: the
+                // `decay_reset` branch above (line ~578) rewinds it to
+                // 0 when the most recent prior failure is older than
+                // 24h, and the increment above makes it 1 in that
+                // case — so a stale-at-cap bead is correctly treated
+                // as a fresh first-time failure against the cap, not
+                // a re-trip of a 25h-old overflow. Comparing against
+                // `effective_spawn_failure_count(now_epoch)` here
+                // would double-count the decay (reset + helper's own
+                // 24h check), which is why we use the raw counter at
+                // the single point of mutation.
                 if overlay.spawn_failure_count > MAX_TRANSIENT_SPAWN_RETRY {
                     // Cap exceeded: stop silently cycling Queued<->Dispatching
                     // forever (the livelock this bead-follow-up closes — see
