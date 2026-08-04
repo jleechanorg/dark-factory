@@ -295,13 +295,11 @@ def test_evidence_gate_fails_closed_on_er_fail_partial_inconclusive() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_evidence_gate_runs_on_is_appropriate_for_repo_visibility() -> None:
-    """Confirm runs-on matches what is correct for this PUBLIC repo.
+def test_evidence_gate_runs_on_uses_self_hosted_runner_labels() -> None:
+    """Confirm evidence gate workflow uses self-hosted runner labels.
 
-    Issue #424 states `runs on ubuntu-latest contrary to the self-hosted
-    runner policy for this private repo`. jleechanorg/dark-factory is
-    PUBLIC (verified via `gh repo view`), so ubuntu-latest IS the
-    correct runs-on.
+    See bead jleechan-z284 / issue #286: evidence-gate workflow is strictly
+    bound to self-hosted runners via vars.SELF_HOSTED_RUNNER_LABELS.
     """
     workflow = _load_workflow()
     job = _job(workflow)
@@ -310,13 +308,9 @@ def test_evidence_gate_runs_on_is_appropriate_for_repo_visibility() -> None:
         runs_on_rendered = ", ".join(runs_on)
     else:
         runs_on_rendered = str(runs_on)
-    assert "ubuntu-latest" in runs_on_rendered, (
-        f"runs-on must include ubuntu-latest for this PUBLIC repo; "
-        f"got {runs_on_rendered!r}. (issue #424 — runner-policy alignment)"
-    )
-    assert "SELF_HOSTED_RUNNER_LABELS" not in runs_on_rendered, (
-        f"runs-on must NOT reference vars.SELF_HOSTED_RUNNER_LABELS on a "
-        f"PUBLIC repo; got {runs_on_rendered!r}."
+    assert "SELF_HOSTED_RUNNER_LABELS" in runs_on_rendered, (
+        f"runs-on must reference vars.SELF_HOSTED_RUNNER_LABELS (bead jleechan-z284); "
+        f"got {runs_on_rendered!r}."
     )
 
 

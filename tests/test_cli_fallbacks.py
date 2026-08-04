@@ -587,10 +587,9 @@ def test_controller_review_codex_unavailable_fails_closed(monkeypatch, tmp_path)
     assert "requires codex backend" in result.output
 
 
-def test_controller_codex_transport_strips_outer_sandbox_exec():
-    """_build_controller_codex_transport must strip any outer sandbox-exec prefix
-    so `codex exec --sandbox read-only` runs natively without triggering nested
-    seatbelt sandbox_apply failures on macOS."""
+def test_controller_codex_transport_preserves_outer_sandbox_exec():
+    """_build_controller_codex_transport must preserve any outer sandbox-exec prefix
+    so the seatbelt profile remains active when running `codex exec --sandbox read-only` on macOS."""
     from runner.handler_dispatch import _build_controller_codex_transport
 
     sandboxed_argv = [
@@ -605,9 +604,9 @@ def test_controller_codex_transport_strips_outer_sandbox_exec():
     ]
     transport = _build_controller_codex_transport(sandboxed_argv)
 
-    assert transport[0] == "codex"
-    assert transport[1] == "exec"
+    assert transport[0] == "/usr/bin/sandbox-exec"
+    assert transport[3] == "/usr/local/bin/codex"
+    assert transport[4] == "exec"
     assert "--sandbox" in transport
     assert "read-only" in transport
-    assert transport[0] != "/usr/bin/sandbox-exec"
 
