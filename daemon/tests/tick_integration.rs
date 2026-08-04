@@ -464,6 +464,7 @@ fn run_tick_emits_dispatched_only_for_actual_dispatch_successes() {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: Some("owner/repo".to_string()),
@@ -576,6 +577,7 @@ fn test_autonomy_increment_and_timebox_envelope() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -642,6 +644,7 @@ fn test_autonomy_budget_warning_crossing() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -702,6 +705,7 @@ fn test_wedge_detection_dispatched_coder_silent() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -777,6 +781,7 @@ fn test_wedge_detection_dispatched_coder_silent_saved_by_transcript_activity() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -872,6 +877,7 @@ fn test_wedge_detection_dispatched_coder_silent_stale_transcript_still_parks() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -955,6 +961,7 @@ fn test_dispatch_integrity_sweep_parks_session_branch_mismatch() {
             session_id: Some("wa-3004".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -1077,6 +1084,7 @@ fn test_dispatch_integrity_sweep_leaves_matching_branch_alone() {
             session_id: Some("wa-4001".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -1141,6 +1149,7 @@ fn test_dispatch_integrity_sweep_detects_force_push_on_adopted_branch() {
             session_id: Some("session-xyz".into()),
             is_adopted: true,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: Some("pre-session-sha-abc123".into()),
             park_reason: None,
             target_repo: None,
@@ -1230,6 +1239,7 @@ fn test_dispatch_integrity_sweep_allows_fast_forward_adopted_commit() {
             session_id: Some("session-ff".into()),
             is_adopted: true,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: Some("pre-session-sha-def456".into()),
             park_reason: None,
             target_repo: None,
@@ -1301,6 +1311,7 @@ fn test_wedge_detection_attested_session_stalled() {
             session_id: Some("session-abc123yz".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -1420,6 +1431,7 @@ fn test_wedge_detection_attested_session_not_stalled_if_remote_ahead() {
             session_id: Some("session-ubas-1".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -1539,6 +1551,7 @@ fn test_wedge_detection_still_parks_when_local_matches_remote() {
             session_id: Some("session-stuck-1".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -1634,6 +1647,7 @@ fn test_wedge_detection_still_parks_when_local_is_ahead_of_remote() {
             session_id: Some("session-local-ahead-1".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -1756,6 +1770,7 @@ fn test_wedge_detection_still_parks_when_branches_have_diverged() {
             session_id: Some("session-diverged-1".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -2304,6 +2319,7 @@ fn factory_labeled_pr_branch_collision_with_live_owner_dedups_without_human_held
             session_id: Some("sess-existing".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -3264,6 +3280,7 @@ fn disposition_required_bead_resumes_when_gates_go_green() {
             session_id: None,
             is_adopted: true,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
@@ -3354,6 +3371,7 @@ fn disposition_required_bead_in_cooldown_is_skipped_without_scm_call() {
             session_id: None,
             is_adopted: true,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
@@ -3445,6 +3463,7 @@ fn disposition_required_reassessment_error_preserves_hold_provenance() {
             session_id: None,
             is_adopted: true,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
@@ -4122,6 +4141,7 @@ fn drive_existing_pr_pending_ci_does_not_reach_ready() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -4217,6 +4237,7 @@ fn drive_existing_pr_failed_ci_parks_human_held() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -4315,6 +4336,7 @@ fn recover_human_held_requeues_queued_bead_with_attempt_below_max() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: Some("transient_spawn_retry_cap_exceeded".into()),
             target_repo: None,
@@ -4407,6 +4429,7 @@ fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -4428,6 +4451,7 @@ fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -4780,6 +4804,7 @@ fn capped_human_held_comment_failure_retries_before_recording_escalation() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -4875,6 +4900,7 @@ fn permanent_gh_error_marks_escalation_undeliverable_and_never_retries() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
@@ -5002,6 +5028,7 @@ fn capped_human_held_candidate_lookup_failure_retries_before_recording_escalatio
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -5118,6 +5145,7 @@ fn capped_human_held_missing_comment_target_records_local_escalation_fallback() 
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -5206,6 +5234,7 @@ fn er_runner_capped_unknown_only_gate_report_escalates_and_parks_at_recovery_cap
             session_id: Some("session-er-capped".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -5369,6 +5398,7 @@ fn er_runner_capped_unknown_only_comment_failure_retries_before_parking() {
             session_id: Some("session-er-capped-retry".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -5485,6 +5515,7 @@ fn attested_ci_pending_does_not_bump_autonomy_secs() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -5590,6 +5621,7 @@ fn attested_ci_pending_does_not_timebox_park() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -5701,6 +5733,7 @@ fn non_green_bead_reenters_loop_via_automated_human_held_exit() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: Some(
                 "gate assessment not all-green (stage 1: recorded, not executed)".into(),
@@ -5807,6 +5840,7 @@ fn attested_ci_not_pending_does_bump_autonomy_secs() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -5911,6 +5945,7 @@ fn qdw_per_bead_isolation_snapshot_failure_does_not_abort_fast_tier() {
                 session_id: Some("sess-1".into()),
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: None,
@@ -6070,6 +6105,7 @@ fn qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead() {
             session_id: Some("sess-1".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -6094,6 +6130,7 @@ fn qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead() {
             session_id: Some("sess-1".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -6538,6 +6575,7 @@ fn qdw_post_er_refetch_failure_skips_bead_without_false_park() {
             session_id: Some("sess-1".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -6563,6 +6601,7 @@ fn qdw_post_er_refetch_failure_skips_bead_without_false_park() {
             session_id: Some("sess-2".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -6723,6 +6762,7 @@ fn qdw_assess_refetch_failure_stays_attested_and_never_closes_pr() {
             session_id: Some("sess-assess".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -7029,6 +7069,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -7215,6 +7256,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -7429,6 +7471,7 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -7625,6 +7668,7 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -7914,6 +7958,7 @@ fn cross_repo_bead_verification_loop_uses_its_own_repo_not_cfg_target_repo() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             // The bead's OWN resolved repo: a test-pattern placeholder,
@@ -8142,6 +8187,7 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -8343,6 +8389,7 @@ fn cross_model_reviewer_cursor_agent_falls_back_and_emits_review_degraded() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
@@ -8586,6 +8633,7 @@ fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
@@ -8808,11 +8856,12 @@ fn transient_spawn_failures_below_cap_stay_retriable_and_do_not_park() {
 /// `transient_spawn_retry_cap_exceeded`.
 #[test]
 fn transient_spawn_retry_cap_exceeded_parks_human_held_with_escalation() {
-    // MAX_TRANSIENT_SPAWN_RETRY (daemon::dispatch, `pub(crate)`) == 15;
+    // MAX_TRANSIENT_SPAWN_RETRY (daemon::dispatch, `pub(crate)`) == 5
+    // (bead jleechan-2402 / G12 spec: "5 transient errors per bead in 24h");
     // hardcoded here the same way this file already hardcodes
     // MAX_HUMAN_HELD_RECOVERY_ATTEMPT (== 10, private in tick.rs) elsewhere,
     // since neither is reachable from an external test crate.
-    const MAX_TRANSIENT_SPAWN_RETRY: u32 = 15;
+    const MAX_TRANSIENT_SPAWN_RETRY: u32 = 5;
     const BEAD_ID: &str = "fake-bead-1";
     const EXTERNAL_REF: &str = "owner/repo#8123";
 
@@ -8865,11 +8914,11 @@ fn transient_spawn_retry_cap_exceeded_parks_human_held_with_escalation() {
     assert_eq!(overlay0.state, OverlayState::Queued);
     assert_eq!(overlay0.spawn_failure_count, 1);
 
-    // Ticks 1..=14: fourteen more transient spawn failures (15 total).
+    // Ticks 1..=4: four more transient spawn failures (5 total).
     // `spawn_failure_count > MAX_TRANSIENT_SPAWN_RETRY` requires STRICTLY
-    // greater than 15, so the bead must stay retriable through exactly 15
+    // greater than 5, so the bead must stay retriable through exactly 5
     // consecutive failures — the "still under the cap" half of the bound.
-    for tick_index in 1..=14u64 {
+    for tick_index in 1..=4u64 {
         let summary = run_tick(&deps, tick_index, 0)
             .unwrap_or_else(|e| panic!("tick {tick_index} should succeed: {e:?}"));
         assert_eq!(
@@ -8893,11 +8942,11 @@ fn transient_spawn_retry_cap_exceeded_parks_human_held_with_escalation() {
     assert_eq!(at_cap.spawn_failure_count, MAX_TRANSIENT_SPAWN_RETRY);
     assert_eq!(at_cap.state, OverlayState::Queued);
 
-    // Tick 15: the 16th consecutive transient spawn failure pushes
-    // spawn_failure_count to 16 (> 15). The bead must park HUMAN_HELD
+    // Tick 5: the 6th consecutive transient spawn failure pushes
+    // spawn_failure_count to 6 (> 5). The bead must park HUMAN_HELD
     // instead of requeuing again, and tick.rs must post a real escalation
     // comment + emit telemetry.
-    let summary_cap = run_tick(&deps, 15, 0).expect("cap tick should succeed");
+    let summary_cap = run_tick(&deps, 5, 0).expect("cap tick should succeed");
     assert_eq!(summary_cap.beads_dispatched, 0);
     assert_eq!(
         summary_cap.beads_parked_human_held, 1,
@@ -8959,13 +9008,13 @@ fn transient_spawn_retry_cap_exceeded_parks_human_held_with_escalation() {
     );
 
     // Tick 16: dedup check. `run_slow_tier` runs first — the QUEUED bead
-    // (recovered at the end of tick 15) is dispatched again, spawn fails
+    // (recovered at the end of tick 5) is dispatched again, spawn fails
     // again, and because `spawn_failure_count` was NOT reset by recovery
-    // (still > 15) the dispatch path re-parks HUMAN_HELD immediately rather
-    // than granting a fresh 15-retry budget. Then `run_recovery_step`
+    // (still > 5) the dispatch path re-parks HUMAN_HELD immediately rather
+    // than granting a fresh 5-retry budget. Then `run_recovery_step`
     // requeues it to QUEUED again. `escalation_already_recorded` must
     // prevent a second escalation comment.
-    let summary_dedup = run_tick(&deps, 16, 0).expect("dedup tick should succeed");
+    let summary_dedup = run_tick(&deps, 6, 0).expect("dedup tick should succeed");
     assert_eq!(
         summary_dedup.beads_escalated, 0,
         "an already-escalated capped bead must not escalate again"
@@ -9072,10 +9121,10 @@ fn spawn_failure_count_resets_after_a_successful_dispatch() {
 /// N=20 consecutive `Deferred` spawn "failures" (backpressure, not failure)
 /// for the same bead, driven across 20 separate simulated dispatch cycles via
 /// the real `run_tick` call stack. N is intentionally chosen above
-/// `MAX_TRANSIENT_SPAWN_RETRY` (15) to prove the cap simply does not apply to
-/// this path — if the fix regressed and `Deferred` fell back into the
-/// general transient arm, this bead would park HUMAN_HELD partway through
-/// the loop and the test would fail loudly.
+/// `MAX_TRANSIENT_SPAWN_RETRY` (5, per G12 spec) to prove the cap simply
+/// does not apply to this path — if the fix regressed and `Deferred` fell
+/// back into the general transient arm, this bead would park HUMAN_HELD
+/// partway through the loop and the test would fail loudly.
 #[test]
 fn deferred_spawn_backpressure_never_increments_counter_or_parks_across_repeated_cycles() {
     const BEAD_ID: &str = "fake-bead-1";
@@ -9139,7 +9188,7 @@ fn deferred_spawn_backpressure_never_increments_counter_or_parks_across_repeated
         assert_eq!(
             overlay.spawn_failure_count, 0,
             "tick {tick_index}: Deferred must NEVER increment spawn_failure_count, even after \
-             {tick_index} consecutive cycles well past MAX_TRANSIENT_SPAWN_RETRY (15)"
+             {tick_index} consecutive cycles well past MAX_TRANSIENT_SPAWN_RETRY (5)"
         );
     }
 
@@ -9179,7 +9228,7 @@ fn deferred_spawn_backpressure_never_increments_counter_or_parks_across_repeated
 /// parking must never affect A.
 #[test]
 fn mixed_batch_deferred_backpressure_and_genuine_transient_failures_are_independent() {
-    const MAX_TRANSIENT_SPAWN_RETRY: u32 = 15;
+    const MAX_TRANSIENT_SPAWN_RETRY: u32 = 5;
     const BEAD_A: &str = "fake-bead-a";
     const BEAD_B: &str = "fake-bead-b";
     const EXTERNAL_REF_A: &str = "owner/repo#9101";
@@ -9241,10 +9290,10 @@ fn mixed_batch_deferred_backpressure_and_genuine_transient_failures_are_independ
         vendor_health: None,
     };
 
-    // Ticks 0..=14: fifteen consecutive cycles. Bead A must stay QUEUED with
+    // Ticks 0..=4: five consecutive cycles. Bead A must stay QUEUED with
     // a permanently-zero counter; bead B accumulates spawn_failure_count but
-    // must stay under the cap (>15 required to trip it).
-    for tick_index in 0..=14u64 {
+    // must stay under the cap (>5 required to trip it).
+    for tick_index in 0..=4u64 {
         let summary = run_tick(&deps, tick_index, 0)
             .unwrap_or_else(|e| panic!("tick {tick_index} should succeed: {e:?}"));
         assert_eq!(
@@ -9274,16 +9323,16 @@ fn mixed_batch_deferred_backpressure_and_genuine_transient_failures_are_independ
         assert_eq!(overlay_b.spawn_failure_count, (tick_index as u32) + 1);
     }
 
-    let a_at_fifteen = store.load(BEAD_A).unwrap().unwrap();
-    assert_eq!(a_at_fifteen.spawn_failure_count, 0);
+    let a_at_five = store.load(BEAD_A).unwrap().unwrap();
+    assert_eq!(a_at_five.spawn_failure_count, 0);
     let b_at_cap = store.load(BEAD_B).unwrap().unwrap();
     assert_eq!(b_at_cap.spawn_failure_count, MAX_TRANSIENT_SPAWN_RETRY);
     assert_eq!(b_at_cap.state, OverlayState::Queued);
 
-    // Tick 15: bead B's 16th consecutive genuine transient failure exceeds
+    // Tick 5: bead B's 6th consecutive genuine transient failure exceeds
     // the cap and must park HUMAN_HELD + escalate. Bead A, in the very same
     // batch, must remain completely unaffected.
-    let summary_cap = run_tick(&deps, 15, 0).expect("cap tick should succeed");
+    let summary_cap = run_tick(&deps, 5, 0).expect("cap tick should succeed");
     assert_eq!(
         summary_cap.beads_parked_human_held, 1,
         "exactly one bead (B) should park on this tick"
@@ -9615,6 +9664,7 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
                 session_id: None,
                 is_adopted: true,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: None,
@@ -10029,6 +10079,7 @@ fn seed_attested_red_ci_bead(
             session_id: Some("fake-session-1".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
@@ -10275,6 +10326,7 @@ fn autonomy_timebox_park_kills_associated_ao_session_and_clears_handle() {
             session_id: Some("df-mh9o-timebox".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
@@ -10363,6 +10415,7 @@ fn coder_silent_park_kills_associated_ao_session_and_clears_handle() {
             session_id: Some("df-mh9o-silent".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
@@ -10451,6 +10504,7 @@ fn session_branch_mismatch_park_kills_associated_ao_session_and_clears_handle() 
             session_id: Some("df-mh9o-mismatch".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
@@ -10551,6 +10605,7 @@ fn autonomy_timebox_park_retains_handle_when_stop_fails() {
             session_id: Some("df-mh9o-stop-fails".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
@@ -10626,6 +10681,7 @@ fn adopted_branch_history_rewrite_park_kills_associated_ao_session() {
             session_id: Some("df-mh9o-adopted".into()),
             is_adopted: true,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: Some("aaaaaaaaaaaaaaaa".into()),
             park_reason: None,
             attempt_started_at: None,
@@ -10850,6 +10906,7 @@ fn slow_tier_dispatched_branch_mismatch_re_resolves_stale_pr_number() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
@@ -11003,6 +11060,7 @@ fn slow_tier_dispatched_branch_mismatch_no_op_when_pr_number_already_matches() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
@@ -11119,6 +11177,7 @@ fn slow_tier_dispatched_branch_mismatch_clears_stale_pr_number_when_branch_has_n
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
@@ -11239,6 +11298,7 @@ fn slow_tier_pre_gate_validation_re_resolves_when_stored_pr_no_longer_open() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
@@ -11370,6 +11430,7 @@ fn transient_pr_number_reresolve_error_keeps_dispatched_no_promotion() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
@@ -11462,6 +11523,7 @@ fn pre_gate_no_open_pr_demotes_attested_to_dispatched_and_resumes() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
@@ -11587,6 +11649,7 @@ fn evidence_bead(store: &FakeStateStore, scm: &mut FakeScm, bead_id: &str, pr: u
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
@@ -12421,6 +12484,7 @@ fn msmq_verifier_skips_reassessment_when_reroll_deferred() {
         session_id: None,
         is_adopted: false,
         spawn_failure_count: 0,
+        last_spawn_failure_at: None,
         pre_session_head_sha: None,
         park_reason: None,
         attempt_started_at: None,
@@ -12704,6 +12768,7 @@ fn dispatch_guarantee_queued_bead_dispatched_despite_escalation_backlog() {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: Some("owner/repo".to_string()),
@@ -12735,6 +12800,7 @@ fn dispatch_guarantee_queued_bead_dispatched_despite_escalation_backlog() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
@@ -12849,6 +12915,7 @@ fn escalation_dedup_tick_level_identical_payload_suppressed_changed_context_re_e
         session_id: None,
         is_adopted: false,
         spawn_failure_count: 0,
+        last_spawn_failure_at: None,
         pre_session_head_sha: None,
         park_reason: None,
         attempt_started_at: None,
@@ -13081,6 +13148,7 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
         session_id: None,
         is_adopted: false,
         spawn_failure_count: 0,
+        last_spawn_failure_at: None,
         pre_session_head_sha: None,
         park_reason: None,
         attempt_started_at: None,
@@ -13143,6 +13211,7 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
         session_id: None,
         is_adopted: false,
         spawn_failure_count: 0,
+        last_spawn_failure_at: None,
         pre_session_head_sha: None,
         park_reason: None,
         target_repo: None,
@@ -13192,6 +13261,7 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
         session_id: None,
         is_adopted: false,
         spawn_failure_count: 0,
+        last_spawn_failure_at: None,
         pre_session_head_sha: None,
         park_reason: None,
         target_repo: None,
@@ -13316,6 +13386,7 @@ fn vendor_health_ledger_ci_pending_with_capped_vendor_skips_wait() {
         session_id: None,
         is_adopted: false,
         spawn_failure_count: 0,
+        last_spawn_failure_at: None,
         pre_session_head_sha: None,
         park_reason: None,
         target_repo: None,
@@ -13481,3 +13552,102 @@ fn per_bead_transient_errors_do_not_increment_global_consecutive_failures() {
 // regardless of any prior counter value. The contract test for that
 // shape lives in `daemon/src/main.rs::tests::classify_tick_result_resets_after_success`
 // (single source of truth — not duplicated here).
+
+// TDD Red (bead jleechan-2402 / G12: retry-backoff-bleed-into-global-
+// suppression): the per-bead transient-spawn retry counter MUST be
+// decayed back to 0 once the most recent failure is older than the
+// 24h backoff window, even if the raw `spawn_failure_count` integer
+// still reads at-or-above the cap. Without this decay, a bead that
+// hit 5 transient errors 25 hours ago would still be parked the next
+// time the infra hiccups, defeating the entire point of the per-bead
+// queue slot (preventing one bad bead from monopolizing the global
+// dispatch queue). This test is the regression for that invariant —
+// the r1 fix (`last_spawn_failure_at` + `effective_spawn_failure_count`)
+// introduced both pieces; this test pins the contract regardless of
+// the cap value (G12 lowered the cap from 15 to 5, but the decay
+// window itself is the load-bearing part of the fix).
+#[test]
+fn g12_per_bead_spawn_failure_count_decays_after_24h_window() {
+    use daemon::state::BeadOverlay;
+
+    const ONE_DAY_PLUS_ONE_SEC: u64 = 24 * 60 * 60 + 1;
+    const NOW: u64 = 2_000_000; // arbitrary fixed epoch
+    const TWENTY_FIVE_HOURS_AGO: u64 = NOW - ONE_DAY_PLUS_ONE_SEC;
+
+    // Bead whose `spawn_failure_count` is at the G12 cap (5) but whose
+    // last transient failure was >24h ago. Per the G12 contract, the
+    // effective retry count MUST read 0 so the dispatch loop treats
+    // the bead as fresh — NOT 5, which would re-park the bead and
+    // bleed into the global tick suppression path.
+    let overlay = BeadOverlay {
+        bead_id: "decayed-bead".into(),
+        state: OverlayState::Queued,
+        attempt: 0,
+        reroll_count: 0,
+        autonomy_secs: 0,
+        spend_usd: 0.0,
+        pr_number: None,
+        branch: None,
+        session_id: None,
+        is_adopted: false,
+        spawn_failure_count: 5,
+        last_spawn_failure_at: Some(TWENTY_FIVE_HOURS_AGO),
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: None,
+        attempt_started_at: None,
+    };
+    assert_eq!(
+        overlay.effective_spawn_failure_count(NOW),
+        0,
+        "G12: a bead whose most recent transient failure is older than the \
+         24h window must report effective_spawn_failure_count = 0 even when \
+         the raw counter is at-or-above the cap. This is the per-bead \
+         isolation that prevents one stale-stuck bead from monopolizing the \
+         global dispatch queue."
+    );
+
+    // Boundary check: a failure one second inside the 24h window
+    // (i.e. 23h59m59s ago) is still inside the window — the effective
+    // count must be the raw value. The implementation uses
+    // `now_epoch - last >= 24h` as the decay trigger, so anything
+    // STRICTLY less than 24h stays in the window.
+    let just_under_24h_ago = BeadOverlay {
+        spawn_failure_count: 5,
+        last_spawn_failure_at: Some(NOW - 24 * 60 * 60 + 1),
+        ..overlay.clone()
+    };
+    assert_eq!(
+        just_under_24h_ago.effective_spawn_failure_count(NOW),
+        5,
+        "G12: a failure 1 second inside the 24h window is still inside the \
+         window — the raw count applies; decay only fires at >= 24h"
+    );
+
+    // Boundary check: a failure exactly 24h ago IS at the decay boundary
+    // (the implementation uses `>=`), so it decays to 0.
+    let exactly_24h_ago = BeadOverlay {
+        spawn_failure_count: 5,
+        last_spawn_failure_at: Some(NOW - 24 * 60 * 60),
+        ..overlay.clone()
+    };
+    assert_eq!(
+        exactly_24h_ago.effective_spawn_failure_count(NOW),
+        0,
+        "G12: 24h is the inclusive decay boundary — last_spawn_failure_at == \
+         now - 24h triggers decay (the implementation uses >=)"
+    );
+
+    // Sanity: a bead with no recorded failure at all is treated as 0.
+    let never_failed = BeadOverlay {
+        spawn_failure_count: 0,
+        last_spawn_failure_at: None,
+        ..overlay.clone()
+    };
+    assert_eq!(
+        never_failed.effective_spawn_failure_count(NOW),
+        0,
+        "G12: last_spawn_failure_at = None is the 'no transient failures \
+         yet recorded' state — effective count is unconditionally 0"
+    );
+}
