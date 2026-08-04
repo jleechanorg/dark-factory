@@ -68,6 +68,7 @@ def test_non_operator_graph_preserves_ao_dispatch(tmp_path, monkeypatch):
 def test_terminal_resume_removes_only_owned_operator_trust(
     tmp_path, monkeypatch, terminal_case
 ):
+    """A crash after a terminal record must not strand that run's sidecar."""
     import runner.handler_audit as handler_audit
 
     dot = tmp_path / "terminal_resume.dot"

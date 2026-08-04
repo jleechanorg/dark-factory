@@ -893,7 +893,6 @@ def test_implementing_agent_sandbox_denies_controller_private_parent_relocation(
     trust_root = controller_root / "operator-trust"
     trust_root.mkdir(parents=True)
     run_root = controller_root / "runs"
-    run_root.mkdir()
     trust_file = trust_root / "registry.json"
     trust_file.write_text("sealed-trust\n", encoding="utf-8")
     results = tmp_path / "relocation-results.txt"
@@ -909,7 +908,7 @@ def test_implementing_agent_sandbox_denies_controller_private_parent_relocation(
         '  printf bad >"$DF_RELOCATED_TRUST/injected" 2>/dev/null && printf write\\n >>"$DF_RESULTS"; '
         '  /bin/rm "$DF_RELOCATED_TRUST/registry.json" 2>/dev/null && printf delete\\n >>"$DF_RESULTS"; '
         '  /bin/mv "$DF_RELOCATED_ROOT" "$DF_CONTROLLER_ROOT" 2>/dev/null || true; '
-        'fi; printf allowed >"$DF_ALLOWED"'
+        'fi; /bin/mkdir -p "$DF_RUN_ROOT" && printf allowed >"$DF_ALLOWED"'
     )
     args = handler_sandbox._sandboxed_args_for_workdir(
         ["/bin/sh", "-c", probe], tmp_path
@@ -927,6 +926,7 @@ def test_implementing_agent_sandbox_denies_controller_private_parent_relocation(
             "DF_RELOCATED_ROOT": str(relocated_root),
             "DF_RELOCATED_TRUST": str(relocated_root / "operator-trust"),
             "DF_RESULTS": str(results),
+            "DF_RUN_ROOT": str(run_root),
             "DF_ALLOWED": str(allowed),
         },
         check=False,
