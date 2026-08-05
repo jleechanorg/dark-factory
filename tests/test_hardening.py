@@ -13,12 +13,17 @@ import json
 import pathlib
 import sqlite3
 import sys
+import tempfile
 
 import pytest
 
 ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
+
+# Scratch workdir in the OS tempdir — using the repo root here leaks one
+# branch_* mkdtemp per fan-out test into the working tree.
+SCRATCH = pathlib.Path(tempfile.mkdtemp(prefix="test_hardening_"))
 
 from conftest import _pipeline  # noqa: E402
 
@@ -276,7 +281,7 @@ def test_engine_records_finally_on_stuck(monkeypatch, tmp_path):
 
     db_path = tmp_path / "cxdb.sqlite"
     g = parse(dot)
-    ctx = Context(goal="t", workdir=ROOT, backend="echo", cxdb_path=db_path)
+    ctx = Context(goal="t", workdir=SCRATCH, backend="echo", cxdb_path=db_path)
     history = run(g, ctx, max_steps=10)
 
     assert any(r.outcome == "stuck" for r in history), \
@@ -304,7 +309,7 @@ def test_checkpoint_includes_synthetic_terminal_record(monkeypatch, tmp_path):
 
     checkpoint = tmp_path / "checkpoint.json"
     g = parse(_pipeline("hello.dot"))
-    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx = Context(goal="t", workdir=SCRATCH, backend="echo")
     history = run(g, ctx, checkpoint=checkpoint, max_steps=50)
 
     saved = json.loads(checkpoint.read_text())
@@ -321,7 +326,7 @@ def test_prompt_references_cannot_escape_workdir():
         name="leak",
         attrs={"prompt": f"@{holdout_path}"},
     )
-    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx = Context(goal="t", workdir=SCRATCH, backend="echo")
 
     text = _render_prompt(node, ctx)
 
@@ -338,7 +343,7 @@ def test_prompt_references_allow_absolute_prompt_path(tmp_path):
         name="implement",
         attrs={"prompt": f"@{prompt_file}"},
     )
-    ctx = Context(goal="short", workdir=ROOT, backend="echo")
+    ctx = Context(goal="short", workdir=SCRATCH, backend="echo")
     text = _render_prompt(node, ctx)
 
     assert text == "Print exactly: done"
@@ -372,7 +377,7 @@ def test_tool_nodes_cannot_read_holdout_files():
             ),
         },
     )
-    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx = Context(goal="t", workdir=SCRATCH, backend="echo")
 
     result = _tool(node, ctx)
 
@@ -400,7 +405,7 @@ def test_tool_sandbox_still_denies_real_holdouts_when_env_overridden(monkeypatch
             ),
         },
     )
-    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx = Context(goal="t", workdir=SCRATCH, backend="echo")
 
     result = _tool(node, ctx)
 
@@ -497,7 +502,7 @@ def test_intermediate_success_does_not_clear_unvalidated_failure(tmp_path):
         '}\n'
     )
     g = parse(dot)
-    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx = Context(goal="t", workdir=SCRATCH, backend="echo")
 
     history = run(g, ctx)
 
@@ -521,7 +526,7 @@ def test_holdout_eval_ignores_pipeline_repo_override(tmp_path):
             "holdouts_repo": str(fake_repo),
         },
     )
-    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx = Context(goal="t", workdir=SCRATCH, backend="echo")
 
     result = _holdout_eval(node, ctx)
 
@@ -538,7 +543,7 @@ def test_holdout_eval_nonzero_returncode_cannot_spoof_pass(monkeypatch, tmp_path
     monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(fake_repo))
 
     node = Node(name="holdout", attrs={"type": "holdout_eval", "feature": "hello"})
-    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx = Context(goal="t", workdir=SCRATCH, backend="echo")
 
     result = _holdout_eval(node, ctx)
 
@@ -565,7 +570,7 @@ def test_holdout_eval_subprocess_env_is_sanitized(monkeypatch, tmp_path):
     monkeypatch.setenv("MY_HOLDOUT_SECRET", "sealed")
 
     node = Node(name="holdout", attrs={"type": "holdout_eval", "feature": "hello"})
-    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx = Context(goal="t", workdir=SCRATCH, backend="echo")
 
     result = _holdout_eval(node, ctx)
 
@@ -601,7 +606,7 @@ def test_holdout_eval_uses_state_substituted_implementation(monkeypatch, tmp_pat
             "implementation": "${state.ao.worktree}",
         },
     )
-    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx = Context(goal="t", workdir=SCRATCH, backend="echo")
     ctx.state["ao.worktree"] = str(impl)
 
     result = _holdout_eval(node, ctx)
@@ -773,7 +778,7 @@ def test_cross_run_circuit_breaker_short_circuits_when_prior_runs_all_exhausted(
     g = parse(_pipeline("hello.dot"))
     ctx = Context(
         goal="circuit breaker test",
-        workdir=ROOT,
+        workdir=SCRATCH,
         backend="echo",
         cxdb_path=cxdb_path,
     )
@@ -819,7 +824,7 @@ def test_cross_run_circuit_breaker_disabled_when_threshold_not_reached(
     g = parse(_pipeline("hello.dot"))
     ctx = Context(
         goal="below threshold test",
-        workdir=ROOT,
+        workdir=SCRATCH,
         backend="echo",
         cxdb_path=cxdb_path,
     )
@@ -869,7 +874,7 @@ def test_cross_run_circuit_breaker_breaks_streak_on_success(monkeypatch, tmp_pat
     g = parse(_pipeline("hello.dot"))
     ctx = Context(
         goal="streak broken test",
-        workdir=ROOT,
+        workdir=SCRATCH,
         backend="echo",
         cxdb_path=cxdb_path,
     )
@@ -890,7 +895,7 @@ def test_cross_run_circuit_breaker_skipped_without_cxdb(monkeypatch, tmp_path):
 
     g = parse(_pipeline("hello.dot"))
     # No cxdb_path
-    ctx = Context(goal="no cxdb test", workdir=ROOT, backend="echo")
+    ctx = Context(goal="no cxdb test", workdir=SCRATCH, backend="echo")
     history = run(g, ctx, max_steps=50)
 
     assert history[-1].outcome == "success"
@@ -927,7 +932,7 @@ def test_cross_run_circuit_breaker_only_affects_matching_pipeline(
     g = parse(_pipeline("hello.dot"))
     ctx = Context(
         goal="pipeline mismatch test",
-        workdir=ROOT,
+        workdir=SCRATCH,
         backend="echo",
         cxdb_path=cxdb_path,
     )

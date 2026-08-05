@@ -17,10 +17,15 @@ import pathlib
 import sqlite3
 import subprocess
 import sys
+import tempfile
 
 ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
+
+# Scratch workdir in the OS tempdir — using the repo root here leaks one
+# branch_* mkdtemp per fan-out test into the working tree.
+SCRATCH = pathlib.Path(tempfile.mkdtemp(prefix="test_evidence_bundle_"))
 
 from conftest import _pipeline  # noqa: E402
 
@@ -54,7 +59,7 @@ def _drive_run(tmp_path: pathlib.Path, monkeypatch) -> tuple[pathlib.Path, str, 
 
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", tainted_holdout)
     graph = parse(_pipeline("hello.dot"))
-    ctx = Context(goal="bundle smoke", workdir=ROOT, backend="echo", cxdb_path=db_path)
+    ctx = Context(goal="bundle smoke", workdir=SCRATCH, backend="echo", cxdb_path=db_path)
     history = run(graph, ctx, max_steps=20)
     assert history[-1].outcome == "success"
     assert ctx.run_id is not None
@@ -71,7 +76,7 @@ def test_bundle_layout_and_manifest_fields(tmp_path, monkeypatch):
         run_id=run_id,
         pipeline_path=_pipeline("hello.dot"),
         graph=graph,
-        workdir=ROOT,
+        workdir=SCRATCH,
         command=command,
     )
 
@@ -172,7 +177,7 @@ def test_bundle_extract_contains_only_this_run(tmp_path, monkeypatch):
         run_id=run_id,
         pipeline_path=_pipeline("hello.dot"),
         graph=graph,
-        workdir=ROOT,
+        workdir=SCRATCH,
     )
 
     extract = bundle / f"cxdb-{run_id}.sqlite"
@@ -197,7 +202,7 @@ def test_bundle_does_not_leak_holdout_content(tmp_path, monkeypatch):
         run_id=run_id,
         pipeline_path=_pipeline("hello.dot"),
         graph=graph,
-        workdir=ROOT,
+        workdir=SCRATCH,
     )
 
     # The redactor must have stripped the tainted holdout output from the
@@ -229,6 +234,13 @@ def test_cli_evidence_bundle_flag_creates_bundle(tmp_path):
     provisioned from the bundle dir (acceptance criterion in the bead spec)."""
     bundle = tmp_path / "auto-bundle"
     cxdb = tmp_path / "qhez-test.sqlite"
+    # Mirror the repo's implementation tree into the scratch workdir so the
+    # sealed holdout evaluator can locate `implementation` (it resolves
+    # relative to ctx.workdir). Without this symlink the holdout returns
+    # "implementation missing".
+    impl_link = tmp_path / "impl"
+    if not impl_link.exists():
+        impl_link.symlink_to(ROOT / "impl")
     proc = subprocess.run(
         [
             sys.executable,
@@ -242,6 +254,8 @@ def test_cli_evidence_bundle_flag_creates_bundle(tmp_path):
             "echo",
             "--feature",
             "hello",
+            "--workdir",
+            str(tmp_path),
             "--cxdb",
             str(cxdb),
             "--evidence-bundle",

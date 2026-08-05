@@ -56,9 +56,32 @@ def run_conformance(*args: str, timeout: int = 600, env: dict | None = None) -> 
     equal to the inner cap races the inner timeout and the wrapper fires
     first, returning `subprocess.TimeoutExpired` -> test red. Raising to
     600s gives a 360s margin and eliminates the flap-on-warm-run class.
+
+    For the ``run`` subcommand (which directly invokes the runner), inject
+    ``--workdir=<scratch>`` so fan-out branch isolation mkdtemp dirs land in
+    the OS tempdir instead of leaking into the repo root. ``parse``,
+    ``validate``, ``list-handlers``, and ``score`` do not accept
+    ``--workdir`` so the scratch override is skipped for those. The
+    ``score`` chain runs an inner pytest that itself uses test-local
+    scratch workdirs via the per-file SCRATCH constants and the tests/
+    fixtures we patched.
     """
+    full_args = args
+    sub = args[0] if args else ""
+    if sub == "run":
+        import tempfile
+        scratch = pathlib.Path(tempfile.mkdtemp(prefix="run_conformance_"))
+        # The sealed holdout evaluator resolves `implementation` relative to
+        # ctx.workdir. Mirror the repo's `impl/` tree into the scratch workdir
+        # so the hello-dot holdout can find greet.py and pass.
+        impl_link = scratch / "impl"
+        if not impl_link.exists():
+            impl_link.symlink_to(ROOT / "impl")
+        # Inject --workdir AFTER the subcommand since `bin/conformance` uses
+        # subparsers(required=True); top-level flags are rejected.
+        full_args = (sub, "--workdir", str(scratch), *args[1:])
     return subprocess.run(
-        [sys.executable, str(ROOT / "bin" / "conformance"), *args],
+        [sys.executable, str(ROOT / "bin" / "conformance"), *full_args],
         cwd=ROOT,
         capture_output=True,
         text=True,
