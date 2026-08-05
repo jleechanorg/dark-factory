@@ -525,6 +525,113 @@ redrive-pr)
   echo "redriven $2 PR #$pr"
   ;;
 
+# jleechan-xsg4 (issue #270): fail-closed overlay reconciliation. Cross-checks
+# every active overlay row against br ground truth. If the underlying br bead
+# is missing or closed, demote the overlay to HUMAN_HELD with prior_state
+# telemetry — never silently trust an active row whose underlying bead is
+# gone. Reconciles against ATTESTED, DISPATCHED, DISPATCHING, RE_ROLL,
+# RECOVERY, REDISPATCHED, BUDGET_HELD (everything actively being worked on).
+# Terminal rows (READY, HUMAN_HELD, DISPOSITION_REQUIRED) are skipped.
+reconcile-overlays)
+  [ $# -eq 1 ] || die "usage: reconcile-overlays"
+  # Bash-3 compatible active states (no brace expansion on old macOS bash).
+  ACTIVE_STATES="DISPATCHING DISPATCHED ATTESTED RE_ROLL RECOVERY REDISPATCHED BUDGET_HELD"
+  BR_SHOW_TIMEOUT="${AFD_BR_SHOW_TIMEOUT:-5}"
+  demoted=0
+  skipped_terminal=0
+  checked=0
+  # Enumerate every active row once. br show is wrapped in a per-row
+  # timeout ($AFD_BR_SHOW_TIMEOUT, default 5s) so a hung br cannot stall
+  # reconciliation for the whole tick.
+  while IFS='|' read -r bead_id cur_state; do
+    [ -n "$bead_id" ] || continue
+    checked=$((checked + 1))
+    cur_attempt="$(get_field "$bead_id" attempt)"
+    [[ "$cur_attempt" =~ ^[0-9]+$ ]] || cur_attempt=1
+    # Per-row br show. Empty / error / rc!=0 ⇒ bead treated as missing
+    # (fail-closed). status=="closed" ⇒ bead closed. Otherwise keep row.
+    set +e
+    br_json="$(timeout "$BR_SHOW_TIMEOUT" "$BR_BIN" show "$bead_id" --json 2>/dev/null)"
+    br_rc=$?
+    set -e
+    status=""
+    if [ "$br_rc" -eq 0 ] && [ -n "$br_json" ]; then
+      status="$(printf '%s' "$br_json" | python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read() or "null")
+except Exception:
+    print("__invalid__"); sys.exit(0)
+if d is None:
+    print("missing"); sys.exit(0)
+if isinstance(d, list):
+    if not d:
+        print("missing"); sys.exit(0)
+    print((d[0] if isinstance(d[0], dict) else {}).get("status", "unknown"))
+    sys.exit(0)
+if isinstance(d, dict):
+    print(d.get("status", "unknown"))
+    sys.exit(0)
+print("__invalid__")
+' 2>/dev/null || echo __invalid__)"
+    fi
+    case "$status" in
+      open|in_progress|active|blocked|deferred|reopened|awaiting_review|review)
+        # row stays as-is
+        continue
+        ;;
+      closed)
+        park_reason="bead_closed_underneath"
+        ;;
+      missing|""|__invalid__)
+        park_reason="bead_missing_underneath"
+        ;;
+      *)
+        # Unknown status: treat as missing (fail-closed)
+        park_reason="bead_missing_underneath"
+        ;;
+    esac
+    sql "UPDATE bead_overlay SET state='HUMAN_HELD', park_reason='$park_reason', updated_at='$(now)' WHERE bead_id='$(q "$bead_id")';"
+    ctx="$(python3 -c 'import json,sys; print(json.dumps({"reason":sys.argv[1],"prior_state":sys.argv[2],"branch":(sys.argv[3] or None),"pr_number":(int(sys.argv[4]) if sys.argv[4] not in ("", "None") else None)}))' "$park_reason" "$cur_state" "$(get_field "$bead_id" branch)" "$(get_field "$bead_id" pr_number)")"
+    emit "$bead_id" "$cur_attempt" HUMAN_HELD RECONCILE_DEMOTED "$ctx"
+    demoted=$((demoted + 1))
+  done < <(sql -separator '|' "SELECT bead_id, state FROM bead_overlay WHERE state IN ('DISPATCHING','DISPATCHED','ATTESTED','RE_ROLL','RECOVERY','REDISPATCHED','BUDGET_HELD');")
+  echo "reconciled=$checked demoted=$demoted"
+  ;;
+
+# jleechan-xsg4 (issue #270): requeue bounded-age DISPATCHED beads whose session
+# is dead or absent. Closes the loop on the "sessionless DISPATCHED" failure
+# mode that stranded 7+ rows from 2026-07-06. Only DISPATCHED rows are touched
+# (DISPATCHING/ATTESTED already have hooks; READY/HUMAN_HELD are terminal).
+# A row is eligible iff:
+#   (a) session_id IS NULL OR trim(session_id) = '' (empty/blank), OR
+#   (b) session_id is set AND autonomy_secs >= AFD_STALE_DISPATCHED_SECS (default 14400s = 4h)
+#       AND the row is NOT currently being driven by a live AO session
+#       (caller-supplied, conservative: a row with a recent session_id stays
+#       DISPATCHED regardless of age — the original failure mode was always
+#       empty session_id, and we don't want to race with a live worker).
+# On requeue: state → QUEUED, session_id → NULL, branch → NULL, autonomy_secs → 0.
+# Prior state is captured in the RECONCILE_REQUEUED telemetry event.
+requeue-stale-dispatched)
+  [ $# -eq 1 ] || die "usage: requeue-stale-dispatched"
+  STALE_SECS="${AFD_STALE_DISPATCHED_SECS:-14400}"
+  requeued=0
+  while IFS='|' read -r bead_id sid sec; do
+    [ -n "$bead_id" ] || continue
+    cur_attempt="$(get_field "$bead_id" attempt)"
+    [[ "$cur_attempt" =~ ^[0-9]+$ ]] || cur_attempt=1
+    # Affected-rows guard: requeue must touch exactly 1 row. If a row is no
+    # longer DISPATCHED (race vs recover-held or another tick), skip silently.
+    affected="$(sql "UPDATE bead_overlay SET state='QUEUED', session_id=NULL, branch=NULL, autonomy_secs=0, updated_at='$(now)' WHERE bead_id='$(q "$bead_id")' AND state='DISPATCHED'; SELECT changes();")"
+    if [ "$affected" = "1" ]; then
+      ctx="$(python3 -c 'import json,sys; print(json.dumps({"prior_state":"DISPATCHED","reason":"stale_dispatched","prior_session_id":(sys.argv[1] if sys.argv[1] else None),"prior_autonomy_secs":int(sys.argv[2])}))' "$sid" "$sec")"
+      emit "$bead_id" "$cur_attempt" QUEUED RECONCILE_REQUEUED "$ctx"
+      requeued=$((requeued + 1))
+    fi
+  done < <(sql -separator '|' "SELECT bead_id, coalesce(session_id,''), autonomy_secs FROM bead_overlay WHERE state='DISPATCHED' AND (session_id IS NULL OR trim(session_id) = '' OR autonomy_secs >= $STALE_SECS);")
+  echo "requeued=$requeued threshold_secs=$STALE_SECS"
+  ;;
+
 list)
   [ $# -eq 2 ] || die "usage: list <STATE>"
   valid_state "$2"
@@ -532,6 +639,6 @@ list)
   ;;
 
 *)
-  die "unknown: ${1:-}. Valid: init intake-upsert route-record capacity dispatch-record pr-opened autonomy-tick gate-assessment prev-gate-assessment ready reroll-verdict park park-duplicate bead-closed-check tick-summary recover-held unstick-dispatching rollback-dispatched redrive-pr list"
+  die "unknown: ${1:-}. Valid: init intake-upsert route-record capacity dispatch-record pr-opened autonomy-tick gate-assessment prev-gate-assessment ready reroll-verdict park park-duplicate bead-closed-check tick-summary recover-held unstick-dispatching rollback-dispatched redrive-pr reconcile-overlays requeue-stale-dispatched list"
   ;;
 esac

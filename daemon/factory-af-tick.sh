@@ -22,6 +22,16 @@
 #   AFD_AO_PROJECT          AO project name (default: worldarchitect)
 #   MAX_DISPATCH            max beads per tick (default 2)
 #   AO_MAX_CONCURRENT_SESSIONS  AO concurrency cap (default 30)
+#   AFD_TICK_DEADLINE_SEC   whole-tick wallclock budget (default 60s). The
+#                           dispatch loop checks this on every iteration and
+#                           breaks out before the tick overruns. Bead
+#                           jleechan-he2p / issue #270 — without this, a slow
+#                           AO preflight could starve fresh P0 work for the
+#                           full 240s launchd tick.
+#   AFD_AO_PREFLIGHT_TIMEOUT  bounding timeout for the AO concurrency probe
+#                           (default 10s). The probe runs once per tick, not
+#                           per bead, so this is the only place a hung AO
+#                           CLI can stall the tick.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export BR_DB="${BR_DB:-$ROOT/.beads/beads.db}"
@@ -166,6 +176,13 @@ fi
 "$O" init
 "$O" unstick-dispatching
 "$O" recover-held
+# jleechan-xsg4 (issue #270): fail-closed overlay reconciliation. Sweep
+# every active overlay row against br ground truth: demote rows whose
+# underlying bead is missing or closed to HUMAN_HELD, requeue DISPATCHED
+# rows whose session is dead or absent. Without this, stale active rows
+# starve the dispatch loop indefinitely.
+"$O" reconcile-overlays || true
+"$O" requeue-stale-dispatched || true
 # Roll back DISPATCHED beads whose async spawn failed (state file "fail:rc=N").
 # Closes the Codex P1 loop on PR #193: async-spawn can succeed at the wrapper
 # level (fast-fail window passed) but fail later; the state file records the
@@ -208,8 +225,12 @@ fi
 bash "$I"
 
 # ---------- AO concurrency probe ----------
+# jleechan-he2p / issue #270: bound the probe with timeout so a hung AO CLI
+# cannot stall the whole tick. The probe runs exactly once per tick (not
+# per bead) — the per-bead dedup uses a per-project cache below.
 AO="$(bash "$ROOT/daemon/factory-ao-bin.sh" 2>/dev/null || true)"
 AO_CAP="${AO_MAX_CONCURRENT_SESSIONS:-30}"
+AO_PREFLIGHT_TIMEOUT="${AFD_AO_PREFLIGHT_TIMEOUT:-10}"
 # Validate AO_PROJECT is non-empty + looks like a project name. Defensive: an
 # empty / malformed project would cause `session ls -p ""` to dump all projects
 # and inflate the active count, falsely tripping AO_MAX_CONCURRENT_SESSIONS.
@@ -217,6 +238,47 @@ if [ -z "${AO_PROJECT:-}" ] || [[ ! "$AO_PROJECT" =~ ^[A-Za-z0-9._-]+$ ]]; then
     echo "[af] WARN: AFD_AO_PROJECT='${AO_PROJECT:-}' is empty or malformed; defaulting to 'worldarchitect'" >&2
     AO_PROJECT="worldarchitect"
 fi
+# jleechan-he2p: whole-tick deadline. The dispatch loop checks this on every
+# iteration and breaks out before the tick overruns. Default 60s leaves plenty
+# of headroom under the 240s launchd tick budget.
+AFD_TICK_DEADLINE_SEC="${AFD_TICK_DEADLINE_SEC:-60}"
+_afd_tick_start=$(date +%s)
+_afd_tick_deadline_check() {
+  local now=$(date +%s)
+  local elapsed=$((now - _afd_tick_start))
+  if [ "$elapsed" -ge "$AFD_TICK_DEADLINE_SEC" ]; then
+    echo "[af] tick deadline ${AFD_TICK_DEADLINE_SEC}s reached (elapsed=${elapsed}s) — breaking dispatch loop" >&2
+    return 1
+  fi
+  return 0
+}
+
+# jleechan-he2p: per-project AO session cache. The dispatch loop used to call
+# `ao session ls -p $proj` per bead, which serialized the loop on AO CLI
+# latency (multi-second per call × N beads). The cache holds the output of
+# one session ls per project for the duration of the tick, so the per-bead
+# dedup is a local file lookup.
+_afd_session_cache_dir="$(mktemp -d -t af_sessions.XXXXXX)"
+trap 'rm -f "$ERR_TMP"; rm -rf "$_afd_session_cache_dir"' EXIT
+_afd_session_cache_get() {
+  local proj="$1"
+  [[ "$proj" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "CACHE_ERROR:invalid_project_name=${proj}" >&2; return 0; }
+  local cache_file="${_afd_session_cache_dir}/${proj}.txt"
+  if [ -f "$cache_file" ]; then
+    cat "$cache_file"
+    return 0
+  fi
+  # Cache miss: query AO once for this project, bounded by the preflight
+  # timeout. The result is written to the cache file even on failure so a
+  # transient AO failure doesn't trigger a per-bead retry storm.
+  local out=""
+  if [ -n "$AO" ]; then
+    out="$(timeout "$AO_PREFLIGHT_TIMEOUT" "$AO" session ls -p "$proj" 2>/dev/null || true)"
+  fi
+  printf '%s' "$out" > "$cache_file"
+  printf '%s' "$out"
+}
+
 if [ -n "$AO" ]; then
     # CR: scope the --json probe to $AO_PROJECT the same way the non-JSON
     # fallback below does (`-p "$AO_PROJECT"`). Without -p here, a successful
@@ -224,7 +286,7 @@ if [ -n "$AO" ]; then
     # ao_active and falsely tripping AO_MAX_CONCURRENT_SESSIONS for
     # deployments using a non-default AFD_AO_PROJECT.
     if "$AO" session ls -p "$AO_PROJECT" --json >/dev/null 2>&1; then
-        ao_active="$("$AO" session ls -p "$AO_PROJECT" --json 2>/dev/null | python3 -c '
+        ao_active="$(timeout "$AO_PREFLIGHT_TIMEOUT" "$AO" session ls -p "$AO_PROJECT" --json 2>/dev/null | python3 -c '
 import json,sys
 try:
     d = json.load(sys.stdin)
@@ -237,7 +299,7 @@ try:
 except Exception:
     print(0)' 2>/dev/null || echo 0)"
     else
-        ao_active="$("$AO" session ls -p "$AO_PROJECT" 2>/dev/null | rg -c '\[(spawning|running|active|working|pr_open)\]' || echo 0)"
+        ao_active="$(timeout "$AO_PREFLIGHT_TIMEOUT" "$AO" session ls -p "$AO_PROJECT" 2>/dev/null | rg -c '\[(spawning|running|active|working|pr_open)\]' || echo 0)"
     fi
     # Ensure ao_active is a non-negative integer (defensive: rg/race could leave empty)
     case "${ao_active:-0}" in
@@ -285,10 +347,19 @@ fi
 # ---------- dispatch loop ----------
 dispatched=0
 ERR_TMP="$(mktemp -t af_dispatch_err.XXXXXX)"
-trap 'rm -f "$ERR_TMP"' EXIT
+# jleechan-he2p / issue #270: the original trap (above) only cleaned $ERR_TMP.
+# Extended to also clean the per-project session cache directory.
+# trap 'rm -f "$ERR_TMP"; rm -rf "$_afd_session_cache_dir"' EXIT
 while IFS=$'\t' read -r bead_id pr branch bead_repo; do
     [ -n "$bead_id" ] || continue
     [ "$dispatched" -ge "$MAX_DISPATCH" ] && break
+    # jleechan-he2p: whole-tick deadline check. A slow AO preflight or
+    # a queued remediation must not starve fresh P0 work for the full
+    # 240s launchd tick — break out of the loop so the next tick can
+    # resume from a clean state.
+    if ! _afd_tick_deadline_check; then
+        break
+    fi
 
     # Resolve target repo (default to global TARGET_REPO if empty). Fail closed
     # (skip, don't guess) when neither is set — see bead jleechan-gvdw: a
@@ -341,9 +412,16 @@ PY
         continue
     fi
 
-    if [ -n "$AO" ] && "$AO" session ls -p "$proj" 2>/dev/null | rg "pulls/${pr}\\b" | rg -q '\[(spawning|running|active|working|pr_open)\]'; then
-        echo "[af] skip $bead_id PR #$pr (active session exists in project $proj)" >&2
-        continue
+    # jleechan-he2p / issue #270: per-bead dedup uses the per-project session
+    # cache (one AO session ls per project per tick, NOT per bead). The old
+    # code re-invoked AO for every bead in the loop, which serialized the
+    # dispatch behind AO CLI latency and starved fresh P0 work.
+    if [ -n "$AO" ]; then
+        proj_sessions="$(_afd_session_cache_get "$proj")"
+        if [ -n "$proj_sessions" ] && printf '%s\n' "$proj_sessions" | rg "pulls/${pr}\\b" | rg -q '\[(spawning|running|active|working|pr_open)\]'; then
+            echo "[af] skip $bead_id PR #$pr (active session exists in project $proj)" >&2
+            continue
+        fi
     fi
     echo "[af] remediate $bead_id PR #$pr on $repo in project $proj"
     # CX-2: thread proj and repo through to factory-ao-remediate.sh so the spawned
