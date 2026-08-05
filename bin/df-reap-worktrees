@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+# bin/df-reap-worktrees
+#
+# CLI wrapper for runner.worktree_layout.main (bead jleechan-jw4c).
+#
+# See runner.worktree_layout for the rationale (agent worktrees must live
+# OUTSIDE the primary checkout; reaper must bound both count and age;
+# cross-worktree writes must be detectable).
+"""Allow ``python -m runner.worktree_layout`` to be invoked via this script path."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+# Make `runner` importable when this script is invoked directly.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from runner.worktree_layout import main  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(main())
