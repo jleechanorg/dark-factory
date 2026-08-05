@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import pathlib
 import sys
+import tempfile
 
 ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
@@ -23,7 +24,15 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 from conftest import ROOT  # noqa: E402, F811
 
+# Scratch workdir in the OS tempdir — using the repo root here leaked one
+# branch_* mkdtemp per fan-out test into the working tree.
+SCRATCH = pathlib.Path(tempfile.mkdtemp(prefix="test_two_node_dot_"))
+
 from runner.parser import parse  # noqa: E402
+
+from conftest import register_scratch_dir  # noqa: E402
+
+register_scratch_dir(SCRATCH)
 
 
 # Every node type that can run a subprocess in dark-factory. Must stay
@@ -186,7 +195,7 @@ def test_worker_prompt_renders_untrusted_reviewer_feedback_only_on_retry() -> No
     from runner.handler_render import _render_prompt
 
     worker = parse(ROOT / _PIPELINE).nodes["worker"]
-    ctx = Context(goal="repair the controller", workdir=ROOT, backend="echo")
+    ctx = Context(goal="repair the controller", workdir=SCRATCH, backend="echo")
     first_attempt = _render_prompt(worker, ctx)
     assert "(no prior reviewer feedback)" in first_attempt
 

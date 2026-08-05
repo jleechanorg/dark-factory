@@ -16,12 +16,17 @@ from __future__ import annotations
 
 import pathlib
 import sys
+import tempfile
 
 ROOT = pathlib.Path(__file__).parent.parent
+
+# Scratch workdir in the OS tempdir — using the repo root here leaked one
+# branch_* mkdtemp per fan-out test into the working tree.
+SCRATCH = pathlib.Path(tempfile.mkdtemp(prefix="fix_loop_awareness_"))
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from conftest import _pipeline  # noqa: E402
+from conftest import _pipeline, register_scratch_dir  # noqa: E402
 
 from runner.engine import run  # noqa: E402
 from runner.handler_control import (  # noqa: E402
@@ -34,6 +39,8 @@ from runner.handler_control import (  # noqa: E402
 )
 from runner.handlers import Context, Result, TYPE_REGISTRY  # noqa: E402
 from runner.parser import Node, parse  # noqa: E402
+
+register_scratch_dir(SCRATCH)
 
 # -- D1 ------------------------------------------------------------------
 
@@ -132,7 +139,7 @@ def test_tool_returns_failure_for_missing_test_file(tmp_path, monkeypatch):
 
 
 def test_record_test_failure_state_writes_three_keys():
-    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx = Context(goal="t", workdir=SCRATCH, backend="echo")
     _record_test_failure_state(
         ctx,
         cmd="python3 -m pytest foo.py",
@@ -145,7 +152,7 @@ def test_record_test_failure_state_writes_three_keys():
 
 
 def test_record_test_failure_state_truncates_huge_output():
-    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx = Context(goal="t", workdir=SCRATCH, backend="echo")
     huge = "x" * 20_000
     _record_test_failure_state(ctx, cmd="pytest", rc="1", output=huge)
     # 4000 chars + truncation marker
@@ -158,7 +165,7 @@ def test_record_test_failure_state_is_first_wins():
     the fix prompt benefits from a stable, citable record of what went
     wrong the first time.
     """
-    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx = Context(goal="t", workdir=SCRATCH, backend="echo")
     _record_test_failure_state(ctx, cmd="pytest a.py", rc="1", output="first failure")
     _record_test_failure_state(ctx, cmd="pytest b.py", rc="2", output="second failure")
     assert "first failure" in ctx.state["last_test_output"]
@@ -224,7 +231,7 @@ def test_tool_does_not_record_state_on_success():
             name="test",
             attrs={"command": "true", "goal_gate": "true", "timeout": "30"},
         )
-        ctx = Context(goal="t", workdir=ROOT, backend="echo")
+        ctx = Context(goal="t", workdir=SCRATCH, backend="echo")
         result = _tool(node, ctx)
         assert result.outcome == "success"
         assert "last_test_output" not in ctx.state
@@ -296,7 +303,7 @@ digraph NoProgressTest {
     monkeypatch.setitem(TYPE_REGISTRY, "codergen", fake_fix)
 
     g = parse(pipeline_path, require_start_exit=True)
-    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx = Context(goal="t", workdir=SCRATCH, backend="echo")
     history = run(g, ctx, max_steps=50)
 
     # The fix node should be visited at most 2 times before the no_progress
@@ -355,7 +362,7 @@ digraph NoProgressTest2 {
     monkeypatch.setitem(TYPE_REGISTRY, "codergen", fake_fix)
 
     g = parse(pipeline_path, require_start_exit=True)
-    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx = Context(goal="t", workdir=SCRATCH, backend="echo")
     history = run(g, ctx, max_steps=200)
 
     # The fix node should be visited at least 2 times (diverse outputs).
@@ -384,7 +391,7 @@ def test_fix_md_prompt_substitutes_failure_handoff_state(monkeypatch, tmp_path):
     # The Node stores the prompt path in attrs["prompt"] (with leading
     # `@`); the `prompt_ref` property strips it.
     node = Node(name="fix", attrs={"prompt": "@prompts/slim/fix.md"})
-    ctx = Context(goal="fix the failing test", workdir=ROOT, backend="echo")
+    ctx = Context(goal="fix the failing test", workdir=SCRATCH, backend="echo")
     ctx.state["last_test_command"] = "python3 -m pytest tests/test_x.py"
     ctx.state["last_test_rc"] = "4"
     ctx.state["last_test_output"] = "fixture 'bar' not found"

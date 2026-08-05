@@ -6,18 +6,25 @@ from __future__ import annotations
 
 import pathlib
 import sys
+import tempfile
 
 ROOT = pathlib.Path(__file__).parent.parent
+
+# Scratch workdir in the OS tempdir — using the repo root here leaked one
+# branch_* mkdtemp per fan-out test into the working tree.
+SCRATCH = pathlib.Path(tempfile.mkdtemp(prefix="engine_smoke_"))
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from conftest import _pipeline  # noqa: E402
+from conftest import _pipeline, register_scratch_dir  # noqa: E402
 
 from runner.cxdb import CXDB  # noqa: E402
 from runner.engine import run  # noqa: E402
 from runner.handlers import Context, Result, TYPE_REGISTRY  # noqa: E402
 from runner.healer import report  # noqa: E402
 from runner.parser import parse  # noqa: E402
+
+register_scratch_dir(SCRATCH)
 
 
 def test_holdout_missing_feature_handoff_reaches_fix_prompt(tmp_path):
@@ -53,7 +60,7 @@ def test_gate_echo_seeded_outcome(monkeypatch):
         return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
     g = parse(_pipeline("gates.dot"))
-    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx = Context(goal="t", workdir=SCRATCH, backend="echo")
     ctx.state["gate_skeptic.outcome"] = "success"
     ctx.state["adversarial_reviewer.outcome"] = "success"
     ctx.state["gate_es.outcome"] = "success"
@@ -84,7 +91,7 @@ def test_cxdb_records_steps(tmp_path, monkeypatch):
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
     db_path = tmp_path / "cxdb.sqlite"
     g = parse(_pipeline("gates.dot"))
-    ctx = Context(goal="t", workdir=ROOT, backend="echo", cxdb_path=db_path)
+    ctx = Context(goal="t", workdir=SCRATCH, backend="echo", cxdb_path=db_path)
     ctx.state.update(
         {
             "gate_skeptic.outcome": "success",
@@ -123,7 +130,7 @@ def test_healer_reports_failures(tmp_path, monkeypatch):
 
     db_path = tmp_path / "cxdb.sqlite"
     g = parse(_pipeline("gates.dot"))
-    ctx = Context(goal="t", workdir=ROOT, backend="echo", cxdb_path=db_path)
+    ctx = Context(goal="t", workdir=SCRATCH, backend="echo", cxdb_path=db_path)
     run(g, ctx, max_steps=20)
 
     text = report(db_path)
@@ -138,7 +145,7 @@ def test_healer_reports_gate_infra_errors(tmp_path, monkeypatch):
         return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
     g = parse(_pipeline("gates.dot"))
-    ctx = Context(goal="t", workdir=ROOT, backend="echo", cxdb_path=tmp_path / "cxdb.sqlite")
+    ctx = Context(goal="t", workdir=SCRATCH, backend="echo", cxdb_path=tmp_path / "cxdb.sqlite")
     ctx.state["gate_skeptic.outcome"] = "success"
     ctx.state["adversarial_reviewer.outcome"] = "success"
     ctx.state["gate_es.outcome"] = "success"
@@ -158,7 +165,7 @@ def test_healer_no_failures(tmp_path, monkeypatch):
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
     db_path = tmp_path / "cxdb.sqlite"
     g = parse(_pipeline("gates.dot"))
-    ctx = Context(goal="t", workdir=ROOT, backend="echo", cxdb_path=db_path)
+    ctx = Context(goal="t", workdir=SCRATCH, backend="echo", cxdb_path=db_path)
     ctx.state.update(
         {
             "gate_skeptic.outcome": "success",

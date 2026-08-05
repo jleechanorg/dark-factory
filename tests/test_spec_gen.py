@@ -11,14 +11,23 @@ from __future__ import annotations
 
 import pathlib
 import sys
+import tempfile
 
 ROOT = pathlib.Path(__file__).parent.parent
+
+# Scratch workdir in the OS tempdir — using the repo root here leaked one
+# branch_* mkdtemp per fan-out test into the working tree.
+SCRATCH = pathlib.Path(tempfile.mkdtemp(prefix="spec_gen_"))
 sys.path.insert(0, str(ROOT))
 
 import runner.handlers as handlers_mod
 from runner.engine import run
 from runner.handlers import Context, TYPE_REGISTRY
 from runner.parser import parse
+
+from conftest import register_scratch_dir  # noqa: E402
+
+register_scratch_dir(SCRATCH)
 
 SPEC_GEN = ROOT / "pipelines" / "slim" / "spec_gen.dot"
 
@@ -306,7 +315,7 @@ def test_spec_gen_happy_path_explore_plan_main_review_main_plan_attractor_review
     g.nodes["plan_main"].attrs["backend"] = "echo"
     g.nodes["plan_attractor"].attrs["backend"] = "echo"
 
-    ctx = Context(goal="define a reviewed spec for a tiny utility", workdir=ROOT, backend="echo")
+    ctx = Context(goal="define a reviewed spec for a tiny utility", workdir=SCRATCH, backend="echo")
     ctx.state["review_main.outcome"] = "success"
     ctx.state["review_attractor.outcome"] = "success"
 
@@ -345,7 +354,7 @@ def test_spec_gen_fix_main_loop_on_review_main_failure(monkeypatch, tmp_path):
     g.nodes["plan_main"].attrs["backend"] = "echo"
     g.nodes["plan_attractor"].attrs["backend"] = "echo"
 
-    ctx = Context(goal="bad spec needs one fix", workdir=ROOT, backend="echo")
+    ctx = Context(goal="bad spec needs one fix", workdir=SCRATCH, backend="echo")
     ctx.state["review_attractor.outcome"] = "success"
 
     # First review_main visit fails; second succeeds.
@@ -383,7 +392,7 @@ def test_spec_gen_fix_attractor_loop_on_review_attractor_failure(monkeypatch, tm
     g.nodes["plan_main"].attrs["backend"] = "echo"
     g.nodes["plan_attractor"].attrs["backend"] = "echo"
 
-    ctx = Context(goal="attractor spec needs one fix", workdir=ROOT, backend="echo")
+    ctx = Context(goal="attractor spec needs one fix", workdir=SCRATCH, backend="echo")
     ctx.state["review_main.outcome"] = "success"
 
     # First review_attractor visit fails; second succeeds.
@@ -420,7 +429,7 @@ def test_spec_gen_full_node_sequence_happy_path(monkeypatch, tmp_path):
     g.nodes["plan_main"].attrs["backend"] = "echo"
     g.nodes["plan_attractor"].attrs["backend"] = "echo"
 
-    ctx = Context(goal="spec-gen happy path ordering", workdir=ROOT, backend="echo")
+    ctx = Context(goal="spec-gen happy path ordering", workdir=SCRATCH, backend="echo")
     ctx.state["review_main.outcome"] = "success"
     ctx.state["review_attractor.outcome"] = "success"
 

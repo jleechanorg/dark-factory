@@ -17,18 +17,25 @@ import pathlib
 import sqlite3
 import subprocess
 import sys
+import tempfile
 
 ROOT = pathlib.Path(__file__).parent.parent
+
+# Scratch workdir in the OS tempdir — using the repo root here leaked one
+# branch_* mkdtemp per fan-out test into the working tree.
+SCRATCH = pathlib.Path(tempfile.mkdtemp(prefix="evidence_bundle_"))
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from conftest import _pipeline  # noqa: E402
+from conftest import _pipeline, register_scratch_dir  # noqa: E402
 
 from runner.engine import run  # noqa: E402
 from runner.evidence import write_bundle, _HOLDOUT_PATH_TOKEN  # noqa: E402
 from runner.handlers import Context, Result, TYPE_REGISTRY  # noqa: E402
 from runner.parser import parse  # noqa: E402
 from runner.panic_hook import PANIC_EXIT_CODE  # noqa: E402
+
+register_scratch_dir(SCRATCH)
 
 
 def _drive_run(tmp_path: pathlib.Path, monkeypatch) -> tuple[pathlib.Path, str, object]:
@@ -54,7 +61,7 @@ def _drive_run(tmp_path: pathlib.Path, monkeypatch) -> tuple[pathlib.Path, str, 
 
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", tainted_holdout)
     graph = parse(_pipeline("hello.dot"))
-    ctx = Context(goal="bundle smoke", workdir=ROOT, backend="echo", cxdb_path=db_path)
+    ctx = Context(goal="bundle smoke", workdir=SCRATCH, backend="echo", cxdb_path=db_path)
     history = run(graph, ctx, max_steps=20)
     assert history[-1].outcome == "success"
     assert ctx.run_id is not None
@@ -71,7 +78,7 @@ def test_bundle_layout_and_manifest_fields(tmp_path, monkeypatch):
         run_id=run_id,
         pipeline_path=_pipeline("hello.dot"),
         graph=graph,
-        workdir=ROOT,
+        workdir=SCRATCH,
         command=command,
     )
 
@@ -172,7 +179,7 @@ def test_bundle_extract_contains_only_this_run(tmp_path, monkeypatch):
         run_id=run_id,
         pipeline_path=_pipeline("hello.dot"),
         graph=graph,
-        workdir=ROOT,
+        workdir=SCRATCH,
     )
 
     extract = bundle / f"cxdb-{run_id}.sqlite"
@@ -197,7 +204,7 @@ def test_bundle_does_not_leak_holdout_content(tmp_path, monkeypatch):
         run_id=run_id,
         pipeline_path=_pipeline("hello.dot"),
         graph=graph,
-        workdir=ROOT,
+        workdir=SCRATCH,
     )
 
     # The redactor must have stripped the tainted holdout output from the

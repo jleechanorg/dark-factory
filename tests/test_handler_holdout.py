@@ -31,6 +31,7 @@ import pathlib
 import subprocess
 import sys
 
+import tempfile
 import pytest
 
 # Import order matters: ``runner.handler_holdout`` does
@@ -48,6 +49,14 @@ from runner.handler_holdout import (
 from runner.parser import Node
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+# Scratch workdir in the OS tempdir — using the repo root here leaked one
+# branch_* mkdtemp per fan-out test into the working tree.
+SCRATCH = pathlib.Path(tempfile.mkdtemp(prefix="handler_holdout_"))
+
+from conftest import register_scratch_dir  # noqa: E402
+
+register_scratch_dir(SCRATCH)
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +384,7 @@ def test_fibonacci_worktree_never_touches_firebase_or_homebrew_java(
             "implementation": str(impl),
         },
     )
-    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx = Context(goal="t", workdir=SCRATCH, backend="echo")
 
     result = _holdout_eval(node, ctx)
 
@@ -440,7 +449,7 @@ def test_fibonacci_worktree_does_not_inject_homebrew_java_into_eval_env(
             "implementation": str(impl),
         },
     )
-    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx = Context(goal="t", workdir=SCRATCH, backend="echo")
 
     result = _holdout_eval(node, ctx)
     assert result.outcome == "success", result.output
@@ -497,7 +506,7 @@ def test_fibonacci_worktree_keeps_gcp_creds_in_env(monkeypatch, fibonacci_worktr
             "implementation": str(impl),
         },
     )
-    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx = Context(goal="t", workdir=SCRATCH, backend="echo")
 
     result = _holdout_eval(node, ctx)
     assert result.outcome == "success", result.output
@@ -563,7 +572,7 @@ def test_manifest_declared_firebase_still_injects_java_and_strips_gcp(
             "startup_delay": "0",
         },
     )
-    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx = Context(goal="t", workdir=SCRATCH, backend="echo")
 
     result = _holdout_eval(node, ctx)
     assert result.outcome == "success", result.output

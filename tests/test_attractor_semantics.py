@@ -11,14 +11,23 @@ from __future__ import annotations
 import pathlib
 import sys
 
+import tempfile
 import pytest
 
 ROOT = pathlib.Path(__file__).parent.parent
+
+# Scratch workdir in the OS tempdir — using the repo root here leaked one
+# branch_* mkdtemp per fan-out test into the working tree.
+SCRATCH = pathlib.Path(tempfile.mkdtemp(prefix="attractor_semantics_"))
 sys.path.insert(0, str(ROOT))
 
 from runner.engine import run, _edge_matches
 from runner.handlers import Context, Result, TYPE_REGISTRY
 from runner.parser import Edge, Graph, Node
+
+from conftest import register_scratch_dir  # noqa: E402
+
+register_scratch_dir(SCRATCH)
 
 
 def test_hexagon_node_decision_key_from_state():
@@ -49,7 +58,7 @@ def test_hexagon_node_decision_key_from_state():
     graph = Graph(name="hex_test", goal="test hexagon", nodes=nodes, edges=edges)
 
     # Choice = yes -> should go to yes_branch (and other_branch should not be visited because choice!=yes is false)
-    ctx = Context(goal="test", workdir=ROOT, backend="echo")
+    ctx = Context(goal="test", workdir=SCRATCH, backend="echo")
     ctx.state["choice"] = "yes"
     history = run(graph, ctx, max_steps=10)
     visited = [r.node for r in history]
@@ -58,7 +67,7 @@ def test_hexagon_node_decision_key_from_state():
     assert "other_branch" not in visited
 
     # Choice = maybe -> should go to other_branch (since choice!=yes is true, and choice=yes/no are false)
-    ctx3 = Context(goal="test", workdir=ROOT, backend="echo")
+    ctx3 = Context(goal="test", workdir=SCRATCH, backend="echo")
     ctx3.state["choice"] = "maybe"
     history3 = run(graph, ctx3, max_steps=10)
     visited3 = [r.node for r in history3]
@@ -82,7 +91,7 @@ def test_hexagon_node_default_decision_key():
     ]
     graph = Graph(name="hex_default_test", goal="test hexagon default key", nodes=nodes, edges=edges)
 
-    ctx = Context(goal="test", workdir=ROOT, backend="echo")
+    ctx = Context(goal="test", workdir=SCRATCH, backend="echo")
     ctx.state["decide_default"] = "yes"
     history = run(graph, ctx, max_steps=10)
     visited = [r.node for r in history]
@@ -110,7 +119,7 @@ def test_conditional_edges_priority_over_unconditional():
     graph = Graph(name="priority_test", goal="test priority", nodes=nodes, edges=edges)
 
     # If status is "ok", the conditional edge matches, so it MUST go to cond_branch.
-    ctx = Context(goal="test", workdir=ROOT, backend="echo")
+    ctx = Context(goal="test", workdir=SCRATCH, backend="echo")
 
     def custom_check_ok(node, ctx):
         return Result(outcome="success", metadata={"status": "ok"})
@@ -124,7 +133,7 @@ def test_conditional_edges_priority_over_unconditional():
     assert "uncond_branch" not in visited
 
     # If status is "bad", the conditional edge does NOT match, so it MUST fall back to uncond_branch.
-    ctx2 = Context(goal="test", workdir=ROOT, backend="echo")
+    ctx2 = Context(goal="test", workdir=SCRATCH, backend="echo")
 
     def custom_check_bad(node, ctx):
         return Result(outcome="success", metadata={"status": "bad"})

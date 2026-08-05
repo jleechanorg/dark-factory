@@ -9,6 +9,7 @@ import json
 import pathlib
 import subprocess
 import sys
+import tempfile
 
 import pytest
 
@@ -16,7 +17,13 @@ ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from conftest import _pipeline  # noqa: E402
+# Scratch workdir in the OS tempdir — using the repo root here leaked one
+# branch_* mkdtemp per fan-out test into the working tree.
+SCRATCH = pathlib.Path(tempfile.mkdtemp(prefix="test_engine_"))
+
+from conftest import _pipeline, register_scratch_dir  # noqa: E402
+
+register_scratch_dir(SCRATCH)
 
 from runner.engine import run  # noqa: E402
 from runner.handlers import Context, Result, TYPE_REGISTRY  # noqa: E402
@@ -63,7 +70,7 @@ def test_echo_backend_loops_on_failed_holdout(monkeypatch, tmp_path):
 
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
     g = parse(_pipeline("hello.dot"))
-    ctx = Context(goal="test", workdir=ROOT, backend="echo")
+    ctx = Context(goal="test", workdir=SCRATCH, backend="echo")
     history = run(g, ctx, max_steps=50)
 
     # Should terminate via fix-node max_visits=3 (4th visit triggers exhausted).
@@ -79,7 +86,7 @@ def test_echo_backend_green_path(monkeypatch):
 
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
     g = parse(_pipeline("hello.dot"))
-    ctx = Context(goal="test", workdir=ROOT, backend="echo")
+    ctx = Context(goal="test", workdir=SCRATCH, backend="echo")
     history = run(g, ctx, max_steps=50)
 
     nodes = [r.node for r in history]
@@ -114,7 +121,7 @@ def test_successful_validation_clears_prior_failure(monkeypatch):
 
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
     g = parse(_pipeline("hello.dot"))
-    ctx = Context(goal="test", workdir=ROOT, backend="echo")
+    ctx = Context(goal="test", workdir=SCRATCH, backend="echo")
     history = run(g, ctx, max_steps=50)
 
     assert [r.node for r in history][-3:] == ["fix", "holdout", "exit"]
@@ -127,7 +134,7 @@ def test_default_event_log_path_uses_final_cxdb_run_id(monkeypatch, tmp_path):
 
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
     graph = parse(_pipeline("hello.dot"))
-    ctx = Context(goal="event path", workdir=ROOT, backend="echo", cxdb_path=tmp_path / "cxdb.sqlite")
+    ctx = Context(goal="event path", workdir=SCRATCH, backend="echo", cxdb_path=tmp_path / "cxdb.sqlite")
 
     history = run(graph, ctx, max_steps=50)
 
@@ -227,7 +234,7 @@ def test_cli_missing_holdout_feature_fails_before_run(tmp_path):
 def test_max_steps_before_exit_is_failure():
     """A run that stops before reaching exit must not report success."""
     g = parse(_pipeline("hello.dot"))
-    ctx = Context(goal="test", workdir=ROOT, backend="echo")
+    ctx = Context(goal="test", workdir=SCRATCH, backend="echo")
     history = run(g, ctx, max_steps=1)
 
     assert history[-1].outcome == "exhausted"
@@ -268,7 +275,7 @@ def test_engine_resume_from_checkpoint(tmp_path):
         )
     )
     graph = parse(dot)
-    ctx = Context(goal="resume", workdir=ROOT, backend="echo")
+    ctx = Context(goal="resume", workdir=SCRATCH, backend="echo")
     history = run(graph, ctx, resume=checkpoint, max_steps=10)
 
     assert [step.node for step in history] == ["start", "one", "two", "exit"]
@@ -294,7 +301,7 @@ def test_engine_parallel_fanout_with_join_quorum_and_allow_partial(tmp_path, mon
     monkeypatch.setitem(TYPE_REGISTRY, "branch_partial", lambda node, ctx: Result(outcome="partial", output="ok"))
 
     graph = parse(dot)
-    ctx = Context(goal="parallel", workdir=ROOT, backend="echo")
+    ctx = Context(goal="parallel", workdir=SCRATCH, backend="echo")
     history = run(graph, ctx, max_steps=20)
 
     assert [step.node for step in history] == [
@@ -377,7 +384,7 @@ def test_structured_events_and_transcripts(monkeypatch, tmp_path):
     monkeypatch.setitem(TYPE_REGISTRY, "codergen", fake_codergen)
     
     g = parse(dot_file)
-    ctx = Context(goal="test retries", workdir=ROOT, backend="echo")
+    ctx = Context(goal="test retries", workdir=SCRATCH, backend="echo")
     checkpoint_file = tmp_path / "checkpoint.json"
     
     history = run(g, ctx, checkpoint=checkpoint_file, max_steps=50)
@@ -464,7 +471,7 @@ def test_structured_events_and_transcripts(monkeypatch, tmp_path):
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout_node)
     
     g_holdout = parse(dot_file_holdout)
-    ctx_holdout = Context(goal="test holdout", workdir=ROOT, backend="echo")
+    ctx_holdout = Context(goal="test holdout", workdir=SCRATCH, backend="echo")
     history_holdout = run(g_holdout, ctx_holdout, max_steps=50)
     
     assert history_holdout[-1].outcome == "success"

@@ -558,14 +558,24 @@ def cmd_score(_: argparse.Namespace) -> int:
             timeout=60,
             check=False,
         )
-        runtime = subprocess.run(
-            [sys.executable, str(ROOT / "bin" / "conformance"), "run", "pipelines/factory/hello.dot"],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
+        # Inject --workdir=<scratch> so the runtime subprocess's branch_* mkdtemp
+        # dirs land in the OS tempdir instead of accumulating at the repo root.
+        # Wrap in try/finally so the scratch is reaped even on subprocess.TimeoutExpired.
+        import shutil
+        import tempfile
+        _runtime_scratch = pathlib.Path(tempfile.mkdtemp(prefix="cmd_score_runtime_"))
+        try:
+            runtime = subprocess.run(
+                [sys.executable, str(ROOT / "bin" / "conformance"), "run",
+                 "pipelines/factory/hello.dot", "--workdir", str(_runtime_scratch)],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        finally:
+            shutil.rmtree(_runtime_scratch, ignore_errors=True)
         elapsed = time.monotonic() - started
         passed = build.returncode == tests.returncode == validation.returncode == runtime.returncode == 0
         payload = {

@@ -11,12 +11,17 @@ import json
 import pathlib
 import sqlite3
 import sys
+import tempfile
 
 ROOT = pathlib.Path(__file__).parent.parent
+
+# Scratch workdir in the OS tempdir — using the repo root here leaked one
+# branch_* mkdtemp per fan-out test into the working tree.
+SCRATCH = pathlib.Path(tempfile.mkdtemp(prefix="token_tracking_"))
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from conftest import _pipeline  # noqa: E402
+from conftest import _pipeline, register_scratch_dir  # noqa: E402
 
 from runner.cxdb import CXDB  # noqa: E402
 from runner.engine import run  # noqa: E402
@@ -29,6 +34,8 @@ from runner.handlers import (  # noqa: E402
 )
 from runner.healer import _clusters  # noqa: E402
 from runner.parser import parse  # noqa: E402
+
+register_scratch_dir(SCRATCH)
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +153,7 @@ def test_echo_backend_records_wall_ms_in_cxdb(tmp_path, monkeypatch):
 
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
     graph = parse(_pipeline("hello.dot"))
-    ctx = Context(goal="test", workdir=ROOT, backend="echo", cxdb_path=db_path)
+    ctx = Context(goal="test", workdir=SCRATCH, backend="echo", cxdb_path=db_path)
     history = run(graph, ctx, max_steps=20)
     assert history[-1].outcome == "success"
 
@@ -200,7 +207,7 @@ def test_fake_codergen_with_banner_lands_in_cxdb_metadata(tmp_path, monkeypatch)
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
 
     graph = parse(_pipeline("hello.dot"))
-    ctx = Context(goal="test", workdir=ROOT, backend="echo", cxdb_path=db_path)
+    ctx = Context(goal="test", workdir=SCRATCH, backend="echo", cxdb_path=db_path)
     history = run(graph, ctx, max_steps=20)
     assert history[-1].outcome == "success"
 

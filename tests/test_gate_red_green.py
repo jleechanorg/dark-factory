@@ -11,14 +11,23 @@ import pathlib
 import sys
 import textwrap
 
+import tempfile
 import pytest
 
 ROOT = pathlib.Path(__file__).parent.parent
+
+# Scratch workdir in the OS tempdir — using the repo root here leaked one
+# branch_* mkdtemp per fan-out test into the working tree.
+SCRATCH = pathlib.Path(tempfile.mkdtemp(prefix="gate_red_green_"))
 sys.path.insert(0, str(ROOT))
 
 from runner.engine import run
 from runner.handlers import Context, Result, TYPE_REGISTRY
 from runner.parser import parse, Node
+
+from conftest import register_scratch_dir  # noqa: E402
+
+register_scratch_dir(SCRATCH)
 
 
 def _make_node(attrs: dict[str, str]) -> Node:
@@ -100,7 +109,7 @@ def test_gate_red_with_unresolved_state_path_fails():
     from runner.handlers import _gate_red
 
     node = _make_node({"test_path": "${state.bug_fix.test_path}"})
-    ctx = Context(goal="g", workdir=ROOT, backend="echo")
+    ctx = Context(goal="g", workdir=SCRATCH, backend="echo")
     # no state set
     result = _gate_red(node, ctx)
     assert result.outcome == "failure"

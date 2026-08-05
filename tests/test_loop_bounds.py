@@ -12,17 +12,24 @@ from __future__ import annotations
 import pathlib
 import sys
 
+import tempfile
 import pytest
 
 ROOT = pathlib.Path(__file__).parent.parent
+
+# Scratch workdir in the OS tempdir — using the repo root here leaked one
+# branch_* mkdtemp per fan-out test into the working tree.
+SCRATCH = pathlib.Path(tempfile.mkdtemp(prefix="loop_bounds_"))
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from conftest import _pipeline  # noqa: E402
+from conftest import _pipeline, register_scratch_dir  # noqa: E402
 
 from runner.engine import run  # noqa: E402
 from runner.handlers import Context, Result, TYPE_REGISTRY  # noqa: E402
 from runner.parser import parse  # noqa: E402
+
+register_scratch_dir(SCRATCH)
 
 
 def test_max_visits_attribute_parsed(tmp_path):
@@ -65,7 +72,7 @@ def test_engine_emits_exhausted_after_max_visits(tmp_path, monkeypatch):
     monkeypatch.setitem(TYPE_REGISTRY, "codergen", fake_codergen)
 
     g = parse(dot)
-    ctx = Context(goal="loop test", workdir=ROOT, backend="echo")
+    ctx = Context(goal="loop test", workdir=SCRATCH, backend="echo")
     history = run(g, ctx, max_steps=50)
 
     assert history[-1].node == "ping"

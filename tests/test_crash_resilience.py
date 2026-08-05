@@ -22,17 +22,24 @@ import pathlib
 import sqlite3
 import sys
 
+import tempfile
 import pytest
 
 ROOT = pathlib.Path(__file__).parent.parent
+
+# Scratch workdir in the OS tempdir — using the repo root here leaked one
+# branch_* mkdtemp per fan-out test into the working tree.
+SCRATCH = pathlib.Path(tempfile.mkdtemp(prefix="crash_resilience_"))
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from conftest import _pipeline  # noqa: E402
+from conftest import _pipeline, register_scratch_dir  # noqa: E402
 
 from runner.engine import run  # noqa: E402
 from runner.handlers import Context, Result, TYPE_REGISTRY  # noqa: E402
 from runner.parser import parse  # noqa: E402
+
+register_scratch_dir(SCRATCH)
 
 
 def test_node_exception_is_recorded_not_raised(monkeypatch):
@@ -44,7 +51,7 @@ def test_node_exception_is_recorded_not_raised(monkeypatch):
     # holdout has a `fix` edge in hello.dot — but here implement raises first.
     monkeypatch.setitem(TYPE_REGISTRY, "codergen", boom)
     g = parse(_pipeline("hello.dot"))
-    ctx = Context(goal="test", workdir=ROOT, backend="echo")
+    ctx = Context(goal="test", workdir=SCRATCH, backend="echo")
 
     # Must return, not raise.
     history = run(g, ctx, max_steps=50)
@@ -77,7 +84,7 @@ def test_node_exception_routes_to_fix_edge(monkeypatch):
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", exploding_holdout)
     monkeypatch.setitem(TYPE_REGISTRY, "codergen", fix_handler)
     g = parse(_pipeline("hello.dot"))
-    ctx = Context(goal="test", workdir=ROOT, backend="echo")
+    ctx = Context(goal="test", workdir=SCRATCH, backend="echo")
 
     history = run(g, ctx, max_steps=50)
 
@@ -108,7 +115,7 @@ def test_node_exception_ends_gracefully_without_fix_edge(monkeypatch, tmp_path):
 
     monkeypatch.setitem(TYPE_REGISTRY, "codergen", boom)
     g = parse(dot)
-    ctx = Context(goal="test", workdir=ROOT, backend="echo")
+    ctx = Context(goal="test", workdir=SCRATCH, backend="echo")
 
     history = run(g, ctx, max_steps=50)
 
@@ -126,7 +133,7 @@ def test_run_final_is_error_in_cxdb_on_crash(monkeypatch, tmp_path):
     monkeypatch.setitem(TYPE_REGISTRY, "codergen", boom)
     g = parse(_pipeline("hello.dot"))
     cxdb_path = tmp_path / "crash.sqlite"
-    ctx = Context(goal="test", workdir=ROOT, backend="echo", cxdb_path=cxdb_path)
+    ctx = Context(goal="test", workdir=SCRATCH, backend="echo", cxdb_path=cxdb_path)
 
     history = run(g, ctx, max_steps=50)
 
@@ -153,7 +160,7 @@ def test_crash_writes_per_run_log_file(monkeypatch, tmp_path):
 
     monkeypatch.setitem(TYPE_REGISTRY, "codergen", boom)
     g = parse(_pipeline("hello.dot"))
-    ctx = Context(goal="test", workdir=ROOT, backend="echo")
+    ctx = Context(goal="test", workdir=SCRATCH, backend="echo")
 
     history = run(g, ctx, max_steps=50)
 
@@ -175,7 +182,7 @@ def test_normal_run_still_writes_log_file(monkeypatch, tmp_path):
 
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
     g = parse(_pipeline("hello.dot"))
-    ctx = Context(goal="test", workdir=ROOT, backend="echo")
+    ctx = Context(goal="test", workdir=SCRATCH, backend="echo")
 
     history = run(g, ctx, max_steps=50)
 

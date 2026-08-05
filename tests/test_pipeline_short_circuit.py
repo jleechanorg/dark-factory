@@ -7,16 +7,23 @@ from __future__ import annotations
 import pathlib
 import stat
 import sys
+import tempfile
 
 ROOT = pathlib.Path(__file__).parent.parent
+
+# Scratch workdir in the OS tempdir — using the repo root here leaked one
+# branch_* mkdtemp per fan-out test into the working tree.
+SCRATCH = pathlib.Path(tempfile.mkdtemp(prefix="pipeline_short_circuit_"))
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from conftest import _pipeline  # noqa: E402
+from conftest import _pipeline, register_scratch_dir  # noqa: E402
 
 from runner.engine import run  # noqa: E402
 from runner.handlers import Context, Result, TYPE_REGISTRY  # noqa: E402
 from runner.parser import parse  # noqa: E402
+
+register_scratch_dir(SCRATCH)
 
 
 def test_pr_gates_runs_holdout_before_evidence_gates(monkeypatch):
@@ -28,7 +35,7 @@ def test_pr_gates_runs_holdout_before_evidence_gates(monkeypatch):
     g = parse(_pipeline("pr_gates.dot"))
     assert g.nodes["holdout"].attrs.get("type") == "holdout_eval"
 
-    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx = Context(goal="t", workdir=SCRATCH, backend="echo")
     ctx.state["gate_skeptic.outcome"] = "success"
     ctx.state["adversarial_reviewer.outcome"] = "success"
     ctx.state["gate_es.outcome"] = "success"
@@ -58,7 +65,7 @@ def test_pr_gates_holdout_failure_short_circuits(monkeypatch):
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
 
     g = parse(_pipeline("pr_gates.dot"))
-    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx = Context(goal="t", workdir=SCRATCH, backend="echo")
 
     history = run(g, ctx, max_steps=20)
     nodes = [r.node for r in history]
@@ -74,7 +81,7 @@ def test_gate_failure_short_circuits(monkeypatch):
         return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
     g = parse(_pipeline("gates.dot"))
-    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx = Context(goal="t", workdir=SCRATCH, backend="echo")
     ctx.state["gate_skeptic.outcome"] = "success"
     ctx.state["adversarial_reviewer.outcome"] = "success"
     ctx.state["gate_es.outcome"] = "success"
@@ -114,7 +121,7 @@ def test_gate_nonzero_returncode_cannot_spoof_pass(monkeypatch, tmp_path):
     monkeypatch.setenv("PATH", f"{bin_dir}:{pathlib.Path('/usr/bin')}")
 
     g = parse(_pipeline("gates.dot"))
-    ctx = Context(goal="t", workdir=ROOT, backend="claude")
+    ctx = Context(goal="t", workdir=SCRATCH, backend="claude")
     ctx.state["gate_skeptic.outcome"] = "success"
     ctx.state["adversarial_reviewer.outcome"] = "success"
 
