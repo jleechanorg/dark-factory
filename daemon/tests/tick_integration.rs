@@ -4112,7 +4112,16 @@ fn drive_existing_pr_failed_ci_parks_human_held() {
             unresolved_thread_count: Some(0),
             head_sha: "abc".into(),
             body: "".into(),
-            comments: vec![],
+            // bead jleechan-8mlh: wire /er PASS so EvidenceFloor is
+            // Green (otherwise it reads ErVerdict::Absent -> Unknown, a
+            // transient block that defers the reroll per auto-factory
+            // SKILL.md step 7). The test exercises the red-CI-park
+            // path, so the only non-green gate must be Red.
+            comments: vec![PrComment {
+                author: "dark-factory-bot".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: 0,
+            }],
             files: vec![],
             updated_at_epoch: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -7829,9 +7838,23 @@ fn cross_repo_bead_verification_loop_uses_its_own_repo_not_cfg_target_repo() {
     .expect("run_tick should succeed for a cross-repo bead");
 
     assert_eq!(summary.gates_assessed, 1);
-    assert_eq!(summary.beads_parked_human_held, 1);
+    // bead jleechan-8mlh: the CI=red + EvFloor=Unknown (no /er) combination
+    // used to park HUMAN_HELD; per the auto-factory SKILL.md step 7
+    // contract ("`unknown` defers to the next tick rather than racing to
+    // READY"), the daemon now stays ATTESTED and re-assesses on the next
+    // tick. The cross-repo verification loop is still expected to fire
+    // (gates_assessed == 1) — the snapshot fetches below prove the right
+    // repo is used.
+    assert_eq!(
+        summary.beads_parked_human_held, 0,
+        "red+transient-unknown must defer, not park HUMAN_HELD"
+    );
     let overlay = store.load(bead_id).unwrap().unwrap();
-    assert_eq!(overlay.state, OverlayState::HumanHeld);
+    assert_eq!(
+        overlay.state,
+        OverlayState::Attested,
+        "red+transient-unknown keeps the bead ATTESTED for re-assessment"
+    );
 
     // 1. EVERY snapshot fetch in the whole verification loop (the
     //    active-overlay wedge-detection fetch in `run_tick`, plus

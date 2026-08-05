@@ -8,6 +8,7 @@ use daemon::constraints;
 use daemon::errors::DaemonError;
 use daemon::reroll::{self, RerollDeps, RerollOutcome};
 use daemon::state::{BeadOverlay, OverlayState, StateStore};
+use daemon::tools::PrComment;
 use daemon::tick::{run_tick, TickDeps};
 use daemon::tools::{Issue, Llm, Permission, PrSnapshot};
 
@@ -534,7 +535,19 @@ fn test_tick_stage2_integration() {
             unresolved_thread_count: Some(0),
             head_sha: "head-sha-abc".into(),
             body: "".into(),
-            comments: vec![],
+            // bead jleechan-8mlh: wire an /er PASS comment so the
+            // EvidenceFloor gate is decisively Green (Pass on production
+            // evidence). Without this, the evidence-floor gate reads
+            // `ErVerdict::Absent` -> `Unknown`, which is now a transient
+            // block that defers the reroll (auto-factory SKILL.md step 7:
+            // "`unknown` defers to the next tick rather than racing to
+            // READY"). The test exercises the spec-creation path on a real
+            // red reroll, so the only non-green gates must be Red.
+            comments: vec![PrComment {
+                author: "dark-factory-bot".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: 0,
+            }],
             files: vec![],
             updated_at_epoch: 0,
             ci_status: "red".to_string(),

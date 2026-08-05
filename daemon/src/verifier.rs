@@ -1383,11 +1383,16 @@ pub enum ChainDisposition {
 }
 
 /// Aggregate a report into a [`ChainDisposition`]. Precedence:
-///   1. any coder-fixable RED gate → `Reroll` (a coder can act now);
-///   2. else any TRANSIENT unknown → `TransientOnly` (the picture is not yet
+///   1. any TRANSIENT unknown → `TransientOnly` (the picture is not yet
 ///      settled — e.g. CI still running, or a whole-snapshot SCM outage that
-///      turned every gate Unknown — so WAIT and re-assess rather than hold on
-///      an incomplete signal);
+///      turned every gate Unknown — so WAIT and re-assess rather than act on
+///      an incomplete signal). Bead jleechan-8mlh: a transient unknown
+///      outranks a coder-fixable red because the red may resolve into a
+///      green once the transient clears (e.g. an EvidenceFloor that ticks
+///      past once CI flips). Rerolling NOW parks the bead HUMAN_HELD at the
+///      circuit breaker (auto-factory SKILL.md step 7: "`unknown` defers to
+///      the next tick rather than racing to READY");
+///   2. else any coder-fixable RED gate → `Reroll` (a coder can act now);
 ///   3. else any STRUCTURAL-pending gate → `HoldDisposition` (the ONLY
 ///      remaining blockers are external verifiers the coder cannot drive);
 ///   4. else `TransientOnly` (all green — the caller handles that separately).
@@ -1395,7 +1400,8 @@ pub enum ChainDisposition {
 /// The transient-before-structural ordering is deliberate: a report must be
 /// classified `HoldDisposition` only when structural gates are the SOLE
 /// blockers, never when a transient unknown might still resolve into a
-/// coder-fixable red or a green.
+/// coder-fixable red or a green. Bead jleechan-8mlh extends this rule to
+/// the structural-vs-coder-fixable case as well.
 pub fn classify_chain(report: &GateReport) -> ChainDisposition {
     let mut has_coder_fixable = false;
     let mut has_structural = false;
@@ -1408,10 +1414,10 @@ pub fn classify_chain(report: &GateReport) -> ChainDisposition {
             None => {}
         }
     }
-    if has_coder_fixable {
-        ChainDisposition::Reroll
-    } else if has_transient {
+    if has_transient {
         ChainDisposition::TransientOnly
+    } else if has_coder_fixable {
+        ChainDisposition::Reroll
     } else if has_structural {
         ChainDisposition::HoldDisposition
     } else {
@@ -2782,6 +2788,53 @@ mod tests {
         let cfg = test_cfg();
         let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
         assert_eq!(classify_chain(&report), ChainDisposition::TransientOnly);
+    }
+
+    /// jleechan-8mlh: a coder-fixable RED gate PLUS a transient-UNKNOWN
+    /// gate (CI still pending) must defer to the next tick rather than
+    /// reroll immediately. Auto-factory SKILL.md step 7 contract:
+    /// "`unknown` defers to the next tick rather than racing to READY."
+    /// A transient unknown means the picture is not yet settled — the
+    /// CI verdict may resolve into a green that invalidates the red
+    /// (e.g. an evidence floor that ticks past once CI flips), so
+    /// rerolling NOW is premature and parks the bead HUMAN_HELD at the
+    /// circuit breaker (issue jleechan-8mlh: 11 of 40 premature parks
+    /// because CI was still pending at the gate-assessment moment).
+    #[test]
+    fn classify_chain_red_plus_ci_unknown_defers() {
+        // CI still pending (Unknown, transient) + EvidenceFloor Red
+        // (coder-fixable). Per the contract, transient defers — the
+        // chain MUST be TransientOnly, NOT Reroll.
+        let mut scm = FakeScm::default();
+        let mut snapshot = all_green_snapshot(7);
+        snapshot.ci_success = false;
+        snapshot.ci_status = "unknown".to_string();
+        scm.snapshots.insert(7, snapshot);
+        let cfg = test_cfg();
+        let evidence_red = PrEvidence {
+            is_production: true,
+            non_test_changed_loc: 10,
+            er_verdict: ErVerdict::Fail, // → EvidenceFloor Red
+            ..Default::default()
+        };
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence_red).unwrap();
+        // CI is Unknown (Transient), EvidenceFloor is Red (CoderFixable).
+        assert!(!report.all_green);
+        let ci = gate(&report, GateName::Ci);
+        let ev = gate(&report, GateName::EvidenceFloor);
+        assert!(
+            matches!(ci, GateResult::Unknown(_)),
+            "expected Ci Unknown, got {ci:?}"
+        );
+        assert!(
+            matches!(ev, GateResult::Red(_)),
+            "expected EvidenceFloor Red, got {ev:?}"
+        );
+        assert_eq!(
+            classify_chain(&report),
+            ChainDisposition::TransientOnly,
+            "red + transient-unknown must defer to next tick, not reroll"
+        );
     }
 
     // --- jleechan-yoqy / issue #323: canonical evidence contract tests ---
