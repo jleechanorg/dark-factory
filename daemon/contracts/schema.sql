@@ -124,6 +124,31 @@ CREATE TABLE IF NOT EXISTS bead_overlay (
   -- DBs get it via the idempotent `ensure_last_er_evidence_hash_column`
   -- migration in `SqliteStateStore::open`.
   last_er_evidence_hash TEXT,
+  -- Bead jleechan-6l1f: boolean flag the daemon stamps to the bead's latest
+  -- gate assessment result (`true` iff `report.all_green == true`). Used by
+  -- the regression-detection path in `tick::run_fast_tier` to recognise the
+  -- green->red transition (a previously-green PR whose CI/review went red
+  -- must NOT silently sit READY; live incident PR #540 dead-ended because
+  -- the daemon recorded all_green=true once but never re-detected when CI
+  -- later went red). Default 0 (= "never green") is the safe default: a
+  -- bead that has never been green cannot be a regression candidate.
+  -- Owned by `tick::run_fast_tier` via `last_all_green`/`set_last_all_green`
+  -- (NOT a BeadOverlay field, same decoupling as `last_er_evidence_hash`).
+  -- Older DBs get it via the idempotent `ensure_last_all_green_columns`
+  -- migration in `SqliteStateStore::open`.
+  last_all_green INTEGER NOT NULL DEFAULT 0,
+  -- Bead jleechan-6l1f: cumulative green->red transition count for the bead.
+  -- Used to enforce `tick::MAX_GATE_REGRESSIONS` (default 3) so a flapping
+  -- check cannot ping-pong a bead through the reroll lane forever; once
+  -- the cap is hit the daemon emits `GATE_REGRESSED_CAPPED` and parks
+  -- HUMAN_HELD with `park_reason='gate_regression_capped'` (a new distinct
+  -- reason, so the circuit-breaker-style retry suppression in
+  -- `recover_human_held` does not requeue the bead identically to a
+  -- transient red). Owned by the tick engine via `gate_regression_count`/
+  -- `incr_gate_regression_count` (NOT a BeadOverlay field). Older DBs get
+  -- it via the idempotent `ensure_last_all_green_columns` migration in
+  -- `SqliteStateStore::open`.
+  gate_regression_count INTEGER NOT NULL DEFAULT 0,
   -- Bead jleechan-g1ib / CLAIMED tag coordination: which machine holds the
   -- multi-machine claim for this bead, if any. NULL means "no claim" (free to
   -- dispatch). The tick dispatch loop skips rows where `claimed_by IS NOT NULL

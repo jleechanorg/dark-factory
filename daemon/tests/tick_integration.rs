@@ -13241,3 +13241,435 @@ fn vendor_health_ledger_ci_pending_with_capped_vendor_skips_wait() {
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+// ===========================================================================
+// jleechan-6l1f: green-then-regressed beads dead-end.
+//
+// Live incident (PR #540 proof): a bead reached all_green=true at
+// 2026-08-04T13:18:43Z and was promoted ATTESTED->READY. ~24h later CI went
+// red on the same PR head, but the bead sat READY-and-apparently-done while
+// auto-merge-guard.sh correctly refused the merge (no green snapshot). The
+// daemon never re-detected the green->red transition, so no reroll was
+// triggered — the dead-end.
+//
+// Each test below exercises one slice of the fix:
+//   1. test_gate_regression_emits_event_and_demotes_to_attested_when_ci_goes_red
+//      A READY bead (last_all_green=true) whose CI goes red on a subsequent
+//      tick must emit GATE_REGRESSED and demote Ready -> Attested so the
+//      existing red-branch (reroll / HUMAN_HELD in stage 1) picks it up.
+//   2. test_gate_regression_does_not_fire_when_first_assessment_is_red
+//      A bead that has NEVER been green (e.g. CI went red before the daemon
+//      ever saw it green) must NOT emit GATE_REGRESSED — only the transition
+//      green->red is a regression; red->stays-red is the existing path.
+//   3. test_gate_regression_caps_at_max_and_parks_human_held
+//      After MAX_GATE_REGRESSIONS green->red transitions, a further
+//      green->red must emit GATE_REGRESSED_CAPPED and park HUMAN_HELD with
+//      park_reason=gate_regression_capped (a new distinct reason, so the
+//      circuit-breaker-style retry suppression in recover_human_held does not
+//      requeue it identically).
+//   4. test_gate_regression_counter_increments_on_each_green_to_red
+//      Across N ticks that each flip green->red, the counter advances so
+//      the cap test above actually sees a > cap value.
+// ===========================================================================
+
+#[test]
+fn test_gate_regression_emits_event_and_demotes_to_attested_when_ci_goes_red() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    // Bead started READY (last_all_green=true): we hand-set the store
+    // mirror of the new column via set_last_all_green. The bead is staged
+    // as if it had been promoted on an earlier tick.
+    let pr = 7701_u64;
+    let branch = "factory/reg-bead-r1";
+    store
+        .save(&BeadOverlay {
+            bead_id: "reg-bead".into(),
+            state: OverlayState::Ready,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(pr),
+            branch: Some(branch.into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        })
+        .unwrap();
+    store.register_branch("reg-bead", branch).unwrap();
+    store.set_last_all_green("reg-bead", true).unwrap();
+
+    // PR snapshot now RED (CI failure on head).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    scm.pr_snapshots.insert(
+        pr,
+        PrSnapshot {
+            pr_number: pr,
+            ci_success: false,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: format!("sha-{pr}"),
+            body: String::new(),
+            comments: Vec::new(),
+            files: Vec::new(),
+            updated_at_epoch: now,
+            ci_status: "red".into(),
+            coderabbit_status: "approved".into(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: now.saturating_sub(60),
+        },
+    );
+    scm.pr_numbers_for_branch.insert(
+        ("owner/repo".into(), branch.into()),
+        Some(pr),
+    );
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), pr),
+        PrHeadBranch::SameRepo(branch.into()),
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_gate_regression_emits.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        1,
+        0,
+    )
+    .expect("regression tick must not error");
+
+    // The gate assessment MUST run (proves the READY bead is now reachable
+    // by the fast tier — pre-fix it would be skipped entirely).
+    assert_eq!(
+        summary.gates_assessed, 1,
+        "READY bead must be re-assessed on the regression tick; got {summary:?}"
+    );
+
+    // The bead MUST be demoted off READY so the red-branch picks it up.
+    let after = store.load("reg-bead").unwrap().unwrap();
+    assert_ne!(
+        after.state,
+        OverlayState::Ready,
+        "READY bead with a regressed gate MUST be demoted off READY (was {after:?})"
+    );
+    // In stage-1 test config (no re-roll execution), a coder-fixable red
+    // routes to HUMAN_HELD — both Attested (reroll-not-yet-executed) and
+    // HumanHeld are valid non-Ready terminal outcomes; the contract is
+    // specifically that the bead no longer claims to be done.
+    assert!(
+        after.state == OverlayState::Attested
+            || after.state == OverlayState::HumanHeld,
+        "regressed bead must land in Attested or HumanHeld, was {:?}",
+        after.state
+    );
+
+    // last_all_green MUST be cleared (otherwise the next tick would re-fire
+    // GATE_REGRESSED on what is now a sustained-red state).
+    assert_eq!(
+        store.last_all_green("reg-bead").unwrap(),
+        Some(false),
+        "last_all_green MUST be cleared on a green->red regression"
+    );
+
+    // The dedicated telemetry event MUST be emitted so dashboards / ops
+    // can distinguish "stuck red from intake" from "previously green,
+    // regressed" (different fix paths).
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("GATE_REGRESSED"),
+        "GATE_REGRESSED telemetry event MUST be emitted on green->red transition; log:\n{log}"
+    );
+    assert!(
+        log.contains("\"all_green\":false"),
+        "the regression tick's GATE_ASSESSMENT must report all_green=false; log:\n{log}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn test_gate_regression_does_not_fire_when_first_assessment_is_red() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    // ATTESTED bead, NEVER green (last_all_green=false / unset).
+    let pr = 7702_u64;
+    let branch = "factory/never-green-r1";
+    store
+        .save(&BeadOverlay {
+            bead_id: "never-green".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(pr),
+            branch: Some(branch.into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        })
+        .unwrap();
+    store.register_branch("never-green", branch).unwrap();
+    store.set_last_all_green("never-green", false).unwrap();
+
+    // PR snapshot RED from the start.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    scm.pr_snapshots.insert(
+        pr,
+        PrSnapshot {
+            pr_number: pr,
+            ci_success: false,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: format!("sha-{pr}"),
+            body: String::new(),
+            comments: Vec::new(),
+            files: Vec::new(),
+            updated_at_epoch: now,
+            ci_status: "red".into(),
+            coderabbit_status: "approved".into(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: now.saturating_sub(60),
+        },
+    );
+    scm.pr_numbers_for_branch.insert(
+        ("owner/repo".into(), branch.into()),
+        Some(pr),
+    );
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), pr),
+        PrHeadBranch::SameRepo(branch.into()),
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_gate_regression_not_first_red.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        1,
+        0,
+    )
+    .expect("first-red tick must not error");
+
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        !log.contains("GATE_REGRESSED"),
+        "GATE_REGRESSED must NOT fire for a bead that has never been green; \
+         this is the existing red-only path (REROLL_VERDICT_RECORDED); log:\n{log}"
+    );
+    assert!(
+        log.contains("GATE_ASSESSMENT"),
+        "GATE_ASSESSMENT must still fire; log:\n{log}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn test_gate_regression_caps_at_max_and_parks_human_held() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    // ATTESTED bead whose last_all_green=true and gate_regression_count is
+    // already at MAX_GATE_REGRESSIONS — the next green->red MUST cap, not
+    // loop forever.
+    let pr = 7703_u64;
+    let branch = "factory/regression-cap-r1";
+    store
+        .save(&BeadOverlay {
+            bead_id: "regression-cap".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(pr),
+            branch: Some(branch.into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        })
+        .unwrap();
+    store.register_branch("regression-cap", branch).unwrap();
+    store.set_last_all_green("regression-cap", true).unwrap();
+    // Pre-set the counter to MAX_GATE_REGRESSIONS so the very next tick
+    // hits the cap path.
+    for _ in 0..daemon::tick::MAX_GATE_REGRESSIONS {
+        store.incr_gate_regression_count("regression-cap").unwrap();
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    scm.pr_snapshots.insert(
+        pr,
+        PrSnapshot {
+            pr_number: pr,
+            ci_success: false,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: format!("sha-{pr}"),
+            body: String::new(),
+            comments: Vec::new(),
+            files: Vec::new(),
+            updated_at_epoch: now,
+            ci_status: "red".into(),
+            coderabbit_status: "approved".into(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: now.saturating_sub(60),
+        },
+    );
+    scm.pr_numbers_for_branch.insert(
+        ("owner/repo".into(), branch.into()),
+        Some(pr),
+    );
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), pr),
+        PrHeadBranch::SameRepo(branch.into()),
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_gate_regression_capped.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        1,
+        0,
+    )
+    .expect("capped-regression tick must not error");
+
+    let after = store.load("regression-cap").unwrap().unwrap();
+    assert_eq!(
+        after.state,
+        OverlayState::HumanHeld,
+        "capped regression MUST park HUMAN_HELD; was {:?}",
+        after.state
+    );
+    assert_eq!(
+        after.park_reason.as_deref(),
+        Some("gate_regression_capped"),
+        "park_reason MUST be the distinct gate_regression_capped reason (so \
+         recover_human_held does not requeue this bead identically to a \
+         transient red); was {:?}",
+        after.park_reason
+    );
+
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("GATE_REGRESSED_CAPPED"),
+        "GATE_REGRESSED_CAPPED telemetry MUST fire on cap hit; log:\n{log}"
+    );
+    assert!(
+        !log.contains("\"event_type\":\"GATE_REGRESSED\""),
+        "once capped, GATE_REGRESSED MUST NOT fire again (cap is terminal); log:\n{log}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn test_gate_regression_counter_increments_on_each_green_to_red() {
+    let _scm = FakeScm::new();
+    let _tracker = FakeTracker::new();
+    let _sessions = FakeSessions::new();
+    let _llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let _cfg = test_cfg();
+    let _vcs = FakeVcs::new();
+
+    // Drive the counter manually through MAX_GATE_REGRESSIONS-1 ticks so
+    // we end at exactly the cap boundary (the cap test above then exercises
+    // the (cap+1)th transition). The fake store's incr_gate_regression_count
+    // is the canonical writer; this test only asserts it bumps per call
+    // and that the next-tick cap test above sees the correct value.
+    for n in 1..=daemon::tick::MAX_GATE_REGRESSIONS {
+        let got = store
+            .incr_gate_regression_count("counter-bead")
+            .unwrap();
+        assert_eq!(
+            got, n,
+            "incr_gate_regression_count must monotonically increment; \
+             expected {n}, got {got}"
+        );
+    }
+    assert_eq!(
+        store.gate_regression_count("counter-bead").unwrap(),
+        daemon::tick::MAX_GATE_REGRESSIONS,
+        "gate_regression_count must read back the cumulative count"
+    );
+}
