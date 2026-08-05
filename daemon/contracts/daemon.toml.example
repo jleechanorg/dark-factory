@@ -52,7 +52,9 @@ pre_gate_validation_enabled = true
 # [repos."jleechanorg/worldarchitect.ai"]
 # ao_project = "worldarchitect"
 # push_remote = "worldai"   # dual-remote clone; bare `git push` is WRONG here
+# local_checkout = "/home/jleechan/projects/worldarchitect.ai"  # gate-8 vacuous-red-green detector (bead jleechan-sk55) joins PR changed-file paths against THIS tree, NOT the daemon cwd. Required for cross-repo beads; absent entry surfaces ManifestMissing -> Unknown rather than silently running on the wrong tree.
 #
 # [repos."jleechanorg/dark-factory"]
 # ao_project = "dark-factory"
 # push_remote = "origin"
+# local_checkout = "/home/jleechan/projects/dark-factory"  # gate-8 detector uses THIS tree for dark-factory PRs.

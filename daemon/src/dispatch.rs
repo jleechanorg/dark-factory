@@ -2045,6 +2045,7 @@ mod tests {
         cfg.repos.insert(
             "someorg/other-repo".to_string(),
             crate::config::RepoConfig {
+                local_checkout: None,
                 ao_project: "other-project".to_string(),
                 push_remote: "origin".to_string(),
             },
@@ -2117,6 +2118,7 @@ mod tests {
         cfg.repos.insert(
             "jleechanorg/some-repo".to_string(),
             crate::config::RepoConfig {
+                local_checkout: None,
                 ao_project: "some-project".to_string(),
                 push_remote: "origin".to_string(),
             },
@@ -2201,6 +2203,7 @@ mod tests {
         cfg.repos.insert(
             "someorg/other-repo".to_string(),
             crate::config::RepoConfig {
+                local_checkout: None,
                 ao_project: "other-project".to_string(),
                 push_remote: "origin".to_string(),
             },
@@ -2272,6 +2275,7 @@ mod tests {
         cfg.repos.insert(
             "jleechanorg/worldarchitect.ai".to_string(),
             crate::config::RepoConfig {
+                local_checkout: None,
                 ao_project: "worldarchitect".to_string(),
                 push_remote: "worldai".to_string(),
             },
@@ -3381,6 +3385,7 @@ mod tests {
         cfg.repos.insert(
             "jleechanorg/worldarchitect.ai".to_string(),
             crate::config::RepoConfig {
+                local_checkout: None,
                 ao_project: "worldarchitect".to_string(),
                 push_remote: "worldai".to_string(),
             },

@@ -1148,6 +1148,12 @@ fn execute_adopted(
                 .clone()
                 .unwrap_or_else(|| adopted_repo.clone()),
             push_remote: "origin".to_string(),
+            // Bead jleechan-sk55: gate-8 detector needs the routed repo's
+            // local checkout path. The fallback path here only fires
+            // when `resolve_repo` itself returned None (an unmapped
+            // repo that the caller is choosing to ignore for the
+            // reroll); there is no checkout to surface, so default None.
+            local_checkout: None,
         }
     });
     let spec = SpawnSpec {

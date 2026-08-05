@@ -9,6 +9,18 @@ use std::path::Path;
 pub struct RepoConfig {
     pub ao_project: String,
     pub push_remote: String,
+    /// Local checkout path of this repo on the daemon host. Used by the
+    /// gate-8 vacuous-red-green detector (bead jleechan-sk55) to resolve
+    /// PR changed-file paths against the CORRECT working tree when a
+    /// bead's routed `repo` differs from `cfg.target_repo` (the daemon's
+    /// own checkout). `None` means the routed repo has no local checkout
+    /// on this host — the detector MUST surface a structured
+    /// `ManifestMissing` rather than silently running against the daemon
+    /// cwd (issue #387 r6 follow-up; jleechan-sk55 finding). Optional for
+    /// backward compat with every pre-existing `daemon.toml`; absent
+    /// entries default to `None` via `#[serde(default)]`.
+    #[serde(default)]
+    pub local_checkout: Option<std::path::PathBuf>,
 }
 
 /// Resolved dispatch routing for a repo — the AO project to spawn into and
@@ -17,6 +29,10 @@ pub struct RepoConfig {
 pub struct RepoRouting {
     pub ao_project: String,
     pub push_remote: String,
+    /// Local checkout path of this repo on the daemon host (see
+    /// [`RepoConfig::local_checkout`]). `None` when no local checkout is
+    /// configured for the routed repo.
+    pub local_checkout: Option<std::path::PathBuf>,
 }
 
 #[derive(serde::Deserialize, Debug, Clone)]
@@ -147,6 +163,7 @@ impl Config {
             return Some(RepoRouting {
                 ao_project: rc.ao_project.clone(),
                 push_remote: rc.push_remote.clone(),
+                local_checkout: rc.local_checkout.clone(),
             });
         }
         if repo == self.target_repo {
@@ -175,9 +192,24 @@ impl Config {
             // the WRONG remote here the moment Stage C starts consuming it.
             // Add that `[repos.*]` entry to `config/daemon.toml` for any
             // dual-remote repo rather than relying on this fallback.
+            //
+            // jleechan-sk55 (issue #387 r6 follow-up): legacy single-repo
+            // configs where `repo == self.target_repo` historically had
+            // the daemon run cargo from its own cwd (the daemon's source
+            // tree). For the common case where the daemon is a checkout
+            // of the SAME repo it gates (i.e. dark-factory self-hosting),
+            // that cwd IS the local checkout of `target_repo`. We can't
+            // KNOW that without explicit config, so we conservatively
+            // populate `local_checkout: None` for the fallback path —
+            // operators MUST add an explicit `[repos."<repo>"]` entry with
+            // `local_checkout` set to the daemon's cwd path for the
+            // gate-8 detector to function. The detector surfaces a
+            // structured `ManifestMissing` (Unknown) rather than silently
+            // running on the wrong tree when no checkout is configured.
             return Some(RepoRouting {
                 ao_project,
                 push_remote: "origin".to_string(),
+                local_checkout: None,
             });
         }
         None
@@ -344,6 +376,7 @@ spec_dir = ".factory/specs/"
             Some(RepoRouting {
                 ao_project: "repo".to_string(),
                 push_remote: "origin".to_string(),
+                local_checkout: None,
             }),
             "the global target_repo must still resolve when [repos] is absent"
         );
@@ -386,6 +419,7 @@ push_remote = "origin"
             Some(RepoRouting {
                 ao_project: "worldarchitect".to_string(),
                 push_remote: "worldai".to_string(),
+                local_checkout: None,
             })
         );
         assert_eq!(
@@ -393,6 +427,7 @@ push_remote = "origin"
             Some(RepoRouting {
                 ao_project: "dark-factory".to_string(),
                 push_remote: "origin".to_string(),
+                local_checkout: None,
             })
         );
     }
@@ -460,7 +495,60 @@ spec_dir = ".factory/specs/"
             Some(RepoRouting {
                 ao_project: "worldarchitect".to_string(),
                 push_remote: "origin".to_string(),
+                local_checkout: None,
             })
         );
+    }
+
+    /// Bead jleechan-sk55: an explicit `[repos.*]` entry with
+    /// `local_checkout` set must surface that path through `resolve_repo`,
+    /// so the gate-8 detector can find the routed repo's working tree.
+    #[test]
+    fn resolve_repo_surfaces_local_checkout_for_explicit_repo_entry() {
+        let dir = std::env::temp_dir().join("afd_cfg_test_local_checkout");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("local_checkout.toml");
+        std::fs::write(
+            &p,
+            r#"
+target_repo = "jleechanorg/dark-factory"
+ao_project = "dark-factory"
+base_branch = "main"
+stage = 1
+max_workers = 30
+max_batch = 15
+fast_tick_secs = 10
+slow_tick_secs = 30
+autonomy_timebox_secs = 10800
+budget_warn_usd = 20.0
+spec_dir = ".factory/specs/"
+
+[repos."jleechanorg/worldarchitect.ai"]
+ao_project = "worldarchitect"
+push_remote = "worldai"
+local_checkout = "/home/jleechan/projects/worldarchitect.ai"
+"#,
+        )
+        .unwrap();
+        let cfg = load(&p).unwrap();
+        let resolved = cfg
+            .resolve_repo("jleechanorg/worldarchitect.ai")
+            .expect("explicit [repos.*] entry must resolve");
+        assert_eq!(resolved.ao_project, "worldarchitect");
+        assert_eq!(resolved.push_remote, "worldai");
+        assert_eq!(
+            resolved.local_checkout.as_deref(),
+            Some(std::path::Path::new("/home/jleechan/projects/worldarchitect.ai"))
+        );
+
+        // Legacy fallback path still has local_checkout = None: a missing
+        // `[repos.*]` entry for `cfg.target_repo` returns the single-repo
+        // routing but the operator has not told us where the local
+        // checkout lives, so the gate-8 detector MUST surface
+        // ManifestMissing (Unknown) rather than silently using cwd.
+        let fallback = cfg
+            .resolve_repo("jleechanorg/dark-factory")
+            .expect("target_repo must resolve via fallback");
+        assert_eq!(fallback.local_checkout, None);
     }
 }

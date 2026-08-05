@@ -3112,6 +3112,53 @@ fn skeptic_evidence(
 ///
 /// The detector's verdict is translated verbatim — the r5 contract says
 /// the gate consumer is the source of truth on what each verdict means for
+/// Bead jleechan-sk55 (issue #387 r6 follow-up): resolve the local
+/// working tree of the bead's ROUTED target repo from the daemon's
+/// `cfg`, NOT from `std::env::current_dir()`. The previous
+/// implementation read `current_dir()` which is the daemon's own
+/// source checkout (e.g. `~/projects/dark-factory`); on a cross-repo
+/// bead routed to e.g. `jleechanorg/worldarchitect.ai`, changed-file
+/// paths got joined against the wrong tree, the detector read test
+/// files from the wrong tree, and gate 8 surfaced
+/// `GreenFailed: git error: read test file ...: No such file or
+/// directory` -> translate_error -> `Unknown` for 84% of assessments.
+///
+/// Same class of bug as jleechan-v6ud (reroll PR-close repo routing)
+/// and jleechan-wuts (reroll git-ops routing) — use
+/// `overlay.repo(cfg)` semantics, not the daemon process's cwd.
+///
+/// Returns `Ok(path)` when the routed repo has a `local_checkout`
+/// configured, or `Err(VacuousRedGreenStatus::ManifestMissing)` with
+/// an actionable message naming the routed repo and the missing
+/// `[repos."<repo>"].local_checkout` config field. The detector MUST
+/// NOT silently fall back to `current_dir()` — that was the bug.
+fn resolve_routed_repo_root(
+    cfg: &crate::config::Config,
+    repo: &str,
+) -> Result<std::path::PathBuf, verifier::VacuousRedGreenStatus> {
+    match cfg.resolve_repo(repo) {
+        Some(routing) => match routing.local_checkout {
+            Some(p) => Ok(p),
+            None => Err(verifier::VacuousRedGreenStatus::ManifestMissing(format!(
+                "no local_checkout configured for routed repo {repo}; add \
+                 `[repos.\"{repo}\"]` with `local_checkout = \"<path>\"` to \
+                 daemon.toml so gate 8 can resolve changed-file paths against \
+                 the routed target repo (bead jleechan-sk55)"
+            ))),
+        },
+        None => {
+            // `resolve_repo` returns None only when `repo` is neither
+            // `cfg.target_repo` nor in `cfg.repos`. Callers in
+            // `run_fast_tier` already gate on `overlay.repo(cfg)` being
+            // set, so this branch is defensive — surface the same
+            // structured status rather than crashing.
+            Err(verifier::VacuousRedGreenStatus::ManifestMissing(format!(
+                "repo {repo} not registered in cfg.resolve_repo; cannot determine local checkout"
+            )))
+        }
+    }
+}
+
 /// merge eligibility (`Vacuous -> Red`, others -> Green/Unknown).
 fn vacuous_red_green_for_pr(
     deps: &TickDeps,
@@ -3134,20 +3181,30 @@ fn vacuous_red_green_for_pr(
         return verifier::VacuousRedGreenStatus::NotProvided;
     }
 
-    // The detector needs a local working tree to revert + cargo-run.
-    // The daemon's own CWD is a checkout of `cfg.target_repo` (the
-    // canonical dark-factory source tree) for the Stage-2 production
-    // lane; if the current CWD does not contain a Cargo.toml, the
-    // detector has no manifest to run against, and we surface that as
-    // ManifestMissing rather than silently treating NEVER_RAN as a
-    // vacuous pass (issue #387 r5 finding 3).
-    let repo_root = match std::env::current_dir() {
+    // Bead jleechan-sk55 (issue #387 r6 follow-up): the detector needs
+    // the LOCAL working tree of the bead's ROUTED target repo, NOT the
+    // daemon's cwd. The previous implementation read `current_dir()`
+    // which is the daemon's own source checkout (e.g.
+    // `~/projects/dark-factory`); on a cross-repo bead routed to e.g.
+    // `jleechanorg/worldarchitect.ai`, the changed-file paths got joined
+    // against the wrong tree and `cargo test` either failed to find the
+    // test files (`GreenFailed: git error: read test file ...: No such
+    // file or directory` -> translate_error -> `Unknown`) or, worse,
+    // spuriously "passed" by running tests against an unrelated tree.
+    // Same class of bug as jleechan-v6ud (reroll PR-close repo routing)
+    // and jleechan-wuts (reroll git-ops routing) — use `overlay.repo(cfg)`
+    // semantics, not the daemon process's cwd.
+    //
+    // Resolution order:
+    //   1. `cfg.resolve_repo(repo).local_checkout` — explicit per-repo
+    //      operator-configured path.
+    //   2. `None` (fallback) — surface structured `ManifestMissing` so
+    //      gate 8 reports Unknown instead of silently running cargo
+    //      against the daemon's source tree. Operators see the
+    //      actionable diagnostic in the GATE_ASSESSMENT event payload.
+    let repo_root: std::path::PathBuf = match resolve_routed_repo_root(deps.cfg, repo) {
         Ok(p) => p,
-        Err(_) => {
-            return verifier::VacuousRedGreenStatus::ManifestMissing(
-                "could not read daemon cwd".to_string(),
-            );
-        }
+        Err(status) => return status,
     };
     let manifest = match crate::vacuous_red_green::find_cargo_manifest(&repo_root) {
         Some(m) => m,
@@ -5669,5 +5726,286 @@ mod skeptic_prompt_vendor_waiver_tests {
             prompt.contains("pass|warn <note>|fail <reason>"),
             "verdict grammar must remain in the base prompt"
         );
+    }
+}
+
+// =========================================================
+// Bead jleechan-sk55 (issue #387 r6 follow-up): regression test
+// pinning the cross-repo path-resolution contract for gate 8.
+// =========================================================
+// =========================================================
+// Bead jleechan-sk55 (issue #387 r6 follow-up): regression test
+// pinning the cross-repo path-resolution contract for gate 8.
+// =========================================================
+#[cfg(test)]
+mod vacuous_red_green_cross_repo_routing_tests {
+    //! Bead jleechan-sk55: the pre-fix `vacuous_red_green_for_pr` bound
+    //! `repo_root` from `std::env::current_dir()`. The daemon's cwd is
+    //! its own source checkout (e.g. `~/projects/dark-factory`); on a
+    //! cross-repo bead routed to `jleechanorg/worldarchitect.ai`, the
+    //! detector joined the PR's changed-file paths against the wrong
+    //! tree, then surfaced `GreenFailed: git error: read test file
+    //! .../mvp_site/tests/...: No such file or directory` -> Unknown.
+    //! 84% of GATE_ASSESSMENT events for gate 8 were `unknown`.
+    //!
+    //! These tests pin the new contract through the pure helper
+    //! `resolve_routed_repo_root(cfg, repo) -> Result<PathBuf,
+    //! VacuousRedGreenStatus>`:
+    //!
+    //!   - When a routed repo has an explicit
+    //!     `[repos."<repo>"].local_checkout`, the helper MUST return
+    //!     that path verbatim — never `std::env::current_dir()`.
+    //!   - When no `local_checkout` is configured, the helper MUST
+    //!     surface a structured `ManifestMissing` whose message names
+    //!     the routed repo and points at the config field the
+    //!     operator needs to set.
+    //!
+    //! Extracting this into a pure helper (vs. asserting through the
+    //! full `vacuous_red_green_for_pr` flow) lets us pin the routing
+    //! contract without mocking the entire Scm/Vcs/StateStore surface
+    //! (the detector needs Scm/Vcs only AFTER path resolution
+    //! succeeds). The integration with `vacuous_red_green_for_pr` is
+    //! still covered by the existing cfg tests
+    //! (`resolve_repo_surfaces_local_checkout_for_explicit_repo_entry`)
+    //! and by the contract that the helper returns the routed path
+    //! verbatim (the integration is a one-line match).
+
+    use super::*;
+    use crate::config::Config;
+    use std::collections::HashMap;
+
+    /// Build a minimal `Config` for routing tests. Only the
+    /// routing-relevant fields are populated.
+    fn minimal_cfg(
+        target_repo: &str,
+        repos: HashMap<String, crate::config::RepoConfig>,
+    ) -> Config {
+        Config {
+            target_repo: target_repo.to_string(),
+            ao_project: None,
+            base_branch: "main".to_string(),
+            stage: 1,
+            max_workers: 30,
+            max_batch: 15,
+            fast_tick_secs: 60,
+            slow_tick_secs: 600,
+            autonomy_timebox_secs: 10_800,
+            budget_warn_usd: 20.0,
+            spec_dir: ".factory/specs/".to_string(),
+            reroll_head_stability_window_secs: 30,
+            reroll_death_confirm_secs: 5,
+            held_recheck_cooldown_secs: 900,
+            repos,
+            pre_gate_validation_enabled: false,
+            escalation_refire_secs: 3600,
+        }
+    }
+
+    /// The core regression test: an explicit `local_checkout` for the
+    /// routed repo MUST be returned verbatim by
+    /// `resolve_routed_repo_root`. This pins the post-fix contract that
+    /// path resolution routes through `[repos."<repo>"].local_checkout`,
+    /// NOT through `std::env::current_dir()`. If the function ever
+    /// silently falls back to cwd, this test fails.
+    #[test]
+    fn resolve_routed_repo_root_returns_explicit_local_checkout_path() {
+        let routed_checkout =
+            std::env::temp_dir().join("afd_sk55_explicit_local_checkout_path");
+        let _ = std::fs::remove_dir_all(&routed_checkout);
+        std::fs::create_dir_all(&routed_checkout).unwrap();
+
+        let mut repos = HashMap::new();
+        repos.insert(
+            "jleechanorg/worldarchitect.ai".to_string(),
+            crate::config::RepoConfig {
+                ao_project: "worldarchitect".to_string(),
+                push_remote: "worldai".to_string(),
+                local_checkout: Some(routed_checkout.clone()),
+            },
+        );
+        let cfg = minimal_cfg("jleechanorg/dark-factory", repos);
+
+        let resolved = resolve_routed_repo_root(&cfg, "jleechanorg/worldarchitect.ai")
+            .expect("explicit [repos.*] local_checkout must resolve");
+        assert_eq!(
+            resolved,
+            routed_checkout,
+            "resolve_routed_repo_root must return the routed repo's \
+             configured local_checkout verbatim — never the daemon cwd. \
+             This is the core jleechan-sk55 contract."
+        );
+    }
+
+    /// Cross-repo regression: a different repo's `local_checkout`
+    /// (i.e. the daemon's own repo) MUST NOT leak into the result.
+    /// If `repo` doesn't have its own entry, the helper fails closed
+    /// with `ManifestMissing` instead of returning the daemon's cwd
+    /// (which is the bug we just fixed).
+    #[test]
+    fn resolve_routed_repo_root_does_not_silently_use_cwd() {
+        let daemon_cwd_equivalent = std::env::temp_dir().join("afd_sk55_daemon_cwd_sim");
+        let _ = std::fs::remove_dir_all(&daemon_cwd_equivalent);
+        std::fs::create_dir_all(&daemon_cwd_equivalent).unwrap();
+
+        let mut repos = HashMap::new();
+        // Configure a local_checkout for the daemon's OWN repo
+        // (`cfg.target_repo`), but NOT for the routed bead repo. The
+        // helper must NOT return the daemon's local_checkout when
+        // asked about a routed repo — that was the pre-fix bug
+        // (silently using `current_dir()`).
+        repos.insert(
+            "jleechanorg/dark-factory".to_string(),
+            crate::config::RepoConfig {
+                ao_project: "dark-factory".to_string(),
+                push_remote: "origin".to_string(),
+                local_checkout: Some(daemon_cwd_equivalent.clone()),
+            },
+        );
+        let cfg = minimal_cfg("jleechanorg/dark-factory", repos);
+
+        let routed = "jleechanorg/worldarchitect.ai";
+        // Routed repo has NO [repos.*] entry → resolve_repo returns
+        // None → ManifestMissing naming the unmapped repo.
+        let status = resolve_routed_repo_root(&cfg, routed);
+        match status {
+            Err(verifier::VacuousRedGreenStatus::ManifestMissing(reason)) => {
+                assert!(
+                    reason.contains(routed),
+                    "ManifestMissing must name the routed repo so the \
+                     operator knows which entry to add. Got: {reason}"
+                );
+                assert!(
+                    reason.contains("not registered")
+                        || reason.contains("local_checkout"),
+                    "ManifestMissing must point at the missing config \
+                     (either the repo entry OR its local_checkout field). \
+                     Got: {reason}"
+                );
+                assert!(
+                    !reason.contains(&daemon_cwd_equivalent.display().to_string()),
+                    "ManifestMissing must NOT reference the daemon's \
+                     cwd-equivalent local_checkout (the pre-fix bug \
+                     surfaced the daemon's tree path as the routed \
+                     repo's path). Got: {reason}"
+                );
+            }
+            Ok(other) => panic!(
+                "expected Err(ManifestMissing) for unrouted repo, \
+                 got Ok({other:?})"
+            ),
+            Err(other) => panic!(
+                "expected Err(ManifestMissing) for unrouted repo, got \
+                 Err({other:?})"
+            ),
+        }
+    }
+
+    /// When the routed repo's `[repos.*]` entry exists but omits
+    /// `local_checkout` (operator has configured routing for AO
+    /// project + push remote but not the local checkout path), the
+    /// helper fails closed with `ManifestMissing` naming the routed
+    /// repo and pointing at the missing config field.
+    #[test]
+    fn resolve_routed_repo_root_fails_closed_when_repo_entry_lacks_local_checkout() {
+        let mut repos = HashMap::new();
+        repos.insert(
+            "jleechanorg/worldarchitect.ai".to_string(),
+            crate::config::RepoConfig {
+                ao_project: "worldarchitect".to_string(),
+                push_remote: "worldai".to_string(),
+                // local_checkout: None — operator has NOT configured
+                // a local checkout for the routed repo.
+                local_checkout: None,
+            },
+        );
+        let cfg = minimal_cfg("jleechanorg/dark-factory", repos);
+
+        let status =
+            resolve_routed_repo_root(&cfg, "jleechanorg/worldarchitect.ai");
+        match status {
+            Err(verifier::VacuousRedGreenStatus::ManifestMissing(reason)) => {
+                assert!(
+                    reason.contains("jleechanorg/worldarchitect.ai"),
+                    "ManifestMissing must name the routed repo. Got: {reason}"
+                );
+                assert!(
+                    reason.contains("local_checkout"),
+                    "ManifestMissing must point at the missing config \
+                     field. Got: {reason}"
+                );
+                assert!(
+                    reason.contains("add `[repos.\"jleechanorg/worldarchitect.ai\"]`"),
+                    "ManifestMissing must give the operator the exact \
+                     config snippet to add. Got: {reason}"
+                );
+            }
+            other => panic!(
+                "expected Err(ManifestMissing) when routed repo entry \
+                 lacks local_checkout, got {other:?}"
+            ),
+        }
+    }
+
+    /// Legacy single-repo target_repo: when `repo == cfg.target_repo`
+    /// AND no `[repos.*]` entry exists, the legacy fallback returns
+    /// `RepoRouting { local_checkout: None, .. }`. The helper MUST
+    /// still fail closed with `ManifestMissing` — no routed repo
+    /// gets a free pass via cwd.
+    #[test]
+    fn resolve_routed_repo_root_fails_closed_for_legacy_single_repo_target_repo() {
+        let cfg = minimal_cfg("jleechanorg/dark-factory", HashMap::new());
+
+        let status =
+            resolve_routed_repo_root(&cfg, "jleechanorg/dark-factory");
+        match status {
+            Err(verifier::VacuousRedGreenStatus::ManifestMissing(reason)) => {
+                assert!(
+                    reason.contains("jleechanorg/dark-factory"),
+                    "ManifestMissing must name the routed target repo. \
+                     Got: {reason}"
+                );
+                assert!(
+                    reason.contains("local_checkout"),
+                    "ManifestMissing must point at the missing config \
+                     field. Got: {reason}"
+                );
+            }
+            other => panic!(
+                "expected Err(ManifestMissing) for legacy single-repo \
+                 target_repo with no local_checkout configured, got \
+                 {other:?}"
+            ),
+        }
+    }
+
+    /// A repo that's neither `cfg.target_repo` nor in `cfg.repos`
+    /// (e.g. an unmapped bead that slipped past the
+    /// `unmapped_target_repo` park gate) surfaces a structured
+    /// `ManifestMissing` naming the routed repo. Defensive — the
+    /// caller (`run_fast_tier`) already gates on this, but the helper
+    /// must NOT crash.
+    #[test]
+    fn resolve_routed_repo_root_fails_closed_for_unmapped_repo() {
+        let cfg = minimal_cfg("jleechanorg/dark-factory", HashMap::new());
+
+        let status = resolve_routed_repo_root(&cfg, "someorg/unrelated-repo");
+        match status {
+            Err(verifier::VacuousRedGreenStatus::ManifestMissing(reason)) => {
+                assert!(
+                    reason.contains("someorg/unrelated-repo"),
+                    "ManifestMissing must name the unmapped repo. Got: {reason}"
+                );
+                assert!(
+                    reason.contains("not registered in cfg.resolve_repo"),
+                    "ManifestMissing must indicate the repo is not \
+                     registered, so operators see they need to add a \
+                     `[repos.*]` entry. Got: {reason}"
+                );
+            }
+            other => panic!(
+                "expected Err(ManifestMissing) for unmapped repo, got \
+                 {other:?}"
+            ),
+        }
     }
 }
