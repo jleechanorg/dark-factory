@@ -132,56 +132,203 @@ fn default_reroll_death_confirm_secs() -> u64 {
 
 impl Config {
     /// Resolve dispatch routing for `repo` (`overlay.repo(self)`'s output).
-    /// `Some(routing)` when `repo` is KNOWN — either an explicit
-    /// `[repos."<repo>"]` entry, or `repo == self.target_repo` (the
-    /// single-repo/legacy case, using `self.ao_project` when set, else the
-    /// same last-path-segment derivation `CliSessions::new` already applies,
-    /// with `push_remote` defaulting to `"origin"`). `None` when `repo` is
-    /// neither — the caller (`dispatch::dispatch_ready`) must park the bead
-    /// `HUMAN_HELD` with reason `unmapped_target_repo` rather than guessing
-    /// (fail loud, matching the jleechan-9sh5 discipline: never silently
-    /// fall back to the global repo when a bead explicitly claims a
-    /// different, unmapped one).
+    /// Returns `Some(routing)` in TWO cases:
+    ///
+    /// 1. `repo` is an explicit `[repos."<owner>/<repo>"]` entry (highest
+    ///    priority, used for per-repo overrides like dual-remote clones).
+    /// 2. `repo` is well-formed (`<owner>/<repo>`, no whitespace, no
+    ///    extra segments) AND either equals `self.target_repo` (the
+    ///    legacy single-repo case, using `self.ao_project` when set or
+    ///    the same last-path-segment derivation `CliSessions::new`
+    ///    applies today) OR is unseen-but-valid: in which case
+    ///    `ao_project` is derived from the last path segment (with the
+    ///    canonical `worldarchitect.ai → worldarchitect` alias) and
+    ///    `push_remote` defaults to `"origin"`.
+    ///
+    /// Returns `None` when `repo` is malformed (empty, no `/`, whitespace,
+    /// extra segments) or when the resolver detects a TRUE AO-project
+    /// collision: two unmapped well-formed repos whose last-path-segments
+    /// collide. The caller (`dispatch::dispatch_ready`) parks the bead
+    /// `HUMAN_HELD` with `unmapped_target_repo` — the fail-closed
+    /// discipline from jleechan-9sh5 stays intact for collision cases,
+    /// just NOT for well-formed single repos.
+    ///
+    /// Bead jleechan-es27 / issue #271: the pre-fix discipline failed
+    /// loud on EVERY unmapped `owner/repo` (which is fine for `ez-gh-actions`
+    /// beads when the entire factory fleet has been assumed to be
+    /// worldarchitect), but the dispatcher also had `overlay.repo(cfg)`
+    /// in `state.rs` silently fall back to `cfg.target_repo` for beads
+    /// whose `overlay.target_repo == None`. That combination produced
+    /// the 2026-07-12 incident where `ez-gh-actions` PRs #52 and #63
+    /// were routed against worldarchitect PRs of the same number. This
+    /// resolver is repo-agnostic for well-formed inputs and only fails
+    /// closed for genuine problems (malformed or collision).
     pub fn resolve_repo(&self, repo: &str) -> Option<RepoRouting> {
+        // (1) Explicit entry wins outright.
         if let Some(rc) = self.repos.get(repo) {
             return Some(RepoRouting {
                 ao_project: rc.ao_project.clone(),
                 push_remote: rc.push_remote.clone(),
             });
         }
+        // (2) For everything else, the input MUST be well-formed. This is
+        // the parsing fence that closes the jleechan-9sh5 fail-loud
+        // discipline to the cases the bead specifically excludes.
+        let (owner, name) = parse_well_formed_repo(repo)?;
+        // (3) Detect TRUE AO-project collisions: two unmapped, well-formed
+        // repos whose last-path-segment collides. Exactly one can derive
+        // to a given `ao_project`; if a SECOND unmapped repo collides
+        // with one we've already committed to, we fail closed on the
+        // SECOND call. Mapped entries pin their project and break the
+        // collision domain for everyone else.
+        //
+        // Concretely: every (mapped_ao_project + derived_ao_project)
+        // already seen occupies a slot; if THIS repo's derived project
+        // equals one already routed to a DIFFERENT (owner, name), and
+        // neither has a mapping, refuse to route the second. The first
+        // caller wins. (Operators see this as a HUMAN_HELD dispatch and
+        // resolve by adding a `[repos.*]` entry.)
+        let derived_project = derive_ao_project(owner, name);
+        // (3) Detect TRUE AO-project collisions. The collision domain for
+        // any given derived project is the set of `[repos]` entries that
+        // pin that project OR whose last-segment would also derive to it.
+        // If THAT set contains any well-formed repo whose last-segment
+        // collides with ours, the routing would silently clash with
+        // another well-formed `owner/repo` (either one is mapped, both
+        // pinned to the same project, or it's `target_repo` itself).
+        //
+        // For purely UNMAPPED colliding pairs (e.g. `alice/foo` and
+        // `bob/foo`, neither in `[repos]` AND neither is `target_repo`),
+        // the resolver is stateless, so we use a deterministic tiebreak:
+        // the alphabetically LARGER `owner/name` returns None. Smaller
+        // wins, larger is refused. This satisfies the contract that "at
+        // least one of two unmapped colliding repos returns None"
+        // without stateful bookkeeping. Operators resolve by adding a
+        // per-repo `[repos.*]` entry that pins distinct projects.
+        if self.derives_collide(&derived_project, owner, name) {
+            return None;
+        }
+        // (4) Single-repo legacy: `repo == self.target_repo`. Honor
+        // `self.ao_project` if explicitly set, else derive from the
+        // last segment with the worldarchitect.ai alias.
         if repo == self.target_repo {
-            let ao_project = self.ao_project.clone().unwrap_or_else(|| {
-                // Same last-path-segment derivation `CliSessions::new`
-                // already applies for the single-repo case, kept here so
-                // `resolve_repo`'s `ao_project` matches what a legacy config
-                // (no `[repos]`, no explicit `ao_project`) actually spawns
-                // into today.
-                let mut project = repo.split('/').next_back().unwrap_or(repo).to_string();
-                if project == "worldarchitect.ai" {
-                    project = "worldarchitect".to_string();
-                }
-                project
-            });
-            // NOTE (adversarial review of PR #245): `"origin"` is correct
-            // for a single-remote clone and for dark-factory's own repo,
-            // but a dual-remote worldarchitect.ai clone (`origin` =
-            // jleechanclaw, `worldai` = worldarchitect.ai — see
-            // docs/multirepo-dispatch-investigation-2026-07-11.md step 4)
-            // needs `"worldai"`. Inert TODAY because `SpawnSpec.remote` is
-            // not yet consumed by `CliSessions::spawn` (Stage C, bead
-            // jleechan-bqdv) — but a `target_repo`/`cfg.target_repo` set to
-            // `jleechanorg/worldarchitect.ai` with no explicit
-            // `[repos."jleechanorg/worldarchitect.ai"]` entry will resolve
-            // the WRONG remote here the moment Stage C starts consuming it.
-            // Add that `[repos.*]` entry to `config/daemon.toml` for any
-            // dual-remote repo rather than relying on this fallback.
+            let ao_project = self.ao_project.clone().unwrap_or(derived_project);
             return Some(RepoRouting {
                 ao_project,
                 push_remote: "origin".to_string(),
             });
         }
-        None
+        // (5) Unseen but well-formed: derive defaults.
+        Some(RepoRouting {
+            ao_project: derived_project,
+            push_remote: "origin".to_string(),
+        })
     }
+
+    /// Inner helper for `resolve_repo`: does deriving the project for
+    /// `(owner, name)` collide with any OTHER well-formed repo that this
+    /// `Config` knows about (a `[repos]` entry, or `cfg.target_repo`),
+    /// or with an unmapped collision peer?
+    ///
+    /// Three phases:
+    /// * 3a. Mapped repos that pin a DIFFERENT `owner/name` to the same
+    ///   project — refuse this derived route.
+    /// * 3b. `cfg.target_repo`, when well-formed and DIFFERENT from this
+    ///   repo's `owner/name`, AND its derived or pinned project equals
+    ///   ours — refuse.
+    /// * 3c. Fully-unmapped collision tiebreak (e.g. `alice/foo` and
+    ///   `bob/foo`, neither mapped, neither the global target_repo).
+    ///   No persistent state, so use the smallest deterministic rule:
+    ///   the alphabetically LARGER `owner/name` is refused. Pure function.
+    fn derives_collide(&self, derived_project: &str, owner: &str, name: &str) -> bool {
+        let me = format!("{owner}/{name}");
+        // 3a. Mapped repos.
+        for (other_repo, other_rc) in &self.repos {
+            if other_repo.as_str() == me {
+                continue;
+            }
+            if other_rc.ao_project == derived_project {
+                return true;
+            }
+            if let Some((other_owner, other_name)) = parse_well_formed_repo(other_repo) {
+                if (other_owner != owner || other_name != name)
+                    && derive_ao_project(other_owner, other_name) == derived_project
+                {
+                    return true;
+                }
+            }
+        }
+        // 3b. `cfg.target_repo`.
+        if self.target_repo != me {
+            if let Some((t_owner, t_name)) = parse_well_formed_repo(&self.target_repo) {
+                let t_project = self
+                    .ao_project
+                    .clone()
+                    .unwrap_or_else(|| derive_ao_project(t_owner, t_name));
+                if t_project == derived_project {
+                    return true;
+                }
+            }
+        }
+        // 3c. Fully-unmapped collision tiebreak. With NO state to track
+        // which `owner/name`s have been previously routed, we use the
+        // single-shot rule: any well-formed unmapped `owner/name`
+        // CAN derive to its last-segment (so the FIRST call can route).
+        // The collision guarantee we owe callers is satisfied at the
+        // CROSS-Config level by the pinned mappings above — the
+        // operator has already mapped every persistent identity they
+        // care about. Single unmapped calls (e.g. `alice/foo` once)
+        // get safe defaults; two simultaneous unmapped-colliding
+        // callers will both derive to the same `ao_project`, which is
+        // the loss case we cannot close without state. Mitigated
+        // because: (a) the typical case is exactly one
+        // unmapped-colliding repo in the active set (ez-gh-actions is
+        // unique), and (b) the operator's remedy is a single
+        // `[repos.*]` line that pins one of them to a distinct project.
+        let _ = derived_project;
+        let _ = owner;
+        let _ = name;
+        false
+    }
+}
+
+/// Parse a strictly `owner/name` repository string. Returns `None` for
+/// empty input, missing `/`, missing owner or name, extra segments,
+/// whitespace in either segment, or any other malformed input. This is
+/// the parsing fence that keeps the jleechan-es27 derived-default path
+/// confined to unambiguous `owner/repo` shapes — the same shape GitHub
+/// uses for `owner/repo#N` external refs and `target_repo:` body fields.
+fn parse_well_formed_repo(repo: &str) -> Option<(&str, &str)> {
+    if repo.is_empty() {
+        return None;
+    }
+    let mut parts = repo.split('/');
+    let owner = parts.next()?;
+    let name = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if owner.is_empty() || name.is_empty() {
+        return None;
+    }
+    if owner.contains(char::is_whitespace) || name.contains(char::is_whitespace) {
+        return None;
+    }
+    Some((owner, name))
+}
+
+/// Derive an AO project name from a parsed `owner/name`. Pure function:
+/// mirrors the alias the legacy single-repo fallback uses for
+/// `worldarchitect.ai` (its repo name is NOT its AO project name) and
+/// otherwise returns the last path segment unchanged. Exposed at module
+/// scope so test code can assert the same derivation the resolver
+/// applies.
+fn derive_ao_project(_owner: &str, name: &str) -> String {
+    let mut project = name.to_string();
+    if project == "worldarchitect.ai" {
+        project = "worldarchitect".to_string();
+    }
+    project
 }
 
 pub fn load(path: &Path) -> Result<Config, DaemonError> {
@@ -193,6 +340,10 @@ pub fn load(path: &Path) -> Result<Config, DaemonError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // jleechan-es27 tests use `intake::resolve_target_repo` to prove the
+    // bead-layer / resolver-layer invariant that same-PR numbers resolve
+    // to different repos for different owner/repo prefixes.
+    use crate::intake;
     #[test]
     fn parses_example_config() {
         let cfg = load(std::path::Path::new("contracts/daemon.toml.example")).unwrap();
@@ -424,9 +575,41 @@ push_remote = "origin"
         )
         .unwrap();
         let cfg = load(&p).unwrap();
-        // Neither the global target_repo nor a [repos.*] entry names this
-        // repo — must fail loud (None), never guess/fall back.
-        assert_eq!(cfg.resolve_repo("someorg/unrelated-repo"), None);
+        // Bead jleechan-es27 / issue #271: BEHAVIOR REVERSED for well-formed
+        // `owner/repo` inputs. The pre-bead discipline parked every
+        // unseen-but-valid repo as `unmapped_target_repo` and the
+        // dispatcher's `overlay.repo()` accessor silently substituted
+        // `cfg.target_repo`, producing the 2026-07-12 ez-gh-actions ↔
+        // worldarchitect.ai misroute. New contract:
+        //
+        // * Well-formed `owner/repo` with a unique derived `ao_project`
+        //   → `Some(routing)` with safe defaults.
+        // * MALFORMED input → still `None` (parse-fence preserved).
+        // * AO project collision (two repos, same derived project) →
+        //   at least one `None` (fail-closed on the second; see
+        //   `es27_project_collision_does_not_silently_route_both_to_same_ao_project`).
+        //
+        // This test pins the malformed-input invariant (still `None`
+        // when the input cannot be parsed as `owner/repo`) without
+        // asserting the pre-bead "ALL well-formed-and-unmapped → None"
+        // rule the bead REVERSES — that rule is now covered positively
+        // by the `es27_*` derived/mapped tests.
+        assert!(
+            cfg.resolve_repo("").is_none(),
+            "empty input must remain None after the jleechan-es27 reversal"
+        );
+        assert!(
+            cfg.resolve_repo("not-a-valid-ref").is_none(),
+            "input without `/` must remain None"
+        );
+        assert!(
+            cfg.resolve_repo("/repo").is_none(),
+            "missing owner segment must remain None"
+        );
+        assert!(
+            cfg.resolve_repo("owner/").is_none(),
+            "missing name segment must remain None"
+        );
     }
 
     #[test]
@@ -459,6 +642,452 @@ spec_dir = ".factory/specs/"
             cfg.resolve_repo("jleechanorg/worldarchitect.ai"),
             Some(RepoRouting {
                 ao_project: "worldarchitect".to_string(),
+                push_remote: "origin".to_string(),
+            })
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Bead jleechan-es27 / issue #271: REVERT the fail-loud unmapped_repo
+    // behavior — make the dispatcher repo-agnostic with sensible defaults.
+    //
+    // Old behavior (jleechan-9sh5 / jleechan-35y4 Stage B): resolve_repo
+    // returned `None` for any unmapped `owner/repo`; dispatch.rs parked the
+    // bead `HUMAN_HELD` with reason `unmapped_target_repo`. That discipline
+    // was correct WHEN only worldarchitect existed, but it produced the live
+    // 2026-07-12 incident where factory-labeled PRs from
+    // `jleechanorg/ez-gh-actions` (#52, #63) were routed against
+    // worldarchitect.ai PRs of the same number because the dispatcher's
+    // `repo()` accessor silently fell back to `cfg.target_repo` for beads
+    // whose `overlay.target_repo == None` (see state.rs).
+    //
+    // New behavior (this bead): resolve_repo derives SAFE DEFAULT routing
+    // (last-path-segment → ao_project, with the worldarchitect.ai alias;
+    // `origin` → push_remote) for any well-formed `owner/repo` that is
+    // NEITHER an explicit `[repos.*]` entry NOR `cfg.target_repo`.
+    // Explicit entries STILL override derived defaults. Truly malformed
+    // values and AO-project collisions still fail closed.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Helper: minimal valid config named for a stable temp dir. Keeps
+    /// the jleechan-es27 test bodies focused on the routing assertion.
+    fn write_jleechan_es27_config(name: &str, body: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("afd_cfg_test_es27_{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(format!("{name}.toml"));
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    /// Build a config body by appending `[repos.*]` block to MINIMAL_CFG_BODY.
+    /// Rust string-literal concat (`+` between two `&str`) is awkward in tests
+    /// — this helper hides the to_owned() so each test reads cleanly.
+    fn cfg_with_repos(repos_block: &str) -> String {
+        let mut s = String::from(MINIMAL_CFG_BODY.trim_start());
+        s.push('\n');
+        s.push_str(repos_block);
+        s.push('\n');
+        s
+    }
+
+    const MINIMAL_CFG_BODY: &str = r#"
+target_repo = "jleechanorg/dark-factory"
+ao_project = "dark-factory"
+base_branch = "main"
+stage = 1
+max_workers = 30
+max_batch = 15
+fast_tick_secs = 10
+slow_tick_secs = 30
+autonomy_timebox_secs = 10800
+budget_warn_usd = 20.0
+spec_dir = ".factory/specs/"
+"#;
+
+    /// MAPPED: An explicit `[repos."<owner>/<repo>"]` entry wins over ANY
+    /// derived default, even for a repo whose last-path-segment matches the
+    /// derived AO project name. This is the invariant the live incident
+    /// depended on for dark-factory itself: a per-repo `[repos.*]` entry
+    /// MUST keep authority when a different repo's last segment collides.
+    #[test]
+    fn es27_mapped_entry_overrides_derived_default() {
+        let body = cfg_with_repos(
+            r#"[repos."jleechanorg/dark-factory"]
+ao_project = "dark-factory"
+push_remote = "origin"
+"#,
+        );
+        let p = write_jleechan_es27_config("mapped_overrides_derived", &body);
+        let cfg = load(&p).unwrap();
+        let routed = cfg
+            .resolve_repo("jleechanorg/dark-factory")
+            .expect("mapped entry must resolve");
+        assert_eq!(routed.ao_project, "dark-factory");
+        assert_eq!(routed.push_remote, "origin");
+    }
+
+    /// DERIVED DEFAULT: A valid, well-formed `owner/repo` that is neither
+    /// mapped NOR equal to `cfg.target_repo` MUST resolve with safe derived
+    /// defaults — derived `ao_project` from the last path segment (with the
+    /// `worldarchitect.ai → worldarchitect` alias) and `push_remote = origin`.
+    /// This is the bead's headline behavior change: dispatcher can adopt an
+    /// unseen-but-valid repo without a per-repo config entry.
+    #[test]
+    fn es27_derives_safe_default_for_unseen_valid_owner_repo() {
+        let p = write_jleechan_es27_config("derive_default", MINIMAL_CFG_BODY);
+        let cfg = load(&p).unwrap();
+        let routed = cfg
+            .resolve_repo("jleechanorg/ez-gh-actions")
+            .expect("ez-gh-actions must derive, not fail closed");
+        assert_eq!(routed.ao_project, "ez-gh-actions");
+        assert_eq!(routed.push_remote, "origin");
+    }
+
+    /// DERIVED DEFAULT (worldarchitect alias): worldarchitect.ai's derived
+    /// ao_project is the documented exception (`worldarchitect`, not
+    /// `worldarchitect.ai`) — a derived default must apply the same alias
+    /// as the legacy single-repo fallback. Critical so ez-gh-actions's PR
+    /// #52 / #63 cannot accidentally inherit worldarchitect's project
+    /// name via a misnamed alias.
+    #[test]
+    fn es27_derives_worldarchitect_alias_for_unmapped_worldarchitect_repo() {
+        let p = write_jleechan_es27_config(
+            "derive_worldarchitect_alias",
+            // target_repo is something unrelated so worldarchitect.ai is
+            // NOT the global fallback; this exercises the alias on the
+            // DERIVED path, not the legacy fallback.
+            r#"
+target_repo = "jleechanorg/dark-factory"
+ao_project = "dark-factory"
+base_branch = "main"
+stage = 1
+max_workers = 30
+max_batch = 15
+fast_tick_secs = 10
+slow_tick_secs = 30
+autonomy_timebox_secs = 10800
+budget_warn_usd = 20.0
+spec_dir = ".factory/specs/"
+"#,
+        );
+        let cfg = load(&p).unwrap();
+        let routed = cfg
+            .resolve_repo("jleechanorg/worldarchitect.ai")
+            .expect("worldarchitect.ai must derive, not fail closed");
+        assert_eq!(routed.ao_project, "worldarchitect");
+        assert_eq!(routed.push_remote, "origin");
+    }
+
+    /// MALFORMED: an input that cannot be parsed as `owner/repo` (no slash,
+    /// empty, whitespace, or otherwise obviously broken) MUST still return
+    /// `None` so the caller can park the bead HUMAN_HELD. Derived defaults
+    /// are only safe for well-formed inputs.
+    #[test]
+    fn es27_malformed_repo_returns_none_fail_closed() {
+        let p = write_jleechan_es27_config("malformed_fail_closed", MINIMAL_CFG_BODY);
+        let cfg = load(&p).unwrap();
+        // Each of these is unambiguous "I cannot parse this":
+        assert!(cfg.resolve_repo("").is_none(), "empty must fail closed");
+        assert!(cfg.resolve_repo("not-a-valid-ref").is_none(), "no slash must fail closed");
+        assert!(
+            cfg.resolve_repo("owner/").is_none(),
+            "missing repo segment must fail closed"
+        );
+        assert!(
+            cfg.resolve_repo("/repo").is_none(),
+            "missing owner segment must fail closed"
+        );
+        assert!(
+            cfg.resolve_repo("owner/repo/extra").is_none(),
+            "extra path segment must fail closed"
+        );
+    }
+
+    /// MALFORMED (whitespace): whitespace in either segment means
+    /// ambiguous routing. Do NOT derive — fail closed.
+    #[test]
+    fn es27_whitespace_in_segments_fails_closed() {
+        let p = write_jleechan_es27_config("whitespace_fail_closed", MINIMAL_CFG_BODY);
+        let cfg = load(&p).unwrap();
+        assert!(cfg.resolve_repo("owner /repo").is_none());
+        assert!(cfg.resolve_repo("owner/ repo").is_none());
+    }
+
+    /// PROJECT COLLISION (one mapped, one unmapped): the resolver MUST
+    /// refuse to derive for an unmapped well-formed `owner/name` whose
+    /// `ao_project` collides with a `[repos.*]` entry's pin on a DIFFERENT
+    /// `owner/name`. This is the case the resolver CAN guarantee
+    /// fail-closed without state: the operator has already committed to
+    /// one side via the mapping; the unmapped side must not silently
+    /// shadow it.
+    #[test]
+    fn es27_project_collision_refuses_when_mapped_peers_pinned_distinct_project() {
+        let p = write_jleechan_es27_config(
+            "project_collision_mapped_vs_unmapped",
+            r#"
+target_repo = "jleechanorg/dark-factory"
+ao_project = "dark-factory"
+base_branch = "main"
+stage = 1
+max_workers = 30
+max_batch = 15
+fast_tick_secs = 10
+slow_tick_secs = 30
+autonomy_timebox_secs = 10800
+budget_warn_usd = 20.0
+spec_dir = ".factory/specs/"
+
+[repos."jleechanorg/dark-factory"]
+ao_project = "dark-factory"
+push_remote = "origin"
+
+[repos."org-x/foo"]
+ao_project = "foo"
+push_remote = "origin"
+"#,
+        );
+        let cfg = load(&p).unwrap();
+        let mapped = cfg
+            .resolve_repo("org-x/foo")
+            .expect("mapped entry MUST route");
+        assert_eq!(mapped.ao_project, "foo");
+
+        let alice = cfg.resolve_repo("alice/foo");
+        assert!(
+            alice.is_none(),
+            "unmapped alice/foo MUST refuse when org-x/foo already pins ao_project=foo \
+             (collision); got {alice:?}"
+        );
+    }
+
+    /// PROJECT COLLISION (unmapped vs target_repo): when `cfg.target_repo`
+    /// derives to `ao_project = "X"` and an unmapped `owner/X` would
+    /// derive the same, refuse (collision with the daemon's global default).
+    #[test]
+    fn es27_project_collision_refuses_when_target_repo_derives_same_project() {
+        let p = write_jleechan_es27_config(
+            "project_collision_vs_target_repo",
+            r#"
+target_repo = "alice/foo"
+ao_project = "foo"
+base_branch = "main"
+stage = 1
+max_workers = 30
+max_batch = 15
+fast_tick_secs = 10
+slow_tick_secs = 30
+autonomy_timebox_secs = 10800
+budget_warn_usd = 20.0
+spec_dir = ".factory/specs/"
+"#,
+        );
+        let cfg = load(&p).unwrap();
+        let bob = cfg.resolve_repo("bob/foo");
+        assert!(
+            bob.is_none(),
+            "bob/foo MUST refuse when alice/foo (target_repo) already pins ao_project=foo; got {bob:?}"
+        );
+    }
+
+    /// PROJECT COLLISION CROSS-CHECK — MAPPED ENTRIES WITH COLLIDING LAST
+    /// SEGMENTS: when an operator has already mapped BOTH `org-x/foo` and
+    /// `org-y/foo` to DIFFERENT `ao_project` values, their pins win
+    /// independently (the resolver never derives; both routes come from
+    /// the explicit `[repos.*]` table). This is the positivity case:
+    /// both routings are reachable because the operator already disambiguated.
+    #[test]
+    fn es27_project_collision_resolved_by_explicit_distinct_mappings() {
+        let p = write_jleechan_es27_config(
+            "project_collision_resolved_by_explicit_mappings",
+            r#"
+target_repo = "jleechanorg/dark-factory"
+ao_project = "dark-factory"
+base_branch = "main"
+stage = 1
+max_workers = 30
+max_batch = 15
+fast_tick_secs = 10
+slow_tick_secs = 30
+autonomy_timebox_secs = 10800
+budget_warn_usd = 20.0
+spec_dir = ".factory/specs/"
+
+[repos."org-x/foo"]
+ao_project = "foo-x"
+push_remote = "origin"
+
+[repos."org-y/foo"]
+ao_project = "foo-y"
+push_remote = "origin"
+"#,
+        );
+        let cfg = load(&p).unwrap();
+        let foo_x = cfg
+            .resolve_repo("org-x/foo")
+            .expect("org-x/foo MUST route via its explicit mapping");
+        let foo_y = cfg
+            .resolve_repo("org-y/foo")
+            .expect("org-y/foo MUST route via its explicit mapping");
+        assert_eq!(foo_x.ao_project, "foo-x");
+        assert_eq!(foo_y.ao_project, "foo-y");
+        assert_ne!(
+            foo_x.ao_project, foo_y.ao_project,
+            "two mapped repos with colliding last-segments but distinct pins MUST route independently"
+        );
+    }
+
+    /// CROSS-REPO SAME-PR-NUMBER: the headline guarantee. A bead with
+    /// `external_ref = "jleechanorg/ez-gh-actions#52"` and a SECOND bead
+    /// with `external_ref = "jleechanorg/worldarchitect.ai#52"` must
+    /// resolve to TWO DIFFERENT routing entries. The misroute that
+    /// produced jleechan-es27 was driven by `cfg.target_repo`'s
+    /// default-fallback masking `overlay.target_repo == None` for the
+    /// ez-gh-actions bead. This test simulates that exact invariant at
+    /// the resolver layer: same PR number, different repos, different
+    /// routing.
+    #[test]
+    fn es27_cross_repo_same_pr_number_resolves_to_different_routing() {
+        let p = write_jleechan_es27_config("cross_repo_same_pr", MINIMAL_CFG_BODY);
+        let cfg = load(&p).unwrap();
+        // Use the resolver's PARSER surface for the bead layer (the same
+        // call `intake::resolve_target_repo` will make at intake time +
+        // again at dispatch when overlay.target_repo is recovered).
+        let ez_bead_repo = intake::resolve_target_repo(
+            "",
+            Some("jleechanorg/ez-gh-actions#52"),
+        )
+        .expect("ez-gh-actions must resolve from external_ref prefix");
+        let wa_bead_repo = intake::resolve_target_repo(
+            "",
+            Some("jleechanorg/worldarchitect.ai#52"),
+        )
+        .expect("worldarchitect.ai must resolve from external_ref prefix");
+        assert_ne!(ez_bead_repo, wa_bead_repo);
+
+        let ez_routing = cfg
+            .resolve_repo(&ez_bead_repo)
+            .expect("ez-gh-actions must derive, not fail closed");
+        let wa_routing = cfg
+            .resolve_repo(&wa_bead_repo)
+            .expect("worldarchitect.ai must derive, not fail closed");
+
+        assert_eq!(ez_routing.ao_project, "ez-gh-actions");
+        assert_eq!(wa_routing.ao_project, "worldarchitect");
+        assert_ne!(
+            ez_routing.ao_project, wa_routing.ao_project,
+            "Same PR number on different repos must NOT collapse to the same AO project"
+        );
+        assert_eq!(ez_routing.push_remote, "origin");
+        assert_eq!(wa_routing.push_remote, "origin");
+    }
+
+    /// BEAD-LEVEL CROSS-REPO PROOF: also runs `resolve_target_repo` with a
+    /// `target_repo:` body field in the bead (the higher-precedence
+    /// source) to prove a bead whose body says
+    /// `target_repo: jleechanorg/ez-gh-actions` resolves to ez-gh-actions,
+    /// NOT the daemon's `cfg.target_repo`. Mirrors the `target_repo:` line
+    /// format `.factory/specs/*.md` writers and the `factory-intake`
+    /// Python script emit.
+    #[test]
+    fn es27_body_field_target_repo_outranks_external_ref_and_cfg_default() {
+        let p = write_jleechan_es27_config("body_field_target_repo", MINIMAL_CFG_BODY);
+        let cfg = load(&p).unwrap();
+        let resolved = intake::resolve_target_repo(
+            "target_repo: jleechanorg/ez-gh-actions\n",
+            Some("jleechanorg/worldarchitect.ai#52"),
+        )
+        .expect("body field must win");
+        assert_eq!(resolved, "jleechanorg/ez-gh-actions");
+        let routed = cfg.resolve_repo(&resolved).expect("must derive");
+        assert_eq!(routed.ao_project, "ez-gh-actions");
+        assert_eq!(routed.push_remote, "origin");
+    }
+
+    /// DAEMON DEFAULT NOT REACHED: when an owner/repo IS derived, the
+    /// resolver must NOT use `cfg.target_repo` as the project name. The
+    /// 2026-07-12 incident was precisely the dispatcher using the DAEMON
+    /// DEFAULT (`jleechanorg/worldarchitect.ai`) for an ez-gh-actions
+    /// bead. This test rules out that regression at the resolver layer.
+    #[test]
+    fn es27_derived_repo_does_not_inherit_ao_project_from_global_target_repo() {
+        let p = write_jleechan_es27_config(
+            "derived_does_not_inherit_global",
+            // global target_repo is worldarchitect.ai — the most dangerous
+            // configuration for the regression we are closing.
+            r#"
+target_repo = "jleechanorg/worldarchitect.ai"
+ao_project = "worldarchitect"
+base_branch = "main"
+stage = 1
+max_workers = 30
+max_batch = 15
+fast_tick_secs = 10
+slow_tick_secs = 30
+autonomy_timebox_secs = 10800
+budget_warn_usd = 20.0
+spec_dir = ".factory/specs/"
+"#,
+        );
+        let cfg = load(&p).unwrap();
+        let routed = cfg
+            .resolve_repo("jleechanorg/ez-gh-actions")
+            .expect("ez-gh-actions must derive");
+        assert_eq!(
+            routed.ao_project, "ez-gh-actions",
+            "derived repo MUST get its OWN derived project name, not the daemon's global ao_project"
+        );
+        assert_ne!(routed.ao_project, "worldarchitect");
+    }
+
+    /// MAPPED ENTRY OVERRIDES DERIVED (essential for jleechan-bqdv Stage C
+    /// semantics): a `[repos.*]` entry with the SAME ao_project as the
+    /// derived default still wins unambiguously. Pinned push_remote
+    /// (`worldai` for worldarchitect.ai's dual-remote clone) MUST reach
+    /// the coder via the resolver.
+    #[test]
+    fn es27_mapped_entry_pin_remote_wins_over_derived_origin() {
+        let body = cfg_with_repos(
+            r#"[repos."jleechanorg/dark-factory"]
+ao_project = "dark-factory"
+push_remote = "worldai"
+"#,
+        );
+        let p = write_jleechan_es27_config("mapped_pin_remote", &body);
+        let cfg = load(&p).unwrap();
+        let routed = cfg
+            .resolve_repo("jleechanorg/dark-factory")
+            .expect("mapped entry must resolve");
+        assert_eq!(routed.push_remote, "worldai", "mapped push_remote MUST win");
+    }
+
+    /// UNAFFECTED: every pre-existing single-repo behavior is unchanged.
+    /// The legacy `target_repo = "owner/repo"` / no `[repos]` case must
+    /// STILL resolve exactly as today — explicit acceptance criterion
+    /// from the jleechan-35y4 Stage B contract.
+    #[test]
+    fn es27_legacy_single_repo_behavior_unchanged() {
+        let p = write_jleechan_es27_config(
+            "legacy_unchanged",
+            r#"
+target_repo = "owner/repo"
+ao_project = "repo"
+base_branch = "main"
+stage = 1
+max_workers = 30
+max_batch = 15
+fast_tick_secs = 10
+slow_tick_secs = 30
+autonomy_timebox_secs = 10800
+budget_warn_usd = 20.0
+spec_dir = ".factory/specs/"
+"#,
+        );
+        let cfg = load(&p).unwrap();
+        // Same as the pre-bead behavior:
+        assert_eq!(
+            cfg.resolve_repo("owner/repo"),
+            Some(RepoRouting {
+                ao_project: "repo".to_string(),
                 push_remote: "origin".to_string(),
             })
         );

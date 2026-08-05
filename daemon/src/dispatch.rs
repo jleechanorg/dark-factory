@@ -1828,11 +1828,23 @@ mod tests {
     }
 
     /// jleechan-35y4 Stage B acceptance criterion: a bead whose resolved
-    /// `target_repo` (Stage A) names neither an explicit `[repos.*]` entry
-    /// nor the daemon's global `cfg.target_repo` must park HUMAN_HELD with
+    /// `target_repo` (Stage A) is MALFORMED must park HUMAN_HELD with
     /// reason `unmapped_target_repo` — fail loud, never guess/fall back to
-    /// the global repo (the jleechan-9sh5 discipline this spec explicitly
-    /// calls out). No branch registration, no spawn attempt.
+    /// the global repo.
+    ///
+    /// Bead jleechan-es27 / issue #271: the pre-bead criterion was that
+    /// ANY unmapped `owner/repo` (well-formed but unfamiliar) parks
+    /// HUMAN_HELD. That discipline produced the 2026-07-12 incident
+    /// where `jleechanorg/ez-gh-actions` beads fell through to
+    /// `cfg.target_repo` and routed against worldarchitect PRs of the
+    /// same number, because `overlay.repo()` in `state.rs` silently
+    /// defaulted to `cfg.target_repo` for beads with `overlay.target_repo
+    /// == None`. The fix made `Config::resolve_repo` repo-agnostic for
+    /// well-formed inputs — derive safe defaults — and the only
+    /// remaining fail-closed case is the malformed one this test still
+    /// covers. The well-formed-but-unmapped case is now covered by the
+    /// `target_repo_derives_routing_*` tests below + the
+    /// `es27_*` config tests in `config.rs`.
     #[test]
     fn dispatch_ready_parks_human_held_when_target_repo_is_unmapped() {
         let sessions = FakeSessions::new(0);
@@ -1852,10 +1864,12 @@ mod tests {
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
                 park_reason: None,
-                // Neither cfg().target_repo ("owner/repo") nor any
-                // [repos.*] entry (cfg() has an empty repos table) names
-                // this repo.
-                target_repo: Some("someorg/unrelated-repo".to_string()),
+                // MALFORMED — missing owner segment. The parser fence in
+                // `parse_well_formed_repo` returns None; resolve_repo
+                // returns None; dispatch.rs parks HUMAN_HELD with
+                // `unmapped_target_repo`. This is the ONLY remaining
+                // fail-closed case for the dispatcher after jleechan-es27.
+                target_repo: Some("/unrelated-repo".to_string()),
                 attempt_started_at: None,
             })
             .unwrap();
@@ -1864,12 +1878,12 @@ mod tests {
 
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
 
-        assert_eq!(report.success_count(), 0, "unmapped repo must never spawn");
+        assert_eq!(report.success_count(), 0, "malformed repo must never spawn");
         assert_eq!(report.failures.len(), 1);
         assert_eq!(report.failures[0].phase, "unmapped_target_repo");
         assert!(
-            report.failures[0].error.contains("someorg/unrelated-repo"),
-            "error should name the unmapped repo: {}",
+            report.failures[0].error.contains("/unrelated-repo"),
+            "error should name the malformed repo: {}",
             report.failures[0].error
         );
 
@@ -1891,6 +1905,68 @@ mod tests {
             .filter(|c| c.starts_with("spawn("))
             .count();
         assert_eq!(spawn_calls, 0, "Sessions::spawn must never be called");
+    }
+
+    /// jleechan-es27 / issue #271: a bead whose resolved `target_repo`
+    /// is a well-formed but UNMAPPED `owner/repo` (e.g.
+    /// `someorg/unrelated-repo` here) MUST proceed past the unmapped
+    /// check — `Config::resolve_repo` now derives safe defaults for any
+    /// well-formed repo that is neither mapped nor `cfg.target_repo`.
+    /// The bead-level invariant the 2026-07-12 incident violated was
+    /// that ez-gh-actions beads fell through to worldarchitect's
+    /// routing; this test pins the post-fix invariant that a well-formed
+    /// non-mapped repo derives its OWN `ao_project` and does NOT alias
+    /// the daemon's global default.
+    #[test]
+    fn dispatch_ready_derives_routing_for_well_formed_unmapped_repo() {
+        let sessions = FakeSessions::new(1);
+        let store = FakeStateStore::new();
+        // Pick a different well-formed repo that is neither `cfg().target_repo`
+        // ("owner/repo") nor in any `[repos.*]` entry (cfg().repos is empty).
+        // The bead derives `ao_project = "unrelated-repo"`, NOT
+        // `"owner/repo"` — that distinction is the bead's headline fix.
+        let derived_repo = "someorg/unrelated-repo";
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some(derived_repo.to_string()),
+                attempt_started_at: None,
+            })
+            .unwrap();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        // We don't assert success/failure counts here because the
+        // downstream FakeSessions may itself fail on the spawned
+        // session once the bead-derived routing resolves. The critical
+        // assertion is the NEGATIVE one: the dispatch must NOT park
+        // HUMAN_HELD with `unmapped_target_repo` for a well-formed
+        // bead. If the resolver reverted to the old fail-loud
+        // discipline, `report.failures[*].phase == "unmapped_target_repo"`
+        // and `park_reason == Some("unmapped_target_repo")` — neither is
+        // acceptable for a well-formed input.
+        let _ = dispatch_ready(&sessions, &store, &cfg, &ready);
+
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_ne!(
+            overlay.park_reason.as_deref(),
+            Some("unmapped_target_repo"),
+            "well-formed `someorg/unrelated-repo` MUST derive a routing, not park as unmapped_target_repo; \
+             this is the jleechan-es27 headline fix (ez-gh-actions beads were misrouted to \
+             worldarchitect.ai in the 2026-07-12 incident). Bead state: {overlay:?}"
+        );
     }
 
     /// jleechan-8jxr r2 acceptance criterion #1: a manually-created factory
