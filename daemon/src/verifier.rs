@@ -538,6 +538,12 @@ pub enum VacuousRedGreenStatus {
     /// `Unknown` so operators can fix the PATH/CARGO_HOME rather than
     /// chasing ghost git errors.
     CargoNotFound(String),
+    /// Bead jleechan-6xje: pytest backend parity. The runtime detector
+    /// could not locate a pytest binary on PATH or in a venv adjacent
+    /// to the supplied python. Mirrors `CargoNotFound` so the gate
+    /// can surface a structured "toolchain missing" signal rather
+    /// than collapsing into a misleading `GreenFailed`.
+    PytestNotFound(String),
 }
 
 /// Bead jleechan-yoqy / issue #323: fail-closed verification result for the
@@ -966,6 +972,15 @@ fn vacuous_red_green_gate(evidence: &PrEvidence) -> GateResult {
         )),
         VacuousRedGreenStatus::CargoNotFound(reason) => GateResult::Unknown(format!(
             "runtime red-green vacuous-test detector: cargo binary not found: {reason}"
+        )),
+        // Bead jleechan-6xje: pytest backend parity. The detector
+        // could not locate a pytest binary on the host. Same
+        // classification as `CargoNotFound` (the gate doesn't care
+        // which backend's toolchain is missing — both are
+        // Unknown, not Red, so the operator can fix the install
+        // rather than seeing a vacuous-pass churn).
+        VacuousRedGreenStatus::PytestNotFound(reason) => GateResult::Unknown(format!(
+            "runtime red-green vacuous-test detector: pytest binary not found: {reason}"
         )),
     }
 }
@@ -3107,6 +3122,29 @@ mod tests {
             VacuousRedGreenStatus::ManifestMissing("no Cargo.toml".to_string());
         let r = vacuous_red_green_gate(&ev);
         assert!(matches!(r, GateResult::Unknown(_)), "got {r:?}");
+    }
+
+    #[test]
+    fn vacuous_red_green_gate_unknown_when_pytest_not_found() {
+        // Bead jleechan-6xje: pytest backend parity. The detector
+        // could not locate a pytest binary on the host — the gate
+        // surface this as `Unknown` (not `Red` and not `Vacuous`),
+        // mirroring the cargo analogue. Operators see a clear
+        // "toolchain missing" signal rather than a misleading
+        // Vacuous pass.
+        let mut ev = all_green_evidence();
+        ev.vacuous_red_green =
+            VacuousRedGreenStatus::PytestNotFound("pytest was not on PATH".to_string());
+        let r = vacuous_red_green_gate(&ev);
+        match r {
+            GateResult::Unknown(msg) => {
+                assert!(
+                    msg.contains("pytest"),
+                    "Unknown reason must name pytest: {msg}"
+                );
+            }
+            other => panic!("expected GateResult::Unknown, got {other:?}"),
+        }
     }
 
     /// TDD guard for issue #387 r5 finding 1: the assess() function must

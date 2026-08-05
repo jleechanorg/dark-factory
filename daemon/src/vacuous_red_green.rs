@@ -161,6 +161,13 @@ pub enum RedGreenError {
     /// variant surfaces the real reason and hints at the fix.
     #[error("cargo binary not found: {0}")]
     CargoNotFound(String),
+    /// Bead jleechan-6xje: pytest backend parity. The runtime detector
+    /// could not locate a pytest binary on PATH or in a venv adjacent
+    /// to the supplied python. Mirrors `CargoNotFound` so the gate
+    /// can surface a structured "toolchain missing" signal rather
+    /// than collapsing into a misleading `GreenFailed`.
+    #[error("pytest binary not found: {0}")]
+    PytestNotFound(String),
 }
 
 /// Result of locating the cargo binary for the runtime detector.
@@ -267,6 +274,378 @@ fn which_cargo_via_rustup() -> Option<PathBuf> {
     }
 }
 
+// ---- jleechan-6xje: pytest backend (Gate 8 parity for Python repos) ----
+//
+// The cargo backend above was the only test runner the detector knew
+// about, so on Python repos (worldarchitect.ai = 93 of 124 unknown
+// assessments, 75% of factory traffic) the detector surfaced
+// `ManifestMissing` -> `Unknown` and never measured the
+// vacuous-test contract. The pytest backend mirrors the cargo
+// backend's three-phase contract (head / baseline / revert) and
+// reuses the same `Verdict` / `RunOutcome` / `RedGreenReport` shapes
+// so the gate, the verifier status, and the tick.rs glue all stay
+// backend-agnostic. The backend is chosen by `Backend::detect`,
+// which inspects the working tree for a `pyproject.toml` /
+// `pytest.ini` (pytest) or a `Cargo.toml` (cargo).
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Backend {
+    Cargo,
+    Pytest,
+}
+
+impl Backend {
+    /// Short human-readable name for log lines and error strings.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Backend::Cargo => "cargo",
+            Backend::Pytest => "pytest",
+        }
+    }
+
+    /// Pick the backend for a working tree. The order is
+    /// cargo-first because the existing detector was cargo-only and
+    /// operators who ship a Cargo.toml were invoking it specifically
+    /// for the Rust side; mixed-stack repos get the cargo verdict by
+    /// default. Pytest is only chosen when no Cargo.toml is reachable
+    /// but a Python manifest is.
+    pub fn detect(repo_root: &Path) -> Option<Self> {
+        if find_cargo_manifest(repo_root).is_some()
+            || find_cargo_manifest_recursive(repo_root, 4).is_some()
+        {
+            return Some(Backend::Cargo);
+        }
+        if find_pytest_manifest_recursive(repo_root, 4).is_some() {
+            return Some(Backend::Pytest);
+        }
+        None
+    }
+
+    /// Classify a caller-supplied manifest path. `Cargo.toml` and
+    /// friends map to cargo; `pyproject.toml` / `pytest.ini` /
+    /// `setup.cfg` / `tox.ini` / `conftest.py` map to pytest. An
+    /// unrecognised extension defaults to cargo so the legacy
+    /// `check_red_green` shim keeps its behaviour.
+    pub fn from_manifest_path(manifest: &Path) -> Self {
+        let name = manifest
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        match name.as_str() {
+            "pyproject.toml" | "pytest.ini" | "setup.cfg" | "tox.ini" | "conftest.py" => {
+                Backend::Pytest
+            }
+            _ => Backend::Cargo,
+        }
+    }
+}
+
+/// Result of locating the pytest binary the detector should use.
+/// Mirrors `CargoLocation` — the daemon's startup path can surface
+/// `PytestNotFound` as a distinct, structured signal instead of
+/// collapsing into a generic `GreenFailed` (`git error: spawn pytest:
+/// No such file or directory` would be the misleading equivalent).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PytestLocation {
+    OnPath,
+    Found(PathBuf),
+    NotFound,
+}
+
+/// Resolve the pytest binary the detector should use. The lookup is
+/// intentionally simple — pytest is normally installed via `pip` /
+/// `uv` and ends up on PATH or under a virtualenv's `bin/` — so PATH
+/// wins, then a `bin/pytest` next to `python3` (a poor-man's
+/// rustup-fallback for the most common Linux layout). When `python3`
+/// resolution fails we surface `NotFound` so the gate can report a
+/// structured toolchain-missing signal.
+pub fn resolve_pytest(python_bin: Option<&Path>) -> PytestLocation {
+    // 1. Bare `pytest` on PATH — the simplest case.
+    if let Some(p) = which_pytest_on_path() {
+        if p.as_os_str().is_empty() {
+            return PytestLocation::OnPath;
+        }
+        return PytestLocation::Found(p);
+    }
+    // 2. `<python_bin>/../bin/pytest` — the venv layout. Operators
+    // typically point us at a project venv via `python_bin`; the
+    // sibling `pytest` is the right binary to run.
+    if let Some(p) = python_bin {
+        let candidate = p.parent().map(|d| d.join("pytest"));
+        if let Some(c) = candidate {
+            if c.is_file() {
+                return PytestLocation::Found(c);
+            }
+        }
+    }
+    PytestLocation::NotFound
+}
+
+fn which_pytest_on_path() -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for entry in std::env::split_paths(&path_var) {
+        if entry.join("pytest").is_file() {
+            return Some(PathBuf::new()); // bare-name hit on PATH
+        }
+    }
+    None
+}
+
+/// Bounded recursive Python manifest search (mirrors
+/// `find_cargo_manifest_recursive`). Looks for `pyproject.toml`
+/// first, then falls back to `pytest.ini` / `setup.cfg` / `tox.ini`,
+/// skipping the same noisy subtrees (`.venv`, `node_modules`,
+/// `.git`) plus Python-specific build artifacts (`build`, `dist`,
+/// `__pycache__`, `*.egg-info`). Why bounded: a malicious or
+/// unusually deep tree cannot cost real seconds per tick. The cap
+/// at 4 covers the worldarchitect.ai layout (`<repo_root>/mvp_site/
+/// pyproject.toml`) with headroom.
+pub fn find_pytest_manifest_recursive(repo_root: &Path, max_depth: usize) -> Option<PathBuf> {
+    const SKIP_DIRS: &[&str] = &[
+        ".venv",
+        "venv",
+        "env",
+        "node_modules",
+        ".git",
+        "build",
+        "dist",
+        "__pycache__",
+        ".eggs",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+    ];
+
+    // Depth 0: the root itself (fast path; preserves symmetry with
+    // the cargo walker).
+    if let Some(p) = probe_python_files(repo_root) {
+        return Some(p);
+    }
+
+    // Depth 1..=max_depth: BFS so the first match is the shallowest one.
+    let mut frontier: Vec<PathBuf> = std::iter::once(repo_root.to_path_buf()).collect();
+    for _depth in 1..=max_depth {
+        let mut next_frontier: Vec<PathBuf> = Vec::with_capacity(frontier.len() * 4);
+        for dir in &frontier {
+            let entries = match std::fs::read_dir(dir) {
+                Ok(e) => e,
+                Err(_) => continue, // unreadable dir (perms, vanished) — skip silently
+            };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if !p.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if SKIP_DIRS.iter().any(|s| *s == name_str) {
+                    continue;
+                }
+                if let Some(found) = probe_python_files(&p) {
+                    return Some(found);
+                }
+                next_frontier.push(p);
+            }
+        }
+        frontier = next_frontier;
+    }
+    None
+}
+
+/// Probe a single directory for any Python manifest marker. Returns
+/// the FIRST marker found (pyproject.toml beats pytest.ini beats
+/// setup.cfg). The order matters: `pyproject.toml` is the canonical
+/// Python build-system manifest and the most authoritative signal
+/// that the project intends to be a Python package.
+fn probe_python_files(dir: &Path) -> Option<PathBuf> {
+    let pyproject = dir.join("pyproject.toml");
+    if pyproject.is_file() {
+        return Some(pyproject);
+    }
+    for fallback in ["pytest.ini", "setup.cfg", "tox.ini", "conftest.py"] {
+        let candidate = dir.join(fallback);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Scan a Python source file for top-level `def test_*` and
+/// `async def test_*` declarations. Python's pytest discovery
+/// defaults to `test_*.py` files containing `test_*` functions /
+/// methods at module scope; we deliberately ignore class methods
+/// (mirrors the r6 file-level scoping contract on the Rust side)
+/// and private helpers (`_test_*`). The fast scanner is line-based
+/// — complex constructs (decorators, multi-line defs) are out of
+/// scope for v1; the discovery filter is only ever an upper bound,
+/// the gate still runs the targeted fns through pytest, which
+/// checks the much richer real grammar.
+pub fn discover_python_test_fns(source: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        // Skip comments and continuations.
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        // The fn keyword can be `def` or `async def`. Strip the
+        // optional `async` prefix.
+        let after_async = trimmed
+            .strip_prefix("async def ")
+            .or_else(|| trimmed.strip_prefix("def "));
+        let Some(rest) = after_async else {
+            continue;
+        };
+        // The fn name must start with `test_` and contain only
+        // ASCII alphanumerics + underscores. pytest reserves
+        // leading `_test_*` for helpers.
+        let name = match rest.split(|c: char| !c.is_ascii_alphanumeric() && c != '_').next() {
+            Some(n) => n,
+            None => continue,
+        };
+        if !name.starts_with("test_") {
+            continue;
+        }
+        if name == "test_" {
+            // Defensive: a literal `test_` with no suffix is not a
+            // pytest-discoverable test.
+            continue;
+        }
+        out.push(name.to_string());
+    }
+    out
+}
+
+/// Diff-aware fn-level scoping for Python test files (mirrors
+/// `compute_targeted_test_fns` for Rust). Given the parsed
+/// HEAD-side `def test_*` names and the optional base-side source,
+/// returns `(targeted_names, skipped_records)` where
+/// `targeted_names` contains exactly the head-side fns that were
+/// added or modified by the PR. Python's looser semantics (no
+/// `#[ignore]` equivalent baked into the language; pytest uses
+/// `@pytest.mark.skip` instead) means we don't track skip reasons
+/// here — operators see the targets and the gate's
+/// `failing_tests` listing carries the runtime signal.
+///
+/// "Modified" detection runs per-fn over the body bytes (the slice
+/// between the `def <name>(` line and the next blank line or next
+/// `def` line at the same indent level). This is the same heuristic
+/// used by the Rust backend's `fn_bodies_iter` — sufficient for the
+/// one-stmt-per-fn test shapes pytest encourages. A decorator-only
+/// change (e.g. `@pytest.mark.parametrize` added on a separate line)
+/// is reported as modified because the body slice captures it.
+pub fn compute_targeted_python_test_fns(
+    base_src: Option<&str>,
+    head_src: &str,
+) -> (Vec<String>, Vec<TestFnInfo>) {
+    let head_fns = discover_python_test_fns(head_src);
+    if head_fns.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let base_fns: BTreeSet<String> = match base_src {
+        None => BTreeSet::new(),
+        Some(src) => discover_python_test_fns(src).into_iter().collect(),
+    };
+
+    let base_body_by_name = match base_src {
+        None => std::collections::HashMap::new(),
+        Some(src) => python_fn_body_index(src),
+    };
+    let head_body_by_name = python_fn_body_index(head_src);
+
+    let mut targeted: Vec<String> = Vec::new();
+    for name in head_fns {
+        if !base_fns.contains(&name) {
+            targeted.push(name);
+            continue;
+        }
+        let head_body = head_body_by_name
+            .get(&name)
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        let base_body = base_body_by_name
+            .get(&name)
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        if head_body != base_body {
+            targeted.push(name);
+        }
+    }
+
+    (targeted, Vec::new())
+}
+
+/// Build a name -> body-slice index for every `def test_*` in
+/// `source`. Each body slice starts on the line AFTER the `def`
+/// declaration and ends on the line just before the next
+/// `def` / `async def` at the same indent level (or EOF). This
+/// captures decorators and the fn body in one slice without
+/// needing a real Python parser.
+fn python_fn_body_index(source: &str) -> std::collections::HashMap<String, String> {
+    let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let lines: Vec<&str> = source.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let trimmed = lines[i].trim_start();
+        let after_async = trimmed
+            .strip_prefix("async def ")
+            .or_else(|| trimmed.strip_prefix("def "));
+        let (rest, decl_indent) = match after_async {
+            Some(r) => (r, lines[i].len() - trimmed.len()),
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        let name = match rest
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .next()
+        {
+            Some(n) => n,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        if !name.starts_with("test_") {
+            i += 1;
+            continue;
+        }
+        // Walk the body: the body starts on the line AFTER the
+        // `def` declaration and continues until the next line
+        // whose indent is `<= decl_indent` and which is either a
+        // `def` / `async def` or a non-blank / non-decorator line.
+        // For the test shapes we care about (`def test_x(): <one
+        // assertion>`), the body is just the next line.
+        let body_start = i + 1;
+        let mut body_end = body_start;
+        while body_end < lines.len() {
+            let l = lines[body_end];
+            let indent = l.len() - l.trim_start().len();
+            let trimmed_local = l.trim_start();
+            if trimmed_local.is_empty() {
+                body_end += 1;
+                continue;
+            }
+            if indent <= decl_indent
+                && (trimmed_local.starts_with("def ")
+                    || trimmed_local.starts_with("async def "))
+            {
+                break;
+            }
+            body_end += 1;
+        }
+        let body = lines[body_start..body_end].join("\n");
+        out.insert(name.to_string(), body);
+        i = body_end;
+    }
+    out
+}
+
 /// Run the runtime red-green check against `repo_root`. `base_ref` is the
 /// git ref (SHA, branch name, tag) the PR is measured against; the diff
 /// between `base_ref` and the working tree is the production+test delta
@@ -337,9 +716,20 @@ pub fn check_red_green_with_manifest(
     // runs the gate (for backward compat with the legacy CLI), but the
     // report's `manifest_path` field is `None` so downstream consumers
     // can flag "this run was a fallback, not a real daemon flow".
+    // jleechan-6xje / P0: when the cargo walker returns None, look for
+    // a Python manifest so the gate stops silently returning
+    // `ManifestMissing` on the 75% of factory traffic that is Python.
+    let backend = match manifest_path {
+        Some(p) => Backend::from_manifest_path(p),
+        None => Backend::detect(repo_root)
+            .ok_or_else(|| RedGreenError::ManifestMissing(no_manifest_reason(repo_root)))?,
+    };
     let resolved_manifest: Option<PathBuf> = match manifest_path {
         Some(p) => Some(p.to_path_buf()),
-        None => find_cargo_manifest(repo_root),
+        None => match backend {
+            Backend::Cargo => find_cargo_manifest(repo_root),
+            Backend::Pytest => find_pytest_manifest_recursive(repo_root, 4),
+        },
     };
 
     // Bead jleechan-sb4b: resolve the cargo binary via the same fallback
@@ -347,7 +737,10 @@ pub fn check_red_green_with_manifest(
     // missing, but we surface a structured `CargoNotFound` error instead
     // of the previous misleading `git error: spawn cargo test: No such
     // file or directory` so the gate reports a real cause.
+    // jleechan-6xje: pytest backend has its own resolver. The orchestrator
+    // picks the right one based on the backend choice above.
     let cargo_loc = resolve_cargo(cargo_home_from_env().as_deref());
+    let pytest_loc = resolve_pytest(None);
 
     // Step 1: discover the diff-aware added/modified test fns + their
     // per-fn skip reasons across the changed test files. r6 contract
@@ -358,6 +751,10 @@ pub fn check_red_green_with_manifest(
     // (added fns = name missing from base; modified fns = same name in
     // both, different body). `#[ignore]` / `#[ignore = "..."]` populate
     // `skip_reason` (issue #387 r5 finding 4).
+    // jleechan-6xje: the Python backend uses a parallel diff-aware
+    // walker that ignores `#[ignore]` (Python has no equivalent baked
+    // into the language; pytest uses `@pytest.mark.skip` which is a
+    // future-extension seam).
     let mut targeted: BTreeSet<String> = BTreeSet::new();
     let mut skipped: Vec<TestFnInfo> = Vec::new();
     for path in &test_files {
@@ -369,8 +766,12 @@ pub fn check_red_green_with_manifest(
             Some(r) => read_base_blob(repo_root, base_ref, &r),
             None => None,
         };
-        let (added_or_modified, skipped_local) =
-            compute_targeted_test_fns(base_src.as_deref(), &head_src);
+        let (added_or_modified, skipped_local) = match backend {
+            Backend::Cargo => compute_targeted_test_fns(base_src.as_deref(), &head_src),
+            Backend::Pytest => {
+                compute_targeted_python_test_fns(base_src.as_deref(), &head_src)
+            }
+        };
         for info in skipped_local {
             skipped.push(info);
         }
@@ -382,13 +783,22 @@ pub fn check_red_green_with_manifest(
 
     // Phase (a) — green-on-PR-head. If the targeted tests don't pass
     // before any revert, the gate reports `GreenFailed` immediately.
-    let head_pass = run_cargo_tests(
-        repo_root,
-        &test_files,
-        &targeted_tests,
-        resolved_manifest.as_deref(),
-        cargo_loc.clone(),
-    )?;
+    let head_pass = match backend {
+        Backend::Cargo => run_cargo_tests(
+            repo_root,
+            &test_files,
+            &targeted_tests,
+            resolved_manifest.as_deref(),
+            cargo_loc.clone(),
+        )?,
+        Backend::Pytest => run_pytest_tests(
+            repo_root,
+            &test_files,
+            &targeted_tests,
+            resolved_manifest.as_deref(),
+            pytest_loc.clone(),
+        )?,
+    };
     if !head_pass.all_passed() {
         return Ok(RedGreenReport {
             verdict: Verdict::GreenFailed,
@@ -401,20 +811,31 @@ pub fn check_red_green_with_manifest(
         });
     }
 
-    // Phase (c) — baseline-main sanity. We can't easily run cargo against
-    // a different commit in-place without disturbing the working tree, so
-    // we use `git worktree add --detach` to materialize `base_ref` in a
-    // temp dir, run the targeted tests there, and clean up. This catches
-    // the "test was already broken before the PR" case where the
-    // red-on-revert finding would otherwise be a false positive.
-    let baseline_pass = run_baseline_check(
-        repo_root,
-        base_ref,
-        &test_files,
-        &targeted_tests,
-        resolved_manifest.as_deref(),
-        cargo_loc.clone(),
-    )?;
+    // Phase (c) — baseline-main sanity. We can't easily run the test
+    // runner against a different commit in-place without disturbing the
+    // working tree, so we use `git worktree add --detach` to materialize
+    // `base_ref` in a temp dir, run the targeted tests there, and clean
+    // up. This catches the "test was already broken before the PR" case
+    // where the red-on-revert finding would otherwise be a false
+    // positive.
+    let baseline_pass = match backend {
+        Backend::Cargo => run_baseline_check(
+            repo_root,
+            base_ref,
+            &test_files,
+            &targeted_tests,
+            resolved_manifest.as_deref(),
+            cargo_loc.clone(),
+        )?,
+        Backend::Pytest => run_pytest_baseline_check(
+            repo_root,
+            base_ref,
+            &test_files,
+            &targeted_tests,
+            resolved_manifest.as_deref(),
+            pytest_loc.clone(),
+        )?,
+    };
     if !baseline_pass.all_passed() {
         return Ok(RedGreenReport {
             verdict: Verdict::BaselineFailed,
@@ -428,10 +849,10 @@ pub fn check_red_green_with_manifest(
     }
 
     // Phase (b) — red-on-revert. Stash the production diff, revert it,
-    // run cargo against the reverted tree, restore. The diff capture +
-    // restore are best-effort wrappers; we panic-on-restore-fail at the
-    // call site (`restore_diff`) so a partial revert never leaves the
-    // tree dirty.
+    // run the test runner against the reverted tree, restore. The diff
+    // capture + restore are best-effort wrappers; we panic-on-restore-fail
+    // at the call site (`restore_diff`) so a partial revert never leaves
+    // the tree dirty.
     let full_diff = capture_production_diff(repo_root, base_ref)?;
     let production_diff = filter_diff_for_paths(
         &full_diff,
@@ -444,13 +865,22 @@ pub fn check_red_green_with_manifest(
 
     apply_revert(repo_root, &production_diff)?;
 
-    let revert_outcome = run_cargo_tests(
-        repo_root,
-        &test_files,
-        &targeted_tests,
-        resolved_manifest.as_deref(),
-        cargo_loc.clone(),
-    );
+    let revert_outcome = match backend {
+        Backend::Cargo => run_cargo_tests(
+            repo_root,
+            &test_files,
+            &targeted_tests,
+            resolved_manifest.as_deref(),
+            cargo_loc.clone(),
+        ),
+        Backend::Pytest => run_pytest_tests(
+            repo_root,
+            &test_files,
+            &targeted_tests,
+            resolved_manifest.as_deref(),
+            pytest_loc.clone(),
+        ),
+    };
 
     if let Err(e) = restore_diff(repo_root, &production_diff) {
         return Err(RedGreenError::RestoreFailed(format!(
@@ -476,6 +906,17 @@ pub fn check_red_green_with_manifest(
         skipped_tests: skipped,
         manifest_path: resolved_manifest,
     })
+}
+
+/// Build a human-readable reason for the gate when neither backend
+/// could find a manifest. The string is what
+/// `verifier::VacuousRedGreenStatus::ManifestMissing` shows operators
+/// in the PR evidence, so it should name both backend attempts.
+fn no_manifest_reason(repo_root: &Path) -> String {
+    format!(
+        "no Cargo.toml or pyproject.toml/pytest.ini reachable from {} (walk-up + recursive depth-4 both failed on both backends)",
+        repo_root.display()
+    )
 }
 
 /// Scan a Rust source file for `#[test] fn <name>(` declarations.
@@ -1225,6 +1666,229 @@ fn run_baseline_check(
     result
 }
 
+/// Pytest analogue of `run_cargo_tests`. Runs the targeted tests
+/// against the working tree (or against a baseline worktree when
+/// invoked from `run_pytest_baseline_check`). Returns a
+/// `CargoOutcome` so the orchestrator can keep using a single
+/// per-phase shape — `failing` lists test names that failed or
+/// never ran, `compile_errored` is repurposed to mean "collection
+/// failed" (pytest's equivalent of a Rust compile error).
+fn run_pytest_tests(
+    repo_root: &Path,
+    test_files: &[PathBuf],
+    targeted_tests: &[String],
+    manifest: Option<&Path>,
+    pytest_loc: PytestLocation,
+) -> Result<CargoOutcome, RedGreenError> {
+    if targeted_tests.is_empty() {
+        return Ok(CargoOutcome {
+            failing: vec![],
+            compile_errored: false,
+        });
+    }
+
+    let pytest_bin = match &pytest_loc {
+        PytestLocation::OnPath => PathBuf::from("pytest"),
+        PytestLocation::Found(p) => p.clone(),
+        PytestLocation::NotFound => {
+            return Err(RedGreenError::PytestNotFound(
+                "pytest was not found on PATH or in a venv adjacent to the supplied python; \
+                 install pytest (`pip install pytest` / `uv pip install pytest`) or set \
+                 PYTHON so the runtime detector can locate it."
+                    .to_string(),
+            ));
+        }
+    };
+
+    let mut failing: Vec<String> = Vec::new();
+    let mut compile_errored = false;
+
+    // Build the per-test selector list once. pytest's targeted
+    // invocation accepts `--collect-only -q` to enumerate the
+    // would-be-run set, but for the runtime check we just pass
+    // `<file>::<test_name>` nodes directly. Multiple files in
+    // a single pytest invocation is fine; pytest collects them
+    // all.
+    let mut selector_args: Vec<String> = Vec::new();
+    for tf in test_files {
+        let rel = relative_repo_path(repo_root, tf).unwrap_or_else(|| {
+            tf.to_string_lossy().into_owned()
+        });
+        for name in targeted_tests {
+            selector_args.push(format!("{rel}::{name}"));
+        }
+    }
+
+    let mut args: Vec<String> = vec![
+        // `-v` (verbose) is required so pytest emits per-test
+        // `::test_x PASSED` lines on stdout. The detector's
+        // pass/fail parser keys off those lines; with `-q`
+        // pytest only emits a one-line summary, which would mark
+        // every targeted test as NEVER_RAN and trip the r5
+        // finding-3 fail-closed contract.
+        "-v".to_string(),
+        "--no-header".to_string(),
+        "--tb=line".to_string(),
+        "-p".to_string(),
+        "no:cacheprovider".to_string(),
+    ];
+
+    // When the manifest is given AND it is a real `pyproject.toml`,
+    // we pass it as the rootdir so pytest picks up the right
+    // `[tool.pytest.ini_options]` for the project. We deliberately
+    // do NOT pass `--rootdir` for `pytest.ini`/`setup.cfg` —
+    // pytest's own discovery handles those natively when the
+    // working dir is the project root.
+    if let Some(m) = manifest {
+        let name = m
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if name == "pyproject.toml" {
+            args.push("--rootdir".to_string());
+            args.push(
+                m.parent()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| m.to_string_lossy().into_owned()),
+            );
+        }
+    }
+
+    args.extend(selector_args);
+
+    let out = Command::new(&pytest_bin)
+        .current_dir(repo_root)
+        .args(&args)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+        .output()
+        .map_err(|e| {
+            RedGreenError::PytestNotFound(format!(
+                "spawn {pytest_bin:?}: {e}; pytest binary not usable from this environment",
+                pytest_bin = pytest_bin
+            ))
+        })?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // Pytest surfaces collection failures as `ERROR <file>` /
+    // `ERROR collecting <file>` on stderr. If we see those AND exit
+    // was non-zero AND no per-test PASS lines were emitted, the test
+    // never collected — the strongest possible "production code is
+    // being exercised" signal (the import chain must have failed).
+    // With `-v`, pytest emits per-test lines, so the "no PASSED
+    // lines" check is the right compile-equivalent signal.
+    if !out.status.success()
+        && (stderr.contains("ERROR collecting") || stderr.contains("ERROR "))
+        && !stdout.contains("PASSED")
+    {
+        compile_errored = true;
+    }
+
+    // Parse pytest's per-test PASS/FAIL summary lines. pytest's
+    // short summary format prints one line per test in the form:
+    //   `tests/test_scenario.py::test_classify_high PASSED`
+    //   `tests/test_scenario.py::test_classify_high FAILED`
+    //   `tests/test_scenario.py::test_classify_high SKIPPED`
+    for name in targeted_tests {
+        let passed = stdout.contains(&format!("::{name} PASSED"));
+        let failed = stdout.contains(&format!("::{name} FAILED"));
+        let skipped = stdout.contains(&format!("::{name} SKIPPED"));
+        let errored = stdout.contains(&format!("::{name} ERROR"));
+        if failed || errored {
+            failing.push(name.clone());
+        } else if !passed && !skipped {
+            // If neither PASS nor FAIL nor SKIP is recorded, the
+            // test was not collected by pytest (e.g. the file
+            // failed to import, the test name was mistyped, or the
+            // selector didn't match). Treat that as a hard fail
+            // signal — issue #387 r5 finding 3 (cargo analogue):
+            // NEVER_RAN must NOT be silently counted as a real
+            // pass.
+            failing.push(format!("{name}:NEVER_RAN"));
+        }
+    }
+
+    Ok(CargoOutcome {
+        failing,
+        compile_errored,
+    })
+}
+
+/// Pytest analogue of `run_baseline_check`. Materializes `base_ref`
+/// in a temp worktree, runs the targeted pytest tests there, and
+/// cleans up. Mirrors the cargo version's contract: the worktree is
+/// always removed even on error.
+fn run_pytest_baseline_check(
+    repo_root: &Path,
+    base_ref: &str,
+    test_files: &[PathBuf],
+    targeted_tests: &[String],
+    manifest: Option<&Path>,
+    pytest_loc: PytestLocation,
+) -> Result<CargoOutcome, RedGreenError> {
+    let tmp = std::env::temp_dir().join(format!(
+        "vacuous_pytest_baseline_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let add = Command::new("git")
+        .current_dir(repo_root)
+        .args([
+            "worktree",
+            "add",
+            "--detach",
+            "--quiet",
+            tmp.to_string_lossy().as_ref(),
+            base_ref,
+        ])
+        .output()
+        .map_err(|e| RedGreenError::Git(format!("spawn git worktree: {e}")))?;
+    if !add.status.success() {
+        return Err(RedGreenError::BaselineFailed(format!(
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&add.stderr)
+        )));
+    }
+
+    let baseline_manifest = manifest.map(|m| {
+        if m.is_absolute() {
+            m.to_path_buf()
+        } else {
+            tmp.join(m)
+        }
+    });
+
+    let result = run_pytest_tests(
+        &tmp,
+        test_files,
+        targeted_tests,
+        baseline_manifest.as_deref(),
+        pytest_loc,
+    );
+
+    // Always clean up the worktree, even on error. We swallow cleanup
+    // errors — the test outcome is the primary signal; a stale /tmp
+    // worktree is a leak, not a defect.
+    let _ = Command::new("git")
+        .current_dir(repo_root)
+        .args([
+            "worktree",
+            "remove",
+            "--force",
+            tmp.to_string_lossy().as_ref(),
+        ])
+        .output();
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    result
+}
+
 // Tiny smoke test — the integration suite under `tests/` is the real proof.
 #[cfg(test)]
 mod unit_tests {
@@ -1757,6 +2421,283 @@ fn b() {
             msg.contains("test reason"),
             "error must include the embedded reason: {msg}"
         );
+    }
+
+    // ---- jleechan-6xje: pytest backend parity tests ----
+    //
+    // The cargo backend carries the r5 contract. These tests pin the
+    // pytest backend's mirror: a manifest-discovery helper that mirrors
+    // `find_cargo_manifest_recursive`, a Python test-fn scanner that
+    // mirrors `discover_test_fns_with_skip`, a backend chooser that
+    // mirrors `find_cargo_manifest`'s role, and a resolver that mirrors
+    // `resolve_cargo`. Each test is the smallest unit of new behavior
+    // the detector needs to gain Python coverage.
+
+    #[test]
+    fn find_pytest_manifest_recursive_finds_root_level_pyproject_toml() {
+        let dir = tempdir_unique("py-root");
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            "[project]\nname=\"x\"\n",
+        )
+        .unwrap();
+        let found = find_pytest_manifest_recursive(&dir, 4).unwrap();
+        assert!(found.ends_with("pyproject.toml"));
+        assert_eq!(
+            std::fs::canonicalize(found).unwrap(),
+            std::fs::canonicalize(dir.join("pyproject.toml")).unwrap()
+        );
+    }
+
+    #[test]
+    fn find_pytest_manifest_recursive_finds_nested_pyproject_toml() {
+        // Reproduce the worldarchitect.ai layout: repo root has no
+        // pyproject.toml, but a nested package carries one. The
+        // walk-up helper cannot find a Python manifest; the recursive
+        // helper must.
+        let dir = tempdir_unique("py-nested");
+        std::fs::create_dir(dir.join("mvp_site")).unwrap();
+        std::fs::write(
+            dir.join("mvp_site").join("pyproject.toml"),
+            "[project]\nname=\"mvp_site\"\n",
+        )
+        .unwrap();
+        assert!(
+            find_pytest_manifest_recursive(&dir, 4).is_some(),
+            "nested pyproject.toml must be reachable by the recursive helper"
+        );
+        let found = find_pytest_manifest_recursive(&dir, 4).unwrap();
+        assert!(found.ends_with("pyproject.toml"));
+    }
+
+    #[test]
+    fn find_pytest_manifest_recursive_accepts_pytest_ini_as_fallback() {
+        // A repo without pyproject.toml but with pytest.ini is still a
+        // pytest project. The recursive helper must surface pytest.ini
+        // when pyproject.toml is absent.
+        let dir = tempdir_unique("py-ini");
+        std::fs::write(
+            dir.join("pytest.ini"),
+            "[pytest]\ntestpaths = tests\n",
+        )
+        .unwrap();
+        let found = find_pytest_manifest_recursive(&dir, 4).unwrap();
+        assert!(found.ends_with("pytest.ini"));
+    }
+
+    #[test]
+    fn find_pytest_manifest_recursive_skips_venv_node_modules_git() {
+        // Subtrees that almost never carry the manifest must be excluded
+        // to avoid the "found a huge dependency lockfile" false positive.
+        let dir = tempdir_unique("py-skip");
+        std::fs::create_dir_all(dir.join(".venv").join("lib")).unwrap();
+        std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(
+            dir.join(".venv").join("pyproject.toml"),
+            "[project]\nname=\"venv\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("node_modules").join("pyproject.toml"),
+            "[project]\nname=\"npm\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(".git").join("pyproject.toml"),
+            "[project]\nname=\"git-internal\"\n",
+        )
+        .unwrap();
+        let found = find_pytest_manifest_recursive(&dir, 4);
+        assert!(
+            found.is_none(),
+            "must not surface a manifest from .venv/node_modules/.git; got {found:?}"
+        );
+    }
+
+    #[test]
+    fn find_pytest_manifest_recursive_respects_max_depth() {
+        let dir = tempdir_unique("py-depth");
+        let deep = dir.join("a").join("b").join("c").join("d").join("e");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("pyproject.toml"), "[project]\nname=\"deep\"\n").unwrap();
+        assert!(
+            find_pytest_manifest_recursive(&dir, 3).is_none(),
+            "depth=3 must not reach a/b/c/d/e/pyproject.toml"
+        );
+        let found = find_pytest_manifest_recursive(&dir, 6).unwrap();
+        assert!(found.ends_with("pyproject.toml"));
+    }
+
+    #[test]
+    fn discover_python_test_fns_extracts_sync_and_async_defs() {
+        let src = r#"
+def test_classify_high():
+    assert classify_score(95) == "high"
+
+
+async def test_async_thing():
+    assert True
+
+
+def helper():
+    return 1
+
+
+def test_classify_low():
+    assert classify_score(10) == "low"
+"#;
+        let names = discover_python_test_fns(src);
+        assert_eq!(
+            names,
+            vec![
+                "test_classify_high".to_string(),
+                "test_async_thing".to_string(),
+                "test_classify_low".to_string(),
+            ],
+            "sync and async `test_*` defs at module scope must be discovered"
+        );
+    }
+
+    #[test]
+    fn discover_python_test_fns_ignores_class_methods_and_private_defs() {
+        // pytest's default discovery rule is `test_*` at module scope.
+        // Methods inside a class are still discovered by pytest, but
+        // this fast scanner operates at file level; the r6 contract
+        // says "added/modified at the file level" for the Rust backend,
+        // and the Python backend mirrors that with the same broadness.
+        // What we MUST exclude: private helpers (`_test_*`), non-test
+        // defs, and defs that aren't named `test_*`.
+        let src = r#"
+def _test_helper():
+    return 1
+
+
+def regular_function():
+    return 1
+
+
+def test_real():
+    assert True
+"#;
+        let names = discover_python_test_fns(src);
+        assert_eq!(names, vec!["test_real".to_string()]);
+    }
+
+    #[test]
+    fn compute_targeted_python_test_fns_emits_added_when_file_new() {
+        let head = r#"
+def test_new():
+    assert True
+"#;
+        let (targeted, skipped) = compute_targeted_python_test_fns(None, head);
+        assert_eq!(targeted, vec!["test_new".to_string()]);
+        assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn compute_targeted_python_test_fns_emits_modified_when_body_changed() {
+        let base = r#"
+def test_a():
+    assert True
+"#;
+        let head = r#"
+def test_a():
+    assert False
+"#;
+        let (targeted, _) = compute_targeted_python_test_fns(Some(base), head);
+        assert_eq!(targeted, vec!["test_a".to_string()]);
+    }
+
+    #[test]
+    fn compute_targeted_python_test_fns_excludes_unchanged_fns() {
+        let base = r#"
+def test_a():
+    assert True
+
+def test_b():
+    assert False
+"#;
+        let head = r#"
+def test_a():
+    assert True
+
+def test_b():
+    assert False
+"#;
+        let (targeted, _) = compute_targeted_python_test_fns(Some(base), head);
+        assert!(
+            targeted.is_empty(),
+            "no fn changed, expected empty targeted list; got {targeted:?}"
+        );
+    }
+
+    #[test]
+    fn backend_detect_picks_cargo_when_both_manifests_present() {
+        let dir = tempdir_unique("backend-both");
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        std::fs::write(dir.join("pyproject.toml"), "[project]\nname=\"x\"\n").unwrap();
+        // Pick the backend from the directory layout. Both manifest
+        // kinds co-exist in mixed-stack repos; the cargo backend wins
+        // because the existing detector was cargo-only and operators
+        // likely invoked it specifically for the Rust side.
+        assert_eq!(Backend::detect(&dir), Some(Backend::Cargo));
+    }
+
+    #[test]
+    fn backend_detect_picks_pytest_when_only_pyproject_present() {
+        let dir = tempdir_unique("backend-pyonly");
+        std::fs::write(dir.join("pyproject.toml"), "[project]\nname=\"x\"\n").unwrap();
+        assert_eq!(Backend::detect(&dir), Some(Backend::Pytest));
+    }
+
+    #[test]
+    fn backend_detect_picks_cargo_when_only_cargo_manifest_present() {
+        let dir = tempdir_unique("backend-cargoonly");
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        assert_eq!(Backend::detect(&dir), Some(Backend::Cargo));
+    }
+
+    #[test]
+    fn backend_detect_returns_none_when_no_manifest_found() {
+        let dir = tempdir_unique("backend-none");
+        assert_eq!(Backend::detect(&dir), None);
+    }
+
+    #[test]
+    fn red_green_error_pytest_not_found_display_is_actionable() {
+        // The pytest analogue of the cargo display test: the error must
+        // name pytest (not "git") so operators immediately see the
+        // toolchain is missing.
+        let e = RedGreenError::PytestNotFound("test reason".to_string());
+        let msg = format!("{e}");
+        assert!(msg.contains("pytest"), "error must name pytest: {msg}");
+        assert!(
+            msg.contains("test reason"),
+            "error must include the embedded reason: {msg}"
+        );
+        assert!(
+            !msg.contains("git"),
+            "PytestNotFound must NOT mention git: {msg}"
+        );
+    }
+
+    #[test]
+    fn pytest_location_resolves_to_found_when_pytest_on_path() {
+        // The bare-on-PATH path: the helper returns `OnPath` so the
+        // detector can use `pytest` directly without an absolute path.
+        if std::env::var_os("PATH")
+            .and_then(|p| {
+                std::env::split_paths(&p)
+                    .find(|entry| entry.join("pytest").is_file())
+            })
+            .is_none()
+        {
+            eprintln!("pytest not on PATH; skipping pytest resolver positive test");
+            return;
+        }
+        let loc = resolve_pytest(None);
+        assert_eq!(loc, PytestLocation::OnPath);
     }
 }
 

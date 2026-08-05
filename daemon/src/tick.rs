@@ -3256,6 +3256,12 @@ fn translate_error(e: crate::vacuous_red_green::RedGreenError) -> verifier::Vacu
         // the daemon's PATH lacked cargo. The new variant names the
         // real cause and hints at the fix.
         RedGreenError::CargoNotFound(s) => verifier::VacuousRedGreenStatus::CargoNotFound(s),
+        // Bead jleechan-6xje: pytest backend parity. The detector
+        // surface a structured "pytest not found" signal rather than
+        // collapsing into a misleading git error. The gate maps
+        // this to `Unknown` via the same `RunnerNotFound` arm the
+        // verifier adds below.
+        RedGreenError::PytestNotFound(s) => verifier::VacuousRedGreenStatus::PytestNotFound(s),
     }
 }
 
