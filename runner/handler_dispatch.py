@@ -48,7 +48,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
-from .handler_core import Result
+from .handler_core import Result, current_dispatch_meta
 
 if TYPE_CHECKING:
     from .parser import Node
@@ -195,9 +195,7 @@ def _launch_shadow_gate_review(
     if prompt_is_complete and backend != "codex":
         shadow.launch_error = "controller review requests require codex backend"
         return shadow
-    seq = int(getattr(ctx, "_df_current_seq", getattr(ctx, "last_completed_seq", 0)))
-    attempt = int(getattr(ctx, "_df_current_attempt", 1))
-    node_name = str(getattr(ctx, "_df_current_node", name))
+    seq, attempt, node_name = current_dispatch_meta(ctx, name)
     try:
         from . import engine_observability as _obs
 
@@ -364,9 +362,7 @@ def _finish_shadow_gate_review(
 
     output_path = ""
     output_sha = ""
-    seq = int(getattr(ctx, "_df_current_seq", getattr(ctx, "last_completed_seq", 0)))
-    attempt = int(getattr(ctx, "_df_current_attempt", 1))
-    node_name = str(getattr(ctx, "_df_current_node", name))
+    seq, attempt, node_name = current_dispatch_meta(ctx, name)
     try:
         from . import engine_observability as _obs
 
@@ -594,9 +590,7 @@ def _run_gate_once(
     try:
         from . import engine_observability as _obs
 
-        seq = int(getattr(ctx, "_df_current_seq", getattr(ctx, "last_completed_seq", 0)))
-        attempt = int(getattr(ctx, "_df_current_attempt", 1))
-        node_name = str(getattr(ctx, "_df_current_node", name))
+        seq, attempt, node_name = current_dispatch_meta(ctx, name)
         prompt_path, prompt_sha = _obs._write_input_sidecar(
             ctx,
             seq,

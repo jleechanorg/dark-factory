@@ -176,6 +176,17 @@ def _target_worktree(ctx: "Context") -> pathlib.Path:
         return pathlib.Path(".").resolve()
 
 
+def current_dispatch_meta(ctx: "Context", fallback_node: str = "") -> tuple[int, int, str]:
+    """Engine-set dispatch coordinates (seq, attempt, node_name) for sidecars.
+
+    engine_run sets `_df_current_*` on ctx before each node dispatch; handlers
+    invoked outside the engine fall back to the last completed seq / attempt 1.
+    """
+    seq = int(getattr(ctx, "_df_current_seq", getattr(ctx, "last_completed_seq", 0)))
+    attempt = int(getattr(ctx, "_df_current_attempt", 1))
+    node_name = str(getattr(ctx, "_df_current_node", fallback_node))
+    return seq, attempt, node_name
+
 
 def _start(node: Node, ctx: Context) -> Result:
     return Result(outcome="success", output=f"start: {ctx.goal!r}")
