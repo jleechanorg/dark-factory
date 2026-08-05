@@ -23,7 +23,7 @@
 mod common;
 
 use common::{FakeLlm, FakeScm, FakeSessions, FakeStateStore, FakeTracker, FakeVcs};
-use daemon::config::Config;
+use daemon::config::{Config, RepoConfig};
 
 use daemon::er_runner;
 use daemon::errors::DaemonError;
@@ -35,6 +35,22 @@ use daemon::tools::{
 use daemon::verifier::SkepticVerdict;
 
 fn test_cfg() -> Config {
+    let mut repos = std::collections::HashMap::new();
+    // Bead jleechan-sk55: gate-8 needs a `local_checkout` per routed repo
+    // so the vacuous-red-green detector can resolve changed-file paths
+    // against the correct working tree. Tests that override
+    // `cfg.target_repo` to a non-test repo (e.g. "myorg/myrepo") depend
+    // on this entry being present. The path is created by
+    // `ensure_test_repo_checkout` below so the detector can find a
+    // `Cargo.toml` and run.
+    repos.insert(
+        "myorg/myrepo".into(),
+        RepoConfig {
+            ao_project: "myorg-myrepo".into(),
+            push_remote: "origin".into(),
+            local_checkout: Some(std::path::PathBuf::from("/tmp/myorg-myrepo")),
+        },
+    );
     Config {
         target_repo: "owner/repo".into(),
         ao_project: None,
@@ -53,9 +69,34 @@ fn test_cfg() -> Config {
         reroll_head_stability_window_secs: 1,
         reroll_death_confirm_secs: 0,
         held_recheck_cooldown_secs: 900,
-        repos: std::collections::HashMap::new(),
+        repos,
         pre_gate_validation_enabled: false,
         escalation_refire_secs: 3600,
+    }
+}
+
+/// Bead jleechan-sk55: gate-8 (vacuous_red_green) needs a real working
+/// tree at the routed repo's `local_checkout` path. This helper creates
+/// a minimal Cargo.toml under `/tmp/myorg-myrepo` so the detector can
+/// resolve a manifest and run. Tests that override `cfg.target_repo` to
+/// `myorg/myrepo` must call this before `run_tick` if they want gate 8
+/// to evaluate to anything other than `ManifestMissing`.
+fn ensure_test_repo_checkout() {
+    let path = std::path::PathBuf::from("/tmp/myorg-myrepo");
+    let _ = std::fs::create_dir_all(&path);
+    let manifest = path.join("Cargo.toml");
+    if !manifest.exists() {
+        std::fs::write(
+            &manifest,
+            "[package]\nname = \"myrepo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+             [lib]\npath = \"lib.rs\"\n",
+        )
+        .expect("write Cargo.toml");
+    }
+    let lib = path.join("lib.rs");
+    if !lib.exists() {
+        std::fs::write(&lib, "pub fn ping() -> u32 { 42 }\n")
+            .expect("write lib.rs");
     }
 }
 
@@ -6847,6 +6888,7 @@ fn write_fake_reviewer(dir: &std::path::Path, name: &str, reply: &str) {
 #[test]
 #[cfg(unix)]
 fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff() {
+    ensure_test_repo_checkout();
     let _lock = REAL_TARGET_REPO_TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -7033,6 +7075,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
 #[test]
 #[cfg(unix)]
 fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha() {
+    ensure_test_repo_checkout();
     let _lock = REAL_TARGET_REPO_TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -8396,6 +8439,7 @@ fn cross_model_reviewer_cursor_agent_falls_back_and_emits_review_degraded() {
 #[test]
 #[cfg(unix)]
 fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
+    ensure_test_repo_checkout();
     // The opposite half of the cross-model guarantee: when two vendors
     // from DISTINCT model families both contribute, review_degraded MUST
     // be false. We arrange for `codex` and `claude` to be the two
