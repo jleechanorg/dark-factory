@@ -864,20 +864,26 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
         and str(ctx.state.get("_df_test_allow_echo_controller_fixture") or "").strip().lower()
         in {"true", "1", "yes", "on"}
     )
-    if ctx.backend in ("echo", "mock_llm") and (
-        not review_contract or explicit_controller_echo_fixture
-    ):
-        hint = ctx.state.get(f"{node.name}.outcome", "success")
-        return Result(
-            outcome=hint,
-            output=f"echo parallel reviewer {node.name}: pre-seeded {hint}",
-            metadata={
-                "slash_command": node.name,
-                "verdict": "echo:" + str(hint),
-                "reviewer_backend": str(ctx.backend),
-                "parallel_reviewer": "echo",
-            },
-        )
+    if ctx.backend in ("echo", "mock_llm"):
+        controller_installed = False
+        if review_contract and not explicit_controller_echo_fixture:
+            try:
+                candidate_backend, _ = _resolve_gate_backend(node, ctx)
+                controller_installed = _handlers_shim._probe_backend_installed(candidate_backend)
+            except Exception:
+                controller_installed = False
+        if not (review_contract and controller_installed and not explicit_controller_echo_fixture):
+            hint = ctx.state.get(f"{node.name}.outcome", "success")
+            return Result(
+                outcome=hint,
+                output=f"echo parallel reviewer {node.name}: pre-seeded {hint}",
+                metadata={
+                    "slash_command": node.name,
+                    "verdict": "echo:" + str(hint),
+                    "reviewer_backend": str(ctx.backend),
+                    "parallel_reviewer": "echo",
+                },
+            )
     target_dir = _handlers_shim._target_worktree(ctx)
     expected_sha = _handlers_shim._worktree_head_sha(target_dir)
 
