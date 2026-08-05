@@ -406,3 +406,382 @@ fn cargo_not_found_error_message_is_not_misleading_git_error() {
          message this bead replaces (got: {msg:?})"
     );
 }
+
+// ---- bead jleechan-6xje: pytest backend for the red-green detector ----
+//
+// Issue #387 r5 only wired cargo; the gate is structurally inert on the
+// 93-of-124 worldarchitect.ai (Python) PRs the factory reviews. The fix
+// is a backend abstraction (`TestRunnerKind` + `check_red_green_with_kind`)
+// so the detector can dispatch to pytest when the repo has no Cargo.toml
+// but does have a Python test config. These tests pin the new contract.
+
+// Helper: build a tiny Python project that mirrors the cargo mini-project
+// shape. Returned `MiniPythonProject` exposes the project root + the
+// recorded base SHA the diff is measured against.
+struct MiniPythonProject {
+    root: PathBuf,
+    base_sha: String,
+}
+
+#[derive(Clone, Copy)]
+enum PyProjectKind {
+    /// Test asserts a real property of the production function. Reverting
+    /// the production function to a stub makes the test fail. The runtime
+    /// detector should report `verdict == Verdict::Genuine`.
+    GenuineRedGreen,
+    /// Test passes regardless of production correctness (always-green pin).
+    /// Reverting the production function does NOT make the test fail. The
+    /// runtime detector should report `verdict == Verdict::Vacuous`.
+    VacuousAlwaysGreen,
+}
+
+fn build_mini_python_project(kind: PyProjectKind) -> MiniPythonProject {
+    let tmp = std::env::temp_dir().join(format!(
+        "vacuous_py_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let root = tmp.clone();
+    std::fs::create_dir_all(&root).unwrap();
+
+    // pyproject.toml declares the Python project + the pytest config so
+    // pytest discovers tests via the standard `testpaths` convention.
+    std::fs::write(
+        root.join("pyproject.toml"),
+        "[project]\nname = \"mini_py\"\nversion = \"0.0.1\"\nrequires-python = \">=3.11\"\n\n\
+         [tool.pytest.ini_options]\ntestpaths = [\"tests\"]\npython_files = [\"test_*.py\"]\n\
+         python_functions = [\"test_*\"]\n",
+    )
+    .unwrap();
+
+    // "Base" tree contains an empty tests dir + a production lib that
+    // already has a baseline function. The PR's changes layer a NEW
+    // function + tests on top — this way the tests import BOTH the
+    // baseline `keep()` function (which exists on base and head) AND the
+    // new `classify_score()` function (which exists only on head).
+    // The baseline check then succeeds (tests run + pass on base because
+    // `keep()` exists) while the revert check fails (tests fail when
+    // `classify_score()` is reverted because they assert on its
+    // output).
+    std::fs::create_dir(root.join("src")).unwrap();
+    std::fs::write(root.join("src").join("__init__.py"), "").unwrap();
+    std::fs::write(root.join("src").join("lib.py"), BASE_PY_LIB).unwrap();
+
+    std::fs::create_dir(root.join("tests")).unwrap();
+    std::fs::write(root.join("tests").join("__init__.py"), "").unwrap();
+
+    run(Command::new("git").current_dir(&root).args(["init", "-q", "-b", "main"]));
+    run(Command::new("git")
+        .current_dir(&root)
+        .args(["config", "user.email", "jleechan2015@users.noreply.github.com"]));
+    run(Command::new("git")
+        .current_dir(&root)
+        .args(["config", "user.name", "test"]));
+    run(Command::new("git")
+        .current_dir(&root)
+        .args(["config", "commit.gpgsign", "false"]));
+    run(Command::new("git").current_dir(&root).args(["add", "-A"]));
+    run(Command::new("git").current_dir(&root).args(["commit", "-q", "-m", "base"]));
+    let base_sha = String::from_utf8(
+        run(Command::new("git").current_dir(&root).args(["rev-parse", "HEAD"])),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    // Layer the PR's changes on top of base. The test files live under
+    // `tests/test_scenario.py` and import from `src.lib` — that import is
+    // what makes them "genuine" (they reference the production symbol).
+    let lib_src = match kind {
+        PyProjectKind::GenuineRedGreen => GENUINE_PY_LIB,
+        PyProjectKind::VacuousAlwaysGreen => VACUOUS_PY_LIB,
+    };
+    let test_src = match kind {
+        PyProjectKind::GenuineRedGreen => GENUINE_PY_TEST,
+        PyProjectKind::VacuousAlwaysGreen => VACUOUS_PY_TEST,
+    };
+    std::fs::write(root.join("src").join("lib.py"), lib_src).unwrap();
+    std::fs::write(root.join("tests").join("test_scenario.py"), test_src).unwrap();
+
+    MiniPythonProject { root, base_sha }
+}
+
+fn commit_py_tree(proj: &MiniPythonProject, message: &str) {
+    run(Command::new("git")
+        .current_dir(&proj.root)
+        .args(["add", "-A"]));
+    run(Command::new("git")
+        .current_dir(&proj.root)
+        .args(["commit", "-q", "-m", message]));
+}
+
+fn classify_changed_py_files(proj: &MiniPythonProject) -> Vec<(PathBuf, FileClass)> {
+    let diff = String::from_utf8(
+        run(Command::new("git").current_dir(&proj.root).args([
+            "diff",
+            "--name-only",
+            &format!("{}...HEAD", proj.base_sha),
+        ])),
+    )
+    .unwrap();
+    diff.lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let p = proj.root.join(l);
+            // Python convention: anything under tests/ or starting with
+            // test_*.py is a test file. The detector's backend dispatch
+            // (added by jleechan-6xje) must classify these as `Test`
+            // regardless of the cargo-only heuristic in `tick.rs`.
+            let kind = if l.contains("/tests/") || l.starts_with("tests/") || l.starts_with("test_") {
+                FileClass::Test
+            } else {
+                FileClass::Production
+            };
+            (p, kind)
+        })
+        .collect()
+}
+
+const BASE_PY_LIB: &str = r#"
+def keep(x):
+    return x + 1
+"#;
+
+const GENUINE_PY_LIB: &str = r#"
+def keep(x):
+    return x + 1
+
+
+def classify_score(n: int) -> str:
+    if n >= 90:
+        return "high"
+    elif n >= 60:
+        return "medium"
+    else:
+        return "low"
+"#;
+
+const GENUINE_PY_TEST: &str = r#"
+from src.lib import classify_score, keep
+
+
+def test_classify_high():
+    assert classify_score(95) == "high"
+
+
+def test_classify_medium():
+    assert classify_score(70) == "medium"
+
+
+def test_classify_low():
+    assert classify_score(10) == "low"
+
+
+def test_keep_baseline():
+    # Touches the baseline function so the baseline-main sanity check
+    # passes on the pristine base_ref (the test is sound independently
+    # of the PR's `classify_score` addition).
+    assert keep(3) == 4
+"#;
+
+const VACUOUS_PY_LIB: &str = r#"
+def keep(x):
+    return x + 1
+"#;
+
+const VACUOUS_PY_TEST: &str = r#"
+# Vacuous Python test: this fixture does NOT import any production symbol
+# added by the PR. The assertions hold for arbitrary input — reverting
+# `classify_score` cannot break them because the tests never call it.
+# Mirrors the cargo vacuous fixture in #387 r5's contract. We DO import
+# the baseline `keep()` so the baseline-main sanity check still passes
+# (the tests are sound independently of the PR).
+from src.lib import keep
+
+
+def test_keep_baseline():
+    assert keep(3) == 4
+
+
+def test_vacuous_constant_truth():
+    assert 2 + 2 == 4
+
+
+def test_vacuous_string_literal():
+    s = "hello"
+    assert len(s) == 5
+
+
+def test_vacuous_range_check():
+    x = 50
+    assert 0 <= x <= 200
+"#;
+
+// ---- bead jleechan-6xje: pytest backend contract ----
+//
+// The runtime detector must accept a `TestRunnerKind` enum and dispatch
+// to the pytest runner when the repo is a Python project. The public
+// entry point is `check_red_green_with_kind(repo_root, base_ref, changed,
+// TestRunnerKind::Pytest)` — same `(PathBuf, FileClass)` shape as the
+// cargo entry point, same `RedGreenReport` return, but tests are run via
+// `pytest --collect-only -q` for discovery and `pytest -q --json-report`
+// for execution.
+//
+// These tests pin that contract end-to-end against a real pytest run.
+
+#[test]
+fn pytest_backend_flags_genuine_red_green_on_python_repo() {
+    // The detector must successfully run pytest against a Python mini-
+    // project that has only pyproject.toml (no Cargo.toml), and report
+    // Genuine when reverting the production function breaks the test.
+    // Pre-bead-jleechan-6xje this fails because the cargo-only
+    // `find_cargo_manifest` returns None and the gate surfaces
+    // `ManifestMissing -> Unknown` on every Python PR.
+    let proj = build_mini_python_project(PyProjectKind::GenuineRedGreen);
+    commit_py_tree(&proj, "feat: real test");
+    let changed = classify_changed_py_files(&proj);
+
+    let report = daemon::vacuous_red_green::check_red_green_with_kind(
+        &proj.root,
+        &proj.base_sha,
+        &changed,
+        daemon::vacuous_red_green::TestRunnerKind::Pytest,
+        None,
+    )
+    .expect("pytest backend report");
+
+    assert_eq!(
+        report.verdict,
+        Verdict::Genuine,
+        "expected genuine red-green verdict on Python repo; report={report:?}"
+    );
+    assert!(
+        !report.vacuous,
+        "vacuous bool must be false on Genuine; report={report:?}"
+    );
+    assert!(
+        report.failed_on_revert >= 1,
+        "at least one test must fail on the reverted tree; report={report:?}"
+    );
+    assert!(
+        !report.targeted_tests.is_empty(),
+        "targeted_tests must be populated by pytest discovery; report={report:?}"
+    );
+}
+
+#[test]
+fn pytest_backend_flags_vacuous_test_on_python_repo() {
+    let proj = build_mini_python_project(PyProjectKind::VacuousAlwaysGreen);
+    commit_py_tree(&proj, "feat: vacuous test");
+    let changed = classify_changed_py_files(&proj);
+
+    let report = daemon::vacuous_red_green::check_red_green_with_kind(
+        &proj.root,
+        &proj.base_sha,
+        &changed,
+        daemon::vacuous_red_green::TestRunnerKind::Pytest,
+        None,
+    )
+    .expect("pytest backend report");
+
+    assert_eq!(
+        report.verdict,
+        Verdict::Vacuous,
+        "expected vacuous verdict on Python repo with always-green pin; report={report:?}"
+    );
+    assert!(
+        report.vacuous,
+        "vacuous bool must be true; report={report:?}"
+    );
+    assert_eq!(
+        report.failed_on_revert, 0,
+        "vacuous Python fixture must have 0 failing tests after revert; report={report:?}"
+    );
+}
+
+#[test]
+fn detect_runner_kind_returns_pytest_for_python_repo() {
+    // `detect_runner_kind` is the dispatch helper the production tick
+    // path uses to choose between Cargo and Pytest based on which config
+    // file is reachable from the repo root.
+    let proj = build_mini_python_project(PyProjectKind::GenuineRedGreen);
+    commit_py_tree(&proj, "feat: real test");
+    let kind = daemon::vacuous_red_green::detect_runner_kind(&proj.root);
+    assert_eq!(
+        kind,
+        daemon::vacuous_red_green::TestRunnerKind::Pytest,
+        "a repo with pyproject.toml must be detected as Pytest"
+    );
+}
+
+#[test]
+fn detect_runner_kind_returns_cargo_for_rust_repo() {
+    // Rust mini-project (cargo) must still detect as Cargo — preserves
+    // the legacy behavior. Reuses `build_mini_project` from earlier in
+    // this file.
+    let proj = build_mini_project(ProjectKind::GenuineRedGreen);
+    let _ = commit_current_tree(&proj, "feat: real test");
+    let kind = daemon::vacuous_red_green::detect_runner_kind(&proj.root);
+    assert_eq!(
+        kind,
+        daemon::vacuous_red_green::TestRunnerKind::Cargo,
+        "a repo with Cargo.toml must be detected as Cargo"
+    );
+}
+
+#[test]
+fn detect_runner_kind_prefers_cargo_when_both_configs_present() {
+    // When a repo has BOTH Cargo.toml and pyproject.toml, prefer Cargo.
+    // The factory's primary target is the dark-factory Rust workspace,
+    // and a Python pyproject.toml there (e.g. vendored JS tool) should
+    // not silently flip the gate off cargo.
+    let dir = std::env::temp_dir().join(format!(
+        "vacuous_both_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[package]\nname=\"x\"\nversion=\"0.0.1\"\nedition=\"2021\"\n").unwrap();
+    std::fs::write(dir.join("pyproject.toml"), "[project]\nname=\"x\"\nversion=\"0.0.1\"\n").unwrap();
+    let kind = daemon::vacuous_red_green::detect_runner_kind(&dir);
+    assert_eq!(
+        kind,
+        daemon::vacuous_red_green::TestRunnerKind::Cargo,
+        "Cargo.toml + pyproject.toml: Cargo wins (factory primary)"
+    );
+}
+
+#[test]
+fn discover_pytest_test_fns_finds_test_functions() {
+    // Mirrors `discover_test_fns_with_skip` for Rust: a pure-function
+    // parser that returns the head-side `test_*` fns in a Python test
+    // file. The diff-aware scoping in `compute_targeted_test_fns` is
+    // runner-agnostic (it operates on whatever fn names the per-backend
+    // discovery returns), so the parser is the only per-backend piece.
+    let src = r#"
+def test_alpha():
+    assert True
+
+
+def test_beta():
+    assert 1 + 1 == 2
+
+
+def helper_not_a_test():
+    return 42
+"#;
+    let infos = daemon::vacuous_red_green::discover_pytest_test_fns(src);
+    let names: Vec<&str> = infos.iter().map(|i| i.name.as_str()).collect();
+    assert!(names.contains(&"test_alpha"), "must find test_alpha: {names:?}");
+    assert!(names.contains(&"test_beta"), "must find test_beta: {names:?}");
+    assert!(
+        !names.contains(&"helper_not_a_test"),
+        "must NOT include non-test fns: {names:?}"
+    );
+}

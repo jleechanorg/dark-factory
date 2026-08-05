@@ -3087,9 +3087,10 @@ fn skeptic_evidence(
         // has the SCM/git context to derive the diff); Stage 1's mock-llm
         // test-repo lane has no PR diff to revert, so it stays NotProvided.
         // The fast-tier caller is responsible for invoking
-        // `daemon::vacuous_red_green::check_red_green_with_manifest` and
-        // translating the verdict into a `VacuousRedGreenStatus` before
-        // constructing `PrEvidence` here.
+        // `daemon::vacuous_red_green::check_red_green_with_kind` (bead
+        // jleechan-6xje: dispatch on cargo vs pytest) and translating the
+        // verdict into a `VacuousRedGreenStatus` before constructing
+        // `PrEvidence` here.
         vacuous_red_green: verifier::VacuousRedGreenStatus::NotProvided,
     })
 }
@@ -3141,6 +3142,13 @@ fn vacuous_red_green_for_pr(
     // detector has no manifest to run against, and we surface that as
     // ManifestMissing rather than silently treating NEVER_RAN as a
     // vacuous pass (issue #387 r5 finding 3).
+    //
+    // Bead jleechan-6xje: detect the test runner kind BEFORE the
+    // manifest lookup so the Python path (`worldarchitect.ai` PRs, the
+    // 93 of 124 `vacuous_red_green: unknown` events in the factory
+    // telemetry) can route to the pytest backend instead of silently
+    // returning `ManifestMissing`. Cargo still wins when BOTH configs
+    // are present (the factory's primary target).
     let repo_root = match std::env::current_dir() {
         Ok(p) => p,
         Err(_) => {
@@ -3149,24 +3157,40 @@ fn vacuous_red_green_for_pr(
             );
         }
     };
-    let manifest = match crate::vacuous_red_green::find_cargo_manifest(&repo_root) {
-        Some(m) => m,
-        None => {
-            // jleechan-ni1k / issue #437 bonus: dark-factory's daemon
-            // crate lives at `<repo_root>/daemon/Cargo.toml`, not at the
-            // repo root. The walk-up `find_cargo_manifest` returns None
-            // on this nested-crate layout, surfacing `ManifestMissing`
-            // on the very repo the gate is supposed to vet. Fall back
-            // to a bounded recursive search (skips `target` /
-            // `node_modules` / `.git`, capped at depth 4) so a nested
-            // crate manifest is reachable. If both lookups fail, we
-            // keep the original error message so operators see both
-            // paths attempted.
-            match crate::vacuous_red_green::find_cargo_manifest_recursive(&repo_root, 4) {
+    let kind = crate::vacuous_red_green::detect_runner_kind(&repo_root);
+    let manifest = match kind {
+        crate::vacuous_red_green::TestRunnerKind::Cargo => {
+            match crate::vacuous_red_green::find_cargo_manifest(&repo_root) {
+                Some(m) => m,
+                None => {
+                    // jleechan-ni1k / issue #437 bonus: dark-factory's daemon
+                    // crate lives at `<repo_root>/daemon/Cargo.toml`, not at
+                    // the repo root. The walk-up `find_cargo_manifest`
+                    // returns None on this nested-crate layout, surfacing
+                    // `ManifestMissing` on the very repo the gate is supposed
+                    // to vet. Fall back to a bounded recursive search (skips
+                    // `target` / `node_modules` / `.git`, capped at depth 4)
+                    // so a nested crate manifest is reachable. If both
+                    // lookups fail, we keep the original error message so
+                    // operators see both paths attempted.
+                    match crate::vacuous_red_green::find_cargo_manifest_recursive(&repo_root, 4) {
+                        Some(m) => m,
+                        None => {
+                            return verifier::VacuousRedGreenStatus::ManifestMissing(format!(
+                                "no Cargo.toml reachable from {} (walk-up + recursive depth-4 both failed)",
+                                repo_root.display()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        crate::vacuous_red_green::TestRunnerKind::Pytest => {
+            match crate::vacuous_red_green::find_python_pytest_config(&repo_root) {
                 Some(m) => m,
                 None => {
                     return verifier::VacuousRedGreenStatus::ManifestMissing(format!(
-                        "no Cargo.toml reachable from {} (walk-up + recursive depth-4 both failed)",
+                        "no pyproject.toml/pytest.ini/setup.cfg/tox.ini reachable from {}",
                         repo_root.display()
                     ));
                 }
@@ -3224,11 +3248,14 @@ fn vacuous_red_green_for_pr(
         return verifier::VacuousRedGreenStatus::NoChangedTests;
     }
 
-    // Invoke the detector.
-    match crate::vacuous_red_green::check_red_green_with_manifest(
+    // Invoke the detector. Bead jleechan-6xje: dispatch to the backend
+    // the repo actually uses (cargo vs pytest) so Python PRs route to
+    // the pytest runner instead of failing the r5 manifest lookup.
+    match crate::vacuous_red_green::check_red_green_with_kind(
         &repo_root,
         &base_ref,
         &changed,
+        kind,
         Some(&manifest),
     ) {
         Ok(report) => translate_verdict(report.verdict, report.failed_on_revert),

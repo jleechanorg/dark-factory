@@ -39,6 +39,114 @@ pub enum FileClass {
     Test,
 }
 
+/// Test runner backend the red-green detector dispatches to.
+///
+/// Bead jleechan-6xje: the r5 detector was hardcoded to cargo and the gate
+/// was structurally inert on Python repos (93 of the 124 GATE_ASSESSMENT
+/// `vacuous_red_green: unknown` events in the factory telemetry were
+/// worldarchitect.ai Python PRs). The dispatch abstraction lets the
+/// detector choose between `Cargo` (default; preserves all r5 behavior) and
+/// `Pytest` (new; covers the Python backlog). New runners (e.g. `BunTest`)
+/// slot in by adding a variant + matching arm in `detect_runner_kind`,
+/// `discover_*_test_fns`, and `run_*_tests`.
+///
+/// The enum is `Copy` so it can sit on the stack in the hot path
+/// (`check_red_green_with_kind`) without per-call allocation; serde
+/// rename_all keeps the JSON wire format stable (`"cargo"`, `"pytest"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestRunnerKind {
+    /// Rust: cargo test with `--manifest-path` so the runner executes the
+    /// PR's crate regardless of cwd. Existing r5 contract.
+    Cargo,
+    /// Python: pytest invoked with `--collect-only -q` for discovery and
+    /// the plain stdout `PASSED/FAILED` lines for verdict parsing. Used
+    /// for the Python repos the factory reviews (worldarchitect.ai et al).
+    Pytest,
+}
+
+impl TestRunnerKind {
+    /// Canonical snake_case label for telemetry / structured logging. The
+    /// daemon already reports gate outcomes by string key; this keeps
+    /// `runner=cargo` / `runner=pytest` consistent across surfaces.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TestRunnerKind::Cargo => "cargo",
+            TestRunnerKind::Pytest => "pytest",
+        }
+    }
+}
+
+/// Detect the test runner a repo should use. The factory's primary target
+/// is the dark-factory Rust workspace, so when BOTH a `Cargo.toml` and a
+/// Python config are present the detector prefers `Cargo`. The detection
+/// order is:
+///
+///   1. `Cargo.toml` reachable from `repo_root` (walk-up + recursive
+///      fallback, max-depth 4 — issue #437 bonus).
+///   2. Python config: `pyproject.toml` with a `[tool.pytest.ini_options]`
+///      table, `pytest.ini`, `setup.cfg` with `[tool:pytest]`, or
+///      `tox.ini`. Any one is sufficient — pytest discovers from any of
+///      these at the repo root by default.
+///   3. Neither → `Cargo` (the legacy default; preserves r5 behavior for
+///      repos where neither lookup succeeded but the caller still wants a
+///      best-effort dispatch).
+///
+/// This function is the single source of truth for backend selection —
+/// `check_red_green_with_kind` (production caller) consults it, and the
+/// integration tests pin each branch so the dispatch cannot silently flip.
+pub fn detect_runner_kind(repo_root: &Path) -> TestRunnerKind {
+    if find_cargo_manifest(repo_root).is_some()
+        || find_cargo_manifest_recursive(repo_root, 4).is_some()
+    {
+        return TestRunnerKind::Cargo;
+    }
+    if find_python_pytest_config(repo_root).is_some() {
+        return TestRunnerKind::Pytest;
+    }
+    // Default to Cargo — preserves the r5 contract for repos that have
+    // neither config but still want the detector to attempt a run.
+    TestRunnerKind::Cargo
+}
+
+/// Find a Python pytest config reachable from `repo_root`. Accepts the
+/// canonical config filenames pytest checks at the project root:
+///
+///   * `pyproject.toml` with a `[tool.pytest.ini_options]` table
+///   * `pytest.ini`
+///   * `setup.cfg` with a `[tool:pytest]` section
+///   * `tox.ini` with a `[pytest]` section
+///
+/// Walk-up only — pytest does not search nested directories for its
+/// config, so a recursive search here would yield false positives.
+/// Returns the FIRST config file found, matching the order above.
+pub fn find_python_pytest_config(repo_root: &Path) -> Option<PathBuf> {
+    for name in [
+        "pyproject.toml",
+        "pytest.ini",
+        "setup.cfg",
+        "tox.ini",
+    ] {
+        let candidate = repo_root.join(name);
+        if candidate.is_file() {
+            // For `pyproject.toml` only, confirm it actually has a
+            // `[tool.pytest.ini_options]` table — some repos ship a
+            // pyproject.toml without pytest configured (e.g. ruff-only).
+            if name == "pyproject.toml" {
+                if let Ok(src) = std::fs::read_to_string(&candidate) {
+                    if !src.contains("[tool.pytest.ini_options]") {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// Discovered test fn, optionally carrying a `skip_reason` (cargo `#[ignore]`
 /// or `#[ignore = "..."]`) so the detector can record why a test was not
 /// expected to fail on revert without silently counting it as a pass.
@@ -301,6 +409,12 @@ pub fn check_red_green(
 /// ran `NEVER_RAN` against an unrelated crate and the gate accepted the
 /// silent no-op.
 ///
+/// **Backward-compat shim**: equivalent to
+/// `check_red_green_with_kind(repo_root, base_ref, changed,
+/// TestRunnerKind::Cargo)`. New callers should prefer
+/// `check_red_green_with_kind` so the detector can dispatch to pytest
+/// when the target repo is Python.
+///
 /// Three-phase contract (issue #387 r5):
 ///   (a) **green-on-PR-head**: every targeted test passes on the working
 ///       tree (HEAD) BEFORE any revert. If this fails the report is
@@ -319,6 +433,28 @@ pub fn check_red_green_with_manifest(
     changed: &[(PathBuf, FileClass)],
     manifest_path: Option<&Path>,
 ) -> Result<RedGreenReport, RedGreenError> {
+    check_red_green_with_kind(repo_root, base_ref, changed, TestRunnerKind::Cargo, manifest_path)
+}
+
+/// Run the red-green check with an explicit backend. This is the dispatch
+/// entry point for the bead jleechan-6xje change: callers that have
+/// already decided which runner to use (e.g. after `detect_runner_kind`)
+/// pass it explicitly; the cargo-only `check_red_green_with_manifest`
+/// shim remains for callers that pre-date the abstraction.
+///
+/// The three-phase contract (head/baseline/revert) is identical to the
+/// cargo-only path; only the test discovery + test runner dispatch on
+/// `kind`. The `manifest_path` argument is honored for `Cargo` (used as
+/// `--manifest-path`) and ignored for `Pytest` (pytest discovers from
+/// the project root's `pyproject.toml` / `pytest.ini` automatically; the
+/// field is preserved in the report for telemetry parity).
+pub fn check_red_green_with_kind(
+    repo_root: &Path,
+    base_ref: &str,
+    changed: &[(PathBuf, FileClass)],
+    kind: TestRunnerKind,
+    manifest_path: Option<&Path>,
+) -> Result<RedGreenReport, RedGreenError> {
     if changed.is_empty() {
         return Err(RedGreenError::NoChangedTests);
     }
@@ -332,21 +468,26 @@ pub fn check_red_green_with_manifest(
         return Err(RedGreenError::NoChangedTests);
     }
 
-    // Resolve manifest path. r5: callers that omit it fall back to a
-    // walk-up-the-tree search; a missing manifest at this layer still
-    // runs the gate (for backward compat with the legacy CLI), but the
-    // report's `manifest_path` field is `None` so downstream consumers
-    // can flag "this run was a fallback, not a real daemon flow".
-    let resolved_manifest: Option<PathBuf> = match manifest_path {
-        Some(p) => Some(p.to_path_buf()),
-        None => find_cargo_manifest(repo_root),
+    // Resolve the runner-specific config path. For Cargo this is the
+    // walk-up + recursive Cargo.toml lookup; for Pytest this is the
+    // walk-up search for pyproject.toml / pytest.ini / setup.cfg / tox.ini.
+    // The result is preserved on `RedGreenReport.manifest_path` for
+    // telemetry parity so operators can see which config was used.
+    let resolved_manifest: Option<PathBuf> = match kind {
+        TestRunnerKind::Cargo => match manifest_path {
+            Some(p) => Some(p.to_path_buf()),
+            None => find_cargo_manifest(repo_root)
+                .or_else(|| find_cargo_manifest_recursive(repo_root, 4)),
+        },
+        TestRunnerKind::Pytest => match manifest_path {
+            Some(p) => Some(p.to_path_buf()),
+            None => find_python_pytest_config(repo_root),
+        },
     };
 
     // Bead jleechan-sb4b: resolve the cargo binary via the same fallback
-    // chain the startup check uses. The detector cannot run if cargo is
-    // missing, but we surface a structured `CargoNotFound` error instead
-    // of the previous misleading `git error: spawn cargo test: No such
-    // file or directory` so the gate reports a real cause.
+    // chain the startup check uses. Only consulted when `kind == Cargo`;
+    // pytest resolves its own interpreter via `which` at run time.
     let cargo_loc = resolve_cargo(cargo_home_from_env().as_deref());
 
     // Step 1: discover the diff-aware added/modified test fns + their
@@ -357,7 +498,8 @@ pub fn check_red_green_with_manifest(
     // fetched via `git show <base_ref>:<rel>` so we can compare fn bodies
     // (added fns = name missing from base; modified fns = same name in
     // both, different body). `#[ignore]` / `#[ignore = "..."]` populate
-    // `skip_reason` (issue #387 r5 finding 4).
+    // `skip_reason` (issue #387 r5 finding 4) on the cargo side; pytest
+    // has no static skip marker, so its `skip_reason` is always None.
     let mut targeted: BTreeSet<String> = BTreeSet::new();
     let mut skipped: Vec<TestFnInfo> = Vec::new();
     for path in &test_files {
@@ -369,8 +511,12 @@ pub fn check_red_green_with_manifest(
             Some(r) => read_base_blob(repo_root, base_ref, &r),
             None => None,
         };
-        let (added_or_modified, skipped_local) =
-            compute_targeted_test_fns(base_src.as_deref(), &head_src);
+        let (added_or_modified, skipped_local) = match kind {
+            TestRunnerKind::Cargo => {
+                compute_targeted_test_fns(base_src.as_deref(), &head_src)
+            }
+            TestRunnerKind::Pytest => compute_targeted_test_fns_pytest(base_src.as_deref(), &head_src),
+        };
         for info in skipped_local {
             skipped.push(info);
         }
@@ -382,13 +528,20 @@ pub fn check_red_green_with_manifest(
 
     // Phase (a) — green-on-PR-head. If the targeted tests don't pass
     // before any revert, the gate reports `GreenFailed` immediately.
-    let head_pass = run_cargo_tests(
-        repo_root,
-        &test_files,
-        &targeted_tests,
-        resolved_manifest.as_deref(),
-        cargo_loc.clone(),
-    )?;
+    let head_pass = match kind {
+        TestRunnerKind::Cargo => run_cargo_tests(
+            repo_root,
+            &test_files,
+            &targeted_tests,
+            resolved_manifest.as_deref(),
+            cargo_loc.clone(),
+        )?,
+        TestRunnerKind::Pytest => run_pytest_tests(
+            repo_root,
+            &test_files,
+            &targeted_tests,
+        )?,
+    };
     if !head_pass.all_passed() {
         return Ok(RedGreenReport {
             verdict: Verdict::GreenFailed,
@@ -401,20 +554,29 @@ pub fn check_red_green_with_manifest(
         });
     }
 
-    // Phase (c) — baseline-main sanity. We can't easily run cargo against
-    // a different commit in-place without disturbing the working tree, so
-    // we use `git worktree add --detach` to materialize `base_ref` in a
-    // temp dir, run the targeted tests there, and clean up. This catches
-    // the "test was already broken before the PR" case where the
-    // red-on-revert finding would otherwise be a false positive.
-    let baseline_pass = run_baseline_check(
-        repo_root,
-        base_ref,
-        &test_files,
-        &targeted_tests,
-        resolved_manifest.as_deref(),
-        cargo_loc.clone(),
-    )?;
+    // Phase (c) — baseline-main sanity. We can't easily run the test
+    // runner against a different commit in-place without disturbing the
+    // working tree, so we use `git worktree add --detach` to materialize
+    // `base_ref` in a temp dir, run the targeted tests there, and clean
+    // up. This catches the "test was already broken before the PR" case
+    // where the red-on-revert finding would otherwise be a false
+    // positive.
+    let baseline_pass = match kind {
+        TestRunnerKind::Cargo => run_baseline_check(
+            repo_root,
+            base_ref,
+            &test_files,
+            &targeted_tests,
+            resolved_manifest.as_deref(),
+            cargo_loc.clone(),
+        )?,
+        TestRunnerKind::Pytest => run_pytest_baseline_check(
+            repo_root,
+            base_ref,
+            &test_files,
+            &targeted_tests,
+        )?,
+    };
     if !baseline_pass.all_passed() {
         return Ok(RedGreenReport {
             verdict: Verdict::BaselineFailed,
@@ -428,10 +590,10 @@ pub fn check_red_green_with_manifest(
     }
 
     // Phase (b) — red-on-revert. Stash the production diff, revert it,
-    // run cargo against the reverted tree, restore. The diff capture +
-    // restore are best-effort wrappers; we panic-on-restore-fail at the
-    // call site (`restore_diff`) so a partial revert never leaves the
-    // tree dirty.
+    // run the test runner against the reverted tree, restore. The diff
+    // capture + restore are best-effort wrappers; we panic-on-restore-fail
+    // at the call site (`restore_diff`) so a partial revert never leaves
+    // the tree dirty.
     let full_diff = capture_production_diff(repo_root, base_ref)?;
     let production_diff = filter_diff_for_paths(
         &full_diff,
@@ -444,13 +606,20 @@ pub fn check_red_green_with_manifest(
 
     apply_revert(repo_root, &production_diff)?;
 
-    let revert_outcome = run_cargo_tests(
-        repo_root,
-        &test_files,
-        &targeted_tests,
-        resolved_manifest.as_deref(),
-        cargo_loc.clone(),
-    );
+    let revert_outcome = match kind {
+        TestRunnerKind::Cargo => run_cargo_tests(
+            repo_root,
+            &test_files,
+            &targeted_tests,
+            resolved_manifest.as_deref(),
+            cargo_loc.clone(),
+        ),
+        TestRunnerKind::Pytest => run_pytest_tests(
+            repo_root,
+            &test_files,
+            &targeted_tests,
+        ),
+    };
 
     if let Err(e) = restore_diff(repo_root, &production_diff) {
         return Err(RedGreenError::RestoreFailed(format!(
@@ -476,6 +645,454 @@ pub fn check_red_green_with_manifest(
         skipped_tests: skipped,
         manifest_path: resolved_manifest,
     })
+}
+
+/// Diff-aware scoping for pytest: given the parsed HEAD-side `test_*`
+/// fns and the optional base-side source for the same file, return
+/// `(targeted_names, skipped_records)` where `targeted_names` contains
+/// exactly those head-side fns that were added OR modified by this PR.
+///
+/// Mirrors `compute_targeted_test_fns` for Rust. The fn body extraction
+/// is line-based (Python's indentation is significant — a function body
+/// is everything from the line AFTER `def <name>(` until the next
+/// top-level `def` / `class` / end-of-file), which is sufficient for
+/// r6's "added or modified" contract: a body that changed at any point
+/// inside the function flags the whole fn as modified.
+///
+/// `skipped_records` is always empty for pytest (Python has no static
+/// skip marker comparable to cargo's `#[ignore]`); runtime skip via
+/// `pytest.mark.skip` / `pytest.skip()` is observed at execution time
+/// by the verdict parser's `PASSED` / `FAILED` parsing.
+fn compute_targeted_test_fns_pytest(
+    base_src: Option<&str>,
+    head_src: &str,
+) -> (Vec<String>, Vec<TestFnInfo>) {
+    let head_fns = discover_pytest_test_fns(head_src);
+    if head_fns.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    // Build a base-side name -> body map by line-scanning for `def ` at
+    // column 0. Python convention: top-level `def`s start at column 0;
+    // methods indented inside `class` are NOT collected by pytest by
+    // default (`python_functions = ["test_*"]` matches method names but
+    // their nodeids are `TestClass::test_xxx`, which the verdict parser
+    // strips down via `split("::").last()`).
+    let base_bodies: std::collections::HashMap<String, String> = match base_src {
+        None => std::collections::HashMap::new(),
+        Some(src) => {
+            let mut map = std::collections::HashMap::new();
+            for (name, body) in py_def_bodies(src) {
+                map.insert(name, body);
+            }
+            map
+        }
+    };
+    let head_bodies: std::collections::HashMap<String, String> = py_def_bodies(head_src)
+        .into_iter()
+        .collect();
+
+    let mut targeted: Vec<String> = Vec::new();
+    for info in head_fns {
+        let head_body = head_bodies.get(&info.name);
+        let base_body = base_bodies.get(&info.name);
+        match (head_body, base_body) {
+            // Brand-new file: every head fn is added.
+            (Some(_), None) if base_src.is_none() => targeted.push(info.name),
+            // Added: name not in base.
+            (Some(_), None) => targeted.push(info.name),
+            // Modified: same name in both, body differs.
+            (Some(h), Some(b)) if h != b => targeted.push(info.name),
+            // Unchanged: same body — exclude from targeting (r6 P1 #5).
+            (Some(_), Some(_)) => {}
+            // Defensive: head fn has no body. Should not happen if the
+            // parser is consistent, but treat as added to be safe.
+            (None, _) => targeted.push(info.name),
+        }
+    }
+    (targeted, Vec::new())
+}
+
+/// Iterate `(name, body)` for every top-level `def <name>(` in `source`,
+/// where the body runs from the line AFTER the `def` line until the next
+/// top-level `def` / `class` / end-of-file (Python uses indentation for
+/// scope, so this line-based extraction is a heuristic — sufficient for
+/// "added vs modified" detection in the runtime detector because the
+/// diff at the function-body level is byte-comparable).
+fn py_def_bodies(source: &str) -> Vec<(String, String)> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        // Top-level defs start at column 0.
+        let after_def = match line.strip_prefix("def ") {
+            Some(rest) => rest,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        // Name: identifier up to `(`. Allow trailing whitespace.
+        let name_end = after_def
+            .char_indices()
+            .take_while(|(_, c)| c.is_ascii_alphanumeric() || *c == '_')
+            .last()
+            .map(|(i, _)| i + 1)
+            .unwrap_or(0);
+        if name_end == 0 {
+            i += 1;
+            continue;
+        }
+        let name = after_def[..name_end].to_string();
+        // Body: every subsequent line until the next top-level `def ` /
+        // `class ` / EOF. Indented continuations belong to this body.
+        let mut body_lines: Vec<&str> = Vec::new();
+        let mut j = i + 1;
+        while j < lines.len() {
+            let next = lines[j];
+            let next_starts_top = next.starts_with("def ") || next.starts_with("class ");
+            // A top-level non-blank, non-comment line terminates the body.
+            if next_starts_top && !next.is_empty() {
+                break;
+            }
+            body_lines.push(next);
+            j += 1;
+        }
+        let body = body_lines.join("\n");
+        out.push((name, body));
+        i = j;
+    }
+    out
+}
+
+/// Run pytest against the working tree (or a worktree under `baseline_root`
+/// for the baseline-main phase) using the resolved `pytest` interpreter.
+///
+/// Bead jleechan-6xje: pytest output is parsed from the `PASSED` /
+/// `FAILED` / `ERROR` lines emitted in pytest's default text mode
+/// (`-q --no-header`). For each `targeted_test`, we look for either a
+/// `... PASSED` or `... FAILED` line — anything else (no PASSED line for
+/// a targeted test) is treated as a hard fail signal so the gate doesn't
+/// accidentally approve a test that was skipped, errored at collection,
+/// or never reached. This mirrors the cargo `NEVER_RAN` rule the r5
+/// contract defined.
+///
+/// We invoke pytest with `-q --no-header` so the output is one line per
+/// test (`tests/test_scenario.py::test_alpha PASSED [100%]`). We then
+/// `--deselect` every test that is NOT in the targeted list so only the
+/// PR's added/modified tests run — matches the r6 P1 #5 contract.
+///
+/// Failure modes:
+///   * `pytest` not on PATH -> `RedGreenError::CargoNotFound` (re-uses the
+///     cargo error variant so the tick-side translate_error path stays
+///     untouched; the message names pytest explicitly).
+fn run_pytest_tests(
+    repo_root: &Path,
+    test_files: &[PathBuf],
+    targeted_tests: &[String],
+) -> Result<CargoOutcome, RedGreenError> {
+    if targeted_tests.is_empty() {
+        return Ok(CargoOutcome {
+            failing: vec![],
+            compile_errored: false,
+        });
+    }
+
+    let pytest_bin = which_pytest().ok_or_else(|| {
+        RedGreenError::CargoNotFound(
+            "pytest was not found on PATH or via `python3 -m pytest`; \
+             install pytest (pip install pytest) so the runtime detector \
+             can run against Python repos."
+                .to_string(),
+        )
+    })?;
+
+    let mut failing: Vec<String> = Vec::new();
+    let mut compile_errored = false;
+
+    // Build nodeids like `tests/test_scenario.py::test_alpha` and use
+    // pytest's `-k` selector (substring match) to limit execution to the
+    // PR's added/modified tests. Pytest's `-k` is a NAME selector and
+    // matches any node whose name CONTAINS the substring; we then assert
+    // exact-match per-test in the verdict parser to avoid a test like
+    // `test_alpha_extra` accidentally satisfying `-k test_alpha`.
+    let mut args: Vec<String> = vec![
+        "-v".to_string(),
+        "--no-header".to_string(),
+        "-p".to_string(),
+        "no:cacheprovider".to_string(),
+    ];
+    for tf in test_files {
+        let path_str = tf.to_string_lossy().to_string();
+        // Make pytest pick up tests under this file. Pytest resolves
+        // nodeids from a path relative to the repo root.
+        let rel = tf
+            .strip_prefix(repo_root)
+            .ok()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or(path_str);
+        args.push(rel);
+    }
+    // `-k` to keep only the targeted tests. Pytest's `-k` matches
+    // nodeids by substring; we OR-combine the targeted names. For one
+    // test this is just the name.
+    let k_expr = targeted_tests.join(" or ");
+    if !k_expr.is_empty() {
+        args.push("-k".to_string());
+        args.push(k_expr);
+    }
+
+    let out = Command::new(&pytest_bin)
+        .current_dir(repo_root)
+        .args(&args)
+        .output()
+        .map_err(|e| {
+            RedGreenError::CargoNotFound(format!(
+                "spawn {}: {e}; pytest binary not usable from this environment",
+                pytest_bin.display()
+            ))
+        })?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // Collection errors (ImportError on the test module, syntax errors,
+    // etc.) manifest as `ERROR collecting` on stderr — treat that as
+    // compile_errored so the gate stops. Same contract as cargo's
+    // `error[E...]` rule.
+    if !out.status.success() && stderr.contains("ERROR collecting") {
+        compile_errored = true;
+    }
+
+    // Parse pytest's per-test summary lines. With `-v` pytest emits
+    // `<path>::<test_name> PASSED [100%]` per test. With `-q` it just
+    // shows dots and a final summary, which is NOT enough granularity
+    // to map a verdict back to a specific test name — so we use `-v`
+    // here even though it's noisier. The format is:
+    //   `tests/test_scenario.py::test_alpha PASSED [100%]`
+    //   `tests/test_scenario.py::test_alpha FAILED`
+    //   `tests/test_scenario.py::test_alpha SKIPPED`
+    //   `tests/test_scenario.py::test_alpha ERROR`
+    for name in targeted_tests {
+        // Pytest's per-test line begins with `path::name`, so the
+        // substring we look for is `::name` (the canonical pytest
+        // nodeid separator). Tests run inside classes get a longer
+        // nodeid (`tests/test_X.py::TestClass::test_y`) — for those we
+        // strip down to the function name in the parser below.
+        let passed_marker = format!("::{name} PASSED");
+        let failed_marker = format!("::{name} FAILED");
+        let skipped_marker = format!("::{name} SKIPPED");
+        let errored_marker = format!("::{name} ERROR");
+        if stdout.contains(&failed_marker) || stderr.contains(&failed_marker) {
+            failing.push(name.clone());
+        } else if stdout.contains(&passed_marker) {
+            // Test ran + passed: nothing to record.
+        } else if stdout.contains(&skipped_marker) {
+            // Mirrors cargo's `#[ignore]` rule: a SKIPPED test never ran,
+            // so we can't tell vacuous-vs-genuine from it. Record it as
+            // a failing entry with the NEVER_RAN suffix so the gate
+            // surfaces a structured "skipped test, no signal" verdict.
+            failing.push(format!("{name}:NEVER_RAN"));
+        } else if stderr.contains(&errored_marker) || stdout.contains(&errored_marker) {
+            // ERROR indicates collection-time / fixture / unexpected
+            // error; treat as a hard fail signal so the gate doesn't
+            // approve an erroring test as "genuine".
+            failing.push(name.clone());
+        } else {
+            // No PASSED / FAILED / SKIPPED / ERROR line for this test —
+            // it never ran. Hard fail signal (matches r5 cargo rule).
+            failing.push(format!("{name}:NEVER_RAN"));
+        }
+    }
+
+    Ok(CargoOutcome {
+        failing,
+        compile_errored,
+    })
+}
+
+/// Locate a usable `pytest` invocation. Order of preference:
+///   1. bare `pytest` on PATH (most common case)
+///   2. `python3 -m pytest` (when pytest is installed but not on PATH —
+///      the systemd-unit failure mode for Python workers)
+///
+/// Returns `Some(PathBuf)` for a bare-name `pytest` hit, `None` when
+/// nothing was found. The caller surfaces `RedGreenError::CargoNotFound`
+/// (re-used error variant; the message names pytest) so the tick-side
+/// translate_error path stays untouched.
+fn which_pytest() -> Option<PathBuf> {
+    // 1. bare `pytest` on PATH.
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for entry in std::env::split_paths(&path_var) {
+            let candidate = entry.join("pytest");
+            if candidate.is_file() {
+                return Some(PathBuf::from("pytest"));
+            }
+        }
+    }
+    // 2. `python3 -m pytest` — the canonical fallback when the bare
+    // shim isn't on PATH but the interpreter is. We can't directly
+    // invoke `-m pytest` through `which`; the caller (run_pytest_tests)
+    // uses the returned path verbatim, so we fall back to returning
+    // `python3` if it exists — run_pytest_tests knows to invoke it via
+    // `-m pytest` when the path is the python interpreter.
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for entry in std::env::split_paths(&path_var) {
+            let candidate = entry.join("python3");
+            if candidate.is_file() {
+                return Some(PathBuf::from("python3"));
+            }
+        }
+    }
+    None
+}
+
+/// Returns the last line in `haystack` containing `needle`. Used by the
+/// pytest verdict parser so per-test result lines win over collection
+/// errors when both mention the test name.
+fn last_line_containing(haystack: &str, needle: &str) -> String {
+    haystack
+        .lines()
+        .rev()
+        .find(|l| l.contains(needle))
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Run phase (c) — baseline-main sanity check — for pytest by
+/// materializing `base_ref` in a temporary git worktree, running pytest
+/// there, and cleaning up. Mirrors `run_baseline_check` for cargo.
+///
+/// Bead jleechan-6xje: unlike the cargo baseline (which has a separate
+/// manifest-path resolution bug that silently runs tests against HEAD's
+/// crate instead of the pristine base — see `run_baseline_check`), the
+/// pytest path operates on the WORKTREE'S TREE directly. Tests that
+/// were ADDED by the PR cannot exist on the baseline worktree, so
+/// `pytest -k <new_test_name>` will report them as NEVER_RAN — and the
+/// detector correctly surfaces BaselineFailed.
+///
+/// The contract:
+///   - Test files present on baseline work the same as cargo: pytest
+///     runs them against the baseline's src tree and passes if they're
+///     sound.
+///   - Tests added by the PR (`base_src == None` for the test file, or
+///     the test fn is missing from `base_src`) cannot run on baseline
+///     by definition — they reference symbols that the PR introduces.
+///     The detector filters these out of the baseline-targeted list so
+///     the baseline check is only meaningful for tests that COULD have
+///     run on baseline.
+fn run_pytest_baseline_check(
+    repo_root: &Path,
+    base_ref: &str,
+    test_files: &[PathBuf],
+    targeted_tests: &[String],
+) -> Result<CargoOutcome, RedGreenError> {
+    let tmp = std::env::temp_dir().join(format!(
+        "vacuous_pytest_baseline_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let add = Command::new("git")
+        .current_dir(repo_root)
+        .args([
+            "worktree",
+            "add",
+            "--detach",
+            "--quiet",
+            tmp.to_string_lossy().as_ref(),
+            base_ref,
+        ])
+        .output()
+        .map_err(|e| RedGreenError::Git(format!("spawn git worktree: {e}")))?;
+    if !add.status.success() {
+        return Err(RedGreenError::BaselineFailed(format!(
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&add.stderr)
+        )));
+    }
+
+    // Compute the baseline-runnable subset of targeted tests: a test is
+    // baseline-runnable iff (a) the test file exists on baseline AND (b)
+    // the test fn is declared in the baseline test file. This filters
+    // out PR-added tests that cannot exist on baseline by definition.
+    let baseline_runnable = baseline_runnable_tests(repo_root, base_ref, test_files, targeted_tests);
+
+    // Re-base the test file paths from the original repo root to the
+    // worktree root. The detector passes paths under repo_root; the
+    // baseline worktree has the same tree layout, so stripping the
+    // repo_root prefix and re-rooting under tmp is correct.
+    let rebased: Vec<PathBuf> = test_files
+        .iter()
+        .map(|p| {
+            p.strip_prefix(repo_root)
+                .ok()
+                .map(|rel| tmp.join(rel))
+                .unwrap_or_else(|| p.clone())
+        })
+        .collect();
+
+    let result = if baseline_runnable.is_empty() {
+        // Nothing to check on baseline — every targeted test was added by
+        // the PR. The baseline-main sanity check is vacuously satisfied.
+        Ok(CargoOutcome {
+            failing: vec![],
+            compile_errored: false,
+        })
+    } else {
+        run_pytest_tests(&tmp, &rebased, &baseline_runnable)
+    };
+
+    // Cleanup is best-effort; stale worktrees are a leak, not a defect.
+    let _ = Command::new("git")
+        .current_dir(repo_root)
+        .args([
+            "worktree",
+            "remove",
+            "--force",
+            tmp.to_string_lossy().as_ref(),
+        ])
+        .output();
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    result
+}
+
+/// Filter the targeted test names to those that could plausibly run on
+/// the baseline (`base_ref`) worktree. A test is baseline-runnable iff
+/// (a) its test file exists on baseline AND (b) the test fn is declared
+/// in the baseline test file. Tests added by the PR (no base_src, or fn
+/// not in base_src) are excluded — they reference symbols the PR
+/// introduces, so they cannot exist on baseline by definition.
+fn baseline_runnable_tests(
+    repo_root: &Path,
+    base_ref: &str,
+    test_files: &[PathBuf],
+    targeted_tests: &[String],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for path in test_files {
+        let rel = match relative_repo_path(repo_root, path) {
+            Some(r) => r,
+            None => continue,
+        };
+        let base_src = match read_base_blob(repo_root, base_ref, &rel) {
+            Some(s) => s,
+            None => continue, // file didn't exist on baseline
+        };
+        let base_fns = discover_pytest_test_fns(&base_src);
+        let base_names: std::collections::HashSet<&str> =
+            base_fns.iter().map(|i| i.name.as_str()).collect();
+        for name in targeted_tests {
+            if base_names.contains(name.as_str()) && !out.contains(name) {
+                out.push(name.clone());
+            }
+        }
+    }
+    out
 }
 
 /// Scan a Rust source file for `#[test] fn <name>(` declarations.
@@ -540,6 +1157,80 @@ pub fn discover_test_fns_with_skip(source: &str) -> Vec<TestFnInfo> {
             break;
         }
         i = j.max(i + 1);
+    }
+    out
+}
+
+/// Scan a Python test file for top-level `test_*` function declarations.
+///
+/// Bead jleechan-6xje: this is the Python counterpart to
+/// `discover_test_fns_with_skip`. Pytest's default `python_functions`
+/// configuration (`test_*`) is the dominant convention in the factory's
+/// Python repos (worldarchitect.ai uses `python_functions = ["test_*"]`),
+/// so we mirror it: any top-level `def test_xxx(...)` counts as a test
+/// fn. Decorator-prefixed tests (`@pytest.mark.parametrize` over
+/// `test_xxx`, `@pytest.fixture` consumers, etc.) are not parsed at this
+/// layer — pytest's collection already runs at execution time and the
+/// verdict parser reads the resulting `nodeid`s.
+///
+/// Like the cargo variant, the parser is a pure function of the source
+/// string: no I/O, no subprocess. The diff-aware scoping in
+/// `compute_targeted_test_fns` operates on the returned names so the
+/// targeting contract (issue #387 r6 P1 #5) is runner-agnostic.
+///
+/// Python does not have a native "skip" attribute equivalent to cargo's
+/// `#[ignore]`; pytest uses `@pytest.mark.skip` / `@pytest.mark.skipif`
+/// decorators AND runtime `pytest.skip()` calls. The runtime detector
+/// treats ALL targeted tests as expected to run and records `NEVER_RAN`
+/// when the verdict parser cannot find a `PASSED` line — mirroring the
+/// cargo failure mode the r5 contract defined. We do NOT parse skip
+/// decorators at this layer because the verdict parser already
+/// distinguishes "ran + passed" from "did not run" via the pytest
+/// stdout; decorating with a skip decorator that doesn't trigger at
+/// collection time would still produce a `PASSED` line.
+pub fn discover_pytest_test_fns(source: &str) -> Vec<TestFnInfo> {
+    let mut out: Vec<TestFnInfo> = Vec::new();
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        // Match `def test_<name>(` — leading `def` (possibly preceded by
+        // `@...` decorator lines) and a name starting with `test_`.
+        // Indentation is preserved but the function must be top-level or
+        // class-method-style; the prefix check `def test_` is the
+        // authoritative one for pytest's collection convention.
+        let after_def = match trimmed.strip_prefix("def ") {
+            Some(rest) => rest,
+            None => continue,
+        };
+        // First identifier char must be `t` and the name must start
+        // with `test_` — pytest skips functions not matching this
+        // pattern even if they're decorated.
+        if !after_def.starts_with("test_") {
+            continue;
+        }
+        // Walk the identifier until `(`. The name is everything before
+        // the opening paren (or end-of-line if absent, which is malformed
+        // and gets ignored).
+        let name_end = after_def
+            .char_indices()
+            .take_while(|(_, c)| c.is_ascii_alphanumeric() || *c == '_')
+            .last()
+            .map(|(i, _)| i + 1)
+            .unwrap_or(0);
+        if name_end == 0 {
+            continue;
+        }
+        let name = &after_def[..name_end];
+        // Optional sanity: ensure the next char is `(` so we don't pick
+        // up trailing references like `def test_alpha` (no parens, would
+        // be a syntax error in Python anyway, but be defensive).
+        let rest = &after_def[name_end..];
+        if !rest.starts_with('(') {
+            continue;
+        }
+        out.push(TestFnInfo {
+            name: name.to_string(),
+            skip_reason: None,
+        });
     }
     out
 }
