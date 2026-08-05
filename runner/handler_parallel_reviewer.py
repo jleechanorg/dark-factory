@@ -858,18 +858,32 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     """Run parallel reviewer lanes and pass combined evidence downstream."""
     import runner.handlers as _handlers_shim  # late-bound shim for monkeypatched helpers
     review_contract = str(node.attrs.get("review_contract") or "").strip()
+    preseeded_outcome = f"{node.name}.outcome" in ctx.state
+    explicit_controller_echo_fixture = (
+        preseeded_outcome
+        and str(ctx.state.get("_df_test_allow_echo_controller_fixture") or "").strip().lower()
+        in {"true", "1", "yes", "on"}
+    )
     if ctx.backend in ("echo", "mock_llm"):
-        hint = ctx.state.get(f"{node.name}.outcome", "success")
-        return Result(
-            outcome=hint,
-            output=f"echo parallel reviewer {node.name}: pre-seeded {hint}",
-            metadata={
-                "slash_command": node.name,
-                "verdict": "echo:" + str(hint),
-                "reviewer_backend": str(ctx.backend),
-                "parallel_reviewer": "echo",
-            },
-        )
+        controller_installed = False
+        if review_contract and not explicit_controller_echo_fixture:
+            try:
+                candidate_backend, _ = _resolve_gate_backend(node, ctx)
+                controller_installed = _handlers_shim._probe_backend_installed(candidate_backend)
+            except Exception:
+                controller_installed = False
+        if not (review_contract and controller_installed and not explicit_controller_echo_fixture):
+            hint = ctx.state.get(f"{node.name}.outcome", "success")
+            return Result(
+                outcome=hint,
+                output=f"echo parallel reviewer {node.name}: pre-seeded {hint}",
+                metadata={
+                    "slash_command": node.name,
+                    "verdict": "echo:" + str(hint),
+                    "reviewer_backend": str(ctx.backend),
+                    "parallel_reviewer": "echo",
+                },
+            )
     target_dir = _handlers_shim._target_worktree(ctx)
     expected_sha = _handlers_shim._worktree_head_sha(target_dir)
 
