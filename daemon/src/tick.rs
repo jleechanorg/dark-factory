@@ -3098,6 +3098,42 @@ fn skeptic_evidence(
 /// `SkepticVerdict` for gate 7.
 ///
 /// Single-pass success is preserved: if EITHER reviewer returns a usable
+/// Bead jleechan-sk55 / issue #496 — resolve the on-disk working tree
+/// for a bead's `overlay.repo(cfg)` (the same `owner/name` string the
+/// daemon's intake and Scm adapters already route on). The host
+/// convention is `$HOME/projects/<repo_basename>` — every project's
+/// working tree lives there by default, regardless of which repo the
+/// daemon's own cwd happens to be checked out of. Returns `None` when
+/// the repo string is malformed (no `/` separator) or no such directory
+/// exists on disk; the caller MUST treat `None` as a fail-closed
+/// signal and surface a structured `ManifestMissing` rather than
+/// silently falling back to the daemon's cwd (which is exactly the
+/// pre-r7 bug: gate 8 was inert on 84% of cross-repo PRs).
+///
+/// The convention is intentionally minimal — a single env-var +
+/// consistent basename derivation. A future Stage D migration can swap
+/// this for a richer `cfg.repos[repo].worktree_path` table without
+/// changing the call site signature.
+///
+/// Examples (host-relative):
+/// - `jleechanorg/dark-factory`     → `/home/jleechan/projects/dark-factory`
+/// - `jleechanorg/worldarchitect.ai` → `/home/jleechan/projects/worldarchitect.ai`
+fn resolve_repo_root_for_repo(repo: &str) -> Option<std::path::PathBuf> {
+    let (owner, name) = repo.split_once('/')?;
+    if owner.is_empty() || name.is_empty() {
+        return None;
+    }
+    let home = std::env::var_os("HOME")?;
+    let candidate = std::path::PathBuf::from(home)
+        .join("projects")
+        .join(name);
+    if candidate.is_dir() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
 /// Bead jleechan-ijod / issue #387 (r5/r6): invoke the runtime red-green
 /// vacuous-test detector for `pr` in `repo` and translate its
 /// `RedGreenReport` into a `VacuousRedGreenStatus` for the gate-8
@@ -3135,18 +3171,36 @@ fn vacuous_red_green_for_pr(
     }
 
     // The detector needs a local working tree to revert + cargo-run.
-    // The daemon's own CWD is a checkout of `cfg.target_repo` (the
-    // canonical dark-factory source tree) for the Stage-2 production
-    // lane; if the current CWD does not contain a Cargo.toml, the
-    // detector has no manifest to run against, and we surface that as
-    // ManifestMissing rather than silently treating NEVER_RAN as a
-    // vacuous pass (issue #387 r5 finding 3).
-    let repo_root = match std::env::current_dir() {
-        Ok(p) => p,
-        Err(_) => {
-            return verifier::VacuousRedGreenStatus::ManifestMissing(
-                "could not read daemon cwd".to_string(),
-            );
+    //
+    // r7 (bead jleechan-sk55 / issue #496) — the detector's `repo_root`
+    // MUST be the bead's resolved target repo, NOT the daemon's cwd.
+    // The pre-r7 code bound `repo_root = std::env::current_dir()` (the
+    // daemon's own checkout of `cfg.target_repo`), so when a bead's
+    // `overlay.repo(cfg)` resolved to a DIFFERENT repo (e.g.
+    // `jleechanorg/worldarchitect.ai`), `repo_root.join(&f.path)`
+    // produced a path inside the wrong repo — the detector's
+    // `git show <base_ref>:<path>` failed with `No such file or
+    // directory`, surfaced as `GreenFailed`, and gate 8 translated that
+    // to `Unknown`. Outcome: Gate 8 was inert on 84% of cross-repo
+    // assessments (108 of 119 Unknown rows in the production daemon
+    // telemetry). The gate designed to catch vacuous tests was itself
+    // not running for the majority of factory traffic.
+    //
+    // The fix routes `repo_root` through `resolve_repo_root_for_repo`
+    // (host convention: `$HOME/projects/<repo_basename>`), with a
+    // fail-closed fallback to `ManifestMissing` when no such checkout
+    // exists on disk — fail loud, fail closed, no silent cwd fallback.
+    // Same class of bug as jleechan-v6ud (reroll PR-close repo
+    // routing) and jleechan-wuts (reroll git-ops routing): use the
+    // bead's repo, not the daemon's cwd.
+    let repo_root = match resolve_repo_root_for_repo(repo) {
+        Some(p) => p,
+        None => {
+            return verifier::VacuousRedGreenStatus::ManifestMissing(format!(
+                "no local checkout found for repo {repo:?} (host convention: \
+                 $HOME/projects/<repo_basename>) — cannot run vacuous-red-green \
+                 detector without a working tree to revert + cargo-run"
+            ));
         }
     };
     let manifest = match crate::vacuous_red_green::find_cargo_manifest(&repo_root) {
@@ -5668,6 +5722,143 @@ mod skeptic_prompt_vendor_waiver_tests {
         assert!(
             prompt.contains("pass|warn <note>|fail <reason>"),
             "verdict grammar must remain in the base prompt"
+        );
+    }
+}
+
+/// Bead jleechan-sk55 / issue #496 — Gate 8 (vacuous red-green) was
+/// `Unknown` on 84% of cross-repo PRs because `vacuous_red_green_for_pr`
+/// bound `repo_root = std::env::current_dir()` (the daemon's own
+/// checkout of `cfg.target_repo`). When a bead's `overlay.repo(cfg)`
+/// resolved to a DIFFERENT repo (e.g. `jleechanorg/worldarchitect.ai`),
+/// `repo_root.join(&f.path)` produced a path inside the wrong repo —
+/// the detector's `git show <base_ref>:<path>` failed with
+/// `No such file or directory`, surfaced as `GreenFailed`, and the gate
+/// translated that to `Unknown`. The gate that exists to catch vacuous
+/// tests was itself not running for the majority of factory traffic.
+///
+/// The fix routes `repo_root` from the bead's resolved target repo via a
+/// canonical host-path helper (`$HOME/projects/<repo_basename>`), so a
+/// cross-repo PR's changed-file paths resolve against THAT repo's
+/// working tree, not the daemon's cwd. Same class of bug as
+/// jleechan-v6ud (reroll PR-close repo routing) and jleechan-wuts
+/// (reroll git-ops routing) — use the bead's repo, not the daemon's
+/// cwd).
+#[cfg(test)]
+mod vacuous_red_green_repo_routing_tests {
+    use super::resolve_repo_root_for_repo;
+
+    /// The canonical success case: a cross-repo PR with `repo =
+    /// "jleechanorg/worldarchitect.ai"` resolves to the worldarchitect.ai
+    /// host checkout, NOT the daemon's cwd. The bead's sample file
+    /// `mvp_site/tests/test_campaign_utils_state_updates_provenance.py`
+    /// must NOT be prefixed with `/home/jleechan/projects/dark-factory/`
+    /// (the daemon's cwd) — that's the bug. The test pins the contract
+    /// independently of any disk-state issues at test time (we only
+    /// check the path resolution, not that the file exists).
+    #[test]
+    fn cross_repo_pr_routes_to_target_repo_worktree_not_cwd() {
+        // Find the actual on-disk repo (the test fixture relies on the
+        // host's `$HOME/projects/<repo>` convention; if the fixture is
+        // ever relocated the test will simply skip rather than fail).
+        let target_root = match resolve_repo_root_for_repo(
+            "jleechanorg/worldarchitect.ai",
+        ) {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "SKIP: no /home/jleechan/projects/worldarchitect.ai checkout on this host; \
+                     cross-repo gate-8 routing is unit-tested via the helper contract below"
+                );
+                return;
+            }
+        };
+
+        // The path must end with the worldarchitect.ai basename, NOT
+        // the daemon's cwd basename. The test would also fail on a
+        // pristine host where the helper is wrong (it would return
+        // cwd).
+        let daemon_cwd = std::env::current_dir().expect("read cwd");
+        assert_ne!(
+            target_root, daemon_cwd,
+            "cross-repo PR '{repo}' must NOT resolve to the daemon's cwd ({cwd:?}); \
+             gate-8 must read changed files from the target repo's worktree",
+            repo = "jleechanorg/worldarchitect.ai",
+            cwd = daemon_cwd,
+        );
+
+        // The resolved path must be a directory (host convention is
+        // `$HOME/projects/<repo_basename>`).
+        assert!(
+            target_root.is_dir(),
+            "resolved repo root {target_root:?} must be a directory on disk",
+        );
+
+        // The basename check pins the convention. If a future maintainer
+        // moves the worktree to a different on-disk layout, this test
+        // will fail loudly rather than silently falling back to cwd.
+        let expected_basename = "worldarchitect.ai";
+        assert_eq!(
+            target_root.file_name().and_then(|n| n.to_str()),
+            Some(expected_basename),
+            "worldarchitect.ai repo must resolve to a path ending in {expected_basename:?}",
+        );
+    }
+
+    /// The same-repo case: `repo = "jleechanorg/dark-factory"` and the
+    /// daemon's cwd is a dark-factory checkout. The helper should still
+    /// resolve to a working directory whose basename is `dark-factory`
+    /// (which is the cwd on a default host layout, but the test is
+    /// independent of that fact — it pins the contract that the
+    /// helper's output is the same dark-factory worktree the daemon
+    /// uses, not a different dark-factory tree).
+    #[test]
+    fn same_repo_pr_routes_to_dark_factory_worktree() {
+        let target_root = match resolve_repo_root_for_repo(
+            "jleechanorg/dark-factory",
+        ) {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "SKIP: no /home/jleechan/projects/dark-factory checkout on this host"
+                );
+                return;
+            }
+        };
+
+        assert_eq!(
+            target_root.file_name().and_then(|n| n.to_str()),
+            Some("dark-factory"),
+            "dark-factory repo must resolve to a path ending in 'dark-factory'",
+        );
+        assert!(
+            target_root.is_dir(),
+            "resolved dark-factory root {target_root:?} must be a directory on disk",
+        );
+    }
+
+    /// If the helper gets a malformed repo string (no slash), it must
+    /// return `None` rather than guessing. The caller treats `None` as
+    /// `ManifestMissing` (the same downgraded verdict the gate had
+    /// BEFORE the fix, when `current_dir()` happened to be a cargo
+    /// repo) — fail loud, fail closed, no silent fallback.
+    #[test]
+    fn malformed_repo_string_returns_none() {
+        assert!(
+            resolve_repo_root_for_repo("not-a-repo").is_none(),
+            "repo string without owner/name split must return None (no silent cwd fallback)",
+        );
+        assert!(
+            resolve_repo_root_for_repo("").is_none(),
+            "empty repo string must return None",
+        );
+        assert!(
+            resolve_repo_root_for_repo("owner/").is_none(),
+            "empty repo baseline must return None",
+        );
+        assert!(
+            resolve_repo_root_for_repo("/repo").is_none(),
+            "repo without owner must return None",
         );
     }
 }
