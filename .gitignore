@@ -73,3 +73,6 @@ test.db
 # exhausts retries. Not canonical history; regenerate per run.
 failed_run_log*.txt
 branch_fail_step_*
+# Per-branch mkdtemp scratch dirs (runner/engine_branches.py) if a caller
+# passes the repo root as workdir; belt-and-braces with the test fix.
+branch_*_*/
