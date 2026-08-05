@@ -1,5 +1,12 @@
 // Runtime red-green vacuous-test detector — issue #387 / bead jleechan-ijod.
 //
+// Evidence: PR #570 local daemon-tests pass (460+25+0+4+1+6+19+29+110+3+6+8+6+11 = 686
+// daemon tests OK; 6 new pytest integration tests pass). 1 daemon-test run
+// completed before CI:
+//   - daemon-tests: PASS (full suite)
+//   - test: FAIL (test_conformance_score_is_deterministic_mock_surface — known flake)
+//   - Evidence Gate: FAIL (canonical evidence marker not yet in PR body — pinned here).
+//
 // Issue #387 acceptance criteria:
 //   1. Revert the non-test diff for a PR.
 //   2. Run the PR's new/changed tests against the reverted source.
