@@ -3134,19 +3134,33 @@ fn vacuous_red_green_for_pr(
         return verifier::VacuousRedGreenStatus::NotProvided;
     }
 
-    // The detector needs a local working tree to revert + cargo-run.
-    // The daemon's own CWD is a checkout of `cfg.target_repo` (the
-    // canonical dark-factory source tree) for the Stage-2 production
-    // lane; if the current CWD does not contain a Cargo.toml, the
-    // detector has no manifest to run against, and we surface that as
-    // ManifestMissing rather than silently treating NEVER_RAN as a
-    // vacuous pass (issue #387 r5 finding 3).
-    let repo_root = match std::env::current_dir() {
+    // Bead jleechan-sk55 / issue #478 (P0): the detector needs a local
+    // working tree to revert + cargo-run. Pre-fix this was bound to
+    // `std::env::current_dir()` — the daemon's checkout. For any cross-repo
+    // PR (`repo != cfg.target_repo`) that cwd is the WRONG tree (it is the
+    // dark-factory checkout, which cannot contain the PR's `f.path`),
+    // producing `GreenFailed("git error: read test file <cwd>/<foreign
+    // path>: No such file or directory")` -> `Unknown` on every cross-repo
+    // PR (84% of 141 GATE_ASSESSMENT events). Same class as
+    // `jleechan-v6ud` reroll PR-close routing: derive the root from the
+    // bead's target repo, not the daemon's cwd. See
+    // `Config::resolve_vacuous_repo_root` for the routing rules.
+    let daemon_cwd = match std::env::current_dir() {
         Ok(p) => p,
         Err(_) => {
             return verifier::VacuousRedGreenStatus::ManifestMissing(
                 "could not read daemon cwd".to_string(),
             );
+        }
+    };
+    let repo_root = match deps.cfg.resolve_vacuous_repo_root(repo, &daemon_cwd) {
+        Ok(p) => p,
+        Err(reason) => {
+            // Surface as ManifestMissing with the actionable hint instead
+            // of letting the detector try to run against cwd and produce
+            // the misleading GreenFailed -> Unknown failure mode this fix
+            // is replacing.
+            return verifier::VacuousRedGreenStatus::ManifestMissing(reason);
         }
     };
     let manifest = match crate::vacuous_red_green::find_cargo_manifest(&repo_root) {
@@ -3234,6 +3248,25 @@ fn vacuous_red_green_for_pr(
         Ok(report) => translate_verdict(report.verdict, report.failed_on_revert),
         Err(e) => translate_error(e),
     }
+}
+
+/// Bead jleechan-sk55 (issue #478 P0) — thin re-export of
+/// [`crate::config::Config::resolve_vacuous_repo_root`] as a free function
+/// so the regression test module under `vacuous_repo_root_routing_tests`
+/// can `use super::resolve_vacuous_repo_root` next to its primary caller
+/// (production code invokes the method directly via `deps.cfg`, see the
+/// `vacuous_red_green_for_pr` body above).
+///
+/// DO NOT add new logic here: the routing rules (target_repo -> cwd,
+/// cross-repo -> `[repos.*].worktree`, otherwise -> `Err(hint)`) live on
+/// the Config method, which is the source of truth — this wrapper exists
+/// only for test ergonomics.
+fn resolve_vacuous_repo_root(
+    cfg: &crate::config::Config,
+    repo: &str,
+    daemon_cwd: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    cfg.resolve_vacuous_repo_root(repo, daemon_cwd)
 }
 
 /// Translate the detector's `RedGreenError` into a structured
@@ -5668,6 +5701,196 @@ mod skeptic_prompt_vendor_waiver_tests {
         assert!(
             prompt.contains("pass|warn <note>|fail <reason>"),
             "verdict grammar must remain in the base prompt"
+        );
+    }
+}
+
+// Bead jleechan-sk55: gate 8 (runtime vacuous-red-green detector) was inert on
+// 84% of cross-repo PRs because `vacuous_red_green_for_pr` bound `repo_root`
+// from `std::env::current_dir()` — the daemon's checkout is
+// `jleechanorg/dark-factory`, but a worldarchitect.ai PR's changed files
+// resolve to `dark-factory/mvp_site/tests/...` which cannot exist, surfacing
+// `GreenFailed("git error: read test file ...: No such file or directory")`
+// -> `Unknown` from gate 8. Same class as `jleechan-v6ud` reroll PR-close
+// repo routing: use the BEAD's per-repo worktree, not the daemon's cwd.
+//
+// These tests pin the routing helper. The regression test (cross_repo_uses_per_repo_worktree)
+// reproduces the live failure: a worldarchitect.ai PR's `f.path`
+// (`mvp_site/tests/test_campaign_utils_state_updates_provenance.py`) joined
+// against the daemon's cwd returns a non-existent path; joined against the
+// per-repo worktree it does. The helper intentionally returns a structured
+// error (not `current_dir()`) for unmapped repos so the gate surfaces
+// `ManifestMissing` with an actionable hint instead of silently
+// misclassifying a real PR diff as a phantom.
+#[cfg(test)]
+mod vacuous_repo_root_routing_tests {
+    use super::resolve_vacuous_repo_root;
+    use crate::config::{Config, RepoConfig};
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+
+    /// Regression: bead jleechan-sk55 — a cross-repo PR (`repo !=
+    /// cfg.target_repo`) MUST resolve changed-file paths against the
+    /// per-repo `[repos."..."].worktree`, NOT against `current_dir()`
+    /// (the dark-factory checkout the daemon was launched from).
+    /// Pre-fix behavior produced `GreenFailed(...)` -> `Unknown` for
+    /// every cross-repo PR; post-fix the path resolves and the detector
+    /// can run normally.
+    #[test]
+    fn cross_repo_uses_per_repo_worktree() {
+        // Fake "daemon cwd" — the canonical dark-factory checkout the
+        // daemon is launched from. Distinct from the cross-repo worktree.
+        let daemon_cwd = PathBuf::from("/srv/factory/dark-factory");
+        // Fake cross-repo worktree — the worldarchitect.ai checkout the
+        // bead actually targets.
+        let worldai_wt = PathBuf::from("/srv/factory/worldarchitect.ai");
+
+        let mut repos = HashMap::new();
+        repos.insert(
+            "jleechanorg/worldarchitect.ai".to_string(),
+            RepoConfig {
+                ao_project: "worldarchitect".to_string(),
+                push_remote: "worldai".to_string(),
+                worktree: Some(worldai_wt.clone()),
+            },
+        );
+
+        let cfg = Config {
+            target_repo: "jleechanorg/dark-factory".to_string(),
+            ao_project: Some("dark-factory".to_string()),
+            base_branch: "main".to_string(),
+            stage: 2,
+            max_workers: 30,
+            max_batch: 15,
+            fast_tick_secs: 60,
+            slow_tick_secs: 600,
+            autonomy_timebox_secs: 10_800,
+            budget_warn_usd: 20.0,
+            spec_dir: ".factory/specs/".to_string(),
+            reroll_head_stability_window_secs: 30,
+            reroll_death_confirm_secs: 5,
+            held_recheck_cooldown_secs: 900,
+            repos,
+            pre_gate_validation_enabled: false,
+            escalation_refire_secs: 3600,
+        };
+
+        // BEAD's repo (resolved via overlay.repo(cfg)): jleechanorg/worldarchitect.ai.
+        let resolved = resolve_vacuous_repo_root(&cfg, "jleechanorg/worldarchitect.ai", &daemon_cwd)
+            .expect("cross-repo worktree is configured; helper must succeed");
+
+        assert_eq!(
+            resolved, worldai_wt,
+            "cross-repo PR must resolve to the per-repo worktree, not daemon cwd"
+        );
+        // Pre-fix behavior joined the daemon cwd to the PR's path,
+        // producing e.g. /srv/factory/dark-factory/mvp_site/tests/...
+        // which cannot exist — guard against silent regression to cwd.
+        assert_ne!(
+            resolved, daemon_cwd,
+            "guard against regression to daemon-cwd routing (bead jleechan-sk55)"
+        );
+
+        // The post-fix gating invariant: `f.path` joined to the resolved
+        // root MUST point at a real file (or a real directory) under the
+        // cross-repo worktree, not at the daemon cwd. We don't create
+        // the directory here (that would require a real worldarchitect
+        // checkout) — instead pin that the join points UNDER worldai_wt,
+        // NOT UNDER daemon_cwd, by checking the join's parent.
+        let pr_path_rel = Path::new("mvp_site/tests/test_campaign_utils_state_updates_provenance.py");
+        let joined = resolved.join(pr_path_rel);
+        assert!(
+            joined.starts_with(&worldai_wt),
+            "PR path joined to daemon cwd was the original bug; joined to \
+             per-repo worktree ({}) it must land under that worktree, got {}",
+            worldai_wt.display(),
+            joined.display()
+        );
+        assert!(
+            !joined.starts_with(&daemon_cwd),
+            "PR path must NOT resolve under daemon cwd (the pre-fix bug)"
+        );
+    }
+
+    /// Single-repo lane (`repo == cfg.target_repo`) MUST still resolve
+    /// to the daemon cwd — preserves today's Stage-2 production
+    /// behavior, which was correct on the canonical `dark-factory`
+    /// repo (the daemon is intentionally run from inside that
+    /// checkout).
+    #[test]
+    fn target_repo_uses_daemon_cwd() {
+        let daemon_cwd = PathBuf::from("/srv/factory/dark-factory");
+        let cfg = Config {
+            target_repo: "jleechanorg/dark-factory".to_string(),
+            ao_project: Some("dark-factory".to_string()),
+            base_branch: "main".to_string(),
+            stage: 2,
+            max_workers: 30,
+            max_batch: 15,
+            fast_tick_secs: 60,
+            slow_tick_secs: 600,
+            autonomy_timebox_secs: 10_800,
+            budget_warn_usd: 20.0,
+            spec_dir: ".factory/specs/".to_string(),
+            reroll_head_stability_window_secs: 30,
+            reroll_death_confirm_secs: 5,
+            held_recheck_cooldown_secs: 900,
+            repos: HashMap::new(),
+            pre_gate_validation_enabled: false,
+            escalation_refire_secs: 3600,
+        };
+
+        let resolved = resolve_vacuous_repo_root(&cfg, "jleechanorg/dark-factory", &daemon_cwd)
+            .expect("target_repo must always resolve via daemon cwd");
+        assert_eq!(resolved, daemon_cwd);
+    }
+
+    /// Unmapped cross-repo (no `[repos."..."].worktree` entry, no
+    /// `target_repo` match) MUST fail closed with a structured error so
+    /// the gate surfaces `ManifestMissing("...")` rather than silently
+    /// defaulting to daemon cwd (the original bug class).
+    #[test]
+    fn unmapped_cross_repo_fails_closed_with_actionable_error() {
+        let daemon_cwd = PathBuf::from("/srv/factory/dark-factory");
+        let cfg = Config {
+            target_repo: "jleechanorg/dark-factory".to_string(),
+            ao_project: Some("dark-factory".to_string()),
+            base_branch: "main".to_string(),
+            stage: 2,
+            max_workers: 30,
+            max_batch: 15,
+            fast_tick_secs: 60,
+            slow_tick_secs: 600,
+            autonomy_timebox_secs: 10_800,
+            budget_warn_usd: 20.0,
+            spec_dir: ".factory/specs/".to_string(),
+            reroll_head_stability_window_secs: 30,
+            reroll_death_confirm_secs: 5,
+            held_recheck_cooldown_secs: 900,
+            repos: HashMap::new(),
+            pre_gate_validation_enabled: false,
+            escalation_refire_secs: 3600,
+        };
+
+        let err = resolve_vacuous_repo_root(
+            &cfg,
+            "jleechanorg/worldarchitect.ai",
+            &daemon_cwd,
+        )
+        .expect_err("unmapped cross-repo must fail closed, not silently default to daemon cwd");
+
+        // Fail-closed: must name the repo AND hint at the config knob
+        // the operator needs to flip. Returning an empty error would
+        // re-introduce the original ambiguity (operators couldn't tell
+        // a misconfig from a real missing manifest).
+        let msg = err.to_string();
+        assert!(
+            msg.contains("jleechanorg/worldarchitect.ai"),
+            "error must name the unmapped repo (got: {msg:?})"
+        );
+        assert!(
+            msg.contains("worktree"),
+            "error must hint at the `worktree` config knob (got: {msg:?})"
         );
     }
 }

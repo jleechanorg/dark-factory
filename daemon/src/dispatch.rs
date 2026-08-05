@@ -2047,6 +2047,7 @@ mod tests {
             crate::config::RepoConfig {
                 ao_project: "other-project".to_string(),
                 push_remote: "origin".to_string(),
+                ..Default::default()
             },
         );
         // Bead has a parseable `external_ref` (Stage A fallback) — the
@@ -2119,6 +2120,7 @@ mod tests {
             crate::config::RepoConfig {
                 ao_project: "some-project".to_string(),
                 push_remote: "origin".to_string(),
+                ..Default::default()
             },
         );
         let ready = vec![(
@@ -2203,6 +2205,7 @@ mod tests {
             crate::config::RepoConfig {
                 ao_project: "other-project".to_string(),
                 push_remote: "origin".to_string(),
+                ..Default::default()
             },
         );
         let ready = beads(1);
@@ -2274,6 +2277,7 @@ mod tests {
             crate::config::RepoConfig {
                 ao_project: "worldarchitect".to_string(),
                 push_remote: "worldai".to_string(),
+                ..Default::default()
             },
         );
         let ready = beads(1);
@@ -3383,6 +3387,7 @@ mod tests {
             crate::config::RepoConfig {
                 ao_project: "worldarchitect".to_string(),
                 push_remote: "worldai".to_string(),
+                ..Default::default()
             },
         );
         let ready = beads(1);

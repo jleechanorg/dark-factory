@@ -1,14 +1,26 @@
 use crate::errors::DaemonError;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// One `[repos."<owner>/<repo>"]` table entry (bead jleechan-35y4, Stage B of
 /// the multi-repo dispatch fix — see
 /// `docs/multirepo-dispatch-investigation-2026-07-11.md`).
-#[derive(serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct RepoConfig {
     pub ao_project: String,
     pub push_remote: String,
+    /// Bead jleechan-sk55 / issue #478: optional absolute path to the local
+    /// checkout of this repo on the machine the daemon runs on. Used by
+    /// `vacuous_red_green_for_pr` (gate 8) to resolve per-PR changed-file
+    /// paths against the BEAD's target repo worktree — not against the
+    /// daemon's cwd (which is the canonical dark-factory checkout, wrong
+    /// for every cross-repo PR pre-fix). `#[serde(default)]` keeps every
+    /// existing `daemon.toml` parsing unchanged: the absence simply means
+    /// gate 8 surfaces `ManifestMissing` with an actionable hint for that
+    /// repo (fail-closed, not the silent cwd fallback that produced the
+    /// 84%-Unknown incident).
+    #[serde(default)]
+    pub worktree: Option<std::path::PathBuf>,
 }
 
 /// Resolved dispatch routing for a repo — the AO project to spawn into and
@@ -131,6 +143,55 @@ fn default_reroll_death_confirm_secs() -> u64 {
 }
 
 impl Config {
+    /// Bead jleechan-sk55 (issue #478 P0): resolve the local checkout path
+    /// the gate-8 (vacuous-red-green) detector MUST use to read the PR's
+    /// changed test files.
+    ///
+    /// Resolution order (mirror of `resolve_repo`'s dispatch routing):
+    ///   1. **`repo == self.target_repo`** → `daemon_cwd`. Preserves the
+    ///      canonical single-repo behavior (daemon is launched from inside
+    ///      the dark-factory checkout, so cwd IS the worktree).
+    ///   2. **`[repos."<repo>"].worktree`** is `Some(p)` → `p`. The cross-repo
+    ///      path the bead's resolved-repo lookup `overlay.repo(cfg)` returns,
+    ///      joined with the PR's `f.path`, now lands inside the actual
+    ///      target-repo checkout instead of under the dark-factory cwd that
+    ///      cannot contain foreign paths.
+    ///   3. **Otherwise** → `Err(...)` naming the repo + the `worktree`
+    ///      config knob the operator must set. Pre-fix this branch silently
+    ///      joined cwd to foreign paths, producing
+    ///      `GreenFailed("git error: read test file <cwd>/...: No such file or directory")`
+    ///      on every cross-repo PR (84% of the 141 GATE_ASSESSMENT events
+    ///      the bug was detected across). Fail-closed surfaces
+    ///      `ManifestMissing` with an actionable hint instead.
+    ///
+    /// The function is intentionally pure (no `std::env::current_dir()`)
+    /// so the regression test can pin the routing behavior without touching
+    /// process state. The caller — `tick::vacuous_red_green_for_pr` —
+    /// passes its own resolved `daemon_cwd` as `fallback`.
+    pub fn resolve_vacuous_repo_root(
+        &self,
+        repo: &str,
+        daemon_cwd: &Path,
+    ) -> Result<PathBuf, String> {
+        // (1) target_repo path — cwd IS the worktree by construction.
+        if repo == self.target_repo {
+            return Ok(daemon_cwd.to_path_buf());
+        }
+        // (2) cross-repo with an explicit worktree override.
+        if let Some(rc) = self.repos.get(repo) {
+            if let Some(wt) = rc.worktree.as_ref() {
+                return Ok(wt.clone());
+            }
+        }
+        // (3) fail-closed: name the repo and the config knob.
+        Err(format!(
+            "no worktree configured for repo {repo:?}: add \
+             `[repos.\"{repo}\"].worktree = \"<absolute path to its local checkout>\"` \
+             to daemon.toml so gate 8 can resolve changed-file paths against \
+             the bead's target repo (bead jleechan-sk55)"
+        ))
+    }
+
     /// Resolve dispatch routing for `repo` (`overlay.repo(self)`'s output).
     /// `Some(routing)` when `repo` is KNOWN — either an explicit
     /// `[repos."<repo>"]` entry, or `repo == self.target_repo` (the
