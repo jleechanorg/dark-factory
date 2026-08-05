@@ -4540,6 +4540,34 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     _ => None,
                 })
                 .collect();
+            // bead jleechan-8mlh / auto-factory SKILL.md step 7: a transient
+            // UNKNOWN gate (CI still pending, unverifiable thread count)
+            // defers to the next tick regardless of any sibling red gates —
+            // the picture is not yet settled, the red may resolve into a
+            // green once the transient clears, and rerolling NOW is what
+            // parked beads HUMAN_HELD at the circuit breaker (11 of 40
+            // premature parks in the smoke run). Mirrors
+            // `verifier::classify_chain` precedence: transient > coder-fixable.
+            if !red_reasons.is_empty()
+                && matches!(
+                    verifier::classify_chain(&report),
+                    verifier::ChainDisposition::TransientOnly
+                )
+            {
+                emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    "GATE_ASSESSMENT_TRANSIENT_UNKNOWN",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "reason": "gate assessment had transient unknown gate(s) alongside red gate(s); \
+                                   deferring to next tick per auto-factory contract (jleechan-8mlh)"
+                    }),
+                )?;
+                continue;
+            }
             if red_reasons.is_empty() {
                 // jleechan-zaga / issue #348: no coder-fixable RED gate, but
                 // is the chain blocked by a STRUCTURAL-pending gate (an
