@@ -598,9 +598,22 @@ def test_controller_review_codex_unavailable_fails_closed(monkeypatch, tmp_path)
     assert attempts == ["codex"]
 
 
-def test_controller_codex_transport_preserves_outer_sandbox_exec():
-    """_build_controller_codex_transport must preserve any outer sandbox-exec prefix
-    so the seatbelt profile remains active when running `codex exec --sandbox read-only` on macOS."""
+def test_controller_codex_transport_strips_outer_sandbox_exec():
+    """_build_controller_codex_transport strips any outer sandbox-exec prefix.
+
+    Nesting `codex exec --sandbox read-only` inside an outer seatbelt profile
+    triggers `sandbox_apply` failures on macOS, so PR #542/#549 made the
+    controller transport drop the wrapper and delegate confinement to codex's
+    own read-only sandbox. Confinement is therefore asserted on the emitted
+    flags, not on the outer wrapper: `--sandbox read-only` is always present,
+    and the builder still fails closed on bypass/write-capable modes (see
+    test_controller_codex_transport_rejects_* below).
+
+    Regression guard: PR #548 briefly asserted the opposite (`preserves`)
+    against PR #503 behavior; PR #549 re-applied the #542 strip without
+    updating it, leaving main's `test` job red. Keep this test and the
+    docstring in `_build_controller_codex_transport` in agreement.
+    """
     from runner.handler_dispatch import _build_controller_codex_transport
 
     sandboxed_argv = [
@@ -615,8 +628,11 @@ def test_controller_codex_transport_preserves_outer_sandbox_exec():
     ]
     transport = _build_controller_codex_transport(sandboxed_argv)
 
-    assert transport[0] == "/usr/bin/sandbox-exec"
-    assert transport[3] == "/usr/local/bin/codex"
-    assert transport[4] == "exec"
-    assert "--sandbox" in transport
-    assert "read-only" in transport
+    assert "/usr/bin/sandbox-exec" not in transport
+    assert transport[0] == "codex"
+    assert transport[1] == "exec"
+    # Confinement is delegated to codex itself, so the read-only sandbox flag
+    # and the JSON-over-stdin payload marker are non-negotiable.
+    assert transport[transport.index("--sandbox") + 1] == "read-only"
+    assert transport[-1] == "-"
+    assert "--dangerously-bypass-approvals-and-sandbox" not in transport
