@@ -133,6 +133,13 @@ REVIEWER_ENV_BASE_ALLOWLIST = {
     "LC_ALL",
     "TERM",
     "PWD",
+    # Not a secret — a linker search path. Self-hosted Linux CI runners
+    # promote LD_LIBRARY_PATH via $GITHUB_ENV (see .github/workflows/ci.yml
+    # "Fix Python 3.13 shared-library path") so subprocess python3 can find
+    # libpython3.13.so.1.0. Stripping it here made every reviewer subprocess
+    # (which invokes python3/codex/gemini) fail with rc=127 "error while
+    # loading shared libraries" on those runners.
+    "LD_LIBRARY_PATH",
 }
 
 # Per-reviewer provider credential allowlist. Only the reviewer that

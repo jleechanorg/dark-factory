@@ -210,6 +210,15 @@ def test_subprocess_fail_exit_code(tmp_path):
             pathlib.Path(__file__).resolve().parent.parent
         ),
     }
+    # Self-hosted Linux CI runners promote LD_LIBRARY_PATH via $GITHUB_ENV
+    # (see .github/workflows/ci.yml "Fix Python 3.13 shared-library path")
+    # so subprocess python3 can find libpython3.13.so.1.0. Without it, THIS
+    # subprocess (sys.executable, a from-scratch env) fails with rc=127
+    # "error while loading shared libraries" before runner.preflight even
+    # gets a chance to run — a false negative unrelated to what this test
+    # is actually probing (the hard-stop no-backend-available path).
+    if "LD_LIBRARY_PATH" in os.environ:
+        sanitized_env["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
     proc = subprocess.run(
         [
             sys.executable,
