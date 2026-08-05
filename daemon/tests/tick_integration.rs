@@ -3828,7 +3828,18 @@ fn manual_bead_adoption_never_calls_create_bead_or_fabricates_external_ref() {
     tracker.candidates.borrow_mut().push(daemon::tools::Bead {
         id: "manual-bead-999".into(),
         title: "Orphan-shaped manual bead".into(),
-        description: "created directly via `br create`, no --external-ref".into(),
+        // jleechan-htf7 r2: the body MUST include a `target_repo:` field so
+        // the manual adoption path actually proceeds to Queued. The
+        // unresolvable-repo shape (no external_ref, no target_repo) now
+        // fail-closes at adoption — that's the new r2 contract, pinned by
+        // `manual_bead_adoption_fails_closed_when_target_repo_unresolvable`
+        // below. PR #201's invariant (don't call create_bead, don't
+        // fabricate external_ref) still needs a Queued manual bead to
+        // exercise; this body field supplies the resolvable target_repo
+        // without touching the orphan-defect shape the test is locking in.
+        description: "target_repo: owner/repo\n\
+                      \n\
+                      created directly via `br create`, no --external-ref".into(),
         notes: String::new(),
         file_tree_summary: "".into(),
         external_ref: None, // exactly the jleechan-3wh0 orphan shape
@@ -3887,6 +3898,200 @@ fn manual_bead_adoption_never_calls_create_bead_or_fabricates_external_ref() {
     assert_eq!(
         candidate.external_ref, None,
         "manual bead's external_ref must not be silently fabricated by tick processing"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-htf7 r2: the manual bead-adoption path in `run_tick` (the
+/// `INTAKE_BEAD_CREATED`/`{"manual": true}` branch at tick.rs:1815-1864) is
+/// the only entry through which a bead can enter the daemon's overlay
+/// system WITHOUT a non-empty `external_ref`. PR #201 (jleechan-3wh0) added
+/// a regression test that locks in `create_bead` is not called and
+/// `external_ref` is not fabricated, but it did NOT lock in the structural
+/// invariant that prevents the manual path from creating an INTERMEDIATE
+/// `Queued` overlay row for a bead the daemon can never dispatch (no
+/// resolvable `target_repo`).
+///
+/// Today the path silently adopts the bead with `state: Queued`, calls
+/// `router::route` (an LLM call), pushes the bead through `dispatch`, and
+/// only THEN learns `overlay.target_repo = None` and parks it
+/// `unmapped_repo` at `tick.rs:2133-2145`. That reactive park still leaves
+/// the bead in the routing/dispatch pipeline for every tick, wasting an
+/// LLM call and creating churn telemetry. The fix is fail-closed at
+/// adoption: when a manual bead has neither an `external_ref` owner/repo
+/// prefix nor a `target_repo:` body field, park it `HUMAN_HELD` with reason
+/// `unmapped_repo` immediately and skip routing entirely.
+///
+/// This test pins the new structural invariant:
+/// - Overlay state MUST be `HUMAN_HELD` (not `Queued`) at adoption time.
+/// - `park_reason` MUST be `unmapped_repo` (or the local-fallback variant).
+/// - `summary.beads_parked_human_held` MUST increment; `beads_dispatched`
+///   MUST stay 0.
+/// - The LLM MUST NOT be called for routing (no `judge(...)` invocation).
+/// - Telemetry MUST emit `PARKED_HUMAN_HELD` for the manual adoption branch
+///   (NOT route through dispatch and emit the same event later).
+/// - `Tracker::create_bead` MUST still NOT be called (PR #201 invariant
+///   preserved).
+#[test]
+fn manual_bead_adoption_fails_closed_when_target_repo_unresolvable() {
+    let scm = FakeScm::new(); // no SCM — this bead came from `br create`, not GitHub
+    let tracker = FakeTracker::new();
+    tracker.candidates.borrow_mut().push(Bead {
+        id: "no-repo-manual-bead".into(),
+        title: "Manual bead with no repo signal".into(),
+        // No body `target_repo:` field, no external_ref — exactly the shape
+        // that triggers the future-orphan defect on every tick.
+        description: "manually created via `br create` with no --external-ref".into(),
+        notes: String::new(),
+        file_tree_summary: "".into(),
+        external_ref: None,
+    });
+
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    // No `llm.response` pre-seeded — if the daemon calls `judge`, it gets
+    // an empty string and the test's "no LLM calls" assertion will catch it.
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    let telemetry_log = std::env::temp_dir().join("afd_manual_bead_fail_closed_test.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        0,
+        0,
+    )
+    .expect("tick should succeed even when manual adoption fail-closes");
+
+    // (1) Overlay must be HUMAN_HELD, not Queued — fail-closed adoption
+    // parks before routing, so dispatch never enters the loop.
+    let overlay = store
+        .load("no-repo-manual-bead")
+        .expect("overlay load must not error")
+        .expect("manual adoption must persist the overlay row");
+    assert_eq!(
+        overlay.state,
+        OverlayState::HumanHeld,
+        "manual bead without external_ref / target_repo MUST be parked HUMAN_HELD \
+         at adoption time, not left Queued for the dispatch layer to fail on. \
+         A Queued overlay here means the r2 fix regressed: the daemon is \
+         letting a future-orphan shape enter routing."
+    );
+    let park_reason = overlay
+        .park_reason
+        .as_deref()
+        .expect("HUMAN_HELD overlay must carry a park_reason");
+    assert!(
+        park_reason == "unmapped_repo"
+            || park_reason.starts_with("escalation_local_fallback:unmapped_repo"),
+        "park_reason must be unmapped_repo-derived, got: {park_reason:?}"
+    );
+    assert_eq!(
+        overlay.target_repo, None,
+        "fail-closed adoption must preserve the unresolvable target_repo so the \
+         reason in park_reason matches the persisted column (consistency check \
+         against silent mutation)"
+    );
+
+    // (2) Summary counters: HUMAN_HELD park, not a transient dispatch error,
+    // and ZERO dispatches (the LLM should never have been called).
+    assert_eq!(
+        summary.beads_parked_human_held, 1,
+        "manual fail-closed adoption must increment beads_parked_human_held (got: {})",
+        summary.beads_parked_human_held
+    );
+    assert_eq!(
+        summary.beads_dispatched, 0,
+        "a no-repo manual bead must NOT dispatch"
+    );
+    assert_eq!(
+        summary.beads_routed, 0,
+        "a no-repo manual bead must NOT enter the routing pipeline (LLM call \
+         skipped — fail-closed adoption is what saves the LLM cost). Got \
+         beads_routed={}",
+        summary.beads_routed
+    );
+
+    // (3) LLM must NOT be called for routing — fail-closed adoption is what
+    // saves the wasted judge() invocation. An empty `llm.calls` is the
+    // strongest assertion here; if any future refactor reintroduces routing
+    // for unresolvable-repo manual beads, this assertion fires immediately.
+    let llm_calls = llm.calls.borrow();
+    assert!(
+        llm_calls.is_empty(),
+        "manual fail-closed adoption must skip router::route() entirely — \
+         any LLM call here means the r2 fail-closed gate regressed. \
+         LLM calls observed: {llm_calls:?}"
+    );
+
+    // (4) create_bead must NOT be called — PR #201 invariant preserved.
+    let tracker_calls = tracker.calls.borrow();
+    assert!(
+        tracker_calls.iter().all(|c| !c.starts_with("create_bead(")),
+        "manual-bead adoption must NEVER call create_bead (PR #201 invariant). \
+         A create_bead(...) call here means the r2 path started minting new \
+         beads/refs, which is the orphan-defect shape: {tracker_calls:?}"
+    );
+
+    // (5) Telemetry must emit PARKED_HUMAN_HELD for the fail-closed adoption,
+    // and the bead's tracker record must remain untouched (no fabricated
+    // external_ref). Read the JSONL line-by-line for stable assertions.
+    let body = std::fs::read_to_string(&telemetry_log).unwrap();
+    let events: Vec<serde_json::Value> = body
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let parked = events
+        .iter()
+        .find(|e| e["eventType"] == "PARKED_HUMAN_HELD" && e["beadId"] == "no-repo-manual-bead");
+    assert!(
+        parked.is_some(),
+        "telemetry MUST emit PARKED_HUMAN_HELD for fail-closed manual adoption; \
+         events = {events:?}"
+    );
+    let parked_event = parked.expect("checked above");
+    assert_eq!(
+        parked_event["context"]["reason"], "unmapped_repo",
+        "PARKED_HUMAN_HELD event for manual fail-closed adoption must name the \
+         unmapped_repo reason in its context payload so downstream tooling \
+         (Healer, dashboards) attributes it correctly; got context = {:?}",
+        parked_event["context"]
+    );
+    assert_eq!(
+        parked_event["context"]["source"], "manual_adoption_fail_closed",
+        "PARKED_HUMAN_HELD context must tag the adoption-time source so Healer \
+         can distinguish r2 fail-closed parks from dispatch-layer unmapped_repo \
+         parks (bead jleechan-8jxr). Got context = {:?}",
+        parked_event["context"]
+    );
+
+    // PR #201 invariant: the tracker's candidate record for the manual bead
+    // stays at external_ref = None — no fake linkage was minted to satisfy
+    // the r2 fail-closed gate.
+    let candidate = tracker
+        .candidates
+        .borrow()
+        .iter()
+        .find(|b| b.id == "no-repo-manual-bead")
+        .cloned()
+        .expect("candidate should still be present");
+    assert_eq!(
+        candidate.external_ref, None,
+        "manual bead's external_ref must remain None — fail-closed adoption must \
+         not silently mint a fabricated ref to satisfy the unmapped_repo check"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);

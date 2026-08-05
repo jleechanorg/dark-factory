@@ -1831,6 +1831,112 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     bead.description.as_str(),
                     bead.external_ref.as_deref(),
                 );
+                // jleechan-htf7 r2: fail-closed adoption for manual beads.
+                // A `br create`-style bead that arrives here WITHOUT a
+                // resolvable `target_repo` (no body `target_repo:` field,
+                // no parseable `external_ref` owner/repo prefix) used to be
+                // admitted as `state: Queued`, routed through the LLM, and
+                // only THEN parked `unmapped_repo` at the dispatch layer
+                // (see `tick.rs:2133-2145`). That reactive park leaves a
+                // future-orphan shape in the routing pipeline on every
+                // tick, wastes a `judge(...)` call, and creates churn
+                // telemetry for a defect the daemon can never recover from
+                // on its own.
+                //
+                // Fail-closed here: park HUMAN_HELD with the same
+                // `unmapped_repo` reason the dispatch layer would have used,
+                // skip routing entirely, and emit `PARKED_HUMAN_HELD`
+                // directly so downstream tooling (Healer, dashboards) sees
+                // the same event shape whether the park came from adoption
+                // or from dispatch. PR #201 invariants (`create_bead`
+                // never called, `external_ref` never fabricated) still
+                // apply — this gate only short-circuits before routing.
+                if target_repo.is_none() {
+                    let mut o = BeadOverlay {
+                        bead_id: bead.id.clone(),
+                        state: OverlayState::HumanHeld,
+                        attempt: 1,
+                        reroll_count: 0,
+                        autonomy_secs: 0,
+                        spend_usd: 0.0,
+                        pr_number: None,
+                        branch: None,
+                        session_id: None,
+                        is_adopted: false,
+                        spawn_failure_count: 0,
+                        pre_session_head_sha: None,
+                        park_reason: None,
+                        target_repo,
+                        attempt_started_at: None,
+                    };
+                    set_human_hold_reason(&mut o, HumanHoldReason::UnmappedRepo);
+                    deps.store.save(&o)?;
+                    summary.beads_parked_human_held += 1;
+                    emit(
+                        deps.telemetry_log,
+                        &bead.id,
+                        1,
+                        OverlayState::HumanHeld.as_str(),
+                        "PARKED_HUMAN_HELD",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "reason": "unmapped_repo",
+                            "source": "manual_adoption_fail_closed",
+                            "external_ref": bead.external_ref,
+                        }),
+                    )?;
+                    if !escalation_already_recorded(deps, &bead.id)? {
+                        if let Err(err) =
+                            post_scm_comment_by_bead_id(deps, &bead.id, &format!(
+                                "🤖 **[dark-factory]** Escalation required: bead `{}` was \
+                                 created manually via `br create` with neither an \
+                                 `external_ref` nor a `target_repo:` body field, so the \
+                                 daemon cannot determine which repo it belongs to. \
+                                 Automation parked it HUMAN_HELD at adoption time \
+                                 (jleechan-htf7 r2 fail-closed gate) rather than routing \
+                                 it and parking at dispatch. Operator action: supply an \
+                                 explicit `target_repo: <owner>/<repo>` line in the bead \
+                                 body, set `external_ref = \"<owner>/<repo>#NNN\"`, or \
+                                 file under an issue/PR labeled `factory` so intake can \
+                                 resolve the repo from the GitHub external_ref.",
+                                bead.id,
+                            ))
+                        {
+                            if is_missing_scm_target_error(&err) {
+                                record_local_escalation_fallback(
+                                    deps,
+                                    &bead.id,
+                                    "unmapped_repo",
+                                )?;
+                                summary.beads_escalated_locally += 1;
+                                emit(
+                                    deps.telemetry_log,
+                                    &bead.id,
+                                    1,
+                                    OverlayState::HumanHeld.as_str(),
+                                    "ESCALATED_LOCALLY",
+                                    serde_json::json!({}),
+                                    serde_json::json!({
+                                        "reason": "unmapped_repo",
+                                        "source": "manual_adoption_fail_closed",
+                                        "scm_error": err.to_string(),
+                                    }),
+                                )?;
+                            } else if !err.is_transient() {
+                                mark_escalation_undeliverable_and_emit(
+                                    deps,
+                                    summary,
+                                    &bead.id,
+                                    1,
+                                    OverlayState::HumanHeld.as_str(),
+                                    "unmapped_repo",
+                                    &err,
+                                )?;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let o = BeadOverlay {
                     bead_id: bead.id.clone(),
                     state: OverlayState::Queued,
