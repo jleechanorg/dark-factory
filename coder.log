@@ -1,6 +1,0 @@
-[2026-06-27 13:58:58] [COMMIT] Committing fix
-[2026-06-27 13:59:12] [PUSH] Force-push with new fix
-[2026-06-27 13:59:28] [PUSH_OK] New HEAD pushed
-[2026-06-27 13:59:40] [WAIT_CI] Waiting for new CI run on PR #109
-[2026-06-27 14:00:23] [CHECK] Looking at full test logs while CI runs
-[2026-06-27 14:00:51] [FULL_TESTS] Running test_handler_holdout + test_2gv + test_engine + test_gates
