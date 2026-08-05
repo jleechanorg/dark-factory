@@ -389,6 +389,7 @@ fn drive_one_tick(
             cfg,
             telemetry_log,
             vendor_health: None,
+            pr_resolution_cooldown: None,
         },
         0,
         0,

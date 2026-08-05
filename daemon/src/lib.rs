@@ -24,4 +24,5 @@ pub mod vacuous_red_green;
 
 
 pub mod gates_compute;
+pub mod pr_resolution_cooldown;
 pub mod vendor_health;

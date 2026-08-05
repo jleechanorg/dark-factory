@@ -606,6 +606,14 @@ fn run(args: Args) -> Result<(), DaemonError> {
     // every `TickDeps` borrow below stays valid for the daemon lifetime.
     let vendor_health = std::sync::Arc::new(std::sync::Mutex::new(VendorHealthLedger::new()));
     daemon::vendor_health::set_global_ledger(vendor_health.clone());
+    // Bead jleechan-48ou: process-wide pr-resolution rate-limit cooldown,
+    // mirrors the vendor_health pattern above. Shared across `--once` and
+    // the poll loop so a `gh` rate-limit hit during a slow tier does not
+    // bleed into subsequent ticks (and across restart-via-ticks of the
+    // same daemon process).
+    let pr_resolution_cooldown = std::sync::Arc::new(std::sync::Mutex::new(
+        daemon::pr_resolution_cooldown::PrResolutionCooldown::default(),
+    ));
 
     let deps = TickDeps {
         scm: scm.as_ref(),
@@ -617,6 +625,7 @@ fn run(args: Args) -> Result<(), DaemonError> {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: Some(&*vendor_health),
+        pr_resolution_cooldown: Some(&*pr_resolution_cooldown),
     };
 
     if args.once {

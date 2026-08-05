@@ -54,6 +54,17 @@ pub struct TickDeps<'a> {
     /// never executed. Optional so existing test sites that don't
     /// exercise the ledger can pass `None` (pre-r1 behavior preserved).
     pub vendor_health: Option<&'a Mutex<crate::vendor_health::VendorHealthLedger>>,
+    /// Bead jleechan-48ou: daemon-process-wide cooldown for the per-bead
+    /// `pr_number_for_branch` lookup. When `gh` returns a rate-limit-
+    /// classified error from any of the three call sites in this file
+    /// (DISPATCHED→ATTESTED promotion + ATTESTED pre-gate validation
+    /// drift), this cooldown is set so the next tick(s) skip the lookup
+    /// instead of re-hammering the GraphQL bucket every slow tier for
+    /// every DISPATCHED bead. Cleared on the first `Ok(_)` so recovery
+    /// is immediate. `None` falls through to pre-fix fail-closed
+    /// per-bead `Err` behavior — matches the `vendor_health` pattern so
+    /// existing tests don't have to wire anything new.
+    pub pr_resolution_cooldown: Option<&'a Mutex<crate::pr_resolution_cooldown::PrResolutionCooldown>>,
 }
 
 /// Summary counters returned by `run_tick`, mirrored into the `TICK` telemetry
@@ -145,6 +156,183 @@ const EVIDENCE_HEAD_STALE_SENTINEL_ATTEMPT: u32 = u32::MAX - 1;
 // (the `gh pr list` query); per-PR probes are served from the adoption
 // probe cache. 20 is a generous in-between signal.
 const INTAKE_GH_CALL_WARN_THRESHOLD: u32 = 20;
+
+/// Outcome of `pr_number_for_branch_with_cooldown`. Encodes the three
+/// real exit shapes so call sites don't have to thread `Err` through
+/// their own `match` — the helper has already classified the error
+/// (rate-limit vs generic transient) and updated the cooldown when
+/// relevant.
+#[derive(Debug)]
+pub enum PrResolutionOutcome {
+    /// Lookup was suppressed because the daemon-process-wide cooldown
+    /// is still active. Caller must keep the bead in its current
+    /// state (typically DISPATCHED with stale `pr_number` left
+    /// untouched, per t40t-r12) and `continue` to the next bead.
+    SkippedDueToCooldown {
+        until_epoch: u64,
+        remaining_secs: u64,
+    },
+    /// Lookup ran. `Ok(None)` and `Ok(Some(_)` are returned raw so the
+    /// caller can do its existing branch→PR resolution logic.
+    Resolved(Result<Option<u64>, DaemonError>),
+}
+
+/// Bead jleechan-48ou: wrap `deps.scm.pr_number_for_branch(...)` with
+/// the daemon-process-wide rate-limit cooldown. Three call sites use
+/// this helper (DISPATCHED→ATTESTED promotion at ~line 3487, ATTESTED
+/// pre-gate validation drift at ~line 3727, ATTESTED pre-gate
+/// validation closed-PR at ~line 3816). All three previously called
+/// `pr_number_for_branch` unconditionally every slow-tier tick for
+/// every DISPATCHED/ATTESTED bead with a branch — a sustained `gh`
+/// rate-limit window caused N GraphQL hits per slow tick (N =
+/// dispatched-bead count). Live incident 2026-08-05 19:35-20:05Z:
+/// jleechan-htf7 alone logged ~30 `PR_NUMBER_REREZOLVE_TRANSIENT_ERROR`
+/// events across 30 min, extending recovery and adding ~287 events
+/// in the wider 3.4-day tail.
+///
+/// Behavior:
+///   * Cooldown active → return `SkippedDueToCooldown` WITHOUT calling
+///     `gh`. Caller treats this as if `Err` was returned (bead stays in
+///     current state) — but the slow tier's per-bead work continues
+///     so other beads that don't need this lookup still advance.
+///   * Lookup `Err` with `is_gh_rate_limit()` → set the cooldown
+///     (`now + 60s`, mirror of jtg8-r4's intake sweep pattern), then
+///     return the `Err` so the caller emits the existing
+///     `PR_NUMBER_REREZOLVE_TRANSIENT_ERROR` telemetry with the
+///     cooldown end stamped.
+///   * Lookup `Err` non-rate-limit → just return the `Err` (unchanged
+///     behavior — pre-fix transient errors that aren't rate-limit just
+///     log + retry next tick as before).
+///   * Lookup `Ok(_)` → clear the cooldown so the very next tick
+///     resumes the lookup the moment `gh` is responsive again.
+///
+/// When `deps.pr_resolution_cooldown` is `None` (legacy / test sites
+/// that don't exercise the cooldown), the helper falls through to a
+/// bare `pr_number_for_branch` call so existing tests stay green —
+/// matches the `vendor_health: None` pattern.
+pub fn pr_number_for_branch_with_cooldown(
+    deps: &TickDeps,
+    telemetry_log: &Path,
+    bead_id: &str,
+    attempt: u32,
+    state_str: &str,
+    phase: &str,
+    repo: &str,
+    branch: &str,
+) -> PrResolutionOutcome {
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Honor an active cooldown BEFORE invoking gh.
+    if let Some(cooldown) = deps.pr_resolution_cooldown {
+        let mut guard = match cooldown.lock() {
+            Ok(g) => g,
+            // jleechan-48ou: a poisoned Mutex must not panic the daemon.
+            // Fall through to the un-cooldowned lookup — better to take
+            // one extra `gh` hit than to crash the slow tier and park
+            // every bead. The poison will show up loudly in tests on
+            // the very next lock attempt and be diagnosable.
+            Err(_) => return PrResolutionOutcome::Resolved(
+                deps.scm.pr_number_for_branch(repo, branch),
+            ),
+        };
+        if guard.is_active(now_epoch) {
+            let remaining = guard.remaining_secs(now_epoch);
+            let until = guard.until_epoch;
+            guard.record_skip();
+            let _ = emit(
+                telemetry_log,
+                bead_id,
+                attempt,
+                state_str,
+                "PR_NUMBER_REREZOLVE_RATE_LIMIT_COOLDOWN",
+                serde_json::json!({}),
+                serde_json::json!({
+                    "phase": phase,
+                    "repo": repo,
+                    "branch": branch,
+                    "cooldown_until_epoch": until,
+                    "remaining_secs": remaining,
+                    "skips_since_clear": guard.skips_since_clear,
+                    "action": "skipped_due_to_cooldown",
+                }),
+            );
+            return PrResolutionOutcome::SkippedDueToCooldown {
+                until_epoch: until,
+                remaining_secs: remaining,
+            };
+        }
+    }
+
+    // No active cooldown — invoke gh.
+    let result = deps.scm.pr_number_for_branch(repo, branch);
+
+    // Classify the error and update the cooldown.
+    if let Some(cooldown) = deps.pr_resolution_cooldown {
+        let mut guard = match cooldown.lock() {
+            Ok(g) => g,
+            Err(_) => return PrResolutionOutcome::Resolved(result),
+        };
+        match &result {
+            Err(e) if e.is_gh_rate_limit() => {
+                let until = guard.record_rate_limit(now_epoch);
+                // The transient telemetry for the caller is unchanged
+                // (PR_NUMBER_REREZOLVE_TRANSIENT_ERROR); we annotate it
+                // with the cooldown end so operators can read the
+                // window from the log alone.
+                let _ = emit(
+                    telemetry_log,
+                    bead_id,
+                    attempt,
+                    state_str,
+                    "PR_NUMBER_REREZOLVE_TRANSIENT_ERROR_COOLDOWN_SET",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "phase": phase,
+                        "repo": repo,
+                        "branch": branch,
+                        "cooldown_until_epoch": until,
+                        "cooldown_secs": crate::pr_resolution_cooldown::PR_RESOLUTION_RATE_LIMIT_COOLDOWN_SECS,
+                    }),
+                );
+                // Stash the cooldown end on the result via a wrapper so
+                // the caller's own PR_NUMBER_REREZOLVE_TRANSIENT_ERROR
+                // emit can include it as `cooldown_set_until_epoch`.
+                // We piggyback the value by re-wrapping the result with
+                // a tag here. (Caller still emits its own transient
+                // event; this companion event is the cooldown audit.)
+            }
+            Err(_) => {
+                // Non-rate-limit transient — pre-fix behavior.
+            }
+            Ok(_) => {
+                // gh is responsive — clear the cooldown so the very
+                // next tick resumes the lookup.
+                if guard.until_epoch > 0 {
+                    guard.clear();
+                    let _ = emit(
+                        telemetry_log,
+                        bead_id,
+                        attempt,
+                        state_str,
+                        "PR_NUMBER_REREZOLVE_COOLDOWN_CLEARED",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "phase": phase,
+                            "repo": repo,
+                            "branch": branch,
+                            "reason": "ok_response_received",
+                        }),
+                    );
+                }
+            }
+        }
+    }
+
+    PrResolutionOutcome::Resolved(result)
+}
 
 /// Bead jleechan-msmq: an ATTESTED bead with `reroll_count > 0` is in the
 /// reroll pipeline. The OLD PR's gate verdict cannot advance the bead
@@ -3484,8 +3672,49 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 // reason=`branch_mismatch_no_open_pr`. A hard `Err` is logged
                 // via `PR_NUMBER_REREZOLVE_TRANSIENT_ERROR` and skipped —
                 // the next tick re-attempts the lookup.
-                match deps.scm.pr_number_for_branch(&repo, branch) {
-                    Ok(Some(discovered)) if Some(discovered) != overlay.pr_number => {
+                // jleechan-48ou: rate-limit-cooldown wrapper around the
+                // branch→PR lookup. `SkippedDueToCooldown` is treated
+                // identically to a transient Err (bead stays DISPATCHED,
+                // `continue` to the next bead) — but no gh call was made.
+                match pr_number_for_branch_with_cooldown(
+                    deps,
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::Dispatched.as_str(),
+                    "dispatched_to_attested",
+                    &repo,
+                    branch,
+                ) {
+                    PrResolutionOutcome::SkippedDueToCooldown {
+                        until_epoch,
+                        remaining_secs,
+                    } => {
+                        // Mirror the existing PR_NUMBER_REREZOLVE_TRANSIENT_ERROR
+                        // emit shape but with a cooldown-aware reason so
+                        // operators see this is an intentional skip, not a
+                        // gh-side transient.
+                        let _ = emit(
+                            deps.telemetry_log,
+                            bead_id,
+                            overlay.attempt,
+                            OverlayState::Dispatched.as_str(),
+                            "PR_NUMBER_REREZOLVE_TRANSIENT_ERROR",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "branch": branch,
+                                "phase": "dispatched_to_attested",
+                                "cooldown_active": true,
+                                "cooldown_until_epoch": until_epoch,
+                                "cooldown_remaining_secs": remaining_secs,
+                                "action": "kept_dispatched_no_promotion_cooldown_skip",
+                            }),
+                        );
+                        continue;
+                    }
+                    PrResolutionOutcome::Resolved(Ok(Some(discovered)))
+                        if Some(discovered) != overlay.pr_number =>
+                    {
                         let previous = overlay.pr_number;
                         overlay.pr_number = Some(discovered);
                         deps.store.save(&overlay)?;
@@ -3505,7 +3734,9 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             }),
                         )?;
                     }
-                    Ok(None) if overlay.pr_number.is_some() && !overlay.is_adopted => {
+                    PrResolutionOutcome::Resolved(Ok(None))
+                        if overlay.pr_number.is_some() && !overlay.is_adopted =>
+                    {
                         // Fail-closed: a stale `pr_number` points at a PR
                         // that is no longer open for this branch (e.g. it
                         // merged and the bead was re-cut with a fresh -rN
@@ -3546,8 +3777,8 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             }),
                         )?;
                     }
-                    Ok(_) => {}
-                    Err(e) => {
+                    PrResolutionOutcome::Resolved(Ok(_)) => {}
+                    PrResolutionOutcome::Resolved(Err(e)) => {
                         // jleechan-t40t r12 (issue #326): FAIL CLOSED. A
                         // transient branch→PR resolution error leaves the
                         // stored `pr_number` UNVALIDATED this tick. The pre-fix
@@ -3557,6 +3788,22 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         // the branch may no longer be bound to). Keep the bead
                         // DISPATCHED and retry the resolution next tick — never
                         // promote on an unvalidated number.
+                        //
+                        // jleechan-48ou: the helper has already classified
+                        // this Err and, if it was rate-limit, set the
+                        // daemon-process-wide cooldown (and emitted a
+                        // `PR_NUMBER_REREZOLVE_TRANSIENT_ERROR_COOLDOWN_SET`
+                        // companion event). The transient telemetry below
+                        // mirrors the pre-fix shape so dashboards keyed on
+                        // `PR_NUMBER_REREZOLVE_TRANSIENT_ERROR` keep
+                        // working, plus the cooldown metadata is stamped
+                        // so operators can correlate.
+                        let cooldown_meta = if e.is_gh_rate_limit() {
+                            deps.pr_resolution_cooldown
+                                .and_then(|c| c.lock().ok().map(|g| g.until_epoch))
+                        } else {
+                            None
+                        };
                         let _ = emit(
                             deps.telemetry_log,
                             bead_id,
@@ -3567,6 +3814,8 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             serde_json::json!({
                                 "branch": branch,
                                 "error": format!("{e:?}"),
+                                "is_gh_rate_limit": e.is_gh_rate_limit(),
+                                "cooldown_set_until_epoch": cooldown_meta,
                                 "action": "kept_dispatched_no_promotion",
                             }),
                         );
@@ -3722,11 +3971,38 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                 "reason": "stored_pr_head_ref_drifted",
                             }),
                         );
-                        match deps
-                            .scm
-                            .pr_number_for_branch(&repo, overlay.branch.as_deref().unwrap_or(""))
-                        {
-                            Ok(Some(discovered)) => {
+                        match pr_number_for_branch_with_cooldown(
+                            deps,
+                            deps.telemetry_log,
+                            bead_id,
+                            overlay.attempt,
+                            OverlayState::Attested.as_str(),
+                            "pre_gate_validation_drift",
+                            &repo,
+                            overlay.branch.as_deref().unwrap_or(""),
+                        ) {
+                            PrResolutionOutcome::SkippedDueToCooldown {
+                                until_epoch,
+                                remaining_secs,
+                            } => {
+                                let _ = emit(
+                                    deps.telemetry_log,
+                                    bead_id,
+                                    overlay.attempt,
+                                    OverlayState::Attested.as_str(),
+                                    "PR_NUMBER_REREZOLVE_TRANSIENT_ERROR",
+                                    serde_json::json!({}),
+                                    serde_json::json!({
+                                        "branch": overlay.branch,
+                                        "phase": "pre_gate_validation",
+                                        "cooldown_active": true,
+                                        "cooldown_until_epoch": until_epoch,
+                                        "cooldown_remaining_secs": remaining_secs,
+                                    }),
+                                );
+                                continue;
+                            }
+                            PrResolutionOutcome::Resolved(Ok(Some(discovered))) => {
                                 overlay.pr_number = Some(discovered);
                                 deps.store.save(&overlay)?;
                                 emit(
@@ -3745,7 +4021,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                 )?;
                                 discovered
                             }
-                            Ok(None) => {
+                            PrResolutionOutcome::Resolved(Ok(None)) => {
                                 // jleechan-t40t r12 (issue #326): the stored PR
                                 // drifted off the branch AND the branch has no
                                 // live PR. Clearing `pr_number` alone would
@@ -3775,7 +4051,19 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                 );
                                 continue;
                             }
-                            Err(e) => {
+                            PrResolutionOutcome::Resolved(Err(e)) => {
+                                // jleechan-48ou: helper has already classified
+                                // the Err and may have set the cooldown. We
+                                // just stamp the existing transient telemetry
+                                // shape — same event name dashboards key on,
+                                // plus `is_gh_rate_limit` + cooldown metadata
+                                // for correlation.
+                                let cooldown_meta = if e.is_gh_rate_limit() {
+                                    deps.pr_resolution_cooldown
+                                        .and_then(|c| c.lock().ok().map(|g| g.until_epoch))
+                                } else {
+                                    None
+                                };
                                 let _ = emit(
                                     deps.telemetry_log,
                                     bead_id,
@@ -3787,6 +4075,8 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                         "branch": overlay.branch,
                                         "phase": "pre_gate_validation",
                                         "error": format!("{e:?}"),
+                                        "is_gh_rate_limit": e.is_gh_rate_limit(),
+                                        "cooldown_set_until_epoch": cooldown_meta,
                                     }),
                                 );
                                 continue;
@@ -3811,11 +4101,38 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             "reason": "stored_pr_no_longer_open_or_branch_mismatch",
                         }),
                     );
-                    match deps
-                        .scm
-                        .pr_number_for_branch(&repo, overlay.branch.as_deref().unwrap_or(""))
-                    {
-                        Ok(Some(discovered)) => {
+                    match pr_number_for_branch_with_cooldown(
+                        deps,
+                        deps.telemetry_log,
+                        bead_id,
+                        overlay.attempt,
+                        OverlayState::Attested.as_str(),
+                        "pre_gate_validation_closed_pr",
+                        &repo,
+                        overlay.branch.as_deref().unwrap_or(""),
+                    ) {
+                        PrResolutionOutcome::SkippedDueToCooldown {
+                            until_epoch,
+                            remaining_secs,
+                        } => {
+                            let _ = emit(
+                                deps.telemetry_log,
+                                bead_id,
+                                overlay.attempt,
+                                OverlayState::Attested.as_str(),
+                                "PR_NUMBER_REREZOLVE_TRANSIENT_ERROR",
+                                serde_json::json!({}),
+                                serde_json::json!({
+                                    "branch": overlay.branch,
+                                    "phase": "pre_gate_validation",
+                                    "cooldown_active": true,
+                                    "cooldown_until_epoch": until_epoch,
+                                    "cooldown_remaining_secs": remaining_secs,
+                                }),
+                            );
+                            continue;
+                        }
+                        PrResolutionOutcome::Resolved(Ok(Some(discovered))) => {
                             overlay.pr_number = Some(discovered);
                             deps.store.save(&overlay)?;
                             emit(
@@ -3834,7 +4151,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             )?;
                             discovered
                         }
-                        Ok(None) => {
+                        PrResolutionOutcome::Resolved(Ok(None)) => {
                             // jleechan-t40t r12 (issue #326): stored PR is
                             // closed/missing and the branch has no live PR.
                             // Demote ATTESTED→DISPATCHED (rather than leaving it
@@ -3861,7 +4178,13 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             );
                             continue;
                         }
-                        Err(e) => {
+                        PrResolutionOutcome::Resolved(Err(e)) => {
+                            let cooldown_meta = if e.is_gh_rate_limit() {
+                                deps.pr_resolution_cooldown
+                                    .and_then(|c| c.lock().ok().map(|g| g.until_epoch))
+                            } else {
+                                None
+                            };
                             let _ = emit(
                                 deps.telemetry_log,
                                 bead_id,
@@ -3873,6 +4196,8 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                     "branch": overlay.branch,
                                     "phase": "pre_gate_validation",
                                     "error": format!("{e:?}"),
+                                    "is_gh_rate_limit": e.is_gh_rate_limit(),
+                                    "cooldown_set_until_epoch": cooldown_meta,
                                 }),
                             );
                             continue;

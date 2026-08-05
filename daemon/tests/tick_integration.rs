@@ -100,6 +100,7 @@ fn one_full_tick_cycle_keeps_unknown_only_gate_attested() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         0,
         0,
@@ -186,6 +187,7 @@ fn one_full_tick_cycle_keeps_unknown_only_gate_attested() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         1,
         0,
@@ -337,6 +339,7 @@ fn run_tick_rejects_non_stage_1_or_2_config() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let err =
@@ -386,6 +389,7 @@ fn run_tick_never_calls_dispatch_when_router_parses_no_verdict() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let summary =
@@ -488,6 +492,7 @@ fn run_tick_emits_dispatched_only_for_actual_dispatch_successes() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         0,
         0,
@@ -597,6 +602,7 @@ fn test_autonomy_increment_and_timebox_envelope() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     // Run tick with 300 seconds (5 minutes) elapsed
@@ -663,6 +669,7 @@ fn test_autonomy_budget_warning_crossing() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     // Run tick with 60 seconds elapsed (new autonomy_secs = 810, crossing 800)
@@ -727,6 +734,7 @@ fn test_wedge_detection_dispatched_coder_silent() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     // Run tick
@@ -814,6 +822,7 @@ fn test_wedge_detection_dispatched_coder_silent_saved_by_transcript_activity() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let summary = run_tick(&deps, 1, 10).unwrap();
@@ -904,6 +913,7 @@ fn test_wedge_detection_dispatched_coder_silent_stale_transcript_still_parks() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let summary = run_tick(&deps, 1, 10).unwrap();
@@ -976,6 +986,7 @@ fn test_dispatch_integrity_sweep_parks_session_branch_mismatch() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let summary = run_tick(&deps, 1, 1).unwrap();
@@ -1098,6 +1109,7 @@ fn test_dispatch_integrity_sweep_leaves_matching_branch_alone() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let summary = run_tick(&deps, 1, 1).unwrap();
@@ -1175,6 +1187,7 @@ fn test_dispatch_integrity_sweep_detects_force_push_on_adopted_branch() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let summary = run_tick(&deps, 1, 1).unwrap();
@@ -1256,6 +1269,7 @@ fn test_dispatch_integrity_sweep_allows_fast_forward_adopted_commit() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let _summary = run_tick(&deps, 1, 1).unwrap();
@@ -1352,6 +1366,7 @@ fn test_wedge_detection_attested_session_stalled() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     // Run tick. With the dispatch-scheduling-guarantee ordering
@@ -1484,6 +1499,7 @@ fn test_wedge_detection_attested_session_not_stalled_if_remote_ahead() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let summary = run_tick(&deps, 1, 10).unwrap();
@@ -1592,6 +1608,7 @@ fn test_wedge_detection_still_parks_when_local_matches_remote() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let summary = run_tick(&deps, 1, 10).unwrap();
@@ -1694,6 +1711,7 @@ fn test_wedge_detection_still_parks_when_local_is_ahead_of_remote() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let summary = run_tick(&deps, 1, 10).unwrap();
@@ -1813,6 +1831,7 @@ fn test_wedge_detection_still_parks_when_branches_have_diverged() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let summary = run_tick(&deps, 1, 10).unwrap();
@@ -1891,6 +1910,7 @@ fn factory_labeled_existing_pr_is_adopted_and_verified_without_spawn() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         0,
         0,
@@ -1977,6 +1997,7 @@ fn factory_labeled_existing_pr_second_tick_reuses_tracking_bead_without_spawn() 
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let first = run_tick(&deps, 0, 0).expect("first tick adopts PR");
@@ -2077,6 +2098,7 @@ fn existing_pr_adoption_does_not_re_emit_telemetry_on_subsequent_ticks() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     run_tick(&deps, 0, 0).expect("first tick adopts PR");
@@ -2160,6 +2182,7 @@ fn existing_pr_adoption_re_emits_after_state_transition_away_from_attested() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     // First tick adopts the PR — overlay moves to Attested; telemetry
@@ -2248,6 +2271,7 @@ fn factory_labeled_existing_pr_without_session_is_not_parked_as_stalled() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     run_tick(&deps, 0, 0).expect("first tick adopts PR");
@@ -2329,6 +2353,7 @@ fn factory_labeled_pr_branch_collision_is_refused_without_stealing_mapping() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         0,
         0,
@@ -2418,6 +2443,7 @@ fn fork_labeled_pr_never_registers_branch_at_tick_level() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         0,
         0,
@@ -2518,6 +2544,7 @@ fn adopted_non_green_pr_parks_human_held_with_v1_escalation() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         0,
         0,
@@ -2630,6 +2657,7 @@ fn adopted_red_pr_stage2_reroll_spawns_remediation_session_leaves_pr_open() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         0,
         0,
@@ -2773,6 +2801,7 @@ fn adopted_red_pr_stage2_reroll_spawn_failure_parks_human_held_with_escalation()
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         0,
         0,
@@ -2895,6 +2924,7 @@ fn adopted_red_pr_structural_only_red_gates_holds_disposition_required_not_rerol
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         0,
         0,
@@ -3038,6 +3068,7 @@ fn adopted_red_pr_mixed_red_gates_still_rerolls() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         0,
         0,
@@ -3155,6 +3186,7 @@ fn disposition_required_bead_resumes_when_gates_go_green() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         1,
         0,
@@ -3254,6 +3286,7 @@ fn disposition_required_bead_in_cooldown_is_skipped_without_scm_call() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         1,
         0,
@@ -3338,6 +3371,7 @@ fn disposition_required_reassessment_error_preserves_hold_provenance() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         1,
         0,
@@ -3390,6 +3424,7 @@ fn disposition_required_reassessment_error_preserves_hold_provenance() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         2,
         0,
@@ -3461,6 +3496,7 @@ fn test_manual_bead_input_auto_queued_and_dispatched() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     // Run tick 1: should detect manual bead in tracker, see no overlay,
@@ -3535,6 +3571,7 @@ fn drive_existing_pr_bead_dispatches_onto_pr_head_branch_not_generated_branch() 
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let summary = run_tick(&deps, 0, 0).expect("tick should succeed");
@@ -3630,6 +3667,7 @@ fn bead_with_external_ref_but_no_open_pr_falls_back_to_generated_branch() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let summary = run_tick(&deps, 0, 0).expect("tick should succeed");
@@ -3691,6 +3729,7 @@ fn drive_pr_bead_with_fork_head_falls_back_to_generated_branch_not_fork_head() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let summary = run_tick(&deps, 0, 0).expect("tick should succeed");
@@ -3763,6 +3802,7 @@ fn remote_credentials_never_reach_tick_telemetry_or_escalation_comments() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         0,
         0,
@@ -3856,6 +3896,7 @@ fn manual_bead_adoption_never_calls_create_bead_or_fabricates_external_ref() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let summary = run_tick(&deps, 0, 0).expect("tick should succeed");
@@ -3930,6 +3971,7 @@ fn newly_intaken_bead_dispatch_uses_real_tracker_title() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         0,
         0,
@@ -4045,6 +4087,7 @@ fn drive_existing_pr_pending_ci_does_not_reach_ready() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         1,
         0,
@@ -4140,6 +4183,7 @@ fn drive_existing_pr_failed_ci_parks_human_held() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         1,
         0,
@@ -4205,6 +4249,7 @@ fn recover_human_held_requeues_queued_bead_with_attempt_below_max() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         // tick_index=1 with fast_tick_secs==slow_tick_secs==60 means
         // the slow tier fires (ratio=1, every tick), which is where
@@ -4318,6 +4363,7 @@ fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         1,
         0,
@@ -4381,6 +4427,7 @@ fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         2,
         0,
@@ -4474,6 +4521,7 @@ fn adopted_pr_that_never_goes_green_escalates_at_recovery_cap_and_dedups() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     // Tick 0: adopt the labeled PR (real intake path — creates the bead,
@@ -4670,6 +4718,7 @@ fn capped_human_held_comment_failure_retries_before_recording_escalation() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let summary = run_tick(&deps, 1, 0).expect("comment failure should not abort tick");
@@ -4768,6 +4817,7 @@ fn permanent_gh_error_marks_escalation_undeliverable_and_never_retries() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     // Tick 1: permanent error → one ESCALATION_UNDELIVERABLE, terminal mark set.
@@ -4901,6 +4951,7 @@ fn capped_human_held_candidate_lookup_failure_retries_before_recording_escalatio
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     // Tick 1: under the dispatch-scheduling-guarantee ordering, `run_slow_tier`
@@ -5010,6 +5061,7 @@ fn capped_human_held_missing_comment_target_records_local_escalation_fallback() 
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let summary = run_tick(&deps, 1, 0).expect("missing target should not abort tick");
@@ -5134,6 +5186,7 @@ fn er_runner_capped_unknown_only_gate_report_escalates_and_parks_at_recovery_cap
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         0,
         0,
@@ -5189,6 +5242,7 @@ fn er_runner_capped_unknown_only_gate_report_escalates_and_parks_at_recovery_cap
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         1,
         0,
@@ -5274,6 +5328,7 @@ fn er_runner_capped_unknown_only_comment_failure_retries_before_parking() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let summary = run_tick(&deps, 0, 0).expect("comment failure should not abort tick");
@@ -5404,6 +5459,7 @@ fn attested_ci_pending_does_not_bump_autonomy_secs() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         1,
         // Pretend 600s elapsed since the last tick; ci_pending must freeze the clock.
@@ -5509,6 +5565,7 @@ fn attested_ci_pending_does_not_timebox_park() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         1,
         600, // 10-minute tick; ci_pending=true means clock should NOT advance
@@ -5593,6 +5650,7 @@ fn non_green_bead_reenters_loop_via_automated_human_held_exit() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         // slow-tier-due (ratio=1, every tick fires both tiers)
         1,
@@ -5726,6 +5784,7 @@ fn attested_ci_not_pending_does_bump_autonomy_secs() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         1,
         300,
@@ -5840,6 +5899,7 @@ fn qdw_per_bead_isolation_snapshot_failure_does_not_abort_fast_tier() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         0,
         0,
@@ -6018,6 +6078,7 @@ fn qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         // elapsed_secs=1 (non-zero) so the pre-fix `Err=>false` path
         // would have bumped autonomy_secs to timebox and parked the
@@ -6475,6 +6536,7 @@ fn qdw_post_er_refetch_failure_skips_bead_without_false_park() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         0,
         0,
@@ -6633,6 +6695,7 @@ fn qdw_assess_refetch_failure_stays_attested_and_never_closes_pr() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         0,
         0,
@@ -6964,6 +7027,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         1,
         0,
@@ -7158,6 +7222,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         1,
         0,
@@ -7359,6 +7424,7 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         1,
         0,
@@ -7553,6 +7619,7 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         1,
         0,
@@ -7822,6 +7889,7 @@ fn cross_repo_bead_verification_loop_uses_its_own_repo_not_cfg_target_repo() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         1,
         0,
@@ -8072,6 +8140,7 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         1,
         0,
@@ -8273,6 +8342,7 @@ fn cross_model_reviewer_cursor_agent_falls_back_and_emits_review_degraded() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         1,
         0,
@@ -8516,6 +8586,7 @@ fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         1,
         0,
@@ -8630,6 +8701,7 @@ fn transient_spawn_failures_below_cap_stay_retriable_and_do_not_park() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     // Three consecutive transient spawn failures — well under the cap
@@ -8721,6 +8793,7 @@ fn transient_spawn_retry_cap_exceeded_parks_human_held_with_escalation() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     // Tick 0: intake creates + routes the bead, then dispatch attempts
@@ -8900,6 +8973,7 @@ fn spawn_failure_count_resets_after_a_successful_dispatch() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     for tick_index in 0..2u64 {
@@ -8986,6 +9060,7 @@ fn deferred_spawn_backpressure_never_increments_counter_or_parks_across_repeated
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     for tick_index in 0..N {
@@ -9108,6 +9183,7 @@ fn mixed_batch_deferred_backpressure_and_genuine_transient_failures_are_independ
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     // Ticks 0..=14: fifteen consecutive cycles. Bead A must stay QUEUED with
@@ -9299,6 +9375,7 @@ fn earlier_candidate_create_bead_error_does_not_silence_later_candidate_matching
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let summary = run_tick(&deps, 0, 0).expect(
@@ -9511,6 +9588,7 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         0,
         0,
@@ -9728,6 +9806,7 @@ fn run_slow_tier_pr_existence_probe_targets_bead_own_repo_not_global_cfg() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         0,
         0,
@@ -9830,6 +9909,7 @@ fn run_slow_tier_pr_existence_probe_unchanged_for_single_repo_legacy_bead() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         0,
         0,
@@ -9976,6 +10056,7 @@ fn tick_parks_human_held_on_permanent_reroll_error() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         1,
         0,
@@ -10040,6 +10121,7 @@ fn tick_deferred_reroll_stays_attested_and_reselects_next_tick() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let summary1 = run_tick(&deps, 1, 0).expect("tick 1 should succeed");
@@ -10165,6 +10247,7 @@ fn autonomy_timebox_park_kills_associated_ao_session_and_clears_handle() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let summary = run_tick(&deps, 1, 100).expect("tick should succeed");
@@ -10259,6 +10342,7 @@ fn coder_silent_park_kills_associated_ao_session_and_clears_handle() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let summary = run_tick(&deps, 1, 10).expect("tick should succeed");
@@ -10346,6 +10430,7 @@ fn session_branch_mismatch_park_kills_associated_ao_session_and_clears_handle() 
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let summary = run_tick(&deps, 1, 10).expect("tick should succeed");
@@ -10441,6 +10526,7 @@ fn autonomy_timebox_park_retains_handle_when_stop_fails() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let summary = run_tick(&deps, 1, 100).expect("tick should succeed");
@@ -10526,6 +10612,7 @@ fn adopted_branch_history_rewrite_park_kills_associated_ao_session() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let summary = run_tick(&deps, 1, 10).expect("tick should succeed");
@@ -10613,6 +10700,7 @@ fn run_tick_emits_parked_human_held_for_unmapped_repo_dispatch_failure() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         0,
         0,
@@ -10774,6 +10862,7 @@ fn slow_tier_dispatched_branch_mismatch_re_resolves_stale_pr_number() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let summary = run_tick(&deps, 1, 0).expect("tick should succeed");
@@ -10932,6 +11021,7 @@ fn slow_tier_dispatched_branch_mismatch_no_op_when_pr_number_already_matches() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
     let _ = run_tick(&deps, 1, 0).expect("tick should succeed");
     let body = std::fs::read_to_string(&telemetry_log).unwrap();
@@ -11016,6 +11106,7 @@ fn slow_tier_dispatched_branch_mismatch_clears_stale_pr_number_when_branch_has_n
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let _ = run_tick(&deps, 1, 0).expect("tick should succeed");
@@ -11169,6 +11260,7 @@ fn slow_tier_pre_gate_validation_re_resolves_when_stored_pr_no_longer_open() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let _ = run_tick(&deps, 1, 0).expect("tick should succeed");
@@ -11264,6 +11356,7 @@ fn transient_pr_number_reresolve_error_keeps_dispatched_no_promotion() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         1,
         0,
@@ -11358,6 +11451,7 @@ fn pre_gate_no_open_pr_demotes_attested_to_dispatched_and_resumes() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         1,
         0,
@@ -11412,6 +11506,7 @@ fn pre_gate_no_open_pr_demotes_attested_to_dispatched_and_resumes() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
         },
         2,
         0,
@@ -11505,7 +11600,7 @@ fn evidence_gate_verified_gist_reaches_ready() {
     let telemetry_log = std::env::temp_dir().join("afd_yoqy_ev_ok.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
     let summary = run_tick(
-        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log, vendor_health: None },
+        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log, vendor_health: None, pr_resolution_cooldown: None },
         1, 0,
     )
     .expect("tick must not error");
@@ -11543,7 +11638,7 @@ fn evidence_gate_empty_gist_fails_closed_not_ready() {
     let telemetry_log = std::env::temp_dir().join("afd_yoqy_ev_empty.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
     let summary = run_tick(
-        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log, vendor_health: None },
+        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log, vendor_health: None, pr_resolution_cooldown: None },
         1, 0,
     )
     .expect("tick must not error");
@@ -11586,7 +11681,7 @@ fn evidence_gate_head_mismatch_fails_closed() {
     let telemetry_log = std::env::temp_dir().join("afd_yoqy_ev_stale.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
     run_tick(
-        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log, vendor_health: None },
+        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log, vendor_health: None, pr_resolution_cooldown: None },
         1, 0,
     )
     .expect("tick must not error");
@@ -11649,6 +11744,7 @@ fn rln6_evidence_head_stale_fast_rejects_with_one_shot_comment() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
             vendor_health: None,
+            pr_resolution_cooldown: None,
         },
         1,
         0,
@@ -11717,6 +11813,7 @@ fn rln6_evidence_head_stale_fast_rejects_with_one_shot_comment() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
             vendor_health: None,
+            pr_resolution_cooldown: None,
         },
         1,
         0,
@@ -11790,6 +11887,7 @@ fn rln6_v2_evidence_head_stale_emits_gate_assessment_before_fast_reject() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
             vendor_health: None,
+            pr_resolution_cooldown: None,
         },
         1,
         0,
@@ -11881,6 +11979,7 @@ fn rln6_v2_evidence_head_stale_does_not_persist_sentinel_on_comment_failure() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
             vendor_health: None,
+            pr_resolution_cooldown: None,
         },
         1,
         0,
@@ -11923,6 +12022,7 @@ fn rln6_v2_evidence_head_stale_does_not_persist_sentinel_on_comment_failure() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
             vendor_health: None,
+            pr_resolution_cooldown: None,
         },
         1,
         0,
@@ -12004,6 +12104,7 @@ fn rln6_v2_evidence_head_stale_sentinel_resets_on_new_mismatch_tuple() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
             vendor_health: None,
+            pr_resolution_cooldown: None,
         },
         1,
         0,
@@ -12049,6 +12150,7 @@ fn rln6_v2_evidence_head_stale_sentinel_resets_on_new_mismatch_tuple() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
             vendor_health: None,
+            pr_resolution_cooldown: None,
         },
         1,
         0,
@@ -12094,6 +12196,7 @@ fn rln6_v2_evidence_head_stale_sentinel_resets_on_new_mismatch_tuple() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
             vendor_health: None,
+            pr_resolution_cooldown: None,
         },
         1,
         0,
@@ -12146,7 +12249,7 @@ fn evidence_gate_incomplete_marker_fails_closed() {
     let telemetry_log = std::env::temp_dir().join("afd_yoqy_ev_incomplete.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
     run_tick(
-        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log, vendor_health: None },
+        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log, vendor_health: None, pr_resolution_cooldown: None },
         1, 0,
     ).expect("tick must not error");
     assert_ne!(
@@ -12189,7 +12292,7 @@ fn evidence_gate_transient_gist_error_is_pending_not_red() {
     let telemetry_log = std::env::temp_dir().join("afd_yoqy_ev_transient.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
     run_tick(
-        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log, vendor_health: None },
+        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log, vendor_health: None, pr_resolution_cooldown: None },
         1, 0,
     ).expect("tick must not error");
     // Not READY (evidence unknown), but NOT parked/rerolled — stays ATTESTED to retry.
@@ -12313,6 +12416,7 @@ fn msmq_verifier_skips_reassessment_when_reroll_deferred() {
         scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm,
         store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     // ---- Tick 1: reroll_deferral_count=0 → full gate assessment fires.
@@ -12423,7 +12527,7 @@ fn jleechan328_gate_assessment_emits_head_sha_for_exact_head_binding() {
     let telemetry_log = std::env::temp_dir().join("afd_yoqy_headbind.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
     let summary = run_tick(
-        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log, vendor_health: None },
+        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log, vendor_health: None, pr_resolution_cooldown: None },
         1, 0,
     )
     .expect("tick must not error");
@@ -12506,7 +12610,7 @@ fn jleechan328_gate_assessment_emits_operator_disposition_round_trip() {
         let telemetry_log = std::env::temp_dir().join(format!("afd_yoqy_disp_{disposition}.jsonl"));
         let _ = std::fs::remove_file(&telemetry_log);
         let summary = run_tick(
-            &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log, vendor_health: None },
+            &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log, vendor_health: None, pr_resolution_cooldown: None },
             1, 0,
         )
         .expect("tick must not error");
@@ -12627,6 +12731,7 @@ fn dispatch_guarantee_queued_bead_dispatched_despite_escalation_backlog() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     // Run one tick. Under the new ordering, `run_slow_tier` (dispatch) runs
@@ -12740,6 +12845,7 @@ fn escalation_dedup_tick_level_identical_payload_suppressed_changed_context_re_e
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     // ── Tick 1: first escalation → ESCALATION_REQUIRED emitted ──
@@ -12973,6 +13079,7 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
             vendor_health: Some(&ledger),
+            pr_resolution_cooldown: None,
         },
         0,
         0,
@@ -13030,6 +13137,7 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
             vendor_health: Some(&ledger),
+            pr_resolution_cooldown: None,
         },
         1,
         0,
@@ -13083,6 +13191,7 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
             vendor_health: Some(&ledger),
+            pr_resolution_cooldown: None,
         },
         2,
         0,
@@ -13214,6 +13323,7 @@ fn vendor_health_ledger_ci_pending_with_capped_vendor_skips_wait() {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
             vendor_health: Some(&ledger),
+            pr_resolution_cooldown: None,
         },
         0,
         0,
@@ -13240,4 +13350,290 @@ fn vendor_health_ledger_ci_pending_with_capped_vendor_skips_wait() {
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
+}
+
+// ----------------------------------------------------------------------------
+// Bead jleechan-48ou: rate-limit cooldown for `pr_number_for_branch`.
+//
+// The pre-fix code calls `deps.scm.pr_number_for_branch(...)` for EVERY
+// DISPATCHED bead with a branch on EVERY slow-tier tick, with no
+// awareness of `gh` rate-limit signals. During a sustained
+// `gh: API rate limit exceeded` window (live incident 2026-08-05
+// 19:35-20:05Z, ~30 events / 30 min for a single bead across the
+// `daemon.jsonl` tail), the daemon logged `PR_NUMBER_REREZOLVE_TRANSIENT_ERROR`
+// and retried unconditionally — self-amplifying the exhaustion and
+// extending recovery.
+//
+// Acceptance: on a rate-limit-classified Err, the daemon sets a
+// process-wide cooldown and skips subsequent lookups for the window.
+// On the first `Ok(_)` after the window, the cooldown clears and the
+// next lookup fires immediately.
+//
+// This test drives three ticks:
+//   tick 1: DISPATCHED bead + scripted rate-limit Err on the lookup
+//           → transient telemetry emitted with `cooldown_set_until_epoch`
+//           → cooldown is active.
+//   tick 2: DIFFERENT DISPATCHED bead, lookup would succeed — but
+//           cooldown is still active → lookup SKIPPED, scm.calls has
+//           NO entry for the second bead's branch,
+//           `PR_NUMBER_REREZOLVE_RATE_LIMIT_COOLDOWN` emitted with
+//           `action="skipped_due_to_cooldown"`, second bead stays
+//           DISPATCHED.
+//   tick 3: cooldown manually cleared → next lookup fires and the
+//           second bead promotes normally.
+#[test]
+fn pr_resolution_rate_limit_cooldown_skips_lookup_until_recovery() {
+    use std::sync::Mutex;
+
+    use daemon::pr_resolution_cooldown::PrResolutionCooldown;
+    use daemon::state::{BeadOverlay, OverlayState};
+
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let cooldown = Mutex::new(PrResolutionCooldown::default());
+
+    let telemetry_dir = std::env::temp_dir().join("afd_pr_resolution_cooldown_test");
+    let _ = std::fs::remove_dir_all(&telemetry_dir);
+    std::fs::create_dir_all(&telemetry_dir).unwrap();
+    let telemetry_log = telemetry_dir.join(format!("daemon-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    // --- DISPATCHED bead #1: lookup errors with rate-limit phrase. ---
+    let branch_a = "factory/pr-cooldown-a-r1";
+    store
+        .save(&BeadOverlay {
+            bead_id: "cooldown-a".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            // Pre-existing stale pr_number — must be left untouched on
+            // transient Err, exactly as t40t-r12 requires.
+            pr_number: Some(999),
+            branch: Some(branch_a.into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            attempt_started_at: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store.register_branch("cooldown-a", branch_a).unwrap();
+    scm.pr_number_for_branch_errors.insert(
+        ("owner/repo".into(), branch_a.into()),
+        "gh: API rate limit exceeded for installation ID 12345".into(),
+    );
+
+    let _summary1 = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+            pr_resolution_cooldown: Some(&cooldown),
+        },
+        0,
+        0,
+    )
+    .expect("tick 1 (rate-limit Err) must not abort the tick");
+
+    // Cooldown MUST now be active (until_epoch is in the future relative
+    // to wall-clock — we just take `now` here for the comparison).
+    {
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let c = cooldown.lock().unwrap();
+        assert!(
+            c.is_active(now_epoch),
+            "rate-limit Err must set the cooldown; cooldown={c:?}, now_epoch={now_epoch}"
+        );
+        assert!(
+            c.until_epoch > now_epoch,
+            "cooldown must end in the future after rate-limit Err; \
+             until_epoch={} now_epoch={now_epoch}",
+            c.until_epoch
+        );
+    }
+
+    // Bead A stays DISPATCHED with stale pr_number untouched (t40t-r12 invariant).
+    let overlay_a = store.load("cooldown-a").unwrap().unwrap();
+    assert_eq!(
+        overlay_a.state,
+        OverlayState::Dispatched,
+        "bead A must remain DISPATCHED on transient Err"
+    );
+    assert_eq!(
+        overlay_a.pr_number,
+        Some(999),
+        "stale pr_number must NOT be mutated on transient Err"
+    );
+
+    // Telemetry: PR_NUMBER_REREZOLVE_TRANSIENT_ERROR with
+    // `cooldown_set_until_epoch` so the operator can read the cooldown
+    // end from the log alone.
+    let log1 = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log1.contains("\"PR_NUMBER_REREZOLVE_TRANSIENT_ERROR\"")
+            && log1.contains("\"cooldown_set_until_epoch\""),
+        "tick 1 must emit PR_NUMBER_REREZOLVE_TRANSIENT_ERROR with cooldown_set_until_epoch; log:\n{log1}"
+    );
+
+    // --- DISPATCHED bead #2: lookup would succeed, but cooldown is active. ---
+    let branch_b = "factory/pr-cooldown-b-r1";
+    store
+        .save(&BeadOverlay {
+            bead_id: "cooldown-b".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some(branch_b.into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            attempt_started_at: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store.register_branch("cooldown-b", branch_b).unwrap();
+    // Scripted success — would have promoted B to ATTESTED if called.
+    scm.pr_numbers_for_branch.insert(
+        ("owner/repo".into(), branch_b.into()),
+        Some(4242),
+    );
+
+    let calls_before_tick2 = { scm.calls.borrow().len() };
+    let _summary2 = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+            pr_resolution_cooldown: Some(&cooldown),
+        },
+        1,
+        0,
+    )
+    .expect("tick 2 (cooldown active) must not abort the tick");
+
+    // The lookup MUST have been SKIPPED — no `pr_number_for_branch` call
+    // for branch_b in the scm.calls log, even though it would have
+    // returned Ok(Some(4242)). Clone into owned Vec so the Ref drops
+    // before run_tick (which mutably borrows scm.calls internally).
+    let new_calls: Vec<String> = scm.calls.borrow()[calls_before_tick2..].to_vec();
+    let branch_b_call = format!("pr_number_for_branch(owner/repo,{branch_b})");
+    assert!(
+        !new_calls.iter().any(|c| c == &branch_b_call),
+        "while cooldown is active, pr_number_for_branch MUST NOT be called \
+         for cooldown-b; got new_calls={new_calls:?}"
+    );
+
+    // Bead B stays DISPATCHED with pr_number still None.
+    let overlay_b = store.load("cooldown-b").unwrap().unwrap();
+    assert_eq!(
+        overlay_b.state,
+        OverlayState::Dispatched,
+        "bead B must remain DISPATCHED while the lookup is skipped"
+    );
+    assert_eq!(
+        overlay_b.pr_number, None,
+        "bead B's pr_number must remain None while the lookup is skipped"
+    );
+
+    // Skip counter incremented.
+    {
+        let c = cooldown.lock().unwrap();
+        assert!(
+            c.skips_since_clear >= 1,
+            "skips_since_clear must increment on a skipped lookup; cooldown={c:?}"
+        );
+    }
+
+    let log2 = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log2.contains("\"PR_NUMBER_REREZOLVE_RATE_LIMIT_COOLDOWN\"")
+            && log2.contains("\"skipped_due_to_cooldown\""),
+        "tick 2 must emit PR_NUMBER_REREZOLVE_RATE_LIMIT_COOLDOWN with \
+         action=skipped_due_to_cooldown; log:\n{log2}"
+    );
+
+    // --- Tick 3: clear cooldown manually → lookup resumes, B promotes. ---
+    cooldown.lock().unwrap().clear();
+    // Remove the scripted rate-limit Err for branch_a so its tick-3
+    // lookup returns Ok and does NOT re-set the cooldown before
+    // branch_b's lookup runs (the loop processes overlays in order;
+    // branch_a is processed first because its overlay was saved first).
+    scm.pr_number_for_branch_errors.remove(&("owner/repo".into(), branch_a.into()));
+    let calls_before_tick3 = { scm.calls.borrow().len() };
+
+    let _summary3 = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+            pr_resolution_cooldown: Some(&cooldown),
+        },
+        2,
+        0,
+    )
+    .expect("tick 3 (cooldown cleared) must not abort the tick");
+
+    let new_calls_tick3: Vec<String> = scm.calls.borrow()[calls_before_tick3..].to_vec();
+    assert!(
+        new_calls_tick3.iter().any(|c| c == &branch_b_call),
+        "after cooldown cleared, pr_number_for_branch MUST be called for \
+         branch_b; got new_calls_tick3={new_calls_tick3:?}"
+    );
+
+    let overlay_b_after = store.load("cooldown-b").unwrap().unwrap();
+    assert_eq!(
+        overlay_b_after.state,
+        OverlayState::Attested,
+        "bead B must promote DISPATCHED→ATTESTED once cooldown is cleared \
+         and the lookup succeeds"
+    );
+    assert_eq!(
+        overlay_b_after.pr_number,
+        Some(4242),
+        "bead B's pr_number must be the discovered 4242 after recovery"
+    );
+
+    let log3 = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log3.contains("\"PR_OPENED\""),
+        "tick 3 must emit PR_OPENED for the recovered bead; log:\n{log3}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+    let _ = std::fs::remove_dir_all(&telemetry_dir);
 }

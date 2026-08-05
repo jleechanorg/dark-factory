@@ -295,6 +295,7 @@ fn sqlite_dispatch_guarantee_queued_bead_dispatched_despite_escalation_backlog()
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     let summary = run_tick(&deps, 0, 0).expect("tick should succeed");
@@ -379,6 +380,7 @@ fn sqlite_escalation_dedup_tick_level_identical_payload_suppressed_changed_conte
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         vendor_health: None,
+        pr_resolution_cooldown: None,
     };
 
     // ── Tick 1: first escalation → ESCALATION_REQUIRED emitted ──
