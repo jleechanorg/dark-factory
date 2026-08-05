@@ -77,7 +77,7 @@ from typing import TYPE_CHECKING
 
 import runner.handlers as _handlers_shim
 
-from .handler_core import Result
+from .handler_core import Result, current_dispatch_meta
 
 if TYPE_CHECKING:
     from .parser import Node
@@ -197,8 +197,7 @@ def _start_shadow_codex_review(
     try:
         from . import engine_observability as _obs
 
-        seq = int(getattr(ctx, "_df_current_seq", getattr(ctx, "last_completed_seq", 0)))
-        attempt = int(getattr(ctx, "_df_current_attempt", 1))
+        seq, attempt, _ = current_dispatch_meta(ctx)
         prompt_path, prompt_sha = _obs._write_input_sidecar(
             ctx,
             seq,
@@ -312,8 +311,7 @@ def _finish_shadow_codex_review(
     try:
         from . import engine_observability as _obs
 
-        seq = int(getattr(ctx, "_df_current_seq", getattr(ctx, "last_completed_seq", 0)))
-        attempt = int(getattr(ctx, "_df_current_attempt", 1))
+        seq, attempt, _ = current_dispatch_meta(ctx)
         output_path, output_sha = _obs._write_input_sidecar(
             ctx,
             seq,

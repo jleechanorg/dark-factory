@@ -46,7 +46,7 @@ from typing import TYPE_CHECKING
 # Symbols that tests monkeypatch via ``runner.handlers._X`` are looked up
 # lazily inside ``_parallel_reviewer`` via the shim — see the function body.
 from .handler_core import Result
-from .handler_core import _gate_strict_flag
+from .handler_core import _gate_strict_flag, current_dispatch_meta
 # Canonical implementation lives in handler_verdict (pr228 B1 relocation).
 # Re-exported here for backward compatibility: handler_verdict is a leaf
 # module (imports nothing from handlers), so this creates no import cycle.
@@ -966,8 +966,7 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
         else:
             ctx.state["_df_controller_review_json"] = prior_controller_json
 
-    seq = int(getattr(ctx, "_df_current_seq", getattr(ctx, "last_completed_seq", 0)))
-    attempt = int(getattr(ctx, "_df_current_attempt", 1))
+    seq, attempt, _ = current_dispatch_meta(ctx)
     primary = _record_primary_output(node.name, attempt, primary, seq, ctx)
     primary.metadata.update(backend_meta)
     if request is not None:
