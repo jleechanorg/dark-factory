@@ -15,6 +15,10 @@ ROOT = pathlib.Path(__file__).parent.parent
 # branch_* mkdtemp per fan-out test into the working tree.
 SCRATCH = pathlib.Path(tempfile.mkdtemp(prefix="test_slim_"))
 
+from conftest import register_scratch_dir  # noqa: E402
+
+register_scratch_dir(SCRATCH)
+
 
 def test_slim_stylesheet_routes_roles_by_class():
     graph = parse(ROOT / "pipelines" / "slim" / "minimal_feature.dot")

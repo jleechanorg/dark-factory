@@ -20,6 +20,10 @@ sys.path.insert(0, str(ROOT))
 # branch_* mkdtemp per fan-out test into the working tree.
 SCRATCH = pathlib.Path(tempfile.mkdtemp(prefix="test_spec_gen_"))
 
+from conftest import register_scratch_dir  # noqa: E402
+
+register_scratch_dir(SCRATCH)
+
 import runner.handlers as handlers_mod
 from runner.engine import run
 from runner.handlers import Context, TYPE_REGISTRY

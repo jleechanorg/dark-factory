@@ -25,7 +25,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 # branch_* mkdtemp per fan-out test into the working tree.
 SCRATCH = pathlib.Path(tempfile.mkdtemp(prefix="test_hardening_"))
 
-from conftest import _pipeline  # noqa: E402
+from conftest import _pipeline, register_scratch_dir  # noqa: E402
+
+register_scratch_dir(SCRATCH)
 
 import runner.handlers as handlers_mod  # noqa: E402
 from runner.cxdb import CXDB  # noqa: E402

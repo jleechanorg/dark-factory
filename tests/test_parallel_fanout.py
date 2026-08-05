@@ -30,6 +30,10 @@ ROOT = Path(__file__).parent.parent
 # branch_* mkdtemp per fan-out test into the working tree (378 observed).
 SCRATCH = Path(tempfile.mkdtemp(prefix="test_parallel_fanout_"))
 
+from conftest import register_scratch_dir  # noqa: E402
+
+register_scratch_dir(SCRATCH)
+
 
 # ---------------------------------------------------------------------------
 # DOT helpers — branch nodes have no custom type; echo backend resolves from state

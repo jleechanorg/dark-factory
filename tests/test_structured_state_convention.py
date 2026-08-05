@@ -53,6 +53,10 @@ sys.path.insert(0, str(ROOT))
 # branch_* mkdtemp per fan-out test into the working tree.
 SCRATCH = pathlib.Path(tempfile.mkdtemp(prefix="test_structured_state_convention_"))
 
+from conftest import register_scratch_dir  # noqa: E402
+
+register_scratch_dir(SCRATCH)
+
 import runner.handlers as handlers_mod  # noqa: E402
 from runner.engine import run  # noqa: E402
 from runner.handler_core import _serialize_state_value  # noqa: E402
