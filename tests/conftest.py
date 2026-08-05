@@ -68,6 +68,7 @@ def run_conformance(*args: str, timeout: int = 600, env: dict | None = None) -> 
     """
     full_args = args
     sub = args[0] if args else ""
+    scratch: pathlib.Path | None = None
     if sub == "run":
         import tempfile
         scratch = pathlib.Path(tempfile.mkdtemp(prefix="run_conformance_"))
@@ -77,9 +78,41 @@ def run_conformance(*args: str, timeout: int = 600, env: dict | None = None) -> 
         impl_link = scratch / "impl"
         if not impl_link.exists():
             impl_link.symlink_to(ROOT / "impl")
-        # Inject --workdir AFTER the subcommand since `bin/conformance` uses
-        # subparsers(required=True); top-level flags are rejected.
-        full_args = (sub, "--workdir", str(scratch), *args[1:])
+        # Strip any caller-supplied --workdir <path> so the scratch we inject
+        # is authoritative. Otherwise a stray --workdir=<repo root> in a
+        # fixture would re-introduce the branch_* disk leak this helper
+        # exists to prevent.
+        rest: list[str] = []
+        skip_next = False
+        for arg in args[1:]:
+            if skip_next:
+                skip_next = False
+                continue
+            if arg == "--workdir":
+                skip_next = True
+                continue
+            if arg.startswith("--workdir="):
+                continue
+            rest.append(arg)
+        full_args = (sub, "--workdir", str(scratch), *rest)
+    if scratch is not None:
+        # Clean up the scratch workdir after the subprocess exits or raises.
+        # The runner is done with it once the subprocess returns, and the
+        # OS will eventually reap it but explicit cleanup keeps the OS
+        # tempdir from filling up under repeated invocations.
+        import shutil
+        try:
+            return subprocess.run(
+                [sys.executable, str(ROOT / "bin" / "conformance"), *full_args],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+                check=False,
+            )
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
     return subprocess.run(
         [sys.executable, str(ROOT / "bin" / "conformance"), *full_args],
         cwd=ROOT,
@@ -111,3 +144,34 @@ def _declare_test_environment() -> None:
     # found" for `@pipelines/_base.dot`. Set it to the install root (parent of
     # this conftest).
     os.environ.setdefault("DARK_FACTORY_HOME", str(ROOT))
+
+
+# Registry of module-level SCRATCH workdirs created by tests that
+# default `Context(workdir=...)` to a tempfile.mkdtemp. Tests register
+# their SCRATCH path via `register_scratch_dir(SCRATCH)` at import time
+# (after the mkdtemp call); the pytest_sessionfinish hook below removes
+# them on session teardown so the OS tempdir doesn't accumulate
+# branch_* sibling dirs across many pytest runs.
+_SCRATCH_DIRS: list[pathlib.Path] = []
+
+
+def register_scratch_dir(path: pathlib.Path) -> pathlib.Path:
+    """Register a module-level SCRATCH workdir for session-end cleanup.
+
+    Returns ``path`` unchanged so test files can write
+    ``SCRATCH = register_scratch_dir(pathlib.Path(tempfile.mkdtemp(...)))``.
+    """
+    _SCRATCH_DIRS.append(path)
+    return path
+
+
+def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
+    """Remove every registered module-level SCRATCH workdir at session end.
+
+    Hook fires after the test session finishes; using a hook (not a fixture)
+    guarantees cleanup runs even when no test requests the fixture.
+    """
+    import shutil
+    for scratch in _SCRATCH_DIRS:
+        shutil.rmtree(scratch, ignore_errors=True)
+    _SCRATCH_DIRS.clear()
