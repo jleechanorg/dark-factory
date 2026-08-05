@@ -81,7 +81,7 @@ Additionally, the team found (bead `jleechan-4pa`, PR [#29](https://github.com/j
 ## Incident 4 — Hermes independently detected `plan.md` had no lane-count guard: the factory would have emitted a 67-lane plan (2026-06-10)
 
 **Source:**
-- `/Users/jleechan/projects/dark-factory/PARALLELIZATION_AUDIT_2026-06-10.md` (Hermes-authored, 129 lines)
+- [`PARALLELIZATION_AUDIT_2026-06-10.md`](PARALLELIZATION_AUDIT_2026-06-10.md) (Hermes-authored, 129 lines)
 - PR [#37](https://github.com/jleechanorg/dark-factory/pull/37): `feat(plan): add lane-independence hard requirement to plan.md`
 
 **What the factory produced:**
