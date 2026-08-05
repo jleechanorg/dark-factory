@@ -149,7 +149,22 @@ CREATE TABLE IF NOT EXISTS bead_overlay (
   -- Older DBs pre-date this column and get it via the idempotent
   -- `ensure_attempt_started_at_column` migration in `SqliteStateStore::open`
   -- (same guard pattern as `ensure_reroll_deferral_count_column`).
-  attempt_started_at INTEGER
+  attempt_started_at INTEGER,
+  -- Unix-epoch seconds of the most recent transient `Sessions::spawn`
+  -- failure (bead jleechan-2y4t / G12: per-bead retry backoff must be
+  -- isolated to a 24h window so a bead that hit 5 transient errors 25
+  -- hours ago is not still parked the next time the infra hiccups).
+  -- Used by `BeadOverlay::effective_spawn_failure_count` to decay the
+  -- raw counter to 0 when the last failure is older than
+  -- `SPAWN_FAILURE_WINDOW_SECS` (24h). Nullable: NULL means "no
+  -- transient failures yet recorded" — the decay helper treats it as 0.
+  -- Reset to NULL on a confirmed DISPATCHED save, paired with the
+  -- `spawn_failure_count = 0` reset.
+  -- Older DBs pre-date this column and get it via the idempotent
+  -- `ensure_last_spawn_failure_at_column` migration in
+  -- `SqliteStateStore::open` (same guard pattern as
+  -- `ensure_attempt_started_at_column`).
+  last_spawn_failure_at INTEGER
 );
 
 -- Deletion guard: the daemon/skills may delete ONLY refs recorded here (spec §4.2.8).

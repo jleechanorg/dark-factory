@@ -68,11 +68,18 @@ fn dispatch_prompt_preamble(repo: &str, remote: &str, branch: &str) -> String {
 /// Queued` forever with no attempt increment, no `autonomy_secs`
 /// accumulation (it never reaches `DISPATCHED`, so `query_active_overlays`'s
 /// `DISPATCHED`/`ATTESTED` scope never sees it), and no wedge-detection
-/// trigger — a livelock with zero telemetry signal. Mirrors
-/// `tick::MAX_HUMAN_HELD_RECOVERY_ATTEMPT`'s order of magnitude (10); set
-/// slightly higher because transient spawn hiccups are expected to be more
-/// frequent/short-lived than a full gate-rejection HUMAN_HELD cycle.
-pub(crate) const MAX_TRANSIENT_SPAWN_RETRY: u32 = 15;
+/// trigger — a livelock with zero telemetry signal.
+///
+/// Bead jleechan-2y4t / G12: cap lowered from 15 to 5 with a 24h decay
+/// window (see [`crate::state::SPAWN_FAILURE_WINDOW_SECS`] and
+/// [`crate::state::BeadOverlay::effective_spawn_failure_count`]). The audit
+/// observed 3 beads each accumulating >=5 transient errors in 24h; under
+/// the prior cap=15 those beads could each monopolize the dispatch queue
+/// for 15 cycles (or longer if errors from prior days leaked forward
+/// without decay). Cap=5 matches the audit's threshold so the bead
+/// escalation surfaces earlier — the same pattern G10/G11/G12/G13 use
+/// across the factory-evolve audit series (threshold + isolation).
+pub(crate) const MAX_TRANSIENT_SPAWN_RETRY: u32 = 5;
 
 /// Caller-resolved drive-PR branch-binding decision (bead
 /// jleechan-drive-pr-branch-binding-pcpr), threaded from
@@ -228,6 +235,7 @@ pub fn dispatch_ready(
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             // jleechan-8jxr r2: pre-fill with cfg.target_repo so this
@@ -545,6 +553,15 @@ pub fn dispatch_ready(
             Err(err) if err.is_transient() => {
                 overlay.spawn_failure_count += 1;
                 overlay.session_id = None;
+                // Bead jleechan-2y4t / G12: stamp the wall-clock of THIS
+                // failure atomically with the counter increment so the
+                // 24h decay contract in
+                // `BeadOverlay::effective_spawn_failure_count` has a
+                // fresh anchor to compare against. Without this stamp
+                // the raw counter would outlive the window (the
+                // audit's exact "3 beads with stale counters that
+                // block the queue today" failure mode).
+                overlay.last_spawn_failure_at = Some(crate::state::now_epoch_secs());
                 if overlay.spawn_failure_count > MAX_TRANSIENT_SPAWN_RETRY {
                     // Cap exceeded: stop silently cycling Queued<->Dispatching
                     // forever (the livelock this bead-follow-up closes — see
@@ -727,6 +744,16 @@ pub fn dispatch_ready(
         // transient tool error, ...) has cleared, so the retry-cap counter no
         // longer needs to remember it.
         overlay.spawn_failure_count = 0;
+        // Bead jleechan-2y4t / G12: a successful dispatch wipes the
+        // bead's transient-failure history entirely (paired with the
+        // counter reset above) so a confirmed DISPATCHED never carries
+        // a stale `last_spawn_failure_at` into a future hiccup. Without
+        // this reset the decay contract would still treat the next
+        // transient failure as "fresh" (because we'd be stamping a new
+        // `last_spawn_failure_at` anyway), but resetting here is the
+        // symmetric, auditable contract: "dispatch succeeded ⇒ bead has
+        // no on-record transient history".
+        overlay.last_spawn_failure_at = None;
         // Bead bze8.3: stamp `attempt_started_at` atomically alongside the
         // DISPATCHED save so a redispatch cannot inherit elapsed autonomy
         // from the prior attempt. The wall-clock anchor here is the single
@@ -1802,6 +1829,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
             pre_session_head_sha: None,
             park_reason: None,
             // jleechan-8jxr r2: a real intake-persisted overlay carries a
@@ -1850,6 +1878,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: None,
                 // Neither cfg().target_repo ("owner/repo") nor any
@@ -1923,6 +1952,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: None,
                 // The failure mode bead jleechan-8jxr r2 fixes: intake
@@ -2032,6 +2062,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: None,
@@ -2107,6 +2138,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: None,
@@ -2177,6 +2209,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: None,
                 // Stage A: `external_ref` prefix "someorg/other-repo" becomes the
@@ -2261,6 +2294,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: Some("jleechanorg/worldarchitect.ai".to_string()),
@@ -3371,6 +3405,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                last_spawn_failure_at: None,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: Some("jleechanorg/worldarchitect.ai".to_string()),
