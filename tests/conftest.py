@@ -77,6 +77,39 @@ def make_node(name: str = "test", **attrs) -> _Node:
     return _Node(name=name, attrs=attrs)
 
 
+def mock_pre_gate_reviewers(monkeypatch) -> None:
+    """Stub the pre-gate reviewer nodes so gate/engine tests can seed outcomes.
+
+    `gates.dot` / `pr_gates.dot` place `gate_skeptic` and
+    `adversarial_reviewer` between `holdout` and `gate_es`. Neither honors
+    the plain `ctx.state["<node>.outcome"]` seeding convention on its own:
+
+      - `gate_skeptic` has no registered handler, so it falls through to
+        `_codergen`, which only reads seeded state under the echo backend.
+      - `adversarial_reviewer` is `type="parallel_reviewer"` and carries
+        `review_contract="cold-review-v1"`. `_parallel_reviewer` refuses to
+        take its echo shortcut for a contract-bound reviewer, so that a gate
+        can never certify itself from its own fixture.
+
+    Without this stub, a seeded `adversarial_reviewer.outcome="success"` is
+    ignored, the node returns non-success, and
+    `adversarial_reviewer -> fix [condition="outcome!=success"]` diverts the
+    run into the bounded fix loop, breaking node-sequence assertions.
+
+    Replacing the handler (rather than weakening it) is the supported way to
+    drive graph topology in tests. Registered by handler *type*, so it works
+    under any backend.
+    """
+    from runner.handlers import TYPE_REGISTRY, Result
+
+    def _seeded(node, ctx):
+        pre = ctx.state.get(f"{node.name}.outcome")
+        return Result(outcome=pre or "success", output=f"stub_reviewer({node.name})")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "gate_skeptic", _seeded)
+    monkeypatch.setitem(TYPE_REGISTRY, "parallel_reviewer", _seeded)
+
+
 @pytest.fixture(autouse=True, scope="session")
 def _declare_test_environment() -> None:
     """Set the env var every test in this directory expects."""

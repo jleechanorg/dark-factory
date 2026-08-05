@@ -12,7 +12,7 @@ ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from conftest import _pipeline  # noqa: E402
+from conftest import _pipeline, mock_pre_gate_reviewers  # noqa: E402
 
 from runner.engine import run  # noqa: E402
 from runner.handlers import Context, Result, TYPE_REGISTRY  # noqa: E402
@@ -25,6 +25,7 @@ def test_pr_gates_runs_holdout_before_evidence_gates(monkeypatch):
     def fake_holdout(node, ctx):
         return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+    mock_pre_gate_reviewers(monkeypatch)
     g = parse(_pipeline("pr_gates.dot"))
     assert g.nodes["holdout"].attrs.get("type") == "holdout_eval"
 
@@ -56,6 +57,7 @@ def test_pr_gates_holdout_failure_short_circuits(monkeypatch):
     def fake_holdout(node, ctx):
         return Result(outcome="failure", output="holdout FAIL")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+    mock_pre_gate_reviewers(monkeypatch)
 
     g = parse(_pipeline("pr_gates.dot"))
     ctx = Context(goal="t", workdir=ROOT, backend="echo")
@@ -73,6 +75,7 @@ def test_gate_failure_short_circuits(monkeypatch):
     def fake_holdout(node, ctx):
         return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+    mock_pre_gate_reviewers(monkeypatch)
     g = parse(_pipeline("gates.dot"))
     ctx = Context(goal="t", workdir=ROOT, backend="echo")
     ctx.state["gate_skeptic.outcome"] = "success"
@@ -94,6 +97,7 @@ def test_gate_nonzero_returncode_cannot_spoof_pass(monkeypatch, tmp_path):
     def fake_holdout(node, ctx):
         return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+    mock_pre_gate_reviewers(monkeypatch)
     # gate_skeptic has no registered handler; default _codergen would call
     # claude --print /gate_skeptic (no such command). Mock it so the test
     # can focus on the gate_es rc!=0 spoof scenario.

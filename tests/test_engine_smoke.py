@@ -11,7 +11,7 @@ ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from conftest import _pipeline  # noqa: E402
+from conftest import _pipeline, mock_pre_gate_reviewers  # noqa: E402
 
 from runner.cxdb import CXDB  # noqa: E402
 from runner.engine import run  # noqa: E402
@@ -52,6 +52,7 @@ def test_gate_echo_seeded_outcome(monkeypatch):
     def fake_holdout(node, ctx):
         return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+    mock_pre_gate_reviewers(monkeypatch)
     g = parse(_pipeline("gates.dot"))
     ctx = Context(goal="t", workdir=ROOT, backend="echo")
     ctx.state["gate_skeptic.outcome"] = "success"
@@ -82,6 +83,7 @@ def test_cxdb_records_steps(tmp_path, monkeypatch):
     def fake_holdout(node, ctx):
         return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+    mock_pre_gate_reviewers(monkeypatch)
     db_path = tmp_path / "cxdb.sqlite"
     g = parse(_pipeline("gates.dot"))
     ctx = Context(goal="t", workdir=ROOT, backend="echo", cxdb_path=db_path)
@@ -120,6 +122,7 @@ def test_healer_reports_failures(tmp_path, monkeypatch):
     def fake_holdout(node, ctx):
         return Result(outcome="fail", output="boom")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+    mock_pre_gate_reviewers(monkeypatch)
 
     db_path = tmp_path / "cxdb.sqlite"
     g = parse(_pipeline("gates.dot"))
@@ -137,6 +140,7 @@ def test_healer_reports_gate_infra_errors(tmp_path, monkeypatch):
     def fake_holdout(node, ctx):
         return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+    mock_pre_gate_reviewers(monkeypatch)
     g = parse(_pipeline("gates.dot"))
     ctx = Context(goal="t", workdir=ROOT, backend="echo", cxdb_path=tmp_path / "cxdb.sqlite")
     ctx.state["gate_skeptic.outcome"] = "success"
@@ -156,6 +160,7 @@ def test_healer_no_failures(tmp_path, monkeypatch):
     def fake_holdout(node, ctx):
         return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+    mock_pre_gate_reviewers(monkeypatch)
     db_path = tmp_path / "cxdb.sqlite"
     g = parse(_pipeline("gates.dot"))
     ctx = Context(goal="t", workdir=ROOT, backend="echo", cxdb_path=db_path)

@@ -858,7 +858,26 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     """Run parallel reviewer lanes and pass combined evidence downstream."""
     import runner.handlers as _handlers_shim  # late-bound shim for monkeypatched helpers
     review_contract = str(node.attrs.get("review_contract") or "").strip()
-    if ctx.backend in ("echo", "mock_llm"):
+    # A reviewer bound to a review contract must not be able to certify
+    # itself from pre-seeded `ctx.state` — that is the gate
+    # self-certification anti-pattern: a check whose expected value comes
+    # from its own fixture can never fail. Contract-free reviewer nodes
+    # keep the plain echo shortcut, because they make no contract claim.
+    #
+    # The bypass is an EXPLICIT, hermetic opt-in
+    # (`_df_test_allow_echo_controller_fixture`) rather than a probe for an
+    # installed controller backend. A probe would make the outcome depend on
+    # whether `codex` happens to exist on the host, so the same test would
+    # take different branches on a dev box vs. CI — non-hermetic and flaky,
+    # which is why the probe-based variant was reverted. Tests that need to
+    # drive graph topology should replace the handler instead; see
+    # `tests/conftest.py::mock_pre_gate_reviewers`.
+    echo_fixture_allowed = str(
+        ctx.state.get("_df_test_allow_echo_controller_fixture") or ""
+    ).strip().lower() in {"true", "1", "yes", "on"}
+    if ctx.backend in ("echo", "mock_llm") and (
+        not review_contract or echo_fixture_allowed
+    ):
         hint = ctx.state.get(f"{node.name}.outcome", "success")
         return Result(
             outcome=hint,

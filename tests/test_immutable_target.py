@@ -510,11 +510,65 @@ class ControllerSnapshotTests(unittest.TestCase):
         node = Node(name="cold_reviewer", attrs={"review_contract": "cold-review-v1"})
         ctx = Context(goal="fixture", workdir=self.repo, backend="echo")
         ctx.state["cold_reviewer.outcome"] = "success"
+        # The opt-in marker is what makes this fixture legal. Without it a
+        # contract-bound reviewer refuses to certify itself from seeded state
+        # — see test_controller_contract_rejects_unmarked_preseeded_echo_outcome.
+        ctx.state["_df_test_allow_echo_controller_fixture"] = "true"
 
         result = _parallel_reviewer(node, ctx)
 
         self.assertEqual(result.outcome, "success")
         self.assertEqual(result.metadata["reviewer_backend"], "echo")
+
+    def test_contract_bound_reviewer_refuses_unmarked_echo_self_certification(self) -> None:
+        """A contract-bound reviewer must NOT accept a seeded outcome under echo.
+
+        Regression guard for the gate self-certification anti-pattern: a check
+        whose expected value comes from its own fixture can never fail. Commit
+        9159a777 removed this guard to get the suite green; the supported way to
+        drive graph topology in tests is to replace the handler
+        (`tests/conftest.py::mock_pre_gate_reviewers`), not to let a
+        contract-bound reviewer certify itself.
+
+        Paired with `test_controller_contract_allows_explicitly_preseeded_echo_fixture`,
+        which is the same call WITH the opt-in marker.
+        """
+        from runner.handler_core import Context
+        from runner.handler_parallel_reviewer import _parallel_reviewer
+        from runner.parser import Node
+
+        node = Node(name="cold_reviewer", attrs={"review_contract": "cold-review-v1"})
+        ctx = Context(goal="fixture", workdir=self.repo, backend="echo")
+        # Seeded, but WITHOUT `_df_test_allow_echo_controller_fixture`.
+        ctx.state["cold_reviewer.outcome"] = "success"
+
+        result = _parallel_reviewer(node, ctx)
+
+        self.assertNotEqual(
+            result.outcome,
+            "success",
+            "contract-bound reviewer certified itself from seeded state under echo",
+        )
+        self.assertNotEqual(result.metadata.get("parallel_reviewer"), "echo")
+
+    def test_contract_free_reviewer_still_honors_echo_seeding(self) -> None:
+        """A reviewer with NO review_contract keeps the plain echo shortcut.
+
+        The guard is scoped to contract-bound reviewers only — it must not
+        break ordinary echo-lane smoke graphs.
+        """
+        from runner.handler_core import Context
+        from runner.handler_parallel_reviewer import _parallel_reviewer
+        from runner.parser import Node
+
+        node = Node(name="plain_reviewer", attrs={})
+        ctx = Context(goal="fixture", workdir=self.repo, backend="echo")
+        ctx.state["plain_reviewer.outcome"] = "success"
+
+        result = _parallel_reviewer(node, ctx)
+
+        self.assertEqual(result.outcome, "success")
+        self.assertEqual(result.metadata["parallel_reviewer"], "echo")
 
     def test_controller_contract_rejects_unmarked_preseeded_echo_outcome(self) -> None:
         """An inherited outcome key in non-echo run still resolves the controller backend."""
@@ -584,7 +638,16 @@ class ControllerSnapshotTests(unittest.TestCase):
             return Result(
                 outcome="success",
                 output="worker completed",
-                context_updates={"cold_reviewer.outcome": "success"},
+                context_updates={
+                    "cold_reviewer.outcome": "success",
+                    # This stub worker seeds its own reviewer's verdict, which a
+                    # contract-bound reviewer rejects by default. That refusal is
+                    # the point of the guard, so the fixture has to opt in
+                    # explicitly. Only a monkeypatched Python stub can do this —
+                    # real `_codergen` workers never write another node's
+                    # `.outcome` key, so this is not a production vector.
+                    "_df_test_allow_echo_controller_fixture": "true",
+                },
             )
 
         with patch.dict(TYPE_REGISTRY, {"codergen": _worker_with_inherited_reviewer_outcome}):

@@ -23,9 +23,6 @@ from __future__ import annotations
 
 import os
 import pathlib
-import sys
-
-import pytest
 import subprocess
 import sys
 
@@ -618,7 +615,14 @@ def test_controller_codex_transport_strips_outer_sandbox_exec():
     ]
     transport = _build_controller_codex_transport(sandboxed_argv)
 
+    assert "/usr/bin/sandbox-exec" not in transport
     assert transport[0] == "codex"
     assert transport[1] == "exec"
+    # Confinement is delegated to codex itself once the outer seatbelt is
+    # dropped, so assert the read-only sandbox VALUE (not just flag presence),
+    # the JSON-over-stdin payload marker, and the absence of the bypass flag.
+    assert transport[transport.index("--sandbox") + 1] == "read-only"
+    assert transport[-1] == "-"
+    assert "--dangerously-bypass-approvals-and-sandbox" not in transport
     assert "--sandbox" in transport
     assert "read-only" in transport
