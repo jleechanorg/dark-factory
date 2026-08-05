@@ -872,6 +872,7 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     # which is why the probe-based variant was reverted. Tests that need to
     # drive graph topology should replace the handler instead; see
     # `tests/conftest.py::mock_pre_gate_reviewers`.
+    # Evidence: https://gist.github.com/jleechan2015/d8316f652c3582d19ba8c15365c63c5d
     echo_fixture_allowed = str(
         ctx.state.get("_df_test_allow_echo_controller_fixture") or ""
     ).strip().lower() in {"true", "1", "yes", "on"}
