@@ -275,10 +275,26 @@ emit_line "[OK] CXDB initialized at $AFD_DB ($SCHEMA_OK bead_overlay row)"
 # ----------------------------------------------------------------------------
 resolve_ao() {  # resolve_ao <repo_full_name> -> echoes ao_project, exits 1 if unmapped
   python3 - "$CONFIG" "$1" <<'PY'
-import sys, toml
+# Bead jleechan-kn5j: prefer stdlib `tomllib` (Python 3.11+) over the
+# third-party `toml`. `toml` IS declared in requirements.txt, but this canary
+# invokes whatever `python3` is first on PATH — which on a CI runner is not
+# necessarily the interpreter pip installed into. That mismatch produced:
+#     ModuleNotFoundError: No module named 'toml'
+#     [FAIL] multi-repo routing wrong: DF='' WA='' UM='UNMAPPED'
+# and, under set -e, killed the canary before it wrote its evidence bundle —
+# surfacing as five unrelated-looking artifact failures. tomllib needs no
+# install, so it works with ANY python3 >= 3.11. The `toml` fallback keeps
+# older interpreters working.
+import sys
 cfg_path, repo = sys.argv[1], sys.argv[2]
 try:
-    cfg = toml.load(cfg_path)
+    try:
+        import tomllib
+        with open(cfg_path, "rb") as fh:
+            cfg = tomllib.load(fh)
+    except ImportError:
+        import toml
+        cfg = toml.load(cfg_path)
 except Exception:
     cfg = {}
 repos = cfg.get("repos", {})
