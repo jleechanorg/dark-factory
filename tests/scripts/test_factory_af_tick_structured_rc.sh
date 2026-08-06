@@ -83,7 +83,13 @@ set -e
 assert "factory-af-tick AFD_BEAD_FILTER rejects trailing comma (rc=2)" "2" "$rc"
 
 set +e
-( cd /tmp && AFD_BEAD_FILTER='jleechan-1,' bash "$TICK" ) 2>&1 | rg -q "comma\|empty\|allowlist" && echo "good error message"
+# Bead jleechan-kn5j: ripgrep is not installed on the CI runners
+# ("line 86: rg: command not found"). grep -E is POSIX-ubiquitous and the
+# pattern is a plain alternation, so no rg-specific behaviour is lost.
+# NOTE the original passed rg an escaped alternation ("comma\|empty\|...")
+# which is BRE syntax rg does not use — it was matching literally and could
+# never have fired. grep -E with a real alternation is what was intended.
+( cd /tmp && AFD_BEAD_FILTER='jleechan-1,' bash "$TICK" ) 2>&1 | grep -Eq "comma|empty|allowlist" && echo "good error message"
 set -e
 
 set +e
