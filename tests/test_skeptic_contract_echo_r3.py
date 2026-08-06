@@ -187,8 +187,14 @@ def test_load_bead_contract_from_br_show_output(monkeypatch):
     BeadContract. Production currently hand-authors the JSON —
     nothing reads the bead. This test fails until we add a converter
     that pulls description+notes from `br`'s structured output.
+
+    The contract-echo subsystem now lives in `runner.skeptic_contract_echo`,
+    so the monkeypatch targets the new module, not `skeptic_gate`. The
+    skeptic_gate re-exports `load_bead_contract_from_bead` for backward
+    compatibility with callers; the call below goes through the new module
+    directly to prove the extraction was real (not a re-export only).
     """
-    from runner import skeptic_gate
+    from runner import skeptic_contract_echo
 
     fake_br_output = {
         "id": "jleechan-pq08",
@@ -213,9 +219,11 @@ def test_load_bead_contract_from_br_show_output(monkeypatch):
     def fake_show(_bead_id: str, br_bin: str = "br") -> str:
         return json.dumps(fake_br_output)
 
-    monkeypatch.setattr(skeptic_gate, "_br_show_json", fake_show)
+    monkeypatch.setattr(skeptic_contract_echo, "_br_show_json", fake_show)
 
-    contract = skeptic_gate.load_bead_contract_from_bead("jleechan-pq08", br_bin="br")
+    contract = skeptic_contract_echo.load_bead_contract_from_bead(
+        "jleechan-pq08", br_bin="br"
+    )
     assert isinstance(contract, BeadContract)
     assert contract.id == "jleechan-pq08"
     assert "ATTEMPT r3 GUIDANCE" in contract.description or "ATTEMPT r3 GUIDANCE" in "\n".join(contract.notes)
