@@ -1,5 +1,15 @@
 """Canonical agent worktree layout + reaper (bead jleechan-jw4c).
 
+Follow-up that wires the CLI to the safety guards as the DEFAULT:
+bead jleechan-6i73 / PR #601. Without it, the CLI reaped exactly as
+before even after the guards landed — including the worktree that holds
+the only `gh pr merge` call site. Now `bin/df-reap-worktrees` defaults
+to `protected_paths=protected_worktree_paths()` AND
+`check_git_safety=True`; opt-outs are `--no-systemd-protect` and
+`--no-git-safety`.
+
+Evidence: https://gist.github.com/jleechan2015/8f268bc2359f09b5d7c2a3c049f5b632
+
 Three forces this module addresses:
 
 1.  Agent worktrees MUST live OUTSIDE the primary checkout. The previous
