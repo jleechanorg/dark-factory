@@ -2644,9 +2644,14 @@ fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, DaemonError> 
             ],
             REVIEWER_TIMEOUT_SECS,
         ),
+        // Flag order matters: agy's `--print` takes the PROMPT as its own
+        // value, so any flag placed between `--print` and the prompt is
+        // swallowed as the message and the real prompt is dropped (the
+        // reviewer then answers the literal flag string — the historical
+        // "agy returns empty stdout" symptom was this, not quota).
         "agy" => run_tool(
             "agy",
-            &["--print", "--dangerously-skip-permissions", prompt],
+            &["--dangerously-skip-permissions", "--print", prompt],
             REVIEWER_TIMEOUT_SECS,
         ),
         // jleechan-bkru: 4th reviewer vendor, added after a live 2026-07-09
@@ -2948,7 +2953,44 @@ fn skeptic_evidence(
                 if v2_present {
                     used_vendors.push(vendor2_label.clone());
                 }
-                v.expect("combine_dual_verdict returns Some(..) whenever it returns Ok(..)")
+                let mut verdict_so_far =
+                    v.expect("combine_dual_verdict returns Some(..) whenever it returns Ok(..)");
+                // Cross-model guarantee (issue #385 / strict merge policy
+                // #328): if everything parseable so far came from ONE model
+                // family (e.g. a codex quota outage leaves claude alone),
+                // `compute_review_degraded` will flag the assessment and the
+                // strict gate deterministically fails itself — the 2026-08-06
+                // fleet-wide circuit-breaker park loop. Pursue a SECOND
+                // family down the remaining priority list. The second
+                // reviewer's verdict is COMBINED (a dissenting second family
+                // can still fail the gate); it is never merely counted.
+                if verifier::compute_review_degraded(&used_vendors) {
+                    let have_family = verifier::vendor_model_family(&used_vendors[0]);
+                    for vendor_n in priority.iter().skip(2) {
+                        if used_vendors.iter().any(|u| u.as_str() == *vendor_n) {
+                            continue;
+                        }
+                        if verifier::vendor_model_family(vendor_n) == have_family {
+                            continue;
+                        }
+                        let v_n = dispatch_reviewer(vendor_n, &prompt)
+                            .ok()
+                            .and_then(|r| verifier::parse_skeptic_verdict(&r));
+                        if let Some(second) = v_n {
+                            if let Ok(Some(combined)) = combine_dual_verdict(
+                                Some(verdict_so_far.clone()),
+                                Some(second),
+                                bead_id,
+                                pr,
+                            ) {
+                                verdict_so_far = combined;
+                                used_vendors.push((*vendor_n).to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+                verdict_so_far
             }
             Err(total_outage_err) => {
                 // vendor1 AND vendor2 both failed to parse. Try each
