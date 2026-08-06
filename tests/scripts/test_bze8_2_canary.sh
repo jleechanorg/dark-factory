@@ -159,13 +159,30 @@ fi
 
 # 4. canary --help from a directory containing a single space in out-dir
 # also works (regression check on the bash strict-mode arg parsing).
-SPACED="$SCRATCH/with space"
-mkdir -p "$SPACED"
-set +e
-bash "$CANARY" --out-dir "$SPACED" >/dev/null 2>&1
-SP_RC=$?
-set -e
-assert "canary accepts --out-dir containing spaces" "0" "$SP_RC"
+#
+# Bead jleechan-kn5j: this runs the canary END TO END, so it needs the same
+# prerequisites as the E2E block above — sqlite3 AND cargo (the canary builds
+# the rust daemon). It previously sat OUTSIDE those guards, so on a runner
+# without cargo it was the last surviving failure after everything else was
+# fixed: it asserted rc=0 while the canary was exiting 1 on
+# "cargo: command not found", which says nothing about space handling.
+if ! command -v sqlite3 >/dev/null 2>&1 || ! command -v cargo >/dev/null 2>&1; then
+    echo "SKIP: spaced --out-dir check needs sqlite3 + cargo (canary runs end to end)"
+else
+    SPACED="$SCRATCH/with space"
+    mkdir -p "$SPACED"
+    set +e
+    SPACED_LOG="$SCRATCH/canary-spaced.log"
+    bash "$CANARY" --out-dir "$SPACED" >"$SPACED_LOG" 2>&1
+    SP_RC=$?
+    set -e
+    if [ "$SP_RC" -ne 0 ]; then
+        echo "--- spaced-dir canary output (rc=$SP_RC) ---"
+        tail -20 "$SPACED_LOG" | sed 's/^/    /'
+        echo "--- end ---"
+    fi
+    assert "canary accepts --out-dir containing spaces" "0" "$SP_RC"
+fi
 
 echo
 echo "=== RESULTS: $PASS passed, $FAIL failed ==="
