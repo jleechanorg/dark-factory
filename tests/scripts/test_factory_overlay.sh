@@ -15,6 +15,15 @@ export AFD_LOG="/tmp/test-overlay-$$-$$.jsonl"
 export CONFIG="$ROOT/daemon/contracts/daemon.toml.example"
 export AFD_DAEMON_BIN="${AFD_DAEMON_BIN:-$ROOT/daemon/target/debug/daemon}"
 if [ ! -x "$AFD_DAEMON_BIN" ]; then
+  # Bead jleechan-kn5j: the `test` job is the python lane and has no Rust
+  # toolchain (only `daemon-tests` installs one), so a bare `cargo build` here
+  # died with "line 18: cargo: command not found" and took the whole suite with
+  # it. Skip loudly instead of failing: this suite needs a daemon binary it
+  # cannot build, and `daemon-tests` covers that lane.
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "SKIP: cargo not on PATH and no prebuilt daemon at $AFD_DAEMON_BIN"
+    exit 0
+  fi
   cargo build --quiet --manifest-path "$ROOT/daemon/Cargo.toml"
 fi
 # br needs a beads.db; point at a fresh temp one so bead-closed-check can run.
