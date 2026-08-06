@@ -3,6 +3,10 @@
 Workflow wf_7c58132f-e17: 3 review lanes (sonnet) -> haiku dedup -> refute-by-default verify (sonnet). 16 agents, 1,151,090 tokens. Goal bead jleechan-fpnx; roadmap: ~/roadmap/dark-factory/factory-code-cleanup-goal-ironclad-2026-08-05.md.
 Both verifier deaths (VOID) were re-verified out-of-band before disposition: one by operator direct-read, one by a fresh adversarial sonnet agent. No finding was silently dropped; capacity drops: 0.
 
+## Rebase verification (PR #580)
+
+Rebased onto current main to pick up `b5be1881` (skip `test_conformance_score_is_deterministic_mock_surface`) and `17aa092e` (propagate `LD_LIBRARY_PATH`). Local pytest on rebased head: 87 passed / 1 skipped / 0 failed across `tests/test_conformance.py`, `tests/test_parallel_fanout.py`, `tests/test_prompt_contracts.py`; 10 passed for `tests/test_structural_preflight.py`.
+
 ## Cross-model cold review (C6)
 
 Reviewer chain: codex exec (quota-exhausted, could not run) → gemini CLI (client
