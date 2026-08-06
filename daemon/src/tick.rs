@@ -2761,13 +2761,54 @@ fn build_skeptic_prompt(
         }
     }
 
+    // Bead jleechan-5arc: the skeptic must be an INDEPENDENT signal.
+    //
+    // The previous prompt told the reviewer to run `gh pr checks` — exactly
+    // the data the `Ci` gate already computes — and to judge "ready to
+    // merge". That made skeptic re-derive other gates' verdicts from the
+    // same events, so it failed whenever CI was merely pending and whenever
+    // a vendor was silent. Measured: 603 fail / 45 pass across 652
+    // assessments, with ZERO passes in the 12 days to 2026-08-05 even though
+    // PRs merged clean in that window (beads 41gk/PR #546, jsby/PR #466,
+    // jtg8/PR #455 were 3/3, 9/9, 3/3 skeptic-fail and all shipped fine).
+    // A 20-sample classification found 50% of fails were pure restatements
+    // of ci_green/coderabbit/bugbot/evidence_review.
+    //
+    // Worse, it broke the `Waived` contract documented at
+    // `verifier::GateResult` (see the jleechan-jsby doc comment): a waiver
+    // for an unavailable vendor REQUIRES compensating coverage — skeptic +
+    // /er + cross-model — to be green. A skeptic that reads `gh pr checks`
+    // and the vendor's own comments cannot compensate for that vendor: the
+    // waiver needs skeptic green exactly when the signals skeptic is reading
+    // are absent or red. That circularity made the waiver unreachable when
+    // it was most needed.
+    //
+    // The fix scopes skeptic to the artifact only other gates do NOT read:
+    // the diff itself. `gh pr checks` is removed, and the verdict question
+    // is narrowed from "ready to merge" to "is there a defect in this diff".
+    // Its genuine defect-finding is preserved — 30% of the sampled fails
+    // were real, diff-specific defects, and those must still fail.
     format!(
         "You are the Stage-1 Skeptic gate for an autonomous coding factory.\n\
-         Review bead {bead_id}'s PR #{pr} in repo {repo} end-to-end (diff, \
-         evidence, tests) and judge whether it is ready to merge:\n\
+         Judge ONE question about bead {bead_id}'s PR #{pr} in repo {repo}: \
+         does the DIFF ITSELF contain a defect?\n\
            gh pr diff {pr} --repo {repo}\n\
            gh pr view {pr} --repo {repo} --json body,comments\n\
-           gh pr checks {pr} --repo {repo}\n\
+         \n\
+         SCOPE — you are one of several independent gates. CI status, merge \
+         conflicts, CodeRabbit, Bugbot, comment resolution and evidence \
+         review are SEPARATE gates that already read those signals. Do NOT \
+         run `gh pr checks` and do NOT fail for anything they own: pending, \
+         running, queued or failing CI; a missing, pending or unhappy vendor \
+         review; unresolved review threads. Another gate reporting red is not \
+         your finding to repeat — restating it adds no information and \
+         destroys your value as an independent signal.\n\
+         \n\
+         FAIL only for a defect you can point to in the diff: incorrect \
+         logic, a test that does not exercise what it claims, a missing edge \
+         case, a security or data-integrity problem, or evidence that \
+         contradicts the change. Cite the file and line. If the diff is sound, \
+         PASS — even while other gates are still red or pending.\n\
          Respond with exactly one line of the form:\n\
          pass|warn <note>|fail <reason>{vendor_waiver_block}",
     )
@@ -5533,6 +5574,62 @@ mod existing_pr_adoption_dedup_tests {
 #[cfg(test)]
 mod skeptic_prompt_vendor_waiver_tests {
     use super::build_skeptic_prompt;
+
+    /// Bead jleechan-5arc: the skeptic must not re-derive the `Ci` gate.
+    ///
+    /// The prompt previously instructed `gh pr checks` — the same data
+    /// `ci_green` computes — so skeptic failed whenever CI was merely
+    /// pending. Measured 603 fail / 45 pass over 652 assessments, with zero
+    /// passes in the 12 days to 2026-08-05 while PRs merged clean.
+    #[test]
+    fn skeptic_prompt_does_not_instruct_gh_pr_checks() {
+        let ledger = crate::vendor_health::VendorHealthLedger::new();
+        let prompt = build_skeptic_prompt("bead-x", 123, "owner/repo", &ledger);
+        // Assert on the INVOCATION form (with args). The prompt legitimately
+        // mentions the bare command inside its own prohibition ("do NOT run
+        // `gh pr checks`"), so a naive substring check matches our guardrail
+        // text and would fail for the wrong reason.
+        assert!(
+            !prompt.contains("gh pr checks 123 --repo owner/repo"),
+            "skeptic prompt must not INSTRUCT the reviewer to read CI status - \
+             that is the Ci gate's job, and duplicating it destroys skeptic's \
+             independence (making the vendor Waived contract unreachable)"
+        );
+    }
+
+    /// The scope instruction must be explicit, not merely implied by omission:
+    /// a reviewer can still run `gh pr checks` on its own initiative.
+    #[test]
+    fn skeptic_prompt_forbids_failing_on_other_gates_signals() {
+        let ledger = crate::vendor_health::VendorHealthLedger::new();
+        let prompt = build_skeptic_prompt("bead-x", 7, "owner/repo", &ledger);
+        let lower = prompt.to_lowercase();
+        assert!(
+            lower.contains("separate gate"),
+            "prompt must state that CI/vendor/comment checks are separate gates"
+        );
+        assert!(
+            lower.contains("do not fail"),
+            "prompt must explicitly forbid failing on other gates' signals"
+        );
+    }
+
+    /// Independence must not cost capability: 30% of sampled fails were real,
+    /// diff-specific defects and those must still be found.
+    #[test]
+    fn skeptic_prompt_still_reviews_the_diff() {
+        let ledger = crate::vendor_health::VendorHealthLedger::new();
+        let prompt = build_skeptic_prompt("bead-x", 7, "owner/repo", &ledger);
+        assert!(
+            prompt.contains("gh pr diff 7 --repo owner/repo"),
+            "skeptic must still read the diff — that is its actual job"
+        );
+        assert!(
+            prompt.contains("pass|warn <note>|fail <reason>"),
+            "the one-line verdict contract must be unchanged"
+        );
+    }
+
     use crate::vendor_health::{
         CapObservation, CapSource, Vendor, VendorHealthLedger,
     };
@@ -5664,7 +5761,13 @@ mod skeptic_prompt_vendor_waiver_tests {
         );
         assert!(prompt.contains("gh pr diff 127 --repo owner/repo"));
         assert!(prompt.contains("gh pr view 127 --repo owner/repo --json body,comments"));
-        assert!(prompt.contains("gh pr checks 127 --repo owner/repo"));
+        // Bead jleechan-5arc: the CI-status instruction was REMOVED. Skeptic
+        // is an independent signal and must not re-derive the Ci gate; the
+        // Waived contract at verifier::GateResult depends on that independence.
+        assert!(
+            !prompt.contains("gh pr checks 127 --repo owner/repo"),
+            "the gh pr checks instruction must stay removed (jleechan-5arc)"
+        );
         assert!(
             prompt.contains("pass|warn <note>|fail <reason>"),
             "verdict grammar must remain in the base prompt"
