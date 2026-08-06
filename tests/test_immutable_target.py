@@ -705,3 +705,52 @@ def _sha256(data: bytes) -> str:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_echo_controller_fixture_marker_stays_rare():
+    """The opt-in marker must not spread — it is the guard's escape hatch.
+
+    `_df_test_allow_echo_controller_fixture` lets a test bypass the rule that a
+    `review_contract`-bound reviewer cannot certify itself from pre-seeded
+    state. That guard is only as strong as the marker being rare: nothing stops
+    a future test from sprinkling it around to turn a red test green, which
+    would silently restore the exact hole the guard closes — and unlike the
+    original hole it would be invisible, because every test would still pass.
+
+    The supported way to drive graph topology is to REPLACE the handler
+    (`tests/conftest.py::mock_pre_gate_reviewers`), not to opt out of the guard.
+
+    Counts ASSIGNMENTS, not mentions: prose, docstrings and this test's own
+    literal must not trip the guard, or documenting the marker would break CI
+    and the natural fix would be to stop documenting it.
+
+    Raising this cap is a deliberate contract decision, not a routine fix.
+    """
+    import pathlib
+    import re
+
+    tests_dir = pathlib.Path(__file__).resolve().parent
+    marker = "_df_test_allow_echo_controller_fixture"
+    # Matches `ctx.state["<marker>"] = ...` and `"<marker>": ...` in a dict
+    # literal — i.e. the marker actually being SET.
+    assign = re.compile(re.escape(f'"{marker}"') + r"\s*(?:\]\s*=|:)")
+
+    hits = {}
+    for path in sorted(tests_dir.rglob("*.py")):
+        n = len(assign.findall(path.read_text(encoding="utf-8")))
+        if n:
+            hits[path.name] = n
+
+    total = sum(hits.values())
+    # Two legitimate opt-ins today, both in test_immutable_target.py:
+    #   - the guard's own "allows explicitly pre-seeded fixture" test
+    #   - the CLI echo fixture whose stub worker seeds its own reviewer
+    assert total <= 2, (
+        f"{marker} is assigned {total} times ({hits}); the guard's escape hatch "
+        "is spreading. Use tests/conftest.py::mock_pre_gate_reviewers instead, "
+        "or raise this cap deliberately with a note explaining why."
+    )
+    assert set(hits) <= {"test_immutable_target.py"}, (
+        f"{marker} escaped its home file: {hits}. Contract-bound reviewer "
+        "bypasses belong in one auditable place."
+    )
