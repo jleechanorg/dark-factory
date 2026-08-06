@@ -78,6 +78,7 @@ from typing import TYPE_CHECKING
 import runner.handlers as _handlers_shim
 
 from .handler_core import Result
+from . import shadow_review as _shadow_review_mod  # shared codergen + dispatch shadow helper
 
 if TYPE_CHECKING:
     from .parser import Node
@@ -102,6 +103,12 @@ _CMD_RUN_EXIT_RE = re.compile(
 
 @dataclass
 class _ShadowCodexReview:
+    """Type alias back-compat shim — the real class now lives in ``runner.shadow_review``.
+
+    Preserved so legacy tests that import ``runner.handler_codergen._ShadowCodexReview``
+    keep working. New code should call
+    ``runner.shadow_review.start_shadow_codex_review`` directly.
+    """
     prompt: str = ""
     proc: subprocess.Popen | None = None
     prompt_path: str = ""
@@ -111,75 +118,20 @@ class _ShadowCodexReview:
 
 
 def _shadow_review_enabled(node: "Node", ctx: "Context", backend: str) -> bool:
-    """True when a review node should get a parallel plain-Codex check."""
-    raw = node.attrs.get("shadow_codex_review", ctx.state.get("_df_shadow_codex_review", "false"))
-    if isinstance(raw, str) and raw.strip().lower() in {"false", "0", "no", "off"}:
-        return False
-    if raw is False:
-        return False
+    """Back-compat wrapper: thin delegation to ``runner.shadow_review._enabled``.
+
+    Retained so legacy callers keep their public symbol, but the real
+    implementation lives in ``runner.shadow_review`` so both the codergen
+    and dispatch shadow lanes share one definition.
+    """
     if backend in {"echo", "mock_llm"}:
         return False
-    return str(node.attrs.get("class", "")).strip().lower() == "review"
+    return _shadow_review_mod._enabled(node, ctx)
 
 
 def _shadow_review_prompt(node: "Node", ctx: "Context", primary_prompt: str) -> str:
-    """Build the simple independent reviewer prompt for the Codex shadow lane."""
-    review_target = str(node.attrs.get("shadow_review_target", "diff")).strip() or "diff"
-    diff = ctx.state.get("_last_diff", "(no diff captured)")
-    changed_files = ctx.state.get("_last_changed_files", "(no changed files captured)")
-    previous = ctx.state.get("_last_output", "")
-    return f"""\
-review this {review_target}
-
-You are the parallel Codex reviewer for a Dark Factory reviewer node.
-Do an independent, blocker-first review of the current workspace. Focus on
-what a coder can fix next, not on restating gate status.
-
-Goal:
-{ctx.goal}
-
-Reviewer node:
-{node.name}
-
-Changed files:
-{changed_files}
-
-Diff captured before this reviewer:
-```
-{diff}
-```
-
-Previous node output:
-```
-{previous}
-```
-
-Primary reviewer prompt for comparison:
-```
-{primary_prompt}
-```
-
-Return this exact free-form shape:
-
-## Review Verdict
-pass | fail
-
-## Blocking Findings
-1. Severity: concise issue title.
-   Evidence: exact file/function/run/artifact/line or say none.
-   Why it matters: behavioral or merge-readiness impact.
-   Fix: smallest concrete coder action.
-
-## Evidence Checked
-- Exact commands, files, logs, screenshots, videos, URLs, or artifacts inspected.
-
-## Required Next Actions
-1. Smallest patch or evidence regeneration step.
-2. Exact verification command or artifact to rerun.
-
-End with this machine-readable routing line:
-verdict: <pass|fail>
-"""
+    """Back-compat wrapper: thin delegation to ``runner.shadow_review._build_prompt``."""
+    return _shadow_review_mod._build_prompt(node, ctx, primary_prompt)
 
 
 def _start_shadow_codex_review(
@@ -188,70 +140,22 @@ def _start_shadow_codex_review(
     backend: str,
     primary_prompt: str,
 ) -> _ShadowCodexReview | None:
-    """Launch the plain Codex shadow review before the primary reviewer blocks."""
+    """Back-compat wrapper around ``runner.shadow_review.start_shadow_codex_review``.
+
+    Preserves the historical signature so the dispatch gate callers and
+    legacy tests that pass ``(node, ctx, backend, prompt_text)`` keep
+    working. The codergen shadow lane is the only consumer; ``backend``
+    is checked here to keep the echo/mock_llm short-circuit in the
+    codergen module (the shared helper does not know about echo).
+    """
     if not _shadow_review_enabled(node, ctx, backend):
         return None
-
-    prompt = _shadow_review_prompt(node, ctx, primary_prompt)
-    shadow = _ShadowCodexReview(prompt=prompt, started_at=time.monotonic())
-    try:
-        from . import engine_observability as _obs
-
-        seq = int(getattr(ctx, "_df_current_seq", getattr(ctx, "last_completed_seq", 0)))
-        attempt = int(getattr(ctx, "_df_current_attempt", 1))
-        prompt_path, prompt_sha = _obs._write_input_sidecar(
-            ctx,
-            seq,
-            node.name,
-            attempt,
-            prompt,
-            kind="shadow_codex_prompt",
-        )
-        shadow.prompt_path = prompt_path or ""
-        shadow.prompt_sha256 = prompt_sha or ""
-        if prompt_path:
-            _obs._emit_event(
-                ctx,
-                "shadow_review_prompt",
-                {
-                    "node": node.name,
-                    "attempt": str(attempt),
-                    "shadow_backend": "codex",
-                    "shadow_prompt_path": shadow.prompt_path,
-                    "shadow_prompt_sha256": shadow.prompt_sha256,
-                },
-                seq,
-            )
-    except Exception:
-        pass
-
-    if shutil.which("codex") is None:
-        shadow.launch_error = "codex executable not found"
-        return shadow
-
-    args = _handlers_shim._sandboxed_args_for_workdir([
-        "codex",
-        "exec",
-        "--yolo",
-        "--skip-git-repo-check",
-        prompt,
-    ], ctx.workdir)
-    if args is None:
-        shadow.launch_error = "sandbox-exec unavailable"
-        return shadow
-    try:
-        shadow.proc = subprocess.Popen(
-            args,
-            cwd=ctx.workdir,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-            env=_handlers_shim._sanitized_env(),
-        )
-    except Exception as exc:
-        shadow.launch_error = f"{type(exc).__name__}: {exc}"
-    return shadow
+    # Persist the rendered primary prompt onto ctx so the shared helper
+    # (which reads from ctx.state["_last_output"]) sees the same input the
+    # legacy codergen wrapper fed into its `_shadow_review_prompt`.
+    ctx.state["_last_output"] = primary_prompt
+    workdir = ctx.state.get("ao.worktree") or ctx.workdir
+    return _shadow_review_mod.start_shadow_codex_review(node, ctx, workdir=workdir)
 
 
 def _finish_shadow_codex_review(
@@ -260,123 +164,18 @@ def _finish_shadow_codex_review(
     node: "Node",
     ctx: "Context",
 ) -> "Result":
-    """Merge the parallel Codex review into a reviewer node's result."""
-    if shadow is None:
-        return result
+    """Back-compat wrapper around ``runner.shadow_review.finish_shadow_codex_review``.
 
-    timeout_s = _handlers_shim._coerce_timeout(
-        node.attrs.get("shadow_codex_timeout", node.attrs.get("timeout", "1200")),
-        1200,
-    )
-    stdout = ""
-    stderr = ""
-    timed_out = False
-    returncode = ""
-    if shadow.launch_error:
-        output = f"shadow codex review did not run: {shadow.launch_error}"
-        shadow_outcome = "error"
-        verdict = "unknown"
-    else:
-        proc = shadow.proc
-        if proc is None:
-            output = "shadow codex review did not run: missing process handle"
-            shadow_outcome = "error"
-            verdict = "unknown"
-        else:
-            remaining = max(1, timeout_s - int(time.monotonic() - shadow.started_at))
-            try:
-                stdout, stderr = proc.communicate(timeout=remaining)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                    stdout, stderr = proc.communicate(timeout=5)
-                except Exception:
-                    try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except Exception:
-                        pass
-                    stdout, stderr = proc.communicate()
-            returncode = str(proc.returncode if proc.returncode is not None else "")
-            output = (stdout + ("\nSTDERR:\n" + stderr if stderr else "")).strip()
-            if timed_out and not output:
-                output = f"shadow codex review timed out after {timeout_s} seconds"
-            verdict, normalized = _handlers_shim._parse_verdict(output)
-            if proc.returncode != 0 or timed_out:
-                shadow_outcome = "error"
-            else:
-                shadow_outcome = normalized
-
-    output_path = ""
-    output_sha = ""
-    try:
-        from . import engine_observability as _obs
-
-        seq = int(getattr(ctx, "_df_current_seq", getattr(ctx, "last_completed_seq", 0)))
-        attempt = int(getattr(ctx, "_df_current_attempt", 1))
-        output_path, output_sha = _obs._write_input_sidecar(
-            ctx,
-            seq,
-            node.name,
-            attempt,
-            output,
-            kind="shadow_codex_output",
-        )
-        _obs._emit_event(
-            ctx,
-            "shadow_review_result",
-            {
-                "node": node.name,
-                "attempt": str(attempt),
-                "shadow_backend": "codex",
-                "shadow_outcome": shadow_outcome,
-                "shadow_verdict": verdict,
-                "shadow_returncode": returncode,
-                "shadow_output_path": output_path or "",
-                "shadow_output_sha256": output_sha or "",
-            },
-            seq,
-        )
-    except Exception:
-        pass
-
-    meta = dict(result.metadata)
-    meta.update(
-        {
-            "shadow_codex_review": "true",
-            "shadow_codex_outcome": shadow_outcome,
-            "shadow_codex_verdict": verdict,
-            "shadow_codex_returncode": returncode,
-            "shadow_codex_timed_out": "true" if timed_out else "false",
-            "shadow_codex_prompt_path": shadow.prompt_path,
-            "shadow_codex_prompt_sha256": shadow.prompt_sha256,
-            "shadow_codex_output_path": output_path or "",
-            "shadow_codex_output_sha256": output_sha or "",
-        }
-    )
-    comparison = (
-        "\n\n---\n\n"
-        "## Parallel Codex Review\n"
-        f"{output}\n\n"
-        "## Review Comparison\n"
-        f"- Primary reviewer outcome: {result.outcome}\n"
-        f"- Shadow Codex outcome: {shadow_outcome}\n"
-        f"- Shadow Codex verdict: {verdict}\n"
-    )
-    final_outcome = result.outcome
-    if result.outcome == "success" and shadow_outcome != "success":
-        final_outcome = "failure"
-    updates = dict(result.context_updates)
-    updates[f"{node.name}.shadow_codex_output"] = output
-    updates[f"{node.name}.shadow_codex_outcome"] = shadow_outcome
-    updates[f"{node.name}.shadow_codex_output_path"] = output_path or ""
-    return Result(
-        outcome=final_outcome,
-        output=result.output + comparison,
-        metadata=meta,
-        preferred_label=result.preferred_label,
-        suggested_next_ids=result.suggested_next_ids,
-        context_updates=updates,
+    Codergen has no canonical ``expected_sha`` (the implementing agent
+    writes inside its AO-managed worktree), so we pass ``None`` —
+    keeping the historical no-SHA contract and preserving the
+    hardcoded ``shadow_codex_*`` metadata keys + ``## Parallel Codex
+    Review`` literal asserted by
+    ``tests/test_codergen_shadow_review.py`` +
+    ``tests/test_state_threading.py``.
+    """
+    return _shadow_review_mod.finish_shadow_codex_review(
+        result, shadow, node, ctx, expected_sha=None,
     )
 
 
