@@ -173,6 +173,17 @@ pub struct BeadOverlay {
     /// so the wall-clock comparison `now_epoch - attempt_started_at`
     /// directly yields elapsed seconds without timezone parsing.
     pub attempt_started_at: Option<u64>,
+    /// Unix-epoch seconds at which the slow tier is allowed to retry
+    /// `state=Queued` for this bead after a transient `Sessions::spawn`
+    /// failure (bead jleechan-yvlq / G12 retry-backoff bleed fix). The
+    /// `next_retry_at` stamp is BEAD-LOCAL — it only gates this one bead
+    /// from being added to the per-tick `ready` list, never the global
+    /// queue. Reset to `None` on every successful `DISPATCHED` save. The
+    /// per-bead backoff (see `dispatch::per_bead_backoff_secs`) grows
+    /// exponentially with `spawn_failure_count` but is capped at 600s
+    /// (10 min). `None` means "no backoff in effect — eligible for
+    /// dispatch this tick".
+    pub next_retry_at: Option<u64>,
 }
 
 impl BeadOverlay {
@@ -772,6 +783,7 @@ impl SqliteStateStore {
         Self::ensure_claimed_by_columns(&conn)?;
         Self::ensure_peer_claims_table(&conn)?;
         Self::ensure_attempt_started_at_column(&conn)?;
+        Self::ensure_next_retry_at_column(&conn)?;
         Ok(Self { conn })
     }
 
@@ -1363,6 +1375,33 @@ impl SqliteStateStore {
         Ok(())
     }
 
+    /// Idempotent migration for the `next_retry_at` column (bead
+    /// jleechan-yvlq / G12 retry-backoff bleed fix). Same probe-then-`ALTER`
+    /// pattern as `ensure_attempt_started_at_column`. Nullable (NULL = "no
+    /// backoff in effect — eligible for dispatch this tick"). The per-bead
+    /// backoff delay is bounded by `dispatch::per_bead_backoff_secs`; the
+    /// slow tier consults `next_retry_at` ONLY to skip the per-bead
+    /// `ready` re-add, never to halt the global tick — see
+    /// `tick::run_slow_tier`'s `next_retry_at` early-return.
+    fn ensure_next_retry_at_column(conn: &Connection) -> Result<(), DaemonError> {
+        let has_col: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
+                 WHERE name = 'next_retry_at'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_next_retry_at_column: pragma", e))?;
+        if !has_col {
+            conn.execute(
+                "ALTER TABLE bead_overlay ADD COLUMN next_retry_at INTEGER",
+                [],
+            )
+            .map_err(|e| tool_err("ensure_next_retry_at_column: add column", e))?;
+        }
+        Ok(())
+    }
+
     /// `is_memory` distinguishes the two `configure` call sites: `open()` (file-backed,
     /// `is_memory=false`) and `open_in_memory_with_schema()` (`is_memory=true`). WAL is a
     /// documented no-op against `:memory:` connections, so failures/non-"wal" readbacks are
@@ -1398,7 +1437,7 @@ impl SqliteStateStore {
             .prepare(
                 "SELECT bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
                  pr_number, branch, session_id, is_adopted, spawn_failure_count, pre_session_head_sha, \
-                 park_reason, target_repo, attempt_started_at \
+                 park_reason, target_repo, attempt_started_at, next_retry_at \
                  FROM bead_overlay WHERE state IN ('DISPATCHED', 'ATTESTED')",
             )
             .map_err(|e| tool_err(&format!("{op} prepare"), e))?;
@@ -1420,6 +1459,7 @@ impl SqliteStateStore {
                     row.get::<_, Option<String>>(12)?,
                     row.get::<_, Option<String>>(13)?,
                     row.get::<_, Option<i64>>(14)?,
+                    row.get::<_, Option<i64>>(15)?,
                 ))
             })
             .map_err(|e| tool_err(&format!("{op} query"), e))?;
@@ -1441,6 +1481,7 @@ impl SqliteStateStore {
                 park_reason,
                 target_repo,
                 attempt_started_at,
+                next_retry_at,
             ) = r.map_err(|e| tool_err(&format!("{op} row"), e))?;
             out.push(BeadOverlay {
                 bead_id,
@@ -1458,6 +1499,7 @@ impl SqliteStateStore {
                 park_reason,
                 target_repo,
                 attempt_started_at: attempt_started_at.map(|v| v.max(0) as u64),
+                next_retry_at: next_retry_at.map(|v| v.max(0) as u64),
             });
         }
         Ok(out)
@@ -1483,7 +1525,7 @@ impl StateStore for SqliteStateStore {
             .query_row(
                 "SELECT bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
                  pr_number, branch, session_id, is_adopted, spawn_failure_count, pre_session_head_sha, \
-                 park_reason, target_repo, attempt_started_at \
+                 park_reason, target_repo, attempt_started_at, next_retry_at \
                  FROM bead_overlay WHERE bead_id = ?1",
                 params![bead_id],
                 |row| {
@@ -1494,6 +1536,7 @@ impl StateStore for SqliteStateStore {
                     let park_reason: Option<String> = row.get(12)?;
                     let target_repo: Option<String> = row.get(13)?;
                     let attempt_started_at: Option<i64> = row.get(14)?;
+                    let next_retry_at: Option<i64> = row.get(15)?;
                     Ok((
                         state_str,
                         BeadOverlay {
@@ -1512,6 +1555,7 @@ impl StateStore for SqliteStateStore {
                             park_reason,
                             target_repo,
                             attempt_started_at: attempt_started_at.map(|v| v.max(0) as u64),
+                            next_retry_at: next_retry_at.map(|v| v.max(0) as u64),
                         },
                     ))
                 },
@@ -1529,14 +1573,15 @@ impl StateStore for SqliteStateStore {
         self.conn
             .execute(
                 "INSERT INTO bead_overlay \
-                 (bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id, updated_at, is_adopted, spawn_failure_count, pre_session_head_sha, park_reason, target_repo, attempt_started_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
+                 (bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id, updated_at, is_adopted, spawn_failure_count, pre_session_head_sha, park_reason, target_repo, attempt_started_at, next_retry_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) \
                  ON CONFLICT(bead_id) DO UPDATE SET \
                    state=excluded.state, attempt=excluded.attempt, reroll_count=excluded.reroll_count, \
                    autonomy_secs=excluded.autonomy_secs, spend_usd=excluded.spend_usd, \
                    pr_number=excluded.pr_number, branch=excluded.branch, session_id=excluded.session_id, updated_at=excluded.updated_at, \
                    is_adopted=excluded.is_adopted, spawn_failure_count=excluded.spawn_failure_count, pre_session_head_sha=excluded.pre_session_head_sha, \
-                   park_reason=excluded.park_reason, target_repo=excluded.target_repo, attempt_started_at=excluded.attempt_started_at",
+                   park_reason=excluded.park_reason, target_repo=excluded.target_repo, attempt_started_at=excluded.attempt_started_at, \
+                   next_retry_at=excluded.next_retry_at",
                 params![
                     overlay.bead_id,
                     overlay.state.as_str(),
@@ -1554,6 +1599,7 @@ impl StateStore for SqliteStateStore {
                     overlay.park_reason,
                     overlay.target_repo,
                     overlay.attempt_started_at.map(|v| v as i64),
+                    overlay.next_retry_at.map(|v| v as i64),
                 ],
             )
             .map_err(|e| tool_err("save", e))?;
@@ -1759,7 +1805,7 @@ impl StateStore for SqliteStateStore {
                 "UPDATE bead_overlay \
              SET state = 'QUEUED', attempt = attempt + 1, autonomy_secs = 0, \
                  pr_number = NULL, session_id = NULL, park_reason = NULL, \
-                 attempt_started_at = NULL, updated_at = ?1 \
+                 attempt_started_at = NULL, next_retry_at = NULL, updated_at = ?1 \
              WHERE state = 'HUMAN_HELD' \
                AND attempt < ?2 \
                AND session_id IS NULL \
@@ -1767,7 +1813,7 @@ impl StateStore for SqliteStateStore {
                     OR substr(park_reason, 1, length(?8)) = ?8) \
              RETURNING bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
                  pr_number, branch, session_id, is_adopted, spawn_failure_count, \
-                 pre_session_head_sha, park_reason, target_repo, attempt_started_at",
+                 pre_session_head_sha, park_reason, target_repo, attempt_started_at, next_retry_at",
             )
             .map_err(|e| tool_err("recover_human_held prepare", e))?;
         let rows = stmt
@@ -1799,6 +1845,7 @@ impl StateStore for SqliteStateStore {
                         row.get::<_, Option<String>>(12)?,
                         row.get::<_, Option<String>>(13)?,
                         row.get::<_, Option<i64>>(14)?,
+                        row.get::<_, Option<i64>>(15)?,
                     ))
                 },
             )
@@ -1821,6 +1868,7 @@ impl StateStore for SqliteStateStore {
                 park_reason,
                 target_repo,
                 attempt_started_at,
+                next_retry_at,
             ) = r.map_err(|e| tool_err("recover_human_held row", e))?;
             out.push(BeadOverlay {
                 bead_id,
@@ -1838,6 +1886,7 @@ impl StateStore for SqliteStateStore {
                 park_reason,
                 target_repo,
                 attempt_started_at: attempt_started_at.map(|v| v.max(0) as u64),
+                next_retry_at: next_retry_at.map(|v| v.max(0) as u64),
             });
         }
         Ok(out)
@@ -1852,7 +1901,7 @@ impl StateStore for SqliteStateStore {
             .prepare(
                 "SELECT bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
                  pr_number, branch, session_id, is_adopted, spawn_failure_count, pre_session_head_sha, \
-                 park_reason, target_repo, attempt_started_at \
+                 park_reason, target_repo, attempt_started_at, next_retry_at \
                  FROM bead_overlay WHERE state = 'HUMAN_HELD' AND attempt >= ?1",
             )
             .map_err(|e| tool_err("human_held_at_or_above_attempt prepare", e))?;
@@ -1874,6 +1923,7 @@ impl StateStore for SqliteStateStore {
                     row.get::<_, Option<String>>(12)?,
                     row.get::<_, Option<String>>(13)?,
                     row.get::<_, Option<i64>>(14)?,
+                    row.get::<_, Option<i64>>(15)?,
                 ))
             })
             .map_err(|e| tool_err("human_held_at_or_above_attempt query", e))?;
@@ -1895,6 +1945,7 @@ impl StateStore for SqliteStateStore {
                 park_reason,
                 target_repo,
                 attempt_started_at,
+                next_retry_at,
             ) = r.map_err(|e| tool_err("human_held_at_or_above_attempt row", e))?;
             out.push(BeadOverlay {
                 bead_id,
@@ -1912,6 +1963,7 @@ impl StateStore for SqliteStateStore {
                 park_reason,
                 target_repo,
                 attempt_started_at: attempt_started_at.map(|v| v.max(0) as u64),
+                next_retry_at: next_retry_at.map(|v| v.max(0) as u64),
             });
         }
         Ok(out)
@@ -2560,6 +2612,7 @@ mod tests {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+            next_retry_at: None,
         };
         s.save(&o).unwrap();
 
@@ -2598,6 +2651,7 @@ mod tests {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+            next_retry_at: None,
         };
         s.save(&o).unwrap();
         // Unset by default.
@@ -2745,6 +2799,7 @@ mod tests {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+            next_retry_at: None,
         };
         s.save(&o).expect("DISPOSITION_REQUIRED must persist after open-time migration");
         let got = s.load("held-bead").unwrap().unwrap();
@@ -2771,6 +2826,7 @@ mod tests {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+            next_retry_at: None,
         };
         s.save(&o).unwrap();
         let got = s.load("b1").unwrap().unwrap();
@@ -2800,6 +2856,7 @@ mod tests {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+            next_retry_at: None,
         };
         s.save(&o).unwrap();
         o.state = OverlayState::Attested;
@@ -2839,6 +2896,7 @@ mod tests {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+            next_retry_at: None,
         };
 
         s.save(&o).unwrap();
@@ -2877,6 +2935,7 @@ mod tests {
             park_reason: Some("spawn_cleanup_failed".into()),
             target_repo: None,
             attempt_started_at: None,
+            next_retry_at: None,
         };
 
         s.save(&o).unwrap();
@@ -2933,6 +2992,7 @@ mod tests {
                 park_reason: None,
                 target_repo: None,
                 attempt_started_at: None,
+            next_retry_at: None,
             };
             s.save(&o).unwrap();
             let got = s.load(&o.bead_id).unwrap().unwrap();
@@ -2974,6 +3034,7 @@ mod tests {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+            next_retry_at: None,
         };
         s.save(&o).unwrap();
         s.register_branch("b1", "factory/b1-r1").unwrap();
@@ -3547,6 +3608,7 @@ mod tests {
                 park_reason: Some("transient_spawn_retry_cap_exceeded".into()),
                 target_repo: None,
                 attempt_started_at: None,
+            next_retry_at: None,
             },
         );
         overlays.insert(
@@ -3567,6 +3629,7 @@ mod tests {
                 park_reason: None,
                 target_repo: None,
                 attempt_started_at: None,
+            next_retry_at: None,
             },
         );
         overlays.insert(
@@ -3587,6 +3650,7 @@ mod tests {
                 park_reason: None,
                 target_repo: None,
                 attempt_started_at: None,
+            next_retry_at: None,
             },
         );
         for (bead_id, session_id, park_reason) in [
@@ -3620,6 +3684,7 @@ mod tests {
                     park_reason,
                     target_repo: None,
                     attempt_started_at: None,
+            next_retry_at: None,
                 },
             );
         }
@@ -3642,6 +3707,7 @@ mod tests {
                 park_reason: None,
                 target_repo: None,
                 attempt_started_at: None,
+            next_retry_at: None,
             },
         );
         overlays.insert(
@@ -3662,6 +3728,7 @@ mod tests {
                 park_reason: None,
                 target_repo: None,
                 attempt_started_at: None,
+            next_retry_at: None,
             },
         );
         for overlay in overlays.values() {
@@ -3766,6 +3833,7 @@ mod tests {
                 park_reason: Some(crate::reroll::CIRCUIT_BREAKER_PARK_REASON.to_string()),
                 target_repo: None,
                 attempt_started_at: None,
+            next_retry_at: None,
             },
         );
         overlays.insert(
@@ -3786,6 +3854,7 @@ mod tests {
                 park_reason: Some("session_stalled".to_string()),
                 target_repo: None,
                 attempt_started_at: None,
+            next_retry_at: None,
             },
         );
         for overlay in overlays.values() {
@@ -3865,6 +3934,7 @@ mod tests {
                 park_reason: Some("unmapped_target_repo".to_string()),
                 target_repo: Some("someorg/unrelated-repo".to_string()),
                 attempt_started_at: None,
+            next_retry_at: None,
             },
         );
         overlays.insert(
@@ -3885,6 +3955,7 @@ mod tests {
                 park_reason: Some("session_stalled".to_string()),
                 target_repo: None,
                 attempt_started_at: None,
+            next_retry_at: None,
             },
         );
         for overlay in overlays.values() {
@@ -3952,6 +4023,7 @@ mod tests {
                 park_reason: Some("unmapped_repo".to_string()),
                 target_repo: None,
                 attempt_started_at: None,
+            next_retry_at: None,
             },
         );
         overlays.insert(
@@ -3972,6 +4044,7 @@ mod tests {
                 park_reason: Some("session_stalled".to_string()),
                 target_repo: Some("owner/repo".to_string()),
                 attempt_started_at: None,
+            next_retry_at: None,
             },
         );
         for overlay in overlays.values() {
@@ -4035,6 +4108,7 @@ mod tests {
                 park_reason: Some("worktree_remote_mismatch".to_string()),
                 target_repo: Some("jleechanorg/worldarchitect.ai".to_string()),
                 attempt_started_at: None,
+            next_retry_at: None,
             },
         );
         overlays.insert(
@@ -4055,6 +4129,7 @@ mod tests {
                 park_reason: Some("session_stalled".to_string()),
                 target_repo: None,
                 attempt_started_at: None,
+            next_retry_at: None,
             },
         );
         overlays.insert(
@@ -4075,6 +4150,7 @@ mod tests {
                 park_reason: Some("spawn_cleanup_failed".to_string()),
                 target_repo: None,
                 attempt_started_at: None,
+            next_retry_at: None,
             },
         );
         overlays.insert(
@@ -4095,6 +4171,7 @@ mod tests {
                 park_reason: Some("worktree_remote_unverifiable".to_string()),
                 target_repo: None,
                 attempt_started_at: None,
+            next_retry_at: None,
             },
         );
         overlays.insert(
@@ -4115,6 +4192,7 @@ mod tests {
                 park_reason: Some("spawn_branch_mismatch".to_string()),
                 target_repo: None,
                 attempt_started_at: None,
+            next_retry_at: None,
             },
         );
         for overlay in overlays.values() {
@@ -4214,6 +4292,7 @@ mod tests {
                     park_reason: None,
                     target_repo: None,
                     attempt_started_at: None,
+            next_retry_at: None,
                 })
                 .unwrap();
         }
@@ -4236,6 +4315,7 @@ mod tests {
                 park_reason: Some("transient_spawn_retry_cap_exceeded".into()),
                 target_repo: None,
                 attempt_started_at: None,
+            next_retry_at: None,
             })
             .unwrap();
 
@@ -4289,6 +4369,7 @@ mod tests {
                     park_reason: Some(park_reason),
                     target_repo: None,
                     attempt_started_at: None,
+            next_retry_at: None,
                 })
                 .unwrap();
         }
@@ -4330,6 +4411,7 @@ mod tests {
             park_reason: Some(HumanHoldReason::SessionStalled.value()),
             target_repo: Some("jleechanorg/dark-factory".into()),
             attempt_started_at: None,
+            next_retry_at: None,
         };
         recovery_store.save(&overlay).unwrap();
 
@@ -4433,6 +4515,7 @@ mod tests {
                 park_reason: None,
                 target_repo: None,
                 attempt_started_at: None,
+            next_retry_at: None,
             })
             .unwrap();
         store
@@ -4452,6 +4535,7 @@ mod tests {
                 park_reason: None,
                 target_repo: None,
                 attempt_started_at: None,
+            next_retry_at: None,
             })
             .unwrap();
         store
@@ -4471,6 +4555,7 @@ mod tests {
                 park_reason: None,
                 target_repo: None,
                 attempt_started_at: None,
+            next_retry_at: None,
             })
             .unwrap();
 
@@ -4942,6 +5027,7 @@ mod tests {
                 park_reason: None,
                 target_repo: None,
                 attempt_started_at: Some(old_started_at),
+                next_retry_at: None,
             })
             .unwrap();
 
@@ -4962,6 +5048,7 @@ mod tests {
                 park_reason: None,
                 target_repo: None,
                 attempt_started_at: Some(now_epoch),
+                next_retry_at: None,
             })
             .unwrap();
 

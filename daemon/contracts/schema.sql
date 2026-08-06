@@ -174,7 +174,17 @@ CREATE TABLE IF NOT EXISTS bead_overlay (
   -- Older DBs pre-date this column and get it via the idempotent
   -- `ensure_attempt_started_at_column` migration in `SqliteStateStore::open`
   -- (same guard pattern as `ensure_reroll_deferral_count_column`).
-  attempt_started_at INTEGER
+  attempt_started_at INTEGER,
+  -- Per-bead retry backoff stamp (bead jleechan-yvlq / G12 retry-backoff
+  -- bleed fix). Set by `dispatch::dispatch_ready` on transient spawn
+  -- failure to `now_epoch + per_bead_backoff_secs(count)`; the slow tier
+  -- skips the bead from per-tick `ready` until `next_retry_at <= now_epoch`.
+  -- BEAD-LOCAL — never gates the global tick. Cleared on every successful
+  -- DISPATCHED save. Older DBs pre-date this column and get it via the
+  -- idempotent `ensure_next_retry_at_column` migration in
+  -- `SqliteStateStore::open` (same guard pattern as
+  -- `ensure_attempt_started_at_column`).
+  next_retry_at INTEGER
 );
 
 -- Deletion guard: the daemon/skills may delete ONLY refs recorded here (spec §4.2.8).

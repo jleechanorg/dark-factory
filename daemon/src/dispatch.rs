@@ -74,6 +74,36 @@ fn dispatch_prompt_preamble(repo: &str, remote: &str, branch: &str) -> String {
 /// frequent/short-lived than a full gate-rejection HUMAN_HELD cycle.
 pub(crate) const MAX_TRANSIENT_SPAWN_RETRY: u32 = 15;
 
+/// Per-bead retry backoff floor (bead jleechan-yvlq / G12 retry-backoff
+/// bleed fix). The first transient spawn failure stamps `next_retry_at =
+/// now_epoch + 30s`; subsequent failures double the delay up to the
+/// `PER_BEAD_BACKOFF_CAP_SECS` ceiling (10 min). The cap matters: without
+/// it, a single stubborn bead would back off for hours while sitting in
+/// the queue, occupying a slot in `routing_candidates` but never being
+/// dispatched, reproducing the very global-suppression-bleed the G12 audit
+/// catches. The cap also bounds the operator's worst-case window before
+/// `MAX_TRANSIENT_SPAWN_RETRY` trips and the bead parks HUMAN_HELD.
+pub(crate) const PER_BEAD_BACKOFF_FLOOR_SECS: u64 = 30;
+pub(crate) const PER_BEAD_BACKOFF_CAP_SECS: u64 = 600;
+
+/// Compute the per-bead retry backoff delay for a given (post-increment)
+/// `spawn_failure_count`. Exponential `floor * 2^(count-1)` capped at
+/// [`PER_BEAD_BACKOFF_CAP_SECS`]. `count=0` returns `0` (no backoff), but
+/// `dispatch::dispatch_ready` only ever calls this after a transient
+/// failure has already incremented `spawn_failure_count` to >= 1.
+/// Exposed for `tick::run_slow_tier`'s `next_retry_at` stamping too.
+pub(crate) fn per_bead_backoff_secs(spawn_failure_count: u32) -> u64 {
+    if spawn_failure_count == 0 {
+        return 0;
+    }
+    // Saturate shift to avoid overflow for absurd counts (defensive: the
+    // dispatch loop caps at MAX_TRANSIENT_SPAWN_RETRY=15, so this is far
+    // beyond any real input).
+    let shift = spawn_failure_count.saturating_sub(1).min(20);
+    let raw = PER_BEAD_BACKOFF_FLOOR_SECS.saturating_mul(1u64 << shift);
+    raw.min(PER_BEAD_BACKOFF_CAP_SECS)
+}
+
 /// Caller-resolved drive-PR branch-binding decision (bead
 /// jleechan-drive-pr-branch-binding-pcpr), threaded from
 /// `tick.rs::run_slow_tier` into `dispatch_ready` via `ready`'s third tuple
@@ -239,6 +269,7 @@ pub fn dispatch_ready(
             // only used if the dispatch path runs before any intake.
             target_repo: Some(cfg.target_repo.clone()),
             attempt_started_at: None,
+            next_retry_at: None,
             },
             Err(err) if err.is_transient() => {
                 report
@@ -545,6 +576,24 @@ pub fn dispatch_ready(
             Err(err) if err.is_transient() => {
                 overlay.spawn_failure_count += 1;
                 overlay.session_id = None;
+                // Bead jleechan-yvlq / G12 retry-backoff bleed: stamp a
+                // per-bead `next_retry_at` so the slow tier skips this bead
+                // on the next tick until the exponential backoff elapses.
+                // The stamp is BEAD-LOCAL — it only gates this one bead from
+                // re-entering the per-tick `ready` list, never the global
+                // tick. The previous behavior (state=Queued with no delay)
+                // made one bad bead re-dispatch on every 4-minute tick and
+                // burn the queue slot until `MAX_TRANSIENT_SPAWN_RETRY`
+                // parked it HUMAN_HELD, which is exactly the bleed G12
+                // audits.
+                let now_epoch = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                overlay.next_retry_at = Some(
+                    now_epoch
+                        .saturating_add(per_bead_backoff_secs(overlay.spawn_failure_count)),
+                );
                 if overlay.spawn_failure_count > MAX_TRANSIENT_SPAWN_RETRY {
                     // Cap exceeded: stop silently cycling Queued<->Dispatching
                     // forever (the livelock this bead-follow-up closes — see
@@ -727,6 +776,11 @@ pub fn dispatch_ready(
         // transient tool error, ...) has cleared, so the retry-cap counter no
         // longer needs to remember it.
         overlay.spawn_failure_count = 0;
+        // Bead jleechan-yvlq / G12 retry-backoff bleed: a successful
+        // dispatch must clear any stale `next_retry_at` from a prior
+        // attempt's transient failure so the bead is eligible for normal
+        // re-dispatch on later ticks (no stale backoff stamp).
+        overlay.next_retry_at = None;
         // Bead bze8.3: stamp `attempt_started_at` atomically alongside the
         // DISPATCHED save so a redispatch cannot inherit elapsed autonomy
         // from the prior attempt. The wall-clock anchor here is the single
@@ -1812,6 +1866,7 @@ mod tests {
             // pins. Update the test fixture to reflect production reality.
             target_repo: Some("owner/repo".to_string()),
             attempt_started_at: None,
+            next_retry_at: None,
             })
             .unwrap();
         let cfg = cfg();
@@ -1857,6 +1912,7 @@ mod tests {
                 // this repo.
                 target_repo: Some("someorg/unrelated-repo".to_string()),
                 attempt_started_at: None,
+            next_retry_at: None,
             })
             .unwrap();
         let cfg = cfg();
@@ -1933,6 +1989,7 @@ mod tests {
                 // into the wrong repo.
                 target_repo: None,
                 attempt_started_at: None,
+            next_retry_at: None,
             })
             .unwrap();
         let cfg = cfg();
@@ -2036,6 +2093,7 @@ mod tests {
                 park_reason: None,
                 target_repo: None,
                 attempt_started_at: None,
+            next_retry_at: None,
             })
             .unwrap();
         // Add a [repos.*] entry for the bead's resolved repo so dispatch
@@ -2111,6 +2169,7 @@ mod tests {
                 park_reason: None,
                 target_repo: None,
                 attempt_started_at: None,
+            next_retry_at: None,
             })
             .unwrap();
         let mut cfg = cfg();
@@ -2187,6 +2246,7 @@ mod tests {
                 // (the Stage B failure mode), not dispatch.
                 target_repo: Some("someorg/other-repo".to_string()),
                 attempt_started_at: None,
+            next_retry_at: None,
             })
             .unwrap();
         let cfg = cfg();
@@ -2265,6 +2325,7 @@ mod tests {
                 park_reason: None,
                 target_repo: Some("jleechanorg/worldarchitect.ai".to_string()),
                 attempt_started_at: None,
+            next_retry_at: None,
             })
             .unwrap();
         let mut cfg = cfg();
@@ -3375,6 +3436,7 @@ mod tests {
                 park_reason: None,
                 target_repo: Some("jleechanorg/worldarchitect.ai".to_string()),
                 attempt_started_at: None,
+            next_retry_at: None,
             })
             .unwrap();
         let mut cfg = cfg();
@@ -3634,5 +3696,143 @@ mod tests {
             assert_eq!(overlay.state, OverlayState::HumanHeld);
             assert_eq!(overlay.park_reason.as_deref(), Some("worktree_remote_mismatch"));
         }
+    }
+
+    // ---------- G12 retry-backoff-bleed-into-global-suppression ----------
+    // Bead jleechan-yvlq: Per-bead retry backoff must be isolated to that
+    // bead's queue slot. Before the fix, a transient spawn failure on a
+    // single bead left the bead in `state=Queued` with no timing delay, so
+    // the very next tick (4-minute cadence) re-dispatched the same bead
+    // against the same transient error and emitted another
+    // `BEAD_DISPATCH_TRANSIENT_ERROR`. Over 15 cycles the bead tripped
+    // `MAX_TRANSIENT_SPAWN_RETRY` and parked HUMAN_HELD — but during those
+    // cycles the bead occupied a slot in `ready` on every tick, blocking
+    // the global queue with a per-bead problem. The fix stamps a
+    // per-bead `next_retry_at` epoch on transient failure so the bead sits
+    // out a bounded delay and other beads dispatch unimpeded.
+
+    /// Spawn failure on one bead must NOT prevent the next bead from
+    /// dispatching in the same `dispatch_ready` call.
+    #[test]
+    fn g12_transient_failure_on_one_bead_does_not_block_other_beads_same_tick() {
+        let sessions = FakeSessions::new(0);
+        sessions.fail_spawn_for("bead-1");
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(3);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        let success_ids: Vec<&str> = report
+            .successes
+            .iter()
+            .map(|s| s.bead_id.as_str())
+            .collect();
+        assert_eq!(
+            success_ids,
+            vec!["bead-0", "bead-2"],
+            "a transient spawn failure on bead-1 must not block bead-2"
+        );
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].bead_id, "bead-1");
+    }
+
+    /// A transient spawn failure must stamp a per-bead `next_retry_at`
+    /// timestamp in the FUTURE so the slow tier skips the bead on the next
+    /// tick until the delay elapses. The bead stays `state=Queued` (not
+    /// parked) and is not dispatched again until the wall-clock advances.
+    #[test]
+    fn g12_transient_failure_stamps_per_bead_next_retry_at() {
+        let sessions = FakeSessions::new(0);
+        sessions.fail_spawn_for("bead-1");
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(3);
+
+        let _ = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        let bead_1 = store.load("bead-1").unwrap().unwrap();
+        assert_eq!(bead_1.state, OverlayState::Queued);
+        assert!(
+            bead_1.next_retry_at.is_some(),
+            "transient spawn failure must stamp next_retry_at so the next tick skips this bead"
+        );
+        let next_retry_at = bead_1.next_retry_at.unwrap();
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        assert!(
+            next_retry_at > now_epoch,
+            "next_retry_at must be in the future (was {next_retry_at}, now {now_epoch})"
+        );
+        // Bounded per-bead delay: at minimum 30s, at most 600s (10 min).
+        let delay = next_retry_at.saturating_sub(now_epoch);
+        assert!(
+            (30..=600).contains(&delay),
+            "per-bead backoff must be bounded (30s..=600s), got {delay}s"
+        );
+    }
+
+    /// The per-bead backoff must grow monotonically with the failure count
+    /// (exponential) but stay bounded by the per-bead cap.
+    #[test]
+    fn g12_per_bead_backoff_grows_exponentially_bounded() {
+        // Sanity: the function `per_bead_backoff_secs` exists and is
+        // monotonically non-decreasing with cap.
+        let b1 = crate::dispatch::per_bead_backoff_secs(1);
+        let b5 = crate::dispatch::per_bead_backoff_secs(5);
+        let b15 = crate::dispatch::per_bead_backoff_secs(15);
+        let b100 = crate::dispatch::per_bead_backoff_secs(100);
+        assert!(b1 >= 30, "first failure must back off at least 30s");
+        assert!(b5 > b1, "backoff must grow with count (b1={b1}, b5={b5})");
+        assert!(b15 > b5, "backoff must keep growing (b5={b5}, b15={b15})");
+        assert!(
+            b100 <= 600,
+            "backoff must stay bounded at 600s for any count (b100={b100})"
+        );
+    }
+
+    /// A successful dispatch must clear `next_retry_at` so the bead is
+    /// eligible for normal re-dispatch on later ticks (no stale backoff
+    /// stamp from a previous attempt).
+    #[test]
+    fn g12_successful_dispatch_clears_next_retry_at() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        // Pre-seed the overlay with a stale next_retry_at from a prior
+        // failed attempt.
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("owner/repo".into()),
+                attempt_started_at: None,
+                next_retry_at: Some(u64::MAX),
+            })
+            .unwrap();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        assert_eq!(report.success_count(), 1);
+
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::Dispatched);
+        assert!(
+            overlay.next_retry_at.is_none(),
+            "successful dispatch must clear the stale next_retry_at, leaving None"
+        );
     }
 }

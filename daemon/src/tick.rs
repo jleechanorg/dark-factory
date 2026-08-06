@@ -1637,6 +1637,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 park_reason: None,
                 target_repo,
                 attempt_started_at: None,
+            next_retry_at: None,
             });
             overlay.state = OverlayState::Attested;
             overlay.pr_number = Some(adopted.pr_number);
@@ -1777,6 +1778,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             park_reason: None,
             target_repo,
             attempt_started_at: None,
+            next_retry_at: None,
         };
         deps.store.save(&overlay)?;
         summary.beads_created += 1;
@@ -1827,6 +1829,43 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         let overlay = match deps.store.load(&bead.id)? {
             Some(o) => {
                 if o.state == OverlayState::Queued || o.state == OverlayState::Redispatched {
+                    // Bead jleechan-yvlq / G12 retry-backoff bleed fix: a
+                    // bead whose transient spawn failure stamped a
+                    // `next_retry_at` in the future must sit out the
+                    // current tick. The skip is BEAD-LOCAL — only this
+                    // one bead is dropped from `ready`, never the global
+                    // queue. Without this check, the previous behavior
+                    // re-dispatched the same bead on every 4-minute tick
+                    // until `MAX_TRANSIENT_SPAWN_RETRY` parked it
+                    // HUMAN_HELD, which is exactly the bleed G12 audits.
+                    if let Some(next_retry_at) = o.next_retry_at {
+                        let now_epoch = now_epoch_secs();
+                        if now_epoch < next_retry_at {
+                            // Emit a quiet telemetry marker so dashboards
+                            // can distinguish "bead-local backoff" from
+                            // "global tick halted" — the former's queue
+                            // slot is empty, the latter never fires
+                            // (the global queue is never halted for
+                            // spawn-retry bleed — see remediation hint
+                            // for jleechan-yvlq).
+                            let _ = emit(
+                                deps.telemetry_log,
+                                &bead.id,
+                                o.attempt,
+                                OverlayState::Queued.as_str(),
+                                "BEAD_DISPATCH_BACKOFF_DEFERRED",
+                                serde_json::json!({}),
+                                serde_json::json!({
+                                    "next_retry_at": next_retry_at,
+                                    "now_epoch": now_epoch,
+                                    "delay_remaining_secs":
+                                        next_retry_at.saturating_sub(now_epoch),
+                                    "spawn_failure_count": o.spawn_failure_count,
+                                }),
+                            );
+                            continue;
+                        }
+                    }
                     o
                 } else {
                     continue;
@@ -1895,6 +1934,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         park_reason: None,
                         target_repo,
                         attempt_started_at: None,
+            next_retry_at: None,
                     };
                     set_human_hold_reason(&mut o, HumanHoldReason::UnmappedRepo);
                     deps.store.save(&o)?;
@@ -2072,6 +2112,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     park_reason: None,
                     target_repo,
                     attempt_started_at: None,
+            next_retry_at: None,
                 };
                 deps.store.save(&o)?;
                 summary.beads_created += 1;
