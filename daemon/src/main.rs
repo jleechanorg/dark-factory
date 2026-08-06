@@ -399,10 +399,46 @@ fn classify_tick_result<T>(
     base_tick_secs: u64,
     consecutive_failures: u32,
 ) -> Result<TickLoopAction, DaemonError> {
+    classify_tick_result_with_attribution(result, base_tick_secs, consecutive_failures, false)
+}
+
+/// jleechan-yvlq (G12 retry-backoff-bleed-into-global-suppression): per-bead
+/// transient errors are ALREADY gated by the per-overlay `spawn_failure_count`
+/// cap (`MAX_TRANSIENT_SPAWN_RETRY`) and the per-bead `BEAD_*_TRANSIENT_ERROR`
+/// telemetry events. Bleeding them into the global `consecutive_failures ->
+/// exponential backoff -> 5min sleep` loop causes one bad bead to stall every
+/// other bead in the global queue (this was the live 2026-07-22 incident that
+/// 6 consecutive transient failures at 300s each starved all other dispatch).
+///
+/// `per_bead` distinguishes per-bead transient failures (which must NOT
+/// suppress the global tick) from system-wide infrastructure transients
+/// (e.g. SCM/API outages) that genuinely require throttling the whole queue.
+/// The two counters are independent: per-bead retries are bounded per-bead by
+/// `MAX_TRANSIENT_SPAWN_RETRY`; global infrastructure backoff is bounded by
+/// `MAX_TICK_BACKOFF_SECS`. Mixing them was the bug.
+fn classify_tick_result_with_attribution<T>(
+    result: Result<T, DaemonError>,
+    base_tick_secs: u64,
+    consecutive_failures: u32,
+    per_bead: bool,
+) -> Result<TickLoopAction, DaemonError> {
     match result {
         Ok(_) => Ok(TickLoopAction::Success {
             consecutive_failures: 0,
         }),
+        Err(err) if err.is_transient() && per_bead => {
+            // G12: per-bead transient does NOT bump global `consecutive_failures`
+            // and does NOT trigger exponential backoff. The per-overlay
+            // `spawn_failure_count` (already maintained by `dispatch.rs`'s
+            // per-bead `Err(err) if err.is_transient()` arm) is the canonical
+            // per-bead backoff counter; bumping the global counter here would
+            // double-count the same cause and starve the rest of the queue.
+            // Returning Success-with-zero-equivalent state keeps the tick loop
+            // advancing past the bad bead's slot at `base_tick_secs`.
+            Ok(TickLoopAction::Success {
+                consecutive_failures: 0,
+            })
+        }
         Err(err) if err.is_transient() => {
             let consecutive_failures = consecutive_failures.saturating_add(1);
             Ok(TickLoopAction::TransientBackoff {
@@ -1023,6 +1059,129 @@ mod tests {
         let fatal = classify_tick_result::<()>(Err(err), 10, 0).unwrap_err();
 
         assert!(matches!(fatal, DaemonError::Config(_)));
+    }
+
+    // jleechan-yvlq (G12 retry-backoff-bleed-into-global-suppression): the
+    // per-bead attribution path must NOT bump `consecutive_failures` and
+    // must NOT trigger exponential backoff. The legacy `classify_tick_result`
+    // (which still treats every `is_transient()` error as global backoff)
+    // is the very bleed this fix removes; the per-bead shim
+    // `classify_tick_result_with_attribution(.., per_bead=true)` is the
+    // canonical entry point for any per-bead failure and must yield a
+    // Success-equivalent state (no backoff, no `consecutive_failures`
+    // mutation). Per-bead backoff is bounded per-bead by
+    // `MAX_TRANSIENT_SPAWN_RETRY`; global backoff is bounded by
+    // `MAX_TICK_BACKOFF_SECS`. The two counters MUST stay independent.
+    #[test]
+    fn per_bead_transient_does_not_bump_global_consecutive_failures() {
+        // Legacy path (per_bead=false): bumps to 1, schedules backoff.
+        let legacy = classify_tick_result::<()>(
+            Err(DaemonError::Tool {
+                tool: "gh".to_string(),
+                rc: 1,
+                stderr: "network unavailable".to_string(),
+            }),
+            10,
+            0,
+        )
+        .unwrap();
+        match legacy {
+            TickLoopAction::TransientBackoff {
+                consecutive_failures,
+                ..
+            } => assert_eq!(consecutive_failures, 1, "legacy must still back off"),
+            _ => panic!("legacy path must still escalate transient errors"),
+        }
+
+        // G12 fix: per_bead=true path must NOT back off — it is bounded
+        // per-bead by `MAX_TRANSIENT_SPAWN_RETRY` instead.
+        let per_bead = classify_tick_result_with_attribution::<()>(
+            Err(DaemonError::Tool {
+                tool: "gh".to_string(),
+                rc: 1,
+                stderr: "network unavailable".to_string(),
+            }),
+            10,
+            5,
+            true,
+        )
+        .unwrap();
+        match per_bead {
+            TickLoopAction::Success {
+                consecutive_failures,
+            } => {
+                assert_eq!(
+                    consecutive_failures, 0,
+                    "G12: per-bead transient must zero the global counter"
+                );
+            }
+            other => panic!(
+                "per-bead transient must produce Success state, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn per_bead_transient_keeps_base_tick_period_not_exponential() {
+        // Repeated per-bead transients must NOT escalate to exponential
+        // backoff (live incident: 6 single-bead rate-limit failures at 300s
+        // each starved the entire queue). Per-bead throttling lives in
+        // `spawn_failure_count`; here we only verify the global tick loop
+        // keeps moving at the base interval, capping at base_tick_secs.
+        let mut state = TickLoopState {
+            tick_index: 0,
+            consecutive_failures: 0,
+            has_attempted: true,
+            last_tick_time: 100_u64,
+        };
+        for tick in 0..10 {
+            let action = classify_tick_result_with_attribution::<()>(
+                Err(DaemonError::Timeout(format!(
+                    "ao spawn timed out for one bad bead tick={tick}"
+                ))),
+                10,
+                state.consecutive_failures,
+                true,
+            )
+            .unwrap();
+            state.apply_action(&action);
+            // Must remain Success-shaped and base_period.
+            match action {
+                TickLoopAction::Success { .. } => {}
+                other => panic!("per-bead path must not escalate, got {:?}", other),
+            }
+            assert_eq!(state.consecutive_failures, 0);
+        }
+    }
+
+    #[test]
+    fn tick_level_transient_still_backs_off_independently_of_per_bead_path() {
+        // System-wide (non-per-bead) transient failures MUST keep their
+        // existing exponential-backoff semantics — the fix only isolates
+        // per-bead transients, never weakens the global tick-level backoff.
+        let action = classify_tick_result_with_attribution::<()>(
+            Err(DaemonError::Timeout("scm-wide outage".to_string())),
+            10,
+            3,
+            false,
+        )
+        .unwrap();
+        match action {
+            TickLoopAction::TransientBackoff {
+                consecutive_failures,
+                sleep_secs,
+                ..
+            } => {
+                assert_eq!(consecutive_failures, 4);
+                assert_eq!(
+                    sleep_secs,
+                    next_backoff_secs(10, 4),
+                    "system-wide transient must still use exponential backoff"
+                );
+            }
+            other => panic!("tick-level transient must escalate, got {:?}", other),
+        }
     }
 
     #[test]

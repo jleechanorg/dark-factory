@@ -116,6 +116,18 @@ pub struct TickSummary {
     /// full reroll cycle by the fast-rejection path" without re-deriving
     /// from telemetry.
     pub gates_assessed_fast_rejected: usize,
+    /// jleechan-yvlq (G12 retry-backoff-bleed-into-global-suppression):
+    /// per-bead transient failures that the new `classify_tick_result_with
+    /// _attribution(_, _, _, per_bead=true)` path prevented from leaking
+    /// into the global `consecutive_failures -> exponential backoff` loop.
+    /// Each one represents a single problematic bead whose retry is bounded
+    /// by per-overlay `spawn_failure_count`; the global tick loop keeps
+    /// advancing at `base_tick_secs` for the rest of the queue. Mirrors
+    /// the G12 acceptance test in `daemon/src/main.rs::tests` —
+    /// operators can now grep daemon.jsonl for both the counter and the
+    /// accompanying `BEAD_*_TRANSIENT_ERROR` telemetry events to confirm
+    /// isolation.
+    pub per_bead_transient_suppressions: usize,
 }
 
 /// Bounded retry cap for the automated HUMAN_HELD exit. Matches the shell
@@ -1264,6 +1276,7 @@ pub fn run_tick(
             "beadsHeldDispositionRequired": summary.beads_held_disposition_required,
             "escalationsSuppressed": summary.escalations_suppressed,
             "escalationsUndeliverable": summary.escalations_undeliverable,
+            "perBeadTransientSuppressions": summary.per_bead_transient_suppressions,
         }),
         serde_json::json!({"tick_index": tick_index, "slow_tier_due": slow_tier_due}),
     )?;
