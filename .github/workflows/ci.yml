@@ -47,6 +47,60 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest
 
+      - name: Provide sqlite3 CLI (build from amalgamation, no root)
+        # `daemon/factory-overlay.sh:77` is `sql() { sqlite3 ... }` — the overlay
+        # is the canonical executable spec for the factory state machine and every
+        # subcommand shells out to the sqlite3 BINARY. Without it,
+        # tests/scripts/*.sh fail with "line 77: sqlite3: command not found" and
+        # read empty state (expected 'DISPATCHED', got '').
+        #
+        # THREE SIMPLER APPROACHES ARE RULED OUT — do not "simplify" this back:
+        #  1. `sudo apt-get install sqlite3` — no sudo. The Linux runners are
+        #     containers with the no-new-privileges flag: "sudo: The 'no new
+        #     privileges' flag is set, which prevents sudo from running as root."
+        #  2. A python-stdlib sqlite3 CLI shim — passed a toy self-test, then
+        #     FAILED the real tests/scripts/test_factory_overlay.sh with a
+        #     JSONDecodeError. The overlay depends on CLI behaviour a shim does
+        #     not reproduce. Install a real binary; do not emulate one.
+        #  3. `apt-get download` + `dpkg -x` — worked on a dev host, FAILED on CI:
+        #     "apt-get download sqlite3 failed - no package lists or no network."
+        #     The container has no apt lists.
+        #
+        # Building the amalgamation needs only a C compiler (present — this job's
+        # sibling builds Rust) and one file fetch. Pinned + checksummed so the
+        # build is reproducible and a tampered/rotated archive fails closed.
+        # Bead jleechan-xn4n.
+        run: |
+          set -euo pipefail
+          if command -v sqlite3 >/dev/null 2>&1; then
+            echo "sqlite3 already present: $(sqlite3 --version)"
+            exit 0
+          fi
+          if [ "$(uname -s)" != "Linux" ]; then
+            echo "::error::sqlite3 missing on a non-Linux runner — unexpected; not building."
+            exit 1
+          fi
+          ver=sqlite-amalgamation-3450100
+          sha256=5592243caf28b2cdef41e6ab58d25d653dfc53deded8450eb66072c929f030c4
+          work="$(mktemp -d)"
+          curl -fsSL --retry 3 -o "$work/amalg.zip" "https://sqlite.org/2024/$ver.zip"
+          echo "$sha256  $work/amalg.zip" | sha256sum -c - \
+            || { echo "::error::sqlite amalgamation checksum mismatch — refusing to build."; exit 1; }
+          unzip -q "$work/amalg.zip" -d "$work"
+          ( cd "$work/$ver" && cc -O1 -DSQLITE_THREADSAFE=0 \
+              -DSQLITE_OMIT_LOAD_EXTENSION shell.c sqlite3.c -o sqlite3 -lm )
+          mkdir -p "$HOME/.local/bin"
+          cp "$work/$ver/sqlite3" "$HOME/.local/bin/sqlite3"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          sqlite3 --version
+          # Fail here, not deep inside the overlay suite, if the binary is broken.
+          t="$(mktemp -d)"
+          sqlite3 "$t/p.db" "CREATE TABLE t(a TEXT);" "INSERT INTO t VALUES('ok');"
+          [ "$(sqlite3 -cmd '.timeout 5000' "$t/p.db" 'SELECT a FROM t;')" = "ok" ] \
+            || { echo "::error::built sqlite3 failed its self-test"; exit 1; }
+          echo "sqlite3 built from amalgamation and self-tested"
+
       - name: Fix Python 3.13 shared-library path (self-hosted runners)
         # actions/setup-python installs Python 3.13 under a toolcache path
         # (`/home/runner/_work/_tool/Python/<ver>/<arch>/`) and ships

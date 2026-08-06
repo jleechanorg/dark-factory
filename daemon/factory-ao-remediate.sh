@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Bead jleechan-kn5j: uses `grep -E`, not ripgrep. `rg` is NOT installed on the
+# CI runners ("factory-ao-remediate.sh: line 141: rg: command not found"), and
+# this script is exercised by tests/scripts/test_factory_ao_remediate.sh. The
+# patterns here are plain alternations, so grep -E is a faithful substitute and
+# removes a hard dependency on a tool the runner image does not guarantee.
 # Spawn AO remediation for a factory ATTESTED bead — isolated target-repo worktree.
 # Uses Go AO mirror (~/bin/ao-go) by default; TS fallback via AO_BIN=~/bin/ao-ts.
 #
@@ -138,7 +143,7 @@ run_spawn_foreground() {
   # Returns "exit_code<TAB>output" so the caller can branch on rc.
   local out rc
   set +e
-  if "$AO" spawn --help 2>&1 | rg -q '\-\-name'; then
+  if "$AO" spawn --help 2>&1 | grep -Eq '\-\-name'; then
     out="$(timeout "$SPAWN_TIMEOUT" "$AO" spawn --project "$AO_PROJECT" --name "$DISPLAY_NAME" --agent claude-code --claim-pr "$PR" --prompt "$PROMPT" 2>&1)"
   else
     out="$(timeout "$SPAWN_TIMEOUT" "$AO" spawn --project "$AO_PROJECT" --claim-pr "$PR" --agent claude-code "$PROMPT" 2>&1)"
@@ -152,10 +157,10 @@ classify_spawn_outcome() {
   # $1 = spawn rc, $2 = spawn output. Echoes 0 (success) or 1 (failure).
   local rc="$1" out="$2"
   if [ "$rc" -eq 0 ]; then return 0; fi
-  if echo "$out" | rg -q 'spawned session |Session [a-z0-9_-]+ created|✓ Session|pr_open|working|spawning|claimed https://'; then
+  if echo "$out" | grep -Eq 'spawned session |Session [a-z0-9_-]+ created|✓ Session|pr_open|working|spawning|claimed https://'; then
     return 0
   fi
-  if "$AO" session ls 2>/dev/null | rg "pulls/${PR}\b" | rg -q "\[(spawning|running|active|working|pr_open)\]"; then
+  if "$AO" session ls 2>/dev/null | grep -E "pulls/${PR}\b" | grep -Eq "\[(spawning|running|active|working|pr_open)\]"; then
     return 0
   fi
   return 1

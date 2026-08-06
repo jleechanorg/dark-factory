@@ -53,13 +53,40 @@ SCRATCH="$(mktemp -d -t bze8-test.XXXXXX)"
 cleanup() { rm -rf "$SCRATCH" "$HELP_FILE"; }
 trap cleanup EXIT
 
+# The canary E2E needs BOTH the sqlite3 CLI and a Rust toolchain: it builds
+# `daemon/target/debug/daemon` before exercising the tick. This mirrors the
+# pre-existing sqlite3 guard rather than inventing a new convention.
+#
+# Bead jleechan-kn5j: `cargo` is absent in the `test` job — only `daemon-tests`
+# installs a Rust toolchain — so on Linux runners the canary died with
+# "line 171: cargo: command not found / daemon build failed" and, under set -e,
+# never wrote its evidence bundle. That surfaced as five artifact assertions
+# failing for what looked like unrelated reasons.
+#
+# Skipping is honest here (the job genuinely cannot run this E2E) and the
+# canary IS still covered: `daemon-tests`, which has the toolchain, is the
+# right home for it. Reported as SKIP, never as PASS, so the gap stays visible.
 if ! command -v sqlite3 >/dev/null 2>&1; then
     echo "SKIP: sqlite3 not installed; canary E2E test cannot run"
+elif ! command -v cargo >/dev/null 2>&1; then
+    echo "SKIP: cargo not on PATH; canary E2E builds the rust daemon and cannot run"
 else
     set +e
-    bash "$CANARY" --out-dir "$SCRATCH" >/dev/null 2>&1
+    # Bead jleechan-kn5j: capture instead of discarding. Sending the canary's
+    # output to /dev/null means a CI failure surfaces as a bare exit code with
+    # no cause — this exact test failed on Linux runners for hours showing only
+    # "canary exits 0 overall (expected '0', got '1')" while the real error
+    # ("no such table: bead_overlay") was thrown away. Keep it quiet on success,
+    # print it on failure.
+    CANARY_LOG="$SCRATCH/canary-run.log"
+    bash "$CANARY" --out-dir "$SCRATCH" >"$CANARY_LOG" 2>&1
     CANARY_RC=$?
     set -e
+    if [ "$CANARY_RC" -ne 0 ]; then
+        echo "--- canary output (rc=$CANARY_RC) ---"
+        tail -40 "$CANARY_LOG" | sed 's/^/    /'
+        echo "--- end canary output ---"
+    fi
 
     # Crucial: the canary itself exits 0. (An internal AF-tick rc=1 is OK —
     # that's acceptance-2 fail-closed in action — as long as the CANARY exits
@@ -132,13 +159,30 @@ fi
 
 # 4. canary --help from a directory containing a single space in out-dir
 # also works (regression check on the bash strict-mode arg parsing).
-SPACED="$SCRATCH/with space"
-mkdir -p "$SPACED"
-set +e
-bash "$CANARY" --out-dir "$SPACED" >/dev/null 2>&1
-SP_RC=$?
-set -e
-assert "canary accepts --out-dir containing spaces" "0" "$SP_RC"
+#
+# Bead jleechan-kn5j: this runs the canary END TO END, so it needs the same
+# prerequisites as the E2E block above — sqlite3 AND cargo (the canary builds
+# the rust daemon). It previously sat OUTSIDE those guards, so on a runner
+# without cargo it was the last surviving failure after everything else was
+# fixed: it asserted rc=0 while the canary was exiting 1 on
+# "cargo: command not found", which says nothing about space handling.
+if ! command -v sqlite3 >/dev/null 2>&1 || ! command -v cargo >/dev/null 2>&1; then
+    echo "SKIP: spaced --out-dir check needs sqlite3 + cargo (canary runs end to end)"
+else
+    SPACED="$SCRATCH/with space"
+    mkdir -p "$SPACED"
+    set +e
+    SPACED_LOG="$SCRATCH/canary-spaced.log"
+    bash "$CANARY" --out-dir "$SPACED" >"$SPACED_LOG" 2>&1
+    SP_RC=$?
+    set -e
+    if [ "$SP_RC" -ne 0 ]; then
+        echo "--- spaced-dir canary output (rc=$SP_RC) ---"
+        tail -20 "$SPACED_LOG" | sed 's/^/    /'
+        echo "--- end ---"
+    fi
+    assert "canary accepts --out-dir containing spaces" "0" "$SP_RC"
+fi
 
 echo
 echo "=== RESULTS: $PASS passed, $FAIL failed ==="

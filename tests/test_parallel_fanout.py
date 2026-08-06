@@ -28,6 +28,14 @@ from runner.parser import parse
 # branch_* mkdtemp per fan-out test into the working tree (378 observed).
 SCRATCH = Path(tempfile.mkdtemp(prefix="test_parallel_fanout_"))
 
+# Scratch workdir in the OS tempdir — using the repo root here leaked one
+# branch_* mkdtemp per fan-out test into the working tree (378 observed).
+SCRATCH = Path(tempfile.mkdtemp(prefix="test_parallel_fanout_"))
+
+from conftest import register_scratch_dir  # noqa: E402
+
+register_scratch_dir(SCRATCH)
+
 
 # ---------------------------------------------------------------------------
 # DOT helpers — branch nodes have no custom type; echo backend resolves from state

@@ -43,6 +43,7 @@ import json
 import os
 import pathlib
 import shutil
+import signal
 import subprocess
 import time
 from dataclasses import dataclass
@@ -331,8 +332,24 @@ def _finish_shadow_gate_review(
                     stdout, stderr = proc.communicate(timeout=remaining)
             except subprocess.TimeoutExpired:
                 timed_out = True
-                proc.kill()
-                stdout, stderr = proc.communicate()
+                # Adopt codergen's escalation (jleechan-txdh dedup parity):
+                # SIGTERM the process group first, drain stdout, then SIGKILL.
+                # Pre-dedup dispatch used only ``proc.kill()`` (SIGTERM-via-
+                # terminate, no SIGKILL); the dedup brings dispatch in line
+                # with the codergen shadow path so a single escalation rule
+                # governs both.
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except Exception:
+                    pass
+                try:
+                    stdout, stderr = proc.communicate(timeout=5)
+                except Exception:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except Exception:
+                        pass
+                    stdout, stderr = proc.communicate()
             returncode = str(proc.returncode if proc.returncode is not None else "")
             output = (stdout + ("\nSTDERR:\n" + stderr if stderr else "")).strip()
             command_receipts = ()
@@ -444,7 +461,14 @@ def _finish_shadow_gate_review(
     )
 
 
-def _gate_subprocess_args(backend: str, prompt: str, ctx: "Context", timeout: int) -> Optional[list[str]]:
+def _gate_subprocess_args(
+    backend: str,
+    prompt: str,
+    ctx: "Context",
+    timeout: int,
+    *,
+    workdir: "Optional[pathlib.Path]" = None,
+) -> Optional[list[str]]:
     import runner.handlers as _handlers_shim  # late-bound shim
     """Build the sandboxed argv for a *reviewer* gate on the given backend.
 
@@ -463,8 +487,34 @@ def _gate_subprocess_args(backend: str, prompt: str, ctx: "Context", timeout: in
     resolved name end-to-end so cross-vendor review is a real subprocess
     rather than a metadata label.
 
+    When ``workdir`` is provided, the sealed-doc deny rules (jleechan-113
+    contract) cover that worktree's benchmark docs. This matches the
+    codergen shadow-review path (``_sandboxed_args_for_workdir``); without
+    this extension the dispatch shadow could not honor the same isolation
+    when running inside ``ctx.workdir``. ``workdir=None`` falls back to
+    the legacy holdout-only deny rules — matching every existing
+    caller's behavior.
+
     Returns ``None`` when sandbox-exec is unavailable.
     """
+    sealed_args_builder = getattr(_handlers_shim, "_sandboxed_args_for_workdir", None)
+    if workdir is not None and callable(sealed_args_builder):
+        # Caller explicitly opts in to the sealed-doc deny rule (jleechan-113).
+        if backend == "agy":
+            return sealed_args_builder([
+                "agy",
+                "--add-dir", str(workdir),
+                "--dangerously-skip-permissions",
+                "--print-timeout", f"{timeout}s",
+                "--print",
+                prompt,
+            ], workdir)
+        if backend == "codex":
+            return sealed_args_builder([
+                "codex", "exec", "--yolo", "--skip-git-repo-check", prompt,
+            ], workdir)
+        claude_bin = _handlers_shim._get_claude_executable()
+        return sealed_args_builder([claude_bin, "--print", "--dangerously-skip-permissions", prompt], workdir)
     if backend == "agy":
         return _handlers_shim._sandboxed_args([
             "agy",
