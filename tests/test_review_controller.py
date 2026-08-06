@@ -402,8 +402,8 @@ def test_request_integrity_rejects_tampered_envelope_prompt_and_head():
 @pytest.mark.parametrize(
     ("field", "value"),
     (
-        ("task_text", "x" * (1024 * 1024 + 1)),
-        ("diff_text", "x" * (1024 * 1024 + 1)),
+        pytest.param("task_text", "x" * (1024 * 1024 + 1), id="task_text"),
+        pytest.param("diff_text", "x" * (1024 * 1024 + 1), id="diff_text"),
     ),
 )
 def test_rejects_oversized_task_and_diff_inputs(field, value):
