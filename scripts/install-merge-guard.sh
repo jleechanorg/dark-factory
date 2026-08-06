@@ -72,13 +72,19 @@ ensure_log_dir() {
 }
 
 install_systemd_user() {
+    # `$USER` is exported by interactive login shells but NOT by CI containers,
+    # and this script runs under `set -u`, so a bare "$USER" aborts the whole
+    # installer with "line 79: USER: unbound variable" before it can emit its
+    # [dry-run] markers. Fall back to the real uid's name, which is always
+    # resolvable. Observed on runner ez-runner-c (bead jleechan-kn5j).
+    local user_name="${USER:-$(id -un 2>/dev/null || echo unknown)}"
     if ! command -v systemctl >/dev/null 2>&1; then
         echo "[error] systemctl not found on PATH; cannot install systemd user unit" >&2
         exit 3
     fi
-    if [ -z "${XDG_RUNTIME_DIR:-}" ] && ! loginctl show-user "$USER" >/dev/null 2>&1; then
+    if [ -z "${XDG_RUNTIME_DIR:-}" ] && ! loginctl show-user "$user_name" >/dev/null 2>&1; then
         echo "[error] systemd user session not available (no XDG_RUNTIME_DIR, loginctl inactive)" >&2
-        echo "[hint]  enable lingering with: sudo loginctl enable-linger $USER" >&2
+        echo "[hint]  enable lingering with: sudo loginctl enable-linger $user_name" >&2
         exit 3
     fi
 
