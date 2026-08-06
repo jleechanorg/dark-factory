@@ -9,7 +9,7 @@ to `protected_paths=protected_worktree_paths()` AND
 `--no-git-safety`.
 
 Evidence: https://gist.github.com/jleechan2015/8f268bc2359f09b5d7c2a3c049f5b632
-(see PR body for the current head SHA this evidence is bound to).
+(see PR body for the current head SHA this evidence is bound to). PR #601.
 
 Three forces this module addresses:
 
