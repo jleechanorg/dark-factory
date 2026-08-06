@@ -126,6 +126,16 @@ pub struct TickSummary {
 /// review — the daemon stops blindly retrying past this point.
 const MAX_HUMAN_HELD_RECOVERY_ATTEMPT: u32 = 10;
 const ESCALATION_REVIEWER: &str = "dark-factory-escalation";
+// jleechan-6l1f: gate-regression cap. After this many green->red
+// transitions, a further regression MUST emit GATE_REGRESSED_CAPPED and
+// park HUMAN_HELD with park_reason="gate_regression_capped" rather than
+// silently looping the bead back into the reroll lane forever. Distinct
+// from MAX_HUMAN_HELD_RECOVERY_ATTEMPT (which caps automated requeue from
+// HUMAN_HELD): this cap sits in front of the demotion path, so a
+// persistently-flapping gate can't even reach `recover_human_held`. Live
+// incident: PR #540 sat READY all_green=true at 2026-08-04T13:18:43Z;
+// when CI regressed the bead silently dead-ended (no reroll triggered).
+pub const MAX_GATE_REGRESSIONS: u32 = 3;
 const ESCALATION_SENTINEL_ATTEMPT: u32 = u32::MAX;
 // jleechan-rln6: one-shot sentinel for the stale-evidence fast-rejection
 // path. Keyed on the SAME `save_rejection`/`load_rejection` infrastructure
@@ -3664,6 +3674,26 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             )?;
             overlay.state = OverlayState::Attested; // in-memory only (NOT saved)
         }
+        // jleechan-6l1f: gate-regression entry path. A READY bead must be
+        // re-assessed on every fast tick so a green->red transition (PR went
+        // red after being merge-ready) is detected and routed back into the
+        // reroll lane — without this, READY was a terminal state that the
+        // fast-tier `if overlay.state != OverlayState::Attested` filter
+        // skipped, so a regressed PR silently sat READY forever while
+        // auto-merge-guard.sh correctly refused the merge (the live
+        // incident: PR #540 sat all_green=true at 2026-08-04T13:18:43Z,
+        // went red ~24h later, and never re-entered the fix loop). The
+        // demotion is IN-MEMORY only: persisting it now would churn the
+        // DB and re-emit READY_FOR_MERGE-style telemetry on every healthy
+        // READY bead, breaking the contract that READY is "terminal until
+        // the merge guard accepts". If the assessment finds a regression
+        // the demotion-to-Attested is persisted in the same save as the
+        // red-state transition below; if it stays green we leave the
+        // stored READY alone.
+        let entered_as_ready = overlay.state == OverlayState::Ready;
+        if entered_as_ready {
+            overlay.state = OverlayState::Attested; // in-memory only (NOT saved)
+        }
         if overlay.state != OverlayState::Attested {
             continue;
         }
@@ -4400,6 +4430,137 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         };
         let report = verifier::assess(deps.scm, pr, &repo, deps.cfg, &evidence)?;
         summary.gates_assessed += 1;
+        // jleechan-6l1f: gate-regression detection. Compare the bead's
+        // recorded `last_all_green` against the new `report.all_green`:
+        //   - true -> false (was green, now red) is the FIRST-CLASS regression
+        //     transition: emit GATE_REGRESSED, bump the counter, and route
+        //     the bead through the existing red branch below. If the counter
+        //     is already at MAX_GATE_REGRESSIONS, emit GATE_REGRESSED_CAPPED
+        //     and park HUMAN_HELD with the distinct park_reason
+        //     "gate_regression_capped" (so `recover_human_held` does NOT
+        //     requeue it identically to a transient red — circuit-breaker-
+        //     style suppression).
+        //   - any other transition (false->false, false->true, true->true)
+        //     is the normal flow; only the green->red case is special.
+        //
+        // The regression branch runs BEFORE the GATE_ASSESSMENT emit so the
+        // guard sees a fresh assessment (with all_green=false) on the same
+        // tick the regression is detected — a 60s tick is the minimum
+        // window the merge guard polls, so emitting the assessment FIRST and
+        // the regression event SECOND would let the guard accept a stale
+        // all_green=true window for one tick.
+        let prev_all_green = deps.store.last_all_green(bead_id)?.unwrap_or(false);
+        let new_all_green = report.all_green;
+        let is_regression = prev_all_green && !new_all_green;
+        if is_regression {
+            let reg_count = deps.store.gate_regression_count(bead_id)?;
+            if reg_count >= MAX_GATE_REGRESSIONS {
+                // Cap hit: the bead has flapped green->red enough times
+                // that further reroll is no longer productive. Park
+                // HUMAN_HELD with a distinct park_reason that
+                // `recover_human_held`'s retry-safe allow-list does NOT
+                // include (so the bead is not silently requeued).
+                let red_gate_names: Vec<String> = report
+                    .results
+                    .iter()
+                    .filter_map(|(gate_name, result)| match result {
+                        verifier::GateResult::Red(reason) => {
+                            Some(format!("{gate_name:?}: {reason}"))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                overlay.state = OverlayState::HumanHeld;
+                set_human_hold_reason(
+                    &mut overlay,
+                    HumanHoldReason::GateRegressionCapped,
+                );
+                deps.store.save(&overlay)?;
+                summary.beads_parked_human_held += 1;
+                emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "GATE_REGRESSED_CAPPED",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "reason": "green->red transitions exceeded MAX_GATE_REGRESSIONS; routing to HUMAN_HELD",
+                        "max_gate_regressions": MAX_GATE_REGRESSIONS,
+                        "regression_count": reg_count,
+                        "pr_number": pr,
+                        "red_gates": red_gate_names,
+                    }),
+                )?;
+                let comment_body = format!(
+                    "🤖 **[dark-factory]** Gate regression capped: bead `{bead_id}` has \
+                     flipped green->red {reg_count} times (>= MAX_GATE_REGRESSIONS={MAX_GATE_REGRESSIONS}). \
+                     Automation parked the bead HUMAN_HELD for inspection rather than \
+                     silently looping the reroll lane.\n\n\
+                     Current red gates:\n{}",
+                    red_gate_names
+                        .iter()
+                        .map(|g| format!("- `{g}`"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+                let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
+                continue;
+            }
+            // Bump the counter, emit the regression event, and let the
+            // existing red-branch path below route the bead through
+            // `reroll::execute` (stage 2) or `PARKED_HUMAN_HELD` (stage 1).
+            // Persist the demotion off READY here so a healthy READY that
+            // re-assessed-and-stayed-green in the previous block is NOT
+            // re-promoted to READY by `beads_ready` below (the report is
+            // red this tick, so we want the demotion durable).
+            let _ = deps.store.incr_gate_regression_count(bead_id)?;
+            if entered_as_ready {
+                // Demote READY -> ATTESTED so the red-branch routes it;
+                // save() bumps updated_at. The in-memory `overlay.state`
+                // is already Attested (we demoted it above).
+                overlay.state = OverlayState::Attested;
+                deps.store.save(&overlay)?;
+            }
+            let red_gate_names: Vec<String> = report
+                .results
+                .iter()
+                .filter_map(|(gate_name, result)| match result {
+                    verifier::GateResult::Red(reason) => {
+                        Some(format!("{gate_name:?}: {reason}"))
+                    }
+                    _ => None,
+                })
+                .collect();
+            emit(
+                deps.telemetry_log,
+                bead_id,
+                overlay.attempt,
+                OverlayState::Attested.as_str(),
+                "GATE_REGRESSED",
+                serde_json::json!({}),
+                serde_json::json!({
+                    "reason": "previously all_green, now not all_green",
+                    "pr_number": pr,
+                    "head_sha": snapshot.head_sha,
+                    "red_gates": red_gate_names,
+                    "regression_count": deps.store.gate_regression_count(bead_id)?,
+                }),
+            )?;
+            let comment_body = format!(
+                "🤖 **[dark-factory]** Gate regression detected for bead `{bead_id}`: \
+                 this PR previously passed all safety gates and is now failing \
+                 (count {} of {MAX_GATE_REGRESSIONS} before escalation). Re-entering \
+                 the fix loop.\n\nCurrent red gates:\n{}",
+                deps.store.gate_regression_count(bead_id)?,
+                red_gate_names
+                    .iter()
+                    .map(|g| format!("- `{g}`"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
+        }
         // jleechan-rln6 / PR #463 round-1 Codex P1 finding: the
         // GATE_ASSESSMENT emit must happen BEFORE the fast-rejection
         // `continue` short-circuit. `auto-merge-guard.sh` reads the LATEST
@@ -4470,6 +4631,14 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             serde_json::json!({}),
             gate_assessment_context,
         )?;
+        // jleechan-6l1f: stamp the bead's `last_all_green` to the latest
+        // assessment result so the next tick's regression-detection predicate
+        // has authoritative input. The stamp is unconditional — even on a
+        // regression tick (where we already emitted GATE_REGRESSED above),
+        // the column MUST reflect the current report, not the stale prior
+        // value (otherwise the next tick would re-fire GATE_REGRESSED on a
+        // sustained-red state).
+        deps.store.set_last_all_green(bead_id, new_all_green)?;
 
         // jleechan-rln6: FAST-REJECTION short-circuit for a STALE evidence
         // marker. When the ONLY red gate is `EvidenceFloor` AND its reason
