@@ -6,6 +6,7 @@ import json
 import pathlib
 import subprocess
 import sys
+import tempfile
 
 import pytest
 
@@ -13,7 +14,13 @@ ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from conftest import _pipeline  # noqa: E402
+# Scratch workdir in the OS tempdir — using the repo root here leaks one
+# branch_* mkdtemp per fan-out test into the working tree.
+SCRATCH = pathlib.Path(tempfile.mkdtemp(prefix="test_perf_log_"))
+
+from conftest import _pipeline, register_scratch_dir  # noqa: E402
+
+register_scratch_dir(SCRATCH)
 
 from runner.engine import run  # noqa: E402
 from runner.handlers import Context, Result, TYPE_REGISTRY  # noqa: E402
@@ -75,7 +82,7 @@ def test_perf_log_writes_enter_exit_success(monkeypatch, tmp_path):
     graph = parse(_pipeline("hello.dot"))
     ctx = Context(
         goal="perf test",
-        workdir=ROOT,
+        workdir=SCRATCH,
         backend="echo",
         perf_log_root=tmp_path / "perf",
     )
@@ -117,7 +124,7 @@ def test_perf_log_records_failure_outcome(monkeypatch, tmp_path):
     graph = parse(_pipeline("hello.dot"))
     ctx = Context(
         goal="fail test",
-        workdir=ROOT,
+        workdir=SCRATCH,
         backend="echo",
         perf_log_root=tmp_path / "perf",
     )
@@ -141,7 +148,7 @@ def test_perf_log_records_error_on_exception(monkeypatch, tmp_path):
     graph = parse(_pipeline("hello.dot"))
     ctx = Context(
         goal="error test",
-        workdir=ROOT,
+        workdir=SCRATCH,
         backend="echo",
         perf_log_root=tmp_path / "perf",
     )
@@ -161,7 +168,7 @@ def test_no_perf_log_when_disabled(monkeypatch, tmp_path):
     graph = parse(_pipeline("hello.dot"))
     ctx = Context(
         goal="disabled",
-        workdir=ROOT,
+        workdir=SCRATCH,
         backend="echo",
         perf_log_root=None,
     )
@@ -193,7 +200,7 @@ def test_parallel_branch_enter_exit(monkeypatch, tmp_path):
     graph = parse(dot)
     ctx = Context(
         goal="parallel",
-        workdir=ROOT,
+        workdir=SCRATCH,
         backend="echo",
         perf_log_root=tmp_path / "perf",
     )

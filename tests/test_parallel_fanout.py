@@ -13,6 +13,7 @@ Covers:
 """
 from __future__ import annotations
 
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -24,6 +25,14 @@ from runner.handlers import Context, Result, TYPE_REGISTRY
 from runner.parser import parse
 
 ROOT = Path(__file__).parent.parent
+
+# Scratch workdir in the OS tempdir — using the repo root here leaked one
+# branch_* mkdtemp per fan-out test into the working tree (378 observed).
+SCRATCH = Path(tempfile.mkdtemp(prefix="test_parallel_fanout_"))
+
+from conftest import register_scratch_dir  # noqa: E402
+
+register_scratch_dir(SCRATCH)
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +87,7 @@ def _dot_3branch(tmp_path: Path, policy: str, k: str) -> Path:
     return dot
 
 
-def _ctx(workdir: Path = ROOT, backend: str = "echo", cxdb_path: str | None = None) -> Context:
+def _ctx(workdir: Path = SCRATCH, backend: str = "echo", cxdb_path: str | None = None) -> Context:
     return Context(goal="test parallel", workdir=workdir, backend=backend,
                    cxdb_path=cxdb_path)
 
