@@ -311,9 +311,17 @@ jobs:
 
                 # (b.2) PR anchor — the gist must mention the PR number
                 # OR the repo short name (the segment after the slash).
+                # The PR anchor accepts any word-boundary-adjacent form:
+                # `PR #571`, `(#571)`, `[#571]`, `"#571"` (JSON), and
+                # line-start `#571` all match. The previous form required
+                # a literal `"` immediately before the hash, which no
+                # human- or agent-written gist naturally satisfies —
+                # `PR #571` (the canonical form) failed the gate with
+                # `missing_pr_anchor`. The `[^0-9]` guard prevents `#1571`
+                # from matching a `#571` search.
                 repo_short="${REPO##*/}"
                 pr_anchor_found="no"
-                if echo "$gist_body" | grep -qE "\"#${PR_NUMBER}\b|\"#${PR_NUMBER}\"|\\\\\"#${PR_NUMBER}\\\\\"";
+                if echo "$gist_body" | grep -qE "(^|[^0-9])#${PR_NUMBER}\b";
                   then
                   pr_anchor_found="yes"
                 fi

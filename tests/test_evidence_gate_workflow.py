@@ -896,3 +896,112 @@ def test_signal_b_content_floor(
     assert (
         _simulate_signal_b_decision(files, pr, repo, declared, current) == expected
     ), f"Signal B (bytes={sum(len(c) for _,c in files)}, declared={declared!r}) should map to {expected}"
+
+
+# ---------------------------------------------------------------------------
+# bead jleechan-2qn8 — Signal B PR anchor regex must accept natural prose.
+#
+# The previous regex only matched when the literal `#N` was quote-adjacent
+# (a JSON-embedded form), which no human- or agent-written gist naturally
+# satisfies. A gist that says `PR #571` (the natural form) failed the gate
+# with `missing_pr_anchor`. The fix replaces the quote-adjacent alternation
+# with a word-boundary adjacency that accepts the same JSON form AND every
+# natural prose form a human or agent writes.
+# ---------------------------------------------------------------------------
+
+
+def _pr_anchor_regex(pr_number: int) -> str:
+    """Mirror the (fixed) PR anchor regex used by evidence-gate.yml.
+
+    The new pattern: `#<PR_NUMBER>` preceded by start-of-line or any
+    non-digit character (so `#571` inside `PR #571` matches but `#1571`
+    does not). The previous form required a literal `"` immediately
+    before the `#`, which only matched JSON-embedded forms.
+    """
+    return rf'(^|[^0-9])#{pr_number}\b'
+
+
+def _match_pr_anchor(text: str, pr_number: int) -> bool:
+    """Run the actual bash regex against the given text via subprocess.
+
+    Using subprocess avoids re-implementing POSIX `grep -E` semantics in
+    Python (where `\\b` and character classes differ).
+    """
+    import subprocess
+
+    proc = subprocess.run(
+        ["bash", "-c", f"grep -qE '{_pr_anchor_regex(pr_number)}'"],
+        input=text,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    return proc.returncode == 0
+
+
+@pytest.mark.parametrize(
+    "gist_body,pr_number,expected",
+    [
+        # Natural prose — the form humans and agents actually write.
+        ("PR #571 passed review.\n", 571, True),
+        ("See PR #571 for the full diff.\n", 571, True),
+        ("Closes #571 with this change.\n", 571, True),
+        ("(#571) trailing parens\n", 571, True),
+        ("[#571] bracketed ref\n", 571, True),
+        ("* #571 bulleted\n", 571, True),
+        ("#571\n", 571, True),  # line-start
+        # JSON-embedded form — must still match (back-compat).
+        ('key: "#571" pull_request\n', 571, True),
+        ('"#571" pull_request\n', 571, True),
+        # Wrong PR number — must NOT match (regression guard).
+        ("PR #572 unrelated\n", 571, False),
+        ("PR #1571 superset\n", 571, False),
+        # No PR anchor — must NOT match.
+        ("this is unrelated evidence\n", 571, False),
+        ("", 571, False),
+    ],
+)
+def test_signal_b_pr_anchor_regex_accepts_natural_prose(
+    gist_body: str, pr_number: int, expected: bool
+) -> None:
+    """bead jleechan-2qn8: the PR anchor regex must accept natural prose forms.
+
+    The previous regex required a literal `"` immediately before `#N`,
+    which no human- or agent-written gist naturally satisfies. A gist
+    that says `PR #571` failed the gate with `missing_pr_anchor`. The
+    fix replaces the quote-adjacent alternation with a word-boundary
+    adjacency that accepts the JSON form AND every natural prose form.
+    """
+    actual = _match_pr_anchor(gist_body, pr_number)
+    assert actual == expected, (
+        f"PR anchor regex (pr={pr_number}) on {gist_body!r}: "
+        f"expected {expected}, got {actual}."
+    )
+
+
+def test_signal_b_pr_anchor_regex_is_quote_free() -> None:
+    """bead jleechan-2qn8: the fixed PR anchor regex must NOT require a
+    literal double-quote before `#N`.
+
+    The previous regex's alternation (`"#N\\b|"#N"|\\"#N\\"`) all
+    required a `"` immediately before the hash — JSON-only. The fix
+    removes the quote requirement entirely.
+    """
+    text = _verdict_step_text(_load_workflow())
+    # Look for the old quote-adjacent alternation. The new pattern
+    # uses `(^|[^0-9])#<PR>` and contains no `"` before the hash.
+    has_quote_adjacent = bool(
+        re.search(r'\\?"#\$\{?PR_NUMBER\}?\\?b', text)
+        or re.search(r'\\?"#\$\{?PR_NUMBER\}?\\?"', text)
+        or re.search(r'\\\\\\?"#\$\{?PR_NUMBER\}?\\\\\\?"', text)
+    )
+    assert not has_quote_adjacent, (
+        "evidence-gate.yml PR anchor regex still requires a quote "
+        "immediately before `#N` — the natural prose form `PR #571` "
+        "will fail the gate. (bead jleechan-2qn8)"
+    )
+    # The new form must be present: `(^|[^0-9])#<PR_NUMBER>`.
+    assert re.search(r"\(\^|\[\^0-9\]\)#\$\{?PR_NUMBER\}?", text), (
+        "evidence-gate.yml PR anchor regex must use `(^|[^0-9])#<PR_NUMBER>` "
+        "form so natural prose `PR #571` matches. (bead jleechan-2qn8)"
+    )
