@@ -717,6 +717,101 @@ def _parse_reviewers(reviewers_json: str) -> List[Tuple[str, str]]:
 # ---------------------------------------------------------------------------
 
 
+def _load_contract_or_exit(
+    args,
+    *,
+    repo: str,
+    head_sha: str,
+    enabled: bool,
+    perf_log_dir: Optional[str],
+    perf_log_cb=None,
+) -> tuple:
+    """Load the bead contract (issue #386) with the documented fail-closed
+    semantics. Extracted from `main()` to deduplicate the contract-load
+    block that previously appeared twice in main() (lines 957-1000 AND
+    1052-1095 in the original).
+
+    Return contract:
+        (contract, None)  -> load succeeded OR no contract flag was set
+                             (caller continues with `contract` — may be None)
+        (None, 2)         -> load failed; the caller MUST return 2 (fail-
+                             closed). The helper has already emitted the
+                             stderr line and the perf-log entry.
+
+    Behavior parity (must hold before AND after this extraction):
+        - No flag set               -> (None, None)
+        - --bead-id load success    -> (BeadContract(...), None)
+        - --contract-file success   -> (BeadContract(...), None)
+        - ANY load failure          -> (None, 2) and stderr + perf-log
+
+    Perf-log seam: prefer caller-supplied `perf_log_cb` (newer contract);
+    fall back to the module-level `_emit_perf_log` with `duration_ms=0`
+    (matches every existing call site in main() at extraction time).
+    """
+    contract: Optional[BeadContract] = None
+    if args.bead_id:
+        try:
+            contract = load_bead_contract_from_bead(args.bead_id, br_bin=args.br_bin)
+        except Exception as exc:
+            print(
+                f"[skeptic-gate] bead contract load failed for "
+                f"bead_id={args.bead_id!r}: {exc}; refusing to gate "
+                "without the operator-supplied contract",
+                file=sys.stderr,
+            )
+            _emit_contract_failure(
+                perf_log_cb, args,
+                repo=repo, head_sha=head_sha,
+                enabled=enabled, perf_log_dir=perf_log_dir,
+            )
+            return None, 2
+    elif args.contract_file:
+        try:
+            contract = load_bead_contract(args.contract_file)
+        except (ValueError, TypeError, FileNotFoundError, json.JSONDecodeError, OSError) as exc:
+            # OSError covers PermissionError (chmod 0 / 000), IsADirectoryError,
+            # and other read failures that FileNotFoundError alone misses.
+            print(
+                f"[skeptic-gate] contract load failed: {exc}; "
+                "refusing to gate without the operator-supplied contract",
+                file=sys.stderr,
+            )
+            _emit_contract_failure(
+                perf_log_cb, args,
+                repo=repo, head_sha=head_sha,
+                enabled=enabled, perf_log_dir=perf_log_dir,
+            )
+            return None, 2
+    return contract, None
+
+
+def _emit_contract_failure(
+    perf_log_cb, args, *,
+    repo: str, head_sha: str,
+    enabled: bool, perf_log_dir: Optional[str],
+) -> None:
+    """Helper seam: prefer a caller-supplied callback (newer contract);
+    fall back to the module-level `_emit_perf_log` with a 0 duration
+    (matches every existing call site in main() at extraction time)."""
+    if perf_log_cb is not None:
+        perf_log_cb(
+            repo=repo,
+            pr_number=args.pr_number,
+            head_sha=head_sha,
+            outcome="failure",
+        )
+        return
+    _emit_perf_log(
+        perf_log_dir=perf_log_dir,
+        enabled=enabled,
+        repo=repo,
+        pr_number=args.pr_number,
+        head_sha=head_sha,
+        outcome="failure",
+        duration_ms=0,
+    )
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="skeptic-gate",
@@ -943,62 +1038,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         file=sys.stderr,
     )
 
-    # ---- 3a. Load bead contract (issue #386) --------------------------------
-    # When the workflow operator wires --bead-id or --contract-file, the
-    # gate must enforce per-item verdicts against the bead's acceptance
-    # items. Resolution order (highest precedence first):
-    #   - --bead-id: live source of truth (`br show --json <bead>`).
-    #   - --contract-file: hand-authored JSON path (legacy fallback).
-    #   - neither: legacy 10-field contract (issue #384 invariant).
-    #
-    # A failing `br` lookup OR a missing/unreadable contract file is a
-    # hard error — we never silently fall back to the legacy 10-field
-    # contract when the operator asked for the contract-echo step.
-    contract: Optional[BeadContract] = None
-    if args.bead_id:
-        try:
-            contract = load_bead_contract_from_bead(args.bead_id, br_bin=args.br_bin)
-        except Exception as exc:
-            print(
-                f"[skeptic-gate] bead contract load failed for "
-                f"bead_id={args.bead_id!r}: {exc}; refusing to gate "
-                "without the operator-supplied contract",
-                file=sys.stderr,
-            )
-            _emit_perf_log(
-                perf_log_dir=args.perf_log_dir,
-                enabled=not args.no_perf_log,
-                repo=repo,
-                pr_number=args.pr_number,
-                head_sha=head_sha,
-                outcome="failure",
-                duration_ms=int((time.monotonic() - _perf_start) * 1000),
-            )
-            return 2
-    elif args.contract_file:
-        try:
-            contract = load_bead_contract(args.contract_file)
-        except (ValueError, TypeError, FileNotFoundError, json.JSONDecodeError, OSError) as exc:
-            # OSError covers PermissionError (chmod 0 / 000), IsADirectoryError,
-            # and other read failures that FileNotFoundError alone misses.
-            # All such failures must take the fail-closed return 2 path — never
-            # silently fall through to the legacy 10-field contract.
-            print(
-                f"[skeptic-gate] contract load failed: {exc}; "
-                "refusing to gate without the operator-supplied contract",
-                file=sys.stderr,
-            )
-            _emit_perf_log(
-                perf_log_dir=args.perf_log_dir,
-                enabled=not args.no_perf_log,
-                repo=repo,
-                pr_number=args.pr_number,
-                head_sha=head_sha,
-                outcome="failure",
-                duration_ms=int((time.monotonic() - _perf_start) * 1000),
-            )
-            return 2
-
     # ---- 4. Load rules and Dispatch ------------------------------------------
     from runner.rule_loader import RuleLoader
     from runner.dispatcher import VerifierDispatcher
@@ -1049,50 +1088,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     # A failing `br` lookup OR a missing/unreadable contract file is a
     # hard error — we never silently fall back to the legacy 10-field
     # contract when the operator asked for the contract-echo step.
-    contract: Optional[BeadContract] = None
-    if args.bead_id:
-        try:
-            contract = load_bead_contract_from_bead(args.bead_id, br_bin=args.br_bin)
-        except Exception as exc:
-            print(
-                f"[skeptic-gate] bead contract load failed for "
-                f"bead_id={args.bead_id!r}: {exc}; refusing to gate "
-                "without the operator-supplied contract",
-                file=sys.stderr,
-            )
-            _emit_perf_log(
-                perf_log_dir=args.perf_log_dir,
-                enabled=not args.no_perf_log,
-                repo=repo,
-                pr_number=args.pr_number,
-                head_sha=head_sha,
-                outcome="failure",
-                duration_ms=int((time.monotonic() - _perf_start) * 1000),
-            )
-            return 2
-    elif args.contract_file:
-        try:
-            contract = load_bead_contract(args.contract_file)
-        except (ValueError, TypeError, FileNotFoundError, json.JSONDecodeError, OSError) as exc:
-            # OSError covers PermissionError (chmod 0 / 000), IsADirectoryError,
-            # and other read failures that FileNotFoundError alone misses.
-            # All such failures must take the fail-closed return 2 path — never
-            # silently fall through to the legacy 10-field contract.
-            print(
-                f"[skeptic-gate] contract load failed: {exc}; "
-                "refusing to gate without the operator-supplied contract",
-                file=sys.stderr,
-            )
-            _emit_perf_log(
-                perf_log_dir=args.perf_log_dir,
-                enabled=not args.no_perf_log,
-                repo=repo,
-                pr_number=args.pr_number,
-                head_sha=head_sha,
-                outcome="failure",
-                duration_ms=int((time.monotonic() - _perf_start) * 1000),
-            )
-            return 2
+    contract, contract_exit = _load_contract_or_exit(
+        args,
+        repo=repo,
+        head_sha=head_sha,
+        enabled=not args.no_perf_log,
+        perf_log_dir=args.perf_log_dir,
+    )
+    if contract_exit is not None:
+        # Helper already emitted the perf-log entry. Preserve the
+        # fail-closed return-code so the upstream caller sees exit 2.
+        return contract_exit
 
     dispatcher = VerifierDispatcher(
         cheap_reviewer="gemini", cheap_model="gemini-2.5-flash",
