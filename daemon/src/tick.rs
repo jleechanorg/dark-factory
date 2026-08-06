@@ -1841,6 +1841,221 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     bead.description.as_str(),
                     bead.external_ref.as_deref(),
                 );
+                // jleechan-htf7 r3: fail-closed adoption for manual beads.
+                // A `br create`-style bead that arrives here WITHOUT a
+                // resolvable `target_repo` (no body `target_repo:` field,
+                // no parseable `external_ref` owner/repo prefix) used to be
+                // admitted as `state: Queued`, routed through the LLM, and
+                // only THEN parked `unmapped_repo` at the dispatch layer
+                // (see `tick.rs:2133-2145`). That reactive park leaves a
+                // future-orphan shape in the routing pipeline on every
+                // tick, wastes a `judge(...)` call, and creates churn
+                // telemetry for a defect the daemon can never recover from
+                // on its own.
+                //
+                // Fail-closed here: park HUMAN_HELD with the same
+                // `unmapped_repo` reason the dispatch layer would have used,
+                // skip routing entirely, and emit `PARKED_HUMAN_HELD`
+                // directly so downstream tooling (Healer, dashboards) sees
+                // the same event shape whether the park came from adoption
+                // or from dispatch. PR #201 invariants (`create_bead`
+                // never called, `external_ref` never fabricated) still
+                // apply — this gate only short-circuits before routing.
+                //
+                // jleechan-htf7 r3 incremental (post-r2 review): the
+                // escalation comment for the parked bead is posted via the
+                // SAME `post_scm_comment_by_bead_id` idiom the dispatch
+                // flow uses for `unmapped_target_repo`
+                // (`tick.rs:2290-2353`). That idiom has FOUR outcomes; r2
+                // only handled two. r3 mirrors all four so the manual
+                // adoption site never silently drops an escalation record:
+                //   (a) missing-target  -> `record_local_escalation_fallback`
+                //                          + `ESCALATED_LOCALLY` event
+                //   (b) non-transient   -> `mark_escalation_undeliverable_and_emit`
+                //                          + `ESCALATION_UNDELIVERABLE` event
+                //   (c) transient       -> `ESCALATION_NOTIFICATION_FAILED`
+                //                          event (deduped, retry next tick)
+                //   (d) success         -> `record_escalation` +
+                //                          `beads_escalated += 1` +
+                //                          `ESCALATION_REQUIRED` (deduped)
+                if target_repo.is_none() {
+                    let mut o = BeadOverlay {
+                        bead_id: bead.id.clone(),
+                        state: OverlayState::HumanHeld,
+                        attempt: 1,
+                        reroll_count: 0,
+                        autonomy_secs: 0,
+                        spend_usd: 0.0,
+                        pr_number: None,
+                        branch: None,
+                        session_id: None,
+                        is_adopted: false,
+                        spawn_failure_count: 0,
+                        pre_session_head_sha: None,
+                        park_reason: None,
+                        target_repo,
+                        attempt_started_at: None,
+                    };
+                    set_human_hold_reason(&mut o, HumanHoldReason::UnmappedRepo);
+                    deps.store.save(&o)?;
+                    summary.beads_parked_human_held += 1;
+                    emit(
+                        deps.telemetry_log,
+                        &bead.id,
+                        1,
+                        OverlayState::HumanHeld.as_str(),
+                        "PARKED_HUMAN_HELD",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "reason": "unmapped_repo",
+                            "source": "manual_adoption_fail_closed",
+                            "external_ref": bead.external_ref,
+                        }),
+                    )?;
+                    if !escalation_already_recorded(deps, &bead.id)? {
+                        let comment_body = format!(
+                            "🤖 **[dark-factory]** Escalation required: bead `{}` was \
+                             created manually via `br create` with neither an \
+                             `external_ref` nor a `target_repo:` body field, so the \
+                             daemon cannot determine which repo it belongs to. \
+                             Automation parked it HUMAN_HELD at adoption time \
+                             (jleechan-htf7 r3 fail-closed gate) rather than routing \
+                             it and parking at dispatch. Operator action: supply an \
+                             explicit `target_repo: <owner>/<repo>` line in the bead \
+                             body, set `external_ref = \"<owner>/<repo>#NNN\"`, or \
+                             file under an issue/PR labeled `factory` so intake can \
+                             resolve the repo from the GitHub external_ref.",
+                            bead.id,
+                        );
+                        // (a)+(b)+(c)+(d): mirror the canonical
+                        // `unmapped_target_repo` dispatch-flow idiom at
+                        // `tick.rs:2284-2353`. The `unmapped_repo` reason
+                        // here is the manual-adoption analogue of that
+                        // reason, so the four-way handling is identical.
+                        match post_scm_comment_by_bead_id(deps, &bead.id, &comment_body) {
+                            Ok(()) => {
+                                // (d) success: record escalation + bump
+                                // beads_escalated + emit ESCALATION_REQUIRED.
+                                record_escalation(deps, &bead.id, "unmapped_repo")?;
+                                summary.beads_escalated += 1;
+                                let ctx = serde_json::json!({
+                                    "reason": "unmapped_repo",
+                                    "source": "manual_adoption_fail_closed",
+                                });
+                                let now_epoch = now_epoch_secs();
+                                let (should_emit, ctx_hash) = escalation_dedup_should_emit(
+                                    deps,
+                                    &bead.id,
+                                    "unmapped_repo",
+                                    &ctx,
+                                    now_epoch,
+                                )?;
+                                if !should_emit {
+                                    summary.escalations_suppressed += 1;
+                                } else {
+                                    emit(
+                                        deps.telemetry_log,
+                                        &bead.id,
+                                        1,
+                                        OverlayState::HumanHeld.as_str(),
+                                        "ESCALATION_REQUIRED",
+                                        serde_json::json!({}),
+                                        ctx,
+                                    )?;
+                                    record_escalation_emit_dedup(
+                                        deps,
+                                        &bead.id,
+                                        "unmapped_repo",
+                                        &ctx_hash,
+                                        now_epoch,
+                                    )?;
+                                }
+                            }
+                            Err(err) => {
+                                if is_missing_scm_target_error(&err) {
+                                    // (a) missing-target: local escalation
+                                    // fallback records the sentinel AND
+                                    // bumps beads_escalated_locally so
+                                    // dashboards see the escalation event
+                                    // even though no SCM comment was
+                                    // postable.
+                                    record_local_escalation_fallback(
+                                        deps,
+                                        &bead.id,
+                                        "unmapped_repo",
+                                    )?;
+                                    summary.beads_escalated_locally += 1;
+                                    emit(
+                                        deps.telemetry_log,
+                                        &bead.id,
+                                        1,
+                                        OverlayState::HumanHeld.as_str(),
+                                        "ESCALATED_LOCALLY",
+                                        serde_json::json!({}),
+                                        serde_json::json!({
+                                            "reason": "unmapped_repo",
+                                            "source": "manual_adoption_fail_closed",
+                                            "scm_error": err.to_string(),
+                                        }),
+                                    )?;
+                                } else if !err.is_transient() {
+                                    // (b) non-transient: terminal mark +
+                                    // ESCALATION_UNDELIVERABLE; never
+                                    // re-attempt on later ticks.
+                                    mark_escalation_undeliverable_and_emit(
+                                        deps,
+                                        summary,
+                                        &bead.id,
+                                        1,
+                                        OverlayState::HumanHeld.as_str(),
+                                        "unmapped_repo",
+                                        &err,
+                                    )?;
+                                } else {
+                                    // (c) transient: emit
+                                    // ESCALATION_NOTIFICATION_FAILED with
+                                    // dedup so the next tick retries. Do
+                                    // NOT record the escalation sentinel —
+                                    // the comment will be retried.
+                                    let ctx = serde_json::json!({
+                                        "reason": "unmapped_repo",
+                                        "source": "manual_adoption_fail_closed",
+                                        "error": err.to_string(),
+                                    });
+                                    let now_epoch = now_epoch_secs();
+                                    let (should_emit, ctx_hash) = escalation_dedup_should_emit(
+                                        deps,
+                                        &bead.id,
+                                        "unmapped_repo",
+                                        &ctx,
+                                        now_epoch,
+                                    )?;
+                                    if !should_emit {
+                                        summary.escalations_suppressed += 1;
+                                    } else {
+                                        emit(
+                                            deps.telemetry_log,
+                                            &bead.id,
+                                            1,
+                                            OverlayState::HumanHeld.as_str(),
+                                            "ESCALATION_NOTIFICATION_FAILED",
+                                            serde_json::json!({}),
+                                            ctx,
+                                        )?;
+                                        record_escalation_emit_dedup(
+                                            deps,
+                                            &bead.id,
+                                            "unmapped_repo",
+                                            &ctx_hash,
+                                            now_epoch,
+                                        )?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let o = BeadOverlay {
                     bead_id: bead.id.clone(),
                     state: OverlayState::Queued,
