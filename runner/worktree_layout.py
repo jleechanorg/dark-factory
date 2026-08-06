@@ -30,18 +30,23 @@ from __future__ import annotations
 
 import argparse
 import errno
+import logging
 import os
+import re
 import shutil
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
+from typing import Callable, Iterable, Optional, Sequence
 
 
 ENV_AGENT_WORKTREES_ROOT = "DARK_FACTORY_AGENT_WORKTREES"
 ENV_AGENT_WORKTREES_TTL = "DARK_FACTORY_AGENT_WORKTREES_TTL_DAYS"
 ENV_AGENT_WORKTREES_MAX = "DARK_FACTORY_AGENT_WORKTREES_MAX_COUNT"
+
+logger = logging.getLogger("dark_factory.worktree_layout")
 
 
 # Legacy location that the convention SHIFTED AWAY from. Present so the
@@ -193,6 +198,251 @@ class AgentWorktreeLayout:
 
 
 # ---------------------------------------------------------------------------
+# Protect-list guard (jleechan-jw4c) — a systemd --user unit's WorkingDirectory
+# (or any path it references) is a LIVE dependency, not a disposable checkout.
+# Concrete incident this guards against: dark-factory-merge-guard.service's
+# WorkingDirectory IS an agent worktree
+# (~/projects/dark-factory-worktrees/fix-jleechan-s3c-merge-guard-scheduler)
+# — the ONLY code path that runs `gh pr merge`. If the reaper prunes that
+# directory, merge authority vanishes SILENTLY: the timer keeps firing every
+# 60s, `cd` into a directory that no longer exists, and no-ops forever.
+# ---------------------------------------------------------------------------
+
+
+# Only extract path tokens from directives that are actually path-bearing
+# (as opposed to e.g. Documentation=https://... or Description=...) — this
+# is precise rather than "any absolute path anywhere in the file" so it
+# doesn't false-positive on URLs while still generalizing beyond a literal
+# /home/ prefix (unit files are commonly exercised against tmp dirs in
+# tests, which don't live under /home).
+_PATH_BEARING_UNIT_KEYS = frozenset(
+    {
+        "WorkingDirectory",
+        "ExecStart",
+        "ExecStartPre",
+        "ExecStartPost",
+        "ExecStop",
+        "ExecStopPost",
+        "ExecReload",
+        "ReadWritePaths",
+        "ReadOnlyPaths",
+        "BindPaths",
+        "BindReadOnlyPaths",
+        "RootDirectory",
+    }
+)
+_ABS_PATH_TOKEN_RE = re.compile(r"/[^\s\"']+")
+
+
+def _enabled_unit_names(systemd_user_dir: Path) -> set[str]:
+    """Unit names that are ENABLED, derived structurally from symlinks
+    under ``*.wants/`` directories — this is exactly what `systemctl
+    --user enable` creates, so it mirrors `systemctl --user is-enabled`
+    without shelling out (keeps this unit-testable with a fake unit-dir
+    tree and avoids a hard runtime dependency on systemd being present).
+    """
+    names: set[str] = set()
+    if not systemd_user_dir.exists():
+        return names
+    for wants_dir in systemd_user_dir.glob("*.wants"):
+        if not wants_dir.is_dir():
+            continue
+        for entry in wants_dir.iterdir():
+            names.add(entry.name)
+    return names
+
+
+def _timer_target_service(timer_file: Path) -> str:
+    """The .service unit a .timer triggers: explicit ``Unit=`` line, else
+    the timer's own basename with .service instead of .timer (systemd's
+    own default resolution). This covers the merge-guard's actual shape:
+    the .service has no [Install] section of its own — only the .timer
+    that points at it is ever "enabled".
+    """
+    try:
+        text = timer_file.read_text()
+    except OSError:
+        return timer_file.stem + ".service"
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("Unit="):
+            return line.split("=", 1)[1].strip()
+    return timer_file.stem + ".service"
+
+
+def _paths_referenced_by_unit(unit_file: Path) -> set[Path]:
+    try:
+        text = unit_file.read_text()
+    except OSError:
+        return set()
+    found: set[Path] = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        if key not in _PATH_BEARING_UNIT_KEYS:
+            continue
+        for raw in _ABS_PATH_TOKEN_RE.findall(value):
+            cleaned = raw.rstrip(",;")
+            try:
+                found.add(Path(cleaned).expanduser().resolve())
+            except (OSError, RuntimeError):
+                continue
+    return found
+
+
+def protected_worktree_paths(systemd_user_dir: Optional[Path] = None) -> set[Path]:
+    """Filesystem paths referenced by ENABLED systemd --user units.
+
+    Scans every unit under ``systemd_user_dir`` (default
+    ``~/.config/systemd/user``) that is either itself enabled or is a
+    .service triggered by an enabled .timer, and extracts every absolute
+    path token (``WorkingDirectory=``, ``ExecStart=``, etc.) referenced in
+    its unit file. The reaper refuses to prune anything in the returned
+    set — see the module-level rationale above.
+    """
+    resolved_dir = (
+        Path(systemd_user_dir)
+        if systemd_user_dir is not None
+        else Path.home() / ".config" / "systemd" / "user"
+    ).expanduser()
+    if not resolved_dir.exists():
+        return set()
+
+    enabled = _enabled_unit_names(resolved_dir)
+    live_units: set[str] = set(enabled)
+    for name in enabled:
+        if name.endswith(".timer"):
+            timer_file = resolved_dir / name
+            if timer_file.exists():
+                live_units.add(_timer_target_service(timer_file))
+
+    paths: set[Path] = set()
+    for name in sorted(live_units):
+        unit_file = resolved_dir / name
+        if unit_file.exists():
+            paths |= _paths_referenced_by_unit(unit_file)
+    return paths
+
+
+def is_worktree_protected(path: Path, protected_paths: Iterable[Path]) -> bool:
+    """True if ``path`` equals, contains, or is contained by any entry in
+    ``protected_paths``, using BOUNDARY-safe comparison.
+
+    Boundary-safety matters: a protected path of ``.../a/b`` must NOT
+    match a candidate ``.../a/bc`` — plain string-prefix comparison on the
+    unresolved paths would wrongly match on that near-miss.
+    """
+    resolved = Path(path).expanduser().resolve()
+    for protected in protected_paths:
+        p = Path(protected).expanduser().resolve()
+        if resolved == p:
+            return True
+        try:
+            if p.is_relative_to(resolved) or resolved.is_relative_to(p):
+                return True
+        except AttributeError:  # py<3.9 fallback (defensive)
+            resolved_sep = str(resolved) + os.sep
+            p_sep = str(p) + os.sep
+            if str(p).startswith(resolved_sep) or str(resolved).startswith(p_sep):
+                return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Git safety guard — locked / dirty (uncommitted) / unpushed worktrees must
+# never be pruned even when TTL/count would otherwise select them. Fails
+# CLOSED: any git command this can't positively confirm is treated as the
+# unsafe condition it was checking for.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class WorktreeGitStatus:
+    locked: bool
+    dirty: bool
+    unpushed: bool
+
+
+def _run_git(args: Sequence[str], cwd: Path) -> "subprocess.CompletedProcess[str]":
+    return subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def git_worktree_status(path: Path) -> WorktreeGitStatus:
+    """Inspect a real git worktree's safety-relevant status: locked (per
+    ``git worktree list --porcelain``), dirty (uncommitted changes), and
+    unpushed (commits — or the entire branch — not present on the
+    upstream). Any git command that errors (bogus/missing .git, not a
+    worktree, git unavailable) is treated as the unsafe outcome, so a
+    worktree the reaper cannot positively verify is never prunable.
+    """
+    path = Path(path)
+
+    locked = True
+    list_proc = _run_git(["worktree", "list", "--porcelain"], path)
+    if list_proc.returncode == 0:
+        try:
+            resolved = str(path.resolve())
+        except OSError:
+            resolved = str(path)
+        for block in list_proc.stdout.split("\n\n"):
+            lines = block.splitlines()
+            if not lines or not lines[0].startswith("worktree "):
+                continue
+            wt_path = lines[0][len("worktree "):].strip()
+            try:
+                if str(Path(wt_path).resolve()) != resolved:
+                    continue
+            except OSError:
+                continue
+            locked = any(line == "locked" or line.startswith("locked ") for line in lines[1:])
+            break
+
+    dirty = True
+    status_proc = _run_git(["status", "--porcelain"], path)
+    if status_proc.returncode == 0:
+        dirty = bool(status_proc.stdout.strip())
+
+    unpushed = True
+    upstream_proc = _run_git(
+        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], path
+    )
+    if upstream_proc.returncode == 0:
+        count_proc = _run_git(["rev-list", "--count", "@{u}..HEAD"], path)
+        if count_proc.returncode == 0:
+            unpushed = count_proc.stdout.strip() != "0"
+
+    return WorktreeGitStatus(locked=locked, dirty=dirty, unpushed=unpushed)
+
+
+def is_worktree_safe_to_prune(
+    path: Path,
+    *,
+    protected_paths: Iterable[Path] = (),
+    status: Optional[WorktreeGitStatus] = None,
+) -> tuple[bool, str]:
+    """Combine the systemd protect-list and git safety checks. Returns
+    ``(safe, reason)`` — ``reason`` explains the refusal when unsafe.
+    """
+    if is_worktree_protected(path, protected_paths):
+        return False, "referenced by an enabled systemd unit"
+    st = status if status is not None else git_worktree_status(path)
+    if st.locked:
+        return False, "worktree is locked (git worktree list --porcelain)"
+    if st.dirty:
+        return False, "worktree has uncommitted changes"
+    if st.unpushed:
+        return False, "worktree has unpushed commits (or no upstream to verify against)"
+    return True, "safe to prune"
+
+
+# ---------------------------------------------------------------------------
 # Reaper
 # ---------------------------------------------------------------------------
 
@@ -204,12 +454,26 @@ def reap_stale_worktrees(
     ttl_seconds: Optional[int],
     max_count: Optional[int],
     now: Optional[float] = None,
+    protected_paths: Iterable[Path] = (),
+    check_git_safety: bool = False,
+    git_status_provider: Callable[[Path], WorktreeGitStatus] = git_worktree_status,
 ) -> ReapSummary:
     """Prune stale entries under ``root``.
 
     Forward-only: directories that resolve INSIDE ``primary_checkout``
     are recorded as ``refused`` and never deleted. Use ``migrate_legacy_nested``
     to relocate them by hand.
+
+    Two additional guards, both opt-in via keyword so existing callers are
+    unaffected:
+
+    * ``protected_paths`` — entries matching (per :func:`is_worktree_protected`)
+      are refused and the refusal is logged (never silent). Pass
+      :func:`protected_worktree_paths` for the systemd-derived set.
+    * ``check_git_safety`` — when true, a locked/dirty/unpushed worktree
+      (per :func:`git_worktree_status`, or ``git_status_provider`` for
+      test injection) is refused and logged, even if TTL/count would
+      otherwise select it.
 
     Returns a :class:`ReapSummary`. The caller decides whether to
     actually delete (the CLI pairs this with ``--dry-run``).
@@ -222,6 +486,8 @@ def reap_stale_worktrees(
     if ttl_seconds is None and max_count is None:
         return summary
 
+    protected_list = list(protected_paths)
+
     candidates: list[tuple[Path, float]] = []
     for child in sorted(root.iterdir()):
         if not child.is_dir():
@@ -229,6 +495,20 @@ def reap_stale_worktrees(
         if _is_inside(child, primary):
             summary.refused.append(ReapedWorktree(path=child, reason="nested-legacy"))
             continue
+        if protected_list and is_worktree_protected(child, protected_list):
+            reason = "protected: referenced by an enabled systemd unit"
+            summary.refused.append(ReapedWorktree(path=child, reason=reason))
+            logger.warning("refusing to prune worktree %s: %s", child, reason)
+            continue
+        if check_git_safety:
+            safe, why = is_worktree_safe_to_prune(
+                child, status=git_status_provider(child)
+            )
+            if not safe:
+                reason = f"unsafe: {why}"
+                summary.refused.append(ReapedWorktree(path=child, reason=reason))
+                logger.warning("refusing to prune worktree %s: %s", child, why)
+                continue
         try:
             mtime = child.stat().st_mtime
         except OSError:
