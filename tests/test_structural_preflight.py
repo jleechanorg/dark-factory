@@ -26,6 +26,8 @@ import subprocess
 import sys
 import textwrap
 
+from conftest import hermetic_subprocess_env  # noqa: E402
+
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -240,12 +242,12 @@ def test_subprocess_emits_valid_json(tmp_path):
         capture_output=True,
         text=True,
         timeout=30,
-        env={
-            "PATH": "/usr/bin:/bin",
-            "HOME": str(ROOT),
-            "PYTHONPATH": str(ROOT),
-            "DARK_FACTORY_HOME": str(ROOT),
-        },
+        env=hermetic_subprocess_env(
+            PATH="/usr/bin:/bin",
+            HOME=str(ROOT),
+            PYTHONPATH=str(ROOT),
+            DARK_FACTORY_HOME=str(ROOT),
+        ),
     )
     assert proc.returncode == 0, proc.stderr
     payload = json.loads(proc.stdout)
@@ -279,12 +281,12 @@ def test_subprocess_emits_valid_json(tmp_path):
         capture_output=True,
         text=True,
         timeout=30,
-        env={
-            "PATH": "/usr/bin:/bin",
-            "HOME": str(ROOT),
-            "PYTHONPATH": str(ROOT),
-            "DARK_FACTORY_HOME": str(ROOT),
-        },
+        env=hermetic_subprocess_env(
+            PATH="/usr/bin:/bin",
+            HOME=str(ROOT),
+            PYTHONPATH=str(ROOT),
+            DARK_FACTORY_HOME=str(ROOT),
+        ),
     )
     assert proc2.returncode == 2, proc2.stdout + proc2.stderr
     payload2 = json.loads(proc2.stdout)
@@ -377,12 +379,12 @@ def test_module_runnable_as_python_m_runner():
         capture_output=True,
         text=True,
         timeout=15,
-        env={
-            "PATH": "/usr/bin:/bin",
-            "HOME": str(ROOT),
-            "PYTHONPATH": str(ROOT),
-            "DARK_FACTORY_HOME": str(ROOT),
-        },
+        env=hermetic_subprocess_env(
+            PATH="/usr/bin:/bin",
+            HOME=str(ROOT),
+            PYTHONPATH=str(ROOT),
+            DARK_FACTORY_HOME=str(ROOT),
+        ),
     )
     assert proc.returncode == 0, proc.stderr
     assert "pipeline" in proc.stdout.lower()
@@ -393,3 +395,42 @@ def test_threshold_constant_is_60():
     """The timeout threshold is exposed as a module constant (60s) so
     downstream tooling can read it without re-hardcoding the value."""
     assert structural_preflight.TIMEOUT_THRESHOLD_S == 60
+
+
+def test_hermetic_env_propagates_ld_library_path(monkeypatch):
+    """`hermetic_subprocess_env` must forward LD_LIBRARY_PATH when it is set.
+
+    Regression guard for the failure that kept `main` red while every dev box
+    stayed green: GitHub's setup-python puts `libpython3.13.so.1.0` outside the
+    default linker search path, so a `sys.executable` subprocess launched with a
+    hand-built env that omits LD_LIBRARY_PATH dies before executing any of our
+    code:
+
+        python: error while loading shared libraries: libpython3.13.so.1.0
+
+    Local runs cannot reproduce that (system python has libpython on the default
+    path), so this asserts the CONTRACT directly rather than the symptom. The
+    end-state proof is the `test` job going green on the hosted runner.
+
+    LD_LIBRARY_PATH is a linker search path, not a secret — same rationale as
+    `runner/skeptic_gate_cli.py::REVIEWER_ENV_BASE_ALLOWLIST`.
+    """
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/opt/hostedtoolcache/Python/3.13.14/x64/lib")
+    env = hermetic_subprocess_env(PATH="/usr/bin:/bin", HOME=str(ROOT))
+
+    assert env["LD_LIBRARY_PATH"] == "/opt/hostedtoolcache/Python/3.13.14/x64/lib"
+    # Hermeticity is preserved: nothing else leaks in from the ambient shell.
+    assert set(env) == {"PATH", "HOME", "LD_LIBRARY_PATH"}
+
+
+def test_hermetic_env_omits_ld_library_path_when_unset(monkeypatch):
+    """When LD_LIBRARY_PATH is absent, the env stays exactly as the caller built it.
+
+    Keeps local hermetic runs byte-identical to their pre-fix behavior, so the
+    fix cannot mask a genuine environment problem on a dev box.
+    """
+    monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
+    env = hermetic_subprocess_env(PATH="/usr/bin:/bin", HOME=str(ROOT))
+
+    assert "LD_LIBRARY_PATH" not in env
+    assert set(env) == {"PATH", "HOME"}
