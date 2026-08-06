@@ -2869,9 +2869,14 @@ fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, DaemonError> 
             ],
             REVIEWER_TIMEOUT_SECS,
         ),
+        // Flag order matters: agy's `--print` takes the PROMPT as its own
+        // value, so any flag placed between `--print` and the prompt is
+        // swallowed as the message and the real prompt is dropped (the
+        // reviewer then answers the literal flag string — the historical
+        // "agy returns empty stdout" symptom was this, not quota).
         "agy" => run_tool(
             "agy",
-            &["--print", "--dangerously-skip-permissions", prompt],
+            &["--dangerously-skip-permissions", "--print", prompt],
             REVIEWER_TIMEOUT_SECS,
         ),
         // jleechan-bkru: 4th reviewer vendor, added after a live 2026-07-09
@@ -3173,7 +3178,37 @@ fn skeptic_evidence(
                 if v2_present {
                     used_vendors.push(vendor2_label.clone());
                 }
-                v.expect("combine_dual_verdict returns Some(..) whenever it returns Ok(..)")
+                let mut verdict_so_far =
+                    v.expect("combine_dual_verdict returns Some(..) whenever it returns Ok(..)");
+                // Cross-model guarantee (issue #385 / strict merge policy
+                // #328): if everything parseable so far came from ONE model
+                // family (e.g. a codex quota outage leaves claude alone),
+                // `compute_review_degraded` will flag the assessment and the
+                // strict gate deterministically fails itself — the 2026-08-06
+                // fleet-wide circuit-breaker park loop. Pursue a SECOND
+                // family down the remaining priority list. The second
+                // reviewer's verdict is COMBINED (a dissenting second family
+                // can still fail the gate); it is never merely counted.
+                if verifier::compute_review_degraded(&used_vendors) {
+                    for vendor_n in second_family_candidates(&used_vendors, &priority) {
+                        let v_n = dispatch_reviewer(vendor_n, &prompt)
+                            .ok()
+                            .and_then(|r| verifier::parse_skeptic_verdict(&r));
+                        if let Some(second) = v_n {
+                            if let Ok(Some(combined)) = combine_dual_verdict(
+                                Some(verdict_so_far.clone()),
+                                Some(second),
+                                bead_id,
+                                pr,
+                            ) {
+                                verdict_so_far = combined;
+                                used_vendors.push(vendor_n.to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+                verdict_so_far
             }
             Err(total_outage_err) => {
                 // vendor1 AND vendor2 both failed to parse. Try each
@@ -3557,6 +3592,89 @@ fn resolve_pr_base_ref(deps: &TickDeps, pr: u64, repo: &str) -> Result<String, S
 /// `run_fast_tier`'s per-bead catch-and-continue fires (phase =
 /// `skeptic_evidence`), the bead stays ATTESTED, and the next tick
 /// retries the reviewer call.
+///
+/// Cross-model guarantee (issue #385): given the vendors that already
+/// contributed a parseable verdict and the coder-excluded priority list,
+/// return the untried fallback vendors (priority index 2+) whose model
+/// family differs from EVERY family already represented — i.e. the
+/// candidates whose verdict could satisfy `compute_review_degraded ==
+/// false`. Pure so the second-family pursuit is unit-testable without
+/// spawning reviewer subprocesses. Unknown/empty-family vendor labels are
+/// excluded (they cannot lift the degraded flag; see
+/// `verifier::vendor_model_family`).
+pub fn second_family_candidates<'a>(
+    used: &[String],
+    priority: &[&'a str],
+) -> Vec<&'a str> {
+    let have: std::collections::BTreeSet<&str> = used
+        .iter()
+        .map(|u| verifier::vendor_model_family(u))
+        .filter(|f| !f.is_empty())
+        .collect();
+    priority
+        .iter()
+        .skip(2)
+        .copied()
+        .filter(|v| {
+            let fam = verifier::vendor_model_family(v);
+            !fam.is_empty()
+                && !have.contains(fam)
+                && !used.iter().any(|u| u.as_str() == *v)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod second_family_candidate_tests {
+    //! PR #596 cold-review Major 1: the Ok-arm second-family pursuit is the
+    //! fix's primary behavioral change — pin its candidate-selection
+    //! semantics (family diversity, no re-dispatch of used vendors, skip(2)
+    //! primaries, unknown families excluded) without spawning subprocesses.
+    use super::second_family_candidates;
+
+    const PRIORITY: [&str; 5] = ["codex", "claude", "agy", "gemini", "cursor-agent"];
+
+    #[test]
+    fn claude_only_yields_all_non_anthropic_fallbacks_in_priority_order() {
+        let used = vec!["claude".to_string()];
+        assert_eq!(
+            second_family_candidates(&used, &PRIORITY),
+            vec!["agy", "gemini", "cursor-agent"]
+        );
+    }
+
+    #[test]
+    fn already_used_fallback_vendor_and_its_family_are_not_recandidated() {
+        let used = vec!["claude".to_string(), "agy".to_string()];
+        // agy already contributed (family google-antigravity); gemini is a
+        // DIFFERENT Google family (google-gemini) so it stays a candidate.
+        assert_eq!(
+            second_family_candidates(&used, &PRIORITY),
+            vec!["gemini", "cursor-agent"]
+        );
+    }
+
+    #[test]
+    fn two_families_present_still_lists_only_new_families() {
+        let used = vec!["claude".to_string(), "codex".to_string()];
+        // Caller only invokes this when degraded, but the helper itself
+        // must never re-offer a represented family.
+        assert_eq!(
+            second_family_candidates(&used, &PRIORITY),
+            vec!["agy", "gemini", "cursor-agent"]
+        );
+    }
+
+    #[test]
+    fn unknown_family_vendors_are_excluded_and_short_priority_is_empty() {
+        let used = vec!["claude".to_string()];
+        let priority = ["codex", "claude", "mock_llm", "not-a-vendor"];
+        assert!(second_family_candidates(&used, &priority).is_empty());
+        let short = ["codex", "claude"];
+        assert!(second_family_candidates(&used, &short).is_empty());
+    }
+}
+
 pub fn combine_dual_verdict(
     v1: Option<verifier::SkepticVerdict>,
     v2: Option<verifier::SkepticVerdict>,
