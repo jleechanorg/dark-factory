@@ -77,6 +77,37 @@ def make_node(name: str = "test", **attrs) -> _Node:
     return _Node(name=name, attrs=attrs)
 
 
+def hermetic_subprocess_env(**overrides) -> dict:
+    """Build a minimal, explicit env for a `sys.executable` subprocess.
+
+    Tests that shell out to `python -m runner...` deliberately pass a tiny
+    hand-built env instead of inheriting `os.environ`, so the subprocess can't
+    accidentally depend on the developer's shell. That hermeticity is correct
+    and is preserved here — this helper only adds the one variable the
+    interpreter needs in order to START.
+
+    `LD_LIBRARY_PATH` is not a secret, it is a linker search path. GitHub's
+    `setup-python` installs `libpython3.13.so.1.0` outside the default linker
+    search path, so a `sys.executable` spawned WITHOUT `LD_LIBRARY_PATH` dies
+    before running a single byte of our code:
+
+        python: error while loading shared libraries: libpython3.13.so.1.0
+
+    That failure is invisible locally (system python has libpython on the
+    default path) and only appears on the hosted runner — which is why these
+    tests passed on every dev box while `main` stayed red. Same rationale, same
+    variable, as `runner/skeptic_gate_cli.py`'s `REVIEWER_ENV_BASE_ALLOWLIST`
+    (see its LD_LIBRARY_PATH comment).
+
+    Propagated only when actually set, so local hermetic runs are unchanged.
+    """
+    env = dict(overrides)
+    ld = os.environ.get("LD_LIBRARY_PATH")
+    if ld:
+        env["LD_LIBRARY_PATH"] = ld
+    return env
+
+
 @pytest.fixture(autouse=True, scope="session")
 def _declare_test_environment() -> None:
     """Set the env var every test in this directory expects."""
