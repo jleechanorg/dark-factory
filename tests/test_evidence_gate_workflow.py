@@ -830,6 +830,107 @@ def test_evidence_gate_workflow_uses_head_equals_strip() -> None:
         )
 
 
+# jleechan-2qn8 — Signal B PR-anchor regex accepts word-boundary adjacency,
+# not just quote adjacency. Original regex required a literal double-quote
+# immediately before the PR number, so gists that say "PR #571" or "#571"
+# in prose fail the gate even when the gist is real, current, and
+# substantive. See .github/workflows/evidence-gate.yml around line 316.
+
+
+def _simulate_pr_anchor_match(gist_body: str, pr_number: int) -> bool:
+    """Mirror the Signal B PR-anchor regex after the jleechan-2qn8 fix.
+
+    The regex must accept any non-digit byte immediately before `#<N>`,
+    not require a literal double-quote. The fallback to `$repo_short`
+    already existed for the `jleechanorg/dark-factory` short form.
+    """
+    import re
+    pattern = rf'(^|[^0-9])#{pr_number}\b'
+    return bool(re.search(pattern, gist_body))
+
+
+@pytest.mark.parametrize(
+    "gist_body,pr_number,expected",
+    [
+        # The bug: a gist that says "PR #571" in prose does NOT match
+        # the old quote-adjacent regex but MUST match the word-boundary
+        # fix (jleechan-2qn8 acceptance).
+        ("This PR #571 was merged cleanly on 2026-08-06.", 571, True),
+        # Bash-style quote form ("#571") — still matches under both regexes.
+        ('See "#571" for the canonical reference.', 571, True),
+        # Escaped-quote form (the third alternative): `"\"#571\""`.
+        (r'See \"#571\" for the canonical reference.', 571, True),
+        # Word-boundary adjacency: the number is preceded by space.
+        ("Issue: #571 — see trace.", 571, True),
+        # Mid-token adjacency must NOT match: "1234571" contains #571 as
+        # a continuation, not a PR anchor.
+        ("ticket 1234571 was the same", 571, False),
+        # Same number, but a different PR — must not cross-match.
+        ("PR #999 was merged earlier.", 571, False),
+    ],
+)
+def test_signal_b_pr_anchor_regex_is_word_boundary_adjacent(
+    gist_body: str, pr_number: int, expected: bool,
+) -> None:
+    """jleechan-2qn8: Signal B PR-anchor regex must accept the natural
+    `PR #N` prose form, not just JSON quote-adjacent `"#N"`."""
+    actual = _simulate_pr_anchor_match(gist_body, pr_number)
+    assert actual is expected, (
+        f"gist body {gist_body!r} pr_number={pr_number}: expected "
+        f"{expected}, got {actual}. The Signal B regex was "
+        f"quote-adjacent-only (`\"#N`) which is unreachable for ordinary "
+        f"gists. (jleechan-2qn8)"
+    )
+
+
+def test_evidence_gate_workflow_uses_word_boundary_pr_anchor() -> None:
+    """Regression: the workflow YAML MUST use a word-boundary PR anchor
+    regex, not the quote-adjacent `"#N` form (jleechan-2qn8).
+
+    The OLD line was:
+        grep -qE '"#${PR_NUMBER}\\b|"#${PR_NUMBER}"|\\\\"#${PR_NUMBER}\\\\"'
+    which required a literal double-quote immediately before the hash,
+    so a natural gist that says `PR #571` is unreachable. The NEW line
+    MUST accept any non-digit byte (or beginning of input) before the
+    hash, so `PR #571` and `#571 — see trace` are anchor-matched and
+    `1234571` is not.
+    """
+    text = _verdict_step_text(_load_workflow())
+    # The old form requires a literal `"` immediately before
+    # `#${PR_NUMBER}`. We DO NOT accept it; the regression PASSES only
+    # when the new word-boundary form is present.
+    old_quote_adjacent = bool(
+        re.search(
+            r'"#\$\{PR_NUMBER\}\b',
+            text,
+        )
+    )
+    assert not old_quote_adjacent, (
+        "evidence-gate.yml Signal B PR-anchor regex still uses the "
+        "quote-adjacent `\"#${PR_NUMBER}\\b` form (the third "
+        "backslash-escaped alternative is the same pattern). A natural "
+        "gist like `PR #571` does not satisfy this anchor and the gate "
+        "reports `missing_pr_anchor` even when the gist is real and "
+        "substantive. Replace with `(^|[^0-9])#${PR_NUMBER}\\b` (or any "
+        "non-digit-byte-boundary alternative). (jleechan-2qn8)"
+    )
+    # Sanity: the new word-boundary form MUST exist somewhere — accept
+    # any non-digit boundary (`(^|[^0-9])`, `[^0-9]`, or simply a
+    # `\\b` after `#${PR_NUMBER}` placed after a non-quote character).
+    has_word_boundary = (
+        "(^|[^0-9])" in text
+        or r"(^|[^0-9])" in text
+        or re.search(r"\b[^A-Za-z0-9]?#\$\{PR_NUMBER\}|#\$\{PR_NUMBER\}\b", text)
+        is not None
+    )
+    assert has_word_boundary, (
+        "evidence-gate.yml Signal B PR-anchor regex should use a "
+        "non-digit-byte boundary. After removing the `\"#${PR_NUMBER}\\b` "
+        "alternative, the regex must include `(^|[^0-9])` (or a similar "
+        "non-quote boundary) before `#${PR_NUMBER}`. (jleechan-2qn8)"
+    )
+
+
 @pytest.mark.parametrize(
     "files,pr,repo,declared,current,expected",
     [

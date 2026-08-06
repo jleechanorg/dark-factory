@@ -311,9 +311,20 @@ jobs:
 
                 # (b.2) PR anchor — the gist must mention the PR number
                 # OR the repo short name (the segment after the slash).
+                #
+                # jleechan-2qn8: the previous regex `\\"#${PR_NUMBER}\\b`
+                # required a literal double-quote immediately before the
+                # hash and was unreachable for ordinary gist prose like
+                # `PR #571` or `#571 — see trace`. The current regex uses
+                # a non-digit-byte boundary (`(^|[^0-9])`) so the hash
+                # is recognised at the start of input or after any
+                # non-digit byte, while a digit-continued `1234571` does
+                # NOT match (token-continuation is rejected).
+                # The fallback to `$repo_short` covers gists that name
+                # the repo but not the PR number.
                 repo_short="${REPO##*/}"
                 pr_anchor_found="no"
-                if echo "$gist_body" | grep -qE "\"#${PR_NUMBER}\b|\"#${PR_NUMBER}\"|\\\\\"#${PR_NUMBER}\\\\\"";
+                if echo "$gist_body" | grep -qE "(^|[^0-9])#${PR_NUMBER}\b";
                   then
                   pr_anchor_found="yes"
                 fi
