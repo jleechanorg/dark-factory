@@ -53,6 +53,10 @@ ROOT = pathlib.Path(__file__).parent.parent
 SCRATCH = pathlib.Path(tempfile.mkdtemp(prefix="structured_state_convention_"))
 sys.path.insert(0, str(ROOT))
 
+# Scratch workdir in the OS tempdir — using the repo root here leaks one
+# branch_* mkdtemp per fan-out test into the working tree.
+SCRATCH = pathlib.Path(tempfile.mkdtemp(prefix="test_structured_state_convention_"))
+
 import runner.handlers as handlers_mod  # noqa: E402
 from runner.engine import run  # noqa: E402
 from runner.handler_core import _serialize_state_value  # noqa: E402

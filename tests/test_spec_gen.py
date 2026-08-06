@@ -20,6 +20,10 @@ ROOT = pathlib.Path(__file__).parent.parent
 SCRATCH = pathlib.Path(tempfile.mkdtemp(prefix="spec_gen_"))
 sys.path.insert(0, str(ROOT))
 
+# Scratch workdir in the OS tempdir — using the repo root here leaks one
+# branch_* mkdtemp per fan-out test into the working tree.
+SCRATCH = pathlib.Path(tempfile.mkdtemp(prefix="test_spec_gen_"))
+
 import runner.handlers as handlers_mod
 from runner.engine import run
 from runner.handlers import Context, TYPE_REGISTRY
