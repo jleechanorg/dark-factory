@@ -29,6 +29,8 @@ import subprocess
 import sys
 import textwrap
 
+from conftest import hermetic_subprocess_env  # noqa: E402
+
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -404,12 +406,12 @@ def test_cli_subprocess_emits_exact_message(tmp_path):
         capture_output=True,
         text=True,
         timeout=30,
-        env={
-            "PATH": "/usr/bin:/bin",
-            "HOME": str(ROOT),
-            "PYTHONPATH": str(ROOT),
-            "DARK_FACTORY_HOME": str(ROOT),
-        },
+        env=hermetic_subprocess_env(
+            PATH="/usr/bin:/bin",
+            HOME=str(ROOT),
+            PYTHONPATH=str(ROOT),
+            DARK_FACTORY_HOME=str(ROOT),
+        ),
     )
     assert proc.returncode == 2, proc.stdout + proc.stderr
     payload = json.loads(proc.stdout)
