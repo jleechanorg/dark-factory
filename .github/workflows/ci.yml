@@ -47,55 +47,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest
 
-      - name: Provide sqlite3 CLI (sudo-free)
-        # `daemon/factory-overlay.sh:77` is `sql() { sqlite3 ... }` — the overlay
-        # is the canonical executable spec for the factory state machine and
-        # every subcommand shells out to the sqlite3 BINARY. Without it,
-        # tests/scripts/*.sh fail with "line 77: sqlite3: command not found"
-        # and read empty state (expected 'DISPATCHED', got '').
-        #
-        # The Linux self-hosted runners are containers started with the
-        # "no new privileges" flag, so apt-get/sudo is not available:
-        #   sudo: The "no new privileges" flag is set, which prevents sudo from
-        #   running as root.                     (observed on ez-runner-c-7)
-        # The Mac runners ship sqlite3, which is why the same commit can pass on
-        # one runner and fail on another (bead jleechan-xn4n).
-        #
-        # `apt-get download` + `dpkg -x` needs NO root: it fetches the distro's
-        # own .deb and extracts it into $HOME. We install the REAL binary rather
-        # than emulating the CLI — a python-stdlib shim was tried first and
-        # failed the real overlay suite, because the overlay depends on sqlite3
-        # CLI behaviour a shim does not reproduce.
-        run: |
-          set -uo pipefail
-          if command -v sqlite3 >/dev/null 2>&1; then
-            echo "sqlite3 already present: $(sqlite3 --version)"
-            exit 0
-          fi
-          echo "sqlite3 absent; installing without root via apt-get download + dpkg -x"
-          workdir="$(mktemp -d)"; prefix="$HOME/.local"
-          mkdir -p "$prefix/bin"
-          ( cd "$workdir" && apt-get download sqlite3 >/dev/null 2>&1 ) || {
-            echo "::error::apt-get download sqlite3 failed — no package lists or no network."
-            echo "::error::Bake sqlite3 into the Linux runner image (bead jleechan-xn4n)."
-            exit 1
-          }
-          deb="$(find "$workdir" -maxdepth 1 -name 'sqlite3_*.deb' | head -1)"
-          [ -n "$deb" ] || { echo "::error::no sqlite3 .deb downloaded"; exit 1; }
-          dpkg -x "$deb" "$workdir/root"
-          bin="$(find "$workdir/root" -type f -name sqlite3 -perm -u+x | head -1)"
-          [ -n "$bin" ] || { echo "::error::sqlite3 binary not found inside $deb"; exit 1; }
-          cp "$bin" "$prefix/bin/sqlite3"
-          echo "$prefix/bin" >> "$GITHUB_PATH"
-          export PATH="$prefix/bin:$PATH"
-          # Fail loudly here rather than letting the overlay report empty state.
-          sqlite3 --version || { echo "::error::extracted sqlite3 is not runnable"; exit 1; }
-          t="$(mktemp -d)"
-          sqlite3 "$t/probe.db" "CREATE TABLE t(a TEXT);" "INSERT INTO t VALUES('ok');"
-          [ "$(sqlite3 "$t/probe.db" 'SELECT a FROM t;')" = "ok" ] \
-            || { echo "::error::sqlite3 self-test failed"; exit 1; }
-          echo "sqlite3 installed and self-tested"
-
       - name: Fix Python 3.13 shared-library path (self-hosted runners)
         # actions/setup-python installs Python 3.13 under a toolcache path
         # (`/home/runner/_work/_tool/Python/<ver>/<arch>/`) and ships
