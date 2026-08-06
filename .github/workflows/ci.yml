@@ -47,6 +47,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest
 
+      - name: Install sqlite3 CLI
+        # `daemon/factory-overlay.sh:77` defines `sql() { sqlite3 ... }` — the
+        # overlay is the canonical executable spec for the factory state
+        # machine, and every one of its subcommands shells out to the sqlite3
+        # BINARY (python's bundled sqlite3 module does not provide it). Neither
+        # hosted nor self-hosted runners ship it, so `tests/scripts/*.sh` fail
+        # with "factory-overlay.sh: line 77: sqlite3: command not found" and
+        # report empty state (expected 'DISPATCHED', got ''). Idempotent and a
+        # no-op when the binary is already present.
+        run: |
+          if ! command -v sqlite3 >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq sqlite3
+          fi
+          sqlite3 --version
+
       - name: Fix Python 3.13 shared-library path (self-hosted runners)
         # actions/setup-python installs Python 3.13 under a toolcache path
         # (`/home/runner/_work/_tool/Python/<ver>/<arch>/`) and ships
