@@ -3828,7 +3828,16 @@ fn manual_bead_adoption_never_calls_create_bead_or_fabricates_external_ref() {
     tracker.candidates.borrow_mut().push(daemon::tools::Bead {
         id: "manual-bead-999".into(),
         title: "Orphan-shaped manual bead".into(),
-        description: "created directly via `br create`, no --external-ref".into(),
+        // jleechan-htf7 r3: the body MUST include a `target_repo:` field so
+        // the manual adoption path actually proceeds to Queued. The
+        // unresolvable-repo shape (no external_ref, no target_repo) now
+        // fail-closes at adoption — that's the new r3 contract, pinned by
+        // `manual_bead_adoption_fails_closed_when_target_repo_unresolvable`
+        // below. PR #201's invariant (don't call create_bead, don't
+        // fabricate external_ref) still needs a Queued manual bead to
+        // exercise; this body field supplies the resolvable target_repo
+        // without touching the orphan-defect shape the test is locking in.
+        description: "target_repo: owner/repo\n\ncreated directly via `br create`, no --external-ref".into(),
         notes: String::new(),
         file_tree_summary: "".into(),
         external_ref: None, // exactly the jleechan-3wh0 orphan shape
@@ -3887,6 +3896,315 @@ fn manual_bead_adoption_never_calls_create_bead_or_fabricates_external_ref() {
     assert_eq!(
         candidate.external_ref, None,
         "manual bead's external_ref must not be silently fabricated by tick processing"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-htf7 r3: the manual bead-adoption path in `run_tick` (the
+/// `INTAKE_BEAD_CREATED`/`{"manual": true}` branch at tick.rs:1815-1864) is
+/// the only entry through which a bead can enter the daemon's overlay
+/// system WITHOUT a non-empty `external_ref`. PR #201 (jleechan-3wh0) added
+/// a regression test that locks in `create_bead` is not called and
+/// `external_ref` is not fabricated, but it did NOT lock in the structural
+/// invariant that prevents the manual path from creating an INTERMEDIATE
+/// `Queued` overlay row for a bead the daemon can never dispatch (no
+/// resolvable `target_repo`).
+///
+/// Pre-r3 the path silently adopted the bead with `state: Queued`, called
+/// `router::route` (an LLM call), pushed the bead through `dispatch`, and
+/// only THEN learned `overlay.target_repo = None` and parked it
+/// `unmapped_repo` at `tick.rs:2133-2145`. That reactive park still leaves
+/// the bead in the routing/dispatch pipeline for every tick, wasting an
+/// LLM call and creating churn telemetry. The fix is fail-closed at
+/// adoption: when a manual bead has neither an `external_ref` owner/repo
+/// prefix nor a `target_repo:` body field, park it `HUMAN_HELD` with reason
+/// `unmapped_repo` immediately and skip routing entirely.
+///
+/// This test pins the new structural invariant:
+/// - Overlay state MUST be `HUMAN_HELD` (not `Queued`) at adoption time.
+/// - `park_reason` MUST be `unmapped_repo` (or the local-fallback variant).
+/// - `summary.beads_parked_human_held` MUST increment; `beads_dispatched`
+///   MUST stay 0.
+/// - The LLM MUST NOT be called for routing (no `judge(...)` invocation).
+/// - Telemetry MUST emit `PARKED_HUMAN_HELD` for the manual adoption branch
+///   (NOT route through dispatch and emit the same event later).
+/// - `Tracker::create_bead` MUST still NOT be called (PR #201 invariant
+///   preserved).
+#[test]
+fn manual_bead_adoption_fails_closed_when_target_repo_unresolvable() {
+    let scm = FakeScm::new(); // no SCM — this bead came from `br create`, not GitHub
+    let tracker = FakeTracker::new();
+    tracker.candidates.borrow_mut().push(Bead {
+        id: "no-repo-manual-bead".into(),
+        title: "Manual bead with no repo signal".into(),
+        // No body `target_repo:` field, no external_ref — exactly the shape
+        // that triggers the future-orphan defect on every tick.
+        description: "manually created via `br create` with no --external-ref".into(),
+        notes: String::new(),
+        file_tree_summary: "".into(),
+        external_ref: None,
+    });
+
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    // No `llm.response` pre-seeded — if the daemon calls `judge`, it gets
+    // an empty string and the test's "no LLM calls" assertion will catch it.
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    let telemetry_log = std::env::temp_dir().join("afd_manual_bead_fail_closed_test.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        0,
+        0,
+    )
+    .expect("tick should succeed even when manual adoption fail-closes");
+
+    // (1) Overlay must be HUMAN_HELD, not Queued — fail-closed adoption
+    // parks before routing, so dispatch never enters the loop.
+    let overlay = store
+        .load("no-repo-manual-bead")
+        .expect("overlay load must not error")
+        .expect("manual adoption must persist the overlay row");
+    assert_eq!(
+        overlay.state,
+        OverlayState::HumanHeld,
+        "manual bead without external_ref / target_repo MUST be parked HUMAN_HELD \
+         at adoption time, not left Queued for the dispatch layer to fail on. \
+         A Queued overlay here means the r3 fix regressed: the daemon is \
+         letting a future-orphan shape enter routing."
+    );
+    let park_reason = overlay
+        .park_reason
+        .as_deref()
+        .expect("HUMAN_HELD overlay must carry a park_reason");
+    assert!(
+        park_reason == "unmapped_repo"
+            || park_reason.starts_with("escalation_local_fallback:unmapped_repo"),
+        "park_reason must be unmapped_repo-derived, got: {park_reason:?}"
+    );
+    assert_eq!(
+        overlay.target_repo, None,
+        "fail-closed adoption must preserve the unresolvable target_repo so the \
+         reason in park_reason matches the persisted column (consistency check \
+         against silent mutation)"
+    );
+
+    // (2) Summary counters: HUMAN_HELD park, not a transient dispatch error,
+    // and ZERO dispatches (the LLM should never have been called).
+    assert_eq!(
+        summary.beads_parked_human_held, 1,
+        "manual fail-closed adoption must increment beads_parked_human_held (got: {})",
+        summary.beads_parked_human_held
+    );
+    assert_eq!(
+        summary.beads_dispatched, 0,
+        "a no-repo manual bead must NOT dispatch"
+    );
+    assert_eq!(
+        summary.beads_routed, 0,
+        "a no-repo manual bead must NOT enter the routing pipeline (LLM call \
+         skipped — fail-closed adoption is what saves the LLM cost). Got \
+         beads_routed={}",
+        summary.beads_routed
+    );
+
+    // (3) LLM must NOT be called for routing — fail-closed adoption is what
+    // saves the wasted judge() invocation. An empty `llm.calls` is the
+    // strongest assertion here; if any future refactor reintroduces routing
+    // for unresolvable-repo manual beads, this assertion fires immediately.
+    let llm_calls = llm.calls.borrow();
+    assert!(
+        llm_calls.is_empty(),
+        "manual fail-closed adoption must skip router::route() entirely — \
+         any LLM call here means the r3 fail-closed gate regressed. \
+         LLM calls observed: {llm_calls:?}"
+    );
+
+    // (4) create_bead must NOT be called — PR #201 invariant preserved.
+    let tracker_calls = tracker.calls.borrow();
+    assert!(
+        tracker_calls.iter().all(|c| !c.starts_with("create_bead(")),
+        "manual-bead adoption must NEVER call create_bead (PR #201 invariant). \
+         A create_bead(...) call here means the r3 path started minting new \
+         beads/refs, which is the orphan-defect shape: {tracker_calls:?}"
+    );
+
+    // (5) Telemetry must emit PARKED_HUMAN_HELD for the fail-closed adoption,
+    // and the bead's tracker record must remain untouched (no fabricated
+    // external_ref). Read the JSONL line-by-line for stable assertions.
+    let body = std::fs::read_to_string(&telemetry_log).unwrap();
+    let events: Vec<serde_json::Value> = body
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let parked = events
+        .iter()
+        .find(|e| e["eventType"] == "PARKED_HUMAN_HELD" && e["beadId"] == "no-repo-manual-bead");
+    assert!(
+        parked.is_some(),
+        "telemetry MUST emit PARKED_HUMAN_HELD for fail-closed manual adoption; \
+         events = {events:?}"
+    );
+    let parked_event = parked.expect("checked above");
+    assert_eq!(
+        parked_event["context"]["reason"], "unmapped_repo",
+        "PARKED_HUMAN_HELD event for manual fail-closed adoption must name the \
+         unmapped_repo reason in its context payload so downstream tooling \
+         (Healer, dashboards) attributes it correctly; got context = {:?}",
+        parked_event["context"]
+    );
+    assert_eq!(
+        parked_event["context"]["source"], "manual_adoption_fail_closed",
+        "PARKED_HUMAN_HELD context must tag the adoption-time source so Healer \
+         can distinguish r3 fail-closed parks from dispatch-layer unmapped_repo \
+         parks (bead jleechan-8jxr). Got context = {:?}",
+        parked_event["context"]
+    );
+
+    // PR #201 invariant: the tracker's candidate record for the manual bead
+    // stays at external_ref = None — no fake linkage was minted to satisfy
+    // the daemon. The comment posted via post_scm_comment_by_bead_id is
+    // tested separately (success / transient / permanent / missing-target)
+    // by the r3 escalation-outcome tests below.
+    let candidate = tracker
+        .candidates
+        .borrow()
+        .iter()
+        .find(|b| b.id == "no-repo-manual-bead")
+        .cloned()
+        .expect("candidate should still be present");
+    assert_eq!(
+        candidate.external_ref, None,
+        "PR #201 invariant: a manual bead with no external_ref must remain \
+         with external_ref = None after the fail-closed adoption gate \
+         (no fake linkage minted to satisfy the daemon)"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-htf7 r3 incremental: the dispatch-flow canonical idiom for the
+/// `unmapped_target_repo` reason (`tick.rs:2290-2353`) handles FOUR outcomes
+/// of `post_scm_comment_by_bead_id`:
+///   (a) missing-target  -> `record_local_escalation_fallback` +
+///                          `ESCALATED_LOCALLY` event
+///   (b) non-transient   -> `mark_escalation_undeliverable_and_emit` +
+///                          `ESCALATION_UNDELIVERABLE` event (terminal)
+///   (c) transient       -> `ESCALATION_NOTIFICATION_FAILED` event (deduped)
+///   (d) success         -> `record_escalation` + `summary.beads_escalated
+///                          += 1` + `ESCALATION_REQUIRED` event (deduped)
+///
+/// PR #579 (r2) implemented only (a) and (b) for the new fail-closed manual
+/// adoption gate. PR #579 CodeRabbit review flagged this gap and r3 closes
+/// it by adding (c) and (d) to the manual adoption site — completing the
+/// outcome-handling to mirror the canonical dispatch-flow idiom.
+///
+/// The fail-closed manual adoption gate's "target_repo = None" pre-condition
+/// means the bead has no `external_ref` AND no `target_repo:` body field.
+/// Today, that combination deterministically takes the missing-target
+/// branch (a) — `post_scm_comment_by_bead_id` cannot resolve a comment
+/// target without an `external_ref`. Branches (c) and (d) are therefore
+/// unreachable through this path today, but the r3 structural parity is
+/// the durable invariant that future maintainers can rely on.
+///
+/// This test exercises the missing-target path explicitly and asserts the
+/// structural escalation record is complete: the sentinel is written,
+/// `beads_escalated_locally` bumps, and the `ESCALATED_LOCALLY` event
+/// fires. (Branches (c) and (d) are pinned by the dispatch-flow tests
+/// already in the suite — `capped_human_held_comment_failure_retries_*`,
+/// `permanent_gh_error_marks_escalation_undeliverable_and_never_retries` —
+/// so the r3 fix inherits that coverage without duplicating it.)
+#[test]
+fn manual_bead_adoption_fail_closed_local_fallback_path_persists_escalation() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    tracker.candidates.borrow_mut().push(Bead {
+        id: "no-repo-local-fallback-bead".into(),
+        title: "Manual bead, local-fallback escalation path".into(),
+        description: "manually created via `br create` with no --external-ref".into(),
+        notes: String::new(),
+        file_tree_summary: "".into(),
+        external_ref: None,
+    });
+
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join(
+        "afd_manual_bead_fail_closed_local_fallback_test.jsonl",
+    );
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        0,
+        0,
+    )
+    .expect("tick should succeed even when manual adoption fail-closes");
+
+    // (a) missing-target: park HUMAN_HELD + record_local_escalation_fallback.
+    assert_eq!(
+        summary.beads_parked_human_held, 1,
+        "manual fail-closed adoption must increment beads_parked_human_held (got: {})",
+        summary.beads_parked_human_held
+    );
+    assert!(
+        summary.beads_escalated_locally >= 1,
+        "missing-target path MUST record a local escalation fallback so the \
+         operator still sees the escalation event (r3 invariant: never lose \
+         the escalation record). Got beads_escalated_locally={}",
+        summary.beads_escalated_locally
+    );
+
+    // Sentinel recorded so subsequent ticks skip re-attempt.
+    let rejection = store
+        .load_rejection("no-repo-local-fallback-bead", u32::MAX)
+        .unwrap();
+    assert!(
+        rejection.is_some(),
+        "escalation sentinel MUST be recorded on the missing-target path so \
+         escalation_already_recorded blocks re-attempt on later ticks (r3 \
+         invariant; matches the unmapped_target_repo dispatch-flow idiom). \
+         Got: {rejection:?}"
+    );
+
+    // (a) ESCALATED_LOCALLY event is emitted (NOT silently dropped).
+    let body = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        body.contains("ESCALATED_LOCALLY"),
+        "telemetry MUST emit ESCALATED_LOCALLY for the missing-target \
+         local-fallback path so dashboards see the escalation; got: {body}"
+    );
+    assert!(
+        body.contains("\"reason\":\"unmapped_repo\""),
+        "ESCALATED_LOCALLY context must carry reason=unmapped_repo; got: {body}"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
@@ -13240,4 +13558,436 @@ fn vendor_health_ledger_ci_pending_with_capped_vendor_skips_wait() {
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
+}
+
+// ===========================================================================
+// jleechan-6l1f: green-then-regressed beads dead-end.
+//
+// Live incident (PR #540 proof): a bead reached all_green=true at
+// 2026-08-04T13:18:43Z and was promoted ATTESTED->READY. ~24h later CI went
+// red on the same PR head, but the bead sat READY-and-apparently-done while
+// auto-merge-guard.sh correctly refused the merge (no green snapshot). The
+// daemon never re-detected the green->red transition, so no reroll was
+// triggered — the dead-end.
+//
+// Each test below exercises one slice of the fix:
+//   1. test_gate_regression_emits_event_and_demotes_to_attested_when_ci_goes_red
+//      A READY bead (last_all_green=true) whose CI goes red on a subsequent
+//      tick must emit GATE_REGRESSED and demote Ready -> Attested so the
+//      existing red-branch (reroll / HUMAN_HELD in stage 1) picks it up.
+//   2. test_gate_regression_does_not_fire_when_first_assessment_is_red
+//      A bead that has NEVER been green (e.g. CI went red before the daemon
+//      ever saw it green) must NOT emit GATE_REGRESSED — only the transition
+//      green->red is a regression; red->stays-red is the existing path.
+//   3. test_gate_regression_caps_at_max_and_parks_human_held
+//      After MAX_GATE_REGRESSIONS green->red transitions, a further
+//      green->red must emit GATE_REGRESSED_CAPPED and park HUMAN_HELD with
+//      park_reason=gate_regression_capped (a new distinct reason, so the
+//      circuit-breaker-style retry suppression in recover_human_held does not
+//      requeue it identically).
+//   4. test_gate_regression_counter_increments_on_each_green_to_red
+//      Across N ticks that each flip green->red, the counter advances so
+//      the cap test above actually sees a > cap value.
+// ===========================================================================
+
+#[test]
+fn test_gate_regression_emits_event_and_demotes_to_attested_when_ci_goes_red() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    // Bead started READY (last_all_green=true): we hand-set the store
+    // mirror of the new column via set_last_all_green. The bead is staged
+    // as if it had been promoted on an earlier tick.
+    let pr = 7701_u64;
+    let branch = "factory/reg-bead-r1";
+    store
+        .save(&BeadOverlay {
+            bead_id: "reg-bead".into(),
+            state: OverlayState::Ready,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(pr),
+            branch: Some(branch.into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        })
+        .unwrap();
+    store.register_branch("reg-bead", branch).unwrap();
+    store.set_last_all_green("reg-bead", true).unwrap();
+
+    // PR snapshot now RED (CI failure on head).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    scm.pr_snapshots.insert(
+        pr,
+        PrSnapshot {
+            pr_number: pr,
+            ci_success: false,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: format!("sha-{pr}"),
+            body: String::new(),
+            comments: Vec::new(),
+            files: Vec::new(),
+            updated_at_epoch: now,
+            ci_status: "red".into(),
+            coderabbit_status: "approved".into(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: now.saturating_sub(60),
+        },
+    );
+    scm.pr_numbers_for_branch.insert(
+        ("owner/repo".into(), branch.into()),
+        Some(pr),
+    );
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), pr),
+        PrHeadBranch::SameRepo(branch.into()),
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_gate_regression_emits.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        1,
+        0,
+    )
+    .expect("regression tick must not error");
+
+    // The gate assessment MUST run (proves the READY bead is now reachable
+    // by the fast tier — pre-fix it would be skipped entirely).
+    assert_eq!(
+        summary.gates_assessed, 1,
+        "READY bead must be re-assessed on the regression tick; got {summary:?}"
+    );
+
+    // The bead MUST be demoted off READY so the red-branch picks it up.
+    let after = store.load("reg-bead").unwrap().unwrap();
+    assert_ne!(
+        after.state,
+        OverlayState::Ready,
+        "READY bead with a regressed gate MUST be demoted off READY (was {after:?})"
+    );
+    // In stage-1 test config (no re-roll execution), a coder-fixable red
+    // routes to HUMAN_HELD — both Attested (reroll-not-yet-executed) and
+    // HumanHeld are valid non-Ready terminal outcomes; the contract is
+    // specifically that the bead no longer claims to be done.
+    assert!(
+        after.state == OverlayState::Attested
+            || after.state == OverlayState::HumanHeld,
+        "regressed bead must land in Attested or HumanHeld, was {:?}",
+        after.state
+    );
+
+    // last_all_green MUST be cleared (otherwise the next tick would re-fire
+    // GATE_REGRESSED on what is now a sustained-red state).
+    assert_eq!(
+        store.last_all_green("reg-bead").unwrap(),
+        Some(false),
+        "last_all_green MUST be cleared on a green->red regression"
+    );
+
+    // The dedicated telemetry event MUST be emitted so dashboards / ops
+    // can distinguish "stuck red from intake" from "previously green,
+    // regressed" (different fix paths).
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("GATE_REGRESSED"),
+        "GATE_REGRESSED telemetry event MUST be emitted on green->red transition; log:\n{log}"
+    );
+    assert!(
+        log.contains("\"all_green\":false"),
+        "the regression tick's GATE_ASSESSMENT must report all_green=false; log:\n{log}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn test_gate_regression_does_not_fire_when_first_assessment_is_red() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    // ATTESTED bead, NEVER green (last_all_green=false / unset).
+    let pr = 7702_u64;
+    let branch = "factory/never-green-r1";
+    store
+        .save(&BeadOverlay {
+            bead_id: "never-green".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(pr),
+            branch: Some(branch.into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        })
+        .unwrap();
+    store.register_branch("never-green", branch).unwrap();
+    store.set_last_all_green("never-green", false).unwrap();
+
+    // PR snapshot RED from the start.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    scm.pr_snapshots.insert(
+        pr,
+        PrSnapshot {
+            pr_number: pr,
+            ci_success: false,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: format!("sha-{pr}"),
+            body: String::new(),
+            comments: Vec::new(),
+            files: Vec::new(),
+            updated_at_epoch: now,
+            ci_status: "red".into(),
+            coderabbit_status: "approved".into(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: now.saturating_sub(60),
+        },
+    );
+    scm.pr_numbers_for_branch.insert(
+        ("owner/repo".into(), branch.into()),
+        Some(pr),
+    );
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), pr),
+        PrHeadBranch::SameRepo(branch.into()),
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_gate_regression_not_first_red.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        1,
+        0,
+    )
+    .expect("first-red tick must not error");
+
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        !log.contains("GATE_REGRESSED"),
+        "GATE_REGRESSED must NOT fire for a bead that has never been green; \
+         this is the existing red-only path (REROLL_VERDICT_RECORDED); log:\n{log}"
+    );
+    assert!(
+        log.contains("GATE_ASSESSMENT"),
+        "GATE_ASSESSMENT must still fire; log:\n{log}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn test_gate_regression_caps_at_max_and_parks_human_held() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    // ATTESTED bead whose last_all_green=true and gate_regression_count is
+    // already at MAX_GATE_REGRESSIONS — the next green->red MUST cap, not
+    // loop forever.
+    let pr = 7703_u64;
+    let branch = "factory/regression-cap-r1";
+    store
+        .save(&BeadOverlay {
+            bead_id: "regression-cap".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(pr),
+            branch: Some(branch.into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        })
+        .unwrap();
+    store.register_branch("regression-cap", branch).unwrap();
+    store.set_last_all_green("regression-cap", true).unwrap();
+    // Pre-set the counter to MAX_GATE_REGRESSIONS so the very next tick
+    // hits the cap path.
+    for _ in 0..daemon::tick::MAX_GATE_REGRESSIONS {
+        store.incr_gate_regression_count("regression-cap").unwrap();
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    scm.pr_snapshots.insert(
+        pr,
+        PrSnapshot {
+            pr_number: pr,
+            ci_success: false,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: format!("sha-{pr}"),
+            body: String::new(),
+            comments: Vec::new(),
+            files: Vec::new(),
+            updated_at_epoch: now,
+            ci_status: "red".into(),
+            coderabbit_status: "approved".into(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: now.saturating_sub(60),
+        },
+    );
+    scm.pr_numbers_for_branch.insert(
+        ("owner/repo".into(), branch.into()),
+        Some(pr),
+    );
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), pr),
+        PrHeadBranch::SameRepo(branch.into()),
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_gate_regression_capped.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        1,
+        0,
+    )
+    .expect("capped-regression tick must not error");
+
+    let after = store.load("regression-cap").unwrap().unwrap();
+    assert_eq!(
+        after.state,
+        OverlayState::HumanHeld,
+        "capped regression MUST park HUMAN_HELD; was {:?}",
+        after.state
+    );
+    assert_eq!(
+        after.park_reason.as_deref(),
+        Some("gate_regression_capped"),
+        "park_reason MUST be the distinct gate_regression_capped reason (so \
+         recover_human_held does not requeue this bead identically to a \
+         transient red); was {:?}",
+        after.park_reason
+    );
+
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("GATE_REGRESSED_CAPPED"),
+        "GATE_REGRESSED_CAPPED telemetry MUST fire on cap hit; log:\n{log}"
+    );
+    assert!(
+        !log.contains("\"event_type\":\"GATE_REGRESSED\""),
+        "once capped, GATE_REGRESSED MUST NOT fire again (cap is terminal); log:\n{log}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn test_gate_regression_counter_increments_on_each_green_to_red() {
+    let _scm = FakeScm::new();
+    let _tracker = FakeTracker::new();
+    let _sessions = FakeSessions::new();
+    let _llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let _cfg = test_cfg();
+    let _vcs = FakeVcs::new();
+
+    // Drive the counter manually through MAX_GATE_REGRESSIONS-1 ticks so
+    // we end at exactly the cap boundary (the cap test above then exercises
+    // the (cap+1)th transition). The fake store's incr_gate_regression_count
+    // is the canonical writer; this test only asserts it bumps per call
+    // and that the next-tick cap test above sees the correct value.
+    for n in 1..=daemon::tick::MAX_GATE_REGRESSIONS {
+        let got = store
+            .incr_gate_regression_count("counter-bead")
+            .unwrap();
+        assert_eq!(
+            got, n,
+            "incr_gate_regression_count must monotonically increment; \
+             expected {n}, got {got}"
+        );
+    }
+    assert_eq!(
+        store.gate_regression_count("counter-bead").unwrap(),
+        daemon::tick::MAX_GATE_REGRESSIONS,
+        "gate_regression_count must read back the cumulative count"
+    );
 }

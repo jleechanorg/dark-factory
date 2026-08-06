@@ -126,6 +126,16 @@ pub struct TickSummary {
 /// review — the daemon stops blindly retrying past this point.
 const MAX_HUMAN_HELD_RECOVERY_ATTEMPT: u32 = 10;
 const ESCALATION_REVIEWER: &str = "dark-factory-escalation";
+// jleechan-6l1f: gate-regression cap. After this many green->red
+// transitions, a further regression MUST emit GATE_REGRESSED_CAPPED and
+// park HUMAN_HELD with park_reason="gate_regression_capped" rather than
+// silently looping the bead back into the reroll lane forever. Distinct
+// from MAX_HUMAN_HELD_RECOVERY_ATTEMPT (which caps automated requeue from
+// HUMAN_HELD): this cap sits in front of the demotion path, so a
+// persistently-flapping gate can't even reach `recover_human_held`. Live
+// incident: PR #540 sat READY all_green=true at 2026-08-04T13:18:43Z;
+// when CI regressed the bead silently dead-ended (no reroll triggered).
+pub const MAX_GATE_REGRESSIONS: u32 = 3;
 const ESCALATION_SENTINEL_ATTEMPT: u32 = u32::MAX;
 // jleechan-rln6: one-shot sentinel for the stale-evidence fast-rejection
 // path. Keyed on the SAME `save_rejection`/`load_rejection` infrastructure
@@ -1831,6 +1841,221 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     bead.description.as_str(),
                     bead.external_ref.as_deref(),
                 );
+                // jleechan-htf7 r3: fail-closed adoption for manual beads.
+                // A `br create`-style bead that arrives here WITHOUT a
+                // resolvable `target_repo` (no body `target_repo:` field,
+                // no parseable `external_ref` owner/repo prefix) used to be
+                // admitted as `state: Queued`, routed through the LLM, and
+                // only THEN parked `unmapped_repo` at the dispatch layer
+                // (see `tick.rs:2133-2145`). That reactive park leaves a
+                // future-orphan shape in the routing pipeline on every
+                // tick, wastes a `judge(...)` call, and creates churn
+                // telemetry for a defect the daemon can never recover from
+                // on its own.
+                //
+                // Fail-closed here: park HUMAN_HELD with the same
+                // `unmapped_repo` reason the dispatch layer would have used,
+                // skip routing entirely, and emit `PARKED_HUMAN_HELD`
+                // directly so downstream tooling (Healer, dashboards) sees
+                // the same event shape whether the park came from adoption
+                // or from dispatch. PR #201 invariants (`create_bead`
+                // never called, `external_ref` never fabricated) still
+                // apply — this gate only short-circuits before routing.
+                //
+                // jleechan-htf7 r3 incremental (post-r2 review): the
+                // escalation comment for the parked bead is posted via the
+                // SAME `post_scm_comment_by_bead_id` idiom the dispatch
+                // flow uses for `unmapped_target_repo`
+                // (`tick.rs:2290-2353`). That idiom has FOUR outcomes; r2
+                // only handled two. r3 mirrors all four so the manual
+                // adoption site never silently drops an escalation record:
+                //   (a) missing-target  -> `record_local_escalation_fallback`
+                //                          + `ESCALATED_LOCALLY` event
+                //   (b) non-transient   -> `mark_escalation_undeliverable_and_emit`
+                //                          + `ESCALATION_UNDELIVERABLE` event
+                //   (c) transient       -> `ESCALATION_NOTIFICATION_FAILED`
+                //                          event (deduped, retry next tick)
+                //   (d) success         -> `record_escalation` +
+                //                          `beads_escalated += 1` +
+                //                          `ESCALATION_REQUIRED` (deduped)
+                if target_repo.is_none() {
+                    let mut o = BeadOverlay {
+                        bead_id: bead.id.clone(),
+                        state: OverlayState::HumanHeld,
+                        attempt: 1,
+                        reroll_count: 0,
+                        autonomy_secs: 0,
+                        spend_usd: 0.0,
+                        pr_number: None,
+                        branch: None,
+                        session_id: None,
+                        is_adopted: false,
+                        spawn_failure_count: 0,
+                        pre_session_head_sha: None,
+                        park_reason: None,
+                        target_repo,
+                        attempt_started_at: None,
+                    };
+                    set_human_hold_reason(&mut o, HumanHoldReason::UnmappedRepo);
+                    deps.store.save(&o)?;
+                    summary.beads_parked_human_held += 1;
+                    emit(
+                        deps.telemetry_log,
+                        &bead.id,
+                        1,
+                        OverlayState::HumanHeld.as_str(),
+                        "PARKED_HUMAN_HELD",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "reason": "unmapped_repo",
+                            "source": "manual_adoption_fail_closed",
+                            "external_ref": bead.external_ref,
+                        }),
+                    )?;
+                    if !escalation_already_recorded(deps, &bead.id)? {
+                        let comment_body = format!(
+                            "🤖 **[dark-factory]** Escalation required: bead `{}` was \
+                             created manually via `br create` with neither an \
+                             `external_ref` nor a `target_repo:` body field, so the \
+                             daemon cannot determine which repo it belongs to. \
+                             Automation parked it HUMAN_HELD at adoption time \
+                             (jleechan-htf7 r3 fail-closed gate) rather than routing \
+                             it and parking at dispatch. Operator action: supply an \
+                             explicit `target_repo: <owner>/<repo>` line in the bead \
+                             body, set `external_ref = \"<owner>/<repo>#NNN\"`, or \
+                             file under an issue/PR labeled `factory` so intake can \
+                             resolve the repo from the GitHub external_ref.",
+                            bead.id,
+                        );
+                        // (a)+(b)+(c)+(d): mirror the canonical
+                        // `unmapped_target_repo` dispatch-flow idiom at
+                        // `tick.rs:2284-2353`. The `unmapped_repo` reason
+                        // here is the manual-adoption analogue of that
+                        // reason, so the four-way handling is identical.
+                        match post_scm_comment_by_bead_id(deps, &bead.id, &comment_body) {
+                            Ok(()) => {
+                                // (d) success: record escalation + bump
+                                // beads_escalated + emit ESCALATION_REQUIRED.
+                                record_escalation(deps, &bead.id, "unmapped_repo")?;
+                                summary.beads_escalated += 1;
+                                let ctx = serde_json::json!({
+                                    "reason": "unmapped_repo",
+                                    "source": "manual_adoption_fail_closed",
+                                });
+                                let now_epoch = now_epoch_secs();
+                                let (should_emit, ctx_hash) = escalation_dedup_should_emit(
+                                    deps,
+                                    &bead.id,
+                                    "unmapped_repo",
+                                    &ctx,
+                                    now_epoch,
+                                )?;
+                                if !should_emit {
+                                    summary.escalations_suppressed += 1;
+                                } else {
+                                    emit(
+                                        deps.telemetry_log,
+                                        &bead.id,
+                                        1,
+                                        OverlayState::HumanHeld.as_str(),
+                                        "ESCALATION_REQUIRED",
+                                        serde_json::json!({}),
+                                        ctx,
+                                    )?;
+                                    record_escalation_emit_dedup(
+                                        deps,
+                                        &bead.id,
+                                        "unmapped_repo",
+                                        &ctx_hash,
+                                        now_epoch,
+                                    )?;
+                                }
+                            }
+                            Err(err) => {
+                                if is_missing_scm_target_error(&err) {
+                                    // (a) missing-target: local escalation
+                                    // fallback records the sentinel AND
+                                    // bumps beads_escalated_locally so
+                                    // dashboards see the escalation event
+                                    // even though no SCM comment was
+                                    // postable.
+                                    record_local_escalation_fallback(
+                                        deps,
+                                        &bead.id,
+                                        "unmapped_repo",
+                                    )?;
+                                    summary.beads_escalated_locally += 1;
+                                    emit(
+                                        deps.telemetry_log,
+                                        &bead.id,
+                                        1,
+                                        OverlayState::HumanHeld.as_str(),
+                                        "ESCALATED_LOCALLY",
+                                        serde_json::json!({}),
+                                        serde_json::json!({
+                                            "reason": "unmapped_repo",
+                                            "source": "manual_adoption_fail_closed",
+                                            "scm_error": err.to_string(),
+                                        }),
+                                    )?;
+                                } else if !err.is_transient() {
+                                    // (b) non-transient: terminal mark +
+                                    // ESCALATION_UNDELIVERABLE; never
+                                    // re-attempt on later ticks.
+                                    mark_escalation_undeliverable_and_emit(
+                                        deps,
+                                        summary,
+                                        &bead.id,
+                                        1,
+                                        OverlayState::HumanHeld.as_str(),
+                                        "unmapped_repo",
+                                        &err,
+                                    )?;
+                                } else {
+                                    // (c) transient: emit
+                                    // ESCALATION_NOTIFICATION_FAILED with
+                                    // dedup so the next tick retries. Do
+                                    // NOT record the escalation sentinel —
+                                    // the comment will be retried.
+                                    let ctx = serde_json::json!({
+                                        "reason": "unmapped_repo",
+                                        "source": "manual_adoption_fail_closed",
+                                        "error": err.to_string(),
+                                    });
+                                    let now_epoch = now_epoch_secs();
+                                    let (should_emit, ctx_hash) = escalation_dedup_should_emit(
+                                        deps,
+                                        &bead.id,
+                                        "unmapped_repo",
+                                        &ctx,
+                                        now_epoch,
+                                    )?;
+                                    if !should_emit {
+                                        summary.escalations_suppressed += 1;
+                                    } else {
+                                        emit(
+                                            deps.telemetry_log,
+                                            &bead.id,
+                                            1,
+                                            OverlayState::HumanHeld.as_str(),
+                                            "ESCALATION_NOTIFICATION_FAILED",
+                                            serde_json::json!({}),
+                                            ctx,
+                                        )?;
+                                        record_escalation_emit_dedup(
+                                            deps,
+                                            &bead.id,
+                                            "unmapped_repo",
+                                            &ctx_hash,
+                                            now_epoch,
+                                        )?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let o = BeadOverlay {
                     bead_id: bead.id.clone(),
                     state: OverlayState::Queued,
@@ -2644,9 +2869,14 @@ fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, DaemonError> 
             ],
             REVIEWER_TIMEOUT_SECS,
         ),
+        // Flag order matters: agy's `--print` takes the PROMPT as its own
+        // value, so any flag placed between `--print` and the prompt is
+        // swallowed as the message and the real prompt is dropped (the
+        // reviewer then answers the literal flag string — the historical
+        // "agy returns empty stdout" symptom was this, not quota).
         "agy" => run_tool(
             "agy",
-            &["--print", "--dangerously-skip-permissions", prompt],
+            &["--dangerously-skip-permissions", "--print", prompt],
             REVIEWER_TIMEOUT_SECS,
         ),
         // jleechan-bkru: 4th reviewer vendor, added after a live 2026-07-09
@@ -2948,7 +3178,37 @@ fn skeptic_evidence(
                 if v2_present {
                     used_vendors.push(vendor2_label.clone());
                 }
-                v.expect("combine_dual_verdict returns Some(..) whenever it returns Ok(..)")
+                let mut verdict_so_far =
+                    v.expect("combine_dual_verdict returns Some(..) whenever it returns Ok(..)");
+                // Cross-model guarantee (issue #385 / strict merge policy
+                // #328): if everything parseable so far came from ONE model
+                // family (e.g. a codex quota outage leaves claude alone),
+                // `compute_review_degraded` will flag the assessment and the
+                // strict gate deterministically fails itself — the 2026-08-06
+                // fleet-wide circuit-breaker park loop. Pursue a SECOND
+                // family down the remaining priority list. The second
+                // reviewer's verdict is COMBINED (a dissenting second family
+                // can still fail the gate); it is never merely counted.
+                if verifier::compute_review_degraded(&used_vendors) {
+                    for vendor_n in second_family_candidates(&used_vendors, &priority) {
+                        let v_n = dispatch_reviewer(vendor_n, &prompt)
+                            .ok()
+                            .and_then(|r| verifier::parse_skeptic_verdict(&r));
+                        if let Some(second) = v_n {
+                            if let Ok(Some(combined)) = combine_dual_verdict(
+                                Some(verdict_so_far.clone()),
+                                Some(second),
+                                bead_id,
+                                pr,
+                            ) {
+                                verdict_so_far = combined;
+                                used_vendors.push(vendor_n.to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+                verdict_so_far
             }
             Err(total_outage_err) => {
                 // vendor1 AND vendor2 both failed to parse. Try each
@@ -3332,6 +3592,89 @@ fn resolve_pr_base_ref(deps: &TickDeps, pr: u64, repo: &str) -> Result<String, S
 /// `run_fast_tier`'s per-bead catch-and-continue fires (phase =
 /// `skeptic_evidence`), the bead stays ATTESTED, and the next tick
 /// retries the reviewer call.
+///
+/// Cross-model guarantee (issue #385): given the vendors that already
+/// contributed a parseable verdict and the coder-excluded priority list,
+/// return the untried fallback vendors (priority index 2+) whose model
+/// family differs from EVERY family already represented — i.e. the
+/// candidates whose verdict could satisfy `compute_review_degraded ==
+/// false`. Pure so the second-family pursuit is unit-testable without
+/// spawning reviewer subprocesses. Unknown/empty-family vendor labels are
+/// excluded (they cannot lift the degraded flag; see
+/// `verifier::vendor_model_family`).
+pub fn second_family_candidates<'a>(
+    used: &[String],
+    priority: &[&'a str],
+) -> Vec<&'a str> {
+    let have: std::collections::BTreeSet<&str> = used
+        .iter()
+        .map(|u| verifier::vendor_model_family(u))
+        .filter(|f| !f.is_empty())
+        .collect();
+    priority
+        .iter()
+        .skip(2)
+        .copied()
+        .filter(|v| {
+            let fam = verifier::vendor_model_family(v);
+            !fam.is_empty()
+                && !have.contains(fam)
+                && !used.iter().any(|u| u.as_str() == *v)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod second_family_candidate_tests {
+    //! PR #596 cold-review Major 1: the Ok-arm second-family pursuit is the
+    //! fix's primary behavioral change — pin its candidate-selection
+    //! semantics (family diversity, no re-dispatch of used vendors, skip(2)
+    //! primaries, unknown families excluded) without spawning subprocesses.
+    use super::second_family_candidates;
+
+    const PRIORITY: [&str; 5] = ["codex", "claude", "agy", "gemini", "cursor-agent"];
+
+    #[test]
+    fn claude_only_yields_all_non_anthropic_fallbacks_in_priority_order() {
+        let used = vec!["claude".to_string()];
+        assert_eq!(
+            second_family_candidates(&used, &PRIORITY),
+            vec!["agy", "gemini", "cursor-agent"]
+        );
+    }
+
+    #[test]
+    fn already_used_fallback_vendor_and_its_family_are_not_recandidated() {
+        let used = vec!["claude".to_string(), "agy".to_string()];
+        // agy already contributed (family google-antigravity); gemini is a
+        // DIFFERENT Google family (google-gemini) so it stays a candidate.
+        assert_eq!(
+            second_family_candidates(&used, &PRIORITY),
+            vec!["gemini", "cursor-agent"]
+        );
+    }
+
+    #[test]
+    fn two_families_present_still_lists_only_new_families() {
+        let used = vec!["claude".to_string(), "codex".to_string()];
+        // Caller only invokes this when degraded, but the helper itself
+        // must never re-offer a represented family.
+        assert_eq!(
+            second_family_candidates(&used, &PRIORITY),
+            vec!["agy", "gemini", "cursor-agent"]
+        );
+    }
+
+    #[test]
+    fn unknown_family_vendors_are_excluded_and_short_priority_is_empty() {
+        let used = vec!["claude".to_string()];
+        let priority = ["codex", "claude", "mock_llm", "not-a-vendor"];
+        assert!(second_family_candidates(&used, &priority).is_empty());
+        let short = ["codex", "claude"];
+        assert!(second_family_candidates(&used, &short).is_empty());
+    }
+}
+
 pub fn combine_dual_verdict(
     v1: Option<verifier::SkepticVerdict>,
     v2: Option<verifier::SkepticVerdict>,
@@ -3662,6 +4005,26 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 bead_id,
                 now_epoch.saturating_add(deps.cfg.held_recheck_cooldown_secs),
             )?;
+            overlay.state = OverlayState::Attested; // in-memory only (NOT saved)
+        }
+        // jleechan-6l1f: gate-regression entry path. A READY bead must be
+        // re-assessed on every fast tick so a green->red transition (PR went
+        // red after being merge-ready) is detected and routed back into the
+        // reroll lane — without this, READY was a terminal state that the
+        // fast-tier `if overlay.state != OverlayState::Attested` filter
+        // skipped, so a regressed PR silently sat READY forever while
+        // auto-merge-guard.sh correctly refused the merge (the live
+        // incident: PR #540 sat all_green=true at 2026-08-04T13:18:43Z,
+        // went red ~24h later, and never re-entered the fix loop). The
+        // demotion is IN-MEMORY only: persisting it now would churn the
+        // DB and re-emit READY_FOR_MERGE-style telemetry on every healthy
+        // READY bead, breaking the contract that READY is "terminal until
+        // the merge guard accepts". If the assessment finds a regression
+        // the demotion-to-Attested is persisted in the same save as the
+        // red-state transition below; if it stays green we leave the
+        // stored READY alone.
+        let entered_as_ready = overlay.state == OverlayState::Ready;
+        if entered_as_ready {
             overlay.state = OverlayState::Attested; // in-memory only (NOT saved)
         }
         if overlay.state != OverlayState::Attested {
@@ -4400,6 +4763,137 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         };
         let report = verifier::assess(deps.scm, pr, &repo, deps.cfg, &evidence)?;
         summary.gates_assessed += 1;
+        // jleechan-6l1f: gate-regression detection. Compare the bead's
+        // recorded `last_all_green` against the new `report.all_green`:
+        //   - true -> false (was green, now red) is the FIRST-CLASS regression
+        //     transition: emit GATE_REGRESSED, bump the counter, and route
+        //     the bead through the existing red branch below. If the counter
+        //     is already at MAX_GATE_REGRESSIONS, emit GATE_REGRESSED_CAPPED
+        //     and park HUMAN_HELD with the distinct park_reason
+        //     "gate_regression_capped" (so `recover_human_held` does NOT
+        //     requeue it identically to a transient red — circuit-breaker-
+        //     style suppression).
+        //   - any other transition (false->false, false->true, true->true)
+        //     is the normal flow; only the green->red case is special.
+        //
+        // The regression branch runs BEFORE the GATE_ASSESSMENT emit so the
+        // guard sees a fresh assessment (with all_green=false) on the same
+        // tick the regression is detected — a 60s tick is the minimum
+        // window the merge guard polls, so emitting the assessment FIRST and
+        // the regression event SECOND would let the guard accept a stale
+        // all_green=true window for one tick.
+        let prev_all_green = deps.store.last_all_green(bead_id)?.unwrap_or(false);
+        let new_all_green = report.all_green;
+        let is_regression = prev_all_green && !new_all_green;
+        if is_regression {
+            let reg_count = deps.store.gate_regression_count(bead_id)?;
+            if reg_count >= MAX_GATE_REGRESSIONS {
+                // Cap hit: the bead has flapped green->red enough times
+                // that further reroll is no longer productive. Park
+                // HUMAN_HELD with a distinct park_reason that
+                // `recover_human_held`'s retry-safe allow-list does NOT
+                // include (so the bead is not silently requeued).
+                let red_gate_names: Vec<String> = report
+                    .results
+                    .iter()
+                    .filter_map(|(gate_name, result)| match result {
+                        verifier::GateResult::Red(reason) => {
+                            Some(format!("{gate_name:?}: {reason}"))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                overlay.state = OverlayState::HumanHeld;
+                set_human_hold_reason(
+                    &mut overlay,
+                    HumanHoldReason::GateRegressionCapped,
+                );
+                deps.store.save(&overlay)?;
+                summary.beads_parked_human_held += 1;
+                emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "GATE_REGRESSED_CAPPED",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "reason": "green->red transitions exceeded MAX_GATE_REGRESSIONS; routing to HUMAN_HELD",
+                        "max_gate_regressions": MAX_GATE_REGRESSIONS,
+                        "regression_count": reg_count,
+                        "pr_number": pr,
+                        "red_gates": red_gate_names,
+                    }),
+                )?;
+                let comment_body = format!(
+                    "🤖 **[dark-factory]** Gate regression capped: bead `{bead_id}` has \
+                     flipped green->red {reg_count} times (>= MAX_GATE_REGRESSIONS={MAX_GATE_REGRESSIONS}). \
+                     Automation parked the bead HUMAN_HELD for inspection rather than \
+                     silently looping the reroll lane.\n\n\
+                     Current red gates:\n{}",
+                    red_gate_names
+                        .iter()
+                        .map(|g| format!("- `{g}`"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+                let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
+                continue;
+            }
+            // Bump the counter, emit the regression event, and let the
+            // existing red-branch path below route the bead through
+            // `reroll::execute` (stage 2) or `PARKED_HUMAN_HELD` (stage 1).
+            // Persist the demotion off READY here so a healthy READY that
+            // re-assessed-and-stayed-green in the previous block is NOT
+            // re-promoted to READY by `beads_ready` below (the report is
+            // red this tick, so we want the demotion durable).
+            let _ = deps.store.incr_gate_regression_count(bead_id)?;
+            if entered_as_ready {
+                // Demote READY -> ATTESTED so the red-branch routes it;
+                // save() bumps updated_at. The in-memory `overlay.state`
+                // is already Attested (we demoted it above).
+                overlay.state = OverlayState::Attested;
+                deps.store.save(&overlay)?;
+            }
+            let red_gate_names: Vec<String> = report
+                .results
+                .iter()
+                .filter_map(|(gate_name, result)| match result {
+                    verifier::GateResult::Red(reason) => {
+                        Some(format!("{gate_name:?}: {reason}"))
+                    }
+                    _ => None,
+                })
+                .collect();
+            emit(
+                deps.telemetry_log,
+                bead_id,
+                overlay.attempt,
+                OverlayState::Attested.as_str(),
+                "GATE_REGRESSED",
+                serde_json::json!({}),
+                serde_json::json!({
+                    "reason": "previously all_green, now not all_green",
+                    "pr_number": pr,
+                    "head_sha": snapshot.head_sha,
+                    "red_gates": red_gate_names,
+                    "regression_count": deps.store.gate_regression_count(bead_id)?,
+                }),
+            )?;
+            let comment_body = format!(
+                "🤖 **[dark-factory]** Gate regression detected for bead `{bead_id}`: \
+                 this PR previously passed all safety gates and is now failing \
+                 (count {} of {MAX_GATE_REGRESSIONS} before escalation). Re-entering \
+                 the fix loop.\n\nCurrent red gates:\n{}",
+                deps.store.gate_regression_count(bead_id)?,
+                red_gate_names
+                    .iter()
+                    .map(|g| format!("- `{g}`"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
+        }
         // jleechan-rln6 / PR #463 round-1 Codex P1 finding: the
         // GATE_ASSESSMENT emit must happen BEFORE the fast-rejection
         // `continue` short-circuit. `auto-merge-guard.sh` reads the LATEST
@@ -4470,6 +4964,14 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             serde_json::json!({}),
             gate_assessment_context,
         )?;
+        // jleechan-6l1f: stamp the bead's `last_all_green` to the latest
+        // assessment result so the next tick's regression-detection predicate
+        // has authoritative input. The stamp is unconditional — even on a
+        // regression tick (where we already emitted GATE_REGRESSED above),
+        // the column MUST reflect the current report, not the stale prior
+        // value (otherwise the next tick would re-fire GATE_REGRESSED on a
+        // sustained-red state).
+        deps.store.set_last_all_green(bead_id, new_all_green)?;
 
         // jleechan-rln6: FAST-REJECTION short-circuit for a STALE evidence
         // marker. When the ONLY red gate is `EvidenceFloor` AND its reason

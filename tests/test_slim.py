@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pathlib
 import sys
+import tempfile
 
 import runner.handlers as handlers_mod
 from runner.handlers import Context, Result, TYPE_REGISTRY
@@ -9,6 +10,14 @@ from runner.engine import run
 from runner.parser import parse
 
 ROOT = pathlib.Path(__file__).parent.parent
+
+# Scratch workdir in the OS tempdir — using the repo root here leaks one
+# branch_* mkdtemp per fan-out test into the working tree.
+SCRATCH = pathlib.Path(tempfile.mkdtemp(prefix="test_slim_"))
+
+from conftest import register_scratch_dir  # noqa: E402
+
+register_scratch_dir(SCRATCH)
 
 
 def test_slim_stylesheet_routes_roles_by_class():
@@ -47,7 +56,7 @@ def test_minimal_feature_factory_runs_with_deterministic_gates(monkeypatch, tmp_
     # production routes plan→claude opus and review→agy; pin echo for offline determinism
     graph.nodes["plan"].attrs["backend"] = "echo"
     graph.nodes["review"].attrs["backend"] = "echo"
-    ctx = Context(goal="ship a tiny feature", workdir=ROOT, backend="echo")
+    ctx = Context(goal="ship a tiny feature", workdir=SCRATCH, backend="echo")
     ctx.state["feature"] = "hello"
     ctx.state["slim.test_command"] = f"{sys.executable} -c \"print('tests ok')\""
 
@@ -94,7 +103,7 @@ def test_minimal_pr_factory_runs_with_deterministic_gates(monkeypatch, tmp_path)
     # production routes plan→claude opus and review→agy; pin echo for offline determinism
     graph.nodes["plan"].attrs["backend"] = "echo"
     graph.nodes["review"].attrs["backend"] = "echo"
-    ctx = Context(goal="refactor a tiny thing in-flight", workdir=ROOT, backend="echo")
+    ctx = Context(goal="refactor a tiny thing in-flight", workdir=SCRATCH, backend="echo")
     ctx.state["feature"] = "hello"
     ctx.state["slim.test_command"] = f"{sys.executable} -c \"print('tests ok')\""
 
@@ -127,7 +136,7 @@ def test_minimal_pr_factory_runs_with_deterministic_gates(monkeypatch, tmp_path)
 def test_minimal_research_factory_runs_with_deterministic_gates(monkeypatch, tmp_path):
     monkeypatch.setattr(handlers_mod, "_sandboxed_args", lambda args: args)
     graph = parse(ROOT / "pipelines" / "slim" / "minimal_research.dot")
-    ctx = Context(goal="research some code", workdir=ROOT, backend="echo")
+    ctx = Context(goal="research some code", workdir=SCRATCH, backend="echo")
     # gate_er is echo-short-circuited by --backend echo; pre-seed a success
     # verdict so the lane exits deterministically without invoking a real
     # reviewer (per factory-evolve G1, research must pass a reviewer).

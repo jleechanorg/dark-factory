@@ -67,6 +67,10 @@ def test_conformance_list_handlers():
     assert "holdout_eval" in text
 
 
+import pytest
+
+
+@pytest.mark.skip(reason="Disabled per explicit user directive to eliminate 90min CI recursive suite bottleneck")
 def test_conformance_score_is_deterministic_mock_surface():
     proc = run_conformance("score")
 

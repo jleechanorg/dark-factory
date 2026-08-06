@@ -275,10 +275,26 @@ emit_line "[OK] CXDB initialized at $AFD_DB ($SCHEMA_OK bead_overlay row)"
 # ----------------------------------------------------------------------------
 resolve_ao() {  # resolve_ao <repo_full_name> -> echoes ao_project, exits 1 if unmapped
   python3 - "$CONFIG" "$1" <<'PY'
-import sys, toml
+# Bead jleechan-kn5j: prefer stdlib `tomllib` (Python 3.11+) over the
+# third-party `toml`. `toml` IS declared in requirements.txt, but this canary
+# invokes whatever `python3` is first on PATH — which on a CI runner is not
+# necessarily the interpreter pip installed into. That mismatch produced:
+#     ModuleNotFoundError: No module named 'toml'
+#     [FAIL] multi-repo routing wrong: DF='' WA='' UM='UNMAPPED'
+# and, under set -e, killed the canary before it wrote its evidence bundle —
+# surfacing as five unrelated-looking artifact failures. tomllib needs no
+# install, so it works with ANY python3 >= 3.11. The `toml` fallback keeps
+# older interpreters working.
+import sys
 cfg_path, repo = sys.argv[1], sys.argv[2]
 try:
-    cfg = toml.load(cfg_path)
+    try:
+        import tomllib
+        with open(cfg_path, "rb") as fh:
+            cfg = tomllib.load(fh)
+    except ImportError:
+        import toml
+        cfg = toml.load(cfg_path)
 except Exception:
     cfg = {}
 repos = cfg.get("repos", {})
@@ -466,7 +482,17 @@ sqlite3 "$AFD_DB" "UPDATE bead_overlay SET state='DISPATCHED', branch='factory/$
 # after pushing a branch: pr-opened → CI runs → gate-assessment → ready).
 sqlite3 "$AFD_DB" "UPDATE bead_overlay SET state='DISPATCHED' WHERE bead_id='$(printf '%s' "$BEAD" | sed "s/'/''/g")' AND state='QUEUED';" >/dev/null
 "$ROOT/daemon/factory-overlay.sh" pr-opened "$BEAD" 1 "https://github.com/jleechanorg/dark-factory/pull/1" >/dev/null
-GATES_JSON='{"ci_green":"pass","no_conflicts":"pass","coderabbit":"pass","bugbot":"pass","comments_resolved":"pass","evidence_review":"pass","skeptic":"pass"}'
+# Bead jleechan-kn5j: this MUST stay in lockstep with the canonical gate set in
+# `daemon/src/verifier.rs::GateName`. Gate 8 (`vacuous_red_green`, issue #387 /
+# bead jleechan-ijod) was added to the verifier and to factory-overlay.sh's
+# schema check, but this canary was never updated — so `gate-assessment` began
+# rejecting it with:
+#     AssertionError: missing required gates: ['vacuous_red_green']
+#     factory-overlay: invalid gates json
+# Under `set -e` that killed the canary BEFORE it wrote its evidence bundle,
+# which is why REPORT.json / EVIDENCE.md / deploy-bze8.jsonl were all missing
+# and the CXDB never got a READY row — four separate test failures, one cause.
+GATES_JSON='{"ci_green":"pass","no_conflicts":"pass","coderabbit":"pass","bugbot":"pass","comments_resolved":"pass","evidence_review":"pass","skeptic":"pass","vacuous_red_green":"pass"}'
 GA_OUT="$("$ROOT/daemon/factory-overlay.sh" gate-assessment "$BEAD" 1 "$GATES_JSON" 2>&1)"
 "$ROOT/daemon/factory-overlay.sh" ready "$BEAD" 1 >/dev/null
 TERMINAL_STATE="$(sqlite3 "$AFD_DB" "SELECT state FROM bead_overlay WHERE bead_id='$BEAD';")"

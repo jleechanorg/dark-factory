@@ -393,6 +393,38 @@ pub trait StateStore {
     fn clear_attempt_started_at(&self, _bead_id: &str) -> Result<(), DaemonError> {
         Ok(())
     }
+    /// jleechan-6l1f: read the boolean the daemon recorded for `bead_id`'s
+    /// last gate assessment (`true` iff the last report was all_green).
+    /// `None` means "never recorded" — equivalent to `false` for the
+    /// regression-detection predicate (a bead that has never been green is
+    /// NOT a regression candidate). Owned by `tick::run_fast_tier`, decoupled
+    /// from `BeadOverlay` for the same reason as
+    /// `last_er_evidence_hash`/`reroll_deferral_count`: this is a per-bead
+    /// retry counter the tick engine owns, written by the regression
+    /// detection path and consulted before the GATE_ASSESSMENT emit.
+    /// Older DBs that pre-date this column get it via the idempotent
+    /// `ensure_last_all_green_columns` migration in `SqliteStateStore::open`.
+    fn last_all_green(&self, _bead_id: &str) -> Result<Option<bool>, DaemonError> {
+        Ok(None)
+    }
+    /// jleechan-6l1f: stamp `bead_id`'s last-all_green flag. Default no-op
+    /// for fakes that don't persist the column.
+    fn set_last_all_green(&self, _bead_id: &str, _value: bool) -> Result<(), DaemonError> {
+        Ok(())
+    }
+    /// jleechan-6l1f: read the cumulative green->red transition count for
+    /// `bead_id`. Used to enforce `MAX_GATE_REGRESSIONS` (default 3) so a
+    /// flapping check cannot ping-pong a bead through reroll forever.
+    /// Default `Ok(0)` so fakes that don't exercise the cap path see
+    /// "never regressed".
+    fn gate_regression_count(&self, _bead_id: &str) -> Result<u32, DaemonError> {
+        Ok(0)
+    }
+    /// jleechan-6l1f: atomically increment `bead_id`'s regression count and
+    /// return the new value. Default `Ok(1)` mirrors `incr_er_runner_attempt`.
+    fn incr_gate_regression_count(&self, _bead_id: &str) -> Result<u32, DaemonError> {
+        Ok(1)
+    }
     /// 1s2q-escalation-dedup Task 2: mark the `(bead_id, reason)` escalation
     /// ledger row as terminal ("escalation_undeliverable") so
     /// `escalation_should_emit` returns `Ok(false)` for it on every future
@@ -587,6 +619,14 @@ pub enum HumanHoldReason {
     AdoptedSpawnFailed,
     UnknownOnlyGateCapped,
     CircuitBreaker,
+    /// Bead jleechan-6l1f: gate regression hit `MAX_GATE_REGRESSIONS`
+    /// consecutive green->red transitions. Distinct park_reason so
+    /// `recover_human_held` (which allow-lists only retry-safe reasons)
+    /// does NOT auto-requeue a flapping bead. NOT in
+    /// `recoverable_exact_values()` — the cap is terminal, the operator
+    /// must inspect the bead (or the underlying flaky gate) before any
+    /// further automated attempt.
+    GateRegressionCapped,
     EscalationLocalFallback(String),
 }
 
@@ -628,6 +668,7 @@ impl HumanHoldReason {
             Self::AdoptedSpawnFailed => "adopted_spawn_failed",
             Self::UnknownOnlyGateCapped => "unknown_only_gate_report_with_er_runner_capped",
             Self::CircuitBreaker => CIRCUIT_BREAKER_PARK_REASON,
+            Self::GateRegressionCapped => "gate_regression_capped",
             Self::EscalationLocalFallback(reason) => {
                 return format!("escalation_local_fallback:{reason}");
             }
@@ -698,6 +739,7 @@ impl SqliteStateStore {
         Self::ensure_reroll_deferral_count_column(&conn)?;
         Self::ensure_held_recheck_after_column(&conn)?;
         Self::ensure_last_er_evidence_hash_column(&conn)?;
+        Self::ensure_last_all_green_columns(&conn)?;
         Self::ensure_disposition_required_state(&conn)?;
         Self::ensure_escalation_ledger_table(&conn)?;
         Self::ensure_escalation_ledger_terminal_column(&conn)?;
@@ -723,6 +765,7 @@ impl SqliteStateStore {
         Self::ensure_reroll_deferral_count_column(&conn)?;
         Self::ensure_held_recheck_after_column(&conn)?;
         Self::ensure_last_er_evidence_hash_column(&conn)?;
+        Self::ensure_last_all_green_columns(&conn)?;
         Self::ensure_disposition_required_state(&conn)?;
         Self::ensure_escalation_ledger_table(&conn)?;
         Self::ensure_escalation_ledger_terminal_column(&conn)?;
@@ -1025,6 +1068,61 @@ impl SqliteStateStore {
                 [],
             )
             .map_err(|e| tool_err("ensure_last_er_evidence_hash_column: add column", e))?;
+        }
+        Ok(())
+    }
+
+    /// Idempotent migration for the regression-detection columns (bead
+    /// jleechan-6l1f). Two columns added in one migration because they are
+    /// always written together by the fast tier (last_all_green stamps the
+    /// latest assessment, gate_regression_count bumps on the green->red
+    /// transition). Defaults match the regression-detection predicate:
+    /// `last_all_green` defaults to 0 (= "never green" — the predicate
+    /// treats this as `false`, which is the safe default since a bead that
+    /// has never been green cannot be a regression candidate). Same probe
+    /// pattern as the other `ensure_*_column` helpers above (SQLite has no
+    /// `ADD COLUMN IF NOT EXISTS`).
+    fn ensure_last_all_green_columns(conn: &Connection) -> Result<(), DaemonError> {
+        let has_last_all_green: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
+                 WHERE name = 'last_all_green'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_last_all_green_columns: pragma last_all_green", e))?;
+        if !has_last_all_green {
+            conn.execute(
+                "ALTER TABLE bead_overlay ADD COLUMN last_all_green INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| tool_err("ensure_last_all_green_columns: add last_all_green", e))?;
+        }
+        let has_gate_regression_count: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
+                 WHERE name = 'gate_regression_count'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| {
+                tool_err(
+                    "ensure_last_all_green_columns: pragma gate_regression_count",
+                    e,
+                )
+            })?;
+        if !has_gate_regression_count {
+            conn.execute(
+                "ALTER TABLE bead_overlay \
+                 ADD COLUMN gate_regression_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| {
+                tool_err(
+                    "ensure_last_all_green_columns: add gate_regression_count",
+                    e,
+                )
+            })?;
         }
         Ok(())
     }
@@ -2031,6 +2129,63 @@ impl StateStore for SqliteStateStore {
             Ok(_) => Ok(()),
             Err(e) if no_such_column(&e) => Ok(()),
             Err(e) => Err(tool_err("set_er_evidence_hash", e)),
+        }
+    }
+
+    fn last_all_green(&self, bead_id: &str) -> Result<Option<bool>, DaemonError> {
+        let row: Result<Option<i64>, rusqlite::Error> = self.conn.query_row(
+            "SELECT last_all_green FROM bead_overlay WHERE bead_id = ?1",
+            params![bead_id],
+            |row| row.get(0),
+        );
+        match row {
+            Ok(v) => Ok(v.map(|b| b != 0)),
+            Err(e) if no_such_column(&e) => Ok(None),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(tool_err("last_all_green", e)),
+        }
+    }
+
+    fn set_last_all_green(&self, bead_id: &str, value: bool) -> Result<(), DaemonError> {
+        let res = self.conn.execute(
+            "UPDATE bead_overlay SET last_all_green = ?2, updated_at = ?3 WHERE bead_id = ?1",
+            params![bead_id, value as i64, now_iso8601()],
+        );
+        match res {
+            Ok(_) => Ok(()),
+            Err(e) if no_such_column(&e) => Ok(()),
+            Err(e) => Err(tool_err("set_last_all_green", e)),
+        }
+    }
+
+    fn gate_regression_count(&self, bead_id: &str) -> Result<u32, DaemonError> {
+        let row: Result<Option<i64>, rusqlite::Error> = self.conn.query_row(
+            "SELECT gate_regression_count FROM bead_overlay WHERE bead_id = ?1",
+            params![bead_id],
+            |row| row.get(0),
+        );
+        match row {
+            Ok(v) => Ok(v.unwrap_or(0).max(0) as u32),
+            Err(e) if no_such_column(&e) => Ok(0),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+            Err(e) => Err(tool_err("gate_regression_count", e)),
+        }
+    }
+
+    fn incr_gate_regression_count(&self, bead_id: &str) -> Result<u32, DaemonError> {
+        let res = self.conn.execute(
+            "UPDATE bead_overlay SET gate_regression_count = COALESCE(gate_regression_count, 0) + 1, updated_at = ?2 WHERE bead_id = ?1",
+            params![bead_id, now_iso8601()],
+        );
+        match res {
+            Ok(_) => {
+                // Re-read so callers get the canonical post-increment value
+                // (mirrors `incr_er_runner_attempt`'s SELECT-after-UPDATE
+                // pattern).
+                self.gate_regression_count(bead_id)
+            }
+            Err(e) if no_such_column(&e) => Ok(1),
+            Err(e) => Err(tool_err("incr_gate_regression_count", e)),
         }
     }
 
@@ -3055,7 +3210,9 @@ mod tests {
               target_repo TEXT,
               reroll_deferral_count INTEGER NOT NULL DEFAULT 0,
               held_recheck_after INTEGER,
-              last_er_evidence_hash TEXT
+              last_er_evidence_hash TEXT,
+              last_all_green INTEGER NOT NULL DEFAULT 0,
+              gate_regression_count INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE branch_registry (
               branch     TEXT PRIMARY KEY,
