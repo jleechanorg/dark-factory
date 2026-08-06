@@ -43,8 +43,6 @@ if TYPE_CHECKING:
     from .handler_core import Context
 
 
-
-
 # Vendor-neutral default evidence filenames probed when neither ``state["evidence_paths"]``
 # nor the node ``evidence_paths`` attribute is set. Project-local aliases (e.g.
 # ``gemini_http_request_responses.jsonl``) live in ``<workdir>/.dark-factory/evidence.yaml``
@@ -66,21 +64,155 @@ _OPERATOR_RAW_STREAM_MAX_BYTES = 8 << 20
 _OPERATOR_RECEIPT_MAX_BYTES = 1 << 20
 _OPERATOR_TRUST_REGISTRY_MAX_BYTES = 1 << 20
 
+# Operator policy is pinned from git history so workers cannot rewrite it mid-run.
+# Prefer the dedicated tracked path; legacy repos may still commit
+# ``.dark-factory/evidence.yaml`` (often gitignored for scratch artifacts).
+OPERATOR_MANIFEST_CANONICAL_GIT_PATH = ".github/dark-factory-operator.yaml"
+OPERATOR_MANIFEST_LEGACY_GIT_PATH = ".dark-factory/evidence.yaml"
+OPERATOR_MANIFEST_GIT_PATHS: tuple[str, ...] = (
+    OPERATOR_MANIFEST_CANONICAL_GIT_PATH,
+    OPERATOR_MANIFEST_LEGACY_GIT_PATH,
+)
+EVIDENCE_ALIASES_MANIFEST_PATH = ".dark-factory/evidence.yaml"
+
+
+def _pipeline_requires_operator_trust(graph) -> bool:
+    return any(
+        str(node.attrs.get("type", "")) == "operator_verify"
+        for node in graph.nodes.values()
+    )
+
+
+def _git_show_tracked_bytes(
+    workdir: pathlib.Path, trust_head: str, git_path: str
+) -> bytes | None:
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", trust_head):
+        raise ValueError("trusted manifest commit is malformed")
+    result = subprocess.run(
+        ["/usr/bin/git", "show", f"{trust_head}:{git_path}"],
+        cwd=workdir,
+        capture_output=True,
+        timeout=30,
+    )
+    if result.returncode == 0:
+        return result.stdout
+    return None
+
+
+def _resolve_operator_manifest_from_git(
+    workdir: pathlib.Path, trusted_head: str
+) -> tuple[str, bytes]:
+    for git_path in OPERATOR_MANIFEST_GIT_PATHS:
+        raw = _git_show_tracked_bytes(workdir, trusted_head, git_path)
+        if raw is not None:
+            return git_path, raw
+    paths = ", ".join(OPERATOR_MANIFEST_GIT_PATHS)
+    raise ValueError(
+        "operator verification manifest missing from git history at "
+        f"{trusted_head}; commit one of: {paths}"
+    )
+
+
+def _resolve_operator_manifest_worktree_path(
+    workdir: pathlib.Path,
+) -> tuple[pathlib.Path, bytes]:
+    root = workdir.resolve()
+    for git_path in OPERATOR_MANIFEST_GIT_PATHS:
+        manifest_path = root / git_path
+        if manifest_path.is_symlink():
+            continue
+        if manifest_path.is_file():
+            return manifest_path, manifest_path.read_bytes()
+    raise ValueError("operator verification manifest is missing or a symlink")
+
+
+def validate_operator_trust_preflight(
+    workdir: pathlib.Path, graph
+) -> list[dict[str, str]]:
+    """Preflight operator_verify graphs can resolve a trusted manifest in git history."""
+    if not _pipeline_requires_operator_trust(graph):
+        return []
+
+    diagnostics: list[dict[str, str]] = []
+    root = workdir.resolve()
+    if not (root / ".git").exists():
+        diagnostics.append(
+            {
+                "code": "DF_OPERATOR_MANIFEST_NOT_A_GIT_REPO",
+                "severity": "error",
+                "node": "operator_verify",
+                "message": (
+                    f"operator_verify requires a git workdir; {root} is not a repository"
+                ),
+            }
+        )
+        return diagnostics
+
+    try:
+        trust_head = _controller_trust_head(root)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        diagnostics.append(
+            {
+                "code": "DF_OPERATOR_TRUST_HEAD_UNRESOLVED",
+                "severity": "error",
+                "node": "operator_verify",
+                "message": (
+                    "could not resolve operator trust HEAD (@{u} or "
+                    "DARK_FACTORY_OPERATOR_TRUST_HEAD): "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            }
+        )
+        return diagnostics
+
+    try:
+        git_path, raw = _resolve_operator_manifest_from_git(root, trust_head)
+        _parse_operator_manifest_bytes(root, root / git_path, raw)
+    except ValueError as exc:
+        message = str(exc)
+        code = (
+            "DF_OPERATOR_MANIFEST_MISSING_IN_HISTORY"
+            if "missing from git history" in message
+            else "DF_OPERATOR_MANIFEST_INVALID"
+        )
+        diagnostics.append(
+            {
+                "code": code,
+                "severity": "error",
+                "node": "operator_verify",
+                "message": message,
+            }
+        )
+    return diagnostics
+
+
 def _target_provenance(workdir: pathlib.Path) -> tuple[str, str]:
     """Return trusted HEAD plus a deterministic target-workspace fingerprint."""
     root = workdir.resolve()
-    head = subprocess.run(
-        ["/usr/bin/git", "rev-parse", "HEAD"],
-        cwd=root,
-        capture_output=True,
-        check=True,
-        timeout=30,
-    ).stdout.strip().decode("ascii", errors="strict").lower()
+    head = (
+        subprocess.run(
+            ["/usr/bin/git", "rev-parse", "HEAD"],
+            cwd=root,
+            capture_output=True,
+            check=True,
+            timeout=30,
+        )
+        .stdout.strip()
+        .decode("ascii", errors="strict")
+        .lower()
+    )
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
         raise ValueError("target HEAD is malformed")
     pathspec = ("--", ".", ":(exclude)evidence/operator-verification.json")
     commands = (
-        ("/usr/bin/git", "status", "--porcelain=v1", "-z", "--untracked-files=all", *pathspec),
+        (
+            "/usr/bin/git",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            *pathspec,
+        ),
         ("/usr/bin/git", "diff", "--binary", "HEAD", *pathspec),
         ("/usr/bin/git", "diff", "--binary", "--cached", "HEAD", *pathspec),
     )
@@ -93,20 +225,31 @@ def _target_provenance(workdir: pathlib.Path) -> tuple[str, str]:
         digest.update(result.stdout)
     untracked = subprocess.run(
         (
-            "/usr/bin/git", "ls-files", "--others", "--exclude-standard", "-z",
-            "--", ".", ":(exclude)evidence/operator-verification.json",
+            "/usr/bin/git",
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+            ".",
+            ":(exclude)evidence/operator-verification.json",
         ),
-        cwd=root, capture_output=True, check=True, timeout=30,
+        cwd=root,
+        capture_output=True,
+        check=True,
+        timeout=30,
     ).stdout.split(b"\0")
     untracked_paths = [
-        value.decode("utf-8", errors="surrogateescape")
-        for value in untracked if value
+        value.decode("utf-8", errors="surrogateescape") for value in untracked if value
     ]
     for offset in range(0, len(untracked_paths), 128):
-        chunk = untracked_paths[offset:offset + 128]
+        chunk = untracked_paths[offset : offset + 128]
         content_hashes = subprocess.run(
             ["/usr/bin/git", "hash-object", "--no-filters", "--", *chunk],
-            cwd=root, capture_output=True, check=True, timeout=30,
+            cwd=root,
+            capture_output=True,
+            check=True,
+            timeout=30,
         ).stdout
         digest.update(len(content_hashes).to_bytes(8, "big"))
         digest.update(content_hashes)
@@ -119,11 +262,17 @@ def _validate_controller_trust_head(workdir: pathlib.Path, trust: str) -> str:
         raise ValueError("controller-supplied operator trust HEAD is required")
     subprocess.run(
         ["/usr/bin/git", "cat-file", "-e", f"{trust}^{{commit}}"],
-        cwd=root, capture_output=True, check=True, timeout=30,
+        cwd=root,
+        capture_output=True,
+        check=True,
+        timeout=30,
     )
     subprocess.run(
         ["/usr/bin/git", "merge-base", "--is-ancestor", trust, "HEAD"],
-        cwd=root, capture_output=True, check=True, timeout=30,
+        cwd=root,
+        capture_output=True,
+        check=True,
+        timeout=30,
     )
     return trust
 
@@ -133,10 +282,18 @@ def _controller_trust_head(workdir: pathlib.Path) -> str:
     explicit = os.environ.get("DARK_FACTORY_OPERATOR_TRUST_HEAD", "").strip().lower()
     if explicit:
         return _validate_controller_trust_head(root, explicit)
-    upstream = subprocess.run(
-        ["/usr/bin/git", "rev-parse", "--verify", "@{u}^{commit}"],
-        cwd=root, capture_output=True, check=True, timeout=30,
-    ).stdout.strip().decode("ascii", errors="strict").lower()
+    upstream = (
+        subprocess.run(
+            ["/usr/bin/git", "rev-parse", "--verify", "@{u}^{commit}"],
+            cwd=root,
+            capture_output=True,
+            check=True,
+            timeout=30,
+        )
+        .stdout.strip()
+        .decode("ascii", errors="strict")
+        .lower()
+    )
     return _validate_controller_trust_head(root, upstream)
 
 
@@ -146,22 +303,34 @@ def _reject_unknown_keys(value: dict, allowed: frozenset[str], label: str) -> No
         raise ValueError(f"{label} has unknown keys: {sorted(unknown)}")
 
 
-def _operator_executable(workdir: pathlib.Path, raw: str) -> tuple[str, tuple[str, ...]]:
+def _operator_executable(
+    workdir: pathlib.Path, raw: str
+) -> tuple[str, tuple[str, ...]]:
     if "\0" in raw:
         raise ValueError("operator executable contains NUL")
     candidate = pathlib.Path(raw)
     if candidate.is_absolute():
         if raw not in _OPERATOR_EXECUTABLE_ALLOWLIST:
             raise ValueError("operator executable is not an exact allowlist entry")
-        if candidate.is_symlink() or not candidate.is_file() or not os.access(candidate, os.X_OK):
+        if (
+            candidate.is_symlink()
+            or not candidate.is_file()
+            or not os.access(candidate, os.X_OK)
+        ):
             raise ValueError("allowlisted operator executable is unavailable")
         return raw, ()
     if raw == "@runner-python":
         executable = pathlib.Path(sys.executable).resolve()
-        if executable.is_symlink() or not executable.is_file() or not os.access(executable, os.X_OK):
+        if (
+            executable.is_symlink()
+            or not executable.is_file()
+            or not os.access(executable, os.X_OK)
+        ):
             raise ValueError("runner Python executable is unavailable")
         return str(executable), ("@runner-python",)
-    raise ValueError("operator executable must be a runner-owned token or exact allowlist entry")
+    raise ValueError(
+        "operator executable must be a runner-owned token or exact allowlist entry"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,9 +399,13 @@ def _operator_builtins(trusted_head: str) -> tuple[OperatorCommand, ...]:
         ("git-status", ("/usr/bin/git", "status", "--porcelain=v1")),
     )
     return tuple(
-        OperatorCommand(command_id, command_argv, command_argv, "operator_unwrapped", 30, "required")
+        OperatorCommand(
+            command_id, command_argv, command_argv, "operator_unwrapped", 30, "required"
+        )
         for command_id, command_argv in argv
     )
+
+
 _OPERATOR_FINAL_HEAD = OperatorCommand(
     "git-head-final",
     ("/usr/bin/git", "rev-parse", "HEAD"),
@@ -315,8 +488,10 @@ def _replace_private_bytes_at(directory_fd: int, name: str, data: bytes) -> None
     try:
         _write_private_bytes_at(directory_fd, temp_name, data)
         os.replace(
-            temp_name, name,
-            src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
+            temp_name,
+            name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
         )
         os.fsync(directory_fd)
     finally:
@@ -451,7 +626,10 @@ def _validate_operator_receipt(
     if len(encoded) > _OPERATOR_RECEIPT_MAX_BYTES:
         raise ValueError("operator verification receipt exceeds size bound")
     receipt = json.loads(encoded)
-    if receipt.get("schema_version") != 2 or receipt.get("target_head_sha") != expected_head:
+    if (
+        receipt.get("schema_version") != 2
+        or receipt.get("target_head_sha") != expected_head
+    ):
         raise ValueError("operator verification receipt/head mismatch")
     if expected_receipt is not None and receipt != expected_receipt:
         raise ValueError("operator verification receipt was tampered after creation")
@@ -479,24 +657,9 @@ def _validate_operator_receipt(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _load_operator_manifest(
-    workdir: pathlib.Path, *, trusted_head: str | None = None
+def _parse_operator_manifest_bytes(
+    workdir: pathlib.Path, manifest_path: pathlib.Path, raw: bytes
 ) -> OperatorManifest:
-    manifest_path = workdir / ".dark-factory" / "evidence.yaml"
-    if trusted_head is None:
-        if manifest_path.is_symlink() or not manifest_path.is_file():
-            raise ValueError("operator verification manifest is missing or a symlink")
-        raw = manifest_path.read_bytes()
-    else:
-        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", trusted_head):
-            raise ValueError("trusted manifest commit is malformed")
-        raw = subprocess.run(
-            ["/usr/bin/git", "show", f"{trusted_head}:.dark-factory/evidence.yaml"],
-            cwd=workdir,
-            capture_output=True,
-            check=True,
-            timeout=30,
-        ).stdout
     if len(raw) > _OPERATOR_MANIFEST_MAX_BYTES:
         raise ValueError("operator verification manifest exceeds size bound")
     import yaml
@@ -507,7 +670,9 @@ def _load_operator_manifest(
         raise ValueError("operator verification manifest is malformed YAML") from exc
     if not isinstance(data, dict):
         raise ValueError("operator verification manifest must be a mapping")
-    _reject_unknown_keys(data, frozenset({"aliases", "operator_verification"}), "manifest")
+    _reject_unknown_keys(
+        data, frozenset({"aliases", "operator_verification"}), "manifest"
+    )
     operator = data.get("operator_verification") if isinstance(data, dict) else None
     if not isinstance(operator, dict) or operator.get("schema_version") != 1:
         raise ValueError("operator_verification schema_version must be 1")
@@ -555,7 +720,9 @@ def _load_operator_manifest(
         if (
             isinstance(timeout, bool)
             or not isinstance(timeout, int)
-            or not _OPERATOR_TIMEOUT_MIN_SECONDS <= timeout <= _OPERATOR_TIMEOUT_MAX_SECONDS
+            or not _OPERATOR_TIMEOUT_MIN_SECONDS
+            <= timeout
+            <= _OPERATOR_TIMEOUT_MAX_SECONDS
         ):
             raise ValueError("operator command timeout is outside the bounded range")
         executable, transform_chain = _operator_executable(workdir, argv[0])
@@ -582,7 +749,9 @@ def _load_operator_manifest(
             entry, frozenset({"id", "classification", "reason"}), "operator exclusion"
         )
         exclusion_id = entry.get("id")
-        if not isinstance(exclusion_id, str) or not _OPERATOR_ID_RE.fullmatch(exclusion_id):
+        if not isinstance(exclusion_id, str) or not _OPERATOR_ID_RE.fullmatch(
+            exclusion_id
+        ):
             raise ValueError("operator exclusion id is invalid")
         if exclusion_id in seen_ids:
             raise ValueError("operator verification ids must be unique")
@@ -597,9 +766,24 @@ def _load_operator_manifest(
         operator, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode("utf-8")
     return OperatorManifest(
-        1, tuple(commands), exclusions, manifest_path, raw,
+        1,
+        tuple(commands),
+        exclusions,
+        manifest_path,
+        raw,
         hashlib.sha256(policy_encoded).hexdigest(),
     )
+
+
+def _load_operator_manifest(
+    workdir: pathlib.Path, *, trusted_head: str | None = None
+) -> OperatorManifest:
+    if trusted_head is None:
+        manifest_path, raw = _resolve_operator_manifest_worktree_path(workdir)
+    else:
+        git_path, raw = _resolve_operator_manifest_from_git(workdir, trusted_head)
+        manifest_path = workdir.resolve() / git_path
+    return _parse_operator_manifest_bytes(workdir, manifest_path, raw)
 
 
 def _operator_trust_registry_dir() -> pathlib.Path:
@@ -607,9 +791,7 @@ def _operator_trust_registry_dir() -> pathlib.Path:
 
 
 def _operator_trust_checkpoint_key(checkpoint: pathlib.Path) -> str:
-    absolute = pathlib.Path(
-        os.path.abspath(os.path.expanduser(os.fspath(checkpoint)))
-    )
+    absolute = pathlib.Path(os.path.abspath(os.path.expanduser(os.fspath(checkpoint))))
     return hashlib.sha256(os.fsencode(absolute)).hexdigest()
 
 
@@ -682,7 +864,11 @@ def _validate_operator_trust_record(
     record: object,
 ) -> dict[str, str]:
     if not isinstance(record, dict) or set(record) != {
-        "schema_version", "nonce", "checkpoint_key", "trust_head", "policy_sha256"
+        "schema_version",
+        "nonce",
+        "checkpoint_key",
+        "trust_head",
+        "policy_sha256",
     }:
         raise ValueError("private operator trust record schema is invalid")
     trust_head = str(record.get("trust_head") or "")
@@ -755,9 +941,7 @@ def _restore_operator_run_trust(
     return _validate_operator_trust_record(root, checkpoint_key, record)
 
 
-def _copy_operator_run_trust(
-    checkpoint: pathlib.Path, trust: dict[str, str]
-) -> None:
+def _copy_operator_run_trust(checkpoint: pathlib.Path, trust: dict[str, str]) -> None:
     checkpoint_key = _operator_trust_checkpoint_key(checkpoint)
     record = {
         "schema_version": 1,
@@ -779,9 +963,7 @@ def _copy_operator_run_trust(
         _write_operator_trust_registry(directory_fd, registry)
 
 
-def _remove_operator_run_trust(
-    checkpoint: pathlib.Path, trust: dict[str, str]
-) -> None:
+def _remove_operator_run_trust(checkpoint: pathlib.Path, trust: dict[str, str]) -> None:
     checkpoint_key = _operator_trust_checkpoint_key(checkpoint)
     nonce = str(trust.get("nonce") or "")
     if not re.fullmatch(r"[0-9a-f]{32}", nonce):
@@ -865,9 +1047,7 @@ def _operator_verify(node: "Node", ctx: "Context") -> Result:
         if manifest.policy_sha256 != expected_policy_sha256:
             raise ValueError("operator verification policy differs from private trust")
         manifest_sha = hashlib.sha256(manifest.raw_bytes).hexdigest()
-        visit = 1 + sum(
-            1 for item in ctx.history if item.get("node") == node.name
-        )
+        visit = 1 + sum(1 for item in ctx.history if item.get("node") == node.name)
         raw_dir = (
             _operator_log_root()
             / _safe_operator_component(str(ctx.run_id or "adhoc"), "adhoc")
@@ -887,7 +1067,11 @@ def _operator_verify(node: "Node", ctx: "Context") -> Result:
     failure_type = ""
     target_head = ""
     final_head = ""
-    commands = (*_operator_builtins(trusted_manifest_head), *manifest.commands, _OPERATOR_FINAL_HEAD)
+    commands = (
+        *_operator_builtins(trusted_manifest_head),
+        *manifest.commands,
+        _OPERATOR_FINAL_HEAD,
+    )
     env = _handlers_shim._sanitized_env()
     runner_python = str(pathlib.Path(sys.executable).resolve())
     if sys.executable != runner_python:
@@ -909,18 +1093,31 @@ def _operator_verify(node: "Node", ctx: "Context") -> Result:
                             list(command.effective_argv), workdir
                         )
                         if wrapped is None:
-                            raise RuntimeError("operator worker-safe sandbox unavailable")
+                            raise RuntimeError(
+                                "operator worker-safe sandbox unavailable"
+                            )
                         execution = OperatorCommand(
-                            command.id, command.requested_argv, tuple(wrapped),
-                            command.lane, command.timeout_seconds, command.classification,
+                            command.id,
+                            command.requested_argv,
+                            tuple(wrapped),
+                            command.lane,
+                            command.timeout_seconds,
+                            command.classification,
                             (*command.transform_chain, "worker-holdout-sandbox"),
                         )
                         execution_env = {**env, "DARK_FACTORY_OUTER_SANDBOX": "1"}
-                    elif command in manifest.commands and command.lane == "operator_unwrapped":
+                    elif (
+                        command in manifest.commands
+                        and command.lane == "operator_unwrapped"
+                    ):
                         command_cwd = trusted_snapshot
                         execution = OperatorCommand(
-                            command.id, command.requested_argv, command.effective_argv,
-                            command.lane, command.timeout_seconds, command.classification,
+                            command.id,
+                            command.requested_argv,
+                            command.effective_argv,
+                            command.lane,
+                            command.timeout_seconds,
+                            command.classification,
                             (*command.transform_chain, "trusted-run-initial-snapshot"),
                         )
                     started = time.monotonic_ns()
@@ -938,17 +1135,30 @@ def _operator_verify(node: "Node", ctx: "Context") -> Result:
                     _write_private_bytes(stderr_path, result.stderr)
                     receipt_commands.append(
                         _command_receipt(
-                            execution, result, cwd=command_cwd,
-                            duration_ms=duration_ms, stdout_path=stdout_path,
+                            execution,
+                            result,
+                            cwd=command_cwd,
+                            duration_ms=duration_ms,
+                            stdout_path=stdout_path,
                             stderr_path=stderr_path,
                         )
                     )
                     if command.id == "git-head":
-                        target_head = result.stdout.decode("ascii", errors="strict").strip().lower()
+                        target_head = (
+                            result.stdout.decode("ascii", errors="strict")
+                            .strip()
+                            .lower()
+                        )
                         if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", target_head):
-                            raise ValueError("operator verification target HEAD is malformed")
+                            raise ValueError(
+                                "operator verification target HEAD is malformed"
+                            )
                     elif command.id == "git-head-final":
-                        final_head = result.stdout.decode("ascii", errors="strict").strip().lower()
+                        final_head = (
+                            result.stdout.decode("ascii", errors="strict")
+                            .strip()
+                            .lower()
+                        )
                     if result.output_overflowed:
                         failure_outcome, failure_type = "error", "output_overflow"
                         break
@@ -1030,7 +1240,9 @@ def _operator_verify(node: "Node", ctx: "Context") -> Result:
             "command_count": str(len(receipt_commands)),
             "error_type": failure_type,
         },
-        context_updates={"operator_verification_receipt": "evidence/operator-verification.json"},
+        context_updates={
+            "operator_verification_receipt": "evidence/operator-verification.json"
+        },
     )
 
 
@@ -1047,6 +1259,7 @@ def _load_evidence_aliases(workdir: pathlib.Path) -> list[str]:
         return []
     try:
         import yaml  # local import: PyYAML is a runner dep but optional for callers
+
         data = yaml.safe_load(manifest.read_text(encoding="utf-8")) or {}
     except Exception:
         return []
@@ -1130,6 +1343,7 @@ def _gh_pr_body(workdir: pathlib.Path, target_pr: str) -> Optional[str]:
 
 def _compute_evidence_sha(workdir: pathlib.Path, paths: list[str]) -> Optional[str]:
     import hashlib
+
     h = hashlib.sha256()
     has_files = False
     for p in paths:
@@ -1143,7 +1357,9 @@ def _compute_evidence_sha(workdir: pathlib.Path, paths: list[str]) -> Optional[s
     return h.hexdigest() if has_files else None
 
 
-def _verify_evidence_freshness(workdir: pathlib.Path, paths: list[str], expected_sha: str) -> bool:
+def _verify_evidence_freshness(
+    workdir: pathlib.Path, paths: list[str], expected_sha: str
+) -> bool:
     if not expected_sha:
         return False
     expected_sha_lower = expected_sha.lower()
@@ -1163,6 +1379,7 @@ def _verify_evidence_freshness(workdir: pathlib.Path, paths: list[str], expected
 def _check_unresolved_review_state(workdir: pathlib.Path, target_pr: str) -> bool:
     import json
     import subprocess
+
     if not target_pr or target_pr == "N/A":
         return True
     try:
@@ -1192,12 +1409,15 @@ def _check_unresolved_review_state(workdir: pathlib.Path, target_pr: str) -> boo
     return True
 
 
-def _is_replacement_or_deletion_work(diff_summary: str, pr_description: str, is_replacement_attr: bool) -> bool:
+def _is_replacement_or_deletion_work(
+    diff_summary: str, pr_description: str, is_replacement_attr: bool
+) -> bool:
     if is_replacement_attr:
         return True
     insertions = 0
     deletions = 0
     import re
+
     ins_match = re.search(r"(\d+)\s+insertion", diff_summary)
     del_match = re.search(r"(\d+)\s+deletion", diff_summary)
     if ins_match:
@@ -1206,7 +1426,15 @@ def _is_replacement_or_deletion_work(diff_summary: str, pr_description: str, is_
         deletions = int(del_match.group(1))
     if deletions > 0 and (insertions - deletions <= 0):
         return True
-    keywords = ["delete", "remove", "refactor", "cleanup", "dead code", "replacement", "replace"]
+    keywords = [
+        "delete",
+        "remove",
+        "refactor",
+        "cleanup",
+        "dead code",
+        "replacement",
+        "replace",
+    ]
     desc_lower = pr_description.lower()
     if any(k in desc_lower for k in keywords):
         return True
@@ -1221,7 +1449,9 @@ def _gate_audit(node: "Node", ctx: "Context") -> "Result":
 
     target_pr = ctx.state.get("target_pr") or node.attrs.get("target_pr") or "N/A"
 
-    target_head_sha = ctx.state.get("target_head_sha") or node.attrs.get("target_head_sha")
+    target_head_sha = ctx.state.get("target_head_sha") or node.attrs.get(
+        "target_head_sha"
+    )
     if not target_head_sha:
         target_head_sha = _handlers_shim._worktree_head_sha(ctx.workdir)
 
@@ -1237,7 +1467,9 @@ def _gate_audit(node: "Node", ctx: "Context") -> "Result":
     if not pr_description:
         pr_description = _gh_pr_body(ctx.workdir, target_pr) or "N/A"
 
-    evidence_paths_raw = ctx.state.get("evidence_paths") or node.attrs.get("evidence_paths")
+    evidence_paths_raw = ctx.state.get("evidence_paths") or node.attrs.get(
+        "evidence_paths"
+    )
     evidence_paths = []
     if evidence_paths_raw:
         if isinstance(evidence_paths_raw, str):
@@ -1245,9 +1477,13 @@ def _gate_audit(node: "Node", ctx: "Context") -> "Result":
                 try:
                     evidence_paths = json.loads(evidence_paths_raw)
                 except Exception:
-                    evidence_paths = [p.strip() for p in evidence_paths_raw.split(",") if p.strip()]
+                    evidence_paths = [
+                        p.strip() for p in evidence_paths_raw.split(",") if p.strip()
+                    ]
             else:
-                evidence_paths = [p.strip() for p in evidence_paths_raw.split(",") if p.strip()]
+                evidence_paths = [
+                    p.strip() for p in evidence_paths_raw.split(",") if p.strip()
+                ]
         elif isinstance(evidence_paths_raw, list):
             evidence_paths = evidence_paths_raw
     else:
@@ -1291,7 +1527,9 @@ def _gate_audit(node: "Node", ctx: "Context") -> "Result":
 
     verdict_artifact_path = ctx.workdir / "gate_audit_verdict.json"
 
-    def write_verdict_artifact(outcome: str, verdict: str, details: str, is_repl: bool, ev_sha: str):
+    def write_verdict_artifact(
+        outcome: str, verdict: str, details: str, is_repl: bool, ev_sha: str
+    ):
         verdict_artifact["outcome"] = outcome
         verdict_artifact["verdict"] = verdict
         verdict_artifact["audit_details"] = details
@@ -1299,7 +1537,9 @@ def _gate_audit(node: "Node", ctx: "Context") -> "Result":
         verdict_artifact["evidence_sha"] = ev_sha
         try:
             verdict_artifact_path.parent.mkdir(parents=True, exist_ok=True)
-            verdict_artifact_path.write_text(json.dumps(verdict_artifact, indent=2), encoding="utf-8")
+            verdict_artifact_path.write_text(
+                json.dumps(verdict_artifact, indent=2), encoding="utf-8"
+            )
         except Exception:
             pass
 
@@ -1316,13 +1556,19 @@ def _gate_audit(node: "Node", ctx: "Context") -> "Result":
     if not evidence_sha:
         evidence_sha = _compute_evidence_sha(ctx.workdir, evidence_paths) or "N/A"
 
-    if not target_head_sha or not _verify_evidence_freshness(ctx.workdir, evidence_paths, target_head_sha):
+    if not target_head_sha or not _verify_evidence_freshness(
+        ctx.workdir, evidence_paths, target_head_sha
+    ):
         err_msg = f"Evidence Audit: stale evidence, target HEAD SHA {target_head_sha} not found in evidence logs."
         write_verdict_artifact("failure", "fail", err_msg, False, evidence_sha)
         return Result(
             outcome="failure",
             output=err_msg,
-            metadata={"verdict": "fail", "error_type": "stale_evidence", "evidence_sha": evidence_sha},
+            metadata={
+                "verdict": "fail",
+                "error_type": "stale_evidence",
+                "evidence_sha": evidence_sha,
+            },
         )
 
     if not _check_unresolved_review_state(ctx.workdir, target_pr):
@@ -1331,7 +1577,11 @@ def _gate_audit(node: "Node", ctx: "Context") -> "Result":
         return Result(
             outcome="failure",
             output=err_msg,
-            metadata={"verdict": "fail", "error_type": "unresolved_reviews", "evidence_sha": evidence_sha},
+            metadata={
+                "verdict": "fail",
+                "error_type": "unresolved_reviews",
+                "evidence_sha": evidence_sha,
+            },
         )
 
     is_replacement_attr = False
@@ -1342,7 +1592,9 @@ def _gate_audit(node: "Node", ctx: "Context") -> "Result":
         else:
             is_replacement_attr = str(raw_repl).strip().lower() in {"true", "1", "yes"}
 
-    is_repl = _is_replacement_or_deletion_work(diff_summary, pr_description, is_replacement_attr)
+    is_repl = _is_replacement_or_deletion_work(
+        diff_summary, pr_description, is_replacement_attr
+    )
 
     evidence_snapshots = []
     for p in evidence_paths:
@@ -1391,7 +1643,9 @@ CRITICAL FORMATTING INSTRUCTIONS:
 
     if ctx.backend in ("echo", "mock_llm"):
         hint = ctx.state.get(f"{node.name}.outcome", "success")
-        verdict = "pass" if hint == "success" else ("warn" if hint == "warn" else "fail")
+        verdict = (
+            "pass" if hint == "success" else ("warn" if hint == "warn" else "fail")
+        )
         outcome = hint
         if is_repl:
             if verdict not in ("pass", "approved", "approve"):
@@ -1401,7 +1655,11 @@ CRITICAL FORMATTING INSTRUCTIONS:
         return Result(
             outcome=outcome,
             output=output_text,
-            metadata={"verdict": verdict, "evidence_sha": evidence_sha, "is_replacement": str(is_repl)},
+            metadata={
+                "verdict": verdict,
+                "evidence_sha": evidence_sha,
+                "is_replacement": str(is_repl),
+            },
         )
 
     # Rationale (jleechan-arr): the 1200s default exceeds the roadmap's
@@ -1415,7 +1673,12 @@ CRITICAL FORMATTING INSTRUCTIONS:
     timeout = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1200"), 1200)
     backend, gate_meta = _handlers_shim._resolve_gate_backend(node, ctx)
     result = _handlers_shim._execute_gate(
-        audit_prompt, target_head_sha, timeout, ctx, "gate_audit", backend,
+        audit_prompt,
+        target_head_sha,
+        timeout,
+        ctx,
+        "gate_audit",
+        backend,
         gate_strict=_gate_strict_flag(node),
     )
 
@@ -1436,9 +1699,11 @@ CRITICAL FORMATTING INSTRUCTIONS:
 
     write_verdict_artifact(outcome, verdict, result.output, is_repl, evidence_sha)
     result.outcome = outcome
-    result.metadata.update({
-        "verdict": verdict,
-        "evidence_sha": evidence_sha,
-        "is_replacement": str(is_repl),
-    })
+    result.metadata.update(
+        {
+            "verdict": verdict,
+            "evidence_sha": evidence_sha,
+            "is_replacement": str(is_repl),
+        }
+    )
     return result

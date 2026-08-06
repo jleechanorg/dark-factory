@@ -366,6 +366,12 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.preflight:
             graph, diagnostics = validate_pipeline(pipeline_path)
+            if graph is not None:
+                from .handler_audit import validate_operator_trust_preflight
+
+                diagnostics.extend(
+                    validate_operator_trust_preflight(args.workdir, graph)
+                )
             payload = {
                 "pipeline": str(pipeline_path),
                 "pipeline_name": graph.name if graph else pipeline_path.stem,
