@@ -42,6 +42,7 @@ from runner.worktree_layout import (  # noqa: E402  (intentional: sys.path tweak
     protected_worktree_paths,
     reap_stale_worktrees,
 )
+from runner.worktree_layout import main as reaper_main
 
 
 # ---------------------------------------------------------------------------
@@ -290,8 +291,11 @@ def test_cli_reap_dry_run_does_not_delete(
     primary = tmp_path / "primary"
     primary.mkdir()
     root = tmp_path / "agent-worktrees"
-    root.mkdir()
-    stale = _make_fake_worktree(root, "agent-stale", age_seconds=10**8)
+    root.mkdir(parents=True, exist_ok=True)
+    # Use a real git worktree so the new default `check_git_safety=True`
+    # (jleechan-6i73) sees a clean ordinary worktree and the dry-run plan
+    # is computed without the git guard refusing it.
+    stale = _make_real_git_worktree(tmp_path, root, "agent-stale")
 
     cli = ROOT / "bin" / "df-reap-worktrees"
     env = {**os.environ, "DARK_FACTORY_AGENT_WORKTREES": str(root)}
@@ -587,3 +591,208 @@ def test_reaper_refuses_locked_dirty_and_unpushed_worktrees(tmp_path: Path) -> N
     assert dirty in refused_paths
     assert unpushed in refused_paths
     assert clean not in refused_paths
+
+
+# ---------------------------------------------------------------------------
+# 8. CLI default wiring — bead jleechan-6i73. The CLI call site
+#    (bin/df-reap-worktrees → main()) MUST default to the protect-list AND
+#    git-safety guards so the protection is active without explicit flags.
+#    Opt-OUT flags --no-systemd-protect / --no-git-safety exist for the
+#    rare case where an operator needs to bypass.
+#
+#    The reaper's safety primitives were proven in PR #578; the gap fixed
+#    here is the CLI call site that previously did not pass them in.
+# ---------------------------------------------------------------------------
+
+
+def _run_cli_reap(
+    primary: Path,
+    root: Path,
+    *,
+    extra_args: list[str] | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
+    """Invoke bin/df-reap-worktrees with --apply so the test exercises the
+    full CLI surface, not the in-process main()."""
+    cli = ROOT / "bin" / "df-reap-worktrees"
+    env = {**os.environ, "DARK_FACTORY_AGENT_WORKTREES": str(root)}
+    if extra_env:
+        env.update(extra_env)
+    cmd = [
+        sys.executable,
+        str(cli),
+        "--primary-checkout",
+        str(primary),
+        "--ttl-seconds",
+        "1",
+        "--apply",
+    ]
+    if extra_args:
+        cmd.extend(extra_args)
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+
+
+def test_cli_defaults_protect_systemd_referenced_worktree(tmp_path: Path) -> None:
+    """Without any flags, the CLI MUST treat a worktree referenced by an
+    enabled systemd --user unit as protected (the safe path). The worktree
+    survives and the refusal is surfaced in the CLI output.
+
+    Reproduces the merge-guard scenario from PR #578: the worktree that
+    holds the only `gh pr merge` call site must not be reaped by default.
+
+    The CLI's default `protected_worktree_paths()` reads from
+    ``$HOME/.config/systemd/user``. We pin HOME to a tmp dir and lay the
+    fake unit tree at the exact path the CLI will resolve to.
+
+    Uses a real git worktree so the git safety guard passes for the
+    "ordinary" entry; only the systemd guard is the variable under test.
+    """
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    root = tmp_path / "agent-worktrees"
+    root.mkdir(parents=True, exist_ok=True)
+
+    # Real git worktrees — the guarded one is referenced by a fake
+    # systemd unit; the ordinary one is identical except for the unit.
+    guarded = _make_real_git_worktree(tmp_path, root, "merge-guard-wt")
+    ordinary = _make_real_git_worktree(tmp_path, root, "ordinary-stale")
+
+    # Build a fake systemd --user dir at the location the CLI will read:
+    # protected_worktree_paths() defaults to <home>/.config/systemd/user.
+    unit_dir = tmp_path / ".config" / "systemd" / "user"
+    unit_dir.mkdir(parents=True)
+    service_name = "dark-factory-merge-guard.service"
+    timer_name = service_name.replace(".service", ".timer")
+    (unit_dir / service_name).write_text(
+        "[Unit]\n"
+        f"Description=fake {service_name}\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"WorkingDirectory={guarded}\n"
+        f"ExecStart=/bin/bash {guarded}/run.sh\n"
+    )
+    (unit_dir / timer_name).write_text(
+        "[Unit]\n"
+        f"Unit={service_name}\n"
+        "[Timer]\n"
+        "OnUnitActiveSec=60s\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n"
+    )
+    wants = unit_dir / "timers.target.wants"
+    wants.mkdir()
+    (wants / timer_name).symlink_to(unit_dir / timer_name)
+
+    # Sanity: with HOME=tmp_path, the helper sees the fake unit and the
+    # guarded worktree is in its returned set.
+    assert guarded.resolve() in protected_worktree_paths(systemd_user_dir=unit_dir)
+    assert ordinary.resolve() not in protected_worktree_paths(systemd_user_dir=unit_dir)
+
+    result = _run_cli_reap(
+        primary,
+        root,
+        extra_env={"HOME": str(tmp_path)},
+    )
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert guarded.exists(), (
+        "default CLI run must NOT prune a systemd-protected worktree"
+    )
+    assert not ordinary.exists(), (
+        "default CLI run must still reap ordinary stale worktrees"
+    )
+
+
+def test_cli_defaults_check_git_safety(tmp_path: Path) -> None:
+    """Without any flags, the CLI MUST refuse to prune a locked or dirty
+    worktree. A clean stale worktree is still reaped.
+
+    Uses real git worktrees so the guard fires on actual git state, not
+    mocked output (mirrors the PR #578 invariant).
+    """
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    wt_root = tmp_path / "agent-worktrees"
+    wt_root.mkdir(parents=True, exist_ok=True)
+
+    locked = _make_real_git_worktree(tmp_path, wt_root, "locked-wt", locked=True)
+    clean = _make_real_git_worktree(tmp_path, wt_root, "clean-wt")
+
+    result = _run_cli_reap(primary, wt_root)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert locked.exists(), "default CLI run must NOT prune a locked worktree"
+    assert not clean.exists(), "default CLI run must still reap a clean stale worktree"
+
+
+def test_cli_no_systemd_protect_opt_out_reaps_protected_worktree(
+    tmp_path: Path,
+) -> None:
+    """With --no-systemd-protect, the CLI bypasses the protect-list guard.
+    A worktree that would otherwise be protected is now reap-eligible.
+
+    We pair this with --no-git-safety so the test isolates the systemd
+    guard (the fake `.git`-file worktree used here would otherwise be
+    refused by the git safety guard for failing the locked/dirty check
+    on a non-real worktree — that's a separate guard).
+    """
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    root = tmp_path / "agent-worktrees"
+    root.mkdir()
+
+    guarded = _make_fake_worktree(root, "merge-guard-worktree", age_seconds=10**8)
+
+    result = _run_cli_reap(
+        primary,
+        root,
+        extra_args=["--no-systemd-protect", "--no-git-safety"],
+    )
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert not guarded.exists(), (
+        "--no-systemd-protect must allow the CLI to prune a worktree that would "
+        "otherwise be protected by the systemd list"
+    )
+
+
+def test_cli_no_git_safety_opt_out_reaps_locked_worktree(tmp_path: Path) -> None:
+    """With --no-git-safety, the CLI bypasses the locked/dirty/unpushed
+    guard. A locked worktree is now reap-eligible (operator override).
+    """
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    wt_root = tmp_path / "agent-worktrees"
+    wt_root.mkdir(parents=True, exist_ok=True)
+
+    locked = _make_real_git_worktree(tmp_path, wt_root, "locked-wt", locked=True)
+
+    result = _run_cli_reap(primary, wt_root, extra_args=["--no-git-safety"])
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert not locked.exists(), (
+        "--no-git-safety must allow the CLI to prune a locked worktree"
+    )
+
+
+def test_cli_argparse_accepts_opt_out_flags() -> None:
+    """The CLI's argparse surface must accept the opt-out flags without
+    erroring. Use --help to confirm the flags are documented and the
+    parser accepts them as boolean inverses of the defaults.
+    """
+    cli = ROOT / "bin" / "df-reap-worktrees"
+    result = subprocess.run(
+        [sys.executable, str(cli), "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--no-systemd-protect" in result.stdout
+    assert "--no-git-safety" in result.stdout

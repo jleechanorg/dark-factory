@@ -639,6 +639,27 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Actually delete. Required to mutate the filesystem.",
     )
+    p.add_argument(
+        "--no-systemd-protect",
+        action="store_true",
+        help=(
+            "Opt out of the systemd protect-list guard. By default the CLI "
+            "derives paths referenced by ENABLED systemd --user units and "
+            "refuses to prune any worktree in that set (this is what keeps "
+            "the merge-guard's WorkingDirectory worktree alive). Pass this "
+            "flag only when you have a verified reason to bypass."
+        ),
+    )
+    p.add_argument(
+        "--no-git-safety",
+        action="store_true",
+        help=(
+            "Opt out of the git safety guard. By default the CLI refuses to "
+            "prune a worktree that is locked, has uncommitted changes, or "
+            "has unpushed commits. Pass this flag only when you have a "
+            "verified reason to bypass."
+        ),
+    )
     return p
 
 
@@ -683,11 +704,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 2
 
+    # Defaults: BOTH guards are ON. The CLI is the safe-by-default surface;
+    # the systemd protect-list keeps the merge-guard worktree alive, and
+    # the git safety guard refuses to prune locked/dirty/unpushed worktrees.
+    # Operators who need to bypass can pass --no-systemd-protect and/or
+    # --no-git-safety (bead jleechan-6i73).
+    if args.no_systemd_protect:
+        protected_paths: tuple[Path, ...] = ()
+    else:
+        protected_paths = tuple(protected_worktree_paths())
+    check_git_safety = not args.no_git_safety
+
     summary = reap_stale_worktrees(
         root=root,
         primary_checkout=primary,
         ttl_seconds=ttl_seconds,
         max_count=max_count,
+        protected_paths=protected_paths,
+        check_git_safety=check_git_safety,
     )
     if args.apply:
         summary = apply_reap(summary, dry_run=False)
