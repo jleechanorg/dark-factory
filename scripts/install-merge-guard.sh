@@ -78,14 +78,31 @@ install_systemd_user() {
     # [dry-run] markers. Fall back to the real uid's name, which is always
     # resolvable. Observed on runner ez-runner-c (bead jleechan-kn5j).
     local user_name="${USER:-$(id -un 2>/dev/null || echo unknown)}"
-    if ! command -v systemctl >/dev/null 2>&1; then
-        echo "[error] systemctl not found on PATH; cannot install systemd user unit" >&2
-        exit 3
-    fi
-    if [ -z "${XDG_RUNTIME_DIR:-}" ] && ! loginctl show-user "$user_name" >/dev/null 2>&1; then
-        echo "[error] systemd user session not available (no XDG_RUNTIME_DIR, loginctl inactive)" >&2
-        echo "[hint]  enable lingering with: sudo loginctl enable-linger $user_name" >&2
-        exit 3
+    # These are LIVE-INSTALL preconditions: they matter because we are about to
+    # write units and talk to a running systemd user instance. A --dry-run does
+    # neither — it only prints what it would do — so enforcing them there makes
+    # the dry run unusable exactly where it is most useful: CI containers, which
+    # have no systemd user session at all. Before this guard, --dry-run exited 3
+    # with "systemd user session not available" and emitted no [dry-run] markers,
+    # failing tests/scripts/test_merge_guard_scheduler.sh on every Linux runner.
+    # Bead jleechan-kn5j.
+    if [ "$DRY_RUN" -eq 1 ]; then
+        if ! command -v systemctl >/dev/null 2>&1; then
+            echo "[dry-run] note: systemctl absent here; a real install would require it" >&2
+        elif [ -z "${XDG_RUNTIME_DIR:-}" ] && ! loginctl show-user "$user_name" >/dev/null 2>&1; then
+            echo "[dry-run] note: no systemd user session here; a real install would require" >&2
+            echo "[dry-run]       XDG_RUNTIME_DIR or: sudo loginctl enable-linger $user_name" >&2
+        fi
+    else
+        if ! command -v systemctl >/dev/null 2>&1; then
+            echo "[error] systemctl not found on PATH; cannot install systemd user unit" >&2
+            exit 3
+        fi
+        if [ -z "${XDG_RUNTIME_DIR:-}" ] && ! loginctl show-user "$user_name" >/dev/null 2>&1; then
+            echo "[error] systemd user session not available (no XDG_RUNTIME_DIR, loginctl inactive)" >&2
+            echo "[hint]  enable lingering with: sudo loginctl enable-linger $user_name" >&2
+            exit 3
+        fi
     fi
 
     ensure_log_dir
