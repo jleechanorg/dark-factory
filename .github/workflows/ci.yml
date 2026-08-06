@@ -135,6 +135,36 @@ jobs:
             echo "Self-test ok (rc=$rc)"
           fi
 
+      - name: Provision sqlite3 CLI on Linux runners
+        # Linux container self-hosted runners (ez-runner-c-7 et al.) DO NOT
+        # ship the sqlite3 binary. factory-overlay.sh:77 defines
+        #   sql() { sqlite3 -cmd '.timeout 5000' "$DB" "$@"; }
+        # and every overlay subcommand shells out to that binary, so the
+        # bash integration tests (tests/scripts/*.sh) below fail with
+        #   "daemon/factory-overlay.sh: line 77: sqlite3: command not found"
+        # and report empty state (expected 'DISPATCHED', got '').
+        #
+        # apt-get install sqlite3 was attempted in PR #577 and reverted: the
+        # runners run under the no-new-privileges flag which blocks sudo.
+        # A python-stdlib shim was tried and reverted for the same reason:
+        # the overlay depends on sqlite3 CLI behavior the stdlib module does
+        # not reproduce (PRAGMA, -separator, -json).
+        #
+        # Solution: build sqlite3 from the official amalgamation
+        # (~3MB shell.c + sqlite3.c) with gcc into $HOME/.local/bin, then
+        # export that dir ahead of /usr/bin on PATH. Pattern lifted from
+        # PR #288 / commits cc4fa1a4 + 0876784e which solved the same
+        # problem for the daemon-tests job on Linux-aarch64. The helper
+        # script is idempotent and self-contained.
+        # Bead: jleechan-xn4n.
+        run: |
+          if [ "$(uname -s)" != "Linux" ]; then
+            echo "Not Linux ($(uname -s)) — skipping sqlite3 amalgamation provision."
+            exit 0
+          fi
+          "${GITHUB_WORKSPACE}/daemon/scripts/build_sqlite3_amalgamation.sh" "${HOME}/.local/bin"
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+
       - name: Detect runner platform (Linux-only isolation tests)
         # tests/security/test_agent_isolation.py uses @linux_only markers
         # and will SKIP on macOS runners. This step surfaces that fact
