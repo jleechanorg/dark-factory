@@ -57,9 +57,21 @@ if ! command -v sqlite3 >/dev/null 2>&1; then
     echo "SKIP: sqlite3 not installed; canary E2E test cannot run"
 else
     set +e
-    bash "$CANARY" --out-dir "$SCRATCH" >/dev/null 2>&1
+    # Bead jleechan-kn5j: capture instead of discarding. Sending the canary's
+    # output to /dev/null means a CI failure surfaces as a bare exit code with
+    # no cause — this exact test failed on Linux runners for hours showing only
+    # "canary exits 0 overall (expected '0', got '1')" while the real error
+    # ("no such table: bead_overlay") was thrown away. Keep it quiet on success,
+    # print it on failure.
+    CANARY_LOG="$SCRATCH/canary-run.log"
+    bash "$CANARY" --out-dir "$SCRATCH" >"$CANARY_LOG" 2>&1
     CANARY_RC=$?
     set -e
+    if [ "$CANARY_RC" -ne 0 ]; then
+        echo "--- canary output (rc=$CANARY_RC) ---"
+        tail -40 "$CANARY_LOG" | sed 's/^/    /'
+        echo "--- end canary output ---"
+    fi
 
     # Crucial: the canary itself exits 0. (An internal AF-tick rc=1 is OK —
     # that's acceptance-2 fail-closed in action — as long as the CANARY exits
