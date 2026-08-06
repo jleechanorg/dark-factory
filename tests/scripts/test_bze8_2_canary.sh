@@ -53,8 +53,23 @@ SCRATCH="$(mktemp -d -t bze8-test.XXXXXX)"
 cleanup() { rm -rf "$SCRATCH" "$HELP_FILE"; }
 trap cleanup EXIT
 
+# The canary E2E needs BOTH the sqlite3 CLI and a Rust toolchain: it builds
+# `daemon/target/debug/daemon` before exercising the tick. This mirrors the
+# pre-existing sqlite3 guard rather than inventing a new convention.
+#
+# Bead jleechan-kn5j: `cargo` is absent in the `test` job — only `daemon-tests`
+# installs a Rust toolchain — so on Linux runners the canary died with
+# "line 171: cargo: command not found / daemon build failed" and, under set -e,
+# never wrote its evidence bundle. That surfaced as five artifact assertions
+# failing for what looked like unrelated reasons.
+#
+# Skipping is honest here (the job genuinely cannot run this E2E) and the
+# canary IS still covered: `daemon-tests`, which has the toolchain, is the
+# right home for it. Reported as SKIP, never as PASS, so the gap stays visible.
 if ! command -v sqlite3 >/dev/null 2>&1; then
     echo "SKIP: sqlite3 not installed; canary E2E test cannot run"
+elif ! command -v cargo >/dev/null 2>&1; then
+    echo "SKIP: cargo not on PATH; canary E2E builds the rust daemon and cannot run"
 else
     set +e
     # Bead jleechan-kn5j: capture instead of discarding. Sending the canary's
