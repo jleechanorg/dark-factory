@@ -44,9 +44,18 @@ from __future__ import annotations
 import json
 import pathlib
 import sys
+import tempfile
 
 ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
+
+# Scratch workdir in the OS tempdir — using the repo root here leaks one
+# branch_* mkdtemp per fan-out test into the working tree.
+SCRATCH = pathlib.Path(tempfile.mkdtemp(prefix="test_structured_state_convention_"))
+
+from conftest import register_scratch_dir  # noqa: E402
+
+register_scratch_dir(SCRATCH)
 
 import runner.handlers as handlers_mod  # noqa: E402
 from runner.engine import run  # noqa: E402
@@ -198,7 +207,7 @@ def test_spec_gen_fix_main_render_survives_dict_list_scalar_state(monkeypatch, t
 
     ctx = Context(
         goal="dict/list/scalar state must not crash the SpecGen fix loop",
-        workdir=ROOT,
+        workdir=SCRATCH,
         backend="echo",
     )
     ctx.state["review_attractor.outcome"] = "success"
@@ -270,7 +279,7 @@ def test_tool_node_renders_dict_state_as_json_not_python_repr(monkeypatch, tmp_p
             "timeout": "30",
         },
     )
-    ctx = Context(goal="tool node dict-state JSON convention", workdir=ROOT, backend="echo")
+    ctx = Context(goal="tool node dict-state JSON convention", workdir=SCRATCH, backend="echo")
     ctx.state["review_main.resolved_backend_meta"] = {"b": 2, "a": 1}
 
     result = tool_handler(node, ctx)

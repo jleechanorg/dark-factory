@@ -7,8 +7,10 @@ import argparse
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 
@@ -526,6 +528,22 @@ def cmd_list_handlers(_: argparse.Namespace) -> int:
     return 0
 
 
+def _score_runtime_workdir() -> pathlib.Path:
+    """Return a scratch workdir for ``cmd_score``'s inner runtime check.
+
+    The runtime subprocess invokes the runner with a parallel fan-out
+    (explore_* branches); without an isolated workdir those mkdtemp dirs
+    land at the repo root, polluting the working tree. We mirror the
+    repo's ``impl/`` tree into the scratch dir so the sealed holdout
+    evaluator can find greet.py.
+    """
+    scratch = pathlib.Path(tempfile.mkdtemp(prefix="conformance_score_runtime_"))
+    impl_link = scratch / "impl"
+    if not impl_link.exists():
+        impl_link.symlink_to(ROOT / "impl")
+    return scratch
+
+
 def cmd_score(_: argparse.Namespace) -> int:
     try:
         started = time.monotonic()
@@ -558,14 +576,20 @@ def cmd_score(_: argparse.Namespace) -> int:
             timeout=60,
             check=False,
         )
-        runtime = subprocess.run(
-            [sys.executable, str(ROOT / "bin" / "conformance"), "run", "pipelines/factory/hello.dot"],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
+        runtime_scratch = _score_runtime_workdir()
+        try:
+            runtime = subprocess.run(
+                [sys.executable, str(ROOT / "bin" / "conformance"), "run",
+                 "--workdir", str(runtime_scratch),
+                 "pipelines/factory/hello.dot"],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        finally:
+            shutil.rmtree(runtime_scratch, ignore_errors=True)
         elapsed = time.monotonic() - started
         passed = build.returncode == tests.returncode == validation.returncode == runtime.returncode == 0
         payload = {

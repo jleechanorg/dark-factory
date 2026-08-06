@@ -1209,6 +1209,15 @@ pub struct FakeStateStore {
     /// Bead jleechan-yoqy / issue #323: per-bead last-/er evidence-marker hash
     /// (mirrors the `last_er_evidence_hash` column), for the retrigger tests.
     pub last_er_evidence_hash: RefCell<HashMap<String, String>>,
+    /// Bead jleechan-6l1f: per-bead `last_all_green` boolean (mirrors the
+    /// `last_all_green` SQLite column). Defaults to `None` ("never recorded"),
+    /// which the regression-detection predicate treats as `false` (no
+    /// regression candidate until we have positive proof of a prior green).
+    pub last_all_green: RefCell<HashMap<String, bool>>,
+    /// Bead jleechan-6l1f: per-bead cumulative green->red regression count
+    /// (mirrors the `gate_regression_count` SQLite column). Bumped atomically
+    /// by `incr_gate_regression_count` and consulted by `MAX_GATE_REGRESSIONS`.
+    pub gate_regression_counts: RefCell<HashMap<String, u32>>,
     /// 1s2q-escalation-dedup: per-(bead_id, reason) escalation ledger rows
     /// (mirrors the `escalation_ledger` SQLite table). Each entry is
     /// `(context_hash, last_emitted_epoch, terminal)`. Used by the fake's
@@ -1462,6 +1471,36 @@ impl StateStore for FakeStateStore {
             .borrow_mut()
             .insert(bead_id.to_string(), hash.to_string());
         Ok(())
+    }
+
+    fn last_all_green(&self, bead_id: &str) -> Result<Option<bool>, DaemonError> {
+        Ok(self.last_all_green.borrow().get(bead_id).copied())
+    }
+
+    fn set_last_all_green(&self, bead_id: &str, value: bool) -> Result<(), DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("set_last_all_green({bead_id},{value})"));
+        self.last_all_green
+            .borrow_mut()
+            .insert(bead_id.to_string(), value);
+        Ok(())
+    }
+
+    fn gate_regression_count(&self, bead_id: &str) -> Result<u32, DaemonError> {
+        Ok(self
+            .gate_regression_counts
+            .borrow()
+            .get(bead_id)
+            .copied()
+            .unwrap_or(0))
+    }
+
+    fn incr_gate_regression_count(&self, bead_id: &str) -> Result<u32, DaemonError> {
+        let mut counts = self.gate_regression_counts.borrow_mut();
+        let next = counts.get(bead_id).copied().unwrap_or(0) + 1;
+        counts.insert(bead_id.to_string(), next);
+        Ok(next)
     }
 
     fn save_rejection(
