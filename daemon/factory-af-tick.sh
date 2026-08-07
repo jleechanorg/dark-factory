@@ -29,6 +29,7 @@ br() { command br --db "$BR_DB" "$@"; }
 O="$ROOT/daemon/factory-overlay.sh"
 I="$ROOT/daemon/factory-intake-from-gh.sh"
 R="$ROOT/daemon/factory-ao-remediate.sh"
+G11_CONSUMER="$ROOT/daemon/scripts/g11_dispatch_request_consumer.sh"
 DB="${AFD_DB:-$HOME/.dark-factory/daemon-cxdb.sqlite}"
 MAX_DISPATCH="${MAX_DISPATCH:-2}"
 AO_PROJECT="${AFD_AO_PROJECT:-worldarchitect}"
@@ -39,6 +40,15 @@ AO_PROJECT="${AFD_AO_PROJECT:-worldarchitect}"
 CONFIG="${CONFIG:-$ROOT/config/daemon.toml}"
 [ -f "$CONFIG" ] || CONFIG="$ROOT/daemon/contracts/daemon.toml.example"
 TARGET_REPO="${TARGET_REPO:-}"
+# G11 dispatch_request log side-channel — the audit's `fe-audit.sh` writes
+# `DISPATCH_REQUEST` events here when it finds ATTESTED beads without a
+# DISPATCHED follow-up across restart cycles. The consumer (above) reads
+# this log and promotes each bead back into `bead_overlay` via the existing
+# `intake-upsert` command (idempotent) so the dispatch loop below picks
+# them up on this same tick. Same default path as `fe-audit.sh`'s
+# FE_AUDIT_STATE_DIR — the audit and the consumer must agree on the
+# location or the G11 remediation loop stalls silently.
+G11_DISPATCH_LOG="${G11_DISPATCH_LOG:-$HOME/.dark-factory/fe-audit/dispatch_requests.jsonl}"
 
 # Slack notifications — libnotify-slack.sh is fail-soft (no-ops when env unset),
 # so this sourcing is safe even when neither HERMES_SLACK_BOT_TOKEN nor
@@ -172,6 +182,20 @@ fi
 # final outcome and the next tick's `rollback-dispatched` rolls those beads
 # back to QUEUED for retry.
 "$O" rollback-dispatched
+
+# Bead jleechan-vhsw (G11): consume the audit's side-channel
+# `dispatch_requests.jsonl` log so ATTESTED beads without a DISPATCHED
+# follow-up (across restart cycles) get promoted back into `bead_overlay`
+# and the dispatch loop below picks them up on this same tick. The
+# consumer is its own script so the contract (parse + intake-upsert +
+# atomic rotate) is unit-testable independently of factory-af-tick's
+# dispatch loop. Failure isolation: the consumer MUST NOT abort this
+# tick; if it fails (e.g. transient sqlite error) the side-channel log
+# survives and the next tick retries it.
+if [ -x "$G11_CONSUMER" ]; then
+  bash "$G11_CONSUMER" "$G11_DISPATCH_LOG" "$O" "$DB" || \
+    echo "[af] WARN: G11 dispatch_request consumer failed (rc=$?); side-channel log preserved for next tick" >&2
+fi
 
 # Park superseded duplicates. Generic query — no hardcoded bead IDs.
 # Picks up beads marked with the "superseded" label via the br CLI; if that
