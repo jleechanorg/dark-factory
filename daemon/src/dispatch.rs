@@ -230,6 +230,9 @@ pub fn dispatch_ready(
                 spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            // jleechan-w4q3 r1 (G12 retry-backoff-bleed-into-global-suppression):
+            // no per-bead backoff in effect for a freshly-created overlay.
+            next_attempt_at: None,
             // jleechan-8jxr r2: pre-fill with cfg.target_repo so this
             // defensive fallback (no overlay row in the store yet —
             // should be dead code in production since intake always
@@ -545,6 +548,26 @@ pub fn dispatch_ready(
             Err(err) if err.is_transient() => {
                 overlay.spawn_failure_count += 1;
                 overlay.session_id = None;
+                // Bead jleechan-w4q3 (G12 retry-backoff-bleed-into-global-suppression):
+                // set the per-bead backoff gate so the next `tick::run_slow_tier`
+                // pass skips THIS bead for `per_bead_backoff_secs(
+                // spawn_failure_count)` seconds. This isolates the backoff to
+                // the bead's own queue slot — a hot bead cannot starve the
+                // whole queue anymore. The global tick backoff (`MAX_TICK_BACKOFF_SECS`)
+                // is reserved for genuinely tick-level transient errors (e.g.
+                // `gh api` rate-limit on intake) and is no longer driven by
+                // per-bead spawn failures (`classify_tick_result` no longer
+                // routes `is_per_bead_transient()` to the global counter).
+                let backoff = crate::per_bead_backoff_secs(overlay.spawn_failure_count);
+                if backoff > 0 {
+                    overlay.next_attempt_at = Some(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs()
+                            .saturating_add(backoff),
+                    );
+                }
                 if overlay.spawn_failure_count > MAX_TRANSIENT_SPAWN_RETRY {
                     // Cap exceeded: stop silently cycling Queued<->Dispatching
                     // forever (the livelock this bead-follow-up closes — see
@@ -727,6 +750,11 @@ pub fn dispatch_ready(
         // transient tool error, ...) has cleared, so the retry-cap counter no
         // longer needs to remember it.
         overlay.spawn_failure_count = 0;
+        // Bead jleechan-w4q3 (G12): clear the per-bead backoff gate — the
+        // bead has cleared its backoff and is now in DISPATCHED state. The
+        // next `tick::run_slow_tier` pass will not skip this bead on a stale
+        // `(now < next_attempt_at)` value.
+        overlay.next_attempt_at = None;
         // Bead bze8.3: stamp `attempt_started_at` atomically alongside the
         // DISPATCHED save so a redispatch cannot inherit elapsed autonomy
         // from the prior attempt. The wall-clock anchor here is the single
@@ -1812,6 +1840,7 @@ mod tests {
             // pins. Update the test fixture to reflect production reality.
             target_repo: Some("owner/repo".to_string()),
             attempt_started_at: None,
+            next_attempt_at: None,
             })
             .unwrap();
         let cfg = cfg();
@@ -1857,6 +1886,7 @@ mod tests {
                 // this repo.
                 target_repo: Some("someorg/unrelated-repo".to_string()),
                 attempt_started_at: None,
+                next_attempt_at: None,
             })
             .unwrap();
         let cfg = cfg();
@@ -1933,6 +1963,7 @@ mod tests {
                 // into the wrong repo.
                 target_repo: None,
                 attempt_started_at: None,
+                next_attempt_at: None,
             })
             .unwrap();
         let cfg = cfg();
@@ -2036,6 +2067,7 @@ mod tests {
                 park_reason: None,
                 target_repo: None,
                 attempt_started_at: None,
+                next_attempt_at: None,
             })
             .unwrap();
         // Add a [repos.*] entry for the bead's resolved repo so dispatch
@@ -2111,6 +2143,7 @@ mod tests {
                 park_reason: None,
                 target_repo: None,
                 attempt_started_at: None,
+                next_attempt_at: None,
             })
             .unwrap();
         let mut cfg = cfg();
@@ -2187,6 +2220,7 @@ mod tests {
                 // (the Stage B failure mode), not dispatch.
                 target_repo: Some("someorg/other-repo".to_string()),
                 attempt_started_at: None,
+                next_attempt_at: None,
             })
             .unwrap();
         let cfg = cfg();
@@ -2265,6 +2299,7 @@ mod tests {
                 park_reason: None,
                 target_repo: Some("jleechanorg/worldarchitect.ai".to_string()),
                 attempt_started_at: None,
+                next_attempt_at: None,
             })
             .unwrap();
         let mut cfg = cfg();
@@ -3375,6 +3410,7 @@ mod tests {
                 park_reason: None,
                 target_repo: Some("jleechanorg/worldarchitect.ai".to_string()),
                 attempt_started_at: None,
+                next_attempt_at: None,
             })
             .unwrap();
         let mut cfg = cfg();

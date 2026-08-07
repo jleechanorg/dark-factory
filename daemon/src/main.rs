@@ -394,6 +394,11 @@ fn next_backoff_secs(base_tick_secs: u64, consecutive_failures: u32) -> u64 {
         .min(MAX_TICK_BACKOFF_SECS)
 }
 
+/// Per-bead retry backoff (bead jleechan-w4q3, G12 retry-backoff-bleed-into-global-suppression):
+/// isolated to that bead's queue slot via `BeadOverlay::next_attempt_at`,
+/// not the global tick loop. See `daemon::per_bead_backoff_secs` for the
+/// canonical implementation, which is exposed in the lib so the dispatch
+/// path can call it from there too.
 fn classify_tick_result<T>(
     result: Result<T, DaemonError>,
     base_tick_secs: u64,
@@ -403,6 +408,19 @@ fn classify_tick_result<T>(
         Ok(_) => Ok(TickLoopAction::Success {
             consecutive_failures: 0,
         }),
+        Err(err) if err.is_transient() && err.is_per_bead_transient() => {
+            // Bead jleechan-w4q3 (G12): per-bead transient errors are
+            // OWNED by `dispatch::dispatch_ready`'s `next_attempt_at`
+            // scheduling, NOT by the global tick loop. Routed here only
+            // so we don't double-sleep the tick on a per-bead issue that
+            // is already isolated. Returns Success { 0 } so the tick loop
+            // continues at its normal cadence and other in-flight beads
+            // are NOT suppressed by the hot bead's bleed.
+            let _ = (base_tick_secs, consecutive_failures);
+            Ok(TickLoopAction::Success {
+                consecutive_failures: 0,
+            })
+        }
         Err(err) if err.is_transient() => {
             let consecutive_failures = consecutive_failures.saturating_add(1);
             Ok(TickLoopAction::TransientBackoff {
@@ -740,6 +758,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use daemon::per_bead_backoff_secs;
+
+    use super::*;
 
     // Serializes tests that mutate the process-wide NOTIFY_SOCKET env var. Rust
     // runs tests in parallel by default, so without this lock two tests can each
@@ -989,6 +1010,87 @@ mod tests {
     fn next_backoff_caps_at_five_minutes() {
         assert_eq!(next_backoff_secs(60, 4), 300);
         assert_eq!(next_backoff_secs(u64::MAX, u32::MAX), 300);
+    }
+
+    #[test]
+    fn per_bead_backoff_starts_at_seconds_and_caps_at_one_minute() {
+        // Bead jleechan-w4q3: per-bead retry backoff must be ISOLATED to
+        // that bead's queue slot. The progress is exponential with the
+        // count of consecutive transient spawn failures on THIS bead, but
+        // the maximum is bounded to a small value (60 s) so a single hot
+        // bead cannot starve the whole tick. This is the G12 fix: the
+        // per-bead backoff is bounded to one minute regardless of how many
+        // transient failures the bead has accumulated.
+        assert_eq!(per_bead_backoff_secs(0), 0);
+        assert_eq!(per_bead_backoff_secs(1), 5);
+        assert_eq!(per_bead_backoff_secs(2), 10);
+        assert_eq!(per_bead_backoff_secs(3), 20);
+        assert_eq!(per_bead_backoff_secs(4), 40);
+        assert_eq!(per_bead_backoff_secs(5), 60);
+        assert_eq!(per_bead_backoff_secs(6), 60);
+        assert_eq!(per_bead_backoff_secs(u32::MAX), 60);
+    }
+
+    #[test]
+    fn per_bead_backoff_is_decoupled_from_global_tick_backoff() {
+        // Bead jleechan-w4q3 (G12): a per-bead transient spawn failure
+        // MUST NOT increment `consecutive_failures` on the tick loop. The
+        // global tick backoff is reserved for genuinely tick-level
+        // transient errors (e.g. `gh api` rate-limit on intake). Per-bead
+        // spawn failures are already routed to `overlay.spawn_failure_count`
+        // and now to `overlay.next_attempt_at`; burning the global tick
+        // counter on them conflates two distinct signals and lets one hot
+        // bead block the entire queue (the G12 bleed).
+        //
+        // Today the only DaemonError that can carry a per-bead transient
+        // signal to the tick loop is `SpawnFallbackExhausted` whose last
+        // attempt was itself transient — that is the only error shape the
+        // dispatch path does not handle inline (it always reports per-bead
+        // tool/timeout errors via `DispatchFailure::transient`, not via
+        // Result). Today this case routes through the global
+        // `is_transient()` arm and burns the tick counter; after the fix
+        // it returns Success { 0 } so the global tick loop is unstuck.
+        let per_bead_err = DaemonError::SpawnFallbackExhausted(vec![
+            ("ao_spawn".to_string(), DaemonError::Tool {
+                tool: "ao_spawn".to_string(),
+                rc: 1,
+                stderr: "session cap".to_string(),
+            }),
+        ]);
+        let per_bead_action = classify_tick_result::<()>(
+            Err(per_bead_err),
+            10,
+            0,
+        )
+        .unwrap();
+        // After the fix this should be a `Success` (no global tick
+        // suppression for per-bead transient errors) — i.e. the per-bead
+        // path is OWNED by the dispatch-side `next_attempt_at` scheduling,
+        // not by the TickLoopState counter.
+        assert!(
+            matches!(per_bead_action, TickLoopAction::Success { consecutive_failures: 0 }),
+            "per-bead transient errors must NOT trigger TransientBackoff on the global tick loop (G12 bleed); got {:?}",
+            per_bead_action
+        );
+
+        // Tick-level transient errors (e.g. `gh` rate-limit) MUST still
+        // take the global tick backoff path — the decoupling is one-way.
+        let tick_level_err = DaemonError::Tool {
+            tool: "gh".to_string(),
+            rc: 1,
+            stderr: "gh: API rate limit exceeded for installation ID 12345".to_string(),
+        };
+        let tick_action = classify_tick_result::<()>(
+            Err(tick_level_err),
+            10,
+            0,
+        )
+        .unwrap();
+        assert!(
+            matches!(tick_action, TickLoopAction::TransientBackoff { .. }),
+            "tick-level transient errors MUST still trigger TransientBackoff; got {:?}",
+            tick_action
+        );
     }
 
     #[test]

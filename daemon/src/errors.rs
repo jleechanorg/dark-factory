@@ -194,6 +194,49 @@ impl DaemonError {
             || (lower.contains("403") && lower.contains("rate limit"))
     }
 
+    /// Bead jleechan-w4q3 (G12 retry-backoff-bleed-into-global-suppression):
+    /// true iff this transient error is owned by a single bead's dispatch
+    /// attempt (e.g. `sessions.spawn` returning a transient `Tool`/`Timeout`)
+    /// and should therefore be routed to `BeadOverlay::next_attempt_at` via
+    /// `dispatch::dispatch_ready`, NOT to the global `consecutive_failures`
+    /// counter on the tick loop. A per-bead transient error hitting the
+    /// tick loop would bleed that bead's transient count into the global
+    /// tick backoff and block every other bead's queue with it.
+    ///
+    /// Today the per-bead transient path is the `Tool` / `Timeout` arm that
+    /// `dispatch::dispatch_ready` already catches and reports through
+    /// `DispatchFailure { transient: true, phase: "spawn", ... }` — those
+    /// errors do NOT propagate to `classify_tick_result`. The wrapped
+    /// `SpawnFallbackExhausted` may carry a per-bead transient as its last
+    /// attempt; that case is the only canonical "per-bead transient that
+    /// reaches the tick loop" today, and the dispatched path already
+    /// classifies it as `is_deferred()` or reports it as a per-bead failure
+    /// before it can bubble. We keep this accessor so the tick loop's
+    /// `classify_tick_result` has a single, named predicate for the
+    /// no-bleed classification.
+    pub fn is_per_bead_transient(&self) -> bool {
+        match self {
+            // A `SpawnFallbackExhausted` whose last attempt was a transient
+            // error: in the dispatch path this is caught and reported via
+            // `DispatchFailure::transient` rather than propagated to the
+            // tick loop. If it ever does reach the tick loop, route it as
+            // a per-bead signal (no global tick suppression).
+            DaemonError::SpawnFallbackExhausted(attempts) => {
+                attempts.last().is_some_and(|(_, e)| match e {
+                    DaemonError::Tool { .. } | DaemonError::Timeout(_) => true,
+                    other => other.is_transient(),
+                })
+            }
+            // Bare `Tool` / `Timeout` errors are tick-level (e.g. `gh`
+            // rate-limit, intake query failure) — they are NOT per-bead
+            // spawn failures and so should still burn the global tick
+            // counter. The dispatch path catches per-bead `Tool`/`Timeout`
+            // BEFORE they reach this point and never returns them from
+            // `dispatch_ready`. So nothing here.
+            _ => false,
+        }
+    }
+
     /// Detects `br create --external-ref ...` failing because the ref is
     /// already tracked (`br`'s own uniqueness constraint on `external_ref`),
     /// e.g. `Error: Configuration error: External reference 'owner/repo#42'

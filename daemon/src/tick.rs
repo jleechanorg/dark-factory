@@ -1637,6 +1637,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 park_reason: None,
                 target_repo,
                 attempt_started_at: None,
+                next_attempt_at: None,
             });
             overlay.state = OverlayState::Attested;
             overlay.pr_number = Some(adopted.pr_number);
@@ -1777,6 +1778,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             park_reason: None,
             target_repo,
             attempt_started_at: None,
+            next_attempt_at: None,
         };
         deps.store.save(&overlay)?;
         summary.beads_created += 1;
@@ -1827,6 +1829,23 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         let overlay = match deps.store.load(&bead.id)? {
             Some(o) => {
                 if o.state == OverlayState::Queued || o.state == OverlayState::Redispatched {
+                    // Bead jleechan-w4q3 (G12 retry-backoff-bleed-into-global-suppression):
+                    // honor the per-bead backoff gate. A bead whose transient
+                    // spawn failure set `next_attempt_at = now + X` must NOT
+                    // be considered `ready` until `now_epoch >= next_attempt_at`.
+                    // This isolates the backoff to the bead's own queue slot
+                    // so a hot bead cannot starve the rest of the queue.
+                    // The global tick backoff is reserved for genuinely
+                    // tick-level transient errors (e.g. `gh api` rate-limit).
+                    if let Some(next_at) = o.next_attempt_at {
+                        let now_epoch = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        if now_epoch < next_at {
+                            continue;
+                        }
+                    }
                     o
                 } else {
                     continue;
@@ -1895,6 +1914,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         park_reason: None,
                         target_repo,
                         attempt_started_at: None,
+                        next_attempt_at: None,
                     };
                     set_human_hold_reason(&mut o, HumanHoldReason::UnmappedRepo);
                     deps.store.save(&o)?;
@@ -2072,6 +2092,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     park_reason: None,
                     target_repo,
                     attempt_started_at: None,
+                    next_attempt_at: None,
                 };
                 deps.store.save(&o)?;
                 summary.beads_created += 1;

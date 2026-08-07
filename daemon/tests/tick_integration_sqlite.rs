@@ -247,6 +247,7 @@ fn sqlite_dispatch_guarantee_queued_bead_dispatched_despite_escalation_backlog()
                 park_reason: None,
                 target_repo: Some("owner/repo".to_string()),
                 attempt_started_at: None,
+                next_attempt_at: None,
             })
             .unwrap();
     }
@@ -276,6 +277,7 @@ fn sqlite_dispatch_guarantee_queued_bead_dispatched_despite_escalation_backlog()
             park_reason: None,
             target_repo: Some("owner/repo".to_string()),
             attempt_started_at: None,
+            next_attempt_at: None,
         })
         .unwrap();
 
@@ -360,6 +362,7 @@ fn sqlite_escalation_dedup_tick_level_identical_payload_suppressed_changed_conte
             park_reason: None,
             target_repo: Some("owner/repo".to_string()),
             attempt_started_at: None,
+            next_attempt_at: None,
         })
         .unwrap();
 

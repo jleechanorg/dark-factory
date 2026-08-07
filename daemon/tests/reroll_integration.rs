@@ -56,6 +56,7 @@ fn adopted_overlay(bead_id: &str) -> BeadOverlay {
         park_reason: None,
         target_repo: None,
         attempt_started_at: None,
+        next_attempt_at: None,
     }
 }
 
@@ -126,6 +127,7 @@ fn test_circuit_breaker() {
         park_reason: None,
         target_repo: None,
         attempt_started_at: None,
+        next_attempt_at: None,
     };
     store.save(&bead).unwrap();
 
@@ -214,6 +216,7 @@ fn test_reroll_success() {
         park_reason: None,
         target_repo: None,
         attempt_started_at: None,
+        next_attempt_at: None,
     };
     store.save(&bead).unwrap();
 
@@ -378,6 +381,7 @@ fn test_reroll_routes_vcs_ops_through_bead_repo_for_cross_repo_bead() {
         // bead's reroll target repo is something else.
         target_repo: Some("jleechanorg/other-repo".into()),
         attempt_started_at: None,
+        next_attempt_at: None,
     };
     store.save(&bead).unwrap();
 
@@ -648,6 +652,7 @@ fn test_reroll_adopted_success_spawns_remediation_session_leaves_pr_open() {
         park_reason: None,
         target_repo: None,
         attempt_started_at: None,
+        next_attempt_at: None,
     };
     store.save(&bead).unwrap();
     store
@@ -795,6 +800,7 @@ fn test_reroll_adopted_spawn_failure_parks_human_held() {
         park_reason: None,
         target_repo: None,
         attempt_started_at: None,
+        next_attempt_at: None,
     };
     store.save(&bead).unwrap();
     store
@@ -981,6 +987,7 @@ fn test_reroll_adopted_skips_duplicate_spawn_when_session_already_active() {
         park_reason: None,
         target_repo: None,
         attempt_started_at: None,
+        next_attempt_at: None,
     };
     store.save(&bead).unwrap();
     store
@@ -1143,6 +1150,7 @@ mod quiescence_timeout_races {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+            next_attempt_at: None,
         }
     }
 
@@ -2087,6 +2095,7 @@ fn same_underlying_issue_malformed_reply_is_transient_not_fatal() {
         park_reason: None,
         target_repo: None,
         attempt_started_at: None,
+        next_attempt_at: None,
     };
     store.save(&bead).unwrap();
     store
@@ -2212,6 +2221,7 @@ fn test_reroll_close_pr_uses_bead_resolved_repo_not_cfg_target_repo() {
         park_reason: None,
         target_repo: Some("jleechanorg/dark-factory".into()),
         attempt_started_at: None,
+        next_attempt_at: None,
     };
     store.save(&bead).unwrap();
 
@@ -2342,6 +2352,7 @@ fn test_reroll_recovers_from_stale_local_remote_branch_on_retry() {
         park_reason: None,
         target_repo: None,
         attempt_started_at: None,
+        next_attempt_at: None,
     };
     store.save(&bead).unwrap();
 
@@ -2493,6 +2504,7 @@ fn test_reroll_close_pr_already_merged_is_tolerated_as_successful_supersede() {
         park_reason: None,
         target_repo: None,
         attempt_started_at: None,
+        next_attempt_at: None,
     };
     store.save(&bead).unwrap();
 
