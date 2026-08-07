@@ -239,6 +239,7 @@ pub fn dispatch_ready(
             // only used if the dispatch path runs before any intake.
             target_repo: Some(cfg.target_repo.clone()),
             attempt_started_at: None,
+            spawn_failure_backoff_until: None,
             },
             Err(err) if err.is_transient() => {
                 report
@@ -248,6 +249,36 @@ pub fn dispatch_ready(
             }
             Err(err) => return Err(err),
         };
+
+        // jleechan-w4q3 G12 retry-backoff isolation: silently skip beads
+        // whose per-bead exponential backoff window is still in effect.
+        // The previous requeue path had no cooldown — a bead whose spawn
+        // kept failing transiently was re-attempted on the very next
+        // tick (and every tick after that), so on a sustained AO
+        // session-cap issue one hot bead's failure history kept
+        // `Sessions::spawn` burning in the same loop the daemon was
+        // trying the other beads in. That is the "per-bead retry backoff
+        // bleeds into global tick suppression" failure mode G12 closes:
+        // `spawn_failure_backoff_until` isolates the cooldown to that
+        // bead's queue slot, while `dispatch_ready` continues advancing
+        // for sibling beads in the same ready batch. A skip is not a
+        // failure (no `report.failures` push), not a state transition
+        // (overlay remains Queued, attempt/counter/backoff untouched),
+        // and not a Sessions::spawn call — the bead is simply not
+        // visited this tick.
+        if let Some(backoff_until) = overlay.spawn_failure_backoff_until {
+            let now_epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if now_epoch < backoff_until {
+                continue;
+            }
+            // Window has elapsed: clear the timestamp so the bead is
+            // unambiguously "ready to retry again" (a future re-failure
+            // path will re-stamp with a fresh exponential window).
+            overlay.spawn_failure_backoff_until = None;
+        }
 
         // jleechan-8jxr r2: handle the "no repo identity at all" case
         // BEFORE the `BeadOverlay::repo()` fallback can mask it. A
@@ -569,6 +600,24 @@ pub fn dispatch_ready(
                     ));
                     continue;
                 }
+                // jleechan-w4q3 G12 retry-backoff isolation: stamp an
+                // exponential per-bead backoff window so the next
+                // `dispatch_ready` invocation silently SKIPS this bead (see
+                // the G12 skip-arm above) instead of immediately
+                // re-attempting the same failing spawn. Base = 8s, doubling
+                // each consecutive failure (8, 16, 32, 64, ...), capped at
+                // 1 hour so a long-failing bead eventually retries within
+                // the same slow-tier window (~10 min). This isolates the
+                // hot bead's retry storm to its own queue slot while
+                // sibling beads in the same ready batch proceed normally —
+                // the very failure mode G12 closes.
+                let now_epoch = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let exp_secs = (8u64 << overlay.spawn_failure_count.min(8))
+                    .min(3600);
+                overlay.spawn_failure_backoff_until = Some(now_epoch + exp_secs);
                 overlay.state = OverlayState::Queued;
                 store.save(&overlay)?;
                 report.failures.push(failure(
@@ -727,6 +776,15 @@ pub fn dispatch_ready(
         // transient tool error, ...) has cleared, so the retry-cap counter no
         // longer needs to remember it.
         overlay.spawn_failure_count = 0;
+        // jleechan-w4q3 G12: clear the per-bead backoff window alongside
+        // the counter reset — a successful dispatch means any prior
+        // exponential cooldown is no longer relevant. Mirrors the
+        // spawn_failure_count reset above (same "real progress" argument).
+        // Without this, a bead that legitimately dispatches after a
+        // backoff window elapsed would carry a stale future timestamp
+        // that silently skips it on the next `dispatch_ready` call —
+        // re-introducing the very bleed G12 closes.
+        overlay.spawn_failure_backoff_until = None;
         // Bead bze8.3: stamp `attempt_started_at` atomically alongside the
         // DISPATCHED save so a redispatch cannot inherit elapsed autonomy
         // from the prior attempt. The wall-clock anchor here is the single
@@ -1812,6 +1870,7 @@ mod tests {
             // pins. Update the test fixture to reflect production reality.
             target_repo: Some("owner/repo".to_string()),
             attempt_started_at: None,
+            spawn_failure_backoff_until: None,
             })
             .unwrap();
         let cfg = cfg();
@@ -1857,6 +1916,7 @@ mod tests {
                 // this repo.
                 target_repo: Some("someorg/unrelated-repo".to_string()),
                 attempt_started_at: None,
+            spawn_failure_backoff_until: None,
             })
             .unwrap();
         let cfg = cfg();
@@ -1933,6 +1993,7 @@ mod tests {
                 // into the wrong repo.
                 target_repo: None,
                 attempt_started_at: None,
+            spawn_failure_backoff_until: None,
             })
             .unwrap();
         let cfg = cfg();
@@ -2036,6 +2097,7 @@ mod tests {
                 park_reason: None,
                 target_repo: None,
                 attempt_started_at: None,
+            spawn_failure_backoff_until: None,
             })
             .unwrap();
         // Add a [repos.*] entry for the bead's resolved repo so dispatch
@@ -2111,6 +2173,7 @@ mod tests {
                 park_reason: None,
                 target_repo: None,
                 attempt_started_at: None,
+            spawn_failure_backoff_until: None,
             })
             .unwrap();
         let mut cfg = cfg();
@@ -2187,6 +2250,7 @@ mod tests {
                 // (the Stage B failure mode), not dispatch.
                 target_repo: Some("someorg/other-repo".to_string()),
                 attempt_started_at: None,
+            spawn_failure_backoff_until: None,
             })
             .unwrap();
         let cfg = cfg();
@@ -2265,6 +2329,7 @@ mod tests {
                 park_reason: None,
                 target_repo: Some("jleechanorg/worldarchitect.ai".to_string()),
                 attempt_started_at: None,
+            spawn_failure_backoff_until: None,
             })
             .unwrap();
         let mut cfg = cfg();
@@ -2527,6 +2592,223 @@ mod tests {
         assert!(calls.iter().any(|c| c == "spawn(bead-0)"));
         assert!(calls.iter().any(|c| c == "spawn(bead-1)"));
         assert!(calls.iter().any(|c| c == "spawn(bead-2)"));
+    }
+
+    /// jleechan-w4q3 G12 retry-backoff isolation: a bead whose transient
+    /// spawn failure triggered an exponential per-bead backoff window must
+    /// be SKIPPED on the next `dispatch_ready` call (not re-attempted, not
+    /// re-counted, not parked) while other beads in the same ready batch
+    /// proceed normally. Previously the requeue path re-set state=Queued
+    /// with no cooldown, so the same bead's failure re-fired on the very
+    /// next tick — and when one hot bead was failing on a sustained AO
+    /// session-cap issue, it kept `Sessions::spawn` burning on retries in
+    /// the same loop the daemon tried the other beads in. That is the
+    /// "conflated retry-backoff and global tick suppression" failure mode:
+    /// one bad bead's retry storm blocks progress for the rest of the
+    /// queue. The fix isolates the backoff into the bead's own queue slot
+    /// (`spawn_failure_backoff_until` epoch) so the tick continues
+    /// advancing for unrelated beads.
+    #[test]
+    fn spawn_backoff_skips_bead_until_window_elapses_while_others_proceed() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        // Future epoch seconds — well past "now" so the bead must be skipped.
+        let far_future_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            + 3600;
+        // Pre-seed bead-1 as Queued with a non-zero spawn_failure_count and
+        // a future `spawn_failure_backoff_until` to simulate "this bead has
+        // just had a transient spawn failure and is in its exponential
+        // backoff window".
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-1".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 3,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("owner/repo".to_string()),
+                attempt_started_at: None,
+                spawn_failure_backoff_until: Some(far_future_epoch),
+            })
+            .unwrap();
+
+        let ready = beads(3);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        // bead-0 and bead-2 (no overlay → fresh) must dispatch normally.
+        let success_ids: Vec<&str> = report
+            .successes
+            .iter()
+            .map(|success| success.bead_id.as_str())
+            .collect();
+        assert_eq!(
+            success_ids,
+            vec!["bead-0", "bead-2"],
+            "a bead in backoff must not block its sibling beads from dispatching"
+        );
+
+        // bead-1 must NOT be in successes or failures — the dispatcher
+        // silently skips it (it's not a failure, it's not parked, just
+        // deferred until the backoff window elapses).
+        assert!(
+            report
+                .successes
+                .iter()
+                .all(|success| success.bead_id != "bead-1"),
+            "bead-1 must not be reported as dispatched"
+        );
+        assert!(
+            report.failures.iter().all(|f| f.bead_id != "bead-1"),
+            "bead-1 must not be reported as a failure (it's not failing now, just deferred)"
+        );
+
+        // The bead-1 overlay must remain unchanged (still Queued, same
+        // spawn_failure_count, same backoff timestamp) — skipping is a no-op
+        // on the overlay; the dispatcher must NOT reset the counter or
+        // bump attempt on a backoff-skip.
+        let bead_1 = store.load("bead-1").unwrap().unwrap();
+        assert_eq!(
+            bead_1.state,
+            OverlayState::Queued,
+            "a backoff-skipped bead must remain Queued, not advance state"
+        );
+        assert_eq!(
+            bead_1.spawn_failure_count, 3,
+            "a backoff-skip must NOT touch the failure counter"
+        );
+        assert_eq!(
+            bead_1.spawn_failure_backoff_until,
+            Some(far_future_epoch),
+            "the backoff timestamp must be preserved unchanged"
+        );
+        assert!(
+            bead_1.attempt == 1,
+            "a backoff-skip must NOT bump attempt (it's the same attempt, just deferred)"
+        );
+
+        // Sessions::spawn must never have been called for bead-1.
+        let calls = sessions.calls.borrow();
+        assert!(
+            !calls.iter().any(|c| c == "spawn(bead-1)"),
+            "a bead in backoff must not have Sessions::spawn called on it: calls={:?}",
+            calls.clone()
+        );
+        assert!(calls.iter().any(|c| c == "spawn(bead-0)"));
+        assert!(calls.iter().any(|c| c == "spawn(bead-2)"));
+    }
+
+    /// jleechan-w4q3 G12 companion: after a transient spawn failure, the
+    /// bead's overlay MUST record an exponential `spawn_failure_backoff_until`
+    /// so the next `dispatch_ready` invocation skips it (see the test
+    /// above). Without this, the requeue path is immediate and the bead
+    /// re-fires on every tick until `MAX_TRANSIENT_SPAWN_RETRY` is
+    /// exhausted — the precise "one bad bead blocks the whole queue"
+    /// failure mode G12 closes.
+    #[test]
+    fn transient_spawn_failure_sets_per_bead_exponential_backoff() {
+        let sessions = FakeSessions::new(0);
+        sessions.fail_spawn_for("bead-1");
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(3);
+
+        let _ = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        let bead_1 = store.load("bead-1").unwrap().unwrap();
+        assert_eq!(bead_1.state, OverlayState::Queued);
+        assert_eq!(
+            bead_1.spawn_failure_count, 1,
+            "the counter must increment to track the backoff exponent"
+        );
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let backoff_until = bead_1
+            .spawn_failure_backoff_until
+            .expect("a transient spawn failure must stamp a backoff window");
+        assert!(
+            backoff_until > now_epoch,
+            "backoff must be in the future (now={now_epoch}, until={backoff_until})"
+        );
+        assert!(
+            backoff_until <= now_epoch + 3600,
+            "the first backoff window must be bounded (<= 1 hour), got until={backoff_until}"
+        );
+    }
+
+    /// jleechan-w4q3 G12 companion: a confirmed DISPATCHED save MUST clear
+    /// `spawn_failure_backoff_until` so a fresh dispatch attempt starts
+    /// with no carry-over from a prior attempt's failure history. Without
+    /// this, a bead that successfully dispatches after a backoff window
+    /// elapses would be instantly re-skipped on the very next tick of the
+    /// same loop iteration.
+    #[test]
+    fn successful_dispatch_clears_per_bead_backoff_window() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        // Use a backoff timestamp that's in the PAST (window already
+        // elapsed) — simulates a bead that has just come out of its
+        // exponential cooldown and is now ready to retry. The skip-arm
+        // MUST still clear the (now-stale) timestamp on a successful
+        // dispatch path so a future re-failure starts with `Some(fresh)`.
+        let past_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_sub(60);
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 2,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("owner/repo".to_string()),
+                attempt_started_at: None,
+                spawn_failure_backoff_until: Some(past_epoch),
+            })
+            .unwrap();
+
+        let _ = dispatch_ready(&sessions, &store, &cfg, &beads(1)).unwrap();
+
+        let bead_0 = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(
+            bead_0.state,
+            OverlayState::Dispatched,
+            "the bead must dispatch successfully"
+        );
+        assert!(
+            bead_0.spawn_failure_backoff_until.is_none(),
+            "a confirmed DISPATCHED save must clear the per-bead backoff window"
+        );
+        assert_eq!(
+            bead_0.spawn_failure_count, 0,
+            "a confirmed DISPATCHED save must reset the failure counter (consistent with \
+             the existing spawn_failure_count reset on success)"
+        );
     }
 
     /// jleechan-w28n: `DaemonError::Deferred` (AO's own admission-control
@@ -3375,6 +3657,7 @@ mod tests {
                 park_reason: None,
                 target_repo: Some("jleechanorg/worldarchitect.ai".to_string()),
                 attempt_started_at: None,
+            spawn_failure_backoff_until: None,
             })
             .unwrap();
         let mut cfg = cfg();

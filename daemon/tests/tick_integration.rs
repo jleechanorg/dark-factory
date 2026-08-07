@@ -468,6 +468,7 @@ fn run_tick_emits_dispatched_only_for_actual_dispatch_successes() {
                 park_reason: None,
                 target_repo: Some("owner/repo".to_string()),
                 attempt_started_at: None,
+                spawn_failure_backoff_until: None,
             })
             .unwrap();
     }
@@ -580,6 +581,7 @@ fn test_autonomy_increment_and_timebox_envelope() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
 
@@ -646,6 +648,7 @@ fn test_autonomy_budget_warning_crossing() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
 
@@ -706,6 +709,7 @@ fn test_wedge_detection_dispatched_coder_silent() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
 
@@ -781,6 +785,7 @@ fn test_wedge_detection_dispatched_coder_silent_saved_by_transcript_activity() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
 
@@ -876,6 +881,7 @@ fn test_wedge_detection_dispatched_coder_silent_stale_transcript_still_parks() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
 
@@ -959,6 +965,7 @@ fn test_dispatch_integrity_sweep_parks_session_branch_mismatch() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
 
@@ -1081,6 +1088,7 @@ fn test_dispatch_integrity_sweep_leaves_matching_branch_alone() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
 
@@ -1145,6 +1153,7 @@ fn test_dispatch_integrity_sweep_detects_force_push_on_adopted_branch() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
 
@@ -1234,6 +1243,7 @@ fn test_dispatch_integrity_sweep_allows_fast_forward_adopted_commit() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
 
@@ -1305,6 +1315,7 @@ fn test_wedge_detection_attested_session_stalled() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
 
@@ -1424,6 +1435,7 @@ fn test_wedge_detection_attested_session_not_stalled_if_remote_ahead() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
 
@@ -1543,6 +1555,7 @@ fn test_wedge_detection_still_parks_when_local_matches_remote() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
 
@@ -1638,6 +1651,7 @@ fn test_wedge_detection_still_parks_when_local_is_ahead_of_remote() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
 
@@ -1760,6 +1774,7 @@ fn test_wedge_detection_still_parks_when_branches_have_diverged() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
 
@@ -2308,6 +2323,7 @@ fn factory_labeled_pr_branch_collision_is_refused_without_stealing_mapping() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         })
         .unwrap();
     store
@@ -3136,6 +3152,7 @@ fn disposition_required_bead_resumes_when_gates_go_green() {
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
             target_repo: None,
         })
         .unwrap();
@@ -3226,6 +3243,7 @@ fn disposition_required_bead_in_cooldown_is_skipped_without_scm_call() {
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
             target_repo: None,
         })
         .unwrap();
@@ -3317,6 +3335,7 @@ fn disposition_required_reassessment_error_preserves_hold_provenance() {
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
             target_repo: None,
         })
         .unwrap();
@@ -4313,6 +4332,7 @@ fn drive_existing_pr_pending_ci_does_not_reach_ready() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
     store
@@ -4408,6 +4428,7 @@ fn drive_existing_pr_failed_ci_parks_human_held() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
     store
@@ -4506,6 +4527,7 @@ fn recover_human_held_requeues_queued_bead_with_attempt_below_max() {
             park_reason: Some("transient_spawn_retry_cap_exceeded".into()),
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
 
@@ -4598,6 +4620,7 @@ fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
     // Also seed one above the cap (defensive — matches the shell overlay)
@@ -4619,6 +4642,7 @@ fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
 
@@ -4971,6 +4995,7 @@ fn capped_human_held_comment_failure_retries_before_recording_escalation() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
     *tracker.fail_next_comment.borrow_mut() = Some("transient comment failure".into());
@@ -5065,6 +5090,7 @@ fn permanent_gh_error_marks_escalation_undeliverable_and_never_retries() {
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
             target_repo: None,
         },
     );
@@ -5193,6 +5219,7 @@ fn capped_human_held_candidate_lookup_failure_retries_before_recording_escalatio
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
     tracker.candidates.borrow_mut().push(Bead {
@@ -5309,6 +5336,7 @@ fn capped_human_held_missing_comment_target_records_local_escalation_fallback() 
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
     // No candidates registered on the tracker either — this bead's source
@@ -5397,6 +5425,7 @@ fn er_runner_capped_unknown_only_gate_report_escalates_and_parks_at_recovery_cap
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
     store
@@ -5560,6 +5589,7 @@ fn er_runner_capped_unknown_only_comment_failure_retries_before_parking() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
     store
@@ -5676,6 +5706,7 @@ fn attested_ci_pending_does_not_bump_autonomy_secs() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
     scm.pr_snapshots.insert(
@@ -5781,6 +5812,7 @@ fn attested_ci_pending_does_not_timebox_park() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
     scm.pr_snapshots.insert(
@@ -5894,6 +5926,7 @@ fn non_green_bead_reenters_loop_via_automated_human_held_exit() {
             ),
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
 
@@ -5998,6 +6031,7 @@ fn attested_ci_not_pending_does_bump_autonomy_secs() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
     scm.pr_snapshots.insert(
@@ -6102,6 +6136,7 @@ fn qdw_per_bead_isolation_snapshot_failure_does_not_abort_fast_tier() {
                 park_reason: None,
                 target_repo: None,
                 attempt_started_at: None,
+                spawn_failure_backoff_until: None,
             })
             .unwrap();
         store
@@ -6261,6 +6296,7 @@ fn qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         })
         .unwrap();
     store
@@ -6285,6 +6321,7 @@ fn qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         })
         .unwrap();
     store
@@ -6729,6 +6766,7 @@ fn qdw_post_er_refetch_failure_skips_bead_without_false_park() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         })
         .unwrap();
     store
@@ -6754,6 +6792,7 @@ fn qdw_post_er_refetch_failure_skips_bead_without_false_park() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         })
         .unwrap();
     store
@@ -6914,6 +6953,7 @@ fn qdw_assess_refetch_failure_stays_attested_and_never_closes_pr() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         })
         .unwrap();
     store
@@ -7220,6 +7260,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
     store
@@ -7406,6 +7447,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
     store
@@ -7620,6 +7662,7 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
     store
@@ -7816,6 +7859,7 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
     store
@@ -8107,6 +8151,7 @@ fn cross_repo_bead_verification_loop_uses_its_own_repo_not_cfg_target_repo() {
             // deliberately DIFFERENT from cfg.target_repo above.
             target_repo: Some("owner/repo".into()),
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
     store
@@ -8333,6 +8378,7 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         },
     );
     store
@@ -8533,6 +8579,7 @@ fn cross_model_reviewer_cursor_agent_falls_back_and_emits_review_degraded() {
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
             target_repo: None,
         },
     );
@@ -8776,6 +8823,7 @@ fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
             target_repo: None,
         },
     );
@@ -8952,7 +9000,21 @@ fn transient_spawn_failures_below_cap_stay_retriable_and_do_not_park() {
 
     // Three consecutive transient spawn failures — well under the cap
     // (MAX_TRANSIENT_SPAWN_RETRY == 15, dispatch.rs private const).
+    //
+    // jleechan-w4q3 G12: with per-bead exponential backoff, the bead
+    // SKIPS the next `dispatch_ready` after each transient failure
+    // (the backoff window is 8s, 16s, 32s, ...). Consecutive same-tick
+    // runs therefore only record ONE failure for the backoff-window
+    // duration. To exercise the "three failures" counter, we manually
+    // clear the backoff timestamp between ticks so each run sees the
+    // bead as eligible to retry again — mirroring production behavior
+    // where the daemon's slow-tier tick interval (~600s) always
+    // outlasts even the longest backoff (1h).
     for tick_index in 0..3u64 {
+        if let Some(mut overlay) = store.load(BEAD_ID).unwrap() {
+            overlay.spawn_failure_backoff_until = None;
+            store.save(&overlay).unwrap();
+        }
         let summary = run_tick(&deps, tick_index, 0)
             .unwrap_or_else(|e| panic!("tick {tick_index} should succeed: {e:?}"));
         assert_eq!(summary.beads_dispatched, 0, "tick {tick_index}");
@@ -9056,7 +9118,20 @@ fn transient_spawn_retry_cap_exceeded_parks_human_held_with_escalation() {
     // `spawn_failure_count > MAX_TRANSIENT_SPAWN_RETRY` requires STRICTLY
     // greater than 15, so the bead must stay retriable through exactly 15
     // consecutive failures — the "still under the cap" half of the bound.
+    //
+    // jleechan-w4q3 G12: with per-bead exponential backoff, the bead
+    // SKIPS the next `dispatch_ready` after each transient failure
+    // (window: 8s, 16s, 32s, ...). To drive 15 consecutive failures
+    // through `run_tick` we clear the backoff window before each tick,
+    // mirroring production where the daemon's slow-tier tick interval
+    // (~600s) always outlasts even the 1h-capped backoff. This keeps the
+    // "exactly 15 retries before cap fires" invariant the original test
+    // was designed to prove.
     for tick_index in 1..=14u64 {
+        if let Some(mut overlay) = store.load(BEAD_ID).unwrap() {
+            overlay.spawn_failure_backoff_until = None;
+            store.save(&overlay).unwrap();
+        }
         let summary = run_tick(&deps, tick_index, 0)
             .unwrap_or_else(|e| panic!("tick {tick_index} should succeed: {e:?}"));
         assert_eq!(
@@ -9084,6 +9159,12 @@ fn transient_spawn_retry_cap_exceeded_parks_human_held_with_escalation() {
     // spawn_failure_count to 16 (> 15). The bead must park HUMAN_HELD
     // instead of requeuing again, and tick.rs must post a real escalation
     // comment + emit telemetry.
+    // jleechan-w4q3 G12: clear the per-bead backoff so the cap-exceeding
+    // tick actually attempts spawn (otherwise it would be skipped).
+    if let Some(mut overlay) = store.load(BEAD_ID).unwrap() {
+        overlay.spawn_failure_backoff_until = None;
+        store.save(&overlay).unwrap();
+    }
     let summary_cap = run_tick(&deps, 15, 0).expect("cap tick should succeed");
     assert_eq!(summary_cap.beads_dispatched, 0);
     assert_eq!(
@@ -9221,6 +9302,16 @@ fn spawn_failure_count_resets_after_a_successful_dispatch() {
     };
 
     for tick_index in 0..2u64 {
+        // jleechan-w4q3 G12: clear the per-bead backoff between
+        // consecutive same-second ticks (which would otherwise be skipped)
+        // so we can exercise the "two transient failures then a successful
+        // dispatch" code path that this test was originally written for.
+        // In production the daemon's slow-tier tick interval (~600s)
+        // always outlasts the backoff windows.
+        if let Some(mut overlay) = store.load(BEAD_ID).unwrap() {
+            overlay.spawn_failure_backoff_until = None;
+            store.save(&overlay).unwrap();
+        }
         run_tick(&deps, tick_index, 0)
             .unwrap_or_else(|e| panic!("tick {tick_index} should succeed: {e:?}"));
     }
@@ -9229,6 +9320,12 @@ fn spawn_failure_count_resets_after_a_successful_dispatch() {
     assert_eq!(flaky_overlay.spawn_failure_count, 2);
 
     // The underlying transient condition clears — spawn now succeeds.
+    // Clear the backoff so the recovery tick actually dispatches rather
+    // than silently skipping the bead.
+    if let Some(mut overlay) = store.load(BEAD_ID).unwrap() {
+        overlay.spawn_failure_backoff_until = None;
+        store.save(&overlay).unwrap();
+    }
     sessions.fail_spawn_for.borrow_mut().clear();
     let summary = run_tick(&deps, 2, 0).expect("recovery tick should succeed");
     assert_eq!(summary.beads_dispatched, 1);
@@ -9431,7 +9528,20 @@ fn mixed_batch_deferred_backpressure_and_genuine_transient_failures_are_independ
     // Ticks 0..=14: fifteen consecutive cycles. Bead A must stay QUEUED with
     // a permanently-zero counter; bead B accumulates spawn_failure_count but
     // must stay under the cap (>15 required to trip it).
+    //
+    // jleechan-w4q3 G12: with per-bead exponential backoff, bead B (genuine
+    // transient) would be silently skipped on consecutive same-second ticks.
+    // Clear the backoff between ticks so we still exercise the
+    // "counter increments per attempt" code path that this test was written
+    // for. Production's slow-tier tick interval (~600s) always outlasts the
+    // backoff window so the bead B retry path is still continuously exercised
+    // — the test just needs an explicit nudge to step past G12's new
+    // per-bead cooldown within the same wall-clock second.
     for tick_index in 0..=14u64 {
+        if let Some(mut overlay) = store.load(BEAD_B).unwrap() {
+            overlay.spawn_failure_backoff_until = None;
+            store.save(&overlay).unwrap();
+        }
         let summary = run_tick(&deps, tick_index, 0)
             .unwrap_or_else(|e| panic!("tick {tick_index} should succeed: {e:?}"));
         assert_eq!(
@@ -9470,6 +9580,12 @@ fn mixed_batch_deferred_backpressure_and_genuine_transient_failures_are_independ
     // Tick 15: bead B's 16th consecutive genuine transient failure exceeds
     // the cap and must park HUMAN_HELD + escalate. Bead A, in the very same
     // batch, must remain completely unaffected.
+    // jleechan-w4q3 G12: clear the per-bead backoff so the cap-exceeding
+    // tick actually attempts spawn (otherwise bead B would be skipped).
+    if let Some(mut overlay) = store.load(BEAD_B).unwrap() {
+        overlay.spawn_failure_backoff_until = None;
+        store.save(&overlay).unwrap();
+    }
     let summary_cap = run_tick(&deps, 15, 0).expect("cap tick should succeed");
     assert_eq!(
         summary_cap.beads_parked_human_held, 1,
@@ -9806,6 +9922,7 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
                 park_reason: None,
                 target_repo: None,
                 attempt_started_at: None,
+                spawn_failure_backoff_until: None,
             })
             .unwrap();
         store.register_branch(bead_id, branch).unwrap();
@@ -10220,6 +10337,7 @@ fn seed_attested_red_ci_bead(
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         })
         .unwrap();
     store.register_branch(bead_id, &branch).unwrap();
@@ -10465,6 +10583,7 @@ fn autonomy_timebox_park_kills_associated_ao_session_and_clears_handle() {
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
             target_repo: None,
         },
     );
@@ -10553,6 +10672,7 @@ fn coder_silent_park_kills_associated_ao_session_and_clears_handle() {
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
             target_repo: None,
         },
     );
@@ -10641,6 +10761,7 @@ fn session_branch_mismatch_park_kills_associated_ao_session_and_clears_handle() 
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
             target_repo: None,
         },
     );
@@ -10741,6 +10862,7 @@ fn autonomy_timebox_park_retains_handle_when_stop_fails() {
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
             target_repo: None,
         },
     );
@@ -10816,6 +10938,7 @@ fn adopted_branch_history_rewrite_park_kills_associated_ao_session() {
             pre_session_head_sha: Some("aaaaaaaaaaaaaaaa".into()),
             park_reason: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
             target_repo: None,
         },
     );
@@ -11040,6 +11163,7 @@ fn slow_tier_dispatched_branch_mismatch_re_resolves_stale_pr_number() {
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
             target_repo: None,
         })
         .unwrap();
@@ -11193,6 +11317,7 @@ fn slow_tier_dispatched_branch_mismatch_no_op_when_pr_number_already_matches() {
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
             target_repo: None,
         })
         .unwrap();
@@ -11309,6 +11434,7 @@ fn slow_tier_dispatched_branch_mismatch_clears_stale_pr_number_when_branch_has_n
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
             target_repo: None,
         })
         .unwrap();
@@ -11429,6 +11555,7 @@ fn slow_tier_pre_gate_validation_re_resolves_when_stored_pr_no_longer_open() {
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
             target_repo: None,
         })
         .unwrap();
@@ -11560,6 +11687,7 @@ fn transient_pr_number_reresolve_error_keeps_dispatched_no_promotion() {
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
             target_repo: None,
         })
         .unwrap();
@@ -11652,6 +11780,7 @@ fn pre_gate_no_open_pr_demotes_attested_to_dispatched_and_resumes() {
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
             target_repo: None,
         })
         .unwrap();
@@ -11777,6 +11906,7 @@ fn evidence_bead(store: &FakeStateStore, scm: &mut FakeScm, bead_id: &str, pr: u
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
             target_repo: None,
         })
         .unwrap();
@@ -12611,6 +12741,7 @@ fn msmq_verifier_skips_reassessment_when_reroll_deferred() {
         pre_session_head_sha: None,
         park_reason: None,
         attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         target_repo: Some("owner/repo".into()),
     };
     store.save(&overlay).unwrap();
@@ -12895,6 +13026,7 @@ fn dispatch_guarantee_queued_bead_dispatched_despite_escalation_backlog() {
                 park_reason: None,
                 target_repo: Some("owner/repo".to_string()),
                 attempt_started_at: None,
+                spawn_failure_backoff_until: None,
             })
             .unwrap();
     }
@@ -12925,6 +13057,7 @@ fn dispatch_guarantee_queued_bead_dispatched_despite_escalation_backlog() {
             pre_session_head_sha: None,
             park_reason: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
             target_repo: Some("owner/repo".to_string()),
         })
         .unwrap();
@@ -13039,6 +13172,7 @@ fn escalation_dedup_tick_level_identical_payload_suppressed_changed_context_re_e
         pre_session_head_sha: None,
         park_reason: None,
         attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         target_repo: Some("owner/repo".to_string()),
     }).unwrap();
 
@@ -13271,6 +13405,7 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
         pre_session_head_sha: None,
         park_reason: None,
         attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         target_repo: None,
     };
     store.save(&overlay).unwrap();
@@ -13334,6 +13469,7 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
         park_reason: None,
         target_repo: None,
         attempt_started_at: None,
+                spawn_failure_backoff_until: None,
     };
     store.save(&overlay2).unwrap();
     store.register_branch(bead_id_2, "factory/test-bead-102").unwrap();
@@ -13383,6 +13519,7 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
         park_reason: None,
         target_repo: None,
         attempt_started_at: None,
+                spawn_failure_backoff_until: None,
     };
     store.save(&overlay3).unwrap();
     store.register_branch(bead_id_3, "factory/test-bead-103").unwrap();
@@ -13507,6 +13644,7 @@ fn vendor_health_ledger_ci_pending_with_capped_vendor_skips_wait() {
         park_reason: None,
         target_repo: None,
         attempt_started_at: None,
+                spawn_failure_backoff_until: None,
     };
     store.save(&overlay).unwrap();
     store.register_branch(bead_id, "factory/ci-wait-bead").unwrap();
@@ -13622,6 +13760,7 @@ fn test_gate_regression_emits_event_and_demotes_to_attested_when_ci_goes_red() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         })
         .unwrap();
     store.register_branch("reg-bead", branch).unwrap();
@@ -13761,6 +13900,7 @@ fn test_gate_regression_does_not_fire_when_first_assessment_is_red() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         })
         .unwrap();
     store.register_branch("never-green", branch).unwrap();
@@ -13867,6 +14007,7 @@ fn test_gate_regression_caps_at_max_and_parks_human_held() {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
         })
         .unwrap();
     store.register_branch("regression-cap", branch).unwrap();

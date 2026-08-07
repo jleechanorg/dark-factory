@@ -596,6 +596,7 @@ mod tests {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                    spawn_failure_backoff_until: None,
         }
     }
 
