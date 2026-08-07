@@ -2,10 +2,13 @@
 """fe_audit_query.py — tolerant JSONL telemetry parser for fe-audit.sh.
 
 Reads daemon.jsonl line by line, skips malformed lines (silent), and emits
-results for one of four queries:
+results for one of five queries:
   - g10_ticks    : last N TICK event timestamps
   - g11_attested : bead IDs with lifecycleState=ATTESTED in lookback
   - g11_dispatched : bead IDs with lifecycleState=DISPATCHED in lookback
+  - g11_human_held : bead IDs with lifecycleState=HUMAN_HELD in lookback
+  - g11_dispatch_request : bead IDs that need a DISPATCH_REQUEST event
+                           (attested-now AND not-dispatched-now)
   - g12_transient : bead IDs whose transient-error event count >= threshold
   - g13_dispatch_rate : hour-buckets whose dispatch count > cap
 
@@ -91,6 +94,36 @@ def g11_human_held(records, cutoff):
                 yield bid
 
 
+def g11_dispatch_request(records, cutoff):
+    """Bead IDs that need a DISPATCH_REQUEST event (G11 / bead
+    jleechan-vhsw).
+
+    Returns: ATTESTED beads in the current lookback that have NO
+    DISPATCHED event in the same lookback. The bash caller applies the
+    cross-sweep delta against the prior `last_sweep_attested` /
+    `last_sweep_dispatched` snapshot so a bead that has been
+    ATTESTED + DISPATCHED for many ticks is not refiled on every sweep.
+
+    Numeric only: never matches `lifecycleState` values by keyword
+    intent — the union of those two exact strings is the only gate.
+    """
+    attested = set()
+    dispatched = set()
+    for rec in records:
+        if rec.get("timestamp", "") < cutoff:
+            continue
+        state = rec.get("lifecycleState", "")
+        bid = rec.get("beadId", "")
+        if not bid:
+            continue
+        if state == "ATTESTED":
+            attested.add(bid)
+        elif state == "DISPATCHED":
+            dispatched.add(bid)
+    for bid in sorted(attested - dispatched):
+        yield bid
+
+
 def g12_transient(records, cutoff, threshold):
     """Lines: '<count> <beadId>' for beads with >= threshold transient errors."""
     counter = Counter()
@@ -149,6 +182,9 @@ def main():
             print(bid)
     elif query == "g11_human_held":
         for bid in sorted(set(g11_human_held(records, cutoff))):
+            print(bid)
+    elif query == "g11_dispatch_request":
+        for bid in g11_dispatch_request(records, cutoff):
             print(bid)
     elif query == "g12_transient":
         for line in g12_transient(records, cutoff, threshold):

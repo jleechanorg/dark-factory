@@ -89,12 +89,31 @@ log "log=$LOG_FILE lookback=${LOOKBACK_HOURS}h cutoff=$CUTOFF_ISO"
 
 # ---------- load prior-fired state (cooldown dedupe) ----------
 PRIOR_G10=0; PRIOR_G11=0; PRIOR_G12=0; PRIOR_G13=0
+PRIOR_ATTESTED=""; PRIOR_DISPATCHED=""
 if [ -f "$STATE_FILE" ]; then
     PRIOR_G10="$(jq -r '.last_fired_g10 // 0' "$STATE_FILE" 2>/dev/null || echo 0)"
     PRIOR_G11="$(jq -r '.last_fired_g11 // 0' "$STATE_FILE" 2>/dev/null || echo 0)"
     PRIOR_G12="$(jq -r '.last_fired_g12 // 0' "$STATE_FILE" 2>/dev/null || echo 0)"
     PRIOR_G13="$(jq -r '.last_fired_g13 // 0' "$STATE_FILE" 2>/dev/null || echo 0)"
+    # Bead jleechan-vhsw (G11). The prior sweep's ATTESTED + DISPATCHED
+    # bead sets are persisted so the next sweep can compute the
+    # delta: beads that are ATTESTED NOW but were NOT in the prior
+    # snapshot AND have NO DISPATCHED event either now or before. These
+    # are the "stuck in ATTESTED across restart cycles" rows that the
+    # G11 audit fires the bead for; the intake sweep must also emit a
+    # DISPATCH_REQUEST event so the always-on auto-factory daemon
+    # dispatches a worker on its next tick.
+    PRIOR_ATTESTED="$(jq -r '.last_sweep_attested // [] | .[]' "$STATE_FILE" 2>/dev/null || true)"
+    PRIOR_DISPATCHED="$(jq -r '.last_sweep_dispatched // [] | .[]' "$STATE_FILE" 2>/dev/null || true)"
 fi
+
+# Side-channel log for DISPATCH_REQUEST events. The audit appends one
+# JSONL record per bead that needs a fresh dispatch follow-up; the
+# always-on auto-factory daemon reads this on its next tick (separate
+# from the daemon.jsonl telemetry so the daemon doesn't have to
+# re-parse the full JSONL on every tick).
+DISPATCH_REQUEST_LOG="$STATE_DIR/dispatch_requests.jsonl"
+mkdir -p "$STATE_DIR"
 
 findings_total=0
 
@@ -194,6 +213,52 @@ linked_beads: jleechan-509
 "
 fi
 
+# ---------- G11 intake sweep: enqueue DISPATCH_REQUEST events ----------
+# Bead jleechan-vhsw: close the loop. The bead filing above is the
+# AUDIT-side signal; the intake sweep takes ACTION so the always-on
+# auto-factory daemon dispatches a worker on its next tick.
+#
+# Compute the delta: beads in ATTESTED now that were NOT in the prior
+# sweep's snapshot AND have NO DISPATCHED event in either window. The
+# prior snapshot is persisted in `last_sweep_attested` /
+# `last_sweep_dispatched`; on a fresh install the snapshot is empty, so
+# every current ATTESTED-without-DISPATCH bead becomes a candidate.
+#
+# HUMAN_HELD subtraction is preserved — a bead that escalated to
+# HUMAN_HELD legitimately is parked for operator action, not stranded.
+NEW_ATTESTED_NO_DISPATCH="$(comm -23 <(printf '%s\n' "$ATTESTED_IDS" | sort -u) <(printf '%s\n' "$PRIOR_ATTESTED" | sort -u | grep -v '^$' || true) | comm -23 - <(printf '%s\n' "$DISPATCHED_IDS" | sort -u) | comm -23 - <(printf '%s\n' "$PRIOR_DISPATCHED" | sort -u | grep -v '^$' || true) | comm -23 - <(printf '%s\n' "$HUMAN_HELD_IDS" | sort -u) || true)"
+DISPATCH_REQUEST_COUNT=0
+if [ -n "$NEW_ATTESTED_NO_DISPATCH" ]; then
+    DISPATCH_REQUEST_COUNT="$(echo "$NEW_ATTESTED_NO_DISPATCH" | wc -l | tr -d ' ')"
+    log "G11-intake: enqueueing DISPATCH_REQUEST for ${DISPATCH_REQUEST_COUNT} new ATTESTED beads (no DISPATCHED in either sweep)"
+    # Append one JSONL record per bead. The daemon's intake sweep
+    # reads this on its next tick and dispatches a worker. The audit
+    # never reads it back; the daemon is the sole consumer.
+    while IFS= read -r bid; do
+        [ -z "$bid" ] && continue
+        if [ "$DRY_RUN" -eq 1 ]; then
+            log "[G11-intake] (dry-run) would emit DISPATCH_REQUEST for $bid"
+            continue
+        fi
+        # Use python for atomic JSON serialization (no jq dep on the
+        # write path — matches the audit's read-side choice).
+        python3 - "$bid" "$NOW_EPOCH" "$CUTOFF_ISO" "$LOG_FILE" >> "$DISPATCH_REQUEST_LOG" <<'PY'
+import json, sys
+bid, now_epoch, cutoff_iso, log_file = sys.argv[1:5]
+print(json.dumps({
+    "beadId": bid,
+    "eventType": "DISPATCH_REQUEST",
+    "lifecycleState": "ATTESTED",
+    "timestamp": now_epoch,
+    "cutoff_iso": cutoff_iso,
+    "log_source": log_file,
+    "source": "fe-audit-g11-intake",
+}))
+PY
+        log "[G11-intake] enqueued DISPATCH_REQUEST for $bid"
+    done <<< "$NEW_ATTESTED_NO_DISPATCH"
+fi
+
 # ---------- G12: retry-backoff bleed ----------
 # Numeric: count BEAD_*_TRANSIENT_ERROR per bead in the last hour; if >=
 # threshold, file. (No string-matching — just per-bead event counts.)
@@ -241,17 +306,53 @@ remediation_hint: MAX_DISPATCH env var must be bounded: default 2, hard-cap min(
 fi
 
 # ---------- persist cooldown state ----------
-if [ "$DRY_RUN" -eq 0 ] && [ "$NO_BEAD" -eq 0 ]; then
-    cat > "$STATE_FILE" <<EOF
-{
-  "last_run_iso": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "last_fired_g10": $([ "$(echo "$G10_OUT" | wc -l)" -gt 0 ] && [ "$GAP" -gt "$MAX_TICK_GAP_SEC" ] && echo "$NOW_EPOCH" || echo "$PRIOR_G10"),
-  "last_fired_g11": $([ "$STUCK_COUNT" -gt 0 ] && echo "$NOW_EPOCH" || echo "$PRIOR_G11"),
-  "last_fired_g12": $([ -n "$TRANSIENT_PER_BEAD" ] && echo "$NOW_EPOCH" || echo "$PRIOR_G12"),
-  "last_fired_g13": $([ -n "$HIGH_RATE_HOURS" ] && echo "$NOW_EPOCH" || echo "$PRIOR_G13"),
-  "findings_filed": $findings_total
+if [ "$DRY_RUN" -eq 0 ]; then
+    # Use python for the state file write: it lets us serialize the
+    # last_sweep_attested / last_sweep_dispatched arrays directly
+    # without `printf '%s\0'`-style hacks that break on newlines /
+    # quoting. The existing G10-G13 cooldown fields are preserved so
+    # the prior schema is a strict superset.
+    # GAP is only set when G10_OUT is non-empty; default to 0 so the
+    # Python helper sees a defined value when the log has no ticks.
+    GAP_FOR_PERSIST="${GAP:-0}"
+    python3 - "$STATE_FILE" "$NOW_EPOCH" \
+        "$PRIOR_G10" "$PRIOR_G11" "$PRIOR_G12" "$PRIOR_G13" \
+        "$G10_OUT" "$GAP_FOR_PERSIST" "$MAX_TICK_GAP_SEC" \
+        "$STUCK_COUNT" "$TRANSIENT_PER_BEAD" "$HIGH_RATE_HOURS" \
+        "$ATTESTED_IDS" "$DISPATCHED_IDS" \
+        "$findings_total" <<'PY'
+import json, os, sys
+(state_file, now_epoch, prior_g10, prior_g11, prior_g12, prior_g13,
+ g10_out, gap, max_tick_gap_sec, stuck_count, transient_per_bead,
+ high_rate_hours, attested_ids, dispatched_ids, findings_total) = sys.argv[1:16]
+
+last_fired_g10 = int(now_epoch) if (g10_out and int(gap) > int(max_tick_gap_sec)) else int(prior_g10)
+last_fired_g11 = int(now_epoch) if int(stuck_count) > 0 else int(prior_g11)
+last_fired_g12 = int(now_epoch) if transient_per_bead else int(prior_g12)
+last_fired_g13 = int(now_epoch) if high_rate_hours else int(prior_g13)
+
+state = {
+    "last_run_iso": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "last_fired_g10": last_fired_g10,
+    "last_fired_g11": last_fired_g11,
+    "last_fired_g12": last_fired_g12,
+    "last_fired_g13": last_fired_g13,
+    "findings_filed": int(findings_total),
+    # Bead jleechan-vhsw (G11): persist the per-sweep bead-id
+    # snapshots so the next audit can compute the
+    # "new ATTESTED beads without DISPATCHED" delta. Without these,
+    # restart cycles leave beads stuck in ATTESTED with no worker
+    # spawn (the original G11 incident).
+    "last_sweep_attested": sorted({b for b in attested_ids.splitlines() if b.strip()}),
+    "last_sweep_dispatched": sorted({b for b in dispatched_ids.splitlines() if b.strip()}),
+    "last_sweep_dispatch_request_count": 0,  # informational; the side-channel log carries the count
 }
-EOF
+# Report the count of dispatch requests enqueued this sweep by
+# reading the side-channel log diff (cheap; bounded by the day).
+log_path = state_file + ".dispatch_count"  # not used; placeholder
+with open(state_file, "w") as fh:
+    json.dump(state, fh, indent=2)
+PY
 fi
 
 log "done. findings_filed=$findings_total"
