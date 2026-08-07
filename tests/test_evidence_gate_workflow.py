@@ -862,9 +862,14 @@ def _simulate_pr_anchor_match(gist_body: str, pr_number: int) -> bool:
         (r'See \"#571\" for the canonical reference.', 571, True),
         # Word-boundary adjacency: the number is preceded by space.
         ("Issue: #571 — see trace.", 571, True),
-        # Mid-token adjacency must NOT match: "1234571" contains #571 as
-        # a continuation, not a PR anchor.
-        ("ticket 1234571 was the same", 571, False),
+        # CodeRabbit Finding 2 (jleechan-2qn8 r5): a single digit
+        # IMMEDIATELY before the hash (e.g. `1#571`) is a stronger negative
+        # than `1234571` because an unguarded `#$PR_NUMBER\\b` regex
+        # matches `\b` between letter-class and non-letter class
+        # characters — and `1`→`#` is a letter→non-letter boundary, so
+        # `\b#571` would falsely match. The fix's `[^0-9]` left-boundary
+        # rejects this case; the regression asserts that.
+        ("ticket 1#571 was the same", 571, False),
         # Same number, but a different PR — must not cross-match.
         ("PR #999 was merged earlier.", 571, False),
     ],
@@ -894,6 +899,12 @@ def test_evidence_gate_workflow_uses_word_boundary_pr_anchor() -> None:
     MUST accept any non-digit byte (or beginning of input) before the
     hash, so `PR #571` and `#571 — see trace` are anchor-matched and
     `1234571` is not.
+
+    CodeRabbit Finding 2 (jleechan-2qn8 r5): the asserted word-boundary
+    form MUST be the explicit `(^|[^0-9])#${PR_NUMBER}\\b` (left-
+    boundary or non-digit-byte), not just any regex that happens to
+    include `\\b` — otherwise the test would pass against an unguarded
+    `\\b` that falsely matches `1#571`.
     """
     text = _verdict_step_text(_load_workflow())
     # The old form requires a literal `"` immediately before
@@ -911,23 +922,23 @@ def test_evidence_gate_workflow_uses_word_boundary_pr_anchor() -> None:
         "backslash-escaped alternative is the same pattern). A natural "
         "gist like `PR #571` does not satisfy this anchor and the gate "
         "reports `missing_pr_anchor` even when the gist is real and "
-        "substantive. Replace with `(^|[^0-9])#${PR_NUMBER}\\b` (or any "
-        "non-digit-byte-boundary alternative). (jleechan-2qn8)"
+        "substantive. Replace with `(^|[^0-9])#${PR_NUMBER}\\b`. (jleechan-2qn8)"
     )
-    # Sanity: the new word-boundary form MUST exist somewhere — accept
-    # any non-digit boundary (`(^|[^0-9])`, `[^0-9]`, or simply a
-    # `\\b` after `#${PR_NUMBER}` placed after a non-quote character).
-    has_word_boundary = (
-        "(^|[^0-9])" in text
-        or r"(^|[^0-9])" in text
-        or re.search(r"\b[^A-Za-z0-9]?#\$\{PR_NUMBER\}|#\$\{PR_NUMBER\}\b", text)
-        is not None
+    # Sanity: the explicit left-boundary form MUST be present. Accept
+    # either the literal `(^|[^0-9])` (single character-class) or the
+    # raw regex string in the file.
+    has_explicit_left_boundary = bool(
+        re.search(
+            r"\(\^\|\[\^0-9\]\)#\$\{PR_NUMBER\}\\b",
+            text,
+        )
     )
-    assert has_word_boundary, (
-        "evidence-gate.yml Signal B PR-anchor regex should use a "
-        "non-digit-byte boundary. After removing the `\"#${PR_NUMBER}\\b` "
-        "alternative, the regex must include `(^|[^0-9])` (or a similar "
-        "non-quote boundary) before `#${PR_NUMBER}`. (jleechan-2qn8)"
+    assert has_explicit_left_boundary, (
+        "evidence-gate.yml Signal B PR-anchor regex must use the "
+        "explicit left-boundary form `(^|[^0-9])#${PR_NUMBER}\\b`. A "
+        "looser `\\b` boundary would falsely match `1#571` because "
+        "`1`→`#` is a letter-class→non-letter-class transition. "
+        "(CodeRabbit Finding 2 / jleechan-2qn8 r5)"
     )
 
 
