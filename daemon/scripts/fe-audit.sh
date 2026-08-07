@@ -356,4 +356,8 @@ PY
 fi
 
 log "done. findings_filed=$findings_total"
+# Bead jleechan-vhsw (G11): the dispatch-request log lives at
+# <state_dir>/dispatch_requests.jsonl. The always-on auto-factory
+# daemon reads this on its next tick to detect ATTESTED beads that
+# have no DISPATCHED follow-up across restart cycles.
 exit 0
