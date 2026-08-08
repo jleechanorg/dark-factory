@@ -29,10 +29,16 @@ def _install_fake_runner_python(home: pathlib.Path, call_log: pathlib.Path) -> N
         "    args = sys.argv[3:]\n"
         "    if module == 'runner.preflight':\n"
         "        if '--json' in sys.argv:\n"
-        "            print('{}')\n"
+        "            preflight_json = os.environ.get('DF_FAKE_PREFLIGHT_JSON', '{}')\n"
+        "            print(preflight_json)\n"
+        "            rc = int(os.environ.get('DF_FAKE_PREFLIGHT_RC', '0'))\n"
+        "            raise SystemExit(rc)\n"
         "        raise SystemExit(0)\n"
         "\n"
         "    if module == 'runner._merge_train':\n"
+        "        raise SystemExit(0)\n"
+        "\n"
+        "    if module == 'runner.healer':\n"
         "        raise SystemExit(0)\n"
         "\n"
         "    if module == 'runner':\n"
@@ -63,7 +69,14 @@ def _read_fake_runner_calls(call_log: pathlib.Path) -> list[list[str]]:
     return [json.loads(line)["argv"] for line in call_log.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def _run_installed_wrapper(binary_args: list[str], *, workdir: pathlib.Path, review_return: int = 0) -> tuple[subprocess.CompletedProcess[str], pathlib.Path]:
+def _run_installed_wrapper(
+    binary_args: list[str],
+    *,
+    workdir: pathlib.Path,
+    review_return: int = 0,
+    env_overrides: dict[str, str] | None = None,
+    binary_name: str = "dark-factory",
+) -> tuple[subprocess.CompletedProcess[str], pathlib.Path]:
     fake_home = workdir / "fake_home"
     fake_home.mkdir(parents=True, exist_ok=True)
     call_log = fake_home / "fake-runner-calls.jsonl"
@@ -73,8 +86,10 @@ def _run_installed_wrapper(binary_args: list[str], *, workdir: pathlib.Path, rev
     env["DARK_FACTORY_HOME"] = str(fake_home)
     env["DF_FAKE_RUNNER_CALL_LOG"] = str(call_log)
     env["DF_FAKE_REVIEW_RETURN"] = str(review_return)
+    if env_overrides:
+        env.update(env_overrides)
     result = subprocess.run(
-        [str(ROOT / "bin" / "dark-factory"), *binary_args],
+        [str(ROOT / "bin" / binary_name), *binary_args],
         cwd=workdir,
         env=env,
         capture_output=True,
@@ -379,3 +394,148 @@ def test_reviewer_contract_requires_digest_bound_controller_receipt() -> None:
         assert not missing, f"review controller receipt contract missing {missing}"
     assert "prompt.txt` is a binary-emitted audit capture" in texts[0]
     assert "`prompt.txt` is a binary-emitted audit capture only" in texts[1]
+
+
+def test_dark_factory_preflight_warn_replaces_explicit_backend_arg(tmp_path: pathlib.Path) -> None:
+    workdir = tmp_path
+    preflight_json = json.dumps({
+        "status": "warn",
+        "configured": "codex",
+        "fallback_recommendation": "claude",
+    })
+    result, call_log = _run_installed_wrapper(
+        ["--pipeline", "two_node.dot", "--backend", "codex", "--goal", "ci"],
+        workdir=workdir,
+        env_overrides={"DF_FAKE_PREFLIGHT_JSON": preflight_json},
+    )
+    assert result.returncode == 0
+    assert "codex missing; falling back to claude" in result.stderr
+    calls = _read_fake_runner_calls(call_log)
+    runner_calls = [call for call in calls if call[:2] == ["-m", "runner"]]
+    assert runner_calls[0][2:] == [
+        "--workdir",
+        str(workdir),
+        "--pipeline",
+        "two_node.dot",
+        "--backend",
+        "claude",
+        "--goal",
+        "ci",
+    ]
+
+
+def test_dark_factory_preflight_warn_replaces_equals_backend_arg(tmp_path: pathlib.Path) -> None:
+    workdir = tmp_path
+    preflight_json = json.dumps({
+        "status": "warn",
+        "configured": "codex",
+        "fallback_recommendation": "claude",
+    })
+    result, call_log = _run_installed_wrapper(
+        ["--pipeline", "two_node.dot", "--backend=codex", "--goal", "ci"],
+        workdir=workdir,
+        env_overrides={"DF_FAKE_PREFLIGHT_JSON": preflight_json},
+    )
+    assert result.returncode == 0
+    assert "codex missing; falling back to claude" in result.stderr
+    calls = _read_fake_runner_calls(call_log)
+    runner_calls = [call for call in calls if call[:2] == ["-m", "runner"]]
+    assert runner_calls[0][2:] == [
+        "--workdir",
+        str(workdir),
+        "--pipeline",
+        "two_node.dot",
+        "--backend=claude",
+        "--goal",
+        "ci",
+    ]
+
+
+def test_dark_factory_preflight_warn_adds_backend_arg_when_absent(tmp_path: pathlib.Path) -> None:
+    workdir = tmp_path
+    preflight_json = json.dumps({
+        "status": "warn",
+        "configured": "codex",
+        "fallback_recommendation": "claude",
+    })
+    result, call_log = _run_installed_wrapper(
+        ["--pipeline", "two_node.dot", "--goal", "ci"],
+        workdir=workdir,
+        env_overrides={
+            "DARK_FACTORY_BACKEND": "codex",
+            "DF_FAKE_PREFLIGHT_JSON": preflight_json,
+        },
+    )
+    assert result.returncode == 0
+    assert "codex missing; falling back to claude" in result.stderr
+    calls = _read_fake_runner_calls(call_log)
+    runner_calls = [call for call in calls if call[:2] == ["-m", "runner"]]
+    assert runner_calls[0][2:] == [
+        "--workdir",
+        str(workdir),
+        "--backend",
+        "claude",
+        "--pipeline",
+        "two_node.dot",
+        "--goal",
+        "ci",
+    ]
+
+
+def test_dark_factory_preflight_warn_review_subcommand_inserts_backend_after_review(tmp_path: pathlib.Path) -> None:
+    workdir = tmp_path
+    task_file = workdir / "task.md"
+    output_dir = workdir / "review-output"
+    task_file.write_text("run a controller review", encoding="utf-8")
+    output_dir.mkdir(exist_ok=True)
+
+    preflight_json = json.dumps({
+        "status": "warn",
+        "configured": "codex",
+        "fallback_recommendation": "claude",
+    })
+    result, call_log = _run_installed_wrapper(
+        [
+            "review",
+            "--base-sha",
+            "a" * 40,
+            "--head-sha",
+            "b" * 40,
+            "--task-file",
+            str(task_file),
+            "--output-dir",
+            str(output_dir),
+        ],
+        workdir=workdir,
+        env_overrides={
+            "DARK_FACTORY_BACKEND": "codex",
+            "DF_FAKE_PREFLIGHT_JSON": preflight_json,
+        },
+    )
+    assert result.returncode == 0
+    assert "codex missing; falling back to claude" in result.stderr
+    calls = _read_fake_runner_calls(call_log)
+    runner_calls = [call for call in calls if call[:2] == ["-m", "runner"]]
+    assert runner_calls[0][2] == "review"
+    assert runner_calls[0][3:5] == ["--backend", "claude"]
+
+
+def test_df_healer_preflight_warn_replaces_or_adds_backend_arg(tmp_path: pathlib.Path) -> None:
+    workdir = tmp_path
+    preflight_json = json.dumps({
+        "status": "warn",
+        "configured": "codex",
+        "fallback_recommendation": "echo",
+    })
+    result, call_log = _run_installed_wrapper(
+        ["--backend", "codex"],
+        workdir=workdir,
+        env_overrides={"DF_FAKE_PREFLIGHT_JSON": preflight_json},
+        binary_name="df-healer",
+    )
+    assert result.returncode == 0
+    assert "codex missing; falling back to echo" in result.stderr
+    calls = _read_fake_runner_calls(call_log)
+    healer_calls = [call for call in calls if call[:2] == ["-m", "runner.healer"]]
+    assert healer_calls[0][2:] == ["--backend", "echo"]
+

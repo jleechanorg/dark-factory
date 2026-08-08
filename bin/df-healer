@@ -63,6 +63,9 @@ for arg in "$@"; do
   if [[ "${prev}" == "--backend" ]]; then
     PREFLIGHT_BACKEND="${arg}"
     break
+  elif [[ "${arg}" == --backend=* ]]; then
+    PREFLIGHT_BACKEND="${arg#--backend=}"
+    break
   fi
   prev="${arg}"
 done
@@ -82,11 +85,32 @@ if [[ "${PREFLIGHT_RC}" -eq 2 ]]; then
 elif [[ "${PREFLIGHT_RC}" -eq 0 && -n "${PREFLIGHT_JSON}" ]]; then
   STATUS=""
   FALLBACK=""
-  STATUS="$(printf '%s' "${PREFLIGHT_JSON}" | awk -F'"' '/"status":/ {print $4; exit}')"
-  FALLBACK="$(printf '%s' "${PREFLIGHT_JSON}" | awk -F'"' '/"fallback_recommendation":/ {print $4; exit}')"
+  STATUS="$(printf '%s' "${PREFLIGHT_JSON}" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+  FALLBACK="$(printf '%s' "${PREFLIGHT_JSON}" | sed -n 's/.*"fallback_recommendation"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
   if [[ "${STATUS}" == "warn" ]]; then
     printf '\033[33mwarning\033[0m: %s missing; falling back to %s\n' \
       "${PREFLIGHT_BACKEND}" "${FALLBACK}" >&2
+    if [[ -n "${FALLBACK}" ]]; then
+      new_argv=()
+      backend_replaced=0
+      prev=""
+      for arg in "$@"; do
+        if [[ "${prev}" == "--backend" ]]; then
+          new_argv+=("${FALLBACK}")
+          backend_replaced=1
+        elif [[ "${arg}" == --backend=* ]]; then
+          new_argv+=("--backend=${FALLBACK}")
+          backend_replaced=1
+        else
+          new_argv+=("${arg}")
+        fi
+        prev="${arg}"
+      done
+      if [[ "${backend_replaced}" -eq 0 ]]; then
+        new_argv=("--backend" "${FALLBACK}" "${new_argv[@]}")
+      fi
+      set -- "${new_argv[@]}"
+    fi
   fi
 fi
 
