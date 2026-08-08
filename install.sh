@@ -17,14 +17,13 @@ set -euo pipefail
 
 PYTHON_VERSION="${PYTHON_VERSION:-3.13}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV_DIR="${REPO_ROOT}/.venv"
-PYTHON_BIN="${VENV_DIR}/bin/python"
-BIN_DIR="${REPO_ROOT}/bin"
 LOCAL_BIN="${HOME}/.local/bin"
 CLEAR=0
 SMOKE=1
 LINK=1
 CMDS=1
+RUNTIME_ROOT="${REPO_ROOT}"
+ARTIFACT_CREATED=0
 
 usage() {
   sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
@@ -66,6 +65,39 @@ if ! command -v git-lfs >/dev/null 2>&1; then
 fi
 echo "==> git-lfs $(git-lfs version | head -1)"
 
+# Linux systemd runs unattended, so it must not execute a mutable developer
+# checkout (a branch switch or an uncommitted edit can change the daemon while
+# it is running). Snapshot the source into a versioned UV-managed release and
+# point the installed launcher at that immutable copy. macOS keeps the
+# repo-local development layout for backwards compatibility with launchd.
+if [[ "$(uname -s)" == "Linux" && "${DARK_FACTORY_DISABLE_IMMUTABLE_ARTIFACT:-0}" != "1" ]]; then
+  ARTIFACT_ROOT="${DARK_FACTORY_INSTALL_ROOT:-${HOME}/.local/share/dark-factory}"
+  ARTIFACT_VERSION="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || sha256sum "${REPO_ROOT}/install.sh" | cut -c1-40)"
+  ARTIFACT_DIR="${ARTIFACT_ROOT}/releases/${ARTIFACT_VERSION}"
+  if [[ "${CLEAR}" -eq 1 && -d "${ARTIFACT_DIR}" ]]; then
+    echo "==> removing immutable release (${ARTIFACT_DIR})"
+    rm -rf "${ARTIFACT_DIR}"
+  fi
+  if [[ ! -d "${ARTIFACT_DIR}" ]]; then
+    mkdir -p "${ARTIFACT_ROOT}/releases"
+    STAGING_DIR="$(mktemp -d "${ARTIFACT_ROOT}/.release-${ARTIFACT_VERSION}.XXXXXX")"
+    trap 'rm -rf "${STAGING_DIR:-}"' EXIT
+    tar --exclude=.git --exclude=.venv --exclude='__pycache__' \
+      -cf - -C "${REPO_ROOT}" . | tar -xf - -C "${STAGING_DIR}"
+    mv "${STAGING_DIR}" "${ARTIFACT_DIR}"
+    trap - EXIT
+    ARTIFACT_CREATED=1
+    echo "==> snapshotted immutable release: ${ARTIFACT_DIR}"
+  else
+    echo "==> reusing immutable release: ${ARTIFACT_DIR}"
+  fi
+  RUNTIME_ROOT="${ARTIFACT_DIR}"
+fi
+
+VENV_DIR="${RUNTIME_ROOT}/.venv"
+PYTHON_BIN="${VENV_DIR}/bin/python"
+BIN_DIR="${RUNTIME_ROOT}/bin"
+
 echo "==> uv $(uv --version)"
 echo "==> repo: ${REPO_ROOT}"
 echo "==> python: ${PYTHON_VERSION}"
@@ -73,7 +105,7 @@ echo "==> python: ${PYTHON_VERSION}"
 echo "==> installing Python ${PYTHON_VERSION} via uv"
 uv python install "${PYTHON_VERSION}"
 
-if [[ "${CLEAR}" -eq 1 && -d "${VENV_DIR}" ]]; then
+if [[ "${CLEAR}" -eq 1 && -d "${VENV_DIR}" && "${ARTIFACT_CREATED}" -eq 0 ]]; then
   echo "==> removing existing venv (${VENV_DIR})"
   rm -rf "${VENV_DIR}"
 fi
@@ -85,14 +117,19 @@ else
   echo "==> reusing venv at ${VENV_DIR}"
 fi
 
-REQUIREMENTS_FILE="${REPO_ROOT}/requirements.lock"
+REQUIREMENTS_FILE="${RUNTIME_ROOT}/requirements.lock"
 if [[ ! -f "${REQUIREMENTS_FILE}" ]]; then
   echo "ERROR: requirements.lock not found." >&2
   echo "Regenerate with: uv pip compile requirements.txt --python-version ${PYTHON_VERSION} -o requirements.lock" >&2
   exit 1
 fi
-echo "==> installing $(basename "${REQUIREMENTS_FILE}") into venv (PyPI via uv pip)"
-uv pip install --python "${PYTHON_BIN}" -r "${REQUIREMENTS_FILE}"
+if [[ "${ARTIFACT_CREATED}" -eq 1 || ! -f "${VENV_DIR}/.requirements-installed" ]]; then
+  echo "==> installing $(basename "${REQUIREMENTS_FILE}") into venv (PyPI via uv pip)"
+  uv pip install --python "${PYTHON_BIN}" -r "${REQUIREMENTS_FILE}"
+  touch "${VENV_DIR}/.requirements-installed"
+else
+  echo "==> immutable release dependencies already installed"
+fi
 
 echo "==> verifying import"
 "${PYTHON_BIN}" -c "import pydot, yaml; print('deps ok:', pydot.__version__)"
@@ -132,6 +169,14 @@ fi
 
 chmod +x "${BIN_DIR}/dark-factory" "${BIN_DIR}/df-healer" "${BIN_DIR}/df-validate"
 
+if [[ "${ARTIFACT_CREATED}" -eq 1 ]]; then
+  # Runtime code and the venv are complete before this point. Removing write
+  # permission makes accidental in-place edits fail instead of silently
+  # changing the release used by systemd.
+  find "${RUNTIME_ROOT}" -type f -exec chmod a-w {} +
+  find "${RUNTIME_ROOT}" -type d -exec chmod a-w {} +
+fi
+
 if [[ "${LINK}" -eq 1 ]]; then
   mkdir -p "${LOCAL_BIN}"
   ln -sf "${BIN_DIR}/dark-factory" "${LOCAL_BIN}/dark-factory"
@@ -150,9 +195,11 @@ if [[ "${CMDS}" -eq 1 ]]; then
   CLAUDE_DIR="${HOME}/.claude"
   mkdir -p "${CLAUDE_DIR}/commands" "${CLAUDE_DIR}/skills"
 
-  # 4 factory commands — file symlinks so edits land in the repo
+  # 4 factory commands — point at the installed runtime. On Linux this keeps
+  # every executable prompt payload inside the immutable release rather than
+  # reaching back into the Git checkout.
   for cmd in f fs factory factory-spec; do
-    src="${REPO_ROOT}/.claude/commands/${cmd}.md"
+    src="${RUNTIME_ROOT}/.claude/commands/${cmd}.md"
     dst="${CLAUDE_DIR}/commands/${cmd}.md"
     if [[ -f "${src}" ]]; then
       ln -sf "${src}" "${dst}"
@@ -167,7 +214,7 @@ if [[ "${CMDS}" -eq 1 ]]; then
   # operator can recover user-scope edits; subsequent runs replace the symlink
   # cleanly with `ln -sfn`.
   for skill in dark-factory factory-spec; do
-    src="${REPO_ROOT}/.claude/skills/${skill}"
+    src="${RUNTIME_ROOT}/.claude/skills/${skill}"
     dst="${CLAUDE_DIR}/skills/${skill}"
     if [[ ! -d "${src}" ]]; then
       echo "==> SKIP: ${src} not found" >&2
@@ -183,14 +230,14 @@ if [[ "${CMDS}" -eq 1 ]]; then
   done
 fi
 
-export DARK_FACTORY_HOME="${REPO_ROOT}"
+export DARK_FACTORY_HOME="${RUNTIME_ROOT}"
 export PATH="${LOCAL_BIN}:${PATH}"
 
 if [[ "${SMOKE}" -eq 1 ]]; then
   echo "==> smoke run via dark-factory binary (parallel demo, echo backend, no LLM)"
   cd "${REPO_ROOT}"
   "${BIN_DIR}/dark-factory" \
-    --pipeline pipelines/parallel_demo.dot \
+    --pipeline "${RUNTIME_ROOT}/pipelines/parallel_demo.dot" \
     --goal "install.sh smoke" \
     --no-perf-log \
     --max-steps 20 \
@@ -201,7 +248,7 @@ cat <<EOF
 
 Dark Factory ready (binary install).
 
-  export DARK_FACTORY_HOME="${REPO_ROOT}"
+  export DARK_FACTORY_HOME="${RUNTIME_ROOT}"
   export DARK_FACTORY_HOLDOUTS="\${HOME}/projects/dark-factory-holdouts"
   export PATH="\${HOME}/.local/bin:\${PATH}"
 

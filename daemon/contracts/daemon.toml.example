@@ -52,7 +52,9 @@ pre_gate_validation_enabled = true
 # [repos."jleechanorg/worldarchitect.ai"]
 # ao_project = "worldarchitect"
 # push_remote = "worldai"   # dual-remote clone; bare `git push` is WRONG here
+# local_checkout = "/srv/repos/worldarchitect.ai"  # AO spawn cwd/worktree source
 #
 # [repos."jleechanorg/dark-factory"]
 # ao_project = "dark-factory"
 # push_remote = "origin"
+# local_checkout = "/srv/repos/dark-factory"

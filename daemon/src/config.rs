@@ -9,6 +9,11 @@ use std::path::Path;
 pub struct RepoConfig {
     pub ao_project: String,
     pub push_remote: String,
+    /// Local checkout used as the working directory for workers targeting
+    /// this repository. Cross-repository dispatch must not inherit the
+    /// daemon's own checkout.
+    #[serde(default)]
+    pub local_checkout: Option<std::path::PathBuf>,
 }
 
 /// Resolved dispatch routing for a repo — the AO project to spawn into and
@@ -17,6 +22,7 @@ pub struct RepoConfig {
 pub struct RepoRouting {
     pub ao_project: String,
     pub push_remote: String,
+    pub local_checkout: Option<std::path::PathBuf>,
 }
 
 #[derive(serde::Deserialize, Debug, Clone)]
@@ -147,6 +153,7 @@ impl Config {
             return Some(RepoRouting {
                 ao_project: rc.ao_project.clone(),
                 push_remote: rc.push_remote.clone(),
+                local_checkout: rc.local_checkout.clone(),
             });
         }
         if repo == self.target_repo {
@@ -178,6 +185,7 @@ impl Config {
             return Some(RepoRouting {
                 ao_project,
                 push_remote: "origin".to_string(),
+                local_checkout: None,
             });
         }
         None
@@ -344,6 +352,7 @@ spec_dir = ".factory/specs/"
             Some(RepoRouting {
                 ao_project: "repo".to_string(),
                 push_remote: "origin".to_string(),
+                local_checkout: None,
             }),
             "the global target_repo must still resolve when [repos] is absent"
         );
@@ -372,6 +381,7 @@ spec_dir = ".factory/specs/"
 [repos."jleechanorg/worldarchitect.ai"]
 ao_project = "worldarchitect"
 push_remote = "worldai"
+local_checkout = "/srv/repos/worldarchitect.ai"
 
 [repos."jleechanorg/dark-factory"]
 ao_project = "dark-factory"
@@ -386,6 +396,7 @@ push_remote = "origin"
             Some(RepoRouting {
                 ao_project: "worldarchitect".to_string(),
                 push_remote: "worldai".to_string(),
+                local_checkout: Some(std::path::PathBuf::from("/srv/repos/worldarchitect.ai")),
             })
         );
         assert_eq!(
@@ -393,6 +404,7 @@ push_remote = "origin"
             Some(RepoRouting {
                 ao_project: "dark-factory".to_string(),
                 push_remote: "origin".to_string(),
+                local_checkout: None,
             })
         );
     }
@@ -460,6 +472,7 @@ spec_dir = ".factory/specs/"
             Some(RepoRouting {
                 ao_project: "worldarchitect".to_string(),
                 push_remote: "origin".to_string(),
+                local_checkout: None,
             })
         );
     }

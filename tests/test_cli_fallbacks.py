@@ -197,6 +197,60 @@ def test_codex_coder_missing_returns_clean_error(monkeypatch, tmp_path):
     assert result.metadata.get("backend_missing") != "true"
 
 
+def test_codex_coder_timeout_decodes_partial_byte_output(monkeypatch, tmp_path):
+    """A timed-out Codex worker returns partial bytes without crashing."""
+    _disable_sandbox(monkeypatch)
+
+    def _timeout(args, **kwargs):
+        raise subprocess.TimeoutExpired(
+            args,
+            kwargs["timeout"],
+            output=b"worker completed its edits\n",
+            stderr=b"late stderr: \xff",
+        )
+
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", _timeout)
+
+    result = _codergen(
+        _node("codex"),
+        Context(goal="t", workdir=tmp_path, backend="codex"),
+    )
+
+    assert result.outcome == "failure"
+    assert result.output == "worker completed its edits\n\nSTDERR:\nlate stderr: �"
+    assert result.metadata["timed_out"] == "true"
+
+
+@pytest.mark.parametrize("existing_session", [False, True])
+def test_ao_coder_timeout_decodes_partial_byte_output(
+    monkeypatch,
+    tmp_path,
+    existing_session,
+):
+    """AO spawn/send timeouts return partial bytes without crashing."""
+    _disable_sandbox(monkeypatch)
+
+    def _timeout(args, **kwargs):
+        raise subprocess.TimeoutExpired(
+            args,
+            kwargs["timeout"],
+            output=b"ao preserved output\n",
+            stderr=b"ao stderr: \xff",
+        )
+
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", _timeout)
+    ctx = Context(goal="t", workdir=tmp_path, backend="ao")
+    ctx.state["ao.project"] = "fake-project"
+    if existing_session:
+        ctx.state["ao.session"] = "session-1"
+
+    result = _codergen(_node("ao"), ctx)
+
+    assert result.outcome == "failure"
+    assert result.output == "ao preserved output\n\nSTDERR:\nao stderr: �"
+    assert result.metadata["timed_out"] == "true"
+
+
 def test_agy_coder_missing_panics_unprotected(monkeypatch, tmp_path):
     """agy missing → ``FileNotFoundError`` is caught and returned as clean error Result.
     """

@@ -1148,6 +1148,7 @@ fn execute_adopted(
                 .clone()
                 .unwrap_or_else(|| adopted_repo.clone()),
             push_remote: "origin".to_string(),
+            local_checkout: None,
         }
     });
     let spec = SpawnSpec {
@@ -1157,6 +1158,7 @@ fn execute_adopted(
         repo: adopted_repo,
         ao_project: adopted_routing.ao_project,
         remote: adopted_routing.push_remote,
+        local_checkout: adopted_routing.local_checkout,
     };
 
     // Persist an ambiguous pre-spawn intent before crossing the external AO
