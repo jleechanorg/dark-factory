@@ -1079,6 +1079,40 @@ fn execute_adopted(
         }
     }
 
+    let adopted_repo = bead.repo(deps.cfg).to_string();
+    let adopted_routing = deps.cfg.resolve_repo(&adopted_repo).unwrap_or_else(|| {
+        crate::config::RepoRouting {
+            ao_project: deps
+                .cfg
+                .ao_project
+                .clone()
+                .unwrap_or_else(|| adopted_repo.clone()),
+            push_remote: "origin".to_string(),
+            local_checkout: None,
+        }
+    });
+    if !deps
+        .cfg
+        .worker_checkout_is_configured(&adopted_repo, &adopted_routing)
+    {
+        bead.state = OverlayState::HumanHeld;
+        bead.session_id = None;
+        set_human_hold_reason(bead, HumanHoldReason::TargetCheckoutUnconfigured);
+        deps.store.save(bead)?;
+        emit_telemetry(
+            deps.telemetry_log,
+            &bead.bead_id,
+            bead.attempt,
+            bead.state.as_str(),
+            "REROLL_ADOPTED_TARGET_CHECKOUT_UNCONFIGURED",
+            serde_json::json!({}),
+            serde_json::json!({"repo": adopted_repo}),
+        )?;
+        return Ok(RerollOutcome::Held(format!(
+            "adopted bead targets explicit repo {adopted_repo:?}, but its local_checkout is missing or not absolute"
+        )));
+    }
+
     let next_attempt = bead.attempt + 1;
     let prompt = format!(
         "Address the following code review feedback from {reviewer} on this pull \
@@ -1139,18 +1173,6 @@ fn execute_adopted(
     // with `deps.cfg.ao_project` unset (rather than panicking/unwrapping)
     // keeps this path inert if that restriction is ever lifted before the
     // Stage C/D call-site sweep reaches this function.
-    let adopted_repo = bead.repo(deps.cfg).to_string();
-    let adopted_routing = deps.cfg.resolve_repo(&adopted_repo).unwrap_or_else(|| {
-        crate::config::RepoRouting {
-            ao_project: deps
-                .cfg
-                .ao_project
-                .clone()
-                .unwrap_or_else(|| adopted_repo.clone()),
-            push_remote: "origin".to_string(),
-            local_checkout: None,
-        }
-    });
     let spec = SpawnSpec {
         bead_id: bead.bead_id.clone(),
         branch: branch.clone(),

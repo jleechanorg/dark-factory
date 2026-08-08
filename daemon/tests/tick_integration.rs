@@ -23,7 +23,7 @@
 mod common;
 
 use common::{FakeLlm, FakeScm, FakeSessions, FakeStateStore, FakeTracker, FakeVcs};
-use daemon::config::Config;
+use daemon::config::{Config, RepoConfig};
 
 use daemon::er_runner;
 use daemon::errors::DaemonError;
@@ -10990,6 +10990,87 @@ fn run_tick_emits_parked_human_held_for_unmapped_repo_dispatch_failure() {
         "unmapped_repo park must NOT fall through to BEAD_DISPATCH_TRANSIENT_ERROR; events = {:?}",
         events
     );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn run_tick_escalates_explicit_target_without_checkout_as_human_held() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    tracker.candidates.borrow_mut().push(Bead {
+        id: "missing-checkout-bead".into(),
+        title: "explicit repo needs its own checkout".into(),
+        description: "target_repo: other/repo".into(),
+        notes: String::new(),
+        file_tree_summary: String::new(),
+        external_ref: Some("other/repo#321".into()),
+    });
+
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"explicit target"}"#.into(),
+    ));
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.repos.insert(
+        "other/repo".into(),
+        RepoConfig {
+            ao_project: "other".into(),
+            push_remote: "origin".into(),
+            local_checkout: None,
+        },
+    );
+    let vcs = FakeVcs::new();
+    let telemetry_log =
+        std::env::temp_dir().join("afd_missing_target_checkout_park_test.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        0,
+        0,
+    )
+    .expect("one missing target checkout must not abort the tick");
+
+    assert_eq!(summary.beads_parked_human_held, 1);
+    assert_eq!(summary.beads_dispatched, 0);
+    let overlay = store.load("missing-checkout-bead").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::HumanHeld);
+    assert_eq!(
+        overlay.park_reason.as_deref(),
+        Some("target_checkout_unconfigured")
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap();
+    let events: Vec<serde_json::Value> = telemetry
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(events.iter().any(|event| {
+        event["eventType"] == "PARKED_HUMAN_HELD"
+            && event["beadId"] == "missing-checkout-bead"
+            && event["context"]["reason"] == "target_checkout_unconfigured"
+    }));
+    assert!(!events.iter().any(|event| {
+        event["eventType"] == "BEAD_DISPATCH_TRANSIENT_ERROR"
+            && event["beadId"] == "missing-checkout-bead"
+    }));
+    assert!(tracker.calls.borrow().iter().any(|call| {
+        call.starts_with("comment_external(other/repo#321,")
+            && call.contains("local_checkout")
+    }));
 
     let _ = std::fs::remove_file(&telemetry_log);
 }

@@ -373,12 +373,7 @@ pub fn dispatch_ready(
                 continue;
             }
         };
-        if cfg.repos.contains_key(&repo)
-            && routing
-                .local_checkout
-                .as_ref()
-                .map_or(true, |checkout| !checkout.is_absolute())
-        {
+        if !cfg.worker_checkout_is_configured(&repo, &routing) {
             let error = DaemonError::Config(format!(
                 "bead {} targets explicit repo {repo:?}, but [repos.\"{repo}\"].local_checkout \
                  is missing or not absolute; refusing to spawn from the daemon's unrelated cwd",

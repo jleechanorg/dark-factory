@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 mod common;
 
 use common::{FakeLlm, FakeScm, FakeSessions, FakeStateStore, FakeTracker, FakeVcs};
-use daemon::config::Config;
+use daemon::config::{Config, RepoConfig};
 use daemon::constraints;
 use daemon::errors::DaemonError;
 use daemon::reroll::{self, RerollDeps, RerollOutcome};
@@ -752,6 +752,67 @@ fn test_reroll_adopted_success_spawns_remediation_session_leaves_pr_open() {
             .iter()
             .all(|c| !c.starts_with("close_pr_for_repo(") && !c.starts_with("close_pr(")),
         "adopted remediation must never close the contributor's PR: {scm_calls:?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn test_reroll_adopted_explicit_target_without_checkout_never_spawns() {
+    let scm = FakeScm::new();
+    let sessions = FakeSessions::new();
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert(
+        "alice/my-cool-feature".into(),
+        "pre-session-sha-abc123".into(),
+    );
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    let mut cfg = test_cfg();
+    cfg.repos.insert(
+        cfg.target_repo.clone(),
+        RepoConfig {
+            ao_project: "repo".into(),
+            push_remote: "origin".into(),
+            local_checkout: None,
+        },
+    );
+    let telemetry_log =
+        std::env::temp_dir().join("afd_reroll_adopted_missing_checkout_telemetry.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    let mut bead = adopted_overlay("bead-adopted-missing-checkout");
+    store.save(&bead).unwrap();
+    store
+        .register_branch(&bead.bead_id, bead.branch.as_deref().unwrap())
+        .unwrap();
+
+    let deps = RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "verifier".into(),
+        review_text: "CI check-run(s) not all success".into(),
+    };
+
+    let outcome = reroll::execute(&deps, &mut bead).unwrap();
+
+    assert!(matches!(outcome, RerollOutcome::Held(_)));
+    assert!(
+        sessions
+            .calls
+            .borrow()
+            .iter()
+            .all(|call| call != "spawn(bead-adopted-missing-checkout)")
+    );
+    let updated = store.load(&bead.bead_id).unwrap().unwrap();
+    assert_eq!(updated.state, OverlayState::HumanHeld);
+    assert_eq!(
+        updated.park_reason.as_deref(),
+        Some("target_checkout_unconfigured")
     );
 
     let _ = std::fs::remove_file(&telemetry_log);

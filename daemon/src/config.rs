@@ -190,6 +190,14 @@ impl Config {
         }
         None
     }
+
+    pub fn worker_checkout_is_configured(&self, repo: &str, routing: &RepoRouting) -> bool {
+        !self.repos.contains_key(repo)
+            || routing
+                .local_checkout
+                .as_ref()
+                .is_some_and(|checkout| checkout.is_absolute())
+    }
 }
 
 pub fn load(path: &Path) -> Result<Config, DaemonError> {
