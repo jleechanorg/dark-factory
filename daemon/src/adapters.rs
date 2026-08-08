@@ -1902,6 +1902,16 @@ fn ao_spawn_command_with_mode(
         Command::new("ao")
     };
 
+    // Bind AO's repository discovery/worktree creation to the routed target
+    // checkout. Without this, AO inherits the daemon process cwd (normally
+    // the dark-factory checkout), so an explicit cross-repository target can
+    // receive a worker in the wrong repository. `local_checkout` is only
+    // populated by explicit repo routing; legacy single-repo diagnostics keep
+    // the historical cwd behavior.
+    if let Some(checkout) = &spec.local_checkout {
+        cmd.current_dir(checkout);
+    }
+
     // This is the complete AO v0.1.3 public spawn argv: no --prompt,
     // --name, or --branch. The preload validates this shape independently.
     cmd.arg("spawn")
@@ -2048,6 +2058,7 @@ pub fn verify_ao_bridge_compatibility(
         repo: String::new(),
         ao_project: ao_project.to_string(),
         remote: String::new(),
+        local_checkout: None,
     };
     let mut command = ao_spawn_command_with_mode(agent, &spec, true)?;
     command
@@ -2667,6 +2678,7 @@ mod ao_spawn_contract_tests {
             repo: "jleechanorg/dark-factory".to_string(),
             ao_project: "dark-factory".to_string(),
             remote: "origin".to_string(),
+            local_checkout: None,
         }
     }
 
@@ -2737,7 +2749,7 @@ assert bindings[prompt] == os.environ["DARK_FACTORY_AO_SPAWN_BRANCH"]
 assert os.environ["DARK_FACTORY_AO_V013_BRIDGE"] == "1"
 assert "ao-spawn-v013-bridge.mjs" in os.environ["NODE_OPTIONS"]
 with open(os.environ["AO_FAKE_LOG"], "a", encoding="utf-8") as handle:
-    handle.write(json.dumps({"kind": "spawn", "args": args, "branch": os.environ["DARK_FACTORY_AO_SPAWN_BRANCH"]}) + "\n")
+    handle.write(json.dumps({"kind": "spawn", "args": args, "branch": os.environ["DARK_FACTORY_AO_SPAWN_BRANCH"], "cwd": os.getcwd()}) + "\n")
 if prompt == os.environ.get("AO_FAKE_FAIL_PROMPT"):
     print("scripted second spawn failure", file=sys.stderr)
     raise SystemExit(7)
@@ -2810,6 +2822,34 @@ print("  Branch:   " + os.environ.get("AO_FAKE_RETURN_BRANCH", os.environ["DARK_
         assert_eq!(rows[0]["args"][5], "--");
         assert_eq!(rows[0]["args"][6], prompt);
         assert_eq!(rows[0]["branch"], branch);
+    }
+
+    #[test]
+    fn routed_spawn_uses_target_checkout_as_ao_cwd() {
+        let prompt = "routed checkout prompt";
+        let branch = "factory/jleechan-contract-checkout-r1";
+        let checkout = std::env::temp_dir().join(format!(
+            "afd_target_checkout_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&checkout).unwrap();
+
+        let (spawn_result, calls) = with_fake_ao("target_checkout", serde_json::json!({prompt: branch}), |log| {
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            let mut routed = spec(prompt, branch);
+            routed.repo = "otherorg/other-repo".to_string();
+            routed.ao_project = "other-repo".to_string();
+            routed.local_checkout = Some(checkout.clone());
+            let result = sessions.spawn(&routed);
+            let calls = std::fs::read_to_string(log).unwrap_or_default();
+            (result, calls)
+        });
+        let _ = std::fs::remove_dir_all(&checkout);
+
+        assert!(spawn_result.is_ok(), "routed spawn failed: {spawn_result:?}");
+        let row: serde_json::Value = calls.lines().next().unwrap().parse().unwrap();
+        assert_eq!(row["cwd"], checkout.to_string_lossy().as_ref());
     }
 
     #[test]
