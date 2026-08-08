@@ -2474,7 +2474,11 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 continue;
             }
 
-            if failure.phase == "unmapped_target_repo" {
+            if matches!(
+                failure.phase,
+                "unmapped_target_repo" | "target_checkout_unconfigured" | "spawn_failed"
+            ) {
+                let reason = failure.phase;
                 // jleechan-35y4 (adversarial review of PR #245): this phase
                 // (from `dispatch::dispatch_ready`'s fail-loud park) was
                 // previously falling through to the generic
@@ -2495,24 +2499,34 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     "PARKED_HUMAN_HELD",
                     serde_json::json!({}),
                     serde_json::json!({
-                        "reason": "unmapped_target_repo",
+                        "reason": reason,
                         "error": failure.error.as_str(),
                     }),
                 )?;
                 if escalation_already_recorded(deps, &failure.bead_id)? {
                     continue;
                 }
-                let comment_body = format!(
-                    "🤖 **[dark-factory]** Escalation required: bead `{}` claims a `target_repo` with no matching `[repos.*]` config entry (and it is not the daemon's global `target_repo`). Automation parked it HUMAN_HELD rather than guessing which repo/AO-project to dispatch into; please add a `[repos.\"<repo>\"]` entry to `config/daemon.toml` (or correct the bead's `target_repo`) before requeuing.",
-                    failure.bead_id
-                );
+                let comment_body = match reason {
+                    "target_checkout_unconfigured" => format!(
+                        "🤖 **[dark-factory]** Escalation required: bead `{}` targets a configured repository whose `local_checkout` is missing or not absolute. Automation parked only this bead HUMAN_HELD rather than spawning from the daemon's unrelated cwd; configure `[repos.\"<repo>\"].local_checkout` before requeuing.",
+                        failure.bead_id
+                    ),
+                    "spawn_failed" => format!(
+                        "🤖 **[dark-factory]** Escalation required: bead `{}` hit a permanent worker-spawn failure. Automation parked only this bead HUMAN_HELD and continued unrelated dispatch work; inspect the AO error and target checkout before requeuing. Details: {}",
+                        failure.bead_id, failure.error
+                    ),
+                    _ => format!(
+                        "🤖 **[dark-factory]** Escalation required: bead `{}` claims a `target_repo` with no matching `[repos.*]` config entry (and it is not the daemon's global `target_repo`). Automation parked it HUMAN_HELD rather than guessing which repo/AO-project to dispatch into; please add a `[repos.\"<repo>\"]` entry to `config/daemon.toml` (or correct the bead's `target_repo`) before requeuing.",
+                        failure.bead_id
+                    ),
+                };
                 if let Err(err) = post_scm_comment_by_bead_id(deps, &failure.bead_id, &comment_body)
                 {
                     if is_missing_scm_target_error(&err) {
                         record_local_escalation_fallback(
                             deps,
                             &failure.bead_id,
-                            "unmapped_target_repo",
+                            reason,
                         )?;
                         summary.beads_escalated_locally += 1;
                         emit(
@@ -2523,7 +2537,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             "ESCALATED_LOCALLY",
                             serde_json::json!({}),
                             serde_json::json!({
-                                "reason": "unmapped_target_repo",
+                                "reason": reason,
                                 "scm_error": err.to_string(),
                             }),
                         )?;
@@ -2536,20 +2550,20 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             &failure.bead_id,
                             failure.attempt,
                             OverlayState::HumanHeld.as_str(),
-                            "unmapped_target_repo",
+                            reason,
                             &err,
                         )?;
                         continue;
                     }
                     let ctx = serde_json::json!({
-                        "reason": "unmapped_target_repo",
+                        "reason": reason,
                         "error": err.to_string(),
                     });
                     let now_epoch = now_epoch_secs();
                     let (should_emit, ctx_hash) = escalation_dedup_should_emit(
                         deps,
                         &failure.bead_id,
-                        "unmapped_target_repo",
+                        reason,
                         &ctx,
                         now_epoch,
                     )?;
@@ -2569,20 +2583,20 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     record_escalation_emit_dedup(
                         deps,
                         &failure.bead_id,
-                        "unmapped_target_repo",
+                        reason,
                         &ctx_hash,
                         now_epoch,
                     )?;
                     continue;
                 }
-                record_escalation(deps, &failure.bead_id, "unmapped_target_repo")?;
+                record_escalation(deps, &failure.bead_id, reason)?;
                 summary.beads_escalated += 1;
-                let ctx = serde_json::json!({"reason": "unmapped_target_repo"});
+                let ctx = serde_json::json!({"reason": reason});
                 let now_epoch = now_epoch_secs();
                 let (should_emit, ctx_hash) = escalation_dedup_should_emit(
                     deps,
                     &failure.bead_id,
-                    "unmapped_target_repo",
+                    reason,
                     &ctx,
                     now_epoch,
                 )?;
@@ -2601,7 +2615,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     record_escalation_emit_dedup(
                         deps,
                         &failure.bead_id,
-                        "unmapped_target_repo",
+                        reason,
                         &ctx_hash,
                         now_epoch,
                     )?;

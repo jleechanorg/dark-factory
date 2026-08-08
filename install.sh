@@ -72,7 +72,15 @@ echo "==> git-lfs $(git-lfs version | head -1)"
 # repo-local development layout for backwards compatibility with launchd.
 if [[ "$(uname -s)" == "Linux" && "${DARK_FACTORY_DISABLE_IMMUTABLE_ARTIFACT:-0}" != "1" ]]; then
   ARTIFACT_ROOT="${DARK_FACTORY_INSTALL_ROOT:-${HOME}/.local/share/dark-factory}"
-  ARTIFACT_VERSION="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || sha256sum "${REPO_ROOT}/install.sh" | cut -c1-40)"
+  if ARTIFACT_VERSION="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null)"; then
+    if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=normal 2>/dev/null)" ]]; then
+      echo "ERROR: refusing to publish an immutable release from a dirty Git checkout." >&2
+      echo "Commit or remove tracked/untracked changes, then rerun install.sh." >&2
+      exit 1
+    fi
+  else
+    ARTIFACT_VERSION="$(sha256sum "${REPO_ROOT}/install.sh" | cut -c1-40)"
+  fi
   ARTIFACT_DIR="${ARTIFACT_ROOT}/releases/${ARTIFACT_VERSION}"
   if [[ "${CLEAR}" -eq 1 && -d "${ARTIFACT_DIR}" ]]; then
     echo "==> removing immutable release (${ARTIFACT_DIR})"
@@ -85,6 +93,7 @@ if [[ "$(uname -s)" == "Linux" && "${DARK_FACTORY_DISABLE_IMMUTABLE_ARTIFACT:-0}
     tar --exclude=.git --exclude=.venv --exclude='__pycache__' \
       -cf - -C "${REPO_ROOT}" . | tar -xf - -C "${STAGING_DIR}"
     mv "${STAGING_DIR}" "${ARTIFACT_DIR}"
+    printf '%s\n' "${ARTIFACT_DIR}" > "${ARTIFACT_DIR}/.dark-factory-runtime-root"
     trap - EXIT
     ARTIFACT_CREATED=1
     echo "==> snapshotted immutable release: ${ARTIFACT_DIR}"
@@ -133,6 +142,22 @@ fi
 
 echo "==> verifying import"
 "${PYTHON_BIN}" -c "import pydot, yaml; print('deps ok:', pydot.__version__)"
+
+if [[ "${RUNTIME_ROOT}" != "${REPO_ROOT}" && -f "${RUNTIME_ROOT}/daemon/Cargo.toml" ]]; then
+  DAEMON_BINARY="${RUNTIME_ROOT}/daemon/target/release/daemon"
+  if [[ "${ARTIFACT_CREATED}" -eq 1 ]]; then
+    if ! command -v cargo >/dev/null 2>&1; then
+      echo "ERROR: cargo not found on PATH; required to build the immutable Linux daemon." >&2
+      exit 1
+    fi
+    echo "==> building immutable Rust daemon"
+    cargo build --release --manifest-path "${RUNTIME_ROOT}/daemon/Cargo.toml"
+  elif [[ ! -x "${DAEMON_BINARY}" ]]; then
+    echo "ERROR: immutable release is missing ${DAEMON_BINARY}." >&2
+    echo "Rerun install.sh --clear to rebuild the release." >&2
+    exit 1
+  fi
+fi
 
 # Configure repo-local git hooks (.githooks/) so the pre-push graph-audit
 # guard fires before any push. Mirrors the .github/workflows/ci.yml:35

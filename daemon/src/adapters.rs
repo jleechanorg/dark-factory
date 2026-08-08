@@ -2839,7 +2839,6 @@ print("  Branch:   " + os.environ.get("AO_FAKE_RETURN_BRANCH", os.environ["DARK_
             let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
             let mut routed = spec(prompt, branch);
             routed.repo = "otherorg/other-repo".to_string();
-            routed.ao_project = "other-repo".to_string();
             routed.local_checkout = Some(checkout.clone());
             let result = sessions.spawn(&routed);
             let calls = std::fs::read_to_string(log).unwrap_or_default();

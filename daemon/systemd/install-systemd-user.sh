@@ -7,8 +7,22 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-DEFAULT_REPO="$(cd "$SCRIPT_DIR/../.." && pwd)"
-REPO="${DARK_FACTORY_HOME:-$DEFAULT_REPO}"
+CHECKOUT_REPO="$(cd "$SCRIPT_DIR/../.." && pwd)"
+DEFAULT_REPO="${DARK_FACTORY_HOME:-$CHECKOUT_REPO}"
+INSTALLED_LAUNCHER="${HOME}/.local/bin/dark-factory"
+if [ -e "$INSTALLED_LAUNCHER" ] || [ -L "$INSTALLED_LAUNCHER" ]; then
+    INSTALLED_REAL="$(readlink -f "$INSTALLED_LAUNCHER" 2>/dev/null || true)"
+    if [ -n "$INSTALLED_REAL" ]; then
+        INSTALLED_ROOT="$(cd "$(dirname "$INSTALLED_REAL")/.." 2>/dev/null && pwd || true)"
+        if [ -n "$INSTALLED_ROOT" ] && [ -f "$INSTALLED_ROOT/.dark-factory-runtime-root" ]; then
+            IFS= read -r PINNED_ROOT < "$INSTALLED_ROOT/.dark-factory-runtime-root"
+            if [ "$PINNED_ROOT" = "$INSTALLED_ROOT" ]; then
+                DEFAULT_REPO="$INSTALLED_ROOT"
+            fi
+        fi
+    fi
+fi
+REPO="$DEFAULT_REPO"
 UNIT_NAME="ai.dark-factory.daemon.service"
 UNIT_DIR="${SYSTEMD_USER_DIR:-$HOME/.config/systemd/user}"
 UNIT_PATH="$UNIT_DIR/$UNIT_NAME"
@@ -97,7 +111,18 @@ if [ "$UNINSTALL" -eq 1 ]; then
 fi
 
 if [ "$SKIP_BUILD" -eq 0 ]; then
-    run cargo build --release --manifest-path "$REPO/daemon/Cargo.toml"
+    PINNED_REPO=""
+    if [ -f "$REPO/.dark-factory-runtime-root" ]; then
+        IFS= read -r PINNED_REPO < "$REPO/.dark-factory-runtime-root"
+    fi
+    if [ "$PINNED_REPO" = "$REPO" ]; then
+        [ -x "$REPO/daemon/target/release/daemon" ] || {
+            echo "Immutable runtime is missing its prebuilt daemon: $REPO/daemon/target/release/daemon" >&2
+            exit 1
+        }
+    else
+        run cargo build --release --manifest-path "$REPO/daemon/Cargo.toml"
+    fi
 fi
 run mkdir -p "$UNIT_DIR" "$LOG_DIR"
 ensure_linger

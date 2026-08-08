@@ -35,7 +35,16 @@ trap '__df_panic_collect $? $LINENO' EXIT
 
 _SCRIPT_REAL="$([ -L "${BASH_SOURCE[0]}" ] && readlink -f "${BASH_SOURCE[0]}" || echo "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "${_SCRIPT_REAL}")" && pwd)"
-export DARK_FACTORY_HOME="${DARK_FACTORY_HOME:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+RESOLVED_HOME="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PINNED_HOME=""
+if [[ -f "${RESOLVED_HOME}/.dark-factory-runtime-root" ]]; then
+  IFS= read -r PINNED_HOME < "${RESOLVED_HOME}/.dark-factory-runtime-root"
+fi
+if [[ "${PINNED_HOME}" == "${RESOLVED_HOME}" ]]; then
+  export DARK_FACTORY_HOME="${RESOLVED_HOME}"
+else
+  export DARK_FACTORY_HOME="${DARK_FACTORY_HOME:-${RESOLVED_HOME}}"
+fi
 VENV_PYTHON="${DARK_FACTORY_HOME}/.venv/bin/python"
 
 if [[ ! -x "${VENV_PYTHON}" ]]; then
