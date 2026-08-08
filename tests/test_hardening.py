@@ -443,6 +443,14 @@ def test_ao_spawn_is_launched_through_holdout_sandbox(monkeypatch, tmp_path):
     assert result.outcome == "success"
     assert commands
     assert commands[0][:3] == ["sandboxed", "ao", "spawn"]
+    assert commands[0][3] == "do work"
+    assert "--project" in commands[0]
+    assert commands[0][commands[0].index("--project") + 1] == "dark-factory"
+    assert "--agent" in commands[0]
+    assert commands[0][commands[0].index("--agent") + 1] == "claude-code"
+    assert "--prompt" not in commands[0]
+    assert "--harness" not in commands[0]
+
 
 
 def test_ao_send_is_launched_through_holdout_sandbox(monkeypatch, tmp_path):

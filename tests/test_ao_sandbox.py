@@ -99,7 +99,61 @@ def test_codergen_ao_spawn_args_are_sandboxed(monkeypatch, tmp_path):
     assert "(deny file-read*" in spawn_argv[2]
     # The real `ao spawn` argv must follow the sandbox wrapper.
     assert "ao" in spawn_argv and "spawn" in spawn_argv
+    ao_idx = spawn_argv.index("ao")
+    assert spawn_argv[ao_idx + 1] == "spawn"
+    assert spawn_argv[ao_idx + 2] == "test"
+    assert "--project" in spawn_argv
+    assert spawn_argv[spawn_argv.index("--project") + 1] == "fake-project"
+    assert "--agent" in spawn_argv
+    assert spawn_argv[spawn_argv.index("--agent") + 1] == "claude-code"
+    assert "--prompt" not in spawn_argv
+    assert "--harness" not in spawn_argv
     assert result.outcome == "success"
+
+
+def test_codergen_ao_spawn_cli_arg_structure(monkeypatch, tmp_path):
+    """Verify `_codergen` passes positional prompt, --project, --agent and omits --prompt and --harness."""
+    captured: dict[str, list[str]] = {}
+
+    def fake_sandboxed_args(args):
+        return list(args)
+
+    class _FakeCompleted:
+        def __init__(self) -> None:
+            self.returncode = 0
+            self.stdout = "SESSION=fake-session-456\nWorktree: /tmp/fake-worktree\n"
+            self.stderr = ""
+
+    def _fake_run(args, **kwargs):
+        captured.setdefault("calls", []).append(list(args))
+        return _FakeCompleted()
+
+    monkeypatch.setattr("runner.handler_codergen._handlers_shim._sandboxed_args", fake_sandboxed_args)
+    monkeypatch.setattr("runner.handlers._sandboxed_args", fake_sandboxed_args)
+    monkeypatch.setattr("runner.handlers._ao_wait_idle", lambda *a, **kw: "ready")
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handlers.subprocess.run", _fake_run)
+
+    node = _make_ao_node()
+    ctx = Context(goal="build feature XYZ", workdir=tmp_path, backend="ao")
+    ctx.state["ao.project"] = "custom-project"
+    ctx.state["ao.agent"] = "antigravity"
+
+    result = _codergen(node, ctx)
+
+    assert result.outcome == "success"
+    assert captured.get("calls"), "subprocess.run was not invoked"
+    spawn_argv = captured["calls"][0]
+    assert spawn_argv[:2] == ["ao", "spawn"]
+    assert "Goal: build feature XYZ" in spawn_argv[2]
+
+    assert "--project" in spawn_argv
+    assert spawn_argv[spawn_argv.index("--project") + 1] == "custom-project"
+    assert "--agent" in spawn_argv
+    assert spawn_argv[spawn_argv.index("--agent") + 1] == "antigravity"
+    assert "--prompt" not in spawn_argv
+    assert "--harness" not in spawn_argv
+
 
 
 def test_codergen_ao_send_args_are_sandboxed(monkeypatch, tmp_path):
