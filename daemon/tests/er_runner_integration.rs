@@ -365,6 +365,7 @@ fn attested_overlay(bead_id: &str, pr: u64) -> BeadOverlay {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+                spawn_failure_backoff_until: None,
     }
 }
 

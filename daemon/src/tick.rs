@@ -1637,6 +1637,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 park_reason: None,
                 target_repo,
                 attempt_started_at: None,
+                    spawn_failure_backoff_until: None,
             });
             overlay.state = OverlayState::Attested;
             overlay.pr_number = Some(adopted.pr_number);
@@ -1777,6 +1778,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             park_reason: None,
             target_repo,
             attempt_started_at: None,
+                    spawn_failure_backoff_until: None,
         };
         deps.store.save(&overlay)?;
         summary.beads_created += 1;
@@ -1895,6 +1897,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         park_reason: None,
                         target_repo,
                         attempt_started_at: None,
+                    spawn_failure_backoff_until: None,
                     };
                     set_human_hold_reason(&mut o, HumanHoldReason::UnmappedRepo);
                     deps.store.save(&o)?;
@@ -2072,6 +2075,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     park_reason: None,
                     target_repo,
                     attempt_started_at: None,
+                    spawn_failure_backoff_until: None,
                 };
                 deps.store.save(&o)?;
                 summary.beads_created += 1;
