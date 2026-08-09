@@ -70,24 +70,33 @@ fn adoption_probe_cache_concurrent_persists_leave_no_shared_temp_file() {
     ));
     std::fs::create_dir_all(&root).unwrap();
     let path = root.join("adoption_probe_cache.json");
+    let expected_keys = (0..8)
+        .map(|index| ProbeCacheKey {
+            external_ref: format!("owner/repo#{index}"),
+            head_sha: Some(format!("head-{index}")),
+            updated_at_epoch: Some(index),
+        })
+        .collect::<Vec<_>>();
     let mut workers = Vec::new();
-    for index in 0..8 {
+    for key in expected_keys.clone() {
         let path = path.clone();
         workers.push(std::thread::spawn(move || {
-            let key = ProbeCacheKey {
-                external_ref: format!("owner/repo#{index}"),
-                head_sha: Some(format!("head-{index}")),
-                updated_at_epoch: Some(index),
-            };
             let mut cache = AdoptionProbeCache::load_or_default_at(path);
-            cache.insert(key, CachedDecisionKind::AuthorPermission(Permission::Write), index);
+            cache.insert(
+                key,
+                CachedDecisionKind::AuthorPermission(Permission::Write),
+                1,
+            );
             cache.persist().unwrap();
         }));
     }
     for worker in workers {
         worker.join().unwrap();
     }
-    assert!(AdoptionProbeCache::load_or_default_at(&path).persist().is_ok());
+    let restored = AdoptionProbeCache::load_or_default_at(&path);
+    for key in &expected_keys {
+        assert!(restored.contains(key), "concurrent key was lost: {key:?}");
+    }
     let leftovers = std::fs::read_dir(&root)
         .unwrap()
         .filter_map(Result::ok)

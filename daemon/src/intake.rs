@@ -11,11 +11,50 @@
 use crate::config::Config;
 use crate::errors::DaemonError;
 use crate::tools::{LabeledPr, Permission, Scm, Tracker};
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
 
 const FACTORY_LABEL: &str = "factory";
 static CACHE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct CacheFileLock {
+    path: PathBuf,
+}
+
+impl CacheFileLock {
+    fn acquire(cache_path: &Path) -> Result<Self, DaemonError> {
+        let lock_path = cache_path.with_extension("json.lock");
+        for _ in 0..600 {
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(_) => return Ok(Self { path: lock_path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => {
+                    return Err(DaemonError::Config(format!(
+                        "create adoption_probe_cache lock: {error}"
+                    )));
+                }
+            }
+        }
+        Err(DaemonError::Config(
+            "timed out waiting for adoption_probe_cache lock".to_string(),
+        ))
+    }
+}
+
+impl Drop for CacheFileLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
 
 // jtg8-r4 =====================================================================
 //
@@ -220,25 +259,29 @@ impl AdoptionProbeCache {
     }
 
     /// Persist the cache to the runtime-state cache path. Best-effort:
-    /// writes are atomic via a sibling temporary file + `rename`, so a crash mid-write
+    /// writers serialize through a same-directory lock, reload and merge the
+    /// current file, then atomically rename a sibling temporary file, so a crash mid-write
     /// leaves either the old or the new file intact (never a half-written
     /// file the next daemon boot would fail to parse).
     pub fn persist(&self) -> Result<(), DaemonError> {
-        // Re-serialize as a Vec of (key, decision) tuples so the JSON
-        // stays forward-compatible (HashMap iteration order is
-        // non-deterministic; Vec preserves the order we wrote it in, but
-        // order doesn't matter for correctness — only for cleaner diffs).
-        let entries: Vec<(ProbeCacheKey, CachedProbeDecision)> = self
-            .decisions
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        let json = serde_json::to_string(&entries).map_err(|e| {
-            DaemonError::Parse(format!("serialize adoption_probe_cache: {e}"))
-        })?;
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).ok();
+            std::fs::create_dir_all(parent).map_err(|error| {
+                DaemonError::Config(format!("create adoption_probe_cache directory: {error}"))
+            })?;
         }
+        let _lock = CacheFileLock::acquire(&self.path)?;
+        let mut merged = std::collections::HashMap::new();
+        if let Ok(raw) = std::fs::read_to_string(&self.path) {
+            if let Ok(entries) =
+                serde_json::from_str::<Vec<(ProbeCacheKey, CachedProbeDecision)>>(&raw)
+            {
+                merged.extend(entries);
+            }
+        }
+        merged.extend(self.decisions.iter().map(|(key, value)| (key.clone(), value.clone())));
+        let entries: Vec<(ProbeCacheKey, CachedProbeDecision)> = merged.into_iter().collect();
+        let json = serde_json::to_string(&entries)
+            .map_err(|error| DaemonError::Parse(format!("serialize adoption_probe_cache: {error}")))?;
         let nonce = CACHE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp = self.path.with_extension(format!(
             "json.tmp.{}.{}",
