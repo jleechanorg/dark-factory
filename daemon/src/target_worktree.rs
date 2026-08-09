@@ -444,6 +444,41 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_managed_remote_alias_provisioning_is_serialized() {
+        let root = std::env::temp_dir().join(format!(
+            "afd_target_worktree_remote_concurrent_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        init_git_checkout(&root, "owner/repo");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let root = root.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                ensure_managed_push_remote("owner/repo", &root, "deployment")
+            }));
+        }
+        for worker in workers {
+            worker
+                .join()
+                .expect("alias worker must not panic")
+                .expect("both racing callers must observe a valid alias");
+        }
+        let url = run_tool_in_dir(
+            "git",
+            &["remote", "get-url", "--push", "deployment"],
+            &root.to_string_lossy(),
+            30,
+        )
+        .unwrap();
+        assert_eq!(url.trim(), "https://github.com/owner/repo.git");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn managed_checkout_refuses_to_overwrite_mismatched_configured_push_remote() {
         let root = std::env::temp_dir().join(format!(
             "afd_target_worktree_remote_mismatch_{}",
