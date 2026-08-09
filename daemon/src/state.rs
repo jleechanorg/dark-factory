@@ -2090,10 +2090,13 @@ impl StateStore for SqliteStateStore {
             Ok::<(), DaemonError>(())
         })();
         match result {
-            Ok(()) => self
-                .conn
-                .execute_batch("COMMIT")
-                .map_err(|e| tool_err("save_remediation_session_spawned commit", e)),
+            Ok(()) => match self.conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    Err(tool_err("save_remediation_session_spawned commit", error))
+                }
+            },
             Err(error) => {
                 let _ = self.conn.execute_batch("ROLLBACK");
                 Err(error)
