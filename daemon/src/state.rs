@@ -301,6 +301,17 @@ pub trait StateStore {
     ) -> Result<(), DaemonError> {
         Ok(())
     }
+    /// Atomically persist the post-spawn DISPATCHED overlay and its semantic
+    /// remediation marker. Production SQLite overrides this with a single
+    /// transaction; the default preserves compatibility for older fakes.
+    fn save_remediation_session_spawned(
+        &self,
+        overlay: &BeadOverlay,
+        attempt: u32,
+    ) -> Result<(), DaemonError> {
+        self.save(overlay)?;
+        self.mark_remediation_session_spawned(&overlay.bead_id, attempt)
+    }
     /// Read the `(attempt_count, last_attempt_epoch_secs)` pair for the
     /// `/er` runner (bead jleechan-qqq). Default impl returns `(0, None)`
     /// so test fakes that don't override it get the "never spawned" state.
@@ -1507,6 +1518,40 @@ impl SqliteStateStore {
     }
 }
 
+fn save_overlay_conn(conn: &Connection, overlay: &BeadOverlay) -> Result<(), DaemonError> {
+    conn.execute(
+        "INSERT INTO bead_overlay \
+         (bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id, updated_at, is_adopted, spawn_failure_count, pre_session_head_sha, park_reason, target_repo, attempt_started_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
+         ON CONFLICT(bead_id) DO UPDATE SET \
+           state=excluded.state, attempt=excluded.attempt, reroll_count=excluded.reroll_count, \
+           autonomy_secs=excluded.autonomy_secs, spend_usd=excluded.spend_usd, \
+           pr_number=excluded.pr_number, branch=excluded.branch, session_id=excluded.session_id, updated_at=excluded.updated_at, \
+           is_adopted=excluded.is_adopted, spawn_failure_count=excluded.spawn_failure_count, pre_session_head_sha=excluded.pre_session_head_sha, \
+           park_reason=excluded.park_reason, target_repo=excluded.target_repo, attempt_started_at=excluded.attempt_started_at",
+        params![
+            overlay.bead_id,
+            overlay.state.as_str(),
+            overlay.attempt,
+            overlay.reroll_count,
+            overlay.autonomy_secs,
+            overlay.spend_usd,
+            overlay.pr_number.map(|v| v as i64),
+            overlay.branch,
+            overlay.session_id,
+            now_iso8601(),
+            overlay.is_adopted as i64,
+            overlay.spawn_failure_count,
+            overlay.pre_session_head_sha,
+            overlay.park_reason,
+            overlay.target_repo,
+            overlay.attempt_started_at.map(|v| v as i64),
+        ],
+    )
+    .map_err(|e| tool_err("save", e))?;
+    Ok(())
+}
+
 impl StateStore for SqliteStateStore {
     fn reconcile_dispatching(&self) -> Result<(), DaemonError> {
         let reason = HumanHoldReason::AmbiguousDispatchingRecovery.value();
@@ -1569,38 +1614,7 @@ impl StateStore for SqliteStateStore {
     }
 
     fn save(&self, overlay: &BeadOverlay) -> Result<(), DaemonError> {
-        self.conn
-            .execute(
-                "INSERT INTO bead_overlay \
-                 (bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id, updated_at, is_adopted, spawn_failure_count, pre_session_head_sha, park_reason, target_repo, attempt_started_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
-                 ON CONFLICT(bead_id) DO UPDATE SET \
-                   state=excluded.state, attempt=excluded.attempt, reroll_count=excluded.reroll_count, \
-                   autonomy_secs=excluded.autonomy_secs, spend_usd=excluded.spend_usd, \
-                   pr_number=excluded.pr_number, branch=excluded.branch, session_id=excluded.session_id, updated_at=excluded.updated_at, \
-                   is_adopted=excluded.is_adopted, spawn_failure_count=excluded.spawn_failure_count, pre_session_head_sha=excluded.pre_session_head_sha, \
-                   park_reason=excluded.park_reason, target_repo=excluded.target_repo, attempt_started_at=excluded.attempt_started_at",
-                params![
-                    overlay.bead_id,
-                    overlay.state.as_str(),
-                    overlay.attempt,
-                    overlay.reroll_count,
-                    overlay.autonomy_secs,
-                    overlay.spend_usd,
-                    overlay.pr_number.map(|v| v as i64),
-                    overlay.branch,
-                    overlay.session_id,
-                    now_iso8601(),
-                    overlay.is_adopted as i64,
-                    overlay.spawn_failure_count,
-                    overlay.pre_session_head_sha,
-                    overlay.park_reason,
-                    overlay.target_repo,
-                    overlay.attempt_started_at.map(|v| v as i64),
-                ],
-            )
-            .map_err(|e| tool_err("save", e))?;
-        Ok(())
+        save_overlay_conn(&self.conn, overlay)
     }
 
     fn stamp_attempt_started_at(
@@ -2052,6 +2066,39 @@ impl StateStore for SqliteStateStore {
             )
             .map_err(|e| tool_err("mark_remediation_session_spawned", e))?;
         Ok(())
+    }
+
+    fn save_remediation_session_spawned(
+        &self,
+        overlay: &BeadOverlay,
+        attempt: u32,
+    ) -> Result<(), DaemonError> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| tool_err("save_remediation_session_spawned begin", e))?;
+        let result = (|| {
+            save_overlay_conn(&self.conn, overlay)?;
+            self.conn
+                .execute(
+                    "INSERT INTO remediation_session_spawned (bead_id, attempt, updated_at) \
+                     VALUES (?1, ?2, ?3) \
+                     ON CONFLICT(bead_id) DO UPDATE SET \
+                       attempt = excluded.attempt, updated_at = excluded.updated_at",
+                    params![overlay.bead_id, attempt, now_iso8601()],
+                )
+                .map_err(|e| tool_err("save_remediation_session_spawned marker", e))?;
+            Ok::<(), DaemonError>(())
+        })();
+        match result {
+            Ok(()) => self
+                .conn
+                .execute_batch("COMMIT")
+                .map_err(|e| tool_err("save_remediation_session_spawned commit", e)),
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     fn er_runner_attempt(&self, bead_id: &str) -> Result<(u32, Option<u64>), DaemonError> {

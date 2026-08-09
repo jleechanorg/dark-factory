@@ -1256,7 +1256,10 @@ fn execute_adopted(
             // back to verification after the coder session finishes.
             bead.state = OverlayState::Dispatched;
             bead.pre_session_head_sha = Some(pre_session_sha);
-            if let Err(save_error) = deps.store.save(bead) {
+            if let Err(save_error) = deps
+                .store
+                .save_remediation_session_spawned(bead, remediation_attempt)
+            {
                 if let Err(cleanup_error) = deps.sessions.stop(&session_id) {
                     bead.state = OverlayState::HumanHeld;
                     bead.session_id = Some(session_id.0.clone());
@@ -1280,10 +1283,6 @@ fn execute_adopted(
                 deps.store.save(bead)?;
                 return Err(save_error);
             }
-            // Mark the semantic attempt only after both the external spawn
-            // and the durable DISPATCHED overlay save have succeeded.
-            deps.store
-                .mark_remediation_session_spawned(&bead.bead_id, remediation_attempt)?;
             emit_telemetry(
                 deps.telemetry_log,
                 &bead.bead_id,

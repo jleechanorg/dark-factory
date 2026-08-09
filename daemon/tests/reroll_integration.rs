@@ -1075,6 +1075,44 @@ fn test_adopted_preflight_park_does_not_count_as_semantic_reroll_rejection() {
 }
 
 #[test]
+fn adopted_marker_persistence_failure_stops_worker_before_holding() {
+    let scm = FakeScm::new();
+    let sessions = FakeSessions::new();
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert("alice/my-cool-feature".into(), "sha-marker".into());
+    let store = FakeStateStore::new();
+    store.fail_remediation_session_spawned();
+    let llm = FakeLlm::new();
+    let cfg = test_cfg();
+    let telemetry_log = std::env::temp_dir().join("afd_marker_atomic_failure.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    let mut bead = adopted_overlay("bead-marker-atomic-failure");
+    store.save(&bead).unwrap();
+    let deps = RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "verifier".into(),
+        review_text: "red gate".into(),
+    };
+    assert!(reroll::execute(&deps, &mut bead).is_err());
+    assert!(sessions
+        .calls
+        .borrow()
+        .iter()
+        .any(|call| call == "stop(fake-session-1)"));
+    let held = store.load(&bead.bead_id).unwrap().unwrap();
+    assert_eq!(held.state, OverlayState::HumanHeld);
+    assert!(held.session_id.is_none());
+    assert_eq!(store.remediation_session_spawned_attempt.borrow().get(&bead.bead_id), None);
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
 fn adopted_preflight_after_old_remediation_bypasses_breaker_after_recovery() {
     let scm = FakeScm::new();
     let sessions = FakeSessions::new();

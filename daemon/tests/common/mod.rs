@@ -1221,6 +1221,7 @@ pub struct FakeStateStore {
     /// Durable adopted-remediation lifecycle marker (mirrors the SQLite
     /// `remediation_session_spawned` table).
     pub remediation_session_spawned_attempt: RefCell<HashMap<String, u32>>,
+    pub fail_remediation_session_spawned: RefCell<bool>,
     /// 1s2q-escalation-dedup: per-(bead_id, reason) escalation ledger rows
     /// (mirrors the `escalation_ledger` SQLite table). Each entry is
     /// `(context_hash, last_emitted_epoch, terminal)`. Used by the fake's
@@ -1249,6 +1250,10 @@ impl FakeStateStore {
         self.fail_save_for_state
             .borrow_mut()
             .push((bead_id.to_string(), state));
+    }
+
+    pub fn fail_remediation_session_spawned(&self) {
+        *self.fail_remediation_session_spawned.borrow_mut() = true;
     }
 }
 
@@ -1580,6 +1585,22 @@ impl StateStore for FakeStateStore {
             .borrow_mut()
             .insert(bead_id.to_string(), attempt);
         Ok(())
+    }
+
+    fn save_remediation_session_spawned(
+        &self,
+        overlay: &BeadOverlay,
+        attempt: u32,
+    ) -> Result<(), DaemonError> {
+        if *self.fail_remediation_session_spawned.borrow() {
+            return Err(DaemonError::Tool {
+                tool: "sqlite".into(),
+                rc: -1,
+                stderr: "scripted remediation marker failure".into(),
+            });
+        }
+        self.save(overlay)?;
+        self.mark_remediation_session_spawned(&overlay.bead_id, attempt)
     }
 
     fn escalation_should_emit(
