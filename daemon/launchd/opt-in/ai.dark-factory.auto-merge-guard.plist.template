@@ -3,7 +3,7 @@
 <!--
   Template: ai.dark-factory.auto-merge-guard.plist.template
   Purpose: poll-loop launchd agent that fires daemon/scripts/auto-merge-guard.sh
-           every 60 seconds (jleechan-s3c). The auto-merge-guard.sh script
+           every 900 seconds (15-min cadence, jleechan-s3c). The auto-merge-guard.sh script
            already implements the X4 controls (no-red gate, head-SHA check via
            gh pr view, per-hour budget). This template only adds the caller;
            it does NOT modify the guard script.
@@ -22,7 +22,7 @@
     rm "$HOME/Library/LaunchAgents/ai.dark-factory.auto-merge-guard.plist"
 
   Notes:
-    - StartInterval=60s: 1-min cadence; the guard's per-hour budget (default 8)
+    - StartInterval=900s: 15-min cadence; the guard's per-hour budget (default 8)
       caps actual merges regardless of timer frequency.
     - @HOME@ is substituted from $HOME and @REPO@ is substituted from the
       script's REPO_ROOT by scripts/install-merge-guard.sh at render time, so
@@ -46,7 +46,7 @@
     </array>
 
     <key>StartInterval</key>
-    <integer>60</integer>
+    <integer>900</integer>
 
     <key>RunAtLoad</key>
     <true/>
