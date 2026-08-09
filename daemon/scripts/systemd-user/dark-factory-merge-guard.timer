@@ -1,8 +1,8 @@
 [Unit]
-Description=Schedule dark-factory-merge-guard.service every 60s (jleechan-s3c)
+Description=Schedule dark-factory-merge-guard.service every 900s (jleechan-s3c; bumped rev-1uno — see auto-merge-guard.sh quota preflight)
 
 [Timer]
-OnUnitActiveSec=60s
+OnUnitActiveSec=900s
 Persistent=true
 Unit=dark-factory-merge-guard.service
 
