@@ -9842,7 +9842,11 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
                 session_id: None,
                 is_adopted: true,
                 spawn_failure_count: 0,
-                pre_session_head_sha: None,
+                // These seeded prior rejections model attempts that reached
+                // remediation. The adopted reroll path persists this marker
+                // immediately before spawn; leaving it absent would instead
+                // model a preflight hold, which must bypass the breaker.
+                pre_session_head_sha: Some(format!("{bead_id}-pre-session-sha")),
                 park_reason: None,
                 target_repo: None,
                 attempt_started_at: None,
