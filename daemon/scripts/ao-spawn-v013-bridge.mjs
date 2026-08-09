@@ -117,7 +117,7 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
     }
 
     const config = core.loadConfig();
-    const projectConfig = config.projects[project];
+    let projectConfig = config.projects[project];
     if (!projectConfig) fail(`unknown AO project ${project}`);
     if (!diagnosticMode && process.env.DARK_FACTORY_AO_EXPECTED_REVISION) {
       const targetCheckout = process.env.DARK_FACTORY_AO_TARGET_CHECKOUT;
@@ -136,7 +136,9 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
       } catch (error) {
         fail(`cannot resolve AO project source and target checkout: ${error}`);
       }
-      if (configuredRealpath !== targetRealpath) {
+      const managedTargetCheckout =
+        process.env.DARK_FACTORY_AO_MANAGED_CHECKOUT === "1";
+      if (configuredRealpath !== targetRealpath && !managedTargetCheckout) {
         fail(
           `AO project ${project} source ${configuredRealpath} does not match validated target checkout ${targetRealpath}`,
         );
@@ -156,6 +158,14 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
         fail(
           `AO project ${project} source is at ${actualRevision}, expected validated revision ${expectedRevision}`,
         );
+      }
+      if (managedTargetCheckout) {
+        // The Rust adapter already validated this daemon-owned checkout and
+        // revision.  AO's project registry is still allowed to retain a
+        // user-facing source path; for this spawn the validated target is the
+        // authoritative project root so AO creates the worker in that repo.
+        projectConfig = { ...projectConfig, path: targetRealpath };
+        config.projects = { ...config.projects, [project]: projectConfig };
       }
     }
     const registry = core.createPluginRegistry();
@@ -262,6 +272,7 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
       delete process.env.DARK_FACTORY_AO_V013_BRIDGE;
       delete process.env.DARK_FACTORY_AO_TARGET_CHECKOUT;
       delete process.env.DARK_FACTORY_AO_EXPECTED_REVISION;
+      delete process.env.DARK_FACTORY_AO_MANAGED_CHECKOUT;
       const session = await sessions.spawn({
         projectId: project,
         agent,

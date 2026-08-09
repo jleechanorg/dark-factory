@@ -2020,6 +2020,17 @@ fn ao_spawn_command_with_mode(
         };
         cmd.current_dir(&verified)
             .env("DARK_FACTORY_AO_TARGET_CHECKOUT", &verified);
+        // Managed target worktrees are daemon-owned execution resources.  The
+        // AO project registry may still point at the operator's source
+        // checkout, so tell the preload bridge that this validated checkout
+        // is authoritative for this spawn only.  For configured user-owned
+        // checkouts, remove the marker so an inherited environment variable
+        // cannot weaken the source-mismatch guard.
+        if spec.managed_checkout {
+            cmd.env("DARK_FACTORY_AO_MANAGED_CHECKOUT", "1");
+        } else {
+            cmd.env_remove("DARK_FACTORY_AO_MANAGED_CHECKOUT");
+        }
         if let Some(expected_revision) = spec
             .expected_revision
             .as_deref()
@@ -2936,6 +2947,168 @@ print("  Branch:   " + os.environ.get("AO_FAKE_RETURN_BRANCH", os.environ["DARK_
         }
         let _ = std::fs::remove_dir_all(dir);
         result
+    }
+
+    fn run_bridge_with_registered_source(
+        test_name: &str,
+        managed_checkout: bool,
+    ) -> (std::process::Output, String) {
+        let root = std::env::temp_dir().join(format!(
+            "afd_ao_bridge_managed_checkout_{test_name}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let cli = root.join("node_modules/@jleechanorg/ao-cli");
+        let core = root.join("node_modules/@jleechanorg/ao-core");
+        let configured = root.join("registered-source");
+        let target = root.join("managed-target");
+        let calls = root.join("calls.log");
+        std::fs::create_dir_all(cli.join("dist/lib")).unwrap();
+        std::fs::create_dir_all(core.join("dist")).unwrap();
+        std::fs::create_dir_all(&configured).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&target)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "user.name=Dark Factory Test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "managed target",
+            ])
+            .current_dir(&target)
+            .status()
+            .unwrap();
+        let expected_revision = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&target)
+            .output()
+            .unwrap();
+        let expected_revision = String::from_utf8(expected_revision.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        std::fs::write(
+            cli.join("package.json"),
+            r#"{"name":"@jleechanorg/ao-cli","version":"0.1.3","type":"module"}"#,
+        )
+        .unwrap();
+        std::fs::write(cli.join("dist/index.js"), "throw new Error('CLI must not run');\n")
+            .unwrap();
+        std::fs::write(
+            core.join("package.json"),
+            r#"{"name":"@jleechanorg/ao-core","version":"0.1.0","type":"module","exports":{".":{"import":"./dist/index.js"}}}"#,
+        )
+        .unwrap();
+        let registered_source = configured.to_string_lossy();
+        let target_source = target.to_string_lossy();
+        std::fs::write(
+            core.join("dist/index.js"),
+            format!(
+                r#"import {{appendFileSync}} from 'node:fs';
+const log = (value) => appendFileSync(process.env.AO_FAKE_CALLS, value + '\n');
+export const loadConfig = () => ({{configPath: '/tmp/fake-ao.yaml', projects: {{'worldarchitect': {{path: '{registered_source}'}}}}}});
+export const createPluginRegistry = () => ({{loadFromConfig: async () => {{}}}});
+export const createSessionManager = ({{config}}) => ({{
+  list: async () => [],
+  spawn: async (spec) => {{log(JSON.stringify({{path: config.projects.worldarchitect.path, branch: spec.branch}})); return {{id: 'managed-session', branch: spec.branch, workspacePath: '{target_source}'}}; }},
+}});
+export const acquireSpawnLock = () => ({{acquired: true, release() {{}}}});
+export const resolveSpawnQueueConfig = () => ({{enabled: true, maxActiveSessions: 2}});
+export const isTerminalSession = () => false;
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/preflight.js"),
+            "export const preflight = {checkTmux: async () => {}, checkGhAuth: async () => {}};\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/running-state.js"),
+            "export const getRunning = async () => ({projects: ['worldarchitect']});\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/lifecycle-service.js"),
+            "export const ensureLifecycleWorker = async () => {};\n",
+        )
+        .unwrap();
+
+        let bridge = ao_spawn_bridge_path();
+        let mut command = std::process::Command::new(bridge_test_node());
+        command
+            .arg(cli.join("dist/index.js"))
+            .args([
+                "spawn",
+                "--project",
+                "worldarchitect",
+                "--agent",
+                "minimax",
+                "--",
+                "managed checkout probe",
+            ])
+            .env(
+                "NODE_OPTIONS",
+                format!(
+                    "--experimental-import-meta-resolve --import={}",
+                    bridge.display()
+                ),
+            )
+            .env("DARK_FACTORY_AO_PARENT_NODE_OPTIONS", "")
+            .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
+            .env("DARK_FACTORY_AO_SPAWN_BRANCH", "factory/managed-checkout-r1")
+            .env("DARK_FACTORY_AO_TARGET_CHECKOUT", &target)
+            .env("DARK_FACTORY_AO_EXPECTED_REVISION", &expected_revision)
+            .env("AO_FAKE_CALLS", &calls);
+        if managed_checkout {
+            command.env("DARK_FACTORY_AO_MANAGED_CHECKOUT", "1");
+        }
+        let output = command.output().unwrap();
+        let logged = std::fs::read_to_string(&calls).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(root);
+        (output, logged)
+    }
+
+    #[test]
+    fn managed_target_checkout_overrides_registered_ao_source() {
+        let (output, calls) = run_bridge_with_registered_source("managed", true);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "managed checkout bridge failed; stdout={stdout}; stderr={stderr}"
+        );
+        assert!(stdout.contains("SESSION=managed-session"), "{stdout}");
+        assert!(
+            calls.contains("managed-target"),
+            "AO must receive the validated managed target path: {calls}"
+        );
+        assert!(
+            !calls.contains("registered-source"),
+            "AO must not use its stale registered source path: {calls}"
+        );
+    }
+
+    #[test]
+    fn configured_checkout_source_mismatch_still_fails_closed() {
+        let (output, calls) = run_bridge_with_registered_source("configured", false);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "mismatched configured checkout unexpectedly spawned");
+        assert!(
+            stderr.contains("does not match validated target checkout"),
+            "stdout={stdout}; stderr={stderr}"
+        );
+        assert!(calls.is_empty(), "AO must not be invoked on a source mismatch: {calls}");
     }
 
     #[test]
