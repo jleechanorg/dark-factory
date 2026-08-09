@@ -578,6 +578,7 @@ pub fn dispatch_ready_with_vcs(
             remote: routing.push_remote.clone(),
             local_checkout: Some(worker_checkout),
             expected_revision: Some(expected_revision.clone()),
+            managed_checkout: routing.local_checkout.is_none(),
         };
         let session_id = match sessions.spawn(&spec) {
             Ok(session_id) => session_id,

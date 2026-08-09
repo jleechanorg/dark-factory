@@ -2005,11 +2005,19 @@ fn ao_spawn_command_with_mode(
                 checkout.display()
             )));
         }
-        let verified = crate::target_worktree::ensure_target_worktree(
-            &spec.repo,
-            checkout,
-            spec.expected_revision.as_deref(),
-        )?;
+        let verified = if spec.managed_checkout {
+            crate::target_worktree::ensure_managed_target_worktree(
+                &spec.repo,
+                checkout,
+                spec.expected_revision.as_deref(),
+            )?
+        } else {
+            crate::target_worktree::ensure_target_worktree(
+                &spec.repo,
+                checkout,
+                spec.expected_revision.as_deref(),
+            )?
+        };
         cmd.current_dir(&verified)
             .env("DARK_FACTORY_AO_TARGET_CHECKOUT", &verified);
         if let Some(expected_revision) = spec
@@ -2169,6 +2177,7 @@ pub fn verify_ao_bridge_compatibility(
         remote: String::new(),
         local_checkout: None,
         expected_revision: None,
+        managed_checkout: false,
     };
     let mut command = ao_spawn_command_with_mode(agent, &spec, true)?;
     command
@@ -2810,6 +2819,7 @@ mod ao_spawn_contract_tests {
             remote: "origin".to_string(),
             local_checkout: Some(std::env::current_dir().unwrap()),
             expected_revision: None,
+            managed_checkout: false,
         }
     }
 

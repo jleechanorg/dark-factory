@@ -82,6 +82,27 @@ pub fn ensure_target_worktree(
     requested: &Path,
     head_sha: Option<&str>,
 ) -> Result<PathBuf, DaemonError> {
+    ensure_target_worktree_inner(repo, requested, head_sha, false)
+}
+
+/// Reuse a daemon-owned target checkout, refreshing a stale clean checkout to
+/// `head_sha` when necessary. This is deliberately separate from
+/// [`ensure_target_worktree`]: configured operator checkouts must remain
+/// fail-closed rather than being moved by the daemon.
+pub fn ensure_managed_target_worktree(
+    repo: &str,
+    requested: &Path,
+    head_sha: Option<&str>,
+) -> Result<PathBuf, DaemonError> {
+    ensure_target_worktree_inner(repo, requested, head_sha, true)
+}
+
+fn ensure_target_worktree_inner(
+    repo: &str,
+    requested: &Path,
+    head_sha: Option<&str>,
+    refresh_stale: bool,
+) -> Result<PathBuf, DaemonError> {
     validate_repo(repo)?;
     if !requested.is_absolute() {
         return Err(DaemonError::Config(format!(
@@ -100,7 +121,12 @@ pub fn ensure_target_worktree(
     let _lock = TargetWorktreeLock::acquire(requested)?;
 
     if requested.is_dir() {
-        verify_existing(repo, requested, head_sha)?;
+        verify_origin(repo, requested)?;
+        if refresh_stale {
+            refresh_existing_if_stale(requested, head_sha)?;
+        } else {
+            verify_head(requested, head_sha)?;
+        }
         return Ok(requested.to_path_buf());
     }
     if requested.exists() {
@@ -193,6 +219,11 @@ fn staging_path(requested: &Path) -> PathBuf {
 }
 
 fn verify_existing(repo: &str, path: &Path, head_sha: Option<&str>) -> Result<(), DaemonError> {
+    verify_origin(repo, path)?;
+    verify_head(path, head_sha)
+}
+
+fn verify_origin(repo: &str, path: &Path) -> Result<(), DaemonError> {
     let path_str = path.to_string_lossy();
     let remote = run_tool_in_dir("git", &["remote", "get-url", "origin"], &path_str, 30)?;
     if remote_url_matches_repo(&remote, repo) != Some(true) {
@@ -202,6 +233,11 @@ fn verify_existing(repo: &str, path: &Path, head_sha: Option<&str>) -> Result<()
             remote.trim()
         )));
     }
+    Ok(())
+}
+
+fn verify_head(path: &Path, head_sha: Option<&str>) -> Result<(), DaemonError> {
+    let path_str = path.to_string_lossy();
     if let Some(expected) = head_sha.filter(|sha| !sha.trim().is_empty()) {
         let actual = run_tool_in_dir("git", &["rev-parse", "HEAD"], &path_str, 30)?;
         if actual.trim() != expected {
@@ -214,6 +250,37 @@ fn verify_existing(repo: &str, path: &Path, head_sha: Option<&str>) -> Result<()
         }
     }
     Ok(())
+}
+
+fn refresh_existing_if_stale(path: &Path, head_sha: Option<&str>) -> Result<(), DaemonError> {
+    let Some(expected) = head_sha.filter(|sha| !sha.trim().is_empty()) else {
+        return Ok(());
+    };
+    let path_str = path.to_string_lossy();
+    let actual = run_tool_in_dir("git", &["rev-parse", "HEAD"], &path_str, 30)?;
+    if actual.trim() == expected {
+        return Ok(());
+    }
+    let status = run_tool_in_dir(
+        "git",
+        &["status", "--porcelain", "--untracked-files=all"],
+        &path_str,
+        30,
+    )?;
+    if !status.trim().is_empty() {
+        return Err(DaemonError::Config(format!(
+            "managed target worktree {} has uncommitted changes; refusing to refresh stale snapshot",
+            path.display()
+        )));
+    }
+    run_tool_in_dir(
+        "git",
+        &["fetch", "--depth=1", "origin", expected],
+        &path_str,
+        600,
+    )?;
+    run_tool_in_dir("git", &["checkout", "--detach", expected], &path_str, 60)?;
+    verify_head(path, Some(expected))
 }
 
 fn validate_repo(repo: &str) -> Result<(), DaemonError> {
@@ -272,6 +339,44 @@ mod tests {
         let err = ensure_target_worktree("owner/repo", &root, Some(stale)).unwrap_err();
         assert!(err.to_string().contains("expected snapshot"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn refreshes_clean_managed_checkout_to_stale_snapshot() {
+        if std::env::var_os("AFD_TARGET_REFRESH_HELPER").is_some() {
+            run_refresh_child(false);
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "target_worktree::tests::refreshes_clean_managed_checkout_to_stale_snapshot",
+                "--nocapture",
+            ])
+            .env("AFD_TARGET_REFRESH_HELPER", "1")
+            .env_remove("AFD_TARGET_REFRESH_DIRTY")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn refuses_to_refresh_dirty_managed_checkout() {
+        if std::env::var_os("AFD_TARGET_REFRESH_HELPER").is_some() {
+            run_refresh_child(true);
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "target_worktree::tests::refuses_to_refresh_dirty_managed_checkout",
+                "--nocapture",
+            ])
+            .env("AFD_TARGET_REFRESH_HELPER", "1")
+            .env("AFD_TARGET_REFRESH_DIRTY", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     #[test]
@@ -463,5 +568,67 @@ mod tests {
             .unwrap()
             .trim()
             .to_string()
+    }
+
+    fn run_refresh_child(dirty: bool) {
+        let root = std::env::temp_dir().join(format!(
+            "afd_target_worktree_refresh_child_{}",
+            std::process::id()
+        ));
+        let bin = root.join("bin");
+        let target = root.join("target");
+        let state = root.join("head");
+        let old_head = "1111111111111111111111111111111111111111";
+        let new_head = "2222222222222222222222222222222222222222";
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(&state, old_head).unwrap();
+        let fake_git = bin.join("git");
+        std::fs::write(
+            &fake_git,
+            format!(
+                "#!/bin/sh\ncase \"$1:$2\" in\n  remote:get-url) printf '%s\\n' 'https://github.com/owner/repo.git' ;;\n  rev-parse:HEAD) cat '{}' ;;\n  status:--porcelain) {} ;;\n  fetch:--depth=1) printf '%s' '{}' > '{}' ;;\n  checkout:--detach) printf '%s' \"$3\" > '{}' ;;\n  *) exit 1 ;;\nesac\n",
+                state.display(),
+                if dirty { "printf ' M operator-note\\n'" } else { "exit 0" },
+                new_head,
+                state.display(),
+                state.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&fake_git).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&fake_git, permissions).unwrap();
+        }
+        let old_path = std::env::var_os("PATH");
+        let path = std::env::join_paths(
+            std::iter::once(bin.clone()).chain(
+                old_path
+                    .as_deref()
+                    .into_iter()
+                    .flat_map(std::env::split_paths),
+            ),
+        )
+        .unwrap();
+        std::env::set_var("PATH", path);
+        let result = ensure_managed_target_worktree("owner/repo", &target, Some(new_head));
+        if let Some(path) = old_path {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        if dirty {
+            let error = result.expect_err("dirty managed checkout must fail closed");
+            assert!(error.to_string().contains("uncommitted changes"));
+            assert_eq!(std::fs::read_to_string(&state).unwrap(), old_head);
+        } else {
+            assert_eq!(result.unwrap(), target);
+            assert_eq!(std::fs::read_to_string(&state).unwrap(), new_head);
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

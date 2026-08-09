@@ -1234,6 +1234,7 @@ fn execute_adopted(
         remote: adopted_routing.push_remote,
         local_checkout: Some(adopted_checkout),
         expected_revision: Some(pre_session_sha.clone()),
+        managed_checkout: adopted_routing.local_checkout.is_none(),
     };
 
     // Persist an ambiguous pre-spawn intent before crossing the external AO

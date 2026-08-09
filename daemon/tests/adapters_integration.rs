@@ -123,6 +123,7 @@ fn test_cli_sessions_real_spawn_v013_contract() {
             remote: "origin".to_string(),
             local_checkout: Some(std::env::current_dir().unwrap()),
             expected_revision: None,
+            managed_checkout: false,
         })
         .expect("real AO v0.1.3 adapter spawn failed");
 
