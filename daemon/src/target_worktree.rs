@@ -121,6 +121,12 @@ pub fn ensure_managed_push_remote(
         return Ok(());
     }
 
+    // `dispatch_ready` may process several beads for the same repository in
+    // parallel. Serialize the inspect-or-add sequence with target checkout
+    // provisioning so two spawns cannot both observe a missing alias and
+    // race to add it.
+    let _lock = TargetWorktreeLock::acquire(path)?;
+
     let path_str = path.to_string_lossy();
     let remotes = run_tool_in_dir("git", &["remote"], &path_str, 30)?;
     if remotes.lines().any(|name| name == remote_name) {
