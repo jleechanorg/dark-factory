@@ -263,7 +263,12 @@ fn refresh_existing_if_stale(path: &Path, head_sha: Option<&str>) -> Result<(), 
     }
     let status = run_tool_in_dir(
         "git",
-        &["status", "--porcelain", "--untracked-files=all"],
+        &[
+            "status",
+            "--porcelain",
+            "--ignored",
+            "--untracked-files=all",
+        ],
         &path_str,
         30,
     )?;
@@ -623,7 +628,13 @@ mod tests {
             format!(
                 "#!/bin/sh\ncase \"$1:$2\" in\n  remote:get-url) printf '%s\\n' 'https://github.com/owner/repo.git' ;;\n  rev-parse:HEAD) cat '{}' ;;\n  status:--porcelain) {} ;;\n  fetch:--depth=1) : ;;\n  checkout:--no-overwrite-ignore) test \"$3\" = --detach || exit 1; if [ -f '{}' ]; then exit 1; fi; printf '%s' \"$4\" > '{}' ;;\n  *) exit 1 ;;\nesac\n",
                 state.display(),
-                if dirty { "printf ' M operator-note\\n'" } else { "exit 0" },
+                if dirty {
+                    "printf ' M operator-note\\n'"
+                } else if ignored_conflict {
+                    "printf '!! ignored-artifact\\n'"
+                } else {
+                    "exit 0"
+                },
                 conflict.display(),
                 state.display()
             ),
@@ -655,9 +666,7 @@ mod tests {
         }
         if dirty || ignored_conflict {
             let error = result.expect_err("dirty managed checkout must fail closed");
-            if dirty {
-                assert!(error.to_string().contains("uncommitted changes"));
-            }
+            assert!(error.to_string().contains("uncommitted changes"));
             assert_eq!(std::fs::read_to_string(&state).unwrap(), old_head);
             if ignored_conflict {
                 assert_eq!(
