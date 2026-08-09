@@ -145,9 +145,10 @@ impl Config {
     /// used: release binaries are commonly launched from an immutable
     /// uv/archive path, and a repository basename is not globally unique.
     pub fn target_worktree_path(&self, repo: &str) -> Option<PathBuf> {
-        let routing = self.resolve_repo(repo)?;
-        if let Some(path) = routing.local_checkout {
-            return Some(path);
+        if let Some(routing) = self.resolve_repo(repo) {
+            if let Some(path) = routing.local_checkout {
+                return Some(path);
+            }
         }
         let (owner, name) = repo.split_once('/')?;
         let home = std::env::var_os("HOME").map(PathBuf::from);

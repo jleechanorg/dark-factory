@@ -770,6 +770,125 @@ fn test_reroll_adopted_success_spawns_remediation_session_leaves_pr_open() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+/// An adopted remediation may target a repository that has no explicit
+/// `[repos]` entry. That is distinct from an explicitly invalid checkout:
+/// the daemon owns the isolated checkout path for this case.
+#[test]
+fn test_reroll_adopted_unconfigured_repo_uses_daemon_owned_target_worktree() {
+    use daemon::tools::{SessionId, Sessions, SpawnSpec};
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+
+    static TARGET_WORKTREE_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct TargetWorktreeRootGuard(Option<std::ffi::OsString>);
+
+    impl TargetWorktreeRootGuard {
+        fn set(root: &std::path::Path) -> Self {
+            let previous = std::env::var_os("DARK_FACTORY_TARGET_WORKTREE_ROOT");
+            std::env::set_var("DARK_FACTORY_TARGET_WORKTREE_ROOT", root);
+            Self(previous)
+        }
+    }
+
+    impl Drop for TargetWorktreeRootGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("DARK_FACTORY_TARGET_WORKTREE_ROOT", value),
+                None => std::env::remove_var("DARK_FACTORY_TARGET_WORKTREE_ROOT"),
+            }
+        }
+    }
+
+    struct CapturingSessions {
+        spawn_specs: RefCell<Vec<SpawnSpec>>,
+    }
+
+    impl Sessions for CapturingSessions {
+        fn active_count(&self) -> Result<usize, DaemonError> {
+            Ok(0)
+        }
+
+        fn spawn(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
+            self.spawn_specs.borrow_mut().push(spec.clone());
+            Ok(SessionId("captured-session".into()))
+        }
+
+        fn attach(&self, _branch: &str, _bead_id: &str) -> Result<SessionId, DaemonError> {
+            Err(DaemonError::SessionNotFound {
+                branch: "unused".into(),
+                bead_id: "unused".into(),
+            })
+        }
+
+        fn stop(&self, _id: &SessionId) -> Result<(), DaemonError> {
+            Ok(())
+        }
+
+        fn is_quiescent(&self, _id: &SessionId) -> Result<bool, DaemonError> {
+            Ok(true)
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!(
+        "afd_adopted_unconfigured_target_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _env_lock = TARGET_WORKTREE_ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _target_worktree_root = TargetWorktreeRootGuard::set(&root);
+
+    let scm = FakeScm::new();
+    let sessions = CapturingSessions {
+        spawn_specs: RefCell::new(Vec::new()),
+    };
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert(
+        "alice/my-cool-feature".into(),
+        "pre-session-sha-abc123".into(),
+    );
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    let mut cfg = test_cfg();
+    cfg.repos.clear();
+    let mut bead = adopted_overlay("bead-adopted-unconfigured-repo");
+    bead.target_repo = Some("jleechanorg/worldarchitect.ai".into());
+    store.save(&bead).unwrap();
+    store
+        .register_branch(&bead.bead_id, bead.branch.as_deref().unwrap())
+        .unwrap();
+    let telemetry_log = root.join("telemetry.jsonl");
+    let deps = RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "verifier".into(),
+        review_text: "CI check-run(s) not all success".into(),
+    };
+
+    let outcome = reroll::execute(&deps, &mut bead).unwrap();
+    assert!(matches!(outcome, RerollOutcome::Rerolled { .. }));
+    let spawned = sessions.spawn_specs.borrow();
+    assert_eq!(spawned.len(), 1);
+    assert_eq!(
+        spawned[0].local_checkout,
+        Some(PathBuf::from(&root).join("jleechanorg/worldarchitect.ai"))
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn test_reroll_adopted_explicit_target_without_checkout_never_spawns() {
     let scm = FakeScm::new();
