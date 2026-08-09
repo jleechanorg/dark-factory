@@ -3440,11 +3440,12 @@ fn vacuous_red_green_for_pr(
             ));
         }
     };
-    let repo_root = match crate::target_worktree::ensure_target_worktree(
-        repo,
-        &requested,
-        Some(&snapshot.head_sha),
-    ) {
+    let ensure = if routing.local_checkout.is_none() {
+        crate::target_worktree::ensure_managed_target_worktree
+    } else {
+        crate::target_worktree::ensure_target_worktree
+    };
+    let repo_root = match ensure(repo, &requested, Some(&snapshot.head_sha)) {
         Ok(path) => path,
         Err(error) => {
             return verifier::VacuousRedGreenStatus::ManifestMissing(format!(

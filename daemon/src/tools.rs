@@ -244,6 +244,10 @@ pub struct SpawnSpec {
     /// adopted remediation this is the remote branch SHA captured immediately
     /// before dispatch; a same-origin checkout at another HEAD is unsafe.
     pub expected_revision: Option<String>,
+    /// Whether `local_checkout` is daemon-owned and may be refreshed to
+    /// `expected_revision` after origin and cleanliness checks. Explicit
+    /// operator-configured checkouts must remain protected from mutation.
+    pub managed_checkout: bool,
 }
 
 /// Opaque handle to an AO/`aow` session.
