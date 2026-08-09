@@ -357,6 +357,78 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn clone_auth_failure_preserves_gate_failure_and_cleans_own_staging() {
+        let root = std::env::temp_dir().join(format!(
+            "afd_target_worktree_clone_auth_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let fake_git = bin.join("git");
+        let old_path = std::env::var_os("PATH");
+        let real_git = old_path
+            .as_deref()
+            .into_iter()
+            .flat_map(std::env::split_paths)
+            .map(|dir| dir.join("git"))
+            .find(|path| path.is_file())
+            .expect("test environment must provide git");
+        std::fs::write(
+            &fake_git,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = clone ]; then\n  echo 'authentication required' >&2\n  exit 128\nfi\nexec {} \"$@\"\n",
+                real_git.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&fake_git).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&fake_git, permissions).unwrap();
+        }
+        let target = root.join("owner").join("repo");
+        let parent = target.parent().unwrap();
+        std::fs::create_dir_all(parent).unwrap();
+        std::env::set_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                old_path.as_deref().unwrap_or_default().to_string_lossy()
+            ),
+        );
+        let result = ensure_target_worktree("owner/repo", &target, None);
+        match old_path {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
+        }
+        let error = result.expect_err("clone auth failure must remain a gate failure");
+        assert!(error.to_string().contains("authentication required"));
+        assert!(!target.exists());
+        assert!(target.with_extension("lock").is_file());
+        let staging_entries: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".repo.staging.")
+            })
+            .collect();
+        assert!(
+            staging_entries.is_empty(),
+            "staging leaked: {staging_entries:?}"
+        );
+        // Keep the wrapper directory alive until all parallel unit tests have
+        // observed the restored PATH; non-clone invocations delegate to the
+        // real git binary, so this avoids a PATH race with sibling tests.
+    }
+
     fn init_git_checkout(path: &Path, repo: &str) -> String {
         let _ = std::fs::remove_dir_all(path);
         std::fs::create_dir_all(path).unwrap();

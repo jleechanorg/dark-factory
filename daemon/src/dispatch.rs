@@ -388,8 +388,9 @@ pub fn dispatch_ready_with_vcs(
         };
         if !cfg.worker_checkout_is_configured(&repo, &routing) {
             let error = DaemonError::Config(format!(
-                "bead {} targets explicit repo {repo:?}, but [repos.\"{repo}\"].local_checkout \
-                 is missing or not absolute; refusing to spawn from the daemon's unrelated cwd",
+                "bead {} targets fixture or malformed repo {repo:?}; its configured \
+                 local_checkout is absent/relative and is not eligible for daemon-owned \
+                 provisioning",
                 bead.id
             ));
             overlay.state = OverlayState::HumanHeld;
@@ -409,10 +410,10 @@ pub fn dispatch_ready_with_vcs(
             continue;
         }
         // Every real AO spawn receives an absolute target checkout. Legacy
-        // single-repo routing has no explicit `local_checkout`, so resolve its
-        // daemon-owned owner/repo path here; the CLI adapter provisions and
-        // verifies it before crossing the AO boundary. Explicit operator
-        // checkouts remain fail-closed if they are absent or relative.
+        // single-repo routing and production [repos] entries without an
+        // explicit `local_checkout` resolve a daemon-owned owner/repo path
+        // here; the CLI adapter provisions and verifies it before crossing
+        // the AO boundary. Explicit relative paths remain fail-closed.
         let worker_checkout = match cfg
             .target_worktree_path(&repo)
             .filter(|path| path.is_absolute())

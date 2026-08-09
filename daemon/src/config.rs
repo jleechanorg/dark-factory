@@ -217,11 +217,21 @@ impl Config {
     }
 
     pub fn worker_checkout_is_configured(&self, repo: &str, routing: &RepoRouting) -> bool {
-        !self.repos.contains_key(repo)
-            || routing.local_checkout.as_ref().is_some_and(|checkout| {
-                checkout.is_absolute() && checkout.is_dir()
-            })
+        if !self.repos.contains_key(repo) {
+            return true;
+        }
+        match routing.local_checkout.as_ref() {
+            None => !is_fixture_repo(repo),
+            Some(checkout) => checkout.is_absolute(),
+        }
     }
+}
+
+/// Test/fixture repository identities are not clone-eligible.
+pub fn is_fixture_repo(repo: &str) -> bool {
+    matches!(repo, "owner/repo" | "other/repo" | "myorg/myrepo")
+        || repo.contains("fake-")
+        || repo.contains("test-")
 }
 
 pub fn load(path: &Path) -> Result<Config, DaemonError> {
@@ -575,6 +585,71 @@ push_remote = "origin"
             None => std::env::remove_var("DARK_FACTORY_TARGET_WORKTREE_ROOT"),
         }
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_production_repo_without_checkout_is_clone_eligible() {
+        let cfg = Config {
+            target_repo: "owner/daemon".into(),
+            ao_project: None,
+            base_branch: "main".into(),
+            stage: 1,
+            max_workers: 1,
+            max_batch: 1,
+            fast_tick_secs: 1,
+            slow_tick_secs: 1,
+            autonomy_timebox_secs: 60,
+            budget_warn_usd: 1.0,
+            spec_dir: ".factory/specs/".into(),
+            reroll_head_stability_window_secs: 30,
+            reroll_death_confirm_secs: 5,
+            held_recheck_cooldown_secs: 900,
+            repos: HashMap::from([(
+                "owner/production".into(),
+                RepoConfig {
+                    ao_project: "production".into(),
+                    push_remote: "origin".into(),
+                    local_checkout: None,
+                },
+            )]),
+            pre_gate_validation_enabled: true,
+            escalation_refire_secs: 3600,
+        };
+        let routing = cfg.resolve_repo("owner/production").unwrap();
+        assert!(cfg.worker_checkout_is_configured("owner/production", &routing));
+        assert!(cfg.target_worktree_path("owner/production").is_some());
+    }
+
+    #[test]
+    fn explicit_relative_checkout_is_not_clone_eligible() {
+        let cfg = Config {
+            target_repo: "owner/daemon".into(),
+            ao_project: None,
+            base_branch: "main".into(),
+            stage: 1,
+            max_workers: 1,
+            max_batch: 1,
+            fast_tick_secs: 1,
+            slow_tick_secs: 1,
+            autonomy_timebox_secs: 60,
+            budget_warn_usd: 1.0,
+            spec_dir: ".factory/specs/".into(),
+            reroll_head_stability_window_secs: 30,
+            reroll_death_confirm_secs: 5,
+            held_recheck_cooldown_secs: 900,
+            repos: HashMap::from([(
+                "owner/production".into(),
+                RepoConfig {
+                    ao_project: "production".into(),
+                    push_remote: "origin".into(),
+                    local_checkout: Some(PathBuf::from("relative/checkout")),
+                },
+            )]),
+            pre_gate_validation_enabled: true,
+            escalation_refire_secs: 3600,
+        };
+        let routing = cfg.resolve_repo("owner/production").unwrap();
+        assert!(!cfg.worker_checkout_is_configured("owner/production", &routing));
     }
 
     #[test]

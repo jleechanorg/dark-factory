@@ -3083,7 +3083,7 @@ fn skeptic_evidence(
     // bead's OWN resolved repo so a test-repo bead dispatched under a
     // non-test global `cfg.target_repo` (or vice versa) is classified
     // correctly instead of by the daemon-global repo.
-    let is_test_repo = repo.contains("fake-") || repo.contains("test-") || repo == "owner/repo";
+    let is_test_repo = crate::config::is_fixture_repo(repo);
 
     let mut gha_verdict = "verdict: absent";
     let mut signoff_verdict = "verdict: absent";
@@ -3786,8 +3786,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         // that assert `beads_ready: 1` for these fixtures then fail because
         // Unknown blocks readiness. The Stage-1 lane has no PR diff to revert,
         // so NotProvided is the right answer (matches r5 contract).
-        let is_test_repo =
-            repo.contains("fake-") || repo.contains("test-") || repo == "owner/repo";
+        let is_test_repo = crate::config::is_fixture_repo(&repo);
 
         if overlay.state == OverlayState::Dispatched
             && overlay.pr_number.is_none()
