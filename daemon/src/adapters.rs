@@ -150,6 +150,91 @@ impl Tracker for CliTracker {
     }
 }
 
+#[cfg(test)]
+mod cli_tracker_br_db_tests {
+    use super::{gh_env_test_lock, CliTracker};
+    use crate::tools::Tracker;
+
+    #[test]
+    #[cfg(unix)]
+    fn cli_tracker_passes_configured_db_to_br_read_and_write_calls() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "dark_factory_cli_tracker_br_db_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let log = root.join("br.log");
+        let db = root.join("state/beads.db");
+        let br = root.join("br");
+        std::fs::write(
+            &br,
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$DARK_FACTORY_BR_LOG"
+if [ "$1" = "--db" ]; then shift 2; fi
+case "${1:-}" in
+  list) printf '{"issues":[],"has_more":false}\n' ;;
+  create) printf 'bead-from-fake-br\n' ;;
+  *) exit 64 ;;
+esac
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&br, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let prior_path = std::env::var_os("PATH");
+        let prior_db = std::env::var_os("DARK_FACTORY_BR_DB");
+        let prior_log = std::env::var_os("DARK_FACTORY_BR_LOG");
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!("{}:{}", root.display(), prior_path.as_deref().unwrap_or_default().to_string_lossy()),
+            );
+            std::env::set_var("DARK_FACTORY_BR_DB", &db);
+            std::env::set_var("DARK_FACTORY_BR_LOG", &log);
+        }
+
+        let tracker = CliTracker;
+        let reads = tracker.fetch_candidates();
+        let created = tracker.create_bead("test", "body", "owner/repo#1");
+
+        unsafe {
+            match prior_path {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
+            }
+            match prior_db {
+                Some(value) => std::env::set_var("DARK_FACTORY_BR_DB", value),
+                None => std::env::remove_var("DARK_FACTORY_BR_DB"),
+            }
+            match prior_log {
+                Some(value) => std::env::set_var("DARK_FACTORY_BR_LOG", value),
+                None => std::env::remove_var("DARK_FACTORY_BR_LOG"),
+            }
+        }
+
+        assert!(reads.unwrap().is_empty());
+        assert_eq!(created.unwrap(), "bead-from-fake-br");
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap().lines().collect::<Vec<_>>(),
+            vec![
+                format!("--db {} list --status open --label factory --json --limit 0", db.display()),
+                format!("--db {} create --title test --description body --external-ref owner/repo#1 --labels factory --silent", db.display()),
+            ]
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+}
+
 /// Parse `external_ref` values from `br list --json` output.
 pub(crate) fn parse_external_refs_from_br_list(
     out: &str,
