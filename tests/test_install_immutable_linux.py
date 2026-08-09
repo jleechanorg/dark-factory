@@ -20,6 +20,9 @@ def test_linux_install_keeps_all_runtime_payloads_outside_git_checkout(tmp_path)
     checkout.mkdir()
     shutil.copy2(ROOT / "install.sh", checkout / "install.sh")
     (checkout / "requirements.lock").write_text("")
+    seed_beads = checkout / ".beads" / "issues.jsonl"
+    seed_beads.parent.mkdir(parents=True, exist_ok=True)
+    seed_beads.write_text('{"id":"factory-tdd"}\n')
 
     for name in ("dark-factory", "df-healer", "df-validate"):
         destination = checkout / "bin" / name
@@ -90,10 +93,30 @@ PY
 fi
 """,
     )
+    _write_executable(
+        fake_bin / "br",
+        """#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${DARK_FACTORY_BR_LOG:?}"
+db=''
+previous=''
+for arg in "$@"; do
+  if [ "$previous" = '--db' ]; then
+    db="$arg"
+    break
+  fi
+  previous="$arg"
+done
+[ -n "$db" ]
+mkdir -p "$(dirname "$db")"
+touch "$db"
+""",
+    )
 
     home = tmp_path / "home"
     install_root = tmp_path / "installed"
     runtime_log = tmp_path / "runtime-homes.log"
+    br_log = tmp_path / "br.log"
     env = os.environ.copy()
     env.update(
         {
@@ -101,6 +124,7 @@ fi
             "PATH": f"{fake_bin}:{env['PATH']}",
             "DARK_FACTORY_INSTALL_ROOT": str(install_root),
             "DARK_FACTORY_RUNTIME_LOG": str(runtime_log),
+            "DARK_FACTORY_BR_LOG": str(br_log),
         }
     )
 
@@ -130,6 +154,14 @@ fi
     daemon_binary = release / "daemon" / "target" / "release" / "daemon"
     assert daemon_binary.is_file()
     assert not (daemon_binary.stat().st_mode & stat.S_IWUSR)
+    state_root = home / ".local" / "state" / "dark-factory"
+    state_db = state_root / ".beads" / "beads.db"
+    assert state_db.is_file()
+    assert (state_root / ".beads" / "issues.jsonl").read_text() == seed_beads.read_text()
+    assert br_log.read_text().splitlines() == [
+        f"init --db {state_db}",
+        f"sync --db {state_db} --import-only",
+    ]
 
     rendered_unit = subprocess.run(
         [str(checkout / "daemon" / "systemd" / "install-systemd-user.sh"), "--render-only"],
@@ -142,6 +174,7 @@ fi
     assert rendered_unit.returncode == 0, rendered_unit.stdout + rendered_unit.stderr
     assert f"WorkingDirectory={release}\n" in rendered_unit.stdout
     assert f"ExecStart={daemon_binary}\n" in rendered_unit.stdout
+    assert f"Environment=DARK_FACTORY_BR_DB={state_db}\n" in rendered_unit.stdout
     assert str(checkout) not in rendered_unit.stdout
 
     runtime_log.unlink(missing_ok=True)
