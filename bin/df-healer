@@ -35,7 +35,16 @@ trap '__df_panic_collect $? $LINENO' EXIT
 
 _SCRIPT_REAL="$([ -L "${BASH_SOURCE[0]}" ] && readlink -f "${BASH_SOURCE[0]}" || echo "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "${_SCRIPT_REAL}")" && pwd)"
-export DARK_FACTORY_HOME="${DARK_FACTORY_HOME:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+RESOLVED_HOME="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PINNED_HOME=""
+if [[ -f "${RESOLVED_HOME}/.dark-factory-runtime-root" ]]; then
+  IFS= read -r PINNED_HOME < "${RESOLVED_HOME}/.dark-factory-runtime-root"
+fi
+if [[ "${PINNED_HOME}" == "${RESOLVED_HOME}" ]]; then
+  export DARK_FACTORY_HOME="${RESOLVED_HOME}"
+else
+  export DARK_FACTORY_HOME="${DARK_FACTORY_HOME:-${RESOLVED_HOME}}"
+fi
 VENV_PYTHON="${DARK_FACTORY_HOME}/.venv/bin/python"
 
 if [[ ! -x "${VENV_PYTHON}" ]]; then
@@ -53,6 +62,9 @@ prev=""
 for arg in "$@"; do
   if [[ "${prev}" == "--backend" ]]; then
     PREFLIGHT_BACKEND="${arg}"
+    break
+  elif [[ "${arg}" == --backend=* ]]; then
+    PREFLIGHT_BACKEND="${arg#--backend=}"
     break
   fi
   prev="${arg}"
@@ -73,11 +85,32 @@ if [[ "${PREFLIGHT_RC}" -eq 2 ]]; then
 elif [[ "${PREFLIGHT_RC}" -eq 0 && -n "${PREFLIGHT_JSON}" ]]; then
   STATUS=""
   FALLBACK=""
-  STATUS="$(printf '%s' "${PREFLIGHT_JSON}" | awk -F'"' '/"status":/ {print $4; exit}')"
-  FALLBACK="$(printf '%s' "${PREFLIGHT_JSON}" | awk -F'"' '/"fallback_recommendation":/ {print $4; exit}')"
+  STATUS="$(printf '%s' "${PREFLIGHT_JSON}" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+  FALLBACK="$(printf '%s' "${PREFLIGHT_JSON}" | sed -n 's/.*"fallback_recommendation"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
   if [[ "${STATUS}" == "warn" ]]; then
     printf '\033[33mwarning\033[0m: %s missing; falling back to %s\n' \
       "${PREFLIGHT_BACKEND}" "${FALLBACK}" >&2
+    if [[ -n "${FALLBACK}" ]]; then
+      new_argv=()
+      backend_replaced=0
+      prev=""
+      for arg in "$@"; do
+        if [[ "${prev}" == "--backend" ]]; then
+          new_argv+=("${FALLBACK}")
+          backend_replaced=1
+        elif [[ "${arg}" == --backend=* ]]; then
+          new_argv+=("--backend=${FALLBACK}")
+          backend_replaced=1
+        else
+          new_argv+=("${arg}")
+        fi
+        prev="${arg}"
+      done
+      if [[ "${backend_replaced}" -eq 0 ]]; then
+        new_argv=("--backend" "${FALLBACK}" "${new_argv[@]}")
+      fi
+      set -- "${new_argv[@]}"
+    fi
   fi
 fi
 

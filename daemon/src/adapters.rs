@@ -150,6 +150,91 @@ impl Tracker for CliTracker {
     }
 }
 
+#[cfg(test)]
+mod cli_tracker_br_db_tests {
+    use super::{gh_env_test_lock, CliTracker};
+    use crate::tools::Tracker;
+
+    #[test]
+    #[cfg(unix)]
+    fn cli_tracker_passes_configured_db_to_br_read_and_write_calls() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "dark_factory_cli_tracker_br_db_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let log = root.join("br.log");
+        let db = root.join("state/beads.db");
+        let br = root.join("br");
+        std::fs::write(
+            &br,
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$DARK_FACTORY_BR_LOG"
+if [ "$1" = "--db" ]; then shift 2; fi
+case "${1:-}" in
+  list) printf '{"issues":[],"has_more":false}\n' ;;
+  create) printf 'bead-from-fake-br\n' ;;
+  *) exit 64 ;;
+esac
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&br, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let prior_path = std::env::var_os("PATH");
+        let prior_db = std::env::var_os("DARK_FACTORY_BR_DB");
+        let prior_log = std::env::var_os("DARK_FACTORY_BR_LOG");
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!("{}:{}", root.display(), prior_path.as_deref().unwrap_or_default().to_string_lossy()),
+            );
+            std::env::set_var("DARK_FACTORY_BR_DB", &db);
+            std::env::set_var("DARK_FACTORY_BR_LOG", &log);
+        }
+
+        let tracker = CliTracker;
+        let reads = tracker.fetch_candidates();
+        let created = tracker.create_bead("test", "body", "owner/repo#1");
+
+        unsafe {
+            match prior_path {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
+            }
+            match prior_db {
+                Some(value) => std::env::set_var("DARK_FACTORY_BR_DB", value),
+                None => std::env::remove_var("DARK_FACTORY_BR_DB"),
+            }
+            match prior_log {
+                Some(value) => std::env::set_var("DARK_FACTORY_BR_LOG", value),
+                None => std::env::remove_var("DARK_FACTORY_BR_LOG"),
+            }
+        }
+
+        assert!(reads.unwrap().is_empty());
+        assert_eq!(created.unwrap(), "bead-from-fake-br");
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap().lines().collect::<Vec<_>>(),
+            vec![
+                format!("--db {} list --status open --label factory --json --limit 0", db.display()),
+                format!("--db {} create --title test --description body --external-ref owner/repo#1 --labels factory --silent", db.display()),
+            ]
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+}
+
 /// Parse `external_ref` values from `br list --json` output.
 pub(crate) fn parse_external_refs_from_br_list(
     out: &str,
@@ -1902,6 +1987,16 @@ fn ao_spawn_command_with_mode(
         Command::new("ao")
     };
 
+    // Bind AO's repository discovery/worktree creation to the routed target
+    // checkout. Without this, AO inherits the daemon process cwd (normally
+    // the dark-factory checkout), so an explicit cross-repository target can
+    // receive a worker in the wrong repository. `local_checkout` is only
+    // populated by explicit repo routing; legacy single-repo diagnostics keep
+    // the historical cwd behavior.
+    if let Some(checkout) = &spec.local_checkout {
+        cmd.current_dir(checkout);
+    }
+
     // This is the complete AO v0.1.3 public spawn argv: no --prompt,
     // --name, or --branch. The preload validates this shape independently.
     cmd.arg("spawn")
@@ -2048,6 +2143,7 @@ pub fn verify_ao_bridge_compatibility(
         repo: String::new(),
         ao_project: ao_project.to_string(),
         remote: String::new(),
+        local_checkout: None,
     };
     let mut command = ao_spawn_command_with_mode(agent, &spec, true)?;
     command
@@ -2667,6 +2763,7 @@ mod ao_spawn_contract_tests {
             repo: "jleechanorg/dark-factory".to_string(),
             ao_project: "dark-factory".to_string(),
             remote: "origin".to_string(),
+            local_checkout: None,
         }
     }
 
@@ -2737,7 +2834,7 @@ assert bindings[prompt] == os.environ["DARK_FACTORY_AO_SPAWN_BRANCH"]
 assert os.environ["DARK_FACTORY_AO_V013_BRIDGE"] == "1"
 assert "ao-spawn-v013-bridge.mjs" in os.environ["NODE_OPTIONS"]
 with open(os.environ["AO_FAKE_LOG"], "a", encoding="utf-8") as handle:
-    handle.write(json.dumps({"kind": "spawn", "args": args, "branch": os.environ["DARK_FACTORY_AO_SPAWN_BRANCH"]}) + "\n")
+    handle.write(json.dumps({"kind": "spawn", "args": args, "branch": os.environ["DARK_FACTORY_AO_SPAWN_BRANCH"], "cwd": os.getcwd()}) + "\n")
 if prompt == os.environ.get("AO_FAKE_FAIL_PROMPT"):
     print("scripted second spawn failure", file=sys.stderr)
     raise SystemExit(7)
@@ -2810,6 +2907,33 @@ print("  Branch:   " + os.environ.get("AO_FAKE_RETURN_BRANCH", os.environ["DARK_
         assert_eq!(rows[0]["args"][5], "--");
         assert_eq!(rows[0]["args"][6], prompt);
         assert_eq!(rows[0]["branch"], branch);
+    }
+
+    #[test]
+    fn routed_spawn_uses_target_checkout_as_ao_cwd() {
+        let prompt = "routed checkout prompt";
+        let branch = "factory/jleechan-contract-checkout-r1";
+        let checkout = std::env::temp_dir().join(format!(
+            "afd_target_checkout_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&checkout).unwrap();
+
+        let (spawn_result, calls) = with_fake_ao("target_checkout", serde_json::json!({prompt: branch}), |log| {
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            let mut routed = spec(prompt, branch);
+            routed.repo = "otherorg/other-repo".to_string();
+            routed.local_checkout = Some(checkout.clone());
+            let result = sessions.spawn(&routed);
+            let calls = std::fs::read_to_string(log).unwrap_or_default();
+            (result, calls)
+        });
+        let _ = std::fs::remove_dir_all(&checkout);
+
+        assert!(spawn_result.is_ok(), "routed spawn failed: {spawn_result:?}");
+        let row: serde_json::Value = calls.lines().next().unwrap().parse().unwrap();
+        assert_eq!(row["cwd"], checkout.to_string_lossy().as_ref());
     }
 
     #[test]

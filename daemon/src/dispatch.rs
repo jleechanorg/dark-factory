@@ -373,6 +373,28 @@ pub fn dispatch_ready(
                 continue;
             }
         };
+        if !cfg.worker_checkout_is_configured(&repo, &routing) {
+            let error = DaemonError::Config(format!(
+                "bead {} targets explicit repo {repo:?}, but [repos.\"{repo}\"].local_checkout \
+                 is missing or not absolute; refusing to spawn from the daemon's unrelated cwd",
+                bead.id
+            ));
+            overlay.state = OverlayState::HumanHeld;
+            overlay.session_id = None;
+            set_human_hold_reason(
+                &mut overlay,
+                HumanHoldReason::TargetCheckoutUnconfigured,
+            );
+            store.save(&overlay)?;
+            report.failures.push(failure(
+                bead,
+                overlay.attempt,
+                None,
+                "target_checkout_unconfigured",
+                error,
+            ));
+            continue;
+        }
 
         // jleechan-drive-pr-branch-binding-pcpr: a resolved open-PR head
         // branch wins over the generated `factory/<bead>-r<attempt>` one —
@@ -476,6 +498,7 @@ pub fn dispatch_ready(
             repo: repo.clone(),
             ao_project: routing.ao_project.clone(),
             remote: routing.push_remote.clone(),
+            local_checkout: routing.local_checkout.clone(),
         };
         let session_id = match sessions.spawn(&spec) {
             Ok(session_id) => session_id,
@@ -580,7 +603,20 @@ pub fn dispatch_ready(
                 ));
                 continue;
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                overlay.state = OverlayState::HumanHeld;
+                overlay.session_id = None;
+                set_human_hold_reason(&mut overlay, HumanHoldReason::SpawnFailed);
+                store.save(&overlay)?;
+                report.failures.push(failure(
+                    bead,
+                    overlay.attempt,
+                    Some(branch.clone()),
+                    "spawn_failed",
+                    err,
+                ));
+                continue;
+            }
         };
 
         // jleechan-5ia2: a `bead_overlay` row was found with
@@ -1893,6 +1929,57 @@ mod tests {
         assert_eq!(spawn_calls, 0, "Sessions::spawn must never be called");
     }
 
+    #[test]
+    fn explicit_target_without_checkout_fails_only_that_item() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("other/repo".into()),
+                attempt_started_at: None,
+            })
+            .unwrap();
+        let mut cfg = cfg();
+        cfg.repos.insert(
+            "other/repo".into(),
+            crate::config::RepoConfig {
+                ao_project: "other-repo".into(),
+                push_remote: "origin".into(),
+                local_checkout: None,
+            },
+        );
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &beads(2)).unwrap();
+
+        assert_eq!(report.success_count(), 1);
+        assert_eq!(report.successes[0].bead_id, "bead-1");
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].bead_id, "bead-0");
+        assert_eq!(report.failures[0].phase, "target_checkout_unconfigured");
+        let failed = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(failed.state, OverlayState::HumanHeld);
+        assert_eq!(
+            failed.park_reason.as_deref(),
+            Some("target_checkout_unconfigured")
+        );
+        let calls = sessions.calls.borrow();
+        assert!(!calls.iter().any(|call| call == "spawn(bead-0)"));
+        assert!(calls.iter().any(|call| call == "spawn(bead-1)"));
+    }
+
     /// jleechan-8jxr r2 acceptance criterion #1: a manually-created factory
     /// bead (no `target_repo:` body field, no parseable `external_ref`)
     /// whose intake left `overlay.target_repo = None` MUST NOT silently
@@ -2047,6 +2134,7 @@ mod tests {
             crate::config::RepoConfig {
                 ao_project: "other-project".to_string(),
                 push_remote: "origin".to_string(),
+                local_checkout: Some(std::env::current_dir().unwrap()),
             },
         );
         // Bead has a parseable `external_ref` (Stage A fallback) — the
@@ -2119,6 +2207,7 @@ mod tests {
             crate::config::RepoConfig {
                 ao_project: "some-project".to_string(),
                 push_remote: "origin".to_string(),
+                local_checkout: Some(std::env::current_dir().unwrap()),
             },
         );
         let ready = vec![(
@@ -2203,6 +2292,7 @@ mod tests {
             crate::config::RepoConfig {
                 ao_project: "other-project".to_string(),
                 push_remote: "origin".to_string(),
+                local_checkout: Some(std::env::current_dir().unwrap()),
             },
         );
         let ready = beads(1);
@@ -2274,6 +2364,7 @@ mod tests {
             crate::config::RepoConfig {
                 ao_project: "worldarchitect".to_string(),
                 push_remote: "worldai".to_string(),
+                local_checkout: Some(std::env::current_dir().unwrap()),
             },
         );
         let ready = beads(1);
@@ -2644,28 +2735,27 @@ mod tests {
     }
 
     #[test]
-    fn non_transient_spawn_failure_after_dispatching_intent_is_fatal() {
+    fn non_transient_spawn_failure_is_parked_without_aborting_unrelated_items() {
         let sessions = FakeSessions::new(0);
         sessions.fail_spawn_fatal_for("bead-0");
         let store = FakeStateStore::new();
         let cfg = cfg();
         let ready = beads(2);
 
-        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
-        assert!(
-            matches!(err, DaemonError::Parse(_)),
-            "non-transient spawn failure must stop the batch: {err:?}"
-        );
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
 
         let bead_0 = store.load("bead-0").unwrap().unwrap();
-        assert_eq!(bead_0.state, OverlayState::Dispatching);
-        assert!(
-            store.load("bead-1").unwrap().is_none(),
-            "later beads must not dispatch after a fatal spawn failure"
-        );
+        assert_eq!(bead_0.state, OverlayState::HumanHeld);
+        assert_eq!(bead_0.park_reason.as_deref(), Some("spawn_failed"));
+        assert_eq!(report.success_count(), 1);
+        assert_eq!(report.successes[0].bead_id, "bead-1");
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].bead_id, "bead-0");
+        assert_eq!(report.failures[0].phase, "spawn_failed");
+        assert!(!report.failures[0].transient);
         let calls = sessions.calls.borrow();
         assert!(calls.iter().any(|c| c == "spawn(bead-0)"));
-        assert!(!calls.iter().any(|c| c == "spawn(bead-1)"));
+        assert!(calls.iter().any(|c| c == "spawn(bead-1)"));
     }
 
     #[test]
@@ -3383,6 +3473,7 @@ mod tests {
             crate::config::RepoConfig {
                 ao_project: "worldarchitect".to_string(),
                 push_remote: "worldai".to_string(),
+                local_checkout: Some(std::env::current_dir().unwrap()),
             },
         );
         let ready = beads(1);

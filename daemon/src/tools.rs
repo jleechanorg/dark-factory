@@ -237,6 +237,9 @@ pub struct SpawnSpec {
     /// git remote name the coder must push to for `repo` (e.g. `"origin"`
     /// or a dual-remote clone's non-default remote like `"worldai"`).
     pub remote: String,
+    /// Local checkout to use as the AO process cwd. This keeps worktree
+    /// creation and repository discovery bound to the bead's target repo.
+    pub local_checkout: Option<std::path::PathBuf>,
 }
 
 /// Opaque handle to an AO/`aow` session.
@@ -962,6 +965,11 @@ fn run_tool_with_cwd(
     timeout_secs: u64,
 ) -> Result<String, DaemonError> {
     let mut command = Command::new(cmd);
+    if cmd == "br" {
+        if let Ok(db) = std::env::var("DARK_FACTORY_BR_DB") {
+            command.args(["--db", db.as_str()]);
+        }
+    }
     command
         .args(args)
         .stdin(Stdio::null())

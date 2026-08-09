@@ -301,7 +301,9 @@ jobs:
 
       - name: cargo test (daemon crate)
         working-directory: daemon
-        run: cargo test --verbose
+        # The self-hosted runner can concurrently run the Python test job;
+        # serial compilation prevents rustc from being OOM-killed mid-suite.
+        run: cargo test --verbose -j 1
 
       - name: cargo clippy (deny warnings)
         working-directory: daemon

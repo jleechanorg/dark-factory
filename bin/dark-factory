@@ -61,7 +61,16 @@ trap '__df_exit_code=$?; __df_release_lock; __df_panic_collect ${__df_exit_code}
 
 _SCRIPT_REAL="$([ -L "${BASH_SOURCE[0]}" ] && readlink -f "${BASH_SOURCE[0]}" || echo "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "${_SCRIPT_REAL}")" && pwd)"
-export DARK_FACTORY_HOME="${DARK_FACTORY_HOME:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+RESOLVED_HOME="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PINNED_HOME=""
+if [[ -f "${RESOLVED_HOME}/.dark-factory-runtime-root" ]]; then
+  IFS= read -r PINNED_HOME < "${RESOLVED_HOME}/.dark-factory-runtime-root"
+fi
+if [[ "${PINNED_HOME}" == "${RESOLVED_HOME}" ]]; then
+  export DARK_FACTORY_HOME="${RESOLVED_HOME}"
+else
+  export DARK_FACTORY_HOME="${DARK_FACTORY_HOME:-${RESOLVED_HOME}}"
+fi
 VENV_PYTHON="${DARK_FACTORY_HOME}/.venv/bin/python"
 TARGET_WORKDIR="$(pwd)"
 
@@ -78,6 +87,9 @@ prev=""
 for arg in "$@"; do
   if [[ "${prev}" == "--backend" ]]; then
     PREFLIGHT_BACKEND="${arg}"
+    break
+  elif [[ "${arg}" == --backend=* ]]; then
+    PREFLIGHT_BACKEND="${arg#--backend=}"
     break
   fi
   prev="${arg}"
@@ -103,16 +115,39 @@ if [[ "${PREFLIGHT_RC}" -eq 2 ]]; then
   exit 2
 elif [[ "${PREFLIGHT_RC}" -eq 0 && -n "${PREFLIGHT_JSON}" ]]; then
   # Pass or warn. For warn, print a single yellow line + recommendation
-  # to stderr and continue. We use a minimal awk parse of the JSON
-  # fields we need (no jq dependency) — structured consumers can
-  # re-run the preflight module directly with --json.
+  # to stderr and continue.
   STATUS=""
   FALLBACK=""
-  STATUS="$(printf '%s' "${PREFLIGHT_JSON}" | awk -F'"' '/"status":/ {print $4; exit}')"
-  FALLBACK="$(printf '%s' "${PREFLIGHT_JSON}" | awk -F'"' '/"fallback_recommendation":/ {print $4; exit}')"
+  STATUS="$(printf '%s' "${PREFLIGHT_JSON}" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+  FALLBACK="$(printf '%s' "${PREFLIGHT_JSON}" | sed -n 's/.*"fallback_recommendation"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
   if [[ "${STATUS}" == "warn" ]]; then
     printf '\033[33mwarning\033[0m: %s missing; falling back to %s\n' \
       "${PREFLIGHT_BACKEND}" "${FALLBACK}" >&2
+    if [[ -n "${FALLBACK}" ]]; then
+      new_argv=()
+      backend_replaced=0
+      prev=""
+      for arg in "$@"; do
+        if [[ "${prev}" == "--backend" ]]; then
+          new_argv+=("${FALLBACK}")
+          backend_replaced=1
+        elif [[ "${arg}" == --backend=* ]]; then
+          new_argv+=("--backend=${FALLBACK}")
+          backend_replaced=1
+        else
+          new_argv+=("${arg}")
+        fi
+        prev="${arg}"
+      done
+      if [[ "${backend_replaced}" -eq 0 ]]; then
+        if [[ "${__DF_IS_REVIEW:-0}" -eq 1 ]]; then
+          new_argv=("review" "--backend" "${FALLBACK}" "${new_argv[@]:1}")
+        else
+          new_argv=("--backend" "${FALLBACK}" "${new_argv[@]}")
+        fi
+      fi
+      set -- "${new_argv[@]}"
+    fi
   fi
 fi
 

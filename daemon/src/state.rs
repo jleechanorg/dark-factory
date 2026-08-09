@@ -564,6 +564,7 @@ pub enum HumanHoldReason {
     SpecValidationFailed,
     RouterParse(String),
     UnmappedTargetRepo,
+    TargetCheckoutUnconfigured,
     /// Bead jleechan-8jxr r2: a manually-created factory bead whose intake
     /// could not resolve ANY repo identity (no `target_repo:` body field,
     /// no `external_ref` with a parseable `owner/repo#N` prefix, and no
@@ -583,6 +584,7 @@ pub enum HumanHoldReason {
     WorktreeRemoteMismatch,
     WorktreeRemoteUnverifiable,
     SpawnCleanupFailed,
+    SpawnFailed,
     SpawnBranchMismatch,
     AmbiguousDispatchingRecovery,
     AutonomyTimeboxExceeded,
@@ -644,10 +646,12 @@ impl HumanHoldReason {
                 return format!("{ROUTER_PARSE_PARK_REASON_PREFIX} {reason}");
             }
             Self::UnmappedTargetRepo => "unmapped_target_repo",
+            Self::TargetCheckoutUnconfigured => "target_checkout_unconfigured",
             Self::UnmappedRepo => "unmapped_repo",
             Self::WorktreeRemoteMismatch => "worktree_remote_mismatch",
             Self::WorktreeRemoteUnverifiable => "worktree_remote_unverifiable",
             Self::SpawnCleanupFailed => "spawn_cleanup_failed",
+            Self::SpawnFailed => "spawn_failed",
             Self::SpawnBranchMismatch => "spawn_branch_mismatch",
             Self::AmbiguousDispatchingRecovery => "ambiguous_dispatching_recovery",
             Self::AutonomyTimeboxExceeded => "autonomy_timebox_exceeded",

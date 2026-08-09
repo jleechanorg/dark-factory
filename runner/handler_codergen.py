@@ -100,6 +100,17 @@ _CMD_RUN_EXIT_RE = re.compile(
 )
 
 
+def _subprocess_output(stdout: str | bytes | None, stderr: str | bytes | None) -> str:
+    """Combine subprocess output, including byte payloads from timeouts."""
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode("utf-8", errors="replace")
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", errors="replace")
+    stdout = stdout or ""
+    stderr = stderr or ""
+    return (stdout + ("\nSTDERR:\n" + stderr if stderr else "")).strip()
+
+
 @dataclass
 class _ShadowCodexReview:
     prompt: str = ""
@@ -674,7 +685,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         agent = ctx.state.get("ao.agent", "claude-code")
         session = ctx.state.get("ao.session")
         if not session:
-            spawn_args = ["ao", "spawn", "--prompt", prompt_text, "--project", project, "--harness", agent]
+            spawn_args = ["ao", "spawn", prompt_text, "--project", project, "--agent", agent]
             spawn_args = _handlers_shim._sandboxed_args(spawn_args)
             if spawn_args is None:
                 return _finalize(Result(outcome="failure", output="sandbox-exec unavailable"))
@@ -690,11 +701,9 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                     env=_handlers_shim._sanitized_env(),
                 )
             except subprocess.TimeoutExpired as exc:
-                stdout = exc.stdout or ""
-                stderr = exc.stderr or ""
                 return _finalize(Result(
                     outcome="failure",
-                    output=(stdout + ("\nSTDERR:\n" + stderr if stderr else "")).strip()
+                    output=_subprocess_output(exc.stdout, exc.stderr)
                     or f"ao spawn timed out after {ao_spawn_timeout} seconds",
                     metadata={
                         "session": "",
@@ -786,11 +795,9 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                 env=_handlers_shim._sanitized_env(),
             )
         except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout or ""
-            stderr = exc.stderr or ""
             return _finalize(Result(
                 outcome="failure",
-                output=(stdout + ("\nSTDERR:\n" + stderr if stderr else "")).strip()
+                output=_subprocess_output(exc.stdout, exc.stderr)
                 or f"ao send timed out after {ao_send_timeout} seconds",
                 metadata={
                     "session": session,
@@ -933,11 +940,9 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                 env=_handlers_shim._sanitized_env(),
             )
         except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout or ""
-            stderr = exc.stderr or ""
             return _finalize(Result(
                 outcome="failure",
-                output=(stdout + ("\nSTDERR:\n" + stderr if stderr else "")).strip()
+                output=_subprocess_output(exc.stdout, exc.stderr)
                 or f"codex backend timed out after {timeout_s} seconds",
                 metadata={
                     "timed_out": "true",
