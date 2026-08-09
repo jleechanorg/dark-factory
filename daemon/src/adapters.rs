@@ -2018,6 +2018,13 @@ fn ao_spawn_command_with_mode(
                 spec.expected_revision.as_deref(),
             )?
         };
+        if spec.managed_checkout {
+            crate::target_worktree::ensure_managed_push_remote(
+                &spec.repo,
+                &verified,
+                &spec.remote,
+            )?;
+        }
         cmd.current_dir(&verified)
             .env("DARK_FACTORY_AO_TARGET_CHECKOUT", &verified);
         // Managed target worktrees are daemon-owned execution resources.  The

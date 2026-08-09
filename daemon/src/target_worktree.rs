@@ -97,6 +97,75 @@ pub fn ensure_managed_target_worktree(
     ensure_target_worktree_inner(repo, requested, head_sha, true)
 }
 
+/// Ensure a daemon-owned checkout exposes the configured push-remote name.
+///
+/// Managed checkouts are cloned with Git's conventional `origin` remote, but
+/// a repository routing entry may deliberately use another remote name. AO
+/// creates its worker worktrees from this checkout, so the alias must exist
+/// before spawn. Existing aliases are never rewritten: they must already
+/// point at the verified target repository. This helper is intentionally not
+/// used for operator-owned checkouts.
+pub fn ensure_managed_push_remote(
+    repo: &str,
+    path: &Path,
+    remote_name: &str,
+) -> Result<(), DaemonError> {
+    validate_repo(repo)?;
+    if remote_name.is_empty() || remote_name.starts_with('-') {
+        return Err(DaemonError::Config(format!(
+            "configured push remote name is invalid: {remote_name:?}"
+        )));
+    }
+    verify_origin(repo, path)?;
+    if remote_name == "origin" {
+        return Ok(());
+    }
+
+    // `dispatch_ready` may process several beads for the same repository in
+    // parallel. Serialize the inspect-or-add sequence with target checkout
+    // provisioning so two spawns cannot both observe a missing alias and
+    // race to add it.
+    let _lock = TargetWorktreeLock::acquire(path)?;
+
+    let path_str = path.to_string_lossy();
+    let remotes = run_tool_in_dir("git", &["remote"], &path_str, 30)?;
+    if remotes.lines().any(|name| name == remote_name) {
+        let url = run_tool_in_dir(
+            "git",
+            &["remote", "get-url", "--push", remote_name],
+            &path_str,
+            30,
+        )?;
+        if remote_url_matches_repo(&url, repo) != Some(true) {
+            return Err(DaemonError::Config(format!(
+                "managed target worktree {} has push remote {remote_name:?} that does not match {repo}",
+                path.display()
+            )));
+        }
+        return Ok(());
+    }
+
+    let origin_push_url = run_tool_in_dir(
+        "git",
+        &["remote", "get-url", "--push", "origin"],
+        &path_str,
+        30,
+    )?;
+    if remote_url_matches_repo(&origin_push_url, repo) != Some(true) {
+        return Err(DaemonError::Config(format!(
+            "managed target worktree {} has origin push URL that does not match {repo}",
+            path.display()
+        )));
+    }
+    run_tool_in_dir(
+        "git",
+        &["remote", "add", remote_name, origin_push_url.trim()],
+        &path_str,
+        30,
+    )?;
+    Ok(())
+}
+
 fn ensure_target_worktree_inner(
     repo: &str,
     requested: &Path,
@@ -346,6 +415,101 @@ mod tests {
         let after =
             run_tool_in_dir("git", &["rev-parse", "HEAD"], &root.to_string_lossy(), 30).unwrap();
         assert_eq!(after.trim(), actual);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_checkout_adds_missing_configured_push_remote_as_origin_alias() {
+        let root = std::env::temp_dir().join(format!(
+            "afd_target_worktree_remote_alias_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        init_git_checkout(&root, "owner/repo");
+
+        ensure_managed_push_remote("owner/repo", &root, "deployment").unwrap();
+        let url = run_tool_in_dir(
+            "git",
+            &["remote", "get-url", "--push", "deployment"],
+            &root.to_string_lossy(),
+            30,
+        )
+        .unwrap();
+        assert_eq!(
+            url.trim(),
+            "https://github.com/owner/repo.git",
+            "the worker source must expose the configured remote name"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_managed_remote_alias_provisioning_is_serialized() {
+        let root = std::env::temp_dir().join(format!(
+            "afd_target_worktree_remote_concurrent_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        init_git_checkout(&root, "owner/repo");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let root = root.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                ensure_managed_push_remote("owner/repo", &root, "deployment")
+            }));
+        }
+        for worker in workers {
+            worker
+                .join()
+                .expect("alias worker must not panic")
+                .expect("both racing callers must observe a valid alias");
+        }
+        let url = run_tool_in_dir(
+            "git",
+            &["remote", "get-url", "--push", "deployment"],
+            &root.to_string_lossy(),
+            30,
+        )
+        .unwrap();
+        assert_eq!(url.trim(), "https://github.com/owner/repo.git");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_checkout_refuses_to_overwrite_mismatched_configured_push_remote() {
+        let root = std::env::temp_dir().join(format!(
+            "afd_target_worktree_remote_mismatch_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        init_git_checkout(&root, "owner/repo");
+        run_tool_in_dir(
+            "git",
+            &[
+                "remote",
+                "add",
+                "deployment",
+                "https://github.com/other/repo.git",
+            ],
+            &root.to_string_lossy(),
+            30,
+        )
+        .unwrap();
+
+        let error = ensure_managed_push_remote("owner/repo", &root, "deployment")
+            .expect_err("a configured remote must never be rewritten");
+        assert!(error.to_string().contains("does not match owner/repo"));
+        let url = run_tool_in_dir(
+            "git",
+            &["remote", "get-url", "--push", "deployment"],
+            &root.to_string_lossy(),
+            30,
+        )
+        .unwrap();
+        assert_eq!(url.trim(), "https://github.com/other/repo.git");
         std::fs::remove_dir_all(root).unwrap();
     }
 
