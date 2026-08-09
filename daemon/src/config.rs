@@ -577,4 +577,48 @@ push_remote = "origin"
         }
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn isolated_target_worktree_path_keeps_same_name_repositories_separate() {
+        let root = std::env::temp_dir().join(format!(
+            "afd_isolated_same_name_{}",
+            std::process::id()
+        ));
+        let previous = std::env::var_os("DARK_FACTORY_TARGET_WORKTREE_ROOT");
+        std::env::set_var("DARK_FACTORY_TARGET_WORKTREE_ROOT", &root);
+        let cfg_path = root.join("daemon.toml");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            &cfg_path,
+            r#"target_repo = "owner-a/repo"
+base_branch = "main"
+stage = 1
+max_workers = 1
+max_batch = 1
+fast_tick_secs = 1
+slow_tick_secs = 1
+autonomy_timebox_secs = 60
+budget_warn_usd = 1.0
+spec_dir = ".factory/specs/"
+[repos."owner-a/repo"]
+ao_project = "repo-a"
+push_remote = "origin"
+[repos."owner-b/repo"]
+ao_project = "repo-b"
+push_remote = "origin"
+"#,
+        )
+        .unwrap();
+        let cfg = load(&cfg_path).unwrap();
+        let first = cfg.target_worktree_path("owner-a/repo").unwrap();
+        let second = cfg.target_worktree_path("owner-b/repo").unwrap();
+        assert_ne!(first, second);
+        assert!(first.ends_with(std::path::Path::new("owner-a/repo")));
+        assert!(second.ends_with(std::path::Path::new("owner-b/repo")));
+        match previous {
+            Some(value) => std::env::set_var("DARK_FACTORY_TARGET_WORKTREE_ROOT", value),
+            None => std::env::remove_var("DARK_FACTORY_TARGET_WORKTREE_ROOT"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

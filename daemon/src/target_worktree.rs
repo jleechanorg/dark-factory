@@ -160,6 +160,20 @@ mod tests {
     }
 
     #[test]
+    fn rejects_existing_checkout_at_stale_snapshot_head() {
+        let root = std::env::temp_dir().join(format!(
+            "afd_target_worktree_stale_{}",
+            std::process::id()
+        ));
+        let actual = init_git_checkout(&root, "owner/repo");
+        let stale = "0000000000000000000000000000000000000000";
+        assert_ne!(actual, stale);
+        let err = ensure_target_worktree("owner/repo", &root, Some(stale)).unwrap_err();
+        assert!(err.to_string().contains("expected snapshot"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn rejects_malformed_repository_before_touching_disk() {
         let root = std::env::temp_dir().join(format!(
             "afd_target_worktree_invalid_{}",
