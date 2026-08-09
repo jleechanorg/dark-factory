@@ -319,6 +319,40 @@ assert "redrive-pr ok" "redriven test-dup PR #9999" "$out"
 state="$(sqlite3 "$AFD_DB" "SELECT state FROM bead_overlay WHERE bead_id='test-dup';")"
 assert "state after redrive-pr" "QUEUED" "$state"
 
+# 18b. redrive-pr validation gap (rev-sp88, PR 7860 / jleechan-70lx): entry
+# currently does NOT validate pr_number/branch at all (contrast with
+# dispatch-record's guard at the "CR-6" test above), so an invalid branch is
+# silently written into bead_overlay instead of being rejected immediately --
+# the bead only fails LATER when something else (dispatch-record) tries to
+# validate it, producing a silent QUEUED-but-broken churn loop instead of an
+# immediate, clear rejection at the point of input.
+set +e
+out_badbranch="$("$OVERLAY" redrive-pr test-redrive-badbranch 9998 'factory/not-a-valid-suffix' 2>&1)"
+rc_badbranch=$?
+set -e
+assert "redrive-pr rejects invalid branch at entry (rc=6 EX_VALID_INPUT)" "6" "$rc_badbranch"
+
+# 18c. valid_branch's existing-PR-branch regex excludes '+' (rev-sp88 / PR
+# 7860): jleechan-70lx's real branch worktree-feat+restore-rag-shadow-mode is
+# rejected by this pattern, which is why that bead is stuck HUMAN_HELD.
+# Exercise it through dispatch-record -- an existing valid_branch consumer --
+# so the assertion is tied directly to the regex, independent of the
+# redrive-pr entry-validation gap covered by 18b above.
+"$OVERLAY" intake-upsert test-redrive-plus-src 'plus branch regex test' >/dev/null
+"$OVERLAY" route-record test-redrive-plus-src STANDARD_PATH >/dev/null
+set +e
+out_plus_dispatch="$("$OVERLAY" dispatch-record test-redrive-plus-src 'worktree-feat+restore-rag-shadow-mode' 2>&1)"
+rc_plus_dispatch=$?
+set -e
+assert "dispatch-record accepts '+' in branch name" "ok" "$out_plus_dispatch"
+
+# 18d. redrive-pr end-to-end with the real PR 7860 branch name -- the exact
+# operator command that will be run on jleechan-70lx once this fix lands.
+out_plus_redrive="$("$OVERLAY" redrive-pr test-redrive-plus 7860 'worktree-feat+restore-rag-shadow-mode')"
+assert "redrive-pr accepts '+' in branch name" "redriven test-redrive-plus PR #7860" "$out_plus_redrive"
+state_plus_redrive="$(sqlite3 "$AFD_DB" "SELECT state FROM bead_overlay WHERE bead_id='test-redrive-plus';")"
+assert "state after '+' branch redrive-pr" "QUEUED" "$state_plus_redrive"
+
 # 19. unstick-dispatching (no rows in DISPATCHING, should be 0)
 out="$("$OVERLAY" unstick-dispatching)"
 assert "unstick-dispatching 0" "unstuck=0" "$out"
