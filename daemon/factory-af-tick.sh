@@ -286,7 +286,7 @@ fi
 dispatched=0
 ERR_TMP="$(mktemp -t af_dispatch_err.XXXXXX)"
 trap 'rm -f "$ERR_TMP"' EXIT
-while IFS=$'\t' read -r bead_id pr branch bead_repo; do
+while IFS='|' read -r bead_id pr branch bead_repo; do
     [ -n "$bead_id" ] || continue
     [ "$dispatched" -ge "$MAX_DISPATCH" ] && break
 
@@ -402,7 +402,7 @@ PY
     else
         echo "[af] skip $bead_id (ao spawn failed)" >&2
     fi
-done < <(sqlite3 "$DB" -separator $'\t' \
+done < <(sqlite3 "$DB" -separator '|' \
   "SELECT bead_id, pr_number, coalesce(branch,''), coalesce(target_repo,'') FROM bead_overlay
    WHERE state IN ('QUEUED','ATTESTED') AND pr_number IS NOT NULL
    $bead_filter

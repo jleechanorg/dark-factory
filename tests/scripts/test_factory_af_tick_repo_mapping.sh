@@ -117,7 +117,7 @@ R="$FAKE_R"
 WRAPPER_BEAD="\${AFD_WRAPPER_BEAD:-test-repo-mapping}"
 dispatched=0
 MAX_DISPATCH=2
-while IFS=\$'\t' read -r bead_id pr branch bead_repo; do
+while IFS='|' read -r bead_id pr branch bead_repo; do
   [ -n "\$bead_id" ] || continue
   [ "\$dispatched" -ge "\$MAX_DISPATCH" ] && break
 
@@ -166,7 +166,7 @@ PY
   else
     echo "[af] skip \$bead_id (ao spawn failed)" >&2
   fi
-done < <(sqlite3 "\$AFD_DB" -separator \$'\t' \
+done < <(sqlite3 "\$AFD_DB" -separator '|' \
   "SELECT bead_id, pr_number, coalesce(branch,''), coalesce(target_repo,'') FROM bead_overlay
    WHERE state IN ('QUEUED','ATTESTED') AND pr_number IS NOT NULL
    AND bead_id IN ('\${WRAPPER_BEAD}')
