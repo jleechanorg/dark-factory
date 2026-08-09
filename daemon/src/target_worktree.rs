@@ -324,7 +324,7 @@ mod tests {
             std::process::id()
         ));
         let head = init_git_checkout(&root, "other/repo");
-        let err = ensure_target_worktree("owner/repo", &root, Some(&head)).unwrap_err();
+        let err = ensure_managed_target_worktree("owner/repo", &root, Some(&head)).unwrap_err();
         assert!(err.to_string().contains("origin"));
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -338,6 +338,9 @@ mod tests {
         assert_ne!(actual, stale);
         let err = ensure_target_worktree("owner/repo", &root, Some(stale)).unwrap_err();
         assert!(err.to_string().contains("expected snapshot"));
+        let after =
+            run_tool_in_dir("git", &["rev-parse", "HEAD"], &root.to_string_lossy(), 30).unwrap();
+        assert_eq!(after.trim(), actual);
         std::fs::remove_dir_all(root).unwrap();
     }
 
