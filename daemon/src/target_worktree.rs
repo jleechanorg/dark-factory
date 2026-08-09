@@ -352,7 +352,7 @@ mod tests {
     #[test]
     fn refreshes_clean_managed_checkout_to_stale_snapshot() {
         if std::env::var_os("AFD_TARGET_REFRESH_HELPER").is_some() {
-            run_refresh_child(false);
+            run_refresh_child(false, false);
             return;
         }
         let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -371,7 +371,7 @@ mod tests {
     #[test]
     fn refuses_to_refresh_dirty_managed_checkout() {
         if std::env::var_os("AFD_TARGET_REFRESH_HELPER").is_some() {
-            run_refresh_child(true);
+            run_refresh_child(true, false);
             return;
         }
         let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -382,6 +382,25 @@ mod tests {
             ])
             .env("AFD_TARGET_REFRESH_HELPER", "1")
             .env("AFD_TARGET_REFRESH_DIRTY", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn refuses_refresh_when_checkout_would_overwrite_ignored_artifact() {
+        if std::env::var_os("AFD_TARGET_REFRESH_HELPER").is_some() {
+            run_refresh_child(false, true);
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "target_worktree::tests::refuses_refresh_when_checkout_would_overwrite_ignored_artifact",
+                "--nocapture",
+            ])
+            .env("AFD_TARGET_REFRESH_HELPER", "1")
+            .env_remove("AFD_TARGET_REFRESH_DIRTY")
             .status()
             .unwrap();
         assert!(status.success());
@@ -578,7 +597,7 @@ mod tests {
             .to_string()
     }
 
-    fn run_refresh_child(dirty: bool) {
+    fn run_refresh_child(dirty: bool, ignored_conflict: bool) {
         let root = std::env::temp_dir().join(format!(
             "afd_target_worktree_refresh_child_{}",
             std::process::id()
@@ -586,6 +605,7 @@ mod tests {
         let bin = root.join("bin");
         let target = root.join("target");
         let state = root.join("head");
+        let conflict = root.join("ignored-conflict");
         let old_head = "1111111111111111111111111111111111111111";
         let new_head = "2222222222222222222222222222222222222222";
         let _ = std::fs::remove_dir_all(&root);
@@ -593,16 +613,18 @@ mod tests {
         std::fs::create_dir_all(&target).unwrap();
         std::fs::write(&state, old_head).unwrap();
         let ignored_artifact = target.join("ignored-artifact");
-        std::fs::write(&ignored_artifact, "preserve me").unwrap();
+        if ignored_conflict {
+            std::fs::write(&ignored_artifact, "preserve me").unwrap();
+            std::fs::write(&conflict, "1").unwrap();
+        }
         let fake_git = bin.join("git");
         std::fs::write(
             &fake_git,
             format!(
-                "#!/bin/sh\ncase \"$1:$2\" in\n  remote:get-url) printf '%s\\n' 'https://github.com/owner/repo.git' ;;\n  rev-parse:HEAD) cat '{}' ;;\n  status:--porcelain) {} ;;\n  fetch:--depth=1) printf '%s' '{}' > '{}' ;;\n  checkout:--no-overwrite-ignore) test \"$3\" = --detach || exit 1; printf '%s' \"$4\" > '{}' ;;\n  *) exit 1 ;;\nesac\n",
+                "#!/bin/sh\ncase \"$1:$2\" in\n  remote:get-url) printf '%s\\n' 'https://github.com/owner/repo.git' ;;\n  rev-parse:HEAD) cat '{}' ;;\n  status:--porcelain) {} ;;\n  fetch:--depth=1) : ;;\n  checkout:--no-overwrite-ignore) test \"$3\" = --detach || exit 1; if [ -f '{}' ]; then exit 1; fi; printf '%s' \"$4\" > '{}' ;;\n  *) exit 1 ;;\nesac\n",
                 state.display(),
                 if dirty { "printf ' M operator-note\\n'" } else { "exit 0" },
-                new_head,
-                state.display(),
+                conflict.display(),
                 state.display()
             ),
         )
@@ -631,17 +653,21 @@ mod tests {
         } else {
             std::env::remove_var("PATH");
         }
-        if dirty {
+        if dirty || ignored_conflict {
             let error = result.expect_err("dirty managed checkout must fail closed");
-            assert!(error.to_string().contains("uncommitted changes"));
+            if dirty {
+                assert!(error.to_string().contains("uncommitted changes"));
+            }
             assert_eq!(std::fs::read_to_string(&state).unwrap(), old_head);
+            if ignored_conflict {
+                assert_eq!(
+                    std::fs::read_to_string(ignored_artifact).unwrap(),
+                    "preserve me"
+                );
+            }
         } else {
             assert_eq!(result.unwrap(), target);
             assert_eq!(std::fs::read_to_string(&state).unwrap(), new_head);
-            assert_eq!(
-                std::fs::read_to_string(ignored_artifact).unwrap(),
-                "preserve me"
-            );
         }
         std::fs::remove_dir_all(root).unwrap();
     }
