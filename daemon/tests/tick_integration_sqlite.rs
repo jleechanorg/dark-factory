@@ -359,7 +359,7 @@ fn sqlite_escalation_dedup_tick_level_identical_payload_suppressed_changed_conte
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     let store = SqliteTestStore::new();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let cfg = test_cfg();
 
     let bead_id = "bead-dedup-tick-sql";
