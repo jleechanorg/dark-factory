@@ -35,6 +35,14 @@ impl CacheFileLock {
             {
                 Ok(_) => return Ok(Self { path: lock_path }),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if std::fs::metadata(&lock_path)
+                        .and_then(|metadata| metadata.modified())
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age > Duration::from_secs(30))
+                    {
+                        let _ = std::fs::remove_file(&lock_path);
+                    }
                     thread::sleep(Duration::from_millis(5));
                 }
                 Err(error) => {
