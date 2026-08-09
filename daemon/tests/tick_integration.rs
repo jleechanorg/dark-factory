@@ -53,7 +53,14 @@ fn test_cfg() -> Config {
         reroll_head_stability_window_secs: 1,
         reroll_death_confirm_secs: 0,
         held_recheck_cooldown_secs: 900,
-        repos: std::collections::HashMap::new(),
+        repos: std::collections::HashMap::from([(
+            "owner/repo".into(),
+            RepoConfig {
+                ao_project: "repo".into(),
+                push_remote: "origin".into(),
+                local_checkout: Some(std::env::current_dir().unwrap()),
+            },
+        )]),
         pre_gate_validation_enabled: false,
         escalation_refire_secs: 3600,
     }

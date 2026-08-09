@@ -217,6 +217,9 @@ impl Config {
     }
 
     pub fn worker_checkout_is_configured(&self, repo: &str, routing: &RepoRouting) -> bool {
+        if is_fixture_repo(repo) && routing.local_checkout.is_none() {
+            return false;
+        }
         if !self.repos.contains_key(repo) {
             return true;
         }

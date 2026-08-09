@@ -1664,7 +1664,14 @@ mod tests {
             reroll_head_stability_window_secs: 30,
             reroll_death_confirm_secs: 5,
             held_recheck_cooldown_secs: 900,
-            repos: std::collections::HashMap::new(),
+            repos: std::collections::HashMap::from([(
+                "owner/repo".into(),
+                crate::config::RepoConfig {
+                    ao_project: "repo".into(),
+                    push_remote: "origin".into(),
+                    local_checkout: Some(std::env::current_dir().unwrap()),
+                },
+            )]),
             pre_gate_validation_enabled: false,
             escalation_refire_secs: 3600,
         }
@@ -1941,9 +1948,9 @@ mod tests {
         assert_eq!(report.success_count(), 1);
         let checkout = sessions.spawn_checkouts.borrow()[0]
             .clone()
-            .expect("legacy global route must bind a worker checkout");
+            .expect("explicit test checkout must bind a worker checkout");
         assert!(checkout.is_absolute());
-        assert!(checkout.ends_with(std::path::Path::new("owner/repo")));
+        assert_eq!(checkout, std::env::current_dir().unwrap());
 
         assert_eq!(store.branches.borrow().as_slice(), ["factory/bead-0-r1"]);
 
@@ -2119,6 +2126,48 @@ mod tests {
         let overlay = store.load("bead-0").unwrap().unwrap();
         assert_eq!(overlay.state, OverlayState::HumanHeld);
         assert!(!checkout.exists());
+    }
+
+    #[test]
+    fn legacy_fixture_target_is_parked_without_branch_or_spawn() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("owner/repo".into()),
+                attempt_started_at: None,
+            })
+            .unwrap();
+        let mut cfg = cfg();
+        cfg.repos.clear();
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &beads(1)).unwrap();
+
+        assert_eq!(report.success_count(), 0);
+        assert_eq!(report.failures[0].phase, "target_checkout_unconfigured");
+        assert!(store.branches.borrow().is_empty());
+        assert!(sessions
+            .calls
+            .borrow()
+            .iter()
+            .all(|call| !call.starts_with("spawn(")));
+        assert_eq!(
+            store.load("bead-0").unwrap().unwrap().state,
+            OverlayState::HumanHeld
+        );
     }
 
     /// jleechan-8jxr r2 acceptance criterion #1: a manually-created factory
