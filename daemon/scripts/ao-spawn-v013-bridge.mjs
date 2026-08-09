@@ -260,6 +260,8 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
       delete process.env.DARK_FACTORY_AO_PARENT_NODE_OPTIONS;
       delete process.env.DARK_FACTORY_AO_SPAWN_BRANCH;
       delete process.env.DARK_FACTORY_AO_V013_BRIDGE;
+      delete process.env.DARK_FACTORY_AO_TARGET_CHECKOUT;
+      delete process.env.DARK_FACTORY_AO_EXPECTED_REVISION;
       const session = await sessions.spawn({
         projectId: project,
         agent,
