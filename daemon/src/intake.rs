@@ -30,8 +30,11 @@ impl CacheFileLock {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&lock_path)
-            .map_err(|error| DaemonError::Config(format!("open adoption_probe_cache lock: {error}")))?;
+            .map_err(|error| {
+                DaemonError::Config(format!("open adoption_probe_cache lock: {error}"))
+            })?;
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
@@ -46,7 +49,10 @@ impl CacheFileLock {
                 )));
             }
         }
-        Ok(Self { path: lock_path, file })
+        Ok(Self {
+            path: lock_path,
+            file,
+        })
     }
 }
 
@@ -291,16 +297,19 @@ impl AdoptionProbeCache {
                 merged.extend(entries);
             }
         }
-        merged.extend(self.decisions.iter().map(|(key, value)| (key.clone(), value.clone())));
+        merged.extend(
+            self.decisions
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
         let entries: Vec<(ProbeCacheKey, CachedProbeDecision)> = merged.into_iter().collect();
-        let json = serde_json::to_string(&entries)
-            .map_err(|error| DaemonError::Parse(format!("serialize adoption_probe_cache: {error}")))?;
+        let json = serde_json::to_string(&entries).map_err(|error| {
+            DaemonError::Parse(format!("serialize adoption_probe_cache: {error}"))
+        })?;
         let nonce = CACHE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp = self.path.with_extension(format!(
-            "json.tmp.{}.{}",
-            std::process::id(),
-            nonce
-        ));
+        let tmp = self
+            .path
+            .with_extension(format!("json.tmp.{}.{}", std::process::id(), nonce));
         std::fs::write(&tmp, json.as_bytes())
             .map_err(|e| DaemonError::Config(format!("write adoption_probe_cache: {e}")))?;
         if let Err(error) = std::fs::rename(&tmp, &self.path) {
@@ -380,9 +389,8 @@ impl AdoptionProbeCache {
     /// ops use.
     #[allow(dead_code)]
     pub fn evict_older_than(&mut self, now_epoch: u64, max_age_secs: u64) {
-        self.decisions.retain(|_, entry| {
-            now_epoch.saturating_sub(entry.cached_at_epoch) <= max_age_secs
-        });
+        self.decisions
+            .retain(|_, entry| now_epoch.saturating_sub(entry.cached_at_epoch) <= max_age_secs);
     }
 
     /// For tests / observability: number of cached decisions.
@@ -575,15 +583,8 @@ pub fn normalize_labeled_prs_outcome(
     }
 
     // Delegate the per-PR decisions to the cache-aware variant below.
-    let (adopted, outcomes) = normalize_labeled_prs_with_cache(
-        scm,
-        tracker,
-        cfg,
-        &prs,
-        cache,
-        &mut metrics,
-        now_epoch,
-    )?;
+    let (adopted, outcomes) =
+        normalize_labeled_prs_with_cache(scm, tracker, cfg, &prs, cache, &mut metrics, now_epoch)?;
     Ok(LabeledPrsIntakeOutcome {
         adopted,
         outcomes,
@@ -1064,15 +1065,13 @@ mod tests {
     // Unit-level coverage for the pure permission-gate helper; the fake-backed
     // contract tests (idempotency, write-tier gate, mixed batch) live in
     // `daemon/tests/intake.rs` per Task 6 Step 1.
-    use crate::tools::Permission;
     use super::{resolve_target_repo, CacheFileLock};
+    use crate::tools::Permission;
 
     #[test]
     fn cache_lock_waits_for_live_owner_and_releases_after_owner_drop() {
-        let root = std::env::temp_dir().join(format!(
-            "afd_cache_lock_owner_{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("afd_cache_lock_owner_{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let cache_path = root.join("adoption_probe_cache.json");
         let owner = CacheFileLock::acquire(&cache_path).unwrap();
@@ -1093,10 +1092,8 @@ mod tests {
 
     #[test]
     fn cache_lock_three_party_contenders_never_overlap_rmw_owners() {
-        let root = std::env::temp_dir().join(format!(
-            "afd_cache_lock_three_party_{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("afd_cache_lock_three_party_{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let cache_path = root.join("adoption_probe_cache.json");
         let owner = CacheFileLock::acquire(&cache_path).unwrap();
@@ -1140,7 +1137,8 @@ mod tests {
 
     #[test]
     fn resolve_target_repo_prefers_explicit_body_field_over_external_ref() {
-        let body = "Some description.\ntarget_repo: jleechanorg/dark-factory\nexisting_branch: fix/x\n";
+        let body =
+            "Some description.\ntarget_repo: jleechanorg/dark-factory\nexisting_branch: fix/x\n";
         let got = resolve_target_repo(body, Some("jleechanorg/worldarchitect.ai#123"));
         assert_eq!(got.as_deref(), Some("jleechanorg/dark-factory"));
     }
