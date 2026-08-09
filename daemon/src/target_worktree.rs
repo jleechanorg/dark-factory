@@ -42,10 +42,12 @@ pub fn ensure_target_worktree(
     }
 
     if let Some(parent) = requested.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| DaemonError::Config(format!(
-            "create target worktree parent {}: {e}",
-            parent.display()
-        )))?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            DaemonError::Config(format!(
+                "create target worktree parent {}: {e}",
+                parent.display()
+            ))
+        })?;
     }
     let destination = requested.to_str().ok_or_else(|| {
         DaemonError::Config(format!(
