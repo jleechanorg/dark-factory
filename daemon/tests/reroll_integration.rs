@@ -950,6 +950,110 @@ fn test_reroll_adopted_explicit_target_without_checkout_never_spawns() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+#[test]
+fn test_adopted_preflight_park_does_not_count_as_semantic_reroll_rejection() {
+    let scm = FakeScm::new();
+    let sessions = FakeSessions::new();
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert(
+        "alice/my-cool-feature".into(),
+        "pre-session-sha-abc123".into(),
+    );
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"inhibitionSpecs":["no force push"],"positiveAssertions":["fix the failing check"],"securityRedactionEncountered":false}"#.into(),
+    ));
+    let mut cfg = test_cfg();
+    cfg.repos.insert(
+        cfg.target_repo.clone(),
+        RepoConfig {
+            ao_project: "repo".into(),
+            push_remote: "origin".into(),
+            local_checkout: Some("relative-not-a-checkout".into()),
+        },
+    );
+    cfg.spec_dir = std::env::temp_dir()
+        .join("afd_preflight_park_not_semantic_rejection")
+        .to_string_lossy()
+        .to_string();
+    let _ = std::fs::remove_dir_all(&cfg.spec_dir);
+    std::fs::create_dir_all(&cfg.spec_dir).unwrap();
+    let telemetry_log =
+        std::env::temp_dir().join("afd_preflight_park_not_semantic_rejection.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    let feedback = "skeptic: the failing check still needs a code fix";
+    let mut bead = adopted_overlay("bead-preflight-park");
+    store.save(&bead).unwrap();
+
+    let first_deps = RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "skeptic".into(),
+        review_text: feedback.into(),
+    };
+    assert!(matches!(
+        reroll::execute(&first_deps, &mut bead).unwrap(),
+        RerollOutcome::Held(_)
+    ));
+    assert!(sessions
+        .calls
+        .borrow()
+        .iter()
+        .all(|call| call != "spawn(bead-preflight-park)"));
+    let first_attempt = store.load(&bead.bead_id).unwrap().unwrap();
+    assert_eq!(first_attempt.pre_session_head_sha, None);
+    assert_eq!(
+        first_attempt.park_reason.as_deref(),
+        Some("target_checkout_unconfigured")
+    );
+
+    // Recovery clears the transient park reason. The no-remediation marker
+    // remains, so the re-adopted attempt must still bypass the breaker.
+    drop(first_deps);
+    cfg.repos.get_mut(&cfg.target_repo).unwrap().local_checkout =
+        Some(std::env::current_dir().unwrap());
+    bead.state = OverlayState::Attested;
+    bead.park_reason = None;
+    bead.attempt = 2;
+    bead.reroll_count = 1;
+    store.save(&bead).unwrap();
+    let resumed_deps = RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "skeptic".into(),
+        review_text: feedback.into(),
+    };
+    assert!(matches!(
+        reroll::execute(&resumed_deps, &mut bead).unwrap(),
+        RerollOutcome::Rerolled { .. }
+    ));
+    assert_eq!(
+        sessions
+            .calls
+            .borrow()
+            .iter()
+            .filter(|call| *call == "spawn(bead-preflight-park)")
+            .count(),
+        1
+    );
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap();
+    assert!(!telemetry.contains("CIRCUIT_BREAKER_TRIGGERED"));
+
+    let _ = std::fs::remove_dir_all(&cfg.spec_dir);
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 /// bead jleechan-tfs1, requirement (d): when the remediation coder session
 /// cannot be spawned, `reroll::execute` must park the bead `HUMAN_HELD`
 /// rather than fabricating a placeholder commit. This is the direct

@@ -235,6 +235,14 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
         return Ok(RerollOutcome::Aborted("bead not found in store".into()));
     }
 
+    // For adopted beads, pre_session_head_sha is captured immediately before
+    // a remediation worker is spawned. A prior attempt without that durable
+    // marker ended in preflight, so its review feedback cannot be a
+    // consecutive remediation rejection for the circuit breaker.
+    let prior_attempt_ended_before_remediation = latest
+        .as_ref()
+        .is_some_and(|overlay| overlay.is_adopted && overlay.pre_session_head_sha.is_none());
+
     bead.state = OverlayState::ReRoll;
     deps.store.save(bead)?;
 
@@ -255,7 +263,7 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
         format!("{:016x}", hasher.finish())
     };
 
-    if bead.attempt > 1 {
+    if bead.attempt > 1 && !prior_attempt_ended_before_remediation {
         if let Some((prev_reviewer, _prev_hash)) = deps.store.load_rejection(&bead.bead_id, bead.attempt - 1)? {
             if prev_reviewer == deps.reviewer {
                 let prev_text = deps.store.load_rejection_text(&bead.bead_id, bead.attempt - 1)?;
