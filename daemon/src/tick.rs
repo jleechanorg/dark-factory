@@ -2514,7 +2514,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 }
                 let comment_body = match reason {
                     "target_checkout_unconfigured" => format!(
-                        "🤖 **[dark-factory]** Escalation required: bead `{}` targets a configured repository whose `local_checkout` is missing or not absolute. Automation parked only this bead HUMAN_HELD rather than spawning from the daemon's unrelated cwd; configure `[repos.\"<repo>\"].local_checkout` before requeuing.",
+                        "🤖 **[dark-factory]** Escalation required: bead `{}` targets a configured repository whose `local_checkout` is absent, relative, or not a directory. Automation parked only this bead HUMAN_HELD rather than cloning or spawning from an invalid checkout; repair `[repos.\"<repo>\"].local_checkout` before requeuing.",
                         failure.bead_id
                     ),
                     "spawn_failed" => format!(
@@ -3419,6 +3419,19 @@ fn vacuous_red_green_for_pr(
     // Installed uv/release binaries are immutable and their CWD may not even
     // be a checkout. Resolve the target resource from config, then provision
     // a dedicated isolated checkout when the host has not created it yet.
+    let routing = match deps.cfg.resolve_repo(repo) {
+        Some(routing) => routing,
+        None => {
+            return verifier::VacuousRedGreenStatus::ManifestMissing(format!(
+                "no repository routing configured for {repo:?}"
+            ));
+        }
+    };
+    if !deps.cfg.worker_checkout_is_configured(repo, &routing) {
+        return verifier::VacuousRedGreenStatus::ManifestMissing(format!(
+            "configured local checkout for repo {repo:?} is missing, relative, or not a directory"
+        ));
+    }
     let requested = match deps.cfg.target_worktree_path(repo) {
         Some(path) => path,
         None => {

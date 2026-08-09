@@ -388,9 +388,9 @@ pub fn dispatch_ready_with_vcs(
         };
         if !cfg.worker_checkout_is_configured(&repo, &routing) {
             let error = DaemonError::Config(format!(
-                "bead {} targets fixture or malformed repo {repo:?}; its configured \
-                 local_checkout is absent/relative and is not eligible for daemon-owned \
-                 provisioning",
+                "bead {} targets fixture or invalid checkout repo {repo:?}; its configured \
+                 local_checkout is absent, relative, or not a directory and is not eligible \
+                 for daemon-owned provisioning",
                 bead.id
             ));
             overlay.state = OverlayState::HumanHeld;
@@ -2067,6 +2067,58 @@ mod tests {
         let calls = sessions.calls.borrow();
         assert!(!calls.iter().any(|call| call == "spawn(bead-0)"));
         assert!(calls.iter().any(|call| call == "spawn(bead-1)"));
+    }
+
+    #[test]
+    fn explicit_missing_absolute_checkout_fails_closed_without_spawn() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("owner/production".into()),
+                attempt_started_at: None,
+            })
+            .unwrap();
+        let mut cfg = cfg();
+        let checkout = std::env::temp_dir().join(format!(
+            "afd_dispatch_missing_checkout_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&checkout);
+        cfg.repos.insert(
+            "owner/production".into(),
+            crate::config::RepoConfig {
+                ao_project: "production".into(),
+                push_remote: "origin".into(),
+                local_checkout: Some(checkout.clone()),
+            },
+        );
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &beads(1)).unwrap();
+
+        assert_eq!(report.success_count(), 0);
+        assert_eq!(report.failures[0].phase, "target_checkout_unconfigured");
+        assert!(sessions
+            .calls
+            .borrow()
+            .iter()
+            .all(|call| !call.starts_with("spawn(")));
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::HumanHeld);
+        assert!(!checkout.exists());
     }
 
     /// jleechan-8jxr r2 acceptance criterion #1: a manually-created factory

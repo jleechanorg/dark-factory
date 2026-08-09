@@ -222,16 +222,16 @@ impl Config {
         }
         match routing.local_checkout.as_ref() {
             None => !is_fixture_repo(repo),
-            Some(checkout) => checkout.is_absolute(),
+            Some(checkout) => checkout.is_absolute() && checkout.is_dir(),
         }
     }
 }
 
 /// Test/fixture repository identities are not clone-eligible.
 pub fn is_fixture_repo(repo: &str) -> bool {
+    // Keep this allow-list explicit: production repositories whose names
+    // happen to contain `test-` or `fake-` must still run the real gates.
     matches!(repo, "owner/repo" | "other/repo" | "myorg/myrepo")
-        || repo.contains("fake-")
-        || repo.contains("test-")
 }
 
 pub fn load(path: &Path) -> Result<Config, DaemonError> {
@@ -618,6 +618,51 @@ push_remote = "origin"
         let routing = cfg.resolve_repo("owner/production").unwrap();
         assert!(cfg.worker_checkout_is_configured("owner/production", &routing));
         assert!(cfg.target_worktree_path("owner/production").is_some());
+    }
+
+    #[test]
+    fn explicit_missing_absolute_checkout_is_not_clone_eligible() {
+        let root = std::env::temp_dir().join(format!(
+            "afd_missing_checkout_{}",
+            std::process::id()
+        ));
+        let checkout = root.join("production");
+        let cfg = Config {
+            target_repo: "owner/daemon".into(),
+            ao_project: None,
+            base_branch: "main".into(),
+            stage: 1,
+            max_workers: 1,
+            max_batch: 1,
+            fast_tick_secs: 1,
+            slow_tick_secs: 1,
+            autonomy_timebox_secs: 60,
+            budget_warn_usd: 1.0,
+            spec_dir: ".factory/specs/".into(),
+            reroll_head_stability_window_secs: 30,
+            reroll_death_confirm_secs: 5,
+            held_recheck_cooldown_secs: 900,
+            repos: HashMap::from([(
+                "owner/production".into(),
+                RepoConfig {
+                    ao_project: "production".into(),
+                    push_remote: "origin".into(),
+                    local_checkout: Some(checkout.clone()),
+                },
+            )]),
+            pre_gate_validation_enabled: true,
+            escalation_refire_secs: 3600,
+        };
+        let routing = cfg.resolve_repo("owner/production").unwrap();
+        assert!(!cfg.worker_checkout_is_configured("owner/production", &routing));
+        assert_eq!(cfg.target_worktree_path("owner/production"), Some(checkout));
+    }
+
+    #[test]
+    fn production_repo_names_are_not_fixture_classified_by_substrings() {
+        for repo in ["owner/test-repo", "owner/fake-repo"] {
+            assert!(!is_fixture_repo(repo), "{repo} must remain production-shaped");
+        }
     }
 
     #[test]
