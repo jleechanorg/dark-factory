@@ -11,6 +11,7 @@
 use crate::config::Config;
 use crate::errors::DaemonError;
 use crate::tools::{LabeledPr, Permission, Scm, Tracker};
+use std::path::{Path, PathBuf};
 
 const FACTORY_LABEL: &str = "factory";
 
@@ -30,8 +31,9 @@ const FACTORY_LABEL: &str = "factory";
 //  - `metrics.probe_cache_hits/misses`: per-pass counter for cache health.
 //
 // The on-disk `AdoptionProbeCache` is keyed on
-// `(external_ref, head_sha, updated_at_epoch)` and persists at
-// `.beads/adoption_probe_cache.json`. Cache invalidation:
+// `(external_ref, head_sha, updated_at_epoch)` and persists in the daemon's
+// runtime state directory (`$DARK_FACTORY_STATE_DIR` or `~/.dark-factory`).
+// Cache invalidation:
 //   - any change to head_sha or updated_at_epoch → cache miss (re-probe)
 //   - collaborator tier change between probes → cache miss (r4 fix vs r3's
 //     stale Read→Write promotion bug)
@@ -141,7 +143,7 @@ pub enum CachedDecisionKind {
 /// promotion: 1 hour. Matches the launchd watchdog's recovery cadence.
 pub const MAX_CACHED_PERMISSION_AGE_SECS: u64 = 3_600;
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct AdoptionProbeCache {
     /// keyed by `ProbeCacheKey`. The hash impl treats `(Some, Some)` as a
     /// distinct key from `(Some, None)` so PRs whose `updated_at_epoch`
@@ -149,15 +151,33 @@ pub struct AdoptionProbeCache {
     /// independently — `None` keys still get cached, just separately from
     /// `Some` keys.
     decisions: std::collections::HashMap<ProbeCacheKey, CachedProbeDecision>,
+    path: PathBuf,
 }
 
-/// On-disk persistence file for the adoption-probe cache. Survives daemon
-/// restarts so a freshly-spawned daemon doesn't re-probe the entire
-/// factory-labeled PR set on its first slow tick (which would burn ~50 gh
-/// API calls at startup). The file is rewritten on every slow-tier pass
-/// via `persist`; `load` is best-effort and silently returns an empty
-/// cache on missing/corrupt files.
-pub const ADOPTION_PROBE_CACHE_FILE: &str = ".beads/adoption_probe_cache.json";
+/// Mutable state belongs to the daemon runtime directory, not the immutable
+/// installed release or a target repository checkout.
+pub fn runtime_state_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("DARK_FACTORY_STATE_DIR") {
+        return PathBuf::from(dir);
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".dark-factory");
+    }
+    std::env::temp_dir().join("dark-factory")
+}
+
+pub fn adoption_probe_cache_path() -> PathBuf {
+    runtime_state_dir().join("adoption_probe_cache.json")
+}
+
+impl Default for AdoptionProbeCache {
+    fn default() -> Self {
+        Self {
+            decisions: std::collections::HashMap::new(),
+            path: adoption_probe_cache_path(),
+        }
+    }
+}
 
 impl AdoptionProbeCache {
     /// Construct an empty cache (no persistence). Use
@@ -166,25 +186,39 @@ impl AdoptionProbeCache {
         Self::default()
     }
 
-    /// Load the cache from `ADOPTION_PROBE_CACHE_FILE` if present;
-    /// otherwise return an empty cache. Never errors out — a corrupt or
-    /// absent file just means "cold cache, probe everything" (the pre-fix
-    /// behavior).
-    pub fn load_or_default() -> Self {
-        let raw = match std::fs::read_to_string(ADOPTION_PROBE_CACHE_FILE) {
+    pub fn load_or_default_at(path: impl AsRef<Path>) -> Self {
+        let path = path.as_ref().to_path_buf();
+        let raw = match std::fs::read_to_string(&path) {
             Ok(s) => s,
-            Err(_) => return Self::default(),
+            Err(_) => {
+                return Self {
+                    decisions: std::collections::HashMap::new(),
+                    path,
+                }
+            }
         };
         match serde_json::from_str::<Vec<(ProbeCacheKey, CachedProbeDecision)>>(&raw) {
             Ok(entries) => Self {
                 decisions: entries.into_iter().collect(),
+                path,
             },
-            Err(_) => Self::default(),
+            Err(_) => Self {
+                decisions: std::collections::HashMap::new(),
+                path,
+            },
         }
     }
 
-    /// Persist the cache to `ADOPTION_PROBE_CACHE_FILE`. Best-effort:
-    /// writes are atomic via `tempfile` + `rename`, so a crash mid-write
+    /// Load the cache from the runtime-state cache path if present;
+    /// otherwise return an empty cache. Never errors out — a corrupt or
+    /// absent file just means "cold cache, probe everything" (the pre-fix
+    /// behavior).
+    pub fn load_or_default() -> Self {
+        Self::load_or_default_at(adoption_probe_cache_path())
+    }
+
+    /// Persist the cache to the runtime-state cache path. Best-effort:
+    /// writes are atomic via a sibling temporary file + `rename`, so a crash mid-write
     /// leaves either the old or the new file intact (never a half-written
     /// file the next daemon boot would fail to parse).
     pub fn persist(&self) -> Result<(), DaemonError> {
@@ -200,13 +234,13 @@ impl AdoptionProbeCache {
         let json = serde_json::to_string(&entries).map_err(|e| {
             DaemonError::Parse(format!("serialize adoption_probe_cache: {e}"))
         })?;
-        if let Some(parent) = std::path::Path::new(ADOPTION_PROBE_CACHE_FILE).parent() {
+        if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let tmp = format!("{ADOPTION_PROBE_CACHE_FILE}.tmp");
+        let tmp = self.path.with_extension("json.tmp");
         std::fs::write(&tmp, json.as_bytes())
             .map_err(|e| DaemonError::Config(format!("write adoption_probe_cache: {e}")))?;
-        std::fs::rename(&tmp, ADOPTION_PROBE_CACHE_FILE).map_err(|e| {
+        std::fs::rename(&tmp, &self.path).map_err(|e| {
             DaemonError::Config(format!(
                 "rename adoption_probe_cache tmp->final: {e}"
             ))

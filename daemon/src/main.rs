@@ -294,9 +294,7 @@ fn dirs_home_log_path() -> Option<PathBuf> {
 }
 
 fn default_state_db_path() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(|home| Path::new(&home).join(".dark-factory/daemon-cxdb.sqlite"))
-        .unwrap_or_else(|| PathBuf::from("daemon-cxdb.sqlite"))
+    daemon::intake::runtime_state_dir().join("daemon-cxdb.sqlite")
 }
 
 fn load_config(path: &Path) -> Result<Config, DaemonError> {

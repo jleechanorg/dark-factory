@@ -3408,19 +3408,30 @@ fn vacuous_red_green_for_pr(
         return verifier::VacuousRedGreenStatus::NotProvided;
     }
 
-    // The detector needs a local working tree to revert + cargo-run.
-    // The daemon's own CWD is a checkout of `cfg.target_repo` (the
-    // canonical dark-factory source tree) for the Stage-2 production
-    // lane; if the current CWD does not contain a Cargo.toml, the
-    // detector has no manifest to run against, and we surface that as
-    // ManifestMissing rather than silently treating NEVER_RAN as a
-    // vacuous pass (issue #387 r5 finding 3).
-    let repo_root = match std::env::current_dir() {
-        Ok(p) => p,
-        Err(_) => {
-            return verifier::VacuousRedGreenStatus::ManifestMissing(
-                "could not read daemon cwd".to_string(),
-            );
+    // The detector needs a local working tree to revert + cargo-run. Resolve
+    // the bead's target execution resource, never the daemon binary's CWD:
+    // Installed uv/release binaries are immutable and their CWD may not even
+    // be a checkout. Resolve the target resource from config, then provision
+    // a dedicated isolated checkout when the host has not created it yet.
+    let requested = match deps.cfg.target_worktree_path(repo) {
+        Some(path) => path,
+        None => {
+            return verifier::VacuousRedGreenStatus::ManifestMissing(format!(
+                "no target worktree path available for repo {repo:?}"
+            ));
+        }
+    };
+    let repo_root = match crate::target_worktree::ensure_target_worktree(
+        repo,
+        &requested,
+        Some(&snapshot.head_sha),
+    ) {
+        Ok(path) => path,
+        Err(error) => {
+            return verifier::VacuousRedGreenStatus::ManifestMissing(format!(
+                "provision target worktree for repo {repo:?} at {}: {error}",
+                requested.display()
+            ));
         }
     };
     let manifest = match crate::vacuous_red_green::find_cargo_manifest(&repo_root) {

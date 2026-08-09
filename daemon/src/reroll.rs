@@ -1173,6 +1173,18 @@ fn execute_adopted(
     // with `deps.cfg.ao_project` unset (rather than panicking/unwrapping)
     // keeps this path inert if that restriction is ever lifted before the
     // Stage C/D call-site sweep reaches this function.
+    let adopted_repo = bead.repo(deps.cfg).to_string();
+    let adopted_routing = deps.cfg.resolve_repo(&adopted_repo).unwrap_or_else(|| {
+        crate::config::RepoRouting {
+            ao_project: deps
+                .cfg
+                .ao_project
+                .clone()
+                .unwrap_or_else(|| adopted_repo.clone()),
+            push_remote: "origin".to_string(),
+            local_checkout: None,
+        }
+    });
     let spec = SpawnSpec {
         bead_id: bead.bead_id.clone(),
         branch: branch.clone(),

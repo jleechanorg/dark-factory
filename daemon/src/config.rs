@@ -1,6 +1,6 @@
 use crate::errors::DaemonError;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// One `[repos."<owner>/<repo>"]` table entry (bead jleechan-35y4, Stage B of
 /// the multi-repo dispatch fix — see
@@ -137,6 +137,35 @@ fn default_reroll_death_confirm_secs() -> u64 {
 }
 
 impl Config {
+    /// Resolve the target repository checkout used by execution-time gates.
+    /// Explicit `local_checkout` wins. When omitted, reuse a host-managed
+    /// checkout under `$HOME/projects/<repo>` or an isolated target-worktree
+    /// under `$DARK_FACTORY_TARGET_WORKTREE_ROOT` (defaulting to
+    /// `$HOME/.dark-factory/target-worktrees`). The daemon's own current
+    /// directory is intentionally never used: release binaries are commonly
+    /// launched from an immutable uv/archive path.
+    pub fn target_worktree_path(&self, repo: &str) -> Option<PathBuf> {
+        let routing = self.resolve_repo(repo)?;
+        if let Some(path) = routing.local_checkout {
+            return Some(path);
+        }
+        let name = repo.split('/').next_back()?;
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let conventional = home.as_ref().map(|h| h.join("projects").join(name));
+        if conventional.as_ref().is_some_and(|path| path.is_dir()) {
+            return conventional;
+        }
+        let isolated_root = std::env::var_os("DARK_FACTORY_TARGET_WORKTREE_ROOT")
+            .map(PathBuf::from)
+            .or_else(|| home.map(|h| h.join(".dark-factory/target-worktrees")))?;
+        Some(isolated_root.join(name))
+    }
+
+    pub fn target_worktree(&self, repo: &str) -> Option<PathBuf> {
+        let path = self.target_worktree_path(repo)?;
+        path.is_dir().then_some(path)
+    }
+
     /// Resolve dispatch routing for `repo` (`overlay.repo(self)`'s output).
     /// `Some(routing)` when `repo` is KNOWN — either an explicit
     /// `[repos."<repo>"]` entry, or `repo == self.target_repo` (the
@@ -483,5 +512,73 @@ spec_dir = ".factory/specs/"
                 local_checkout: None,
             })
         );
+    }
+
+    #[test]
+    fn target_worktree_prefers_explicit_local_checkout() {
+        let root = std::env::temp_dir().join(format!("afd_target_worktree_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let cfg_path = root.join("daemon.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                r#"target_repo = "owner/daemon"
+base_branch = "main"
+stage = 1
+max_workers = 1
+max_batch = 1
+fast_tick_secs = 1
+slow_tick_secs = 1
+autonomy_timebox_secs = 60
+budget_warn_usd = 1.0
+spec_dir = ".factory/specs/"
+[repos."owner/target"]
+ao_project = "target"
+push_remote = "origin"
+local_checkout = "{}"
+"#,
+                root.join("target-checkout").display()
+            ),
+        )
+        .unwrap();
+        let cfg = load(&cfg_path).unwrap();
+        let expected = root.join("target-checkout");
+        assert_eq!(cfg.target_worktree_path("owner/target"), Some(expected));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn target_worktree_reuses_isolated_checkout_when_local_checkout_is_missing() {
+        let root = std::env::temp_dir().join(format!("afd_isolated_target_{}", std::process::id()));
+        let isolated = root.join("target");
+        std::fs::create_dir_all(&isolated).unwrap();
+        let previous = std::env::var_os("DARK_FACTORY_TARGET_WORKTREE_ROOT");
+        std::env::set_var("DARK_FACTORY_TARGET_WORKTREE_ROOT", &root);
+        let cfg_path = root.join("daemon.toml");
+        std::fs::write(
+            &cfg_path,
+            r#"target_repo = "owner/daemon"
+base_branch = "main"
+stage = 1
+max_workers = 1
+max_batch = 1
+fast_tick_secs = 1
+slow_tick_secs = 1
+autonomy_timebox_secs = 60
+budget_warn_usd = 1.0
+spec_dir = ".factory/specs/"
+[repos."owner/target"]
+ao_project = "target"
+push_remote = "origin"
+"#,
+        )
+        .unwrap();
+        let cfg = load(&cfg_path).unwrap();
+        assert_eq!(cfg.target_worktree("owner/target"), Some(isolated));
+        match previous {
+            Some(value) => std::env::set_var("DARK_FACTORY_TARGET_WORKTREE_ROOT", value),
+            None => std::env::remove_var("DARK_FACTORY_TARGET_WORKTREE_ROOT"),
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 }

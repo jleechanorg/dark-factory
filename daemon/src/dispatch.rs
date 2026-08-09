@@ -2364,7 +2364,7 @@ mod tests {
             crate::config::RepoConfig {
                 ao_project: "worldarchitect".to_string(),
                 push_remote: "worldai".to_string(),
-                local_checkout: Some(std::env::current_dir().unwrap()),
+               local_checkout: Some(std::env::current_dir().unwrap()),
             },
         );
         let ready = beads(1);
@@ -3473,7 +3473,7 @@ mod tests {
             crate::config::RepoConfig {
                 ao_project: "worldarchitect".to_string(),
                 push_remote: "worldai".to_string(),
-                local_checkout: Some(std::env::current_dir().unwrap()),
+               local_checkout: Some(std::env::current_dir().unwrap()),
             },
         );
         let ready = beads(1);

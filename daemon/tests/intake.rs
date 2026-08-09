@@ -31,6 +31,33 @@ fn test_cfg() -> Config {
     }
 }
 
+#[test]
+fn adoption_probe_cache_persists_in_runtime_state_not_target_beads_dir() {
+    let root = std::env::temp_dir().join(format!(
+        "afd_adoption_cache_runtime_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let cache_path = root.join("adoption_probe_cache.json");
+    let key = ProbeCacheKey {
+        external_ref: "owner/repo#1".into(),
+        head_sha: Some("head".into()),
+        updated_at_epoch: Some(1),
+    };
+    let mut cache = AdoptionProbeCache::load_or_default_at(&cache_path);
+    cache.insert(key.clone(), CachedDecisionKind::AuthorPermission(Permission::Write), 1);
+    cache.persist().unwrap();
+
+    assert!(cache_path.is_file());
+    assert!(!root.join(".beads/adoption_probe_cache.json").exists());
+    let restored = AdoptionProbeCache::load_or_default_at(&cache_path);
+    assert!(restored.contains(&key));
+    let _ = std::fs::remove_dir_all(root);
+}
+
 fn issue(number: u64, author_login: &str) -> Issue {
     Issue {
         number,
