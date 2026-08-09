@@ -137,6 +137,19 @@ impl StateStore for SqliteTestStore {
     ) -> Result<Option<(String, String)>, daemon::errors::DaemonError> {
         self.store.load_rejection(bead_id, attempt)
     }
+    fn remediation_session_spawned_attempt(
+        &self,
+        bead_id: &str,
+    ) -> Result<Option<u32>, daemon::errors::DaemonError> {
+        self.store.remediation_session_spawned_attempt(bead_id)
+    }
+    fn mark_remediation_session_spawned(
+        &self,
+        bead_id: &str,
+        attempt: u32,
+    ) -> Result<(), daemon::errors::DaemonError> {
+        self.store.mark_remediation_session_spawned(bead_id, attempt)
+    }
     fn escalation_should_emit(
         &self,
         bead_id: &str,
@@ -182,6 +195,35 @@ fn now_epoch() -> u64 {
 }
 
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[test]
+fn adopted_remediation_marker_is_migrated_and_persistent() {
+    let store = SqliteTestStore::new();
+    assert_eq!(
+        store
+            .remediation_session_spawned_attempt("marker-bead")
+            .unwrap(),
+        None
+    );
+    store
+        .mark_remediation_session_spawned("marker-bead", 7)
+        .unwrap();
+    assert_eq!(
+        store
+            .remediation_session_spawned_attempt("marker-bead")
+            .unwrap(),
+        Some(7)
+    );
+    let table_exists: i64 = store
+        .inspect
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'remediation_session_spawned'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(table_exists, 1, "legacy-store migration must create marker table");
+}
 
 fn test_repo_cfg(project: &str) -> RepoConfig {
     RepoConfig {

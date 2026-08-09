@@ -235,13 +235,19 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
         return Ok(RerollOutcome::Aborted("bead not found in store".into()));
     }
 
-    // For adopted beads, pre_session_head_sha is captured immediately before
-    // a remediation worker is spawned. A prior attempt without that durable
-    // marker ended in preflight, so its review feedback cannot be a
-    // consecutive remediation rejection for the circuit breaker.
-    let prior_attempt_ended_before_remediation = latest
-        .as_ref()
-        .is_some_and(|overlay| overlay.is_adopted && overlay.pre_session_head_sha.is_none());
+    // `pre_session_head_sha` is a pre-spawn crash-recovery intent and is not
+    // evidence that a remediation worker ever started. The separate marker
+    // is written only after sessions.spawn succeeds and the DISPATCHED
+    // overlay is persisted, so preflight and spawn-failure attempts bypass
+    // the semantic breaker while a genuinely completed prior remediation
+    // still trips it.
+    let prior_remediation_spawned = if latest.as_ref().is_some_and(|o| o.is_adopted) {
+        deps.store
+            .remediation_session_spawned_attempt(&bead.bead_id)?
+            .is_some_and(|attempt| attempt == bead.attempt.saturating_sub(1))
+    } else {
+        false
+    };
 
     bead.state = OverlayState::ReRoll;
     deps.store.save(bead)?;
@@ -263,7 +269,7 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
         format!("{:016x}", hasher.finish())
     };
 
-    if bead.attempt > 1 && !prior_attempt_ended_before_remediation {
+    if bead.attempt > 1 && (!bead.is_adopted || prior_remediation_spawned) {
         if let Some((prev_reviewer, _prev_hash)) = deps.store.load_rejection(&bead.bead_id, bead.attempt - 1)? {
             if prev_reviewer == deps.reviewer {
                 let prev_text = deps.store.load_rejection_text(&bead.bead_id, bead.attempt - 1)?;
@@ -1146,7 +1152,8 @@ fn execute_adopted(
         }
     };
 
-    let next_attempt = bead.attempt + 1;
+    let remediation_attempt = bead.attempt;
+    let next_attempt = remediation_attempt + 1;
     let prompt = format!(
         "Address the following code review feedback from {reviewer} on this pull \
          request (attempt {attempt}). Work ONLY on the existing branch `{branch}` - \
@@ -1273,6 +1280,10 @@ fn execute_adopted(
                 deps.store.save(bead)?;
                 return Err(save_error);
             }
+            // Mark the semantic attempt only after both the external spawn
+            // and the durable DISPATCHED overlay save have succeeded.
+            deps.store
+                .mark_remediation_session_spawned(&bead.bead_id, remediation_attempt)?;
             emit_telemetry(
                 deps.telemetry_log,
                 &bead.bead_id,

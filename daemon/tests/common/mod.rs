@@ -1218,6 +1218,9 @@ pub struct FakeStateStore {
     /// (mirrors the `gate_regression_count` SQLite column). Bumped atomically
     /// by `incr_gate_regression_count` and consulted by `MAX_GATE_REGRESSIONS`.
     pub gate_regression_counts: RefCell<HashMap<String, u32>>,
+    /// Durable adopted-remediation lifecycle marker (mirrors the SQLite
+    /// `remediation_session_spawned` table).
+    pub remediation_session_spawned_attempt: RefCell<HashMap<String, u32>>,
     /// 1s2q-escalation-dedup: per-(bead_id, reason) escalation ledger rows
     /// (mirrors the `escalation_ledger` SQLite table). Each entry is
     /// `(context_hash, last_emitted_epoch, terminal)`. Used by the fake's
@@ -1555,6 +1558,28 @@ impl StateStore for FakeStateStore {
             .borrow()
             .get(&(bead_id.to_string(), attempt))
             .map(|(_, _, feedback_text)| feedback_text.clone()))
+    }
+
+    fn remediation_session_spawned_attempt(
+        &self,
+        bead_id: &str,
+    ) -> Result<Option<u32>, DaemonError> {
+        Ok(self
+            .remediation_session_spawned_attempt
+            .borrow()
+            .get(bead_id)
+            .copied())
+    }
+
+    fn mark_remediation_session_spawned(
+        &self,
+        bead_id: &str,
+        attempt: u32,
+    ) -> Result<(), DaemonError> {
+        self.remediation_session_spawned_attempt
+            .borrow_mut()
+            .insert(bead_id.to_string(), attempt);
+        Ok(())
     }
 
     fn escalation_should_emit(

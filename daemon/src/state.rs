@@ -280,6 +280,27 @@ pub trait StateStore {
     ) -> Result<Option<String>, DaemonError> {
         Ok(None)
     }
+    /// Return the adopted remediation attempt whose worker session was
+    /// successfully spawned and persisted. This marker is deliberately
+    /// separate from `pre_session_head_sha`: that SHA is written before the
+    /// external spawn boundary and therefore cannot prove remediation began.
+    /// A missing marker means the prior attempt stopped in preflight or spawn
+    /// failure and must not trip the semantic circuit breaker.
+    fn remediation_session_spawned_attempt(
+        &self,
+        _bead_id: &str,
+    ) -> Result<Option<u32>, DaemonError> {
+        Ok(None)
+    }
+    /// Persist the durable attempt marker after an adopted remediation
+    /// session has spawned and the resulting DISPATCHED overlay was saved.
+    fn mark_remediation_session_spawned(
+        &self,
+        _bead_id: &str,
+        _attempt: u32,
+    ) -> Result<(), DaemonError> {
+        Ok(())
+    }
     /// Read the `(attempt_count, last_attempt_epoch_secs)` pair for the
     /// `/er` runner (bead jleechan-qqq). Default impl returns `(0, None)`
     /// so test fakes that don't override it get the "never spawned" state.
@@ -744,6 +765,7 @@ impl SqliteStateStore {
         Self::ensure_held_recheck_after_column(&conn)?;
         Self::ensure_last_er_evidence_hash_column(&conn)?;
         Self::ensure_last_all_green_columns(&conn)?;
+        Self::ensure_remediation_session_spawned_table(&conn)?;
         Self::ensure_disposition_required_state(&conn)?;
         Self::ensure_escalation_ledger_table(&conn)?;
         Self::ensure_escalation_ledger_terminal_column(&conn)?;
@@ -770,6 +792,7 @@ impl SqliteStateStore {
         Self::ensure_held_recheck_after_column(&conn)?;
         Self::ensure_last_er_evidence_hash_column(&conn)?;
         Self::ensure_last_all_green_columns(&conn)?;
+        Self::ensure_remediation_session_spawned_table(&conn)?;
         Self::ensure_disposition_required_state(&conn)?;
         Self::ensure_escalation_ledger_table(&conn)?;
         Self::ensure_escalation_ledger_terminal_column(&conn)?;
@@ -1128,6 +1151,22 @@ impl SqliteStateStore {
                 )
             })?;
         }
+        Ok(())
+    }
+
+    /// Idempotent migration for the adopted-remediation lifecycle marker.
+    /// Unlike `pre_session_head_sha`, which is intentionally persisted before
+    /// crossing the external AO spawn boundary, this table is written only
+    /// after a successful spawn and a successful DISPATCHED overlay save.
+    fn ensure_remediation_session_spawned_table(conn: &Connection) -> Result<(), DaemonError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS remediation_session_spawned (\
+               bead_id TEXT PRIMARY KEY,\
+               attempt INTEGER NOT NULL,\
+               updated_at TEXT NOT NULL\
+             )",
+        )
+        .map_err(|e| tool_err("ensure_remediation_session_spawned_table", e))?;
         Ok(())
     }
 
@@ -1981,6 +2020,38 @@ impl StateStore for SqliteStateStore {
             )
             .optional()
             .map_err(|e| tool_err("load_rejection_text", e))
+    }
+
+    fn remediation_session_spawned_attempt(
+        &self,
+        bead_id: &str,
+    ) -> Result<Option<u32>, DaemonError> {
+        self.conn
+            .query_row(
+                "SELECT attempt FROM remediation_session_spawned WHERE bead_id = ?1",
+                params![bead_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|value| value.map(|attempt| attempt.max(0) as u32))
+            .map_err(|e| tool_err("remediation_session_spawned_attempt", e))
+    }
+
+    fn mark_remediation_session_spawned(
+        &self,
+        bead_id: &str,
+        attempt: u32,
+    ) -> Result<(), DaemonError> {
+        self.conn
+            .execute(
+                "INSERT INTO remediation_session_spawned (bead_id, attempt, updated_at) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(bead_id) DO UPDATE SET \
+                   attempt = excluded.attempt, updated_at = excluded.updated_at",
+                params![bead_id, attempt, now_iso8601()],
+            )
+            .map_err(|e| tool_err("mark_remediation_session_spawned", e))?;
+        Ok(())
     }
 
     fn er_runner_attempt(&self, bead_id: &str) -> Result<(u32, Option<u64>), DaemonError> {
