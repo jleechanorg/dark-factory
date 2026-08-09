@@ -279,7 +279,12 @@ fn refresh_existing_if_stale(path: &Path, head_sha: Option<&str>) -> Result<(), 
         &path_str,
         600,
     )?;
-    run_tool_in_dir("git", &["checkout", "--detach", expected], &path_str, 60)?;
+    run_tool_in_dir(
+        "git",
+        &["checkout", "--no-overwrite-ignore", "--detach", expected],
+        &path_str,
+        60,
+    )?;
     verify_head(path, Some(expected))
 }
 
@@ -587,11 +592,13 @@ mod tests {
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::create_dir_all(&target).unwrap();
         std::fs::write(&state, old_head).unwrap();
+        let ignored_artifact = target.join("ignored-artifact");
+        std::fs::write(&ignored_artifact, "preserve me").unwrap();
         let fake_git = bin.join("git");
         std::fs::write(
             &fake_git,
             format!(
-                "#!/bin/sh\ncase \"$1:$2\" in\n  remote:get-url) printf '%s\\n' 'https://github.com/owner/repo.git' ;;\n  rev-parse:HEAD) cat '{}' ;;\n  status:--porcelain) {} ;;\n  fetch:--depth=1) printf '%s' '{}' > '{}' ;;\n  checkout:--detach) printf '%s' \"$3\" > '{}' ;;\n  *) exit 1 ;;\nesac\n",
+                "#!/bin/sh\ncase \"$1:$2\" in\n  remote:get-url) printf '%s\\n' 'https://github.com/owner/repo.git' ;;\n  rev-parse:HEAD) cat '{}' ;;\n  status:--porcelain) {} ;;\n  fetch:--depth=1) printf '%s' '{}' > '{}' ;;\n  checkout:--no-overwrite-ignore) test \"$3\" = --detach || exit 1; printf '%s' \"$4\" > '{}' ;;\n  *) exit 1 ;;\nesac\n",
                 state.display(),
                 if dirty { "printf ' M operator-note\\n'" } else { "exit 0" },
                 new_head,
@@ -631,6 +638,10 @@ mod tests {
         } else {
             assert_eq!(result.unwrap(), target);
             assert_eq!(std::fs::read_to_string(&state).unwrap(), new_head);
+            assert_eq!(
+                std::fs::read_to_string(ignored_artifact).unwrap(),
+                "preserve me"
+            );
         }
         std::fs::remove_dir_all(root).unwrap();
     }
