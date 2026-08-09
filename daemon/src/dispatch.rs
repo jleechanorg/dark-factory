@@ -10,7 +10,7 @@ use crate::router::RoutingVerdict;
 use crate::state::{
     set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore,
 };
-use crate::tools::{remote_url_for_display, remote_url_matches_repo, Bead, Sessions, SpawnSpec};
+use crate::tools::{remote_url_for_display, remote_url_matches_repo, Bead, Sessions, SpawnSpec, Vcs};
 
 #[cfg(test)]
 const SPAWN_CLEANUP_FAILED_PARK_REASON: &str = "spawn_cleanup_failed";
@@ -203,6 +203,19 @@ pub fn dispatch_ready(
     store: &dyn StateStore,
     cfg: &Config,
     ready: &[(Bead, RoutingVerdict, DriveBranchDecision)],
+) -> Result<DispatchReport, DaemonError> {
+    dispatch_ready_with_vcs(sessions, store, cfg, ready, None)
+}
+
+/// Production dispatch variant: resolve each routed repository's authoritative
+/// base revision before AO, so the expected revision is durable in DISPATCHING
+/// and the adapter can reject a stale same-origin checkout.
+pub fn dispatch_ready_with_vcs(
+    sessions: &dyn Sessions,
+    store: &dyn StateStore,
+    cfg: &Config,
+    ready: &[(Bead, RoutingVerdict, DriveBranchDecision)],
+    vcs: Option<&dyn Vcs>,
 ) -> Result<DispatchReport, DaemonError> {
     let active = sessions.active_count()?;
     let free_slots = cfg.max_workers.saturating_sub(active);
@@ -500,6 +513,38 @@ pub fn dispatch_ready(
             return Err(err);
         }
 
+        let expected_revision = match vcs {
+            Some(vcs) => match vcs.base_head_for_repo(&repo, &cfg.base_branch) {
+                Ok(sha) if !sha.trim().is_empty() => sha,
+                Ok(_) => {
+                    let error = DaemonError::Config(format!(
+                        "authoritative base revision for repo {repo:?} is empty"
+                    ));
+                    overlay.state = OverlayState::HumanHeld;
+                    set_human_hold_reason(&mut overlay, HumanHoldReason::TargetCheckoutUnconfigured);
+                    store.save(&overlay)?;
+                    report.failures.push(failure(
+                        bead, overlay.attempt, None, "expected_revision_unavailable", error,
+                    ));
+                    continue;
+                }
+                Err(error) => {
+                    overlay.state = OverlayState::HumanHeld;
+                    set_human_hold_reason(&mut overlay, HumanHoldReason::TargetCheckoutUnconfigured);
+                    store.save(&overlay)?;
+                    report.failures.push(failure(
+                        bead, overlay.attempt, None, "expected_revision_unavailable", error,
+                    ));
+                    continue;
+                }
+            },
+            None => overlay
+                .pre_session_head_sha
+                .clone()
+                .unwrap_or_else(|| "test-unverified-revision".to_string()),
+        };
+        overlay.pre_session_head_sha = Some(expected_revision.clone());
+        store.save(&overlay)?;
         let preamble = dispatch_prompt_preamble(&repo, &routing.push_remote, &branch);
         let prompt = match verdict {
             RoutingVerdict::ResearchPath => {
@@ -531,7 +576,7 @@ pub fn dispatch_ready(
             ao_project: routing.ao_project.clone(),
             remote: routing.push_remote.clone(),
             local_checkout: Some(worker_checkout),
-            expected_revision: overlay.pre_session_head_sha.clone(),
+            expected_revision: Some(expected_revision.clone()),
         };
         let session_id = match sessions.spawn(&spec) {
             Ok(session_id) => session_id,

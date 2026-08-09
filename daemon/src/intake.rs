@@ -58,7 +58,9 @@ impl Drop for CacheFileLock {
             const LOCK_UN: i32 = 8;
             let _ = unsafe { flock(self.file.as_raw_fd(), LOCK_UN) };
         }
-        let _ = std::fs::remove_file(&self.path);
+        // Keep the lock inode persistent. Removing it would let a waiting
+        // contender open a different inode and bypass an owner that still
+        // holds the kernel lock.
     }
 }
 
@@ -1086,6 +1088,40 @@ mod tests {
         drop(owner);
         waiter.join().unwrap();
         assert!(acquired.load(std::sync::atomic::Ordering::SeqCst));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cache_lock_three_party_contenders_never_overlap_rmw_owners() {
+        let root = std::env::temp_dir().join(format!(
+            "afd_cache_lock_three_party_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let cache_path = root.join("adoption_probe_cache.json");
+        let owner = CacheFileLock::acquire(&cache_path).unwrap();
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut contenders = Vec::new();
+        for _ in 0..2 {
+            let path = cache_path.clone();
+            let active = active.clone();
+            let max_active = max_active.clone();
+            contenders.push(std::thread::spawn(move || {
+                let _lock = CacheFileLock::acquire(&path).unwrap();
+                let now = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                max_active.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        assert_eq!(active.load(std::sync::atomic::Ordering::SeqCst), 0);
+        drop(owner);
+        for contender in contenders {
+            contender.join().unwrap();
+        }
+        assert_eq!(max_active.load(std::sync::atomic::Ordering::SeqCst), 1);
         std::fs::remove_dir_all(root).unwrap();
     }
 

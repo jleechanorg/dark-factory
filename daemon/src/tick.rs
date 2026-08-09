@@ -2194,7 +2194,13 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             return Ok(());
         }
         let dispatch_report =
-            dispatch::dispatch_ready(deps.sessions, deps.store, deps.cfg, &ready)?;
+            dispatch::dispatch_ready_with_vcs(
+                deps.sessions,
+                deps.store,
+                deps.cfg,
+                &ready,
+                Some(deps.vcs),
+            )?;
         summary.beads_dispatched += dispatch_report.success_count();
 
         for failure in &dispatch_report.failures {
