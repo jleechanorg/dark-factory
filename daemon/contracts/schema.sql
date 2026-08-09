@@ -196,6 +196,16 @@ CREATE TABLE IF NOT EXISTS review_rejection (
   PRIMARY KEY (bead_id, attempt)
 );
 
+-- Durable lifecycle marker for adopted remediation. `pre_session_head_sha`
+-- is written before worker spawn for crash reconciliation and cannot prove
+-- that remediation actually began. This row is written only after a
+-- successful sessions.spawn and DISPATCHED overlay persistence.
+CREATE TABLE IF NOT EXISTS remediation_session_spawned (
+  bead_id    TEXT PRIMARY KEY,
+  attempt    INTEGER NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 -- Escalation dedup ledger (1s2q-escalation-dedup): per-(bead_id, reason) record
 -- of the last emitted ESCALATION_REQUIRED / ESCALATION_NOTIFICATION_FAILED
 -- event's context hash + epoch. The tick engine consults this before emitting:

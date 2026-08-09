@@ -737,6 +737,26 @@ fn test_reroll_adopted_success_spawns_remediation_session_leaves_pr_open() {
         Some("pre-session-sha-abc123"),
         "adopted remediation must capture the pre-session HEAD SHA for later force-push detection"
     );
+    assert_eq!(
+        store
+            .remediation_session_spawned_attempt
+            .borrow()
+            .get("bead-adopted"),
+        Some(&1),
+        "semantic marker must identify the attempt that actually spawned remediation"
+    );
+
+    // The immediately following adopted attempt has the same reviewer and
+    // feedback, so the durable marker must trip the semantic breaker.
+    let mut retry = updated.clone();
+    retry.state = OverlayState::Attested;
+    retry.session_id = None;
+    store.save(&retry).unwrap();
+    let retry_outcome = reroll::execute(&deps, &mut retry).unwrap();
+    assert!(
+        matches!(retry_outcome, RerollOutcome::Held(ref reason) if reason.contains("circuit-breaker")),
+        "a genuinely remediated prior attempt must still trip the breaker: {retry_outcome:?}"
+    );
 
     // (c) Never force-pushes/rewrites history, never fabricates a branch or
     // daemon-side placeholder commit:
@@ -950,6 +970,222 @@ fn test_reroll_adopted_explicit_target_without_checkout_never_spawns() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+#[test]
+fn test_adopted_preflight_park_does_not_count_as_semantic_reroll_rejection() {
+    let scm = FakeScm::new();
+    let sessions = FakeSessions::new();
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert(
+        "alice/my-cool-feature".into(),
+        "pre-session-sha-abc123".into(),
+    );
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"inhibitionSpecs":["no force push"],"positiveAssertions":["fix the failing check"],"securityRedactionEncountered":false}"#.into(),
+    ));
+    let mut cfg = test_cfg();
+    cfg.repos.insert(
+        cfg.target_repo.clone(),
+        RepoConfig {
+            ao_project: "repo".into(),
+            push_remote: "origin".into(),
+            local_checkout: Some("relative-not-a-checkout".into()),
+        },
+    );
+    cfg.spec_dir = std::env::temp_dir()
+        .join("afd_preflight_park_not_semantic_rejection")
+        .to_string_lossy()
+        .to_string();
+    let _ = std::fs::remove_dir_all(&cfg.spec_dir);
+    std::fs::create_dir_all(&cfg.spec_dir).unwrap();
+    let telemetry_log =
+        std::env::temp_dir().join("afd_preflight_park_not_semantic_rejection.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    let feedback = "skeptic: the failing check still needs a code fix";
+    let mut bead = adopted_overlay("bead-preflight-park");
+    store.save(&bead).unwrap();
+
+    let first_deps = RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "skeptic".into(),
+        review_text: feedback.into(),
+    };
+    assert!(matches!(
+        reroll::execute(&first_deps, &mut bead).unwrap(),
+        RerollOutcome::Held(_)
+    ));
+    assert!(sessions
+        .calls
+        .borrow()
+        .iter()
+        .all(|call| call != "spawn(bead-preflight-park)"));
+    let first_attempt = store.load(&bead.bead_id).unwrap().unwrap();
+    assert_eq!(first_attempt.pre_session_head_sha, None);
+    assert_eq!(
+        first_attempt.park_reason.as_deref(),
+        Some("target_checkout_unconfigured")
+    );
+
+    // Recovery clears the transient park reason. The no-remediation marker
+    // remains, so the re-adopted attempt must still bypass the breaker.
+    drop(first_deps);
+    cfg.repos.get_mut(&cfg.target_repo).unwrap().local_checkout =
+        Some(std::env::current_dir().unwrap());
+    bead.state = OverlayState::Attested;
+    bead.park_reason = None;
+    bead.attempt = 2;
+    bead.reroll_count = 1;
+    store.save(&bead).unwrap();
+    let resumed_deps = RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "skeptic".into(),
+        review_text: feedback.into(),
+    };
+    assert!(matches!(
+        reroll::execute(&resumed_deps, &mut bead).unwrap(),
+        RerollOutcome::Rerolled { .. }
+    ));
+    assert_eq!(
+        sessions
+            .calls
+            .borrow()
+            .iter()
+            .filter(|call| *call == "spawn(bead-preflight-park)")
+            .count(),
+        1
+    );
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap();
+    assert!(!telemetry.contains("CIRCUIT_BREAKER_TRIGGERED"));
+
+    let _ = std::fs::remove_dir_all(&cfg.spec_dir);
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn adopted_marker_persistence_failure_stops_worker_before_holding() {
+    let scm = FakeScm::new();
+    let sessions = FakeSessions::new();
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert("alice/my-cool-feature".into(), "sha-marker".into());
+    let store = FakeStateStore::new();
+    store.fail_remediation_session_spawned();
+    let llm = FakeLlm::new();
+    let cfg = test_cfg();
+    let telemetry_log = std::env::temp_dir().join("afd_marker_atomic_failure.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    let mut bead = adopted_overlay("bead-marker-atomic-failure");
+    store.save(&bead).unwrap();
+    let deps = RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "verifier".into(),
+        review_text: "red gate".into(),
+    };
+    assert!(reroll::execute(&deps, &mut bead).is_err());
+    assert!(sessions
+        .calls
+        .borrow()
+        .iter()
+        .any(|call| call == "stop(fake-session-1)"));
+    let held = store.load(&bead.bead_id).unwrap().unwrap();
+    assert_eq!(held.state, OverlayState::HumanHeld);
+    assert!(held.session_id.is_none());
+    assert_eq!(store.remediation_session_spawned_attempt.borrow().get(&bead.bead_id), None);
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn adopted_preflight_after_old_remediation_bypasses_breaker_after_recovery() {
+    let scm = FakeScm::new();
+    let sessions = FakeSessions::new();
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert("alice/my-cool-feature".into(), "sha-1".into());
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    let mut cfg = test_cfg();
+    let telemetry_log = std::env::temp_dir().join("afd_marker_preflight_after_remediation.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    let mut bead = adopted_overlay("bead-marker-sequence");
+    store.save(&bead).unwrap();
+
+    // Attempt 1 succeeds and records marker=1.
+    let first = RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "verifier".into(),
+        review_text: "old feedback".into(),
+    };
+    assert!(matches!(reroll::execute(&first, &mut bead).unwrap(), RerollOutcome::Rerolled { .. }));
+    assert_eq!(store.remediation_session_spawned_attempt.borrow().get(&bead.bead_id), Some(&1));
+
+    // Attempt 2 reaches preflight with different feedback, so the old marker
+    // cannot trip the breaker before the checkout validation runs.
+    cfg.repos.get_mut(&cfg.target_repo).unwrap().local_checkout = Some("relative-invalid".into());
+    bead.state = OverlayState::Attested;
+    store.save(&bead).unwrap();
+    let preflight = RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "skeptic".into(),
+        review_text: "new feedback".into(),
+    };
+    let preflight_outcome = reroll::execute(&preflight, &mut bead).unwrap();
+    assert!(matches!(preflight_outcome, RerollOutcome::Held(_)), "preflight outcome: {preflight_outcome:?}");
+    assert_eq!(store.remediation_session_spawned_attempt.borrow().get(&bead.bead_id), Some(&1));
+
+    // Recovery advances to attempt 3, and the same preflight feedback now
+    // bypasses the breaker because marker=1 != prior attempt 2.
+    drop(preflight);
+    cfg.repos.get_mut(&cfg.target_repo).unwrap().local_checkout =
+        Some(std::env::current_dir().unwrap());
+    bead.state = OverlayState::Attested;
+    bead.attempt = 3;
+    bead.park_reason = None;
+    store.save(&bead).unwrap();
+    let recovered = RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "skeptic".into(),
+        review_text: "new feedback".into(),
+    };
+    assert!(matches!(reroll::execute(&recovered, &mut bead).unwrap(), RerollOutcome::Rerolled { .. }));
+    assert_eq!(store.remediation_session_spawned_attempt.borrow().get(&bead.bead_id), Some(&3));
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 /// bead jleechan-tfs1, requirement (d): when the remediation coder session
 /// cannot be spawned, `reroll::execute` must park the bead `HUMAN_HELD`
 /// rather than fabricating a placeholder commit. This is the direct
@@ -1047,6 +1283,31 @@ fn test_reroll_adopted_spawn_failure_parks_human_held() {
             .iter()
             .all(|c| !c.starts_with("close_pr_for_repo(") && !c.starts_with("close_pr(")),
         "a failed adopted remediation must never close the contributor's PR: {scm_calls:?}"
+    );
+    drop(vcs_calls);
+    drop(scm_calls);
+
+    assert_eq!(
+        store
+            .remediation_session_spawned_attempt
+            .borrow()
+            .get("bead-adopted-conflict"),
+        None,
+        "a failed spawn must not be recorded as semantic remediation"
+    );
+    // Simulate operator recovery into the same review attempt. The same
+    // feedback is allowed to retry because the prior attempt never spawned;
+    // importantly it must not be converted into a circuit-breaker hold.
+    let mut recovered = updated;
+    recovered.state = OverlayState::Attested;
+    recovered.attempt = 2;
+    recovered.park_reason = None;
+    recovered.session_id = None;
+    store.save(&recovered).unwrap();
+    let recovered_outcome = reroll::execute(&deps, &mut recovered).unwrap();
+    assert!(
+        matches!(recovered_outcome, RerollOutcome::Held(ref reason) if !reason.contains("circuit-breaker")),
+        "spawn failure recovery must bypass the breaker: {recovered_outcome:?}"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);

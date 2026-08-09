@@ -9842,11 +9842,18 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
                 session_id: None,
                 is_adopted: true,
                 spawn_failure_count: 0,
-                pre_session_head_sha: None,
+                // These seeded prior rejections model attempts that reached
+                // remediation. Seed the durable lifecycle marker explicitly;
+                // `pre_session_head_sha` alone is only a pre-spawn intent and
+                // must not authorize the semantic circuit breaker.
+                pre_session_head_sha: Some(format!("{bead_id}-pre-session-sha")),
                 park_reason: None,
                 target_repo: None,
                 attempt_started_at: None,
             })
+            .unwrap();
+        store
+            .mark_remediation_session_spawned(bead_id, 1)
             .unwrap();
         store.register_branch(bead_id, branch).unwrap();
         store
