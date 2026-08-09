@@ -80,7 +80,7 @@ js() { printf '%s' "$1" | python3 -c 'import json,sys; print(json.dumps(sys.stdi
 valid_bead_id() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] || die_code $EX_BEAD_ID "invalid bead_id: $1"; }
 valid_branch()  {
   [[ "$1" =~ ^factory/[A-Za-z0-9._-]+-r[0-9]+$ ]] && return 0
-  if [[ "$1" =~ ^[A-Za-z0-9._/-]+$ ]] && [[ ! "$1" =~ ^factory/ ]] && [[ ! "$1" =~ ^refs/ ]] && [[ "$1" != "HEAD" ]]; then
+  if [[ "$1" =~ ^[A-Za-z0-9._/+-]+$ ]] && [[ ! "$1" =~ ^factory/ ]] && [[ ! "$1" =~ ^refs/ ]] && [[ "$1" != "HEAD" ]]; then
     return 0
   fi
   die_code $EX_VALID_INPUT "branch must match factory/<bead_id>-r<n> OR existing-PR branch name: $1"
@@ -512,6 +512,8 @@ rollback-dispatched)
 redrive-pr)
   [ $# -eq 4 ] || die "usage: redrive-pr <bead_id> <pr_number> <branch>"
   valid_bead_id "$2"
+  valid_pr "$3"
+  valid_branch "$4"
   bid="$(q "$2")"
   pr="$3"
   branch="$(q "$4")"
