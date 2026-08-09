@@ -160,6 +160,21 @@ if [[ "${RUNTIME_ROOT}" != "${REPO_ROOT}" && -f "${RUNTIME_ROOT}/daemon/Cargo.to
 fi
 
 # Configure repo-local git hooks (.githooks/) so the pre-push graph-audit
+if [[ "${RUNTIME_ROOT}" != "${REPO_ROOT}" ]]; then
+  STATE_ROOT="${XDG_STATE_HOME:-${HOME}/.local/state}/dark-factory"
+  BR_DB="${STATE_ROOT}/.beads/beads.db"
+  if [[ ! -f "${BR_DB}" ]]; then
+    mkdir -p "${STATE_ROOT}/.beads"
+    cp "${RUNTIME_ROOT}/.beads/issues.jsonl" "${STATE_ROOT}/.beads/issues.jsonl"
+    (
+      cd "${STATE_ROOT}"
+      br init --db "${BR_DB}"
+      br sync --db "${BR_DB}" --import-only
+    )
+    echo "==> initialized persistent Beads state: ${BR_DB}"
+  fi
+fi
+
 # guard fires before any push. Mirrors the .github/workflows/ci.yml:35
 # step locally. Setting core.hooksPath is local-only (.git/config), so
 # other operators' checkouts and CI runners are unaffected. Idempotent:
