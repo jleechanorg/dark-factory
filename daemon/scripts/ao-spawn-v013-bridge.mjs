@@ -1,6 +1,8 @@
 import { dirname, join, parse } from "node:path";
 import { pathToFileURL } from "node:url";
 import { readFile } from "node:fs/promises";
+import { realpathSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 
 if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
   const fail = (message) => {
@@ -117,6 +119,45 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
     const config = core.loadConfig();
     const projectConfig = config.projects[project];
     if (!projectConfig) fail(`unknown AO project ${project}`);
+    if (!diagnosticMode && process.env.DARK_FACTORY_AO_EXPECTED_REVISION) {
+      const targetCheckout = process.env.DARK_FACTORY_AO_TARGET_CHECKOUT;
+      if (!targetCheckout || !targetCheckout.startsWith("/")) {
+        fail("DARK_FACTORY_AO_TARGET_CHECKOUT is required for worker spawns");
+      }
+      const configuredSource = projectConfig.path;
+      if (typeof configuredSource !== "string" || !configuredSource.startsWith("/")) {
+        fail(`AO project ${project} has no absolute source path`);
+      }
+      let configuredRealpath;
+      let targetRealpath;
+      try {
+        configuredRealpath = realpathSync(configuredSource);
+        targetRealpath = realpathSync(targetCheckout);
+      } catch (error) {
+        fail(`cannot resolve AO project source and target checkout: ${error}`);
+      }
+      if (configuredRealpath !== targetRealpath) {
+        fail(
+          `AO project ${project} source ${configuredRealpath} does not match validated target checkout ${targetRealpath}`,
+        );
+      }
+      const expectedRevision = process.env.DARK_FACTORY_AO_EXPECTED_REVISION;
+      let actualRevision;
+      try {
+        actualRevision = execFileSync(
+          "git",
+          ["-C", targetRealpath, "rev-parse", "HEAD"],
+          { encoding: "utf8" },
+        ).trim();
+      } catch (error) {
+        fail(`cannot resolve validated target checkout revision: ${error}`);
+      }
+      if (actualRevision !== expectedRevision) {
+        fail(
+          `AO project ${project} source is at ${actualRevision}, expected validated revision ${expectedRevision}`,
+        );
+      }
+    }
     const registry = core.createPluginRegistry();
     await registry.loadFromConfig(config, async (packageName) =>
       import(resolveAoPackage(packageName)),

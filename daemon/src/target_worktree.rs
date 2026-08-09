@@ -7,7 +7,65 @@
 
 use crate::errors::DaemonError;
 use crate::tools::{remote_url_matches_repo, run_tool, run_tool_in_dir};
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// The lock inode is deliberately persistent.  Kernel-owned `flock` state is
+/// released when the process exits, while removing/recreating the pathname
+/// during a clone would let a waiter acquire a different inode and race the
+/// publisher.
+struct TargetWorktreeLock {
+    file: File,
+}
+
+impl TargetWorktreeLock {
+    fn acquire(target: &Path) -> Result<Self, DaemonError> {
+        let lock_path = target.with_extension("lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&lock_path)
+            .map_err(|error| {
+                DaemonError::Config(format!(
+                    "open target worktree lock {}: {error}",
+                    lock_path.display()
+                ))
+            })?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            const LOCK_EX: i32 = 2;
+            if unsafe { flock(file.as_raw_fd(), LOCK_EX) } != 0 {
+                return Err(DaemonError::Config(format!(
+                    "acquire target worktree lock {}: {}",
+                    lock_path.display(),
+                    std::io::Error::last_os_error()
+                )));
+            }
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for TargetWorktreeLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            const LOCK_UN: i32 = 8;
+            let _ = unsafe { flock(self.file.as_raw_fd(), LOCK_UN) };
+        }
+    }
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn flock(fd: i32, operation: i32) -> i32;
+}
 
 /// Reuse an existing target checkout or provision one by cloning the named
 /// GitHub repository into `requested`.
@@ -30,6 +88,16 @@ pub fn ensure_target_worktree(
             requested.display()
         )));
     }
+    if let Some(parent) = requested.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            DaemonError::Config(format!(
+                "create target worktree parent {}: {e}",
+                parent.display()
+            ))
+        })?;
+    }
+    let _lock = TargetWorktreeLock::acquire(requested)?;
+
     if requested.is_dir() {
         verify_existing(repo, requested, head_sha)?;
         return Ok(requested.to_path_buf());
@@ -41,18 +109,11 @@ pub fn ensure_target_worktree(
         )));
     }
 
-    if let Some(parent) = requested.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            DaemonError::Config(format!(
-                "create target worktree parent {}: {e}",
-                parent.display()
-            ))
-        })?;
-    }
-    let destination = requested.to_str().ok_or_else(|| {
+    let staging = staging_path(requested);
+    let staging_str = staging.to_str().ok_or_else(|| {
         DaemonError::Config(format!(
-            "target worktree path is not valid UTF-8: {}",
-            requested.display()
+            "target worktree staging path is not valid UTF-8: {}",
+            staging.display()
         ))
     })?;
     let remote = format!("https://github.com/{repo}.git");
@@ -62,31 +123,72 @@ pub fn ensure_target_worktree(
             "--no-checkout",
             "--filter=blob:none",
             remote.as_str(),
-            destination,
+            staging_str,
         ];
         run_tool("git", &args, 600)
     } else {
-        let args = ["clone", "--filter=blob:none", remote.as_str(), destination];
+        let args = ["clone", "--filter=blob:none", remote.as_str(), staging_str];
         run_tool("git", &args, 600)
     };
     if let Err(err) = clone_result {
-        let _ = std::fs::remove_dir_all(requested);
+        let _ = std::fs::remove_dir_all(&staging);
         return Err(err);
     }
 
     if let Some(sha) = head_sha.filter(|sha| !sha.trim().is_empty()) {
         let fetch_args = ["fetch", "--depth=1", "origin", sha];
-        if let Err(err) = run_tool_in_dir("git", &fetch_args, destination, 600) {
-            let _ = std::fs::remove_dir_all(requested);
+        if let Err(err) = run_tool_in_dir("git", &fetch_args, staging_str, 600) {
+            let _ = std::fs::remove_dir_all(&staging);
             return Err(err);
         }
         let checkout_args = ["checkout", "--detach", sha];
-        if let Err(err) = run_tool_in_dir("git", &checkout_args, destination, 60) {
-            let _ = std::fs::remove_dir_all(requested);
+        if let Err(err) = run_tool_in_dir("git", &checkout_args, staging_str, 60) {
+            let _ = std::fs::remove_dir_all(&staging);
             return Err(err);
         }
     }
+    if let Err(error) = std::fs::rename(&staging, requested) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(DaemonError::Config(format!(
+            "atomically publish target worktree {}: {error}",
+            requested.display()
+        )));
+    }
     Ok(requested.to_path_buf())
+}
+
+/// Validate an AO-created worker workspace without provisioning or mutating it.
+/// A worker workspace must already exist; an absent path is never cloned as a
+/// side effect of accepting a session.
+pub fn validate_existing_target_worktree(
+    repo: &str,
+    path: &Path,
+    head_sha: Option<&str>,
+) -> Result<PathBuf, DaemonError> {
+    validate_repo(repo)?;
+    if !path.is_absolute() {
+        return Err(DaemonError::Config(format!(
+            "worker workspace path must be absolute: {}",
+            path.display()
+        )));
+    }
+    if !path.is_dir() {
+        return Err(DaemonError::Config(format!(
+            "worker workspace path is not a directory: {}",
+            path.display()
+        )));
+    }
+    verify_existing(repo, path, head_sha)?;
+    Ok(path.to_path_buf())
+}
+
+fn staging_path(requested: &Path) -> PathBuf {
+    let nonce = STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let name = requested
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("target-worktree");
+    requested.with_file_name(format!(".{name}.staging.{}.{}", std::process::id(), nonce))
 }
 
 fn verify_existing(repo: &str, path: &Path, head_sha: Option<&str>) -> Result<(), DaemonError> {
@@ -161,10 +263,8 @@ mod tests {
 
     #[test]
     fn rejects_existing_checkout_at_stale_snapshot_head() {
-        let root = std::env::temp_dir().join(format!(
-            "afd_target_worktree_stale_{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("afd_target_worktree_stale_{}", std::process::id()));
         let actual = init_git_checkout(&root, "owner/repo");
         let stale = "0000000000000000000000000000000000000000";
         assert_ne!(actual, stale);
@@ -182,6 +282,79 @@ mod tests {
         let err = ensure_target_worktree("repo-without-owner", &root, None).unwrap_err();
         assert!(matches!(err, DaemonError::Config(_)));
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn target_lock_path_is_persistent_and_workspace_validation_never_provisions() {
+        let root =
+            std::env::temp_dir().join(format!("afd_target_worktree_lock_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("owner").join("repo");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let lock_path = target.with_extension("lock");
+        {
+            let _lock = TargetWorktreeLock::acquire(&target).unwrap();
+            assert!(lock_path.is_file());
+        }
+        assert!(lock_path.is_file());
+        let missing = root.join("missing");
+        let error = validate_existing_target_worktree("owner/repo", &missing, None).unwrap_err();
+        assert!(error.to_string().contains("not a directory"));
+        assert!(!missing.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn target_lock_serializes_contending_processes() {
+        if std::env::var_os("AFD_TARGET_LOCK_HELPER").is_some() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "afd_target_worktree_process_lock_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("owner").join("repo");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let marker = root.join("acquired");
+        let lock = TargetWorktreeLock::acquire(&target).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "target_worktree::tests::target_lock_helper_process",
+                "--nocapture",
+            ])
+            .env("AFD_TARGET_LOCK_HELPER", "1")
+            .env("AFD_TARGET_LOCK_PATH", &target)
+            .env("AFD_TARGET_LOCK_MARKER", &marker)
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !marker.exists(),
+            "contender acquired the lock while owner held it"
+        );
+        drop(lock);
+        let status = child.wait().unwrap();
+        assert!(status.success());
+        assert!(marker.is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn target_lock_helper_process() {
+        if std::env::var_os("AFD_TARGET_LOCK_HELPER").is_none() {
+            return;
+        }
+        let target = PathBuf::from(std::env::var("AFD_TARGET_LOCK_PATH").unwrap());
+        let _lock = TargetWorktreeLock::acquire(&target).unwrap();
+        std::fs::write(
+            std::env::var("AFD_TARGET_LOCK_MARKER").unwrap(),
+            b"acquired",
+        )
+        .unwrap();
     }
 
     fn init_git_checkout(path: &Path, repo: &str) -> String {

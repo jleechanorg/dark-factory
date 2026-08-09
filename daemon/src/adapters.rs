@@ -2010,7 +2010,15 @@ fn ao_spawn_command_with_mode(
             checkout,
             spec.expected_revision.as_deref(),
         )?;
-        cmd.current_dir(verified);
+        cmd.current_dir(&verified)
+            .env("DARK_FACTORY_AO_TARGET_CHECKOUT", &verified);
+        if let Some(expected_revision) = spec
+            .expected_revision
+            .as_deref()
+            .filter(|revision| !revision.trim().is_empty())
+        {
+            cmd.env("DARK_FACTORY_AO_EXPECTED_REVISION", expected_revision);
+        }
     }
 
     // This is the complete AO v0.1.3 public spawn argv: no --prompt,
@@ -2318,6 +2326,18 @@ impl CliSessions {
                 "ao spawn --agent {agent} returned session {} with branch {:?}, expected {:?}; refusing to dispatch a branch-mismatched worker",
                 session.0, observed_branch, spec.branch
             )))
+        } else if let Some(expected_revision) = spec.expected_revision.as_deref() {
+            match crate::target_worktree::validate_existing_target_worktree(
+                &spec.repo,
+                workspace.as_ref().expect("workspace checked above"),
+                Some(expected_revision),
+            ) {
+                Ok(_) => None,
+                Err(error) => Some(DaemonError::Config(format!(
+                    "AO worker workspace for session {} is not bound to repo {} at expected revision {}: {error}",
+                    session.0, spec.repo, expected_revision
+                ))),
+            }
         } else {
             None
         };
@@ -2967,6 +2987,86 @@ print("  Branch:   " + os.environ.get("AO_FAKE_RETURN_BRANCH", os.environ["DARK_
         let error = spawn_result.expect_err("stale checkout must fail closed");
         assert!(error.to_string().contains("expected snapshot"), "{error}");
         assert!(calls.is_empty(), "AO must not be invoked on a stale checkout");
+    }
+
+    #[test]
+    fn worker_spawn_rejects_same_origin_stale_ao_workspace_after_spawn() {
+        let prompt = "same origin stale AO workspace";
+        let branch = "factory/jleechan-contract-stale-ao-workspace-r1";
+        let checkout = std::env::current_dir().unwrap();
+        let expected_revision = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&checkout)
+            .output()
+            .unwrap();
+        let expected_revision = String::from_utf8(expected_revision.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let workspace = std::env::temp_dir().join(format!(
+            "afd_stale_ao_workspace_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&workspace);
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&workspace)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/jleechanorg/dark-factory.git",
+            ])
+            .current_dir(&workspace)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "stale",
+            ])
+            .current_dir(&workspace)
+            .status()
+            .unwrap();
+
+        let (spawn_result, calls) = with_fake_ao(
+            "stale_ao_workspace",
+            serde_json::json!({prompt: branch}),
+            |log| {
+                let previous = std::env::var("AO_FAKE_WORKTREE").ok();
+                std::env::set_var("AO_FAKE_WORKTREE", &workspace);
+                let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+                let mut routed = spec(prompt, branch);
+                routed.local_checkout = Some(checkout.clone());
+                routed.expected_revision = Some(expected_revision.clone());
+                let result = sessions.spawn(&routed);
+                match previous {
+                    Some(value) => std::env::set_var("AO_FAKE_WORKTREE", value),
+                    None => std::env::remove_var("AO_FAKE_WORKTREE"),
+                }
+                (result, std::fs::read_to_string(log).unwrap_or_default())
+            },
+        );
+        let _ = std::fs::remove_dir_all(&workspace);
+
+        let error = spawn_result.expect_err("same-origin stale AO workspace must fail closed");
+        assert!(error.to_string().contains("expected snapshot"), "{error}");
+        let rows: Vec<serde_json::Value> = calls
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.iter().filter(|row| row["kind"] == "spawn").count(), 1);
+        assert_eq!(rows.iter().filter(|row| row["kind"] == "kill").count(), 1);
     }
 
     #[test]
