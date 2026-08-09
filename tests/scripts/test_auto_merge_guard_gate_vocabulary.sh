@@ -45,15 +45,18 @@ emit_assessment() { # <gates_json>
 }
 
 # Extract the predicate as a standalone command via. Reuses the exact
-# python heredoc block that lives at lines 41-114 of the production
+# python heredoc block that lives at lines 85-158 of the production
 # script (PR #328 / bze8.1 added head_sha / canonical gate-key set /
-# operator_disposition; line 40 is the bash `printf ... | python3 -c '`
-# wrapper and line 115 is the trailing `'"$live_head"` close-arg, neither
+# operator_disposition; line 84 is the bash `printf ... | python3 -c '`
+# wrapper and line 159 is the trailing `'"$live_head"` close-arg, neither
 # of which Python accepts inside `-c`).
 # jleechan-ni1k / issue #437 P2 widened the predicate to 8 required gates
 # (added `vacuous_red_green`) and added the P1 LIVE_HEAD_MISSING branch;
-# the block now spans 41..=114 (was 41..=104).
-predicate_block="$(sed -n '41,114p' "$GUARD" | sed 's/^  //')"
+# the block spanned 41..=114 pre-rev-1uno. Bead rev-1uno inserted a
+# rate_limit quota preflight (44 lines) ahead of this function, shifting
+# the range to 85..=158 — keep this range in lockstep with any future
+# edits above `latest_assessment_no_red()` in auto-merge-guard.sh.
+predicate_block="$(sed -n '85,158p' "$GUARD" | sed 's/^  //')"
 
 run_predicate() { # <input_json>
   printf '%s' "$1" | python3 -c "$predicate_block" "$LIVE_HEAD"

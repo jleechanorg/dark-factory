@@ -22,6 +22,50 @@ REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || echo 
 LOG="${AFD_LOG:-$HOME/Library/Logs/dark-factory/daemon.jsonl}"
 H="daemon/factory-overlay.sh"
 MAX_PER_HOUR="${1:-8}"
+
+# --- API quota preflight (bead rev-1uno): gh pr list/view/checks all call
+# GitHub's GraphQL API internally. A GraphQL-only sweep here previously
+# drove the shared org graphql quota (user 13840161) to 0/5000, starving
+# every other consumer of that quota. Preflight both quotas; route point
+# lookups to REST when graphql is low; back off the whole pass (attempt
+# zero merges) when both quotas are critically low.
+GRAPHQL_LOW="${AMG_GRAPHQL_LOW:-500}"
+CORE_LOW="${AMG_CORE_LOW:-200}"
+_rl_json="$(gh api rate_limit 2>/dev/null)"
+if [ -z "$_rl_json" ]; then
+  echo "auto-merge-guard: rate_limit preflight failed (gh api unreachable) — backing off this pass, no merges attempted" >&2
+  exit 0
+fi
+CORE_REMAINING="$(RL_JSON="$_rl_json" RL_KEY=core python3 - 2>/dev/null <<'PYEOF'
+import json, os
+try:
+    d = json.loads(os.environ["RL_JSON"])
+    print(d["resources"][os.environ["RL_KEY"]]["remaining"])
+except Exception:
+    print(0)
+PYEOF
+)"
+GRAPHQL_REMAINING="$(RL_JSON="$_rl_json" RL_KEY=graphql python3 - 2>/dev/null <<'PYEOF'
+import json, os
+try:
+    d = json.loads(os.environ["RL_JSON"])
+    print(d["resources"][os.environ["RL_KEY"]]["remaining"])
+except Exception:
+    print(0)
+PYEOF
+)"
+CORE_REMAINING="${CORE_REMAINING:-0}"
+GRAPHQL_REMAINING="${GRAPHQL_REMAINING:-0}"
+if [ "$CORE_REMAINING" -lt "$CORE_LOW" ] && [ "$GRAPHQL_REMAINING" -lt "$GRAPHQL_LOW" ]; then
+  echo "auto-merge-guard: both quotas low (core=$CORE_REMAINING graphql=$GRAPHQL_REMAINING) — backing off this pass, no merges attempted" >&2
+  exit 0
+fi
+USE_GRAPHQL=1
+if [ "$GRAPHQL_REMAINING" -lt "$GRAPHQL_LOW" ]; then
+  USE_GRAPHQL=0
+  echo "auto-merge-guard: graphql quota low (graphql=$GRAPHQL_REMAINING) — routing point lookups to REST this pass" >&2
+fi
+
 RATE_FILE="$HOME/.dark-factory/merge-timestamps"
 mkdir -p "$(dirname "$RATE_FILE")"; touch "$RATE_FILE"
 now_epoch=$(date +%s)
@@ -115,11 +159,26 @@ else:
 sys.exit(0)' "$live_head"
 }
 
-gh pr list --repo "$REPO" --state open --json number,headRefName \
-  --jq '.[]|select(.headRefName|startswith("factory/"))|"\(.number) \(.headRefName)"' 2>/dev/null |
+if [ "$USE_GRAPHQL" -eq 1 ]; then
+  _pr_rows="$(gh pr list --repo "$REPO" --state open --json number,headRefName \
+    --jq '.[]|select(.headRefName|startswith("factory/"))|"\(.number) \(.headRefName)"' 2>/dev/null)"
+else
+  _pr_rows="$(gh api "repos/$REPO/pulls?state=open&per_page=100" \
+    --jq '.[]|select(.head.ref|startswith("factory/"))|"\(.number) \(.head.ref)"' 2>/dev/null)"
+fi
+printf '%s\n' "$_pr_rows" |
 while read -r num branch; do
   [ -n "$num" ] || continue
-  checks="$(gh pr checks "$num" --repo "$REPO" 2>/dev/null)"
+  if [ "$USE_GRAPHQL" -eq 1 ]; then
+    checks="$(gh pr checks "$num" --repo "$REPO" 2>/dev/null)"
+  else
+    _pr_sha="$(gh api "repos/$REPO/pulls/$num" --jq '.head.sha' 2>/dev/null)"
+    if [ -n "$_pr_sha" ]; then
+      checks="$(gh api "repos/$REPO/commits/$_pr_sha/check-runs" --jq '.check_runs[]|"\(.name) \(.conclusion // .status)"' 2>/dev/null)"
+    else
+      checks=""
+    fi
+  fi
   echo "$checks" | grep -qiE "pending|queued|in_progress" && { echo "PR $num: CI pending — skip"; continue; }
   echo "$checks" | grep -qi "fail" && { echo "PR $num: CI FAILED — skip (needs attention)"; continue; }
   # jleechan-328 P1 #1: pass the LIVE PR head SHA so the predicate can
@@ -140,8 +199,13 @@ while read -r num branch; do
   # (b) refuse to continue with `continue` if the live head is missing,
   # emitting the distinct `STALE:LIVE_HEAD_MISSING` reason so operators
   # can grep for it on the next tick.
-  live_head_sha="$(gh pr view "$num" --repo "$REPO" --json headRefOid --jq .headRefOid 2>/dev/null)"
-  gh_rc=$?
+  if [ "$USE_GRAPHQL" -eq 1 ]; then
+    live_head_sha="$(gh pr view "$num" --repo "$REPO" --json headRefOid --jq .headRefOid 2>/dev/null)"
+    gh_rc=$?
+  else
+    live_head_sha="$(gh api "repos/$REPO/pulls/$num" --jq .head.sha 2>/dev/null)"
+    gh_rc=$?
+  fi
   if [ "$gh_rc" -ne 0 ] || [ -z "${live_head_sha:-}" ] || [ "$live_head_sha" = "null" ]; then
     echo "PR $num: STALE:LIVE_HEAD_MISSING — refusing merge (gh_rc=${gh_rc}, live_head_sha=${live_head_sha:-empty}; gh api outage or transient error must not promote stale gate evidence)"
     continue
@@ -149,11 +213,23 @@ while read -r num branch; do
   verdict="$(latest_assessment_no_red "$num" "$live_head_sha")" || { echo "PR $num: verifier assessment ${verdict:-missing} — refusing merge (green CI is insufficient)"; continue; }
   echo "PR $num: assessment $verdict"
   # mergeable?
-  [ "$(gh pr view "$num" --repo "$REPO" --json mergeable --jq .mergeable)" = "MERGEABLE" ] || { echo "PR $num: not MERGEABLE (conflicts) — skip"; continue; }
+  if [ "$USE_GRAPHQL" -eq 1 ]; then
+    _mergeable="$(gh pr view "$num" --repo "$REPO" --json mergeable --jq .mergeable 2>/dev/null)"
+    [ "$_mergeable" = "MERGEABLE" ] || { echo "PR $num: not MERGEABLE (conflicts) — skip"; continue; }
+  else
+    _mergeable="$(gh api "repos/$REPO/pulls/$num" --jq '.mergeable' 2>/dev/null)"
+    [ "$_mergeable" = "true" ] || { echo "PR $num: not MERGEABLE (conflicts) — skip"; continue; }
+  fi
   echo "PR $num: gates red-free + mergeable — merging"
   gh pr merge "$num" --repo "$REPO" --squash 2>&1 | tail -1
   sleep 3
-  if [ "$(gh pr view "$num" --repo "$REPO" --json state --jq .state)" = "MERGED" ]; then
+  if [ "$USE_GRAPHQL" -eq 1 ]; then
+    _merged_state="$(gh pr view "$num" --repo "$REPO" --json state --jq .state 2>/dev/null)"
+    _is_merged=false; [ "$_merged_state" = "MERGED" ] && _is_merged=true
+  else
+    _is_merged="$(gh api "repos/$REPO/pulls/$num" --jq '.merged' 2>/dev/null)"
+  fi
+  if [ "$_is_merged" = "true" ]; then
     echo "$now_epoch" >> "$RATE_FILE"
     bead="$(printf '%s' "$branch" | sed -E 's|^factory/||; s|-r[0-9]+$||')"
     br close "$bead" --reason "Merged via factory PR #$num (auto-merge-guard: no-red gate policy verified)" 2>/dev/null | tail -1
