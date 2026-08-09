@@ -85,7 +85,11 @@ valid_branch()  {
   fi
   die_code $EX_VALID_INPUT "branch must match factory/<bead_id>-r<n> OR existing-PR branch name: $1"
 }
-valid_pr() { [[ "$1" =~ ^[0-9]+$ ]] || die "pr_number must be numeric: $1"; }
+valid_pr() {
+  [[ "$1" =~ ^[0-9]+$ ]] || die_code $EX_VALID_INPUT "pr_number must be numeric: $1"
+  [ "$1" != "0" ] || die_code $EX_VALID_INPUT "pr_number must be >= 1 (0 is not a valid PR number): $1"
+  [ "${#1}" -le 10 ] || die_code $EX_VALID_INPUT "pr_number too large (max 10 digits): $1"
+}
 VALID_STATES="QUEUED DISPATCHING DISPATCHED ATTESTED READY RE_ROLL RECOVERY REDISPATCHED BUDGET_HELD HUMAN_HELD"
 valid_state() { case " $VALID_STATES " in *" $1 "*) ;; *) die "invalid state: $1";; esac; }
 now() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
