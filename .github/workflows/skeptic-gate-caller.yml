@@ -105,4 +105,4 @@ jobs:
       bead_id: ${{ inputs.bead_id }}
       contract_file: ${{ inputs.contract_file }}
     secrets:
-      github_token: ${{ secrets.GITHUB_TOKEN }}
+      gate_github_token: ${{ secrets.GITHUB_TOKEN }}
