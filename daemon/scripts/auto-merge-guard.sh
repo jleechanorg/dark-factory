@@ -159,6 +159,102 @@ else:
 sys.exit(0)' "$live_head"
 }
 
+# --- checks_all_green (codex skeptic review REQUEST_CHANGES on #619/#620/#621
+# follow-up): the ORIGINAL checks-evaluation block only grepped raw check-run
+# text for "pending|queued|in_progress" (not-yet-green) or "fail" (red). Three
+# fail-open gaps that let a non-green PR slip through as "green":
+#   1. CANCELLED / TIMED_OUT conclusions contain neither substring — they
+#      matched neither grep and the PR was silently treated as green.
+#   2. The REST check-runs call had no pagination — `gh api` defaults to 30
+#      items/page, so a check-run past item 30 could never be seen.
+#   3. An EMPTY check-run list (e.g. transient API hiccup, or a PR with zero
+#      registered runs) matched NEITHER grep either — empty-is-not-pending
+#      and empty-is-not-fail, so it also fell through as "green with zero
+#      evidence". This was the most dangerous gap: no evidence should never
+#      read as affirmative evidence.
+#   4. The legacy commit-status API (separate from check-runs) was never
+#      consulted at all.
+# checks_all_green() closes all four: REST path uses `--paginate` and treats
+# anything other than status=completed + conclusion in
+# {success,neutral,skipped} as NOT green (this structurally also covers
+# cancelled/timed_out/action_required/stale — none of those are in the
+# allowed set); an empty check-run list is explicitly NOT green; and the
+# legacy status API is consulted too (empty/never-used is fine, but a
+# present non-success legacy status blocks). The GraphQL path can't easily
+# paginate/parse `gh pr checks`' text table the same way, so it applies an
+# equivalent-strictness text scan: empty output is NOT green, the bad-state
+# regex is extended past pending/queued/in_progress to also catch
+# cancelled/timed-out/error/action_required/stale, and — since "no bad
+# keyword found" is not proof of green — the output must ALSO contain
+# explicit pass evidence (pass|success|neutral|skip) or it's treated as
+# NOT green (ambiguous/unrecognized-only output no longer silently passes).
+checks_all_green() { # <pr_number> <live_head_sha> -> prints "GREEN:..."/"NOT_GREEN:reason", returns 0/1
+  local pr="$1" head="$2"
+  if [ "$USE_GRAPHQL" -eq 1 ]; then
+    local checks
+    checks="$(gh pr checks "$pr" --repo "$REPO" 2>/dev/null)"
+    if [ -z "$checks" ]; then
+      echo "NOT_GREEN:EMPTY_CHECKS"; return 1
+    fi
+    if printf '%s' "$checks" | grep -qiE "pending|queued|in_progress|cancelled|canceled|timed[_ ]?out|timeout|action_required|stale"; then
+      echo "NOT_GREEN:BAD_STATE"; return 1
+    fi
+    if printf '%s' "$checks" | grep -qi "fail"; then
+      echo "NOT_GREEN:FAIL"; return 1
+    fi
+    if ! printf '%s' "$checks" | grep -qiE "pass|success|neutral|skip"; then
+      echo "NOT_GREEN:NO_PASS_EVIDENCE"; return 1
+    fi
+    echo "GREEN:GRAPHQL"; return 0
+  fi
+  # REST path: paginate check-runs (gh api defaults to 30/page — a bad run
+  # past item 30 must not be invisible) and require every run to be
+  # status=completed with conclusion in {success,neutral,skipped}.
+  local runs
+  runs="$(gh api "repos/$REPO/commits/$head/check-runs" --paginate \
+    --jq '.check_runs[]|"\(.status) \(.conclusion // "null")"' 2>/dev/null)"
+  if [ -z "$runs" ]; then
+    echo "NOT_GREEN:EMPTY_CHECK_RUNS"; return 1
+  fi
+  local bad
+  bad="$(printf '%s\n' "$runs" | awk '
+    { status=$1; conclusion=$2 }
+    status != "completed" { print; next }
+    conclusion != "success" && conclusion != "neutral" && conclusion != "skipped" { print }
+  ')"
+  if [ -n "$bad" ]; then
+    echo "NOT_GREEN:CHECK_RUNS:$(printf '%s' "$bad" | tr '\n' ';')"; return 1
+  fi
+  # Legacy combined commit-status API — separate from check-runs. Empty /
+  # never-used (total_count=0) is fine (no legacy statuses to fail on); a
+  # present non-success state blocks.
+  local status_json status_state status_total
+  status_json="$(gh api "repos/$REPO/commits/$head/status" 2>/dev/null)"
+  if [ -n "$status_json" ]; then
+    status_state="$(printf '%s' "$status_json" | python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get("state") or "")
+except Exception:
+    print("")
+' 2>/dev/null)"
+    status_total="$(printf '%s' "$status_json" | python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get("total_count") or 0)
+except Exception:
+    print(0)
+' 2>/dev/null)"
+    status_total="${status_total:-0}"
+    if [ "$status_total" != "0" ] && [ "$status_state" != "success" ]; then
+      echo "NOT_GREEN:LEGACY_STATUS:${status_state:-unknown}"; return 1
+    fi
+  fi
+  echo "GREEN:REST"; return 0
+}
+
 if [ "$USE_GRAPHQL" -eq 1 ]; then
   _pr_rows="$(gh pr list --repo "$REPO" --state open --json number,headRefName \
     --jq '.[]|select(.headRefName|startswith("factory/"))|"\(.number) \(.headRefName)"' 2>/dev/null)"
@@ -169,22 +265,6 @@ fi
 printf '%s\n' "$_pr_rows" |
 while read -r num branch; do
   [ -n "$num" ] || continue
-  if [ "$USE_GRAPHQL" -eq 1 ]; then
-    checks="$(gh pr checks "$num" --repo "$REPO" 2>/dev/null)"
-  else
-    _pr_sha="$(gh api "repos/$REPO/pulls/$num" --jq '.head.sha' 2>/dev/null)"
-    if [ -n "$_pr_sha" ]; then
-      checks="$(gh api "repos/$REPO/commits/$_pr_sha/check-runs" --jq '.check_runs[]|"\(.name) \(.conclusion // .status)"' 2>/dev/null)"
-    else
-      checks=""
-    fi
-  fi
-  echo "$checks" | grep -qiE "pending|queued|in_progress" && { echo "PR $num: CI pending — skip"; continue; }
-  echo "$checks" | grep -qi "fail" && { echo "PR $num: CI FAILED — skip (needs attention)"; continue; }
-  # jleechan-328 P1 #1: pass the LIVE PR head SHA so the predicate can
-  # refuse stale assessments (the daemon emits `head_sha` in every
-  # GATE_ASSESSMENT context; without the comparison a push after a green
-  # assessment would merge with stale gate evidence).
   # jleechan-328 P1 #1: pass the LIVE PR head SHA so the predicate can
   # refuse stale assessments (the daemon emits `head_sha` in every
   # GATE_ASSESSMENT context; without the comparison a push after a green
@@ -199,6 +279,13 @@ while read -r num branch; do
   # (b) refuse to continue with `continue` if the live head is missing,
   # emitting the distinct `STALE:LIVE_HEAD_MISSING` reason so operators
   # can grep for it on the next tick.
+  #
+  # Consolidated (codex skeptic follow-up): this used to be computed a
+  # second time, mid-loop, after the checks grep — duplicating this exact
+  # `gh api repos/.../pulls/$num --jq .head.sha` call. Computing it here,
+  # first, means checks_all_green() can reuse it directly (no duplicate
+  # REST round-trip) AND the STALE:LIVE_HEAD_MISSING fail-closed guard now
+  # runs before ANY checks evaluation — fail closed even earlier.
   if [ "$USE_GRAPHQL" -eq 1 ]; then
     live_head_sha="$(gh pr view "$num" --repo "$REPO" --json headRefOid --jq .headRefOid 2>/dev/null)"
     gh_rc=$?
@@ -209,6 +296,11 @@ while read -r num branch; do
   if [ "$gh_rc" -ne 0 ] || [ -z "${live_head_sha:-}" ] || [ "$live_head_sha" = "null" ]; then
     echo "PR $num: STALE:LIVE_HEAD_MISSING — refusing merge (gh_rc=${gh_rc}, live_head_sha=${live_head_sha:-empty}; gh api outage or transient error must not promote stale gate evidence)"
     continue
+  fi
+  checks_reason="$(checks_all_green "$num" "$live_head_sha")"
+  checks_rc=$?
+  if [ "$checks_rc" -ne 0 ]; then
+    echo "PR $num: CI not green ($checks_reason) — skip"; continue
   fi
   verdict="$(latest_assessment_no_red "$num" "$live_head_sha")" || { echo "PR $num: verifier assessment ${verdict:-missing} — refusing merge (green CI is insufficient)"; continue; }
   echo "PR $num: assessment $verdict"
