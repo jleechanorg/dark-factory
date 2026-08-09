@@ -11,57 +11,60 @@
 use crate::config::Config;
 use crate::errors::DaemonError;
 use crate::tools::{LabeledPr, Permission, Scm, Tracker};
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread;
-use std::time::Duration;
 
 const FACTORY_LABEL: &str = "factory";
 static CACHE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct CacheFileLock {
     path: PathBuf,
+    file: File,
 }
 
 impl CacheFileLock {
     fn acquire(cache_path: &Path) -> Result<Self, DaemonError> {
         let lock_path = cache_path.with_extension("json.lock");
-        for _ in 0..600 {
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock_path)
-            {
-                Ok(_) => return Ok(Self { path: lock_path }),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if std::fs::metadata(&lock_path)
-                        .and_then(|metadata| metadata.modified())
-                        .ok()
-                        .and_then(|modified| modified.elapsed().ok())
-                        .is_some_and(|age| age > Duration::from_secs(30))
-                    {
-                        let _ = std::fs::remove_file(&lock_path);
-                    }
-                    thread::sleep(Duration::from_millis(5));
-                }
-                Err(error) => {
-                    return Err(DaemonError::Config(format!(
-                        "create adoption_probe_cache lock: {error}"
-                    )));
-                }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&lock_path)
+            .map_err(|error| DaemonError::Config(format!("open adoption_probe_cache lock: {error}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            const LOCK_EX: i32 = 2;
+            // flock blocks until the kernel-owned lock is available and is
+            // released automatically if the writer process exits.
+            let result = unsafe { flock(file.as_raw_fd(), LOCK_EX) };
+            if result != 0 {
+                return Err(DaemonError::Config(format!(
+                    "acquire adoption_probe_cache lock: {}",
+                    std::io::Error::last_os_error()
+                )));
             }
         }
-        Err(DaemonError::Config(
-            "timed out waiting for adoption_probe_cache lock".to_string(),
-        ))
+        Ok(Self { path: lock_path, file })
     }
 }
 
 impl Drop for CacheFileLock {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            const LOCK_UN: i32 = 8;
+            let _ = unsafe { flock(self.file.as_raw_fd(), LOCK_UN) };
+        }
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn flock(fd: i32, operation: i32) -> i32;
 }
 
 // jtg8-r4 =====================================================================
@@ -1060,7 +1063,31 @@ mod tests {
     // contract tests (idempotency, write-tier gate, mixed batch) live in
     // `daemon/tests/intake.rs` per Task 6 Step 1.
     use crate::tools::Permission;
-    use super::resolve_target_repo;
+    use super::{resolve_target_repo, CacheFileLock};
+
+    #[test]
+    fn cache_lock_waits_for_live_owner_and_releases_after_owner_drop() {
+        let root = std::env::temp_dir().join(format!(
+            "afd_cache_lock_owner_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let cache_path = root.join("adoption_probe_cache.json");
+        let owner = CacheFileLock::acquire(&cache_path).unwrap();
+        let waiter_path = cache_path.clone();
+        let acquired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiter_acquired = acquired.clone();
+        let waiter = std::thread::spawn(move || {
+            let _lock = CacheFileLock::acquire(&waiter_path).unwrap();
+            waiter_acquired.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!acquired.load(std::sync::atomic::Ordering::SeqCst));
+        drop(owner);
+        waiter.join().unwrap();
+        assert!(acquired.load(std::sync::atomic::Ordering::SeqCst));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn permission_write_tier_gate_matches_design_contract() {

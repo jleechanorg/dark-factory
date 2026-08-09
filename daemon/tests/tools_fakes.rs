@@ -132,6 +132,7 @@ fn fake_sessions_spawn_attach_stop_quiescent_roundtrip() {
         ao_project: "repo".into(),
         remote: "origin".into(),
         local_checkout: None,
+        expected_revision: None,
     };
     let id = fake.spawn(&spec).unwrap();
     assert_eq!(id, SessionId("sess-9".into()));

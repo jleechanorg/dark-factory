@@ -2005,7 +2005,11 @@ fn ao_spawn_command_with_mode(
                 checkout.display()
             )));
         }
-        let verified = crate::target_worktree::ensure_target_worktree(&spec.repo, checkout, None)?;
+        let verified = crate::target_worktree::ensure_target_worktree(
+            &spec.repo,
+            checkout,
+            spec.expected_revision.as_deref(),
+        )?;
         cmd.current_dir(verified);
     }
 
@@ -2156,6 +2160,7 @@ pub fn verify_ao_bridge_compatibility(
         ao_project: ao_project.to_string(),
         remote: String::new(),
         local_checkout: None,
+        expected_revision: None,
     };
     let mut command = ao_spawn_command_with_mode(agent, &spec, true)?;
     command
@@ -2776,6 +2781,7 @@ mod ao_spawn_contract_tests {
             ao_project: "dark-factory".to_string(),
             remote: "origin".to_string(),
             local_checkout: Some(std::env::current_dir().unwrap()),
+            expected_revision: None,
         }
     }
 
@@ -2940,6 +2946,27 @@ print("  Branch:   " + os.environ.get("AO_FAKE_RETURN_BRANCH", os.environ["DARK_
         let error = spawn_result.expect_err("missing checkout must fail closed");
         assert!(error.to_string().contains("no target checkout"), "{error}");
         assert!(calls.is_empty(), "AO must not be invoked without a checkout");
+    }
+
+    #[test]
+    fn worker_spawn_rejects_stale_expected_revision_before_ao() {
+        let prompt = "stale revision prompt";
+        let branch = "factory/jleechan-contract-stale-revision-r1";
+        let (spawn_result, calls) = with_fake_ao(
+            "stale_revision",
+            serde_json::json!({prompt: branch}),
+            |log| {
+                let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+                let mut stale = spec(prompt, branch);
+                stale.expected_revision = Some("0000000000000000000000000000000000000000".into());
+                let result = sessions.spawn(&stale);
+                let calls = std::fs::read_to_string(log).unwrap_or_default();
+                (result, calls)
+            },
+        );
+        let error = spawn_result.expect_err("stale checkout must fail closed");
+        assert!(error.to_string().contains("expected snapshot"), "{error}");
+        assert!(calls.is_empty(), "AO must not be invoked on a stale checkout");
     }
 
     #[test]

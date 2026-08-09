@@ -240,6 +240,10 @@ pub struct SpawnSpec {
     /// Local checkout to use as the AO process cwd. This keeps worktree
     /// creation and repository discovery bound to the bead's target repo.
     pub local_checkout: Option<std::path::PathBuf>,
+    /// Authoritative revision the checkout must contain before spawning. For
+    /// adopted remediation this is the remote branch SHA captured immediately
+    /// before dispatch; a same-origin checkout at another HEAD is unsafe.
+    pub expected_revision: Option<String>,
 }
 
 /// Opaque handle to an AO/`aow` session.

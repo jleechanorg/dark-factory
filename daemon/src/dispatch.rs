@@ -531,6 +531,7 @@ pub fn dispatch_ready(
             ao_project: routing.ao_project.clone(),
             remote: routing.push_remote.clone(),
             local_checkout: Some(worker_checkout),
+            expected_revision: overlay.pre_session_head_sha.clone(),
         };
         let session_id = match sessions.spawn(&spec) {
             Ok(session_id) => session_id,
