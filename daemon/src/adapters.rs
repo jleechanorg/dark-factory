@@ -1987,14 +1987,26 @@ fn ao_spawn_command_with_mode(
         Command::new("ao")
     };
 
-    // Bind AO's repository discovery/worktree creation to the routed target
-    // checkout. Without this, AO inherits the daemon process cwd (normally
-    // the dark-factory checkout), so an explicit cross-repository target can
-    // receive a worker in the wrong repository. `local_checkout` is only
-    // populated by explicit repo routing; legacy single-repo diagnostics keep
-    // the historical cwd behavior.
-    if let Some(checkout) = &spec.local_checkout {
-        cmd.current_dir(checkout);
+    // Bind every worker spawn to its routed target checkout. Without this, AO
+    // inherits the daemon process cwd (normally the dark-factory checkout),
+    // so even legacy single-repo routing can create a worker in the wrong
+    // repository. Startup diagnostics are read-only and intentionally do not
+    // require a worker checkout.
+    if !diagnostic {
+        let checkout = spec.local_checkout.as_ref().ok_or_else(|| {
+            DaemonError::Config(format!(
+                "AO worker spawn for repo {:?} has no target checkout; refusing to inherit daemon cwd",
+                spec.repo
+            ))
+        })?;
+        if !checkout.is_absolute() {
+            return Err(DaemonError::Config(format!(
+                "AO worker spawn target checkout must be absolute: {}",
+                checkout.display()
+            )));
+        }
+        let verified = crate::target_worktree::ensure_target_worktree(&spec.repo, checkout, None)?;
+        cmd.current_dir(verified);
     }
 
     // This is the complete AO v0.1.3 public spawn argv: no --prompt,
@@ -2763,7 +2775,7 @@ mod ao_spawn_contract_tests {
             repo: "jleechanorg/dark-factory".to_string(),
             ao_project: "dark-factory".to_string(),
             remote: "origin".to_string(),
-            local_checkout: None,
+            local_checkout: Some(std::env::current_dir().unwrap()),
         }
     }
 
@@ -2910,6 +2922,27 @@ print("  Branch:   " + os.environ.get("AO_FAKE_RETURN_BRANCH", os.environ["DARK_
     }
 
     #[test]
+    fn worker_spawn_without_checkout_fails_closed_before_ao() {
+        let prompt = "missing checkout prompt";
+        let branch = "factory/jleechan-contract-missing-checkout-r1";
+        let (spawn_result, calls) = with_fake_ao(
+            "missing_checkout",
+            serde_json::json!({prompt: branch}),
+            |log| {
+                let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+                let mut missing = spec(prompt, branch);
+                missing.local_checkout = None;
+                let result = sessions.spawn(&missing);
+                let calls = std::fs::read_to_string(log).unwrap_or_default();
+                (result, calls)
+            },
+        );
+        let error = spawn_result.expect_err("missing checkout must fail closed");
+        assert!(error.to_string().contains("no target checkout"), "{error}");
+        assert!(calls.is_empty(), "AO must not be invoked without a checkout");
+    }
+
+    #[test]
     fn routed_spawn_uses_target_checkout_as_ao_cwd() {
         let prompt = "routed checkout prompt";
         let branch = "factory/jleechan-contract-checkout-r1";
@@ -2919,6 +2952,16 @@ print("  Branch:   " + os.environ.get("AO_FAKE_RETURN_BRANCH", os.environ["DARK_
             std::thread::current().name().unwrap_or("test")
         ));
         std::fs::create_dir_all(&checkout).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&checkout)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["remote", "add", "origin", "https://github.com/otherorg/other-repo.git"])
+            .current_dir(&checkout)
+            .status()
+            .unwrap();
 
         let (spawn_result, calls) = with_fake_ao("target_checkout", serde_json::json!({prompt: branch}), |log| {
             let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
@@ -2929,11 +2972,10 @@ print("  Branch:   " + os.environ.get("AO_FAKE_RETURN_BRANCH", os.environ["DARK_
             let calls = std::fs::read_to_string(log).unwrap_or_default();
             (result, calls)
         });
-        let _ = std::fs::remove_dir_all(&checkout);
-
         assert!(spawn_result.is_ok(), "routed spawn failed: {spawn_result:?}");
         let row: serde_json::Value = calls.lines().next().unwrap().parse().unwrap();
-        assert_eq!(row["cwd"], checkout.to_string_lossy().as_ref());
+        assert_eq!(row["cwd"], checkout.canonicalize().unwrap().to_string_lossy().as_ref());
+        let _ = std::fs::remove_dir_all(&checkout);
     }
 
     #[test]

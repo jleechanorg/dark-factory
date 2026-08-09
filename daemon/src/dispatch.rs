@@ -395,6 +395,38 @@ pub fn dispatch_ready(
             ));
             continue;
         }
+        // Every real AO spawn receives an absolute target checkout. Legacy
+        // single-repo routing has no explicit `local_checkout`, so resolve its
+        // daemon-owned owner/repo path here; the CLI adapter provisions and
+        // verifies it before crossing the AO boundary. Explicit operator
+        // checkouts remain fail-closed if they are absent or relative.
+        let worker_checkout = match cfg
+            .target_worktree_path(&repo)
+            .filter(|path| path.is_absolute())
+        {
+            Some(path) => path,
+            None => {
+                let error = DaemonError::Config(format!(
+                    "bead {} has no absolute worker checkout for repo {repo:?}; refusing to inherit daemon cwd",
+                    bead.id
+                ));
+                overlay.state = OverlayState::HumanHeld;
+                overlay.session_id = None;
+                set_human_hold_reason(
+                    &mut overlay,
+                    HumanHoldReason::TargetCheckoutUnconfigured,
+                );
+                store.save(&overlay)?;
+                report.failures.push(failure(
+                    bead,
+                    overlay.attempt,
+                    None,
+                    "target_checkout_unconfigured",
+                    error,
+                ));
+                continue;
+            }
+        };
 
         // jleechan-drive-pr-branch-binding-pcpr: a resolved open-PR head
         // branch wins over the generated `factory/<bead>-r<attempt>` one —
@@ -498,7 +530,7 @@ pub fn dispatch_ready(
             repo: repo.clone(),
             ao_project: routing.ao_project.clone(),
             remote: routing.push_remote.clone(),
-            local_checkout: routing.local_checkout.clone(),
+            local_checkout: Some(worker_checkout),
         };
         let session_id = match sessions.spawn(&spec) {
             Ok(session_id) => session_id,
@@ -1184,6 +1216,7 @@ mod tests {
         /// jleechan-if09's narrower `prompts: RefCell<Vec<String>>` (same
         /// purpose, plus the bead id).
         spawn_prompts: RefCell<Vec<(String, String)>>,
+        spawn_checkouts: RefCell<Vec<Option<std::path::PathBuf>>>,
         /// jleechan-bqdv Stage C: scripted `worktree_remote_url` override,
         /// keyed by `ao_project`. Empty by default (matches the trait's
         /// `Ok(None)` default — "cannot verify") so every pre-existing test
@@ -1215,6 +1248,7 @@ mod tests {
                 fail_stop_for: RefCell::new(Vec::new()),
                 scripted_branch: RefCell::new(HashMap::new()),
                 spawn_prompts: RefCell::new(Vec::new()),
+                spawn_checkouts: RefCell::new(Vec::new()),
                 scripted_worktree_remote: RefCell::new(scripted_worktree_remote),
             }
         }
@@ -1282,6 +1316,9 @@ mod tests {
             self.spawn_prompts
                 .borrow_mut()
                 .push((spec.bead_id.clone(), spec.prompt.clone()));
+            self.spawn_checkouts
+                .borrow_mut()
+                .push(spec.local_checkout.clone());
             if self.fail_spawn_fatal_for.borrow().contains(&spec.bead_id) {
                 return Err(DaemonError::Parse(format!(
                     "scripted fatal spawn failure for {}",
@@ -1855,6 +1892,11 @@ mod tests {
 
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
         assert_eq!(report.success_count(), 1);
+        let checkout = sessions.spawn_checkouts.borrow()[0]
+            .clone()
+            .expect("legacy global route must bind a worker checkout");
+        assert!(checkout.is_absolute());
+        assert!(checkout.ends_with(std::path::Path::new("owner/repo")));
 
         assert_eq!(store.branches.borrow().as_slice(), ["factory/bead-0-r1"]);
 

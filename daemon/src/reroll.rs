@@ -1112,6 +1112,31 @@ fn execute_adopted(
             "adopted bead targets explicit repo {adopted_repo:?}, but its local_checkout is missing or not absolute"
         )));
     }
+    let adopted_checkout = match deps
+        .cfg
+        .target_worktree_path(&adopted_repo)
+        .filter(|path| path.is_absolute())
+    {
+        Some(path) => path,
+        None => {
+            bead.state = OverlayState::HumanHeld;
+            bead.session_id = None;
+            set_human_hold_reason(bead, HumanHoldReason::TargetCheckoutUnconfigured);
+            deps.store.save(bead)?;
+            emit_telemetry(
+                deps.telemetry_log,
+                &bead.bead_id,
+                bead.attempt,
+                bead.state.as_str(),
+                "REROLL_ADOPTED_TARGET_CHECKOUT_UNCONFIGURED",
+                serde_json::json!({}),
+                serde_json::json!({"repo": adopted_repo}),
+            )?;
+            return Ok(RerollOutcome::Held(format!(
+                "adopted bead has no absolute worker checkout for repo {adopted_repo:?}; refusing to inherit daemon cwd"
+            )));
+        }
+    };
 
     let next_attempt = bead.attempt + 1;
     let prompt = format!(
@@ -1192,7 +1217,7 @@ fn execute_adopted(
         repo: adopted_repo,
         ao_project: adopted_routing.ao_project,
         remote: adopted_routing.push_remote,
-        local_checkout: adopted_routing.local_checkout,
+        local_checkout: Some(adopted_checkout),
     };
 
     // Persist an ambiguous pre-spawn intent before crossing the external AO

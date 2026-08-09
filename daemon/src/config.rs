@@ -138,27 +138,23 @@ fn default_reroll_death_confirm_secs() -> u64 {
 
 impl Config {
     /// Resolve the target repository checkout used by execution-time gates.
-    /// Explicit `local_checkout` wins. When omitted, reuse a host-managed
-    /// checkout under `$HOME/projects/<repo>` or an isolated target-worktree
-    /// under `$DARK_FACTORY_TARGET_WORKTREE_ROOT` (defaulting to
-    /// `$HOME/.dark-factory/target-worktrees`). The daemon's own current
-    /// directory is intentionally never used: release binaries are commonly
-    /// launched from an immutable uv/archive path.
+    /// Explicit `local_checkout` wins. When omitted, resolve a daemon-owned
+    /// checkout under `$DARK_FACTORY_TARGET_WORKTREE_ROOT` (defaulting to
+    /// `$HOME/.dark-factory/target-worktrees`) using the complete
+    /// `<owner>/<repo>` identity. The daemon's own current directory is never
+    /// used: release binaries are commonly launched from an immutable
+    /// uv/archive path, and a repository basename is not globally unique.
     pub fn target_worktree_path(&self, repo: &str) -> Option<PathBuf> {
         let routing = self.resolve_repo(repo)?;
         if let Some(path) = routing.local_checkout {
             return Some(path);
         }
-        let name = repo.split('/').next_back()?;
+        let (owner, name) = repo.split_once('/')?;
         let home = std::env::var_os("HOME").map(PathBuf::from);
-        let conventional = home.as_ref().map(|h| h.join("projects").join(name));
-        if conventional.as_ref().is_some_and(|path| path.is_dir()) {
-            return conventional;
-        }
         let isolated_root = std::env::var_os("DARK_FACTORY_TARGET_WORKTREE_ROOT")
             .map(PathBuf::from)
             .or_else(|| home.map(|h| h.join(".dark-factory/target-worktrees")))?;
-        Some(isolated_root.join(name))
+        Some(isolated_root.join(owner).join(name))
     }
 
     pub fn target_worktree(&self, repo: &str) -> Option<PathBuf> {
@@ -550,7 +546,7 @@ local_checkout = "{}"
     #[test]
     fn target_worktree_reuses_isolated_checkout_when_local_checkout_is_missing() {
         let root = std::env::temp_dir().join(format!("afd_isolated_target_{}", std::process::id()));
-        let isolated = root.join("target");
+        let isolated = root.join("owner").join("target");
         std::fs::create_dir_all(&isolated).unwrap();
         let previous = std::env::var_os("DARK_FACTORY_TARGET_WORKTREE_ROOT");
         std::env::set_var("DARK_FACTORY_TARGET_WORKTREE_ROOT", &root);

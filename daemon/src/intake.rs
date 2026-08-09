@@ -237,14 +237,23 @@ impl AdoptionProbeCache {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let tmp = self.path.with_extension("json.tmp");
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let tmp = self.path.with_extension(format!(
+            "json.tmp.{}.{}",
+            std::process::id(),
+            nonce
+        ));
         std::fs::write(&tmp, json.as_bytes())
             .map_err(|e| DaemonError::Config(format!("write adoption_probe_cache: {e}")))?;
-        std::fs::rename(&tmp, &self.path).map_err(|e| {
-            DaemonError::Config(format!(
-                "rename adoption_probe_cache tmp->final: {e}"
-            ))
-        })?;
+        if let Err(error) = std::fs::rename(&tmp, &self.path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(DaemonError::Config(format!(
+                "rename adoption_probe_cache tmp->final: {error}"
+            )));
+        }
         Ok(())
     }
 
