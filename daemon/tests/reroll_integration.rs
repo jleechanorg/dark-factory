@@ -33,7 +33,20 @@ fn test_cfg() -> Config {
         reroll_head_stability_window_secs: 1,
         reroll_death_confirm_secs: 0,
         held_recheck_cooldown_secs: 900,
-        repos: std::collections::HashMap::new(),
+        // The production policy requires fixture repositories to declare an
+        // explicit existing checkout before an adopted reroll may spawn. The
+        // integration fixture owns the daemon test cwd, so configure the
+        // legacy `owner/repo` identity with that absolute path here. Tests
+        // that exercise the unconfigured legacy fixture path override this
+        // entry with `local_checkout: None` below.
+        repos: std::collections::HashMap::from([(
+            "owner/repo".into(),
+            RepoConfig {
+                ao_project: "repo".into(),
+                push_remote: "origin".into(),
+                local_checkout: Some(std::env::current_dir().unwrap()),
+            },
+        )]),
         pre_gate_validation_enabled: false,
         escalation_refire_secs: 3600,
     }

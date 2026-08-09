@@ -121,7 +121,8 @@ fn test_cli_sessions_real_spawn_v013_contract() {
             repo: "jleechanorg/dark-factory".to_string(),
             ao_project: "dark-factory".to_string(),
             remote: "origin".to_string(),
-            local_checkout: None,
+            local_checkout: Some(std::env::current_dir().unwrap()),
+            expected_revision: None,
         })
         .expect("real AO v0.1.3 adapter spawn failed");
 

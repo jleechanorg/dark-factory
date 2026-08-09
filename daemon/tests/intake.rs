@@ -31,6 +31,82 @@ fn test_cfg() -> Config {
     }
 }
 
+#[test]
+fn adoption_probe_cache_persists_in_runtime_state_not_target_beads_dir() {
+    let root = std::env::temp_dir().join(format!(
+        "afd_adoption_cache_runtime_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let cache_path = root.join("adoption_probe_cache.json");
+    let key = ProbeCacheKey {
+        external_ref: "owner/repo#1".into(),
+        head_sha: Some("head".into()),
+        updated_at_epoch: Some(1),
+    };
+    let mut cache = AdoptionProbeCache::load_or_default_at(&cache_path);
+    cache.insert(key.clone(), CachedDecisionKind::AuthorPermission(Permission::Write), 1);
+    cache.persist().unwrap();
+
+    assert!(cache_path.is_file());
+    assert!(!root.join(".beads/adoption_probe_cache.json").exists());
+    let restored = AdoptionProbeCache::load_or_default_at(&cache_path);
+    assert!(restored.contains(&key));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn adoption_probe_cache_concurrent_persists_leave_no_shared_temp_file() {
+    let root = std::env::temp_dir().join(format!(
+        "afd_adoption_cache_race_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("adoption_probe_cache.json");
+    let expected_keys = (0..8)
+        .map(|index| ProbeCacheKey {
+            external_ref: format!("owner/repo#{index}"),
+            head_sha: Some(format!("head-{index}")),
+            updated_at_epoch: Some(index),
+        })
+        .collect::<Vec<_>>();
+    let mut workers = Vec::new();
+    for key in expected_keys.clone() {
+        let path = path.clone();
+        workers.push(std::thread::spawn(move || {
+            let mut cache = AdoptionProbeCache::load_or_default_at(path);
+            cache.insert(
+                key,
+                CachedDecisionKind::AuthorPermission(Permission::Write),
+                1,
+            );
+            cache.persist().unwrap();
+        }));
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    let restored = AdoptionProbeCache::load_or_default_at(&path);
+    for key in &expected_keys {
+        assert!(restored.contains(key), "concurrent key was lost: {key:?}");
+    }
+    let leftovers = std::fs::read_dir(&root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .filter(|name| name.to_string_lossy().contains(".json.tmp"))
+        .collect::<Vec<_>>();
+    assert!(leftovers.is_empty(), "temporary files leaked: {leftovers:?}");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 fn issue(number: u64, author_login: &str) -> Issue {
     Issue {
         number,

@@ -2194,7 +2194,13 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             return Ok(());
         }
         let dispatch_report =
-            dispatch::dispatch_ready(deps.sessions, deps.store, deps.cfg, &ready)?;
+            dispatch::dispatch_ready_with_vcs(
+                deps.sessions,
+                deps.store,
+                deps.cfg,
+                &ready,
+                Some(deps.vcs),
+            )?;
         summary.beads_dispatched += dispatch_report.success_count();
 
         for failure in &dispatch_report.failures {
@@ -2508,7 +2514,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 }
                 let comment_body = match reason {
                     "target_checkout_unconfigured" => format!(
-                        "🤖 **[dark-factory]** Escalation required: bead `{}` targets a configured repository whose `local_checkout` is missing or not absolute. Automation parked only this bead HUMAN_HELD rather than spawning from the daemon's unrelated cwd; configure `[repos.\"<repo>\"].local_checkout` before requeuing.",
+                        "🤖 **[dark-factory]** Escalation required: bead `{}` targets a configured repository whose `local_checkout` is absent, relative, or not a directory. Automation parked only this bead HUMAN_HELD rather than cloning or spawning from an invalid checkout; repair `[repos.\"<repo>\"].local_checkout` before requeuing.",
                         failure.bead_id
                     ),
                     "spawn_failed" => format!(
@@ -3077,7 +3083,7 @@ fn skeptic_evidence(
     // bead's OWN resolved repo so a test-repo bead dispatched under a
     // non-test global `cfg.target_repo` (or vice versa) is classified
     // correctly instead of by the daemon-global repo.
-    let is_test_repo = repo.contains("fake-") || repo.contains("test-") || repo == "owner/repo";
+    let is_test_repo = crate::config::is_fixture_repo(repo);
 
     let mut gha_verdict = "verdict: absent";
     let mut signoff_verdict = "verdict: absent";
@@ -3408,19 +3414,43 @@ fn vacuous_red_green_for_pr(
         return verifier::VacuousRedGreenStatus::NotProvided;
     }
 
-    // The detector needs a local working tree to revert + cargo-run.
-    // The daemon's own CWD is a checkout of `cfg.target_repo` (the
-    // canonical dark-factory source tree) for the Stage-2 production
-    // lane; if the current CWD does not contain a Cargo.toml, the
-    // detector has no manifest to run against, and we surface that as
-    // ManifestMissing rather than silently treating NEVER_RAN as a
-    // vacuous pass (issue #387 r5 finding 3).
-    let repo_root = match std::env::current_dir() {
-        Ok(p) => p,
-        Err(_) => {
-            return verifier::VacuousRedGreenStatus::ManifestMissing(
-                "could not read daemon cwd".to_string(),
-            );
+    // The detector needs a local working tree to revert + cargo-run. Resolve
+    // the bead's target execution resource, never the daemon binary's CWD:
+    // Installed uv/release binaries are immutable and their CWD may not even
+    // be a checkout. Resolve the target resource from config, then provision
+    // a dedicated isolated checkout when the host has not created it yet.
+    let routing = match deps.cfg.resolve_repo(repo) {
+        Some(routing) => routing,
+        None => {
+            return verifier::VacuousRedGreenStatus::ManifestMissing(format!(
+                "no repository routing configured for {repo:?}"
+            ));
+        }
+    };
+    if !deps.cfg.worker_checkout_is_configured(repo, &routing) {
+        return verifier::VacuousRedGreenStatus::ManifestMissing(format!(
+            "configured local checkout for repo {repo:?} is missing, relative, or not a directory"
+        ));
+    }
+    let requested = match deps.cfg.target_worktree_path(repo) {
+        Some(path) => path,
+        None => {
+            return verifier::VacuousRedGreenStatus::ManifestMissing(format!(
+                "no target worktree path available for repo {repo:?}"
+            ));
+        }
+    };
+    let repo_root = match crate::target_worktree::ensure_target_worktree(
+        repo,
+        &requested,
+        Some(&snapshot.head_sha),
+    ) {
+        Ok(path) => path,
+        Err(error) => {
+            return verifier::VacuousRedGreenStatus::ManifestMissing(format!(
+                "provision target worktree for repo {repo:?} at {}: {error}",
+                requested.display()
+            ));
         }
     };
     let manifest = match crate::vacuous_red_green::find_cargo_manifest(&repo_root) {
@@ -3769,8 +3799,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         // that assert `beads_ready: 1` for these fixtures then fail because
         // Unknown blocks readiness. The Stage-1 lane has no PR diff to revert,
         // so NotProvided is the right answer (matches r5 contract).
-        let is_test_repo =
-            repo.contains("fake-") || repo.contains("test-") || repo == "owner/repo";
+        let is_test_repo = crate::config::is_fixture_repo(&repo);
 
         if overlay.state == OverlayState::Dispatched
             && overlay.pr_number.is_none()

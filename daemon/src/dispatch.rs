@@ -10,7 +10,7 @@ use crate::router::RoutingVerdict;
 use crate::state::{
     set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore,
 };
-use crate::tools::{remote_url_for_display, remote_url_matches_repo, Bead, Sessions, SpawnSpec};
+use crate::tools::{remote_url_for_display, remote_url_matches_repo, Bead, Sessions, SpawnSpec, Vcs};
 
 #[cfg(test)]
 const SPAWN_CLEANUP_FAILED_PARK_REASON: &str = "spawn_cleanup_failed";
@@ -204,6 +204,19 @@ pub fn dispatch_ready(
     cfg: &Config,
     ready: &[(Bead, RoutingVerdict, DriveBranchDecision)],
 ) -> Result<DispatchReport, DaemonError> {
+    dispatch_ready_with_vcs(sessions, store, cfg, ready, None)
+}
+
+/// Production dispatch variant: resolve each routed repository's authoritative
+/// base revision before AO, so the expected revision is durable in DISPATCHING
+/// and the adapter can reject a stale same-origin checkout.
+pub fn dispatch_ready_with_vcs(
+    sessions: &dyn Sessions,
+    store: &dyn StateStore,
+    cfg: &Config,
+    ready: &[(Bead, RoutingVerdict, DriveBranchDecision)],
+    vcs: Option<&dyn Vcs>,
+) -> Result<DispatchReport, DaemonError> {
     let active = sessions.active_count()?;
     let free_slots = cfg.max_workers.saturating_sub(active);
     let batch = free_slots.min(cfg.max_batch);
@@ -375,8 +388,9 @@ pub fn dispatch_ready(
         };
         if !cfg.worker_checkout_is_configured(&repo, &routing) {
             let error = DaemonError::Config(format!(
-                "bead {} targets explicit repo {repo:?}, but [repos.\"{repo}\"].local_checkout \
-                 is missing or not absolute; refusing to spawn from the daemon's unrelated cwd",
+                "bead {} targets fixture or invalid checkout repo {repo:?}; its configured \
+                 local_checkout is absent, relative, or not a directory and is not eligible \
+                 for daemon-owned provisioning",
                 bead.id
             ));
             overlay.state = OverlayState::HumanHeld;
@@ -395,6 +409,38 @@ pub fn dispatch_ready(
             ));
             continue;
         }
+        // Every real AO spawn receives an absolute target checkout. Legacy
+        // single-repo routing and production [repos] entries without an
+        // explicit `local_checkout` resolve a daemon-owned owner/repo path
+        // here; the CLI adapter provisions and verifies it before crossing
+        // the AO boundary. Explicit relative paths remain fail-closed.
+        let worker_checkout = match cfg
+            .target_worktree_path(&repo)
+            .filter(|path| path.is_absolute())
+        {
+            Some(path) => path,
+            None => {
+                let error = DaemonError::Config(format!(
+                    "bead {} has no absolute worker checkout for repo {repo:?}; refusing to inherit daemon cwd",
+                    bead.id
+                ));
+                overlay.state = OverlayState::HumanHeld;
+                overlay.session_id = None;
+                set_human_hold_reason(
+                    &mut overlay,
+                    HumanHoldReason::TargetCheckoutUnconfigured,
+                );
+                store.save(&overlay)?;
+                report.failures.push(failure(
+                    bead,
+                    overlay.attempt,
+                    None,
+                    "target_checkout_unconfigured",
+                    error,
+                ));
+                continue;
+            }
+        };
 
         // jleechan-drive-pr-branch-binding-pcpr: a resolved open-PR head
         // branch wins over the generated `factory/<bead>-r<attempt>` one —
@@ -468,6 +514,38 @@ pub fn dispatch_ready(
             return Err(err);
         }
 
+        let expected_revision = match vcs {
+            Some(vcs) => match vcs.base_head_for_repo(&repo, &cfg.base_branch) {
+                Ok(sha) if !sha.trim().is_empty() => sha,
+                Ok(_) => {
+                    let error = DaemonError::Config(format!(
+                        "authoritative base revision for repo {repo:?} is empty"
+                    ));
+                    overlay.state = OverlayState::HumanHeld;
+                    set_human_hold_reason(&mut overlay, HumanHoldReason::TargetCheckoutUnconfigured);
+                    store.save(&overlay)?;
+                    report.failures.push(failure(
+                        bead, overlay.attempt, None, "expected_revision_unavailable", error,
+                    ));
+                    continue;
+                }
+                Err(error) => {
+                    overlay.state = OverlayState::HumanHeld;
+                    set_human_hold_reason(&mut overlay, HumanHoldReason::TargetCheckoutUnconfigured);
+                    store.save(&overlay)?;
+                    report.failures.push(failure(
+                        bead, overlay.attempt, None, "expected_revision_unavailable", error,
+                    ));
+                    continue;
+                }
+            },
+            None => overlay
+                .pre_session_head_sha
+                .clone()
+                .unwrap_or_else(|| "test-unverified-revision".to_string()),
+        };
+        overlay.pre_session_head_sha = Some(expected_revision.clone());
+        store.save(&overlay)?;
         let preamble = dispatch_prompt_preamble(&repo, &routing.push_remote, &branch);
         let prompt = match verdict {
             RoutingVerdict::ResearchPath => {
@@ -498,7 +576,8 @@ pub fn dispatch_ready(
             repo: repo.clone(),
             ao_project: routing.ao_project.clone(),
             remote: routing.push_remote.clone(),
-            local_checkout: routing.local_checkout.clone(),
+            local_checkout: Some(worker_checkout),
+            expected_revision: Some(expected_revision.clone()),
         };
         let session_id = match sessions.spawn(&spec) {
             Ok(session_id) => session_id,
@@ -1184,6 +1263,7 @@ mod tests {
         /// jleechan-if09's narrower `prompts: RefCell<Vec<String>>` (same
         /// purpose, plus the bead id).
         spawn_prompts: RefCell<Vec<(String, String)>>,
+        spawn_checkouts: RefCell<Vec<Option<std::path::PathBuf>>>,
         /// jleechan-bqdv Stage C: scripted `worktree_remote_url` override,
         /// keyed by `ao_project`. Empty by default (matches the trait's
         /// `Ok(None)` default — "cannot verify") so every pre-existing test
@@ -1215,6 +1295,7 @@ mod tests {
                 fail_stop_for: RefCell::new(Vec::new()),
                 scripted_branch: RefCell::new(HashMap::new()),
                 spawn_prompts: RefCell::new(Vec::new()),
+                spawn_checkouts: RefCell::new(Vec::new()),
                 scripted_worktree_remote: RefCell::new(scripted_worktree_remote),
             }
         }
@@ -1282,6 +1363,9 @@ mod tests {
             self.spawn_prompts
                 .borrow_mut()
                 .push((spec.bead_id.clone(), spec.prompt.clone()));
+            self.spawn_checkouts
+                .borrow_mut()
+                .push(spec.local_checkout.clone());
             if self.fail_spawn_fatal_for.borrow().contains(&spec.bead_id) {
                 return Err(DaemonError::Parse(format!(
                     "scripted fatal spawn failure for {}",
@@ -1580,7 +1664,14 @@ mod tests {
             reroll_head_stability_window_secs: 30,
             reroll_death_confirm_secs: 5,
             held_recheck_cooldown_secs: 900,
-            repos: std::collections::HashMap::new(),
+            repos: std::collections::HashMap::from([(
+                "owner/repo".into(),
+                crate::config::RepoConfig {
+                    ao_project: "repo".into(),
+                    push_remote: "origin".into(),
+                    local_checkout: Some(std::env::current_dir().unwrap()),
+                },
+            )]),
             pre_gate_validation_enabled: false,
             escalation_refire_secs: 3600,
         }
@@ -1855,6 +1946,11 @@ mod tests {
 
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
         assert_eq!(report.success_count(), 1);
+        let checkout = sessions.spawn_checkouts.borrow()[0]
+            .clone()
+            .expect("explicit test checkout must bind a worker checkout");
+        assert!(checkout.is_absolute());
+        assert_eq!(checkout, std::env::current_dir().unwrap());
 
         assert_eq!(store.branches.borrow().as_slice(), ["factory/bead-0-r1"]);
 
@@ -1978,6 +2074,100 @@ mod tests {
         let calls = sessions.calls.borrow();
         assert!(!calls.iter().any(|call| call == "spawn(bead-0)"));
         assert!(calls.iter().any(|call| call == "spawn(bead-1)"));
+    }
+
+    #[test]
+    fn explicit_missing_absolute_checkout_fails_closed_without_spawn() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("owner/production".into()),
+                attempt_started_at: None,
+            })
+            .unwrap();
+        let mut cfg = cfg();
+        let checkout = std::env::temp_dir().join(format!(
+            "afd_dispatch_missing_checkout_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&checkout);
+        cfg.repos.insert(
+            "owner/production".into(),
+            crate::config::RepoConfig {
+                ao_project: "production".into(),
+                push_remote: "origin".into(),
+                local_checkout: Some(checkout.clone()),
+            },
+        );
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &beads(1)).unwrap();
+
+        assert_eq!(report.success_count(), 0);
+        assert_eq!(report.failures[0].phase, "target_checkout_unconfigured");
+        assert!(sessions
+            .calls
+            .borrow()
+            .iter()
+            .all(|call| !call.starts_with("spawn(")));
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::HumanHeld);
+        assert!(!checkout.exists());
+    }
+
+    #[test]
+    fn legacy_fixture_target_is_parked_without_branch_or_spawn() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("owner/repo".into()),
+                attempt_started_at: None,
+            })
+            .unwrap();
+        let mut cfg = cfg();
+        cfg.repos.clear();
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &beads(1)).unwrap();
+
+        assert_eq!(report.success_count(), 0);
+        assert_eq!(report.failures[0].phase, "target_checkout_unconfigured");
+        assert!(store.branches.borrow().is_empty());
+        assert!(sessions
+            .calls
+            .borrow()
+            .iter()
+            .all(|call| !call.starts_with("spawn(")));
+        assert_eq!(
+            store.load("bead-0").unwrap().unwrap().state,
+            OverlayState::HumanHeld
+        );
     }
 
     /// jleechan-8jxr r2 acceptance criterion #1: a manually-created factory
@@ -2364,7 +2554,7 @@ mod tests {
             crate::config::RepoConfig {
                 ao_project: "worldarchitect".to_string(),
                 push_remote: "worldai".to_string(),
-                local_checkout: Some(std::env::current_dir().unwrap()),
+               local_checkout: Some(std::env::current_dir().unwrap()),
             },
         );
         let ready = beads(1);
@@ -3473,7 +3663,7 @@ mod tests {
             crate::config::RepoConfig {
                 ao_project: "worldarchitect".to_string(),
                 push_remote: "worldai".to_string(),
-                local_checkout: Some(std::env::current_dir().unwrap()),
+               local_checkout: Some(std::env::current_dir().unwrap()),
             },
         );
         let ready = beads(1);

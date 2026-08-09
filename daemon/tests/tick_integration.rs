@@ -34,6 +34,20 @@ use daemon::tools::{
 };
 use daemon::verifier::SkepticVerdict;
 
+fn test_repo_cfg(project: &str) -> RepoConfig {
+    RepoConfig {
+        ao_project: project.into(),
+        push_remote: "origin".into(),
+        local_checkout: Some(std::env::current_dir().unwrap()),
+    }
+}
+
+fn test_vcs() -> FakeVcs {
+    let mut vcs = FakeVcs::default();
+    vcs.heads.insert("main".into(), "base-sha-123".into());
+    vcs
+}
+
 fn test_cfg() -> Config {
     Config {
         target_repo: "owner/repo".into(),
@@ -53,7 +67,13 @@ fn test_cfg() -> Config {
         reroll_head_stability_window_secs: 1,
         reroll_death_confirm_secs: 0,
         held_recheck_cooldown_secs: 900,
-        repos: std::collections::HashMap::new(),
+        repos: std::collections::HashMap::from([
+            ("owner/repo".into(), test_repo_cfg("repo")),
+            (
+                "myorg/global-real-repo".into(),
+                test_repo_cfg("global-real-repo"),
+            ),
+        ]),
         pre_gate_validation_enabled: false,
         escalation_refire_secs: 3600,
     }
@@ -82,7 +102,7 @@ fn one_full_tick_cycle_keeps_unknown_only_gate_attested() {
     ));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_dir = std::env::temp_dir().join("afd_tick_integration_test");
     std::fs::create_dir_all(&telemetry_dir).unwrap();
     let telemetry_log = telemetry_dir.join(format!("daemon-{}.jsonl", std::process::id()));
@@ -324,7 +344,7 @@ fn run_tick_rejects_non_stage_1_or_2_config() {
     let store = FakeStateStore::new();
     let mut cfg = test_cfg();
     cfg.stage = 3;
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_log = std::env::temp_dir().join("afd_tick_integration_stage2_unused.jsonl");
 
     let deps = TickDeps {
@@ -372,7 +392,7 @@ fn run_tick_never_calls_dispatch_when_router_parses_no_verdict() {
     *llm.response.borrow_mut() = Some(Ok("I think this looks fine, hard to say".into()));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_log = std::env::temp_dir().join("afd_tick_integration_parse_fail.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
@@ -473,7 +493,7 @@ fn run_tick_emits_dispatched_only_for_actual_dispatch_successes() {
     }
     store.fail_save_for("bead-0", OverlayState::Dispatching);
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_log = std::env::temp_dir().join("afd_tick_dispatch_isolation.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
@@ -586,7 +606,7 @@ fn test_autonomy_increment_and_timebox_envelope() {
     let telemetry_log = std::env::temp_dir().join("afd_test_autonomy.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let deps = TickDeps {
         scm: &scm,
         tracker: &tracker,
@@ -652,7 +672,7 @@ fn test_autonomy_budget_warning_crossing() {
     let telemetry_log = std::env::temp_dir().join("afd_test_warning.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let deps = TickDeps {
         scm: &scm,
         tracker: &tracker,
@@ -716,7 +736,7 @@ fn test_wedge_detection_dispatched_coder_silent() {
     let telemetry_log = std::env::temp_dir().join("afd_test_wedge_silent.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let deps = TickDeps {
         scm: &scm,
         tracker: &tracker,
@@ -803,7 +823,7 @@ fn test_wedge_detection_dispatched_coder_silent_saved_by_transcript_activity() {
     let telemetry_log = std::env::temp_dir().join("afd_test_wedge_silent_grace.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let deps = TickDeps {
         scm: &scm,
         tracker: &tracker,
@@ -893,7 +913,7 @@ fn test_wedge_detection_dispatched_coder_silent_stale_transcript_still_parks() {
     let telemetry_log = std::env::temp_dir().join("afd_test_wedge_silent_stale.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let deps = TickDeps {
         scm: &scm,
         tracker: &tracker,
@@ -965,7 +985,7 @@ fn test_dispatch_integrity_sweep_parks_session_branch_mismatch() {
     let telemetry_log = std::env::temp_dir().join("afd_test_dispatch_integrity_sweep.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let deps = TickDeps {
         scm: &scm,
         tracker: &tracker,
@@ -1087,7 +1107,7 @@ fn test_dispatch_integrity_sweep_leaves_matching_branch_alone() {
     let telemetry_log = std::env::temp_dir().join("afd_test_dispatch_integrity_ok.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let deps = TickDeps {
         scm: &scm,
         tracker: &tracker,
@@ -1151,7 +1171,7 @@ fn test_dispatch_integrity_sweep_detects_force_push_on_adopted_branch() {
     let telemetry_log = std::env::temp_dir().join("afd_test_force_push_detection.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
-    let mut vcs = FakeVcs::new();
+    let mut vcs = test_vcs();
     // The branch's CURRENT remote tip after the (simulated) force-push:
     vcs.heads
         .insert("alice/my-cool-feature".into(), "rewritten-sha-999".into());
@@ -1240,7 +1260,7 @@ fn test_dispatch_integrity_sweep_allows_fast_forward_adopted_commit() {
     let telemetry_log = std::env::temp_dir().join("afd_test_force_push_ok.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
-    let mut vcs = FakeVcs::new();
+    let mut vcs = test_vcs();
     vcs.heads
         .insert("bob/another-feature".into(), "new-commit-sha-777".into());
     // No entry in ancestor_pairs for this (ancestor, descendant) pair -> the
@@ -1341,7 +1361,7 @@ fn test_wedge_detection_attested_session_stalled() {
     let telemetry_log = std::env::temp_dir().join("afd_test_wedge_stalled.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let deps = TickDeps {
         scm: &scm,
         tracker: &tracker,
@@ -1458,7 +1478,7 @@ fn test_wedge_detection_attested_session_not_stalled_if_remote_ahead() {
 
     sessions.quiescent = true; // sessions report dead
 
-    let mut vcs = FakeVcs::new();
+    let mut vcs = test_vcs();
     // Local branch SHA is older than the remote head SHA, signalling that
     // the daemon's local checkout hasn't been updated but the PR has new
     // commits on remote. `is_remote_ahead` is scripted to return true for
@@ -1575,7 +1595,7 @@ fn test_wedge_detection_still_parks_when_local_matches_remote() {
 
     sessions.quiescent = true;
 
-    let mut vcs = FakeVcs::new();
+    let mut vcs = test_vcs();
     vcs.heads
         .insert("factory/bead-genuinely-stalled-r1".into(), same_sha);
 
@@ -1673,7 +1693,7 @@ fn test_wedge_detection_still_parks_when_local_is_ahead_of_remote() {
 
     sessions.quiescent = true;
 
-    let mut vcs = FakeVcs::new();
+    let mut vcs = test_vcs();
     vcs.heads.insert(
         "factory/bead-local-ahead-r1".into(),
         "local-head-ahead".into(),
@@ -1791,7 +1811,7 @@ fn test_wedge_detection_still_parks_when_branches_have_diverged() {
 
     sessions.quiescent = true;
 
-    let mut vcs = FakeVcs::new();
+    let mut vcs = test_vcs();
     vcs.heads.insert(
         "factory/bead-diverged-r1".into(),
         "local-head-diverged".into(),
@@ -1876,7 +1896,7 @@ fn factory_labeled_existing_pr_is_adopted_and_verified_without_spawn() {
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_log = std::env::temp_dir().join("afd_existing_pr_adoption.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
@@ -1964,7 +1984,7 @@ fn factory_labeled_existing_pr_second_tick_reuses_tracking_bead_without_spawn() 
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_log = std::env::temp_dir().join("afd_existing_pr_adoption_idempotent.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
     let deps = TickDeps {
@@ -2055,7 +2075,7 @@ fn existing_pr_adoption_does_not_re_emit_telemetry_on_subsequent_ticks() {
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     // jleechan-mdun follow-up (CodeRabbit actionable #1): the previous
     // fixed-name `afd_existing_pr_adoption_dedup.jsonl` collided across
     // concurrent `cargo test` jobs in the same process — every parallel
@@ -2145,7 +2165,7 @@ fn existing_pr_adoption_re_emits_after_state_transition_away_from_attested() {
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_dir = std::env::temp_dir().join("afd_existing_pr_adoption_transition");
     std::fs::create_dir_all(&telemetry_dir).unwrap();
     let telemetry_log = telemetry_dir.join(format!("daemon-{}.jsonl", std::process::id()));
@@ -2235,7 +2255,7 @@ fn factory_labeled_existing_pr_without_session_is_not_parked_as_stalled() {
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_log = std::env::temp_dir().join("afd_existing_pr_no_session_waiting.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
     let deps = TickDeps {
@@ -2314,7 +2334,7 @@ fn factory_labeled_pr_branch_collision_is_refused_without_stealing_mapping() {
         .register_branch("existing-bead", "factory/existing-bead-r1")
         .unwrap();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_log = std::env::temp_dir().join("afd_existing_pr_collision.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
@@ -2403,7 +2423,7 @@ fn fork_labeled_pr_never_registers_branch_at_tick_level() {
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_log = std::env::temp_dir().join("afd_fork_pr_tick_level.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
@@ -2503,7 +2523,7 @@ fn adopted_non_green_pr_parks_human_held_with_v1_escalation() {
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_log = std::env::temp_dir().join("afd_existing_pr_adoption_red.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
@@ -2611,7 +2631,7 @@ fn adopted_red_pr_stage2_reroll_spawns_remediation_session_leaves_pr_open() {
     let store = FakeStateStore::new();
     let mut cfg = test_cfg();
     cfg.stage = 2; // Stage 2: actually execute reroll() rather than just recording the verdict
-    let mut vcs = FakeVcs::new();
+    let mut vcs = test_vcs();
     vcs.heads.insert(
         "alice/my-cool-feature".into(),
         "pre-session-sha-abc123".into(),
@@ -2753,7 +2773,7 @@ fn adopted_red_pr_stage2_reroll_spawn_failure_parks_human_held_with_escalation()
     let store = FakeStateStore::new();
     let mut cfg = test_cfg();
     cfg.stage = 2;
-    let mut vcs = FakeVcs::new();
+    let mut vcs = test_vcs();
     vcs.heads.insert(
         "alice/my-conflicted-feature".into(),
         "pre-session-sha-abc123".into(),
@@ -2880,7 +2900,7 @@ fn adopted_red_pr_structural_only_red_gates_holds_disposition_required_not_rerol
     let store = FakeStateStore::new();
     let mut cfg = test_cfg();
     cfg.stage = 2; // Stage 2: reroll normally executes; our new branch must preempt it
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_log = std::env::temp_dir().join("afd_structural_only_red_gates.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
@@ -3017,7 +3037,7 @@ fn adopted_red_pr_mixed_red_gates_still_rerolls() {
     let store = FakeStateStore::new();
     let mut cfg = test_cfg();
     cfg.stage = 2;
-    let mut vcs = FakeVcs::new();
+    let mut vcs = test_vcs();
     // Adopted-PR reroll captures the branch's pre-session HEAD via
     // remote_head_sha before dispatching a remediation session.
     vcs.heads.insert(
@@ -3115,7 +3135,7 @@ fn disposition_required_bead_resumes_when_gates_go_green() {
     let store = FakeStateStore::new();
     let mut cfg = test_cfg();
     cfg.stage = 2;
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     // Pre-seed a bead already held at DISPOSITION_REQUIRED with an open PR and
     // a registered branch (as the daemon would have left it on a prior tick).
@@ -3207,7 +3227,7 @@ fn disposition_required_bead_in_cooldown_is_skipped_without_scm_call() {
     let store = FakeStateStore::new();
     let mut cfg = test_cfg();
     cfg.stage = 2;
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     let branch = "alice/held-in-cooldown";
     store
@@ -3298,7 +3318,7 @@ fn disposition_required_reassessment_error_preserves_hold_provenance() {
     let store = FakeStateStore::new();
     let mut cfg = test_cfg();
     cfg.stage = 2;
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     let branch = "alice/held-then-error";
     store
@@ -3446,7 +3466,7 @@ fn test_manual_bead_input_auto_queued_and_dispatched() {
     ));
     let store = FakeStateStore::new(); // empty database initially
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     let telemetry_log = std::env::temp_dir().join("afd_manual_bead_test.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
@@ -3518,7 +3538,7 @@ fn drive_existing_pr_bead_dispatches_onto_pr_head_branch_not_generated_branch() 
     ));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_log = std::env::temp_dir().join(format!(
         "afd_drive_pr_branch_binding_{}.jsonl",
         std::process::id()
@@ -3613,7 +3633,7 @@ fn bead_with_external_ref_but_no_open_pr_falls_back_to_generated_branch() {
     ));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_log = std::env::temp_dir().join(format!(
         "afd_no_open_pr_generated_branch_{}.jsonl",
         std::process::id()
@@ -3674,7 +3694,7 @@ fn drive_pr_bead_with_fork_head_falls_back_to_generated_branch_not_fork_head() {
     ));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_log = std::env::temp_dir().join(format!(
         "afd_fork_pr_generated_fallback_{}.jsonl",
         std::process::id()
@@ -3747,7 +3767,7 @@ fn remote_credentials_never_reach_tick_telemetry_or_escalation_comments() {
     ));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_log =
         std::env::temp_dir().join(format!("afd_remote_redaction_{}.jsonl", std::process::id()));
     let _ = std::fs::remove_file(&telemetry_log);
@@ -3850,7 +3870,7 @@ fn manual_bead_adoption_never_calls_create_bead_or_fabricates_external_ref() {
     ));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     let telemetry_log = std::env::temp_dir().join("afd_manual_bead_external_ref_test.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
@@ -3952,7 +3972,7 @@ fn manual_bead_adoption_fails_closed_when_target_repo_unresolvable() {
     // an empty string and the test's "no LLM calls" assertion will catch it.
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     let telemetry_log = std::env::temp_dir().join("afd_manual_bead_fail_closed_test.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
@@ -4146,7 +4166,7 @@ fn manual_bead_adoption_fail_closed_local_fallback_path_persists_escalation() {
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_log = std::env::temp_dir().join(
         "afd_manual_bead_fail_closed_local_fallback_test.jsonl",
     );
@@ -4230,7 +4250,7 @@ fn newly_intaken_bead_dispatch_uses_real_tracker_title() {
     ));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_log = std::env::temp_dir().join(format!(
         "afd_new_intake_prompt_{}.jsonl",
         std::process::id()
@@ -4293,7 +4313,7 @@ fn drive_existing_pr_pending_ci_does_not_reach_ready() {
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     store.overlays.borrow_mut().insert(
         "drive-bead".into(),
@@ -4388,7 +4408,7 @@ fn drive_existing_pr_failed_ci_parks_human_held() {
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     store.overlays.borrow_mut().insert(
         "drive-bead".into(),
@@ -4484,7 +4504,7 @@ fn recover_human_held_requeues_queued_bead_with_attempt_below_max() {
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let cfg = test_cfg();
 
     // Pre-seed a HUMAN_HELD bead with attempt=2 (below the 10 cap)
@@ -4576,7 +4596,7 @@ fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let cfg = test_cfg();
 
     // Pre-seed a HUMAN_HELD bead with attempt=10 (the cap)
@@ -4778,7 +4798,7 @@ fn adopted_pr_that_never_goes_green_escalates_at_recovery_cap_and_dedups() {
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_log = std::env::temp_dir().join("afd_adopted_pr_never_green_cap.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
@@ -4950,7 +4970,7 @@ fn capped_human_held_comment_failure_retries_before_recording_escalation() {
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let cfg = test_cfg();
 
     store.overlays.borrow_mut().insert(
@@ -5045,7 +5065,7 @@ fn permanent_gh_error_marks_escalation_undeliverable_and_never_retries() {
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let cfg = test_cfg();
 
     store.overlays.borrow_mut().insert(
@@ -5172,7 +5192,7 @@ fn capped_human_held_candidate_lookup_failure_retries_before_recording_escalatio
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let cfg = test_cfg();
 
     store.overlays.borrow_mut().insert(
@@ -5288,7 +5308,7 @@ fn capped_human_held_missing_comment_target_records_local_escalation_fallback() 
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let cfg = test_cfg();
 
     store.overlays.borrow_mut().insert(
@@ -5376,7 +5396,7 @@ fn er_runner_capped_unknown_only_gate_report_escalates_and_parks_at_recovery_cap
     let llm = FakeLlm::new();
     *llm.response.borrow_mut() = Some(Ok("pass skeptic green".into()));
     let store = QdwAttemptStore::new();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let cfg = test_cfg();
 
     store.inner.overlays.borrow_mut().insert(
@@ -5539,7 +5559,7 @@ fn er_runner_capped_unknown_only_comment_failure_retries_before_parking() {
     let llm = FakeLlm::new();
     *llm.response.borrow_mut() = Some(Ok("pass skeptic green".into()));
     let store = QdwAttemptStore::new();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let cfg = test_cfg();
 
     store.inner.overlays.borrow_mut().insert(
@@ -5648,7 +5668,7 @@ fn attested_ci_pending_does_not_bump_autonomy_secs() {
     let store = FakeStateStore::new();
     let mut cfg = test_cfg();
     cfg.autonomy_timebox_secs = 3600; // 1h timebox so the bead survives the tick
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     let now_epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -5753,7 +5773,7 @@ fn attested_ci_pending_does_not_timebox_park() {
     let store = FakeStateStore::new();
     let mut cfg = test_cfg();
     cfg.autonomy_timebox_secs = 600; // 10 min — would park in one tick if clock runs
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     let now_epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -5866,7 +5886,7 @@ fn non_green_bead_reenters_loop_via_automated_human_held_exit() {
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let cfg = test_cfg();
 
     // Prior tick parked this bead HUMAN_HELD after a non-green gates
@@ -5971,7 +5991,7 @@ fn attested_ci_not_pending_does_bump_autonomy_secs() {
     let store = FakeStateStore::new();
     let mut cfg = test_cfg();
     cfg.autonomy_timebox_secs = 3600;
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     let now_epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -6074,7 +6094,7 @@ fn qdw_per_bead_isolation_snapshot_failure_does_not_abort_fast_tier() {
     let tracker = FakeTracker::new();
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let cfg = test_cfg();
 
     // Honest all-green fixture for PR 102 so it can actually reach READY:
@@ -6239,7 +6259,7 @@ fn qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead() {
     let tracker = FakeTracker::new();
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let cfg = test_cfg();
     *llm.response.borrow_mut() = Some(Ok("pass".to_string()));
 
@@ -6709,7 +6729,7 @@ fn qdw_post_er_refetch_failure_skips_bead_without_false_park() {
         "/er PASS", // affected bead: posted /er verdict
         "pass",     // healthy bead: Skeptic gate
     ]);
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let cfg = test_cfg();
 
     store
@@ -6893,7 +6913,7 @@ fn qdw_assess_refetch_failure_stays_attested_and_never_closes_pr() {
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let mut cfg = test_cfg();
     cfg.stage = 2;
 
@@ -7162,6 +7182,23 @@ fn write_fake_reviewer(dir: &std::path::Path, name: &str, reply: &str) {
     std::fs::set_permissions(&path, perms).unwrap();
 }
 
+#[cfg(unix)]
+fn write_fake_target_worktree_git(dir: &std::path::Path, head_sha: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = dir.join("git");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\ncase \"$1:$2:$3\" in\n  remote:get-url:origin) printf '%s\\n' 'https://github.com/myorg/global-real-repo.git' ;;\n  rev-parse:HEAD:) printf '%s\\n' '{head_sha}' ;;\n  *) exit 1 ;;\nesac\n"
+        ),
+    )
+    .unwrap_or_else(|e| panic!("failed to write fake target-worktree git: {e}"));
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+}
+
 #[test]
 #[cfg(unix)]
 fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff() {
@@ -7180,6 +7217,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
     std::fs::create_dir_all(&fake_bin_dir).unwrap();
     write_fake_reviewer(&fake_bin_dir, "codex", "pass");
     write_fake_reviewer(&fake_bin_dir, "claude", "pass");
+    write_fake_target_worktree_git(&fake_bin_dir, "deadbeef555");
 
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
@@ -7197,10 +7235,10 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     let mut cfg = test_cfg();
-    cfg.target_repo = "myorg/myrepo".into(); // NOT "owner/repo" -> is_test_repo == false
+    cfg.target_repo = "myorg/global-real-repo".into(); // NOT a fixture repo
 
     store.overlays.borrow_mut().insert(
         "real-repo-bead".into(),
@@ -7366,6 +7404,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
     std::fs::create_dir_all(&fake_bin_dir).unwrap();
     write_fake_reviewer(&fake_bin_dir, "codex", "pass");
     write_fake_reviewer(&fake_bin_dir, "claude", "pass");
+    write_fake_target_worktree_git(&fake_bin_dir, "deadbeef556");
 
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
@@ -7383,10 +7422,10 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     let mut cfg = test_cfg();
-    cfg.target_repo = "myorg/myrepo".into(); // NOT "owner/repo" -> is_test_repo == false
+    cfg.target_repo = "myorg/global-real-repo".into(); // NOT a fixture repo
 
     store.overlays.borrow_mut().insert(
         "real-repo-bead-asym".into(),
@@ -7597,10 +7636,10 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     let mut cfg = test_cfg();
-    cfg.target_repo = "myorg/myrepo".into(); // NOT "owner/repo" -> is_test_repo == false
+    cfg.target_repo = "myorg/global-real-repo".into(); // NOT a fixture repo
 
     store.overlays.borrow_mut().insert(
         "real-repo-bead-3rdvendor".into(),
@@ -7793,10 +7832,10 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     let mut cfg = test_cfg();
-    cfg.target_repo = "myorg/myrepo".into(); // NOT "owner/repo" -> is_test_repo == false
+    cfg.target_repo = "myorg/global-real-repo".into(); // NOT a fixture repo
 
     store.overlays.borrow_mut().insert(
         "wzgl-gate-report-bead".into(),
@@ -8077,7 +8116,7 @@ fn cross_repo_bead_verification_loop_uses_its_own_repo_not_cfg_target_repo() {
     let llm = FakeLlm::new();
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
     let store = FakeStateStore::new();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     let mut cfg = test_cfg();
     // Deliberately NOT "owner/repo" / "fake-*" / "test-*" -- if is_test_repo
@@ -8310,10 +8349,10 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     let mut cfg = test_cfg();
-    cfg.target_repo = "myorg/myrepo".into(); // NOT "owner/repo" -> is_test_repo == false
+    cfg.target_repo = "myorg/global-real-repo".into(); // NOT a fixture repo
 
     store.overlays.borrow_mut().insert(
         "real-repo-bead-4thvendor".into(),
@@ -8511,10 +8550,10 @@ fn cross_model_reviewer_cursor_agent_falls_back_and_emits_review_degraded() {
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     let mut cfg = test_cfg();
-    cfg.target_repo = "myorg/myrepo".into(); // NOT "owner/repo" → is_test_repo == false
+    cfg.target_repo = "myorg/global-real-repo".into(); // NOT a fixture repo
 
     store.overlays.borrow_mut().insert(
         "real-repo-bead-cursoragent".into(),
@@ -8740,6 +8779,7 @@ fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
     write_fake_reviewer(&fake_bin_dir, "agy", "unreachable");
     write_fake_reviewer(&fake_bin_dir, "gemini", "unreachable");
     write_fake_reviewer(&fake_bin_dir, "cursor-agent", "unreachable");
+    write_fake_target_worktree_git(&fake_bin_dir, "deadbeef560");
 
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
@@ -8754,10 +8794,10 @@ fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     let mut cfg = test_cfg();
-    cfg.target_repo = "myorg/myrepo".into(); // NOT "owner/repo" → is_test_repo == false
+    cfg.target_repo = "myorg/global-real-repo".into(); // NOT a fixture repo
 
     store.overlays.borrow_mut().insert(
         "real-repo-bead-twofam".into(),
@@ -8931,7 +8971,7 @@ fn transient_spawn_failures_below_cap_stay_retriable_and_do_not_park() {
     ));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_log = std::env::temp_dir().join(format!(
         "afd_spawn_retry_below_cap_{}.jsonl",
         std::process::id()
@@ -9022,7 +9062,7 @@ fn transient_spawn_retry_cap_exceeded_parks_human_held_with_escalation() {
     ));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_log = std::env::temp_dir().join(format!(
         "afd_spawn_retry_cap_exceeded_{}.jsonl",
         std::process::id()
@@ -9201,7 +9241,7 @@ fn spawn_failure_count_resets_after_a_successful_dispatch() {
     ));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_log = std::env::temp_dir().join(format!(
         "afd_spawn_retry_reset_{}.jsonl",
         std::process::id()
@@ -9287,7 +9327,7 @@ fn deferred_spawn_backpressure_never_increments_counter_or_parks_across_repeated
     ));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_log = std::env::temp_dir().join(format!(
         "afd_spawn_deferred_below_cap_{}.jsonl",
         std::process::id()
@@ -9409,7 +9449,7 @@ fn mixed_batch_deferred_backpressure_and_genuine_transient_failures_are_independ
     ));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_log = std::env::temp_dir().join(format!(
         "afd_spawn_mixed_batch_{}.jsonl",
         std::process::id()
@@ -9601,7 +9641,7 @@ fn earlier_candidate_create_bead_error_does_not_silence_later_candidate_matching
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_dir = std::env::temp_dir().join("afd_tick_integration_test");
     std::fs::create_dir_all(&telemetry_dir).unwrap();
     let telemetry_log = telemetry_dir.join(format!("daemon-8171-{}.jsonl", std::process::id()));
@@ -9764,7 +9804,7 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
     let store = FakeStateStore::new();
     let mut cfg = test_cfg();
     cfg.stage = 2;
-    let mut vcs = FakeVcs::new();
+    let mut vcs = test_vcs();
     // jleechan-tfs1 amendment (#209): execute_adopted now captures
     // pre_session_head_sha via Vcs::remote_head_sha before spawning, and
     // fails closed (Held) if that lookup errors. Bead B (the only bead in
@@ -10028,7 +10068,7 @@ fn run_slow_tier_pr_existence_probe_targets_bead_own_repo_not_global_cfg() {
     };
     let store = FakeStateStore::new();
     let cfg = test_cfg(); // target_repo == "owner/repo"
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_log = std::env::temp_dir().join(format!(
         "afd_x8tf_probe_own_repo_{}.jsonl",
         std::process::id()
@@ -10130,7 +10170,7 @@ fn run_slow_tier_pr_existence_probe_unchanged_for_single_repo_legacy_bead() {
     };
     let store = FakeStateStore::new();
     let cfg = test_cfg(); // target_repo == "owner/repo"
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_log = std::env::temp_dir().join(format!(
         "afd_x8tf_probe_legacy_repo_{}.jsonl",
         std::process::id()
@@ -10273,7 +10313,7 @@ fn tick_parks_human_held_on_permanent_reroll_error() {
     let llm = FakeLlm::new();
     *llm.response.borrow_mut() = Some(Ok("pass".into())); // greens the Skeptic gate
     let store = FakeStateStore::new();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let cfg = reroll_stage2_cfg();
 
     let branch = seed_attested_red_ci_bead(&mut scm, &store, "perm-bead", 5001);
@@ -10337,7 +10377,7 @@ fn tick_deferred_reroll_stays_attested_and_reselects_next_tick() {
     let llm = FakeLlm::new();
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
     let store = FakeStateStore::new();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let cfg = reroll_stage2_cfg();
 
     seed_attested_red_ci_bead(&mut scm, &store, "defer-bead", 5002);
@@ -10472,7 +10512,7 @@ fn autonomy_timebox_park_kills_associated_ao_session_and_clears_handle() {
     let telemetry_log = std::env::temp_dir().join("afd_test_mh9o_timebox.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let deps = TickDeps {
         scm: &scm,
         tracker: &tracker,
@@ -10566,7 +10606,7 @@ fn coder_silent_park_kills_associated_ao_session_and_clears_handle() {
     let telemetry_log = std::env::temp_dir().join("afd_test_mh9o_silent.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let deps = TickDeps {
         scm: &scm,
         tracker: &tracker,
@@ -10653,7 +10693,7 @@ fn session_branch_mismatch_park_kills_associated_ao_session_and_clears_handle() 
     let telemetry_log = std::env::temp_dir().join("afd_test_mh9o_mismatch.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let deps = TickDeps {
         scm: &scm,
         tracker: &tracker,
@@ -10748,7 +10788,7 @@ fn autonomy_timebox_park_retains_handle_when_stop_fails() {
     let telemetry_log = std::env::temp_dir().join("afd_test_mh9o_stop_fails.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let deps = TickDeps {
         scm: &scm,
         tracker: &tracker,
@@ -10823,7 +10863,7 @@ fn adopted_branch_history_rewrite_park_kills_associated_ao_session() {
     let telemetry_log = std::env::temp_dir().join("afd_test_mh9o_adopted.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
-    let mut vcs = FakeVcs::new();
+    let mut vcs = test_vcs();
     // Remote HEAD is a totally unrelated commit -> is_ancestor returns
     // false -> adopted_branch_history_rewrite_detected park.
     vcs.heads.insert(
@@ -10916,7 +10956,7 @@ fn run_tick_emits_parked_human_held_for_unmapped_repo_dispatch_failure() {
     ));
     let store = FakeStateStore::new(); // empty: dispatch will load overlay from DB
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_log = std::env::temp_dir().join("afd_unmapped_repo_park_test.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
@@ -11022,7 +11062,7 @@ fn run_tick_escalates_explicit_target_without_checkout_as_human_held() {
             local_checkout: None,
         },
     );
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_log =
         std::env::temp_dir().join("afd_missing_target_checkout_park_test.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
@@ -11098,7 +11138,7 @@ fn slow_tier_dispatched_branch_mismatch_re_resolves_stale_pr_number() {
     let llm = FakeLlm::new();
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
     let store = FakeStateStore::new();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let cfg = test_cfg();
 
     // Seed a DISPATCHED bead on `factory/stale-pr-bead-r1` with a STALE
@@ -11254,7 +11294,7 @@ fn slow_tier_dispatched_branch_mismatch_no_op_when_pr_number_already_matches() {
     let llm = FakeLlm::new();
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
     let store = FakeStateStore::new();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let cfg = test_cfg();
 
     let branch = "factory/clean-pr-bead-r1";
@@ -11365,7 +11405,7 @@ fn slow_tier_dispatched_branch_mismatch_clears_stale_pr_number_when_branch_has_n
     let llm = FakeLlm::new();
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
     let store = FakeStateStore::new();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let cfg = test_cfg();
 
     // Repro: bead's branch is a FRESH -rN (no open PR exists yet), but
@@ -11483,7 +11523,7 @@ fn slow_tier_pre_gate_validation_re_resolves_when_stored_pr_no_longer_open() {
     let llm = FakeLlm::new();
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
     let store = FakeStateStore::new();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let mut cfg = test_cfg();
     // Pre-gate validation is opt-in (default false) so legacy tests
     // aren't disturbed. This test exercises pre-gate drift detection,
@@ -11618,7 +11658,7 @@ fn transient_pr_number_reresolve_error_keeps_dispatched_no_promotion() {
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let cfg = test_cfg();
 
     // A DISPATCHED, non-adopted bead with a STALE pr_number that would promote
@@ -11712,7 +11752,7 @@ fn pre_gate_no_open_pr_demotes_attested_to_dispatched_and_resumes() {
     let llm = FakeLlm::new();
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
     let store = FakeStateStore::new();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let mut cfg = test_cfg();
     cfg.pre_gate_validation_enabled = true;
 
@@ -11889,7 +11929,7 @@ fn evidence_gate_verified_gist_reaches_ready() {
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     evidence_bead(
         &store,
@@ -11927,7 +11967,7 @@ fn evidence_gate_empty_gist_fails_closed_not_ready() {
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     evidence_bead(
         &store,
@@ -11969,7 +12009,7 @@ fn evidence_gate_head_mismatch_fails_closed() {
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     // Marker references a STALE head that does not match the PR head.
     evidence_bead(
@@ -12018,7 +12058,7 @@ fn rln6_evidence_head_stale_fast_rejects_with_one_shot_comment() {
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     // Marker references a STALE head. PR head (snap.head_sha) is
     // `deadbeefcafe` (set by `evidence_bead`); marker says `00000000stale`.
@@ -12161,7 +12201,7 @@ fn rln6_v2_evidence_head_stale_emits_gate_assessment_before_fast_reject() {
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     // Stale-head marker — same fixture as the original rln6 test, the only
     // red gate will be EvidenceFloor with the "does not match PR head"
@@ -12249,7 +12289,7 @@ fn rln6_v2_evidence_head_stale_does_not_persist_sentinel_on_comment_failure() {
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     evidence_bead(
         &store,
@@ -12374,7 +12414,7 @@ fn rln6_v2_evidence_head_stale_sentinel_resets_on_new_mismatch_tuple() {
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     // Initial state: pr_sha=deadbeefcafe, marker references 00000000stale.
     evidence_bead(
@@ -12529,7 +12569,7 @@ fn evidence_gate_incomplete_marker_fails_closed() {
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     // Marker present but no gist URL / no (head ..) — parse_evidence -> None,
     // but has_evidence_marker -> true.
@@ -12573,7 +12613,7 @@ fn evidence_gate_transient_gist_error_is_pending_not_red() {
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     evidence_bead(
         &store,
@@ -12701,7 +12741,7 @@ fn msmq_verifier_skips_reassessment_when_reroll_deferred() {
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let mut cfg = test_cfg();
     cfg.stage = 2; // Stage 2: actually execute reroll() so a deferred
                    // reroll leaves `reroll_deferral_count > 0` on tick 1.
@@ -12800,7 +12840,7 @@ fn jleechan328_gate_assessment_emits_head_sha_for_exact_head_binding() {
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     // P1 #1: the assessment MUST carry the PR's current head SHA. We
     // force a distinctive SHA so a regression that emits an empty or
@@ -12876,7 +12916,7 @@ fn jleechan328_gate_assessment_emits_operator_disposition_round_trip() {
         *llm.response.borrow_mut() = Some(Ok("pass".into()));
         let store = FakeStateStore::new();
         let cfg = test_cfg();
-        let vcs = FakeVcs::new();
+        let vcs = test_vcs();
 
         let bead_id = format!("ev-disposition-{disposition}");
         let pr = 9104u64;
@@ -12949,7 +12989,7 @@ fn dispatch_guarantee_queued_bead_dispatched_despite_escalation_backlog() {
     ));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     // Seed 9 HUMAN_HELD beads at the recovery cap (attempt=10). Each tick,
     // `run_recovery_step` finds them via `human_held_at_or_above_attempt`
@@ -13098,7 +13138,7 @@ fn escalation_dedup_tick_level_identical_payload_suppressed_changed_context_re_e
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let cfg = test_cfg();
 
     // Seed a HUMAN_HELD bead at the recovery cap (attempt=10) with a
@@ -13268,7 +13308,7 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_dir = std::env::temp_dir().join("afd_vendor_waiver_r2_test");
     let _ = std::fs::remove_dir_all(&telemetry_dir);
     std::fs::create_dir_all(&telemetry_dir).unwrap();
@@ -13533,7 +13573,7 @@ fn vendor_health_ledger_ci_pending_with_capped_vendor_skips_wait() {
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let telemetry_dir = std::env::temp_dir().join("afd_vendor_waiver_ciwait_test");
     let _ = std::fs::remove_dir_all(&telemetry_dir);
     std::fs::create_dir_all(&telemetry_dir).unwrap();
@@ -13679,7 +13719,7 @@ fn test_gate_regression_emits_event_and_demotes_to_attested_when_ci_goes_red() {
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     // Bead started READY (last_all_green=true): we hand-set the store
     // mirror of the new column via set_last_all_green. The bead is staged
@@ -13820,7 +13860,7 @@ fn test_gate_regression_does_not_fire_when_first_assessment_is_red() {
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     // ATTESTED bead, NEVER green (last_all_green=false / unset).
     let pr = 7702_u64;
@@ -13924,7 +13964,7 @@ fn test_gate_regression_caps_at_max_and_parks_human_held() {
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     // ATTESTED bead whose last_all_green=true and gate_regression_count is
     // already at MAX_GATE_REGRESSIONS — the next green->red MUST cap, not
@@ -14049,7 +14089,7 @@ fn test_gate_regression_counter_increments_on_each_green_to_red() {
     let _llm = FakeLlm::new();
     let store = FakeStateStore::new();
     let _cfg = test_cfg();
-    let _vcs = FakeVcs::new();
+    let _vcs = test_vcs();
 
     // Drive the counter manually through MAX_GATE_REGRESSIONS-1 ticks so
     // we end at exactly the cap boundary (the cap test above then exercises

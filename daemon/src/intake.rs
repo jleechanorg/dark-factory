@@ -11,8 +11,64 @@
 use crate::config::Config;
 use crate::errors::DaemonError;
 use crate::tools::{LabeledPr, Permission, Scm, Tracker};
+use std::fs::{File, OpenOptions};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const FACTORY_LABEL: &str = "factory";
+static CACHE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct CacheFileLock {
+    path: PathBuf,
+    file: File,
+}
+
+impl CacheFileLock {
+    fn acquire(cache_path: &Path) -> Result<Self, DaemonError> {
+        let lock_path = cache_path.with_extension("json.lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|error| DaemonError::Config(format!("open adoption_probe_cache lock: {error}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            const LOCK_EX: i32 = 2;
+            // flock blocks until the kernel-owned lock is available and is
+            // released automatically if the writer process exits.
+            let result = unsafe { flock(file.as_raw_fd(), LOCK_EX) };
+            if result != 0 {
+                return Err(DaemonError::Config(format!(
+                    "acquire adoption_probe_cache lock: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+        }
+        Ok(Self { path: lock_path, file })
+    }
+}
+
+impl Drop for CacheFileLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            const LOCK_UN: i32 = 8;
+            let _ = unsafe { flock(self.file.as_raw_fd(), LOCK_UN) };
+        }
+        // Keep the lock inode persistent. Removing it would let a waiting
+        // contender open a different inode and bypass an owner that still
+        // holds the kernel lock.
+    }
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn flock(fd: i32, operation: i32) -> i32;
+}
 
 // jtg8-r4 =====================================================================
 //
@@ -30,8 +86,9 @@ const FACTORY_LABEL: &str = "factory";
 //  - `metrics.probe_cache_hits/misses`: per-pass counter for cache health.
 //
 // The on-disk `AdoptionProbeCache` is keyed on
-// `(external_ref, head_sha, updated_at_epoch)` and persists at
-// `.beads/adoption_probe_cache.json`. Cache invalidation:
+// `(external_ref, head_sha, updated_at_epoch)` and persists in the daemon's
+// runtime state directory (`$DARK_FACTORY_STATE_DIR` or `~/.dark-factory`).
+// Cache invalidation:
 //   - any change to head_sha or updated_at_epoch → cache miss (re-probe)
 //   - collaborator tier change between probes → cache miss (r4 fix vs r3's
 //     stale Read→Write promotion bug)
@@ -141,7 +198,7 @@ pub enum CachedDecisionKind {
 /// promotion: 1 hour. Matches the launchd watchdog's recovery cadence.
 pub const MAX_CACHED_PERMISSION_AGE_SECS: u64 = 3_600;
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct AdoptionProbeCache {
     /// keyed by `ProbeCacheKey`. The hash impl treats `(Some, Some)` as a
     /// distinct key from `(Some, None)` so PRs whose `updated_at_epoch`
@@ -149,15 +206,33 @@ pub struct AdoptionProbeCache {
     /// independently — `None` keys still get cached, just separately from
     /// `Some` keys.
     decisions: std::collections::HashMap<ProbeCacheKey, CachedProbeDecision>,
+    path: PathBuf,
 }
 
-/// On-disk persistence file for the adoption-probe cache. Survives daemon
-/// restarts so a freshly-spawned daemon doesn't re-probe the entire
-/// factory-labeled PR set on its first slow tick (which would burn ~50 gh
-/// API calls at startup). The file is rewritten on every slow-tier pass
-/// via `persist`; `load` is best-effort and silently returns an empty
-/// cache on missing/corrupt files.
-pub const ADOPTION_PROBE_CACHE_FILE: &str = ".beads/adoption_probe_cache.json";
+/// Mutable state belongs to the daemon runtime directory, not the immutable
+/// installed release or a target repository checkout.
+pub fn runtime_state_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("DARK_FACTORY_STATE_DIR") {
+        return PathBuf::from(dir);
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".dark-factory");
+    }
+    std::env::temp_dir().join("dark-factory")
+}
+
+pub fn adoption_probe_cache_path() -> PathBuf {
+    runtime_state_dir().join("adoption_probe_cache.json")
+}
+
+impl Default for AdoptionProbeCache {
+    fn default() -> Self {
+        Self {
+            decisions: std::collections::HashMap::new(),
+            path: adoption_probe_cache_path(),
+        }
+    }
+}
 
 impl AdoptionProbeCache {
     /// Construct an empty cache (no persistence). Use
@@ -166,51 +241,75 @@ impl AdoptionProbeCache {
         Self::default()
     }
 
-    /// Load the cache from `ADOPTION_PROBE_CACHE_FILE` if present;
-    /// otherwise return an empty cache. Never errors out — a corrupt or
-    /// absent file just means "cold cache, probe everything" (the pre-fix
-    /// behavior).
-    pub fn load_or_default() -> Self {
-        let raw = match std::fs::read_to_string(ADOPTION_PROBE_CACHE_FILE) {
+    pub fn load_or_default_at(path: impl AsRef<Path>) -> Self {
+        let path = path.as_ref().to_path_buf();
+        let raw = match std::fs::read_to_string(&path) {
             Ok(s) => s,
-            Err(_) => return Self::default(),
+            Err(_) => {
+                return Self {
+                    decisions: std::collections::HashMap::new(),
+                    path,
+                }
+            }
         };
         match serde_json::from_str::<Vec<(ProbeCacheKey, CachedProbeDecision)>>(&raw) {
             Ok(entries) => Self {
                 decisions: entries.into_iter().collect(),
+                path,
             },
-            Err(_) => Self::default(),
+            Err(_) => Self {
+                decisions: std::collections::HashMap::new(),
+                path,
+            },
         }
     }
 
-    /// Persist the cache to `ADOPTION_PROBE_CACHE_FILE`. Best-effort:
-    /// writes are atomic via `tempfile` + `rename`, so a crash mid-write
+    /// Load the cache from the runtime-state cache path if present;
+    /// otherwise return an empty cache. Never errors out — a corrupt or
+    /// absent file just means "cold cache, probe everything" (the pre-fix
+    /// behavior).
+    pub fn load_or_default() -> Self {
+        Self::load_or_default_at(adoption_probe_cache_path())
+    }
+
+    /// Persist the cache to the runtime-state cache path. Best-effort:
+    /// writers serialize through a same-directory lock, reload and merge the
+    /// current file, then atomically rename a sibling temporary file, so a crash mid-write
     /// leaves either the old or the new file intact (never a half-written
     /// file the next daemon boot would fail to parse).
     pub fn persist(&self) -> Result<(), DaemonError> {
-        // Re-serialize as a Vec of (key, decision) tuples so the JSON
-        // stays forward-compatible (HashMap iteration order is
-        // non-deterministic; Vec preserves the order we wrote it in, but
-        // order doesn't matter for correctness — only for cleaner diffs).
-        let entries: Vec<(ProbeCacheKey, CachedProbeDecision)> = self
-            .decisions
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        let json = serde_json::to_string(&entries).map_err(|e| {
-            DaemonError::Parse(format!("serialize adoption_probe_cache: {e}"))
-        })?;
-        if let Some(parent) = std::path::Path::new(ADOPTION_PROBE_CACHE_FILE).parent() {
-            std::fs::create_dir_all(parent).ok();
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                DaemonError::Config(format!("create adoption_probe_cache directory: {error}"))
+            })?;
         }
-        let tmp = format!("{ADOPTION_PROBE_CACHE_FILE}.tmp");
+        let _lock = CacheFileLock::acquire(&self.path)?;
+        let mut merged = std::collections::HashMap::new();
+        if let Ok(raw) = std::fs::read_to_string(&self.path) {
+            if let Ok(entries) =
+                serde_json::from_str::<Vec<(ProbeCacheKey, CachedProbeDecision)>>(&raw)
+            {
+                merged.extend(entries);
+            }
+        }
+        merged.extend(self.decisions.iter().map(|(key, value)| (key.clone(), value.clone())));
+        let entries: Vec<(ProbeCacheKey, CachedProbeDecision)> = merged.into_iter().collect();
+        let json = serde_json::to_string(&entries)
+            .map_err(|error| DaemonError::Parse(format!("serialize adoption_probe_cache: {error}")))?;
+        let nonce = CACHE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = self.path.with_extension(format!(
+            "json.tmp.{}.{}",
+            std::process::id(),
+            nonce
+        ));
         std::fs::write(&tmp, json.as_bytes())
             .map_err(|e| DaemonError::Config(format!("write adoption_probe_cache: {e}")))?;
-        std::fs::rename(&tmp, ADOPTION_PROBE_CACHE_FILE).map_err(|e| {
-            DaemonError::Config(format!(
-                "rename adoption_probe_cache tmp->final: {e}"
-            ))
-        })?;
+        if let Err(error) = std::fs::rename(&tmp, &self.path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(DaemonError::Config(format!(
+                "rename adoption_probe_cache tmp->final: {error}"
+            )));
+        }
         Ok(())
     }
 
@@ -967,7 +1066,65 @@ mod tests {
     // contract tests (idempotency, write-tier gate, mixed batch) live in
     // `daemon/tests/intake.rs` per Task 6 Step 1.
     use crate::tools::Permission;
-    use super::resolve_target_repo;
+    use super::{resolve_target_repo, CacheFileLock};
+
+    #[test]
+    fn cache_lock_waits_for_live_owner_and_releases_after_owner_drop() {
+        let root = std::env::temp_dir().join(format!(
+            "afd_cache_lock_owner_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let cache_path = root.join("adoption_probe_cache.json");
+        let owner = CacheFileLock::acquire(&cache_path).unwrap();
+        let waiter_path = cache_path.clone();
+        let acquired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiter_acquired = acquired.clone();
+        let waiter = std::thread::spawn(move || {
+            let _lock = CacheFileLock::acquire(&waiter_path).unwrap();
+            waiter_acquired.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!acquired.load(std::sync::atomic::Ordering::SeqCst));
+        drop(owner);
+        waiter.join().unwrap();
+        assert!(acquired.load(std::sync::atomic::Ordering::SeqCst));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cache_lock_three_party_contenders_never_overlap_rmw_owners() {
+        let root = std::env::temp_dir().join(format!(
+            "afd_cache_lock_three_party_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let cache_path = root.join("adoption_probe_cache.json");
+        let owner = CacheFileLock::acquire(&cache_path).unwrap();
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut contenders = Vec::new();
+        for _ in 0..2 {
+            let path = cache_path.clone();
+            let active = active.clone();
+            let max_active = max_active.clone();
+            contenders.push(std::thread::spawn(move || {
+                let _lock = CacheFileLock::acquire(&path).unwrap();
+                let now = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                max_active.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        assert_eq!(active.load(std::sync::atomic::Ordering::SeqCst), 0);
+        drop(owner);
+        for contender in contenders {
+            contender.join().unwrap();
+        }
+        assert_eq!(max_active.load(std::sync::atomic::Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn permission_write_tier_gate_matches_design_contract() {

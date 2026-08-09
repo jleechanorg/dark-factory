@@ -15,7 +15,7 @@
 mod common;
 
 use common::{FakeLlm, FakeScm, FakeSessions, FakeTracker, FakeVcs};
-use daemon::config::Config;
+use daemon::config::{Config, RepoConfig};
 use daemon::state::{BeadOverlay, OverlayState, SqliteStateStore, StateStore};
 use daemon::tick::{run_tick, TickDeps};
 use daemon::tools::Bead;
@@ -183,6 +183,20 @@ fn now_epoch() -> u64 {
 
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+fn test_repo_cfg(project: &str) -> RepoConfig {
+    RepoConfig {
+        ao_project: project.into(),
+        push_remote: "origin".into(),
+        local_checkout: Some(std::env::current_dir().unwrap()),
+    }
+}
+
+fn test_vcs() -> FakeVcs {
+    let mut vcs = FakeVcs::default();
+    vcs.heads.insert("main".into(), "base-sha-123".into());
+    vcs
+}
+
 fn test_cfg() -> Config {
     Config {
         target_repo: "owner/repo".into(),
@@ -199,7 +213,13 @@ fn test_cfg() -> Config {
         reroll_head_stability_window_secs: 1,
         reroll_death_confirm_secs: 0,
         held_recheck_cooldown_secs: 900,
-        repos: HashMap::new(),
+        repos: HashMap::from([
+            ("owner/repo".into(), test_repo_cfg("repo")),
+            (
+                "myorg/global-real-repo".into(),
+                test_repo_cfg("global-real-repo"),
+            ),
+        ]),
         pre_gate_validation_enabled: false,
         escalation_refire_secs: 3600,
     }
@@ -224,7 +244,7 @@ fn sqlite_dispatch_guarantee_queued_bead_dispatched_despite_escalation_backlog()
     ));
     let store = SqliteTestStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
 
     // Seed 9 HUMAN_HELD beads at the recovery cap (attempt=10).
     for i in 0..9u32 {
@@ -339,7 +359,7 @@ fn sqlite_escalation_dedup_tick_level_identical_payload_suppressed_changed_conte
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     let store = SqliteTestStore::new();
-    let vcs = FakeVcs::new();
+    let vcs = test_vcs();
     let cfg = test_cfg();
 
     let bead_id = "bead-dedup-tick-sql";
