@@ -12,8 +12,10 @@ use crate::config::Config;
 use crate::errors::DaemonError;
 use crate::tools::{LabeledPr, Permission, Scm, Tracker};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const FACTORY_LABEL: &str = "factory";
+static CACHE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // jtg8-r4 =====================================================================
 //
@@ -237,10 +239,7 @@ impl AdoptionProbeCache {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or_default();
+        let nonce = CACHE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp = self.path.with_extension(format!(
             "json.tmp.{}.{}",
             std::process::id(),
