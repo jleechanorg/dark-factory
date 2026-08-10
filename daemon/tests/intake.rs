@@ -1236,3 +1236,171 @@ fn intake_metrics_gh_call_count_counts_real_subprocesses() {
         outcome.metrics.gh_call_count
     );
 }
+
+// =============================================================================
+// Multi-repo intake RED regression tests (bead dark-factory-9x69)
+// =============================================================================
+
+#[test]
+fn two_repositories_sharing_a_pr_number() {
+    let mut scm = FakeScm::new();
+    let mut pr_a = labeled_pr_with_cache_key(100, "alice", "feature/pr-100-a", "sha-100-a", 1_700_000_000);
+    pr_a.external_ref = "jleechanorg/dark-factory#100".into();
+    pr_a.head_repo_full_name = Some("jleechanorg/dark-factory".into());
+    pr_a.head_repo_owner_login = Some("jleechanorg".into());
+
+    let mut pr_b = labeled_pr_with_cache_key(100, "alice", "feature/pr-100-b", "sha-100-b", 1_700_000_000);
+    pr_b.external_ref = "jleechanorg/worldarchitect.ai#100".into();
+    pr_b.head_repo_full_name = Some("jleechanorg/worldarchitect.ai".into());
+    pr_b.head_repo_owner_login = Some("jleechanorg".into());
+
+    scm.prs.push(pr_a);
+    scm.prs.push(pr_b);
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let mut cfg = test_cfg();
+    cfg.target_repo = "jleechanorg/dark-factory".into();
+    cfg.repos.insert(
+        "jleechanorg/worldarchitect.ai".into(),
+        daemon::config::RepoConfig {
+            ao_project: "worldarchitect".into(),
+            push_remote: "worldai".into(),
+            local_checkout: None,
+        },
+    );
+
+    let mut cache = AdoptionProbeCache::new();
+    let outcome = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000).unwrap();
+
+    assert_eq!(outcome.adopted.len(), 2, "must adopt PR 100 from both repos without colliding: {:?}", outcome.adopted);
+    let refs: Vec<_> = outcome.adopted.iter().map(|a| a.external_ref.as_str()).collect();
+    assert!(refs.contains(&"jleechanorg/dark-factory#100"));
+    assert!(refs.contains(&"jleechanorg/worldarchitect.ai#100"));
+}
+
+#[test]
+fn one_repository_failing_while_another_succeeds() {
+    struct FailingRepoScm {
+        inner: FakeScm,
+    }
+    impl Scm for FailingRepoScm {
+        fn labeled_issues(&self, label: &str) -> Result<Vec<Issue>, DaemonError> {
+            self.inner.labeled_issues(label)
+        }
+        fn labeled_prs(&self, label: &str, gh_calls: &mut u32) -> Result<Vec<LabeledPr>, DaemonError> {
+            self.inner.labeled_prs(label, gh_calls)
+        }
+        fn labeled_prs_for_repo(
+            &self,
+            repo: &str,
+            label: &str,
+            gh_calls: &mut u32,
+        ) -> Result<Vec<LabeledPr>, DaemonError> {
+            if repo == "jleechanorg/failing-repo" {
+                *gh_calls += 1;
+                return Err(DaemonError::Tool {
+                    tool: "gh".into(),
+                    rc: 1,
+                    stderr: "gh: API rate limit exceeded".into(),
+                });
+            }
+            self.inner.labeled_prs_for_repo(repo, label, gh_calls)
+        }
+        fn collaborator_permission(&self, login: &str) -> Result<Permission, DaemonError> {
+            self.inner.collaborator_permission(login)
+        }
+        fn pr_snapshot(&self, pr: u64) -> Result<PrSnapshot, DaemonError> {
+            self.inner.pr_snapshot(pr)
+        }
+        fn close_pr(&self, pr: u64, comment: &str) -> Result<(), DaemonError> {
+            self.inner.close_pr(pr, comment)
+        }
+        fn remote_branch_last_commit(&self, branch: &str) -> Result<Option<u64>, DaemonError> {
+            self.inner.remote_branch_last_commit(branch)
+        }
+    }
+
+    let mut inner = FakeScm::new();
+    let mut pr = labeled_pr_with_cache_key(50, "alice", "feature/pr-50", "sha-50", 1_700_000_000);
+    pr.external_ref = "jleechanorg/dark-factory#50".into();
+    pr.head_repo_full_name = Some("jleechanorg/dark-factory".into());
+    inner.prs.push(pr);
+    inner.permissions.insert("alice".into(), Permission::Write);
+
+    let scm = FailingRepoScm { inner };
+    let tracker = FakeTracker::new();
+    let mut cfg = test_cfg();
+    cfg.target_repo = "jleechanorg/dark-factory".into();
+    cfg.repos.insert(
+        "jleechanorg/failing-repo".into(),
+        daemon::config::RepoConfig {
+            ao_project: "failing".into(),
+            push_remote: "origin".into(),
+            local_checkout: None,
+        },
+    );
+
+    let mut cache = AdoptionProbeCache::new();
+    let outcome = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000).unwrap();
+
+    assert_eq!(outcome.adopted.len(), 1, "must preserve successful repo dark-factory results despite failing-repo error");
+    assert_eq!(outcome.adopted[0].external_ref, "jleechanorg/dark-factory#50");
+}
+
+#[test]
+fn no_duplicate_replay_from_default_fake_adapter() {
+    let mut scm = FakeScm::new();
+    let mut pr = labeled_pr_with_cache_key(123, "alice", "feature/pr-123", "sha-123", 1_700_000_000);
+    pr.external_ref = "jleechanorg/dark-factory#123".into();
+    scm.prs.push(pr);
+
+    let mut calls = 0;
+    let prs = scm.labeled_prs_for_repo("jleechanorg/worldarchitect.ai", "factory", &mut calls).unwrap();
+    assert!(prs.is_empty(), "labeled_prs_for_repo for worldarchitect.ai must not replay dark-factory PRs: {:?}", prs);
+}
+
+#[test]
+fn deterministic_bounded_repository_order() {
+    let mut cfg = test_cfg();
+    cfg.target_repo = "jleechanorg/dark-factory".into();
+    for i in (0..15).rev() {
+        cfg.repos.insert(
+            format!("jleechanorg/repo-{:02}", i),
+            daemon::config::RepoConfig {
+                ao_project: format!("proj-{i}"),
+                push_remote: "origin".into(),
+                local_checkout: None,
+            },
+        );
+    }
+
+    let repos = intake::target_repositories_sweep_order(&cfg);
+    assert_eq!(repos[0], "jleechanorg/dark-factory", "target_repo must always be scanned first");
+    assert_eq!(repos[1], "jleechanorg/repo-00");
+    assert_eq!(repos[2], "jleechanorg/repo-01");
+    assert_eq!(repos[3], "jleechanorg/repo-02");
+    assert!(repos.len() <= intake::MAX_INTAKE_REPOS_PER_SWEEP, "sweep repo count must be bounded");
+}
+
+#[test]
+fn running_from_installed_non_git_daemon_cwd() {
+    let non_git_dir = std::env::temp_dir().join(format!("non_git_daemon_cwd_{}", std::process::id()));
+    std::fs::create_dir_all(&non_git_dir).unwrap();
+
+    let orig_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(&non_git_dir).unwrap();
+
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let cfg = test_cfg();
+    let mut cache = AdoptionProbeCache::new();
+
+    let result = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000);
+
+    let _ = std::env::set_current_dir(orig_cwd);
+    let _ = std::fs::remove_dir_all(non_git_dir);
+
+    assert!(result.is_ok(), "running from a non-git CWD must succeed cleanly: {:?}", result);
+}
+

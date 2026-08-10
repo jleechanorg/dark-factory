@@ -908,6 +908,22 @@ impl Scm for CliScm {
             .collect())
     }
 
+    fn labeled_prs_for_repo(
+        &self,
+        repo: &str,
+        label: &str,
+        gh_calls: &mut u32,
+    ) -> Result<Vec<LabeledPr>, DaemonError> {
+        self.with_repo(repo).labeled_prs(label, gh_calls)
+    }
+
+    fn collaborator_permission_for_repo(
+        &self,
+        repo: &str,
+        login: &str,
+    ) -> Result<Permission, DaemonError> {
+        self.with_repo(repo).collaborator_permission(login)
+    }
 
     fn collaborator_permission(&self, login: &str) -> Result<Permission, DaemonError> {
         let offline_path = std::path::Path::new(".beads/offline").join(format!("permission_{}.json", login));
@@ -3125,8 +3141,14 @@ export const isTerminalSession = () => false;
         let bindings = serde_json::json!({ prompt: branch });
 
         let (spawn_result, calls) = with_fake_ao("single", bindings, |log| {
+            let saved = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok();
+            std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "minimax");
             let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
             let result = sessions.spawn(&spec(prompt, branch));
+            match saved {
+                Some(val) => std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", val),
+                None => std::env::remove_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN"),
+            }
             let calls = std::fs::read_to_string(log).unwrap_or_default();
             (result, calls)
         });

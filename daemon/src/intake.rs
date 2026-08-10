@@ -504,18 +504,38 @@ fn parse_target_repo_body_field(body: &str) -> Option<String> {
     None
 }
 
-fn same_repo_pr(pr: &LabeledPr, cfg: &Config) -> bool {
+fn same_repo_pr(pr: &LabeledPr, target_repo: &str) -> bool {
     if pr.is_cross_repository {
         return false;
     }
     if let Some(head_repo) = pr.head_repo_full_name.as_deref() {
-        return head_repo.eq_ignore_ascii_case(&cfg.target_repo);
+        return head_repo.eq_ignore_ascii_case(target_repo);
     }
     if let Some(head_owner) = pr.head_repo_owner_login.as_deref() {
-        let target_owner = cfg.target_repo.split('/').next().unwrap_or_default();
+        let target_owner = target_repo.split('/').next().unwrap_or_default();
         return head_owner.eq_ignore_ascii_case(target_owner);
     }
     true
+}
+
+pub const MAX_INTAKE_REPOS_PER_SWEEP: usize = 10;
+pub const MAX_INTAKE_SWEEP_GH_CALLS: u32 = 100;
+
+pub fn target_repositories_sweep_order(cfg: &Config) -> Vec<String> {
+    let mut repos = Vec::new();
+    repos.push(cfg.target_repo.clone());
+    let mut secondary: Vec<String> = cfg
+        .repos
+        .keys()
+        .filter(|r| *r != &cfg.target_repo)
+        .cloned()
+        .collect();
+    secondary.sort();
+    repos.extend(secondary);
+    if repos.len() > MAX_INTAKE_REPOS_PER_SWEEP {
+        repos.truncate(MAX_INTAKE_REPOS_PER_SWEEP);
+    }
+    repos
 }
 
 /// jtg8-r4: rate-limit-aware variant of `normalize_labeled_prs`. Detects a
@@ -544,51 +564,62 @@ pub fn normalize_labeled_prs_outcome(
     now_epoch: u64,
 ) -> Result<LabeledPrsIntakeOutcome, DaemonError> {
     let mut metrics = IntakeProbeMetrics::default();
-    // jtg8-r5: plumb the metric into `labeled_prs` so the REST fallback's
-    // per-PR `pulls/{n}` calls are reflected in `gh_call_count` (r4 only
-    // counted this single list-query increment, so the slow-tier
-    // `INTAKE_GH_CALL_WARN_THRESHOLD` warning never fired when the daemon
-    // was burning O(N) core API calls via the fallback path).
-    let prs_result = scm.labeled_prs(FACTORY_LABEL, &mut metrics.gh_call_count);
-    // Even on rate-limit, the impl incremented `gh_call_count` once for
-    // the failed list query — surface that in the metric so the warning
-    // sees the actual failure mode.
-    let prs = match prs_result {
-        Ok(p) => p,
-        Err(e) if e.is_gh_rate_limit() => {
-            metrics.rate_limited_skips += 1;
-            return Ok(LabeledPrsIntakeOutcome {
-                adopted: Vec::new(),
-                outcomes: Vec::new(),
-                rate_limited: true,
-                metrics,
-            });
+    let target_repos = target_repositories_sweep_order(cfg);
+    let mut master_adopted = Vec::new();
+    let mut master_outcomes = Vec::new();
+    let mut any_rate_limited = false;
+
+    for repo in &target_repos {
+        if metrics.gh_call_count >= MAX_INTAKE_SWEEP_GH_CALLS {
+            eprintln!(
+                "auto-factory daemon: WARNING intake sweep gh_call_count={} reached maximum limit ({}); bounding sweep across repositories",
+                metrics.gh_call_count, MAX_INTAKE_SWEEP_GH_CALLS
+            );
+            break;
         }
-        Err(e) => return Err(e),
-    };
-    if prs.is_empty() {
-        return Ok(LabeledPrsIntakeOutcome {
-            adopted: Vec::new(),
-            outcomes: Vec::new(),
-            rate_limited: false,
-            metrics,
-        });
+
+        let prs_result = scm.labeled_prs_for_repo(repo, FACTORY_LABEL, &mut metrics.gh_call_count);
+        let prs = match prs_result {
+            Ok(p) => p,
+            Err(e) if e.is_gh_rate_limit() => {
+                metrics.rate_limited_skips += 1;
+                any_rate_limited = true;
+                eprintln!(
+                    "auto-factory daemon: WARNING intake rate-limited for repository {repo}; skipping and continuing with remaining repositories"
+                );
+                continue;
+            }
+            Err(e) => {
+                eprintln!(
+                    "auto-factory daemon: WARNING intake failed for repository {repo}: {e}; continuing with remaining repositories"
+                );
+                continue;
+            }
+        };
+
+        if prs.is_empty() {
+            continue;
+        }
+
+        let (adopted, outcomes) = normalize_labeled_prs_with_cache(
+            scm,
+            tracker,
+            cfg,
+            repo,
+            &prs,
+            cache,
+            &mut metrics,
+            now_epoch,
+        )?;
+        master_adopted.extend(adopted);
+        master_outcomes.extend(outcomes);
     }
 
-    // Delegate the per-PR decisions to the cache-aware variant below.
-    let (adopted, outcomes) = normalize_labeled_prs_with_cache(
-        scm,
-        tracker,
-        cfg,
-        &prs,
-        cache,
-        &mut metrics,
-        now_epoch,
-    )?;
+    let rate_limited = any_rate_limited && master_adopted.is_empty();
     Ok(LabeledPrsIntakeOutcome {
-        adopted,
-        outcomes,
-        rate_limited: false,
+        adopted: master_adopted,
+        outcomes: master_outcomes,
+        rate_limited,
         metrics,
     })
 }
@@ -611,7 +642,8 @@ pub fn normalize_labeled_prs_outcome(
 pub(crate) fn normalize_labeled_prs_with_cache(
     scm: &dyn Scm,
     tracker: &dyn Tracker,
-    cfg: &Config,
+    _cfg: &Config,
+    repo: &str,
     prs: &[LabeledPr],
     cache: &mut AdoptionProbeCache,
     metrics: &mut IntakeProbeMetrics,
@@ -638,7 +670,7 @@ pub(crate) fn normalize_labeled_prs_with_cache(
 
         // Pre-flight: cross-repo — uncacheable (the rejection comment must
         // be posted fresh so the contributor sees it on this tick).
-        if !same_repo_pr(pr, cfg) {
+        if !same_repo_pr(pr, repo) {
             let comment_body = "🤖 **[dark-factory]** Escalation required: fork/cross-repository PR adoption is not supported in v1. Same-repo factory PRs can be verified automatically; fork remediation lands with bead `jleechan-tfs1`.";
             let _ = tracker.comment_external(&pr.external_ref, comment_body);
             outcomes.push(IntakeOutcome {
@@ -678,7 +710,7 @@ pub(crate) fn normalize_labeled_prs_with_cache(
             // window restarts.
             metrics.probe_cache_misses += 1;
             metrics.gh_call_count += 1;
-            let permission = match scm.collaborator_permission(&pr.author_login) {
+            let permission = match scm.collaborator_permission_for_repo(repo, &pr.author_login) {
                 Ok(p) => p,
                 Err(e) => {
                     outcomes.push(IntakeOutcome {
@@ -733,7 +765,7 @@ pub(crate) fn normalize_labeled_prs_with_cache(
 
         // New PR — create_bead. The existing race-recovery logic from
         // `normalize_labeled_prs` carries over verbatim.
-        let title = format!("{} ({})", pr.title, cfg.target_repo);
+        let title = format!("{} ({})", pr.title, repo);
         let bead_id = match tracker.create_bead(&title, &pr.body, &pr.external_ref) {
             Ok(id) => id,
             Err(e) => {
@@ -837,7 +869,7 @@ pub fn normalize(
         // *determine* the permission tier (e.g. a transient GitHub API
         // error) is recorded as Errored for this candidate only — it must
         // not abort the rest of the batch.
-        let permission = match scm.collaborator_permission(&issue.author_login) {
+        let permission = match scm.collaborator_permission_for_repo(&cfg.target_repo, &issue.author_login) {
             Ok(p) => p,
             Err(e) => {
                 outcomes.push(IntakeOutcome {
@@ -935,7 +967,7 @@ pub fn normalize_labeled_prs(
     // telemetry, but the trait signature must stay uniform across both
     // callers to avoid drift).
     let mut legacy_gh_calls: u32 = 0;
-    let prs = scm.labeled_prs(FACTORY_LABEL, &mut legacy_gh_calls)?;
+    let prs = scm.labeled_prs_for_repo(&cfg.target_repo, FACTORY_LABEL, &mut legacy_gh_calls)?;
     if prs.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
@@ -956,7 +988,7 @@ pub fn normalize_labeled_prs(
             continue;
         }
 
-        if !same_repo_pr(&pr, cfg) {
+        if !same_repo_pr(&pr, &cfg.target_repo) {
             let comment_body = "🤖 **[dark-factory]** Escalation required: fork/cross-repository PR adoption is not supported in v1. Same-repo factory PRs can be verified automatically; fork remediation lands with bead `jleechan-tfs1`.";
             let _ = tracker.comment_external(&pr.external_ref, comment_body);
             outcomes.push(IntakeOutcome {
@@ -966,7 +998,7 @@ pub fn normalize_labeled_prs(
             continue;
         }
 
-        let permission = match scm.collaborator_permission(&pr.author_login) {
+        let permission = match scm.collaborator_permission_for_repo(&cfg.target_repo, &pr.author_login) {
             Ok(p) => p,
             Err(e) => {
                 outcomes.push(IntakeOutcome {
