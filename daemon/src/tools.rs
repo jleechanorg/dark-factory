@@ -426,6 +426,15 @@ pub trait Tracker {
     fn comment_external(&self, external_ref: &str, body: &str) -> Result<(), DaemonError>;
 }
 
+pub fn parse_external_ref_repo(external_ref: &str) -> Option<String> {
+    let parts: Vec<&str> = external_ref.split('#').collect();
+    if parts.len() == 2 {
+        Some(parts[0].to_string())
+    } else {
+        None
+    }
+}
+
 /// `gh` CLI (REST + GraphQL). Production adapters use short-lived in-memory
 /// TTL caches for repeated tick reads; a durable ETag cache is not wired yet.
 pub trait Scm {
@@ -439,7 +448,40 @@ pub trait Scm {
     /// silently burning O(N) on the REST fallback (bead jtg8-r5, codex
     /// P2 review "Count REST fallback subprocesses in gh metrics").
     fn labeled_prs(&self, label: &str, gh_calls: &mut u32) -> Result<Vec<LabeledPr>, DaemonError>;
+    /// Repo-scoped variant of [`labeled_prs`](Scm::labeled_prs). Default impl
+    /// filters `labeled_prs` for items matching `repo` in `external_ref`, avoiding
+    /// replaying identical PR lists across repositories on fake adapters. `CliScm`
+    /// overrides to retarget the query via `with_repo`.
+    fn labeled_prs_for_repo(
+        &self,
+        repo: &str,
+        label: &str,
+        gh_calls: &mut u32,
+    ) -> Result<Vec<LabeledPr>, DaemonError> {
+        let prs = self.labeled_prs(label, gh_calls)?;
+        Ok(prs
+            .into_iter()
+            .filter(|pr| {
+                if let Some(owner_repo) = parse_external_ref_repo(&pr.external_ref) {
+                    owner_repo.eq_ignore_ascii_case(repo)
+                } else {
+                    false
+                }
+            })
+            .collect())
+    }
     fn collaborator_permission(&self, login: &str) -> Result<Permission, DaemonError>;
+    /// Repo-scoped variant of [`collaborator_permission`](Scm::collaborator_permission).
+    /// Default impl delegates to `collaborator_permission`; `CliScm` overrides to retarget
+    /// via `with_repo`.
+    fn collaborator_permission_for_repo(
+        &self,
+        repo: &str,
+        login: &str,
+    ) -> Result<Permission, DaemonError> {
+        let _ = repo;
+        self.collaborator_permission(login)
+    }
     fn pr_snapshot(&self, pr: u64) -> Result<PrSnapshot, DaemonError>;
     /// Repo-scoped variant of [`pr_snapshot`](Scm::pr_snapshot) (bead
     /// jleechan-9xrs, Stage D of the multi-repo dispatch fix — see

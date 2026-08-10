@@ -471,8 +471,34 @@ impl CliScm {
         let issues: Vec<RestIssue> = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse gh labeled PR REST list: {e}"))
         })?;
+        // PR #629 follow-up fix (codex P2 "Enforce the call cap within each
+        // repository scan"): the sweep-wide gh-call budget was only checked
+        // BETWEEN repos, in `normalize_labeled_prs_outcome`'s outer loop
+        // (daemon/src/intake.rs) -- this single call can perform the list
+        // request above plus up to 100 per-PR `pulls/{n}` requests before
+        // ever returning, so a sweep starting well below the cap could
+        // still blow through it here. Collecting into `pr_issues` first
+        // (instead of filtering the iterator inline) lets the loop below
+        // report exactly how many labeled PRs were left unqueried when the
+        // budget runs out mid-scan.
+        let pr_issues: Vec<RestIssue> = issues
+            .into_iter()
+            .filter(|issue| issue.pull_request.is_some())
+            .collect();
+        let total = pr_issues.len();
         let mut prs = Vec::new();
-        for issue in issues.into_iter().filter(|issue| issue.pull_request.is_some()) {
+        for (idx, issue) in pr_issues.into_iter().enumerate() {
+            if Self::rest_fallback_budget_exhausted(*gh_calls) {
+                eprintln!(
+                    "auto-factory daemon: WARNING intake REST fallback for {} stopping mid-repo-scan at gh_call_count={} (cap={}); {} of {} labeled PR(s) not queried this tick",
+                    self.repo,
+                    *gh_calls,
+                    crate::intake::MAX_INTAKE_SWEEP_GH_CALLS,
+                    total - idx,
+                    total
+                );
+                break;
+            }
             // jtg8-r5: count each per-PR `pulls/{n}` call so the
             // slow-tier `gh_call_count` warning sees the real O(N) burn
             // (the r4 implementation only counted the list query, so the
@@ -519,6 +545,20 @@ impl CliScm {
             });
         }
         Ok(prs)
+    }
+
+    /// PR #629 follow-up fix (codex P2 "Enforce the call cap within each
+    /// repository scan"): pure boundary check so the REST-fallback per-PR
+    /// pulls loop's cap enforcement is unit-testable without shelling out
+    /// to a real/faked `gh` binary — mirrors this file's own
+    /// `parse_rest_pull_payload` precedent (extracted specifically so its
+    /// logic is directly testable). `gh_calls` is the SAME cumulative,
+    /// sweep-wide counter threaded through `normalize_labeled_prs_outcome`
+    /// (`daemon/src/intake.rs`), not a per-repo counter, so this correctly
+    /// bounds the TOTAL sweep budget rather than giving each repo its own
+    /// separate allowance.
+    pub(crate) fn rest_fallback_budget_exhausted(gh_calls: u32) -> bool {
+        gh_calls >= crate::intake::MAX_INTAKE_SWEEP_GH_CALLS
     }
 
     /// jtg8-r5 (P2 review "Populate the REST fallback SHA from head.sha"):
@@ -601,6 +641,42 @@ impl CliScm {
             head_repo_owner_login,
             is_cross_repository,
         ))
+    }
+}
+
+#[cfg(test)]
+mod rest_fallback_budget_exhausted_tests {
+    use super::CliScm;
+
+    /// PR #629 follow-up fix (codex P2): the pure boundary check must stay
+    /// permissive strictly BELOW the sweep-wide cap and trip AT it (not
+    /// one-past-it) — `labeled_prs_via_rest`'s loop calls this BEFORE
+    /// incrementing `gh_calls` for the call it is about to make, so
+    /// tripping exactly at the cap (rather than one over) is what prevents
+    /// the (cap+1)-th call from ever being issued.
+    #[test]
+    fn permissive_below_cap_trips_at_cap() {
+        assert!(
+            !CliScm::rest_fallback_budget_exhausted(crate::intake::MAX_INTAKE_SWEEP_GH_CALLS - 1),
+            "one call below the cap must still be allowed to proceed"
+        );
+        assert!(
+            CliScm::rest_fallback_budget_exhausted(crate::intake::MAX_INTAKE_SWEEP_GH_CALLS),
+            "reaching the cap exactly must stop further calls (matches the outer \
+             sweep loop's own `>=` check in normalize_labeled_prs_outcome)"
+        );
+        assert!(
+            CliScm::rest_fallback_budget_exhausted(crate::intake::MAX_INTAKE_SWEEP_GH_CALLS + 1),
+            "already over the cap (e.g. from a prior repo's overshoot) must also stop"
+        );
+    }
+
+    #[test]
+    fn zero_calls_never_exhausted() {
+        assert!(
+            !CliScm::rest_fallback_budget_exhausted(0),
+            "a fresh sweep with zero calls made so far must never report exhausted"
+        );
     }
 }
 
@@ -908,6 +984,22 @@ impl Scm for CliScm {
             .collect())
     }
 
+    fn labeled_prs_for_repo(
+        &self,
+        repo: &str,
+        label: &str,
+        gh_calls: &mut u32,
+    ) -> Result<Vec<LabeledPr>, DaemonError> {
+        self.with_repo(repo).labeled_prs(label, gh_calls)
+    }
+
+    fn collaborator_permission_for_repo(
+        &self,
+        repo: &str,
+        login: &str,
+    ) -> Result<Permission, DaemonError> {
+        self.with_repo(repo).collaborator_permission(login)
+    }
 
     fn collaborator_permission(&self, login: &str) -> Result<Permission, DaemonError> {
         let offline_path = std::path::Path::new(".beads/offline").join(format!("permission_{}.json", login));
@@ -3125,8 +3217,14 @@ export const isTerminalSession = () => false;
         let bindings = serde_json::json!({ prompt: branch });
 
         let (spawn_result, calls) = with_fake_ao("single", bindings, |log| {
+            let saved = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok();
+            std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "minimax");
             let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
             let result = sessions.spawn(&spec(prompt, branch));
+            match saved {
+                Some(val) => std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", val),
+                None => std::env::remove_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN"),
+            }
             let calls = std::fs::read_to_string(log).unwrap_or_default();
             (result, calls)
         });

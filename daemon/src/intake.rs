@@ -10,7 +10,9 @@
 //! the AO session's credentials").
 use crate::config::Config;
 use crate::errors::DaemonError;
-use crate::tools::{LabeledPr, Permission, Scm, Tracker};
+use crate::state::now_iso8601;
+use crate::telemetry::{self, TelemetryEvent};
+use crate::tools::{Bead, LabeledPr, Permission, Scm, Tracker};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -504,18 +506,88 @@ fn parse_target_repo_body_field(body: &str) -> Option<String> {
     None
 }
 
-fn same_repo_pr(pr: &LabeledPr, cfg: &Config) -> bool {
+fn same_repo_pr(pr: &LabeledPr, target_repo: &str) -> bool {
     if pr.is_cross_repository {
         return false;
     }
     if let Some(head_repo) = pr.head_repo_full_name.as_deref() {
-        return head_repo.eq_ignore_ascii_case(&cfg.target_repo);
+        return head_repo.eq_ignore_ascii_case(target_repo);
     }
     if let Some(head_owner) = pr.head_repo_owner_login.as_deref() {
-        let target_owner = cfg.target_repo.split('/').next().unwrap_or_default();
+        let target_owner = target_repo.split('/').next().unwrap_or_default();
         return head_owner.eq_ignore_ascii_case(target_owner);
     }
     true
+}
+
+pub const MAX_INTAKE_REPOS_PER_SWEEP: usize = 10;
+pub const MAX_INTAKE_SWEEP_GH_CALLS: u32 = 100;
+
+/// Case-insensitive-deduped, UNBOUNDED repository universe for this
+/// config: `target_repo` first, then every `cfg.repos` key that does not
+/// identify the same GitHub repository (case-insensitively — GitHub
+/// owner/repo identity is case-insensitive) as `target_repo` or an
+/// earlier entry, sorted for determinism. Original casing is preserved in
+/// the returned strings (used verbatim for SCM/API calls and
+/// `external_ref` construction) — only the *comparison* is case-folded.
+///
+/// PR #629 follow-up fix (codex P2 "Deduplicate repository names
+/// case-insensitively" + CodeRabbit convergent finding): the previous
+/// `*r != &cfg.target_repo` filter was case-SENSITIVE, unlike every other
+/// repository comparison on this path (`same_repo_pr`, the default
+/// `labeled_prs_for_repo` filter in `tools.rs`) — if `cfg.repos` held the
+/// target repository under a different ASCII case, the filter didn't
+/// remove it, the sweep scanned the same repository twice, and every PR
+/// in it produced duplicate `IntakeOutcome`s and duplicate
+/// `ExistingPrIntake` adoptions in one tick.
+///
+/// Callers apply `MAX_INTAKE_REPOS_PER_SWEEP` themselves:
+/// `target_repositories_sweep_order` truncates the ROTATED list;
+/// `normalize_labeled_prs_outcome` also calls this directly (unbounded)
+/// to detect and report truncation.
+fn dedup_repo_universe(cfg: &Config) -> Vec<String> {
+    let mut secondary: Vec<String> = cfg.repos.keys().cloned().collect();
+    secondary.sort();
+    let mut seen_lower: std::collections::HashSet<String> = std::collections::HashSet::new();
+    seen_lower.insert(cfg.target_repo.to_ascii_lowercase());
+    let mut universe = vec![cfg.target_repo.clone()];
+    for repo in secondary {
+        if seen_lower.insert(repo.to_ascii_lowercase()) {
+            universe.push(repo);
+        }
+    }
+    universe
+}
+
+/// Bounded, deterministic-within-a-tick, ROTATING sweep order. PR #629
+/// follow-up fix (codex P1 "Rotate repositories instead of permanently
+/// truncating them"): the pre-fix version always kept `target_repo` plus
+/// the same first `MAX_INTAKE_REPOS_PER_SWEEP - 1` secondary repos
+/// (alphabetically) and discarded the rest FOREVER — with no cursor or
+/// rotation state anywhere in the daemon, factory-labeled PRs in the
+/// discarded repos were never scanned on ANY tick.
+///
+/// `target_repo` always scans first, every tick (it is the daemon's
+/// primary configured repo). The SECONDARY window rotates by one repo per
+/// slow-tier sweep — the rotation offset advances with
+/// `now_epoch / cfg.slow_tick_secs`, so it increments by exactly 1 each
+/// time a real slow-tier tick calls this with a fresh `now_epoch` — so
+/// every secondary repo eventually enters the scanned window and full
+/// coverage is guaranteed within `secondary.len()` sweeps, while the
+/// order within any SINGLE tick stays fully deterministic (same
+/// `now_epoch` in, same order out).
+pub fn target_repositories_sweep_order(cfg: &Config, now_epoch: u64) -> Vec<String> {
+    let mut universe = dedup_repo_universe(cfg);
+    let secondary_len = universe.len().saturating_sub(1);
+    if secondary_len > 0 {
+        let period = cfg.slow_tick_secs.max(1);
+        let rotation = ((now_epoch / period) as usize) % secondary_len;
+        universe[1..].rotate_left(rotation);
+    }
+    if universe.len() > MAX_INTAKE_REPOS_PER_SWEEP {
+        universe.truncate(MAX_INTAKE_REPOS_PER_SWEEP);
+    }
+    universe
 }
 
 /// jtg8-r4: rate-limit-aware variant of `normalize_labeled_prs`. Detects a
@@ -536,61 +608,266 @@ fn same_repo_pr(pr: &LabeledPr, cfg: &Config) -> bool {
 ///
 /// `now_epoch` is the daemon's current epoch seconds, used to record the
 /// cache timestamp for the r4 TTL-based invalidation.
+///
+/// `telemetry_log` receives one `INTAKE_REPO_SWEEP_FAILED` event per
+/// per-repo isolation point (hard SCM error OR rate-limit skip) — PR #629
+/// follow-up fix: previously these were `eprintln!`-only (stderr/journal),
+/// unlike every other per-repo isolation point in this daemon
+/// (`dispatch.rs`/`reroll.rs`), which consistently emit a structured
+/// telemetry event for equivalent failure paths.
 pub fn normalize_labeled_prs_outcome(
     scm: &dyn Scm,
     tracker: &dyn Tracker,
     cfg: &Config,
     cache: &mut AdoptionProbeCache,
     now_epoch: u64,
+    telemetry_log: &Path,
 ) -> Result<LabeledPrsIntakeOutcome, DaemonError> {
     let mut metrics = IntakeProbeMetrics::default();
-    // jtg8-r5: plumb the metric into `labeled_prs` so the REST fallback's
-    // per-PR `pulls/{n}` calls are reflected in `gh_call_count` (r4 only
-    // counted this single list-query increment, so the slow-tier
-    // `INTAKE_GH_CALL_WARN_THRESHOLD` warning never fired when the daemon
-    // was burning O(N) core API calls via the fallback path).
-    let prs_result = scm.labeled_prs(FACTORY_LABEL, &mut metrics.gh_call_count);
-    // Even on rate-limit, the impl incremented `gh_call_count` once for
-    // the failed list query — surface that in the metric so the warning
-    // sees the actual failure mode.
-    let prs = match prs_result {
-        Ok(p) => p,
-        Err(e) if e.is_gh_rate_limit() => {
-            metrics.rate_limited_skips += 1;
-            return Ok(LabeledPrsIntakeOutcome {
-                adopted: Vec::new(),
-                outcomes: Vec::new(),
-                rate_limited: true,
-                metrics,
-            });
-        }
-        Err(e) => return Err(e),
-    };
-    if prs.is_empty() {
-        return Ok(LabeledPrsIntakeOutcome {
-            adopted: Vec::new(),
-            outcomes: Vec::new(),
-            rate_limited: false,
-            metrics,
-        });
+    let target_repos = target_repositories_sweep_order(cfg, now_epoch);
+    let mut master_adopted = Vec::new();
+    let mut master_outcomes = Vec::new();
+    let mut any_rate_limited = false;
+
+    // PR #629 follow-up fix (codex P1 + CodeRabbit convergent finding):
+    // `target_repositories_sweep_order` now rotates so no configured repo
+    // is discarded FOREVER, but a single tick still can't cover every
+    // repo when the configured set exceeds `MAX_INTAKE_REPOS_PER_SWEEP` —
+    // an operator should be able to see that from telemetry, not just
+    // infer it. `dedup_repo_universe` is the same unbounded, deduped list
+    // `target_repositories_sweep_order` computes internally before
+    // rotating/truncating, so comparing its length against the cap here
+    // detects truncation without duplicating the dedup logic.
+    let full_universe_len = dedup_repo_universe(cfg).len();
+    if full_universe_len > MAX_INTAKE_REPOS_PER_SWEEP {
+        eprintln!(
+            "auto-factory daemon: WARNING intake sweep repo count={} exceeds maximum ({}); \
+             {} configured repositor(ies) rotate out of this tick's scanned window (full \
+             coverage is still guaranteed over successive sweeps — see \
+             INTAKE_REPO_SWEEP_TRUNCATED)",
+            full_universe_len,
+            MAX_INTAKE_REPOS_PER_SWEEP,
+            full_universe_len - MAX_INTAKE_REPOS_PER_SWEEP
+        );
+        emit_intake_sweep_truncated(telemetry_log, full_universe_len, MAX_INTAKE_REPOS_PER_SWEEP);
     }
 
-    // Delegate the per-PR decisions to the cache-aware variant below.
-    let (adopted, outcomes) = normalize_labeled_prs_with_cache(
-        scm,
-        tracker,
-        cfg,
-        &prs,
-        cache,
-        &mut metrics,
-        now_epoch,
-    )?;
+    // PR #629 follow-up fix (round 3, codex P1 "unconditional tracker
+    // fetch starves dispatch on an irrelevant failure"): the tracker
+    // snapshot is LAZY + MEMOIZED — fetched at most once per sweep, and
+    // only once some repo's PR batch actually needs it (i.e. `scm`
+    // returned a non-empty `prs` list for that repo). The round-2 version
+    // of this fix fetched unconditionally, upfront, before the per-repo
+    // loop even started, and propagated a fetch failure via `?` — correct
+    // in isolation (no prior repo's results existed yet to lose), but
+    // wrong for the CALLER: `run_slow_tier` (tick.rs) calls this function
+    // with `?` too, so an upfront tracker error aborted the ENTIRE
+    // `normalize_labeled_prs_outcome` call and, transitively, every other
+    // phase of that slow tick — issue intake, routing, dispatch — even
+    // when EVERY repo in the sweep returned zero PRs or was rate-limited
+    // and the tracker was never actually needed. A malformed/unavailable
+    // closed-bead listing has nothing to do with issue intake or
+    // dispatching already-QUEUED beads, so it must never be able to
+    // starve them. `None` = not yet attempted this sweep; `Some(Err(()))`
+    // = attempted and failed (remaining repos needing it degrade without
+    // re-attempting or re-fetching); `Some(Ok(..))` = fetched once, reused
+    // by every subsequent repo's batch.
+    let mut tracker_snapshot_state: Option<TrackerSweepFetchResult> = None;
+
+    for repo in &target_repos {
+        if metrics.gh_call_count >= MAX_INTAKE_SWEEP_GH_CALLS {
+            eprintln!(
+                "auto-factory daemon: WARNING intake sweep gh_call_count={} reached maximum limit ({}); bounding sweep across repositories",
+                metrics.gh_call_count, MAX_INTAKE_SWEEP_GH_CALLS
+            );
+            break;
+        }
+
+        let prs_result = scm.labeled_prs_for_repo(repo, FACTORY_LABEL, &mut metrics.gh_call_count);
+        let prs = match prs_result {
+            Ok(p) => p,
+            Err(e) if e.is_gh_rate_limit() => {
+                metrics.rate_limited_skips += 1;
+                any_rate_limited = true;
+                eprintln!(
+                    "auto-factory daemon: WARNING intake rate-limited for repository {repo}; skipping and continuing with remaining repositories"
+                );
+                emit_intake_repo_sweep_failed(telemetry_log, repo, "rate_limited", &e.to_string());
+                continue;
+            }
+            Err(e) => {
+                eprintln!(
+                    "auto-factory daemon: WARNING intake failed for repository {repo}: {e}; continuing with remaining repositories"
+                );
+                emit_intake_repo_sweep_failed(telemetry_log, repo, "scm_error", &e.to_string());
+                continue;
+            }
+        };
+
+        if prs.is_empty() {
+            continue;
+        }
+
+        // This repo's batch needs the tracker snapshot — fetch it now if
+        // no repo earlier in this sweep already has (memoized: at most
+        // one fetch attempt per sweep, success or failure).
+        let snapshot_result = tracker_snapshot_state.get_or_insert_with(|| {
+            match (tracker.fetch_candidates(), tracker.fetch_all_external_refs()) {
+                (Ok(candidates), Ok(refs)) => Ok((candidates, refs)),
+                (Err(e), _) | (_, Err(e)) => {
+                    eprintln!(
+                        "auto-factory daemon: WARNING intake tracker snapshot fetch failed \
+                         (first needed by repository {repo}): {e}; degrading PR intake for the \
+                         remainder of this sweep — issue intake and dispatch still proceed"
+                    );
+                    emit_intake_repo_sweep_failed(telemetry_log, repo, "tracker_snapshot", &e.to_string());
+                    Err(())
+                }
+            }
+        });
+
+        let (tracker_candidates, known_refs): (&[Bead], &std::collections::HashSet<String>) =
+            match snapshot_result {
+                Ok((candidates, refs)) => (candidates.as_slice(), &*refs),
+                Err(()) => {
+                    eprintln!(
+                        "auto-factory daemon: WARNING intake skipping repository {repo}: tracker \
+                         snapshot unavailable this sweep (see the earlier \
+                         INTAKE_REPO_SWEEP_FAILED tracker_snapshot event)"
+                    );
+                    continue;
+                }
+            };
+        let tracker_snapshot = TrackerSweepSnapshot {
+            candidates: tracker_candidates,
+            known_refs,
+        };
+
+        let (adopted, outcomes) = normalize_labeled_prs_with_cache(
+            scm,
+            tracker,
+            RepoPrBatch { repo: repo.as_str(), prs: &prs },
+            &tracker_snapshot,
+            AdoptionProbeState { cache, metrics: &mut metrics },
+            now_epoch,
+        )?;
+        master_adopted.extend(adopted);
+        master_outcomes.extend(outcomes);
+    }
+
+    // PR #629 follow-up fix: `rate_limited` must only collapse this tick's
+    // results (see `run_slow_tier` in tick.rs) when NOTHING usable was
+    // gathered from ANY repo — not merely when zero PRs happened to be
+    // adopted. The previous `any_rate_limited && master_adopted.is_empty()`
+    // check conflated "adopted zero PRs" (a normal, healthy outcome that
+    // can still carry real skip/reject `IntakeOutcome`s in
+    // `master_outcomes`) with "rate-limited and therefore untrustworthy":
+    // a repo with zero adoptions but real skip/reject outcomes, combined
+    // with an unrelated rate-limited repo, caused `master_adopted.is_empty()`
+    // to be true by coincidence, so the tick discarded that repo's
+    // legitimate, already-computed telemetry for an unrelated reason.
+    let rate_limited =
+        any_rate_limited && master_adopted.is_empty() && master_outcomes.is_empty();
     Ok(LabeledPrsIntakeOutcome {
-        adopted,
-        outcomes,
-        rate_limited: false,
+        adopted: master_adopted,
+        outcomes: master_outcomes,
+        rate_limited,
         metrics,
     })
+}
+
+/// jleechan (PR #629 follow-up fix): emit exactly one structured telemetry
+/// event for a per-repo intake sweep failure — either a hard SCM error or a
+/// rate-limit skip. `bead_id` is the repo id (no bead exists yet for a
+/// repo-level sweep failure), mirroring the `bead_id = external_ref`
+/// convention `emit_intake_outcome` (tick.rs) already uses for per-PR
+/// outcomes — so `grep <repo> daemon.jsonl` finds this line. Best-effort: a
+/// telemetry write failure must never abort or degrade the sweep itself —
+/// the caller's own fail-soft isolation (`continue` past the failing repo)
+/// is the load-bearing behavior; telemetry is an observability side
+/// channel only.
+fn emit_intake_repo_sweep_failed(telemetry_log: &Path, repo: &str, error_class: &str, error: &str) {
+    let event = TelemetryEvent {
+        timestamp: now_iso8601(),
+        bead_id: repo.to_string(),
+        attempt_id: 1,
+        lifecycle_state: "INTAKE".to_string(),
+        event_type: "INTAKE_REPO_SWEEP_FAILED".to_string(),
+        metrics: serde_json::json!({}),
+        context: serde_json::json!({
+            "repo": repo,
+            "error_class": error_class,
+            "error": error,
+        }),
+    };
+    if let Err(e) = telemetry::emit(telemetry_log, &event) {
+        eprintln!(
+            "auto-factory daemon: WARNING failed to emit INTAKE_REPO_SWEEP_FAILED telemetry for {repo}: {e}"
+        );
+    }
+}
+
+/// PR #629 follow-up fix (codex P1 + CodeRabbit convergent finding):
+/// structured telemetry counterpart to `target_repositories_sweep_order`'s
+/// rotation. Rotation guarantees every configured repo eventually gets
+/// scanned, but a single tick still doesn't cover everything when the
+/// configured set exceeds `MAX_INTAKE_REPOS_PER_SWEEP` — an operator
+/// should be able to see that from the daemon's telemetry stream, not
+/// just an `eprintln!`. `bead_id` is a fixed sentinel (no single repo or
+/// bead owns a sweep-wide truncation event).
+fn emit_intake_sweep_truncated(telemetry_log: &Path, configured_repo_count: usize, cap: usize) {
+    let event = TelemetryEvent {
+        timestamp: now_iso8601(),
+        bead_id: "intake_sweep".to_string(),
+        attempt_id: 1,
+        lifecycle_state: "INTAKE".to_string(),
+        event_type: "INTAKE_REPO_SWEEP_TRUNCATED".to_string(),
+        metrics: serde_json::json!({}),
+        context: serde_json::json!({
+            "configured_repo_count": configured_repo_count,
+            "cap": cap,
+        }),
+    };
+    if let Err(e) = telemetry::emit(telemetry_log, &event) {
+        eprintln!(
+            "auto-factory daemon: WARNING failed to emit INTAKE_REPO_SWEEP_TRUNCATED telemetry: {e}"
+        );
+    }
+}
+
+/// At-most-once-per-sweep snapshot of the tracker's known beads/refs,
+/// lazily fetched in `normalize_labeled_prs_outcome` the first time some
+/// repo's PR batch actually needs it, and memoized for the rest of the
+/// sweep (see that function's doc comment for the starvation bug this
+/// closes — round 3 of the PR #629 follow-up).
+pub(crate) struct TrackerSweepSnapshot<'a> {
+    candidates: &'a [Bead],
+    known_refs: &'a std::collections::HashSet<String>,
+}
+
+/// Named alias for the lazy tracker-snapshot memo's inner `Result`, purely
+/// to keep `normalize_labeled_prs_outcome`'s local binding under clippy's
+/// `type_complexity` threshold without an `#[allow]`. `Ok` holds the
+/// owned, one-time-fetched `(fetch_candidates, fetch_all_external_refs)`
+/// pair; `Err(())` records "already attempted and failed this sweep" —
+/// the underlying `DaemonError` is only needed at the point of failure
+/// (already consumed into an `eprintln!`/telemetry event there), not
+/// after memoization.
+type TrackerSweepFetchResult = Result<(Vec<Bead>, std::collections::HashSet<String>), ()>;
+
+/// One repo's already-fetched PR batch — bundled with `repo` purely to keep
+/// `normalize_labeled_prs_with_cache`'s argument count under clippy's
+/// `too_many_arguments` threshold without an `#[allow]`.
+pub(crate) struct RepoPrBatch<'a> {
+    repo: &'a str,
+    prs: &'a [LabeledPr],
+}
+
+/// Mutable per-sweep accumulator state threaded through the per-PR loop —
+/// bundled for the same argument-count reason as `RepoPrBatch`.
+pub(crate) struct AdoptionProbeState<'a> {
+    cache: &'a mut AdoptionProbeCache,
+    metrics: &'a mut IntakeProbeMetrics,
 }
 
 /// jtg8-r4: cache-aware adoption loop. Mirrors `normalize_labeled_prs`'s
@@ -608,21 +885,50 @@ pub fn normalize_labeled_prs_outcome(
 /// forever. (`prs` is the already-fetched `labeled_prs` result — caller
 /// passed them in so `normalize_labeled_prs_outcome` could count the list
 /// query as 1 gh call before delegating here.)
+///
+/// `tracker_snapshot` is the ONE-TIME-per-sweep `fetch_candidates`/
+/// `fetch_all_external_refs` result — see `normalize_labeled_prs_outcome`'s
+/// doc comment. This function no longer fetches the tracker snapshot
+/// itself, so a per-repo processing error here can never abort the whole
+/// multi-repo sweep the way a tracker-fetch error used to.
 pub(crate) fn normalize_labeled_prs_with_cache(
     scm: &dyn Scm,
     tracker: &dyn Tracker,
-    cfg: &Config,
-    prs: &[LabeledPr],
-    cache: &mut AdoptionProbeCache,
-    metrics: &mut IntakeProbeMetrics,
+    batch: RepoPrBatch,
+    tracker_snapshot: &TrackerSweepSnapshot,
+    state: AdoptionProbeState,
     now_epoch: u64,
 ) -> Result<(Vec<ExistingPrIntake>, Vec<IntakeOutcome>), DaemonError> {
-    let tracker_candidates = tracker.fetch_candidates()?;
-    let known_refs = tracker.fetch_all_external_refs()?;
+    let repo = batch.repo;
+    let prs = batch.prs;
+    let tracker_candidates = tracker_snapshot.candidates;
+    let known_refs = tracker_snapshot.known_refs;
+    let cache = state.cache;
+    let metrics = state.metrics;
     let mut intakes = Vec::new();
     let mut outcomes = Vec::new();
 
     for pr in prs {
+        // PR #629 follow-up fix (codex P2 "Enforce the call cap within
+        // each repository scan"): the sweep-wide `MAX_INTAKE_SWEEP_GH_CALLS`
+        // budget was only checked BETWEEN repos, in
+        // `normalize_labeled_prs_outcome`'s outer loop — a single repo with
+        // many labeled PRs could still blow through the cap here via
+        // repeated cache-miss `collaborator_permission_for_repo` probes
+        // before the outer loop ever got a chance to check again. Stop
+        // incrementally, the moment the cumulative sweep budget is
+        // exhausted, exactly like the outer loop already does between
+        // repos; the remaining PRs in this repo are simply not processed
+        // this tick and get picked up on a future sweep.
+        if metrics.gh_call_count >= MAX_INTAKE_SWEEP_GH_CALLS {
+            eprintln!(
+                "auto-factory daemon: WARNING intake sweep gh_call_count={} reached maximum limit ({}); \
+                 stopping mid-scan of repository {repo} with PR(s) unprocessed this tick",
+                metrics.gh_call_count, MAX_INTAKE_SWEEP_GH_CALLS
+            );
+            break;
+        }
+
         let key = ProbeCacheKey::from_pr(pr);
 
         // Pre-flight: empty head_ref_name — uncacheable, never probed.
@@ -638,7 +944,7 @@ pub(crate) fn normalize_labeled_prs_with_cache(
 
         // Pre-flight: cross-repo — uncacheable (the rejection comment must
         // be posted fresh so the contributor sees it on this tick).
-        if !same_repo_pr(pr, cfg) {
+        if !same_repo_pr(pr, repo) {
             let comment_body = "🤖 **[dark-factory]** Escalation required: fork/cross-repository PR adoption is not supported in v1. Same-repo factory PRs can be verified automatically; fork remediation lands with bead `jleechan-tfs1`.";
             let _ = tracker.comment_external(&pr.external_ref, comment_body);
             outcomes.push(IntakeOutcome {
@@ -678,7 +984,7 @@ pub(crate) fn normalize_labeled_prs_with_cache(
             // window restarts.
             metrics.probe_cache_misses += 1;
             metrics.gh_call_count += 1;
-            let permission = match scm.collaborator_permission(&pr.author_login) {
+            let permission = match scm.collaborator_permission_for_repo(repo, &pr.author_login) {
                 Ok(p) => p,
                 Err(e) => {
                     outcomes.push(IntakeOutcome {
@@ -733,7 +1039,7 @@ pub(crate) fn normalize_labeled_prs_with_cache(
 
         // New PR — create_bead. The existing race-recovery logic from
         // `normalize_labeled_prs` carries over verbatim.
-        let title = format!("{} ({})", pr.title, cfg.target_repo);
+        let title = format!("{} ({})", pr.title, repo);
         let bead_id = match tracker.create_bead(&title, &pr.body, &pr.external_ref) {
             Ok(id) => id,
             Err(e) => {
@@ -837,7 +1143,7 @@ pub fn normalize(
         // *determine* the permission tier (e.g. a transient GitHub API
         // error) is recorded as Errored for this candidate only — it must
         // not abort the rest of the batch.
-        let permission = match scm.collaborator_permission(&issue.author_login) {
+        let permission = match scm.collaborator_permission_for_repo(&cfg.target_repo, &issue.author_login) {
             Ok(p) => p,
             Err(e) => {
                 outcomes.push(IntakeOutcome {
@@ -935,7 +1241,7 @@ pub fn normalize_labeled_prs(
     // telemetry, but the trait signature must stay uniform across both
     // callers to avoid drift).
     let mut legacy_gh_calls: u32 = 0;
-    let prs = scm.labeled_prs(FACTORY_LABEL, &mut legacy_gh_calls)?;
+    let prs = scm.labeled_prs_for_repo(&cfg.target_repo, FACTORY_LABEL, &mut legacy_gh_calls)?;
     if prs.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
@@ -956,7 +1262,7 @@ pub fn normalize_labeled_prs(
             continue;
         }
 
-        if !same_repo_pr(&pr, cfg) {
+        if !same_repo_pr(&pr, &cfg.target_repo) {
             let comment_body = "🤖 **[dark-factory]** Escalation required: fork/cross-repository PR adoption is not supported in v1. Same-repo factory PRs can be verified automatically; fork remediation lands with bead `jleechan-tfs1`.";
             let _ = tracker.comment_external(&pr.external_ref, comment_body);
             outcomes.push(IntakeOutcome {
@@ -966,7 +1272,7 @@ pub fn normalize_labeled_prs(
             continue;
         }
 
-        let permission = match scm.collaborator_permission(&pr.author_login) {
+        let permission = match scm.collaborator_permission_for_repo(&cfg.target_repo, &pr.author_login) {
             Ok(p) => p,
             Err(e) => {
                 outcomes.push(IntakeOutcome {

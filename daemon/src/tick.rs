@@ -1510,6 +1510,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         deps.cfg,
         &mut adoption_cache,
         slow_tick_now,
+        deps.telemetry_log,
     )?;
     // jtg8-r4 acceptance #3: warn when per-tick gh call count exceeds the
     // slow-tier budget. The threshold (20) is generous — well below what
