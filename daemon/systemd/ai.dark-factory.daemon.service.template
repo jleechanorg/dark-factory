@@ -13,6 +13,7 @@ Restart=on-failure
 RestartSec=10s
 WatchdogSec=7200s
 KillSignal=SIGINT
+KillMode=process
 TimeoutStopSec=30s
 Environment=HOME=@HOME@
 Environment=DARK_FACTORY_BR_DB=@HOME@/.local/state/dark-factory/.beads/beads.db
