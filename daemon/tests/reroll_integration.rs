@@ -2083,7 +2083,7 @@ mod quiescence_timeout_races {
             .calls
             .borrow()
             .iter()
-            .filter(|c| c.as_str() == format!("head_sha({branch})"))
+            .filter(|c| c.starts_with("head_sha"))
             .count();
         assert!(
             head_polls >= 2,
@@ -2996,6 +2996,170 @@ fn test_reroll_close_pr_already_merged_is_tolerated_as_successful_supersede() {
         telemetry.contains("REROLL_PR_ALREADY_MERGED"),
         "telemetry must record REROLL_PR_ALREADY_MERGED so operators can audit \
          tolerant supersedes; got: {telemetry}"
+    );
+
+    std::fs::remove_dir_all(spec_dir).ok();
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Bead dark-factory-mw85: reroll quiescence head probe must route through
+/// `vcs.head_sha_within_for_repo(&bead.repo(cfg), ...)` using the bead's routed
+/// target repo, rather than calling CWD-bound `git rev-parse` in the daemon's own CWD.
+#[test]
+fn test_reroll_quiescence_head_probe_routes_through_bead_repo_and_defers_on_failure() {
+    let scm = FakeScm::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = true;
+    let mut vcs = FakeVcs::new();
+
+    let target_repo = "jleechanorg/custom-routed-repo";
+    let branch = "factory/bead-mw85-r1";
+    let scoped_branch = format!("{target_repo}@{branch}");
+
+    vcs.heads.insert(scoped_branch.clone(), "head-sha-mw85".into());
+    vcs.heads.insert(format!("{target_repo}@main"), "base-sha-mw85".into());
+
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"inhibitionSpecs":["no print"],"positiveAssertions":["log errors"],"securityRedactionEncountered":false}"#.into()
+    ));
+
+    let mut cfg = test_cfg();
+    cfg.spec_dir = std::env::temp_dir()
+        .join("afd_spec_dir_mw85_test")
+        .to_string_lossy()
+        .to_string();
+    let spec_dir = std::path::Path::new(&cfg.spec_dir);
+    let _ = std::fs::remove_dir_all(spec_dir);
+    std::fs::create_dir_all(spec_dir).unwrap();
+
+    let telemetry_log = std::env::temp_dir().join("afd_telemetry_mw85.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let mut bead = BeadOverlay {
+        bead_id: "bead-mw85".into(),
+        state: OverlayState::Attested,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 5,
+        spend_usd: 0.0,
+        pr_number: Some(888),
+        branch: Some(branch.into()),
+        session_id: Some("session-mw85".into()),
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: Some(target_repo.into()),
+        attempt_started_at: None,
+    };
+    store.save(&bead).unwrap();
+
+    let deps = reroll::RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "skeptic".into(),
+        review_text: "Log error trace".into(),
+    };
+
+    let outcome = reroll::execute(&deps, &mut bead).unwrap();
+    assert!(
+        matches!(outcome, RerollOutcome::Rerolled { .. }),
+        "expected Rerolled outcome, got {:?}",
+        outcome
+    );
+
+    let calls = vcs.calls.borrow();
+    assert!(
+        calls.iter().any(|c| c.starts_with(&format!("head_sha_within_for_repo({target_repo},{branch}"))),
+        "reroll quiescence must call head_sha_within_for_repo with the bead's target_repo '{target_repo}'; got calls: {calls:?}"
+    );
+
+    std::fs::remove_dir_all(spec_dir).ok();
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Bead dark-factory-mw85: probe failure on head_sha_within_for_repo must warn via
+/// telemetry and defer only the affected bead without returning Err / crashing reroll.
+#[test]
+fn test_reroll_quiescence_head_probe_error_warns_and_defers_without_crashing() {
+    let scm = FakeScm::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = true;
+    let vcs = FakeVcs::new();
+
+    let target_repo = "jleechanorg/custom-routed-repo-fail";
+    let branch = "factory/bead-mw85-fail-r1";
+    let scoped_branch = format!("{target_repo}@{branch}");
+
+    vcs.fail_head_sha_for.borrow_mut().insert(
+        scoped_branch,
+        "gh api returned 404 Not Found for branch".into(),
+    );
+
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+
+    let mut cfg = test_cfg();
+    cfg.spec_dir = std::env::temp_dir()
+        .join("afd_spec_dir_mw85_fail_test")
+        .to_string_lossy()
+        .to_string();
+    let spec_dir = std::path::Path::new(&cfg.spec_dir);
+    let _ = std::fs::remove_dir_all(spec_dir);
+    std::fs::create_dir_all(spec_dir).unwrap();
+
+    let telemetry_log = std::env::temp_dir().join("afd_telemetry_mw85_fail.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let mut bead = BeadOverlay {
+        bead_id: "bead-mw85-fail".into(),
+        state: OverlayState::Attested,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 5,
+        spend_usd: 0.0,
+        pr_number: Some(889),
+        branch: Some(branch.into()),
+        session_id: Some("session-mw85-fail".into()),
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: Some(target_repo.into()),
+        attempt_started_at: None,
+    };
+    store.save(&bead).unwrap();
+
+    let deps = reroll::RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "skeptic".into(),
+        review_text: "Log error trace".into(),
+    };
+
+    let outcome = reroll::execute(&deps, &mut bead).expect("reroll must not crash on head probe failure");
+    assert!(
+        matches!(outcome, RerollOutcome::Deferred(_)),
+        "expected Deferred outcome on probe error, got {:?}",
+        outcome
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).expect("telemetry log must exist");
+    assert!(
+        telemetry.contains("REROLL_QUIESCENCE_HEAD_TRANSIENT") || telemetry.contains("REROLL_QUIESCENCE_HEAD_FAILED"),
+        "telemetry must log REROLL_QUIESCENCE_HEAD warning on probe failure; got: {telemetry}"
     );
 
     std::fs::remove_dir_all(spec_dir).ok();

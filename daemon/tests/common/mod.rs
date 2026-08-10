@@ -1086,6 +1086,44 @@ impl Vcs for FakeVcs {
             })
     }
 
+    fn head_sha_within_for_repo(
+        &self,
+        repo: &str,
+        branch: &str,
+        timeout_secs: u64,
+    ) -> Result<String, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("head_sha_within_for_repo({repo},{branch},{timeout_secs})"));
+        let scoped_key = format!("{repo}@{branch}");
+        let fail_map = self.fail_head_sha_for.borrow();
+        if let Some(msg) = fail_map.get(&scoped_key).or_else(|| fail_map.get(branch)) {
+            return Err(DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr: msg.clone(),
+            });
+        }
+        let schedule_map = self.head_sha_schedule.borrow();
+        if let Some(schedule) = schedule_map.get(&scoped_key).or_else(|| schedule_map.get(branch)) {
+            let now = std::time::Instant::now();
+            if let Some((_, sha)) = schedule.iter().rfind(|(at, _)| *at <= now) {
+                return Ok(sha.clone());
+            }
+        }
+        if let Some(sha) = self.heads.get(&scoped_key) {
+            return Ok(sha.clone());
+        }
+        self.heads
+            .get(branch)
+            .cloned()
+            .ok_or_else(|| DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr: format!("no scripted head for {scoped_key}"),
+            })
+    }
+
     fn is_remote_ahead(&self, branch: &str, remote_sha: &str) -> Result<bool, DaemonError> {
         self.calls
             .borrow_mut()

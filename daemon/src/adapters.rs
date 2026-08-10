@@ -5239,6 +5239,30 @@ impl Vcs for CliVcs {
         Ok(out.trim().to_string())
     }
 
+    /// Bead dark-factory-mw85: repo-scoped, budget-bounded `head_sha` — queries
+    /// `gh api repos/<repo>/git/ref/heads/<branch>` to fetch branch HEAD SHA,
+    /// decoupling reroll quiescence from the daemon's local process CWD.
+    fn head_sha_within_for_repo(
+        &self,
+        repo: &str,
+        branch: &str,
+        timeout_secs: u64,
+    ) -> Result<String, DaemonError> {
+        let path = format!("repos/{}/git/ref/heads/{}", repo, branch);
+        let out = run_tool("gh", &["api", &path, "--jq", ".object.sha"], timeout_secs)?;
+        let sha = out.trim();
+        if sha.is_empty() || sha == "null" {
+            return Err(DaemonError::Tool {
+                tool: "gh".to_string(),
+                rc: 0,
+                stderr: format!(
+                    "gh api {path} returned no sha for branch '{branch}' in {repo}"
+                ),
+            });
+        }
+        Ok(sha.to_string())
+    }
+
     fn is_remote_ahead(&self, branch: &str, remote_sha: &str) -> Result<bool, DaemonError> {
         // Two-step check:
         // 1. local_head == remote_sha ⇒ not ahead (worker hasn't actually
@@ -6552,6 +6576,12 @@ case "$url_path" in
       exit 0
     fi
     ;;
+  "repos/${repo}/git/ref/heads/"*)
+    if [ "$jq_filter" = ".object.sha" ]; then
+      echo "${GH_TEST_SHA:-}"
+      exit 0
+    fi
+    ;;
   "repos/${repo}/compare/"*)
     if [ "$jq_filter" = ".status" ]; then
       echo "${GH_TEST_STATUS:-}"
@@ -6703,6 +6733,56 @@ exit 1
         assert!(
             log.contains(".sha"),
             "expected --jq .sha in the logged gh invocation, got:\n{log}"
+        );
+
+        std::fs::remove_dir_all(&log_dir).ok();
+    }
+
+    /// Bead dark-factory-mw85: test `head_sha_within_for_repo` calls `gh api repos/<repo>/git/ref/heads/<branch>`
+    /// with `--jq .object.sha`.
+    #[test]
+    #[cfg(unix)]
+    fn head_sha_within_for_repo_targets_configured_repo_and_preserves_branch() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let log_dir = std::env::temp_dir().join(format!(
+            "afd_cli_vcs_argvlog_mw85_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let log_path = log_dir.join("argv.log");
+
+        let expected_sha = "1234567890abcdef1234567890abcdef12345678";
+        let target_repo = "other-owner/other-repo";
+        let branch = "factory/mw85-r1";
+
+        let result = with_fake_gh(
+            "head_sha_within_for_repo_slash",
+            target_repo,
+            expected_sha,
+            "",
+            Some(&log_path),
+            || {
+                let vcs = CliVcs::new("daemon-owner/daemon-repo".to_string());
+                vcs.head_sha_within_for_repo(target_repo, branch, 10)
+            },
+        );
+
+        assert_eq!(
+            result.expect("head_sha_within_for_repo should succeed"),
+            expected_sha
+        );
+
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            log.contains("repos/other-owner/other-repo/git/ref/heads/factory/mw85-r1"),
+            "expected the exact target_repo+branch URL in the logged gh invocation, got:\n{log}"
+        );
+        assert!(
+            log.contains(".object.sha"),
+            "expected --jq .object.sha in the logged gh invocation, got:\n{log}"
         );
 
         std::fs::remove_dir_all(&log_dir).ok();

@@ -801,7 +801,10 @@ fn evaluate_proceed(
         // Codex P3: sample head_sha FIRST on every poll, before any
         // liveness-based break, so "HEAD sampled every poll" is unconditionally
         // true and a mid-window push is always observed.
-        let head = match deps.vcs.head_sha_within(branch, budget_or_defer!()) {
+        // Bead dark-factory-mw85: route probe through repo-scoped VCS probe
+        // using `overlay.repo(cfg)` so daemon CWD non-git status never blocks quiescence.
+        let bead_repo = bead.repo(deps.cfg);
+        let head = match deps.vcs.head_sha_within_for_repo(bead_repo, branch, budget_or_defer!()) {
             Ok(h) => h,
             Err(e) if e.is_transient() => {
                 emit_telemetry(
@@ -815,7 +818,18 @@ fn evaluate_proceed(
                 )?;
                 return Ok(None);
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                emit_telemetry(
+                    deps.telemetry_log,
+                    &bead.bead_id,
+                    bead.attempt,
+                    bead.state.as_str(),
+                    "REROLL_QUIESCENCE_HEAD_FAILED",
+                    serde_json::json!({}),
+                    serde_json::json!({"reason": "head_query_failed", "error": format!("{e}")}),
+                )?;
+                return Ok(None);
+            }
         };
         match &last_head {
             Some(prev) if *prev == head => {}

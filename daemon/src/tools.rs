@@ -860,6 +860,17 @@ pub trait Vcs {
         let _ = timeout_secs;
         self.head_sha(branch)
     }
+    /// Repo-scoped, budget-bounded variant of [`head_sha_within`](Vcs::head_sha_within) (bead dark-factory-mw85).
+    /// Default delegates to `head_sha_within` ignoring `repo`; `CliVcs` overrides it to query `gh api`.
+    fn head_sha_within_for_repo(
+        &self,
+        repo: &str,
+        branch: &str,
+        timeout_secs: u64,
+    ) -> Result<String, DaemonError> {
+        let _ = repo;
+        self.head_sha_within(branch, timeout_secs)
+    }
     /// `true` iff `local_head` (the local branch's SHA) is a strict ancestor of
     /// `remote_sha` — i.e. the remote PR head contains every local commit AND
     /// has at least one extra commit the local checkout has not seen yet. Returns
