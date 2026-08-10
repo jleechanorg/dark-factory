@@ -131,8 +131,81 @@ permissions:
   statuses: write
 
 jobs:
+  config-check:
+    name: Skeptic config check
+    # UNCONFIGURED-GUARD (bead rev-iqa9, post-audit comment 4953116428):
+    # Defense-in-depth mirror of skeptic-gate-caller.yml's config-check
+    # (identical invariant, duplicated here) for any workflow_call or
+    # workflow_dispatch invocation that reaches this file directly,
+    # bypassing the caller's own guard. Fleet forensics proved the
+    # reviewer CLIs (codex/gemini) are absent from ALL runner containers
+    # as of this fix -- running the real gate unconditionally would
+    # produce a RED "Skeptic" status purely from an unprovisioned
+    # environment, which is strictly worse repo hygiene than a zero-job
+    # failure.
+    #
+    # This job ALWAYS runs and ALWAYS succeeds; it only decides whether
+    # the real gate job below is worth invoking. When pins are missing
+    # it emits a loud ::warning:: + step-summary and the downstream
+    # `skeptic` job is SKIPPED (green config-check + skipped gate, never
+    # a red one).
+    #
+    # This does NOT touch or weaken the "Verify mandatory pin vars"
+    # fail-closed step inside the `skeptic` job below: that step still
+    # hard-fails with no defaulting whenever the gate actually runs
+    # (configured=true, or an explicit human workflow_dispatch). This
+    # job only prevents the gate from being invoked at all in the
+    # unconfigured case.
+    runs-on: ${{ fromJson(vars.SELF_HOSTED_RUNNER_LABELS) }}
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    env:
+      SKEPTIC_CODEX_BIN: ${{ vars.SKEPTIC_CODEX_BIN }}
+      SKEPTIC_CODEX_VERSION: ${{ vars.SKEPTIC_CODEX_VERSION }}
+      SKEPTIC_CODEX_SHA256: ${{ vars.SKEPTIC_CODEX_SHA256 }}
+      SKEPTIC_GEMINI_BIN: ${{ vars.SKEPTIC_GEMINI_BIN }}
+      SKEPTIC_GEMINI_VERSION: ${{ vars.SKEPTIC_GEMINI_VERSION }}
+      SKEPTIC_GEMINI_SHA256: ${{ vars.SKEPTIC_GEMINI_SHA256 }}
+    steps:
+      - name: Evaluate reviewer CLI pin vars
+        id: check
+        run: |
+          set -euo pipefail
+          names=(SKEPTIC_CODEX_BIN SKEPTIC_CODEX_VERSION SKEPTIC_CODEX_SHA256 SKEPTIC_GEMINI_BIN SKEPTIC_GEMINI_VERSION SKEPTIC_GEMINI_SHA256)
+          missing=()
+          for name in "${names[@]}"; do
+            val="${!name}"
+            if [ -z "$val" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ "${#missing[@]}" -eq 0 ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+            echo "[skeptic-config-check] OK: all 6 reviewer CLI pin vars set"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            missing_list="${missing[*]}"
+            echo "::warning::Skeptic gate NOT CONFIGURED -- reviewer CLI pins unset ($missing_list); see dark-factory bead rev-iqa9 (fleet provisioning). Gate intentionally skipped, not run with defaults."
+            {
+              echo "## Skeptic gate -- NOT CONFIGURED"
+              echo ""
+              echo "Reviewer CLI pin vars unset: \`$missing_list\`"
+              echo ""
+              echo "The gate is intentionally **skipped** for this run rather than"
+              echo "executed with defaults (no silent fallback -- post-audit comment"
+              echo "4953116428). See bead **rev-iqa9** (fleet provisioning: reviewer"
+              echo "CLIs absent from all runner containers) for the tracked follow-up."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   skeptic:
     name: Skeptic (SHA-bound PASS/FAIL)
+    needs: [config-check]
+    # Run the real gate only when configured, OR when a human explicitly
+    # dispatches it manually -- see the config-check comment above
+    # (bead rev-iqa9). The "Verify mandatory pin vars" step further
+    # below is untouched and still fail-closed with no defaulting.
+    if: needs.config-check.outputs.configured == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ fromJson(vars.SELF_HOSTED_RUNNER_LABELS) }}
     timeout-minutes: 30
     env:
