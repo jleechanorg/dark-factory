@@ -27,8 +27,14 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export BR_DB="${BR_DB:-$ROOT/.beads/beads.db}"
 br() { command br --db "$BR_DB" "$@"; }
 O="$ROOT/daemon/factory-overlay.sh"
-I="$ROOT/daemon/factory-intake-from-gh.sh"
-R="$ROOT/daemon/factory-ao-remediate.sh"
+# AFD_INTAKE_BIN / AFD_REMEDIATE_BIN: test-only env seams mirroring the
+# AFD_DB pattern below. Production behavior is byte-identical when unset
+# (both still resolve to the real scripts) — this lets tests stub the
+# GH-issue-intake and AO-remediate side effects instead of maintaining a
+# hand-mirrored copy of the dispatch loop (rev-wzrh follow-up: a mirrored
+# copy of the loop can pass while the real script regresses).
+I="${AFD_INTAKE_BIN:-$ROOT/daemon/factory-intake-from-gh.sh}"
+R="${AFD_REMEDIATE_BIN:-$ROOT/daemon/factory-ao-remediate.sh}"
 DB="${AFD_DB:-$HOME/.dark-factory/daemon-cxdb.sqlite}"
 MAX_DISPATCH="${MAX_DISPATCH:-2}"
 AO_PROJECT="${AFD_AO_PROJECT:-worldarchitect}"

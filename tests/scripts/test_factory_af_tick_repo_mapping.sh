@@ -26,21 +26,33 @@
 # (`^[A-Za-z0-9._/-]+$`) and target_repo (`owner/repo`) can never contain
 # `|` per this repo's validators, so pipe is a safe delimiter.
 #
-# This test mirrors the CURRENT dispatch loop in daemon/factory-af-tick.sh
-# (see tests/scripts/test_factory_af_tick.sh for the established
-# wrapper-mirror convention used because $R in factory-af-tick.sh is not
-# env-overridable) with a stubbed bash "$R" (factory-ao-remediate.sh), then
-# inserts a bead with branch=NULL and a real, config-mapped target_repo and
-# asserts dispatch is attempted (no false "no repo mapping" skip).
+# HONESTY FIX (codex-skeptic follow-up on PRs #619/#620/#621): this test
+# used to generate a scratch WRAPPER script that hand-mirrored the dispatch
+# loop's IFS/sqlite3-separator logic instead of calling the real
+# daemon/factory-af-tick.sh. That meant a revert of the pipe-delimiter fix
+# in the PRODUCTION file would NOT be caught here — this test would keep
+# passing against its own frozen copy of the (correct) logic forever. The
+# wrapper existed because `$R` (factory-ao-remediate.sh) in the real script
+# was not env-overridable, so there was no way to stub out the AO-remediate
+# spawn call. Fixed by adding AFD_REMEDIATE_BIN / AFD_INTAKE_BIN env seams
+# to daemon/factory-af-tick.sh (production-behavior-identical when unset —
+# both still default to the real scripts) and invoking the REAL script
+# directly here, with AFD_SKIP_DRIFT_CHECK=1 (the script's own documented
+# test-only bypass for its Gate-0 checkout-drift guard — never set on the
+# production plist) and AFD_DAEMON_BIN pointed at a stub (the existing,
+# already-supported override daemon/factory-overlay.sh uses for its
+# `recover-held` subcommand — this repo's CI does not build the Rust
+# daemon binary, so a real invocation needs this stubbed to stay portable).
 #
-# MAINTENANCE NOTE: the `IFS=$'\t' read` line and the `sqlite3 -separator`
-# line below MUST be kept byte-for-byte in sync with the equivalent lines in
-# daemon/factory-af-tick.sh — that pairing is the exact surface under test.
+# This test inserts a bead with branch=NULL and a real, config-mapped
+# target_repo and asserts dispatch is attempted against the REAL script
+# (no false "no repo mapping" skip).
 #
 # Run with: bash tests/scripts/test_factory_af_tick_repo_mapping.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 OVERLAY="$ROOT/daemon/factory-overlay.sh"
+TICK="$ROOT/daemon/factory-af-tick.sh"
 
 PASS=0; FAIL=0
 assert() {
@@ -79,6 +91,32 @@ STUB_R_EOF
 chmod +x "$FAKE_R"
 : > "$FAKE_R_LOG"
 
+# Stub for factory-intake-from-gh.sh: the real script calls `gh issue list`
+# against a live repo, which would make this test network-dependent and
+# side-effecting (real `br` bead mutations from live GitHub issues). This
+# test is scoped to the repo-mapping field-shift bug, not intake — no-op it.
+FAKE_I="$SCRATCH_DIR/fake-i.sh"
+cat > "$FAKE_I" <<'STUB_I_EOF'
+#!/usr/bin/env bash
+exit 0
+STUB_I_EOF
+chmod +x "$FAKE_I"
+
+# Stub for the compiled Rust daemon binary that `factory-overlay.sh
+# recover-held` shells out to (AFD_DAEMON_BIN, an existing override — see
+# daemon/factory-overlay.sh's DAEMON_BIN resolution). This repo's CI does
+# not build daemon/target/release/daemon, so a real end-to-end invocation
+# of factory-af-tick.sh needs this stubbed to stay portable / fast.
+FAKE_DAEMON="$SCRATCH_DIR/fake-daemon.sh"
+cat > "$FAKE_DAEMON" <<'STUB_DAEMON_EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  recover-held) echo "recovered=0"; exit 0 ;;
+  *) exit 0 ;;
+esac
+STUB_DAEMON_EOF
+chmod +x "$FAKE_DAEMON"
+
 fresh_db() {
   local tag="${1:-main}"
   export AFD_DB="$SCRATCH_DIR/cxdb-$tag.sqlite"
@@ -97,87 +135,20 @@ TOML_EOF
   printf '%s' "$cfg"
 }
 
-# ---------------------------------------------------------------------------
-# Wrapper mirroring the CURRENT daemon/factory-af-tick.sh dispatch loop
-# (repo-resolution + AO-project-resolution + remediate-spawn segment), with
-# $DB -> $AFD_DB, $O -> $OVERLAY, $R -> stubbed fake-R, and the WHERE clause's
-# bead_filter/pr_sql_filter/order_clause simplified to a WRAPPER_BEAD
-# allowlist (same simplification tests 5-7 in test_factory_af_tick.sh use).
-# The post-dispatch dispatch-record/rc-handling tail is intentionally
-# omitted here — this test is scoped to the repo-mapping field-shift bug,
-# not the full state-machine transition (which requires a non-empty branch
-# and is exercised elsewhere in test_factory_af_tick.sh).
-# ---------------------------------------------------------------------------
-WRAPPER="$SCRATCH_DIR/wrapper.sh"
-cat > "$WRAPPER" <<WRAP_EOF
-#!/usr/bin/env bash
-set -euo pipefail
-O="$OVERLAY"
-R="$FAKE_R"
-WRAPPER_BEAD="\${AFD_WRAPPER_BEAD:-test-repo-mapping}"
-dispatched=0
-MAX_DISPATCH=2
-while IFS='|' read -r bead_id pr branch bead_repo; do
-  [ -n "\$bead_id" ] || continue
-  [ "\$dispatched" -ge "\$MAX_DISPATCH" ] && break
-
-  repo="\${bead_repo:-\${TARGET_REPO:-}}"
-  if [ -z "\$repo" ]; then
-    echo "[af] skip \$bead_id: no repo mapping (fail-closed, no bead_repo or TARGET_REPO)" >&2
-    continue
-  fi
-
-  proj="\$(python3 - "\$CONFIG" "\$repo" <<'PY'
-import sys, toml
-config_path = sys.argv[1]
-target_repo = sys.argv[2]
-try:
-    cfg = toml.load(config_path)
-except Exception:
-    cfg = {}
-repos = cfg.get("repos", {})
-if target_repo in repos:
-    print(repos[target_repo].get("ao_project", ""))
-    sys.exit(0)
-global_target = cfg.get("target_repo")
-if target_repo == global_target:
-    ao_project = cfg.get("ao_project")
-    if ao_project:
-        print(ao_project)
-        sys.exit(0)
-    project = target_repo.split('/')[-1]
-    if project == "worldarchitect.ai":
-        project = "worldarchitect"
-    print(project)
-    sys.exit(0)
-print("")
-PY
-)"
-
-  if [ -z "\$proj" ]; then
-    echo "[af] fail closed: target repo '\$repo' has no matching configured AO project. Parking bead \$bead_id." >&2
-    "\$O" park "\$bead_id" "unmapped_target_repo" >/dev/null || true
-    continue
-  fi
-
-  echo "[af] remediate \$bead_id PR #\$pr on \$repo in project \$proj"
-  if bash "\$R" "\$bead_id" "\$pr" "\$repo" "\$proj" 2>&1; then
-    dispatched=\$((dispatched + 1))
-  else
-    echo "[af] skip \$bead_id (ao spawn failed)" >&2
-  fi
-done < <(sqlite3 "\$AFD_DB" -separator '|' \
-  "SELECT bead_id, pr_number, coalesce(branch,''), coalesce(target_repo,'') FROM bead_overlay
-   WHERE state IN ('QUEUED','ATTESTED') AND pr_number IS NOT NULL
-   AND bead_id IN ('\${WRAPPER_BEAD}')
-   ORDER BY updated_at LIMIT 10;")
-echo "af_dispatched=\$dispatched"
-WRAP_EOF
-chmod +x "$WRAPPER"
+run_tick() { # <tick_script_path> -> real invocation of factory-af-tick.sh (or a reverted scratch copy)
+  local tick_bin="$1"
+  AFD_REMEDIATE_BIN="$FAKE_R" \
+  AFD_INTAKE_BIN="$FAKE_I" \
+  AFD_DAEMON_BIN="$FAKE_DAEMON" \
+  AFD_BEAD_FILTER=test-repo-mapping \
+  AFD_SKIP_DRIFT_CHECK=1 \
+  bash "$tick_bin" 2>&1
+}
 
 # ---------------------------------------------------------------------------
 # Test: NULL branch + real, config-mapped target_repo must NOT be
-# misread as "no repo mapping" (rev-wzrh regression).
+# misread as "no repo mapping" (rev-wzrh regression) — exercised against the
+# REAL daemon/factory-af-tick.sh, not a hand-mirrored copy.
 # ---------------------------------------------------------------------------
 fresh_db reposkip
 export CONFIG="$(write_config)"
@@ -191,14 +162,14 @@ row="$(sqlite3 "$AFD_DB" "SELECT branch IS NULL, target_repo FROM bead_overlay W
 assert "fixture: branch IS NULL and target_repo set" "1|jleechanorg/worldarchitect.ai" "$row"
 
 : > "$FAKE_R_LOG"
-out="$(AFD_WRAPPER_BEAD=test-repo-mapping bash "$WRAPPER" 2>&1)"
+out="$(run_tick "$TICK")"
 
 case "$out" in
   *'no repo mapping'*)
     echo "FAIL: rev-wzrh regression — false 'no repo mapping' skip for bead with a real target_repo"
-    echo "--- wrapper output ---"
+    echo "--- tick output ---"
     echo "$out"
-    echo "----------------------"
+    echo "--------------------"
     FAIL=$((FAIL + 1))
     ;;
   *)

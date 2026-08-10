@@ -142,7 +142,7 @@ if [ -f "$PLIST_TPL" ]; then
   fi
   rm -f "$RENDERED"
 
-  assert_grep     "plist StartInterval=60"         '^[[:space:]]*<integer>60</integer>[[:space:]]*$' "$PLIST_TPL"
+  assert_grep     "plist StartInterval=900"        '^[[:space:]]*<integer>900</integer>[[:space:]]*$' "$PLIST_TPL"
   assert_grep     "plist RunAtLoad present"        '^[[:space:]]*<key>RunAtLoad</key>' "$PLIST_TPL"
   assert_grep     "plist @HOME@ is template"       '@HOME@' "$PLIST_TPL"
   assert_grep     "plist @REPO@ is template"       '@REPO@' "$PLIST_TPL"
