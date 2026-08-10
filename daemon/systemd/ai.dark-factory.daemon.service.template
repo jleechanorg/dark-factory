@@ -13,6 +13,31 @@ Restart=on-failure
 RestartSec=10s
 WatchdogSec=7200s
 KillSignal=SIGINT
+# KillMode=process signals ONLY the daemon's main process on stop/restart/
+# crash, not the whole cgroup (systemd default: KillMode=control-group).
+# This is intentional: active AGY/AO worker coding sessions are spawned as
+# detached child processes inside this service's cgroup and must be able to
+# outlive a single daemon restart (deploys, watchdog restarts, crashes) --
+# under the old default, any daemon restart killed every in-flight worker
+# session along with it (the P0 bug this setting fixes).
+#
+# Documented tradeoff (systemd.kill(5), KillMode=): "not recommended" --
+# it lets remaining cgroup processes escape the service manager's lifecycle
+# and resource accounting. Concretely here: children also SURVIVE
+# `systemctl stop` and daemon crashes/OOM kills as unmanaged orphans, not
+# just restarts -- this is the same escape mechanism working in the
+# direction we don't want, and is NOT mitigated by any startup-time
+# orphan-reaping or session-reattachment logic in this daemon today.
+#
+# Accepted because the explicit stop path does not depend on systemd's
+# kill semantics at all: CliSessions::stop (daemon/src/adapters.rs:4349)
+# sends a direct kill(2) to the worker PID/tmux session
+# (`ao session kill <id>`), independent of KillMode, and correctly reaps
+# it. See tests/scripts/test_killmode_process_boundary.sh for a live
+# systemd --user process-boundary proof of both the restart-survival
+# guarantee and the explicit-stop reap guarantee (plus a RED-proof control
+# showing children DO die on restart under the old control-group default).
+KillMode=process
 TimeoutStopSec=30s
 Environment=HOME=@HOME@
 Environment=DARK_FACTORY_BR_DB=@HOME@/.local/state/dark-factory/.beads/beads.db
