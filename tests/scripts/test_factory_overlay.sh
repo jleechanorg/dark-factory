@@ -353,6 +353,93 @@ assert "redrive-pr accepts '+' in branch name" "redriven test-redrive-plus PR #7
 state_plus_redrive="$(sqlite3 "$AFD_DB" "SELECT state FROM bead_overlay WHERE bead_id='test-redrive-plus';")"
 assert "state after '+' branch redrive-pr" "QUEUED" "$state_plus_redrive"
 
+# 18e. redrive-pr rejects INVALID pr_number at entry with the documented exit
+# code (bead rev-wkz63, test-hardening for PR #619 / rev-sp88). The comment
+# block at the top of this file documents rc=6 (EX_VALID_INPUT) for
+# "valid_branch / valid_pr (input format invalid)", but valid_pr's original
+# implementation called the generic die() (rc=1), never die_code. Each case
+# below also asserts NO bead_overlay row is created for the rejected bead_id
+# -- proving the invalid pr_number never reaches the INSERT/UPDATE.
+set +e
+out_nonnumeric="$("$OVERLAY" redrive-pr test-redrive-badpr-nonnumeric abc fix/badpr-nonnumeric 2>&1)"
+rc_nonnumeric=$?
+set -e
+assert "redrive-pr rejects non-numeric pr_number (rc=6 EX_VALID_INPUT)" "6" "$rc_nonnumeric"
+count_nonnumeric="$(sqlite3 "$AFD_DB" "SELECT COUNT(*) FROM bead_overlay WHERE bead_id='test-redrive-badpr-nonnumeric';")"
+assert "no bead_overlay mutation for non-numeric pr_number" "0" "$count_nonnumeric"
+
+set +e
+out_empty="$("$OVERLAY" redrive-pr test-redrive-badpr-empty "" fix/badpr-empty 2>&1)"
+rc_empty=$?
+set -e
+assert "redrive-pr rejects empty pr_number (rc=6 EX_VALID_INPUT)" "6" "$rc_empty"
+count_empty="$(sqlite3 "$AFD_DB" "SELECT COUNT(*) FROM bead_overlay WHERE bead_id='test-redrive-badpr-empty';")"
+assert "no bead_overlay mutation for empty pr_number" "0" "$count_empty"
+
+set +e
+out_negative="$("$OVERLAY" redrive-pr test-redrive-badpr-negative -5 fix/badpr-negative 2>&1)"
+rc_negative=$?
+set -e
+assert "redrive-pr rejects negative pr_number (rc=6 EX_VALID_INPUT)" "6" "$rc_negative"
+count_negative="$(sqlite3 "$AFD_DB" "SELECT COUNT(*) FROM bead_overlay WHERE bead_id='test-redrive-badpr-negative';")"
+assert "no bead_overlay mutation for negative pr_number" "0" "$count_negative"
+
+# Huge pr_number (30 digits): SQLite stores integer literals too large for
+# int64 as a lossy REAL (e.g. 1.0e+30), silently corrupting pr_number if this
+# were ever accepted. valid_pr must reject it before it reaches the SQL layer.
+set +e
+out_huge="$("$OVERLAY" redrive-pr test-redrive-badpr-huge 999999999999999999999999999999 fix/badpr-huge 2>&1)"
+rc_huge=$?
+set -e
+assert "redrive-pr rejects huge/overflow pr_number (rc=6 EX_VALID_INPUT)" "6" "$rc_huge"
+count_huge="$(sqlite3 "$AFD_DB" "SELECT COUNT(*) FROM bead_overlay WHERE bead_id='test-redrive-badpr-huge';")"
+assert "no bead_overlay mutation for huge pr_number" "0" "$count_huge"
+
+# SQL-injection-shaped pr_number: valid_pr's ^[0-9]+$ regex already rejects
+# any non-digit character, so this never reaches the unquoted $pr SQL
+# literal. Assert rejection AND that bead_overlay survives untouched.
+set +e
+out_sqli="$("$OVERLAY" redrive-pr test-redrive-badpr-sqli '1; DROP TABLE bead_overlay' fix/badpr-sqli 2>&1)"
+rc_sqli=$?
+set -e
+assert "redrive-pr rejects SQL-injection-shaped pr_number (rc=6 EX_VALID_INPUT)" "6" "$rc_sqli"
+count_sqli="$(sqlite3 "$AFD_DB" "SELECT COUNT(*) FROM bead_overlay WHERE bead_id='test-redrive-badpr-sqli';")"
+assert "no bead_overlay mutation for SQL-injection-shaped pr_number" "0" "$count_sqli"
+table_intact="$(sqlite3 "$AFD_DB" "SELECT name FROM sqlite_master WHERE type='table' AND name='bead_overlay';")"
+assert "bead_overlay table survives SQL-injection-shaped pr_number attempt" "bead_overlay" "$table_intact"
+
+# "0" is syntactically numeric but not a valid GitHub PR number (PR numbers
+# start at 1). Prior to this fix valid_pr's bare ^[0-9]+$ regex accepted it.
+set +e
+out_zero="$("$OVERLAY" redrive-pr test-redrive-badpr-zero 0 fix/badpr-zero 2>&1)"
+rc_zero=$?
+set -e
+assert "redrive-pr rejects pr_number '0' (rc=6 EX_VALID_INPUT)" "6" "$rc_zero"
+count_zero="$(sqlite3 "$AFD_DB" "SELECT COUNT(*) FROM bead_overlay WHERE bead_id='test-redrive-badpr-zero';")"
+assert "no bead_overlay mutation for pr_number '0'" "0" "$count_zero"
+
+# "00" / "000" (/advice REQUEST_CHANGES on #624, confirmed low-severity
+# finding): the "0" rejection above used `[ "$1" != "0" ]`, a STRING
+# comparison -- "00" and "000" are not string-equal to "0", so they slipped
+# past that check (and the digit regex + length bound both still accept
+# them), then normalized to pr_number=0 downstream in SQLite. Rejection must
+# be arithmetic, not string-based.
+set +e
+out_zero00="$("$OVERLAY" redrive-pr test-redrive-badpr-zero00 00 fix/badpr-zero00 2>&1)"
+rc_zero00=$?
+set -e
+assert "redrive-pr rejects pr_number '00' (rc=6 EX_VALID_INPUT)" "6" "$rc_zero00"
+count_zero00="$(sqlite3 "$AFD_DB" "SELECT COUNT(*) FROM bead_overlay WHERE bead_id='test-redrive-badpr-zero00';")"
+assert "no bead_overlay mutation for pr_number '00'" "0" "$count_zero00"
+
+set +e
+out_zero000="$("$OVERLAY" redrive-pr test-redrive-badpr-zero000 000 fix/badpr-zero000 2>&1)"
+rc_zero000=$?
+set -e
+assert "redrive-pr rejects pr_number '000' (rc=6 EX_VALID_INPUT)" "6" "$rc_zero000"
+count_zero000="$(sqlite3 "$AFD_DB" "SELECT COUNT(*) FROM bead_overlay WHERE bead_id='test-redrive-badpr-zero000';")"
+assert "no bead_overlay mutation for pr_number '000'" "0" "$count_zero000"
+
 # 19. unstick-dispatching (no rows in DISPATCHING, should be 0)
 out="$("$OVERLAY" unstick-dispatching)"
 assert "unstick-dispatching 0" "unstuck=0" "$out"
