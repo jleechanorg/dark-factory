@@ -343,6 +343,35 @@ assert_contains "case7: output shows CI not green for failing legacy status" "CI
 assert_not_contains "case7: gh pr merge NEVER called (legacy status failure)" "pr merge" "$(cat "$GH_SHIM_LOG")"
 
 echo
+echo "=== TEST CASE 8: REST SWEEP CORE-QUOTA BOUND (bead rev-wngvy: graphql low forces REST routing, but core is too low to cover the REST sweep's own per-PR call cost for the number of open factory PRs) ==="
+GH_SHIM_LOG="$SCRATCH_DIR/gh-calls-case8.log"; : > "$GH_SHIM_LOG"
+GH_SHIM_RATE_LIMIT_JSON="$SCRATCH_DIR/rate-limit-case8.json"
+cat > "$GH_SHIM_RATE_LIMIT_JSON" <<'EOF_RL8'
+{"resources":{"core":{"limit":5000,"remaining":250,"reset":9999999999},"graphql":{"limit":5000,"remaining":50,"reset":9999999999}}}
+EOF_RL8
+# core=250 is ABOVE the flat CORE_LOW (default 200) so the pre-existing
+# "both quotas low" backoff does NOT fire on its own -- this case isolates
+# the NEW rev-wngvy check: 40 open factory PRs at the default cost estimate
+# (6 REST calls/PR + 50 margin = 290) exceeds the 250 remaining, so the
+# sweep must back off BEFORE making any per-PR REST calls.
+GH_SHIM_REST_PR_LIST_OUT="$SCRATCH_DIR/rest-pr-list-case8.txt"
+: > "$GH_SHIM_REST_PR_LIST_OUT"
+i=1
+while [ "$i" -le 40 ]; do
+  printf '%s factory/fake-bead-r%s\n' "$((600 + i))" "$i" >> "$GH_SHIM_REST_PR_LIST_OUT"
+  i=$((i + 1))
+done
+GH_SHIM_CHECKRUNS_OUT="$SCRATCH_DIR/checkruns-case8.txt"
+printf 'completed success\n' > "$GH_SHIM_CHECKRUNS_OUT"
+GH_SHIM_HEAD_SHA="deadbeefcase8"
+out8="$(run_guard)"
+echo "$out8"
+assert_contains "case8: output mentions core quota insufficient for REST sweep" "insufficient for REST sweep" "$out8"
+call_log8="$(cat "$GH_SHIM_LOG")"
+assert_not_contains "case8: no per-PR pulls lookup calls made (backed off before per-PR loop)" "pulls/601" "$call_log8"
+assert_not_contains "case8: gh pr merge never called" "pr merge" "$call_log8"
+
+echo
 echo "=== RESULTS: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0

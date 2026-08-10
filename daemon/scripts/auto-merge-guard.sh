@@ -262,6 +262,25 @@ else
   _pr_rows="$(gh api "repos/$REPO/pulls?state=open&per_page=100" \
     --jq '.[]|select(.head.ref|startswith("factory/"))|"\(.number) \(.head.ref)"' 2>/dev/null)"
 fi
+
+# --- bead rev-wngvy: bound the REST sweep by remaining CORE quota. When
+# routing point lookups to REST (USE_GRAPHQL=0), each open factory/* PR
+# costs several REST calls (live head SHA, paginated check-runs, legacy
+# status, mergeable, merge, post-merge state) — a sweep over many open PRs
+# can itself exhaust the core quota it was supposed to conserve. Estimate
+# the sweep's own cost from the PR count just fetched and back off (same
+# fail-safe pattern as the GraphQL backoff above) if core can't cover it.
+if [ "$USE_GRAPHQL" -eq 0 ]; then
+  _rest_pr_count="$(printf '%s\n' "$_pr_rows" | grep -c . || true)"
+  AMG_REST_CALLS_PER_PR="${AMG_REST_CALLS_PER_PR:-6}"
+  AMG_REST_SAFETY_MARGIN="${AMG_REST_SAFETY_MARGIN:-50}"
+  _rest_cost_estimate=$((_rest_pr_count * AMG_REST_CALLS_PER_PR + AMG_REST_SAFETY_MARGIN))
+  if [ "$CORE_REMAINING" -lt "$_rest_cost_estimate" ]; then
+    echo "auto-merge-guard: core quota (remaining=$CORE_REMAINING) insufficient for REST sweep of $_rest_pr_count open factory PR(s) (estimated cost=$_rest_cost_estimate) — backing off this pass, no merges attempted" >&2
+    exit 0
+  fi
+fi
+
 printf '%s\n' "$_pr_rows" |
 while read -r num branch; do
   [ -n "$num" ] || continue
