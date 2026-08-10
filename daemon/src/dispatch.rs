@@ -455,10 +455,27 @@ pub fn dispatch_ready_with_vcs(
                 format!("factory/{}-r{}", bead.id, overlay.attempt),
                 "generated_fork_fallback",
             ),
-            DriveBranchDecision::Generated => (
-                format!("factory/{}-r{}", bead.id, overlay.attempt),
-                "generated",
-            ),
+            DriveBranchDecision::Generated => {
+                if overlay.is_adopted || overlay.pr_number.is_some() {
+                    if let Some(ref existing) = overlay
+                        .branch
+                        .as_deref()
+                        .filter(|b| !b.trim().is_empty())
+                    {
+                        (existing.to_string(), "pr_head")
+                    } else {
+                        (
+                            format!("factory/{}-r{}", bead.id, overlay.attempt),
+                            "generated",
+                        )
+                    }
+                } else {
+                    (
+                        format!("factory/{}-r{}", bead.id, overlay.attempt),
+                        "generated",
+                    )
+                }
+            }
         };
 
         // Register the branch + persist the DISPATCHING intent BEFORE
@@ -478,12 +495,35 @@ pub fn dispatch_ready_with_vcs(
                 ));
                 continue;
             }
-            return Err(err);
+            overlay.state = OverlayState::HumanHeld;
+            overlay.branch = Some(branch.clone());
+            set_human_hold_reason(&mut overlay, HumanHoldReason::SpawnBranchMismatch);
+            if let Err(save_err) = store.save(&overlay) {
+                if save_err.is_transient() {
+                    report.failures.push(failure(
+                        bead,
+                        overlay.attempt,
+                        Some(branch),
+                        "register_branch_park_save",
+                        save_err,
+                    ));
+                    continue;
+                }
+                return Err(save_err);
+            }
+            report.failures.push(failure(
+                bead,
+                overlay.attempt,
+                Some(branch),
+                "register_branch",
+                err,
+            ));
+            continue;
         }
 
         overlay.state = OverlayState::Dispatching;
         overlay.branch = Some(branch.clone());
-        if branch_mode == "pr_head" {
+        if branch_mode == "pr_head" || overlay.is_adopted || overlay.pr_number.is_some() {
             // Explicit stored provenance flag (mirrors
             // `intake::normalize_labeled_prs`'s ADOPTED path): a bead
             // dispatched onto an external PR's own head branch must take
@@ -1543,6 +1583,14 @@ mod tests {
         }
 
         fn register_branch(&self, bead_id: &str, branch: &str) -> Result<(), DaemonError> {
+            if let Some(existing) = self.branch_beads.borrow().get(branch) {
+                if existing != bead_id {
+                    return Err(DaemonError::Config(format!(
+                        "branch {branch} is already registered to bead {existing}; refusing to reassign to {bead_id}"
+                    )));
+                }
+                return Ok(());
+            }
             self.branches.borrow_mut().push(branch.to_string());
             self.branch_beads
                 .borrow_mut()
@@ -3917,4 +3965,159 @@ mod tests {
             assert_eq!(overlay.park_reason.as_deref(), Some("worktree_remote_mismatch"));
         }
     }
+
+    #[test]
+    fn redrive_existing_pr_preserves_branch_and_pr_number_and_sets_adopted_mode() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+
+        let redriven_overlay = BeadOverlay {
+            bead_id: "redrive-bead-123".into(),
+            state: OverlayState::Queued,
+            attempt: 2,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(622),
+            branch: Some("factory/dark-factory-2xt8-r1".into()),
+            session_id: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: Some(cfg.target_repo.clone()),
+            attempt_started_at: None,
+        };
+        store.save(&redriven_overlay).unwrap();
+
+        let ready = vec![(
+            Bead {
+                id: "redrive-bead-123".into(),
+                title: "redriven bead".into(),
+                description: String::new(),
+                notes: String::new(),
+                file_tree_summary: String::new(),
+                external_ref: Some("jleechanorg/dark-factory#622".into()),
+            },
+            RoutingVerdict::StandardPath,
+            DriveBranchDecision::Generated,
+        )];
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(report.success_count(), 1);
+        let success = &report.successes[0];
+        assert_eq!(
+            success.branch, "factory/dark-factory-2xt8-r1",
+            "redriven PR must preserve existing branch end-to-end, not overwrite with factory/redrive-bead-123-r2"
+        );
+        assert_eq!(success.branch_mode, "pr_head");
+
+        let overlay = store
+            .load("redrive-bead-123")
+            .unwrap()
+            .expect("overlay must be persisted");
+        assert_eq!(overlay.branch.as_deref(), Some("factory/dark-factory-2xt8-r1"));
+        assert_eq!(overlay.pr_number, Some(622));
+        assert!(overlay.is_adopted, "redriven PR must maintain adopted mode");
+    }
+
+    #[test]
+    fn ordinary_retry_attempt_2_generates_next_attempt_branch() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+
+        let ordinary_retry_overlay = BeadOverlay {
+            bead_id: "ordinary-retry-bead-123".into(),
+            state: OverlayState::Queued,
+            attempt: 2,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/ordinary-retry-bead-123-r1".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: Some(cfg.target_repo.clone()),
+            attempt_started_at: None,
+        };
+        store.save(&ordinary_retry_overlay).unwrap();
+
+        let ready = vec![(
+            Bead {
+                id: "ordinary-retry-bead-123".into(),
+                title: "ordinary retry bead".into(),
+                description: String::new(),
+                notes: String::new(),
+                file_tree_summary: String::new(),
+                external_ref: None,
+            },
+            RoutingVerdict::StandardPath,
+            DriveBranchDecision::Generated,
+        )];
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(report.success_count(), 1);
+        let success = &report.successes[0];
+        assert_eq!(
+            success.branch, "factory/ordinary-retry-bead-123-r2",
+            "ordinary retry attempt 2 must generate next attempt branch -r2, not reuse -r1"
+        );
+        assert_eq!(success.branch_mode, "generated");
+    }
+
+    #[test]
+    fn register_branch_conflict_on_one_bead_parks_only_that_item_without_refusing_unrelated_work() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+
+        store.register_branch("other-owner", "factory/bead-conflict-r1").unwrap();
+
+        let ready = vec![
+            (
+                Bead {
+                    id: "bead-conflict".into(),
+                    title: "conflicting item".into(),
+                    description: String::new(),
+                    notes: String::new(),
+                    file_tree_summary: String::new(),
+                    external_ref: None,
+                },
+                RoutingVerdict::StandardPath,
+                DriveBranchDecision::Generated,
+            ),
+            (
+                Bead {
+                    id: "bead-valid".into(),
+                    title: "valid item".into(),
+                    description: String::new(),
+                    notes: String::new(),
+                    file_tree_summary: String::new(),
+                    external_ref: None,
+                },
+                RoutingVerdict::StandardPath,
+                DriveBranchDecision::Generated,
+            ),
+        ];
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].bead_id, "bead-conflict");
+        assert_eq!(report.failures[0].phase, "register_branch");
+
+        assert_eq!(report.success_count(), 1);
+        assert_eq!(report.successes[0].bead_id, "bead-valid");
+
+        let conflict_overlay = store.load("bead-conflict").unwrap().unwrap();
+        assert_eq!(conflict_overlay.state, OverlayState::HumanHeld);
+    }
 }
+

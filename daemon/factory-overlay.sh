@@ -519,9 +519,9 @@ redrive-pr)
   branch="$(q "$4")"
   attempt="$(sqlite3 -batch -noheader -cmd '.timeout 5000' "$DB" "SELECT coalesce(attempt,0)+1 FROM bead_overlay WHERE bead_id='$bid';" 2>/dev/null | tail -1)"
   [[ "$attempt" =~ ^[0-9]+$ ]] || attempt=1
-  sql "INSERT INTO bead_overlay (bead_id,state,attempt,pr_number,branch,updated_at)
-       VALUES ('$bid','QUEUED',$attempt,$pr,'$branch','$(now)')
-       ON CONFLICT(bead_id) DO UPDATE SET state='QUEUED', attempt=$attempt, pr_number=$pr, branch='$branch', session_id=NULL, autonomy_secs=0, updated_at='$(now)';"
+  sql "INSERT INTO bead_overlay (bead_id,state,attempt,pr_number,branch,is_adopted,updated_at)
+       VALUES ('$bid','QUEUED',$attempt,$pr,'$branch',1,'$(now)')
+       ON CONFLICT(bead_id) DO UPDATE SET state='QUEUED', attempt=$attempt, pr_number=$pr, branch='$branch', is_adopted=1, session_id=NULL, autonomy_secs=0, updated_at='$(now)';"
   ctx="$(python3 -c 'import json,sys; print(json.dumps({"pr_number":int(sys.argv[1]),"branch":sys.argv[2]}))' "$pr" "$4")"
   emit "$2" "$attempt" QUEUED REDRIVE_RESET "$ctx"
   echo "redriven $2 PR #$pr"
