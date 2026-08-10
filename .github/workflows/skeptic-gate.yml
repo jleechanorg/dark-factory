@@ -232,7 +232,7 @@ jobs:
         # vars were absent. Defaulting hid the failure. Refuse to run
         # if any required pin var is empty.
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN || secrets.gate_github_token }}
+          GH_TOKEN: ${{ secrets.gate_github_token || secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           fail=0
@@ -255,7 +255,7 @@ jobs:
         # SHA256 first (the strongest invariant), then version, then
         # path (per post-audit 4953116428 — version ran before hash).
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN || secrets.gate_github_token }}
+          GH_TOKEN: ${{ secrets.gate_github_token || secrets.GITHUB_TOKEN }}
           CODEX_BIN: ${{ env.SKEPTIC_CODEX_BIN }}
           CODEX_VERSION: ${{ env.SKEPTIC_CODEX_VERSION }}
           CODEX_SHA256: ${{ env.SKEPTIC_CODEX_SHA256 }}
@@ -358,7 +358,7 @@ jobs:
         # PR head Python is NEVER executed. The sparse-checkout pulls
         # ONLY the gate's Python files; nothing else.
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN || secrets.gate_github_token }}
+          GH_TOKEN: ${{ secrets.gate_github_token || secrets.GITHUB_TOKEN }}
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
           ref: ${{ env.TRUSTED_CODE_SHA }}
@@ -372,7 +372,7 @@ jobs:
         # a different ref, we verify post-checkout that the local
         # HEAD SHA equals what the caller pinned.
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN || secrets.gate_github_token }}
+          GH_TOKEN: ${{ secrets.gate_github_token || secrets.GITHUB_TOKEN }}
           TRUSTED_CODE_SHA: ${{ env.TRUSTED_CODE_SHA }}
         run: |
           set -euo pipefail
@@ -396,7 +396,7 @@ jobs:
         # comments into the target repo (token scope mismatch); the
         # gate's read-back step then refuses PASS.
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN || secrets.gate_github_token }}
+          GH_TOKEN: ${{ secrets.gate_github_token || secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           caller_login=$(gh api user --jq '.login' 2>/dev/null || echo "")
@@ -422,7 +422,7 @@ jobs:
         # the legacy 10-field contract (issue #384) — backwards
         # compatible.
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN || secrets.gate_github_token }}
+          GH_TOKEN: ${{ secrets.gate_github_token || secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ inputs.pr_number }}
           PR_HEAD_SHA: ${{ inputs.pr_sha }}
           SKEPTIC_REVIEWERS_JSON: ${{ env.SKEPTIC_REVIEWERS_JSON }}

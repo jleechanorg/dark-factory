@@ -225,3 +225,287 @@ def test_pinned_sha_matches_caller_self_pin() -> None:
         f"do not support expression interpolation, so this MUST be a "
         f"literal SHA, not `${{ github.sha }}` or another template."
     )
+
+# ---------------------------------------------------------------------------
+# Unconfigured-guard tests (bead rev-iqa9).
+#
+# Fleet forensics proved the reviewer CLIs (codex/gemini) are absent from
+# ALL runner containers. `pull_request_target` has no `paths:` filter, so
+# it fires for every PR event. Without a guard, invoking the mandatory
+# gate unconditionally would put a RED "Skeptic" check on every future PR
+# purely because the environment isn't provisioned yet -- strictly worse
+# repo hygiene than a missing gate. Both skeptic-gate-caller.yml and
+# skeptic-gate.yml add a `config-check` job that always succeeds and gates
+# the real `skeptic` job via `needs:` + `if:`, so unrelated PRs show a
+# green config-check + a SKIPPED gate, never a red one. An explicit human
+# `workflow_dispatch` is an escape hatch that always reaches the gate.
+#
+# These tests enforce that guard shape survives future edits, AND that the
+# guard never touches the gate's own fail-closed "Verify mandatory pin
+# vars" step -- that step must keep hard-failing with zero defaulting
+# whenever the gate actually runs (post-audit comment 4953116428).
+# ---------------------------------------------------------------------------
+
+GATE_PATH = REPO_ROOT / ".github" / "workflows" / "skeptic-gate.yml"
+
+SIX_PIN_VARS = (
+    "SKEPTIC_CODEX_BIN",
+    "SKEPTIC_CODEX_VERSION",
+    "SKEPTIC_CODEX_SHA256",
+    "SKEPTIC_GEMINI_BIN",
+    "SKEPTIC_GEMINI_VERSION",
+    "SKEPTIC_GEMINI_SHA256",
+)
+
+# The exact if-condition the `skeptic` job must carry in BOTH files: gated
+# on the config-check output, with an explicit workflow_dispatch escape
+# hatch so a human manual re-run always reaches the real gate.
+_SKEPTIC_IF_RE = re.compile(
+    r"(?m)^\s*if:\s*needs\.config-check\.outputs\.configured\s*==\s*'true'"
+    r"\s*\|\|\s*github\.event_name\s*==\s*'workflow_dispatch'\s*$"
+)
+
+
+def _gate_text() -> str:
+    assert GATE_PATH.exists(), (
+        f"gate workflow missing at {GATE_PATH} — bead rev-iqa9 "
+        f"unconfigured-guard tests require this file to exist"
+    )
+    return GATE_PATH.read_text()
+
+
+def _assert_skeptic_job_gated_by_config_check(text: str, filename: str) -> None:
+    """Shared assertion: the `skeptic` job must declare
+    `needs: [config-check]` and the exact if-condition documented above.
+
+    Factored out so the SAME check runs against the real files below AND
+    against synthetic mutated copies in the RED-first meta-test, proving
+    the assertion actually bites instead of passing on anything.
+    """
+    assert re.search(r"(?m)^\s*needs:\s*\[config-check\]\s*$", text), (
+        f"{filename}: the `skeptic` job MUST declare `needs: [config-check]` "
+        f"— without it the gate runs unconditionally on every PR/dispatch "
+        f"event even when reviewer CLIs are unprovisioned (bead rev-iqa9)."
+    )
+    assert _SKEPTIC_IF_RE.search(text), (
+        f"{filename}: the `skeptic` job's `if:` MUST be exactly "
+        f"\"needs.config-check.outputs.configured == 'true' || "
+        f"github.event_name == 'workflow_dispatch'\" — the first clause "
+        f"gates on config-check so unconfigured PRs show a SKIPPED gate, "
+        f"not RED; the second clause is the explicit human-dispatch "
+        f"escape hatch that always reaches the gate's own fail-closed "
+        f"pin-var check (bead rev-iqa9)."
+    )
+
+
+def test_caller_skeptic_job_gated_by_config_check() -> None:
+    _assert_skeptic_job_gated_by_config_check(
+        _caller_text(), "skeptic-gate-caller.yml"
+    )
+
+
+def test_gate_skeptic_job_gated_by_config_check() -> None:
+    _assert_skeptic_job_gated_by_config_check(_gate_text(), "skeptic-gate.yml")
+
+
+def test_red_first_gate_condition_check_catches_missing_escape_hatch_or_needs() -> None:
+    """RED-first proof for `_assert_skeptic_job_gated_by_config_check`.
+
+    A synthetic *good* snippet must pass; snippets missing the
+    `workflow_dispatch` escape hatch, or missing `needs: [config-check]`
+    entirely, must raise. This proves the regex above actually bites on a
+    regression rather than matching anything with "config-check" in it
+    somewhere in the file.
+    """
+    good = (
+        "  skeptic:\n"
+        "    needs: [config-check]\n"
+        "    if: needs.config-check.outputs.configured == 'true'"
+        " || github.event_name == 'workflow_dispatch'\n"
+    )
+    _assert_skeptic_job_gated_by_config_check(good, "synthetic-good")
+
+    missing_escape_hatch = (
+        "  skeptic:\n"
+        "    needs: [config-check]\n"
+        "    if: needs.config-check.outputs.configured == 'true'\n"
+    )
+    with pytest.raises(AssertionError):
+        _assert_skeptic_job_gated_by_config_check(
+            missing_escape_hatch, "synthetic-mutated-no-escape-hatch"
+        )
+
+    missing_needs = (
+        "  skeptic:\n"
+        "    if: needs.config-check.outputs.configured == 'true'"
+        " || github.event_name == 'workflow_dispatch'\n"
+    )
+    with pytest.raises(AssertionError):
+        _assert_skeptic_job_gated_by_config_check(
+            missing_needs, "synthetic-mutated-no-needs"
+        )
+
+
+def _assert_config_check_verifies_all_six_pin_vars(text: str, filename: str) -> None:
+    assert "config-check:" in text, (
+        f"{filename}: missing the `config-check` job entirely (bead rev-iqa9)"
+    )
+    names_array = re.search(r"names=\(([^)]*)\)", text)
+    assert names_array is not None, (
+        f"{filename}: config-check step has no `names=(...)` enumeration "
+        f"to iterate over the pin vars — the six vars must be actively "
+        f"evaluated in a loop, not merely referenced in `env:`."
+    )
+    enumerated = names_array.group(1)
+    for var in SIX_PIN_VARS:
+        assert var in enumerated, (
+            f"{filename}: `names=(...)` array is missing {var} — this var "
+            f"would never be evaluated by the unconfigured-guard, so a "
+            f"missing pin for it would silently let the gate run instead "
+            f"of being reported as unconfigured (bead rev-iqa9)."
+        )
+
+
+def test_caller_config_check_verifies_all_six_pin_vars() -> None:
+    _assert_config_check_verifies_all_six_pin_vars(
+        _caller_text(), "skeptic-gate-caller.yml"
+    )
+
+
+def test_gate_config_check_verifies_all_six_pin_vars() -> None:
+    _assert_config_check_verifies_all_six_pin_vars(_gate_text(), "skeptic-gate.yml")
+
+
+def test_red_first_pin_var_check_catches_dropped_var() -> None:
+    """RED-first proof for `_assert_config_check_verifies_all_six_pin_vars`.
+
+    Drop one var from an otherwise-good synthetic `names=(...)` array and
+    confirm the helper raises — proves the per-var membership check bites
+    rather than passing on any non-empty array.
+    """
+    good = (
+        "config-check:\n"
+        "    steps:\n"
+        "      - run: |\n"
+        "          names=(SKEPTIC_CODEX_BIN SKEPTIC_CODEX_VERSION "
+        "SKEPTIC_CODEX_SHA256 SKEPTIC_GEMINI_BIN SKEPTIC_GEMINI_VERSION "
+        "SKEPTIC_GEMINI_SHA256)\n"
+    )
+    _assert_config_check_verifies_all_six_pin_vars(good, "synthetic-good")
+
+    dropped_gemini_sha = (
+        "config-check:\n"
+        "    steps:\n"
+        "      - run: |\n"
+        "          names=(SKEPTIC_CODEX_BIN SKEPTIC_CODEX_VERSION "
+        "SKEPTIC_CODEX_SHA256 SKEPTIC_GEMINI_BIN SKEPTIC_GEMINI_VERSION)\n"
+    )
+    with pytest.raises(AssertionError):
+        _assert_config_check_verifies_all_six_pin_vars(
+            dropped_gemini_sha, "synthetic-mutated-dropped-var"
+        )
+
+    no_config_check_job = "skeptic:\n    runs-on: ubuntu-latest\n"
+    with pytest.raises(AssertionError):
+        _assert_config_check_verifies_all_six_pin_vars(
+            no_config_check_job, "synthetic-mutated-no-config-check-job"
+        )
+
+
+def _extract_step_body(text: str, step_name_substr: str) -> str:
+    """Return the YAML body of the first step whose `name:` contains
+    `step_name_substr`, up to (not including) the next `- name:` step or
+    end of file. Used to scope fail-closed-pattern assertions to exactly
+    the pin-var verification step, not the whole file.
+    """
+    pattern = re.compile(
+        r"- name:\s*[\"']?" + re.escape(step_name_substr) + r"[\"']?.*?"
+        r"(?=\n\s*- name:|\Z)",
+        re.DOTALL,
+    )
+    match = pattern.search(text)
+    assert match is not None, (
+        f"could not locate a step named like {step_name_substr!r} in the "
+        f"provided text"
+    )
+    return match.group(0)
+
+
+def _assert_fail_closed_pin_var_step_unmodified(text: str, filename: str) -> None:
+    step_name = "Verify mandatory pin vars are set (no defaults)"
+    assert step_name in text, (
+        f"{filename}: the fail-closed \"{step_name}\" step is missing — "
+        f"the unconfigured-guard (bead rev-iqa9) must never remove or "
+        f"rename the gate's own fail-closed check; it only decides "
+        f"whether to invoke the gate at all."
+    )
+    step_body = _extract_step_body(text, step_name)
+    assert "exit 1" in step_body, (
+        f"{filename}: the fail-closed pin-var step no longer contains "
+        f"`exit 1` — missing pins would no longer hard-fail the gate run "
+        f"(regression against post-audit comment 4953116428)."
+    )
+    assert "fail=1" in step_body and 'if [ "$fail" -ne 0 ]' in step_body, (
+        f"{filename}: the accumulate-then-check fail-closed pattern "
+        f"(`fail=1` ... `if [ \"$fail\" -ne 0 ]`) is missing from the "
+        f"pin-var step — this is the exact mechanism that makes the "
+        f"check fail-closed rather than fail-open."
+    )
+    for var in SIX_PIN_VARS:
+        assert f"{var}:-" not in step_body, (
+            f"{filename}: found a bash default-value operator "
+            f"(`{var}:-...`) inside the fail-closed pin-var step — "
+            f"post-audit comment 4953116428 requires NO defaulting; "
+            f"empty pins must hard-fail, never silently default. The "
+            f"config-check guard (bead rev-iqa9) only decides whether to "
+            f"invoke the gate; it must never soften this step."
+        )
+
+
+def test_gate_fail_closed_pin_var_step_present_and_unmodified() -> None:
+    _assert_fail_closed_pin_var_step_unmodified(_gate_text(), "skeptic-gate.yml")
+
+
+def test_red_first_fail_closed_check_catches_removed_exit_or_reintroduced_default() -> None:
+    """RED-first proof for `_assert_fail_closed_pin_var_step_unmodified`.
+
+    Three synthetic mutations of an otherwise-good step body must each be
+    caught: (1) `exit 1` removed (fail-open regression), (2) the
+    accumulate-then-check pattern removed, (3) a bash default-value
+    operator reintroduced on a guarded var. This proves the checks bite
+    on the exact regression classes bead rev-iqa9 warns against, not just
+    on total step-removal.
+    """
+    good = (
+        "steps:\n"
+        '      - name: "Verify mandatory pin vars are set (no defaults)"\n'
+        "        run: |\n"
+        "          fail=0\n"
+        '          if [ -z "$SKEPTIC_CODEX_BIN" ]; then fail=1; fi\n'
+        '          if [ "$fail" -ne 0 ]; then\n'
+        "            exit 1\n"
+        "          fi\n"
+        "      - name: Next step\n"
+        "        run: echo done\n"
+    )
+    _assert_fail_closed_pin_var_step_unmodified(good, "synthetic-good")
+
+    no_exit = good.replace("            exit 1\n", "            echo skip\n")
+    with pytest.raises(AssertionError):
+        _assert_fail_closed_pin_var_step_unmodified(no_exit, "synthetic-mutated-no-exit")
+
+    no_accumulate_pattern = good.replace("fail=0\n", "").replace(
+        "fail=1; fi\n", "exit 1; fi\n"
+    ).replace('if [ "$fail" -ne 0 ]; then\n            exit 1\n          fi\n', "")
+    with pytest.raises(AssertionError):
+        _assert_fail_closed_pin_var_step_unmodified(
+            no_accumulate_pattern, "synthetic-mutated-no-accumulate-pattern"
+        )
+
+    reintroduced_default = good.replace(
+        '"$SKEPTIC_CODEX_BIN"', '"${SKEPTIC_CODEX_BIN:-/opt/reviewers/codex/codex}"'
+    )
+    with pytest.raises(AssertionError):
+        _assert_fail_closed_pin_var_step_unmodified(
+            reintroduced_default, "synthetic-mutated-reintroduced-default"
+        )
