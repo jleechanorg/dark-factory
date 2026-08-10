@@ -180,14 +180,15 @@ sys.exit(0)' "$live_head"
 # cancelled/timed_out/action_required/stale — none of those are in the
 # allowed set); an empty check-run list is explicitly NOT green; and the
 # legacy status API is consulted too (empty/never-used is fine, but a
-# present non-success legacy status blocks). The GraphQL path can't easily
-# paginate/parse `gh pr checks`' text table the same way, so it applies an
-# equivalent-strictness text scan: empty output is NOT green, the bad-state
-# regex is extended past pending/queued/in_progress to also catch
-# cancelled/timed-out/error/action_required/stale, and — since "no bad
-# keyword found" is not proof of green — the output must ALSO contain
-# explicit pass evidence (pass|success|neutral|skip) or it's treated as
-# NOT green (ambiguous/unrecognized-only output no longer silently passes).
+# present non-success legacy status blocks). The GraphQL path (er-delta
+# follow-up on the /advice error-state finding) no longer scrapes the
+# `gh pr checks` text table at all: it reads `gh pr checks --json bucket`,
+# gh's closed 5-value categorization (pass/fail/pending/skipping/cancel)
+# applied to every raw conclusion — only bucket in {pass,skipping} counts
+# as green, empty output is NOT green, and anything else (fail, pending,
+# cancel — which is where error/timed_out/action_required/startup_failure
+# and any future conclusion land) is NOT green. Reading a structured field
+# closes the missing-keyword bug class instead of enumerating keywords.
 checks_all_green() { # <pr_number> <live_head_sha> -> prints "GREEN:..."/"NOT_GREEN:reason", returns 0/1
   local pr="$1" head="$2"
   if [ "$USE_GRAPHQL" -eq 1 ]; then
