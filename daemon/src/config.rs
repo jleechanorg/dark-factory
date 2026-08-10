@@ -137,6 +137,18 @@ fn default_reroll_death_confirm_secs() -> u64 {
 }
 
 impl Config {
+    /// Return the deduplicated set of all target repositories configured for this
+    /// daemon instance (`target_repo` plus all keys in `repos`).
+    pub fn configured_target_repos(&self) -> Vec<String> {
+        let mut result = vec![self.target_repo.clone()];
+        for repo in self.repos.keys() {
+            if !result.contains(repo) {
+                result.push(repo.clone());
+            }
+        }
+        result
+    }
+
     /// Resolve the target repository checkout used by execution-time gates.
     /// Explicit `local_checkout` wins. When omitted, resolve a daemon-owned
     /// checkout under `$DARK_FACTORY_TARGET_WORKTREE_ROOT` (defaulting to
@@ -626,10 +638,8 @@ push_remote = "origin"
 
     #[test]
     fn explicit_missing_absolute_checkout_is_not_clone_eligible() {
-        let root = std::env::temp_dir().join(format!(
-            "afd_missing_checkout_{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("afd_missing_checkout_{}", std::process::id()));
         let checkout = root.join("production");
         let cfg = Config {
             target_repo: "owner/daemon".into(),
@@ -665,7 +675,10 @@ push_remote = "origin"
     #[test]
     fn production_repo_names_are_not_fixture_classified_by_substrings() {
         for repo in ["owner/test-repo", "owner/fake-repo"] {
-            assert!(!is_fixture_repo(repo), "{repo} must remain production-shaped");
+            assert!(
+                !is_fixture_repo(repo),
+                "{repo} must remain production-shaped"
+            );
         }
     }
 
@@ -703,10 +716,8 @@ push_remote = "origin"
 
     #[test]
     fn isolated_target_worktree_path_keeps_same_name_repositories_separate() {
-        let root = std::env::temp_dir().join(format!(
-            "afd_isolated_same_name_{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("afd_isolated_same_name_{}", std::process::id()));
         let previous = std::env::var_os("DARK_FACTORY_TARGET_WORKTREE_ROOT");
         std::env::set_var("DARK_FACTORY_TARGET_WORKTREE_ROOT", &root);
         let cfg_path = root.join("daemon.toml");

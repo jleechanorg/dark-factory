@@ -212,6 +212,8 @@ pub struct FakeScm {
     /// also recorded in the call log as `labeled_prs_rate_limited(...)`
     /// so tests can prove the rate-limit branch fired.
     pub rate_limit_next_labeled_prs: RefCell<bool>,
+    pub prs_by_repo: HashMap<String, Vec<LabeledPr>>,
+    pub repo_errors: HashMap<String, String>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -254,6 +256,29 @@ impl Scm for FakeScm {
             });
         }
         Ok(self.prs.clone())
+    }
+
+    fn labeled_prs_for_repo(
+        &self,
+        repo: &str,
+        label: &str,
+        gh_calls: &mut u32,
+    ) -> Result<Vec<LabeledPr>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("labeled_prs_for_repo({repo}, {label})"));
+        if let Some(err_msg) = self.repo_errors.get(repo) {
+            return Err(DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr: err_msg.clone(),
+            });
+        }
+        if let Some(prs) = self.prs_by_repo.get(repo) {
+            *gh_calls += 1;
+            return Ok(prs.clone());
+        }
+        self.labeled_prs(label, gh_calls)
     }
 
     fn collaborator_permission(&self, login: &str) -> Result<Permission, DaemonError> {
@@ -302,10 +327,7 @@ impl Scm for FakeScm {
         self.calls
             .borrow_mut()
             .push(format!("close_pr({pr},{comment})"));
-        if let Some(stderr) = self
-            .pr_already_terminal
-            .get(&("default".to_string(), pr))
-        {
+        if let Some(stderr) = self.pr_already_terminal.get(&("default".to_string(), pr)) {
             return Err(DaemonError::Tool {
                 tool: "gh".into(),
                 rc: 1,
@@ -1047,11 +1069,7 @@ impl Vcs for FakeVcs {
     /// override via a wrapper. Recording the call here lets us verify
     /// the reroll reached the recovery branch on a scripted stale
     /// `create_branch_at_for_repo` 422.
-    fn delete_branch_at_for_repo(
-        &self,
-        repo: &str,
-        name: &str,
-    ) -> Result<(), DaemonError> {
+    fn delete_branch_at_for_repo(&self, repo: &str, name: &str) -> Result<(), DaemonError> {
         self.calls
             .borrow_mut()
             .push(format!("delete_branch_at_for_repo({repo},{name})"));
@@ -1228,8 +1246,7 @@ pub struct FakeStateStore {
     /// `escalation_should_emit`/`record_escalation_emit`/
     /// `mark_escalation_undeliverable` impls so tick-integration tests can
     /// exercise the dedup + terminal-marking paths without a real SQLite DB.
-    pub escalation_ledger:
-        RefCell<HashMap<(String, String), EscalationLedgerEntry>>,
+    pub escalation_ledger: RefCell<HashMap<(String, String), EscalationLedgerEntry>>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -1611,9 +1628,9 @@ impl StateStore for FakeStateStore {
         now_epoch: u64,
         refire_secs: u64,
     ) -> Result<bool, DaemonError> {
-        self.calls.borrow_mut().push(format!(
-            "escalation_should_emit({bead_id},{reason})"
-        ));
+        self.calls
+            .borrow_mut()
+            .push(format!("escalation_should_emit({bead_id},{reason})"));
         match self
             .escalation_ledger
             .borrow()
@@ -1639,9 +1656,9 @@ impl StateStore for FakeStateStore {
         context_hash: &str,
         now_epoch: u64,
     ) -> Result<(), DaemonError> {
-        self.calls.borrow_mut().push(format!(
-            "record_escalation_emit({bead_id},{reason})"
-        ));
+        self.calls
+            .borrow_mut()
+            .push(format!("record_escalation_emit({bead_id},{reason})"));
         let mut ledger = self.escalation_ledger.borrow_mut();
         let entry = ledger
             .entry((bead_id.to_string(), reason.to_string()))
@@ -1659,9 +1676,9 @@ impl StateStore for FakeStateStore {
         bead_id: &str,
         reason: &str,
     ) -> Result<(), DaemonError> {
-        self.calls.borrow_mut().push(format!(
-            "mark_escalation_undeliverable({bead_id},{reason})"
-        ));
+        self.calls
+            .borrow_mut()
+            .push(format!("mark_escalation_undeliverable({bead_id},{reason})"));
         let mut ledger = self.escalation_ledger.borrow_mut();
         let entry = ledger
             .entry((bead_id.to_string(), reason.to_string()))

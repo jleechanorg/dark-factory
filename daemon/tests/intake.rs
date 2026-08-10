@@ -48,7 +48,11 @@ fn adoption_probe_cache_persists_in_runtime_state_not_target_beads_dir() {
         updated_at_epoch: Some(1),
     };
     let mut cache = AdoptionProbeCache::load_or_default_at(&cache_path);
-    cache.insert(key.clone(), CachedDecisionKind::AuthorPermission(Permission::Write), 1);
+    cache.insert(
+        key.clone(),
+        CachedDecisionKind::AuthorPermission(Permission::Write),
+        1,
+    );
     cache.persist().unwrap();
 
     assert!(cache_path.is_file());
@@ -103,7 +107,10 @@ fn adoption_probe_cache_concurrent_persists_leave_no_shared_temp_file() {
         .map(|entry| entry.file_name())
         .filter(|name| name.to_string_lossy().contains(".json.tmp"))
         .collect::<Vec<_>>();
-    assert!(leftovers.is_empty(), "temporary files leaked: {leftovers:?}");
+    assert!(
+        leftovers.is_empty(),
+        "temporary files leaked: {leftovers:?}"
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -626,15 +633,20 @@ fn every_create_bead_call_across_both_intake_paths_carries_nonempty_external_ref
     let cfg = test_cfg();
 
     let (created_issues, _issue_outcomes) = intake::normalize(&scm, &tracker, &cfg).unwrap();
-    let (adopted_prs, _pr_outcomes) =
-        intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
+    let (adopted_prs, _pr_outcomes) = intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
 
-    assert_eq!(created_issues.len(), 2, "expected both new issues to create beads");
+    assert_eq!(
+        created_issues.len(),
+        2,
+        "expected both new issues to create beads"
+    );
     assert_eq!(adopted_prs.len(), 2, "expected both new PRs to be adopted");
 
     let calls = tracker.calls.borrow();
-    let create_calls: Vec<&String> =
-        calls.iter().filter(|c| c.starts_with("create_bead(")).collect();
+    let create_calls: Vec<&String> = calls
+        .iter()
+        .filter(|c| c.starts_with("create_bead("))
+        .collect();
     assert_eq!(
         create_calls.len(),
         4,
@@ -698,14 +710,9 @@ fn intake_rate_limit_during_labeled_prs_does_not_abort_dispatch() {
     let cfg = test_cfg();
     let mut cache = AdoptionProbeCache::new();
 
-    let outcome = intake::normalize_labeled_prs_outcome(
-        &scm,
-        &tracker,
-        &cfg,
-        &mut cache,
-        1_700_000_000,
-    )
-    .unwrap();
+    let outcome =
+        intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000)
+            .unwrap();
     assert!(
         outcome.rate_limited,
         "rate-limited intake sweep must report rate_limited=true so the slow tier can skip without erroring"
@@ -769,8 +776,14 @@ fn second_tick_over_unchanged_prs_makes_zero_per_pr_probes() {
     let mut cache = AdoptionProbeCache::new();
 
     // Tick 1 — populates the probe cache for PRs 501/502.
-    let outcome1 = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000).unwrap();
-    assert_eq!(outcome1.adopted.len(), 2, "tick 1 must adopt both fresh PRs");
+    let outcome1 =
+        intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000)
+            .unwrap();
+    assert_eq!(
+        outcome1.adopted.len(),
+        2,
+        "tick 1 must adopt both fresh PRs"
+    );
     assert!(outcome1.outcomes.is_empty());
     assert_eq!(outcome1.metrics.probe_cache_misses, 2);
     assert_eq!(outcome1.metrics.probe_cache_hits, 0);
@@ -793,7 +806,9 @@ fn second_tick_over_unchanged_prs_makes_zero_per_pr_probes() {
     // MUST serve all per-PR adoption/duplicate decisions from disk, so the
     // only allowed gh call this tick is the single `labeled_prs` list query
     // (used to discover PRs and read their cache keys).
-    let outcome2 = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000).unwrap();
+    let outcome2 =
+        intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000)
+            .unwrap();
     assert_eq!(outcome2.adopted.len(), 2, "tick 2 must re-adopt both PRs");
     assert!(outcome2.outcomes.is_empty());
     assert_eq!(outcome2.metrics.probe_cache_hits, 2);
@@ -809,12 +824,14 @@ fn second_tick_over_unchanged_prs_makes_zero_per_pr_probes() {
         .filter(|c| c.starts_with("collaborator_permission("))
         .count();
     assert_eq!(
-        tick2_labeled_prs_calls, 1,
+        tick2_labeled_prs_calls,
+        1,
         "tick 2 must do exactly one list query, got: {:?}",
         tick2_calls.iter().collect::<Vec<_>>()
     );
     assert_eq!(
-        tick2_perm_calls, 0,
+        tick2_perm_calls,
+        0,
         "tick 2 must NOT re-probe collaborator_permission for cached PRs, got: {:?}",
         tick2_calls.iter().collect::<Vec<_>>()
     );
@@ -849,7 +866,9 @@ fn probe_cache_invalidates_on_changed_head_sha_but_serves_unchanged_prs() {
     let mut cache = AdoptionProbeCache::new();
 
     // Tick 1: both PRs probed.
-    let outcome1 = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000).unwrap();
+    let outcome1 =
+        intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000)
+            .unwrap();
     assert_eq!(outcome1.adopted.len(), 2);
     scm.calls.borrow_mut().clear();
 
@@ -858,7 +877,9 @@ fn probe_cache_invalidates_on_changed_head_sha_but_serves_unchanged_prs() {
     scm.prs[0].updated_at_epoch = Some(1_700_002_000);
 
     // Tick 2: PR 601 re-probed, PR 602 served from cache.
-    let outcome2 = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000).unwrap();
+    let outcome2 =
+        intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000)
+            .unwrap();
     assert_eq!(outcome2.adopted.len(), 2);
     assert_eq!(outcome2.metrics.probe_cache_misses, 1, "only PR 601 missed");
     assert_eq!(outcome2.metrics.probe_cache_hits, 1, "only PR 602 hit");
@@ -870,7 +891,8 @@ fn probe_cache_invalidates_on_changed_head_sha_but_serves_unchanged_prs() {
         .count();
     // We expect exactly 1 collaborator_permission call (PR 601 only).
     assert_eq!(
-        tick2_perm_calls, 1,
+        tick2_perm_calls,
+        1,
         "tick 2 must probe ONLY the PR whose head_sha changed (PR 601), got: {:?}",
         tick2_calls.iter().collect::<Vec<_>>()
     );
@@ -909,7 +931,9 @@ fn probe_cache_revalidates_when_collaborator_tier_changes() {
     let mut cache = AdoptionProbeCache::new();
 
     // Tick 1: alice is Read tier, PR 701 is ineligible.
-    let outcome1 = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000).unwrap();
+    let outcome1 =
+        intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000)
+            .unwrap();
     assert!(outcome1.adopted.is_empty());
     assert_eq!(outcome1.outcomes.len(), 1);
     assert!(matches!(
@@ -939,7 +963,8 @@ fn probe_cache_revalidates_when_collaborator_tier_changes() {
         1,
         "tick 2 must adopt PR 701 after alice's promotion to Write; \
          got adopted={:?}, outcomes={:?}",
-        outcome2.adopted, outcome2.outcomes
+        outcome2.adopted,
+        outcome2.outcomes
     );
     let tick2_perm_calls = scm
         .calls
@@ -948,7 +973,8 @@ fn probe_cache_revalidates_when_collaborator_tier_changes() {
         .filter(|c| c.starts_with("collaborator_permission("))
         .count();
     assert_eq!(
-        tick2_perm_calls, 1,
+        tick2_perm_calls,
+        1,
         "tick 2 must re-probe the PR's permission tier after promotion, got: {:?}",
         scm.calls.borrow().iter().collect::<Vec<_>>()
     );
@@ -972,7 +998,11 @@ fn probe_cache_keys_on_external_ref_head_sha_and_updated_at() {
     let k1_new_time = ProbeCacheKey::from_pr(&p1_new_time);
 
     // Identical keys collide (cache hit semantics).
-    cache.insert(k1.clone(), CachedDecisionKind::AuthorPermission(Permission::Write), 1_700_000_000);
+    cache.insert(
+        k1.clone(),
+        CachedDecisionKind::AuthorPermission(Permission::Write),
+        1_700_000_000,
+    );
     assert!(cache.contains(&k1_dup), "identical keys must collide");
 
     // A different head_sha invalidates the cache entry.
@@ -1023,7 +1053,13 @@ fn adoption_probe_cache_refuses_incomplete_keys() {
     let now = 1_700_000_000;
 
     // Complete key (Some, Some) — insert succeeds and is served back.
-    let pr_complete = labeled_pr_with_cache_key(101, "alice", "feature/pr-101", "sha-complete", 1_700_000_000);
+    let pr_complete = labeled_pr_with_cache_key(
+        101,
+        "alice",
+        "feature/pr-101",
+        "sha-complete",
+        1_700_000_000,
+    );
     let key_complete = ProbeCacheKey::from_pr(&pr_complete);
     cache.insert(
         key_complete.clone(),
@@ -1084,7 +1120,8 @@ fn incomplete_key_pr_is_reprobed_every_tick() {
     let mut scm = FakeScm::new();
     // Script a PR with NO head_sha — simulating the r4 REST-fallback
     // bug where `RestPullExt` looks for a non-existent top-level field.
-    let mut pr = labeled_pr_with_cache_key(901, "alice", "feature/pr-901", "sha-901", 1_700_000_000);
+    let mut pr =
+        labeled_pr_with_cache_key(901, "alice", "feature/pr-901", "sha-901", 1_700_000_000);
     pr.head_sha = None;
     pr.updated_at_epoch = Some(1_700_000_005);
     scm.prs.push(pr);
@@ -1095,14 +1132,8 @@ fn incomplete_key_pr_is_reprobed_every_tick() {
     let mut cache = AdoptionProbeCache::new();
 
     // Tick 1: probes alice (cache miss).
-    let _ = intake::normalize_labeled_prs_outcome(
-        &scm,
-        &tracker,
-        &cfg,
-        &mut cache,
-        1_700_000_000,
-    )
-    .unwrap();
+    let _ = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000)
+        .unwrap();
 
     let tick1_perm_calls = scm
         .calls
@@ -1120,14 +1151,8 @@ fn incomplete_key_pr_is_reprobed_every_tick() {
     // replay the stale Read tier (or whatever was first cached). The r5
     // fix: refuse to cache incomplete keys, so tick 2 MUST re-probe.
     scm.calls.borrow_mut().clear();
-    let _ = intake::normalize_labeled_prs_outcome(
-        &scm,
-        &tracker,
-        &cfg,
-        &mut cache,
-        1_700_000_000,
-    )
-    .unwrap();
+    let _ = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000)
+        .unwrap();
 
     let tick2_perm_calls = scm
         .calls
@@ -1196,10 +1221,7 @@ fn intake_metrics_gh_call_count_counts_real_subprocesses() {
             self.recorded_calls.borrow_mut().push("pulls/2".into());
             Ok(Vec::new())
         }
-        fn collaborator_permission(
-            &self,
-            _login: &str,
-        ) -> Result<Permission, DaemonError> {
+        fn collaborator_permission(&self, _login: &str) -> Result<Permission, DaemonError> {
             Ok(Permission::Write)
         }
         fn pr_snapshot(&self, _pr: u64) -> Result<PrSnapshot, DaemonError> {
@@ -1218,14 +1240,9 @@ fn intake_metrics_gh_call_count_counts_real_subprocesses() {
     let cfg = test_cfg();
     let mut cache = AdoptionProbeCache::new();
 
-    let outcome = intake::normalize_labeled_prs_outcome(
-        &scm,
-        &tracker,
-        &cfg,
-        &mut cache,
-        1_700_000_000,
-    )
-    .unwrap();
+    let outcome =
+        intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000)
+            .unwrap();
 
     // The slow-tier metric MUST reflect the 3 real subprocess invocations
     // (1 list + 2 per-PR pulls), not the r4 behavior of reporting `1`.
@@ -1234,5 +1251,131 @@ fn intake_metrics_gh_call_count_counts_real_subprocesses() {
         "gh_call_count must equal the number of real subprocess invocations, \
          including REST fallback per-PR pulls; got {}",
         outcome.metrics.gh_call_count
+    );
+}
+
+#[test]
+fn multi_repo_intake_scans_all_configured_target_repos_and_adopts_dark_factory_pr() {
+    use daemon::config::RepoConfig;
+    use daemon::intake::AdoptionProbeCache;
+
+    let mut cfg = test_cfg();
+    cfg.target_repo = "jleechanorg/worldarchitect.ai".into();
+    cfg.repos.insert(
+        "jleechanorg/dark-factory".into(),
+        RepoConfig {
+            ao_project: "dark-factory".into(),
+            push_remote: "origin".into(),
+            local_checkout: None,
+        },
+    );
+
+    let mut scm = FakeScm::new();
+    scm.permissions
+        .insert("contributor".into(), Permission::Write);
+    let pr = LabeledPr {
+        number: 622,
+        title: "P0 dark-factory adoption test".into(),
+        body: "target_repo: jleechanorg/dark-factory".into(),
+        author_login: "contributor".into(),
+        external_ref: "jleechanorg/dark-factory#622".into(),
+        head_ref_name: "feat/dark-factory-622-existing".into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("jleechanorg/dark-factory".into()),
+        head_repo_owner_login: Some("jleechanorg".into()),
+        head_sha: Some("sha622".into()),
+        updated_at_epoch: Some(100),
+    };
+    scm.prs_by_repo
+        .insert("jleechanorg/dark-factory".into(), vec![pr]);
+    scm.prs_by_repo
+        .insert("jleechanorg/worldarchitect.ai".into(), vec![]);
+
+    let tracker = FakeTracker::new();
+    let mut cache = AdoptionProbeCache::new();
+
+    let outcome =
+        intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000)
+            .expect("multi-repo intake should succeed");
+
+    assert_eq!(
+        outcome.adopted.len(),
+        1,
+        "dark-factory PR 622 must be adopted"
+    );
+    assert_eq!(
+        outcome.adopted[0].external_ref,
+        "jleechanorg/dark-factory#622"
+    );
+    assert_eq!(outcome.adopted[0].pr_number, 622);
+    assert_eq!(
+        outcome.adopted[0].head_ref_name,
+        "feat/dark-factory-622-existing"
+    );
+
+    let calls = scm.calls.borrow();
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.contains("jleechanorg/worldarchitect.ai")),
+        "intake must scan global target repo jleechanorg/worldarchitect.ai"
+    );
+    assert!(
+        calls.iter().any(|c| c.contains("jleechanorg/dark-factory")),
+        "intake must scan configured repo jleechanorg/dark-factory"
+    );
+}
+
+#[test]
+fn multi_repo_intake_per_repo_error_emits_warning_and_continues() {
+    use daemon::config::RepoConfig;
+    use daemon::intake::AdoptionProbeCache;
+
+    let mut cfg = test_cfg();
+    cfg.target_repo = "jleechanorg/worldarchitect.ai".into();
+    cfg.repos.insert(
+        "jleechanorg/dark-factory".into(),
+        RepoConfig {
+            ao_project: "dark-factory".into(),
+            push_remote: "origin".into(),
+            local_checkout: None,
+        },
+    );
+
+    let mut scm = FakeScm::new();
+    scm.permissions
+        .insert("contributor".into(), Permission::Write);
+    scm.repo_errors.insert(
+        "jleechanorg/worldarchitect.ai".into(),
+        "gh: API rate limit exceeded for installation".into(),
+    );
+
+    let pr = LabeledPr {
+        number: 623,
+        title: "P0 dark-factory error resiliency test".into(),
+        body: "".into(),
+        author_login: "contributor".into(),
+        external_ref: "jleechanorg/dark-factory#623".into(),
+        head_ref_name: "feat/dark-factory-623-branch".into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("jleechanorg/dark-factory".into()),
+        head_repo_owner_login: Some("jleechanorg".into()),
+        head_sha: Some("sha623".into()),
+        updated_at_epoch: Some(100),
+    };
+    scm.prs_by_repo
+        .insert("jleechanorg/dark-factory".into(), vec![pr]);
+
+    let tracker = FakeTracker::new();
+    let mut cache = AdoptionProbeCache::new();
+
+    let outcome =
+        intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000)
+            .expect("per-repository error must not fail or crash intake sweep");
+
+    assert_eq!(outcome.adopted.len(), 1);
+    assert_eq!(
+        outcome.adopted[0].external_ref,
+        "jleechanorg/dark-factory#623"
     );
 }

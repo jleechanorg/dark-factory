@@ -32,7 +32,9 @@ impl CacheFileLock {
             .create(true)
             .truncate(false)
             .open(&lock_path)
-            .map_err(|error| DaemonError::Config(format!("open adoption_probe_cache lock: {error}")))?;
+            .map_err(|error| {
+                DaemonError::Config(format!("open adoption_probe_cache lock: {error}"))
+            })?;
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
@@ -47,7 +49,10 @@ impl CacheFileLock {
                 )));
             }
         }
-        Ok(Self { path: lock_path, file })
+        Ok(Self {
+            path: lock_path,
+            file,
+        })
     }
 }
 
@@ -292,16 +297,19 @@ impl AdoptionProbeCache {
                 merged.extend(entries);
             }
         }
-        merged.extend(self.decisions.iter().map(|(key, value)| (key.clone(), value.clone())));
+        merged.extend(
+            self.decisions
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
         let entries: Vec<(ProbeCacheKey, CachedProbeDecision)> = merged.into_iter().collect();
-        let json = serde_json::to_string(&entries)
-            .map_err(|error| DaemonError::Parse(format!("serialize adoption_probe_cache: {error}")))?;
+        let json = serde_json::to_string(&entries).map_err(|error| {
+            DaemonError::Parse(format!("serialize adoption_probe_cache: {error}"))
+        })?;
         let nonce = CACHE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp = self.path.with_extension(format!(
-            "json.tmp.{}.{}",
-            std::process::id(),
-            nonce
-        ));
+        let tmp = self
+            .path
+            .with_extension(format!("json.tmp.{}.{}", std::process::id(), nonce));
         std::fs::write(&tmp, json.as_bytes())
             .map_err(|e| DaemonError::Config(format!("write adoption_probe_cache: {e}")))?;
         if let Err(error) = std::fs::rename(&tmp, &self.path) {
@@ -381,9 +389,8 @@ impl AdoptionProbeCache {
     /// ops use.
     #[allow(dead_code)]
     pub fn evict_older_than(&mut self, now_epoch: u64, max_age_secs: u64) {
-        self.decisions.retain(|_, entry| {
-            now_epoch.saturating_sub(entry.cached_at_epoch) <= max_age_secs
-        });
+        self.decisions
+            .retain(|_, entry| now_epoch.saturating_sub(entry.cached_at_epoch) <= max_age_secs);
     }
 
     /// For tests / observability: number of cached decisions.
@@ -508,11 +515,13 @@ fn same_repo_pr(pr: &LabeledPr, cfg: &Config) -> bool {
     if pr.is_cross_repository {
         return false;
     }
+    let target_repo =
+        resolve_target_repo("", Some(&pr.external_ref)).unwrap_or_else(|| cfg.target_repo.clone());
     if let Some(head_repo) = pr.head_repo_full_name.as_deref() {
-        return head_repo.eq_ignore_ascii_case(&cfg.target_repo);
+        return head_repo.eq_ignore_ascii_case(&target_repo);
     }
     if let Some(head_owner) = pr.head_repo_owner_login.as_deref() {
-        let target_owner = cfg.target_repo.split('/').next().unwrap_or_default();
+        let target_owner = target_repo.split('/').next().unwrap_or_default();
         return head_owner.eq_ignore_ascii_case(target_owner);
     }
     true
@@ -544,51 +553,45 @@ pub fn normalize_labeled_prs_outcome(
     now_epoch: u64,
 ) -> Result<LabeledPrsIntakeOutcome, DaemonError> {
     let mut metrics = IntakeProbeMetrics::default();
-    // jtg8-r5: plumb the metric into `labeled_prs` so the REST fallback's
-    // per-PR `pulls/{n}` calls are reflected in `gh_call_count` (r4 only
-    // counted this single list-query increment, so the slow-tier
-    // `INTAKE_GH_CALL_WARN_THRESHOLD` warning never fired when the daemon
-    // was burning O(N) core API calls via the fallback path).
-    let prs_result = scm.labeled_prs(FACTORY_LABEL, &mut metrics.gh_call_count);
-    // Even on rate-limit, the impl incremented `gh_call_count` once for
-    // the failed list query — surface that in the metric so the warning
-    // sees the actual failure mode.
-    let prs = match prs_result {
-        Ok(p) => p,
-        Err(e) if e.is_gh_rate_limit() => {
-            metrics.rate_limited_skips += 1;
-            return Ok(LabeledPrsIntakeOutcome {
-                adopted: Vec::new(),
-                outcomes: Vec::new(),
-                rate_limited: true,
-                metrics,
-            });
+    let mut prs = Vec::new();
+    let mut rate_limited = false;
+
+    for repo in cfg.configured_target_repos() {
+        match scm.labeled_prs_for_repo(&repo, FACTORY_LABEL, &mut metrics.gh_call_count) {
+            Ok(p) => prs.extend(p),
+            Err(e) if e.is_gh_rate_limit() => {
+                metrics.rate_limited_skips += 1;
+                rate_limited = true;
+                eprintln!(
+                    "auto-factory daemon: WARNING slow-tier intake query rate-limited by gh for repository {repo}; \
+                     skipping adoption sweep for {repo} this tick, dispatch continues"
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "auto-factory daemon: WARNING slow-tier intake query failed for repository {repo}: {e}; \
+                     continuing intake sweep for other repositories"
+                );
+            }
         }
-        Err(e) => return Err(e),
-    };
+    }
+
     if prs.is_empty() {
         return Ok(LabeledPrsIntakeOutcome {
             adopted: Vec::new(),
             outcomes: Vec::new(),
-            rate_limited: false,
+            rate_limited,
             metrics,
         });
     }
 
     // Delegate the per-PR decisions to the cache-aware variant below.
-    let (adopted, outcomes) = normalize_labeled_prs_with_cache(
-        scm,
-        tracker,
-        cfg,
-        &prs,
-        cache,
-        &mut metrics,
-        now_epoch,
-    )?;
+    let (adopted, outcomes) =
+        normalize_labeled_prs_with_cache(scm, tracker, cfg, &prs, cache, &mut metrics, now_epoch)?;
     Ok(LabeledPrsIntakeOutcome {
         adopted,
         outcomes,
-        rate_limited: false,
+        rate_limited,
         metrics,
     })
 }
@@ -733,7 +736,9 @@ pub(crate) fn normalize_labeled_prs_with_cache(
 
         // New PR — create_bead. The existing race-recovery logic from
         // `normalize_labeled_prs` carries over verbatim.
-        let title = format!("{} ({})", pr.title, cfg.target_repo);
+        let target_repo = resolve_target_repo("", Some(&pr.external_ref))
+            .unwrap_or_else(|| cfg.target_repo.clone());
+        let title = format!("{} ({})", pr.title, target_repo);
         let bead_id = match tracker.create_bead(&title, &pr.body, &pr.external_ref) {
             Ok(id) => id,
             Err(e) => {
@@ -1065,15 +1070,13 @@ mod tests {
     // Unit-level coverage for the pure permission-gate helper; the fake-backed
     // contract tests (idempotency, write-tier gate, mixed batch) live in
     // `daemon/tests/intake.rs` per Task 6 Step 1.
-    use crate::tools::Permission;
     use super::{resolve_target_repo, CacheFileLock};
+    use crate::tools::Permission;
 
     #[test]
     fn cache_lock_waits_for_live_owner_and_releases_after_owner_drop() {
-        let root = std::env::temp_dir().join(format!(
-            "afd_cache_lock_owner_{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("afd_cache_lock_owner_{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let cache_path = root.join("adoption_probe_cache.json");
         let owner = CacheFileLock::acquire(&cache_path).unwrap();
@@ -1094,10 +1097,8 @@ mod tests {
 
     #[test]
     fn cache_lock_three_party_contenders_never_overlap_rmw_owners() {
-        let root = std::env::temp_dir().join(format!(
-            "afd_cache_lock_three_party_{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("afd_cache_lock_three_party_{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let cache_path = root.join("adoption_probe_cache.json");
         let owner = CacheFileLock::acquire(&cache_path).unwrap();
@@ -1141,7 +1142,8 @@ mod tests {
 
     #[test]
     fn resolve_target_repo_prefers_explicit_body_field_over_external_ref() {
-        let body = "Some description.\ntarget_repo: jleechanorg/dark-factory\nexisting_branch: fix/x\n";
+        let body =
+            "Some description.\ntarget_repo: jleechanorg/dark-factory\nexisting_branch: fix/x\n";
         let got = resolve_target_repo(body, Some("jleechanorg/worldarchitect.ai#123"));
         assert_eq!(got.as_deref(), Some("jleechanorg/dark-factory"));
     }
