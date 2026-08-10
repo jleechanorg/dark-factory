@@ -455,10 +455,42 @@ pub fn dispatch_ready_with_vcs(
                 format!("factory/{}-r{}", bead.id, overlay.attempt),
                 "generated_fork_fallback",
             ),
-            DriveBranchDecision::Generated => (
-                format!("factory/{}-r{}", bead.id, overlay.attempt),
-                "generated",
-            ),
+            DriveBranchDecision::Generated => {
+                // jleechan-dp0b (PR #627 /advice finding 1): gate branch
+                // reuse on `overlay.is_adopted` ONLY, never on
+                // `overlay.pr_number.is_some()` alone. An ORDINARY
+                // (never-adopted) bead legitimately acquires a `pr_number`
+                // during normal dispatch (tick.rs discovers the PR its own
+                // coder opened and promotes the overlay to ATTESTED without
+                // ever setting `is_adopted`). If that bead is later parked
+                // HUMAN_HELD via a non-reroll path and recovered back to
+                // QUEUED with `pr_number` still populated, the OLD
+                // `is_adopted || pr_number.is_some()` condition misclassified
+                // it as adopted: it reused the stale prior-attempt branch
+                // instead of generating the next attempt branch (-r2, -r3,
+                // ...), and permanently flipped `is_adopted = true` below —
+                // an ordinary bead that was never actually adopted from an
+                // external PR.
+                if overlay.is_adopted {
+                    if let Some(ref existing) = overlay
+                        .branch
+                        .as_deref()
+                        .filter(|b| !b.trim().is_empty())
+                    {
+                        (existing.to_string(), "pr_head")
+                    } else {
+                        (
+                            format!("factory/{}-r{}", bead.id, overlay.attempt),
+                            "generated",
+                        )
+                    }
+                } else {
+                    (
+                        format!("factory/{}-r{}", bead.id, overlay.attempt),
+                        "generated",
+                    )
+                }
+            }
         };
 
         // Register the branch + persist the DISPATCHING intent BEFORE
@@ -478,12 +510,56 @@ pub fn dispatch_ready_with_vcs(
                 ));
                 continue;
             }
-            return Err(err);
+            // jleechan-dp0b (PR #627 /advice finding 2): a non-transient
+            // `register_branch` error means `branch` was REJECTED — it was
+            // never successfully registered. Do NOT persist it onto
+            // `overlay.branch`; any operator or recovery logic that trusts
+            // `overlay.branch` afterward would otherwise read a value that
+            // failed registration, which is state-store corruption. Leave
+            // the overlay's existing `branch` field untouched. Also use a
+            // reason distinct from `SpawnBranchMismatch`, which is reserved
+            // for a worker-spawn-time branch mismatch (see its other call
+            // site below, guarding AO session binding) — a pre-spawn
+            // state-store registration collision is a different failure
+            // category and must not be mislabeled as one.
+            overlay.state = OverlayState::HumanHeld;
+            set_human_hold_reason(&mut overlay, HumanHoldReason::BranchRegistrationConflict);
+            if let Err(save_err) = store.save(&overlay) {
+                if save_err.is_transient() {
+                    report.failures.push(failure(
+                        bead,
+                        overlay.attempt,
+                        Some(branch),
+                        "register_branch_park_save",
+                        save_err,
+                    ));
+                    continue;
+                }
+                return Err(save_err);
+            }
+            report.failures.push(failure(
+                bead,
+                overlay.attempt,
+                Some(branch),
+                "register_branch",
+                err,
+            ));
+            continue;
         }
 
         overlay.state = OverlayState::Dispatching;
         overlay.branch = Some(branch.clone());
-        if branch_mode == "pr_head" {
+        // jleechan-dp0b (PR #627 /advice finding 1): drop the
+        // `|| overlay.pr_number.is_some()` disjunct here too — it mirrors
+        // the same overreach as the branch-decision condition above. Without
+        // this, an ordinary bead that generated a fresh -rN branch (because
+        // the fix above no longer reuses the stale one) would still get
+        // permanently flipped into adopted mode purely because it happens
+        // to carry a `pr_number`. `branch_mode == "pr_head"` alone is
+        // sufficient to catch the genuine `DriveBranchDecision::PrHead`
+        // drive-PR flow; `overlay.is_adopted` catches an already-adopted
+        // bead being redispatched.
+        if branch_mode == "pr_head" || overlay.is_adopted {
             // Explicit stored provenance flag (mirrors
             // `intake::normalize_labeled_prs`'s ADOPTED path): a bead
             // dispatched onto an external PR's own head branch must take
@@ -1543,6 +1619,14 @@ mod tests {
         }
 
         fn register_branch(&self, bead_id: &str, branch: &str) -> Result<(), DaemonError> {
+            if let Some(existing) = self.branch_beads.borrow().get(branch) {
+                if existing != bead_id {
+                    return Err(DaemonError::Config(format!(
+                        "branch {branch} is already registered to bead {existing}; refusing to reassign to {bead_id}"
+                    )));
+                }
+                return Ok(());
+            }
             self.branches.borrow_mut().push(branch.to_string());
             self.branch_beads
                 .borrow_mut()
@@ -3917,4 +4001,291 @@ mod tests {
             assert_eq!(overlay.park_reason.as_deref(), Some("worktree_remote_mismatch"));
         }
     }
+
+    #[test]
+    fn redrive_existing_pr_preserves_branch_and_pr_number_and_sets_adopted_mode() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+
+        let redriven_overlay = BeadOverlay {
+            bead_id: "redrive-bead-123".into(),
+            state: OverlayState::Queued,
+            attempt: 2,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(622),
+            branch: Some("factory/dark-factory-2xt8-r1".into()),
+            session_id: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: Some(cfg.target_repo.clone()),
+            attempt_started_at: None,
+        };
+        store.save(&redriven_overlay).unwrap();
+
+        let ready = vec![(
+            Bead {
+                id: "redrive-bead-123".into(),
+                title: "redriven bead".into(),
+                description: String::new(),
+                notes: String::new(),
+                file_tree_summary: String::new(),
+                external_ref: Some("jleechanorg/dark-factory#622".into()),
+            },
+            RoutingVerdict::StandardPath,
+            DriveBranchDecision::Generated,
+        )];
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(report.success_count(), 1);
+        let success = &report.successes[0];
+        assert_eq!(
+            success.branch, "factory/dark-factory-2xt8-r1",
+            "redriven PR must preserve existing branch end-to-end, not overwrite with factory/redrive-bead-123-r2"
+        );
+        assert_eq!(success.branch_mode, "pr_head");
+
+        let overlay = store
+            .load("redrive-bead-123")
+            .unwrap()
+            .expect("overlay must be persisted");
+        assert_eq!(overlay.branch.as_deref(), Some("factory/dark-factory-2xt8-r1"));
+        assert_eq!(overlay.pr_number, Some(622));
+        assert!(overlay.is_adopted, "redriven PR must maintain adopted mode");
+    }
+
+    #[test]
+    fn ordinary_retry_attempt_2_generates_next_attempt_branch() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+
+        let ordinary_retry_overlay = BeadOverlay {
+            bead_id: "ordinary-retry-bead-123".into(),
+            state: OverlayState::Queued,
+            attempt: 2,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/ordinary-retry-bead-123-r1".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: Some(cfg.target_repo.clone()),
+            attempt_started_at: None,
+        };
+        store.save(&ordinary_retry_overlay).unwrap();
+
+        let ready = vec![(
+            Bead {
+                id: "ordinary-retry-bead-123".into(),
+                title: "ordinary retry bead".into(),
+                description: String::new(),
+                notes: String::new(),
+                file_tree_summary: String::new(),
+                external_ref: None,
+            },
+            RoutingVerdict::StandardPath,
+            DriveBranchDecision::Generated,
+        )];
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(report.success_count(), 1);
+        let success = &report.successes[0];
+        assert_eq!(
+            success.branch, "factory/ordinary-retry-bead-123-r2",
+            "ordinary retry attempt 2 must generate next attempt branch -r2, not reuse -r1"
+        );
+        assert_eq!(success.branch_mode, "generated");
+    }
+
+    #[test]
+    fn human_held_recovered_ordinary_bead_with_stale_pr_number_generates_next_attempt_branch() {
+        // Regression test for the exact HumanHeld-recovery path described in
+        // the PR #627 /advice finding: an ORDINARY (never-adopted) bead can
+        // acquire `pr_number` during a normal dispatch cycle (tick.rs
+        // discovers an opened PR and promotes the overlay to ATTESTED
+        // without ever setting `is_adopted`). If that bead is later parked
+        // HUMAN_HELD via a non-reroll path (e.g. `spawn_retry_cap_exceeded`)
+        // and requeued back to QUEUED with `pr_number` still populated
+        // (the exact fixture shape a recovered-but-not-yet-re-cleared row
+        // can have), the OLD branch-decision condition
+        // (`overlay.is_adopted || overlay.pr_number.is_some()`) misclassified
+        // it as an adopted/drive-PR bead: it reused the stale attempt-1
+        // branch instead of generating -r2, and permanently flipped
+        // `is_adopted = true` on a bead that was never actually adopted.
+        // Unlike `ordinary_retry_attempt_2_generates_next_attempt_branch`
+        // (which dodges the regression entirely via `pr_number: None`),
+        // this fixture sets `pr_number: Some(...)` on a non-adopted overlay
+        // — the exact combination the buggy condition matched.
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+
+        let recovered_overlay = BeadOverlay {
+            bead_id: "recovered-ordinary-bead-456".into(),
+            state: OverlayState::Queued,
+            attempt: 2,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(999),
+            branch: Some("factory/recovered-ordinary-bead-456-r1".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: Some(cfg.target_repo.clone()),
+            attempt_started_at: None,
+        };
+        store.save(&recovered_overlay).unwrap();
+
+        let ready = vec![(
+            Bead {
+                id: "recovered-ordinary-bead-456".into(),
+                title: "recovered ordinary bead".into(),
+                description: String::new(),
+                notes: String::new(),
+                file_tree_summary: String::new(),
+                external_ref: None,
+            },
+            RoutingVerdict::StandardPath,
+            DriveBranchDecision::Generated,
+        )];
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(report.success_count(), 1);
+        let success = &report.successes[0];
+        assert_eq!(
+            success.branch, "factory/recovered-ordinary-bead-456-r2",
+            "ordinary bead with a stale pr_number must generate the next attempt branch -r2, \
+             not reuse the -r1 branch just because pr_number happens to be set"
+        );
+        assert_eq!(success.branch_mode, "generated");
+
+        let overlay = store
+            .load("recovered-ordinary-bead-456")
+            .unwrap()
+            .expect("overlay must be persisted");
+        assert!(
+            !overlay.is_adopted,
+            "an ordinary bead must never be permanently flipped into adopted mode \
+             just because it happens to carry a pr_number"
+        );
+    }
+
+    #[test]
+    fn register_branch_conflict_on_one_bead_parks_only_that_item_without_refusing_unrelated_work() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+
+        store.register_branch("other-owner", "factory/bead-conflict-r1").unwrap();
+
+        let ready = vec![
+            (
+                Bead {
+                    id: "bead-conflict".into(),
+                    title: "conflicting item".into(),
+                    description: String::new(),
+                    notes: String::new(),
+                    file_tree_summary: String::new(),
+                    external_ref: None,
+                },
+                RoutingVerdict::StandardPath,
+                DriveBranchDecision::Generated,
+            ),
+            (
+                Bead {
+                    id: "bead-valid".into(),
+                    title: "valid item".into(),
+                    description: String::new(),
+                    notes: String::new(),
+                    file_tree_summary: String::new(),
+                    external_ref: None,
+                },
+                RoutingVerdict::StandardPath,
+                DriveBranchDecision::Generated,
+            ),
+        ];
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].bead_id, "bead-conflict");
+        assert_eq!(report.failures[0].phase, "register_branch");
+
+        assert_eq!(report.success_count(), 1);
+        assert_eq!(report.successes[0].bead_id, "bead-valid");
+
+        let conflict_overlay = store.load("bead-conflict").unwrap().unwrap();
+        assert_eq!(conflict_overlay.state, OverlayState::HumanHeld);
+    }
+
+    #[test]
+    fn register_branch_conflict_does_not_persist_rejected_branch_or_mislabel_reason() {
+        // Regression test for the PR #627 /advice state-corruption finding:
+        // on a genuine branch-registration collision, `dispatch_ready` must
+        // NOT persist the branch that `register_branch` just rejected (that
+        // value never became a valid registration and trusting
+        // `overlay.branch` afterward would be state-store corruption), and
+        // must NOT mislabel the park with `HumanHoldReason::SpawnBranchMismatch`
+        // — that reason is reserved for a worker-spawn-time branch mismatch
+        // (see its other call site, `dispatch.rs` around the
+        // `spawn_branch_mismatch` validation for AO session binding), a
+        // semantically distinct failure from a pre-spawn state-store
+        // collision.
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+
+        store
+            .register_branch("other-owner", "factory/bead-conflict-2-r1")
+            .unwrap();
+
+        let ready = vec![(
+            Bead {
+                id: "bead-conflict-2".into(),
+                title: "conflicting item".into(),
+                description: String::new(),
+                notes: String::new(),
+                file_tree_summary: String::new(),
+                external_ref: None,
+            },
+            RoutingVerdict::StandardPath,
+            DriveBranchDecision::Generated,
+        )];
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].bead_id, "bead-conflict-2");
+
+        let conflict_overlay = store.load("bead-conflict-2").unwrap().unwrap();
+        assert_eq!(conflict_overlay.state, OverlayState::HumanHeld);
+        assert_eq!(
+            conflict_overlay.branch, None,
+            "a branch that FAILED registration must never be persisted onto the overlay \
+             record — trusting overlay.branch afterward would be state-store corruption"
+        );
+        assert_eq!(
+            conflict_overlay.park_reason.as_deref(),
+            Some(HumanHoldReason::BranchRegistrationConflict.value())
+                .as_deref(),
+            "a branch-registration collision is a distinct failure category from a worker \
+             spawn-time branch mismatch and must not reuse SpawnBranchMismatch's reason"
+        );
+    }
 }
+

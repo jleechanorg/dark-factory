@@ -661,6 +661,17 @@ pub enum HumanHoldReason {
     /// must inspect the bead (or the underlying flaky gate) before any
     /// further automated attempt.
     GateRegressionCapped,
+    /// jleechan-dp0b (PR #627 /advice finding 2): `dispatch_ready` parks a
+    /// bead HUMAN_HELD when `register_branch` rejects a branch with a
+    /// non-transient error (a genuine cross-bead branch collision in the
+    /// state store, discovered BEFORE any worker is spawned). This is a
+    /// distinct failure category from `SpawnBranchMismatch` (a worker
+    /// spawn-time mismatch between the branch the daemon told AO to use and
+    /// the branch the live session actually bound to) — reusing that reason
+    /// mislabeled the park. NOT in `recoverable_exact_values()`: a genuine
+    /// branch-registry collision needs an operator to resolve the
+    /// conflicting bead/branch assignment, not a bare requeue.
+    BranchRegistrationConflict,
     EscalationLocalFallback(String),
 }
 
@@ -705,6 +716,7 @@ impl HumanHoldReason {
             Self::UnknownOnlyGateCapped => "unknown_only_gate_report_with_er_runner_capped",
             Self::CircuitBreaker => CIRCUIT_BREAKER_PARK_REASON,
             Self::GateRegressionCapped => "gate_regression_capped",
+            Self::BranchRegistrationConflict => "branch_registration_conflict",
             Self::EscalationLocalFallback(reason) => {
                 return format!("escalation_local_fallback:{reason}");
             }
