@@ -418,6 +418,28 @@ assert "redrive-pr rejects pr_number '0' (rc=6 EX_VALID_INPUT)" "6" "$rc_zero"
 count_zero="$(sqlite3 "$AFD_DB" "SELECT COUNT(*) FROM bead_overlay WHERE bead_id='test-redrive-badpr-zero';")"
 assert "no bead_overlay mutation for pr_number '0'" "0" "$count_zero"
 
+# "00" / "000" (/advice REQUEST_CHANGES on #624, confirmed low-severity
+# finding): the "0" rejection above used `[ "$1" != "0" ]`, a STRING
+# comparison -- "00" and "000" are not string-equal to "0", so they slipped
+# past that check (and the digit regex + length bound both still accept
+# them), then normalized to pr_number=0 downstream in SQLite. Rejection must
+# be arithmetic, not string-based.
+set +e
+out_zero00="$("$OVERLAY" redrive-pr test-redrive-badpr-zero00 00 fix/badpr-zero00 2>&1)"
+rc_zero00=$?
+set -e
+assert "redrive-pr rejects pr_number '00' (rc=6 EX_VALID_INPUT)" "6" "$rc_zero00"
+count_zero00="$(sqlite3 "$AFD_DB" "SELECT COUNT(*) FROM bead_overlay WHERE bead_id='test-redrive-badpr-zero00';")"
+assert "no bead_overlay mutation for pr_number '00'" "0" "$count_zero00"
+
+set +e
+out_zero000="$("$OVERLAY" redrive-pr test-redrive-badpr-zero000 000 fix/badpr-zero000 2>&1)"
+rc_zero000=$?
+set -e
+assert "redrive-pr rejects pr_number '000' (rc=6 EX_VALID_INPUT)" "6" "$rc_zero000"
+count_zero000="$(sqlite3 "$AFD_DB" "SELECT COUNT(*) FROM bead_overlay WHERE bead_id='test-redrive-badpr-zero000';")"
+assert "no bead_overlay mutation for pr_number '000'" "0" "$count_zero000"
+
 # 19. unstick-dispatching (no rows in DISPATCHING, should be 0)
 out="$("$OVERLAY" unstick-dispatching)"
 assert "unstick-dispatching 0" "unstuck=0" "$out"
