@@ -372,6 +372,55 @@ assert_not_contains "case8: no per-PR pulls lookup calls made (backed off before
 assert_not_contains "case8: gh pr merge never called" "pr merge" "$call_log8"
 
 echo
+echo "=== TEST CASE 9: GraphQL-path checks table has a bucket=fail row among otherwise-passing checks (codex /advice: previous free-text regex omitted 'error' despite the header comment claiming it was covered -- confirmed live via a fixture with 2 passing checks + 1 error-state check returning GREEN on the pre-fix script) ==="
+GH_SHIM_LOG="$SCRATCH_DIR/gh-calls-case9.log"; : > "$GH_SHIM_LOG"
+GH_SHIM_RATE_LIMIT_JSON="$SCRATCH_DIR/rate-limit-case9.json"
+cat > "$GH_SHIM_RATE_LIMIT_JSON" <<'EOF_RL9'
+{"resources":{"core":{"limit":5000,"remaining":4000,"reset":9999999999},"graphql":{"limit":5000,"remaining":4000,"reset":9999999999}}}
+EOF_RL9
+# graphql healthy -> USE_GRAPHQL=1, exercises the `gh pr checks --json bucket`
+# path directly. gh categorizes every raw conclusion (including "error",
+# "timed_out", "action_required", etc.) into exactly one of 5 buckets
+# (pass/fail/pending/skipping/cancel); a fail bucket among otherwise-passing
+# checks must still block, structurally, without enumerating raw state words.
+GH_SHIM_PR_LIST_OUT="$SCRATCH_DIR/pr-list-case9.txt"
+printf '605	factory/fake-bead-errorstate
+' > "$GH_SHIM_PR_LIST_OUT"
+GH_SHIM_CHECKS_OUT="$SCRATCH_DIR/checks-case9.txt"
+printf 'pass\npass\nfail\n' > "$GH_SHIM_CHECKS_OUT"
+GH_SHIM_HEAD_SHA="deadbeefcase9"
+out9="$(run_guard)"
+echo "$out9"
+assert_contains "case9: output shows CI not green for bucket=fail among passing checks" "NOT_GREEN:BAD_BUCKET" "$out9"
+assert_not_contains "case9: gh pr merge NEVER called (bucket=fail check)" "pr merge" "$(cat "$GH_SHIM_LOG")"
+
+echo
+echo "=== TEST CASE 10: legacy commit-status API-error body (no total_count) must fail closed, not pass through as 'zero statuses' ==="
+GH_SHIM_LOG="$SCRATCH_DIR/gh-calls-case10.log"; : > "$GH_SHIM_LOG"
+GH_SHIM_RATE_LIMIT_JSON="$SCRATCH_DIR/rate-limit-case10.json"
+cat > "$GH_SHIM_RATE_LIMIT_JSON" <<'EOF_RL10'
+{"resources":{"core":{"limit":5000,"remaining":4000,"reset":9999999999},"graphql":{"limit":5000,"remaining":50,"reset":9999999999}}}
+EOF_RL10
+GH_SHIM_REST_PR_LIST_OUT="$SCRATCH_DIR/rest-pr-list-case10.txt"
+printf '606 factory/fake-bead-statuserr\n' > "$GH_SHIM_REST_PR_LIST_OUT"
+GH_SHIM_CHECKRUNS_OUT="$SCRATCH_DIR/checkruns-case10.txt"
+printf 'completed success\n' > "$GH_SHIM_CHECKRUNS_OUT"
+GH_SHIM_CHECKRUNS_FULL_OUT=""
+GH_SHIM_CHECKRUNS_PAGE1_OUT=""
+# A GH API error body is still valid JSON (has "message"/"documentation_url"
+# but neither "total_count" nor "state") -- previously this silently
+# defaulted to total_count=0 and was treated identically to a real "no
+# legacy statuses configured" response, letting an API error pass through
+# as green with zero evidence.
+GH_SHIM_COMMIT_STATUS_OUT="$SCRATCH_DIR/commitstatus-case10.json"
+printf '{"message":"Not Found","documentation_url":"https://docs.github.com/rest"}' > "$GH_SHIM_COMMIT_STATUS_OUT"
+GH_SHIM_HEAD_SHA="deadbeefcase10"
+out10="$(run_guard)"
+echo "$out10"
+assert_contains "case10: output shows CI not green for legacy-status API-error body" "LEGACY_STATUS_API_ERROR" "$out10"
+assert_not_contains "case10: gh pr merge NEVER called (legacy-status API error)" "pr merge" "$(cat "$GH_SHIM_LOG")"
+
+echo
 echo "=== RESULTS: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0

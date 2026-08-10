@@ -192,18 +192,31 @@ checks_all_green() { # <pr_number> <live_head_sha> -> prints "GREEN:..."/"NOT_GR
   local pr="$1" head="$2"
   if [ "$USE_GRAPHQL" -eq 1 ]; then
     local checks
-    checks="$(gh pr checks "$pr" --repo "$REPO" 2>/dev/null)"
-    if [ -z "$checks" ]; then
+    # codex /advice follow-up: the previous free-text substring scrape
+    # (grep for "cancelled|timed_out|...") omitted "error" despite the
+    # header comment claiming it was covered -- a checks table with one
+    # line in an error/unknown state and other lines passing slipped
+    # through as green (confirmed live: a fixture with 2 "pass" lines and
+    # one "error" line returned GREEN:GRAPHQL). Free-text scraping is also
+    # inherently unsafe: a CHECK NAME containing a bad-state word (e.g. a
+    # check literally named "error-handling-test") could false-positive
+    # block, or a not-yet-seen raw conclusion word could false-negative
+    # pass. `gh pr checks --json bucket` sidesteps both: gh categorizes
+    # every possible state into exactly one of 5 authoritative buckets
+    # (pass, fail, pending, skipping, cancel) -- reading that structured
+    # field is token-position-exact, not a text scrape, and "fail"
+    # structurally absorbs every failure-class raw state (error,
+    # timed_out, action_required, startup_failure, ...) without needing to
+    # enumerate them.
+    local buckets
+    buckets="$(gh pr checks "$pr" --repo "$REPO" --json bucket --jq '.[].bucket' 2>/dev/null)"
+    if [ -z "$buckets" ]; then
       echo "NOT_GREEN:EMPTY_CHECKS"; return 1
     fi
-    if printf '%s' "$checks" | grep -qiE "pending|queued|in_progress|cancelled|canceled|timed[_ ]?out|timeout|action_required|stale"; then
-      echo "NOT_GREEN:BAD_STATE"; return 1
-    fi
-    if printf '%s' "$checks" | grep -qi "fail"; then
-      echo "NOT_GREEN:FAIL"; return 1
-    fi
-    if ! printf '%s' "$checks" | grep -qiE "pass|success|neutral|skip"; then
-      echo "NOT_GREEN:NO_PASS_EVIDENCE"; return 1
+    local bad_bucket
+    bad_bucket="$(printf '%s\n' "$buckets" | grep -vE '^(pass|skipping)$' | head -1)"
+    if [ -n "$bad_bucket" ]; then
+      echo "NOT_GREEN:BAD_BUCKET:$bad_bucket"; return 1
     fi
     echo "GREEN:GRAPHQL"; return 0
   fi
@@ -228,10 +241,40 @@ checks_all_green() { # <pr_number> <live_head_sha> -> prints "GREEN:..."/"NOT_GR
   # Legacy combined commit-status API — separate from check-runs. Empty /
   # never-used (total_count=0) is fine (no legacy statuses to fail on); a
   # present non-success state blocks.
-  local status_json status_state status_total
+  local status_json status_rc status_total status_state
   status_json="$(gh api "repos/$REPO/commits/$head/status" 2>/dev/null)"
+  status_rc=$?
+  if [ "$status_rc" -ne 0 ]; then
+    echo "NOT_GREEN:LEGACY_STATUS_API_ERROR:rc=$status_rc"; return 1
+  fi
   if [ -n "$status_json" ]; then
-    status_state="$(printf '%s' "$status_json" | python3 -c '
+    # Strict parse: total_count MUST be present as an actual key, or this
+    # is not a genuine commit-status response -- e.g. a GH API error body
+    # like {"message":"...","documentation_url":"..."} has neither
+    # "total_count" nor "state". PARSE_ERROR/MISSING both fail closed
+    # (skip the PR); only a real, well-formed response with
+    # total_count==0 is treated as "no legacy statuses configured" (fine,
+    # falls through).
+    status_total="$(printf '%s' "$status_json" | python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    if "total_count" not in d:
+        print("MISSING")
+    else:
+        print(d["total_count"])
+except Exception:
+    print("PARSE_ERROR")
+' 2>/dev/null)"
+    case "$status_total" in
+      MISSING|PARSE_ERROR|"")
+        echo "NOT_GREEN:LEGACY_STATUS_API_ERROR:unparseable_or_missing_total_count"; return 1
+        ;;
+      0)
+        : # genuinely zero legacy statuses configured -- fine
+        ;;
+      *)
+        status_state="$(printf '%s' "$status_json" | python3 -c '
 import json, sys
 try:
     d = json.loads(sys.stdin.read())
@@ -239,18 +282,11 @@ try:
 except Exception:
     print("")
 ' 2>/dev/null)"
-    status_total="$(printf '%s' "$status_json" | python3 -c '
-import json, sys
-try:
-    d = json.loads(sys.stdin.read())
-    print(d.get("total_count") or 0)
-except Exception:
-    print(0)
-' 2>/dev/null)"
-    status_total="${status_total:-0}"
-    if [ "$status_total" != "0" ] && [ "$status_state" != "success" ]; then
-      echo "NOT_GREEN:LEGACY_STATUS:${status_state:-unknown}"; return 1
-    fi
+        if [ "$status_state" != "success" ]; then
+          echo "NOT_GREEN:LEGACY_STATUS:${status_state:-unknown}"; return 1
+        fi
+        ;;
+    esac
   fi
   echo "GREEN:REST"; return 0
 }
