@@ -523,21 +523,71 @@ fn same_repo_pr(pr: &LabeledPr, target_repo: &str) -> bool {
 pub const MAX_INTAKE_REPOS_PER_SWEEP: usize = 10;
 pub const MAX_INTAKE_SWEEP_GH_CALLS: u32 = 100;
 
-pub fn target_repositories_sweep_order(cfg: &Config) -> Vec<String> {
-    let mut repos = Vec::new();
-    repos.push(cfg.target_repo.clone());
-    let mut secondary: Vec<String> = cfg
-        .repos
-        .keys()
-        .filter(|r| *r != &cfg.target_repo)
-        .cloned()
-        .collect();
+/// Case-insensitive-deduped, UNBOUNDED repository universe for this
+/// config: `target_repo` first, then every `cfg.repos` key that does not
+/// identify the same GitHub repository (case-insensitively — GitHub
+/// owner/repo identity is case-insensitive) as `target_repo` or an
+/// earlier entry, sorted for determinism. Original casing is preserved in
+/// the returned strings (used verbatim for SCM/API calls and
+/// `external_ref` construction) — only the *comparison* is case-folded.
+///
+/// PR #629 follow-up fix (codex P2 "Deduplicate repository names
+/// case-insensitively" + CodeRabbit convergent finding): the previous
+/// `*r != &cfg.target_repo` filter was case-SENSITIVE, unlike every other
+/// repository comparison on this path (`same_repo_pr`, the default
+/// `labeled_prs_for_repo` filter in `tools.rs`) — if `cfg.repos` held the
+/// target repository under a different ASCII case, the filter didn't
+/// remove it, the sweep scanned the same repository twice, and every PR
+/// in it produced duplicate `IntakeOutcome`s and duplicate
+/// `ExistingPrIntake` adoptions in one tick.
+///
+/// Callers apply `MAX_INTAKE_REPOS_PER_SWEEP` themselves:
+/// `target_repositories_sweep_order` truncates the ROTATED list;
+/// `normalize_labeled_prs_outcome` also calls this directly (unbounded)
+/// to detect and report truncation.
+fn dedup_repo_universe(cfg: &Config) -> Vec<String> {
+    let mut secondary: Vec<String> = cfg.repos.keys().cloned().collect();
     secondary.sort();
-    repos.extend(secondary);
-    if repos.len() > MAX_INTAKE_REPOS_PER_SWEEP {
-        repos.truncate(MAX_INTAKE_REPOS_PER_SWEEP);
+    let mut seen_lower: std::collections::HashSet<String> = std::collections::HashSet::new();
+    seen_lower.insert(cfg.target_repo.to_ascii_lowercase());
+    let mut universe = vec![cfg.target_repo.clone()];
+    for repo in secondary {
+        if seen_lower.insert(repo.to_ascii_lowercase()) {
+            universe.push(repo);
+        }
     }
-    repos
+    universe
+}
+
+/// Bounded, deterministic-within-a-tick, ROTATING sweep order. PR #629
+/// follow-up fix (codex P1 "Rotate repositories instead of permanently
+/// truncating them"): the pre-fix version always kept `target_repo` plus
+/// the same first `MAX_INTAKE_REPOS_PER_SWEEP - 1` secondary repos
+/// (alphabetically) and discarded the rest FOREVER — with no cursor or
+/// rotation state anywhere in the daemon, factory-labeled PRs in the
+/// discarded repos were never scanned on ANY tick.
+///
+/// `target_repo` always scans first, every tick (it is the daemon's
+/// primary configured repo). The SECONDARY window rotates by one repo per
+/// slow-tier sweep — the rotation offset advances with
+/// `now_epoch / cfg.slow_tick_secs`, so it increments by exactly 1 each
+/// time a real slow-tier tick calls this with a fresh `now_epoch` — so
+/// every secondary repo eventually enters the scanned window and full
+/// coverage is guaranteed within `secondary.len()` sweeps, while the
+/// order within any SINGLE tick stays fully deterministic (same
+/// `now_epoch` in, same order out).
+pub fn target_repositories_sweep_order(cfg: &Config, now_epoch: u64) -> Vec<String> {
+    let mut universe = dedup_repo_universe(cfg);
+    let secondary_len = universe.len().saturating_sub(1);
+    if secondary_len > 0 {
+        let period = cfg.slow_tick_secs.max(1);
+        let rotation = ((now_epoch / period) as usize) % secondary_len;
+        universe[1..].rotate_left(rotation);
+    }
+    if universe.len() > MAX_INTAKE_REPOS_PER_SWEEP {
+        universe.truncate(MAX_INTAKE_REPOS_PER_SWEEP);
+    }
+    universe
 }
 
 /// jtg8-r4: rate-limit-aware variant of `normalize_labeled_prs`. Detects a
@@ -574,10 +624,33 @@ pub fn normalize_labeled_prs_outcome(
     telemetry_log: &Path,
 ) -> Result<LabeledPrsIntakeOutcome, DaemonError> {
     let mut metrics = IntakeProbeMetrics::default();
-    let target_repos = target_repositories_sweep_order(cfg);
+    let target_repos = target_repositories_sweep_order(cfg, now_epoch);
     let mut master_adopted = Vec::new();
     let mut master_outcomes = Vec::new();
     let mut any_rate_limited = false;
+
+    // PR #629 follow-up fix (codex P1 + CodeRabbit convergent finding):
+    // `target_repositories_sweep_order` now rotates so no configured repo
+    // is discarded FOREVER, but a single tick still can't cover every
+    // repo when the configured set exceeds `MAX_INTAKE_REPOS_PER_SWEEP` —
+    // an operator should be able to see that from telemetry, not just
+    // infer it. `dedup_repo_universe` is the same unbounded, deduped list
+    // `target_repositories_sweep_order` computes internally before
+    // rotating/truncating, so comparing its length against the cap here
+    // detects truncation without duplicating the dedup logic.
+    let full_universe_len = dedup_repo_universe(cfg).len();
+    if full_universe_len > MAX_INTAKE_REPOS_PER_SWEEP {
+        eprintln!(
+            "auto-factory daemon: WARNING intake sweep repo count={} exceeds maximum ({}); \
+             {} configured repositor(ies) rotate out of this tick's scanned window (full \
+             coverage is still guaranteed over successive sweeps — see \
+             INTAKE_REPO_SWEEP_TRUNCATED)",
+            full_universe_len,
+            MAX_INTAKE_REPOS_PER_SWEEP,
+            full_universe_len - MAX_INTAKE_REPOS_PER_SWEEP
+        );
+        emit_intake_sweep_truncated(telemetry_log, full_universe_len, MAX_INTAKE_REPOS_PER_SWEEP);
+    }
 
     // PR #629 follow-up fix: `fetch_candidates`/`fetch_all_external_refs`
     // are repo-independent (the tracker is one global beads store, not
@@ -697,6 +770,34 @@ fn emit_intake_repo_sweep_failed(telemetry_log: &Path, repo: &str, error_class: 
     }
 }
 
+/// PR #629 follow-up fix (codex P1 + CodeRabbit convergent finding):
+/// structured telemetry counterpart to `target_repositories_sweep_order`'s
+/// rotation. Rotation guarantees every configured repo eventually gets
+/// scanned, but a single tick still doesn't cover everything when the
+/// configured set exceeds `MAX_INTAKE_REPOS_PER_SWEEP` — an operator
+/// should be able to see that from the daemon's telemetry stream, not
+/// just an `eprintln!`. `bead_id` is a fixed sentinel (no single repo or
+/// bead owns a sweep-wide truncation event).
+fn emit_intake_sweep_truncated(telemetry_log: &Path, configured_repo_count: usize, cap: usize) {
+    let event = TelemetryEvent {
+        timestamp: now_iso8601(),
+        bead_id: "intake_sweep".to_string(),
+        attempt_id: 1,
+        lifecycle_state: "INTAKE".to_string(),
+        event_type: "INTAKE_REPO_SWEEP_TRUNCATED".to_string(),
+        metrics: serde_json::json!({}),
+        context: serde_json::json!({
+            "configured_repo_count": configured_repo_count,
+            "cap": cap,
+        }),
+    };
+    if let Err(e) = telemetry::emit(telemetry_log, &event) {
+        eprintln!(
+            "auto-factory daemon: WARNING failed to emit INTAKE_REPO_SWEEP_TRUNCATED telemetry: {e}"
+        );
+    }
+}
+
 /// One-time-per-sweep snapshot of the tracker's known beads/refs, fetched
 /// ONCE in `normalize_labeled_prs_outcome` before any repo is processed
 /// (see that function's doc comment for the multi-repo abort bug this
@@ -760,6 +861,26 @@ pub(crate) fn normalize_labeled_prs_with_cache(
     let mut outcomes = Vec::new();
 
     for pr in prs {
+        // PR #629 follow-up fix (codex P2 "Enforce the call cap within
+        // each repository scan"): the sweep-wide `MAX_INTAKE_SWEEP_GH_CALLS`
+        // budget was only checked BETWEEN repos, in
+        // `normalize_labeled_prs_outcome`'s outer loop — a single repo with
+        // many labeled PRs could still blow through the cap here via
+        // repeated cache-miss `collaborator_permission_for_repo` probes
+        // before the outer loop ever got a chance to check again. Stop
+        // incrementally, the moment the cumulative sweep budget is
+        // exhausted, exactly like the outer loop already does between
+        // repos; the remaining PRs in this repo are simply not processed
+        // this tick and get picked up on a future sweep.
+        if metrics.gh_call_count >= MAX_INTAKE_SWEEP_GH_CALLS {
+            eprintln!(
+                "auto-factory daemon: WARNING intake sweep gh_call_count={} reached maximum limit ({}); \
+                 stopping mid-scan of repository {repo} with PR(s) unprocessed this tick",
+                metrics.gh_call_count, MAX_INTAKE_SWEEP_GH_CALLS
+            );
+            break;
+        }
+
         let key = ProbeCacheKey::from_pr(pr);
 
         // Pre-flight: empty head_ref_name — uncacheable, never probed.

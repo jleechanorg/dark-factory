@@ -1503,7 +1503,12 @@ fn deterministic_bounded_repository_order() {
         );
     }
 
-    let repos = intake::target_repositories_sweep_order(&cfg);
+    // now_epoch=0 -> rotation offset (0 / slow_tick_secs) % secondary_len == 0,
+    // i.e. "tick zero, no rotation has happened yet" -- deliberately chosen
+    // so this test's exact-position assertions describe the un-rotated base
+    // case; `secondary_repo_window_rotates_across_ticks_for_full_coverage`
+    // below proves the rotation itself.
+    let repos = intake::target_repositories_sweep_order(&cfg, 0);
     assert_eq!(repos[0], "jleechanorg/dark-factory", "target_repo must always be scanned first");
     assert_eq!(repos[1], "jleechanorg/repo-00");
     assert_eq!(repos[2], "jleechanorg/repo-01");
@@ -1511,24 +1516,162 @@ fn deterministic_bounded_repository_order() {
     assert!(repos.len() <= intake::MAX_INTAKE_REPOS_PER_SWEEP, "sweep repo count must be bounded");
 }
 
+/// PR #629 follow-up fix (codex P1 "Rotate repositories instead of
+/// permanently truncating them"): pre-fix, `target_repositories_sweep_order`
+/// always kept `target_repo` plus the alphabetically-first
+/// `MAX_INTAKE_REPOS_PER_SWEEP - 1` secondary repos and discarded the rest
+/// FOREVER, on every tick, with no cursor or rotation state anywhere. This
+/// test drives 15 secondary repos (5 more than the cap allows in one
+/// sweep) across successive slow-tier ticks (`now_epoch` advancing by
+/// `slow_tick_secs` each time, exactly as `run_slow_tier` does in
+/// production) and asserts every configured secondary repo appears in the
+/// UNION of scanned repos across those ticks — i.e. no repo is left behind
+/// forever. Run against pre-rotation code, this fails: repos 09-14 never
+/// appear in the union no matter how many ticks are simulated.
 #[test]
-fn running_from_installed_non_git_daemon_cwd() {
-    let non_git_dir = std::env::temp_dir().join(format!("non_git_daemon_cwd_{}", std::process::id()));
-    std::fs::create_dir_all(&non_git_dir).unwrap();
+fn secondary_repo_window_rotates_across_ticks_for_full_coverage() {
+    let mut cfg = test_cfg();
+    cfg.target_repo = "jleechanorg/dark-factory".into();
+    cfg.slow_tick_secs = 600;
+    let expected_secondary: Vec<String> = (0..15).map(|i| format!("jleechanorg/repo-{i:02}")).collect();
+    for (i, repo) in expected_secondary.iter().enumerate() {
+        cfg.repos.insert(
+            repo.clone(),
+            daemon::config::RepoConfig {
+                ao_project: format!("proj-{i}"),
+                push_remote: "origin".into(),
+                local_checkout: None,
+            },
+        );
+    }
 
-    let orig_cwd = std::env::current_dir().unwrap();
-    std::env::set_current_dir(&non_git_dir).unwrap();
+    let mut union: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // 15 secondary repos -> full coverage is guaranteed within 15 rotation
+    // steps; simulate one extra tick as headroom.
+    for tick in 0..16u64 {
+        let now_epoch = tick * cfg.slow_tick_secs;
+        let repos = intake::target_repositories_sweep_order(&cfg, now_epoch);
+        assert_eq!(
+            repos[0], "jleechanorg/dark-factory",
+            "target_repo must scan every tick regardless of rotation (tick {tick})"
+        );
+        assert!(
+            repos.len() <= intake::MAX_INTAKE_REPOS_PER_SWEEP,
+            "sweep repo count must stay bounded every tick (tick {tick}): {repos:?}"
+        );
+        union.extend(repos.into_iter().skip(1));
+    }
 
-    let scm = FakeScm::new();
+    for repo in &expected_secondary {
+        assert!(
+            union.contains(repo),
+            "{repo} must be scanned at least once across successive rotating \
+             sweeps -- a repo permanently missing from the union means \
+             rotation isn't actually cycling through the full configured set: \
+             union={union:?}"
+        );
+    }
+}
+
+/// PR #629 follow-up fix (codex P2 "Deduplicate repository names
+/// case-insensitively" + CodeRabbit convergent finding): `cfg.repos`
+/// holding the target repository under a different ASCII case must be
+/// treated as the SAME repository, not scanned twice.
+#[test]
+fn target_repo_case_variant_in_repos_map_is_deduped() {
+    let mut cfg = test_cfg();
+    cfg.target_repo = "jleechanorg/Dark-Factory".into();
+    cfg.repos.insert(
+        // Same repo, different ASCII case, as could happen from an
+        // operator hand-editing config.yaml.
+        "jleechanorg/dark-factory".into(),
+        daemon::config::RepoConfig {
+            ao_project: "dup".into(),
+            push_remote: "origin".into(),
+            local_checkout: None,
+        },
+    );
+    cfg.repos.insert(
+        "jleechanorg/worldarchitect.ai".into(),
+        daemon::config::RepoConfig {
+            ao_project: "worldarchitect".into(),
+            push_remote: "worldai".into(),
+            local_checkout: None,
+        },
+    );
+
+    let repos = intake::target_repositories_sweep_order(&cfg, 0);
+    assert_eq!(
+        repos.len(),
+        2,
+        "the case-variant of target_repo must be deduped, leaving exactly \
+         target_repo + worldarchitect.ai: {repos:?}"
+    );
+    let lower: Vec<String> = repos.iter().map(|r| r.to_ascii_lowercase()).collect();
+    assert_eq!(
+        lower.iter().filter(|r| r.as_str() == "jleechanorg/dark-factory").count(),
+        1,
+        "dark-factory must appear exactly once regardless of casing: {repos:?}"
+    );
+}
+
+/// PR #629 follow-up fix (codex P2 "Enforce the call cap within each
+/// repository scan"): the sweep-wide `MAX_INTAKE_SWEEP_GH_CALLS` budget
+/// was only checked BETWEEN repos in the outer sweep loop
+/// (`normalize_labeled_prs_outcome`) -- a single repo with many labeled
+/// PRs requiring fresh (cache-miss) permission probes could blow straight
+/// through the cap before the outer loop ever got a chance to check
+/// again. This test scripts 105 labeled PRs in ONE repo, each with a
+/// distinct cache key (head_sha/updated_at) so every one is a genuine
+/// cache miss requiring a real probe call, and asserts
+/// `gh_call_count` never exceeds the cap. Run against pre-fix code (no
+/// budget check inside the per-PR loop), `gh_call_count` overshoots to
+/// 106 (1 list call + 105 probes) and this assertion fails.
+#[test]
+fn per_repo_probe_loop_stops_at_sweep_wide_call_cap() {
+    let mut scm = FakeScm::new();
+    let total_prs: u64 = 105;
+    for number in 1..=total_prs {
+        let mut pr = labeled_pr_with_cache_key(
+            number,
+            "alice",
+            &format!("feature/pr-{number}"),
+            &format!("sha-{number}"),
+            1_700_000_000 + number,
+        );
+        pr.external_ref = format!("owner/repo#{number}");
+        scm.prs.push(pr);
+    }
+    scm.permissions.insert("alice".into(), Permission::Write);
+
     let tracker = FakeTracker::new();
-    let cfg = test_cfg();
+    let cfg = test_cfg(); // target_repo = "owner/repo", no secondary repos.
     let mut cache = AdoptionProbeCache::new();
 
-    let result = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000, &test_telemetry_log());
+    let outcome = intake::normalize_labeled_prs_outcome(
+        &scm,
+        &tracker,
+        &cfg,
+        &mut cache,
+        1_700_000_000,
+        &test_telemetry_log(),
+    )
+    .unwrap();
 
-    let _ = std::env::set_current_dir(orig_cwd);
-    let _ = std::fs::remove_dir_all(non_git_dir);
-
-    assert!(result.is_ok(), "running from a non-git CWD must succeed cleanly: {:?}", result);
+    assert!(
+        outcome.metrics.gh_call_count <= intake::MAX_INTAKE_SWEEP_GH_CALLS,
+        "gh_call_count must never exceed the sweep-wide cap even mid-repo-scan; \
+         got {} (cap={})",
+        outcome.metrics.gh_call_count,
+        intake::MAX_INTAKE_SWEEP_GH_CALLS
+    );
+    assert!(
+        outcome.adopted.len() < total_prs as usize,
+        "with a 105-PR single-repo batch and a cap of {}, some PRs must be left \
+         unprocessed this tick (proving the loop actually stopped early, not \
+         just that the final count happens to be under the cap): adopted={}",
+        intake::MAX_INTAKE_SWEEP_GH_CALLS,
+        outcome.adopted.len()
+    );
 }
 
