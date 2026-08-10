@@ -7,7 +7,7 @@ use common::{FakeScm, FakeTracker};
 use daemon::config::Config;
 use daemon::errors::DaemonError;
 use daemon::intake::{self, IntakeVerdict};
-use daemon::tools::{Bead, Issue, LabeledPr, Permission, PrSnapshot, Scm};
+use daemon::tools::{Bead, Issue, LabeledPr, Permission, PrSnapshot, Scm, Tracker};
 
 fn test_cfg() -> Config {
     Config {
@@ -29,6 +29,23 @@ fn test_cfg() -> Config {
         pre_gate_validation_enabled: false,
         escalation_refire_secs: 3600,
     }
+}
+
+/// PR #629 follow-up fix: `normalize_labeled_prs_outcome` now takes a
+/// `telemetry_log` path so per-repo sweep-failure isolation points can emit
+/// a structured `INTAKE_REPO_SWEEP_FAILED` event. Every call site in this
+/// file needs a real (unique, per-call) path — writes are best-effort and
+/// never asserted on here, but the path must be writable so
+/// `emit_intake_repo_sweep_failed`'s `telemetry::emit` doesn't error.
+fn test_telemetry_log() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "afd_intake_test_telemetry_{}_{}.jsonl",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ))
 }
 
 #[test]
@@ -704,6 +721,7 @@ fn intake_rate_limit_during_labeled_prs_does_not_abort_dispatch() {
         &cfg,
         &mut cache,
         1_700_000_000,
+        &test_telemetry_log(),
     )
     .unwrap();
     assert!(
@@ -769,7 +787,7 @@ fn second_tick_over_unchanged_prs_makes_zero_per_pr_probes() {
     let mut cache = AdoptionProbeCache::new();
 
     // Tick 1 — populates the probe cache for PRs 501/502.
-    let outcome1 = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000).unwrap();
+    let outcome1 = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000, &test_telemetry_log()).unwrap();
     assert_eq!(outcome1.adopted.len(), 2, "tick 1 must adopt both fresh PRs");
     assert!(outcome1.outcomes.is_empty());
     assert_eq!(outcome1.metrics.probe_cache_misses, 2);
@@ -793,7 +811,7 @@ fn second_tick_over_unchanged_prs_makes_zero_per_pr_probes() {
     // MUST serve all per-PR adoption/duplicate decisions from disk, so the
     // only allowed gh call this tick is the single `labeled_prs` list query
     // (used to discover PRs and read their cache keys).
-    let outcome2 = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000).unwrap();
+    let outcome2 = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000, &test_telemetry_log()).unwrap();
     assert_eq!(outcome2.adopted.len(), 2, "tick 2 must re-adopt both PRs");
     assert!(outcome2.outcomes.is_empty());
     assert_eq!(outcome2.metrics.probe_cache_hits, 2);
@@ -849,7 +867,7 @@ fn probe_cache_invalidates_on_changed_head_sha_but_serves_unchanged_prs() {
     let mut cache = AdoptionProbeCache::new();
 
     // Tick 1: both PRs probed.
-    let outcome1 = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000).unwrap();
+    let outcome1 = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000, &test_telemetry_log()).unwrap();
     assert_eq!(outcome1.adopted.len(), 2);
     scm.calls.borrow_mut().clear();
 
@@ -858,7 +876,7 @@ fn probe_cache_invalidates_on_changed_head_sha_but_serves_unchanged_prs() {
     scm.prs[0].updated_at_epoch = Some(1_700_002_000);
 
     // Tick 2: PR 601 re-probed, PR 602 served from cache.
-    let outcome2 = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000).unwrap();
+    let outcome2 = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000, &test_telemetry_log()).unwrap();
     assert_eq!(outcome2.adopted.len(), 2);
     assert_eq!(outcome2.metrics.probe_cache_misses, 1, "only PR 601 missed");
     assert_eq!(outcome2.metrics.probe_cache_hits, 1, "only PR 602 hit");
@@ -909,7 +927,7 @@ fn probe_cache_revalidates_when_collaborator_tier_changes() {
     let mut cache = AdoptionProbeCache::new();
 
     // Tick 1: alice is Read tier, PR 701 is ineligible.
-    let outcome1 = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000).unwrap();
+    let outcome1 = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000, &test_telemetry_log()).unwrap();
     assert!(outcome1.adopted.is_empty());
     assert_eq!(outcome1.outcomes.len(), 1);
     assert!(matches!(
@@ -932,6 +950,7 @@ fn probe_cache_revalidates_when_collaborator_tier_changes() {
         &cfg,
         &mut cache,
         1_700_000_000 + intake::MAX_CACHED_PERMISSION_AGE_SECS + 1,
+        &test_telemetry_log(),
     )
     .unwrap();
     assert_eq!(
@@ -1101,6 +1120,7 @@ fn incomplete_key_pr_is_reprobed_every_tick() {
         &cfg,
         &mut cache,
         1_700_000_000,
+        &test_telemetry_log(),
     )
     .unwrap();
 
@@ -1126,6 +1146,7 @@ fn incomplete_key_pr_is_reprobed_every_tick() {
         &cfg,
         &mut cache,
         1_700_000_000,
+        &test_telemetry_log(),
     )
     .unwrap();
 
@@ -1224,6 +1245,7 @@ fn intake_metrics_gh_call_count_counts_real_subprocesses() {
         &cfg,
         &mut cache,
         1_700_000_000,
+        &test_telemetry_log(),
     )
     .unwrap();
 
@@ -1271,7 +1293,7 @@ fn two_repositories_sharing_a_pr_number() {
     );
 
     let mut cache = AdoptionProbeCache::new();
-    let outcome = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000).unwrap();
+    let outcome = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000, &test_telemetry_log()).unwrap();
 
     assert_eq!(outcome.adopted.len(), 2, "must adopt PR 100 from both repos without colliding: {:?}", outcome.adopted);
     let refs: Vec<_> = outcome.adopted.iter().map(|a| a.external_ref.as_str()).collect();
@@ -1342,10 +1364,116 @@ fn one_repository_failing_while_another_succeeds() {
     );
 
     let mut cache = AdoptionProbeCache::new();
-    let outcome = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000).unwrap();
+    let outcome = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000, &test_telemetry_log()).unwrap();
 
     assert_eq!(outcome.adopted.len(), 1, "must preserve successful repo dark-factory results despite failing-repo error");
     assert_eq!(outcome.adopted[0].external_ref, "jleechanorg/dark-factory#50");
+}
+
+/// PR #629 follow-up fix (finding 2): pre-fix, `normalize_labeled_prs_with_cache`
+/// called `tracker.fetch_candidates()?`/`tracker.fetch_all_external_refs()?`
+/// INSIDE the per-repo loop — once per repo — even though the tracker is one
+/// global beads store whose snapshot is identical every time within a tick.
+/// This double reproduces that redundant-refetch shape: `fetch_candidates`
+/// succeeds on its first invocation (repo 1's processing) and fails on its
+/// second (what pre-fix code treated as repo 2's re-fetch). Pre-fix, that
+/// second failure propagated via `?` through the ENTIRE multi-repo sweep,
+/// discarding repo 1's already-accumulated adoption — directly contradicting
+/// this function's own fail-soft, per-repo-isolation contract (the same
+/// contract `one_repository_failing_while_another_succeeds` above already
+/// proves for a raw SCM error). Post-fix, the tracker snapshot is fetched
+/// exactly ONCE, before the loop starts, so this double's second invocation
+/// is never reached and both repos' results survive.
+#[test]
+fn tracker_fetch_failure_isolated_to_second_repo_preserves_first_repos_adoption() {
+    struct FailingSecondFetchTracker {
+        inner: FakeTracker,
+        fetch_candidates_calls: std::cell::Cell<u32>,
+    }
+    impl Tracker for FailingSecondFetchTracker {
+        fn fetch_candidates(&self) -> Result<Vec<Bead>, DaemonError> {
+            let call_number = self.fetch_candidates_calls.get() + 1;
+            self.fetch_candidates_calls.set(call_number);
+            if call_number >= 2 {
+                return Err(DaemonError::Tool {
+                    tool: "br".into(),
+                    rc: 1,
+                    stderr: "br: list beads: connection refused".into(),
+                });
+            }
+            self.inner.fetch_candidates()
+        }
+        fn fetch_all_external_refs(&self) -> Result<std::collections::HashSet<String>, DaemonError> {
+            self.inner.fetch_all_external_refs()
+        }
+        fn create_bead(
+            &self,
+            title: &str,
+            body: &str,
+            external_ref: &str,
+        ) -> Result<String, DaemonError> {
+            self.inner.create_bead(title, body, external_ref)
+        }
+        fn comment_external(&self, external_ref: &str, body: &str) -> Result<(), DaemonError> {
+            self.inner.comment_external(external_ref, body)
+        }
+    }
+
+    let mut scm = FakeScm::new();
+    let mut pr_a = labeled_pr_with_cache_key(60, "alice", "feature/pr-60", "sha-60", 1_700_000_000);
+    pr_a.external_ref = "jleechanorg/dark-factory#60".into();
+    pr_a.head_repo_full_name = Some("jleechanorg/dark-factory".into());
+
+    let mut pr_b = labeled_pr_with_cache_key(61, "alice", "feature/pr-61", "sha-61", 1_700_000_000);
+    pr_b.external_ref = "jleechanorg/worldarchitect.ai#61".into();
+    pr_b.head_repo_full_name = Some("jleechanorg/worldarchitect.ai".into());
+
+    scm.prs.push(pr_a);
+    scm.prs.push(pr_b);
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FailingSecondFetchTracker {
+        inner: FakeTracker::new(),
+        fetch_candidates_calls: std::cell::Cell::new(0),
+    };
+    let mut cfg = test_cfg();
+    cfg.target_repo = "jleechanorg/dark-factory".into();
+    cfg.repos.insert(
+        "jleechanorg/worldarchitect.ai".into(),
+        daemon::config::RepoConfig {
+            ao_project: "worldarchitect".into(),
+            push_remote: "worldai".into(),
+            local_checkout: None,
+        },
+    );
+
+    let mut cache = AdoptionProbeCache::new();
+    let outcome = intake::normalize_labeled_prs_outcome(
+        &scm,
+        &tracker,
+        &cfg,
+        &mut cache,
+        1_700_000_000,
+        &test_telemetry_log(),
+    );
+
+    let outcome = outcome.expect(
+        "a tracker error isolated to what pre-fix code treated as one repo's \
+         redundant re-fetch must not abort the whole multi-repo sweep and \
+         discard the prior repo's already-accumulated adoption",
+    );
+    let refs: Vec<_> = outcome
+        .adopted
+        .iter()
+        .map(|a| a.external_ref.as_str())
+        .collect();
+    assert!(
+        refs.contains(&"jleechanorg/dark-factory#60"),
+        "repo 1's adoption must be retained even though the tracker snapshot \
+         fetch failed on what pre-fix code treated as repo 2's re-fetch; got \
+         adopted={:?}",
+        outcome.adopted
+    );
 }
 
 #[test]
@@ -1396,7 +1524,7 @@ fn running_from_installed_non_git_daemon_cwd() {
     let cfg = test_cfg();
     let mut cache = AdoptionProbeCache::new();
 
-    let result = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000);
+    let result = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000, &test_telemetry_log());
 
     let _ = std::env::set_current_dir(orig_cwd);
     let _ = std::fs::remove_dir_all(non_git_dir);

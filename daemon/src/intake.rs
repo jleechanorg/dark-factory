@@ -10,7 +10,9 @@
 //! the AO session's credentials").
 use crate::config::Config;
 use crate::errors::DaemonError;
-use crate::tools::{LabeledPr, Permission, Scm, Tracker};
+use crate::state::now_iso8601;
+use crate::telemetry::{self, TelemetryEvent};
+use crate::tools::{Bead, LabeledPr, Permission, Scm, Tracker};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -556,18 +558,46 @@ pub fn target_repositories_sweep_order(cfg: &Config) -> Vec<String> {
 ///
 /// `now_epoch` is the daemon's current epoch seconds, used to record the
 /// cache timestamp for the r4 TTL-based invalidation.
+///
+/// `telemetry_log` receives one `INTAKE_REPO_SWEEP_FAILED` event per
+/// per-repo isolation point (hard SCM error OR rate-limit skip) — PR #629
+/// follow-up fix: previously these were `eprintln!`-only (stderr/journal),
+/// unlike every other per-repo isolation point in this daemon
+/// (`dispatch.rs`/`reroll.rs`), which consistently emit a structured
+/// telemetry event for equivalent failure paths.
 pub fn normalize_labeled_prs_outcome(
     scm: &dyn Scm,
     tracker: &dyn Tracker,
     cfg: &Config,
     cache: &mut AdoptionProbeCache,
     now_epoch: u64,
+    telemetry_log: &Path,
 ) -> Result<LabeledPrsIntakeOutcome, DaemonError> {
     let mut metrics = IntakeProbeMetrics::default();
     let target_repos = target_repositories_sweep_order(cfg);
     let mut master_adopted = Vec::new();
     let mut master_outcomes = Vec::new();
     let mut any_rate_limited = false;
+
+    // PR #629 follow-up fix: `fetch_candidates`/`fetch_all_external_refs`
+    // are repo-independent (the tracker is one global beads store, not
+    // scoped per target repo) — fetch ONCE here, before any repo is
+    // processed, instead of re-fetching inside the per-repo loop via an
+    // unguarded `?` in `normalize_labeled_prs_with_cache`. Previously, a
+    // transient tracker error on repo N's (redundant) re-fetch propagated
+    // through this whole multi-repo sweep and discarded repos 1..N-1's
+    // already-accumulated `master_adopted`/`master_outcomes` — directly
+    // contradicting this function's own fail-soft, per-repo-isolation
+    // contract. A failure fetching this snapshot ONCE, before any repo is
+    // processed, is a legitimate whole-sweep abort: the tracker being down
+    // means nothing is possible this tick, and no prior repo's results
+    // exist yet to lose.
+    let tracker_candidates = tracker.fetch_candidates()?;
+    let known_refs = tracker.fetch_all_external_refs()?;
+    let tracker_snapshot = TrackerSweepSnapshot {
+        candidates: &tracker_candidates,
+        known_refs: &known_refs,
+    };
 
     for repo in &target_repos {
         if metrics.gh_call_count >= MAX_INTAKE_SWEEP_GH_CALLS {
@@ -587,12 +617,14 @@ pub fn normalize_labeled_prs_outcome(
                 eprintln!(
                     "auto-factory daemon: WARNING intake rate-limited for repository {repo}; skipping and continuing with remaining repositories"
                 );
+                emit_intake_repo_sweep_failed(telemetry_log, repo, "rate_limited", &e.to_string());
                 continue;
             }
             Err(e) => {
                 eprintln!(
                     "auto-factory daemon: WARNING intake failed for repository {repo}: {e}; continuing with remaining repositories"
                 );
+                emit_intake_repo_sweep_failed(telemetry_log, repo, "scm_error", &e.to_string());
                 continue;
             }
         };
@@ -604,24 +636,89 @@ pub fn normalize_labeled_prs_outcome(
         let (adopted, outcomes) = normalize_labeled_prs_with_cache(
             scm,
             tracker,
-            cfg,
-            repo,
-            &prs,
-            cache,
-            &mut metrics,
+            RepoPrBatch { repo: repo.as_str(), prs: &prs },
+            &tracker_snapshot,
+            AdoptionProbeState { cache, metrics: &mut metrics },
             now_epoch,
         )?;
         master_adopted.extend(adopted);
         master_outcomes.extend(outcomes);
     }
 
-    let rate_limited = any_rate_limited && master_adopted.is_empty();
+    // PR #629 follow-up fix: `rate_limited` must only collapse this tick's
+    // results (see `run_slow_tier` in tick.rs) when NOTHING usable was
+    // gathered from ANY repo — not merely when zero PRs happened to be
+    // adopted. The previous `any_rate_limited && master_adopted.is_empty()`
+    // check conflated "adopted zero PRs" (a normal, healthy outcome that
+    // can still carry real skip/reject `IntakeOutcome`s in
+    // `master_outcomes`) with "rate-limited and therefore untrustworthy":
+    // a repo with zero adoptions but real skip/reject outcomes, combined
+    // with an unrelated rate-limited repo, caused `master_adopted.is_empty()`
+    // to be true by coincidence, so the tick discarded that repo's
+    // legitimate, already-computed telemetry for an unrelated reason.
+    let rate_limited =
+        any_rate_limited && master_adopted.is_empty() && master_outcomes.is_empty();
     Ok(LabeledPrsIntakeOutcome {
         adopted: master_adopted,
         outcomes: master_outcomes,
         rate_limited,
         metrics,
     })
+}
+
+/// jleechan (PR #629 follow-up fix): emit exactly one structured telemetry
+/// event for a per-repo intake sweep failure — either a hard SCM error or a
+/// rate-limit skip. `bead_id` is the repo id (no bead exists yet for a
+/// repo-level sweep failure), mirroring the `bead_id = external_ref`
+/// convention `emit_intake_outcome` (tick.rs) already uses for per-PR
+/// outcomes — so `grep <repo> daemon.jsonl` finds this line. Best-effort: a
+/// telemetry write failure must never abort or degrade the sweep itself —
+/// the caller's own fail-soft isolation (`continue` past the failing repo)
+/// is the load-bearing behavior; telemetry is an observability side
+/// channel only.
+fn emit_intake_repo_sweep_failed(telemetry_log: &Path, repo: &str, error_class: &str, error: &str) {
+    let event = TelemetryEvent {
+        timestamp: now_iso8601(),
+        bead_id: repo.to_string(),
+        attempt_id: 1,
+        lifecycle_state: "INTAKE".to_string(),
+        event_type: "INTAKE_REPO_SWEEP_FAILED".to_string(),
+        metrics: serde_json::json!({}),
+        context: serde_json::json!({
+            "repo": repo,
+            "error_class": error_class,
+            "error": error,
+        }),
+    };
+    if let Err(e) = telemetry::emit(telemetry_log, &event) {
+        eprintln!(
+            "auto-factory daemon: WARNING failed to emit INTAKE_REPO_SWEEP_FAILED telemetry for {repo}: {e}"
+        );
+    }
+}
+
+/// One-time-per-sweep snapshot of the tracker's known beads/refs, fetched
+/// ONCE in `normalize_labeled_prs_outcome` before any repo is processed
+/// (see that function's doc comment for the multi-repo abort bug this
+/// closes).
+pub(crate) struct TrackerSweepSnapshot<'a> {
+    candidates: &'a [Bead],
+    known_refs: &'a std::collections::HashSet<String>,
+}
+
+/// One repo's already-fetched PR batch — bundled with `repo` purely to keep
+/// `normalize_labeled_prs_with_cache`'s argument count under clippy's
+/// `too_many_arguments` threshold without an `#[allow]`.
+pub(crate) struct RepoPrBatch<'a> {
+    repo: &'a str,
+    prs: &'a [LabeledPr],
+}
+
+/// Mutable per-sweep accumulator state threaded through the per-PR loop —
+/// bundled for the same argument-count reason as `RepoPrBatch`.
+pub(crate) struct AdoptionProbeState<'a> {
+    cache: &'a mut AdoptionProbeCache,
+    metrics: &'a mut IntakeProbeMetrics,
 }
 
 /// jtg8-r4: cache-aware adoption loop. Mirrors `normalize_labeled_prs`'s
@@ -639,18 +736,26 @@ pub fn normalize_labeled_prs_outcome(
 /// forever. (`prs` is the already-fetched `labeled_prs` result — caller
 /// passed them in so `normalize_labeled_prs_outcome` could count the list
 /// query as 1 gh call before delegating here.)
+///
+/// `tracker_snapshot` is the ONE-TIME-per-sweep `fetch_candidates`/
+/// `fetch_all_external_refs` result — see `normalize_labeled_prs_outcome`'s
+/// doc comment. This function no longer fetches the tracker snapshot
+/// itself, so a per-repo processing error here can never abort the whole
+/// multi-repo sweep the way a tracker-fetch error used to.
 pub(crate) fn normalize_labeled_prs_with_cache(
     scm: &dyn Scm,
     tracker: &dyn Tracker,
-    _cfg: &Config,
-    repo: &str,
-    prs: &[LabeledPr],
-    cache: &mut AdoptionProbeCache,
-    metrics: &mut IntakeProbeMetrics,
+    batch: RepoPrBatch,
+    tracker_snapshot: &TrackerSweepSnapshot,
+    state: AdoptionProbeState,
     now_epoch: u64,
 ) -> Result<(Vec<ExistingPrIntake>, Vec<IntakeOutcome>), DaemonError> {
-    let tracker_candidates = tracker.fetch_candidates()?;
-    let known_refs = tracker.fetch_all_external_refs()?;
+    let repo = batch.repo;
+    let prs = batch.prs;
+    let tracker_candidates = tracker_snapshot.candidates;
+    let known_refs = tracker_snapshot.known_refs;
+    let cache = state.cache;
+    let metrics = state.metrics;
     let mut intakes = Vec::new();
     let mut outcomes = Vec::new();
 
