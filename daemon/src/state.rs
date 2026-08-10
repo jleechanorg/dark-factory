@@ -365,6 +365,33 @@ pub trait StateStore {
     fn reset_reroll_deferral(&self, _bead_id: &str) -> Result<(), DaemonError> {
         Ok(())
     }
+    /// Read `bead_id`'s consecutive PERMANENT (non-transient)
+    /// `head_sha_within_for_repo` probe-failure count (bead
+    /// advice-627-630-20260809 PR #628 finding 2). Persisted in its own
+    /// column, decoupled from [`BeadOverlay`] — same shape as
+    /// `reroll_deferral_count`, but tracks a narrower signal: only
+    /// non-transient probe failures (`DaemonError::is_transient() == false`)
+    /// increment it, and any successful probe resets it. Distinguishes "a
+    /// bead has been silently deferring on a genuinely permanent VCS error
+    /// for N ticks in a row" from ordinary transient hiccups, which never
+    /// touch this counter. Default `Ok(0)` so fakes that don't exercise the
+    /// permanent-failure escalation path see "never failed permanently".
+    fn reroll_head_permanent_failure_count(&self, _bead_id: &str) -> Result<u32, DaemonError> {
+        Ok(0)
+    }
+    /// Atomically increment `bead_id`'s consecutive permanent head-probe
+    /// failure count and return the new value. Default `Ok(1)` mirrors
+    /// `incr_reroll_deferral`.
+    fn incr_reroll_head_permanent_failure(&self, _bead_id: &str) -> Result<u32, DaemonError> {
+        Ok(1)
+    }
+    /// Reset `bead_id`'s consecutive permanent head-probe failure count to
+    /// `0` — called on any successful probe so a later, unrelated run of
+    /// permanent failures starts fresh. Default `Ok(())` (no-op) for fakes
+    /// that don't persist the counter.
+    fn reset_reroll_head_permanent_failure(&self, _bead_id: &str) -> Result<(), DaemonError> {
+        Ok(())
+    }
     /// Read the earliest epoch at which a bead held `DISPOSITION_REQUIRED` may
     /// be re-assessed (bead jleechan-zaga / issue #348 r3). `None` = no
     /// cooldown recorded (re-assess now). Default `Ok(None)` so fakes that
@@ -773,6 +800,7 @@ impl SqliteStateStore {
         Self::ensure_park_reason_column(&conn)?;
         Self::ensure_target_repo_column(&conn)?;
         Self::ensure_reroll_deferral_count_column(&conn)?;
+        Self::ensure_reroll_head_permanent_failure_count_column(&conn)?;
         Self::ensure_held_recheck_after_column(&conn)?;
         Self::ensure_last_er_evidence_hash_column(&conn)?;
         Self::ensure_last_all_green_columns(&conn)?;
@@ -800,6 +828,7 @@ impl SqliteStateStore {
         Self::ensure_park_reason_column(&conn)?;
         Self::ensure_target_repo_column(&conn)?;
         Self::ensure_reroll_deferral_count_column(&conn)?;
+        Self::ensure_reroll_head_permanent_failure_count_column(&conn)?;
         Self::ensure_held_recheck_after_column(&conn)?;
         Self::ensure_last_er_evidence_hash_column(&conn)?;
         Self::ensure_last_all_green_columns(&conn)?;
@@ -1058,6 +1087,44 @@ impl SqliteStateStore {
                 [],
             )
             .map_err(|e| tool_err("ensure_reroll_deferral_count_column: add column", e))?;
+        }
+        Ok(())
+    }
+
+    /// Idempotent migration for the `reroll_head_permanent_failure_count`
+    /// column (bead advice-627-630-20260809 PR #628 finding 2). Same
+    /// probe-then-`ALTER` pattern as `ensure_reroll_deferral_count_column`.
+    /// The consecutive-PERMANENT-head-probe-failure counter
+    /// `reroll::evaluate_proceed` uses to escalate a loud warning once a
+    /// bead has been silently deferring on a genuinely non-transient VCS
+    /// error for `reroll_head_permanent_fail_threshold()` ticks in a row;
+    /// every pre-existing row correctly defaults to `0` ("never failed
+    /// permanently").
+    fn ensure_reroll_head_permanent_failure_count_column(
+        conn: &Connection,
+    ) -> Result<(), DaemonError> {
+        let has_col: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
+                 WHERE name = 'reroll_head_permanent_failure_count'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| {
+                tool_err("ensure_reroll_head_permanent_failure_count_column: pragma", e)
+            })?;
+        if !has_col {
+            conn.execute(
+                "ALTER TABLE bead_overlay ADD COLUMN \
+                 reroll_head_permanent_failure_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| {
+                tool_err(
+                    "ensure_reroll_head_permanent_failure_count_column: add column",
+                    e,
+                )
+            })?;
         }
         Ok(())
     }
@@ -2205,6 +2272,55 @@ impl StateStore for SqliteStateStore {
         }
     }
 
+    fn reroll_head_permanent_failure_count(&self, bead_id: &str) -> Result<u32, DaemonError> {
+        // Same legacy-DB tolerance as `reroll_deferral_count`: a
+        // pre-migration DB lacks the column, so a "no such column" SELECT
+        // error means "never failed permanently" (0) rather than a hard
+        // failure.
+        let row: Result<i64, rusqlite::Error> = self.conn.query_row(
+            "SELECT reroll_head_permanent_failure_count FROM bead_overlay WHERE bead_id = ?1",
+            params![bead_id],
+            |row| row.get(0),
+        );
+        match row {
+            Ok(count) => Ok(count.max(0) as u32),
+            Err(e) if no_such_column(&e) => Ok(0),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+            Err(e) => Err(tool_err("reroll_head_permanent_failure_count", e)),
+        }
+    }
+
+    fn incr_reroll_head_permanent_failure(&self, bead_id: &str) -> Result<u32, DaemonError> {
+        let res = self.conn.execute(
+            "UPDATE bead_overlay SET \
+                reroll_head_permanent_failure_count = \
+                    COALESCE(reroll_head_permanent_failure_count, 0) + 1, \
+                updated_at = ?2 \
+             WHERE bead_id = ?1",
+            params![bead_id, now_iso8601()],
+        );
+        match res {
+            Ok(_) => self.reroll_head_permanent_failure_count(bead_id),
+            // Legacy DB without the column: fall back to 1 so the
+            // escalation threshold still fires (mirrors `incr_reroll_deferral`).
+            Err(e) if no_such_column(&e) => Ok(1),
+            Err(e) => Err(tool_err("incr_reroll_head_permanent_failure", e)),
+        }
+    }
+
+    fn reset_reroll_head_permanent_failure(&self, bead_id: &str) -> Result<(), DaemonError> {
+        let res = self.conn.execute(
+            "UPDATE bead_overlay SET reroll_head_permanent_failure_count = 0, updated_at = ?2 \
+             WHERE bead_id = ?1",
+            params![bead_id, now_iso8601()],
+        );
+        match res {
+            Ok(_) => Ok(()),
+            Err(e) if no_such_column(&e) => Ok(()),
+            Err(e) => Err(tool_err("reset_reroll_head_permanent_failure", e)),
+        }
+    }
+
     fn held_recheck_after(&self, bead_id: &str) -> Result<Option<u64>, DaemonError> {
         let row: Result<Option<i64>, rusqlite::Error> = self.conn.query_row(
             "SELECT held_recheck_after FROM bead_overlay WHERE bead_id = ?1",
@@ -2700,6 +2816,64 @@ mod tests {
         // Incrementing/reading a bead with no overlay row is a no-op read of 0
         // (the UPDATE matches nothing) rather than an error.
         assert_eq!(s.reroll_deferral_count("no-such-bead").unwrap(), 0);
+    }
+
+    /// advice-627-630-20260809 PR #628 finding 2: the consecutive PERMANENT
+    /// (non-transient) head-probe failure counter must survive between ticks
+    /// (separate `reroll::execute` calls) exactly like `reroll_deferral_count`
+    /// -- exercise the REAL SqliteStateStore, not just the fake.
+    #[test]
+    fn reroll_head_permanent_failure_counter_increments_resets_and_persists() {
+        let s = store();
+        let o = BeadOverlay {
+            bead_id: "permfail-bead".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(43),
+            branch: Some("factory/permfail-bead-r1".into()),
+            session_id: Some("sess-live".into()),
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        };
+        s.save(&o).unwrap();
+
+        // Never failed permanently yet.
+        assert_eq!(
+            s.reroll_head_permanent_failure_count("permfail-bead").unwrap(),
+            0
+        );
+        // Consecutive increments accumulate and are returned.
+        assert_eq!(
+            s.incr_reroll_head_permanent_failure("permfail-bead").unwrap(),
+            1
+        );
+        assert_eq!(
+            s.incr_reroll_head_permanent_failure("permfail-bead").unwrap(),
+            2
+        );
+        assert_eq!(
+            s.reroll_head_permanent_failure_count("permfail-bead").unwrap(),
+            2
+        );
+        // A successful probe resets the streak.
+        s.reset_reroll_head_permanent_failure("permfail-bead").unwrap();
+        assert_eq!(
+            s.reroll_head_permanent_failure_count("permfail-bead").unwrap(),
+            0
+        );
+        // Incrementing/reading a bead with no overlay row is a no-op read of 0
+        // (the UPDATE matches nothing) rather than an error.
+        assert_eq!(
+            s.reroll_head_permanent_failure_count("no-such-bead").unwrap(),
+            0
+        );
     }
 
     /// Bead jleechan-zaga / issue #348 r3: the held-recheck cooldown epoch must
