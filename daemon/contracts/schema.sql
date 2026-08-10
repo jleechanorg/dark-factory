@@ -104,6 +104,28 @@ CREATE TABLE IF NOT EXISTS bead_overlay (
   -- the idempotent `ensure_reroll_deferral_count_column` migration in
   -- `SqliteStateStore::open` (same guard pattern as `ensure_is_adopted_column`).
   reroll_deferral_count INTEGER NOT NULL DEFAULT 0,
+  -- Consecutive PERMANENT (non-transient) reroll head-probe failure counter
+  -- (advice-627-630-20260809 PR #628 finding 2). The fail-closed
+  -- `evaluate_proceed` head-stability check in daemon/src/reroll.rs samples
+  -- `Vcs::head_sha_within_for_repo` every poll; a TRANSIENT failure
+  -- (`DaemonError::is_transient() == true`) is deferred and logged via
+  -- `REROLL_QUIESCENCE_HEAD_TRANSIENT` without touching this column, but a
+  -- PERMANENT (non-transient) failure -- a genuinely misconfigured repo,
+  -- deleted branch, or expired `gh` auth -- still defers (keep
+  -- defer-not-crash) while incrementing this counter, so the daemon can
+  -- distinguish "one bad tick" from "this bead has been silently failing
+  -- the same way for N ticks in a row" and escalate a loud warning once the
+  -- count crosses `reroll_head_permanent_fail_threshold()` (default 3,
+  -- env-overridable via `DARK_FACTORY_REROLL_HEAD_PERMANENT_FAIL_THRESHOLD`).
+  -- Reset to 0 on any successful probe. Owned by the reroll engine via the
+  -- `reroll_head_permanent_failure_count`/`incr_reroll_head_permanent_failure`/
+  -- `reset_reroll_head_permanent_failure` StateStore methods (NOT a
+  -- BeadOverlay field — same decoupling as `reroll_deferral_count`). Older
+  -- DBs pre-date this column and get it via the idempotent
+  -- `ensure_reroll_head_permanent_failure_count_column` migration in
+  -- `SqliteStateStore::open` (same guard pattern as
+  -- `ensure_reroll_deferral_count_column`).
+  reroll_head_permanent_failure_count INTEGER NOT NULL DEFAULT 0,
   -- Bead jleechan-zaga / issue #348 r3: earliest unix epoch (seconds) at
   -- which a bead held at DISPOSITION_REQUIRED may be re-assessed by the fast
   -- tier. NULL means "no cooldown / re-assess now". Set to now +

@@ -2083,7 +2083,7 @@ mod quiescence_timeout_races {
             .calls
             .borrow()
             .iter()
-            .filter(|c| c.as_str() == format!("head_sha({branch})"))
+            .filter(|c| c.starts_with("head_sha"))
             .count();
         assert!(
             head_polls >= 2,
@@ -2996,6 +2996,409 @@ fn test_reroll_close_pr_already_merged_is_tolerated_as_successful_supersede() {
         telemetry.contains("REROLL_PR_ALREADY_MERGED"),
         "telemetry must record REROLL_PR_ALREADY_MERGED so operators can audit \
          tolerant supersedes; got: {telemetry}"
+    );
+
+    std::fs::remove_dir_all(spec_dir).ok();
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Bead dark-factory-mw85: reroll quiescence head probe must route through
+/// `vcs.head_sha_within_for_repo(&bead.repo(cfg), ...)` using the bead's routed
+/// target repo, rather than calling CWD-bound `git rev-parse` in the daemon's own CWD.
+#[test]
+fn test_reroll_quiescence_head_probe_routes_through_bead_repo_and_defers_on_failure() {
+    let scm = FakeScm::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = true;
+    let mut vcs = FakeVcs::new();
+
+    let target_repo = "jleechanorg/custom-routed-repo";
+    let branch = "factory/bead-mw85-r1";
+    let scoped_branch = format!("{target_repo}@{branch}");
+
+    vcs.heads.insert(scoped_branch.clone(), "head-sha-mw85".into());
+    vcs.heads.insert(format!("{target_repo}@main"), "base-sha-mw85".into());
+
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"inhibitionSpecs":["no print"],"positiveAssertions":["log errors"],"securityRedactionEncountered":false}"#.into()
+    ));
+
+    let mut cfg = test_cfg();
+    cfg.spec_dir = std::env::temp_dir()
+        .join("afd_spec_dir_mw85_test")
+        .to_string_lossy()
+        .to_string();
+    let spec_dir = std::path::Path::new(&cfg.spec_dir);
+    let _ = std::fs::remove_dir_all(spec_dir);
+    std::fs::create_dir_all(spec_dir).unwrap();
+
+    let telemetry_log = std::env::temp_dir().join("afd_telemetry_mw85.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let mut bead = BeadOverlay {
+        bead_id: "bead-mw85".into(),
+        state: OverlayState::Attested,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 5,
+        spend_usd: 0.0,
+        pr_number: Some(888),
+        branch: Some(branch.into()),
+        session_id: Some("session-mw85".into()),
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: Some(target_repo.into()),
+        attempt_started_at: None,
+    };
+    store.save(&bead).unwrap();
+
+    let deps = reroll::RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "skeptic".into(),
+        review_text: "Log error trace".into(),
+    };
+
+    let outcome = reroll::execute(&deps, &mut bead).unwrap();
+    assert!(
+        matches!(outcome, RerollOutcome::Rerolled { .. }),
+        "expected Rerolled outcome, got {:?}",
+        outcome
+    );
+
+    let calls = vcs.calls.borrow();
+    assert!(
+        calls.iter().any(|c| c.starts_with(&format!("head_sha_within_for_repo({target_repo},{branch}"))),
+        "reroll quiescence must call head_sha_within_for_repo with the bead's target_repo '{target_repo}'; got calls: {calls:?}"
+    );
+
+    std::fs::remove_dir_all(spec_dir).ok();
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Bead dark-factory-mw85: probe failure on head_sha_within_for_repo must warn via
+/// telemetry and defer only the affected bead without returning Err / crashing reroll.
+#[test]
+fn test_reroll_quiescence_head_probe_error_warns_and_defers_without_crashing() {
+    let scm = FakeScm::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = true;
+    let vcs = FakeVcs::new();
+
+    let target_repo = "jleechanorg/custom-routed-repo-fail";
+    let branch = "factory/bead-mw85-fail-r1";
+    let scoped_branch = format!("{target_repo}@{branch}");
+
+    vcs.fail_head_sha_for.borrow_mut().insert(
+        scoped_branch,
+        "gh api returned 404 Not Found for branch".into(),
+    );
+
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+
+    let mut cfg = test_cfg();
+    cfg.spec_dir = std::env::temp_dir()
+        .join("afd_spec_dir_mw85_fail_test")
+        .to_string_lossy()
+        .to_string();
+    let spec_dir = std::path::Path::new(&cfg.spec_dir);
+    let _ = std::fs::remove_dir_all(spec_dir);
+    std::fs::create_dir_all(spec_dir).unwrap();
+
+    let telemetry_log = std::env::temp_dir().join("afd_telemetry_mw85_fail.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let mut bead = BeadOverlay {
+        bead_id: "bead-mw85-fail".into(),
+        state: OverlayState::Attested,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 5,
+        spend_usd: 0.0,
+        pr_number: Some(889),
+        branch: Some(branch.into()),
+        session_id: Some("session-mw85-fail".into()),
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: Some(target_repo.into()),
+        attempt_started_at: None,
+    };
+    store.save(&bead).unwrap();
+
+    let deps = reroll::RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "skeptic".into(),
+        review_text: "Log error trace".into(),
+    };
+
+    let outcome = reroll::execute(&deps, &mut bead).expect("reroll must not crash on head probe failure");
+    assert!(
+        matches!(outcome, RerollOutcome::Deferred(_)),
+        "expected Deferred outcome on probe error, got {:?}",
+        outcome
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).expect("telemetry log must exist");
+    assert!(
+        telemetry.contains("REROLL_QUIESCENCE_HEAD_TRANSIENT") || telemetry.contains("REROLL_QUIESCENCE_HEAD_FAILED"),
+        "telemetry must log REROLL_QUIESCENCE_HEAD warning on probe failure; got: {telemetry}"
+    );
+
+    std::fs::remove_dir_all(spec_dir).ok();
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// advice-627-630-20260809 PR #628 finding 2 (RED-first): a genuinely
+/// PERMANENT (non-transient) `head_sha_within_for_repo` failure -- scripted
+/// via `fail_head_sha_permanent_for`, which returns `DaemonError::Config`
+/// rather than `fail_head_sha_for`'s always-transient `DaemonError::Tool` --
+/// must still defer (never crash / never `Err` out of `reroll::execute`),
+/// but a SUSTAINED run of `DARK_FACTORY_REROLL_HEAD_PERMANENT_FAIL_THRESHOLD`
+/// (default 3) consecutive permanent failures for the SAME bead must
+/// escalate a loud `REROLL_QUIESCENCE_HEAD_PERMANENT_ESCALATED` telemetry
+/// event, distinct from the per-failure `REROLL_QUIESCENCE_HEAD_FAILED`
+/// event that fires on every one of them. Before this fix, permanent and
+/// transient probe failures were behaviorally identical (both silently
+/// deferred with no escalation) -- this test fails against that prior
+/// behavior since the escalation event never existed.
+#[test]
+fn test_reroll_quiescence_head_probe_permanent_failure_escalates_after_threshold() {
+    let scm = FakeScm::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = true;
+    // The head probe is sampled FIRST on every poll and this test's fake
+    // errors out on every call, so `evaluate_proceed` never reaches the
+    // liveness/death checks below it -- but the OUTER `execute()` call still
+    // does `attach` -> `stop` -> `evaluate_proceed` on every invocation, and
+    // a REAL successful `stop()` would normally make the next `attach`
+    // report the session gone (positive death), short-circuiting straight to
+    // a confirmed proceed instead of re-entering `evaluate_proceed` at all.
+    // Model an orphaned session (stop() "succeeds" but the process lingers)
+    // so repeated `reroll::execute` calls keep re-entering the head-probe
+    // path across ticks, exactly like a real permanently-misconfigured bead
+    // would.
+    sessions.set_orphan_after_stop();
+    let vcs = FakeVcs::new();
+
+    let target_repo = "jleechanorg/custom-routed-repo-permfail";
+    let branch = "factory/bead-mw85-permfail-r1";
+    let scoped_branch = format!("{target_repo}@{branch}");
+
+    vcs.fail_head_sha_permanent_for(
+        &scoped_branch,
+        "repository or branch does not exist (permanent)",
+    );
+
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+
+    let mut cfg = test_cfg();
+    cfg.spec_dir = std::env::temp_dir()
+        .join("afd_spec_dir_mw85_permfail_test")
+        .to_string_lossy()
+        .to_string();
+    let spec_dir = std::path::Path::new(&cfg.spec_dir);
+    let _ = std::fs::remove_dir_all(spec_dir);
+    std::fs::create_dir_all(spec_dir).unwrap();
+
+    let telemetry_log = std::env::temp_dir().join("afd_telemetry_mw85_permfail.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let mut bead = BeadOverlay {
+        bead_id: "bead-mw85-permfail".into(),
+        state: OverlayState::Attested,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 5,
+        spend_usd: 0.0,
+        pr_number: Some(890),
+        branch: Some(branch.into()),
+        session_id: Some("session-mw85-permfail".into()),
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: Some(target_repo.into()),
+        attempt_started_at: None,
+    };
+    store.save(&bead).unwrap();
+
+    let deps = reroll::RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "skeptic".into(),
+        review_text: "Log error trace".into(),
+    };
+
+    // Default threshold is 3 -- calls 1 and 2 must defer WITHOUT escalating.
+    for i in 1..=2 {
+        let outcome = reroll::execute(&deps, &mut bead)
+            .unwrap_or_else(|e| panic!("reroll must not crash on permanent probe failure (call {i}): {e}"));
+        assert!(
+            matches!(outcome, RerollOutcome::Deferred(_)),
+            "call {i}: expected Deferred outcome on permanent probe error, got {:?}",
+            outcome
+        );
+        let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+        assert!(
+            telemetry.contains("REROLL_QUIESCENCE_HEAD_FAILED"),
+            "call {i}: every permanent probe failure must log \
+             REROLL_QUIESCENCE_HEAD_FAILED; got: {telemetry}"
+        );
+        assert!(
+            !telemetry.contains("REROLL_QUIESCENCE_HEAD_PERMANENT_ESCALATED"),
+            "call {i}: must NOT escalate before the threshold is reached; got: {telemetry}"
+        );
+        // Bead must be re-eligible (ATTESTED), not parked, between calls.
+        bead.state = OverlayState::Attested;
+    }
+
+    // Call 3 crosses the default threshold and must escalate exactly once.
+    let outcome = reroll::execute(&deps, &mut bead)
+        .expect("reroll must not crash on permanent probe failure (call 3)");
+    assert!(
+        matches!(outcome, RerollOutcome::Deferred(_)),
+        "call 3: expected Deferred outcome on permanent probe error, got {:?}",
+        outcome
+    );
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert_eq!(
+        telemetry.matches("REROLL_QUIESCENCE_HEAD_PERMANENT_ESCALATED").count(),
+        1,
+        "call 3 must escalate exactly once at the default threshold (3); got: {telemetry}"
+    );
+    assert!(
+        telemetry.contains("\"errorClass\":\"config\""),
+        "escalation telemetry must include the error class so operators can \
+         triage without re-parsing the raw error string; got: {telemetry}"
+    );
+
+    std::fs::remove_dir_all(spec_dir).ok();
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// advice-627-630-20260809 PR #628 finding 2 (RED-first companion): a run of
+/// TRANSIENT probe failures (the pre-existing `fail_head_sha_for`, which
+/// always yields `DaemonError::Tool` -- unconditionally transient per
+/// `DaemonError::is_transient()`) must NEVER trigger the permanent-failure
+/// escalation, no matter how many consecutive ticks it spans -- only
+/// non-transient failures count toward the escalation threshold. Runs one
+/// more iteration than the default threshold (4 > 3) to prove the counter
+/// genuinely never increments for transient errors, not merely that it
+/// hasn't reached the threshold yet.
+#[test]
+fn test_reroll_quiescence_head_probe_transient_failure_never_escalates() {
+    let scm = FakeScm::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = true;
+    // See the sibling permanent-failure test for why this is required for a
+    // multi-call loop: without it, the second `reroll::execute` call would
+    // see the session reported dead by `attach()` after the first `stop()`,
+    // fast-pathing to a confirmed proceed instead of re-entering the
+    // head-probe path being tested here.
+    sessions.set_orphan_after_stop();
+    let vcs = FakeVcs::new();
+
+    let target_repo = "jleechanorg/custom-routed-repo-transient";
+    let branch = "factory/bead-mw85-transient-r1";
+    let scoped_branch = format!("{target_repo}@{branch}");
+
+    vcs.fail_head_sha_for(&scoped_branch, "gh api: temporary network blip");
+
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+
+    let mut cfg = test_cfg();
+    cfg.spec_dir = std::env::temp_dir()
+        .join("afd_spec_dir_mw85_transient_test")
+        .to_string_lossy()
+        .to_string();
+    let spec_dir = std::path::Path::new(&cfg.spec_dir);
+    let _ = std::fs::remove_dir_all(spec_dir);
+    std::fs::create_dir_all(spec_dir).unwrap();
+
+    let telemetry_log = std::env::temp_dir().join("afd_telemetry_mw85_transient.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let mut bead = BeadOverlay {
+        bead_id: "bead-mw85-transient".into(),
+        state: OverlayState::Attested,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 5,
+        spend_usd: 0.0,
+        pr_number: Some(891),
+        branch: Some(branch.into()),
+        session_id: Some("session-mw85-transient".into()),
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: Some(target_repo.into()),
+        attempt_started_at: None,
+    };
+    store.save(&bead).unwrap();
+
+    let deps = reroll::RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "skeptic".into(),
+        review_text: "Log error trace".into(),
+    };
+
+    for i in 1..=4 {
+        let outcome = reroll::execute(&deps, &mut bead)
+            .unwrap_or_else(|e| panic!("reroll must not crash on transient probe failure (call {i}): {e}"));
+        assert!(
+            matches!(outcome, RerollOutcome::Deferred(_)),
+            "call {i}: expected Deferred outcome on transient probe error, got {:?}",
+            outcome
+        );
+        bead.state = OverlayState::Attested;
+    }
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("REROLL_QUIESCENCE_HEAD_TRANSIENT"),
+        "expected transient telemetry to be recorded; got: {telemetry}"
+    );
+    assert!(
+        !telemetry.contains("REROLL_QUIESCENCE_HEAD_PERMANENT_ESCALATED"),
+        "transient probe failures must never escalate, even across 4 \
+         consecutive ticks (> default threshold of 3); got: {telemetry}"
+    );
+    assert_eq!(
+        store.reroll_head_permanent_failure_count("bead-mw85-transient").unwrap(),
+        0,
+        "the permanent-failure counter must never increment for transient errors"
     );
 
     std::fs::remove_dir_all(spec_dir).ok();

@@ -47,6 +47,27 @@ pub enum RerollOutcome {
 /// away from going idle) without any park at all.
 const MAX_REROLL_DEFERRALS: u32 = 5;
 
+/// Default for [`reroll_head_permanent_fail_threshold`] (bead
+/// advice-627-630-20260809 PR #628 finding 2). Deliberately small: a single
+/// permanent (non-transient) head-probe failure is already deferred and
+/// logged individually via `REROLL_QUIESCENCE_HEAD_FAILED`; only a SUSTAINED
+/// run for the SAME bead (misconfigured repo, deleted branch, expired `gh`
+/// token, etc.) crosses this and escalates a loud warning so the condition
+/// doesn't sit invisible in an indefinite silent-defer loop.
+const DEFAULT_REROLL_HEAD_PERMANENT_FAIL_THRESHOLD: u32 = 3;
+
+/// Env-overridable (`DARK_FACTORY_REROLL_HEAD_PERMANENT_FAIL_THRESHOLD`)
+/// consecutive-permanent-head-probe-failure escalation threshold. Invalid or
+/// non-positive values fall back to the default rather than disabling the
+/// escalation (fail loud, not silent).
+fn reroll_head_permanent_fail_threshold() -> u32 {
+    std::env::var("DARK_FACTORY_REROLL_HEAD_PERMANENT_FAIL_THRESHOLD")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_REROLL_HEAD_PERMANENT_FAIL_THRESHOLD)
+}
+
 /// Park reason recorded in `BeadOverlay::park_reason` when the circuit
 /// breaker (bead jleechan-cq8r) trips. Deliberately prefixed with
 /// `"circuit-breaker"` — `StateStore::recover_human_held` (bead
@@ -801,8 +822,17 @@ fn evaluate_proceed(
         // Codex P3: sample head_sha FIRST on every poll, before any
         // liveness-based break, so "HEAD sampled every poll" is unconditionally
         // true and a mid-window push is always observed.
-        let head = match deps.vcs.head_sha_within(branch, budget_or_defer!()) {
-            Ok(h) => h,
+        // Bead dark-factory-mw85: route probe through repo-scoped VCS probe
+        // using `overlay.repo(cfg)` so daemon CWD non-git status never blocks quiescence.
+        let bead_repo = bead.repo(deps.cfg);
+        let head = match deps.vcs.head_sha_within_for_repo(bead_repo, branch, budget_or_defer!()) {
+            Ok(h) => {
+                // advice-627-630-20260809 PR #628 finding 2: a successful
+                // probe breaks any prior streak of PERMANENT failures for
+                // this bead -- only CONSECUTIVE permanent failures escalate.
+                deps.store.reset_reroll_head_permanent_failure(&bead.bead_id)?;
+                h
+            }
             Err(e) if e.is_transient() => {
                 emit_telemetry(
                     deps.telemetry_log,
@@ -815,7 +845,63 @@ fn evaluate_proceed(
                 )?;
                 return Ok(None);
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                // advice-627-630-20260809 PR #628 finding 2: a non-transient
+                // (PERMANENT) probe failure still defers rather than
+                // crashing the daemon (keep defer-not-crash), but unlike the
+                // transient arm above it is tracked via a dedicated durable
+                // per-bead consecutive-failure counter (mirrors
+                // `reroll_deferral_count`) and escalates a LOUD warning once
+                // the count crosses `reroll_head_permanent_fail_threshold()`
+                // -- otherwise a permanently-misconfigured bead (bad repo,
+                // deleted branch, expired `gh` auth) would sit in an
+                // indistinguishable-from-transient silent deferral loop
+                // forever with zero operator visibility.
+                let error_class = e.error_class();
+                let consecutive = deps
+                    .store
+                    .incr_reroll_head_permanent_failure(&bead.bead_id)?;
+                emit_telemetry(
+                    deps.telemetry_log,
+                    &bead.bead_id,
+                    bead.attempt,
+                    bead.state.as_str(),
+                    "REROLL_QUIESCENCE_HEAD_FAILED",
+                    serde_json::json!({"consecutivePermanentFailures": consecutive}),
+                    serde_json::json!({
+                        "reason": "head_query_failed",
+                        "error": format!("{e}"),
+                        "errorClass": error_class,
+                    }),
+                )?;
+                let threshold = reroll_head_permanent_fail_threshold();
+                if consecutive >= threshold {
+                    emit_telemetry(
+                        deps.telemetry_log,
+                        &bead.bead_id,
+                        bead.attempt,
+                        bead.state.as_str(),
+                        "REROLL_QUIESCENCE_HEAD_PERMANENT_ESCALATED",
+                        serde_json::json!({
+                            "consecutivePermanentFailures": consecutive,
+                            "threshold": threshold,
+                        }),
+                        serde_json::json!({
+                            "reason": "head_query_permanently_failing",
+                            "error": format!("{e}"),
+                            "errorClass": error_class,
+                        }),
+                    )?;
+                    eprintln!(
+                        "[reroll] WARNING: bead {} head-probe has failed permanently \
+                         {consecutive} consecutive time(s) (errorClass={error_class}); \
+                         this bead may be stuck in an indefinite deferral loop -- \
+                         investigate repo/branch/gh-auth configuration for it.",
+                        bead.bead_id
+                    );
+                }
+                return Ok(None);
+            }
         };
         match &last_head {
             Some(prev) if *prev == head => {}

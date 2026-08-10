@@ -170,6 +170,30 @@ impl DaemonError {
         }
     }
 
+    /// advice-627-630-20260809 PR #628 finding 2: a short, stable
+    /// machine-readable discriminant for this error's variant, distinct from
+    /// the free-form `Display` string (which embeds tool stderr / branch
+    /// names / etc. and is unsuitable for grouping or dashboarding).
+    /// Consumed by `reroll::evaluate_proceed`'s head-probe failure telemetry
+    /// so a PERMANENT (non-transient) probe failure records WHICH class of
+    /// error it was (e.g. `"config"` vs `"parse"`) alongside the raw message,
+    /// instead of only the opaque `REROLL_QUIESCENCE_HEAD_FAILED` event name.
+    pub fn error_class(&self) -> &'static str {
+        match self {
+            DaemonError::Tool { .. } => "tool",
+            DaemonError::Parse(_) => "parse",
+            DaemonError::Timeout(_) => "timeout",
+            DaemonError::Config(_) => "config",
+            DaemonError::SessionNotFound { .. } => "session_not_found",
+            DaemonError::SessionAmbiguous { .. } => "session_ambiguous",
+            DaemonError::Deferred(_) => "deferred",
+            DaemonError::ComparatorUnparseable(_) => "comparator_unparseable",
+            DaemonError::SpawnFallbackExhausted(_) => "spawn_fallback_exhausted",
+            DaemonError::SpawnCleanupFailed { .. } => "spawn_cleanup_failed",
+            DaemonError::SpawnBatchCleanupFailed { .. } => "spawn_batch_cleanup_failed",
+        }
+    }
+
     /// jtg8-r4: True iff this error carries a `gh` 403 / API-rate-limit signal.
     /// The gh CLI surfaces rate-limit exhaustion as either
     /// `gh: API rate limit exceeded for installation ID ...` (GraphQL/REST)

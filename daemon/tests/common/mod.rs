@@ -914,6 +914,16 @@ pub struct FakeVcs {
     /// Optional error to return from `head_sha` on every call for a given
     /// branch, modeling a `git rev-parse` failure mid-quiescence-check.
     pub fail_head_sha_for: RefCell<HashMap<String, String>>,
+    /// advice-627-630-20260809 PR #628 finding 2: optional PERMANENT
+    /// (non-transient) error to return from `head_sha_within_for_repo` on
+    /// every call for a given `repo@branch` (or bare `branch`) key. Unlike
+    /// `fail_head_sha_for` (which always maps to `DaemonError::Tool`,
+    /// unconditionally transient per `DaemonError::is_transient()`), this
+    /// returns `DaemonError::Config` -- a genuinely non-transient error
+    /// class -- so tests can drive `reroll::evaluate_proceed`'s
+    /// consecutive-permanent-failure escalation path without depending on
+    /// `Tool`'s (unrelated, pre-existing) blanket transient classification.
+    pub fail_head_sha_permanent_for: RefCell<HashMap<String, String>>,
     /// Scripts `remote_head_sha(branch)`. Reuses the same `heads` map as
     /// `head_sha` (the fake doesn't model the local-vs-remote-tracking-ref
     /// distinction) — set `heads.insert(branch, sha)` to script both.
@@ -952,6 +962,16 @@ impl FakeVcs {
         self.fail_head_sha_for
             .borrow_mut()
             .insert(branch.to_string(), message.to_string());
+    }
+
+    /// advice-627-630-20260809 PR #628 finding 2: script a PERMANENT
+    /// (non-transient) `head_sha_within_for_repo` failure for `key` (either
+    /// a bare branch or a `repo@branch` scoped key, matching the lookup
+    /// order the fake's `head_sha_within_for_repo` impl already uses).
+    pub fn fail_head_sha_permanent_for(&self, key: &str, message: &str) {
+        self.fail_head_sha_permanent_for
+            .borrow_mut()
+            .insert(key.to_string(), message.to_string());
     }
 }
 
@@ -1086,6 +1106,52 @@ impl Vcs for FakeVcs {
             })
     }
 
+    fn head_sha_within_for_repo(
+        &self,
+        repo: &str,
+        branch: &str,
+        timeout_secs: u64,
+    ) -> Result<String, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("head_sha_within_for_repo({repo},{branch},{timeout_secs})"));
+        let scoped_key = format!("{repo}@{branch}");
+        let permanent_map = self.fail_head_sha_permanent_for.borrow();
+        if let Some(msg) = permanent_map
+            .get(&scoped_key)
+            .or_else(|| permanent_map.get(branch))
+        {
+            return Err(DaemonError::Config(msg.clone()));
+        }
+        drop(permanent_map);
+        let fail_map = self.fail_head_sha_for.borrow();
+        if let Some(msg) = fail_map.get(&scoped_key).or_else(|| fail_map.get(branch)) {
+            return Err(DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr: msg.clone(),
+            });
+        }
+        let schedule_map = self.head_sha_schedule.borrow();
+        if let Some(schedule) = schedule_map.get(&scoped_key).or_else(|| schedule_map.get(branch)) {
+            let now = std::time::Instant::now();
+            if let Some((_, sha)) = schedule.iter().rfind(|(at, _)| *at <= now) {
+                return Ok(sha.clone());
+            }
+        }
+        if let Some(sha) = self.heads.get(&scoped_key) {
+            return Ok(sha.clone());
+        }
+        self.heads
+            .get(branch)
+            .cloned()
+            .ok_or_else(|| DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr: format!("no scripted head for {scoped_key}"),
+            })
+    }
+
     fn is_remote_ahead(&self, branch: &str, remote_sha: &str) -> Result<bool, DaemonError> {
         self.calls
             .borrow_mut()
@@ -1202,6 +1268,13 @@ pub struct FakeStateStore {
     /// `reroll_deferral_count` SQLite column), so the fail-closed defer/cap
     /// path can be driven across repeated `reroll::execute` calls in a test.
     pub reroll_deferrals: RefCell<HashMap<String, u32>>,
+    /// advice-627-630-20260809 PR #628 finding 2: consecutive PERMANENT
+    /// (non-transient) reroll head-probe failure count per bead. Persisted
+    /// independently of `BeadOverlay` (mirrors the real
+    /// `reroll_head_permanent_failure_count` SQLite column), so the
+    /// permanent-failure escalation path can be driven across repeated
+    /// `reroll::execute` calls in a test.
+    pub reroll_head_permanent_failures: RefCell<HashMap<String, u32>>,
     /// Bead jleechan-zaga / issue #348 r3: per-bead held-recheck cooldown
     /// epoch (mirrors the `held_recheck_after` SQLite column), stored
     /// independently of `BeadOverlay`.
@@ -1448,6 +1521,38 @@ impl StateStore for FakeStateStore {
             .borrow_mut()
             .push(format!("reset_reroll_deferral({bead_id})"));
         self.reroll_deferrals
+            .borrow_mut()
+            .insert(bead_id.to_string(), 0);
+        Ok(())
+    }
+
+    fn reroll_head_permanent_failure_count(&self, bead_id: &str) -> Result<u32, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("reroll_head_permanent_failure_count({bead_id})"));
+        Ok(self
+            .reroll_head_permanent_failures
+            .borrow()
+            .get(bead_id)
+            .copied()
+            .unwrap_or(0))
+    }
+
+    fn incr_reroll_head_permanent_failure(&self, bead_id: &str) -> Result<u32, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("incr_reroll_head_permanent_failure({bead_id})"));
+        let mut map = self.reroll_head_permanent_failures.borrow_mut();
+        let count = map.entry(bead_id.to_string()).or_insert(0);
+        *count += 1;
+        Ok(*count)
+    }
+
+    fn reset_reroll_head_permanent_failure(&self, bead_id: &str) -> Result<(), DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("reset_reroll_head_permanent_failure({bead_id})"));
+        self.reroll_head_permanent_failures
             .borrow_mut()
             .insert(bead_id.to_string(), 0);
         Ok(())

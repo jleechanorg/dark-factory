@@ -5239,6 +5239,30 @@ impl Vcs for CliVcs {
         Ok(out.trim().to_string())
     }
 
+    /// Bead dark-factory-mw85: repo-scoped, budget-bounded `head_sha` — queries
+    /// `gh api repos/<repo>/git/ref/heads/<branch>` to fetch branch HEAD SHA,
+    /// decoupling reroll quiescence from the daemon's local process CWD.
+    fn head_sha_within_for_repo(
+        &self,
+        repo: &str,
+        branch: &str,
+        timeout_secs: u64,
+    ) -> Result<String, DaemonError> {
+        let path = format!("repos/{}/git/ref/heads/{}", repo, branch);
+        let out = run_tool("gh", &["api", &path, "--jq", ".object.sha"], timeout_secs)?;
+        let sha = out.trim();
+        if sha.is_empty() || sha == "null" {
+            return Err(DaemonError::Tool {
+                tool: "gh".to_string(),
+                rc: 0,
+                stderr: format!(
+                    "gh api {path} returned no sha for branch '{branch}' in {repo}"
+                ),
+            });
+        }
+        Ok(sha.to_string())
+    }
+
     fn is_remote_ahead(&self, branch: &str, remote_sha: &str) -> Result<bool, DaemonError> {
         // Two-step check:
         // 1. local_head == remote_sha ⇒ not ahead (worker hasn't actually
@@ -6552,6 +6576,12 @@ case "$url_path" in
       exit 0
     fi
     ;;
+  "repos/${repo}/git/ref/heads/"*)
+    if [ "$jq_filter" = ".object.sha" ]; then
+      echo "${GH_TEST_SHA:-}"
+      exit 0
+    fi
+    ;;
   "repos/${repo}/compare/"*)
     if [ "$jq_filter" = ".status" ]; then
       echo "${GH_TEST_STATUS:-}"
@@ -6703,6 +6733,56 @@ exit 1
         assert!(
             log.contains(".sha"),
             "expected --jq .sha in the logged gh invocation, got:\n{log}"
+        );
+
+        std::fs::remove_dir_all(&log_dir).ok();
+    }
+
+    /// Bead dark-factory-mw85: test `head_sha_within_for_repo` calls `gh api repos/<repo>/git/ref/heads/<branch>`
+    /// with `--jq .object.sha`.
+    #[test]
+    #[cfg(unix)]
+    fn head_sha_within_for_repo_targets_configured_repo_and_preserves_branch() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let log_dir = std::env::temp_dir().join(format!(
+            "afd_cli_vcs_argvlog_mw85_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let log_path = log_dir.join("argv.log");
+
+        let expected_sha = "1234567890abcdef1234567890abcdef12345678";
+        let target_repo = "other-owner/other-repo";
+        let branch = "factory/mw85-r1";
+
+        let result = with_fake_gh(
+            "head_sha_within_for_repo_slash",
+            target_repo,
+            expected_sha,
+            "",
+            Some(&log_path),
+            || {
+                let vcs = CliVcs::new("daemon-owner/daemon-repo".to_string());
+                vcs.head_sha_within_for_repo(target_repo, branch, 10)
+            },
+        );
+
+        assert_eq!(
+            result.expect("head_sha_within_for_repo should succeed"),
+            expected_sha
+        );
+
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            log.contains("repos/other-owner/other-repo/git/ref/heads/factory/mw85-r1"),
+            "expected the exact target_repo+branch URL in the logged gh invocation, got:\n{log}"
+        );
+        assert!(
+            log.contains(".object.sha"),
+            "expected --jq .object.sha in the logged gh invocation, got:\n{log}"
         );
 
         std::fs::remove_dir_all(&log_dir).ok();
@@ -6871,6 +6951,134 @@ exit 1
                 "identical-SHA short-circuit must succeed even with no gh on PATH: {e:?}"
             )),
             "ancestor_sha == descendant_sha must short-circuit to Ok(true)"
+        );
+    }
+
+    /// advice-627-630-20260809 PR #628 finding 1 (the MISSING REGRESSION
+    /// GUARD): every other test in this module -- including
+    /// `head_sha_within_for_repo_targets_configured_repo_and_preserves_branch`
+    /// above -- runs `with_fake_gh`'s closure IN-PROCESS from whatever cwd
+    /// `cargo test` was invoked from (the checkout root, a real git work
+    /// tree). `with_fake_gh` never touches cwd at all. None of them would
+    /// catch a regression that reintroduced a cwd-bound `git` subprocess
+    /// call into `head_sha_within_for_repo` (e.g. reverting its body back to
+    /// `self.head_sha_within(branch, timeout_secs)`, which shells out to
+    /// `git rev-parse <branch>` in the CALLING PROCESS's cwd) -- exactly the
+    /// installed, non-git daemon `WorkingDirectory` bug bead dark-factory-mw85
+    /// exists to fix.
+    ///
+    /// This test proves the probe survives a GENUINELY non-git process cwd.
+    /// It never calls `std::env::set_current_dir` in this shared,
+    /// `cargo test`-parallel process (that would race every other test in
+    /// the binary sharing the same process cwd) -- instead it re-invokes the
+    /// test binary itself as a child process (the established pattern in
+    /// this crate, see `target_worktree.rs`'s
+    /// `refreshes_clean_managed_checkout_to_stale_snapshot` and siblings),
+    /// with `Command::current_dir` pointed at a freshly created directory
+    /// that is verified non-git FIRST (a real `git rev-parse --show-toplevel`
+    /// must fail there) before the child ever runs.
+    #[test]
+    #[cfg(unix)]
+    fn head_sha_within_for_repo_survives_non_git_daemon_cwd() {
+        if std::env::var_os("AFD_HEAD_SHA_NONGIT_HELPER").is_some() {
+            // Child mode: this process's OWN cwd (set by the parent's
+            // `Command::current_dir`) is the freshly created, verified-non-git
+            // directory. If `head_sha_within_for_repo` ever regresses to a
+            // cwd-bound `git rev-parse` call, this directory has no `.git`
+            // for it to find and the call fails right here.
+            let target_repo = std::env::var("AFD_HEAD_SHA_NONGIT_REPO")
+                .expect("parent must set AFD_HEAD_SHA_NONGIT_REPO");
+            let branch = std::env::var("AFD_HEAD_SHA_NONGIT_BRANCH")
+                .expect("parent must set AFD_HEAD_SHA_NONGIT_BRANCH");
+            let expected_sha = std::env::var("AFD_HEAD_SHA_NONGIT_SHA")
+                .expect("parent must set AFD_HEAD_SHA_NONGIT_SHA");
+            let vcs = CliVcs::new("daemon-owner/daemon-repo".to_string());
+            let result = vcs.head_sha_within_for_repo(&target_repo, &branch, 10);
+            assert_eq!(
+                result.unwrap_or_else(|e| panic!(
+                    "head_sha_within_for_repo must succeed from a non-git daemon \
+                     cwd (this is exactly the mw85 regression if it fails): {e:?}"
+                )),
+                expected_sha
+            );
+            return;
+        }
+
+        // Parent mode: build the fixtures, spawn the child, assert it passed.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id();
+
+        // A freshly created, empty directory -- not inside any git work tree
+        // by construction (a brand-new subdirectory of the OS temp dir).
+        let nongit_dir =
+            std::env::temp_dir().join(format!("afd_head_sha_nongit_cwd_{pid}_{nanos}"));
+        let _ = std::fs::remove_dir_all(&nongit_dir);
+        std::fs::create_dir_all(&nongit_dir).unwrap();
+
+        // Verify non-git FIRST -- fail loudly (not silently false-pass) if
+        // the fixture directory somehow ended up inside a git work tree,
+        // since that would make the rest of this test prove nothing.
+        let probe = std::process::Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(&nongit_dir)
+            .output()
+            .expect("git must be on PATH to run the non-git precondition check");
+        assert!(
+            !probe.status.success(),
+            "precondition failed: {} is inside a git work tree (git rev-parse \
+             --show-toplevel unexpectedly succeeded: {}); this test cannot \
+             prove anything about non-git cwds until the fixture directory is \
+             genuinely outside any work tree",
+            nongit_dir.display(),
+            String::from_utf8_lossy(&probe.stdout)
+        );
+
+        // Fake `gh` shim, same shape `with_fake_gh` sets up, so the child can
+        // resolve `gh api repos/<repo>/git/ref/heads/<branch>` without a real
+        // network/auth dependency.
+        let fake_gh_dir = make_fake_gh_dir("head_sha_nongit_cwd");
+        let bin = fake_gh_dir.join("bin");
+
+        let target_repo = "other-owner/other-repo";
+        let branch = "factory/mw85-nongit-r1";
+        let expected_sha = "abcdef0123456789abcdef0123456789abcdef01";
+
+        let mut child_path = std::ffi::OsString::from(bin.to_str().unwrap());
+        if let Some(prior) = std::env::var_os("PATH") {
+            child_path.push(":");
+            child_path.push(prior);
+        }
+
+        let exe = std::env::current_exe().unwrap();
+        let status = std::process::Command::new(&exe)
+            .args([
+                "--exact",
+                "adapters::cli_vcs_gh_tests::head_sha_within_for_repo_survives_non_git_daemon_cwd",
+                "--nocapture",
+            ])
+            .current_dir(&nongit_dir)
+            .env("AFD_HEAD_SHA_NONGIT_HELPER", "1")
+            .env("AFD_HEAD_SHA_NONGIT_REPO", target_repo)
+            .env("AFD_HEAD_SHA_NONGIT_BRANCH", branch)
+            .env("AFD_HEAD_SHA_NONGIT_SHA", expected_sha)
+            .env("PATH", &child_path)
+            .env("GH_TEST_TARGET_REPO", target_repo)
+            .env("GH_TEST_SHA", expected_sha)
+            .status()
+            .expect("failed to spawn child test process");
+
+        std::fs::remove_dir_all(&fake_gh_dir).ok();
+        std::fs::remove_dir_all(&nongit_dir).ok();
+
+        assert!(
+            status.success(),
+            "head_sha_within_for_repo regressed: it failed when invoked from a \
+             genuinely non-git daemon cwd (see the child test's own output \
+             above -- likely a 'not a git repository' error from a \
+             reintroduced cwd-bound `git` call)"
         );
     }
 }
