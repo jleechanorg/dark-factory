@@ -652,25 +652,27 @@ pub fn normalize_labeled_prs_outcome(
         emit_intake_sweep_truncated(telemetry_log, full_universe_len, MAX_INTAKE_REPOS_PER_SWEEP);
     }
 
-    // PR #629 follow-up fix: `fetch_candidates`/`fetch_all_external_refs`
-    // are repo-independent (the tracker is one global beads store, not
-    // scoped per target repo) — fetch ONCE here, before any repo is
-    // processed, instead of re-fetching inside the per-repo loop via an
-    // unguarded `?` in `normalize_labeled_prs_with_cache`. Previously, a
-    // transient tracker error on repo N's (redundant) re-fetch propagated
-    // through this whole multi-repo sweep and discarded repos 1..N-1's
-    // already-accumulated `master_adopted`/`master_outcomes` — directly
-    // contradicting this function's own fail-soft, per-repo-isolation
-    // contract. A failure fetching this snapshot ONCE, before any repo is
-    // processed, is a legitimate whole-sweep abort: the tracker being down
-    // means nothing is possible this tick, and no prior repo's results
-    // exist yet to lose.
-    let tracker_candidates = tracker.fetch_candidates()?;
-    let known_refs = tracker.fetch_all_external_refs()?;
-    let tracker_snapshot = TrackerSweepSnapshot {
-        candidates: &tracker_candidates,
-        known_refs: &known_refs,
-    };
+    // PR #629 follow-up fix (round 3, codex P1 "unconditional tracker
+    // fetch starves dispatch on an irrelevant failure"): the tracker
+    // snapshot is LAZY + MEMOIZED — fetched at most once per sweep, and
+    // only once some repo's PR batch actually needs it (i.e. `scm`
+    // returned a non-empty `prs` list for that repo). The round-2 version
+    // of this fix fetched unconditionally, upfront, before the per-repo
+    // loop even started, and propagated a fetch failure via `?` — correct
+    // in isolation (no prior repo's results existed yet to lose), but
+    // wrong for the CALLER: `run_slow_tier` (tick.rs) calls this function
+    // with `?` too, so an upfront tracker error aborted the ENTIRE
+    // `normalize_labeled_prs_outcome` call and, transitively, every other
+    // phase of that slow tick — issue intake, routing, dispatch — even
+    // when EVERY repo in the sweep returned zero PRs or was rate-limited
+    // and the tracker was never actually needed. A malformed/unavailable
+    // closed-bead listing has nothing to do with issue intake or
+    // dispatching already-QUEUED beads, so it must never be able to
+    // starve them. `None` = not yet attempted this sweep; `Some(Err(()))`
+    // = attempted and failed (remaining repos needing it degrade without
+    // re-attempting or re-fetching); `Some(Ok(..))` = fetched once, reused
+    // by every subsequent repo's batch.
+    let mut tracker_snapshot_state: Option<TrackerSweepFetchResult> = None;
 
     for repo in &target_repos {
         if metrics.gh_call_count >= MAX_INTAKE_SWEEP_GH_CALLS {
@@ -705,6 +707,41 @@ pub fn normalize_labeled_prs_outcome(
         if prs.is_empty() {
             continue;
         }
+
+        // This repo's batch needs the tracker snapshot — fetch it now if
+        // no repo earlier in this sweep already has (memoized: at most
+        // one fetch attempt per sweep, success or failure).
+        let snapshot_result = tracker_snapshot_state.get_or_insert_with(|| {
+            match (tracker.fetch_candidates(), tracker.fetch_all_external_refs()) {
+                (Ok(candidates), Ok(refs)) => Ok((candidates, refs)),
+                (Err(e), _) | (_, Err(e)) => {
+                    eprintln!(
+                        "auto-factory daemon: WARNING intake tracker snapshot fetch failed \
+                         (first needed by repository {repo}): {e}; degrading PR intake for the \
+                         remainder of this sweep — issue intake and dispatch still proceed"
+                    );
+                    emit_intake_repo_sweep_failed(telemetry_log, repo, "tracker_snapshot", &e.to_string());
+                    Err(())
+                }
+            }
+        });
+
+        let (tracker_candidates, known_refs): (&[Bead], &std::collections::HashSet<String>) =
+            match snapshot_result {
+                Ok((candidates, refs)) => (candidates.as_slice(), &*refs),
+                Err(()) => {
+                    eprintln!(
+                        "auto-factory daemon: WARNING intake skipping repository {repo}: tracker \
+                         snapshot unavailable this sweep (see the earlier \
+                         INTAKE_REPO_SWEEP_FAILED tracker_snapshot event)"
+                    );
+                    continue;
+                }
+            };
+        let tracker_snapshot = TrackerSweepSnapshot {
+            candidates: tracker_candidates,
+            known_refs,
+        };
 
         let (adopted, outcomes) = normalize_labeled_prs_with_cache(
             scm,
@@ -798,14 +835,25 @@ fn emit_intake_sweep_truncated(telemetry_log: &Path, configured_repo_count: usiz
     }
 }
 
-/// One-time-per-sweep snapshot of the tracker's known beads/refs, fetched
-/// ONCE in `normalize_labeled_prs_outcome` before any repo is processed
-/// (see that function's doc comment for the multi-repo abort bug this
-/// closes).
+/// At-most-once-per-sweep snapshot of the tracker's known beads/refs,
+/// lazily fetched in `normalize_labeled_prs_outcome` the first time some
+/// repo's PR batch actually needs it, and memoized for the rest of the
+/// sweep (see that function's doc comment for the starvation bug this
+/// closes — round 3 of the PR #629 follow-up).
 pub(crate) struct TrackerSweepSnapshot<'a> {
     candidates: &'a [Bead],
     known_refs: &'a std::collections::HashSet<String>,
 }
+
+/// Named alias for the lazy tracker-snapshot memo's inner `Result`, purely
+/// to keep `normalize_labeled_prs_outcome`'s local binding under clippy's
+/// `type_complexity` threshold without an `#[allow]`. `Ok` holds the
+/// owned, one-time-fetched `(fetch_candidates, fetch_all_external_refs)`
+/// pair; `Err(())` records "already attempted and failed this sweep" —
+/// the underlying `DaemonError` is only needed at the point of failure
+/// (already consumed into an `eprintln!`/telemetry event there), not
+/// after memoization.
+type TrackerSweepFetchResult = Result<(Vec<Bead>, std::collections::HashSet<String>), ()>;
 
 /// One repo's already-fetched PR batch — bundled with `repo` purely to keep
 /// `normalize_labeled_prs_with_cache`'s argument count under clippy's

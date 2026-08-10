@@ -1476,6 +1476,224 @@ fn tracker_fetch_failure_isolated_to_second_repo_preserves_first_repos_adoption(
     );
 }
 
+/// Tracker double for the round-3 lazy/memoized snapshot tests: counts
+/// `fetch_candidates` invocations and, when `should_fail` is set, always
+/// fails (simulating a malformed/unavailable closed-bead listing) so the
+/// tests can assert BOTH "never called" and "called exactly once".
+struct CountingTracker {
+    inner: FakeTracker,
+    fetch_candidates_calls: std::cell::Cell<u32>,
+    should_fail: bool,
+}
+impl CountingTracker {
+    fn new(should_fail: bool) -> Self {
+        Self {
+            inner: FakeTracker::new(),
+            fetch_candidates_calls: std::cell::Cell::new(0),
+            should_fail,
+        }
+    }
+}
+impl Tracker for CountingTracker {
+    fn fetch_candidates(&self) -> Result<Vec<Bead>, DaemonError> {
+        self.fetch_candidates_calls.set(self.fetch_candidates_calls.get() + 1);
+        if self.should_fail {
+            return Err(DaemonError::Tool {
+                tool: "br".into(),
+                rc: 1,
+                stderr: "br: list beads: malformed closed-bead listing".into(),
+            });
+        }
+        self.inner.fetch_candidates()
+    }
+    fn fetch_all_external_refs(&self) -> Result<std::collections::HashSet<String>, DaemonError> {
+        if self.should_fail {
+            return Err(DaemonError::Tool {
+                tool: "br".into(),
+                rc: 1,
+                stderr: "br: list beads: malformed closed-bead listing".into(),
+            });
+        }
+        self.inner.fetch_all_external_refs()
+    }
+    fn create_bead(&self, title: &str, body: &str, external_ref: &str) -> Result<String, DaemonError> {
+        self.inner.create_bead(title, body, external_ref)
+    }
+    fn comment_external(&self, external_ref: &str, body: &str) -> Result<(), DaemonError> {
+        self.inner.comment_external(external_ref, body)
+    }
+}
+
+/// PR #629 follow-up fix (round 3, codex P1): pre-fix, the tracker
+/// snapshot (`fetch_candidates` + `fetch_all_external_refs`) was fetched
+/// UNCONDITIONALLY, before the per-repo loop even started -- regardless
+/// of whether any repo actually had a PR batch to process. This test
+/// scripts every target repo to return an EMPTY PR list (the SCM side is
+/// healthy, there is simply nothing to intake this tick) with a tracker
+/// double that would error if ever called, and asserts the tracker is
+/// NEVER touched. Run against pre-fix (unconditional-fetch) code, this
+/// fails: `fetch_candidates_calls` is 1 even though no repo needed it, and
+/// (worse) the whole sweep would have returned `Err` and aborted
+/// `run_slow_tier` before issue intake / dispatch ever ran.
+#[test]
+fn tracker_never_touched_when_no_repo_has_a_pr_batch() {
+    let scm = FakeScm::new(); // no scm.prs pushed -> every repo's labeled_prs_for_repo returns empty.
+    let tracker = CountingTracker::new(/* should_fail = */ true);
+    let mut cfg = test_cfg();
+    cfg.target_repo = "jleechanorg/dark-factory".into();
+    cfg.repos.insert(
+        "jleechanorg/worldarchitect.ai".into(),
+        daemon::config::RepoConfig {
+            ao_project: "worldarchitect".into(),
+            push_remote: "worldai".into(),
+            local_checkout: None,
+        },
+    );
+    let mut cache = AdoptionProbeCache::new();
+
+    let outcome = intake::normalize_labeled_prs_outcome(
+        &scm,
+        &tracker,
+        &cfg,
+        &mut cache,
+        1_700_000_000,
+        &test_telemetry_log(),
+    );
+
+    assert!(
+        outcome.is_ok(),
+        "a sweep where every repo returns zero PRs must succeed even when the \
+         tracker is completely broken -- the tracker is never needed this tick: {outcome:?}"
+    );
+    assert_eq!(
+        tracker.fetch_candidates_calls.get(),
+        0,
+        "the tracker snapshot must be LAZY: it must never be fetched when no \
+         repo's PR batch actually needs it"
+    );
+}
+
+/// PR #629 follow-up fix (round 3, codex P1): the tracker snapshot must
+/// be MEMOIZED -- fetched at most once per sweep even when multiple repos
+/// each have a non-empty PR batch that needs it. Two repos, both with a
+/// real PR, tracker healthy: `fetch_candidates` must be called exactly
+/// once (repo 1's batch triggers the fetch; repo 2's batch reuses the
+/// memoized result). Run against pre-fix code, `fetch_candidates` is
+/// still called exactly once here too (pre-fix already fetched upfront,
+/// unconditionally) -- this test's job is to PROTECT that "at most once"
+/// property across the lazy-fetch refactor, not to prove a regression by
+/// itself.
+#[test]
+fn tracker_snapshot_fetched_at_most_once_across_two_repos_with_prs() {
+    let mut scm = FakeScm::new();
+    let mut pr_a = labeled_pr_with_cache_key(70, "alice", "feature/pr-70", "sha-70", 1_700_000_000);
+    pr_a.external_ref = "jleechanorg/dark-factory#70".into();
+    pr_a.head_repo_full_name = Some("jleechanorg/dark-factory".into());
+    let mut pr_b = labeled_pr_with_cache_key(71, "alice", "feature/pr-71", "sha-71", 1_700_000_000);
+    pr_b.external_ref = "jleechanorg/worldarchitect.ai#71".into();
+    pr_b.head_repo_full_name = Some("jleechanorg/worldarchitect.ai".into());
+    scm.prs.push(pr_a);
+    scm.prs.push(pr_b);
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = CountingTracker::new(/* should_fail = */ false);
+    let mut cfg = test_cfg();
+    cfg.target_repo = "jleechanorg/dark-factory".into();
+    cfg.repos.insert(
+        "jleechanorg/worldarchitect.ai".into(),
+        daemon::config::RepoConfig {
+            ao_project: "worldarchitect".into(),
+            push_remote: "worldai".into(),
+            local_checkout: None,
+        },
+    );
+    let mut cache = AdoptionProbeCache::new();
+
+    let outcome = intake::normalize_labeled_prs_outcome(
+        &scm,
+        &tracker,
+        &cfg,
+        &mut cache,
+        1_700_000_000,
+        &test_telemetry_log(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        tracker.fetch_candidates_calls.get(),
+        1,
+        "the tracker snapshot must be fetched exactly ONCE across a sweep, no \
+         matter how many repos' PR batches need it"
+    );
+    assert_eq!(
+        outcome.adopted.len(),
+        2,
+        "both repos' PRs must still be adopted using the shared, memoized \
+         snapshot: {:?}",
+        outcome.adopted
+    );
+}
+
+/// PR #629 follow-up fix (round 3, codex P1, the headline fix): when the
+/// tracker snapshot fetch itself FAILS for a repo that has a real PR
+/// batch, `normalize_labeled_prs_outcome` must DEGRADE (skip that repo's
+/// PR intake, emit structured `INTAKE_REPO_SWEEP_FAILED`
+/// `error_class=tracker_snapshot` telemetry) rather than propagate the
+/// error and abort the whole call. The caller, `run_slow_tier` (tick.rs),
+/// uses `?` on this function's return value -- an `Err` here would abort
+/// issue intake AND dispatch for the entire tick on a failure that has
+/// nothing to do with either. Run against pre-fix (round-2) code, this
+/// test's `outcome.is_ok()` assertion fails: the unconditional upfront
+/// fetch propagates the tracker error via `?` before the per-repo loop
+/// even starts.
+#[test]
+fn tracker_snapshot_failure_degrades_without_aborting_the_sweep() {
+    let mut scm = FakeScm::new();
+    let mut pr = labeled_pr_with_cache_key(80, "alice", "feature/pr-80", "sha-80", 1_700_000_000);
+    pr.external_ref = "jleechanorg/dark-factory#80".into();
+    pr.head_repo_full_name = Some("jleechanorg/dark-factory".into());
+    scm.prs.push(pr);
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = CountingTracker::new(/* should_fail = */ true);
+    let mut cfg = test_cfg();
+    cfg.target_repo = "jleechanorg/dark-factory".into();
+    let mut cache = AdoptionProbeCache::new();
+    let telemetry_log = test_telemetry_log();
+
+    let outcome = intake::normalize_labeled_prs_outcome(
+        &scm,
+        &tracker,
+        &cfg,
+        &mut cache,
+        1_700_000_000,
+        &telemetry_log,
+    );
+
+    let outcome = outcome.unwrap_or_else(|e| {
+        panic!(
+            "a tracker snapshot fetch failure must DEGRADE this sweep, not abort \
+             it -- run_slow_tier (tick.rs) uses `?` on this return value, so an \
+             Err here would starve issue intake + dispatch on a failure \
+             unrelated to either: {e:?}"
+        )
+    });
+    assert!(
+        outcome.adopted.is_empty(),
+        "the PR whose repo needed the (failed) tracker snapshot must not be \
+         adopted this tick: {:?}",
+        outcome.adopted
+    );
+
+    let telemetry_body = std::fs::read_to_string(&telemetry_log)
+        .expect("emit_intake_repo_sweep_failed must have written the telemetry log");
+    assert!(
+        telemetry_body.contains("INTAKE_REPO_SWEEP_FAILED") && telemetry_body.contains("tracker_snapshot"),
+        "a structured INTAKE_REPO_SWEEP_FAILED (error_class=tracker_snapshot) \
+         event must be emitted, not just an eprintln!; got: {telemetry_body}"
+    );
+}
+
 #[test]
 fn no_duplicate_replay_from_default_fake_adapter() {
     let mut scm = FakeScm::new();
