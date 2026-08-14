@@ -167,6 +167,24 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
         projectConfig = { ...projectConfig, path: targetRealpath };
         config.projects = { ...config.projects, [project]: projectConfig };
       }
+      try {
+        execFileSync("git", ["-C", targetRealpath, "worktree", "prune"], {
+          encoding: "utf8",
+        });
+      } catch {
+        // Best-effort stale worktree metadata cleanup
+      }
+      try {
+        execFileSync(
+          "git",
+          ["-C", targetRealpath, "update-ref", `refs/heads/${branch}`, expectedRevision],
+          { encoding: "utf8" },
+        );
+      } catch (error) {
+        fail(
+          `cannot update target branch ${branch} to expected revision ${expectedRevision}: ${error}`,
+        );
+      }
     }
     const registry = core.createPluginRegistry();
     await registry.loadFromConfig(config, async (packageName) =>
