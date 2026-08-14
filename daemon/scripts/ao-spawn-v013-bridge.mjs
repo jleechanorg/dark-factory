@@ -1,8 +1,9 @@
-import { dirname, join, parse } from "node:path";
+import { dirname, join, parse, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { readFile } from "node:fs/promises";
-import { realpathSync } from "node:fs";
+import { realpathSync, mkdirSync, rmSync, existsSync, appendFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { homedir } from "node:os";
 
 if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
   const fail = (message) => {
@@ -78,6 +79,7 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
 
     const branch = process.env.DARK_FACTORY_AO_SPAWN_BRANCH;
     if (!branch) fail("DARK_FACTORY_AO_SPAWN_BRANCH is required");
+    const expectedRevision = process.env.DARK_FACTORY_AO_EXPECTED_REVISION;
 
     // Resolve AO dependencies with Node's ESM resolver anchored at the
     // running CLI entry. This supports workspace symlinks, hoisted package
@@ -119,7 +121,7 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
     const config = core.loadConfig();
     let projectConfig = config.projects[project];
     if (!projectConfig) fail(`unknown AO project ${project}`);
-    if (!diagnosticMode && process.env.DARK_FACTORY_AO_EXPECTED_REVISION) {
+    if (!diagnosticMode && expectedRevision) {
       const targetCheckout = process.env.DARK_FACTORY_AO_TARGET_CHECKOUT;
       if (!targetCheckout || !targetCheckout.startsWith("/")) {
         fail("DARK_FACTORY_AO_TARGET_CHECKOUT is required for worker spawns");
@@ -143,7 +145,6 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
           `AO project ${project} source ${configuredRealpath} does not match validated target checkout ${targetRealpath}`,
         );
       }
-      const expectedRevision = process.env.DARK_FACTORY_AO_EXPECTED_REVISION;
       let actualRevision;
       try {
         actualRevision = execFileSync(
@@ -172,6 +173,181 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
     await registry.loadFromConfig(config, async (packageName) =>
       import(resolveAoPackage(packageName)),
     );
+
+    const wrapWorkspacePlugin = (originalWorkspace, expectedRev, aoConfig) => ({
+      ...originalWorkspace,
+
+      async findManagedWorkspace(workspaceConfig) {
+        if (typeof originalWorkspace?.findManagedWorkspace === "function") {
+          const found = await originalWorkspace.findManagedWorkspace(workspaceConfig);
+          if (found && found.path) {
+            try {
+              const headSha = execFileSync(
+                "git",
+                ["-C", found.path, "rev-parse", "HEAD"],
+                { encoding: "utf8" }
+              ).trim();
+              if (headSha === expectedRev) {
+                return found;
+              }
+            } catch {
+              // Treat unresolvable HEAD as stale
+            }
+            try {
+              if (typeof originalWorkspace.destroy === "function") {
+                await originalWorkspace.destroy(
+                  found.path,
+                  found.repoPath ?? workspaceConfig.project?.path
+                );
+              }
+            } catch {
+              // Best-effort cleanup
+            }
+          }
+        }
+        return null;
+      },
+
+      async create(workspaceConfig) {
+        const { projectId, project: pConfig, sessionId, branch: targetBranch } = workspaceConfig;
+        const repoPath = pConfig?.path;
+        if (!repoPath) {
+          throw new Error(`Project ${projectId} is missing path in workspace config`);
+        }
+
+        const worktreeBaseDir =
+          workspaceConfig.worktreeDir ??
+          aoConfig?.plugins?.["workspace-worktree"]?.worktreeDir ??
+          aoConfig?.defaults?.worktreeDir ??
+          join(homedir(), ".worktrees");
+
+        const expandedBaseDir = worktreeBaseDir.startsWith("~/")
+          ? join(homedir(), worktreeBaseDir.slice(2))
+          : worktreeBaseDir;
+
+        const projectWorktreeDir = join(expandedBaseDir, projectId);
+        const worktreePath = join(projectWorktreeDir, sessionId);
+
+        mkdirSync(projectWorktreeDir, { recursive: true });
+
+        // Clean up stale worktree / directory at worktreePath if present
+        try {
+          execFileSync(
+            "git",
+            ["-C", repoPath, "worktree", "remove", "--force", "--force", worktreePath],
+            { stdio: "ignore" }
+          );
+        } catch {}
+        try {
+          execFileSync(
+            "git",
+            ["-C", repoPath, "worktree", "unlock", worktreePath],
+            { stdio: "ignore" }
+          );
+        } catch {}
+        if (existsSync(worktreePath)) {
+          try {
+            rmSync(worktreePath, { recursive: true, force: true });
+          } catch {}
+        }
+        try {
+          execFileSync("git", ["-C", repoPath, "worktree", "prune"], {
+            stdio: "ignore",
+          });
+        } catch {}
+
+        // Clean up stale worktree if the branch is checked out elsewhere
+        try {
+          const listOutput = execFileSync(
+            "git",
+            ["-C", repoPath, "worktree", "list", "--porcelain"],
+            { encoding: "utf8" }
+          );
+          const entries = listOutput.split("\n\n").map((block) => {
+            let p = "";
+            let b = "";
+            for (const line of block.trim().split("\n")) {
+              if (line.startsWith("worktree ")) p = resolve(line.slice("worktree ".length).trim());
+              if (line.startsWith("branch ")) b = line.slice("branch ".length).replace("refs/heads/", "").trim();
+            }
+            return { path: p, branch: b };
+          });
+          const normalizedWorktreePath = resolve(worktreePath);
+          for (const entry of entries) {
+            if (entry.branch === targetBranch && entry.path && entry.path !== normalizedWorktreePath) {
+              try {
+                execFileSync(
+                  "git",
+                  ["-C", repoPath, "worktree", "remove", "--force", "--force", entry.path],
+                  { stdio: "ignore" }
+                );
+              } catch {}
+            }
+          }
+        } catch {}
+
+        // Create worktree on expectedRevision using -B (force-sets/resets branch to expectedRevision)
+        execFileSync(
+          "git",
+          ["-C", repoPath, "worktree", "add", "-B", targetBranch, worktreePath, expectedRev],
+          { encoding: "utf8" }
+        );
+
+        // Set up AO-managed exclude patterns in worktree
+        try {
+          let gitCommonDir;
+          try {
+            gitCommonDir = execFileSync(
+              "git",
+              ["-C", worktreePath, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+              { encoding: "utf8" }
+            ).trim();
+          } catch {
+            const dotGit = join(worktreePath, ".git");
+            gitCommonDir = dotGit;
+          }
+          const excludeDir = join(gitCommonDir, "info");
+          const excludeFile = join(excludeDir, "exclude");
+          mkdirSync(excludeDir, { recursive: true });
+          let existingContent = "";
+          try {
+            existingContent = await readFile(excludeFile, "utf8");
+          } catch {}
+          if (!existingContent.includes("# AO-managed files")) {
+            const patterns = `# AO-managed files - do not track in worktree\n.claude/settings.json\n.claude/metadata-updater.sh\n.cursor/settings.json\n.cursor/metadata-updater.sh\n.gemini/settings.json\n.gemini/metadata-updater.sh\n`;
+            appendFileSync(excludeFile, (existingContent ? "\n\n" : "") + patterns);
+          }
+        } catch {}
+
+        // Lock worktree
+        try {
+          execFileSync(
+            "git",
+            ["-C", repoPath, "worktree", "lock", "--reason", "AO session active", worktreePath],
+            { stdio: "ignore" }
+          );
+        } catch {}
+
+        return {
+          path: worktreePath,
+          branch: targetBranch,
+          sessionId,
+          projectId,
+          repoPath,
+        };
+      },
+    });
+
+    if (expectedRevision && !diagnosticMode && typeof registry.get === "function") {
+      const originalGet = registry.get.bind(registry);
+      registry.get = (slot, name) => {
+        const plugin = originalGet(slot, name);
+        if (slot === "workspace" && plugin) {
+          return wrapWorkspacePlugin(plugin, expectedRevision, config);
+        }
+        return plugin;
+      };
+    }
 
     // Enumerate installed agent plugins for the daemon's fail-closed vendor
     // preflight. Three mutually-exclusive outcomes — the daemon rejects all
