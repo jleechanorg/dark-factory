@@ -60,22 +60,34 @@ def _ao_wait_idle(
     which is much faster than the unfiltered call when the fleet has many
     sessions.
 
+    The inner ``ao status`` probe has its own 180 s subprocess timeout;
+    a hung ``ao status`` must NOT crash the waiter — it is treated as a
+    transient probe failure and the loop retries until the outer
+    deadline elapses, then returns ``"timeout"``.
+
     Returns the last observed terminal activity ("exited", "ready",
     "missing"), or "timeout" if the deadline elapsed before idle stabilised.
     """
     deadline = time.monotonic() + timeout
     consecutive = 0
     status_cmd = ["ao", "status", "--json"]
+    if project:
+        status_cmd = ["ao", "status", "-p", project, "--json"]
     while time.monotonic() < deadline:
-        proc = subprocess.run(
-            status_cmd,
-            cwd=workdir,
-            capture_output=True,
-            text=True,
-            timeout=180,
-            check=False,
-            env=_handlers_shim._sanitized_env(),
-        )
+        try:
+            proc = subprocess.run(
+                status_cmd,
+                cwd=workdir,
+                capture_output=True,
+                text=True,
+                timeout=180,
+                check=False,
+                env=_handlers_shim._sanitized_env(),
+            )
+        except subprocess.TimeoutExpired:
+            # The status probe itself hung — treat as transient and retry.
+            time.sleep(poll_interval)
+            continue
         if proc.returncode == 0:
             activity = _ao_parse_status(proc.stdout, session)
             if activity in ("exited", "missing"):
