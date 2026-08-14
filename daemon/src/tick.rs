@@ -3483,12 +3483,39 @@ fn vacuous_red_green_for_pr(
         }
     };
     let ensure = if routing.local_checkout.is_none() {
-        crate::target_worktree::ensure_managed_target_worktree
+        crate::target_worktree::ensure_managed_target_worktree_with_heal
     } else {
-        crate::target_worktree::ensure_target_worktree
+        crate::target_worktree::ensure_target_worktree_with_heal
     };
-    let repo_root = match ensure(repo, &requested, Some(&snapshot.head_sha)) {
-        Ok(path) => path,
+    // jleechan-y189: self-heal preflight before provisioning. The heal
+    // refuses to touch the worktree when a live AO session is in flight
+    // (per the `is_live` predicate below); every other broken-but-recoverable
+    // state — stale `index.lock`, untracked caches, dirty tracked edits,
+    // missing target branch — is healed in place so the verifier gate never
+    // parks the bead `HUMAN_HELD` for a recoverable worktree failure.
+    // Conservative live signal at the verifier layer: any globally-active
+    // AO session is treated as live, since the verifier runs while workers
+    // may still be flushing output to the same checkout.
+    let is_live = |path: &std::path::Path| -> Result<bool, DaemonError> {
+        let _ = path;
+        match deps.sessions.active_count() {
+            Ok(count) => Ok(count > 0),
+            // Probe failures must NOT block recovery — a flaky `ao status`
+            // would otherwise pin a broken-but-recoverable checkout.
+            Err(_) => Ok(false),
+        }
+    };
+    // The verifier gate has no branch identity on `PrSnapshot` — branch
+    // provisioning is a dispatch-time concern. Pass an empty expected
+    // branch so the heal pass's missing-branch step is a no-op here.
+    let (repo_root, _heal_report) = match ensure(
+        repo,
+        &requested,
+        Some(&snapshot.head_sha),
+        "",
+        is_live,
+    ) {
+        Ok(tuple) => tuple,
         Err(error) => {
             return verifier::VacuousRedGreenStatus::ManifestMissing(format!(
                 "provision target worktree for repo {repo:?} at {}: {error}",

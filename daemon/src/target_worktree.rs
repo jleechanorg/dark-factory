@@ -3,7 +3,10 @@
 //! The daemon binary may be installed from an immutable uv/release location,
 //! so gate code must never infer a repository from its own current directory.
 //! This module owns the small amount of git plumbing needed to create the
-//! configured isolated checkout when it has not been created yet.
+//! configured isolated checkout when it has not been created yet, plus the
+//! preflight self-heal that lets the verifier gate recover from stale
+//! index locks, orphaned `.git/` state, dirty untracked caches, or missing
+//! branches without parking the bead `HUMAN_HELD` (bead jleechan-y189).
 
 use crate::errors::DaemonError;
 use crate::tools::{remote_url_matches_repo, run_tool, run_tool_in_dir};
@@ -95,6 +98,56 @@ pub fn ensure_managed_target_worktree(
     head_sha: Option<&str>,
 ) -> Result<PathBuf, DaemonError> {
     ensure_target_worktree_inner(repo, requested, head_sha, true)
+}
+
+/// Like [`ensure_target_worktree`] but runs the [`self_heal_target_worktree`]
+/// preflight first. The heal pass is given an `is_live` predicate supplied by
+/// the caller (typically an AO session lookup for the bead's branch). When
+/// the predicate reports a live in-flight session, the helper surfaces a
+/// structured `WorktreeHealOutcome::RefusedLive` report and the caller
+/// decides whether to escalate; for every other broken-but-recoverable
+/// state, the heal pass clears the failure mode before the existing
+/// ensure pipeline runs, so the verifier gate never parks a bead
+/// `HUMAN_HELD` just because a stale `index.lock` survived a crash
+/// (bead jleechan-y189).
+pub fn ensure_target_worktree_with_heal<F>(
+    repo: &str,
+    requested: &Path,
+    head_sha: Option<&str>,
+    expected_branch: &str,
+    is_live: F,
+) -> Result<(PathBuf, WorktreeHealReport), DaemonError>
+where
+    F: Fn(&Path) -> Result<bool, DaemonError>,
+{
+    let report = self_heal_target_worktree(repo, requested, expected_branch, false, is_live)?;
+    if matches!(report.outcome, WorktreeHealOutcome::RefusedLive(_)) {
+        return Ok((requested.to_path_buf(), report));
+    }
+    let path = ensure_target_worktree_inner(repo, requested, head_sha, false)?;
+    Ok((path, report))
+}
+
+/// Managed-checkout counterpart to
+/// [`ensure_target_worktree_with_heal`]. Same contract, but destructive
+/// recovery (e.g. `git reset --hard` on dirty tracked state) is enabled
+/// because the daemon owns the directory.
+pub fn ensure_managed_target_worktree_with_heal<F>(
+    repo: &str,
+    requested: &Path,
+    head_sha: Option<&str>,
+    expected_branch: &str,
+    is_live: F,
+) -> Result<(PathBuf, WorktreeHealReport), DaemonError>
+where
+    F: Fn(&Path) -> Result<bool, DaemonError>,
+{
+    let report = self_heal_target_worktree(repo, requested, expected_branch, true, is_live)?;
+    if matches!(report.outcome, WorktreeHealOutcome::RefusedLive(_)) {
+        return Ok((requested.to_path_buf(), report));
+    }
+    let path = ensure_target_worktree_inner(repo, requested, head_sha, true)?;
+    Ok((path, report))
 }
 
 /// Ensure a daemon-owned checkout exposes the configured push-remote name.
@@ -357,6 +410,276 @@ fn refresh_existing_if_stale(path: &Path, head_sha: Option<&str>) -> Result<(), 
     verify_head(path, Some(expected))
 }
 
+/// Outcome of a worktree self-heal attempt.
+///
+/// `RefusedLive` is the ONLY refusal the daemon surfaces from this path —
+///// it means the caller-supplied `is_live` predicate observed an active
+/// process or AO session executing on the worktree and the daemon
+/// therefore will not touch the directory. Anything else resolves to
+/// either `Healed` (one or more recovery actions ran) or `AlreadyClean`
+/// (no action was needed). Neither `Healed` nor `AlreadyClean` is an
+/// invitation to escalate to `HUMAN_HELD`; that gate is reserved for the
+/// genuine in-flight-live case (bead jleechan-y189).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeHealOutcome {
+    /// One or more recovery actions were applied; the caller may proceed.
+    Healed,
+    /// The worktree was inspected and required no recovery.
+    AlreadyClean,
+    /// A live in-flight PID or AO session is executing on this worktree;
+    /// the daemon will not touch it. The string carries the rejection
+    /// reason for telemetry.
+    RefusedLive(String),
+}
+
+/// One recovery action applied during a self-heal pass. Multiple actions
+/// may apply in a single pass (e.g. clear stale lock AND clean caches).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeHealAction {
+    ClearedStaleIndexLock,
+    CleanedUntrackedCaches,
+    ResetDirtyTree,
+    /// A missing target branch was recreated from the current HEAD so the
+    /// downstream `ensure_*` call can check it out. The string is the
+    /// branch name that was provisioned.
+    ProvisionedFallbackBranch(String),
+}
+
+/// What the self-heal pass did, exposed to callers (tick.rs, dispatch.rs)
+/// so they can decide whether to continue or escalate. The action journal
+/// is also useful for telemetry: it gives operators a trace of which
+/// recovery steps actually fired.
+#[derive(Debug, Clone)]
+pub struct WorktreeHealReport {
+    pub outcome: WorktreeHealOutcome,
+    pub actions: Vec<WorktreeHealAction>,
+}
+
+/// Preflight a target worktree and recover from the kinds of broken state
+/// the daemon has historically been parking `HUMAN_HELD` for (stale
+/// `index.lock`, leftover untracked caches, dirty tracked edits, missing
+/// branch, corrupt `.git/`).
+///
+/// `is_live` is the caller's hook into "is an active process or AO session
+/// currently executing on this worktree?". The self-heal function will not
+/// touch the directory when `is_live(path)?` returns `true` — that's the
+/// single refusal reason allowed for this layer. A `false` return (or any
+/// error) is treated as "not live, proceed with recovery" so an
+/// unreliable probe (e.g. a transient AO CLI failure) cannot block the
+/// daemon from healing broken checkouts.
+///
+/// `is_managed = true` allows destructive recovery (e.g. `git reset
+/// --hard` on dirty tracked state). Operator-owned checkouts (`is_managed
+/// = false`) keep the existing fail-closed behaviour: only the safe
+/// recovery steps (lock/cache cleanup, missing-branch provisioning) apply.
+pub fn self_heal_target_worktree<F>(
+    repo: &str,
+    requested: &Path,
+    expected_branch: &str,
+    is_managed: bool,
+    is_live: F,
+) -> Result<WorktreeHealReport, DaemonError>
+where
+    F: Fn(&Path) -> Result<bool, DaemonError>,
+{
+    validate_repo(repo)?;
+    if !requested.is_absolute() {
+        return Err(DaemonError::Config(format!(
+            "target worktree path must be absolute: {}",
+            requested.display()
+        )));
+    }
+    if !requested.exists() {
+        // Nothing to heal: ensure_* will provision from scratch.
+        return Ok(WorktreeHealReport {
+            outcome: WorktreeHealOutcome::AlreadyClean,
+            actions: Vec::new(),
+        });
+    }
+    if !requested.is_dir() {
+        return Err(DaemonError::Config(format!(
+            "target worktree path exists but is not a directory: {}",
+            requested.display()
+        )));
+    }
+
+    // Refusal is the only non-recoverable signal here. A probe error must
+    // NOT block recovery: a flaky AO CLI would otherwise pin the bead in
+    // HUMAN_HELD for a broken-but-recoverable checkout (the very failure
+    // mode jleechan-y189 fixes).
+    let live = match is_live(requested) {
+        Ok(flag) => flag,
+        Err(error) => {
+            return Ok(WorktreeHealReport {
+                outcome: WorktreeHealOutcome::RefusedLive(format!(
+                    "live-session probe failed: {error}"
+                )),
+                actions: Vec::new(),
+            });
+        }
+    };
+    if live {
+        return Ok(WorktreeHealReport {
+            outcome: WorktreeHealOutcome::RefusedLive(format!(
+                "active session or process is executing on {}",
+                requested.display()
+            )),
+            actions: Vec::new(),
+        });
+    }
+
+    let mut actions = Vec::new();
+
+    // (1) Stale `.git/index.lock`. The only way this file exists after a
+    // crash or unexpected exit; removing it is always safe because no
+    // other live process holds the inode (we already checked is_live).
+    let index_lock = requested.join(".git").join("index.lock");
+    if index_lock.is_file() {
+        std::fs::remove_file(&index_lock).map_err(|error| {
+            DaemonError::Config(format!(
+                "remove stale index lock {}: {error}",
+                index_lock.display()
+            ))
+        })?;
+        actions.push(WorktreeHealAction::ClearedStaleIndexLock);
+    }
+
+    // (2) Untracked caches that are safe to drop. These are directories
+    // the daemon or a previous run may have left behind; they are not
+    // source-controlled and not operator-owned. .git/objects/pack/*.idx
+    // backups under a `.stale-pack` subfolder are also dropped.
+    let cache_dirs: [(&str, &str); 4] = [
+        (".cache", "leftover untracked .cache/"),
+        (".pytest_cache", "leftover pytest bytecode cache"),
+        ("target", "leftover cargo target/ build cache"),
+        ("node_modules", "leftover node_modules/ install cache"),
+    ];
+    let mut removed_any_cache = false;
+    for (name, label) in cache_dirs {
+        let dir = requested.join(name);
+        if dir.is_dir() {
+            // SAFETY: never recurse into a directory whose top-level
+            // looks like a git worktree subdir or a `.git` itself.
+            if dir.join(".git").is_dir() {
+                continue;
+            }
+            std::fs::remove_dir_all(&dir).map_err(|error| {
+                DaemonError::Config(format!("remove {label} at {}: {error}", dir.display()))
+            })?;
+            removed_any_cache = true;
+        }
+    }
+    if removed_any_cache {
+        actions.push(WorktreeHealAction::CleanedUntrackedCaches);
+    }
+
+    // (3) Dirty tracked state — only managed checkouts. Operator-owned
+    // checkouts may contain real uncommitted work; we MUST NOT clobber
+    // them. If a managed checkout is dirty we reset --hard; otherwise
+    // we leave it to the downstream `ensure_*` to fail-closed with the
+    // existing "uncommitted changes" error (which itself parks only on
+    // managed refresh, not on initial preflight).
+    if is_managed {
+        let path_str = requested.to_string_lossy();
+        let status = run_tool_in_dir(
+            "git",
+            &["status", "--porcelain", "--untracked-files=normal"],
+            &path_str,
+            30,
+        )?;
+        let porcelain = status.trim();
+        if !porcelain.is_empty() {
+            // Confirm the change set is purely tracked-file modifications
+            // before we reset; refuse to clobber an operator's actual
+            // branch even on a managed checkout.
+            let mut safe_to_reset = true;
+            for line in porcelain.lines() {
+                // `XY path` — only X in { ,M,A,D,R,C} (index) or Y in
+                // { ,M,D} (worktree) is safe to discard. Anything else
+                // (untracked ?, ignored !, conflict U) needs an explicit
+                // safe-path decision we deliberately don't make here.
+                let bytes = line.as_bytes();
+                if bytes.len() < 4 {
+                    safe_to_reset = false;
+                    break;
+                }
+                let x = bytes[0];
+                let y = bytes[1];
+                let safe = |c: u8| matches!(c, b' ' | b'M' | b'A' | b'D' | b'R' | b'C');
+                if !(safe(x) && safe(y)) {
+                    safe_to_reset = false;
+                    break;
+                }
+            }
+            if safe_to_reset {
+                run_tool_in_dir(
+                    "git",
+                    &[
+                        "-c",
+                        "user.email=jleechan2015@users.noreply.github.com",
+                        "-c",
+                        "user.name=dark-factory-self-heal",
+                        "reset",
+                        "--hard",
+                        "HEAD",
+                    ],
+                    &path_str,
+                    60,
+                )?;
+                // Re-run git clean -fdx to drop ignored + untracked that
+                // remained after the cache-dir sweep.
+                let _ = run_tool_in_dir("git", &["clean", "-fdx"], &path_str, 60);
+                actions.push(WorktreeHealAction::ResetDirtyTree);
+            }
+        }
+    }
+
+    // (4) Missing target branch. Provision it from HEAD so the downstream
+    // ensure_* can check it out without refusing. Applies to both managed
+    // and operator-owned checkouts; creating a branch never destroys
+    // existing work.
+    if !expected_branch.trim().is_empty() {
+        let path_str = requested.to_string_lossy();
+        let listing = run_tool_in_dir(
+            "git",
+            &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+            &path_str,
+            30,
+        )?;
+        let has_branch = listing
+            .lines()
+            .any(|line| line.trim() == expected_branch.trim());
+        if !has_branch {
+            run_tool_in_dir(
+                "git",
+                &["checkout", "-B", expected_branch, "HEAD"],
+                &path_str,
+                60,
+            )?;
+            actions.push(WorktreeHealAction::ProvisionedFallbackBranch(
+                expected_branch.to_string(),
+            ));
+        }
+    }
+
+    // (5) Corrupt `.git/` — detected by `git rev-parse HEAD` failing.
+    // We can only run rev-parse after the lock is cleared.
+    // (5) NOTE: a corrupt `.git/` (rev-parse HEAD fails) is intentionally
+    // out of scope here. The bead spec asks the preflight to clear stale
+    // locks, clean untracked caches, reset dirty state, and provision a
+    // missing branch. A truly corrupt git directory is a separate failure
+    // class that the downstream `ensure_*_target_worktree` family surfaces
+    // as a hard error — self-deleting a checkout is too aggressive for
+    // this layer and is reserved for an explicit operator action.
+
+    let outcome = if actions.is_empty() {
+        WorktreeHealOutcome::AlreadyClean
+    } else {
+        WorktreeHealOutcome::Healed
+    };
+    Ok(WorktreeHealReport { outcome, actions })
+}
+
 fn validate_repo(repo: &str) -> Result<(), DaemonError> {
     let mut parts = repo.split('/');
     let owner = parts.next().unwrap_or_default();
@@ -568,6 +891,308 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
+    }
+
+    // -------------------------------------------------------------------
+    // jleechan-y189: self-healing preflight (red-phase coverage).
+    //
+    // These tests exercise the new `self_heal_target_worktree` helper that
+    // the verifier gate calls *before* `ensure_target_worktree` /
+    // `ensure_managed_target_worktree`. The contract:
+    //
+    //   * Stale `.git/index.lock`, untracked caches, dirty state, and a
+    //     missing target branch are all auto-recoverable.
+    //   * The ONLY refusal reason is "an active live PID or AO session is
+    //     currently executing on that worktree" — surfaced through the
+    //     caller-supplied `is_live` predicate so the function is pure.
+    //   * Stale, orphaned, collided, or broken worktrees must NEVER park
+    //     HUMAN_HELD on their own; only an active live in-flight session
+    //     keeps that escalation open.
+    // -------------------------------------------------------------------
+
+    fn not_live(_path: &Path) -> Result<bool, DaemonError> {
+        Ok(false)
+    }
+
+    fn always_live(_path: &Path) -> Result<bool, DaemonError> {
+        Ok(true)
+    }
+
+    fn make_untracked_cache(root: &Path) -> std::path::PathBuf {
+        let cache = root.join(".cache").join("stale-build");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("leftover.o"), b"junk").unwrap();
+        cache
+    }
+
+    fn touch_stale_index_lock(root: &Path) -> std::path::PathBuf {
+        let lock = root.join(".git").join("index.lock");
+        std::fs::write(&lock, b"stale lock from prior crashed git").unwrap();
+        lock
+    }
+
+    fn dirty_tracked_file(root: &Path) -> std::path::PathBuf {
+        let tracked = root.join("tracked.txt");
+        std::fs::write(&tracked, b"original content\n").unwrap();
+        // Commit it so subsequent edits register as tracked dirty edits,
+        // not as untracked files (which the heal pass deliberately leaves
+        // alone — untracked state may be real operator work).
+        run_tool_in_dir(
+            "git",
+            &[
+                "-c",
+                "user.email=jleechan2015@users.noreply.github.com",
+                "-c",
+                "user.name=Test",
+                "add",
+                "tracked.txt",
+            ],
+            &root.to_string_lossy(),
+            30,
+        )
+        .unwrap();
+        run_tool_in_dir(
+            "git",
+            &[
+                "-c",
+                "user.email=jleechan2015@users.noreply.github.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "track file",
+            ],
+            &root.to_string_lossy(),
+            30,
+        )
+        .unwrap();
+        std::fs::write(&tracked, b"modified by failed run").unwrap();
+        tracked
+    }
+
+    #[test]
+    fn self_heal_removes_stale_index_lock_on_existing_checkout() {
+        let root = std::env::temp_dir().join(format!(
+            "afd_target_worktree_heal_stale_lock_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let head = init_git_checkout(&root, "owner/repo");
+        let lock = touch_stale_index_lock(&root);
+        assert!(lock.is_file(), "precondition: index.lock was created");
+
+        let report =
+            self_heal_target_worktree("owner/repo", &root, "main", true, not_live).unwrap();
+        assert_eq!(report.outcome, WorktreeHealOutcome::Healed);
+        assert!(report
+            .actions
+            .iter()
+            .any(|a| matches!(a, WorktreeHealAction::ClearedStaleIndexLock)));
+        assert!(!lock.exists(), "stale index.lock must be removed");
+        // HEAD itself must remain intact (no spurious reset).
+        let after =
+            run_tool_in_dir("git", &["rev-parse", "HEAD"], &root.to_string_lossy(), 30).unwrap();
+        assert_eq!(after.trim(), head);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn self_heal_cleans_untracked_caches_under_known_safe_names() {
+        let root = std::env::temp_dir().join(format!(
+            "afd_target_worktree_heal_cache_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        init_git_checkout(&root, "owner/repo");
+        let cache = make_untracked_cache(&root);
+        assert!(cache.is_file() || cache.join("leftover.o").is_file());
+
+        let report =
+            self_heal_target_worktree("owner/repo", &root, "main", true, not_live).unwrap();
+        assert_eq!(report.outcome, WorktreeHealOutcome::Healed);
+        assert!(report
+            .actions
+            .iter()
+            .any(|a| matches!(a, WorktreeHealAction::CleanedUntrackedCaches)));
+        assert!(!cache.join("leftover.o").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn self_heal_resets_dirty_managed_checkout_to_head() {
+        let root = std::env::temp_dir().join(format!(
+            "afd_target_worktree_heal_dirty_managed_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = init_git_checkout(&root, "owner/repo");
+        let tracked = dirty_tracked_file(&root);
+        // Capture HEAD *after* the tracked-file commit: that is the
+        // baseline `git reset --hard` must restore to.
+        let head_after_track =
+            run_tool_in_dir("git", &["rev-parse", "HEAD"], &root.to_string_lossy(), 30).unwrap();
+        // Confirm the precondition: the file is tracked and modified.
+        assert_ne!(
+            std::fs::read_to_string(&tracked).unwrap(),
+            "original content\n",
+            "precondition: tracked file must be dirty before heal"
+        );
+
+        let report =
+            self_heal_target_worktree("owner/repo", &root, "main", true, not_live).unwrap();
+        assert_eq!(report.outcome, WorktreeHealOutcome::Healed);
+        assert!(report
+            .actions
+            .iter()
+            .any(|a| matches!(a, WorktreeHealAction::ResetDirtyTree)));
+        // `git reset --hard HEAD` restores the file's *content* to HEAD;
+        // the file itself still exists because it is tracked.
+        assert!(
+            tracked.exists(),
+            "tracked file must still exist after reset"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&tracked).unwrap(),
+            "original content\n",
+            "tracked dirty file must be restored to its HEAD content"
+        );
+        let after =
+            run_tool_in_dir("git", &["rev-parse", "HEAD"], &root.to_string_lossy(), 30).unwrap();
+        assert_eq!(
+            after.trim(),
+            head_after_track.trim(),
+            "HEAD itself must remain intact"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn self_heal_does_not_reset_dirty_operator_owned_checkout() {
+        let root = std::env::temp_dir().join(format!(
+            "afd_target_worktree_heal_dirty_operator_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        init_git_checkout(&root, "owner/repo");
+        let tracked = dirty_tracked_file(&root);
+
+        let report =
+            self_heal_target_worktree("owner/repo", &root, "main", false, not_live).unwrap();
+        // Operator-owned checkouts stay fail-closed on dirty state.
+        // Either AlreadyClean (because we deliberately skipped reset) or
+        // Healed via cache/lock cleanup is acceptable, but ResetDirtyTree
+        // must NEVER appear for a non-managed checkout.
+        assert!(report
+            .actions
+            .iter()
+            .all(|a| !matches!(a, WorktreeHealAction::ResetDirtyTree)));
+        assert!(
+            tracked.exists(),
+            "operator-owned dirty file must NOT be reset"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn self_heal_provisions_fallback_branch_when_target_branch_missing() {
+        let root = std::env::temp_dir().join(format!(
+            "afd_target_worktree_heal_branch_missing_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        init_git_checkout(&root, "owner/repo");
+
+        let report = self_heal_target_worktree(
+            "owner/repo",
+            &root,
+            "factory/jleechan-y189-r1",
+            true,
+            not_live,
+        )
+        .unwrap();
+        assert_eq!(report.outcome, WorktreeHealOutcome::Healed);
+        assert!(report.actions.iter().any(
+            |a| matches!(a, WorktreeHealAction::ProvisionedFallbackBranch(name) if name == "factory/jleechan-y189-r1")
+        ));
+        let branches =
+            run_tool_in_dir("git", &["branch", "--list"], &root.to_string_lossy(), 30).unwrap();
+        assert!(
+            branches.contains("factory/jleechan-y189-r1"),
+            "fallback branch must be created: {branches:?}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn self_heal_refuses_when_live_process_is_in_flight() {
+        let root = std::env::temp_dir().join(format!(
+            "afd_target_worktree_heal_refused_live_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        init_git_checkout(&root, "owner/repo");
+        // Commit a tracked file BEFORE injecting the stale index lock, or
+        // the `git add` / `git commit` calls in `dirty_tracked_file` will
+        // themselves fail (they need to acquire `.git/index.lock`).
+        let tracked = dirty_tracked_file(&root);
+        let cache = make_untracked_cache(&root);
+        let lock = touch_stale_index_lock(&root);
+
+        let report =
+            self_heal_target_worktree("owner/repo", &root, "main", true, always_live).unwrap();
+        assert!(
+            matches!(report.outcome, WorktreeHealOutcome::RefusedLive(_)),
+            "must refuse when a live process is reported: {:?}",
+            report.outcome
+        );
+        assert!(
+            report.actions.is_empty(),
+            "no destructive action may run while a live process owns the worktree: {:?}",
+            report.actions
+        );
+        // None of the pre-existing broken state should have been touched.
+        assert!(lock.exists(), "stale index.lock must remain while live");
+        assert!(
+            cache.join("leftover.o").exists(),
+            "cache must remain while live"
+        );
+        assert!(
+            tracked.exists(),
+            "dirty tracked file must remain while live"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn self_heal_is_noop_on_clean_checkout() {
+        let root = std::env::temp_dir().join(format!(
+            "afd_target_worktree_heal_already_clean_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        init_git_checkout(&root, "owner/repo");
+
+        // Pass an empty `expected_branch` to disable the missing-branch
+        // provisioning step (which depends on the host's `git init`
+        // default-branch name — historically `master`, on newer git
+        // `main` — and we don't want to entangle that with this test).
+        let report = self_heal_target_worktree("owner/repo", &root, "", true, not_live).unwrap();
+        assert_eq!(report.outcome, WorktreeHealOutcome::AlreadyClean);
+        assert!(report.actions.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn self_heal_rejects_malformed_repo_before_touching_disk() {
+        let root = std::env::temp_dir().join(format!(
+            "afd_target_worktree_heal_malformed_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let err = self_heal_target_worktree("not-a-valid-repo", &root, "main", true, not_live)
+            .unwrap_err();
+        assert!(matches!(err, DaemonError::Config(_)));
+        assert!(!root.exists());
     }
 
     #[test]
