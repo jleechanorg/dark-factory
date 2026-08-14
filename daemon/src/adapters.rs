@@ -2135,6 +2135,18 @@ fn ao_spawn_command_with_mode(
             .as_deref()
             .filter(|revision| !revision.trim().is_empty())
         {
+            let path_str = verified.to_string_lossy();
+            let _ = run_tool_in_dir("git", &["worktree", "prune"], &path_str, 30);
+            run_tool_in_dir(
+                "git",
+                &[
+                    "update-ref",
+                    &format!("refs/heads/{}", spec.branch),
+                    expected_revision,
+                ],
+                &path_str,
+                30,
+            )?;
             cmd.env("DARK_FACTORY_AO_EXPECTED_REVISION", expected_revision);
         }
     }
@@ -2914,7 +2926,7 @@ mod spawn_classification_tests {
 
 #[cfg(test)]
 mod ao_spawn_contract_tests {
-    use super::{ao_spawn_bridge_path, gh_env_test_lock, CliSessions};
+    use super::{ao_spawn_bridge_path, ao_spawn_command, gh_env_test_lock, CliSessions};
     use crate::errors::DaemonError;
     use crate::tools::{Sessions, SpawnSpec};
     use std::os::unix::fs::PermissionsExt;
@@ -3208,6 +3220,308 @@ export const isTerminalSession = () => false;
             "stdout={stdout}; stderr={stderr}"
         );
         assert!(calls.is_empty(), "AO must not be invoked on a source mismatch: {calls}");
+    }
+
+    fn run_bridge_and_probe_target_branch(
+        test_name: &str,
+        branch: &str,
+        stale_branch_commit: bool,
+    ) -> (std::process::Output, String, Option<String>) {
+        let root = std::env::temp_dir().join(format!(
+            "afd_ao_bridge_branch_probe_{test_name}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let cli = root.join("node_modules/@jleechanorg/ao-cli");
+        let core = root.join("node_modules/@jleechanorg/ao-core");
+        let configured = root.join("registered-source");
+        let target = root.join("managed-target");
+        let calls = root.join("calls.log");
+        std::fs::create_dir_all(cli.join("dist/lib")).unwrap();
+        std::fs::create_dir_all(core.join("dist")).unwrap();
+        std::fs::create_dir_all(&configured).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&target)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "user.name=Dark Factory Test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial commit",
+            ])
+            .current_dir(&target)
+            .status()
+            .unwrap();
+        let initial_revision = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&target)
+            .output()
+            .unwrap();
+        let initial_revision = String::from_utf8(initial_revision.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "user.name=Dark Factory Test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "pr head commit",
+            ])
+            .current_dir(&target)
+            .status()
+            .unwrap();
+        let expected_revision = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&target)
+            .output()
+            .unwrap();
+        let expected_revision = String::from_utf8(expected_revision.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        if stale_branch_commit {
+            std::process::Command::new("git")
+                .args(["branch", branch, &initial_revision])
+                .current_dir(&target)
+                .status()
+                .unwrap();
+        }
+
+        std::fs::write(
+            cli.join("package.json"),
+            r#"{"name":"@jleechanorg/ao-cli","version":"0.1.3","type":"module"}"#,
+        )
+        .unwrap();
+        std::fs::write(cli.join("dist/index.js"), "throw new Error('CLI must not run');\n")
+            .unwrap();
+        std::fs::write(
+            core.join("package.json"),
+            r#"{"name":"@jleechanorg/ao-core","version":"0.1.0","type":"module","exports":{".":{"import":"./dist/index.js"}}}"#,
+        )
+        .unwrap();
+        let registered_source = configured.to_string_lossy();
+        let target_source = target.to_string_lossy();
+        std::fs::write(
+            core.join("dist/index.js"),
+            format!(
+                r#"import {{appendFileSync}} from 'node:fs';
+const log = (value) => appendFileSync(process.env.AO_FAKE_CALLS, value + '\n');
+export const loadConfig = () => ({{configPath: '/tmp/fake-ao.yaml', projects: {{'worldarchitect': {{path: '{registered_source}'}}}}}});
+export const createPluginRegistry = () => ({{loadFromConfig: async () => {{}}}});
+export const createSessionManager = ({{config}}) => ({{
+  list: async () => [],
+  spawn: async (spec) => {{log(JSON.stringify({{path: config.projects.worldarchitect.path, branch: spec.branch}})); return {{id: 'managed-session', branch: spec.branch, workspacePath: '{target_source}'}}; }},
+}});
+export const acquireSpawnLock = () => ({{acquired: true, release() {{}}}});
+export const resolveSpawnQueueConfig = () => ({{enabled: true, maxActiveSessions: 2}});
+export const isTerminalSession = () => false;
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/preflight.js"),
+            "export const preflight = {checkTmux: async () => {}, checkGhAuth: async () => {}};\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/running-state.js"),
+            "export const getRunning = async () => ({projects: ['worldarchitect']});\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/lifecycle-service.js"),
+            "export const ensureLifecycleWorker = async () => {};\n",
+        )
+        .unwrap();
+
+        let bridge = ao_spawn_bridge_path();
+        let mut command = std::process::Command::new(bridge_test_node());
+        command
+            .arg(cli.join("dist/index.js"))
+            .args([
+                "spawn",
+                "--project",
+                "worldarchitect",
+                "--agent",
+                "minimax",
+                "--",
+                "managed checkout branch probe",
+            ])
+            .env(
+                "NODE_OPTIONS",
+                format!(
+                    "--experimental-import-meta-resolve --import={}",
+                    bridge.display()
+                ),
+            )
+            .env("DARK_FACTORY_AO_PARENT_NODE_OPTIONS", "")
+            .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
+            .env("DARK_FACTORY_AO_SPAWN_BRANCH", branch)
+            .env("DARK_FACTORY_AO_TARGET_CHECKOUT", &target)
+            .env("DARK_FACTORY_AO_EXPECTED_REVISION", &expected_revision)
+            .env("DARK_FACTORY_AO_MANAGED_CHECKOUT", "1")
+            .env("AO_FAKE_CALLS", &calls);
+        let output = command.output().unwrap();
+        let _logged = std::fs::read_to_string(&calls).unwrap_or_default();
+
+        let probed_ref = std::process::Command::new("git")
+            .args(["rev-parse", &format!("refs/heads/{branch}")])
+            .current_dir(&target)
+            .output()
+            .ok()
+            .and_then(|out| {
+                if out.status.success() {
+                    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+                } else {
+                    None
+                }
+            });
+
+        let _ = std::fs::remove_dir_all(root);
+        (output, expected_revision, probed_ref)
+    }
+
+    #[test]
+    fn bridge_updates_target_branch_ref_to_expected_revision() {
+        let branch = "docs/claude-guidance-20260814";
+        let (output, expected_revision, probed_ref) =
+            run_bridge_and_probe_target_branch("fresh_branch", branch, false);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "bridge spawn probe failed; stdout={stdout}; stderr={stderr}"
+        );
+        assert_eq!(
+            probed_ref.as_deref(),
+            Some(expected_revision.as_str()),
+            "bridge must create target branch {branch} pointing to expected revision {expected_revision}, got {probed_ref:?}"
+        );
+    }
+
+    #[test]
+    fn bridge_updates_existing_stale_target_branch_ref_to_expected_revision() {
+        let branch = "docs/claude-guidance-20260814";
+        let (output, expected_revision, probed_ref) =
+            run_bridge_and_probe_target_branch("stale_retry", branch, true);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "bridge spawn probe failed; stdout={stdout}; stderr={stderr}"
+        );
+        assert_eq!(
+            probed_ref.as_deref(),
+            Some(expected_revision.as_str()),
+            "bridge must update existing stale branch {branch} to expected revision {expected_revision}, got {probed_ref:?}"
+        );
+    }
+
+    #[test]
+    fn ao_spawn_command_prepares_branch_ref_at_expected_revision() {
+        let root = std::env::temp_dir().join(format!(
+            "afd_ao_spawn_cmd_branch_ref_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/jleechanorg/dark-factory.git",
+            ])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial commit",
+            ])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "pr head commit",
+            ])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        let expected_revision = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let expected_revision = String::from_utf8(expected_revision.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let branch = "docs/claude-guidance-20260814";
+        let mut spawn_spec = spec("test prompt", branch);
+        spawn_spec.local_checkout = Some(root.clone());
+        spawn_spec.expected_revision = Some(expected_revision.clone());
+        spawn_spec.managed_checkout = true;
+
+        let cmd_res = ao_spawn_command("minimax", &spawn_spec);
+        assert!(cmd_res.is_ok(), "ao_spawn_command failed: {cmd_res:?}");
+
+        let probed_ref = std::process::Command::new("git")
+            .args(["rev-parse", &format!("refs/heads/{branch}")])
+            .current_dir(&root)
+            .output()
+            .ok()
+            .and_then(|out| {
+                if out.status.success() {
+                    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+                } else {
+                    None
+                }
+            });
+
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            probed_ref.as_deref(),
+            Some(expected_revision.as_str()),
+            "ao_spawn_command must prepare refs/heads/{branch} at expected revision {expected_revision}"
+        );
     }
 
     #[test]
