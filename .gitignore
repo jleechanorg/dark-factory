@@ -46,6 +46,8 @@ specs/skeptic-report.json
 worktree_factory_evolve/
 # Rust daemon crate build artifacts (Cargo.lock IS committed — binary crate)
 daemon/target/
+daemon.lock
+
 
 # stray test/verify artifacts (cargo test scratch, DoD smoke)
 test.db
