@@ -302,10 +302,7 @@ impl Scm for FakeScm {
         self.calls
             .borrow_mut()
             .push(format!("close_pr({pr},{comment})"));
-        if let Some(stderr) = self
-            .pr_already_terminal
-            .get(&("default".to_string(), pr))
-        {
+        if let Some(stderr) = self.pr_already_terminal.get(&("default".to_string(), pr)) {
             return Err(DaemonError::Tool {
                 tool: "gh".into(),
                 rc: 1,
@@ -1067,11 +1064,7 @@ impl Vcs for FakeVcs {
     /// override via a wrapper. Recording the call here lets us verify
     /// the reroll reached the recovery branch on a scripted stale
     /// `create_branch_at_for_repo` 422.
-    fn delete_branch_at_for_repo(
-        &self,
-        repo: &str,
-        name: &str,
-    ) -> Result<(), DaemonError> {
+    fn delete_branch_at_for_repo(&self, repo: &str, name: &str) -> Result<(), DaemonError> {
         self.calls
             .borrow_mut()
             .push(format!("delete_branch_at_for_repo({repo},{name})"));
@@ -1112,9 +1105,9 @@ impl Vcs for FakeVcs {
         branch: &str,
         timeout_secs: u64,
     ) -> Result<String, DaemonError> {
-        self.calls
-            .borrow_mut()
-            .push(format!("head_sha_within_for_repo({repo},{branch},{timeout_secs})"));
+        self.calls.borrow_mut().push(format!(
+            "head_sha_within_for_repo({repo},{branch},{timeout_secs})"
+        ));
         let scoped_key = format!("{repo}@{branch}");
         let permanent_map = self.fail_head_sha_permanent_for.borrow();
         if let Some(msg) = permanent_map
@@ -1133,7 +1126,10 @@ impl Vcs for FakeVcs {
             });
         }
         let schedule_map = self.head_sha_schedule.borrow();
-        if let Some(schedule) = schedule_map.get(&scoped_key).or_else(|| schedule_map.get(branch)) {
+        if let Some(schedule) = schedule_map
+            .get(&scoped_key)
+            .or_else(|| schedule_map.get(branch))
+        {
             let now = std::time::Instant::now();
             if let Some((_, sha)) = schedule.iter().rfind(|(at, _)| *at <= now) {
                 return Ok(sha.clone());
@@ -1261,6 +1257,11 @@ pub struct FakeStateStore {
     pub overlays: RefCell<HashMap<String, BeadOverlay>>,
     pub branches: RefCell<Vec<String>>,
     pub branch_beads: RefCell<HashMap<String, String>>,
+    /// Bead jleechan-jur5: child → (owner, external_ref) coalesce map
+    /// for the in-memory state store. Mirrors the SQLite `branch_coalesce`
+    /// table so tick-integration tests can drive the coalesce-on-collision
+    /// path without standing up a real DB.
+    pub coalesce_map: RefCell<HashMap<String, (String, String)>>,
     pub rejections: RefCell<HashMap<(String, u32), RejectionRecord>>,
     pub fail_save_for_state: RefCell<Vec<(String, OverlayState)>>,
     /// Bead jleechan-zeij / issue #322 r2: consecutive re-roll deferral count
@@ -1301,8 +1302,7 @@ pub struct FakeStateStore {
     /// `escalation_should_emit`/`record_escalation_emit`/
     /// `mark_escalation_undeliverable` impls so tick-integration tests can
     /// exercise the dedup + terminal-marking paths without a real SQLite DB.
-    pub escalation_ledger:
-        RefCell<HashMap<(String, String), EscalationLedgerEntry>>,
+    pub escalation_ledger: RefCell<HashMap<(String, String), EscalationLedgerEntry>>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -1384,6 +1384,33 @@ impl StateStore for FakeStateStore {
             .borrow_mut()
             .push(format!("bead_id_for_branch({branch})"));
         Ok(self.branch_beads.borrow().get(branch).cloned())
+    }
+
+    fn record_coalesce(
+        &self,
+        child_bead_id: &str,
+        owner_bead_id: &str,
+        external_ref: &str,
+    ) -> Result<(), DaemonError> {
+        self.calls.borrow_mut().push(format!(
+            "record_coalesce({child_bead_id},{owner_bead_id},{external_ref})"
+        ));
+        self.coalesce_map.borrow_mut().insert(
+            child_bead_id.to_string(),
+            (owner_bead_id.to_string(), external_ref.to_string()),
+        );
+        Ok(())
+    }
+
+    fn coalesce_owner_for(&self, bead_id: &str) -> Result<Option<String>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("coalesce_owner_for({bead_id})"));
+        Ok(self
+            .coalesce_map
+            .borrow()
+            .get(bead_id)
+            .map(|(owner, _)| owner.clone()))
     }
 
     fn owned_branches(&self) -> Result<Vec<String>, DaemonError> {
@@ -1716,9 +1743,9 @@ impl StateStore for FakeStateStore {
         now_epoch: u64,
         refire_secs: u64,
     ) -> Result<bool, DaemonError> {
-        self.calls.borrow_mut().push(format!(
-            "escalation_should_emit({bead_id},{reason})"
-        ));
+        self.calls
+            .borrow_mut()
+            .push(format!("escalation_should_emit({bead_id},{reason})"));
         match self
             .escalation_ledger
             .borrow()
@@ -1744,9 +1771,9 @@ impl StateStore for FakeStateStore {
         context_hash: &str,
         now_epoch: u64,
     ) -> Result<(), DaemonError> {
-        self.calls.borrow_mut().push(format!(
-            "record_escalation_emit({bead_id},{reason})"
-        ));
+        self.calls
+            .borrow_mut()
+            .push(format!("record_escalation_emit({bead_id},{reason})"));
         let mut ledger = self.escalation_ledger.borrow_mut();
         let entry = ledger
             .entry((bead_id.to_string(), reason.to_string()))
@@ -1764,9 +1791,9 @@ impl StateStore for FakeStateStore {
         bead_id: &str,
         reason: &str,
     ) -> Result<(), DaemonError> {
-        self.calls.borrow_mut().push(format!(
-            "mark_escalation_undeliverable({bead_id},{reason})"
-        ));
+        self.calls
+            .borrow_mut()
+            .push(format!("mark_escalation_undeliverable({bead_id},{reason})"));
         let mut ledger = self.escalation_ledger.borrow_mut();
         let entry = ledger
             .entry((bead_id.to_string(), reason.to_string()))

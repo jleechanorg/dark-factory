@@ -116,6 +116,16 @@ pub struct TickSummary {
     /// full reroll cycle by the fast-rejection path" without re-deriving
     /// from telemetry.
     pub gates_assessed_fast_rejected: usize,
+    /// Bead jleechan-jur5: intake candidates that shared a branch/PR with
+    /// an already-active bead and were coalesced onto the active owner
+    /// instead of refused + parked HUMAN_HELD (the old
+    /// `adoption_branch_collision` / `branch_key_stealing_not_allowed`
+    /// path). One count per coalesced intake (so a multi-intake collision
+    /// against a single active branch produces one count per colliding
+    /// PR). Distinct from `beads_created` (no overlay is created for the
+    /// colliding intake — its identity is recorded on the active owner
+    /// via `StateStore::coalesce_owner_for`).
+    pub bead_coalesces: usize,
 }
 
 /// Bounded retry cap for the automated HUMAN_HELD exit. Matches the shell
@@ -617,14 +627,10 @@ fn kill_session_and_clear_handle(deps: &TickDeps, overlay: &mut BeadOverlay) {
 /// across 20 days; top offender jleechan-fpca at 23,012 re-emits).
 /// Pinned by the inline `existing_pr_adoption_dedup_tests` module
 /// below and by `tests/tick_integration.rs::existing_pr_adoption_*`.
-pub(crate) fn should_skip_existing_pr_adoption_emit(
-    pre_adopt_state: Option<OverlayState>,
-) -> bool {
+pub(crate) fn should_skip_existing_pr_adoption_emit(pre_adopt_state: Option<OverlayState>) -> bool {
     matches!(
         pre_adopt_state,
-        Some(OverlayState::Attested)
-            | Some(OverlayState::Ready)
-            | Some(OverlayState::HumanHeld)
+        Some(OverlayState::Attested) | Some(OverlayState::Ready) | Some(OverlayState::HumanHeld)
     )
 }
 
@@ -706,7 +712,10 @@ pub fn run_tick(
         let (deadline_epoch, observed_elapsed_secs) = match overlay.attempt_started_at {
             Some(started_at) => {
                 let elapsed = now_epoch.saturating_sub(started_at);
-                (started_at.saturating_add(deps.cfg.autonomy_timebox_secs), elapsed)
+                (
+                    started_at.saturating_add(deps.cfg.autonomy_timebox_secs),
+                    elapsed,
+                )
             }
             None => {
                 // Legacy fallback: timebox check still works against
@@ -1264,6 +1273,7 @@ pub fn run_tick(
             "beadsHeldDispositionRequired": summary.beads_held_disposition_required,
             "escalationsSuppressed": summary.escalations_suppressed,
             "escalationsUndeliverable": summary.escalations_undeliverable,
+            "beadCoalesces": summary.bead_coalesces,
         }),
         serde_json::json!({"tick_index": tick_index, "slow_tier_due": slow_tier_due}),
     )?;
@@ -1553,50 +1563,60 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         }
         if let Some(owner) = deps.store.bead_id_for_branch(&adopted.head_ref_name)? {
             if owner != adopted.bead_id {
+                // Bead jleechan-jur5: instead of refusing the colliding
+                // intake (the old "branch-key stealing is not allowed"
+                // path that posted an escalation comment, parked the
+                // candidate HUMAN_HELD, and starved the branch of the
+                // owner's continued drive), coalesce the candidate onto
+                // the active owner. The owner keeps the branch-registry
+                // key and the overlay; the candidate identity is recorded
+                // in `branch_coalesce` so a future re-tick on the same
+                // child (same external_ref) hits the idempotent re-coalesce
+                // path below and does not double-count. No escalation
+                // comment, no HUMAN_HELD, no escalation telemetry.
                 let owner_live = deps.store.load(&owner)?.is_some();
-                let comment_body = format!(
-                    "🤖 **[dark-factory]** Escalation required: refusing factory PR adoption for branch `{}` because it is already registered to bead `{}`. Branch-key stealing is not allowed; please use a unique same-repo branch.",
-                    adopted.head_ref_name, owner
-                );
-                let _ = deps
-                    .tracker
-                    .comment_external(&adopted.external_ref, &comment_body);
-                let ctx = serde_json::json!({
-                    "reason": "adoption_branch_collision",
-                    "branch": adopted.head_ref_name,
-                    "registered_bead": owner,
-                    "registered_bead_live": owner_live,
-                    "external_ref": adopted.external_ref,
-                });
-                let now_epoch = now_epoch_secs();
-                let (should_emit, ctx_hash) = escalation_dedup_should_emit(
-                    deps,
-                    &adopted.bead_id,
-                    "adoption_branch_collision",
-                    &ctx,
-                    now_epoch,
-                )?;
-                if !should_emit {
-                    summary.escalations_suppressed += 1;
-                    continue;
-                }
-                summary.beads_escalated += 1;
+                deps.store
+                    .record_coalesce(&adopted.bead_id, &owner, &adopted.external_ref)?;
+                summary.bead_coalesces += 1;
                 emit(
                     deps.telemetry_log,
                     &adopted.bead_id,
                     1,
-                    OverlayState::HumanHeld.as_str(),
-                    "ESCALATION_REQUIRED",
+                    OverlayState::Attested.as_str(),
+                    "BEAD_COALESCED",
                     serde_json::json!({}),
-                    ctx,
+                    serde_json::json!({
+                        "reason": "adoption_branch_collision_coalesced",
+                        "branch": adopted.head_ref_name,
+                        "registered_bead": owner,
+                        "registered_bead_live": owner_live,
+                        "external_ref": adopted.external_ref,
+                        "candidate_bead_id": adopted.bead_id,
+                        "pr_number": adopted.pr_number,
+                    }),
                 )?;
-                record_escalation_emit_dedup(
-                    deps,
-                    &adopted.bead_id,
-                    "adoption_branch_collision",
-                    &ctx_hash,
-                    now_epoch,
-                )?;
+                continue;
+            }
+        }
+        // Bead jleechan-jur5: idempotent re-coalesce path. If a
+        // previous tick already recorded this child as coalesced onto
+        // some owner, emit nothing and move on — the active owner is
+        // still driving the branch and the coalesce row is the source
+        // of truth. This avoids re-posting BEAD_COALESCED every tick for
+        // the same child PR (a stable colliding intake would otherwise
+        // spam the telemetry stream).
+        if let Some(prior_owner) = deps.store.coalesce_owner_for(&adopted.bead_id)? {
+            // If the active branch-registry owner is the same as the
+            // coalesce owner, no action — owner is still driving.
+            // If they differ (e.g. the prior owner moved on), let the
+            // normal register_branch flow take over and refresh the
+            // coalesce row on the next tick.
+            if deps
+                .store
+                .bead_id_for_branch(&adopted.head_ref_name)?
+                .as_deref()
+                == Some(prior_owner.as_str())
+            {
                 continue;
             }
         }
@@ -1666,8 +1686,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         // jleechan-7t2g: dedup set extracted into `should_skip_existing_pr_adoption_emit`
         // so the inline unit tests in `existing_pr_adoption_dedup_tests`
         // can pin the predicate directly.
-        let already_attested =
-            should_skip_existing_pr_adoption_emit(pre_adopt_state);
+        let already_attested = should_skip_existing_pr_adoption_emit(pre_adopt_state);
         if !already_attested {
             emit(
                 deps.telemetry_log,
@@ -2194,14 +2213,13 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         if ready.is_empty() {
             return Ok(());
         }
-        let dispatch_report =
-            dispatch::dispatch_ready_with_vcs(
-                deps.sessions,
-                deps.store,
-                deps.cfg,
-                &ready,
-                Some(deps.vcs),
-            )?;
+        let dispatch_report = dispatch::dispatch_ready_with_vcs(
+            deps.sessions,
+            deps.store,
+            deps.cfg,
+            &ready,
+            Some(deps.vcs),
+        )?;
         summary.beads_dispatched += dispatch_report.success_count();
 
         for failure in &dispatch_report.failures {
@@ -2530,11 +2548,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 if let Err(err) = post_scm_comment_by_bead_id(deps, &failure.bead_id, &comment_body)
                 {
                     if is_missing_scm_target_error(&err) {
-                        record_local_escalation_fallback(
-                            deps,
-                            &failure.bead_id,
-                            reason,
-                        )?;
+                        record_local_escalation_fallback(deps, &failure.bead_id, reason)?;
                         summary.beads_escalated_locally += 1;
                         emit(
                             deps.telemetry_log,
@@ -2600,13 +2614,8 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 summary.beads_escalated += 1;
                 let ctx = serde_json::json!({"reason": reason});
                 let now_epoch = now_epoch_secs();
-                let (should_emit, ctx_hash) = escalation_dedup_should_emit(
-                    deps,
-                    &failure.bead_id,
-                    reason,
-                    &ctx,
-                    now_epoch,
-                )?;
+                let (should_emit, ctx_hash) =
+                    escalation_dedup_should_emit(deps, &failure.bead_id, reason, &ctx, now_epoch)?;
                 if !should_emit {
                     summary.escalations_suppressed += 1;
                 } else {
@@ -2828,9 +2837,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     // write logs but does not abort the tick (a missing cache file is
     // the same as a cold cache).
     if let Err(e) = adoption_cache.persist() {
-        eprintln!(
-            "auto-factory daemon: WARNING failed to persist adoption-probe cache: {e}"
-        );
+        eprintln!("auto-factory daemon: WARNING failed to persist adoption-probe cache: {e}");
     }
 
     Ok(())
@@ -2928,11 +2935,9 @@ fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, DaemonError> 
         // `cursor-agent` and the bare `cursor` alias are accepted so
         // `skeptic_reviewers` telemetry is stable regardless of which name
         // the priority list uses.
-        "cursor-agent" | "cursor" => run_tool(
-            "cursor-agent",
-            &["-f", prompt],
-            REVIEWER_TIMEOUT_SECS,
-        ),
+        "cursor-agent" | "cursor" => {
+            run_tool("cursor-agent", &["-f", prompt], REVIEWER_TIMEOUT_SECS)
+        }
         other => Err(DaemonError::Tool {
             tool: other.to_string(),
             rc: -1,
@@ -2993,7 +2998,10 @@ fn build_skeptic_prompt(
     let mut vendor_waiver_block = String::new();
     for vendor in [Vendor::CodeRabbit, Vendor::Bugbot] {
         match vendor_health.health(vendor) {
-            VendorHealth::Capped { observations, since_epoch } => {
+            VendorHealth::Capped {
+                observations,
+                since_epoch,
+            } => {
                 vendor_waiver_block.push_str(&format!(
                     "\nVENDOR WAIVER CONTEXT\n\
                      The {vendor_name} check is structurally unavailable on this PR \
@@ -3595,7 +3603,9 @@ fn translate_error(e: crate::vacuous_red_green::RedGreenError) -> verifier::Vacu
         RedGreenError::RevertFailed(s) | RedGreenError::RestoreFailed(s) => {
             verifier::VacuousRedGreenStatus::GreenFailed(format!("working-tree revert failed: {s}"))
         }
-        RedGreenError::Git(s) => verifier::VacuousRedGreenStatus::GreenFailed(format!("git error: {s}")),
+        RedGreenError::Git(s) => {
+            verifier::VacuousRedGreenStatus::GreenFailed(format!("git error: {s}"))
+        }
         // Bead jleechan-sb4b: surface the missing toolchain as a
         // structured signal. The previous failure mode was a misleading
         // `GreenFailed: git error: spawn cargo test: No such file or
@@ -3625,9 +3635,9 @@ fn translate_verdict(
             "tests failed on pristine base_ref (before any revert)".to_string(),
         ),
         Verdict::NoChangedTests => verifier::VacuousRedGreenStatus::NoChangedTests,
-        Verdict::ManifestMissing => {
-            verifier::VacuousRedGreenStatus::ManifestMissing("detector could not find manifest".to_string())
-        }
+        Verdict::ManifestMissing => verifier::VacuousRedGreenStatus::ManifestMissing(
+            "detector could not find manifest".to_string(),
+        ),
     }
 }
 
@@ -3689,10 +3699,7 @@ fn resolve_pr_base_ref(deps: &TickDeps, pr: u64, repo: &str) -> Result<String, S
 /// spawning reviewer subprocesses. Unknown/empty-family vendor labels are
 /// excluded (they cannot lift the degraded flag; see
 /// `verifier::vendor_model_family`).
-pub fn second_family_candidates<'a>(
-    used: &[String],
-    priority: &[&'a str],
-) -> Vec<&'a str> {
+pub fn second_family_candidates<'a>(used: &[String], priority: &[&'a str]) -> Vec<&'a str> {
     let have: std::collections::BTreeSet<&str> = used
         .iter()
         .map(|u| verifier::vendor_model_family(u))
@@ -3704,9 +3711,7 @@ pub fn second_family_candidates<'a>(
         .copied()
         .filter(|v| {
             let fam = verifier::vendor_model_family(v);
-            !fam.is_empty()
-                && !have.contains(fam)
-                && !used.iter().any(|u| u.as_str() == *v)
+            !fam.is_empty() && !have.contains(fam) && !used.iter().any(|u| u.as_str() == *v)
         })
         .collect()
 }
@@ -3844,38 +3849,32 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         // so NotProvided is the right answer (matches r5 contract).
         let is_test_repo = crate::config::is_fixture_repo(&repo);
 
-        if overlay.state == OverlayState::Dispatched
-            && overlay.pr_number.is_none()
-            && !is_test_repo
+        if overlay.state == OverlayState::Dispatched && overlay.pr_number.is_none() && !is_test_repo
         {
             if let Some(ref session_id) = overlay.session_id {
-                    let mut project = repo.split('/').next_back().unwrap_or(&repo).to_string();
-                    if project == "worldarchitect.ai" {
-                        project = "worldarchitect".to_string();
-                    }
+                let mut project = repo.split('/').next_back().unwrap_or(&repo).to_string();
+                if project == "worldarchitect.ai" {
+                    project = "worldarchitect".to_string();
+                }
 
-                    let r = crate::tools::run_tool("ao", &["status", "-p", &project, "--json"], 30);
-                    if let Ok(out) = r {
-                        let json_start = out.find('[').unwrap_or(0);
-                        if let Ok(val) =
-                            serde_json::from_str::<serde_json::Value>(&out[json_start..])
-                        {
-                            if let Some(arr) = val.as_array() {
-                                if let Some(entry) = arr.iter().find(|e| {
-                                    e.get("name").and_then(|v| v.as_str())
-                                        == Some(session_id.as_str())
-                                }) {
-                                    if let Some(pr_num) =
-                                        entry.get("prNumber").and_then(|v| v.as_u64())
-                                    {
-                                        overlay.pr_number = Some(pr_num);
-                                        deps.store.save(&overlay)?;
-                                    }
+                let r = crate::tools::run_tool("ao", &["status", "-p", &project, "--json"], 30);
+                if let Ok(out) = r {
+                    let json_start = out.find('[').unwrap_or(0);
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&out[json_start..]) {
+                        if let Some(arr) = val.as_array() {
+                            if let Some(entry) = arr.iter().find(|e| {
+                                e.get("name").and_then(|v| v.as_str()) == Some(session_id.as_str())
+                            }) {
+                                if let Some(pr_num) = entry.get("prNumber").and_then(|v| v.as_u64())
+                                {
+                                    overlay.pr_number = Some(pr_num);
+                                    deps.store.save(&overlay)?;
                                 }
                             }
                         }
                     }
                 }
+            }
         }
 
         // Promote DISPATCHED -> ATTESTED once a PR is open (spec §4.2.7).
@@ -4384,9 +4383,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             let vendor_capped = deps
                 .vendor_health
                 .and_then(|m| m.lock().ok())
-                .map(|_l| {
-                    verifier::detect_vendor_cap(&snapshot)
-                })
+                .map(|_l| verifier::detect_vendor_cap(&snapshot))
                 .unwrap_or(false);
             if !vendor_capped {
                 emit(
@@ -4452,8 +4449,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             (crate::vendor_health::Vendor::Bugbot,),
                         ];
                         for (vendor,) in beads {
-                            let is_capped =
-                                verifier::detect_vendor_cap_for(&snapshot, vendor);
+                            let is_capped = verifier::detect_vendor_cap_for(&snapshot, vendor);
                             if is_capped && !ledger.health(vendor).is_capped() {
                                 ledger.record_cap(crate::vendor_health::CapObservation {
                                     vendor,
@@ -4461,7 +4457,10 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                     bead_id: bead_id.to_string(),
                                     pr_number: pr,
                                     ts_epoch: now,
-                                    note: format!("ci_pending={} coderabbit_status={}", snapshot.ci_pending, snapshot.coderabbit_status),
+                                    note: format!(
+                                        "ci_pending={} coderabbit_status={}",
+                                        snapshot.ci_pending, snapshot.coderabbit_status
+                                    ),
                                 });
                                 if ledger.health(vendor).is_capped() {
                                     recently_waived.push(vendor);
@@ -4472,8 +4471,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     // Recovery: clear the vendor if the snapshot is
                     // clean. `detect_vendor_recovery` keys on
                     // STRUCTURED fields only.
-                    let recovered =
-                        verifier::detect_vendor_recovery(&snapshot, &ledger);
+                    let recovered = verifier::detect_vendor_recovery(&snapshot, &ledger);
                     let prev_was_capped: Vec<crate::vendor_health::Vendor> = vec![
                         crate::vendor_health::Vendor::CodeRabbit,
                         crate::vendor_health::Vendor::Bugbot,
@@ -4512,21 +4510,22 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             }
         }
 
-        let mut evidence = match skeptic_evidence(deps, bead_id, pr, &repo, &snapshot, vendor_health) {
-            Ok(e) => e,
-            Err(e) => {
-                let _ = emit(
-                    deps.telemetry_log,
-                    bead_id,
-                    overlay.attempt,
-                    OverlayState::Attested.as_str(),
-                    "BEAD_PROCESSING_TRANSIENT_ERROR",
-                    serde_json::json!({}),
-                    serde_json::json!({"phase": "skeptic_evidence", "error": format!("{e:?}")}),
-                );
-                continue;
-            }
-        };
+        let mut evidence =
+            match skeptic_evidence(deps, bead_id, pr, &repo, &snapshot, vendor_health) {
+                Ok(e) => e,
+                Err(e) => {
+                    let _ = emit(
+                        deps.telemetry_log,
+                        bead_id,
+                        overlay.attempt,
+                        OverlayState::Attested.as_str(),
+                        "BEAD_PROCESSING_TRANSIENT_ERROR",
+                        serde_json::json!({}),
+                        serde_json::json!({"phase": "skeptic_evidence", "error": format!("{e:?}")}),
+                    );
+                    continue;
+                }
+            };
 
         // Bead jleechan-msmq: skip gate re-assessment when this bead's prior
         // reroll attempt DEFERRED (`reroll_deferral_count > 0`,
@@ -4890,10 +4889,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     })
                     .collect();
                 overlay.state = OverlayState::HumanHeld;
-                set_human_hold_reason(
-                    &mut overlay,
-                    HumanHoldReason::GateRegressionCapped,
-                );
+                set_human_hold_reason(&mut overlay, HumanHoldReason::GateRegressionCapped);
                 deps.store.save(&overlay)?;
                 summary.beads_parked_human_held += 1;
                 emit(
@@ -4945,9 +4941,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 .results
                 .iter()
                 .filter_map(|(gate_name, result)| match result {
-                    verifier::GateResult::Red(reason) => {
-                        Some(format!("{gate_name:?}: {reason}"))
-                    }
+                    verifier::GateResult::Red(reason) => Some(format!("{gate_name:?}: {reason}")),
                     _ => None,
                 })
                 .collect();
@@ -5084,14 +5078,10 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             .iter()
             .find(|(name, _)| *name == verifier::GateName::EvidenceFloor)
         {
-            let only_evidence_is_stale = report
-                .results
-                .iter()
-                .all(|(name, result)| {
-                    *name == verifier::GateName::EvidenceFloor
-                        || !matches!(result, verifier::GateResult::Red(_))
-                })
-                && reason.contains("does not match PR head");
+            let only_evidence_is_stale = report.results.iter().all(|(name, result)| {
+                *name == verifier::GateName::EvidenceFloor
+                    || !matches!(result, verifier::GateResult::Red(_))
+            }) && reason.contains("does not match PR head");
             if only_evidence_is_stale {
                 summary.gates_assessed_fast_rejected += 1;
                 continue;
@@ -5652,7 +5642,11 @@ fn evidence_head_stale_already_recorded(
 /// fired the rejection without re-running the parser, AND so the
 /// `evidence_head_stale_already_recorded` dedup key is the actual mismatch
 /// tuple (PR #463 round-1 Codex P2 finding #2).
-fn record_evidence_head_stale(deps: &TickDeps, bead_id: &str, reason: &str) -> Result<(), DaemonError> {
+fn record_evidence_head_stale(
+    deps: &TickDeps,
+    bead_id: &str,
+    reason: &str,
+) -> Result<(), DaemonError> {
     deps.store.save_rejection(
         bead_id,
         EVIDENCE_HEAD_STALE_SENTINEL_ATTEMPT,
@@ -5854,7 +5848,11 @@ mod escalation_context_hash_tests {
         let h3 = escalation_context_hash(&v);
         assert_eq!(h1, h2);
         assert_eq!(h2, h3);
-        assert_eq!(h1.len(), 16, "FNV-1a 64-bit must format as 16 lowercase hex chars");
+        assert_eq!(
+            h1.len(),
+            16,
+            "FNV-1a 64-bit must format as 16 lowercase hex chars"
+        );
     }
 
     /// (b) Canonical form — `serde_json::json!` macros lay fields out in
@@ -5950,7 +5948,11 @@ mod escalation_context_hash_tests {
         const EXPECTED_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
         const EXPECTED_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-        assert_eq!(fnv1a_64(b""), EXPECTED_OFFSET_BASIS, "FNV-1a 64-bit of empty input is the offset basis");
+        assert_eq!(
+            fnv1a_64(b""),
+            EXPECTED_OFFSET_BASIS,
+            "FNV-1a 64-bit of empty input is the offset basis"
+        );
 
         // Manually compute FNV-1a 64-bit of "a" (single byte 0x61).
         let mut expected = EXPECTED_OFFSET_BASIS;
@@ -5965,7 +5967,10 @@ mod escalation_context_hash_tests {
         // PRIME is encoded as a constant in `fnv1a_64`; this assertion is a
         // belt-and-braces guard against a future "let me use the 32-bit
         // variant" refactor silently shifting the hash space.
-        assert_ne!(EXPECTED_PRIME, 0x0100_0193, "FNV-1a 64-bit PRIME must NOT be the 32-bit variant (0x01000193)");
+        assert_ne!(
+            EXPECTED_PRIME, 0x0100_0193,
+            "FNV-1a 64-bit PRIME must NOT be the 32-bit variant (0x01000193)"
+        );
     }
 
     /// (e) Cross-process stability — the hash must NOT depend on any
@@ -6040,7 +6045,11 @@ mod existing_pr_adoption_dedup_tests {
     /// telemetry events across 30 attested beads (jleechan-mdun incident).
     #[test]
     fn suppresses_emit_for_dedup_states() {
-        for state in [OverlayState::Attested, OverlayState::Ready, OverlayState::HumanHeld] {
+        for state in [
+            OverlayState::Attested,
+            OverlayState::Ready,
+            OverlayState::HumanHeld,
+        ] {
             assert!(
                 should_skip_existing_pr_adoption_emit(Some(state)),
                 "overlay in {state:?} must suppress the EXISTING_PR_ADOPTED re-emit"
@@ -6104,7 +6113,11 @@ mod existing_pr_adoption_dedup_tests {
         }
         assert_eq!(
             dedup_states,
-            vec![OverlayState::Attested, OverlayState::Ready, OverlayState::HumanHeld],
+            vec![
+                OverlayState::Attested,
+                OverlayState::Ready,
+                OverlayState::HumanHeld
+            ],
             "EXISTING_PR_ADOPTED dedup set must remain exactly Attested+Ready+HumanHeld"
         );
     }
@@ -6177,9 +6190,7 @@ mod skeptic_prompt_vendor_waiver_tests {
         );
     }
 
-    use crate::vendor_health::{
-        CapObservation, CapSource, Vendor, VendorHealthLedger,
-    };
+    use crate::vendor_health::{CapObservation, CapSource, Vendor, VendorHealthLedger};
 
     fn capped_ledger(vendor: Vendor, bead_prefix: &str) -> VendorHealthLedger {
         let mut ledger = VendorHealthLedger::new();

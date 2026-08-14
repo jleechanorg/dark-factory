@@ -206,6 +206,22 @@ CREATE TABLE IF NOT EXISTS branch_registry (
   created_at TEXT NOT NULL
 );
 
+-- Bead jleechan-jur5: branch/PR collision coalesce. When an intake
+-- candidate shares a branch (or PR identity) with an already-active
+-- bead, the daemon records the colliding child bead id and the
+-- external_ref here instead of refusing the adoption and parking the
+-- child HUMAN_HELD. The owner keeps the active overlay + branch
+-- registry; the child identity is preserved as a pointer so future
+-- ticks can find the owner for the same child without re-escalating.
+CREATE TABLE IF NOT EXISTS branch_coalesce (
+  child_bead_id TEXT PRIMARY KEY,
+  owner_bead_id TEXT NOT NULL,
+  external_ref  TEXT NOT NULL,
+  created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_branch_coalesce_owner
+  ON branch_coalesce (owner_bead_id);
+
 
 -- Circuit breaker: tracking of review rejections per attempt to detect consecutive failures
 CREATE TABLE IF NOT EXISTS review_rejection (

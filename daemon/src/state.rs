@@ -198,6 +198,27 @@ pub trait StateStore {
     fn owned_branches(&self) -> Result<Vec<String>, DaemonError>;
     /// Reverse-lookup: branch → bead_id (used by fast_tier to find drive-existing-pr beads).
     fn bead_id_for_branch(&self, branch: &str) -> Result<Option<String>, DaemonError>;
+    /// Bead jleechan-jur5: record that `child_bead_id` (a colliding
+    /// intake that shares a branch/PR with an already-active bead) has
+    /// been COALESCED onto `owner_bead_id` instead of refused and parked
+    /// HUMAN_HELD. The owner keeps the active overlay state and the
+    /// branch-registry key; the child has no overlay of its own — its
+    /// identity is preserved only as a pointer so callers can find the
+    /// owner when the child PR reappears in a future tick (idempotent
+    /// re-coalesce, no escalation comment).
+    fn record_coalesce(
+        &self,
+        child_bead_id: &str,
+        owner_bead_id: &str,
+        external_ref: &str,
+    ) -> Result<(), DaemonError>;
+    /// Bead jleechan-jur5: reverse-lookup for `record_coalesce`. Returns
+    /// the owner bead id if `bead_id` is a previously-coalesced child,
+    /// or `None` if the bead is an active owner (or unknown). Idempotent
+    /// coalesce path checks this on every tick before calling
+    /// `record_coalesce` so a re-tick on the same child does not
+    /// double-count.
+    fn coalesce_owner_for(&self, bead_id: &str) -> Result<Option<String>, DaemonError>;
     /// Return the overlay rows currently in `DISPATCHED` or `ATTESTED`. The
     /// caller decides whether (and when) to bump `autonomy_secs` per row via
     /// [`bump_autonomy_secs`] — splitting these two ops is what lets the
@@ -441,11 +462,7 @@ pub trait StateStore {
     /// `dispatch::dispatch_ready` immediately after the DISPATCHED save
     /// (bead bze8.3) so a redispatched bead cannot inherit elapsed
     /// autonomy from its prior attempt.
-    fn stamp_attempt_started_at(
-        &self,
-        _bead_id: &str,
-        _now_epoch: u64,
-    ) -> Result<(), DaemonError> {
+    fn stamp_attempt_started_at(&self, _bead_id: &str, _now_epoch: u64) -> Result<(), DaemonError> {
         Ok(())
     }
     /// Clear `attempt_started_at = NULL` for the bead identified by `bead_id`.
@@ -1123,7 +1140,10 @@ impl SqliteStateStore {
                 |row| row.get(0),
             )
             .map_err(|e| {
-                tool_err("ensure_reroll_head_permanent_failure_count_column: pragma", e)
+                tool_err(
+                    "ensure_reroll_head_permanent_failure_count_column: pragma",
+                    e,
+                )
             })?;
         if !has_col {
             conn.execute(
@@ -1415,7 +1435,13 @@ impl SqliteStateStore {
             .map_err(|e| tool_err("ensure_disposition_required_state: rollback probe", e))?;
         let needs_migration = match probe {
             Ok(_) => false, // CHECK already allows it (fresh/already-migrated DB).
-            Err(ref e) if e.to_string().to_ascii_lowercase().contains("check constraint") => true,
+            Err(ref e)
+                if e.to_string()
+                    .to_ascii_lowercase()
+                    .contains("check constraint") =>
+            {
+                true
+            }
             Err(e) => {
                 // A different failure (e.g. a table shape we don't understand)
                 // — do not attempt a rebuild we can't reason about; surface it.
@@ -1437,8 +1463,9 @@ impl SqliteStateStore {
                 .query_map([], |row| row.get::<_, String>(0))
                 .map_err(|e| tool_err("ensure_disposition_required_state: pragma query", e))?;
             for name in rows {
-                live_cols
-                    .insert(name.map_err(|e| tool_err("ensure_disposition_required_state: pragma row", e))?);
+                live_cols.insert(
+                    name.map_err(|e| tool_err("ensure_disposition_required_state: pragma row", e))?,
+                );
             }
         }
         let copy_cols: Vec<&str> = Self::BEAD_OVERLAY_COLUMNS
@@ -1696,11 +1723,7 @@ impl StateStore for SqliteStateStore {
         save_overlay_conn(&self.conn, overlay)
     }
 
-    fn stamp_attempt_started_at(
-        &self,
-        bead_id: &str,
-        now_epoch: u64,
-    ) -> Result<(), DaemonError> {
+    fn stamp_attempt_started_at(&self, bead_id: &str, now_epoch: u64) -> Result<(), DaemonError> {
         // Bead bze8.3: stamped AFTER the DISPATCHED save so a redispatch
         // (a bead whose prior attempt was previously parked with a stale
         // `autonomy_secs` carrying over) starts the budget clock at the
@@ -1783,6 +1806,48 @@ impl StateStore for SqliteStateStore {
         let mut rows = stmt
             .query_map(params![branch], |row| row.get::<_, String>(0))
             .map_err(|e| tool_err("bead_id_for_branch query", e))?;
+        if let Some(Ok(bead)) = rows.next() {
+            Ok(Some(bead))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn record_coalesce(
+        &self,
+        child_bead_id: &str,
+        owner_bead_id: &str,
+        external_ref: &str,
+    ) -> Result<(), DaemonError> {
+        // Bead jleechan-jur5: idempotent INSERT OR REPLACE so a re-tick on
+        // the same child (same external_ref) does not lose the original
+        // owner. The PRIMARY KEY on child_bead_id is the dedup gate;
+        // the owner/external_ref pair carries the canonical coalesce
+        // record. Wrapped in a transaction so a partial write cannot
+        // leave a coalesce row pointing at a not-yet-persisted owner.
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| tool_err("record_coalesce begin", e))?;
+        tx.execute(
+            "INSERT OR REPLACE INTO branch_coalesce (child_bead_id, owner_bead_id, external_ref, created_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![child_bead_id, owner_bead_id, external_ref, now_iso8601()],
+        )
+        .map_err(|e| tool_err("record_coalesce insert", e))?;
+        tx.commit()
+            .map_err(|e| tool_err("record_coalesce commit", e))?;
+        Ok(())
+    }
+
+    fn coalesce_owner_for(&self, bead_id: &str) -> Result<Option<String>, DaemonError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT owner_bead_id FROM branch_coalesce WHERE child_bead_id = ?1")
+            .map_err(|e| tool_err("coalesce_owner_for prepare", e))?;
+        let mut rows = stmt
+            .query_map(params![bead_id], |row| row.get::<_, String>(0))
+            .map_err(|e| tool_err("coalesce_owner_for query", e))?;
         if let Some(Ok(bead)) = rows.next() {
             Ok(Some(bead))
         } else {
@@ -2652,7 +2717,10 @@ impl StateStore for SqliteStateStore {
         claims: &[(String, String, u64, u64)],
         now_epoch: u64,
     ) -> Result<(), DaemonError> {
-        let tx = self.conn.unchecked_transaction().map_err(|e| tool_err("replace_peer_claims: tx", e))?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| tool_err("replace_peer_claims: tx", e))?;
         tx.execute("DELETE FROM peer_claims", [])
             .map_err(|e| tool_err("replace_peer_claims: delete", e))?;
         for (machine, bead_id, claimed_at, expires_at) in claims {
@@ -2673,7 +2741,8 @@ impl StateStore for SqliteStateStore {
             )
             .map_err(|e| tool_err("replace_peer_claims: insert", e))?;
         }
-        tx.commit().map_err(|e| tool_err("replace_peer_claims: commit", e))?;
+        tx.commit()
+            .map_err(|e| tool_err("replace_peer_claims: commit", e))?;
         Ok(())
     }
 
@@ -2858,32 +2927,39 @@ mod tests {
 
         // Never failed permanently yet.
         assert_eq!(
-            s.reroll_head_permanent_failure_count("permfail-bead").unwrap(),
+            s.reroll_head_permanent_failure_count("permfail-bead")
+                .unwrap(),
             0
         );
         // Consecutive increments accumulate and are returned.
         assert_eq!(
-            s.incr_reroll_head_permanent_failure("permfail-bead").unwrap(),
+            s.incr_reroll_head_permanent_failure("permfail-bead")
+                .unwrap(),
             1
         );
         assert_eq!(
-            s.incr_reroll_head_permanent_failure("permfail-bead").unwrap(),
+            s.incr_reroll_head_permanent_failure("permfail-bead")
+                .unwrap(),
             2
         );
         assert_eq!(
-            s.reroll_head_permanent_failure_count("permfail-bead").unwrap(),
+            s.reroll_head_permanent_failure_count("permfail-bead")
+                .unwrap(),
             2
         );
         // A successful probe resets the streak.
-        s.reset_reroll_head_permanent_failure("permfail-bead").unwrap();
+        s.reset_reroll_head_permanent_failure("permfail-bead")
+            .unwrap();
         assert_eq!(
-            s.reroll_head_permanent_failure_count("permfail-bead").unwrap(),
+            s.reroll_head_permanent_failure_count("permfail-bead")
+                .unwrap(),
             0
         );
         // Incrementing/reading a bead with no overlay row is a no-op read of 0
         // (the UPDATE matches nothing) rather than an error.
         assert_eq!(
-            s.reroll_head_permanent_failure_count("no-such-bead").unwrap(),
+            s.reroll_head_permanent_failure_count("no-such-bead")
+                .unwrap(),
             0
         );
     }
@@ -2913,8 +2989,12 @@ mod tests {
         s.save(&o).unwrap();
         // Unset by default.
         assert_eq!(s.held_recheck_after("held-bead").unwrap(), None);
-        s.set_held_recheck_after("held-bead", 1_800_000_000).unwrap();
-        assert_eq!(s.held_recheck_after("held-bead").unwrap(), Some(1_800_000_000));
+        s.set_held_recheck_after("held-bead", 1_800_000_000)
+            .unwrap();
+        assert_eq!(
+            s.held_recheck_after("held-bead").unwrap(),
+            Some(1_800_000_000)
+        );
         // No overlay row -> None, not an error.
         assert_eq!(s.held_recheck_after("no-such-bead").unwrap(), None);
     }
@@ -3057,7 +3137,8 @@ mod tests {
             target_repo: None,
             attempt_started_at: None,
         };
-        s.save(&o).expect("DISPOSITION_REQUIRED must persist after open-time migration");
+        s.save(&o)
+            .expect("DISPOSITION_REQUIRED must persist after open-time migration");
         let got = s.load("held-bead").unwrap().unwrap();
         assert_eq!(got.state, OverlayState::DispositionRequired);
         assert_eq!(got.pr_number, Some(708));
@@ -3467,17 +3548,17 @@ mod tests {
         // here. The field order matches the SELECT in `pre_overlays` /
         // `post_overlays`.
         type OverlaySnapshotRow = (
-            String, // bead_id
-            String, // state
-            i64,    // attempt
-            Option<i64>,        // pr_number
-            Option<String>,     // branch
-            Option<String>,     // session_id
-            Option<String>,     // target_repo
-            Option<String>,     // park_reason
-            Option<String>,     // last_er_evidence_hash
-            Option<i64>,        // held_recheck_after
-            Option<String>,     // pre_session_head_sha
+            String,         // bead_id
+            String,         // state
+            i64,            // attempt
+            Option<i64>,    // pr_number
+            Option<String>, // branch
+            Option<String>, // session_id
+            Option<String>, // target_repo
+            Option<String>, // park_reason
+            Option<String>, // last_er_evidence_hash
+            Option<i64>,    // held_recheck_after
+            Option<String>, // pre_session_head_sha
         );
 
         let mut path = std::env::temp_dir();
@@ -3575,9 +3656,17 @@ mod tests {
                  VALUES (?1, ?2, ?3, 0, 0, 0.0, ?4, ?5, ?6, '2026-07-22T00:00:00Z', \
                          3, 1700000000, 1, 2, ?7, ?8, ?9, 4, ?10, ?11)",
                 rusqlite::params![
-                    bead_id, state, attempt, pr_number, branch, session_id,
-                    pre_session_head_sha, park_reason, target_repo,
-                    held_recheck_after, last_er_evidence_hash
+                    bead_id,
+                    state,
+                    attempt,
+                    pr_number,
+                    branch,
+                    session_id,
+                    pre_session_head_sha,
+                    park_reason,
+                    target_repo,
+                    held_recheck_after,
+                    last_er_evidence_hash
                 ],
             )
             .unwrap();
@@ -3596,16 +3685,136 @@ mod tests {
             ));
         };
 
-        seed_overlay("bead-1", "QUEUED", 1, Some(101), Some("factory/bead-1-r1"), Some("sess-a"), Some("owner/repo1"), None, None, None, None);
-        seed_overlay("bead-2", "DISPATCHED", 2, Some(102), Some("factory/bead-2-r2"), Some("sess-b"), Some("owner/repo1"), None, Some("abc123"), None, None);
-        seed_overlay("bead-3", "ATTESTED", 3, Some(103), Some("factory/bead-3-r3"), Some("sess-c"), Some("owner/repo2"), None, None, Some(1700001000), Some("deadbeef1234"));
-        seed_overlay("bead-4", "READY", 4, Some(104), Some("factory/bead-4-r4"), None, None, None, Some("def456"), None, None);
-        seed_overlay("bead-5", "HUMAN_HELD", 10, Some(105), Some("factory/bead-5-r10"), None, None, Some("circuit-breaker-triggered"), None, None, None);
-        seed_overlay("bead-6", "DISPATCHING", 1, None, None, None, None, None, None, None, None);
-        seed_overlay("bead-7", "RE_ROLL", 2, Some(107), Some("factory/bead-7-r2"), Some("sess-g"), Some("owner/repo3"), None, None, None, None);
-        seed_overlay("bead-8", "RECOVERY", 3, Some(108), Some("factory/bead-8-r3"), None, Some("owner/repo3"), None, None, None, None);
-        seed_overlay("bead-9", "REDISPATCHED", 4, Some(109), Some("factory/bead-9-r4"), Some("sess-i"), Some("owner/repo1"), None, None, None, None);
-        seed_overlay("bead-10", "BUDGET_HELD", 5, Some(110), Some("factory/bead-10-r5"), None, None, Some("autonomy_timebox_exceeded"), None, Some(1700002000), None);
+        seed_overlay(
+            "bead-1",
+            "QUEUED",
+            1,
+            Some(101),
+            Some("factory/bead-1-r1"),
+            Some("sess-a"),
+            Some("owner/repo1"),
+            None,
+            None,
+            None,
+            None,
+        );
+        seed_overlay(
+            "bead-2",
+            "DISPATCHED",
+            2,
+            Some(102),
+            Some("factory/bead-2-r2"),
+            Some("sess-b"),
+            Some("owner/repo1"),
+            None,
+            Some("abc123"),
+            None,
+            None,
+        );
+        seed_overlay(
+            "bead-3",
+            "ATTESTED",
+            3,
+            Some(103),
+            Some("factory/bead-3-r3"),
+            Some("sess-c"),
+            Some("owner/repo2"),
+            None,
+            None,
+            Some(1700001000),
+            Some("deadbeef1234"),
+        );
+        seed_overlay(
+            "bead-4",
+            "READY",
+            4,
+            Some(104),
+            Some("factory/bead-4-r4"),
+            None,
+            None,
+            None,
+            Some("def456"),
+            None,
+            None,
+        );
+        seed_overlay(
+            "bead-5",
+            "HUMAN_HELD",
+            10,
+            Some(105),
+            Some("factory/bead-5-r10"),
+            None,
+            None,
+            Some("circuit-breaker-triggered"),
+            None,
+            None,
+            None,
+        );
+        seed_overlay(
+            "bead-6",
+            "DISPATCHING",
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        seed_overlay(
+            "bead-7",
+            "RE_ROLL",
+            2,
+            Some(107),
+            Some("factory/bead-7-r2"),
+            Some("sess-g"),
+            Some("owner/repo3"),
+            None,
+            None,
+            None,
+            None,
+        );
+        seed_overlay(
+            "bead-8",
+            "RECOVERY",
+            3,
+            Some(108),
+            Some("factory/bead-8-r3"),
+            None,
+            Some("owner/repo3"),
+            None,
+            None,
+            None,
+            None,
+        );
+        seed_overlay(
+            "bead-9",
+            "REDISPATCHED",
+            4,
+            Some(109),
+            Some("factory/bead-9-r4"),
+            Some("sess-i"),
+            Some("owner/repo1"),
+            None,
+            None,
+            None,
+            None,
+        );
+        seed_overlay(
+            "bead-10",
+            "BUDGET_HELD",
+            5,
+            Some(110),
+            Some("factory/bead-10-r5"),
+            None,
+            None,
+            Some("autonomy_timebox_exceeded"),
+            None,
+            Some(1700002000),
+            None,
+        );
 
         // branch_registry: a few rows that exercise the deletion-guard table.
         conn.execute(
@@ -3614,7 +3823,8 @@ mod tests {
              ('factory/bead-2-r2', 'bead-2', '2026-07-22T00:00:01Z'), \
              ('factory/bead-5-r10', 'bead-5', '2026-07-22T00:00:02Z')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         // review_rejection: rows that exercise the per-bead rejection tracking.
         conn.execute(
@@ -3646,7 +3856,10 @@ mod tests {
                     row.get::<_, Option<i64>>(9)?,
                     row.get::<_, Option<String>>(10)?,
                 ))
-            }).unwrap().map(|r| r.unwrap()).collect()
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
         };
         assert_eq!(
             pre_overlays.len(),
@@ -3655,31 +3868,41 @@ mod tests {
         );
 
         let pre_branches: Vec<(String, String, String)> = {
-            let mut stmt = conn.prepare(
-                "SELECT branch, bead_id, created_at FROM branch_registry ORDER BY branch",
-            ).unwrap();
-            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap().map(|r| r.unwrap()).collect()
+            let mut stmt = conn
+                .prepare("SELECT branch, bead_id, created_at FROM branch_registry ORDER BY branch")
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
         };
-        let pre_rejections: Vec<(String, i64, String, String, String, String)> = {
-            let mut stmt = conn.prepare(
+        let pre_rejections: Vec<(String, i64, String, String, String, String)> =
+            {
+                let mut stmt = conn.prepare(
                 "SELECT bead_id, attempt, reviewer, feedback_hash, feedback_text, created_at \
                  FROM review_rejection ORDER BY bead_id, attempt",
             ).unwrap();
-            stmt.query_map([], |row| Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-            ))).unwrap().map(|r| r.unwrap()).collect()
-        };
+                stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                })
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+            };
         drop(conn);
 
         // ── Migrate: open() must apply every ensure_*_column + the disposition
         //    rebuild + the escalation_ledger CREATE TABLE + the terminal
         //    column ADD without losing any pre-existing row.
-        let _store = SqliteStateStore::open(&path).expect("production-shaped legacy DB must auto-migrate");
+        let _store =
+            SqliteStateStore::open(&path).expect("production-shaped legacy DB must auto-migrate");
 
         // Re-open: idempotency guard — second open() must NOT fail.
         let _store2 = SqliteStateStore::open(&path).expect("second open must be idempotent");
@@ -3711,7 +3934,10 @@ mod tests {
                     row.get::<_, Option<i64>>(9)?,
                     row.get::<_, Option<String>>(10)?,
                 ))
-            }).unwrap().map(|r| r.unwrap()).collect()
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
         };
         assert_eq!(
             post_overlays, pre_overlays,
@@ -3721,10 +3947,13 @@ mod tests {
 
         // 2) branch_registry rows preserved.
         let post_branches: Vec<(String, String, String)> = {
-            let mut stmt = conn.prepare(
-                "SELECT branch, bead_id, created_at FROM branch_registry ORDER BY branch",
-            ).unwrap();
-            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap().map(|r| r.unwrap()).collect()
+            let mut stmt = conn
+                .prepare("SELECT branch, bead_id, created_at FROM branch_registry ORDER BY branch")
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
         };
         assert_eq!(
             post_branches, pre_branches,
@@ -3732,20 +3961,26 @@ mod tests {
         );
 
         // 3) review_rejection rows preserved.
-        let post_rejections: Vec<(String, i64, String, String, String, String)> = {
-            let mut stmt = conn.prepare(
+        let post_rejections: Vec<(String, i64, String, String, String, String)> =
+            {
+                let mut stmt = conn.prepare(
                 "SELECT bead_id, attempt, reviewer, feedback_hash, feedback_text, created_at \
                  FROM review_rejection ORDER BY bead_id, attempt",
             ).unwrap();
-            stmt.query_map([], |row| Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-            ))).unwrap().map(|r| r.unwrap()).collect()
-        };
+                stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                })
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+            };
         assert_eq!(
             post_rejections, pre_rejections,
             "review_rejection rows must be preserved; got pre={pre_rejections:?} post={post_rejections:?}"
@@ -3756,9 +3991,14 @@ mod tests {
         //    ledger is populated lazily by `record_escalation_emit` on
         //    the next escalation event).
         let ledger_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM escalation_ledger", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM escalation_ledger", [], |row| {
+                row.get(0)
+            })
             .unwrap();
-        assert_eq!(ledger_count, 0, "escalation_ledger must start empty after migration");
+        assert_eq!(
+            ledger_count, 0,
+            "escalation_ledger must start empty after migration"
+        );
 
         // 5) The terminal column exists with the documented default (0).
         //    `pragma_table_info.dflt_value` is TEXT (the literal SQL fragment
@@ -3785,7 +4025,8 @@ mod tests {
              (bead_id, state, attempt, updated_at) \
              VALUES ('bead-new-disp', 'DISPOSITION_REQUIRED', 1, '2026-07-22T00:00:03Z')",
             [],
-        ).expect("DISPOSITION_REQUIRED must be insertable after the disposition-rebuild migration");
+        )
+        .expect("DISPOSITION_REQUIRED must be insertable after the disposition-rebuild migration");
 
         // 7) The bead_overlay CHECK constraint still rejects garbage — pins
         //    the constraint is wired up (not silently dropped).
@@ -3822,7 +4063,9 @@ mod tests {
         );
 
         let rejection_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM review_rejection", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM review_rejection", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(
             rejection_count as usize,
@@ -5160,8 +5403,18 @@ mod tests {
         // First sync: two claims.
         s.replace_peer_claims(
             &[
-                ("jeff-ubuntu".to_string(), "bead-a".to_string(), now, now + 60),
-                ("jeff-ubuntu".to_string(), "bead-b".to_string(), now, now + 60),
+                (
+                    "jeff-ubuntu".to_string(),
+                    "bead-a".to_string(),
+                    now,
+                    now + 60,
+                ),
+                (
+                    "jeff-ubuntu".to_string(),
+                    "bead-b".to_string(),
+                    now,
+                    now + 60,
+                ),
             ],
             now,
         )
@@ -5171,7 +5424,12 @@ mod tests {
         // Second sync: peer dropped bead-b. Replace wipes both rows and
         // re-inserts only bead-a.
         s.replace_peer_claims(
-            &[("jeff-ubuntu".to_string(), "bead-a".to_string(), now, now + 60)],
+            &[(
+                "jeff-ubuntu".to_string(),
+                "bead-a".to_string(),
+                now,
+                now + 60,
+            )],
             now + 10,
         )
         .unwrap();

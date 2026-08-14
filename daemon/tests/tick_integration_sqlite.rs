@@ -76,7 +76,13 @@ impl SqliteTestStore {
                 "SELECT context_hash, last_emitted_epoch, terminal \
                  FROM escalation_ledger WHERE bead_id = ?1 AND reason = ?2",
                 params![bead_id, reason],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
             )
             .ok()
     }
@@ -98,19 +104,45 @@ impl StateStore for SqliteTestStore {
     fn save(&self, overlay: &BeadOverlay) -> Result<(), daemon::errors::DaemonError> {
         self.store.save(overlay)
     }
-    fn register_branch(&self, bead_id: &str, branch: &str) -> Result<(), daemon::errors::DaemonError> {
+    fn register_branch(
+        &self,
+        bead_id: &str,
+        branch: &str,
+    ) -> Result<(), daemon::errors::DaemonError> {
         self.store.register_branch(bead_id, branch)
     }
     fn owned_branches(&self) -> Result<Vec<String>, daemon::errors::DaemonError> {
         self.store.owned_branches()
     }
-    fn bead_id_for_branch(&self, branch: &str) -> Result<Option<String>, daemon::errors::DaemonError> {
+    fn bead_id_for_branch(
+        &self,
+        branch: &str,
+    ) -> Result<Option<String>, daemon::errors::DaemonError> {
         self.store.bead_id_for_branch(branch)
+    }
+    fn record_coalesce(
+        &self,
+        child_bead_id: &str,
+        owner_bead_id: &str,
+        external_ref: &str,
+    ) -> Result<(), daemon::errors::DaemonError> {
+        self.store
+            .record_coalesce(child_bead_id, owner_bead_id, external_ref)
+    }
+    fn coalesce_owner_for(
+        &self,
+        bead_id: &str,
+    ) -> Result<Option<String>, daemon::errors::DaemonError> {
+        self.store.coalesce_owner_for(bead_id)
     }
     fn list_active_overlays(&self) -> Result<Vec<BeadOverlay>, daemon::errors::DaemonError> {
         self.store.list_active_overlays()
     }
-    fn bump_autonomy_secs(&self, bead_id: &str, delta_secs: u64) -> Result<(), daemon::errors::DaemonError> {
+    fn bump_autonomy_secs(
+        &self,
+        bead_id: &str,
+        delta_secs: u64,
+    ) -> Result<(), daemon::errors::DaemonError> {
         self.store.bump_autonomy_secs(bead_id, delta_secs)
     }
     fn human_held_at_or_above_attempt(
@@ -148,14 +180,16 @@ impl StateStore for SqliteTestStore {
         bead_id: &str,
         attempt: u32,
     ) -> Result<(), daemon::errors::DaemonError> {
-        self.store.mark_remediation_session_spawned(bead_id, attempt)
+        self.store
+            .mark_remediation_session_spawned(bead_id, attempt)
     }
     fn save_remediation_session_spawned(
         &self,
         overlay: &BeadOverlay,
         attempt: u32,
     ) -> Result<(), daemon::errors::DaemonError> {
-        self.store.save_remediation_session_spawned(overlay, attempt)
+        self.store
+            .save_remediation_session_spawned(overlay, attempt)
     }
     fn escalation_should_emit(
         &self,
@@ -188,7 +222,10 @@ impl StateStore for SqliteTestStore {
     fn reconcile_dispatching(&self) -> Result<(), daemon::errors::DaemonError> {
         self.store.reconcile_dispatching()
     }
-    fn recover_human_held(&self, max_attempt: u32) -> Result<Vec<BeadOverlay>, daemon::errors::DaemonError> {
+    fn recover_human_held(
+        &self,
+        max_attempt: u32,
+    ) -> Result<Vec<BeadOverlay>, daemon::errors::DaemonError> {
         self.store.recover_human_held(max_attempt)
     }
 }
@@ -243,7 +280,10 @@ fn adopted_remediation_marker_is_migrated_and_persistent() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(table_exists, 1, "legacy-store migration must create marker table");
+    assert_eq!(
+        table_exists, 1,
+        "legacy-store migration must create marker table"
+    );
     drop(store);
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
@@ -551,7 +591,12 @@ fn sqlite_escalation_dedup_terminal_marker_survives_real_upsert() {
     // Simulate a notification that was first emitted, then classified as
     // permanent (e.g. `invalid issue format: "local-xxx"`).
     store
-        .record_escalation_emit("bead-perma", "human_held_recovery_attempt_cap_reached", "deadbeef", 1000)
+        .record_escalation_emit(
+            "bead-perma",
+            "human_held_recovery_attempt_cap_reached",
+            "deadbeef",
+            1000,
+        )
         .unwrap();
     let (_, _, terminal_before) = store
         .ledger_row("bead-perma", "human_held_recovery_attempt_cap_reached")
@@ -564,7 +609,10 @@ fn sqlite_escalation_dedup_terminal_marker_survives_real_upsert() {
     let (_, _, terminal_after) = store
         .ledger_row("bead-perma", "human_held_recovery_attempt_cap_reached")
         .unwrap();
-    assert_eq!(terminal_after, 1, "mark_escalation_undeliverable must flip terminal=1");
+    assert_eq!(
+        terminal_after, 1,
+        "mark_escalation_undeliverable must flip terminal=1"
+    );
 
     // Should-suppress regardless of context hash or epoch:
     assert!(!store
@@ -582,10 +630,11 @@ fn sqlite_escalation_dedup_terminal_marker_survives_real_upsert() {
     store
         .mark_escalation_undeliverable("fresh-bead", "fresh-reason")
         .unwrap();
-    let (_, last_epoch, terminal_fresh) = store
-        .ledger_row("fresh-bead", "fresh-reason")
-        .unwrap();
-    assert_eq!(terminal_fresh, 1, "fresh terminal row must be inserted as terminal");
+    let (_, last_epoch, terminal_fresh) = store.ledger_row("fresh-bead", "fresh-reason").unwrap();
+    assert_eq!(
+        terminal_fresh, 1,
+        "fresh terminal row must be inserted as terminal"
+    );
     assert_eq!(
         last_epoch, 0,
         "terminal-only upsert uses epoch 0 to avoid spurious backoff windows"
@@ -595,7 +644,12 @@ fn sqlite_escalation_dedup_terminal_marker_survives_real_upsert() {
     // `mark_escalation_undeliverable` must NOT clear terminal (mirrors the
     // FakeStateStore invariant).
     store
-        .record_escalation_emit("bead-perma", "human_held_recovery_attempt_cap_reached", "newhash", 5000)
+        .record_escalation_emit(
+            "bead-perma",
+            "human_held_recovery_attempt_cap_reached",
+            "newhash",
+            5000,
+        )
         .unwrap();
     let (_, _, terminal_post) = store
         .ledger_row("bead-perma", "human_held_recovery_attempt_cap_reached")
