@@ -3778,6 +3778,8 @@ raise SystemExit(9)
         let branch = "factory/jleechan-contract-opaque-r1";
         let bindings = serde_json::json!({ prompt: branch });
         let (spawn_result, remote_result) = with_fake_ao("opaque", bindings, |log| {
+            let saved_chain = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok();
+            std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "minimax");
             let workspace = log.parent().unwrap().join("df-opaque-134");
             std::fs::create_dir_all(&workspace).unwrap();
             std::process::Command::new("git")
@@ -3804,6 +3806,10 @@ raise SystemExit(9)
             match previous_workspace {
                 Some(value) => std::env::set_var("AO_FAKE_WORKTREE", value),
                 None => std::env::remove_var("AO_FAKE_WORKTREE"),
+            }
+            match saved_chain {
+                Some(val) => std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", val),
+                None => std::env::remove_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN"),
             }
             (spawn_result, remote_result)
         });
@@ -4347,6 +4353,532 @@ os.execvp(os.environ["AO_FAKE_NODE"], [os.environ["AO_FAKE_NODE"], os.environ["A
             second_remote.unwrap().as_deref(),
             Some("https://github.com/jleechanorg/dark-factory.git")
         );
+    }
+
+    #[test]
+    fn bridge_creates_worktree_at_expected_revision_for_adopted_pr() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "afd_ao_bridge_adopted_pr_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let cli = root.join("node_modules/@jleechanorg/ao-cli");
+        let core = root.join("node_modules/@jleechanorg/ao-core");
+        let target = root.join("managed-target");
+        let worktree_dir = root.join("worktrees");
+        let calls = root.join("calls.log");
+        std::fs::create_dir_all(cli.join("dist/lib")).unwrap();
+        std::fs::create_dir_all(core.join("dist")).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&worktree_dir).unwrap();
+
+        std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&target)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "user.name=Dark Factory Test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "base main commit",
+            ])
+            .current_dir(&target)
+            .status()
+            .unwrap();
+        let main_sha = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&target)
+            .output()
+            .unwrap();
+        let main_sha = String::from_utf8(main_sha.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "user.name=Dark Factory Test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "adopted PR commit",
+            ])
+            .current_dir(&target)
+            .status()
+            .unwrap();
+        let pr_sha = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&target)
+            .output()
+            .unwrap();
+        let pr_sha = String::from_utf8(pr_sha.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_ne!(main_sha, pr_sha);
+
+        std::process::Command::new("git")
+            .args(["remote", "add", "origin", target.to_str().unwrap()])
+            .current_dir(&target)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["update-ref", "refs/remotes/origin/main", &main_sha])
+            .current_dir(&target)
+            .status()
+            .unwrap();
+
+        std::process::Command::new("git")
+            .args(["checkout", "--detach", &pr_sha])
+            .current_dir(&target)
+            .status()
+            .unwrap();
+
+        std::fs::write(
+            cli.join("package.json"),
+            r#"{"name":"@jleechanorg/ao-cli","version":"0.1.3","type":"module"}"#,
+        )
+        .unwrap();
+        std::fs::write(cli.join("dist/index.js"), "throw new Error('CLI must not run');\n")
+            .unwrap();
+        std::fs::write(
+            core.join("package.json"),
+            r#"{"name":"@jleechanorg/ao-core","version":"0.1.0","type":"module","exports":{".":{"import":"./dist/index.js"}}}"#,
+        )
+        .unwrap();
+
+        let target_str = target.to_string_lossy();
+        let worktree_dir_str = worktree_dir.to_string_lossy();
+
+        std::fs::write(
+            core.join("dist/index.js"),
+            format!(
+                r#"import {{appendFileSync, mkdirSync}} from 'node:fs';
+import {{execFileSync}} from 'node:child_process';
+import {{join}} from 'node:path';
+
+const log = (value) => appendFileSync(process.env.AO_FAKE_CALLS, JSON.stringify(value) + '\n');
+export const loadConfig = () => ({{
+  configPath: '/tmp/fake-ao.yaml',
+  plugins: {{
+    'workspace-worktree': {{ worktreeDir: '{worktree_dir_str}' }}
+  }},
+  defaults: {{ workspace: 'worktree' }},
+  projects: {{
+    'worldarchitect': {{ path: '{target_str}', defaultBranch: 'main' }}
+  }}
+}});
+
+class MockWorktreePlugin {{
+  constructor() {{
+    this.name = 'worktree';
+  }}
+  async create(cfg) {{
+    const wtPath = join('{worktree_dir_str}', cfg.projectId, cfg.sessionId);
+    mkdirSync(join('{worktree_dir_str}', cfg.projectId), {{ recursive: true }});
+    execFileSync('git', ['-C', '{target_str}', 'worktree', 'add', '-b', cfg.branch, wtPath, 'origin/main']);
+    return {{ path: wtPath, branch: cfg.branch, sessionId: cfg.sessionId, projectId: cfg.projectId }};
+  }}
+}}
+
+export const createPluginRegistry = () => {{
+  const plugins = new Map();
+  const pluginInstance = new MockWorktreePlugin();
+  plugins.set('workspace:worktree', {{ manifest: {{ slot: 'workspace', name: 'worktree' }}, instance: pluginInstance }});
+  return {{
+    register: (mod) => {{}},
+    get: (slot, name) => plugins.get(slot + ':' + name)?.instance || null,
+    list: (slot) => [{{ slot: 'workspace', name: 'worktree' }}],
+    loadFromConfig: async () => {{}},
+  }};
+}};
+
+export const createSessionManager = ({{config, registry}}) => ({{
+  list: async () => [],
+  spawn: async (spec) => {{
+    const ws = registry.get('workspace', 'worktree');
+    const wsInfo = await ws.create({{ projectId: spec.projectId, sessionId: 'wa-3425', branch: spec.branch, project: config.projects[spec.projectId] }});
+    log({{ kind: 'spawn', branch: spec.branch, workspacePath: wsInfo.path }});
+    return {{ id: 'wa-3425', branch: spec.branch, workspacePath: wsInfo.path }};
+  }},
+}});
+
+export const acquireSpawnLock = () => ({{ acquired: true, release() {{}} }});
+export const resolveSpawnQueueConfig = () => ({{ enabled: true, maxActiveSessions: 10 }});
+export const isTerminalSession = () => false;
+"#
+            ),
+        )
+        .unwrap();
+
+        std::fs::write(
+            cli.join("dist/lib/preflight.js"),
+            "export const preflight = {checkTmux: async () => {}, checkGhAuth: async () => {}};\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/running-state.js"),
+            "export const getRunning = async () => ({projects: ['worldarchitect']});\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/lifecycle-service.js"),
+            "export const ensureLifecycleWorker = async () => {};\n",
+        )
+        .unwrap();
+
+        let bridge = ao_spawn_bridge_path();
+        let output = std::process::Command::new(bridge_test_node())
+            .arg(cli.join("dist/index.js"))
+            .args([
+                "spawn",
+                "--project",
+                "worldarchitect",
+                "--agent",
+                "minimax",
+                "--",
+                "adopted PR remediation probe",
+            ])
+            .env(
+                "NODE_OPTIONS",
+                format!(
+                    "--experimental-import-meta-resolve --import={}",
+                    bridge.display()
+                ),
+            )
+            .env("DARK_FACTORY_AO_PARENT_NODE_OPTIONS", "")
+            .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
+            .env(
+                "DARK_FACTORY_AO_SPAWN_BRANCH",
+                "docs/claude-guidance-20260814",
+            )
+            .env("DARK_FACTORY_AO_TARGET_CHECKOUT", &target)
+            .env("DARK_FACTORY_AO_EXPECTED_REVISION", &pr_sha)
+            .env("DARK_FACTORY_AO_MANAGED_CHECKOUT", "1")
+            .env("AO_FAKE_CALLS", &calls)
+            .output()
+            .unwrap();
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "bridge failed; stdout={stdout}; stderr={stderr}"
+        );
+        assert!(stdout.contains("SESSION=wa-3425"), "{stdout}");
+
+        let created_wt = worktree_dir.join("worldarchitect/wa-3425");
+        assert!(created_wt.is_dir(), "worktree directory was not created: {created_wt:?}");
+
+        let created_head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&created_wt)
+            .output()
+            .unwrap();
+        let created_head = String::from_utf8(created_head.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(
+            created_head, pr_sha,
+            "created worktree must be at expected revision {pr_sha}, got {created_head} (main_sha is {main_sha})"
+        );
+
+        let created_branch = std::process::Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&created_wt)
+            .output()
+            .unwrap();
+        let created_branch = String::from_utf8(created_branch.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(created_branch, "docs/claude-guidance-20260814");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bridge_remediates_and_resets_stale_branch_on_clean_retry() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "afd_ao_bridge_adopted_retry_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let cli = root.join("node_modules/@jleechanorg/ao-cli");
+        let core = root.join("node_modules/@jleechanorg/ao-core");
+        let target = root.join("managed-target");
+        let worktree_dir = root.join("worktrees");
+        let calls = root.join("calls.log");
+        std::fs::create_dir_all(cli.join("dist/lib")).unwrap();
+        std::fs::create_dir_all(core.join("dist")).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&worktree_dir).unwrap();
+
+        std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&target)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "user.name=Dark Factory Test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "base main commit",
+            ])
+            .current_dir(&target)
+            .status()
+            .unwrap();
+        let main_sha = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&target)
+            .output()
+            .unwrap();
+        let main_sha = String::from_utf8(main_sha.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "user.name=Dark Factory Test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "adopted PR commit",
+            ])
+            .current_dir(&target)
+            .status()
+            .unwrap();
+        let pr_sha = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&target)
+            .output()
+            .unwrap();
+        let pr_sha = String::from_utf8(pr_sha.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        std::process::Command::new("git")
+            .args(["remote", "add", "origin", target.to_str().unwrap()])
+            .current_dir(&target)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["update-ref", "refs/remotes/origin/main", &main_sha])
+            .current_dir(&target)
+            .status()
+            .unwrap();
+
+        // Simulate a prior failed spawn wa-3425 which left a stale worktree and branch at main_sha
+        let stale_wt = worktree_dir.join("worldarchitect/wa-3425");
+        std::fs::create_dir_all(stale_wt.parent().unwrap()).unwrap();
+        std::process::Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                "docs/claude-guidance-20260814",
+                stale_wt.to_str().unwrap(),
+                &main_sha,
+            ])
+            .current_dir(&target)
+            .status()
+            .unwrap();
+
+        // Target checkout HEAD is at pr_sha
+        std::process::Command::new("git")
+            .args(["checkout", "--detach", &pr_sha])
+            .current_dir(&target)
+            .status()
+            .unwrap();
+
+        std::fs::write(
+            cli.join("package.json"),
+            r#"{"name":"@jleechanorg/ao-cli","version":"0.1.3","type":"module"}"#,
+        )
+        .unwrap();
+        std::fs::write(cli.join("dist/index.js"), "throw new Error('CLI must not run');\n")
+            .unwrap();
+        std::fs::write(
+            core.join("package.json"),
+            r#"{"name":"@jleechanorg/ao-core","version":"0.1.0","type":"module","exports":{".":{"import":"./dist/index.js"}}}"#,
+        )
+        .unwrap();
+
+        let target_str = target.to_string_lossy();
+        let worktree_dir_str = worktree_dir.to_string_lossy();
+
+        std::fs::write(
+            core.join("dist/index.js"),
+            format!(
+                r#"import {{appendFileSync, mkdirSync}} from 'node:fs';
+import {{execFileSync}} from 'node:child_process';
+import {{join}} from 'node:path';
+
+const log = (value) => appendFileSync(process.env.AO_FAKE_CALLS, JSON.stringify(value) + '\n');
+export const loadConfig = () => ({{
+  configPath: '/tmp/fake-ao.yaml',
+  plugins: {{
+    'workspace-worktree': {{ worktreeDir: '{worktree_dir_str}' }}
+  }},
+  defaults: {{ workspace: 'worktree' }},
+  projects: {{
+    'worldarchitect': {{ path: '{target_str}', defaultBranch: 'main' }}
+  }}
+}});
+
+class MockWorktreePlugin {{
+  constructor() {{
+    this.name = 'worktree';
+  }}
+  async create(cfg) {{
+    const wtPath = join('{worktree_dir_str}', cfg.projectId, cfg.sessionId);
+    mkdirSync(join('{worktree_dir_str}', cfg.projectId), {{ recursive: true }});
+    execFileSync('git', ['-C', '{target_str}', 'worktree', 'add', '-b', cfg.branch, wtPath, 'origin/main']);
+    return {{ path: wtPath, branch: cfg.branch, sessionId: cfg.sessionId, projectId: cfg.projectId }};
+  }}
+}}
+
+export const createPluginRegistry = () => {{
+  const plugins = new Map();
+  const pluginInstance = new MockWorktreePlugin();
+  plugins.set('workspace:worktree', {{ manifest: {{ slot: 'workspace', name: 'worktree' }}, instance: pluginInstance }});
+  return {{
+    register: (mod) => {{}},
+    get: (slot, name) => plugins.get(slot + ':' + name)?.instance || null,
+    list: (slot) => [{{ slot: 'workspace', name: 'worktree' }}],
+    loadFromConfig: async () => {{}},
+  }};
+}};
+
+export const createSessionManager = ({{config, registry}}) => ({{
+  list: async () => [],
+  spawn: async (spec) => {{
+    const ws = registry.get('workspace', 'worktree');
+    const wsInfo = await ws.create({{ projectId: spec.projectId, sessionId: 'wa-3426', branch: spec.branch, project: config.projects[spec.projectId] }});
+    log({{ kind: 'spawn', branch: spec.branch, workspacePath: wsInfo.path }});
+    return {{ id: 'wa-3426', branch: spec.branch, workspacePath: wsInfo.path }};
+  }},
+}});
+
+export const acquireSpawnLock = () => ({{ acquired: true, release() {{}} }});
+export const resolveSpawnQueueConfig = () => ({{ enabled: true, maxActiveSessions: 10 }});
+export const isTerminalSession = () => false;
+"#
+            ),
+        )
+        .unwrap();
+
+        std::fs::write(
+            cli.join("dist/lib/preflight.js"),
+            "export const preflight = {checkTmux: async () => {}, checkGhAuth: async () => {}};\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/running-state.js"),
+            "export const getRunning = async () => ({projects: ['worldarchitect']});\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/lifecycle-service.js"),
+            "export const ensureLifecycleWorker = async () => {};\n",
+        )
+        .unwrap();
+
+        let bridge = ao_spawn_bridge_path();
+        let output = std::process::Command::new(bridge_test_node())
+            .arg(cli.join("dist/index.js"))
+            .args([
+                "spawn",
+                "--project",
+                "worldarchitect",
+                "--agent",
+                "minimax",
+                "--",
+                "adopted PR remediation retry probe",
+            ])
+            .env(
+                "NODE_OPTIONS",
+                format!(
+                    "--experimental-import-meta-resolve --import={}",
+                    bridge.display()
+                ),
+            )
+            .env("DARK_FACTORY_AO_PARENT_NODE_OPTIONS", "")
+            .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
+            .env(
+                "DARK_FACTORY_AO_SPAWN_BRANCH",
+                "docs/claude-guidance-20260814",
+            )
+            .env("DARK_FACTORY_AO_TARGET_CHECKOUT", &target)
+            .env("DARK_FACTORY_AO_EXPECTED_REVISION", &pr_sha)
+            .env("DARK_FACTORY_AO_MANAGED_CHECKOUT", "1")
+            .env("AO_FAKE_CALLS", &calls)
+            .output()
+            .unwrap();
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "bridge retry failed; stdout={stdout}; stderr={stderr}"
+        );
+        assert!(stdout.contains("SESSION=wa-3426"), "{stdout}");
+
+        let created_wt = worktree_dir.join("worldarchitect/wa-3426");
+        assert!(created_wt.is_dir(), "worktree directory was not created: {created_wt:?}");
+
+        let created_head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&created_wt)
+            .output()
+            .unwrap();
+        let created_head = String::from_utf8(created_head.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(
+            created_head, pr_sha,
+            "remediated worktree must be at expected revision {pr_sha}, got {created_head}"
+        );
+
+        let created_branch = std::process::Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&created_wt)
+            .output()
+            .unwrap();
+        let created_branch = String::from_utf8(created_branch.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(created_branch, "docs/claude-guidance-20260814");
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 
