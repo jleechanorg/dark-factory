@@ -18,41 +18,101 @@ Exit codes
 
 The module is runnable as ``python -m runner.preflight --backend claude --json``
 so the bash wrappers can capture structured output.
+
+Configuration (Bead jleechan-ev6m)
+---------------------------------
+The probed backend list, transitive deps, and fallback priority are
+sourced from ``config/backends.json`` (or ``~/.dark-factory/backends.json``)
+when available. The legacy constants below are the hardcoded fallback
+used when no JSON config exists. See ``runner/backend_config.py`` for the
+schema.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import logging
+import os
 import pathlib
 import shutil
 import sys
 from typing import Optional
 
+from . import backend_config
 
-# Backends we probe. ``echo`` is always considered available — it is
-# the no-LLM fallback built into the runner.
-PROBED_BACKENDS = ("claude", "codex", "agy", "ao", "echo")
 
-# Transitive deps: if a backend is configured, also check these.
-# Currently only ``ao`` requires ``sandbox-exec`` (macOS seatbelt).
-TRANSITIVE_DEPS = {
+_LOG = logging.getLogger("runner.preflight")
+
+# Legacy defaults — used when no JSON config is present. The JSON-driven
+# config (``config/backends.json``) is the canonical source.
+LEGACY_PROBED_BACKENDS = ("claude", "codex", "agy", "ao", "echo")
+
+LEGACY_TRANSITIVE_DEPS = {
     "ao": ("sandbox-exec",),
 }
 
-# Priority order for fallback_recommendation when the configured backend
-# is missing. The first CLI in this tuple that resolves to a real path
-# wins. ``echo`` is the final always-present fallback.
-FALLBACK_PRIORITY = ("codex", "claude", "agy", "ao", "echo")
+LEGACY_FALLBACK_PRIORITY = ("codex", "claude", "agy", "ao", "echo")
 
-# Install hint shown for each backend when missing.
-HINTS = {
+LEGACY_HINTS = {
     "claude": "Install: npm install -g @anthropics/claude-code",
     "codex": "Install: npm install -g @openai/codex",
     "agy": "Install: see https://github.com/jleechanorg/agent-orchestrator",
     "ao": "Install: see Agent Orchestrator setup docs",
     "sandbox-exec": "macOS-only; built-in",
 }
+
+
+def _load_config_or_default() -> dict | None:
+    """Try to load JSON config; return ``None`` if no config found."""
+    try:
+        return backend_config.load_with_precedence()
+    except FileNotFoundError:
+        return None
+    except Exception as exc:  # pragma: no cover - defensive
+        _LOG.warning("backend_config load failed: %s; using legacy defaults", exc)
+        return None
+
+
+def _resolve_probed_backends() -> tuple[str, ...]:
+    """Return the list of backend names to probe, from JSON config or legacy."""
+    cfg = _load_config_or_default()
+    if cfg:
+        names = tuple(cfg["backends"].keys())
+        if names:
+            return names
+    return LEGACY_PROBED_BACKENDS
+
+
+def _resolve_fallback_priority(cfg: dict | None) -> tuple[str, ...]:
+    """Return fallback priority from JSON config or legacy defaults."""
+    if cfg:
+        chain = cfg.get("fallback_chain", [])
+        reviewer = cfg.get("reviewer_default")
+        ordered: list[str] = []
+        if reviewer:
+            ordered.append(backend_config.resolve_alias(cfg, reviewer))
+        for entry in chain:
+            canonical = backend_config.resolve_alias(cfg, entry)
+            if canonical and canonical not in ordered:
+                ordered.append(canonical)
+        if ordered:
+            return tuple(ordered)
+    return LEGACY_FALLBACK_PRIORITY
+
+
+def _resolve_transitive_deps(backend: str, cfg: dict | None) -> tuple[str, ...]:
+    """Return transitive deps for ``backend`` from JSON or legacy."""
+    if cfg and backend in cfg["backends"]:
+        deps = cfg["backends"][backend].get("transitive_deps", [])
+        return tuple(deps)
+    return LEGACY_TRANSITIVE_DEPS.get(backend, ())
+
+
+def _resolve_hints(cfg: dict | None) -> dict[str, str]:
+    """Return install hints from JSON (if available) merged with legacy."""
+    hints: dict[str, str] = dict(LEGACY_HINTS)
+    return hints
 
 
 def _probe(name: str) -> Optional[str]:
@@ -93,14 +153,19 @@ def preflight_check(backend: str, workdir: pathlib.Path | None = None) -> dict:
     workdir = workdir or pathlib.Path.cwd()
     del workdir  # currently unused; keep the parameter for future expansion
 
+    cfg = _load_config_or_default()
+    probed = _resolve_probed_backends()
+    fallback_priority = _resolve_fallback_priority(cfg)
+    hints = _resolve_hints(cfg)
+
     # Normalize: a backend we don't know about is treated as missing
     # but still appears in the report so the caller can see what was
     # asked for.
-    known = backend in PROBED_BACKENDS
+    known = backend in probed
     configured_present = (backend == "echo") or _probe(backend) is not None
 
     backends: dict[str, dict] = {}
-    for name in PROBED_BACKENDS:
+    for name in probed:
         if name == "echo":
             backends[name] = {"ok": True, "path": None, "hint": None}
             continue
@@ -108,7 +173,7 @@ def preflight_check(backend: str, workdir: pathlib.Path | None = None) -> dict:
         backends[name] = {
             "ok": path is not None,
             "path": path,
-            "hint": None if path else HINTS.get(name),
+            "hint": None if path else hints.get(name),
         }
 
     # Include the configured backend in the report even if it's an
@@ -118,16 +183,16 @@ def preflight_check(backend: str, workdir: pathlib.Path | None = None) -> dict:
         backends[backend] = {
             "ok": path is not None,
             "path": path,
-            "hint": HINTS.get(backend, f"Unknown backend {backend!r}"),
+            "hint": hints.get(backend, f"Unknown backend {backend!r}"),
         }
 
     transitive: dict[str, dict] = {}
-    for dep in TRANSITIVE_DEPS.get(backend, ()):
+    for dep in _resolve_transitive_deps(backend, cfg):
         path = _probe(dep)
         transitive[dep] = {
             "ok": path is not None,
             "path": path,
-            "hint": None if path else HINTS.get(dep),
+            "hint": None if path else hints.get(dep),
         }
 
     # Determine status.
@@ -157,13 +222,13 @@ def preflight_check(backend: str, workdir: pathlib.Path | None = None) -> dict:
                 status = "fail"
 
     # Pick fallback: first available in priority order. If the configured
-    # backend is present, prefer it; otherwise pick the first FALLBACK_PRIORITY
+    # backend is present, prefer it; otherwise pick the first fallback_priority
     # entry that resolves.
     if backend == "echo" or configured_present:
         fallback = backend if backend == "echo" else backend
     else:
         fallback = "echo"
-        for cand in FALLBACK_PRIORITY:
+        for cand in fallback_priority:
             if cand == backend:
                 continue
             info = backends.get(cand)

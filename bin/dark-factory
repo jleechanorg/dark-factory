@@ -80,9 +80,13 @@ if [[ ! -x "${VENV_PYTHON}" ]]; then
   exit 1
 fi
 
-# Extract --backend value from argv (default: echo) without disturbing
-# the rest of the argument list. Cheap linear scan is fine — bash only.
-PREFLIGHT_BACKEND="${DARK_FACTORY_BACKEND:-}"
+# Extract --backend value from argv (default: from JSON config) without
+# disturbing the rest of the argument list. Cheap linear scan is fine —
+# bash only. JSON config precedence: explicit $DARK_FACTORY_BACKENDS_CONFIG
+# > user ~/.dark-factory/backends.json > repo config/backends.json.
+# The legacy $DARK_FACTORY_BACKEND env var is honored (with a deprecation
+# warning from runner.backend_config) for backward compatibility.
+PREFLIGHT_BACKEND=""
 prev=""
 for arg in "$@"; do
   if [[ "${prev}" == "--backend" ]]; then
@@ -94,7 +98,29 @@ for arg in "$@"; do
   fi
   prev="${arg}"
 done
-PREFLIGHT_BACKEND="${PREFLIGHT_BACKEND:-echo}"
+
+# Resolve backend from JSON config when no CLI flag was passed. Honor the
+# legacy DARK_FACTORY_BACKEND env var first (matches runner.backend_config
+# precedence) so existing operators don't need to migrate immediately.
+if [[ -z "${PREFLIGHT_BACKEND}" ]]; then
+  if [[ -n "${DARK_FACTORY_BACKEND:-}" ]]; then
+    PREFLIGHT_BACKEND="${DARK_FACTORY_BACKEND}"
+  elif [[ -x "${VENV_PYTHON}" ]]; then
+    PREFLIGHT_BACKEND="$(
+      PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
+        "${VENV_PYTHON}" -c "
+import sys
+sys.path.insert(0, '${DARK_FACTORY_HOME}')
+from runner import backend_config
+try:
+    print(backend_config.resolve_backend(cli_backend=None))
+except Exception:
+    print('echo')
+" 2>/dev/null
+    )"
+  fi
+  PREFLIGHT_BACKEND="${PREFLIGHT_BACKEND:-echo}"
+fi
 
 # Preflight: probe the configured backend and warn-or-fail before
 # we hand off to the Python runner. Best-effort: if preflight itself

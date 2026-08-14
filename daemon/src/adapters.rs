@@ -2602,8 +2602,28 @@ impl CliSessions {
     }
 
     fn spawn_with_fallback(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
-        let fallback_str = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN")
-            .unwrap_or_else(|_| "aow->claude-code->agy->minimax".to_string());
+        // Bead jleechan-ev6m: prefer JSON config (config/backends.json or
+        // ~/.dark-factory/backends.json) over the legacy
+        // DARK_FACTORY_REVIEWER_FALLBACK_CHAIN env var. The env var is
+        // still honored (with a deprecation warning) for backward
+        // compatibility; see daemon::backend_config.
+        let backend_cfg = crate::backend_config::load_active()
+            .map_err(|e| {
+                eprintln!(
+                    "daemon: warning: failed to load backend config ({e}); \
+                     using legacy fallback defaults"
+                );
+                e
+            })
+            .ok()
+            .flatten();
+        let chain_parts: Vec<String> = crate::backend_config::resolve_fallback_chain_with_precedence(
+            backend_cfg.as_ref(),
+        );
+        // Legacy helper takes a single string with "->" separators; rebuild
+        // that representation from the JSON-driven chain so the rest of the
+        // dispatch path is unchanged.
+        let fallback_str = chain_parts.join("->");
         let fallback_agents = build_runtime_fallback_chain(&self.agent, &fallback_str);
         fallback_spawn(&fallback_agents, |agent| self.run_spawn_process(agent, spec))
     }

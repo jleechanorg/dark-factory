@@ -260,9 +260,12 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--preflight", action="store_true", help="Validate pipeline and emit diagnostics, then exit.")
         p.add_argument(
             "--backend",
-            choices=["echo", "claude", "codex", "ao", "agy"],
-            default="ao",
-            help="LLM backend for codergen nodes",
+            default=None,
+            help=(
+                "LLM backend for codergen nodes. When unset, defaults to "
+                "config/backends.json default_backend (or the legacy "
+                "DARK_FACTORY_BACKEND env var if still set)."
+            ),
         )
         p.add_argument(
             "--ao-project",
@@ -416,14 +419,25 @@ def main(argv: list[str] | None = None) -> int:
             args.cxdb = args.evidence_bundle / "_run.sqlite"
 
         perf_log_root = None if args.no_perf_log else args.perf_log_dir
+        # Resolve --backend from JSON config when the caller didn't pass one
+        # explicitly. The dispatcher in handler_codergen only recognises the
+        # legacy backend names (echo, claude, codex, ao, agy), so we also
+        # canonicalize aliases (e.g. antigravity -> agy) before handing the
+        # value to Context.
+        resolved_backend = args.backend
+        if not resolved_backend:
+            from . import backend_config as _backend_config
+
+            resolved_backend = _backend_config.resolve_backend(cli_backend=None)
         ctx = Context(
             goal=args.goal,
             workdir=args.workdir,
-            backend=args.backend,
+            backend=resolved_backend,
             cxdb_path=args.cxdb,
             event_log_path=args.events,
             perf_log_root=perf_log_root,
         )
+        args.backend = resolved_backend
         ctx.state.update(initial_state)
         if args.backend == "ao":
             if not args.ao_project:

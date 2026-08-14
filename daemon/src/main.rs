@@ -434,8 +434,13 @@ fn ao_runtime_binding(cfg: &Config) -> Result<(String, String), DaemonError> {
             ))
         })?
         .ao_project;
-    let default_agent = std::env::var("DARK_FACTORY_REVIEWER_DEFAULT")
-        .unwrap_or_else(|_| "minimax".to_string());
+    // Bead jleechan-ev6m: prefer the JSON config (config/backends.json or
+    // ~/.dark-factory/backends.json) over the legacy DARK_FACTORY_REVIEWER_DEFAULT
+    // env var. The env var is still honored (with a deprecation warning) for
+    // backward compatibility; see daemon::backend_config::resolve_reviewer_default.
+    let backend_cfg = daemon::backend_config::load_active()
+        .map_err(DaemonError::from)?;
+    let default_agent = daemon::backend_config::resolve_reviewer_default(backend_cfg.as_ref());
     Ok((ao_project, default_agent))
 }
 
@@ -446,31 +451,50 @@ fn ao_runtime_binding(cfg: &Config) -> Result<(String, String), DaemonError> {
 /// plugin cannot pass preflight while failing the runtime fallback chain
 /// (or vice versa).
 fn configured_vendor_list(default_agent: &str) -> Vec<String> {
-    let fallback_str = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN")
-        .unwrap_or_else(|_| "aow->claude-code->agy->minimax".to_string());
-
+    // Bead jleechan-ev6m: prefer the JSON config (config/backends.json or
+    // ~/.dark-factory/backends.json) over the legacy
+    // DARK_FACTORY_REVIEWER_FALLBACK_CHAIN env var. The env var is still
+    // honored (with a deprecation warning) for backward compatibility; see
+    // daemon::backend_config::resolve_fallback_chain_with_precedence.
+    let backend_cfg = daemon::backend_config::load_active()
+        .map_err(|e| {
+            eprintln!(
+                "daemon: warning: failed to load backend config ({e}); \
+                 using legacy fallback defaults"
+            );
+            e
+        })
+        .ok()
+        .flatten();
+    let chain: Vec<String> = legacy_chain
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let canonicalize = |vendor: &str| -> String {
+        if let Some(cfg) = backend_cfg.as_ref() {
+            return daemon::backend_config::resolve_alias(cfg, vendor);
+        }
         daemon::adapters::canonical_for_alias(vendor)
             .map(str::to_string)
             .unwrap_or_else(|| vendor.to_string())
     };
 
-    let mut chain: Vec<String> = Vec::new();
+    let mut ordered: Vec<String> = Vec::new();
     let default_canonical = canonicalize(default_agent);
     if !default_canonical.is_empty() {
-        chain.push(default_canonical);
+        ordered.push(default_canonical);
     }
-    for part in fallback_str.split("->") {
+    for part in chain {
         let trimmed = part.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let canonical = canonicalize(trimmed);
-        if !canonical.is_empty() && !chain.contains(&canonical) {
-            chain.push(canonical);
+        let canonical = canonicalize(&trimmed);
+        if !canonical.is_empty() && !ordered.contains(&canonical) {
+            ordered.push(canonical);
         }
     }
-    chain
+    ordered
 }
 
 fn verify_startup_ao_compatibility(

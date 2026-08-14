@@ -1,0 +1,60 @@
+{
+  "$comment": "Bead jleechan-ev6m — JSON-driven backend + fallback chain config. Single source of truth replacing DARK_FACTORY_BACKEND / DARK_FACTORY_REVIEWER_FALLBACK_CHAIN env vars. See runner/backend_config.py for schema. Override per-user at ~/.dark-factory/backends.json.",
+  "version": 1,
+  "default_backend": "ao",
+  "reviewer_default": "antigravity",
+  "fallback_chain": ["agy", "antigravity", "minimax", "claude-code"],
+  "alias_map": {
+    "aow": "minimax",
+    "agy": "antigravity"
+  },
+  "backends": {
+    "ao": {
+      "cli": "ao",
+      "args": ["spawn"],
+      "agent": "antigravity",
+      "default_project": "worldarchitect.ai",
+      "transitive_deps": ["sandbox-exec"]
+    },
+    "antigravity": {
+      "cli": "agy",
+      "args": ["--print", "--dangerously-skip-permissions"],
+      "agent": "gemini-3.6-flash-high",
+      "default_print_timeout": 300
+    },
+    "agy": {
+      "cli": "agy",
+      "args": ["--print", "--dangerously-skip-permissions"],
+      "agent": "gemini-3.6-flash-high",
+      "default_print_timeout": 300
+    },
+    "minimax": {
+      "cli": "claude",
+      "args": ["--print", "--dangerously-skip-permissions"],
+      "default_timeout": 1800
+    },
+    "claude-code": {
+      "cli": "claude",
+      "args": ["--print", "--dangerously-skip-permissions"],
+      "default_timeout": 1800
+    },
+    "claude": {
+      "cli": "claude",
+      "args": ["--print", "--dangerously-skip-permissions"],
+      "default_timeout": 1800
+    },
+    "codex": {
+      "cli": "codex",
+      "args": ["exec", "--yolo"],
+      "default_timeout": 1800
+    },
+    "echo": {
+      "cli": "echo",
+      "args": []
+    },
+    "mock_llm": {
+      "cli": "mock_llm",
+      "args": []
+    }
+  }
+}
