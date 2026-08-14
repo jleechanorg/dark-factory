@@ -375,6 +375,98 @@ fn validate_repo(repo: &str) -> Result<(), DaemonError> {
     Ok(())
 }
 
+/// Remove stale git lock files left behind by an interrupted prior operation
+/// from `<path>` (a checkout). Real `git checkout`, `git pull`, `git fetch`
+/// (with pack writes), and several other index-mutating commands refuse to
+/// proceed while `<path>/.git/index.lock` exists; the linked-worktree lock
+/// `<path>/.git/worktrees/<name>/locked` blocks every command that wants to
+/// update that linked worktree's refs. Both are unlinking-only locks: when the
+/// owning git process is no longer alive (the common case after a SIGKILL,
+/// OOM kill, or daemon crash mid-operation), removing the file is the only
+/// recovery Git itself performs.
+///
+/// Returns the number of lock files that were removed. Operationally safe by
+/// design: refuses to recurse, never deletes anything outside `<path>/.git/`,
+/// and treats a missing path or missing `.git/` directory as a no-op
+/// (returns 0).
+pub fn clean_stale_git_locks(path: &Path) -> usize {
+    let git_dir = path.join(".git");
+    if !git_dir.is_dir() {
+        return 0;
+    }
+    let mut removed = 0;
+    let index_lock = git_dir.join("index.lock");
+    if index_lock.is_file() && std::fs::remove_file(&index_lock).is_ok() {
+        removed += 1;
+    }
+    let worktrees_dir = git_dir.join("worktrees");
+    if let Ok(entries) = std::fs::read_dir(&worktrees_dir) {
+        for entry in entries.flatten() {
+            let locked = entry.path().join("locked");
+            if locked.is_file() && std::fs::remove_file(&locked).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
+fn is_recoverable_worktree_failure(error: &DaemonError) -> bool {
+    let message = error.to_string();
+    [
+        "index.lock",
+        "Unable to create",
+        "Another git process",
+        "expected snapshot",
+        "could not checkout",
+        "cannot lock ref",
+        "unable to update",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
+/// Reuse or provision a daemon-owned target checkout with two recovery
+/// safeguards layered onto [`ensure_managed_target_worktree`]:
+///
+/// 1. **Preflight lock cleanup.** Before any git operation runs against
+///    `requested`, remove any stale `<path>/.git/index.lock` and
+///    `<path>/.git/worktrees/<name>/locked` files left behind by an
+///    interrupted prior checkout. Real git refuses to operate on a worktree
+///    while these exist; the owning process is no longer alive in the
+///    recovery scenario (daemon restart, SIGKILL, OOM kill mid-checkout).
+///
+/// 2. **Fresh-clone fallback.** If the inner
+///    [`ensure_managed_target_worktree`] still fails with a recoverable
+///    signature (stale `index.lock`, "expected snapshot" HEAD mismatch, or
+///    `git checkout` failure), remove `requested` outright and provision a
+///    fresh checkout from `origin/{default branch}` (passes `head_sha =
+///    None` so the new clone reflects upstream HEAD, not the requested
+///    snapshot). The fresh checkout is what the worker actually uses; the
+///    `factory/<bead>-r<N>` branch is already created cross-repo by
+///    `reroll.rs`, so a local-snapshot divergence is the only thing being
+///    abandoned — and a diverged local snapshot is exactly what the
+///    remediation is trying to escape.
+///
+/// Non-recoverable failures (operator-owned checkout with the wrong
+/// `origin`; clone auth failure; network/repository errors) propagate
+/// unchanged so callers can park the bead `HUMAN_HELD` for those.
+pub fn ensure_managed_target_worktree_with_recovery(
+    repo: &str,
+    requested: &Path,
+    head_sha: Option<&str>,
+) -> Result<PathBuf, DaemonError> {
+    clean_stale_git_locks(requested);
+    match ensure_managed_target_worktree(repo, requested, head_sha) {
+        Ok(path) => Ok(path),
+        Err(error) if is_recoverable_worktree_failure(&error) => {
+            let _ = std::fs::remove_dir_all(requested);
+            ensure_managed_target_worktree(repo, requested, None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -724,6 +816,209 @@ mod tests {
         // Keep the wrapper directory alive until all parallel unit tests have
         // observed the restored PATH; non-clone invocations delegate to the
         // real git binary, so this avoids a PATH race with sibling tests.
+    }
+
+    #[test]
+    fn clean_stale_git_locks_removes_index_lock_and_worktree_lock() {
+        let root = std::env::temp_dir().join(format!(
+            "afd_target_worktree_lock_cleanup_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let target = root.join("owner").join("repo");
+        std::fs::create_dir_all(target.join(".git").join("worktrees").join("feature"))
+            .unwrap();
+        std::fs::write(target.join(".git").join("index.lock"), b"").unwrap();
+        std::fs::write(
+            target.join(".git").join("worktrees").join("feature").join("locked"),
+            b"",
+        )
+        .unwrap();
+
+        let removed = clean_stale_git_locks(&target);
+        assert_eq!(removed, 2, "both lock files must be removed");
+        assert!(!target.join(".git").join("index.lock").exists());
+        assert!(!target
+            .join(".git")
+            .join("worktrees")
+            .join("feature")
+            .join("locked")
+            .exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clean_stale_git_locks_no_op_on_missing_path_or_git_dir() {
+        let missing = std::env::temp_dir().join(format!(
+            "afd_target_worktree_lock_cleanup_missing_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&missing);
+        assert_eq!(clean_stale_git_locks(&missing), 0);
+        std::fs::create_dir_all(&missing).unwrap();
+        assert_eq!(
+            clean_stale_git_locks(&missing),
+            0,
+            "directory without .git/ must be a no-op"
+        );
+        std::fs::remove_dir_all(missing).unwrap();
+    }
+
+    #[test]
+    fn recovery_cleans_stale_index_lock_before_git_checkout() {
+        let root = std::env::temp_dir().join(format!(
+            "afd_target_worktree_recovery_lock_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let bin = root.join("bin");
+        let target = root.join("owner").join("repo");
+        let state = root.join("head");
+        let actual_head = "3333333333333333333333333333333333333333";
+        let expected_head = "7777777777777777777777777777777777777777";
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(&state, actual_head).unwrap();
+        let fake_git = bin.join("git");
+        std::fs::write(
+            &fake_git,
+            format!(
+                "#!/bin/sh\ncase \"$1:$2\" in\n  remote:get-url) printf '%s\\n' 'https://github.com/owner/repo.git' ;;\n  rev-parse:HEAD) cat '{state}' ;;\n  status:--porcelain) exit 0 ;;\n  fetch:--depth=1) : ;;\n  checkout:--no-overwrite-ignore)\n    lock='{git_dir}/index.lock'\n    if [ -f \"$lock\" ]; then\n      echo \"fatal: Unable to create '.git/index.lock': File exists.\" >&2\n      exit 128\n    fi\n    printf '%s' \"$4\" > '{state}'\n    ;;\n  *) exit 1 ;;\nesac\n",
+                state = state.display(),
+                git_dir = target.join(".git").display(),
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&fake_git).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&fake_git, permissions).unwrap();
+        }
+        std::fs::create_dir_all(target.join(".git")).unwrap();
+        std::fs::write(target.join(".git").join("index.lock"), b"").unwrap();
+        let old_path = std::env::var_os("PATH");
+        let new_path = std::env::join_paths(
+            std::iter::once(bin.clone()).chain(
+                old_path
+                    .as_deref()
+                    .into_iter()
+                    .flat_map(std::env::split_paths),
+            ),
+        )
+        .unwrap();
+        std::env::set_var("PATH", &new_path);
+
+        let sanity = ensure_managed_target_worktree(
+            "owner/repo",
+            &target,
+            Some(expected_head),
+        );
+        assert!(
+            sanity.is_err(),
+            "without recovery, a stale .git/index.lock must cause git checkout to fail: {sanity:?}"
+        );
+        std::fs::write(target.join(".git").join("index.lock"), b"").unwrap();
+        let result = ensure_managed_target_worktree_with_recovery(
+            "owner/repo",
+            &target,
+            Some(expected_head),
+        );
+        if let Some(path) = old_path {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        assert!(
+            result.is_ok(),
+            "recovery wrapper must clean the lock and proceed: {result:?}"
+        );
+        assert_eq!(result.unwrap(), target);
+        assert!(!target.join(".git").join("index.lock").exists());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn recovery_falls_back_to_fresh_clone_on_unresolvable_snapshot() {
+        let root = std::env::temp_dir().join(format!(
+            "afd_target_worktree_recovery_fallback_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let bin = root.join("bin");
+        let target = root.join("owner").join("repo");
+        let parent = target.parent().unwrap();
+        let state = root.join("head");
+        let actual_head = "4444444444444444444444444444444444444444";
+        let stale_head =
+            "5555555555555555555555555555555555555555".to_string();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(parent).unwrap();
+        std::fs::write(&state, actual_head).unwrap();
+        let _ = init_git_checkout(&target, "owner/repo");
+
+        let fake_git = bin.join("git");
+        std::fs::write(
+            &fake_git,
+            format!(
+                "#!/bin/sh\ncase \"$1:$2\" in\n  remote:get-url) printf '%s\\n' 'https://github.com/owner/repo.git' ;;\n  rev-parse:HEAD) cat '{state}' ;;\n  status:--porcelain) exit 0 ;;\n  fetch:--depth=1) : ;;\n  checkout:--no-overwrite-ignore) echo 'fatal: cannot lock ref: unable to update index.lock: stale worktree snapshot' >&2 ; exit 128 ;;\n  *) case \"$1\" in clone) for arg in \"$@\"; do last=\"$arg\"; done; mkdir -p \"$last/.git\" && printf 'ref: refs/heads/main\\n' > \"$last/.git/HEAD\" ;; *) exit 1 ;; esac ;;\nesac\n",
+                state = state.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&fake_git).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&fake_git, permissions).unwrap();
+        }
+        let old_path = std::env::var_os("PATH");
+        let new_path = std::env::join_paths(
+            std::iter::once(bin.clone()).chain(
+                old_path
+                    .as_deref()
+                    .into_iter()
+                    .flat_map(std::env::split_paths),
+            ),
+        )
+        .unwrap();
+        std::env::set_var("PATH", &new_path);
+
+        let sanity = ensure_managed_target_worktree(
+            "owner/repo",
+            &target,
+            Some(&stale_head),
+        );
+        assert!(
+            sanity.is_err(),
+            "without recovery, a broken checkout must surface as an error: {sanity:?}"
+        );
+        assert!(
+            target.is_dir(),
+            "without recovery, the broken checkout must still be present so the operator can inspect it"
+        );
+
+        let result =
+            ensure_managed_target_worktree_with_recovery("owner/repo", &target, Some(&stale_head));
+        if let Some(path) = old_path {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        assert!(
+            result.is_ok(),
+            "recovery must remove the broken checkout and provision a fresh one: {result:?}"
+        );
+        let resolved = result.unwrap();
+        assert!(
+            resolved.is_dir(),
+            "fresh checkout must exist after recovery: {}",
+            resolved.display()
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 
     fn init_git_checkout(path: &Path, repo: &str) -> String {
