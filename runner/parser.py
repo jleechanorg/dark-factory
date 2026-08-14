@@ -3,6 +3,12 @@
 Parses Graphviz DOT files produced for Attractor-pattern pipelines into a
 minimal Python graph representation. Only the subset of DOT we care about is
 extracted (node attributes, edge attributes, optional subgraph clusters).
+
+Note: the parser enforces `start` AND `exit` nodes; `parse` raises if either
+is missing. Edge conditions are simple `condition="key=value"` or `key!=value`
+— the runtime does NOT evaluate arbitrary expressions, so richer logic belongs
+in a handler. Prompt references use `prompt="@relative/path.md"` (the `@`
+is stripped by the parser), with `${goal}` and `${state.*}` substitution only.
 """
 
 from __future__ import annotations

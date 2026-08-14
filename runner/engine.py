@@ -13,6 +13,12 @@ The implementation lives in the per-responsibility modules:
 `runner.engine` re-exports every symbol that was previously importable from
 this module so existing call sites (`from runner.engine import ...`) keep
 working. See `docs/refactor/file-ownership-map.engine.md` for the rationale.
+
+Loop bounds come from a node's `max_visits` attribute (e.g.
+`fix [max_visits="3"]`). Exceeding it emits a synthetic `exhausted` step and
+terminates. Each step is appended to `history` and, when `--cxdb` is set,
+to the SQLite event log. The CXDB sequence (`seq`) is tracked independently
+of `len(history)` so refactors can't desync.
 """
 
 from __future__ import annotations

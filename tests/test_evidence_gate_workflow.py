@@ -830,6 +830,118 @@ def test_evidence_gate_workflow_uses_head_equals_strip() -> None:
         )
 
 
+# jleechan-2qn8 — Signal B PR-anchor regex accepts word-boundary adjacency,
+# not just quote adjacency. Original regex required a literal double-quote
+# immediately before the PR number, so gists that say "PR #571" or "#571"
+# in prose fail the gate even when the gist is real, current, and
+# substantive. See .github/workflows/evidence-gate.yml around line 316.
+
+
+def _simulate_pr_anchor_match(gist_body: str, pr_number: int) -> bool:
+    """Mirror the Signal B PR-anchor regex after the jleechan-2qn8 fix.
+
+    The regex must accept any non-digit byte immediately before `#<N>`,
+    not require a literal double-quote. The fallback to `$repo_short`
+    already existed for the `jleechanorg/dark-factory` short form.
+    """
+    import re
+    pattern = rf'(^|[^0-9])#{pr_number}\b'
+    return bool(re.search(pattern, gist_body))
+
+
+@pytest.mark.parametrize(
+    "gist_body,pr_number,expected",
+    [
+        # The bug: a gist that says "PR #571" in prose does NOT match
+        # the old quote-adjacent regex but MUST match the word-boundary
+        # fix (jleechan-2qn8 acceptance).
+        ("This PR #571 was merged cleanly on 2026-08-06.", 571, True),
+        # Bash-style quote form ("#571") — still matches under both regexes.
+        ('See "#571" for the canonical reference.', 571, True),
+        # Escaped-quote form (the third alternative): `"\"#571\""`.
+        (r'See \"#571\" for the canonical reference.', 571, True),
+        # Word-boundary adjacency: the number is preceded by space.
+        ("Issue: #571 — see trace.", 571, True),
+        # CodeRabbit Finding 2 (jleechan-2qn8 r5): a single digit
+        # IMMEDIATELY before the hash (e.g. `1#571`) is a stronger negative
+        # than `1234571` because an unguarded `#$PR_NUMBER\\b` regex
+        # matches `\b` between letter-class and non-letter class
+        # characters — and `1`→`#` is a letter→non-letter boundary, so
+        # `\b#571` would falsely match. The fix's `[^0-9]` left-boundary
+        # rejects this case; the regression asserts that.
+        ("ticket 1#571 was the same", 571, False),
+        # Same number, but a different PR — must not cross-match.
+        ("PR #999 was merged earlier.", 571, False),
+    ],
+)
+def test_signal_b_pr_anchor_regex_is_word_boundary_adjacent(
+    gist_body: str, pr_number: int, expected: bool,
+) -> None:
+    """jleechan-2qn8: Signal B PR-anchor regex must accept the natural
+    `PR #N` prose form, not just JSON quote-adjacent `"#N"`."""
+    actual = _simulate_pr_anchor_match(gist_body, pr_number)
+    assert actual is expected, (
+        f"gist body {gist_body!r} pr_number={pr_number}: expected "
+        f"{expected}, got {actual}. The Signal B regex was "
+        f"quote-adjacent-only (`\"#N`) which is unreachable for ordinary "
+        f"gists. (jleechan-2qn8)"
+    )
+
+
+def test_evidence_gate_workflow_uses_word_boundary_pr_anchor() -> None:
+    """Regression: the workflow YAML MUST use a word-boundary PR anchor
+    regex, not the quote-adjacent `"#N` form (jleechan-2qn8).
+
+    The OLD line was:
+        grep -qE '"#${PR_NUMBER}\\b|"#${PR_NUMBER}"|\\\\"#${PR_NUMBER}\\\\"'
+    which required a literal double-quote immediately before the hash,
+    so a natural gist that says `PR #571` is unreachable. The NEW line
+    MUST accept any non-digit byte (or beginning of input) before the
+    hash, so `PR #571` and `#571 — see trace` are anchor-matched and
+    `1234571` is not.
+
+    CodeRabbit Finding 2 (jleechan-2qn8 r5): the asserted word-boundary
+    form MUST be the explicit `(^|[^0-9])#${PR_NUMBER}\\b` (left-
+    boundary or non-digit-byte), not just any regex that happens to
+    include `\\b` — otherwise the test would pass against an unguarded
+    `\\b` that falsely matches `1#571`.
+    """
+    text = _verdict_step_text(_load_workflow())
+    # The old form requires a literal `"` immediately before
+    # `#${PR_NUMBER}`. We DO NOT accept it; the regression PASSES only
+    # when the new word-boundary form is present.
+    old_quote_adjacent = bool(
+        re.search(
+            r'"#\$\{PR_NUMBER\}\b',
+            text,
+        )
+    )
+    assert not old_quote_adjacent, (
+        "evidence-gate.yml Signal B PR-anchor regex still uses the "
+        "quote-adjacent `\"#${PR_NUMBER}\\b` form (the third "
+        "backslash-escaped alternative is the same pattern). A natural "
+        "gist like `PR #571` does not satisfy this anchor and the gate "
+        "reports `missing_pr_anchor` even when the gist is real and "
+        "substantive. Replace with `(^|[^0-9])#${PR_NUMBER}\\b`. (jleechan-2qn8)"
+    )
+    # Sanity: the explicit left-boundary form MUST be present. Accept
+    # either the literal `(^|[^0-9])` (single character-class) or the
+    # raw regex string in the file.
+    has_explicit_left_boundary = bool(
+        re.search(
+            r"\(\^\|\[\^0-9\]\)#\$\{PR_NUMBER\}\\b",
+            text,
+        )
+    )
+    assert has_explicit_left_boundary, (
+        "evidence-gate.yml Signal B PR-anchor regex must use the "
+        "explicit left-boundary form `(^|[^0-9])#${PR_NUMBER}\\b`. A "
+        "looser `\\b` boundary would falsely match `1#571` because "
+        "`1`→`#` is a letter-class→non-letter-class transition. "
+        "(CodeRabbit Finding 2 / jleechan-2qn8 r5)"
+    )
+
+
 @pytest.mark.parametrize(
     "files,pr,repo,declared,current,expected",
     [
