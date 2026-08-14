@@ -206,6 +206,25 @@ fn is_ref_already_exists(err: &DaemonError, name: &str) -> bool {
     }
 }
 
+/// Bead jleechan-lght (feat: spawn fresh worktree and branch on remediation
+/// failure instead of parking): classify `Sessions::spawn` failures whose
+/// canonical error message indicates the configured adopted-checkout
+/// workspace could not be refreshed because its snapshot is dirty or
+/// conflicted (`target_worktree::refresh_existing_if_stale` refused to
+/// overwrite uncommitted changes or a checked-out ignored artifact).
+/// The canonical signature comes from
+/// `target_worktree::refresh_existing_if_stale` at the
+/// `"... has uncommitted changes; refusing to refresh stale snapshot"`
+/// branch. Both fragments are required for a positive match so a future
+/// change to that error string cannot silently break the fallback route.
+fn is_worktree_dirty_spawn_error(err: &DaemonError) -> bool {
+    if let DaemonError::Config(msg) = err {
+        msg.contains("uncommitted changes") && msg.contains("refusing to refresh")
+    } else {
+        false
+    }
+}
+
 /// Bead jleechan-znmh / issue #341 (reroll PR-already-terminal tolerance):
 /// classify `gh pr close --repo <repo> <n>` failures whose canonical
 /// stderr signature indicates the PR is already merged or already
@@ -1402,6 +1421,20 @@ fn execute_adopted(
             }
             Err(error)
         }
+        Err(e) if is_worktree_dirty_spawn_error(&e) => {
+            // Bead jleechan-lght: the configured adopted-checkout workspace
+            // is dirty or conflicted and `target_worktree::refresh_existing_if_stale`
+            // refused to refresh it. Instead of parking the bead
+            // HUMAN_HELD (the historical behavior), fall back to the
+            // canonical re-roll recovery shape — fresh
+            // `factory/<bead>-r<N+1>` branch off `origin/<base_branch>`,
+            // fresh isolated worktree at a separate path, supersede the
+            // contributor's PR — exactly the structural recovery the
+            // non-adopted re-roll path already does in steps 4-7. This
+            // routes the bead back into the normal DISPATCHED ->
+            // ATTESTED -> READY pipeline without any human in the loop.
+            execute_adopted_dirty_worktree_fallback(deps, bead, &branch, pre_session_sha)
+        }
         Err(e) => {
             bead.state = OverlayState::HumanHeld;
             bead.session_id = None;
@@ -1421,4 +1454,362 @@ fn execute_adopted(
             )))
         }
     }
+}
+
+/// Bead jleechan-lght: the dirty-worktree fallback path for adopted
+/// remediation. When the configured adopted-checkout workspace cannot be
+/// refreshed (uncommitted changes or a checked-out ignored artifact on
+/// the contributor's branch), the daemon instead:
+/// 1. Cuts a fresh `factory/<bead>-r<N+1>` branch off `origin/<base_branch>`
+///    (reusing the jleechan-znmh stale-ref-retry discipline).
+/// 2. Records the new branch in the registry.
+/// 3. Closes the contributor's PR with a "superseded by new attempt
+///    branch …" comment, tolerating already-terminal PRs (jleechan-znmh).
+/// 4. Provisions a fresh isolated worktree at a separate path
+///    (`.fresh.<n>` suffix on the configured checkout root) so the dirty
+///    adopted workspace is never touched.
+/// 5. Spawns a real coder session on the fresh branch and leaves the
+///    bead `DISPATCHED` so the fast tier resumes normal
+///    DISPATCHED -> ATTESTED -> READY verification.
+///
+/// This mirrors `reroll::execute` steps 4-7. The structural difference
+/// is the trigger: this path runs only when the dirty-worktree failure
+/// is observed on the adopted branch, NOT on the normal `Reroll`
+/// verdict. The original contributor branch and its dirty worktree are
+/// deliberately left untouched — a fresh, daemon-owned worktree is used
+/// to back the fresh factory branch.
+fn execute_adopted_dirty_worktree_fallback(
+    deps: &RerollDeps,
+    bead: &mut BeadOverlay,
+    adopted_branch: &str,
+    adopted_pre_session_sha: String,
+) -> Result<RerollOutcome, DaemonError> {
+    let adopted_repo = bead.repo(deps.cfg).to_string();
+
+    emit_telemetry(
+        deps.telemetry_log,
+        &bead.bead_id,
+        bead.attempt,
+        bead.state.as_str(),
+        "REROLL_ADOPTED_DIRTY_WORKTREE_FALLBACK",
+        serde_json::json!({}),
+        serde_json::json!({
+            "branch": adopted_branch,
+            "error": format!(
+                "configured adopted-checkout workspace for {adopted_branch:?} is dirty; routing into fresh factory branch isolation"
+            ),
+        }),
+    )?;
+
+    // Step 1: compute the baseline off origin/main (jleechan-wuts discipline).
+    let base_sha = deps
+        .vcs
+        .base_head_for_repo(&adopted_repo, &deps.cfg.base_branch)?;
+
+    // Step 2: cut the fresh `factory/<bead>-r<N+1>` branch off `base_sha`,
+    // tolerating a stale ref from a prior failed reroll attempt.
+    let next_attempt = bead.attempt + 1;
+    let new_branch = format!("factory/{}-r{}", bead.bead_id, next_attempt);
+    match deps
+        .vcs
+        .create_branch_at_for_repo(&adopted_repo, &new_branch, &base_sha)
+    {
+        Ok(()) => {}
+        Err(e) if is_ref_already_exists(&e, &new_branch) => {
+            emit_telemetry(
+                deps.telemetry_log,
+                &bead.bead_id,
+                bead.attempt,
+                bead.state.as_str(),
+                "REROLL_STALE_BRANCH_DETECTED",
+                serde_json::json!({}),
+                serde_json::json!({
+                    "staleBranch": new_branch,
+                    "repo": adopted_repo,
+                    "stderr": format_tool_stderr(&e),
+                    "trigger": "dirty_worktree_fallback",
+                }),
+            )?;
+            deps.vcs
+                .delete_branch_at_for_repo(&adopted_repo, &new_branch)?;
+            deps.vcs
+                .create_branch_at_for_repo(&adopted_repo, &new_branch, &base_sha)?;
+        }
+        Err(e) => return Err(e),
+    }
+
+    emit_telemetry(
+        deps.telemetry_log,
+        &bead.bead_id,
+        bead.attempt,
+        bead.state.as_str(),
+        "REROLL_BRANCH_CREATED",
+        serde_json::json!({}),
+        serde_json::json!({
+            "newBranch": new_branch,
+            "baseCommit": base_sha,
+            "trigger": "dirty_worktree_fallback",
+        }),
+    )?;
+
+    // Step 3: record the new branch in the registry.
+    deps.store.register_branch(&bead.bead_id, &new_branch)?;
+
+    // Step 4: close the contributor's PR with a supersede comment,
+    // tolerating already-terminal PRs (jleechan-znmh discipline).
+    if let Some(pr_number) = bead.pr_number {
+        let comment = format!(
+            "Superseded by new attempt branch {new_branch} (configured workspace for the original branch was dirty/conflicted)"
+        );
+        match deps
+            .scm
+            .close_pr_for_repo(&adopted_repo, pr_number, &comment)
+        {
+            Ok(()) => {
+                emit_telemetry(
+                    deps.telemetry_log,
+                    &bead.bead_id,
+                    bead.attempt,
+                    bead.state.as_str(),
+                    "REROLL_PR_CLOSED",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "prNumber": pr_number,
+                        "comment": comment,
+                        "repo": adopted_repo,
+                        "trigger": "dirty_worktree_fallback",
+                    }),
+                )?;
+            }
+            Err(e) if is_pr_already_terminal(&e) => {
+                emit_telemetry(
+                    deps.telemetry_log,
+                    &bead.bead_id,
+                    bead.attempt,
+                    bead.state.as_str(),
+                    "REROLL_PR_ALREADY_MERGED",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "prNumber": pr_number,
+                        "repo": adopted_repo,
+                        "stderr": format_tool_stderr(&e),
+                        "disposition": "tolerated_supersede",
+                        "trigger": "dirty_worktree_fallback",
+                    }),
+                )?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    // Step 5: compute the fresh isolated worktree path. The configured
+    // adopted-checkout workspace stays dirty/operator-resolvable; the
+    // fresh factory branch is anchored at a sibling directory so the
+    // two never collide. The actual clone + checkout happens inside
+    // `ao_spawn_command_with_mode` when the spawn fires — the
+    // `expected_revision = Some(base_sha)` argument tells
+    // `ensure_managed_target_worktree` to clone + detach at `base_sha`
+    // on first spawn, which is exactly what we want.
+    let fresh_root = deps
+        .cfg
+        .target_worktree_path(&adopted_repo)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| {
+            DaemonError::Config(format!(
+                "no absolute worker checkout configured for repo {adopted_repo:?}; cannot isolate fresh worktree for dirty-worktree fallback"
+            ))
+        })?;
+    let fresh_root_name = fresh_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("wt");
+    let fresh_path = fresh_root.with_file_name(format!(
+        "{fresh_root_name}.fresh.{next_attempt}"
+    ));
+    // Drop any stale fresh-attempt sibling so a re-run of the
+    // fallback never trips over a half-orphaned workspace.
+    let _ = std::fs::remove_dir_all(&fresh_path);
+    if let Some(parent) = fresh_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            DaemonError::Config(format!(
+                "create fresh-worktree parent {} for dirty-worktree fallback: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    emit_telemetry(
+        deps.telemetry_log,
+        &bead.bead_id,
+        bead.attempt,
+        bead.state.as_str(),
+        "REROLL_ADOPTED_FRESH_WORKTREE_PROVISIONED",
+        serde_json::json!({}),
+        serde_json::json!({
+            "freshPath": fresh_path.to_string_lossy(),
+            "branch": new_branch,
+            "baseCommit": base_sha,
+        }),
+    )?;
+
+    // Step 6: build the spawn spec for the fresh factory branch. Unlike
+    // the adopted path proper, this prompt explains that the work has
+    // moved off the contributor's branch (with the reason) so the coder
+    // doesn't try to push to or close the contributor's PR.
+    let adopted_routing = deps.cfg.resolve_repo(&adopted_repo).unwrap_or_else(|| {
+        crate::config::RepoRouting {
+            ao_project: deps
+                .cfg
+                .ao_project
+                .clone()
+                .unwrap_or_else(|| adopted_repo.clone()),
+            push_remote: "origin".to_string(),
+            local_checkout: None,
+        }
+    });
+    let prompt = format!(
+        "The configured workspace for the original adopted branch {adopted_branch:?} \
+         could not be refreshed (its snapshot was dirty or conflicted), so remediation \
+         has been re-routed onto a fresh branch `{new_branch}` cut off \
+         `{base_branch}` (HEAD {base_sha}). The contributor's PR has been closed with \
+         a supersede-by-new-attempt comment; do NOT reopen it.\n\n\
+         Address the following code review feedback from {reviewer} on this pull \
+         request (attempt {attempt}). Make real code changes that resolve the issues \
+         described below, then commit and push your changes to the fresh branch \
+         `{new_branch}` only, and open a new pull request from it.\n\n\
+         Review feedback:\n{review_text}",
+        base_branch = deps.cfg.base_branch,
+        base_sha = base_sha,
+        reviewer = deps.reviewer,
+        attempt = next_attempt,
+        new_branch = new_branch,
+        review_text = deps.review_text,
+    );
+
+    let spec = SpawnSpec {
+        bead_id: bead.bead_id.clone(),
+        branch: new_branch.clone(),
+        prompt,
+        repo: adopted_repo.clone(),
+        ao_project: adopted_routing.ao_project,
+        remote: adopted_routing.push_remote,
+        local_checkout: Some(fresh_path),
+        expected_revision: Some(base_sha.clone()),
+        managed_checkout: true,
+    };
+
+    // Persist the pre-spawn intent so a process death between spawn and
+    // DISPATCHED save does not strand the bead in DISPATCHING forever.
+    bead.state = OverlayState::Dispatching;
+    bead.session_id = None;
+    bead.pre_session_head_sha = Some(base_sha.clone());
+    deps.store.save(bead)?;
+
+    let session_id = match deps.sessions.spawn(&spec) {
+        Ok(session_id) => session_id,
+        Err(error @ DaemonError::SpawnCleanupFailed { .. }) => {
+            // Mirror the existing execute_adopted SpawnCleanupFailed
+            // arm: persist the session id, mark SpawnCleanupFailed,
+            // propagate.
+            let session = match &error {
+                DaemonError::SpawnCleanupFailed { session, .. } => session.clone(),
+                _ => unreachable!(),
+            };
+            bead.state = OverlayState::HumanHeld;
+            bead.session_id = Some(session.clone());
+            set_human_hold_reason(bead, HumanHoldReason::SpawnCleanupFailed);
+            if let Err(state_error) = deps.store.save(bead) {
+                return Err(DaemonError::SpawnCleanupFailed {
+                    session,
+                    spawn_error: Box::new(error),
+                    cleanup_error: Box::new(DaemonError::Config(format!(
+                        "failed to persist HUMAN_HELD cleanup record: {state_error}"
+                    ))),
+                });
+            }
+            return Err(error);
+        }
+        Err(e) => {
+            // Fresh worktree + branch didn't help: the daemon's own
+            // spawn machinery is genuinely broken (network, cap, etc).
+            // Park the bead so a human can investigate; the fresh
+            // branch and registry record stay so recovery can resume
+            // from this same branch on the next tick.
+            bead.state = OverlayState::HumanHeld;
+            bead.session_id = None;
+            set_human_hold_reason(bead, HumanHoldReason::AdoptedSpawnFailed);
+            deps.store.save(bead)?;
+            emit_telemetry(
+                deps.telemetry_log,
+                &bead.bead_id,
+                bead.attempt,
+                bead.state.as_str(),
+                "REROLL_ADOPTED_FRESH_FALLBACK_SPAWN_FAILED",
+                serde_json::json!({}),
+                serde_json::json!({
+                    "branch": new_branch,
+                    "error": e.to_string(),
+                }),
+            )?;
+            return Ok(RerollOutcome::Held(format!(
+                "adopted remediation fell back to fresh branch {new_branch} \
+                 after the configured workspace was dirty/conflicted, but spawning \
+                 on the fresh worktree also failed: {e}"
+            )));
+        }
+    };
+
+    // Step 7: promote to DISPATCHED with the fresh branch.
+    bead.attempt = next_attempt;
+    bead.reroll_count += 1;
+    bead.session_id = Some(session_id.0.clone());
+    bead.branch = Some(new_branch.clone());
+    bead.pr_number = None;
+    bead.pre_session_head_sha = Some(base_sha);
+    bead.state = OverlayState::Dispatched;
+    if let Err(save_error) = deps
+        .store
+        .save_remediation_session_spawned(bead, next_attempt.saturating_sub(1))
+    {
+        if let Err(cleanup_error) = deps.sessions.stop(&session_id) {
+            bead.state = OverlayState::HumanHeld;
+            bead.session_id = Some(session_id.0.clone());
+            set_human_hold_reason(bead, HumanHoldReason::SpawnCleanupFailed);
+            let cleanup_error = match deps.store.save(bead) {
+                Ok(()) => cleanup_error,
+                Err(state_error) => DaemonError::Config(format!(
+                    "session cleanup failed: {cleanup_error}; additionally failed to persist the HUMAN_HELD cleanup record: {state_error}"
+                )),
+            };
+            return Err(DaemonError::SpawnCleanupFailed {
+                session: session_id.0,
+                spawn_error: Box::new(save_error),
+                cleanup_error: Box::new(cleanup_error),
+            });
+        }
+        bead.state = OverlayState::HumanHeld;
+        bead.session_id = None;
+        set_human_hold_reason(bead, HumanHoldReason::AdoptedSpawnFailed);
+        deps.store.save(bead)?;
+        return Err(save_error);
+    }
+
+    emit_telemetry(
+        deps.telemetry_log,
+        &bead.bead_id,
+        bead.attempt,
+        bead.state.as_str(),
+        "REROLL_ADOPTED_DIRTY_WORKTREE_FALLBACK_SPAWNED",
+        serde_json::json!({
+            "elapsedAutonomySeconds": bead.autonomy_secs,
+        }),
+        serde_json::json!({
+            "branch": new_branch,
+            "sessionId": session_id.0,
+            "supersededBranch": adopted_branch,
+            "supersededPreSessionSha": adopted_pre_session_sha,
+        }),
+    )?;
+
+    Ok(RerollOutcome::Rerolled { new_branch })
 }

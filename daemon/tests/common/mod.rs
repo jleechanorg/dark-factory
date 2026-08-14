@@ -421,6 +421,16 @@ pub struct FakeSessions {
     // end-to-end tests can exercise the two paths independently and prove
     // they never share `overlay.spawn_failure_count`.
     pub fail_spawn_deferred_for: RefCell<Vec<String>>,
+    /// Bead jleechan-lght: scripted one-time spawn failure that simulates
+    /// `target_worktree::refresh_existing_if_stale` refusing to refresh a
+    /// dirty/managed checkout. The fake removes the bead id from the list
+    /// on the FIRST spawn call that matches, so the SECOND spawn (on the
+    /// reroll's fresh branch fallback path) succeeds normally. Emits a
+    /// `DaemonError::Config` whose message text contains both
+    /// "uncommitted changes" and "refusing to refresh stale snapshot" —
+    /// the canonical signature that
+    /// `reroll::is_worktree_dirty_spawn_error` matches.
+    pub fail_first_spawn_dirty_worktree_for: RefCell<Vec<String>>,
     pub spawn_prompts: RefCell<Vec<(String, String)>>,
     pub calls: RefCell<Vec<String>>,
     /// jleechan-5ia2: scripted `session_branch` override, keyed by session
@@ -505,6 +515,7 @@ impl Default for FakeSessions {
             fail_spawn_cleanup_for: RefCell::new(Vec::new()),
             fail_stop_for: RefCell::new(Vec::new()),
             fail_spawn_deferred_for: RefCell::new(Vec::new()),
+            fail_first_spawn_dirty_worktree_for: RefCell::new(Vec::new()),
             spawn_prompts: RefCell::new(Vec::new()),
             calls: RefCell::new(Vec::new()),
             branch_for: RefCell::new(HashMap::new()),
@@ -552,6 +563,17 @@ impl FakeSessions {
 
     pub fn fail_spawn_deferred_for(&self, bead_id: &str) {
         self.fail_spawn_deferred_for
+            .borrow_mut()
+            .push(bead_id.to_string());
+    }
+
+    /// Bead jleechan-lght: script the FIRST spawn for `bead_id` to fail
+    /// with a `DaemonError::Config` whose stderr carries the canonical
+    /// dirty-worktree signature emitted by
+    /// `target_worktree::refresh_existing_if_stale`. Subsequent spawns
+    /// (including the reroll's fresh-branch fallback) succeed normally.
+    pub fn fail_first_spawn_dirty_worktree_for(&self, bead_id: &str) {
+        self.fail_first_spawn_dirty_worktree_for
             .borrow_mut()
             .push(bead_id.to_string());
     }
@@ -696,6 +718,27 @@ impl Sessions for FakeSessions {
             return Err(DaemonError::Deferred(format!(
                 "REQUEST=sq-scripted-{}",
                 spec.bead_id
+            )));
+        }
+        // Bead jleechan-lght: one-time dirty-worktree failure that mirrors
+        // `target_worktree::refresh_existing_if_stale`'s exact signature
+        // (the same string the production path emits), so the reroll layer
+        // can recognize it and route into the fresh-branch fallback.
+        let dirty_pos = self
+            .fail_first_spawn_dirty_worktree_for
+            .borrow()
+            .iter()
+            .position(|b| b == &spec.bead_id);
+        if let Some(pos) = dirty_pos {
+            self.fail_first_spawn_dirty_worktree_for
+                .borrow_mut()
+                .remove(pos);
+            return Err(DaemonError::Config(format!(
+                "managed target worktree {} has uncommitted changes; refusing to refresh stale snapshot",
+                spec.local_checkout
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<unset>".into())
             )));
         }
         Ok(SessionId(self.next_session_id.clone()))

@@ -3404,3 +3404,179 @@ fn test_reroll_quiescence_head_probe_transient_failure_never_escalates() {
     std::fs::remove_dir_all(spec_dir).ok();
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+/// Bead jleechan-lght: when an adopted-PR re-roll fails to refresh the
+/// configured target worktree because the snapshot is dirty or conflicted
+/// (`target_worktree::refresh_existing_if_stale` refuses to refresh), the
+/// daemon must NOT park the bead `HUMAN_HELD`. It must instead fall back
+/// to the canonical re-roll recovery shape: a fresh
+/// `factory/<bead>-r<N+1>` branch cut off `origin/<base_branch>`, a fresh
+/// isolated worktree, and a superseded-PR closure on the contributor's
+/// original PR. This mirrors the non-adopted re-roll steps 4-7 — the
+/// structural difference is that the *trigger* for the fresh path is the
+/// dirty-worktree error, not the normal `Reroll` verdict.
+#[test]
+fn test_reroll_adopted_dirty_worktree_falls_back_to_fresh_branch_isolation() {
+    let scm = FakeScm::new();
+    let sessions = FakeSessions::new();
+    // First spawn fails with the canonical dirty-worktree Config error;
+    // second spawn (on the fresh fallback branch) succeeds.
+    sessions.fail_first_spawn_dirty_worktree_for("bead-adopted-dirty-wt");
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert(
+        "alice/my-cool-feature".into(),
+        "pre-session-sha-abc123".into(),
+    );
+    // Base HEAD off origin/main used to create the fresh factory branch.
+    vcs.heads
+        .insert("main".into(), "origin-main-sha-xyz789".into());
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    let cfg = test_cfg();
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_reroll_adopted_dirty_wt_telemetry_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let mut bead = BeadOverlay {
+        bead_id: "bead-adopted-dirty-wt".into(),
+        state: OverlayState::Attested,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 5,
+        spend_usd: 0.0,
+        pr_number: Some(779),
+        branch: Some("alice/my-cool-feature".into()),
+        session_id: None,
+        is_adopted: true,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: None,
+        attempt_started_at: None,
+    };
+    store.save(&bead).unwrap();
+    store
+        .register_branch("bead-adopted-dirty-wt", "alice/my-cool-feature")
+        .unwrap();
+
+    let deps = RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "verifier".into(),
+        review_text: "CI check-run(s) not all success".into(),
+    };
+
+    let outcome = reroll::execute(&deps, &mut bead).unwrap();
+    match outcome {
+        RerollOutcome::Rerolled { new_branch } => {
+            assert_eq!(
+                new_branch, "factory/bead-adopted-dirty-wt-r2",
+                "dirty adopted worktree must route into the fresh factory/<bead>-r<N+1> branch"
+            );
+        }
+        other => panic!(
+            "expected RerollOutcome::Rerolled (fresh fallback), got {:?}",
+            other
+        ),
+    }
+
+    // Two spawn attempts: the first failed (dirty-worktree), the second
+    // succeeded on the fresh factory branch.
+    let spawn_prompts = sessions.spawn_prompts.borrow();
+    assert_eq!(
+        spawn_prompts.len(),
+        2,
+        "first spawn on dirty adopted worktree + second spawn on fresh branch; got {spawn_prompts:?}"
+    );
+    let (_, second_prompt) = &spawn_prompts[1];
+    assert!(
+        second_prompt.contains("factory/bead-adopted-dirty-wt-r2"),
+        "second spawn must target the fresh factory branch: {second_prompt}"
+    );
+    drop(spawn_prompts);
+
+    // Branch registry now records both the original contributor branch
+    // AND the fresh factory branch.
+    let branches = store.branches.borrow().clone();
+    assert!(
+        branches.iter().any(|b| b == "alice/my-cool-feature"),
+        "original contributor branch must remain registered: {branches:?}"
+    );
+    assert!(
+        branches
+            .iter()
+            .any(|b| b == "factory/bead-adopted-dirty-wt-r2"),
+        "fresh factory branch must be registered: {branches:?}"
+    );
+    drop(branches);
+
+    // The contributor's PR was closed with a supersede-by-factory comment.
+    let scm_calls = scm.calls.borrow().clone();
+    assert!(
+        scm_calls.iter().any(|c| {
+            c.starts_with("close_pr_for_repo(") && c.contains("779")
+        }),
+        "fresh fallback must close the contributor's PR: {scm_calls:?}"
+    );
+    drop(scm_calls);
+
+    // VCS routed the fresh branch creation through the per-repo entry
+    // point (jleechan-wuts discipline) using the base SHA off
+    // origin/main.
+    let vcs_calls = vcs.calls.borrow().clone();
+    assert!(
+        vcs_calls.iter().any(|c| c == "base_head_for_repo(owner/repo,main)"),
+        "fresh fallback must compute the base HEAD off origin/main: {vcs_calls:?}"
+    );
+    assert!(
+        vcs_calls.iter().any(|c| c.contains(
+            "create_branch_at_for_repo(owner/repo,factory/bead-adopted-dirty-wt-r2,origin-main-sha-xyz789)"
+        )),
+        "fresh fallback must create the factory branch off origin/main: {vcs_calls:?}"
+    );
+    drop(vcs_calls);
+
+    // Overlay: bead is now tracking the fresh factory branch, the original
+    // PR number is cleared (it was closed above), and the bead is
+    // DISPATCHED so the fast tier can resume normal verification of the
+    // fresh attempt.
+    let updated = store.load("bead-adopted-dirty-wt").unwrap().unwrap();
+    assert_eq!(
+        updated.state,
+        OverlayState::Dispatched,
+        "dirty-worktree fallback must leave the bead DISPATCHED on the fresh branch, not HUMAN_HELD"
+    );
+    assert_eq!(updated.attempt, 2);
+    assert_eq!(updated.reroll_count, 1);
+    assert_eq!(
+        updated.branch.as_deref(),
+        Some("factory/bead-adopted-dirty-wt-r2"),
+        "bead branch must point at the fresh factory branch"
+    );
+    assert_eq!(
+        updated.pr_number, None,
+        "bead.pr_number must be cleared once the contributor's PR is closed"
+    );
+    assert!(
+        updated.session_id.is_some(),
+        "bead must track the spawned fresh-branch session"
+    );
+
+    // Telemetry: a dedicated event records that the dirty-worktree
+    // failure was observed and routed into the fresh fallback path so
+    // operators can grep for it.
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("REROLL_ADOPTED_DIRTY_WORKTREE_FALLBACK"),
+        "expected dirty-worktree fallback telemetry event; got: {telemetry}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
