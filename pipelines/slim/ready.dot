@@ -1,0 +1,101 @@
+digraph ReadyPRFactory {
+  graph [
+    goal="Enforce PR is /ready: verify CI tests, /es evidence, /er review, /advice approval, and holdouts with bounded N=3 fix iteration"
+    level5="true"
+    label="PR Ready Enforcement"
+    skip_explore="true"
+    skip_plan="true"
+    skip_implement="true"
+    rankdir=LR
+    model_stylesheet="minimal_feature.model.css"
+  ]
+
+  start [shape=Mdiamond, label="Start"]
+  exit  [shape=Msquare, label="Exit - Ready to Merge"]
+
+  // 1. Run deterministic CI tests / build check
+  test [
+    type="tool",
+    label="Run CI Tests",
+    command="${state.slim.test_command}",
+    validation=true,
+    goal_gate=true,
+    timeout=600,
+    retry_target="fix"
+  ]
+
+  // 2. Gate 1: /es Evidence Standards (published gist linked in PR body)
+  gate_es [
+    type="gate_es",
+    label="/es Evidence Standards",
+    backend_priority="codex,minimax,agy,claude-sonnet",
+    prefer_adversarial="true",
+    gate_strict="true",
+    timeout=600,
+    goal_gate=true,
+    retry_target="fix"
+  ]
+
+  // 3. Gate 2: /er Adversarial Evidence Review (PASS verdict at current head)
+  gate_er [
+    type="gate_er",
+    label="/er Evidence Review",
+    backend_priority="codex,minimax,agy,claude-sonnet",
+    prefer_adversarial="true",
+    gate_strict="true",
+    timeout=600,
+    goal_gate=true,
+    retry_target="fix"
+  ]
+
+  // 4. Gate 3: /advice Independent Review Gate (APPROVE / comments handled)
+  gate_advice [
+    type="gate_slash",
+    command="advice",
+    label="/advice Independent Review",
+    timeout=600,
+    goal_gate=true,
+    retry_target="fix"
+  ]
+
+  // 5. Gate 4: Sealed Holdout Evaluation
+  holdout [
+    type="holdout_eval",
+    label="Behavioral Holdouts",
+    feature="${state.feature}",
+    validation=true,
+    goal_gate=true,
+    timeout=600,
+    retry_target="fix"
+  ]
+
+  // 6. Fix & Iterate Node (Bounded by max_visits=3)
+  fix [
+    type="codergen",
+    label="Fix & Iterate (max N=3)",
+    class="fix",
+    prompt="@prompts/slim/ready_fix.md",
+    max_retries=2,
+    max_visits="3",
+    no_progress_max="2",
+    timeout=600
+  ]
+
+  start -> test
+  test -> gate_es [condition="outcome=success"]
+  test -> fix [condition="outcome!=success"]
+
+  gate_es -> gate_er [condition="outcome=success"]
+  gate_es -> fix [condition="outcome!=success"]
+
+  gate_er -> gate_advice [condition="outcome=success"]
+  gate_er -> fix [condition="outcome!=success"]
+
+  gate_advice -> holdout [condition="outcome=success"]
+  gate_advice -> fix [condition="outcome!=success"]
+
+  holdout -> exit [condition="outcome=success"]
+  holdout -> fix [condition="outcome!=success"]
+
+  fix -> test
+}

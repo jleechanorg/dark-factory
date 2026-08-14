@@ -21,6 +21,7 @@ across the board.
 | New feature, full production loop | `pipelines/slim/minimal_feature.dot` | explore → plan → test → review → holdout → gates |
 | New feature, minimal loop | `pipelines/factory/hello.dot` | plan → implement → holdout → fix |
 | In-flight PR iteration | `pipelines/slim/minimal_pr.dot` | explore → research → plan → … → review → holdout → gates; set `--state slim.test_command=...`; requires `$DARK_FACTORY_HOLDOUTS` |
+| PR `/ready` enforcement + fix iteration | `pipelines/slim/ready.dot` | test → /es → /er → /advice → holdout → fix (max 3 visits); enforces all /ready gates |
 | Bug fix with red/green discipline | `pipelines/bug_fix.dot` | reproduce (fresh test) → red gate → fix → green gate → holdout → adversarial evidence; max 3 fix visits |
 | Validate diff + sealed holdout | `pipelines/factory/gates.dot` | code already implemented (no fix loop; explore rollout intentionally skipped — see PR for rationale) |
 | Validate in-flight PR | `pipelines/factory/pr_gates.dot` | holdout + evidence gates (no fix loop) |
@@ -66,6 +67,7 @@ Current bounds:
 | `pipelines/factory/gates.dot` | n/a (no fix loop) | n/a |
 | `pipelines/slim/minimal_feature.dot` | `fix` | `3` |
 | `pipelines/slim/minimal_pr.dot` | `fix` | `3` |
+| `pipelines/slim/ready.dot` | `fix` | `3` |
 | `pipelines/bug_fix.dot` | `fix` | `3` |
 
 `hello.dot` also carries an explicit `fix -> exit [condition="outcome=exhausted"]`
@@ -128,7 +130,7 @@ rationale and what to copy when authoring a new benchmark.
 
 ## Short names (expanded by skill)
 
-`gates`, `hello`, `pr_gates`, `minimal_pr`, `minimal_feature`, `minimal_research`, `bug_fix`, `review_slim`, `review_full`, `spec_gen`
+`gates`, `hello`, `pr_gates`, `minimal_pr`, `minimal_feature`, `minimal_research`, `ready`, `bug_fix`, `review_slim`, `review_full`, `spec_gen`
 
 ## Invocation
 
