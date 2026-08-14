@@ -14349,4 +14349,3 @@ fn test_non_default_repository_branch_collision_telemetry_attribution() {
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
-

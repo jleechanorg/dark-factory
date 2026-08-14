@@ -2064,5 +2064,3 @@ fn non_default_repository_blocked_dispositions_attribution() {
     assert_eq!(empty_outcome.pr_number, Some(8003));
     assert_eq!(empty_outcome.head_sha.as_deref(), Some("sha-empty-8003"));
 }
-
-
