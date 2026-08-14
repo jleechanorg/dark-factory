@@ -14120,3 +14120,233 @@ fn test_gate_regression_counter_increments_on_each_green_to_red() {
         "gate_regression_count must read back the cumulative count"
     );
 }
+
+#[test]
+fn test_non_default_repository_labeled_pr_tick_telemetry_attribution() {
+    let mut scm = FakeScm::new();
+    scm.prs.push(LabeledPr {
+        number: 8843,
+        title: "Fix rewards XP anchor".into(),
+        body: "adopting existing PR".into(),
+        author_login: "jleechan2015".into(),
+        external_ref: "jleechanorg/worldarchitect.ai#8843".into(),
+        head_ref_name: "fix/rewards-xp-anchor-followup".into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("jleechanorg/worldarchitect.ai".into()),
+        head_repo_owner_login: Some("jleechanorg".into()),
+        head_sha: Some("9dc2c198a445450d8fe455e7d691a0492deefe2e".into()),
+        updated_at_epoch: Some(1_700_000_000),
+    });
+    scm.permissions.insert("jleechan2015".into(), Permission::Write);
+    scm.pr_snapshots.insert(
+        8843,
+        qdw_green_snapshot(
+            8843,
+            vec![PrComment {
+                author: "dark-factory-er".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: 0,
+            }],
+        ),
+    );
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.target_repo = "jleechanorg/dark-factory".into();
+    cfg.repos.insert(
+        "jleechanorg/worldarchitect.ai".into(),
+        daemon::config::RepoConfig {
+            ao_project: "worldarchitect".into(),
+            push_remote: "origin".into(),
+            local_checkout: None,
+        },
+    );
+    let vcs = test_vcs();
+    let telemetry_log = std::env::temp_dir().join("afd_non_default_repo_adoption.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        0,
+        0,
+    )
+    .expect("non-default repository PR adoption should succeed");
+
+    assert_eq!(summary.beads_created, 1);
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap();
+    let adopted_line = telemetry
+        .lines()
+        .find(|line| line.contains("EXISTING_PR_ADOPTED"))
+        .expect("telemetry log must contain EXISTING_PR_ADOPTED");
+
+    let parsed: serde_json::Value = serde_json::from_str(adopted_line).unwrap();
+    let context = &parsed["context"];
+    assert_eq!(
+        context["repo"], "jleechanorg/worldarchitect.ai",
+        "EXISTING_PR_ADOPTED context must contain repo attribution: {context:?}"
+    );
+    assert_eq!(
+        context["pr_number"], 8843,
+        "EXISTING_PR_ADOPTED context must contain pr_number attribution: {context:?}"
+    );
+    assert_eq!(
+        context["branch"], "fix/rewards-xp-anchor-followup",
+        "EXISTING_PR_ADOPTED context must contain branch attribution: {context:?}"
+    );
+    assert_eq!(
+        context["head_sha"], "9dc2c198a445450d8fe455e7d691a0492deefe2e",
+        "EXISTING_PR_ADOPTED context must contain head_sha attribution: {context:?}"
+    );
+    assert_eq!(
+        context["external_ref"], "jleechanorg/worldarchitect.ai#8843"
+    );
+    assert_eq!(context["newly_created"], true);
+
+    // Second tick: verify duplicate suppression does not re-emit EXISTING_PR_ADOPTED
+    let _ = std::fs::remove_file(&telemetry_log);
+    let summary2 = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        0,
+        0,
+    )
+    .expect("second tick should succeed");
+
+    assert_eq!(summary2.beads_created, 0);
+    let telemetry2 = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        !telemetry2.contains("EXISTING_PR_ADOPTED"),
+        "subsequent tick must NOT re-emit EXISTING_PR_ADOPTED: {telemetry2}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn test_non_default_repository_branch_collision_telemetry_attribution() {
+    let mut scm = FakeScm::new();
+    scm.prs.push(LabeledPr {
+        number: 8731,
+        title: "Colliding branch PR".into(),
+        body: "collides with existing registration".into(),
+        author_login: "jleechan2015".into(),
+        external_ref: "jleechanorg/worldarchitect.ai#8731".into(),
+        head_ref_name: "fix/rev-ilwk7-move-modal-validators".into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("jleechanorg/worldarchitect.ai".into()),
+        head_repo_owner_login: Some("jleechanorg".into()),
+        head_sha: Some("sha-8731-colliding".into()),
+        updated_at_epoch: Some(1_700_000_000),
+    });
+    scm.permissions.insert("jleechan2015".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    store
+        .save(&BeadOverlay {
+            bead_id: "legacy-bead-ver0".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(123),
+            branch: Some("fix/rev-ilwk7-move-modal-validators".into()),
+            session_id: Some("sess-legacy".into()),
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        })
+        .unwrap();
+    store
+        .register_branch("legacy-bead-ver0", "fix/rev-ilwk7-move-modal-validators")
+        .unwrap();
+
+    let mut cfg = test_cfg();
+    cfg.target_repo = "jleechanorg/dark-factory".into();
+    cfg.repos.insert(
+        "jleechanorg/worldarchitect.ai".into(),
+        daemon::config::RepoConfig {
+            ao_project: "worldarchitect".into(),
+            push_remote: "origin".into(),
+            local_checkout: None,
+        },
+    );
+    let vcs = test_vcs();
+    let telemetry_log = std::env::temp_dir().join("afd_non_default_collision.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        0,
+        0,
+    )
+    .expect("branch collision should escalate without failing the tick");
+
+    assert_eq!(summary.beads_escalated, 1);
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap();
+    let escalation_line = telemetry
+        .lines()
+        .find(|line| line.contains("ESCALATION_REQUIRED") && line.contains("adoption_branch_collision"))
+        .expect("telemetry log must contain ESCALATION_REQUIRED with adoption_branch_collision");
+
+    let parsed: serde_json::Value = serde_json::from_str(escalation_line).unwrap();
+    let context = &parsed["context"];
+    assert_eq!(
+        context["repo"], "jleechanorg/worldarchitect.ai",
+        "adoption_branch_collision context must contain repo attribution: {context:?}"
+    );
+    assert_eq!(
+        context["pr_number"], 8731,
+        "adoption_branch_collision context must contain pr_number attribution: {context:?}"
+    );
+    assert_eq!(
+        context["branch"], "fix/rev-ilwk7-move-modal-validators",
+        "adoption_branch_collision context must contain branch attribution: {context:?}"
+    );
+    assert_eq!(
+        context["head_sha"], "sha-8731-colliding",
+        "adoption_branch_collision context must contain head_sha attribution: {context:?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+

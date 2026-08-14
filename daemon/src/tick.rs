@@ -491,7 +491,7 @@ fn mark_escalation_undeliverable_and_emit(
 /// real bead id and are reported by the caller via INTAKE_BEAD_CREATED /
 /// EXISTING_PR_ADOPTED, which predate this helper.
 fn emit_intake_outcome(telemetry_log: &Path, outcome: &IntakeOutcome) -> Result<(), DaemonError> {
-    let (event_type, context) = match &outcome.verdict {
+    let (event_type, mut context) = match &outcome.verdict {
         IntakeVerdict::SkippedDuplicate => (
             "SKIPPED_DUPLICATE",
             serde_json::json!({"external_ref": outcome.external_ref}),
@@ -515,6 +515,18 @@ fn emit_intake_outcome(telemetry_log: &Path, outcome: &IntakeOutcome) -> Result<
             }),
         ),
     };
+    if let Some(repo) = &outcome.repo {
+        context["repo"] = serde_json::Value::String(repo.clone());
+    }
+    if let Some(pr_number) = outcome.pr_number {
+        context["pr_number"] = serde_json::Value::Number(pr_number.into());
+    }
+    if let Some(branch) = &outcome.branch {
+        context["branch"] = serde_json::Value::String(branch.clone());
+    }
+    if let Some(head_sha) = &outcome.head_sha {
+        context["head_sha"] = serde_json::Value::String(head_sha.clone());
+    }
     emit(
         telemetry_log,
         &outcome.external_ref,
@@ -1563,7 +1575,10 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     .comment_external(&adopted.external_ref, &comment_body);
                 let ctx = serde_json::json!({
                     "reason": "adoption_branch_collision",
+                    "repo": adopted.repo,
+                    "pr_number": adopted.pr_number,
                     "branch": adopted.head_ref_name,
+                    "head_sha": adopted.head_sha,
                     "registered_bead": owner,
                     "registered_bead_live": owner_live,
                     "external_ref": adopted.external_ref,
@@ -1677,8 +1692,10 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 "EXISTING_PR_ADOPTED",
                 serde_json::json!({}),
                 serde_json::json!({
+                    "repo": adopted.repo,
                     "pr_number": adopted.pr_number,
                     "branch": adopted.head_ref_name,
+                    "head_sha": adopted.head_sha,
                     "external_ref": adopted.external_ref,
                     "newly_created": adopted.newly_created,
                 }),
