@@ -460,6 +460,189 @@ fn pr_create_bead_duplicate_error_is_recovered_as_already_adopted() {
     );
 }
 
+/// jleechan-uinw (acceptance criterion #1+#2): a NON-duplicate
+/// `create_bead` failure on ONE candidate must NOT abort the rest of the
+/// batch — every remaining candidate in the same `scm.labeled_issues`
+/// fetch must still be evaluated, recorded as a verdict, and have its
+/// `create_bead` attempted. The fix that enforces this contract
+/// (jleechan-eazj, already on main) wraps `tracker.create_bead` in
+/// `match ... continue` inside the per-issue loop body and converts any
+/// non-duplicate error into an `IntakeVerdict::Errored { reason }` outcome
+/// for that single candidate only. Before the fix, the same shape
+/// short-circuited via `?` and made `normalize` return Err, which
+/// `run_slow_tier` then propagated to `main` -> `std::process::exit(1)`,
+/// killing the daemon and silently starving every later candidate of any
+/// telemetry at all (the live jleechan-eazj incident: 0 outcomes logged
+/// on a slow tick after the first bad candidate).
+///
+/// The regression vector uses `FakeTracker.create_bead_fail_for_ref` (the
+/// hook the eazj fix added for exactly this test): the fake returns a
+/// generic `DaemonError::Tool` (NOT a `duplicate_external_ref_bead_id`)
+/// for the scripted external_ref, and the default success path for
+/// everything else. Two write-tier issues are presented; the FIRST issue's
+/// `create_bead` errors, the SECOND issue is genuinely new. The test
+/// fails if either (a) the second issue's bead doesn't get created, or
+/// (b) the first issue's error reason is not surfaced as an
+/// `IntakeVerdict::Errored` verdict.
+#[test]
+fn create_bead_non_duplicate_error_does_not_abort_remaining_batch() {
+    let mut scm = FakeScm::new();
+    scm.issues.push(issue(11, "alice")); // first in iteration order — create_bead fails
+    scm.issues.push(issue(12, "alice")); // second — must still be processed
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    *tracker.create_bead_fail_for_ref.borrow_mut() = Some((
+        "owner/repo#11".to_string(),
+        "beads store rejected #11: simulated transient infrastructure failure".to_string(),
+    ));
+
+    let cfg = test_cfg();
+
+    let (created, outcomes) = intake::normalize(&scm, &tracker, &cfg).unwrap();
+
+    // jleechan-uinw acceptance criterion: the second, legitimately new
+    // issue MUST still get a bead created in the same `normalize` call.
+    assert!(
+        created.iter().any(|id| id == "fake-bead-1"),
+        "second issue (#12) must still be created when the first issue's create_bead fails: {created:?}"
+    );
+    assert_eq!(
+        created.len(),
+        1,
+        "expected exactly one new bead (the second issue), got: {created:?}"
+    );
+
+    // jleechan-eazj: every non-adopted candidate still gets a verdict —
+    // the failing first issue MUST be reported as `Errored { reason }`,
+    // not silently dropped, and the reason MUST carry the real stderr
+    // (not a generic "something failed" placeholder) so operators can
+    // triage from telemetry alone.
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "expected one verdict for the first issue's failure: {outcomes:?}"
+    );
+    assert_eq!(outcomes[0].external_ref, "owner/repo#11");
+    match &outcomes[0].verdict {
+        IntakeVerdict::Errored { reason } => assert!(
+            reason.contains("simulated transient infrastructure failure"),
+            "errored verdict must surface the real failure reason, got: {reason:?}"
+        ),
+        other => {
+            panic!("expected IntakeVerdict::Errored for the failing first issue, got: {other:?}")
+        }
+    }
+
+    // jleechan-uinw acceptance criterion (call-shape proof): the fake
+    // MUST see TWO create_bead attempts (one for each candidate) — the
+    // first failing, the second succeeding. A regression that aborts the
+    // loop on the first error would only show one create_bead call.
+    let calls = tracker.calls.borrow();
+    let create_calls: Vec<_> = calls
+        .iter()
+        .filter(|c| c.starts_with("create_bead("))
+        .collect();
+    assert_eq!(
+        create_calls.len(),
+        2,
+        "both candidates must reach create_bead — one failing, one succeeding: {create_calls:?}"
+    );
+    assert!(
+        create_calls.iter().any(|c| c.contains("owner/repo#11")),
+        "first candidate create_bead call missing: {create_calls:?}"
+    );
+    assert!(
+        create_calls
+            .iter()
+            .any(|c| c.contains("owner/repo#12")),
+        "second candidate create_bead call missing (regression — per-candidate abort leaked): {create_calls:?}"
+    );
+}
+
+/// jleechan-uinw (acceptance criterion #3): same contract as
+/// `create_bead_non_duplicate_error_does_not_abort_remaining_batch`, but
+/// on the PR-adoption sister loop (`normalize_labeled_prs`,
+/// daemon/src/intake.rs line 1347). One PR's `create_bead` errors
+/// non-duplicately; the rest of the PR batch must still be processed and
+/// adopted. Mirrors the jleechan-eazj fix in the labeled-prs loop body
+/// (lines 1462-1501 of `intake.rs`).
+///
+/// Companion to the issue-intake test above — together they cover the
+/// two consumer loops in `intake.rs` that the eazj fix hardened. The
+/// issue test covers the `scm.labeled_issues` fetch path; this one
+/// covers `scm.labeled_prs`. Both must continue to hold across any
+/// future refactor that touches the per-candidate loop bodies.
+#[test]
+fn pr_create_bead_non_duplicate_error_does_not_abort_remaining_batch() {
+    let mut scm = FakeScm::new();
+    scm.prs
+        .push(labeled_pr(21, "alice", "feature/first-pr-21")); // first — create_bead fails
+    scm.prs
+        .push(labeled_pr(22, "alice", "feature/second-pr-22")); // second — must still be adopted
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    *tracker.create_bead_fail_for_ref.borrow_mut() = Some((
+        "owner/repo#21".to_string(),
+        "beads store rejected #21: simulated non-duplicate transient failure".to_string(),
+    ));
+
+    let cfg = test_cfg();
+
+    let (adopted, outcomes) = intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
+
+    // jleechan-uinw acceptance criterion: second PR MUST still be adopted
+    // in the same sweep as the first PR's create_bead failure.
+    assert_eq!(
+        adopted.len(),
+        1,
+        "second PR (#22) must still be adopted when the first PR's create_bead fails: {adopted:?}"
+    );
+    assert_eq!(adopted[0].pr_number, 22);
+    assert_eq!(adopted[0].external_ref, "owner/repo#22");
+    assert!(
+        adopted[0].newly_created,
+        "the surviving adoption must be a fresh bead creation: {adopted:?}"
+    );
+
+    // jleechan-eazj: the failing first PR still surfaces a verdict.
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "expected one Errored verdict for the first PR: {outcomes:?}"
+    );
+    assert_eq!(outcomes[0].external_ref, "owner/repo#21");
+    match &outcomes[0].verdict {
+        IntakeVerdict::Errored { reason } => assert!(
+            reason.contains("simulated non-duplicate transient failure"),
+            "errored verdict must surface the real failure reason, got: {reason:?}"
+        ),
+        other => panic!(
+            "expected IntakeVerdict::Errored for the failing first PR, got: {other:?}"
+        ),
+    }
+
+    let calls = tracker.calls.borrow();
+    let create_calls: Vec<_> = calls
+        .iter()
+        .filter(|c| c.starts_with("create_bead("))
+        .collect();
+    assert_eq!(
+        create_calls.len(),
+        2,
+        "both PRs must reach create_bead — one failing, one succeeding: {create_calls:?}"
+    );
+    assert!(
+        create_calls.iter().any(|c| c.contains("owner/repo#21")),
+        "first PR create_bead call missing: {create_calls:?}"
+    );
+    assert!(
+        create_calls.iter().any(|c| c.contains("owner/repo#22")),
+        "second PR create_bead call missing (regression — per-candidate abort leaked): {create_calls:?}"
+    );
+}
+
 #[test]
 fn new_factory_pr_from_write_tier_collaborator_creates_existing_pr_intake() {
     let mut scm = FakeScm::new();
