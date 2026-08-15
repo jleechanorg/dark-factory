@@ -36,7 +36,129 @@ mod common;
 use common::{FakeScm, FakeTracker};
 use daemon::config::Config;
 use daemon::intake::{self, IntakeVerdict};
-use daemon::tools::{Issue, LabeledPr, Permission};
+use daemon::tools::{Issue, LabeledPr, Permission, Scm};
+
+/// `FakeScm` (in `daemon/tests/common`) uses the trait default impl for
+/// `labeled_prs_for_repo`, which filters via `parse_external_ref_repo` —
+/// a STRICT `owner/repo#N` parser in `tools.rs` that rejects URL-form refs.
+/// For r28r we MUST be able to feed URL-form refs through the intake sweep
+/// (that's exactly the bug class being fixed), so this thin wrapper just
+/// returns every PR unfiltered when `labeled_prs_for_repo` is called. Tests
+/// that don't exercise URL-form normalization should keep using `FakeScm`
+/// directly.
+struct UnfilteredFakeScm {
+    inner: FakeScm,
+}
+
+impl UnfilteredFakeScm {
+    fn new() -> Self {
+        Self {
+            inner: FakeScm::new(),
+        }
+    }
+}
+
+impl Scm for UnfilteredFakeScm {
+    fn labeled_issues(&self, label: &str) -> Result<Vec<Issue>, daemon::errors::DaemonError> {
+        self.inner.labeled_issues(label)
+    }
+
+    fn labeled_prs(
+        &self,
+        label: &str,
+        gh_calls: &mut u32,
+    ) -> Result<Vec<LabeledPr>, daemon::errors::DaemonError> {
+        self.inner.labeled_prs(label, gh_calls)
+    }
+
+    /// Override the trait default — return every PR (including URL-form
+    /// refs that the strict `parse_external_ref_repo` would otherwise drop).
+    fn labeled_prs_for_repo(
+        &self,
+        _repo: &str,
+        label: &str,
+        gh_calls: &mut u32,
+    ) -> Result<Vec<LabeledPr>, daemon::errors::DaemonError> {
+        self.inner.labeled_prs(label, gh_calls)
+    }
+
+    fn collaborator_permission(
+        &self,
+        login: &str,
+    ) -> Result<Permission, daemon::errors::DaemonError> {
+        self.inner.collaborator_permission(login)
+    }
+
+    fn collaborator_permission_for_repo(
+        &self,
+        repo: &str,
+        login: &str,
+    ) -> Result<Permission, daemon::errors::DaemonError> {
+        self.inner.collaborator_permission_for_repo(repo, login)
+    }
+
+    fn pr_snapshot(
+        &self,
+        pr: u64,
+    ) -> Result<daemon::tools::PrSnapshot, daemon::errors::DaemonError> {
+        self.inner.pr_snapshot(pr)
+    }
+
+    fn pr_snapshot_for_repo(
+        &self,
+        repo: &str,
+        pr: u64,
+    ) -> Result<daemon::tools::PrSnapshot, daemon::errors::DaemonError> {
+        self.inner.pr_snapshot_for_repo(repo, pr)
+    }
+
+    fn close_pr(
+        &self,
+        pr: u64,
+        comment: &str,
+    ) -> Result<(), daemon::errors::DaemonError> {
+        self.inner.close_pr(pr, comment)
+    }
+
+    fn close_pr_for_repo(
+        &self,
+        repo: &str,
+        pr: u64,
+        comment: &str,
+    ) -> Result<(), daemon::errors::DaemonError> {
+        self.inner.close_pr_for_repo(repo, pr, comment)
+    }
+
+    fn remote_branch_last_commit(
+        &self,
+        branch: &str,
+    ) -> Result<Option<u64>, daemon::errors::DaemonError> {
+        self.inner.remote_branch_last_commit(branch)
+    }
+
+    fn open_pr_head_ref_for_repo(
+        &self,
+        repo: &str,
+        pr: u64,
+    ) -> Result<daemon::tools::PrHeadBranch, daemon::errors::DaemonError> {
+        self.inner.open_pr_head_ref_for_repo(repo, pr)
+    }
+
+    fn pr_number_for_branch(
+        &self,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<u64>, daemon::errors::DaemonError> {
+        self.inner.pr_number_for_branch(repo, branch)
+    }
+
+    fn gist_nonempty(
+        &self,
+        gist_id: &str,
+    ) -> Result<Option<bool>, daemon::errors::DaemonError> {
+        self.inner.gist_nonempty(gist_id)
+    }
+}
 
 fn test_cfg() -> Config {
     Config {
@@ -168,14 +290,14 @@ fn normalize_canonicalizes_url_form_issue_external_ref_for_create_bead() {
 /// stored bead_overlay row has the canonical ref.
 #[test]
 fn normalize_labeled_prs_canonicalizes_url_form_external_ref_for_create_bead() {
-    let mut scm = FakeScm::new();
-    scm.prs.push(labeled_pr_with_ref(
+    let mut scm = UnfilteredFakeScm::new();
+    scm.inner.prs.push(labeled_pr_with_ref(
         8058,
         "alice",
         "feature/8058",
         "https://github.com/owner/repo/pull/8058",
     ));
-    scm.permissions.insert("alice".into(), Permission::Write);
+    scm.inner.permissions.insert("alice".into(), Permission::Write);
 
     let tracker = FakeTracker::new();
     let cfg = test_cfg();
@@ -183,9 +305,15 @@ fn normalize_labeled_prs_canonicalizes_url_form_external_ref_for_create_bead() {
     let telemetry_log = test_telemetry_log();
     let mut cache = intake::AdoptionProbeCache::default();
 
-    let result =
-        intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000, &telemetry_log)
-            .unwrap();
+    let result = intake::normalize_labeled_prs_outcome(
+        &scm,
+        &tracker,
+        &cfg,
+        &mut cache,
+        1_700_000_000,
+        &telemetry_log,
+    )
+    .unwrap();
 
     // Successful adoptions produce an `adopted` entry (not an outcome entry).
     assert_eq!(
@@ -227,13 +355,13 @@ fn normalize_labeled_prs_canonicalizes_url_form_external_ref_for_create_bead() {
 /// `SkippedDuplicate` without calling `create_bead` a second time.
 #[test]
 fn normalize_dedups_url_then_short_form_for_same_pr() {
-    let mut scm = FakeScm::new();
-    scm.issues.push(issue_with_ref(
+    let mut scm = UnfilteredFakeScm::new();
+    scm.inner.issues.push(issue_with_ref(
         8058,
         "alice",
         "https://github.com/owner/repo/issues/8058",
     ));
-    scm.permissions.insert("alice".into(), Permission::Write);
+    scm.inner.permissions.insert("alice".into(), Permission::Write);
 
     let tracker = FakeTracker::new();
     let cfg = test_cfg();
@@ -242,15 +370,15 @@ fn normalize_dedups_url_then_short_form_for_same_pr() {
     // owner/repo#8058 (canonical).
     let (created_first, outcomes_first) = intake::normalize(&scm, &tracker, &cfg).unwrap();
     assert_eq!(created_first.len(), 1, "first event must create a bead");
-    assert_eq!(outcomes_first.len(), 1);
+    assert!(outcomes_first.is_empty(), "first event must not produce an outcome (it created): {outcomes_first:?}");
 
     // Second intake event: short form for the SAME canonical ref. The fake
     // tracker's `known_refs` derives from its candidates vec (post-create),
     // so once the first bead lands there, a second event with the canonical
     // ref MUST be a SkippedDuplicate without a second create_bead call.
-    let mut scm2 = FakeScm::new();
-    scm2.issues.push(issue_with_ref(8058, "alice", "owner/repo#8058"));
-    scm2.permissions.insert("alice".into(), Permission::Write);
+    let mut scm2 = UnfilteredFakeScm::new();
+    scm2.inner.issues.push(issue_with_ref(8058, "alice", "owner/repo#8058"));
+    scm2.inner.permissions.insert("alice".into(), Permission::Write);
 
     let (created_second, outcomes_second) = intake::normalize(&scm2, &tracker, &cfg).unwrap();
 
