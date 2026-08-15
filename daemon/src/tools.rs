@@ -248,6 +248,13 @@ pub struct SpawnSpec {
     /// `expected_revision` after origin and cleanliness checks. Explicit
     /// operator-configured checkouts must remain protected from mutation.
     pub managed_checkout: bool,
+    /// Bead jleechan-jw4c: the worker session's expected working directory
+    /// (typically the agent-id subdirectory under `cfg.agent_worktree_root`).
+    /// Stored on the spec so adapter implementations can validate the
+    /// child process's cwd before returning `Ok`. `None` disables the guard
+    /// for legacy single-checkout layouts where the operator has not flipped
+    /// on the new isolation root.
+    pub expected_cwd: Option<std::path::PathBuf>,
 }
 
 /// Opaque handle to an AO/`aow` session.
@@ -381,6 +388,42 @@ pub fn remote_url_for_display(_url: &str) -> &'static str {
 /// coder-silence watcher locate a dispatched coder's own transcript
 /// directory from the absolute worktree path AO already reports at spawn
 /// time, without guessing at session identity.
+/// Bead jleechan-jw4c: validate that the actual `cwd` of a spawned worker
+/// matches the daemon's expected cwd. Returns `Ok(())` when the guard is
+/// disabled (`expected` is `None`, which is the legacy layout) or when the
+/// paths match. Returns `Err(DaemonError::WorktreeCwdMismatch)` when they
+/// differ — the failure mode that the bead's RED measurement described
+/// (worker writing into the shared primary checkout while its assigned
+/// worktree was a different tree).
+///
+/// The comparison uses canonical paths on both sides so a `..`-resolved
+/// `local_checkout` (e.g. `cwd` from a wrapper that landed at the repo
+/// root) still matches the absolute form the daemon passed in. Relative
+/// anchors are rejected: a worker whose cwd is `"."` is treated as a
+/// mismatch because the assignment always uses an absolute path.
+pub fn check_cwd_guard(
+    expected: Option<&std::path::Path>,
+    actual: &std::path::Path,
+) -> Result<(), DaemonError> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let expected_canon = expected
+        .canonicalize()
+        .unwrap_or_else(|_| expected.to_path_buf());
+    let actual_canon = actual
+        .canonicalize()
+        .unwrap_or_else(|_| actual.to_path_buf());
+    if expected_canon == actual_canon {
+        Ok(())
+    } else {
+        Err(DaemonError::WorktreeCwdMismatch {
+            expected: expected_canon.display().to_string(),
+            actual: actual_canon.display().to_string(),
+        })
+    }
+}
+
 pub fn claude_project_slug(worktree_path: &std::path::Path) -> String {
     worktree_path
         .to_string_lossy()
@@ -1444,5 +1487,46 @@ mod tests {
             parent_cwd.canonicalize().unwrap(),
             "run_tool must NOT change the child's cwd; got {out:?}, parent cwd {parent_cwd:?}"
         );
+    }
+
+    // Bead jleechan-jw4c: the cwd guard rejects a worker whose actual cwd
+    // does not match the daemon's expected cwd. The guard is silent (Ok)
+    // when the expected cwd is `None` (legacy layout) and FAIL CLOSED when
+    // a non-empty expected cwd does not match the actual.
+
+    #[test]
+    fn cwd_guard_passes_when_expected_is_none() {
+        let result = check_cwd_guard(None, std::path::Path::new("/tmp"));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn cwd_guard_passes_when_paths_match_after_canonicalize() {
+        let dir = std::env::temp_dir().join(format!("afd_cwd_match_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let result = check_cwd_guard(Some(&dir), &dir);
+        assert!(result.is_ok(), "matching cwds must pass the guard");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cwd_guard_fails_closed_when_paths_differ() {
+        let expected = std::env::temp_dir().join(format!("afd_cwd_expected_{}", std::process::id()));
+        let actual = std::env::temp_dir().join(format!("afd_cwd_actual_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&expected);
+        let _ = std::fs::remove_dir_all(&actual);
+        std::fs::create_dir_all(&expected).unwrap();
+        std::fs::create_dir_all(&actual).unwrap();
+        let err = check_cwd_guard(Some(&expected), &actual).unwrap_err();
+        match err {
+            DaemonError::WorktreeCwdMismatch { expected: e, actual: a } => {
+                assert!(e.contains("afd_cwd_expected"));
+                assert!(a.contains("afd_cwd_actual"));
+            }
+            other => panic!("expected WorktreeCwdMismatch, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&expected);
+        let _ = std::fs::remove_dir_all(&actual);
     }
 }

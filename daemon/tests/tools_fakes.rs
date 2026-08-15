@@ -134,6 +134,7 @@ fn fake_sessions_spawn_attach_stop_quiescent_roundtrip() {
         local_checkout: None,
         expected_revision: None,
         managed_checkout: false,
+        expected_cwd: None,
     };
     let id = fake.spawn(&spec).unwrap();
     assert_eq!(id, SessionId("sess-9".into()));

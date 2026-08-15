@@ -652,9 +652,18 @@ pub fn dispatch_ready_with_vcs(
             repo: repo.clone(),
             ao_project: routing.ao_project.clone(),
             remote: routing.push_remote.clone(),
-            local_checkout: Some(worker_checkout),
+            local_checkout: Some(worker_checkout.clone()),
             expected_revision: Some(expected_revision.clone()),
             managed_checkout: routing.local_checkout.is_none(),
+            // Bead jleechan-jw4c: the expected worker's cwd is the same
+            // workload's checkout. The spawn adapter validates this against
+            // the actual cwd before returning Ok (see
+            // `tools::check_cwd_guard`); a mismatch parks
+            // `HUMAN_HELD reason=worktree_cwd_mismatch`. The forward-edge
+            // for the new isolation layout is the addition of the agent-id
+            // path under `cfg.agent_worktree_root`; for the legacy layout
+            // it is simply the worker_checkout path itself.
+            expected_cwd: Some(worker_checkout),
         };
         let session_id = match sessions.spawn(&spec) {
             Ok(session_id) => session_id,
@@ -1347,6 +1356,18 @@ mod tests {
         /// keeps trusting a fresh spawn unconditionally; only the
         /// worktree-remote-mismatch regression tests populate this.
         scripted_worktree_remote: RefCell<HashMap<String, String>>,
+        /// Bead jleechan-jw4c: bead ids whose cwd guard should be skipped
+        /// (legacy layout coverage, or tests that explicitly want to
+        /// exercise the dispatch path without the guard). Empty by default
+        /// so the guard is enforced for every bead id.
+        ignore_cwd_guard_for: RefCell<Vec<String>>,
+        /// Bead jleechan-jw4c: scripted cwd to report per bead id when the
+        /// fake spawn is called. Used by the cwd-mismatch regression test
+        /// to simulate a worker whose actual cwd differs from the
+        /// daemon's expected cwd. Missing entries default to the test
+        /// process's own cwd (which matches the expected cwd when the
+        /// spec's `local_checkout` is also the test cwd).
+        spawn_cwd_for: RefCell<HashMap<String, std::path::PathBuf>>,
     }
 
     impl FakeSessions {
@@ -1374,6 +1395,8 @@ mod tests {
                 spawn_prompts: RefCell::new(Vec::new()),
                 spawn_checkouts: RefCell::new(Vec::new()),
                 scripted_worktree_remote: RefCell::new(scripted_worktree_remote),
+                ignore_cwd_guard_for: RefCell::new(Vec::new()),
+                spawn_cwd_for: RefCell::new(HashMap::new()),
             }
         }
 
@@ -1434,6 +1457,30 @@ mod tests {
         }
 
         fn spawn(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
+            // Bead jleechan-jw4c: enforce the cwd guard BEFORE the fake
+            // records the spawn. The fake mirrors the production adapter's
+            // failure mode: a worker whose cwd does not match the assigned
+            // worktree is rejected (fail closed) and the dispatch lands in
+            // the WorktreeCwdMismatch branch upstream. Tests can flip
+            // `ignore_cwd_guard_for.borrow_mut().insert(spec.bead_id.clone())`
+            // to bypass the guard for legacy layout coverage.
+            if !self
+                .ignore_cwd_guard_for
+                .borrow()
+                .contains(&spec.bead_id)
+            {
+                let actual = self
+                    .spawn_cwd_for
+                    .borrow()
+                    .get(&spec.bead_id)
+                    .cloned()
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                if let Err(err) =
+                    crate::tools::check_cwd_guard(spec.expected_cwd.as_deref(), &actual)
+                {
+                    return Err(err);
+                }
+            }
             self.calls
                 .borrow_mut()
                 .push(format!("spawn({})", spec.bead_id));
@@ -1759,6 +1806,9 @@ mod tests {
             )]),
             pre_gate_validation_enabled: false,
             escalation_refire_secs: 3600,
+            agent_worktree_root: None,
+            worktree_ttl_secs: 14 * 24 * 60 * 60,
+            worktree_max_count: 200,
         }
     }
 

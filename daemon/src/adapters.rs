@@ -2288,6 +2288,7 @@ pub fn verify_ao_bridge_compatibility(
         local_checkout: None,
         expected_revision: None,
         managed_checkout: false,
+        expected_cwd: None,
     };
     let mut command = ao_spawn_command_with_mode(agent, &spec, true)?;
     command
@@ -2930,6 +2931,7 @@ mod ao_spawn_contract_tests {
             local_checkout: Some(std::env::current_dir().unwrap()),
             expected_revision: None,
             managed_checkout: false,
+            expected_cwd: None,
         }
     }
 
