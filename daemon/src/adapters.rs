@@ -1,5 +1,5 @@
 use crate::errors::{DaemonError, SpawnBatchCleanupFailure};
-use crate::tools::{run_tool, run_tool_in_dir, Bead, Issue, LabeledPr, Llm, Permission, PrHeadBranch, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
+use crate::tools::{run_tool, run_tool_in_dir, Bead, Issue, LabeledPr, Llm, Permission, PrHeadBranch, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs, WorktreeHeadAncestry};
 use std::process::{Command, Stdio};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -2389,6 +2389,9 @@ pub struct CliSessions {
     pub agent: String,
     spawned_worktrees:
         std::sync::Mutex<std::collections::HashMap<(String, String), std::path::PathBuf>>,
+    spawned_session_worktrees: std::sync::Mutex<
+        std::collections::HashMap<String, (String, std::path::PathBuf)>,
+    >,
 }
 
 impl CliSessions {
@@ -2401,6 +2404,7 @@ impl CliSessions {
             project,
             agent: agent.to_string(),
             spawned_worktrees: std::sync::Mutex::new(std::collections::HashMap::new()),
+            spawned_session_worktrees: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -2485,8 +2489,12 @@ impl CliSessions {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(
                 (spec.ao_project.clone(), spec.branch.clone()),
-                workspace,
+                workspace.clone(),
             );
+        self.spawned_session_worktrees
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session.0.clone(), (spec.branch.clone(), workspace));
         Ok(session)
     }
 
@@ -5620,6 +5628,88 @@ impl Sessions for CliSessions {
         }
     }
 
+    fn worktree_head_ancestry(
+        &self,
+        session_id: &SessionId,
+        expected_branch: &str,
+        ancestor_sha: &str,
+    ) -> Result<Option<WorktreeHeadAncestry>, DaemonError> {
+        let recorded = self
+            .spawned_session_worktrees
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&session_id.0)
+            .cloned();
+        let Some((recorded_branch, path)) = recorded else {
+            return Ok(None);
+        };
+        if recorded_branch != expected_branch {
+            return Err(DaemonError::Config(format!(
+                "AO workspace for session {} belongs to branch {recorded_branch:?}, expected {expected_branch:?}",
+                session_id.0
+            )));
+        }
+        if !path.is_dir() {
+            return Err(DaemonError::Config(format!(
+                "AO workspacePath {} for session {} branch {expected_branch:?} is not a directory",
+                path.display(),
+                session_id.0
+            )));
+        }
+        let cwd = path.to_string_lossy().into_owned();
+        let current_branch = run_tool_in_dir(
+            "git",
+            &["symbolic-ref", "--quiet", "--short", "HEAD"],
+            &cwd,
+            10,
+        )?
+        .trim()
+        .to_string();
+        if current_branch != expected_branch {
+            return Err(DaemonError::Config(format!(
+                "AO workspace for session {} is currently on branch {current_branch:?}, expected {expected_branch:?}",
+                session_id.0
+            )));
+        }
+        let head_sha = run_tool_in_dir("git", &["rev-parse", "HEAD"], &cwd, 10)?
+            .trim()
+            .to_string();
+        if head_sha.is_empty() {
+            return Err(DaemonError::Parse(format!(
+                "git returned an empty HEAD SHA in AO workspace {}",
+                path.display()
+            )));
+        }
+        let contains_ancestor = match run_tool_in_dir(
+            "git",
+            &["merge-base", "--is-ancestor", ancestor_sha, &head_sha],
+            &cwd,
+            10,
+        ) {
+            Ok(_) => true,
+            Err(DaemonError::Tool { tool, rc: 1, .. }) if tool == "git" => false,
+            Err(error) => return Err(error),
+        };
+        let stable_head = run_tool_in_dir("git", &["rev-parse", "HEAD"], &cwd, 10)?
+            .trim()
+            .to_string();
+        let stable_branch = run_tool_in_dir(
+            "git",
+            &["symbolic-ref", "--quiet", "--short", "HEAD"],
+            &cwd,
+            10,
+        )?
+        .trim()
+        .to_string();
+        if stable_head != head_sha || stable_branch != expected_branch {
+            return Ok(None);
+        }
+        Ok(Some(WorktreeHeadAncestry {
+            head_sha,
+            contains_ancestor,
+        }))
+    }
+
     /// Bead jleechan-coder-silent-false-parks-h92r: unlike
     /// `worktree_remote_url` (a spawn-time-only assertion that fails closed
     /// on a missing mapping), this is an advisory liveness signal consulted
@@ -5926,7 +6016,7 @@ mod active_session_count_tests {
 #[cfg(test)]
 mod worktree_remote_url_tests {
     use super::{gh_env_test_lock, CliSessions};
-    use crate::tools::Sessions;
+    use crate::tools::{SessionId, Sessions};
 
     fn record_workspace(
         sessions: &CliSessions,
@@ -5942,6 +6032,177 @@ mod worktree_remote_url_tests {
                 (project.to_string(), branch.to_string()),
                 path.to_path_buf(),
             );
+    }
+
+    fn record_session_workspace(
+        sessions: &CliSessions,
+        session_id: &str,
+        branch: &str,
+        path: &std::path::Path,
+    ) {
+        sessions
+            .spawned_session_worktrees
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                session_id.to_string(),
+                (branch.to_string(), path.to_path_buf()),
+            );
+    }
+
+    fn git(path: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn init_commit(path: &std::path::Path, contents: &str) -> String {
+        std::fs::create_dir_all(path).unwrap();
+        git(path, &["init", "-q"]);
+        git(
+            path,
+            &[
+                "config",
+                "user.email",
+                "jleechan2015@users.noreply.github.com",
+            ],
+        );
+        git(path, &["config", "user.name", "Factory Test"]);
+        std::fs::write(path.join("tracked.txt"), contents).unwrap();
+        git(path, &["add", "tracked.txt"]);
+        git(path, &["commit", "-qm", "initial"]);
+        git(path, &["rev-parse", "HEAD"])
+    }
+
+    #[test]
+    fn worktree_head_ancestry_uses_exact_session_workspace() {
+        let root = std::env::temp_dir().join(format!(
+            "afd_worktree_ancestry_true_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let first_sha = init_commit(&root, "first");
+        git(&root, &["branch", "-m", "factory/test-r1"]);
+        std::fs::write(root.join("tracked.txt"), "second").unwrap();
+        git(&root, &["add", "tracked.txt"]);
+        git(&root, &["commit", "-qm", "second"]);
+        let current_sha = git(&root, &["rev-parse", "HEAD"]);
+
+        let sessions = CliSessions::new("owner/repo", "claude-code");
+        record_session_workspace(&sessions, "session-ancestry", "factory/test-r1", &root);
+        let relation = sessions
+            .worktree_head_ancestry(
+                &SessionId("session-ancestry".into()),
+                "factory/test-r1",
+                &first_sha,
+            )
+            .unwrap()
+            .unwrap();
+
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(relation.contains_ancestor);
+        assert_eq!(relation.head_sha, current_sha);
+    }
+
+    #[test]
+    fn worktree_head_ancestry_reports_real_local_rewrite() {
+        let root = std::env::temp_dir().join(format!(
+            "afd_worktree_ancestry_false_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let first_sha = init_commit(&root, "first");
+        git(
+            &root,
+            &["checkout", "-q", "--orphan", "factory/test-r2"],
+        );
+        git(&root, &["rm", "-q", "-f", "tracked.txt"]);
+        std::fs::write(root.join("replacement.txt"), "replacement").unwrap();
+        git(&root, &["add", "replacement.txt"]);
+        git(&root, &["commit", "-qm", "rewritten"]);
+
+        let sessions = CliSessions::new("owner/repo", "claude-code");
+        record_session_workspace(&sessions, "session-rewrite", "factory/test-r2", &root);
+        let relation = sessions
+            .worktree_head_ancestry(
+                &SessionId("session-rewrite".into()),
+                "factory/test-r2",
+                &first_sha,
+            )
+            .unwrap()
+            .unwrap();
+
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(!relation.contains_ancestor);
+    }
+
+    #[test]
+    fn worktree_head_ancestry_rejects_replaced_session_branch() {
+        let sessions = CliSessions::new("owner/repo", "claude-code");
+        let root = std::env::temp_dir();
+        record_session_workspace(&sessions, "session-wrong", "factory/other-r1", &root);
+        let error = sessions
+            .worktree_head_ancestry(
+                &SessionId("session-wrong".into()),
+                "factory/expected-r1",
+                "abc123",
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("belongs to branch"));
+    }
+
+    #[test]
+    fn worktree_head_ancestry_rejects_workspace_checked_out_elsewhere() {
+        let root = std::env::temp_dir().join(format!(
+            "afd_worktree_ancestry_wrong_branch_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let first_sha = init_commit(&root, "first");
+        git(&root, &["branch", "-m", "factory/expected-r1"]);
+        git(&root, &["checkout", "-qb", "other-branch"]);
+
+        let sessions = CliSessions::new("owner/repo", "claude-code");
+        record_session_workspace(
+            &sessions,
+            "session-checked-out-elsewhere",
+            "factory/expected-r1",
+            &root,
+        );
+        let error = sessions
+            .worktree_head_ancestry(
+                &SessionId("session-checked-out-elsewhere".into()),
+                "factory/expected-r1",
+                &first_sha,
+            )
+            .unwrap_err();
+
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(error.to_string().contains("currently on branch"));
+    }
+
+    #[test]
+    fn worktree_head_ancestry_returns_none_after_restart_loses_mapping() {
+        let sessions = CliSessions::new("owner/repo", "claude-code");
+        assert_eq!(
+            sessions
+                .worktree_head_ancestry(
+                    &SessionId("session-before-restart".into()),
+                    "factory/test-r1",
+                    "abc123",
+                )
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

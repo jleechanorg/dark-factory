@@ -1301,6 +1301,237 @@ fn test_dispatch_integrity_sweep_allows_fast_forward_adopted_commit() {
 }
 
 #[test]
+fn append_only_sweep_warns_but_keeps_unpublished_local_descendant_running() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let branch = "factory/bead-unpublished-r5";
+    let pre_sha = "pre-session-sha-unpublished";
+    store.overlays.borrow_mut().insert(
+        "bead-unpublished".into(),
+        BeadOverlay {
+            bead_id: "bead-unpublished".into(),
+            state: OverlayState::Dispatched,
+            attempt: 5,
+            reroll_count: 1,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some(branch.into()),
+            session_id: Some("session-unpublished".into()),
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: Some(pre_sha.into()),
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+    sessions.set_worktree_ancestor("session-unpublished", branch, pre_sha, true);
+    let telemetry_log =
+        std::env::temp_dir().join("afd_test_append_only_unpublished_local.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    let vcs = test_vcs();
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 1, 1).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 0);
+    let overlay = store.load("bead-unpublished").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::Dispatched);
+    assert_eq!(overlay.session_id.as_deref(), Some("session-unpublished"));
+    assert!(!sessions.calls.borrow().iter().any(|c| c == "stop(session-unpublished)"));
+    let logs = std::fs::read_to_string(&telemetry_log).unwrap();
+    assert!(logs.contains("APPEND_ONLY_REMOTE_CHECK_DEFERRED"), "logs: {logs}");
+    assert!(logs.contains("local_worktree_ancestry_confirmed"), "logs: {logs}");
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn append_only_sweep_parks_local_rewrite_without_trusting_stale_remote() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let branch = "factory/bead-local-rewrite-r2";
+    let pre_sha = "pre-local-rewrite";
+    store.overlays.borrow_mut().insert(
+        "bead-local-rewrite".into(),
+        BeadOverlay {
+            bead_id: "bead-local-rewrite".into(),
+            state: OverlayState::Dispatched,
+            attempt: 2,
+            reroll_count: 1,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some(branch.into()),
+            session_id: Some("session-local-rewrite".into()),
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: Some(pre_sha.into()),
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+    sessions.set_worktree_ancestor("session-local-rewrite", branch, pre_sha, false);
+    let telemetry_log = std::env::temp_dir().join("afd_test_append_only_local_rewrite.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    let mut vcs = test_vcs();
+    vcs.heads.insert(branch.into(), "stale-safe-remote-head".into());
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 1, 1).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 1);
+    let overlay = store.load("bead-local-rewrite").unwrap().unwrap();
+    assert_eq!(overlay.park_reason.as_deref(), Some("adopted_branch_history_rewrite_detected"));
+    assert!(!vcs.calls.borrow().iter().any(|c| c.starts_with("remote_head_sha(")));
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn append_only_sweep_falls_back_to_remote_when_local_probe_errors() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let branch = "factory/bead-local-error-r2";
+    let pre_sha = "pre-local-error";
+    store.overlays.borrow_mut().insert(
+        "bead-local-error".into(),
+        BeadOverlay {
+            bead_id: "bead-local-error".into(),
+            state: OverlayState::Dispatched,
+            attempt: 2,
+            reroll_count: 1,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some(branch.into()),
+            session_id: Some("session-local-error".into()),
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: Some(pre_sha.into()),
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+    sessions.fail_worktree_ancestor(
+        "session-local-error",
+        branch,
+        pre_sha,
+        "transient local git read",
+    );
+    let telemetry_log = std::env::temp_dir().join("afd_test_append_only_local_error.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    let mut vcs = test_vcs();
+    vcs.heads.insert(branch.into(), "remote-descendant".into());
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 1, 1).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 0);
+    assert_eq!(store.load("bead-local-error").unwrap().unwrap().state, OverlayState::Dispatched);
+    assert!(vcs.calls.borrow().iter().any(|c| c.starts_with("remote_head_sha(")));
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn append_only_sweep_does_not_let_local_proof_override_remote_rewrite() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let branch = "alice/remote-rewritten";
+    let pre_sha = "pre-remote-rewrite";
+    store.overlays.borrow_mut().insert(
+        "bead-remote-rewrite".into(),
+        BeadOverlay {
+            bead_id: "bead-remote-rewrite".into(),
+            state: OverlayState::Dispatched,
+            attempt: 2,
+            reroll_count: 1,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some(branch.into()),
+            session_id: Some("session-remote-rewrite".into()),
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: Some(pre_sha.into()),
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+    sessions.set_worktree_ancestor("session-remote-rewrite", branch, pre_sha, true);
+    let telemetry_log = std::env::temp_dir().join("afd_test_append_only_remote_rewrite.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    let mut vcs = test_vcs();
+    vcs.heads.insert(branch.into(), "rewritten-remote-head".into());
+    vcs.ancestor_pairs
+        .insert((pre_sha.into(), "rewritten-remote-head".into()), false);
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 1, 1).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 1);
+    assert_eq!(
+        store.load("bead-remote-rewrite").unwrap().unwrap().park_reason.as_deref(),
+        Some("adopted_branch_history_rewrite_detected")
+    );
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
 fn test_wedge_detection_attested_session_stalled() {
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();

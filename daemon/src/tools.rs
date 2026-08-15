@@ -734,6 +734,13 @@ pub enum SessionActivity {
     NotFound,
 }
 
+/// Append-only evidence read from the exact AO worker worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeHeadAncestry {
+    pub head_sha: String,
+    pub contains_ancestor: bool,
+}
+
 /// `ao` / `aow` CLIs.
 pub trait Sessions {
     fn active_count(&self) -> Result<usize, DaemonError>;
@@ -834,6 +841,20 @@ pub trait Sessions {
         remote_name: &str,
     ) -> Result<Option<String>, DaemonError> {
         let _ = (ao_project, branch, remote_name);
+        Ok(None)
+    }
+    /// Inspect the exact AO worktree recorded for `session_id` and verify it
+    /// still belongs to `expected_branch`, then report whether its current
+    /// HEAD contains `ancestor_sha`. `Ok(None)`
+    /// means no live-process workspace mapping is available (for example,
+    /// after a daemon restart), so callers must use their remote fallback.
+    fn worktree_head_ancestry(
+        &self,
+        session_id: &SessionId,
+        expected_branch: &str,
+        ancestor_sha: &str,
+    ) -> Result<Option<WorktreeHeadAncestry>, DaemonError> {
+        let _ = (session_id, expected_branch, ancestor_sha);
         Ok(None)
     }
     /// Most recent modification time (unix epoch seconds) observed across

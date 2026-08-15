@@ -14,7 +14,7 @@ use daemon::state::{
 };
 use daemon::tools::{
     Bead, Issue, LabeledPr, Llm, Permission, PrHeadBranch, PrSnapshot, Scm, SessionActivity,
-    SessionId, Sessions, SpawnSpec, Tracker, Vcs,
+    SessionId, Sessions, SpawnSpec, Tracker, Vcs, WorktreeHeadAncestry,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -492,6 +492,8 @@ pub struct FakeSessions {
     /// populate this to simulate a coder whose transcript is still updating
     /// even though the remote branch has been silent.
     pub transcript_activity_for: RefCell<HashMap<String, u64>>,
+    pub worktree_ancestor_for: RefCell<HashMap<String, bool>>,
+    pub worktree_ancestor_error_for: RefCell<HashMap<String, String>>,
 }
 
 impl Default for FakeSessions {
@@ -521,6 +523,8 @@ impl Default for FakeSessions {
             activity_sequence: RefCell::new(Vec::new()),
             worktree_remote_override: RefCell::new(None),
             transcript_activity_for: RefCell::new(HashMap::new()),
+            worktree_ancestor_for: RefCell::new(HashMap::new()),
+            worktree_ancestor_error_for: RefCell::new(HashMap::new()),
         }
     }
 }
@@ -648,6 +652,32 @@ impl FakeSessions {
         self.transcript_activity_for
             .borrow_mut()
             .insert(format!("{ao_project},{branch}"), epoch);
+    }
+
+    pub fn set_worktree_ancestor(
+        &self,
+        session_id: &str,
+        expected_branch: &str,
+        ancestor_sha: &str,
+        is_ancestor: bool,
+    ) {
+        self.worktree_ancestor_for.borrow_mut().insert(
+            format!("{session_id},{expected_branch},{ancestor_sha}"),
+            is_ancestor,
+        );
+    }
+
+    pub fn fail_worktree_ancestor(
+        &self,
+        session_id: &str,
+        expected_branch: &str,
+        ancestor_sha: &str,
+        message: &str,
+    ) {
+        self.worktree_ancestor_error_for.borrow_mut().insert(
+            format!("{session_id},{expected_branch},{ancestor_sha}"),
+            message.to_string(),
+        );
     }
 }
 
@@ -871,6 +901,40 @@ impl Sessions for FakeSessions {
             .borrow()
             .get(&format!("{ao_project},{branch}"))
             .copied())
+    }
+
+    fn worktree_head_ancestry(
+        &self,
+        session_id: &SessionId,
+        expected_branch: &str,
+        ancestor_sha: &str,
+    ) -> Result<Option<WorktreeHeadAncestry>, DaemonError> {
+        self.calls.borrow_mut().push(format!(
+            "worktree_head_ancestry({},{expected_branch},{ancestor_sha})",
+            session_id.0
+        ));
+        if let Some(message) = self.worktree_ancestor_error_for.borrow().get(&format!(
+            "{},{expected_branch},{ancestor_sha}",
+            session_id.0
+        )) {
+            return Err(DaemonError::Tool {
+                tool: "git".to_string(),
+                rc: 128,
+                stderr: message.clone(),
+            });
+        }
+        Ok(self
+            .worktree_ancestor_for
+            .borrow()
+            .get(&format!(
+                "{},{expected_branch},{ancestor_sha}",
+                session_id.0
+            ))
+            .copied()
+            .map(|contains_ancestor| WorktreeHeadAncestry {
+                head_sha: "fake-local-worktree-head".to_string(),
+                contains_ancestor,
+            }))
     }
 }
 

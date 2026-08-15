@@ -808,25 +808,68 @@ pub fn run_tick(
                 // history-rewrite is caught on the very next tick rather
                 // than silently surviving until promotion.
                 //
-                // Fail-closed by design (opposite bias from the
-                // session_branch_mismatch check below, which intentionally
-                // treats "cannot verify" as NOT a violation): both a
-                // confirmed non-ancestor (`Ok(false)`) and an inconclusive
-                // check (`Err`, e.g. a fetch failure) escalate. A missed
-                // stall retries next tick for free; a missed force-push is
-                // silent, permanent history loss on a branch the daemon
-                // does not own.
+                // The exact session worktree and published remote are both
+                // consulted. Either can prove a rewrite. If the remote ref
+                // is not published yet (or GitHub is transiently unavailable),
+                // positive local ancestry keeps the healthy worker running
+                // and emits warning telemetry; without positive evidence,
+                // an inconclusive check still escalates fail-closed.
                 if overlay.is_adopted {
                     if let (Some(branch), Some(pre_sha)) =
                         (overlay.branch.clone(), overlay.pre_session_head_sha.clone())
                     {
-                        let verdict = deps.vcs.remote_head_sha(&branch).and_then(|post_sha| {
+                        let remote_verdict = || deps.vcs.remote_head_sha(&branch).and_then(|post_sha| {
                             deps.vcs
                                 .is_ancestor(&pre_sha, &post_sha)
                                 .map(|ok| (ok, post_sha))
                         });
+                        let local_verdict = match overlay.session_id.as_ref() {
+                            Some(session_id) => deps.sessions.worktree_head_ancestry(
+                                &SessionId(session_id.clone()),
+                                &branch,
+                                &pre_sha,
+                            ),
+                            None => Ok(None),
+                        };
+                        let mut remote_fallback_warning = None;
+                        let verdict = match local_verdict {
+                            Ok(Some(local)) if !local.contains_ancestor => {
+                                Ok((false, local.head_sha))
+                            }
+                            Ok(Some(local)) => match remote_verdict() {
+                                Ok(remote) => Ok(remote),
+                                Err(remote_error) => {
+                                    remote_fallback_warning = Some(remote_error.to_string());
+                                    Ok((true, local.head_sha))
+                                }
+                            },
+                            Ok(None) => remote_verdict(),
+                            Err(local_error) => remote_verdict().map_err(|remote_error| {
+                                DaemonError::Parse(format!(
+                                    "local AO worktree append-only check failed: {local_error}; remote check also failed: {remote_error}"
+                                ))
+                            }),
+                        };
                         match verdict {
-                            Ok((true, _)) => {}
+                            Ok((true, post_sha)) => {
+                                if let Some(remote_error) = remote_fallback_warning {
+                                    emit(
+                                        deps.telemetry_log,
+                                        &overlay.bead_id,
+                                        overlay.attempt,
+                                        overlay.state.as_str(),
+                                        "APPEND_ONLY_REMOTE_CHECK_DEFERRED",
+                                        serde_json::json!({}),
+                                        serde_json::json!({
+                                            "reason": "local_worktree_ancestry_confirmed",
+                                            "branch": branch,
+                                            "pre_session_sha": pre_sha,
+                                            "local_head_sha": post_sha,
+                                            "remote_error": remote_error,
+                                        }),
+                                    )?;
+                                }
+                            }
                             Ok((false, post_sha)) => {
                                 overlay.state = OverlayState::HumanHeld;
                                 // jleechan-park-leaves-zombie-session-mh9o:

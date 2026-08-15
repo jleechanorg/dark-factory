@@ -120,6 +120,8 @@ fn fake_sessions_spawn_attach_stop_quiescent_roundtrip() {
         activity_sequence: Default::default(),
         worktree_remote_override: Default::default(),
         transcript_activity_for: Default::default(),
+        worktree_ancestor_for: Default::default(),
+        worktree_ancestor_error_for: Default::default(),
     };
 
     assert_eq!(fake.active_count().unwrap(), 3);
