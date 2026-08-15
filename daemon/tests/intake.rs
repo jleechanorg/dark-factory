@@ -560,19 +560,24 @@ fn create_bead_non_duplicate_error_does_not_abort_remaining_batch() {
     );
 }
 
-/// jleechan-uinw (acceptance criterion #3): same contract as
-/// `create_bead_non_duplicate_error_does_not_abort_remaining_batch`, but
-/// on the PR-adoption sister loop (`normalize_labeled_prs`,
-/// daemon/src/intake.rs line 1347). One PR's `create_bead` errors
-/// non-duplicately; the rest of the PR batch must still be processed and
-/// adopted. Mirrors the jleechan-eazj fix in the labeled-prs loop body
-/// (lines 1462-1501 of `intake.rs`).
+/// jleechan-uinw (acceptance criterion #3): the PRODUCTION PR-adoption
+/// loop (`normalize_labeled_prs_outcome`, called from
+/// `daemon/src/tick.rs:1562`) must isolate per-candidate create_bead
+/// errors: when the FIRST PR's `create_bead` errors non-duplicately, the
+/// NEXT legitimately-new PR must still be adopted in the same sweep.
+/// Mirrors the jleechan-eazj fix in the production `with_cache` loop
+/// body (`daemon/src/intake.rs` lines 1121-1150). The `normalize_labeled_prs`
+/// helper (originally targeted by this test) is now a legacy shim used
+/// only by tests; the production contract lives in `normalize_labeled_prs_outcome`.
+/// Codex review (P2 comment 3788751987) flagged this on the original
+/// test shape against `normalize_labeled_prs`; this revision routes
+/// through the production entrypoint so a future regression in the
+/// production loop body's per-candidate error isolation fails CI here.
 ///
 /// Companion to the issue-intake test above — together they cover the
 /// two consumer loops in `intake.rs` that the eazj fix hardened. The
 /// issue test covers the `scm.labeled_issues` fetch path; this one
-/// covers `scm.labeled_prs`. Both must continue to hold across any
-/// future refactor that touches the per-candidate loop bodies.
+/// covers `scm.labeled_prs` via the production `out` API.
 #[test]
 fn pr_create_bead_non_duplicate_error_does_not_abort_remaining_batch() {
     let mut scm = FakeScm::new();
@@ -589,31 +594,46 @@ fn pr_create_bead_non_duplicate_error_does_not_abort_remaining_batch() {
     ));
 
     let cfg = test_cfg();
+    let mut cache = AdoptionProbeCache::new();
 
-    let (adopted, outcomes) = intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
+    // PRODUCTION entrypoint (tick.rs:1562 calls this directly).
+    let outcome = intake::normalize_labeled_prs_outcome(
+        &scm,
+        &tracker,
+        &cfg,
+        &mut cache,
+        1_700_000_000,
+        &test_telemetry_log(),
+    )
+    .unwrap();
 
-    // jleechan-uinw acceptance criterion: second PR MUST still be adopted
-    // in the same sweep as the first PR's create_bead failure.
-    assert_eq!(
-        adopted.len(),
-        1,
-        "second PR (#22) must still be adopted when the first PR's create_bead fails: {adopted:?}"
-    );
-    assert_eq!(adopted[0].pr_number, 22);
-    assert_eq!(adopted[0].external_ref, "owner/repo#22");
+    // jleechan-uinw acceptance criterion: the second PR MUST still be
+    // adopted in the same sweep as the first PR's create_bead failure.
     assert!(
-        adopted[0].newly_created,
-        "the surviving adoption must be a fresh bead creation: {adopted:?}"
+        !outcome.rate_limited,
+        "production PR loop must not be reported rate-limited: {:?}",
+        outcome.rate_limited
+    );
+    assert_eq!(
+        outcome.adopted.len(),
+        1,
+        "second PR (#22) must still be adopted when the first PR's create_bead fails: {outcome:?}"
+    );
+    assert_eq!(outcome.adopted[0].pr_number, 22);
+    assert_eq!(outcome.adopted[0].external_ref, "owner/repo#22");
+    assert!(
+        outcome.adopted[0].newly_created,
+        "the surviving adoption must be a fresh bead creation: {outcome:?}"
     );
 
     // jleechan-eazj: the failing first PR still surfaces a verdict.
     assert_eq!(
-        outcomes.len(),
+        outcome.outcomes.len(),
         1,
-        "expected one Errored verdict for the first PR: {outcomes:?}"
+        "expected one Errored verdict for the first PR: {outcome:?}"
     );
-    assert_eq!(outcomes[0].external_ref, "owner/repo#21");
-    match &outcomes[0].verdict {
+    assert_eq!(outcome.outcomes[0].external_ref, "owner/repo#21");
+    match &outcome.outcomes[0].verdict {
         IntakeVerdict::Errored { reason } => assert!(
             reason.contains("simulated non-duplicate transient failure"),
             "errored verdict must surface the real failure reason, got: {reason:?}"
