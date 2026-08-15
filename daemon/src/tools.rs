@@ -8,6 +8,16 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+mod unix_signals {
+    pub type Pid = i32;
+    pub const SIGKILL: i32 = 9;
+
+    unsafe extern "C" {
+        pub fn kill(pid: Pid, signal: i32) -> i32;
+    }
+}
+
 /// A `br` bead candidate (design doc §4, spec §4.2.3).
 ///
 /// `description`, `notes`, and `file_tree_summary` exist so the router's
@@ -1036,6 +1046,14 @@ fn run_tool_with_cwd(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Reviewer CLIs such as Codex spawn helper processes. Give every tool
+    // invocation a dedicated process group so a timeout cannot leave those
+    // helpers running after their direct parent has been killed.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }
@@ -1077,6 +1095,16 @@ fn run_tool_with_cwd(
             Ok(Some(status)) => break Ok(status),
             Ok(None) => {
                 if Instant::now() >= deadline {
+                    #[cfg(unix)]
+                    {
+                        // POSIX kill accepts a negative PID to signal the
+                        // process group created above. This leaves the
+                        // daemon's own group untouched.
+                        unsafe {
+                            unix_signals::kill(-(child.id() as unix_signals::Pid), unix_signals::SIGKILL);
+                        }
+                    }
+                    #[cfg(not(unix))]
                     let _ = child.kill();
                     let _ = child.wait();
                     break Err(DaemonError::Timeout(format!(
@@ -1308,6 +1336,70 @@ mod tests {
             matches!(err, DaemonError::Timeout(_)),
             "expected Timeout, got {err:?}"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_tool_timeout_kills_spawned_descendants() {
+        let pid_file = std::env::temp_dir().join(format!(
+            "dark_factory_run_tool_descendant_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pid_file_arg = pid_file.to_string_lossy().into_owned();
+        let err = run_tool(
+            "sh",
+            &[
+                "-c",
+                "sleep 30 >/dev/null 2>&1 & echo $! > \"$1\"; wait",
+                "sh",
+                &pid_file_arg,
+            ],
+            1,
+        )
+        .unwrap_err();
+        assert!(matches!(err, DaemonError::Timeout(_)), "got {err:?}");
+
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("timed-out child must record its descendant PID")
+            .trim()
+            .to_owned();
+        let pid: unix_signals::Pid = pid.parse().expect("descendant PID must be numeric");
+        let is_alive = process_is_live(pid);
+        if is_alive {
+            unsafe {
+                unix_signals::kill(pid, unix_signals::SIGKILL);
+            }
+        }
+        let _ = std::fs::remove_file(&pid_file);
+        assert!(
+            !is_alive,
+            "timeout must terminate descendant PID {pid}, not only its direct child"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_is_live(pid: unix_signals::Pid) -> bool {
+        // Linux reports an unreaped zombie as signalable via kill(pid, 0),
+        // even though it cannot execute. A timed-out descendant is correctly
+        // terminated once it reaches Z; PID 1 owns reaping it thereafter.
+        let stat_path = format!("/proc/{pid}/stat");
+        match std::fs::read_to_string(stat_path) {
+            Ok(stat) => stat
+                .rsplit_once(") ")
+                .and_then(|(_, rest)| rest.chars().next())
+                .map(|state| state != 'Z')
+                .unwrap_or_else(|| unsafe { unix_signals::kill(pid, 0) == 0 }),
+            Err(_) => false,
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn process_is_live(pid: unix_signals::Pid) -> bool {
+        unsafe { unix_signals::kill(pid, 0) == 0 }
     }
 
     #[test]
