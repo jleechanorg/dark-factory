@@ -177,6 +177,9 @@ fn test_cfg() -> Config {
         reroll_death_confirm_secs: 0,
         held_recheck_cooldown_secs: 900,
         repos: std::collections::HashMap::new(),
+        agent_worktree_root: None,
+        worktree_ttl_secs: 14 * 24 * 60 * 60,
+        worktree_max_count: 200,
         pre_gate_validation_enabled: false,
         escalation_refire_secs: 3600,
     }
