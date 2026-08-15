@@ -25,8 +25,9 @@ After merge, the gate will see Signal A satisfied via the new comment.
 ## References
 
 - PR: https://github.com/jleechanorg/dark-factory/pull/645
-- HEAD: `dbd73ee41ead4bf96c3dbf680df7273ab1b2d972`
-- `/er PASS head=dbd73ee4` PR comment: id 5300511127
+- HEAD: `f10533eaa9a267e66529bdee1e9327f5fe1073e6`
+- `/er PASS head=f10533ea` PR comment: id 5300527853
+- Earlier `/er PASS head=dbd73ee4` PR comment: id 5300511127 (stale; superseded by anchor commit)
 - Cross-model verifier verdict: https://github.com/jleechanorg/dark-factory/pull/645#issuecomment-5300448192
 - Bead: jleechan-jw4c (this PR); follow-up beads jleechan-CliSessions-cwd-guard
   + jleechan-tick-reaper-integration tracked separately per verifier MEDIUM
@@ -36,9 +37,9 @@ After merge, the gate will see Signal A satisfied via the new comment.
 
 ```
 [dark-factory /er]
-/er PASS head=dbd73ee41ead4bf96c3dbf680df7273ab1b2d972
+/er PASS head=f10533eaa9a267e66529bdee1e9327f5fe1073e6
 ```
 
 Per `feedback_2026-08-05_evidence_gate_signal_b_keywords.md`, this file
 exists to re-trigger `evidence-gate.yml` on PR #645 with `daemon/**`
-path-filter satisfied and Signal A detected from PR comment 5300511127.
+path-filter satisfied and Signal A detected from PR comment 5300527853.
