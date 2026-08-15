@@ -1036,6 +1036,14 @@ fn run_tool_with_cwd(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Reviewer CLIs such as Codex spawn helper processes. Give every tool
+    // invocation a dedicated process group so a timeout cannot leave those
+    // helpers running after their direct parent has been killed.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }
@@ -1077,6 +1085,16 @@ fn run_tool_with_cwd(
             Ok(Some(status)) => break Ok(status),
             Ok(None) => {
                 if Instant::now() >= deadline {
+                    #[cfg(unix)]
+                    {
+                        // POSIX kill accepts a negative PID to signal the
+                        // process group created above. This leaves the
+                        // daemon's own group untouched.
+                        unsafe {
+                            libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+                        }
+                    }
+                    #[cfg(not(unix))]
                     let _ = child.kill();
                     let _ = child.wait();
                     break Err(DaemonError::Timeout(format!(
@@ -1307,6 +1325,49 @@ mod tests {
         assert!(
             matches!(err, DaemonError::Timeout(_)),
             "expected Timeout, got {err:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_tool_timeout_kills_spawned_descendants() {
+        let pid_file = std::env::temp_dir().join(format!(
+            "dark_factory_run_tool_descendant_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pid_file_arg = pid_file.to_string_lossy().into_owned();
+        let err = run_tool(
+            "sh",
+            &[
+                "-c",
+                "sleep 30 >/dev/null 2>&1 & echo $! > \"$1\"; wait",
+                "sh",
+                &pid_file_arg,
+            ],
+            1,
+        )
+        .unwrap_err();
+        assert!(matches!(err, DaemonError::Timeout(_)), "got {err:?}");
+
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("timed-out child must record its descendant PID")
+            .trim()
+            .to_owned();
+        let pid: libc::pid_t = pid.parse().expect("descendant PID must be numeric");
+        let is_alive = unsafe { libc::kill(pid, 0) == 0 };
+        if is_alive {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        let _ = std::fs::remove_file(&pid_file);
+        assert!(
+            !is_alive,
+            "timeout must terminate descendant PID {pid}, not only its direct child"
         );
     }
 
