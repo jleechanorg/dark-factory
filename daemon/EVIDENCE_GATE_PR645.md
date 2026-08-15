@@ -25,8 +25,8 @@ After merge, the gate will see Signal A satisfied via the new comment.
 ## References
 
 - PR: https://github.com/jleechanorg/dark-factory/pull/645
-- HEAD: `f016d2070fc6c3e87f2c9ed838c5c2f5e9e2f3aa` (post-r28r-merge mechanical-fix)
-- `/er PASS head=f10533ea` PR comment: id 5300527853 (stale after r28r merge)
+- HEAD: `7fa3ee95d7c5911fb83c7f5db878db537453375a` (post-rebase onto origin/main 5b84905a; includes r28r merge + r28r_external_ref.rs Config fix)
+- `/er PASS head=f10533ea` PR comment: id 5300527853 (stale after rebase)
 - Earlier `/er PASS head=dbd73ee4` PR comment: id 5300511127 (stale)
 - Cross-model verifier verdict: https://github.com/jleechanorg/dark-factory/pull/645#issuecomment-5300448192
 - Bead: jleechan-jw4c (this PR); follow-up beads jleechan-CliSessions-cwd-guard
@@ -37,7 +37,7 @@ After merge, the gate will see Signal A satisfied via the new comment.
 
 ```
 [dark-factory /er]
-/er PASS head=f016d2070fc6c3e87f2c9ed838c5c2f5e9e2f3aa
+/er PASS head=7fa3ee95d7c5911fb83c7f5db878db537453375a
 ```
 
 Per `feedback_2026-08-05_evidence_gate_signal_b_keywords.md`, this file
