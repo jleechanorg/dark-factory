@@ -165,7 +165,7 @@ jobs:
     #     checked-out HEAD" steps defend against drift — even if the
     #     SHA above is later rebased, the gate fails closed when the
     #     checked-out HEAD disagrees with the input.
-    uses: jleechanorg/dark-factory/.github/workflows/skeptic-gate.yml@4c2d23d71fe3d0a063792bb27e99c3489f43cbc1
+    uses: jleechanorg/dark-factory/.github/workflows/skeptic-gate.yml@a39572417f374144fd6d216ba98bab11c3664771
     with:
       pr_number: ${{ github.event.pull_request.number }}
       pr_sha: ${{ github.event.pull_request.head.sha }}
