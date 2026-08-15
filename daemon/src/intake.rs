@@ -408,6 +408,8 @@ pub struct ExistingPrIntake {
     pub head_ref_name: String,
     pub external_ref: String,
     pub newly_created: bool,
+    pub repo: String,
+    pub head_sha: Option<String>,
 }
 
 /// jleechan-eazj: the five verdicts every factory-labeled candidate must
@@ -448,6 +450,10 @@ pub enum IntakeVerdict {
 pub struct IntakeOutcome {
     pub external_ref: String,
     pub verdict: IntakeVerdict,
+    pub repo: Option<String>,
+    pub pr_number: Option<u64>,
+    pub branch: Option<String>,
+    pub head_sha: Option<String>,
 }
 
 /// jleechan-35y4 Stage A: resolve which repo a bead belongs to, in
@@ -984,6 +990,10 @@ pub(crate) fn normalize_labeled_prs_with_cache(
                 verdict: IntakeVerdict::SkippedIneligible {
                     precondition: "empty_head_ref_name".to_string(),
                 },
+                repo: Some(repo.to_string()),
+                pr_number: Some(pr.number),
+                branch: Some(pr.head_ref_name.clone()),
+                head_sha: pr.head_sha.clone(),
             });
             continue;
         }
@@ -996,6 +1006,10 @@ pub(crate) fn normalize_labeled_prs_with_cache(
             outcomes.push(IntakeOutcome {
                 external_ref: pr.external_ref.clone(),
                 verdict: IntakeVerdict::SkippedFork,
+                repo: Some(repo.to_string()),
+                pr_number: Some(pr.number),
+                branch: Some(pr.head_ref_name.clone()),
+                head_sha: pr.head_sha.clone(),
             });
             continue;
         }
@@ -1017,6 +1031,10 @@ pub(crate) fn normalize_labeled_prs_with_cache(
                                     "author_permission_below_write_tier:{perm:?}"
                                 ),
                             },
+                            repo: Some(repo.to_string()),
+                            pr_number: Some(pr.number),
+                            branch: Some(pr.head_ref_name.clone()),
+                            head_sha: pr.head_sha.clone(),
                         });
                         continue;
                     }
@@ -1038,6 +1056,10 @@ pub(crate) fn normalize_labeled_prs_with_cache(
                         verdict: IntakeVerdict::SkippedIneligible {
                             precondition: format!("probe_error:{e}"),
                         },
+                        repo: Some(repo.to_string()),
+                        pr_number: Some(pr.number),
+                        branch: Some(pr.head_ref_name.clone()),
+                        head_sha: pr.head_sha.clone(),
                     });
                     continue;
                 }
@@ -1053,6 +1075,10 @@ pub(crate) fn normalize_labeled_prs_with_cache(
                     verdict: IntakeVerdict::SkippedIneligible {
                         precondition: format!("author_permission_below_write_tier:{permission:?}"),
                     },
+                    repo: Some(repo.to_string()),
+                    pr_number: Some(pr.number),
+                    branch: Some(pr.head_ref_name.clone()),
+                    head_sha: pr.head_sha.clone(),
                 });
                 continue;
             }
@@ -1070,6 +1096,8 @@ pub(crate) fn normalize_labeled_prs_with_cache(
                 head_ref_name: pr.head_ref_name.clone(),
                 external_ref: pr.external_ref.clone(),
                 newly_created: false,
+                repo: repo.to_string(),
+                head_sha: pr.head_sha.clone(),
             });
             continue;
         }
@@ -1079,6 +1107,10 @@ pub(crate) fn normalize_labeled_prs_with_cache(
             outcomes.push(IntakeOutcome {
                 external_ref: pr.external_ref.clone(),
                 verdict: IntakeVerdict::SkippedDuplicate,
+                repo: Some(repo.to_string()),
+                pr_number: Some(pr.number),
+                branch: Some(pr.head_ref_name.clone()),
+                head_sha: pr.head_sha.clone(),
             });
             continue;
         }
@@ -1097,6 +1129,10 @@ pub(crate) fn normalize_labeled_prs_with_cache(
                     outcomes.push(IntakeOutcome {
                         external_ref: pr.external_ref.clone(),
                         verdict: IntakeVerdict::SkippedDuplicate,
+                        repo: Some(repo.to_string()),
+                        pr_number: Some(pr.number),
+                        branch: Some(pr.head_ref_name.clone()),
+                        head_sha: pr.head_sha.clone(),
                     });
                     continue;
                 }
@@ -1105,6 +1141,10 @@ pub(crate) fn normalize_labeled_prs_with_cache(
                     verdict: IntakeVerdict::Errored {
                         reason: e.to_string(),
                     },
+                    repo: Some(repo.to_string()),
+                    pr_number: Some(pr.number),
+                    branch: Some(pr.head_ref_name.clone()),
+                    head_sha: pr.head_sha.clone(),
                 });
                 continue;
             }
@@ -1120,6 +1160,8 @@ pub(crate) fn normalize_labeled_prs_with_cache(
             head_ref_name: pr.head_ref_name.clone(),
             external_ref: pr.external_ref.clone(),
             newly_created: true,
+            repo: repo.to_string(),
+            head_sha: pr.head_sha.clone(),
         });
     }
 
@@ -1184,6 +1226,10 @@ pub fn normalize(
             outcomes.push(IntakeOutcome {
                 external_ref: issue.external_ref.clone(),
                 verdict: IntakeVerdict::SkippedDuplicate,
+                repo: Some(cfg.target_repo.clone()),
+                pr_number: Some(issue.number),
+                branch: None,
+                head_sha: None,
             });
             continue;
         }
@@ -1203,6 +1249,10 @@ pub fn normalize(
                     verdict: IntakeVerdict::Errored {
                         reason: e.to_string(),
                     },
+                    repo: Some(cfg.target_repo.clone()),
+                    pr_number: Some(issue.number),
+                    branch: None,
+                    head_sha: None,
                 });
                 continue;
             }
@@ -1213,6 +1263,10 @@ pub fn normalize(
                 verdict: IntakeVerdict::SkippedIneligible {
                     precondition: format!("author_permission_below_write_tier:{permission:?}"),
                 },
+                repo: Some(cfg.target_repo.clone()),
+                pr_number: Some(issue.number),
+                branch: None,
+                head_sha: None,
             });
             continue;
         }
@@ -1241,6 +1295,10 @@ pub fn normalize(
                     outcomes.push(IntakeOutcome {
                         external_ref: issue.external_ref.clone(),
                         verdict: IntakeVerdict::SkippedDuplicate,
+                        repo: Some(cfg.target_repo.clone()),
+                        pr_number: Some(issue.number),
+                        branch: None,
+                        head_sha: None,
                     });
                     continue;
                 }
@@ -1257,6 +1315,10 @@ pub fn normalize(
                     verdict: IntakeVerdict::Errored {
                         reason: e.to_string(),
                     },
+                    repo: Some(cfg.target_repo.clone()),
+                    pr_number: Some(issue.number),
+                    branch: None,
+                    head_sha: None,
                 });
                 continue;
             }
@@ -1316,6 +1378,10 @@ pub fn normalize_labeled_prs(
                 verdict: IntakeVerdict::SkippedIneligible {
                     precondition: "empty_head_ref_name".to_string(),
                 },
+                repo: Some(cfg.target_repo.clone()),
+                pr_number: Some(pr.number),
+                branch: Some(pr.head_ref_name.clone()),
+                head_sha: pr.head_sha.clone(),
             });
             continue;
         }
@@ -1326,6 +1392,10 @@ pub fn normalize_labeled_prs(
             outcomes.push(IntakeOutcome {
                 external_ref: pr.external_ref.clone(),
                 verdict: IntakeVerdict::SkippedFork,
+                repo: Some(cfg.target_repo.clone()),
+                pr_number: Some(pr.number),
+                branch: Some(pr.head_ref_name.clone()),
+                head_sha: pr.head_sha.clone(),
             });
             continue;
         }
@@ -1338,6 +1408,10 @@ pub fn normalize_labeled_prs(
                     verdict: IntakeVerdict::Errored {
                         reason: e.to_string(),
                     },
+                    repo: Some(cfg.target_repo.clone()),
+                    pr_number: Some(pr.number),
+                    branch: Some(pr.head_ref_name.clone()),
+                    head_sha: pr.head_sha.clone(),
                 });
                 continue;
             }
@@ -1348,6 +1422,10 @@ pub fn normalize_labeled_prs(
                 verdict: IntakeVerdict::SkippedIneligible {
                     precondition: format!("author_permission_below_write_tier:{permission:?}"),
                 },
+                repo: Some(cfg.target_repo.clone()),
+                pr_number: Some(pr.number),
+                branch: Some(pr.head_ref_name.clone()),
+                head_sha: pr.head_sha.clone(),
             });
             continue;
         }
@@ -1359,9 +1437,11 @@ pub fn normalize_labeled_prs(
             intakes.push(ExistingPrIntake {
                 bead_id: bead.id.clone(),
                 pr_number: pr.number,
-                head_ref_name: pr.head_ref_name,
-                external_ref: pr.external_ref,
+                head_ref_name: pr.head_ref_name.clone(),
+                external_ref: pr.external_ref.clone(),
                 newly_created: false,
+                repo: cfg.target_repo.clone(),
+                head_sha: pr.head_sha.clone(),
             });
             continue;
         }
@@ -1370,6 +1450,10 @@ pub fn normalize_labeled_prs(
             outcomes.push(IntakeOutcome {
                 external_ref: pr.external_ref.clone(),
                 verdict: IntakeVerdict::SkippedDuplicate,
+                repo: Some(cfg.target_repo.clone()),
+                pr_number: Some(pr.number),
+                branch: Some(pr.head_ref_name.clone()),
+                head_sha: pr.head_sha.clone(),
             });
             continue;
         }
@@ -1390,6 +1474,10 @@ pub fn normalize_labeled_prs(
                     outcomes.push(IntakeOutcome {
                         external_ref: pr.external_ref.clone(),
                         verdict: IntakeVerdict::SkippedDuplicate,
+                        repo: Some(cfg.target_repo.clone()),
+                        pr_number: Some(pr.number),
+                        branch: Some(pr.head_ref_name.clone()),
+                        head_sha: pr.head_sha.clone(),
                     });
                     continue;
                 }
@@ -1403,6 +1491,10 @@ pub fn normalize_labeled_prs(
                     verdict: IntakeVerdict::Errored {
                         reason: e.to_string(),
                     },
+                    repo: Some(cfg.target_repo.clone()),
+                    pr_number: Some(pr.number),
+                    branch: Some(pr.head_ref_name.clone()),
+                    head_sha: pr.head_sha.clone(),
                 });
                 continue;
             }
@@ -1418,6 +1510,8 @@ pub fn normalize_labeled_prs(
             head_ref_name: pr.head_ref_name,
             external_ref: pr.external_ref,
             newly_created: true,
+            repo: cfg.target_repo.clone(),
+            head_sha: pr.head_sha,
         });
     }
 

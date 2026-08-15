@@ -1896,3 +1896,174 @@ fn per_repo_probe_loop_stops_at_sweep_wide_call_cap() {
     );
 }
 
+#[test]
+fn non_default_repository_labeled_pr_adoption_attribution() {
+    let mut scm = FakeScm::new();
+    let mut pr = labeled_pr_with_cache_key(
+        8843,
+        "jleechan2015",
+        "fix/rewards-xp-anchor-followup",
+        "9dc2c198a445450d8fe455e7d691a0492deefe2e",
+        1_700_000_000,
+    );
+    pr.external_ref = "jleechanorg/worldarchitect.ai#8843".into();
+    pr.head_repo_full_name = Some("jleechanorg/worldarchitect.ai".into());
+    pr.head_repo_owner_login = Some("jleechanorg".into());
+    scm.prs.push(pr);
+    scm.permissions.insert("jleechan2015".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let mut cfg = test_cfg();
+    cfg.target_repo = "jleechanorg/dark-factory".into();
+    cfg.repos.insert(
+        "jleechanorg/worldarchitect.ai".into(),
+        daemon::config::RepoConfig {
+            ao_project: "worldarchitect".into(),
+            push_remote: "origin".into(),
+            local_checkout: None,
+        },
+    );
+    let mut cache = AdoptionProbeCache::new();
+
+    let outcome = intake::normalize_labeled_prs_outcome(
+        &scm,
+        &tracker,
+        &cfg,
+        &mut cache,
+        1_700_000_000,
+        &test_telemetry_log(),
+    )
+    .unwrap();
+
+    assert_eq!(outcome.adopted.len(), 1);
+    let adopted = &outcome.adopted[0];
+    assert_eq!(adopted.repo, "jleechanorg/worldarchitect.ai");
+    assert_eq!(adopted.pr_number, 8843);
+    assert_eq!(adopted.head_ref_name, "fix/rewards-xp-anchor-followup");
+    assert_eq!(
+        adopted.head_sha.as_deref(),
+        Some("9dc2c198a445450d8fe455e7d691a0492deefe2e")
+    );
+    assert_eq!(adopted.external_ref, "jleechanorg/worldarchitect.ai#8843");
+    assert!(adopted.newly_created);
+}
+
+#[test]
+fn non_default_repository_blocked_dispositions_attribution() {
+    let mut scm = FakeScm::new();
+
+    // 1. Fork PR
+    let mut fork_pr = labeled_pr_with_cache_key(
+        8001,
+        "mallory",
+        "feature/fork-branch",
+        "sha-fork-8001",
+        1_700_000_000,
+    );
+    fork_pr.external_ref = "jleechanorg/worldarchitect.ai#8001".into();
+    fork_pr.is_cross_repository = true;
+    fork_pr.head_repo_full_name = Some("mallory/worldarchitect.ai".into());
+    scm.prs.push(fork_pr);
+    scm.permissions.insert("mallory".into(), Permission::Write);
+
+    // 2. Ineligible (Read-tier permission)
+    let mut read_pr = labeled_pr_with_cache_key(
+        8002,
+        "bob-read",
+        "feature/read-branch",
+        "sha-read-8002",
+        1_700_000_000,
+    );
+    read_pr.external_ref = "jleechanorg/worldarchitect.ai#8002".into();
+    read_pr.head_repo_full_name = Some("jleechanorg/worldarchitect.ai".into());
+    scm.prs.push(read_pr);
+    scm.permissions.insert("bob-read".into(), Permission::Read);
+
+    // 3. Ineligible (Empty head ref)
+    let mut empty_ref_pr = labeled_pr_with_cache_key(
+        8003,
+        "alice",
+        "   ",
+        "sha-empty-8003",
+        1_700_000_000,
+    );
+    empty_ref_pr.external_ref = "jleechanorg/worldarchitect.ai#8003".into();
+    empty_ref_pr.head_repo_full_name = Some("jleechanorg/worldarchitect.ai".into());
+    scm.prs.push(empty_ref_pr);
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let mut cfg = test_cfg();
+    cfg.target_repo = "jleechanorg/dark-factory".into();
+    cfg.repos.insert(
+        "jleechanorg/worldarchitect.ai".into(),
+        daemon::config::RepoConfig {
+            ao_project: "worldarchitect".into(),
+            push_remote: "origin".into(),
+            local_checkout: None,
+        },
+    );
+    let mut cache = AdoptionProbeCache::new();
+
+    let outcome = intake::normalize_labeled_prs_outcome(
+        &scm,
+        &tracker,
+        &cfg,
+        &mut cache,
+        1_700_000_000,
+        &test_telemetry_log(),
+    )
+    .unwrap();
+
+    assert_eq!(outcome.adopted.len(), 0);
+    assert_eq!(outcome.outcomes.len(), 3);
+
+    let fork_outcome = outcome
+        .outcomes
+        .iter()
+        .find(|o| o.external_ref == "jleechanorg/worldarchitect.ai#8001")
+        .unwrap();
+    assert_eq!(fork_outcome.verdict, IntakeVerdict::SkippedFork);
+    assert_eq!(
+        fork_outcome.repo.as_deref(),
+        Some("jleechanorg/worldarchitect.ai")
+    );
+    assert_eq!(fork_outcome.pr_number, Some(8001));
+    assert_eq!(fork_outcome.branch.as_deref(), Some("feature/fork-branch"));
+    assert_eq!(fork_outcome.head_sha.as_deref(), Some("sha-fork-8001"));
+
+    let read_outcome = outcome
+        .outcomes
+        .iter()
+        .find(|o| o.external_ref == "jleechanorg/worldarchitect.ai#8002")
+        .unwrap();
+    assert!(matches!(
+        read_outcome.verdict,
+        IntakeVerdict::SkippedIneligible { .. }
+    ));
+    assert_eq!(
+        read_outcome.repo.as_deref(),
+        Some("jleechanorg/worldarchitect.ai")
+    );
+    assert_eq!(read_outcome.pr_number, Some(8002));
+    assert_eq!(read_outcome.branch.as_deref(), Some("feature/read-branch"));
+    assert_eq!(read_outcome.head_sha.as_deref(), Some("sha-read-8002"));
+
+    let empty_outcome = outcome
+        .outcomes
+        .iter()
+        .find(|o| o.external_ref == "jleechanorg/worldarchitect.ai#8003")
+        .unwrap();
+    assert_eq!(
+        empty_outcome.verdict,
+        IntakeVerdict::SkippedIneligible {
+            precondition: "empty_head_ref_name".into()
+        }
+    );
+    assert_eq!(
+        empty_outcome.repo.as_deref(),
+        Some("jleechanorg/worldarchitect.ai")
+    );
+    assert_eq!(empty_outcome.pr_number, Some(8003));
+    assert_eq!(empty_outcome.head_sha.as_deref(), Some("sha-empty-8003"));
+}
