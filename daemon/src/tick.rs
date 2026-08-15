@@ -4023,6 +4023,17 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 };
 
                 if ready_to_promote {
+                    // A positive branch-to-open-PR binding is the durable
+                    // boundary between the deferred old attempt and this
+                    // fresh attempt. Keep the marker while the old PR is the
+                    // only assessable surface, then clear it immediately
+                    // before the new PR becomes ATTESTED so the first fast
+                    // tier pass assesses this PR rather than suppressing it.
+                    if !overlay.is_adopted
+                        && deps.store.reroll_deferral_count(bead_id).unwrap_or(0) > 0
+                    {
+                        deps.store.reset_reroll_deferral(bead_id)?;
+                    }
                     overlay.state = OverlayState::Attested;
                     deps.store.save(&overlay)?;
                     let event_type = if overlay.is_adopted {
