@@ -4607,6 +4607,67 @@ export const isTerminalSession = () => false;
             .to_string();
         assert_eq!(created_branch, "docs/claude-guidance-20260814");
 
+        // A configured target checkout can itself be on the adopted PR
+        // branch. Retrying there must fail closed: it must never treat the
+        // primary checkout as a stale AO worktree and recursively delete it.
+        std::process::Command::new("git")
+            .args(["worktree", "unlock", created_wt.to_str().unwrap()])
+            .current_dir(&target)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["worktree", "remove", "--force", "--force", created_wt.to_str().unwrap()])
+            .current_dir(&target)
+            .status()
+            .unwrap();
+        let checkout_status = std::process::Command::new("git")
+            .args(["checkout", "-q", "docs/claude-guidance-20260814"])
+            .current_dir(&target)
+            .status()
+            .unwrap();
+        assert!(checkout_status.success(), "target must own the adopted branch for this safety probe");
+        let sentinel = target.join("operator-uncommitted-sentinel");
+        std::fs::write(&sentinel, "must survive failed worker spawn\n").unwrap();
+
+        let collision_output = std::process::Command::new(bridge_test_node())
+            .arg(cli.join("dist/index.js"))
+            .args([
+                "spawn",
+                "--project",
+                "worldarchitect",
+                "--agent",
+                "minimax",
+                "--",
+                "adopted PR primary-worktree collision probe",
+            ])
+            .env(
+                "NODE_OPTIONS",
+                format!(
+                    "--experimental-import-meta-resolve --import={}",
+                    bridge.display()
+                ),
+            )
+            .env("DARK_FACTORY_AO_PARENT_NODE_OPTIONS", "")
+            .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
+            .env(
+                "DARK_FACTORY_AO_SPAWN_BRANCH",
+                "docs/claude-guidance-20260814",
+            )
+            .env("DARK_FACTORY_AO_TARGET_CHECKOUT", &target)
+            .env("DARK_FACTORY_AO_EXPECTED_REVISION", &pr_sha)
+            .env("DARK_FACTORY_AO_MANAGED_CHECKOUT", "1")
+            .env("AO_FAKE_CALLS", &calls)
+            .output()
+            .unwrap();
+        assert!(
+            !collision_output.status.success(),
+            "primary-checkout branch collision must fail closed"
+        );
+        assert!(
+            sentinel.is_file(),
+            "worker retry must never delete the configured primary checkout"
+        );
+
         let _ = std::fs::remove_dir_all(root);
     }
 

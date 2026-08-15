@@ -202,6 +202,11 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
                 }
                 // Stale worktree found at wrong revision — clean it up so create() can build a fresh one
                 const repo = targetRealpath || projectConfig.path || wsConfig.project?.path;
+                if (resolve(found.path) === resolve(realpathSync(repo))) {
+                  throw new Error(
+                    `Refusing to remove configured target checkout ${found.path} while recovering an AO workspace`,
+                  );
+                }
                 try {
                   execFileSync("git", ["-C", repo, "worktree", "unlock", found.path]);
                 } catch {}
@@ -214,7 +219,13 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
                 try {
                   execFileSync("git", ["-C", repo, "worktree", "prune"]);
                 } catch {}
-              } catch {
+              } catch (error) {
+                if (
+                  error instanceof Error &&
+                  error.message.startsWith("Refusing to remove configured target checkout")
+                ) {
+                  throw error;
+                }
                 return null;
               }
               return null;
@@ -231,6 +242,7 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
             }
 
             const repoPath = targetRealpath || projectConfig.path || wsConfig.project?.path;
+            const repoRealpath = resolve(realpathSync(repoPath));
             const worktreeDirConfig =
               config.plugins?.["workspace-worktree"]?.worktreeDir ||
               config.plugins?.worktree?.worktreeDir ||
@@ -239,9 +251,24 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
               ? join(homedir(), worktreeDirConfig.slice(2))
               : worktreeDirConfig;
             const projectWorktreeDir = join(worktreeBaseDir, wsConfig.projectId);
-            const worktreePath = join(projectWorktreeDir, wsConfig.sessionId);
-
             mkdirSync(projectWorktreeDir, { recursive: true });
+            // Canonicalize the root after creating it: macOS may spell the
+            // same temporary directory as both /var/... and /private/var/....
+            const managedWorktreeRoot = realpathSync(projectWorktreeDir);
+            const worktreePath = join(managedWorktreeRoot, wsConfig.sessionId);
+            const isManagedWorktree = (path) => {
+              const resolvedPath = resolve(path);
+              return (
+                resolvedPath !== repoRealpath &&
+                resolvedPath.startsWith(`${managedWorktreeRoot}/`)
+              );
+            };
+
+            if (!isManagedWorktree(worktreePath)) {
+              throw new Error(
+                `Refusing to use non-managed worker path ${worktreePath} for target checkout ${repoRealpath}`,
+              );
+            }
 
             // 1. Clean up stale worktree at worktreePath if any
             try {
@@ -257,47 +284,52 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
               execFileSync("git", ["-C", repoPath, "worktree", "prune"]);
             } catch {}
 
-            // 2. Clean up any other worktree holding wsConfig.branch (stale retry case)
-            try {
-              const listOutput = execFileSync(
-                "git",
-                ["-C", repoPath, "worktree", "list", "--porcelain"],
-                { encoding: "utf8" },
-              );
-              const normalized = listOutput.replace(/\r\n/g, "\n").trim();
-              if (normalized) {
-                const blocks = normalized.split("\n\n");
-                for (const block of blocks) {
-                  let path = "";
-                  let branchRef = "";
-                  for (const line of block.split("\n")) {
-                    if (line.startsWith("worktree ")) {
-                      path = resolve(line.slice("worktree ".length).trim());
-                    } else if (line.startsWith("branch ")) {
-                      branchRef = line.slice("branch ".length).trim();
-                    }
-                  }
-                  if (
-                    branchRef === `refs/heads/${wsConfig.branch}` &&
-                    path &&
-                    path !== resolve(worktreePath)
-                  ) {
-                    try {
-                      execFileSync("git", ["-C", repoPath, "worktree", "unlock", path]);
-                    } catch {}
-                    try {
-                      execFileSync("git", ["-C", repoPath, "worktree", "remove", "--force", "--force", path]);
-                    } catch {}
-                    if (existsSync(path)) {
-                      rmSync(path, { recursive: true, force: true });
-                    }
-                    try {
-                      execFileSync("git", ["-C", repoPath, "worktree", "prune"]);
-                    } catch {}
+            // 2. Clean up an AO-managed stale retry worktree holding this
+            // branch. Never remove the configured target checkout or any
+            // operator-owned checkout outside the configured worktree root.
+            const listOutput = execFileSync(
+              "git",
+              ["-C", repoPath, "worktree", "list", "--porcelain"],
+              { encoding: "utf8" },
+            );
+            const normalized = listOutput.replace(/\r\n/g, "\n").trim();
+            if (normalized) {
+              const blocks = normalized.split("\n\n");
+              for (const block of blocks) {
+                let path = "";
+                let branchRef = "";
+                for (const line of block.split("\n")) {
+                  if (line.startsWith("worktree ")) {
+                    path = resolve(line.slice("worktree ".length).trim());
+                  } else if (line.startsWith("branch ")) {
+                    branchRef = line.slice("branch ".length).trim();
                   }
                 }
+                if (
+                  branchRef === `refs/heads/${wsConfig.branch}` &&
+                  path &&
+                  path !== resolve(worktreePath)
+                ) {
+                  if (!isManagedWorktree(path)) {
+                    throw new Error(
+                      `Refusing to remove branch collision at non-managed checkout ${path}`,
+                    );
+                  }
+                  try {
+                    execFileSync("git", ["-C", repoPath, "worktree", "unlock", path]);
+                  } catch {}
+                  try {
+                    execFileSync("git", ["-C", repoPath, "worktree", "remove", "--force", "--force", path]);
+                  } catch {}
+                  if (existsSync(path)) {
+                    rmSync(path, { recursive: true, force: true });
+                  }
+                  try {
+                    execFileSync("git", ["-C", repoPath, "worktree", "prune"]);
+                  } catch {}
+                }
               }
-            } catch {}
+            }
 
             // 3. Ensure expectedRevision is present in local repository
             try {
