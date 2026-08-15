@@ -10453,6 +10453,72 @@ fn tick_deferred_reroll_stays_attested_and_reselects_next_tick() {
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+// A deferred reroll suppresses duplicate assessment of the old PR, but that
+// suppression must not leak into a later, durably discovered PR for the fresh
+// attempt. The DISPATCHED -> ATTESTED promotion is that durable boundary.
+#[test]
+fn tick_resets_reroll_deferral_when_fresh_attempt_pr_opens() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let vcs = test_vcs();
+    let cfg = reroll_stage2_cfg();
+
+    let branch = seed_attested_red_ci_bead(&mut scm, &store, "fresh-attempt", 5003);
+    store.incr_reroll_deferral("fresh-attempt").unwrap();
+
+    // Model a newly established retry: it has a branch-to-PR binding and is
+    // promoted from DISPATCHED only after that binding has been observed.
+    let mut overlay = store.load("fresh-attempt").unwrap().unwrap();
+    overlay.state = OverlayState::Dispatched;
+    overlay.reroll_count = 1;
+    overlay.session_id = None;
+    store.save(&overlay).unwrap();
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.clone()), Some(5003));
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 5003),
+        PrHeadBranch::SameRepo(branch.clone()),
+    );
+    let snapshot = scm.pr_snapshots.get_mut(&5003).unwrap();
+    snapshot.ci_success = true;
+    snapshot.ci_status = "green".into();
+    snapshot.head_sha = "fresh-attempt-head".into();
+
+    let telemetry_log = std::env::temp_dir().join("afd_fresh_attempt_resets_deferral.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 2, 0).expect("fresh attempt tick should succeed");
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert_eq!(summary.gates_assessed, 1, "fresh PR must be gate-assessed: {log}");
+    assert!(log.contains("\"eventType\":\"PR_OPENED\""), "fresh PR must promote: {log}");
+    assert!(
+        !log.contains("VERIFIER_SKIPPED_REROLL_IN_PROGRESS"),
+        "old-PR suppression must not apply to the fresh PR: {log}"
+    );
+    assert_eq!(
+        store.reroll_deferral_count("fresh-attempt").unwrap(),
+        0,
+        "PR_OPENED must clear the previous attempt's deferral marker"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
 // jleechan-park-leaves-zombie-session-mh9o: regression for the U4-class
 // zero-touch blocker where every PARKED_* transition leaked its AO session.
 //

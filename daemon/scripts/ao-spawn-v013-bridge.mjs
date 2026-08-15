@@ -1,7 +1,8 @@
-import { dirname, join, parse } from "node:path";
+import { dirname, join, parse, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { readFile } from "node:fs/promises";
-import { realpathSync } from "node:fs";
+import { realpathSync, existsSync, rmSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
 
 if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
@@ -119,7 +120,9 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
     const config = core.loadConfig();
     let projectConfig = config.projects[project];
     if (!projectConfig) fail(`unknown AO project ${project}`);
-    if (!diagnosticMode && process.env.DARK_FACTORY_AO_EXPECTED_REVISION) {
+    let expectedRevision = process.env.DARK_FACTORY_AO_EXPECTED_REVISION;
+    let targetRealpath;
+    if (!diagnosticMode && expectedRevision) {
       const targetCheckout = process.env.DARK_FACTORY_AO_TARGET_CHECKOUT;
       if (!targetCheckout || !targetCheckout.startsWith("/")) {
         fail("DARK_FACTORY_AO_TARGET_CHECKOUT is required for worker spawns");
@@ -129,7 +132,6 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
         fail(`AO project ${project} has no absolute source path`);
       }
       let configuredRealpath;
-      let targetRealpath;
       try {
         configuredRealpath = realpathSync(configuredSource);
         targetRealpath = realpathSync(targetCheckout);
@@ -143,7 +145,6 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
           `AO project ${project} source ${configuredRealpath} does not match validated target checkout ${targetRealpath}`,
         );
       }
-      const expectedRevision = process.env.DARK_FACTORY_AO_EXPECTED_REVISION;
       let actualRevision;
       try {
         actualRevision = execFileSync(
@@ -172,6 +173,272 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
     await registry.loadFromConfig(config, async (packageName) =>
       import(resolveAoPackage(packageName)),
     );
+
+    // For adopted PRs or exact-revision spawns, the workspace must start at
+    // expectedRevision (the PR head), not origin/main.
+    // AO v0.1.3's workspace-worktree plugin hardcodes `baseRef = origin/${defaultBranch}`
+    // and force-resets with `-B` to baseRef on collision. Wrap `findManagedWorkspace`
+    // and `create` so the worktree and its branch are created/reset to `expectedRevision`.
+    if (expectedRevision && typeof registry?.get === "function") {
+      const workspacePlugins = ["worktree", "clone"];
+      for (const wsPluginName of workspacePlugins) {
+        const wsPlugin = registry.get("workspace", wsPluginName);
+        if (wsPlugin && typeof wsPlugin.create === "function") {
+          const originalCreate = wsPlugin.create.bind(wsPlugin);
+
+          if (typeof wsPlugin.findManagedWorkspace === "function") {
+            const originalFind = wsPlugin.findManagedWorkspace.bind(wsPlugin);
+            wsPlugin.findManagedWorkspace = async (wsConfig) => {
+              const found = await originalFind(wsConfig);
+              if (!found) return null;
+              try {
+                const actualSha = execFileSync(
+                  "git",
+                  ["-C", found.path, "rev-parse", "HEAD"],
+                  { encoding: "utf8" },
+                ).trim();
+                if (actualSha === expectedRevision) {
+                  return found;
+                }
+                // Stale worktree found at wrong revision — clean it up so create() can build a fresh one
+                const repo = targetRealpath || projectConfig.path || wsConfig.project?.path;
+                if (resolve(found.path) === resolve(realpathSync(repo))) {
+                  throw new Error(
+                    `Refusing to remove configured target checkout ${found.path} while recovering an AO workspace`,
+                  );
+                }
+                try {
+                  execFileSync("git", ["-C", repo, "worktree", "unlock", found.path]);
+                } catch {}
+                try {
+                  execFileSync("git", ["-C", repo, "worktree", "remove", "--force", "--force", found.path]);
+                } catch {}
+                if (existsSync(found.path)) {
+                  rmSync(found.path, { recursive: true, force: true });
+                }
+                try {
+                  execFileSync("git", ["-C", repo, "worktree", "prune"]);
+                } catch {}
+              } catch (error) {
+                if (
+                  error instanceof Error &&
+                  error.message.startsWith("Refusing to remove configured target checkout")
+                ) {
+                  throw error;
+                }
+                return null;
+              }
+              return null;
+            };
+          }
+
+          wsPlugin.create = async (wsConfig) => {
+            const SAFE_PATH_SEGMENT = /^[a-zA-Z0-9_-]+$/;
+            if (!SAFE_PATH_SEGMENT.test(wsConfig.projectId)) {
+              throw new Error(`Invalid projectId "${wsConfig.projectId}"`);
+            }
+            if (!SAFE_PATH_SEGMENT.test(wsConfig.sessionId)) {
+              throw new Error(`Invalid sessionId "${wsConfig.sessionId}"`);
+            }
+
+            const repoPath = targetRealpath || projectConfig.path || wsConfig.project?.path;
+            const repoRealpath = resolve(realpathSync(repoPath));
+            const worktreeDirConfig =
+              config.plugins?.["workspace-worktree"]?.worktreeDir ||
+              config.plugins?.worktree?.worktreeDir ||
+              join(homedir(), ".worktrees");
+            const worktreeBaseDir = worktreeDirConfig.startsWith("~/")
+              ? join(homedir(), worktreeDirConfig.slice(2))
+              : worktreeDirConfig;
+            const projectWorktreeDir = join(worktreeBaseDir, wsConfig.projectId);
+            mkdirSync(projectWorktreeDir, { recursive: true });
+            // Canonicalize the root after creating it: macOS may spell the
+            // same temporary directory as both /var/... and /private/var/....
+            const managedWorktreeRoot = realpathSync(projectWorktreeDir);
+            const worktreePath = join(managedWorktreeRoot, wsConfig.sessionId);
+            const isManagedWorktree = (path) => {
+              const resolvedPath = resolve(path);
+              return (
+                resolvedPath !== repoRealpath &&
+                resolvedPath.startsWith(`${managedWorktreeRoot}/`)
+              );
+            };
+
+            if (!isManagedWorktree(worktreePath)) {
+              throw new Error(
+                `Refusing to use non-managed worker path ${worktreePath} for target checkout ${repoRealpath}`,
+              );
+            }
+
+            // 1. Clean up stale worktree at worktreePath if any
+            try {
+              execFileSync("git", ["-C", repoPath, "worktree", "unlock", worktreePath]);
+            } catch {}
+            try {
+              execFileSync("git", ["-C", repoPath, "worktree", "remove", "--force", "--force", worktreePath]);
+            } catch {}
+            if (existsSync(worktreePath)) {
+              rmSync(worktreePath, { recursive: true, force: true });
+            }
+            try {
+              execFileSync("git", ["-C", repoPath, "worktree", "prune"]);
+            } catch {}
+
+            // 2. Clean up an AO-managed stale retry worktree holding this
+            // branch. Never remove the configured target checkout or any
+            // operator-owned checkout outside the configured worktree root.
+            const listOutput = execFileSync(
+              "git",
+              ["-C", repoPath, "worktree", "list", "--porcelain"],
+              { encoding: "utf8" },
+            );
+            const normalized = listOutput.replace(/\r\n/g, "\n").trim();
+            if (normalized) {
+              const blocks = normalized.split("\n\n");
+              for (const block of blocks) {
+                let path = "";
+                let branchRef = "";
+                for (const line of block.split("\n")) {
+                  if (line.startsWith("worktree ")) {
+                    path = resolve(line.slice("worktree ".length).trim());
+                  } else if (line.startsWith("branch ")) {
+                    branchRef = line.slice("branch ".length).trim();
+                  }
+                }
+                if (
+                  branchRef === `refs/heads/${wsConfig.branch}` &&
+                  path &&
+                  path !== resolve(worktreePath)
+                ) {
+                  if (!isManagedWorktree(path)) {
+                    throw new Error(
+                      `Refusing to remove branch collision at non-managed checkout ${path}`,
+                    );
+                  }
+                  try {
+                    execFileSync("git", ["-C", repoPath, "worktree", "unlock", path]);
+                  } catch {}
+                  try {
+                    execFileSync("git", ["-C", repoPath, "worktree", "remove", "--force", "--force", path]);
+                  } catch {}
+                  if (existsSync(path)) {
+                    rmSync(path, { recursive: true, force: true });
+                  }
+                  try {
+                    execFileSync("git", ["-C", repoPath, "worktree", "prune"]);
+                  } catch {}
+                }
+              }
+            }
+
+            // 3. Ensure expectedRevision is present in local repository
+            try {
+              execFileSync("git", ["-C", repoPath, "cat-file", "-e", `${expectedRevision}^{commit}`]);
+            } catch {
+              try {
+                execFileSync("git", ["-C", repoPath, "fetch", "--depth=1", "origin", expectedRevision]);
+              } catch {}
+            }
+
+            // 4. Create worktree at expectedRevision, force-resetting/creating wsConfig.branch to expectedRevision
+            try {
+              execFileSync("git", [
+                "-C",
+                repoPath,
+                "worktree",
+                "add",
+                "-B",
+                wsConfig.branch,
+                worktreePath,
+                expectedRevision,
+              ]);
+            } catch (worktreeError) {
+              try {
+                execFileSync("git", ["-C", repoPath, "worktree", "remove", "--force", worktreePath]);
+              } catch {}
+              throw new Error(
+                `Failed to create worktree for branch "${wsConfig.branch}" at expected revision ${expectedRevision}: ${
+                  worktreeError instanceof Error ? worktreeError.message : String(worktreeError)
+                }`,
+              );
+            }
+
+            // 5. Setup AO-managed excludes
+            try {
+              let gitCommonDir;
+              try {
+                gitCommonDir = execFileSync(
+                  "git",
+                  ["-C", worktreePath, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                  { encoding: "utf8" },
+                ).trim();
+              } catch {
+                gitCommonDir = join(repoPath, ".git");
+              }
+              const excludeDir = join(gitCommonDir, "info");
+              const excludeFile = join(excludeDir, "exclude");
+              mkdirSync(excludeDir, { recursive: true });
+              let existingContent = "";
+              try {
+                existingContent = readFileSync(excludeFile, "utf8");
+              } catch {}
+              const AO_MANAGED_EXCLUDE_PATTERNS = `# AO-managed files - do not track in worktree
+# Agent configuration and hook scripts (written by agent-base plugin)
+# Paths are relative to the worktree root to avoid matching nested files.
+.claude/settings.json
+.claude/metadata-updater.sh
+.cursor/settings.json
+.cursor/metadata-updater.sh
+.gemini/settings.json
+.gemini/metadata-updater.sh
+`;
+              if (!existingContent.includes("# AO-managed files")) {
+                const newContent = existingContent
+                  ? existingContent.trimEnd() + "\n\n" + AO_MANAGED_EXCLUDE_PATTERNS
+                  : AO_MANAGED_EXCLUDE_PATTERNS;
+                writeFileSync(excludeFile, newContent, "utf8");
+              }
+            } catch {}
+
+            // 6. Lock worktree
+            try {
+              execFileSync("git", [
+                "-C",
+                repoPath,
+                "worktree",
+                "lock",
+                "--reason",
+                "AO session active",
+                worktreePath,
+              ]);
+            } catch {}
+
+            // 7. Verify created worktree HEAD matches expectedRevision
+            const actualHead = execFileSync(
+              "git",
+              ["-C", worktreePath, "rev-parse", "HEAD"],
+              { encoding: "utf8" },
+            ).trim();
+            if (actualHead !== expectedRevision) {
+              try {
+                execFileSync("git", ["-C", repoPath, "worktree", "remove", "--force", worktreePath]);
+              } catch {}
+              throw new Error(
+                `Created worktree HEAD ${actualHead} does not match expected revision ${expectedRevision}`,
+              );
+            }
+
+            return {
+              path: worktreePath,
+              branch: wsConfig.branch,
+              sessionId: wsConfig.sessionId,
+              projectId: wsConfig.projectId,
+              repoPath,
+            };
+          };
+        }
+      }
+    }
 
     // Enumerate installed agent plugins for the daemon's fail-closed vendor
     // preflight. Three mutually-exclusive outcomes — the daemon rejects all
