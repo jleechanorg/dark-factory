@@ -22,6 +22,7 @@ pub mod er_runner;
 pub mod vacuous;
 pub mod vacuous_red_green;
 pub mod target_worktree;
+pub mod worktree_reaper;
 
 
 pub mod gates_compute;

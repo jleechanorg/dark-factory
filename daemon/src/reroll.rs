@@ -1318,9 +1318,14 @@ fn execute_adopted(
         repo: adopted_repo,
         ao_project: adopted_routing.ao_project,
         remote: adopted_routing.push_remote,
-        local_checkout: Some(adopted_checkout),
+        local_checkout: Some(adopted_checkout.clone()),
         expected_revision: Some(pre_session_sha.clone()),
         managed_checkout: adopted_routing.local_checkout.is_none(),
+        // Bead jleechan-jw4c: cwd guard. Legacy layout uses the worker
+        // checkout as the expected cwd; the new isolation layout will
+        // route to `cfg.agent_worktree_root/<repo>/<agent_id>` once the
+        // spawn adapter exposes the agent_id it just claimed.
+        expected_cwd: Some(adopted_checkout),
     };
 
     // Persist an ambiguous pre-spawn intent before crossing the external AO

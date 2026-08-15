@@ -652,9 +652,18 @@ pub fn dispatch_ready_with_vcs(
             repo: repo.clone(),
             ao_project: routing.ao_project.clone(),
             remote: routing.push_remote.clone(),
-            local_checkout: Some(worker_checkout),
+            local_checkout: Some(worker_checkout.clone()),
             expected_revision: Some(expected_revision.clone()),
             managed_checkout: routing.local_checkout.is_none(),
+            // Bead jleechan-jw4c: the expected worker's cwd is the same
+            // workload's checkout. The spawn adapter validates this against
+            // the actual cwd before returning Ok (see
+            // `tools::check_cwd_guard`); a mismatch parks
+            // `HUMAN_HELD reason=worktree_cwd_mismatch`. The forward-edge
+            // for the new isolation layout is the addition of the agent-id
+            // path under `cfg.agent_worktree_root`; for the legacy layout
+            // it is simply the worker_checkout path itself.
+            expected_cwd: Some(worker_checkout),
         };
         let session_id = match sessions.spawn(&spec) {
             Ok(session_id) => session_id,
@@ -755,6 +764,28 @@ pub fn dispatch_ready_with_vcs(
                     overlay.attempt,
                     Some(branch.clone()),
                     "spawn",
+                    err,
+                ));
+                continue;
+            }
+            // Bead jleechan-jw4c: a worker session reported a cwd that
+            // does not match the assigned worktree. This is the
+            // correctness fix for the bead's RED-measured failure mode
+            // (worker writing to the shared checkout while its assigned
+            // worktree existed). Permanent: requeuing would replay the
+            // same leak. The `WorktreeCwdMismatch` park reason is NOT
+            // in `recoverable_exact_values()`, so `recover_human_held`
+            // will not silently requeue it.
+            Err(err @ DaemonError::WorktreeCwdMismatch { .. }) => {
+                overlay.state = OverlayState::HumanHeld;
+                overlay.session_id = None;
+                set_human_hold_reason(&mut overlay, HumanHoldReason::WorktreeCwdMismatch);
+                store.save(&overlay)?;
+                report.failures.push(failure(
+                    bead,
+                    overlay.attempt,
+                    Some(branch.clone()),
+                    "worktree_cwd_mismatch",
                     err,
                 ));
                 continue;
@@ -1347,6 +1378,18 @@ mod tests {
         /// keeps trusting a fresh spawn unconditionally; only the
         /// worktree-remote-mismatch regression tests populate this.
         scripted_worktree_remote: RefCell<HashMap<String, String>>,
+        /// Bead jleechan-jw4c: bead ids whose cwd guard should be skipped
+        /// (legacy layout coverage, or tests that explicitly want to
+        /// exercise the dispatch path without the guard). Empty by default
+        /// so the guard is enforced for every bead id.
+        ignore_cwd_guard_for: RefCell<Vec<String>>,
+        /// Bead jleechan-jw4c: scripted cwd to report per bead id when the
+        /// fake spawn is called. Used by the cwd-mismatch regression test
+        /// to simulate a worker whose actual cwd differs from the
+        /// daemon's expected cwd. Missing entries default to the test
+        /// process's own cwd (which matches the expected cwd when the
+        /// spec's `local_checkout` is also the test cwd).
+        spawn_cwd_for: RefCell<HashMap<String, std::path::PathBuf>>,
     }
 
     impl FakeSessions {
@@ -1374,6 +1417,8 @@ mod tests {
                 spawn_prompts: RefCell::new(Vec::new()),
                 spawn_checkouts: RefCell::new(Vec::new()),
                 scripted_worktree_remote: RefCell::new(scripted_worktree_remote),
+                ignore_cwd_guard_for: RefCell::new(Vec::new()),
+                spawn_cwd_for: RefCell::new(HashMap::new()),
             }
         }
 
@@ -1425,6 +1470,29 @@ mod tests {
                 .borrow_mut()
                 .insert(ao_project.to_string(), url.to_string());
         }
+
+        /// Bead jleechan-jw4c: script the cwd the fake reports for a given
+        /// bead id at spawn time. The default is the test process's own
+        /// cwd (which matches the spec's `local_checkout` whenever the
+        /// dispatch path uses `std::env::current_dir()`). Setting a
+        /// different path simulates the bead's RED-measured failure mode:
+        /// a worker whose actual cwd drifted away from the assigned
+        /// worktree.
+        fn set_spawn_cwd(&self, bead_id: &str, path: std::path::PathBuf) {
+            self.spawn_cwd_for
+                .borrow_mut()
+                .insert(bead_id.to_string(), path);
+        }
+
+        /// Bead jleechan-jw4c: opt a bead id out of the cwd guard for
+        /// legacy layout coverage. Tests that exercise the dispatch path
+        /// without the new isolation layout call this so the FakeSessions
+        /// continues to accept the spec's `expected_cwd = None` flow.
+        fn ignore_cwd_guard(&self, bead_id: &str) {
+            self.ignore_cwd_guard_for
+                .borrow_mut()
+                .push(bead_id.to_string());
+        }
     }
 
     impl Sessions for FakeSessions {
@@ -1434,6 +1502,30 @@ mod tests {
         }
 
         fn spawn(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
+            // Bead jleechan-jw4c: enforce the cwd guard BEFORE the fake
+            // records the spawn. The fake mirrors the production adapter's
+            // failure mode: a worker whose cwd does not match the assigned
+            // worktree is rejected (fail closed) and the dispatch lands in
+            // the WorktreeCwdMismatch branch upstream. Tests can flip
+            // `ignore_cwd_guard_for.borrow_mut().insert(spec.bead_id.clone())`
+            // to bypass the guard for legacy layout coverage.
+            if !self
+                .ignore_cwd_guard_for
+                .borrow()
+                .contains(&spec.bead_id)
+            {
+                let actual = self
+                    .spawn_cwd_for
+                    .borrow()
+                    .get(&spec.bead_id)
+                    .cloned()
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                if let Err(err) =
+                    crate::tools::check_cwd_guard(spec.expected_cwd.as_deref(), &actual)
+                {
+                    return Err(err);
+                }
+            }
             self.calls
                 .borrow_mut()
                 .push(format!("spawn({})", spec.bead_id));
@@ -1759,6 +1851,9 @@ mod tests {
             )]),
             pre_gate_validation_enabled: false,
             escalation_refire_secs: 3600,
+            agent_worktree_root: None,
+            worktree_ttl_secs: 14 * 24 * 60 * 60,
+            worktree_max_count: 200,
         }
     }
 
@@ -4285,6 +4380,72 @@ mod tests {
                 .as_deref(),
             "a branch-registration collision is a distinct failure category from a worker \
              spawn-time branch mismatch and must not reuse SpawnBranchMismatch's reason"
+        );
+    }
+
+    /// Bead jleechan-jw4c — dispatch-level cwd guard test. The fake
+    /// `Sessions::spawn` checks the worker cwd against the spec's
+    /// `expected_cwd` (set by `dispatch_ready` from `worker_checkout`).
+    /// When the fake reports a divergent cwd, the dispatch fails closed
+    /// with `WorktreeCwdMismatch` and the bead is parked
+    /// `HUMAN_HELD reason=worktree_cwd_mismatch`. This is the
+    /// reproduction of the bead's RED-measured failure mode: a worker
+    /// writing to the shared checkout while its assigned worktree
+    /// existed.
+    #[test]
+    fn cwd_mismatch_park_bead_human_held() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        // The fake's default cwd is the test process's cwd (which matches
+        // `worker_checkout`'s assignment from `local_checkout`). Re-route
+        // bead-0's spawn cwd to a divergent path so the guard rejects it.
+        let divergent = std::env::temp_dir().join(format!(
+            "afd_cwd_mismatch_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&divergent);
+        std::fs::create_dir_all(&divergent).unwrap();
+        sessions.set_spawn_cwd("bead-0", divergent.clone());
+        let ready = beads(1);
+
+        let _ = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(
+            overlay.state,
+            OverlayState::HumanHeld,
+            "cwd mismatch must park the bead, not silently accept"
+        );
+        assert_eq!(
+            overlay.park_reason.as_deref(),
+            Some("worktree_cwd_mismatch"),
+            "the park reason must match the dedicated WorktreeCwdMismatch variant"
+        );
+        let _ = std::fs::remove_dir_all(&divergent);
+    }
+
+    /// Bead jleechan-jw4c — happy-path cwd guard. The fake reports the
+    /// test process's own cwd (matching `worker_checkout`'s assignment),
+    /// so the guard passes and the dispatch progresses to DISPATCHED.
+    /// This is the GREEN proof for the cwd guard: the daemon does not
+    /// silently accept mismatched cwds, but a matching-cwd dispatch
+    /// completes normally.
+    #[test]
+    fn cwd_match_dispatch_proceeds_to_dispatched() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let _ = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert!(matches!(
+            overlay.state,
+            OverlayState::Dispatched | OverlayState::Dispatching
+        ));
+        assert!(
+            overlay.park_reason.is_none(),
+            "matching cwd must not park the bead"
         );
     }
 }

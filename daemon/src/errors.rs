@@ -39,6 +39,18 @@ pub enum DaemonError {
     /// double-spawn by requeuing the bead and trying again next tick.
     #[error("ao spawn deferred to internal queue: {0}")]
     Deferred(String),
+    /// Bead jleechan-jw4c: a worker session was spawned with a
+    /// `local_checkout` cwd but the actual child process's cwd did not
+    /// match the assigned worktree path. The observed production failure
+    /// was a worker writing into the SHARED primary checkout while its
+    /// assigned worktree was a different tree — silent acceptance let
+    /// the change leak into an unrelated PR. This variant is fail-closed:
+    /// spawned sessions whose cwd does not match the assignment are
+    /// rejected before they can mutate tracked files. The stranded
+    /// dispatch is parked `HUMAN_HELD` with reason `worktree_cwd_mismatch`
+    /// (a new `HumanHoldReason`).
+    #[error("worker cwd mismatch: expected {expected:?}, got {actual:?}")]
+    WorktreeCwdMismatch { expected: String, actual: String },
     /// The re-roll circuit-breaker's semantic comparator
     /// (`same_underlying_issue` in `reroll.rs`) makes a real LLM call to
     /// judge whether two consecutive rejection reviews describe the same
@@ -191,6 +203,7 @@ impl DaemonError {
             DaemonError::SpawnFallbackExhausted(_) => "spawn_fallback_exhausted",
             DaemonError::SpawnCleanupFailed { .. } => "spawn_cleanup_failed",
             DaemonError::SpawnBatchCleanupFailed { .. } => "spawn_batch_cleanup_failed",
+            DaemonError::WorktreeCwdMismatch { .. } => "worktree_cwd_mismatch",
         }
     }
 

@@ -793,6 +793,9 @@ mod tests {
             repos: std::collections::HashMap::new(),
             pre_gate_validation_enabled: false,
             escalation_refire_secs: 3600,
+            agent_worktree_root: None,
+            worktree_ttl_secs: 14 * 24 * 60 * 60,
+            worktree_max_count: 200,
         };
 
         let (project, _) = ao_runtime_binding(&cfg).unwrap();

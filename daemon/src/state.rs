@@ -700,6 +700,14 @@ pub enum HumanHoldReason {
     /// conflicting bead/branch assignment, not a bare requeue.
     BranchRegistrationConflict,
     EscalationLocalFallback(String),
+    /// Bead jleechan-jw4c: a worker session was spawned with a
+    /// `local_checkout` cwd but the actual child process's cwd did not
+    /// match the assigned worktree path. Permanent — the silent-acceptance
+    /// failure mode is what the bead's RED measurement (worker writing to
+    /// shared checkout while assigned worktree existed) describes, so a
+    /// bare requeue would replay the same leak. Excluded from
+    /// `recoverable_exact_values()`.
+    WorktreeCwdMismatch,
 }
 
 impl HumanHoldReason {
@@ -747,6 +755,7 @@ impl HumanHoldReason {
             Self::EscalationLocalFallback(reason) => {
                 return format!("escalation_local_fallback:{reason}");
             }
+            Self::WorktreeCwdMismatch => "worktree_cwd_mismatch",
         }
         .to_string()
     }

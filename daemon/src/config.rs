@@ -103,6 +103,26 @@ pub struct Config {
     /// unchanged.
     #[serde(default = "default_escalation_refire_secs")]
     pub escalation_refire_secs: u64,
+    /// Bead jleechan-jw4c: root directory for per-agent worktrees spawned
+    /// by AO outside of the primary checkout. When `Some`, the spawn path
+    /// computes the agent's worktree as `$root/<repo>/<agent-id>` and the
+    /// reaper prunes under it. When `None` (default), the daemon keeps the
+    /// legacy primary-checkout layout (`$HOME/.dark-factory/agent-worktrees/`)
+    /// so existing deployments are unaffected. Operators flipping this on
+    /// MUST also flip the equivalent env var on AO/`aow` so the
+    /// `worker_checkout` derivation stays consistent.
+    #[serde(default)]
+    pub agent_worktree_root: Option<String>,
+    /// Bead jleechan-jw4c: max age (in seconds) before a stale agent
+    /// worktree is considered prunable by the reaper. Default 14 days.
+    /// `#[serde(default)]` so existing configs parse unchanged.
+    #[serde(default = "default_worktree_ttl_secs")]
+    pub worktree_ttl_secs: u64,
+    /// Bead jleechan-jw4c: max number of agent worktrees allowed per repo
+    /// under `agent_worktree_root`. New worktree creation fails closed when
+    /// this cap is reached. Default 200 (matches the bead's spec).
+    #[serde(default = "default_worktree_max_count")]
+    pub worktree_max_count: usize,
 }
 
 /// Default head-stability window (bead jleechan-zeij / issue #322 r3): 30s,
@@ -122,6 +142,24 @@ fn default_pre_gate_validation_enabled() -> bool {
 /// `(bead_id, reason)`.
 fn default_escalation_refire_secs() -> u64 {
     3600
+}
+
+/// Bead jleechan-jw4c: 14 days is the default TTL for the agent worktree
+/// reaper. Long enough that an active agent's worktree is never pruned
+/// while it's still alive, short enough that abandoned worktrees become
+/// prunable well within the 60G outage scenario the bead describes.
+fn default_worktree_ttl_secs() -> u64 {
+    14 * 24 * 60 * 60
+}
+
+/// Bead jleechan-jw4c: 200 worktrees per repo is the default cap. Above
+/// this, the daemon refuses to register a new worktree (fail closed). The
+/// number is empirical: the jw4c production RED measurement was 511
+/// registrations spread across multiple repos, so 200 is a healthy per-repo
+/// ceiling that still allows ~3 simultaneous active repos before the cap
+/// triggers.
+fn default_worktree_max_count() -> usize {
+    200
 }
 
 /// Default held-recheck cooldown (bead jleechan-zaga / issue #348 r3): 15
@@ -161,6 +199,40 @@ impl Config {
     pub fn target_worktree(&self, repo: &str) -> Option<PathBuf> {
         let path = self.target_worktree_path(repo)?;
         path.is_dir().then_some(path)
+    }
+
+    /// Bead jleechan-jw4c: resolve the per-agent worktree directory under
+    /// `agent_worktree_root`. Returns `None` when the operator has not
+    /// flipped on the new layout (the config knob is `None`), in which
+    /// case the reaper and the cwd guard treat the legacy layout as
+    /// authoritative. The path is computed even when the directory does
+    /// not yet exist — the caller decides whether to create or refuse.
+    ///
+    /// Layout: `$agent_worktree_root/<repo>/<agent_id>`. The repo's
+    /// `[repos."<owner>/<repo>"]` sharding is intentional: two different
+    /// repos that happen to share an agent-id name (e.g. different
+    /// `df-100`) MUST land in distinct trees to avoid collision.
+    pub fn agent_worktree_path(&self, repo: &str, agent_id: &str) -> Option<PathBuf> {
+        let root = self.agent_worktree_root.as_deref()?;
+        if root.is_empty() {
+            return None;
+        }
+        if agent_id.is_empty() || agent_id.contains('/') || agent_id.contains("..") {
+            return None;
+        }
+        Some(PathBuf::from(root).join(repo).join(agent_id))
+    }
+
+    /// Bead jleechan-jw4c: resolve the per-repo root of the agent worktree
+    /// tree (the parent of every agent-id subtree). `None` when the knob
+    /// is off. The reaper enumerates every `agent_id` directory under
+    /// this root to identify prunable candidates.
+    pub fn agent_worktree_root_for_repo(&self, repo: &str) -> Option<PathBuf> {
+        let root = self.agent_worktree_root.as_deref()?;
+        if root.is_empty() {
+            return None;
+        }
+        Some(PathBuf::from(root).join(repo))
     }
 
     /// Resolve dispatch routing for `repo` (`overlay.repo(self)`'s output).
@@ -618,6 +690,9 @@ push_remote = "origin"
             )]),
             pre_gate_validation_enabled: true,
             escalation_refire_secs: 3600,
+            agent_worktree_root: None,
+            worktree_ttl_secs: 14 * 24 * 60 * 60,
+            worktree_max_count: 200,
         };
         let routing = cfg.resolve_repo("owner/production").unwrap();
         assert!(cfg.worker_checkout_is_configured("owner/production", &routing));
@@ -656,6 +731,9 @@ push_remote = "origin"
             )]),
             pre_gate_validation_enabled: true,
             escalation_refire_secs: 3600,
+            agent_worktree_root: None,
+            worktree_ttl_secs: 14 * 24 * 60 * 60,
+            worktree_max_count: 200,
         };
         let routing = cfg.resolve_repo("owner/production").unwrap();
         assert!(!cfg.worker_checkout_is_configured("owner/production", &routing));
@@ -696,6 +774,9 @@ push_remote = "origin"
             )]),
             pre_gate_validation_enabled: true,
             escalation_refire_secs: 3600,
+            agent_worktree_root: None,
+            worktree_ttl_secs: 14 * 24 * 60 * 60,
+            worktree_max_count: 200,
         };
         let routing = cfg.resolve_repo("owner/production").unwrap();
         assert!(!cfg.worker_checkout_is_configured("owner/production", &routing));
@@ -743,5 +824,108 @@ push_remote = "origin"
             None => std::env::remove_var("DARK_FACTORY_TARGET_WORKTREE_ROOT"),
         }
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    // Bead jleechan-jw4c: the agent_worktree_root knob defaults to OFF so
+    // existing daemon.toml files parse unchanged. Operators flip it on
+    // when they want worktrees relocated out of the primary checkout.
+
+    #[test]
+    fn agent_worktree_root_defaults_to_none_for_legacy_configs() {
+        let dir = std::env::temp_dir().join(format!(
+            "afd_agent_root_default_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("legacy.toml");
+        std::fs::write(
+            &p,
+            r#"target_repo = "owner/repo"
+base_branch = "main"
+stage = 1
+max_workers = 1
+max_batch = 1
+fast_tick_secs = 1
+slow_tick_secs = 1
+autonomy_timebox_secs = 60
+budget_warn_usd = 1.0
+spec_dir = ".factory/specs/"
+"#,
+        )
+        .unwrap();
+        let cfg = load(&p).unwrap();
+        assert!(cfg.agent_worktree_root.is_none());
+        assert!(cfg.agent_worktree_path("owner/repo", "df-100").is_none());
+        assert!(cfg.agent_worktree_root_for_repo("owner/repo").is_none());
+        // 14d default.
+        assert_eq!(cfg.worktree_ttl_secs, 14 * 24 * 60 * 60);
+        assert_eq!(cfg.worktree_max_count, 200);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn agent_worktree_path_uses_owner_repo_layout() {
+        let cfg = Config {
+            target_repo: "owner/repo".into(),
+            ao_project: None,
+            base_branch: "main".into(),
+            stage: 1,
+            max_workers: 1,
+            max_batch: 1,
+            fast_tick_secs: 1,
+            slow_tick_secs: 1,
+            autonomy_timebox_secs: 60,
+            budget_warn_usd: 1.0,
+            spec_dir: ".factory/specs/".into(),
+            reroll_head_stability_window_secs: 30,
+            reroll_death_confirm_secs: 5,
+            held_recheck_cooldown_secs: 0,
+            repos: HashMap::new(),
+            pre_gate_validation_enabled: false,
+            escalation_refire_secs: 0,
+            agent_worktree_root: Some("/tmp/agent_worktrees".into()),
+            worktree_ttl_secs: 60,
+            worktree_max_count: 200,
+        };
+        let path = cfg.agent_worktree_path("owner/repo", "df-100").unwrap();
+        assert!(path.starts_with("/tmp/agent_worktrees/owner/repo/df-100"));
+        let root = cfg.agent_worktree_root_for_repo("owner/repo").unwrap();
+        assert!(root.starts_with("/tmp/agent_worktrees/owner/repo"));
+    }
+
+    #[test]
+    fn worktree_ttl_and_max_count_override_default() {
+        let dir = std::env::temp_dir().join(format!(
+            "afd_worktree_overrides_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("custom.toml");
+        std::fs::write(
+            &p,
+            format!(
+                r#"target_repo = "owner/repo"
+base_branch = "main"
+stage = 1
+max_workers = 1
+max_batch = 1
+fast_tick_secs = 1
+slow_tick_secs = 1
+autonomy_timebox_secs = 60
+budget_warn_usd = 1.0
+spec_dir = ".factory/specs/"
+agent_worktree_root = "{}"
+worktree_ttl_secs = 2592000
+worktree_max_count = 50
+"#,
+                dir.display()
+            ),
+        )
+        .unwrap();
+        let cfg = load(&p).unwrap();
+        assert_eq!(cfg.worktree_ttl_secs, 2_592_000);
+        assert_eq!(cfg.worktree_max_count, 50);
+        assert!(cfg.agent_worktree_root.is_some());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
