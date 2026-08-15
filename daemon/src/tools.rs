@@ -8,6 +8,16 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+mod unix_signals {
+    pub type Pid = i32;
+    pub const SIGKILL: i32 = 9;
+
+    unsafe extern "C" {
+        pub fn kill(pid: Pid, signal: i32) -> i32;
+    }
+}
+
 /// A `br` bead candidate (design doc §4, spec §4.2.3).
 ///
 /// `description`, `notes`, and `file_tree_summary` exist so the router's
@@ -1091,7 +1101,7 @@ fn run_tool_with_cwd(
                         // process group created above. This leaves the
                         // daemon's own group untouched.
                         unsafe {
-                            libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+                            unix_signals::kill(-(child.id() as unix_signals::Pid), unix_signals::SIGKILL);
                         }
                     }
                     #[cfg(not(unix))]
@@ -1357,11 +1367,11 @@ mod tests {
             .expect("timed-out child must record its descendant PID")
             .trim()
             .to_owned();
-        let pid: libc::pid_t = pid.parse().expect("descendant PID must be numeric");
-        let is_alive = unsafe { libc::kill(pid, 0) == 0 };
+        let pid: unix_signals::Pid = pid.parse().expect("descendant PID must be numeric");
+        let is_alive = process_is_live(pid);
         if is_alive {
             unsafe {
-                libc::kill(pid, libc::SIGKILL);
+                unix_signals::kill(pid, unix_signals::SIGKILL);
             }
         }
         let _ = std::fs::remove_file(&pid_file);
@@ -1369,6 +1379,27 @@ mod tests {
             !is_alive,
             "timeout must terminate descendant PID {pid}, not only its direct child"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_is_live(pid: unix_signals::Pid) -> bool {
+        // Linux reports an unreaped zombie as signalable via kill(pid, 0),
+        // even though it cannot execute. A timed-out descendant is correctly
+        // terminated once it reaches Z; PID 1 owns reaping it thereafter.
+        let stat_path = format!("/proc/{pid}/stat");
+        match std::fs::read_to_string(stat_path) {
+            Ok(stat) => stat
+                .rsplit_once(") ")
+                .and_then(|(_, rest)| rest.chars().next())
+                .map(|state| state != 'Z')
+                .unwrap_or_else(|| unsafe { unix_signals::kill(pid, 0) == 0 }),
+            Err(_) => false,
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn process_is_live(pid: unix_signals::Pid) -> bool {
+        unsafe { unix_signals::kill(pid, 0) == 0 }
     }
 
     #[test]
