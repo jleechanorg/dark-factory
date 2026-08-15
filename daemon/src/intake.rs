@@ -488,6 +488,43 @@ fn parse_owner_repo_from_external_ref(external_ref: &str) -> Option<(String, Str
     }
 }
 
+/// jleechan-r28r: canonicalize a `LabeledPr`/`Issue` `external_ref` to the
+/// short `owner/repo#N` form BEFORE it enters the intake dedup/lookup/create
+/// pipeline. Accepts both the short form (returned unchanged) and the
+/// full GitHub URL form (`https://github.com/<owner>/<repo>/pull|N` →
+/// `owner/repo#N`); any other shape is returned unchanged so legacy/malformed
+/// data is preserved for the existing parse-time error path (jleechan-mdgr's
+/// defense-in-depth for the `local-` suffix, etc.) — the contract is
+/// strictly "best-effort normalize, never invent data".
+///
+/// Without this, two intake events for the same PR (one URL-shaped, one
+/// short-shaped) bypass `br`'s string-equal uniqueness check and produce the
+/// live duplicate-pair thrash (e.g. jleechan-jpi vs jleechan-hslx for
+/// PR #8058) that fed the 390x/15min ESCALATION_NOTIFICATION_FAILED burst.
+/// Once normalized at intake, every downstream comparison
+/// (`known_refs.contains`, `tracker_candidates.iter().find(..., pr.external_ref)`,
+/// `tracker.create_bead` uniqueness, the `SkippedDuplicate` outcome's
+/// `external_ref` field) operates on a single canonical key per PR/issue.
+fn to_canonical_external_ref(external_ref: &str) -> String {
+    if let Some((owner_repo, num)) = parse_owner_repo_from_external_ref(external_ref) {
+        return format!("{owner_repo}#{num}");
+    }
+    // GitHub URL form: `https://github.com/<owner>/<repo>/(pull|issues)/<n>`.
+    // Mirrors `adapters::parse_external_ref`'s URL branch; we don't share
+    // that helper because adapters keeps it private and this module
+    // deliberately keeps its own copy of the parse logic (see the
+    // `parse_owner_repo_from_external_ref` comment above).
+    if let Some(rest) = external_ref.strip_prefix("https://github.com/") {
+        let segments: Vec<&str> = rest.split('/').collect();
+        if let [owner, repo, kind, number] = segments.as_slice() {
+            if matches!(*kind, "pull" | "issues") && !owner.is_empty() && !repo.is_empty() && !number.is_empty() {
+                return format!("{owner}/{repo}#{number}");
+            }
+        }
+    }
+    external_ref.to_string()
+}
+
 /// Scan `body` line-by-line for `target_repo: <value>` (matching the
 /// `existing_branch:`/`existing_pr:` grammar documented in
 /// `.claude/skills/auto-factory/SKILL.md`). Returns `None` for a missing
@@ -900,7 +937,10 @@ pub(crate) fn normalize_labeled_prs_with_cache(
     now_epoch: u64,
 ) -> Result<(Vec<ExistingPrIntake>, Vec<IntakeOutcome>), DaemonError> {
     let repo = batch.repo;
-    let prs = batch.prs;
+    // jleechan-r28r: own the slice so the per-iteration
+    // `pr.external_ref = to_canonical_external_ref(...)` mutation is
+    // permitted (`batch.prs` is `&'a [LabeledPr]`, not `Vec<LabeledPr>`).
+    let prs: Vec<LabeledPr> = batch.prs.to_vec();
     let tracker_candidates = tracker_snapshot.candidates;
     let known_refs = tracker_snapshot.known_refs;
     let cache = state.cache;
@@ -908,7 +948,7 @@ pub(crate) fn normalize_labeled_prs_with_cache(
     let mut intakes = Vec::new();
     let mut outcomes = Vec::new();
 
-    for pr in prs {
+    for mut pr in prs {
         // PR #629 follow-up fix (codex P2 "Enforce the call cap within
         // each repository scan"): the sweep-wide `MAX_INTAKE_SWEEP_GH_CALLS`
         // budget was only checked BETWEEN repos, in
@@ -929,7 +969,13 @@ pub(crate) fn normalize_labeled_prs_with_cache(
             break;
         }
 
-        let key = ProbeCacheKey::from_pr(pr);
+        // jleechan-r28r: normalize URL form to canonical owner/repo#N
+        // BEFORE any cache/dedup comparison so a later short-form event for
+        // the same PR hits the same `known_refs` key as an earlier URL
+        // event.
+        pr.external_ref = to_canonical_external_ref(&pr.external_ref);
+
+        let key = ProbeCacheKey::from_pr(&pr);
 
         // Pre-flight: empty head_ref_name — uncacheable, never probed.
         if pr.head_ref_name.trim().is_empty() {
@@ -944,7 +990,7 @@ pub(crate) fn normalize_labeled_prs_with_cache(
 
         // Pre-flight: cross-repo — uncacheable (the rejection comment must
         // be posted fresh so the contributor sees it on this tick).
-        if !same_repo_pr(pr, repo) {
+        if !same_repo_pr(&pr, repo) {
             let comment_body = "🤖 **[dark-factory]** Escalation required: fork/cross-repository PR adoption is not supported in v1. Same-repo factory PRs can be verified automatically; fork remediation lands with bead `jleechan-tfs1`.";
             let _ = tracker.comment_external(&pr.external_ref, comment_body);
             outcomes.push(IntakeOutcome {
@@ -1126,7 +1172,13 @@ pub fn normalize(
     let mut created = Vec::new();
     let mut outcomes = Vec::new();
 
-    for issue in issues {
+    for mut issue in issues {
+        // jleechan-r28r: normalize URL form to canonical owner/repo#N
+        // BEFORE the known_refs.contains check so two intake events for the
+        // same PR (one URL-shaped, one short-shaped) hit the same dedup
+        // key.
+        issue.external_ref = to_canonical_external_ref(&issue.external_ref);
+
         // Idempotency: already-known external_ref -> skip silently, no create_bead call.
         if known_refs.contains(&issue.external_ref) {
             outcomes.push(IntakeOutcome {
@@ -1251,7 +1303,13 @@ pub fn normalize_labeled_prs(
     let mut intakes = Vec::new();
     let mut outcomes = Vec::new();
 
-    for pr in prs {
+    for mut pr in prs {
+        // jleechan-r28r: normalize URL form to canonical owner/repo#N
+        // BEFORE the head_ref_name / tracker_candidates / known_refs /
+        // create_bead checks — see to_canonical_external_ref for the
+        // duplicate-pair rationale.
+        pr.external_ref = to_canonical_external_ref(&pr.external_ref);
+
         if pr.head_ref_name.trim().is_empty() {
             outcomes.push(IntakeOutcome {
                 external_ref: pr.external_ref.clone(),
