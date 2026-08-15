@@ -7,6 +7,7 @@
 
 use crate::errors::DaemonError;
 use crate::tools::{remote_url_matches_repo, run_tool, run_tool_in_dir};
+use crate::worktree_selfheal::self_heal_preflight;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -95,6 +96,76 @@ pub fn ensure_managed_target_worktree(
     head_sha: Option<&str>,
 ) -> Result<PathBuf, DaemonError> {
     ensure_target_worktree_inner(repo, requested, head_sha, true)
+}
+
+/// Self-healing variant of `ensure_target_worktree` (bead jleechan-y189).
+///
+/// Runs the worktree preflight before delegating to
+/// `ensure_target_worktree_inner`:
+/// - removes a stale `.git/index.lock` (live PID locks are NOT removed — the
+///   daemon defers rather than destroys work in-flight);
+/// - removes untracked build/test caches (`target/`, `node_modules/`, ...);
+/// - optionally resets dirty tracked-file state (`git reset --hard HEAD`) when
+///   `dirty_reset` is `true` (managed checkouts) and leaves it alone for
+///   operator checkouts.
+///
+/// Branch selection is intentionally NOT a preflight concern: the bead's
+/// expected branch is materialized when AO spawns the worker worktree, not
+/// when the parent checkout is provisioned. The fallback-provisioning lane
+/// that owns `WORKTREE_SELFHEAL_FALLBACK_PROVISIONED` is bead jleechan-gk2r.
+///
+/// This is the entry point the active-session-only refusal gate (jw4c's
+/// `ActiveSessionProbe`) sits behind: a clean checkout never reaches the
+/// refusal gate.
+#[allow(clippy::too_many_arguments)]
+pub fn ensure_target_worktree_self_heal(
+    repo: &str,
+    requested: &Path,
+    head_sha: Option<&str>,
+    bead_id: &str,
+    _branch: &str,
+    dirty_reset: bool,
+    telemetry_log: Option<&Path>,
+) -> Result<PathBuf, DaemonError> {
+    validate_repo(repo)?;
+    if !requested.is_absolute() {
+        return Err(DaemonError::Config(format!(
+            "target worktree path must be absolute: {}",
+            requested.display()
+        )));
+    }
+    if let Some(parent) = requested.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            DaemonError::Config(format!(
+                "create target worktree parent {}: {e}",
+                parent.display()
+            ))
+        })?;
+    }
+    let _lock = TargetWorktreeLock::acquire(requested)?;
+
+    if requested.is_dir() {
+        // Step 1: crash-safe preflight (stale lock, untracked caches,
+        // optional dirty reset). Result is intentionally ignored beyond
+        // telemetry: the caller's existing origin/head verification is the
+        // authoritative gate.
+        let _ = self_heal_preflight(requested, dirty_reset, telemetry_log, bead_id);
+
+        // Step 2: existing origin/head verification (unchanged).
+        verify_origin(repo, requested)?;
+        verify_head(requested, head_sha)?;
+        return Ok(requested.to_path_buf());
+    }
+
+    if requested.exists() {
+        return Err(DaemonError::Config(format!(
+            "target worktree path exists but is not a directory: {}",
+            requested.display()
+        )));
+    }
+
+    // New checkout — clone path unchanged from the existing inner function.
+    ensure_target_worktree_inner(repo, requested, head_sha, false)
 }
 
 /// Ensure a daemon-owned checkout exposes the configured push-remote name.
