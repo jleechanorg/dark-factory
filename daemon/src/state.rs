@@ -644,6 +644,21 @@ pub enum HumanHoldReason {
     WorktreeRemoteUnverifiable,
     SpawnCleanupFailed,
     SpawnFailed,
+    /// Bead jleechan-contract-batch-cleanup-error-second: `CliSessions::spawn_batch`
+    /// returned `DaemonError::SpawnBatchCleanupFailed` — one spec in the
+    /// batch failed to spawn AND the cleanup of a prior successful spec
+    /// also failed. The error carries `cleanup_errors: Vec<SpawnBatchCleanupFailure>`
+    /// (bead_id + branch + underlying error per leaked session). Distinct
+    /// from `SpawnCleanupFailed` (a single-session leak from
+    /// `Sessions::spawn`) because this happens during serialized batch
+    /// dispatch and the operator/Healer needs to group by class. NOT in
+    /// `recoverable_exact_values()`: the cleanup-loss class is PERMANENT —
+    /// a silent auto-requeue would just replay the leak and lose the
+    /// cleanup-context signal. Confirmed bug-as-of-2026-08-15: this error
+    /// previously fell through to the generic `SpawnFailed` arm and the
+    /// dedicated reason therefore never surfaced on the operator
+    /// dashboard / Healer clustering.
+    SpawnBatchCleanupFailed,
     SpawnBranchMismatch,
     AmbiguousDispatchingRecovery,
     AutonomyTimeboxExceeded,
@@ -730,6 +745,7 @@ impl HumanHoldReason {
             Self::WorktreeRemoteUnverifiable => "worktree_remote_unverifiable",
             Self::SpawnCleanupFailed => "spawn_cleanup_failed",
             Self::SpawnFailed => "spawn_failed",
+            Self::SpawnBatchCleanupFailed => "spawn_batch_cleanup_failed",
             Self::SpawnBranchMismatch => "spawn_branch_mismatch",
             Self::AmbiguousDispatchingRecovery => "ambiguous_dispatching_recovery",
             Self::AutonomyTimeboxExceeded => "autonomy_timebox_exceeded",

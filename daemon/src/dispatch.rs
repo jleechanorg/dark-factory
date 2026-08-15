@@ -14,6 +14,8 @@ use crate::tools::{remote_url_for_display, remote_url_matches_repo, Bead, Sessio
 
 #[cfg(test)]
 const SPAWN_CLEANUP_FAILED_PARK_REASON: &str = "spawn_cleanup_failed";
+#[cfg(test)]
+const SPAWN_BATCH_CLEANUP_FAILED_PARK_REASON: &str = "spawn_batch_cleanup_failed";
 
 fn record_spawn_cleanup_failure(
     store: &dyn StateStore,
@@ -692,6 +694,41 @@ pub fn dispatch_ready_with_vcs(
                 }
                 return Err(err);
             }
+            // jleechan-contract-batch-cleanup-error-second r1: the
+            // batch-spawn cleanup failure path. `CliSessions::spawn_batch`
+            // serializes specs and, when one fails AND a prior successful
+            // spec's cleanup also fails, returns this `SpawnBatchCleanupFailed`
+            // variant carrying `cleanup_errors: Vec<SpawnBatchCleanupFailure>`
+            // describing each leaked session. This MUST stay distinct from
+            // the generic `SpawnFailed` bucket — the operator dashboard and
+            // Healer clustering key on `park_reason`, and lumping these
+            // into `spawn_failed` hides the cleanup-loss class entirely.
+            // Park permanently (NOT in `recoverable_exact_values()`): a
+            // silent auto-requeue would replay the same leak + cleanup-loss
+            // sequence and lose the diagnostic signal the
+            // `cleanup_errors` payload carries. Match arm MUST precede the
+            // general `Err(err) => {` below (Rust match arms are
+            // order-sensitive and the more specific pattern must win) and
+            // must precede the `is_transient()` guard above
+            // (`SpawnBatchCleanupFailed.spawn_error` is a `Parse` by
+            // contract test convention, not transient).
+            Err(err @ DaemonError::SpawnBatchCleanupFailed { .. }) => {
+                overlay.state = OverlayState::HumanHeld;
+                overlay.session_id = None;
+                set_human_hold_reason(
+                    &mut overlay,
+                    HumanHoldReason::SpawnBatchCleanupFailed,
+                );
+                store.save(&overlay)?;
+                report.failures.push(failure(
+                    bead,
+                    overlay.attempt,
+                    Some(branch.clone()),
+                    "spawn_batch_cleanup_failed",
+                    err,
+                ));
+                continue;
+            }
             // jleechan-w28n: AO's own admission-control queue (session-cap
             // backpressure — see `DaemonError::Deferred`'s doc comment) is
             // NOT a failure and must never share `spawn_failure_count` with
@@ -1355,6 +1392,14 @@ mod tests {
         // fallback chain is exhausted.
         fail_spawn_fallback_exhausted_deferred_for: RefCell<Vec<String>>,
         fail_spawn_cleanup_for: RefCell<Vec<String>>,
+        // Bead jleechan-contract-batch-cleanup-error-second: scripted
+        // `DaemonError::SpawnBatchCleanupFailed` from `spawn()`, mirroring
+        // the production `CliSessions::spawn_batch` shape where one spec
+        // spawns fine but a later spec fails AND its prior-session cleanup
+        // also fails. Distinct from `fail_spawn_cleanup_for` (single-session
+        // variant) so end-to-end tests can exercise each path independently
+        // and prove they receive distinct `park_reason` values.
+        fail_spawn_batch_cleanup_for: RefCell<Vec<String>>,
         fail_stop_for: RefCell<Vec<String>>,
         // jleechan-5ia2: scripted `session_branch` override, keyed by
         // session id. Empty by default (matches the trait's `Ok(None)`
@@ -1412,6 +1457,7 @@ mod tests {
                 fail_spawn_deferred_for: RefCell::new(Vec::new()),
                 fail_spawn_fallback_exhausted_deferred_for: RefCell::new(Vec::new()),
                 fail_spawn_cleanup_for: RefCell::new(Vec::new()),
+                fail_spawn_batch_cleanup_for: RefCell::new(Vec::new()),
                 fail_stop_for: RefCell::new(Vec::new()),
                 scripted_branch: RefCell::new(HashMap::new()),
                 spawn_prompts: RefCell::new(Vec::new()),
@@ -1446,6 +1492,12 @@ mod tests {
 
         fn fail_spawn_cleanup_for(&self, bead_id: &str) {
             self.fail_spawn_cleanup_for
+                .borrow_mut()
+                .push(bead_id.to_string());
+        }
+
+        fn fail_spawn_batch_cleanup_for(&self, bead_id: &str) {
+            self.fail_spawn_batch_cleanup_for
                 .borrow_mut()
                 .push(bead_id.to_string());
         }
@@ -1552,6 +1604,35 @@ mod tests {
                         rc: 8,
                         stderr: "scripted kill failure".to_string(),
                     }),
+                });
+            }
+            if self
+                .fail_spawn_batch_cleanup_for
+                .borrow()
+                .contains(&spec.bead_id)
+            {
+                // Mirrors the production `CliSessions::spawn_batch` shape:
+                // a spec earlier in the batch spawned (here, modeled as a
+                // sibling test fixture) and the cleanup of that prior session
+                // ALSO failed. Distinct from `SpawnCleanupFailed` (a
+                // single-spec leak): this carries one-or-more
+                // `SpawnBatchCleanupFailure { bead_id, branch, error }`
+                // entries that the operator / Healer needs to surface.
+                return Err(DaemonError::SpawnBatchCleanupFailed {
+                    spawn_error: Box::new(DaemonError::Parse(format!(
+                        "scripted batch spawn failure for {}",
+                        spec.bead_id
+                    ))),
+                    cleanup_errors: vec![crate::errors::SpawnBatchCleanupFailure {
+                        session: "fake-leaked-session".to_string(),
+                        bead_id: spec.bead_id.clone(),
+                        branch: format!("factory/{}-r1", spec.bead_id),
+                        error: DaemonError::Tool {
+                            tool: "ao session kill".to_string(),
+                            rc: 8,
+                            stderr: "scripted batch cleanup failure".to_string(),
+                        },
+                    }],
                 });
             }
             if self.fail_spawn_for.borrow().contains(&spec.bead_id) {
@@ -3273,6 +3354,60 @@ mod tests {
         assert_eq!(
             bead_0.park_reason.as_deref(),
             Some(SPAWN_CLEANUP_FAILED_PARK_REASON)
+        );
+    }
+
+    /// Bead jleechan-contract-batch-cleanup-error-second r1.
+    /// `SpawnBatchCleanupFailed` MUST park with a dedicated
+    /// `spawn_batch_cleanup_failed` reason — distinct from the generic
+    /// `SpawnFailed` it falls through to today. The contract:
+    ///   - `cli_sessions::spawn_batch` returns this error when a later
+    ///     spec fails AND the earlier spec's cleanup also fails (see
+    ///     `daemon/src/adapters.rs::CliSessions::spawn_batch` and the
+    ///     contract test `batch_spawn_reports_root_and_cleanup_failures`).
+    ///   - `dispatch_ready` calls `sessions.spawn(...)` directly, but the
+    ///     `FakeSessions` here mirrors the batch shape so the
+    ///     dispatch-side park semantics can be exercised end-to-end.
+    ///   - The error carries `cleanup_errors: Vec<SpawnBatchCleanupFailure>`
+    ///     describing which bead/branch sessions COULD NOT be reaped. The
+    ///     operator dashboard groups by `park_reason`; collapsing this into
+    ///     the generic `SpawnFailed` bucket hides the cleanup-loss class
+    ///     from the dashboard, the Healer clustering, and the silent-cycle
+    ///     audit. Per the bead's TENETS, this MUST be its own reason.
+    #[test]
+    fn dispatch_parking_distinguishes_spawn_batch_cleanup_failure_from_generic_spawn_failure() {
+        let sessions = FakeSessions::new(0);
+        sessions.fail_spawn_batch_cleanup_for("bead-0");
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        assert_eq!(report.success_count(), 0, "no bead must reach Dispatched");
+
+        let failures = &report.failures;
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].bead_id, "bead-0");
+        assert_eq!(
+            failures[0].phase, "spawn_batch_cleanup_failed",
+            "phase must be the dedicated batch-cleanup signal — Healer clusters on it"
+        );
+
+        let calls = sessions.calls.borrow();
+        assert!(
+            calls.iter().any(|c| c == "spawn(bead-0)"),
+            "the failing batch spec must have been attempted: {calls:?}"
+        );
+
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::HumanHeld);
+        assert_eq!(overlay.session_id, None);
+        assert_eq!(
+            overlay.park_reason.as_deref(),
+            Some(SPAWN_BATCH_CLEANUP_FAILED_PARK_REASON),
+            "park_reason MUST be the dedicated batch-cleanup signal — \
+             not the generic 'spawn_failed' that this error currently \
+             falls through to",
         );
     }
 
