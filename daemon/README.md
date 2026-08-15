@@ -77,6 +77,10 @@ The 10 canonical `event_type` values (`TICK`, `INTAKE_BEAD_CREATED`,
 
 ## Linux user service
 
+Host-placement policy is canonical in `../CLAUDE.md`: the factory daemon and
+its AO workers run only on `jeff-ubuntu` through `/linux`; do not operate a
+Mac-local factory daemon.
+
 The durable Linux trigger for the Rust daemon is the systemd user unit in
 `daemon/systemd/`. It runs the release binary directly, not the legacy shell
 tick lane:
