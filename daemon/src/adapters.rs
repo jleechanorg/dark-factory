@@ -3210,6 +3210,457 @@ export const isTerminalSession = () => false;
         assert!(calls.is_empty(), "AO must not be invoked on a source mismatch: {calls}");
     }
 
+    /// Regression for bead dark-factory-ik0v / incident jleechan-j9id.
+    ///
+    /// AO's `workspace-worktree.create` always pins `baseRef =
+    /// origin/${project.defaultBranch}` and runs
+    /// `git worktree add -b <branch> <path> <baseRef>`. For an adopted
+    /// remediation spawn — where the contributor's branch already lives on
+    /// origin and the daemon has a validated `expected_revision` (= PR head)
+    /// — that creates the local branch at the wrong commit
+    /// (`origin/<defaultBranch>`) instead of the PR head.
+    ///
+    /// The bridge must detect the adopted case (`origin/<branch>` exists at
+    /// `expected_revision`) and rebind `projectConfig.defaultBranch = branch`
+    /// so AO's `git worktree add -b <branch> <path> origin/<branch>` lands
+    /// the worktree at the PR head.
+    fn run_bridge_with_adopted_target(test_name: &str) -> (std::process::Output, String) {
+        let root = std::env::temp_dir().join(format!(
+            "afd_ao_bridge_adopted_target_{test_name}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let cli = root.join("node_modules/@jleechanorg/ao-cli");
+        let core = root.join("node_modules/@jleechanorg/ao-core");
+        let remote = root.join("remote.git");
+        let source = root.join("source");
+        let target = root.join("adopted-target");
+        let calls = root.join("calls.log");
+        let pr_branch = format!("alice/{test_name}-pr");
+        std::fs::create_dir_all(cli.join("dist/lib")).unwrap();
+        std::fs::create_dir_all(core.join("dist")).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        let source_str = source.to_string_lossy().into_owned();
+        let target_str = target.to_string_lossy().into_owned();
+
+        // Bare remote.
+        std::process::Command::new("git")
+            .args(["init", "-q", "--bare", remote.to_str().unwrap()])
+            .status()
+            .unwrap();
+
+        // Source repo: two commits. main at A, contributor branch at B.
+        for (cmd_dir, _) in [(&source, &source as &std::path::Path)] {
+            let _ = cmd_dir;
+        }
+        let commit_a = || -> String {
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&source)
+                .status()
+                .unwrap();
+            std::process::Command::new("git")
+                .args(["remote", "add", "origin", remote.to_str().unwrap()])
+                .current_dir(&source)
+                .status()
+                .unwrap();
+            std::process::Command::new("git")
+                .args([
+                    "-c", "user.email=test@example.invalid",
+                    "-c", "user.name=Test",
+                    "commit", "--allow-empty", "-m", "A",
+                ])
+                .current_dir(&source)
+                .status()
+                .unwrap();
+            let out = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&source)
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        let sha_a = commit_a();
+        std::process::Command::new("git")
+            .args(["checkout", "-q", "-b", "main"])
+            .current_dir(&source)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["push", "-q", "origin", "main:main"])
+            .current_dir(&source)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "-q", "-b", &pr_branch])
+            .current_dir(&source)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c", "user.email=test@example.invalid",
+                "-c", "user.name=Test",
+                "commit", "--allow-empty", "-m", "B",
+            ])
+            .current_dir(&source)
+            .status()
+            .unwrap();
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&source)
+            .output()
+            .unwrap();
+        let sha_b = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        assert_ne!(sha_a, sha_b);
+        std::process::Command::new("git")
+            .args(["push", "-q", "origin", &format!("{pr_branch}:{pr_branch}")])
+            .current_dir(&source)
+            .status()
+            .unwrap();
+
+        // Target clone, then detach HEAD at sha_b (= daemon-validated PR head).
+        std::process::Command::new("git")
+            .args(["clone", "-q", remote.to_str().unwrap(), target.to_str().unwrap()])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "-q", "--detach", &sha_b])
+            .current_dir(&target)
+            .status()
+            .unwrap();
+
+        std::fs::write(
+            cli.join("package.json"),
+            r#"{"name":"@jleechanorg/ao-cli","version":"0.1.3","type":"module"}"#,
+        )
+        .unwrap();
+        std::fs::write(cli.join("dist/index.js"), "throw new Error('CLI must not run');\n")
+            .unwrap();
+        std::fs::write(
+            core.join("package.json"),
+            r#"{"name":"@jleechanorg/ao-core","version":"0.1.0","type":"module","exports":{".":{"import":"./dist/index.js"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            core.join("dist/index.js"),
+            format!(
+                r#"import {{appendFileSync}} from 'node:fs';
+const log = (value) => appendFileSync(process.env.AO_FAKE_CALLS, value + '\n');
+const project = 'worldarchitect';
+export const loadConfig = () => ({{configPath: '/tmp/fake-ao.yaml', projects: {{[project]: {{path: '{source_str}', defaultBranch: 'main'}}}}}});
+export const createPluginRegistry = () => ({{loadFromConfig: async () => {{}}}});
+export const createSessionManager = ({{config}}) => {{
+  log('config-defaultBranch=' + config.projects[project].defaultBranch);
+  return {{
+    list: async () => [],
+    spawn: async (spec) => {{
+      log(JSON.stringify({{defaultBranch: config.projects[project].defaultBranch, branch: spec.branch, projectId: spec.projectId}}));
+      return {{id: 'adopted-session', branch: spec.branch, workspacePath: '{target_str}'}};
+    }},
+  }};
+}};
+export const acquireSpawnLock = () => ({{acquired: true, release() {{}}}});
+export const resolveSpawnQueueConfig = () => ({{enabled: true, maxActiveSessions: 2}});
+export const isTerminalSession = () => false;
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/preflight.js"),
+            "export const preflight = {checkTmux: async () => {}, checkGhAuth: async () => {}};\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/running-state.js"),
+            "export const getRunning = async () => ({projects: ['worldarchitect']});\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/lifecycle-service.js"),
+            "export const ensureLifecycleWorker = async () => {};\n",
+        )
+        .unwrap();
+
+        let bridge = ao_spawn_bridge_path();
+        let mut command = std::process::Command::new(bridge_test_node());
+        command
+            .arg(cli.join("dist/index.js"))
+            .args([
+                "spawn",
+                "--project",
+                "worldarchitect",
+                "--agent",
+                "minimax",
+                "--",
+                "adopted-pr probe",
+            ])
+            .env(
+                "NODE_OPTIONS",
+                format!(
+                    "--experimental-import-meta-resolve --import={}",
+                    bridge.display()
+                ),
+            )
+            .env("DARK_FACTORY_AO_PARENT_NODE_OPTIONS", "")
+            .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
+            .env("DARK_FACTORY_AO_SPAWN_BRANCH", &pr_branch)
+            .env("DARK_FACTORY_AO_TARGET_CHECKOUT", &target)
+            .env("DARK_FACTORY_AO_EXPECTED_REVISION", &sha_b)
+            .env("DARK_FACTORY_AO_MANAGED_CHECKOUT", "1")
+            .env("AO_FAKE_CALLS", &calls);
+        let output = command.output().unwrap();
+        let logged = std::fs::read_to_string(&calls).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(root);
+        (output, logged)
+    }
+
+    #[test]
+    fn bridge_pins_default_branch_to_adopted_pr_head_when_origin_ref_matches_expected_revision()
+     {
+        let (output, calls) = run_bridge_with_adopted_target("adopted_match");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "adopted-PR bridge failed; stdout={stdout}; stderr={stderr}; calls={calls}"
+        );
+        assert!(stdout.contains("SESSION=adopted-session"), "{stdout}");
+        // The bridge must rebind `projectConfig.defaultBranch` so AO's
+        // `origin/${defaultBranch}` resolves to the PR head (origin/<branch>),
+        // NOT the repo's default `main`.
+        let spawn_line = calls
+            .lines()
+            .find_map(|line| {
+                let value = line.trim();
+                if value.starts_with('{') && value.contains("\"branch\"") {
+                    Some(value)
+                } else {
+                    None
+                }
+            })
+            .expect("spawn call was not recorded");
+        let observed: serde_json::Value =
+            serde_json::from_str(spawn_line).expect("spawn log line must be JSON");
+        assert_eq!(
+            observed["defaultBranch"].as_str(),
+            Some("alice/adopted_match-pr"),
+            "AO must receive the PR branch as defaultBranch so origin/<defaultBranch> \
+             resolves to the PR head; calls={calls}"
+        );
+        assert_eq!(observed["branch"].as_str(), Some("alice/adopted_match-pr"));
+        assert_eq!(observed["projectId"].as_str(), Some("worldarchitect"));
+    }
+
+    #[test]
+    fn bridge_fails_closed_when_adopted_origin_ref_head_diverges_from_expected_revision() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Build a remote whose `alice/<branch>` is at SHA X, but pass
+        // expected_revision = Y (X != Y). The bridge must refuse to spawn:
+        // rebinding defaultBranch would still land AO at X (the stale
+        // remote ref), which is the exact drift this fix prevents.
+        let root = std::env::temp_dir().join(format!(
+            "afd_ao_bridge_adopted_target_diverged_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let cli = root.join("node_modules/@jleechanorg/ao-cli");
+        let core = root.join("node_modules/@jleechanorg/ao-core");
+        let remote = root.join("remote.git");
+        let source = root.join("source");
+        let target = root.join("adopted-target");
+        let calls = root.join("calls.log");
+        let pr_branch = "alice/diverged-pr";
+        std::fs::create_dir_all(cli.join("dist/lib")).unwrap();
+        std::fs::create_dir_all(core.join("dist")).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        let source_str = source.to_string_lossy().into_owned();
+        let target_str = target.to_string_lossy().into_owned();
+
+        std::process::Command::new("git")
+            .args(["init", "-q", "--bare", remote.to_str().unwrap()])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&source)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["remote", "add", "origin", remote.to_str().unwrap()])
+            .current_dir(&source)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c", "user.email=test@example.invalid",
+                "-c", "user.name=Test",
+                "commit", "--allow-empty", "-m", "X",
+            ])
+            .current_dir(&source)
+            .status()
+            .unwrap();
+        let sha_x = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&source)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        std::process::Command::new("git")
+            .args(["checkout", "-q", "-b", "main"])
+            .current_dir(&source)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["push", "-q", "origin", "main:main"])
+            .current_dir(&source)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "-q", "-b", pr_branch])
+            .current_dir(&source)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["push", "-q", "origin", &format!("{pr_branch}:{pr_branch}")])
+            .current_dir(&source)
+            .status()
+            .unwrap();
+
+        // Target clone, then create an UNRELATED commit Y on the same branch.
+        std::process::Command::new("git")
+            .args(["clone", "-q", remote.to_str().unwrap(), target.to_str().unwrap()])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "-q", "-b", pr_branch])
+            .current_dir(&target)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c", "user.email=test@example.invalid",
+                "-c", "user.name=Test",
+                "commit", "--allow-empty", "-m", "Y",
+            ])
+            .current_dir(&target)
+            .status()
+            .unwrap();
+        let sha_y = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&target)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        assert_ne!(sha_x, sha_y, "test setup must produce two distinct SHAs");
+
+        std::fs::write(
+            cli.join("package.json"),
+            r#"{"name":"@jleechanorg/ao-cli","version":"0.1.3","type":"module"}"#,
+        )
+        .unwrap();
+        std::fs::write(cli.join("dist/index.js"), "throw new Error('CLI must not run');\n")
+            .unwrap();
+        std::fs::write(
+            core.join("package.json"),
+            r#"{"name":"@jleechanorg/ao-core","version":"0.1.0","type":"module","exports":{".":{"import":"./dist/index.js"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            core.join("dist/index.js"),
+            format!(
+                r#"import {{appendFileSync}} from 'node:fs';
+const log = (value) => appendFileSync(process.env.AO_FAKE_CALLS, value + '\n');
+export const loadConfig = () => ({{configPath: '/tmp/fake-ao.yaml', projects: {{'worldarchitect': {{path: '{source_str}', defaultBranch: 'main'}}}}}});
+export const createPluginRegistry = () => ({{loadFromConfig: async () => {{}}}});
+export const createSessionManager = () => ({{
+  list: async () => [],
+  spawn: async (spec) => {{log('SPAWN_CALLED'); return {{id: 'never', branch: spec.branch, workspacePath: '{target_str}'}}; }},
+}});
+export const acquireSpawnLock = () => ({{acquired: true, release() {{}}}});
+export const resolveSpawnQueueConfig = () => ({{enabled: true, maxActiveSessions: 2}});
+export const isTerminalSession = () => false;
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/preflight.js"),
+            "export const preflight = {checkTmux: async () => {}, checkGhAuth: async () => {}};\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/running-state.js"),
+            "export const getRunning = async () => ({projects: ['worldarchitect']});\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/lifecycle-service.js"),
+            "export const ensureLifecycleWorker = async () => {};\n",
+        )
+        .unwrap();
+
+        let bridge = ao_spawn_bridge_path();
+        let output = std::process::Command::new(bridge_test_node())
+            .arg(cli.join("dist/index.js"))
+            .args([
+                "spawn",
+                "--project",
+                "worldarchitect",
+                "--agent",
+                "minimax",
+                "--",
+                "diverged probe",
+            ])
+            .env(
+                "NODE_OPTIONS",
+                format!(
+                    "--experimental-import-meta-resolve --import={}",
+                    bridge.display()
+                ),
+            )
+            .env("DARK_FACTORY_AO_PARENT_NODE_OPTIONS", "")
+            .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
+            .env("DARK_FACTORY_AO_SPAWN_BRANCH", pr_branch)
+            .env("DARK_FACTORY_AO_TARGET_CHECKOUT", &target)
+            .env("DARK_FACTORY_AO_EXPECTED_REVISION", &sha_y)
+            .env("DARK_FACTORY_AO_MANAGED_CHECKOUT", "1")
+            .env("AO_FAKE_CALLS", &calls)
+            .output()
+            .unwrap();
+        let logged = std::fs::read_to_string(&calls).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(root);
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "diverged adopted-PR spawn unexpectedly succeeded; stderr={stderr}; calls={logged}"
+        );
+        assert!(
+            stderr.contains("origin/") || stderr.contains("PR head") || stderr.contains("head"),
+            "diverged adopted-PR must fail closed with a clear origin/head diagnostic; \
+             stderr={stderr}; calls={logged}"
+        );
+        assert!(
+            !logged.contains("SPAWN_CALLED"),
+            "AO must not be invoked when origin ref diverges from expected revision: {logged}"
+        );
+    }
+
     #[test]
     fn single_spawn_uses_v013_positional_prompt_and_exact_branch_binding() {
         let prompt = "single prompt with spaces\nand a second line";

@@ -167,6 +167,69 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
         projectConfig = { ...projectConfig, path: targetRealpath };
         config.projects = { ...config.projects, [project]: projectConfig };
       }
+      // Adopted-PR remediation boundary fix (bead dark-factory-ik0v /
+      // incident jleechan-j9id): AO's workspace-worktree.create always pins
+      // `baseRef = origin/${project.defaultBranch}` and runs
+      // `git worktree add -b <branch> <path> <baseRef>`. For an adopted PR
+      // whose branch already lives on `origin` and whose daemon-validated
+      // target checkout sits at the PR head (`expectedRevision`), that
+      // creates the local branch at `origin/<defaultBranch>` instead of at
+      // the PR head — the entire remediation session then starts on the
+      // wrong commit. Detect the adopted case by checking that
+      // `origin/<branch>` exists and resolves to `expectedRevision`; when
+      // it does, rebind `projectConfig.defaultBranch` to the PR branch so
+      // AO's `origin/${defaultBranch}` resolves to the PR head. Normal
+      // factory spawns push the new branch to origin AFTER AO spawns, so
+      // `origin/<branch>` will not exist and we leave the configured
+      // default branch alone.
+      const originBranchRef = `origin/${branch}`;
+      let originBranchHead;
+      try {
+        originBranchHead = execFileSync(
+          "git",
+          ["-C", targetRealpath, "rev-parse", "--verify", "--quiet", originBranchRef],
+          { encoding: "utf8", stdio: ["pipe", "pipe", "ignore"] },
+        ).trim();
+      } catch {
+        originBranchHead = "";
+      }
+      if (originBranchHead) {
+        // Refresh the remote-tracking ref before comparing so a stale
+        // mirror cannot silently pin AO at the wrong commit. Fetch errors
+        // must NOT be treated as "ref absent": a failed fetch while the
+        // ref is still resolvable is exactly the case where an old origin
+        // head would mask a force-push the daemon never saw.
+        try {
+          execFileSync(
+            "git",
+            ["-C", targetRealpath, "fetch", "--quiet", "--no-tags", "origin", branch],
+            { encoding: "utf8", stdio: ["pipe", "ignore", "ignore"] },
+          );
+          originBranchHead = execFileSync(
+            "git",
+            ["-C", targetRealpath, "rev-parse", "--verify", "--quiet", originBranchRef],
+            { encoding: "utf8", stdio: ["pipe", "pipe", "ignore"] },
+          ).trim();
+        } catch (error) {
+          fail(
+            `cannot refresh origin/${branch} for adopted-PR remediation spawn; \
+             refusing to spawn because AO would land at a stale remote head: ${error}`,
+          );
+        }
+        if (originBranchHead !== expectedRevision) {
+          fail(
+            `AO project ${project} adopted-PR branch ${branch} origin head is \
+             ${originBranchHead}, expected validated PR head ${expectedRevision}; \
+             refusing to spawn because rebinding defaultBranch would still land AO \
+             at the divergent commit (the exact drift bead dark-factory-ik0v fixes)`,
+          );
+        }
+        projectConfig = {
+          ...projectConfig,
+          defaultBranch: branch,
+        };
+        config.projects = { ...config.projects, [project]: projectConfig };
+      }
     }
     const registry = core.createPluginRegistry();
     await registry.loadFromConfig(config, async (packageName) =>
