@@ -1,0 +1,18 @@
+[Service]
+# Explicit GH_TOKEN for gh CLI auth (operator directive 2026-08-17).
+# The daemon does not otherwise see a GH_TOKEN env var; gh falls back to
+# ~/.config/gh/hosts.yml, which works but couples factory auth to a
+# keyring-managed token that can silently break. Note: tokens for the same
+# GitHub user share a 5000/hr core + 5000/hr GraphQL budget.
+#
+# To enable:
+#   1. Mint a fine-grained PAT at https://github.com/settings/personal-access-tokens/new
+#      with Contents: Read+Write, Pull requests: Read+Write, on the
+#      jleechanorg/worldarchitect.ai and jleechanorg/dark-factory repos
+#      (or whichever repos this factory dispatches into).
+#   2. Replace <PASTE_PAT_HERE> below with the token value (no quotes).
+#   3. Save to ~/.config/systemd/user/ai.dark-factory.daemon.service.d/github-token.conf
+#      with mode 0600.
+#   4. systemctl --user daemon-reload
+#      systemctl --user restart ai.dark-factory.daemon.service
+Environment=GH_TOKEN=<PASTE_PAT_HERE>
