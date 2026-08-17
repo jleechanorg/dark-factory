@@ -514,6 +514,19 @@ rollback-dispatched)
         emit "$rb_id" 0 QUEUED ROLLBACK_DISPATCHED "$ctx"
         rolled=$((rolled + 1))
         ;;
+      *)
+        # Orphan recovery (2026-08-17): DISPATCHED bead with no spawn state file at
+        # all means the async-spawn never produced a state record (e.g. AO daemon
+        # was down at spawn time, or the spawn wrapper crashed before writing).
+        # Roll back to QUEUED with attempt+1 so the next tick re-dispatches, but
+        # cap the attempt to prevent infinite re-attempt loops on truly stuck beads.
+        if [ "$(get_field "$rb_id" attempt)" -lt 5 ]; then
+          sql "UPDATE bead_overlay SET state='QUEUED', attempt=attempt+1, updated_at='$(now)' WHERE bead_id='$(q "$rb_id")' AND state='DISPATCHED';"
+          ctx="$(python3 -c 'import json,sys; v=sys.argv[1]; print(json.dumps({"pr_number":(int(v) if v not in ("","NULL") else None), "reason":"orphan_no_state_file","max_attempt":5}))' "$rb_pr")"
+          emit "$rb_id" 0 QUEUED ROLLBACK_DISPATCHED "$ctx"
+          rolled=$((rolled + 1))
+        fi
+        ;;
     esac
   done < <(sql -separator '|' "SELECT bead_id, coalesce(cast(pr_number as text),'') FROM bead_overlay WHERE state='DISPATCHED' AND pr_number IS NOT NULL;")
   echo "rolled=$rolled"
