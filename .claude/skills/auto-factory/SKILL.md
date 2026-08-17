@@ -184,12 +184,14 @@ result (cooldown handling is unchanged from the original 7-gate design).
 
 `$H autonomy-tick $ELAPSED_SECS` — increment actives, warn at 80%, park over-box.
 
-## 9. End-of-tick summary
+## 9. End-of-tick summary & Conversation Audit
 
-`$H tick-summary coder` (or verifier if you ran verifier steps).
+- Inspect live coding CLI conversations in `/home/jleechan/.claude/projects/` on `jeff-ubuntu` to verify authentic agent progress before reporting status (see `.claude/skills/factory-status/SKILL.md`).
+- `$H tick-summary coder` (or verifier if you ran verifier steps).
 
 ## NEVER
 
+- NEVER report progress based on database flags alone without auditing live CLI transcripts.
 - NEVER run sqlite3 directly against the CXDB — every mutation via `$H`.
 - NEVER force-push or push directly to `base_branch`.
 - NEVER run `gh pr merge` — dispatch is not the merge authority.
