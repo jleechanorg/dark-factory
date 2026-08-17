@@ -189,10 +189,21 @@ no coding sub-agent lanes. The session's ONLY jobs:
    prompt cap is 4096 characters; a long bead body makes its own dispatch
    fail) with `target_repo:` / `existing_pr:` / `existing_branch:` fields
    when driving an existing PR.
-2. Monitor daemon telemetry (`~/Library/Logs/dark-factory/daemon.jsonl`) and
-   report each lifecycle stage.
+2. Monitor daemon telemetry on `jeff-ubuntu` via SSH (`/home/jleechan/Library/Logs/dark-factory/daemon.jsonl`)
+   and report each lifecycle stage.
 3. Escalate blockers the factory cannot self-fix to the OPERATOR, naming the
    exact blocker — never hand-fix them. "The factory is broken so I'll do it
    myself" is the forbidden move: it hides factory gaps and makes the
    label→merge E2E proof unfalsifiable (2026-07-11/12 incidents: hand-driven
    PRs masked a dead coder loop for a full day).
+
+## Factory host placement (Linux-only)
+
+`jeff-ubuntu` is the sole Auto-Factory host. Start, stop, inspect, and deploy
+the daemon only through `/linux` (`ssh jeff-ubuntu ...`) and its user systemd unit
+`ai.dark-factory.daemon.service`. AO worker dispatch runs on that Linux host only.
+This Mac is an operator client: do not load or start a Dark Factory LaunchAgent,
+a local daemon, or local AO workers from factory intake on macOS.
+Always use SSH to Linux for telemetry (`/home/jleechan/Library/Logs/dark-factory/daemon.jsonl`)
+and operational control.
+

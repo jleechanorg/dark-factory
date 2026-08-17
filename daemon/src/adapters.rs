@@ -2686,6 +2686,7 @@ where
 mod spawn_fallback_tests {
     use super::{build_runtime_fallback_chain, fallback_spawn};
     use crate::errors::DaemonError;
+    use crate::tools::SessionId;
 
     // jleechan-9lvs r2 (CodeRabbit blocker on PR #362): the runtime --agent
     // argv must canonicalize through the SAME alias map the startup
@@ -2785,6 +2786,30 @@ mod spawn_fallback_tests {
             rendered.contains("Agent plugin agy not found"),
             "agy's specific error must still be visible in the aggregated error, got: {rendered}"
         );
+    }
+
+    #[test]
+    fn claude_auth_failure_falls_back_to_minimax() {
+        let agents = vec![
+            "claude-code".to_string(),
+            "minimax".to_string(),
+            "antigravity".to_string(),
+        ];
+
+        let session = fallback_spawn(&agents, |agent| {
+            match agent {
+                "claude-code" => Err(DaemonError::Tool {
+                    tool: "ao spawn --agent claude-code".to_string(),
+                    rc: 1,
+                    stderr: "Failed to authenticate: OAuth session expired and could not be refreshed".to_string(),
+                }),
+                "minimax" => Ok(SessionId("wa-minimax-success".to_string())),
+                other => panic!("unexpected agent {other}"),
+            }
+        })
+        .expect("fallback to minimax must succeed when claude-code fails auth");
+
+        assert_eq!(session, SessionId("wa-minimax-success".to_string()));
     }
 }
 

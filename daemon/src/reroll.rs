@@ -1240,25 +1240,7 @@ fn execute_adopted(
 
     let remediation_attempt = bead.attempt;
     let next_attempt = remediation_attempt + 1;
-    let prompt = format!(
-        "Address the following code review feedback from {reviewer} on this pull \
-         request (attempt {attempt}). Work ONLY on the existing branch `{branch}` - \
-         make real code changes that resolve the issues described below, then commit \
-         and push your changes to that same branch.\n\n\
-         HARD CONSTRAINTS (do not violate under any circumstance):\n\
-         - This is a branch owned by an external contributor. You MUST NOT force-push, \
-         rewrite commits, or otherwise rewrite this branch's history.\n\
-         - You MUST NOT close the existing pull request or open a new one.\n\
-         - You MUST NOT create or push to any other branch.\n\
-         - If resolving the feedback genuinely requires rewriting branch history (e.g. a \
-         base conflict), STOP and leave the branch exactly as-is rather than doing \
-         either - a human will handle it.\n\n\
-         Review feedback:\n{review_text}",
-        reviewer = deps.reviewer,
-        attempt = next_attempt,
-        branch = branch,
-        review_text = deps.review_text,
-    );
+    let prompt = build_remediation_prompt(&deps.reviewer, next_attempt, &branch, &deps.review_text);
     // Capture the pre-session HEAD SHA for post-hoc force-push detection
     // (bead jleechan-tfs1 amendment).
     let pre_session_sha = match deps.vcs.remote_head_sha(&branch) {
@@ -1427,3 +1409,59 @@ fn execute_adopted(
         }
     }
 }
+
+pub fn build_remediation_prompt(
+    reviewer: &str,
+    attempt: u32,
+    branch: &str,
+    review_text: &str,
+) -> String {
+    format!(
+        "Address the following code review feedback from {reviewer} on this pull \
+         request (attempt {attempt}). Work ONLY on the existing branch `{branch}` - \
+         make real code changes that resolve the issues described below, then commit \
+         and push your changes to that same branch.\n\n\
+         HARD CONSTRAINTS (do not violate under any circumstance):\n\
+         - This is a branch owned by an external contributor. You MUST NOT force-push, \
+         rebase, squash, or rewrite existing commits (no git rebase or git push --force).\n\
+         - You MUST NOT close the existing pull request or open a new one.\n\
+         - You MUST NOT create or push to any other branch.\n\
+         - Resolving merge conflicts is NOT rewriting history: you MAY and SHOULD resolve \
+         merge conflicts against origin/main by performing a standard forward merge \
+         (`git merge origin/main --allow-unrelated-histories`), resolving conflicts, \
+         committing the merge commit, and pushing normally without --force.\n\n\
+         Review feedback:\n{review_text}",
+        reviewer = reviewer,
+        attempt = attempt,
+        branch = branch,
+        review_text = review_text,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_remediation_prompt_permits_forward_merge_and_forbids_force_push() {
+        let prompt = build_remediation_prompt(
+            "CodeRabbit",
+            2,
+            "fix/dice-roll-label-maxlength-truncation-repro",
+            "Please fix schema bounds",
+        );
+
+        // Forbids force-push / rebase / squash
+        assert!(prompt.contains("MUST NOT force-push, rebase, squash, or rewrite existing commits"));
+        assert!(prompt.contains("no git rebase or git push --force"));
+
+        // Permits and instructs forward merge for conflict resolution
+        assert!(prompt.contains("Resolving merge conflicts is NOT rewriting history"));
+        assert!(prompt.contains("git merge origin/main --allow-unrelated-histories"));
+        assert!(prompt.contains("pushing normally without --force"));
+
+        // Does NOT instruct the agent to stop on base conflicts
+        assert!(!prompt.contains("STOP and leave the branch exactly as-is"));
+    }
+}
+

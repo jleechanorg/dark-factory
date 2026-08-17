@@ -76,6 +76,16 @@ no coding sub-agent lanes. The session's ONLY jobs:
    label→merge E2E proof unfalsifiable (2026-07-11/12 incidents: hand-driven
    PRs masked a dead coder loop for a full day).
 
+## Factory host placement (Linux-only)
+
+`jeff-ubuntu` is the sole Auto-Factory host. Start, stop, inspect, and deploy
+the daemon only through `/linux` (`ssh jeff-ubuntu ...`) and its user systemd unit
+`ai.dark-factory.daemon.service`. AO worker dispatch runs on that Linux host only.
+This Mac is an operator client: do not load or start a Dark Factory LaunchAgent,
+a local daemon, or local AO workers from factory intake on macOS.
+Always use SSH to Linux for telemetry (`/home/jleechan/Library/Logs/dark-factory/daemon.jsonl`)
+and operational control.
+
 ## Setup
 
 ```bash
