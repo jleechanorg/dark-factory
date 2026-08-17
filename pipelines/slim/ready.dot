@@ -1,7 +1,6 @@
 digraph ReadyPRFactory {
   graph [
     goal="Enforce PR is /ready: verify CI tests, /es evidence, /er review, /advice approval, and holdouts with bounded N=3 fix iteration"
-    level5="true"
     label="PR Ready Enforcement"
     skip_explore="true"
     skip_plan="true"
