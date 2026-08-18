@@ -7449,8 +7449,11 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
             .as_nanos()
     ));
     std::fs::create_dir_all(&fake_bin_dir).unwrap();
-    write_fake_reviewer(&fake_bin_dir, "codex", "pass");
-    write_fake_reviewer(&fake_bin_dir, "claude", "pass");
+    write_fake_reviewer(&fake_bin_dir, "codex", "fail should-not-dispatch-codex");
+    write_fake_reviewer(&fake_bin_dir, "claude", "fail should-not-dispatch-claude");
+    write_fake_reviewer(&fake_bin_dir, "agy", "pass");
+    write_fake_reviewer(&fake_bin_dir, "gemini", "pass");
+    write_fake_reviewer(&fake_bin_dir, "cursor-agent", "unreachable");
     write_fake_target_worktree_git(&fake_bin_dir, "deadbeef555");
 
     let original_path = std::env::var("PATH").unwrap_or_default();
@@ -7636,8 +7639,11 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
             .as_nanos()
     ));
     std::fs::create_dir_all(&fake_bin_dir).unwrap();
-    write_fake_reviewer(&fake_bin_dir, "codex", "pass");
-    write_fake_reviewer(&fake_bin_dir, "claude", "pass");
+    write_fake_reviewer(&fake_bin_dir, "codex", "fail should-not-dispatch-codex");
+    write_fake_reviewer(&fake_bin_dir, "claude", "fail should-not-dispatch-claude");
+    write_fake_reviewer(&fake_bin_dir, "agy", "pass");
+    write_fake_reviewer(&fake_bin_dir, "gemini", "pass");
+    write_fake_reviewer(&fake_bin_dir, "cursor-agent", "unreachable");
     write_fake_target_worktree_git(&fake_bin_dir, "deadbeef556");
 
     let original_path = std::env::var("PATH").unwrap_or_default();
@@ -7836,30 +7842,19 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
             .as_nanos()
     ));
     std::fs::create_dir_all(&fake_bin_dir).unwrap();
-    // vendor1 (codex) and vendor2 (claude) both "succeed" as processes but
-    // produce output `parse_skeptic_verdict` cannot parse — matching
-    // tonight's live incident (agy empty stdout, codex quota-exhausted
-    // error text) without depending on nonzero exit codes.
-    write_fake_reviewer(&fake_bin_dir, "codex", "not a verdict at all");
-    write_fake_reviewer(&fake_bin_dir, "claude", "still not a verdict");
-    // vendor3 (agy) is healthy and would have produced a usable verdict —
-    // the bug is that it is never dispatched.
-    write_fake_reviewer(&fake_bin_dir, "agy", "pass");
-    // vendor4 (gemini) is also healthy. Bead jleechan-984e r2 / strict
-    // merge policy (#328): because the dual-dispatch primaries (codex,
-    // claude) both failed to parse and only agy (the 3rd vendor in the
-    // fallback loop) produced a verdict, `used_vendors == ["agy"]` — a
-    // single-family review. This test now asserts the bead MUST park
-    // HUMAN_HELD instead of reaching READY: the fallback chain still works,
-    // but the cross-model guarantee refuses strict-green on a single-family
-    // Pass.
-    write_fake_reviewer(&fake_bin_dir, "gemini", "pass");
-    write_fake_reviewer(&fake_bin_dir, "cursor-agent", "unreachable");
+    write_fake_reviewer(&fake_bin_dir, "codex", "fail should-not-dispatch-codex");
+    write_fake_reviewer(&fake_bin_dir, "claude", "fail should-not-dispatch-claude");
+    // Dual-dispatch primaries (agy, gemini) both fail to parse; the only
+    // remaining default vendor (cursor-agent) produces a usable verdict.
+    write_fake_reviewer(&fake_bin_dir, "agy", "not a verdict at all");
+    write_fake_reviewer(&fake_bin_dir, "gemini", "still not a verdict");
+    write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
 
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
 
-    // Fix the coder vendor so priority = [codex, claude, agy] deterministically.
+    // Fix the coder vendor so priority = [agy, gemini, cursor-agent]
+    // deterministically (minimax is the coder, not a reviewer).
     let _env_guard = EnvVarGuard::set(&[
         ("PATH", &new_path),
         ("DARK_FACTORY_CODER_DEFAULT", "minimax"),
@@ -7964,10 +7959,10 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
     assert_eq!(
         summary.beads_ready, 0,
         "jleechan-baaf regression (r2): when the first two dispatched reviewer \
-         vendors (codex, claude) both fail to produce a parseable verdict \
-         but a third vendor (agy) is available in `priority` and succeeds, \
+         vendors (agy, gemini) both fail to produce a parseable verdict \
+         but a third vendor (cursor-agent) is available in `priority` and succeeds, \
          `skeptic_evidence` MUST fall back to it (NOT propagate a total- \
-         outage Err) — but with single-family agy the bead MUST park on \
+         outage Err) — but with single-family cursor-agent the bead MUST park on \
          the cross-model gate (issue #385 / strict merge policy #328) \
          instead of reaching READY. summary={summary:?}\ntelemetry:\n{telemetry}"
     );
@@ -7995,13 +7990,13 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
     // before the fix, an outage of the first two vendors caused a total-
     // outage Err, never reaching agy.
     assert!(
-        telemetry.contains("\"skeptic_reviewers\":[\"agy\"]"),
-        "fallback chain regression (baaf): agy must appear in skeptic_reviewers \
-         after codex+claude both fail to parse; telemetry:\n{telemetry}"
+        telemetry.contains("\"skeptic_reviewers\":[\"cursor-agent\"]"),
+        "fallback chain regression (baaf): cursor-agent must appear in skeptic_reviewers \
+         after agy+gemini both fail to parse; telemetry:\n{telemetry}"
     );
     assert!(
         telemetry.contains("\"review_degraded\":true"),
-        "single-family agy review MUST emit review_degraded:true so strict \
+        "single-family cursor-agent review MUST emit review_degraded:true so strict \
          merge policy #328 refuses strict-green; telemetry:\n{telemetry}"
     );
 
@@ -8041,17 +8036,12 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
             .as_nanos()
     ));
     std::fs::create_dir_all(&fake_bin_dir).unwrap();
-    write_fake_reviewer(&fake_bin_dir, "codex", "not a verdict at all");
-    write_fake_reviewer(&fake_bin_dir, "claude", "still not a verdict");
+    write_fake_reviewer(&fake_bin_dir, "codex", "fail should-not-dispatch-codex");
+    write_fake_reviewer(&fake_bin_dir, "claude", "fail should-not-dispatch-claude");
     write_fake_reviewer(&fake_bin_dir, "agy", "pass");
-    // Bead jleechan-984e r2 / strict merge policy (#328): agy alone is a
-    // single-family review, so we add gemini (google-gemini family) as a
-    // second healthy vendor so the cross-model guarantee is satisfied.
-    // This keeps the test focused on its wzgl-acceptance (per-gate
-    // breakdown + vendor identity in telemetry) without coupling it to the
-    // cross-model gate failure mode covered by the cursor-agent test below.
     write_fake_reviewer(&fake_bin_dir, "gemini", "pass");
     write_fake_reviewer(&fake_bin_dir, "cursor-agent", "unreachable");
+    write_fake_target_worktree_git(&fake_bin_dir, "deadbeef558");
 
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
@@ -8150,15 +8140,12 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
     )
     .expect("run_tick should succeed against a real (non-owner/repo) target_repo");
 
-    // Bead jleechan-984e r2 / strict merge policy (#328): agy alone is a
-    // single-family review, so the bead must park HUMAN_HELD on the
-    // cross-model gate failure instead of reaching READY. The telemetry
-    // shape (per-gate object, vendor identity) is the focus of this test;
-    // the ready-vs-held outcome is a side effect of the r2 wiring.
+    // Default dual-dispatch is agy + gemini (two distinct Google families),
+    // so the bead reaches READY. Telemetry shape (per-gate object, vendor
+    // identity) is the focus of this test.
     assert_eq!(
-        summary.beads_ready, 0,
-        "bead must park HUMAN_HELD (single-family agy review is blocked by \
-         cross-model gate under r2 / strict merge policy #328)"
+        summary.beads_ready, 1,
+        "agy+gemini dual-dispatch is two families so the bead must reach READY"
     );
 
     let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
@@ -8220,11 +8207,10 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
         .collect();
     assert_eq!(
         skeptic_reviewers,
-        vec!["agy"],
-        "GATE_ASSESSMENT must report the gate-7 reviewer vendor that actually \
-         produced the verdict (agy, the 3rd-vendor fallback), not the first \
-         two dispatched vendors (codex/claude) that failed to parse, and not \
-         a placeholder; context:\n{context}"
+        vec!["agy", "gemini"],
+        "GATE_ASSESSMENT must report the gate-7 reviewer vendors that actually \
+         produced the verdict (agy+gemini dual-dispatch). Codex/Claude must \
+         not appear even when present on PATH; context:\n{context}"
     );
 
     // jleechan-wzgl (PR #239 review round 1): `pr_number` must be present
@@ -8292,14 +8278,11 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
         .expect("python3 predicate failed to run to completion");
     let predicate_stdout = String::from_utf8_lossy(&output.stdout);
     let predicate_stderr = String::from_utf8_lossy(&output.stderr);
-    // Bead jleechan-984e r2: agy alone is single-family, so the
-    // GATE_ASSESSMENT line is now NOT all-green (the skeptic gate emits
-    // verdict=fail with the cross-model reason). The auto-merge-guard.sh
-    // predicate parses the line (proving the dict-shaped gates + canonical
-    // vocab contract holds) and reports `FAIL:skeptic` with exit 1 because
-    // the cross-model gate tripped. The telemetry-shape contract is what
-    // this test exists to lock in; the ready-vs-fail outcome is the r2
-    // wiring's side effect.
+    // Default dual-dispatch is agy + gemini (two distinct Google families),
+    // so GATE_ASSESSMENT is all-green. The auto-merge-guard.sh predicate
+    // must parse the dict-shaped gates + canonical vocab and report a
+    // non-blocking verdict. Codex/Claude are on PATH with fail-trap
+    // replies; they must not be dispatched.
     assert!(
         predicate_stderr.is_empty(),
         "predicate must parse the GATE_ASSESSMENT line without stderr; \
@@ -8307,20 +8290,14 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
          line={gate_assessment_line}"
     );
     assert!(
-        predicate_stdout.starts_with("FAIL:"),
-        "r2 acceptance: single-family agy review must produce a \
-         FAIL:<gate> prefix from auto-merge-guard.sh (the cross-model gate \
-         blocks strict-green); got: {predicate_stdout}"
-    );
-    assert!(
-        predicate_stdout.contains("skeptic"),
-        "r2 acceptance: the FAIL must name the skeptic gate (the gate the \
-         cross-model wire flipped to fail); got: {predicate_stdout}"
-    );
-    assert!(
-        !output.status.success(),
-        "r2 acceptance: predicate must exit non-zero (block the merge) when \
-         cross-model gate fails; got exit success for stdout={predicate_stdout}"
+        predicate_stdout.starts_with("OK")
+            || predicate_stdout.starts_with("PASS")
+            || predicate_stdout.to_ascii_lowercase().contains("all_green")
+            || output.status.success(),
+        "agy+gemini dual-dispatch is two families so auto-merge-guard.sh \
+         must not FAIL the skeptic gate; got: {predicate_stdout} \
+         exit_success={}",
+        output.status.success()
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
@@ -8553,26 +8530,20 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
             .as_nanos()
     ));
     std::fs::create_dir_all(&fake_bin_dir).unwrap();
-    // vendor1 (codex), vendor2 (claude), vendor3 (agy) all "succeed" as
-    // processes but produce output `parse_skeptic_verdict` cannot parse —
-    // matching tonight's live triple-outage.
-    write_fake_reviewer(&fake_bin_dir, "codex", "not a verdict at all");
-    write_fake_reviewer(&fake_bin_dir, "claude", "still not a verdict");
+    write_fake_reviewer(&fake_bin_dir, "codex", "fail should-not-dispatch-codex");
+    write_fake_reviewer(&fake_bin_dir, "claude", "fail should-not-dispatch-claude");
+    // vendor1 (agy) fails to parse; vendor2 (gemini) produces a Pass. That
+    // is a single-family review, so second-family pursuit must reach
+    // cursor-agent (priority[2]) and combine it. Two families → READY.
     write_fake_reviewer(&fake_bin_dir, "agy", "also not a verdict");
-    // vendor4 (gemini) is healthy and would have produced a usable verdict
-    // — the bug (pre-fix) is that `priority[3]` is never reached.
     write_fake_reviewer(&fake_bin_dir, "gemini", "pass");
-    // vendor5 (cursor-agent) is also healthy. Bead jleechan-984e r2 /
-    // strict merge policy (#328): gemini + cursor-agent are two distinct
-    // model families (google-gemini, cursor), so the cross-model guarantee
-    // is satisfied and the bead reaches READY. `gemini` alone would now
-    // park HUMAN_HELD (single family).
     write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
+    write_fake_target_worktree_git(&fake_bin_dir, "deadbeef558");
 
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
 
-    // Fix the coder vendor so priority = [codex, claude, agy, gemini]
+    // Fix the coder vendor so priority = [agy, gemini, cursor-agent]
     // deterministically.
     let _env_guard = EnvVarGuard::set(&[
         ("PATH", &new_path),
@@ -8671,25 +8642,19 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
     .expect("run_tick should succeed against a real (non-owner/repo) target_repo");
 
     let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
-    // Bead jleechan-984e r2 / strict merge policy (#328): the 4th-vendor
-    // fallback chain still works (gemini was reached and parsed), but the
-    // cross-model guarantee refuses strict-green because only gemini ran
-    // (single family). The bead must park HUMAN_HELD, NOT reach READY.
+    // agy failed to parse; gemini produced a Pass; second-family pursuit
+    // reached cursor-agent. Two distinct families → READY, not degraded.
     assert_eq!(
-        summary.beads_ready, 0,
-        "jleechan-bkru regression (r2): when the first THREE dispatched/ \
-         fallback reviewer vendors (codex, claude, agy) all fail to \
-         produce a parseable verdict but a fourth vendor (gemini) is \
-         available in `priority` and succeeds, `skeptic_evidence` MUST \
-         fall back to it (NOT propagate a total-outage Err) — but with \
-         single-family gemini the bead MUST park on the cross-model gate \
-         (issue #385 / strict merge policy #328) instead of reaching \
-         READY. summary={summary:?}\ntelemetry:\n{telemetry}"
+        summary.beads_ready, 1,
+        "jleechan-bkru retarget: when dual-dispatch primary agy fails to \
+         parse but gemini (vendor2) and cursor-agent (second-family \
+         fallback) both produce a verdict, the bead MUST reach READY. \
+         summary={summary:?}\ntelemetry:\n{telemetry}"
     );
     assert!(
-        telemetry.contains("\"all_green\":false"),
-        "GATE_ASSESSMENT must report all_green:false because the cross-model \
-         gate blocks single-family Pass; telemetry:\n{telemetry}"
+        telemetry.contains("\"all_green\":true"),
+        "GATE_ASSESSMENT must report all_green:true for gemini+cursor-agent; \
+         telemetry:\n{telemetry}"
     );
 
     let overlay = store
@@ -8698,25 +8663,17 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
         .expect("overlay must still exist");
     assert_eq!(
         overlay.state,
-        OverlayState::HumanHeld,
-        "bead must park HUMAN_HELD via the fourth vendor's verdict on the \
-         cross-model gate failure, not stay ATTESTED on a false total-outage \
-         and not reach READY (single-family review cannot pass strict merge \
-         policy #328)"
+        OverlayState::Ready,
+        "bead must reach READY via gemini + cursor-agent (two families)"
     );
-    // The fallback chain itself MUST have worked — gemini must appear in
-    // skeptic_reviewers (proving the 4th-vendor slot was reached and its
-    // verdict parsed).
     assert!(
-        telemetry.contains("\"skeptic_reviewers\":[\"gemini\"]"),
-        "fallback chain regression (bkru): gemini must appear in \
-         skeptic_reviewers after codex+claude+agy all fail to parse; \
+        telemetry.contains("\"gemini\"") && telemetry.contains("\"cursor-agent\""),
+        "second-family pursuit must record both gemini and cursor-agent; \
          telemetry:\n{telemetry}"
     );
     assert!(
-        telemetry.contains("\"review_degraded\":true"),
-        "single-family gemini review MUST emit review_degraded:true so \
-         strict merge policy #328 refuses strict-green; telemetry:\n{telemetry}"
+        telemetry.contains("\"review_degraded\":false"),
+        "gemini+cursor-agent MUST emit review_degraded:false; telemetry:\n{telemetry}"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
@@ -8774,7 +8731,7 @@ fn cross_model_reviewer_cursor_agent_falls_back_and_emits_review_degraded() {
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
 
-    // coder=minimax → priority = [codex, claude, agy, gemini, cursor-agent].
+    // coder=minimax → priority = [agy, gemini, cursor-agent].
     let _env_guard = EnvVarGuard::set(&[
         ("PATH", &new_path),
         ("DARK_FACTORY_CODER_DEFAULT", "minimax"),
@@ -8924,7 +8881,7 @@ fn cross_model_reviewer_cursor_agent_falls_back_and_emits_review_degraded() {
     assert!(
         skeptic_reviewers.contains(&"cursor-agent"),
         "issue #385 acceptance: cursor-agent must appear in skeptic_reviewers \
-         after the first four vendors fail to parse; got: {skeptic_reviewers:?}"
+         after the first two vendors fail to parse; got: {skeptic_reviewers:?}"
     );
 
     // Acceptance check #2 from issue #385: with only one vendor having
@@ -8990,12 +8947,9 @@ fn cross_model_reviewer_cursor_agent_falls_back_and_emits_review_degraded() {
 fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
     // The opposite half of the cross-model guarantee: when two vendors
     // from DISTINCT model families both contribute, review_degraded MUST
-    // be false. We arrange for `codex` and `claude` to be the two
-    // healthy reviewers — `codex` is `openai` family, `claude` is
-    // `anthropic`. coder=agy (excluded from priority → priority becomes
-    // [codex, claude, gemini, cursor-agent] with both codex and claude
-    // reaching vendor1/vendor2 dual-dispatch and BOTH producing parseable
-    // verdicts).
+    // be false. Default dual-dispatch is now agy (google-antigravity) +
+    // gemini (google-gemini). Codex and Claude are on PATH with fail-trap
+    // replies so a regression that re-adds them as defaults fails this test.
     let _lock = REAL_TARGET_REPO_TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -9009,10 +8963,10 @@ fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
             .as_nanos()
     ));
     std::fs::create_dir_all(&fake_bin_dir).unwrap();
-    write_fake_reviewer(&fake_bin_dir, "codex", "pass");
-    write_fake_reviewer(&fake_bin_dir, "claude", "pass");
-    write_fake_reviewer(&fake_bin_dir, "agy", "unreachable");
-    write_fake_reviewer(&fake_bin_dir, "gemini", "unreachable");
+    write_fake_reviewer(&fake_bin_dir, "codex", "fail should-not-dispatch-codex");
+    write_fake_reviewer(&fake_bin_dir, "claude", "fail should-not-dispatch-claude");
+    write_fake_reviewer(&fake_bin_dir, "agy", "pass");
+    write_fake_reviewer(&fake_bin_dir, "gemini", "pass");
     write_fake_reviewer(&fake_bin_dir, "cursor-agent", "unreachable");
     write_fake_target_worktree_git(&fake_bin_dir, "deadbeef560");
 
@@ -9021,7 +8975,7 @@ fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
 
     let _env_guard = EnvVarGuard::set(&[
         ("PATH", &new_path),
-        ("DARK_FACTORY_CODER_DEFAULT", "agy"),
+        ("DARK_FACTORY_CODER_DEFAULT", "minimax"),
     ]);
 
     let mut scm = FakeScm::new();
@@ -9118,7 +9072,7 @@ fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
     let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
     assert_eq!(
         summary.beads_ready, 1,
-        "two-family dual-dispatch: codex + claude both pass → bead must reach READY. \
+        "two-family dual-dispatch: agy + gemini both pass → bead must reach READY. \
          summary={summary:?}\ntelemetry:\n{telemetry}"
     );
 
@@ -9144,20 +9098,25 @@ fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    // Both codex (openai) and claude (anthropic) are in the dual-dispatch
-    // vendor1/vendor2 primary positions and both produced parseable
-    // verdicts, so both MUST appear in skeptic_reviewers.
+    // Both agy (google-antigravity) and gemini (google-gemini) are in the
+    // dual-dispatch vendor1/vendor2 primary positions and both produced
+    // parseable verdicts, so both MUST appear in skeptic_reviewers.
+    // Codex/Claude are on PATH with fail-trap replies and must not appear.
     assert!(
-        skeptic_reviewers.contains(&"codex") && skeptic_reviewers.contains(&"claude"),
-        "both codex and claude must be in skeptic_reviewers (both dual-dispatch \
+        skeptic_reviewers.contains(&"agy") && skeptic_reviewers.contains(&"gemini"),
+        "both agy and gemini must be in skeptic_reviewers (both dual-dispatch \
          primaries produced parseable verdicts); got: {skeptic_reviewers:?}"
+    );
+    assert!(
+        !skeptic_reviewers.iter().any(|v| *v == "codex" || *v == "claude"),
+        "codex and claude must not be default reviewers; got: {skeptic_reviewers:?}"
     );
     // Two distinct model families → review_degraded MUST be false.
     assert_eq!(
         context["review_degraded"].as_bool(),
         Some(false),
-        "issue #385 acceptance: two distinct model families (codex=openai, \
-         claude=anthropic) → review_degraded MUST be false; context:\n{context}"
+        "issue #385 acceptance: two distinct model families (agy=google-antigravity, \
+         gemini=google-gemini) → review_degraded MUST be false; context:\n{context}"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
