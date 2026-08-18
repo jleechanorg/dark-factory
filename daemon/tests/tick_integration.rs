@@ -8016,12 +8016,10 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
 // "ironclad" exit criterion E3 needs to confirm the reviewer was non-self
 // and genuinely ran (not self-certified).
 //
-// This scenario reuses the third-vendor-fallback fixture above (codex and
-// claude both produce unparseable output, agy is the one that actually
-// resolves gate 7) specifically because it makes vendor provenance
-// observable: the fix must report `agy` as the contributing reviewer, not
-// `codex`/`claude` (which were dispatched but never produced a usable
-// verdict) and not a placeholder.
+// This scenario uses the production dual-dispatch fixture (coder=agy, so
+// reviewers are claudem + cursor-agent) specifically because it makes
+// vendor provenance observable: the fix must report those two vendors,
+// not `codex`/`gemini` (fail-traps on PATH) and not a placeholder.
 #[test]
 #[cfg(unix)]
 fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {

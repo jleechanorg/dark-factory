@@ -538,7 +538,7 @@ fn run(args: Args) -> Result<(), DaemonError> {
     // diagnostic exits before AO preflight, locking, workspace creation, or
     // worker launch.
     verify_startup_ao_compatibility(args, &ao_project, &configured_vendors, |project, vendors| {
-        daemon::adapters::verify_ao_bridge_compatibility(project, vendors.first().map(String::as_str).unwrap_or("minimax"), vendors)
+        daemon::adapters::verify_ao_bridge_compatibility(project, vendors.first().map(String::as_str).unwrap_or("agy"), vendors)
     })?;
     // Bead jleechan-sb4b: emit a loud config warning at startup if the
     // runtime red-green detector's toolchain is missing. The previous
