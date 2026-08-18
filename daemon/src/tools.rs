@@ -1077,7 +1077,7 @@ pub trait Llm {
 /// be picked up — a stray `/tmp` cwd was the root cause of bead
 /// `jleechan-g1k`).
 pub fn run_tool(cmd: &str, args: &[&str], timeout_secs: u64) -> Result<String, DaemonError> {
-    run_tool_with_cwd(cmd, args, None, timeout_secs)
+    run_tool_with_cwd(cmd, args, None, &[], timeout_secs)
 }
 
 /// Explicit-cwd variant of `run_tool`. `cwd = None` leaves the child's cwd
@@ -1090,13 +1090,26 @@ pub fn run_tool_in_dir(
     cwd: &str,
     timeout_secs: u64,
 ) -> Result<String, DaemonError> {
-    run_tool_with_cwd(cmd, args, Some(cwd), timeout_secs)
+    run_tool_with_cwd(cmd, args, Some(cwd), &[], timeout_secs)
+}
+
+/// Like `run_tool`, but overlays extra environment variables on the child
+/// only. Used by the `claudem` reviewer so MiniMax credentials never leak
+/// into a sibling thread's Anthropic/`agy` dispatch.
+pub fn run_tool_with_env(
+    cmd: &str,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+    timeout_secs: u64,
+) -> Result<String, DaemonError> {
+    run_tool_with_cwd(cmd, args, None, extra_env, timeout_secs)
 }
 
 fn run_tool_with_cwd(
     cmd: &str,
     args: &[&str],
     cwd: Option<&str>,
+    extra_env: &[(&str, &str)],
     timeout_secs: u64,
 ) -> Result<String, DaemonError> {
     let mut command = Command::new(cmd);
@@ -1120,6 +1133,9 @@ fn run_tool_with_cwd(
     }
     if let Some(dir) = cwd {
         command.current_dir(dir);
+    }
+    for (key, value) in extra_env {
+        command.env(key, value);
     }
     let mut child = command
         .spawn()

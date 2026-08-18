@@ -2188,12 +2188,13 @@ fn ao_spawn_command(agent: &str, spec: &SpawnSpec) -> Result<Command, DaemonErro
 /// never silently disappears from `--agent` argv or preflight checks.
 ///
 /// `aow -> minimax` predates this PR (legacy minimax-by-AO alias).
+/// `claudem -> minimax` is the bashrc MiniMax wrapper name.
 /// `agy -> antigravity` covers AO main's 2026-07-18 rename of the
 /// antigravity plugin; lane 222 burned a full spawn cycle before the
 /// jleechan-agy-vendor-name-drift-9lvs regression exposed the mismatch.
 pub fn canonical_for_alias(vendor: &str) -> Option<&'static str> {
     match vendor {
-        "aow" => Some("minimax"),
+        "aow" | "claudem" => Some("minimax"),
         "agy" => Some("antigravity"),
         _ => None,
     }
@@ -2612,7 +2613,7 @@ impl CliSessions {
 
     fn spawn_with_fallback(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
         let fallback_str = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN")
-            .unwrap_or_else(|_| "aow->claude-code->agy->minimax".to_string());
+            .unwrap_or_else(|_| "agy->claudem".to_string());
         let fallback_agents = build_runtime_fallback_chain(&self.agent, &fallback_str);
         fallback_spawn(&fallback_agents, |agent| self.run_spawn_process(agent, spec))
     }
@@ -8534,6 +8535,7 @@ mod vendor_drift_preflight_r2_tests {
     #[test]
     fn legacy_aow_alias_resolves_to_canonical_minimax_plugin() {
         assert_eq!(canonical_for_alias("aow"), Some("minimax"));
+        assert_eq!(canonical_for_alias("claudem"), Some("minimax"));
     }
 
     // Non-legacy vendor names pass through unchanged so the bridge sees the

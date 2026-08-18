@@ -5,14 +5,15 @@
 // every ATTESTED bead dead-ends in `HUMAN_HELD`.
 //
 // Design (see `docs/er-runner-design-2026-07-07.md`): the runner is a fresh
-// subprocess (`agy --print` / `gemini -p` / `cursor-agent -f`) — independent
-// process tree, no conversation memory of the implementing agent — whose
-// reply is posted verbatim as a PR comment so the existing `parse_er_verdict`
-// picks it up on the next tick. Idempotent (already-posted verdict ⇒ no-op),
-// bounded (max 3 attempts per PR), and cooldown-throttled (default 300s) so a
-// transient comment-fetch delay can't trigger duplicate spawns.
+// subprocess (`claude --print` MiniMax / `agy --print` / `cursor-agent -f`)
+// — independent process tree, no conversation memory of the implementing
+// agent — whose reply is posted verbatim as a PR comment so the existing
+// `parse_er_verdict` picks it up on the next tick. Idempotent
+// (already-posted verdict ⇒ no-op), bounded (max 3 attempts per PR), and
+// cooldown-throttled (default 300s) so a transient comment-fetch delay
+// can't trigger duplicate spawns.
 //
-// ZFC: the verdict is decided by an LLM (agy/gemini/cursor-agent) via prompt,
+// ZFC: the verdict is decided by an LLM (claudem/agy/cursor-agent) via prompt,
 // NOT by any keyword/heuristic router in daemon code. The only "routing"
 // decisions the runner makes — "should we spawn this tick?" — are pure state
 // (existing verdict, cooldown elapsed, attempt cap), matching the existing
@@ -224,8 +225,8 @@ pub fn maybe_run(
 
 /// Spawn the actual reviewer subprocess (production path). Reuses the
 /// skeptic gate's vendor argv table (`tick::dispatch_reviewer`) and the
-/// same default priority (`agy` → `gemini` → `cursor-agent`). Claude
-/// Sonnet and Codex are not in that default list (operator 2026-08-18).
+/// same default priority (`claudem` → `agy` → `cursor-agent`). Gemini CLI,
+/// Claude Sonnet, and Codex are not in that default list (operator 2026-08-18).
 fn spawn_reviewer(prompt: &str) -> Result<String, DaemonError> {
     let mut last_err: Option<DaemonError> = None;
     for vendor in crate::tick::SKEPTIC_REVIEWER_PRIORITY {

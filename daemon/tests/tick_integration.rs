@@ -7450,10 +7450,10 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
     ));
     std::fs::create_dir_all(&fake_bin_dir).unwrap();
     write_fake_reviewer(&fake_bin_dir, "codex", "fail should-not-dispatch-codex");
-    write_fake_reviewer(&fake_bin_dir, "claude", "fail should-not-dispatch-claude");
-    write_fake_reviewer(&fake_bin_dir, "agy", "pass");
-    write_fake_reviewer(&fake_bin_dir, "gemini", "pass");
-    write_fake_reviewer(&fake_bin_dir, "cursor-agent", "unreachable");
+    write_fake_reviewer(&fake_bin_dir, "gemini", "fail should-not-dispatch-gemini");
+    write_fake_reviewer(&fake_bin_dir, "agy", "fail should-not-dispatch-agy-self-review");
+    write_fake_reviewer(&fake_bin_dir, "claude", "pass");
+    write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
     write_fake_target_worktree_git(&fake_bin_dir, "deadbeef555");
 
     let original_path = std::env::var("PATH").unwrap_or_default();
@@ -7464,7 +7464,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
     // of the ambient environment.
     let _env_guard = EnvVarGuard::set(&[
         ("PATH", &new_path),
-        ("DARK_FACTORY_CODER_DEFAULT", "minimax"),
+        ("DARK_FACTORY_CODER_DEFAULT", "agy"),
     ]);
 
     let mut scm = FakeScm::new();
@@ -7640,10 +7640,10 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
     ));
     std::fs::create_dir_all(&fake_bin_dir).unwrap();
     write_fake_reviewer(&fake_bin_dir, "codex", "fail should-not-dispatch-codex");
-    write_fake_reviewer(&fake_bin_dir, "claude", "fail should-not-dispatch-claude");
-    write_fake_reviewer(&fake_bin_dir, "agy", "pass");
-    write_fake_reviewer(&fake_bin_dir, "gemini", "pass");
-    write_fake_reviewer(&fake_bin_dir, "cursor-agent", "unreachable");
+    write_fake_reviewer(&fake_bin_dir, "gemini", "fail should-not-dispatch-gemini");
+    write_fake_reviewer(&fake_bin_dir, "agy", "fail should-not-dispatch-agy-self-review");
+    write_fake_reviewer(&fake_bin_dir, "claude", "pass");
+    write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
     write_fake_target_worktree_git(&fake_bin_dir, "deadbeef556");
 
     let original_path = std::env::var("PATH").unwrap_or_default();
@@ -7654,7 +7654,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
     // of the ambient environment.
     let _env_guard = EnvVarGuard::set(&[
         ("PATH", &new_path),
-        ("DARK_FACTORY_CODER_DEFAULT", "minimax"),
+        ("DARK_FACTORY_CODER_DEFAULT", "agy"),
     ]);
 
     let mut scm = FakeScm::new();
@@ -7843,21 +7843,23 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
     ));
     std::fs::create_dir_all(&fake_bin_dir).unwrap();
     write_fake_reviewer(&fake_bin_dir, "codex", "fail should-not-dispatch-codex");
-    write_fake_reviewer(&fake_bin_dir, "claude", "fail should-not-dispatch-claude");
-    // Dual-dispatch primaries (agy, gemini) both fail to parse; the only
-    // remaining default vendor (cursor-agent) produces a usable verdict.
-    write_fake_reviewer(&fake_bin_dir, "agy", "not a verdict at all");
-    write_fake_reviewer(&fake_bin_dir, "gemini", "still not a verdict");
+    write_fake_reviewer(&fake_bin_dir, "gemini", "fail should-not-dispatch-gemini");
+    // Keep the full 3-vendor list by using a coder that is not in
+    // SKEPTIC_REVIEWER_PRIORITY. Dual-dispatch primaries (claudem via the
+    // `claude` binary, then agy) both fail to parse; cursor-agent is the
+    // skip(2) fallback and produces a usable verdict.
+    write_fake_reviewer(&fake_bin_dir, "claude", "not a verdict at all");
+    write_fake_reviewer(&fake_bin_dir, "agy", "still not a verdict");
     write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
 
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
 
-    // Fix the coder vendor so priority = [agy, gemini, cursor-agent]
-    // deterministically (minimax is the coder, not a reviewer).
+    // coder=codex is not in [claudem, agy, cursor-agent], so priority stays
+    // the full default list and the third-vendor fallback is reachable.
     let _env_guard = EnvVarGuard::set(&[
         ("PATH", &new_path),
-        ("DARK_FACTORY_CODER_DEFAULT", "minimax"),
+        ("DARK_FACTORY_CODER_DEFAULT", "codex"),
     ]);
 
     let mut scm = FakeScm::new();
@@ -7959,7 +7961,7 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
     assert_eq!(
         summary.beads_ready, 0,
         "jleechan-baaf regression (r2): when the first two dispatched reviewer \
-         vendors (agy, gemini) both fail to produce a parseable verdict \
+         vendors (claudem, agy) both fail to produce a parseable verdict \
          but a third vendor (cursor-agent) is available in `priority` and succeeds, \
          `skeptic_evidence` MUST fall back to it (NOT propagate a total- \
          outage Err) — but with single-family cursor-agent the bead MUST park on \
@@ -7984,15 +7986,15 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
          and not reach READY (single-family review cannot pass strict merge \
          policy #328)"
     );
-    // The fallback chain itself MUST have worked — `agy` must appear in
-    // skeptic_reviewers (proving the 3rd-vendor slot was reached and its
-    // verdict parsed). This is the regression guard for the baaf bug:
-    // before the fix, an outage of the first two vendors caused a total-
-    // outage Err, never reaching agy.
+    // The fallback chain itself MUST have worked — `cursor-agent` must
+    // appear in skeptic_reviewers (proving the 3rd-vendor slot was reached
+    // and its verdict parsed). This is the regression guard for the baaf
+    // bug: before the fix, an outage of the first two vendors caused a
+    // total-outage Err, never reaching the fallback vendor.
     assert!(
         telemetry.contains("\"skeptic_reviewers\":[\"cursor-agent\"]"),
         "fallback chain regression (baaf): cursor-agent must appear in skeptic_reviewers \
-         after agy+gemini both fail to parse; telemetry:\n{telemetry}"
+         after claudem+agy both fail to parse; telemetry:\n{telemetry}"
     );
     assert!(
         telemetry.contains("\"review_degraded\":true"),
@@ -8037,10 +8039,10 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
     ));
     std::fs::create_dir_all(&fake_bin_dir).unwrap();
     write_fake_reviewer(&fake_bin_dir, "codex", "fail should-not-dispatch-codex");
-    write_fake_reviewer(&fake_bin_dir, "claude", "fail should-not-dispatch-claude");
-    write_fake_reviewer(&fake_bin_dir, "agy", "pass");
-    write_fake_reviewer(&fake_bin_dir, "gemini", "pass");
-    write_fake_reviewer(&fake_bin_dir, "cursor-agent", "unreachable");
+    write_fake_reviewer(&fake_bin_dir, "gemini", "fail should-not-dispatch-gemini");
+    write_fake_reviewer(&fake_bin_dir, "agy", "fail should-not-dispatch-agy-self-review");
+    write_fake_reviewer(&fake_bin_dir, "claude", "pass");
+    write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
     write_fake_target_worktree_git(&fake_bin_dir, "deadbeef558");
 
     let original_path = std::env::var("PATH").unwrap_or_default();
@@ -8048,7 +8050,7 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
 
     let _env_guard = EnvVarGuard::set(&[
         ("PATH", &new_path),
-        ("DARK_FACTORY_CODER_DEFAULT", "minimax"),
+        ("DARK_FACTORY_CODER_DEFAULT", "agy"),
     ]);
 
     let mut scm = FakeScm::new();
@@ -8140,12 +8142,12 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
     )
     .expect("run_tick should succeed against a real (non-owner/repo) target_repo");
 
-    // Default dual-dispatch is agy + gemini (two distinct Google families),
-    // so the bead reaches READY. Telemetry shape (per-gate object, vendor
-    // identity) is the focus of this test.
+    // Production coder=agy excludes agy, so dual-dispatch is claudem +
+    // cursor-agent (minimax + cursor families) and the bead reaches READY.
+    // Telemetry shape (per-gate object, vendor identity) is the focus.
     assert_eq!(
         summary.beads_ready, 1,
-        "agy+gemini dual-dispatch is two families so the bead must reach READY"
+        "claudem+cursor-agent dual-dispatch is two families so the bead must reach READY"
     );
 
     let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
@@ -8207,10 +8209,11 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
         .collect();
     assert_eq!(
         skeptic_reviewers,
-        vec!["agy", "gemini"],
+        vec!["claudem", "cursor-agent"],
         "GATE_ASSESSMENT must report the gate-7 reviewer vendors that actually \
-         produced the verdict (agy+gemini dual-dispatch). Codex/Claude must \
-         not appear even when present on PATH; context:\n{context}"
+         produced the verdict (claudem+cursor-agent; agy is the coder). \
+         Codex/Gemini CLI/Anthropic Claude must not appear even when present \
+         on PATH; context:\n{context}"
     );
 
     // jleechan-wzgl (PR #239 review round 1): `pr_number` must be present
@@ -8278,10 +8281,10 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
         .expect("python3 predicate failed to run to completion");
     let predicate_stdout = String::from_utf8_lossy(&output.stdout);
     let predicate_stderr = String::from_utf8_lossy(&output.stderr);
-    // Default dual-dispatch is agy + gemini (two distinct Google families),
+    // Production dual-dispatch is claudem + cursor-agent (two families),
     // so GATE_ASSESSMENT is all-green. The auto-merge-guard.sh predicate
     // must parse the dict-shaped gates + canonical vocab and report a
-    // non-blocking verdict. Codex/Claude are on PATH with fail-trap
+    // non-blocking verdict. Codex/Gemini CLI are on PATH with fail-trap
     // replies; they must not be dispatched.
     assert!(
         predicate_stderr.is_empty(),
@@ -8294,7 +8297,7 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
             || predicate_stdout.starts_with("PASS")
             || predicate_stdout.to_ascii_lowercase().contains("all_green")
             || output.status.success(),
-        "agy+gemini dual-dispatch is two families so auto-merge-guard.sh \
+        "claudem+cursor-agent dual-dispatch is two families so auto-merge-guard.sh \
          must not FAIL the skeptic gate; got: {predicate_stdout} \
          exit_success={}",
         output.status.success()
@@ -8498,22 +8501,15 @@ fn cross_repo_bead_verification_loop_uses_its_own_repo_not_cfg_target_repo() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
-// --- jleechan-bkru: 4th-vendor (gemini) fallback gap --------------------
+// --- jleechan-bkru: second-family pursuit after a dual-dispatch miss ----
 //
-// Live incident 2026-07-09 (bead jleechan-93ft, worldarchitect.ai PR #7888):
-// codex, claude, AND agy went simultaneously non-functional (codex quota
-// exhausted multi-day, claude weekly limit hit multi-day, agy quota
-// exhausted + a separate session-continuity bug even when fresh). With
-// `priority = [codex, claude, agy]`, once ALL THREE fail to parse,
-// `skeptic_evidence` had zero remaining vendors to fall back to and
-// permanently failed gate 7, even though a `gemini` CLI reviewer was live
-// and produced a real, parseable verdict in manual testing.
-//
-// This test adds a 4th vendor (`gemini`) to `priority` and asserts that
-// when the first three dispatched/fallback vendors (codex, claude, agy)
-// all fail to produce a parseable verdict, `skeptic_evidence` falls back
-// to the 4th (`gemini`) before giving up — generalizing the jleechan-baaf
-// single `priority[2]` fallback into a loop over all remaining vendors.
+// Historical incident 2026-07-09 added a later-list fallback so a total
+// outage of the dual-dispatch primaries could not permanently fail gate 7.
+// Gemini CLI is no longer in the default list (same Google family as agy).
+// This test now pins the remaining contract: with the full 3-vendor queue
+// [claudem, agy, cursor-agent], a parse miss on vendor1 plus a Pass on
+// vendor2 is still single-family, so second-family pursuit must reach
+// cursor-agent and combine it. Two families → READY.
 #[test]
 #[cfg(unix)]
 fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
@@ -8531,23 +8527,22 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
     ));
     std::fs::create_dir_all(&fake_bin_dir).unwrap();
     write_fake_reviewer(&fake_bin_dir, "codex", "fail should-not-dispatch-codex");
-    write_fake_reviewer(&fake_bin_dir, "claude", "fail should-not-dispatch-claude");
-    // vendor1 (agy) fails to parse; vendor2 (gemini) produces a Pass. That
-    // is a single-family review, so second-family pursuit must reach
-    // cursor-agent (priority[2]) and combine it. Two families → READY.
-    write_fake_reviewer(&fake_bin_dir, "agy", "also not a verdict");
-    write_fake_reviewer(&fake_bin_dir, "gemini", "pass");
+    write_fake_reviewer(&fake_bin_dir, "gemini", "fail should-not-dispatch-gemini");
+    // Keep the full 3-vendor list (coder not in the queue). vendor1
+    // (claudem via `claude`) fails to parse; vendor2 (agy) produces a
+    // Pass. That is a single-family review, so second-family pursuit must
+    // reach cursor-agent (priority[2]) and combine it. Two families → READY.
+    write_fake_reviewer(&fake_bin_dir, "claude", "not a verdict at all");
+    write_fake_reviewer(&fake_bin_dir, "agy", "pass");
     write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
     write_fake_target_worktree_git(&fake_bin_dir, "deadbeef558");
 
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
 
-    // Fix the coder vendor so priority = [agy, gemini, cursor-agent]
-    // deterministically.
     let _env_guard = EnvVarGuard::set(&[
         ("PATH", &new_path),
-        ("DARK_FACTORY_CODER_DEFAULT", "minimax"),
+        ("DARK_FACTORY_CODER_DEFAULT", "codex"),
     ]);
 
     let mut scm = FakeScm::new();
@@ -8642,18 +8637,18 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
     .expect("run_tick should succeed against a real (non-owner/repo) target_repo");
 
     let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
-    // agy failed to parse; gemini produced a Pass; second-family pursuit
+    // claudem failed to parse; agy produced a Pass; second-family pursuit
     // reached cursor-agent. Two distinct families → READY, not degraded.
     assert_eq!(
         summary.beads_ready, 1,
-        "jleechan-bkru retarget: when dual-dispatch primary agy fails to \
-         parse but gemini (vendor2) and cursor-agent (second-family \
+        "jleechan-bkru retarget: when dual-dispatch primary claudem fails to \
+         parse but agy (vendor2) and cursor-agent (second-family \
          fallback) both produce a verdict, the bead MUST reach READY. \
          summary={summary:?}\ntelemetry:\n{telemetry}"
     );
     assert!(
         telemetry.contains("\"all_green\":true"),
-        "GATE_ASSESSMENT must report all_green:true for gemini+cursor-agent; \
+        "GATE_ASSESSMENT must report all_green:true for agy+cursor-agent; \
          telemetry:\n{telemetry}"
     );
 
@@ -8664,16 +8659,16 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
     assert_eq!(
         overlay.state,
         OverlayState::Ready,
-        "bead must reach READY via gemini + cursor-agent (two families)"
+        "bead must reach READY via agy + cursor-agent (two families)"
     );
     assert!(
-        telemetry.contains("\"gemini\"") && telemetry.contains("\"cursor-agent\""),
-        "second-family pursuit must record both gemini and cursor-agent; \
+        telemetry.contains("\"agy\"") && telemetry.contains("\"cursor-agent\""),
+        "second-family pursuit must record both agy and cursor-agent; \
          telemetry:\n{telemetry}"
     );
     assert!(
         telemetry.contains("\"review_degraded\":false"),
-        "gemini+cursor-agent MUST emit review_degraded:false; telemetry:\n{telemetry}"
+        "agy+cursor-agent MUST emit review_degraded:false; telemetry:\n{telemetry}"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
@@ -8687,22 +8682,19 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
 // family available." This test exercises BOTH halves of that contract
 // through the real `run_tick` call stack:
 //
-//   1. The 5th priority member (`cursor-agent`, a different model family
-//      from claude/codex/agy/gemini/minimax) is reachable as a vendor
-//      fallback when the first four are unavailable — proving the
-//      `cursor-agent -f <prompt>` dispatch arm in `dispatch_reviewer` and
-//      the appended `cursor-agent` entry in the priority list.
+//   1. The 3rd priority member (`cursor-agent`, a different model family
+//      from claudem/agy) is reachable as a vendor fallback when the first
+//      two are unavailable — proving the `cursor-agent -f <prompt>`
+//      dispatch arm in `dispatch_reviewer`.
 //
-//   2. When the gate-7 reviewer set ends up as `["agy", "cursor-agent"]`
-//      (two distinct families per `verifier::vendor_model_family`), the
-//      GATE_ASSESSMENT telemetry carries `review_degraded: false`, so
-//      strict merge policy (#328) treats the assessment as strict-green
-//      rather than NOT strict-green.
+//   2. Production dual-dispatch (`claudem` + `cursor-agent`, coder=agy)
+//      covers two families so GATE_ASSESSMENT carries
+//      `review_degraded: false`.
 //
-//   3. The single-family failure mode — `["agy"]` only because cursor-agent
-//      and every earlier vendor failed to parse — produces
-//      `review_degraded: true` in GATE_ASSESSMENT, which is the exact
-//      fail-closed signal the issue asks for.
+//   3. The single-family failure mode — `["cursor-agent"]` only because
+//      claudem and agy failed to parse — produces `review_degraded: true`
+//      in GATE_ASSESSMENT, which is the exact fail-closed signal the
+//      issue asks for.
 #[test]
 #[cfg(unix)]
 fn cross_model_reviewer_cursor_agent_falls_back_and_emits_review_degraded() {
@@ -8719,22 +8711,24 @@ fn cross_model_reviewer_cursor_agent_falls_back_and_emits_review_degraded() {
             .as_nanos()
     ));
     std::fs::create_dir_all(&fake_bin_dir).unwrap();
-    // vendors 1-4 all fail to parse (mimics the live 2026-07-09
-    // codex/claude/agy triple-outage that motivated issue #385). vendor5
-    // (`cursor-agent`) is healthy and produces a parseable verdict.
+    // Dual-dispatch primaries (claudem via `claude`, then agy) fail to
+    // parse; cursor-agent is the skip(2) fallback and produces a verdict.
+    // Gemini CLI is on PATH as a fail-trap and must not be dispatched.
     write_fake_reviewer(&fake_bin_dir, "codex", "not a verdict");
     write_fake_reviewer(&fake_bin_dir, "claude", "still not a verdict");
     write_fake_reviewer(&fake_bin_dir, "agy", "also not a verdict");
-    write_fake_reviewer(&fake_bin_dir, "gemini", "also still not a verdict");
+    write_fake_reviewer(&fake_bin_dir, "gemini", "fail should-not-dispatch-gemini");
     write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
 
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
 
-    // coder=minimax → priority = [agy, gemini, cursor-agent].
+    // coder=codex is not in the reviewer queue, so priority stays
+    // [claudem, agy, cursor-agent] and the third-vendor fallback is
+    // reachable.
     let _env_guard = EnvVarGuard::set(&[
         ("PATH", &new_path),
-        ("DARK_FACTORY_CODER_DEFAULT", "minimax"),
+        ("DARK_FACTORY_CODER_DEFAULT", "codex"),
     ]);
 
     let mut scm = FakeScm::new();
@@ -8964,10 +8958,10 @@ fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
     ));
     std::fs::create_dir_all(&fake_bin_dir).unwrap();
     write_fake_reviewer(&fake_bin_dir, "codex", "fail should-not-dispatch-codex");
-    write_fake_reviewer(&fake_bin_dir, "claude", "fail should-not-dispatch-claude");
-    write_fake_reviewer(&fake_bin_dir, "agy", "pass");
-    write_fake_reviewer(&fake_bin_dir, "gemini", "pass");
-    write_fake_reviewer(&fake_bin_dir, "cursor-agent", "unreachable");
+    write_fake_reviewer(&fake_bin_dir, "gemini", "fail should-not-dispatch-gemini");
+    write_fake_reviewer(&fake_bin_dir, "agy", "fail should-not-dispatch-agy-self-review");
+    write_fake_reviewer(&fake_bin_dir, "claude", "pass");
+    write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
     write_fake_target_worktree_git(&fake_bin_dir, "deadbeef560");
 
     let original_path = std::env::var("PATH").unwrap_or_default();
@@ -8975,7 +8969,7 @@ fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
 
     let _env_guard = EnvVarGuard::set(&[
         ("PATH", &new_path),
-        ("DARK_FACTORY_CODER_DEFAULT", "minimax"),
+        ("DARK_FACTORY_CODER_DEFAULT", "agy"),
     ]);
 
     let mut scm = FakeScm::new();
@@ -9072,7 +9066,7 @@ fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
     let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
     assert_eq!(
         summary.beads_ready, 1,
-        "two-family dual-dispatch: agy + gemini both pass → bead must reach READY. \
+        "two-family dual-dispatch: claudem + cursor-agent both pass → bead must reach READY. \
          summary={summary:?}\ntelemetry:\n{telemetry}"
     );
 
@@ -9098,18 +9092,18 @@ fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    // Both agy (google-antigravity) and gemini (google-gemini) are in the
-    // dual-dispatch vendor1/vendor2 primary positions and both produced
-    // parseable verdicts, so both MUST appear in skeptic_reviewers.
-    // Codex/Claude are on PATH with fail-trap replies and must not appear.
+    // Production coder=agy excludes agy, so dual-dispatch is claudem
+    // (minimax) + cursor-agent (cursor). Both produced parseable verdicts.
+    // Codex/Gemini CLI/Anthropic Claude are on PATH with fail-traps.
     assert!(
-        skeptic_reviewers.contains(&"agy") && skeptic_reviewers.contains(&"gemini"),
-        "both agy and gemini must be in skeptic_reviewers (both dual-dispatch \
-         primaries produced parseable verdicts); got: {skeptic_reviewers:?}"
+        skeptic_reviewers.contains(&"claudem") && skeptic_reviewers.contains(&"cursor-agent"),
+        "both claudem and cursor-agent must be in skeptic_reviewers (both \
+         dual-dispatch primaries produced parseable verdicts); got: {skeptic_reviewers:?}"
     );
     assert!(
-        !skeptic_reviewers.iter().any(|v| *v == "codex" || *v == "claude"),
-        "codex and claude must not be default reviewers; got: {skeptic_reviewers:?}"
+        !skeptic_reviewers.iter().any(|v| *v == "codex" || *v == "claude" || *v == "gemini" || *v == "agy"),
+        "codex, anthropic claude, gemini CLI, and the agy coder must not be \
+         default reviewers; got: {skeptic_reviewers:?}"
     );
     // Two distinct model families → review_degraded MUST be false.
     assert_eq!(

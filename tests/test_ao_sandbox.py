@@ -101,7 +101,7 @@ def test_codergen_ao_spawn_args_are_sandboxed(monkeypatch, tmp_path):
     assert "ao" in spawn_argv and "spawn" in spawn_argv
     ao_idx = spawn_argv.index("ao")
     assert spawn_argv[ao_idx + 1] == "spawn"
-    assert spawn_argv[ao_idx + 2] == "test"
+    assert "Goal: test" in spawn_argv[ao_idx + 2]
     assert "--project" in spawn_argv
     assert spawn_argv[spawn_argv.index("--project") + 1] == "fake-project"
     assert "--agent" in spawn_argv

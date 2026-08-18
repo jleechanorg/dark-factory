@@ -2927,15 +2927,14 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
 /// 110s→150s sizing (PR#216).
 const REVIEWER_TIMEOUT_SECS: u64 = 300;
 
-/// Default skeptic / `/er` reviewer priority. Claude Sonnet and Codex are
-/// intentionally absent from this list (operator 2026-08-18 /linux):
-/// automatic PR review must not consume Anthropic or OpenAI quota. Dual
-/// dispatch is `agy` + `gemini` (distinct Google families per
-/// `verifier::vendor_model_family`); `cursor-agent` is the fallback
-/// second-family vendor. Dispatch arms for `codex` / `claude` remain in
-/// `dispatch_reviewer` so an explicit override can still reach them, but
-/// they are never the default.
-pub(crate) const SKEPTIC_REVIEWER_PRIORITY: &[&str] = &["agy", "gemini", "cursor-agent"];
+/// Default skeptic / `/er` reviewer priority (operator 2026-08-18):
+/// `claudem` (bashrc MiniMax wrapper) → `agy` (Antigravity) →
+/// `cursor-agent` (`agentf`). Gemini CLI is not in this list: it is the
+/// same Google family as `agy` and is no longer a factory reviewer.
+/// Claude Sonnet and Codex stay out. Dual-dispatch of the first two
+/// (with the coder vendor excluded) is what satisfies the cross-model
+/// guarantee; `cursor-agent` is the fallback second family.
+pub(crate) const SKEPTIC_REVIEWER_PRIORITY: &[&str] = &["claudem", "agy", "cursor-agent"];
 
 /// Dispatch one independent reviewer subprocess by vendor name. Extracted
 /// from `skeptic_evidence` so two vendors can be dispatched in parallel
@@ -2961,6 +2960,38 @@ pub(crate) fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, Da
             ],
             REVIEWER_TIMEOUT_SECS,
         ),
+        // bashrc `claudem()`: MiniMax via the Claude Code CLI. Headless
+        // factory review uses `--print` (never `--teammate-mode=tmux`,
+        // which is interactive and would hang the daemon). Env is applied
+        // to this child only so a sibling `agy` thread cannot inherit
+        // MiniMax's ANTHROPIC_BASE_URL.
+        "claudem" | "minimax" => {
+            let key = std::env::var("MINIMAX_API_KEY").unwrap_or_default();
+            crate::tools::run_tool_with_env(
+                "claude",
+                &[
+                    "--print",
+                    "--dangerously-skip-permissions",
+                    "--setting-sources",
+                    "",
+                    "--effort",
+                    "high",
+                    "--model",
+                    "MiniMax-M3",
+                    prompt,
+                ],
+                &[
+                    ("CLAUDEM_MODE", "1"),
+                    ("ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic"),
+                    ("ANTHROPIC_AUTH_TOKEN", key.as_str()),
+                    ("ANTHROPIC_API_KEY", key.as_str()),
+                    ("ANTHROPIC_MODEL", "MiniMax-M3"),
+                    ("ANTHROPIC_SMALL_FAST_MODEL", "MiniMax-M3"),
+                    ("CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL", "0"),
+                ],
+                REVIEWER_TIMEOUT_SECS,
+            )
+        }
         // Flag order matters: agy's `--print` takes the PROMPT as its own
         // value, so any flag placed between `--print` and the prompt is
         // swallowed as the message and the real prompt is dropped (the
@@ -2971,35 +3002,19 @@ pub(crate) fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, Da
             &["--dangerously-skip-permissions", "--print", prompt],
             REVIEWER_TIMEOUT_SECS,
         ),
-        // jleechan-bkru: 4th reviewer vendor, added after a live 2026-07-09
-        // incident where codex+claude+agy were ALL simultaneously
-        // non-functional (codex quota-exhausted multi-day, claude weekly
-        // limit hit multi-day, agy quota-exhausted + a separate
-        // session-continuity bug). `gemini` is Google's Gemini CLI
-        // (`@google/gemini-cli`), a distinct product/account/quota from
-        // `agy` (Antigravity). `--yolo` auto-approves tool calls (gemini's
-        // equivalent of `--dangerously-skip-permissions`); `--skip-trust`
-        // is required in headless/non-interactive contexts or the CLI
-        // refuses to run with a "not a trusted directory" error.
+        // Gemini CLI is kept for explicit override only. It is not in
+        // `SKEPTIC_REVIEWER_PRIORITY` (operator 2026-08-18): same Google
+        // family as `agy`. `--yolo` auto-approves tool calls; `--skip-trust`
+        // is required in headless contexts or the CLI refuses to run.
         "gemini" => run_tool(
             "gemini",
             &["-p", prompt, "--yolo", "--skip-trust"],
             REVIEWER_TIMEOUT_SECS,
         ),
-        // jleechan-984e / issue #385: 5th reviewer vendor (Cursor CLI,
-        // `cursor-agent`). Invoked as `cursor-agent -f <prompt>` (headless
-        // non-interactive mode) — the `-f` flag is the documented
-        // equivalent of `claude --print` / `agy --print` / `gemini -p`
-        // and is required so the tool reads the prompt from argv instead
-        // of trying to open an interactive TUI. Cursor's model family is
-        // distinct from claude/codex/agy/gemini/minimax (see
-        // `verifier::vendor_model_family`), so dispatching it as a
-        // fallback (priority[4] in `skeptic_evidence`) is what makes the
-        // gate-7 reviewer set cross-model instead of single-family. Both
-        // `cursor-agent` and the bare `cursor` alias are accepted so
-        // `skeptic_reviewers` telemetry is stable regardless of which name
-        // the priority list uses.
-        "cursor-agent" | "cursor" => run_tool(
+        // Default fallback reviewer (Cursor CLI, bashrc `agentf`). Invoked as
+        // `cursor-agent -f <prompt>` (headless). Distinct family from
+        // claudem/agy (see `verifier::vendor_model_family`).
+        "cursor-agent" | "cursor" | "agentf" => run_tool(
             "cursor-agent",
             &["-f", prompt],
             REVIEWER_TIMEOUT_SECS,
@@ -3156,23 +3171,25 @@ fn skeptic_evidence(
 
     let coder_agent = std::env::var("DARK_FACTORY_CODER_DEFAULT")
         .or_else(|_| std::env::var("DARK_FACTORY_REVIEWER_DEFAULT"))
-        .unwrap_or_else(|_| "minimax".to_string());
+        .unwrap_or_else(|_| "agy".to_string());
 
     let coder_vendor = match coder_agent.to_ascii_lowercase().as_str() {
+        // `claudem` contains `claude` — check MiniMax aliases first so a
+        // claudem coder is excluded from the claudem reviewer slot, not
+        // from a phantom Anthropic `claude` slot that is not in the queue.
+        a if a.contains("claudem") || a.contains("minimax") => "claudem",
         a if a.contains("claude") => "claude",
-        a if a.contains("minimax") => "minimax",
-        a if a.contains("agy") => "agy",
+        a if a.contains("agy") || a.contains("antigravity") => "agy",
         a if a.contains("codex") => "codex",
         a if a.contains("gemini") => "gemini",
+        a if a.contains("cursor") || a.contains("agentf") => "cursor-agent",
         _ => "",
     };
 
-    // Operator 2026-08-18: Claude Sonnet and Codex are no longer default
-    // automatic-PR-review vendors. Dual-dispatch is agy + gemini (two
-    // distinct Google families); cursor-agent is the fallback so a
-    // single-family outage still has a second family to pursue. MiniMax
-    // is the default coder (`DARK_FACTORY_CODER_DEFAULT`) and is excluded
-    // below to keep the adversarial guarantee.
+    // Operator 2026-08-18: reviewer queue is claudem → agy → cursor-agent.
+    // Default coder is agy (fallback claudem), so production exclusion
+    // drops agy and dual-dispatches claudem + cursor-agent (minimax +
+    // cursor families). Gemini CLI is not in this list.
     let mut priority: Vec<&str> = SKEPTIC_REVIEWER_PRIORITY.to_vec();
     if !coder_vendor.is_empty() {
         priority.retain(|&v| v != coder_vendor);
@@ -3258,8 +3275,8 @@ fn skeptic_evidence(
         // `run_fast_tier`'s per-bead catch-and-continue (phase =
         // "skeptic_evidence"); the bead stays ATTESTED and the next tick
         // retries, instead of guessing a verdict.
-        let vendor1 = priority.first().copied().unwrap_or("agy").to_string();
-        let vendor2 = priority.get(1).copied().unwrap_or("gemini").to_string();
+        let vendor1 = priority.first().copied().unwrap_or("claudem").to_string();
+        let vendor2 = priority.get(1).copied().unwrap_or("agy").to_string();
         let vendor1_label = vendor1.clone();
         let vendor2_label = vendor2.clone();
 
@@ -3782,12 +3799,12 @@ mod second_family_candidate_tests {
     //! primaries, unknown families excluded) without spawning subprocesses.
     use super::second_family_candidates;
 
-    const PRIORITY: [&str; 3] = ["agy", "gemini", "cursor-agent"];
+    const PRIORITY: [&str; 3] = ["claudem", "agy", "cursor-agent"];
 
     #[test]
-    fn agy_only_yields_cursor_agent_fallback() {
-        let used = vec!["agy".to_string()];
-        // skip(2) omits the dual-dispatch primaries (agy, gemini); the only
+    fn claudem_only_yields_cursor_agent_fallback() {
+        let used = vec!["claudem".to_string()];
+        // skip(2) omits the dual-dispatch primaries (claudem, agy); the only
         // remaining distinct family is cursor-agent.
         assert_eq!(
             second_family_candidates(&used, &PRIORITY),
@@ -3797,15 +3814,15 @@ mod second_family_candidate_tests {
 
     #[test]
     fn already_used_fallback_vendor_and_its_family_are_not_recandidated() {
-        let used = vec!["agy".to_string(), "cursor-agent".to_string()];
-        // cursor-agent already contributed; gemini is a dual-dispatch
+        let used = vec!["claudem".to_string(), "cursor-agent".to_string()];
+        // cursor-agent already contributed; agy is a dual-dispatch
         // primary (index 1) so skip(2) never re-offers it.
         assert!(second_family_candidates(&used, &PRIORITY).is_empty());
     }
 
     #[test]
     fn two_families_present_still_lists_only_new_families() {
-        let used = vec!["agy".to_string(), "gemini".to_string()];
+        let used = vec!["claudem".to_string(), "agy".to_string()];
         // Caller only invokes this when degraded, but the helper itself
         // must never re-offer a represented family. cursor is still new.
         assert_eq!(
@@ -3818,8 +3835,9 @@ mod second_family_candidate_tests {
     fn default_priority_excludes_claude_and_codex() {
         assert_eq!(
             super::SKEPTIC_REVIEWER_PRIORITY,
-            &["agy", "gemini", "cursor-agent"]
+            &["claudem", "agy", "cursor-agent"]
         );
+        assert!(!super::SKEPTIC_REVIEWER_PRIORITY.contains(&"gemini"));
         assert!(!super::SKEPTIC_REVIEWER_PRIORITY.contains(&"claude"));
         assert!(!super::SKEPTIC_REVIEWER_PRIORITY.contains(&"codex"));
         assert!(!super::SKEPTIC_REVIEWER_PRIORITY.contains(&"claude-sonnet"));
@@ -3827,10 +3845,10 @@ mod second_family_candidate_tests {
 
     #[test]
     fn unknown_family_or_short_priority_yields_empty() {
-        let used = vec!["agy".to_string()];
-        let priority = ["agy", "gemini", "mock_llm", "not-a-vendor"];
+        let used = vec!["claudem".to_string()];
+        let priority = ["claudem", "agy", "mock_llm", "not-a-vendor"];
         assert!(second_family_candidates(&used, &priority).is_empty());
-        let short = ["agy", "gemini"];
+        let short = ["claudem", "agy"];
         assert!(second_family_candidates(&used, &short).is_empty());
     }
 }

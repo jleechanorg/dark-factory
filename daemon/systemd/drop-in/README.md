@@ -24,10 +24,10 @@ machine-specific — same pattern as `~/.config/gh/hosts.yml`, never tracked.
 
 | Drop-in (runtime) | Purpose | Source |
 |---|---|---|
-| `gemini.conf` | `GEMINI_API_KEY` for gate-7's 4th reviewer vendor | operator directive 2026-07-09 |
+| `gemini.conf` | `GEMINI_API_KEY` (kept for explicit Gemini CLI override; Gemini CLI is **not** a default reviewer — `agy` is the Google lane) | operator directive 2026-07-09; superseded as default 2026-08-18 |
 | `github.conf` | `UnsetEnvironment=GITHUB_TOKEN` (strips the legacy var) | factory host placement doc |
-| `minimax.conf` | `MINIMAX_API_KEY` + `ANTHROPIC_BASE_URL` for the default reviewer | operator directive 2026-07-08 |
-| `zz-runtime-recovery.conf` | Runtime-recovery overrides | factory author |
+| `minimax.conf` | `MINIMAX_API_KEY` for the `claudem` skeptic/`/er` lane (`claude --print` + MiniMax env) | operator directive 2026-07-08; reviewer default 2026-08-18 |
+| `zz-runtime-recovery.conf` | Runtime-recovery overrides. Required live values (2026-08-18): `DARK_FACTORY_CODER_DEFAULT=agy`, `DARK_FACTORY_REVIEWER_DEFAULT=agy`, `DARK_FACTORY_REVIEWER_FALLBACK_CHAIN=agy->claudem` | factory author |
 | **`github-token.conf`** | **`Environment=GH_TOKEN=...` for explicit `gh` auth** | **operator directive 2026-08-17 (this PR)** |
 
 ## When to add a new drop-in here

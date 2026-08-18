@@ -435,7 +435,7 @@ fn ao_runtime_binding(cfg: &Config) -> Result<(String, String), DaemonError> {
         })?
         .ao_project;
     let default_agent = std::env::var("DARK_FACTORY_REVIEWER_DEFAULT")
-        .unwrap_or_else(|_| "minimax".to_string());
+        .unwrap_or_else(|_| "agy".to_string());
     Ok((ao_project, default_agent))
 }
 
@@ -447,7 +447,7 @@ fn ao_runtime_binding(cfg: &Config) -> Result<(String, String), DaemonError> {
 /// (or vice versa).
 fn configured_vendor_list(default_agent: &str) -> Vec<String> {
     let fallback_str = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN")
-        .unwrap_or_else(|_| "aow->claude-code->agy->minimax".to_string());
+        .unwrap_or_else(|_| "agy->claudem".to_string());
 
     let canonicalize = |vendor: &str| -> String {
         daemon::adapters::canonical_for_alias(vendor)
