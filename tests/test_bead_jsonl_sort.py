@@ -89,8 +89,9 @@ def test_br_sync_preserves_id_sort(tmp_path: Path) -> None:
     # is unreachable on this host, not violated.
     if shutil.which("br") is None:
         pytest.skip("`br` CLI not on PATH (not a beads-enabled runner)")
+    # Init first to establish authorized db schema before injecting JSONL
+    subprocess.run(["br", "init"], cwd=tmp_path, check=True, capture_output=True)
     fixture = tmp_path / ".beads"
-    fixture.mkdir(parents=True)
     (fixture / "config.yaml").write_text("issue_prefix: jsonlsort-test\n")
     # Required minimum fields per br 0.2.x schema:
     # id, title, status, priority, issue_type, created_at, updated_at
@@ -110,8 +111,7 @@ def test_br_sync_preserves_id_sort(tmp_path: Path) -> None:
         json.dumps(b) + "\n" + json.dumps(a) + "\n",
         encoding="utf-8",
     )
-    # Init + import the deliberately-out-of-order JSONL
-    subprocess.run(["br", "init"], cwd=tmp_path, check=True, capture_output=True)
+    # Import the deliberately-out-of-order JSONL
     subprocess.run(
         ["br", "sync", "--import-only"], cwd=tmp_path, check=True, capture_output=True
     )

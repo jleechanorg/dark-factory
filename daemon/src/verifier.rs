@@ -282,11 +282,11 @@ fn find_marker_verdict(raw: &str) -> Option<SkepticVerdict> {
 pub fn vendor_model_family(vendor: &str) -> &'static str {
     match vendor {
         "claude" => "anthropic",
-        "minimax" => "minimax",
+        "minimax" | "claudem" => "minimax",
         "codex" => "openai",
         "agy" => "google-antigravity",
         "gemini" => "google-gemini",
-        "cursor-agent" | "cursor" => "cursor",
+        "cursor-agent" | "cursor" | "agentf" => "cursor",
         // Test-repo path: not a real family; the `review_degraded` rule
         // explicitly excludes `mock_llm` from the family count (see
         // `compute_review_degraded`), so returning `""` keeps it inert.
@@ -2935,14 +2935,14 @@ mod tests {
     fn vendor_model_family_known_vendors() {
         assert_eq!(vendor_model_family("claude"), "anthropic");
         assert_eq!(vendor_model_family("minimax"), "minimax");
+        assert_eq!(vendor_model_family("claudem"), "minimax");
         assert_eq!(vendor_model_family("codex"), "openai");
         assert_eq!(vendor_model_family("agy"), "google-antigravity");
         assert_eq!(vendor_model_family("gemini"), "google-gemini");
         assert_eq!(vendor_model_family("cursor-agent"), "cursor");
-        // Bare `cursor` alias must map to the same family so dispatch
-        // routing and telemetry stay consistent regardless of which
-        // spelling the priority list uses.
+        // Bare `cursor` / bashrc `agentf` aliases must map to the same family.
         assert_eq!(vendor_model_family("cursor"), "cursor");
+        assert_eq!(vendor_model_family("agentf"), "cursor");
     }
 
     #[test]
