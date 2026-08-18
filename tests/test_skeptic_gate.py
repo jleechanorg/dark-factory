@@ -506,7 +506,7 @@ def test_parse_reviewers_rejects_only_codex_or_only_gemini():
     with pytest.raises(SystemExit):
         _parse_reviewers('[["codex", ""]]')
     with pytest.raises(SystemExit):
-        _parse_reviewers('[["gemini", "gemini-2.5-pro"]]')
+        _parse_reviewers('[["gemini", "gemini-3.7-pro"]]')
 
 # ===========================================================================
 # Forced PASS/FAIL acceptance (the ironclad acceptance test)
@@ -721,7 +721,7 @@ def test_build_reviewer_cmd_gemini_uses_sandbox():
     NOT `yolo`."""
     from runner.skeptic_gate_cli import _build_reviewer_cmd
 
-    cmd = _build_reviewer_cmd("gemini", "gemini-2.5-pro")
+    cmd = _build_reviewer_cmd("gemini", "gemini-3.7-pro")
     assert "-s" in cmd
     # default approval mode, not yolo
     assert "default" in cmd
@@ -877,7 +877,7 @@ def _cli_argv(**overrides):
         "--pr-sha",
         "abcdef1234567890abcdef1234567890abcdef12",
         "--reviewers-json",
-        '[["codex",""],["gemini","gemini-2.5-pro"]]',
+        '[["codex",""],["gemini","gemini-3.7-pro"]]',
         "--dry-run",
     ]
     for k, v in overrides.items():
@@ -1331,7 +1331,7 @@ def test_adversarial_status_failure_is_fail_closed(monkeypatch, capsys):
             "--pr-sha",
             "abcdef1234567890abcdef1234567890abcdef12",
             "--reviewers-json",
-            '[["codex",""],["gemini","gemini-2.5-pro"]]',
+            '[["codex",""],["gemini","gemini-3.7-pro"]]',
             "--expected-actor",
             "github-actions[bot]",
         ]
@@ -1628,7 +1628,7 @@ def test_publication_readback_rejects_duplicate_field_in_body(monkeypatch):
             "--repo", "jleechanorg/dark-factory",
             "--pr-number", "278",
             "--pr-sha", "abcdef1234567890abcdef1234567890abcdef12",
-            "--reviewers-json", '[["codex", ""], ["gemini", "gemini-2.5-pro"]]',
+            "--reviewers-json", '[["codex", ""], ["gemini", "gemini-3.7-pro"]]',
             "--status-context", "skeptic",
             "--expected-actor", "github-actions[bot]",
             "--codex-bin", "",
@@ -1727,7 +1727,7 @@ def test_status_publish_order_pending_then_success(monkeypatch, capsys):
             "--pr-sha",
             "abcdef1234567890abcdef1234567890abcdef12",
             "--reviewers-json",
-            '[["codex",""],["gemini","gemini-2.5-pro"]]',
+            '[["codex",""],["gemini","gemini-3.7-pro"]]',
             "--expected-actor",
             "github-actions[bot]",
         ]
@@ -1815,7 +1815,7 @@ def test_status_readback_mismatch_overwrites_to_failure(monkeypatch, capsys):
             "--pr-sha",
             "abcdef1234567890abcdef1234567890abcdef12",
             "--reviewers-json",
-            '[["codex",""],["gemini","gemini-2.5-pro"]]',
+            '[["codex",""],["gemini","gemini-3.7-pro"]]',
             "--expected-actor",
             "github-actions[bot]",
         ]
@@ -1889,7 +1889,7 @@ def test_status_overwritten_failure_never_becomes_success(monkeypatch, capsys):
             "--pr-sha",
             "abcdef1234567890abcdef1234567890abcdef12",
             "--reviewers-json",
-            '[["codex",""],["gemini","gemini-2.5-pro"]]',
+            '[["codex",""],["gemini","gemini-3.7-pro"]]',
             "--expected-actor",
             "github-actions[bot]",
         ]
@@ -2096,7 +2096,7 @@ def test_cli_exposes_perf_log_args(monkeypatch):
     # The simplest way: monkeypatch the reviewers to a no-op and let
     # the rest of the pipeline run.
     monkeypatch.setattr(cli_mod, "_parse_reviewers",
-                        lambda s: [("codex", ""), ("gemini", "gemini-2.5-pro")])
+                        lambda s: [("codex", ""), ("gemini", "gemini-3.7-pro")])
 
     # No-op reviewer invocation by returning valid stdout for both.
     monkeypatch.setattr(cli_mod, "invoke_reviewer",

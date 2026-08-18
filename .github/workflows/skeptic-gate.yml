@@ -209,7 +209,7 @@ jobs:
     runs-on: ${{ fromJson(vars.SELF_HOSTED_RUNNER_LABELS) }}
     timeout-minutes: 30
     env:
-      SKEPTIC_REVIEWERS_JSON: '[["codex",""],["gemini","gemini-2.5-pro"]]'
+      SKEPTIC_REVIEWERS_JSON: '[["codex",""],["gemini","gemini-3.7-pro"]]'
       SKEPTIC_STATUS_CONTEXT: "skeptic"
       SKEPTIC_EXPECTED_ACTOR: "github-actions[bot]"
       # Pinned reviewer binary locations + integrity (mandatory — no

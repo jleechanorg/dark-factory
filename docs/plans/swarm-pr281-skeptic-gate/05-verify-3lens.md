@@ -69,7 +69,7 @@ is correct, ~10 fewer lines, no behavior change.
 iteration; `invoke_reviewer`'s default `timeout: int = 900` (`:471`) is never
 overridden at the call site (`:724-730`, no `timeout=` kwarg passed). Workflow
 `timeout-minutes: 30` (`skeptic-gate.yml:119`). Default `SKEPTIC_REVIEWERS_JSON`
-is `[["codex",""],["gemini","gemini-2.5-pro"]]` — exactly 2 reviewers. 2 × 900s
+is `[["codex",""],["gemini","gemini-3.7-pro"]]` — exactly 2 reviewers. 2 × 900s
 = 1800s = the *entire* 30-minute budget, before checkout, binary verification,
 diff fetch, or publish/read-back get any share.
 

@@ -161,7 +161,7 @@ def test_cli_passes_contract_to_build_prompt_when_contract_file_supplied(
         "--pr-number", str(PR_NUMBER),
         "--contract-file", str(contract_json),
         "--dry-run",
-        "--reviewers-json", '[["codex", ""], ["gemini", "gemini-2.5-pro"]]',
+        "--reviewers-json", '[["codex", ""], ["gemini", "gemini-3.7-pro"]]',
     ])
     assert rc == 0
     assert len(captured["build_prompt_calls"]) >= 1
@@ -188,7 +188,7 @@ def test_cli_passes_contract_to_evaluate_when_contract_file_supplied(
         "--pr-number", str(PR_NUMBER),
         "--contract-file", str(contract_json),
         "--dry-run",
-        "--reviewers-json", '[["codex", ""], ["gemini", "gemini-2.5-pro"]]',
+        "--reviewers-json", '[["codex", ""], ["gemini", "gemini-3.7-pro"]]',
     ])
     assert rc == 0
     # Two reviewers (codex AND gemini are mandatory); one evaluate call each.
@@ -217,7 +217,7 @@ def test_cli_runs_legacy_path_when_no_contract_file(monkeypatch):
         "--repo", REPO,
         "--pr-number", str(PR_NUMBER),
         "--dry-run",
-        "--reviewers-json", '[["codex", ""], ["gemini", "gemini-2.5-pro"]]',
+        "--reviewers-json", '[["codex", ""], ["gemini", "gemini-3.7-pro"]]',
     ])
     assert rc == 0
     for kwargs in captured["build_prompt_calls"]:
@@ -246,7 +246,7 @@ def test_cli_fails_closed_on_missing_contract_file(monkeypatch, tmp_path):
         "--pr-number", str(PR_NUMBER),
         "--contract-file", str(missing_path),
         "--dry-run",
-        "--reviewers-json", '[["codex", ""], ["gemini", "gemini-2.5-pro"]]',
+        "--reviewers-json", '[["codex", ""], ["gemini", "gemini-3.7-pro"]]',
     ])
     # 2 = "refusing to gate without the operator-supplied contract".
     assert rc == 2
@@ -275,7 +275,7 @@ def test_cli_fails_closed_on_malformed_contract_file(monkeypatch, tmp_path):
         "--pr-number", str(PR_NUMBER),
         "--contract-file", str(bad),
         "--dry-run",
-        "--reviewers-json", '[["codex", ""], ["gemini", "gemini-2.5-pro"]]',
+        "--reviewers-json", '[["codex", ""], ["gemini", "gemini-3.7-pro"]]',
     ])
     assert rc == 2
     assert captured["build_prompt_calls"] == []
@@ -302,7 +302,7 @@ def test_cli_loads_contract_from_env_var_when_flag_omitted(
         "--repo", REPO,
         "--pr-number", str(PR_NUMBER),
         "--dry-run",
-        "--reviewers-json", '[["codex", ""], ["gemini", "gemini-2.5-pro"]]',
+        "--reviewers-json", '[["codex", ""], ["gemini", "gemini-3.7-pro"]]',
     ])
     assert rc == 0
     assert captured["build_prompt_calls"][0]["contract"].id == "jleechan-pq08"
@@ -394,7 +394,7 @@ def test_cli_fails_closed_on_unreadable_contract_file(monkeypatch, tmp_path):
         "--pr-number", str(PR_NUMBER),
         "--contract-file", str(unreadable),
         "--dry-run",
-        "--reviewers-json", '[["codex", ""], ["gemini", "gemini-2.5-pro"]]',
+        "--reviewers-json", '[["codex", ""], ["gemini", "gemini-3.7-pro"]]',
     ])
     assert rc == 2
     # No reviewer invocation must have happened.
@@ -423,7 +423,7 @@ def test_cli_fails_closed_when_reviewer_omits_prior_finding(monkeypatch, tmp_pat
         "--pr-number", str(PR_NUMBER),
         "--contract-file", str(contract_json),
         "--dry-run",
-        "--reviewers-json", '[["codex", ""], ["gemini", "gemini-2.5-pro"]]',
+        "--reviewers-json", '[["codex", ""], ["gemini", "gemini-3.7-pro"]]',
     ])
     # rc != 0 (gate red) — the prior finding was omitted and the
     # evaluator marked it unaddressed.

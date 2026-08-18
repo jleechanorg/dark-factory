@@ -27,7 +27,7 @@ class TestDispatcher(unittest.TestCase):
         rule_premium = Rule("rule_premium", "Premium Rule", ["**/*.rs"], "premium", "Desc", "Prompt")
 
         dispatcher = VerifierDispatcher(
-            cheap_reviewer="gemini", cheap_model="gemini-2.5-flash",
+            cheap_reviewer="gemini", cheap_model="gemini-3.7-flash",
             premium_reviewer="codex", premium_model="codex-smart"
         )
         results = dispatcher.dispatch(
@@ -42,5 +42,5 @@ class TestDispatcher(unittest.TestCase):
         )
 
         self.assertEqual(len(results), 2)
-        mock_invoke.assert_any_call("gemini", "gemini-2.5-flash", unittest.mock.ANY)
+        mock_invoke.assert_any_call("gemini", "gemini-3.7-flash", unittest.mock.ANY)
         mock_invoke.assert_any_call("codex", "codex-smart", unittest.mock.ANY)

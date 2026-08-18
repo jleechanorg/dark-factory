@@ -18,8 +18,8 @@ from runner import skeptic_gate_cli as _cli
 # tests/test_skeptic_gate_cli_contract_echo.py.
 
 class VerifierDispatcher:
-    def __init__(self, cheap_reviewer: str = "gemini", cheap_model: str = "gemini-2.5-flash",
-                 premium_reviewer: str = "gemini", premium_model: str = "gemini-2.5-pro"):
+    def __init__(self, cheap_reviewer: str = "gemini", cheap_model: str = "gemini-3.7-flash",
+                 premium_reviewer: str = "gemini", premium_model: str = "gemini-3.7-pro"):
         self.cheap_reviewer = cheap_reviewer
         self.cheap_model = cheap_model
         self.premium_reviewer = premium_reviewer

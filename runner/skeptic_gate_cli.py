@@ -76,7 +76,7 @@ from runner.skeptic_gate import (
 MAX_DIFF_BYTES = 1024 * 1024  # 1 MiB
 
 # Default reviewer list. Both must PASS.
-DEFAULT_REVIEWERS_JSON = '[["codex", ""], ["gemini", "gemini-2.5-pro"]]'
+DEFAULT_REVIEWERS_JSON = '[["codex", ""], ["gemini", "gemini-3.7-pro"]]'
 
 # Expected actor on the freshly-published comment. The read-back step
 # refuses anything else (defense against a reviewer-bound identity
@@ -1024,7 +1024,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         rules = []
         for r_name, r_model in reviewers:
             if r_model == "" and r_name == "gemini":
-                r_model = "gemini-2.5-pro"
+                r_model = "gemini-3.7-pro"
             rules.append(
                 Rule(
                     rule_id=r_name,
@@ -1095,8 +1095,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 2
 
     dispatcher = VerifierDispatcher(
-        cheap_reviewer="gemini", cheap_model="gemini-2.5-flash",
-        premium_reviewer="gemini", premium_model="gemini-2.5-pro"
+        cheap_reviewer="gemini", cheap_model="gemini-3.7-flash",
+        premium_reviewer="gemini", premium_model="gemini-3.7-pro"
     )
     results = dispatcher.dispatch(
         rules, changed_files, diff, repo, args.pr_number, head_sha, "unknown",

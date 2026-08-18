@@ -120,7 +120,7 @@ def test_substitute_env_does_not_match_invalid_names(monkeypatch):
     "claude-sonnet-4-6",
     "claude-haiku-4-5-20251001",
     "gpt-5",
-    "gemini-2.5-pro",
+    "gemini-3.7-pro",
 ])
 def test_env_var_overrides_with_various_models(monkeypatch, model_id):
     """Substitution is purely textual — any value passes through."""

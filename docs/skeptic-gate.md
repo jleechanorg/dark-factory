@@ -323,7 +323,7 @@ vars are set" step.
 
 | Env / input | Default | Effect |
 |---|---|---|
-| `SKEPTIC_REVIEWERS_JSON` | `[["codex",""],["gemini","gemini-2.5-pro"]]` | Reviewers that must ALL PASS (must be distinct, must be exactly codex + gemini) |
+| `SKEPTIC_REVIEWERS_JSON` | `[["codex",""],["gemini","gemini-3.7-pro"]]` | Reviewers that must ALL PASS (must be distinct, must be exactly codex + gemini) |
 | `SKEPTIC_STATUS_CONTEXT` | `skeptic` | Commit-status context name (the required-check name) |
 | `SKEPTIC_EXPECTED_ACTOR` | `github-actions[bot]` | Bot actor expected on the published comment |
 | `vars.SELF_HOSTED_RUNNER_LABELS` | **required** | Private repo runner selector (JSON array; must be wrapped in `fromJson()`) |

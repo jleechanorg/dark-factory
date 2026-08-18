@@ -166,7 +166,7 @@ def test_bead_id_flows_to_build_prompt(monkeypatch):
         "--pr-number", str(PR_NUMBER),
         "--bead-id", "jleechan-pq08",
         "--dry-run",
-        "--reviewers-json", '[["codex", ""], ["gemini", "gemini-2.5-pro"]]',
+        "--reviewers-json", '[["codex", ""], ["gemini", "gemini-3.7-pro"]]',
     ])
     assert rc == 0
     assert len(captured["build_prompt_calls"]) >= 1
@@ -186,7 +186,7 @@ def test_bead_id_flows_to_evaluate(monkeypatch):
         "--pr-number", str(PR_NUMBER),
         "--bead-id", "jleechan-pq08",
         "--dry-run",
-        "--reviewers-json", '[["codex", ""], ["gemini", "gemini-2.5-pro"]]',
+        "--reviewers-json", '[["codex", ""], ["gemini", "gemini-3.7-pro"]]',
     ])
     assert rc == 0
     assert len(captured["evaluate_calls"]) >= 1
@@ -220,7 +220,7 @@ def test_bead_id_and_contract_file_mutually_exclusive(monkeypatch):
             "--bead-id", "jleechan-pq08",
             "--contract-file", "/tmp/contract.json",
             "--dry-run",
-            "--reviewers-json", '[["codex", ""], ["gemini", "gemini-2.5-pro"]]',
+            "--reviewers-json", '[["codex", ""], ["gemini", "gemini-3.7-pro"]]',
         ])
 
 
@@ -254,6 +254,6 @@ def test_br_failure_closes_gate(monkeypatch):
         "--pr-number", str(PR_NUMBER),
         "--bead-id", "jleechan-pq08",
         "--dry-run",
-        "--reviewers-json", '[["codex", ""], ["gemini", "gemini-2.5-pro"]]',
+        "--reviewers-json", '[["codex", ""], ["gemini", "gemini-3.7-pro"]]',
     ])
     assert rc == 2
