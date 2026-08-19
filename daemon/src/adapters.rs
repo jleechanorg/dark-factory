@@ -2,8 +2,9 @@ use crate::errors::{DaemonError, SpawnBatchCleanupFailure};
 use crate::tools::{run_tool, run_tool_in_dir, Bead, Issue, LabeledPr, Llm, Permission, PrHeadBranch, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs, WorktreeHeadAncestry};
 use std::process::{Command, Stdio};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
 
 /// jleechan-9sl1 test-isolation fix: a single process-wide lock shared by
 /// EVERY `#[cfg(test)]` module in this file that mutates the global `PATH`
@@ -755,41 +756,308 @@ fn unresolved_thread_count_from_gql(gql_out: &str) -> Result<u32, DaemonError> {
         .count() as u32)
 }
 
+static GRAPHQL_RATE_LIMITED_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+
+pub fn is_graphql_rate_limited() -> bool {
+    let lock = GRAPHQL_RATE_LIMITED_UNTIL.lock().unwrap();
+    if let Some(until) = *lock {
+        if Instant::now() < until {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn mark_graphql_rate_limited(duration: Duration) {
+    let mut lock = GRAPHQL_RATE_LIMITED_UNTIL.lock().unwrap();
+    let until = Instant::now() + duration;
+    *lock = Some(until);
+}
+
+#[cfg(test)]
+pub fn clear_graphql_rate_limited() {
+    let mut lock = GRAPHQL_RATE_LIMITED_UNTIL.lock().unwrap();
+    *lock = None;
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
+struct GhPrView {
+    mergeable: String,
+    reviews: Vec<GhReview>,
+    #[serde(rename = "headRefOid")]
+    head_ref_oid: String,
+    body: String,
+    comments: Vec<GhComment>,
+    files: Vec<GhFile>,
+    #[serde(rename = "updatedAt")]
+    updated_at: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
+struct GhReview {
+    author: GhAuthor,
+    state: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
+struct GhComment {
+    author: GhAuthor,
+    body: String,
+    #[serde(default, rename = "createdAt")]
+    created_at: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
+struct GhAuthor {
+    login: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
+struct GhFile {
+    path: String,
+    additions: u32,
+    deletions: u32,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
+struct GhCheck {
+    state: String,
+    bucket: String,
+    name: String,
+}
+
+#[derive(Clone)]
 pub struct CliScm {
     pub repo: String,
-    labeled_issues_cache: Mutex<HashMap<String, (Vec<Issue>, Instant)>>,
-    permission_cache: Mutex<HashMap<String, (Permission, Instant)>>,
-    pr_snapshot_cache: Mutex<HashMap<u64, (PrSnapshot, Instant)>>,
-    branch_commit_cache: Mutex<HashMap<String, (Option<u64>, Instant)>>,
+    labeled_issues_cache: Arc<Mutex<HashMap<(String, String), (Vec<Issue>, Instant)>>>,
+    permission_cache: Arc<Mutex<HashMap<(String, String), (Permission, Instant)>>>,
+    pr_snapshot_cache: Arc<Mutex<HashMap<(String, u64), (PrSnapshot, Instant)>>>,
+    branch_commit_cache: Arc<Mutex<HashMap<(String, String), (Option<u64>, Instant)>>>,
 }
 
 impl CliScm {
     pub fn new(repo: String) -> Self {
         Self {
             repo,
-            labeled_issues_cache: Mutex::new(HashMap::new()),
-            permission_cache: Mutex::new(HashMap::new()),
-            pr_snapshot_cache: Mutex::new(HashMap::new()),
-            branch_commit_cache: Mutex::new(HashMap::new()),
+            labeled_issues_cache: Arc::new(Mutex::new(HashMap::new())),
+            permission_cache: Arc::new(Mutex::new(HashMap::new())),
+            pr_snapshot_cache: Arc::new(Mutex::new(HashMap::new())),
+            branch_commit_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     /// Return a handle targeting a different repo string (bead jleechan-35y4
-    /// Stage B — see
-    /// `docs/multirepo-dispatch-investigation-2026-07-11.md`'s "keep
-    /// traits, add `with_repo` constructor" note). Deliberately a fresh
-    /// `Self::new(repo)` rather than cloning this instance's in-memory TTL
-    /// caches: those caches (`pr_snapshot_cache` keyed by bare PR number,
-    /// `labeled_issues_cache`/`branch_commit_cache` keyed by label/branch
-    /// name) carry no repo qualifier, so reusing them for a different repo
-    /// could return another repo's cached PR/issue/branch data under a
-    /// colliding key. Construction is cheap (empty `HashMap`s), so a fresh
-    /// instance is both simpler and correct.
+    /// Stage B). Shares the underlying cache ARCs keyed by `(repo, ...)`,
+    /// preventing cross-repo key collisions while preserving in-memory TTL
+    /// hits across retargeted calls like `pr_snapshot_for_repo`.
     pub fn with_repo(&self, repo: &str) -> Self {
-        Self::new(repo.to_string())
+        Self {
+            repo: repo.to_string(),
+            labeled_issues_cache: Arc::clone(&self.labeled_issues_cache),
+            permission_cache: Arc::clone(&self.permission_cache),
+            pr_snapshot_cache: Arc::clone(&self.pr_snapshot_cache),
+            branch_commit_cache: Arc::clone(&self.branch_commit_cache),
+        }
     }
 
+    fn fetch_pr_view_via_rest(&self, pr: u64) -> Result<GhPrView, DaemonError> {
+        let pr_url = format!("repos/{}/pulls/{}", self.repo, pr);
+        let pr_json = run_tool("gh", &["api", &pr_url], 30)?;
+
+        #[derive(serde::Deserialize)]
+        struct RestPr {
+            mergeable: Option<bool>,
+            head: RestHead,
+            body: Option<String>,
+            updated_at: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct RestHead {
+            sha: String,
+        }
+        let rest_pr: RestPr = serde_json::from_str(&pr_json).map_err(|e| {
+            DaemonError::Parse(format!("failed to parse REST PR details: {e}"))
+        })?;
+
+        let reviews_url = format!("repos/{}/pulls/{}/reviews", self.repo, pr);
+        let reviews_json = run_tool("gh", &["api", &reviews_url], 30).unwrap_or_else(|_| "[]".to_string());
+        #[derive(serde::Deserialize)]
+        struct RestReview {
+            user: Option<RestUser>,
+            state: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct RestUser {
+            login: String,
+        }
+        let rest_reviews: Vec<RestReview> = serde_json::from_str(&reviews_json).unwrap_or_default();
+
+        let comments_url = format!("repos/{}/issues/{}/comments", self.repo, pr);
+        let comments_json = run_tool("gh", &["api", &comments_url], 30).unwrap_or_else(|_| "[]".to_string());
+        #[derive(serde::Deserialize)]
+        struct RestComment {
+            user: Option<RestUser>,
+            body: String,
+            #[serde(default)]
+            created_at: String,
+        }
+        let rest_comments: Vec<RestComment> = serde_json::from_str(&comments_json).unwrap_or_default();
+
+        let files_url = format!("repos/{}/pulls/{}/files", self.repo, pr);
+        let files_json = run_tool("gh", &["api", &files_url], 30).unwrap_or_else(|_| "[]".to_string());
+        #[derive(serde::Deserialize)]
+        struct RestFile {
+            filename: String,
+            additions: u32,
+            deletions: u32,
+        }
+        let rest_files: Vec<RestFile> = serde_json::from_str(&files_json).unwrap_or_default();
+
+        Ok(GhPrView {
+            mergeable: if rest_pr.mergeable.unwrap_or(false) {
+                "MERGEABLE".to_string()
+            } else {
+                "CONFLICTING".to_string()
+            },
+            reviews: rest_reviews
+                .into_iter()
+                .map(|r| GhReview {
+                    author: GhAuthor {
+                        login: r.user.map(|u| u.login).unwrap_or_default(),
+                    },
+                    state: r.state,
+                })
+                .collect(),
+            head_ref_oid: rest_pr.head.sha,
+            body: rest_pr.body.unwrap_or_default(),
+            comments: rest_comments
+                .into_iter()
+                .map(|c| GhComment {
+                    author: GhAuthor {
+                        login: c.user.map(|u| u.login).unwrap_or_default(),
+                    },
+                    body: c.body,
+                    created_at: c.created_at,
+                })
+                .collect(),
+            files: rest_files
+                .into_iter()
+                .map(|f| GhFile {
+                    path: f.filename,
+                    additions: f.additions,
+                    deletions: f.deletions,
+                })
+                .collect(),
+            updated_at: rest_pr.updated_at,
+        })
+    }
+
+    fn fetch_pr_checks_via_rest(&self, head_sha: &str, pr: u64) -> Result<String, DaemonError> {
+        let ref_url = format!("repos/{}/commits/{}/check-runs", self.repo, head_sha);
+        let cr_json = run_tool("gh", &["api", &ref_url], 30).map_err(|fallback_err| {
+            DaemonError::Tool {
+                tool: "gh".to_string(),
+                rc: -1,
+                stderr: format!(
+                    "CI check status unavailable for PR #{pr}: primary `gh pr checks` failed and REST check-runs fallback also failed ({fallback_err})"
+                ),
+            }
+        })?;
+
+        #[derive(serde::Deserialize)]
+        struct RestCheckRuns {
+            check_runs: Vec<RestCheckRun>,
+        }
+        #[derive(serde::Deserialize)]
+        struct RestCheckRun {
+            name: String,
+            status: String,
+            conclusion: Option<String>,
+        }
+        let rest_cr: RestCheckRuns = serde_json::from_str(&cr_json).map_err(|parse_err| {
+            DaemonError::Tool {
+                tool: "gh".to_string(),
+                rc: -1,
+                stderr: format!(
+                    "CI check status unavailable for PR #{pr}: primary `gh pr checks` failed and REST check-runs fallback returned non-JSON output: {parse_err}"
+                ),
+            }
+        })?;
+
+        let mut legacy_checks: Vec<GhCheck> = rest_cr
+            .check_runs
+            .into_iter()
+            .map(|cr| {
+                let (state, bucket) = if cr.status == "completed" {
+                    match cr.conclusion.as_deref() {
+                        Some("success") | Some("neutral") => {
+                            ("SUCCESS".to_string(), "pass".to_string())
+                        }
+                        Some("cancelled") => ("CANCELLED".to_string(), "cancel".to_string()),
+                        _ => ("FAILURE".to_string(), "fail".to_string()),
+                    }
+                } else {
+                    ("PENDING".to_string(), "pending".to_string())
+                };
+                GhCheck {
+                    state,
+                    bucket,
+                    name: cr.name,
+                }
+            })
+            .collect();
+
+        let statuses_url = format!("repos/{}/commits/{}/statuses", self.repo, head_sha);
+        if let Ok(statuses_json) = run_tool("gh", &["api", &statuses_url], 30) {
+            #[derive(serde::Deserialize)]
+            struct RestStatus {
+                context: String,
+                state: String,
+            }
+            let rest_statuses: Vec<RestStatus> =
+                serde_json::from_str(&statuses_json).unwrap_or_default();
+            for s in rest_statuses {
+                let bucket = match s.state.as_str() {
+                    "success" => "pass",
+                    "pending" => "pending",
+                    _ => "fail",
+                };
+                legacy_checks.push(GhCheck {
+                    state: s.state.to_uppercase(),
+                    bucket: bucket.to_string(),
+                    name: s.context,
+                });
+            }
+        }
+        Ok(serde_json::to_string(&legacy_checks).unwrap_or_else(|_| "[]".to_string()))
+    }
+
+
     fn labeled_prs_via_rest(&self, label: &str, gh_calls: &mut u32) -> Result<Vec<LabeledPr>, DaemonError> {
+        *gh_calls += 1;
+        // Attempt bulk REST `/pulls` query first (1 API call for all open PRs, including labels + head SHAs)
+        let bulk_pulls = run_tool(
+            "gh",
+            &[
+                "api",
+                &format!(
+                    "repos/{}/pulls?state=open&per_page=100&sort=updated&direction=desc",
+                    self.repo
+                ),
+            ],
+            30,
+        );
+        if let Ok(pulls_out) = bulk_pulls {
+            if let Ok(prs) = Self::parse_rest_pulls_list_payload(&self.repo, label, &pulls_out) {
+                return Ok(prs);
+            }
+        }
+
+        // Fallback: per-issue query
+        self.labeled_prs_via_issues_fallback(label, gh_calls)
+    }
+
+    fn labeled_prs_via_issues_fallback(&self, label: &str, gh_calls: &mut u32) -> Result<Vec<LabeledPr>, DaemonError> {
         let out = run_tool(
             "gh",
             &[
@@ -895,6 +1163,99 @@ impl CliScm {
         }
         Ok(prs)
     }
+
+    /// Single bulk `/pulls` REST list parser. Extracts all labeled PRs in
+    /// 1 request with head SHA, branch name, and cross-repo detection.
+    pub(crate) fn parse_rest_pulls_list_payload(
+        repo: &str,
+        label: &str,
+        pulls_json: &str,
+    ) -> Result<Vec<LabeledPr>, DaemonError> {
+        #[derive(serde::Deserialize)]
+        struct RestPullItem {
+            number: u64,
+            title: String,
+            body: Option<String>,
+            user: Option<RestUser>,
+            #[serde(default)]
+            labels: Vec<RestLabelItem>,
+            head: RestHead,
+            #[serde(default)]
+            updated_at: Option<String>,
+        }
+        #[derive(serde::Deserialize)]
+        struct RestLabelItem {
+            name: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct RestHead {
+            #[serde(rename = "ref")]
+            ref_name: String,
+            sha: Option<String>,
+            repo: Option<RestRepo>,
+        }
+        #[derive(serde::Deserialize)]
+        struct RestRepo {
+            full_name: Option<String>,
+            owner: Option<RestUser>,
+        }
+        #[derive(serde::Deserialize)]
+        struct RestUser {
+            login: String,
+        }
+
+        let json_start = pulls_json.find('[').unwrap_or(0);
+        let items: Vec<RestPullItem> = serde_json::from_str(&pulls_json[json_start..]).map_err(|e| {
+            DaemonError::Parse(format!("failed to parse REST pulls list: {e}"))
+        })?;
+
+        let target_owner = repo.split('/').next().unwrap_or_default();
+        let mut prs = Vec::new();
+        for item in items {
+            let has_label = item.labels.iter().any(|l| l.name.eq_ignore_ascii_case(label));
+            if !has_label {
+                continue;
+            }
+            let head_repo_full_name = item
+                .head
+                .repo
+                .as_ref()
+                .and_then(|r| r.full_name.clone());
+            let head_repo_owner_login = item
+                .head
+                .repo
+                .as_ref()
+                .and_then(|r| r.owner.as_ref().map(|o| o.login.clone()));
+            let is_cross_repository = head_repo_full_name
+                .as_ref()
+                .map(|name| !name.eq_ignore_ascii_case(repo))
+                .or_else(|| {
+                    head_repo_owner_login
+                        .as_ref()
+                        .map(|owner| !owner.eq_ignore_ascii_case(target_owner))
+                })
+                .unwrap_or(false);
+            let updated_at_epoch = item
+                .updated_at
+                .as_deref()
+                .and_then(parse_rfc3339_to_epoch_secs);
+            prs.push(LabeledPr {
+                number: item.number,
+                title: item.title,
+                body: item.body.unwrap_or_default(),
+                author_login: item.user.map(|u| u.login).unwrap_or_default(),
+                external_ref: format!("{}#{}", repo, item.number),
+                head_ref_name: item.head.ref_name,
+                is_cross_repository,
+                head_repo_full_name,
+                head_repo_owner_login,
+                head_sha: item.head.sha,
+                updated_at_epoch,
+            });
+        }
+        Ok(prs)
+    }
+
 
     /// PR #629 follow-up fix (codex P2 "Enforce the call cap within each
     /// repository scan"): pure boundary check so the REST-fallback per-PR
@@ -1144,6 +1505,99 @@ mod parse_rest_pull_payload_tests {
     }
 }
 
+#[cfg(test)]
+mod parse_rest_pulls_list_payload_tests {
+    use super::CliScm;
+
+    #[test]
+    fn parse_rest_pulls_list_payload_extracts_labeled_prs_and_filters_unlabeled() {
+        let payload = serde_json::json!([
+            {
+                "number": 101,
+                "title": "feat: labeled PR",
+                "body": "body for 101",
+                "user": { "login": "alice" },
+                "labels": [{ "name": "factory" }, { "name": "bug" }],
+                "head": {
+                    "ref": "feature/101",
+                    "sha": "1111222233334444555566667777888899990000",
+                    "repo": {
+                        "full_name": "jleechanorg/dark-factory",
+                        "owner": { "login": "jleechanorg" }
+                    }
+                },
+                "updated_at": "2026-08-19T10:00:00Z"
+            },
+            {
+                "number": 102,
+                "title": "chore: unlabeled PR",
+                "body": "body for 102",
+                "user": { "login": "bob" },
+                "labels": [{ "name": "docs" }],
+                "head": {
+                    "ref": "feature/102",
+                    "sha": "2222333344445555666677778888999900001111",
+                    "repo": {
+                        "full_name": "jleechanorg/dark-factory",
+                        "owner": { "login": "jleechanorg" }
+                    }
+                },
+                "updated_at": "2026-08-19T11:00:00Z"
+            },
+            {
+                "number": 103,
+                "title": "fix: cross-repo labeled PR",
+                "body": "body for 103",
+                "user": { "login": "charlie" },
+                "labels": [{ "name": "factory" }],
+                "head": {
+                    "ref": "fork-fix",
+                    "sha": "3333444455556666777788889999000011112222",
+                    "repo": {
+                        "full_name": "contributor/dark-factory",
+                        "owner": { "login": "contributor" }
+                    }
+                },
+                "updated_at": "2026-08-19T12:00:00Z"
+            }
+        ]).to_string();
+
+        let prs = CliScm::parse_rest_pulls_list_payload("jleechanorg/dark-factory", "factory", &payload)
+            .expect("parsing valid pulls list payload must succeed");
+
+        assert_eq!(prs.len(), 2, "must filter out unlabeled PR #102");
+        assert_eq!(prs[0].number, 101);
+        assert_eq!(prs[0].title, "feat: labeled PR");
+        assert_eq!(prs[0].author_login, "alice");
+        assert_eq!(prs[0].head_ref_name, "feature/101");
+        assert_eq!(prs[0].head_sha.as_deref(), Some("1111222233334444555566667777888899990000"));
+        assert!(prs[0].updated_at_epoch.is_some());
+        assert!(!prs[0].is_cross_repository);
+
+        assert_eq!(prs[1].number, 103);
+        assert_eq!(prs[1].author_login, "charlie");
+        assert!(prs[1].is_cross_repository);
+    }
+}
+
+#[cfg(test)]
+mod graphql_rate_limit_circuit_breaker_tests {
+    use super::*;
+
+    #[test]
+    fn circuit_breaker_state_and_timeout() {
+        clear_graphql_rate_limited();
+        assert!(!is_graphql_rate_limited(), "initially not rate limited");
+
+        mark_graphql_rate_limited(Duration::from_secs(60));
+        assert!(is_graphql_rate_limited(), "rate limit circuit breaker active");
+
+        clear_graphql_rate_limited();
+        assert!(!is_graphql_rate_limited(), "cleared rate limit circuit breaker");
+    }
+}
+
+
 
 impl Scm for CliScm {
     fn labeled_issues(&self, label: &str) -> Result<Vec<Issue>, DaemonError> {
@@ -1171,45 +1625,62 @@ impl Scm for CliScm {
         }
         {
             let cache = self.labeled_issues_cache.lock().unwrap();
-            if let Some((val, timestamp)) = cache.get(label) {
+            if let Some((val, timestamp)) = cache.get(&(self.repo.clone(), label.to_string())) {
                 if timestamp.elapsed() < Duration::from_secs(60) {
                     return Ok(val.clone());
                 }
             }
         }
-        let out_issues = match run_tool(
-            "gh",
-            &[
-                "issue",
-                "list",
-                "--repo",
-                &self.repo,
-                "--label",
-                label,
-                "--state",
-                "open",
-                // gh defaults to 30 rows; same truncation class as jleechan-v09l.
-                "--limit",
-                "1000",
-                "--json",
-                "number,title,body,author",
-            ],
-            30,
-        ) {
-            Ok(out) => out,
-            Err(_) => {
-                run_tool(
-                    "gh",
-                    &[
-                        "api",
-                        // REST default per_page is 30; 100 is the API maximum.
-                        &format!(
-                            "repos/{}/issues?labels={label}&state=open&per_page=100",
-                            self.repo
-                        ),
-                    ],
-                    30,
-                )?
+        let out_issues = if is_graphql_rate_limited() {
+            run_tool(
+                "gh",
+                &[
+                    "api",
+                    &format!(
+                        "repos/{}/issues?labels={label}&state=open&per_page=100",
+                        self.repo
+                    ),
+                ],
+                30,
+            )?
+        } else {
+            match run_tool(
+                "gh",
+                &[
+                    "issue",
+                    "list",
+                    "--repo",
+                    &self.repo,
+                    "--label",
+                    label,
+                    "--state",
+                    "open",
+                    "--limit",
+                    "1000",
+                    "--json",
+                    "number,title,body,author",
+                ],
+                30,
+            ) {
+                Ok(out) => out,
+                Err(e) => {
+                    if let DaemonError::Tool { stderr, .. } = &e {
+                        if stderr.contains("rate limit") {
+                            mark_graphql_rate_limited(Duration::from_secs(60));
+                        }
+                    }
+                    run_tool(
+                        "gh",
+                        &[
+                            "api",
+                            &format!(
+                                "repos/{}/issues?labels={label}&state=open&per_page=100",
+                                self.repo
+                            ),
+                        ],
+                        30,
+                    )?
+                }
             }
         };
         #[derive(serde::Deserialize)]
@@ -1245,15 +1716,15 @@ impl Scm for CliScm {
         }
         {
             let mut cache = self.labeled_issues_cache.lock().unwrap();
-            cache.insert(label.to_string(), (issues.clone(), Instant::now()));
+            cache.insert((self.repo.clone(), label.to_string()), (issues.clone(), Instant::now()));
         }
         Ok(issues)
     }
 
     fn labeled_prs(&self, label: &str, gh_calls: &mut u32) -> Result<Vec<LabeledPr>, DaemonError> {
-        // jtg8-r5: count the list query regardless of which branch we end
-        // up on (primary `gh pr list` or REST fallback). The fallback's
-        // per-PR pulls/{n} calls are counted inside `labeled_prs_via_rest`.
+        if is_graphql_rate_limited() {
+            return self.labeled_prs_via_rest(label, gh_calls);
+        }
         *gh_calls += 1;
         let out = match run_tool(
             "gh",
@@ -1277,8 +1748,16 @@ impl Scm for CliScm {
             30,
         ) {
             Ok(out) => out,
-            Err(_) => return self.labeled_prs_via_rest(label, gh_calls),
+            Err(e) => {
+                if let DaemonError::Tool { stderr, .. } = &e {
+                    if stderr.contains("rate limit") {
+                        mark_graphql_rate_limited(Duration::from_secs(60));
+                    }
+                }
+                return self.labeled_prs_via_rest(label, gh_calls);
+            }
         };
+
         #[derive(serde::Deserialize)]
         struct GhPr {
             number: u64,
@@ -1372,7 +1851,7 @@ impl Scm for CliScm {
         }
         {
             let cache = self.permission_cache.lock().unwrap();
-            if let Some((val, timestamp)) = cache.get(login) {
+            if let Some((val, timestamp)) = cache.get(&(self.repo.clone(), login.to_string())) {
                 if timestamp.elapsed() < Duration::from_secs(300) {
                     return Ok(*val);
                 }
@@ -1397,7 +1876,7 @@ impl Scm for CliScm {
         };
         {
             let mut cache = self.permission_cache.lock().unwrap();
-            cache.insert(login.to_string(), (perm, Instant::now()));
+            cache.insert((self.repo.clone(), login.to_string()), (perm, Instant::now()));
         }
         Ok(perm)
     }
@@ -1455,132 +1934,43 @@ impl Scm for CliScm {
         }
         {
             let cache = self.pr_snapshot_cache.lock().unwrap();
-            if let Some((val, timestamp)) = cache.get(&pr) {
-                if timestamp.elapsed() < Duration::from_secs(60) {
+            if let Some((val, timestamp)) = cache.get(&(self.repo.clone(), pr)) {
+                if timestamp.elapsed() < Duration::from_secs(30) {
                     return Ok(val.clone());
                 }
             }
         }
         let pr_str = pr.to_string();
-        #[derive(serde::Deserialize, serde::Serialize, Clone)]
-        struct GhPrView {
-            mergeable: String,
-            reviews: Vec<GhReview>,
-            #[serde(rename = "headRefOid")]
-            head_ref_oid: String,
-            body: String,
-            comments: Vec<GhComment>,
-            files: Vec<GhFile>,
-            #[serde(rename = "updatedAt")]
-            updated_at: String,
-        }
-        #[derive(serde::Deserialize, serde::Serialize, Clone)]
-        struct GhReview {
-            author: GhAuthor,
-            state: String,
-        }
-        #[derive(serde::Deserialize, serde::Serialize, Clone)]
-        struct GhComment {
-            author: GhAuthor,
-            body: String,
-            // jleechan-nplh: comment age, needed to filter stale `/er`
-            // verdicts against the head commit. Default-tolerated so a gh
-            // schema hiccup degrades to "age unknown" (epoch 0) rather than
-            // failing the whole snapshot.
-            #[serde(default, rename = "createdAt")]
-            created_at: String,
-        }
-        #[derive(serde::Deserialize, serde::Serialize, Clone)]
-        struct GhAuthor {
-            login: String,
-        }
-        #[derive(serde::Deserialize, serde::Serialize, Clone)]
-        struct GhFile {
-            path: String,
-            additions: u32,
-            deletions: u32,
-        }
-        let view: GhPrView = match run_tool(
-            "gh",
-            &[
-                "pr",
-                "view",
-                &pr_str,
-                "--repo",
-                &self.repo,
-                "--json",
-                "mergeable,reviews,headRefOid,body,comments,files,updatedAt",
-            ],
-            30,
-        ) {
-            Ok(view_out) => {
-                let json_start = view_out.find('{').unwrap_or(0);
-                serde_json::from_str(&view_out[json_start..]).map_err(|e| {
-                    DaemonError::Parse(format!("failed to parse gh pr view JSON: {e}"))
-                })?
-            }
-            Err(_) => {
-                // REST Fallback!
-                let pr_url = format!("repos/{}/pulls/{}", self.repo, pr);
-                let pr_json = run_tool("gh", &["api", &pr_url], 30)?;
-                
-                #[derive(serde::Deserialize)]
-                struct RestPr {
-                    mergeable: Option<bool>,
-                    head: RestHead,
-                    body: Option<String>,
-                    updated_at: String,
+        let gql_limited = is_graphql_rate_limited();
+        let view: GhPrView = if gql_limited {
+            self.fetch_pr_view_via_rest(pr)?
+        } else {
+            match run_tool(
+                "gh",
+                &[
+                    "pr",
+                    "view",
+                    &pr_str,
+                    "--repo",
+                    &self.repo,
+                    "--json",
+                    "mergeable,reviews,headRefOid,body,comments,files,updatedAt",
+                ],
+                30,
+            ) {
+                Ok(view_out) => {
+                    let json_start = view_out.find('{').unwrap_or(0);
+                    serde_json::from_str(&view_out[json_start..]).map_err(|e| {
+                        DaemonError::Parse(format!("failed to parse gh pr view JSON: {e}"))
+                    })?
                 }
-                #[derive(serde::Deserialize)]
-                struct RestHead {
-                    sha: String,
-                }
-                let rest_pr: RestPr = serde_json::from_str(&pr_json).map_err(|e| {
-                    DaemonError::Parse(format!("failed to parse REST PR details: {e}"))
-                })?;
-
-                let reviews_url = format!("repos/{}/pulls/{}/reviews", self.repo, pr);
-                let reviews_json = run_tool("gh", &["api", &reviews_url], 30).unwrap_or_else(|_| "[]".to_string());
-                #[derive(serde::Deserialize)]
-                struct RestReview {
-                    user: Option<RestUser>,
-                    state: String,
-                }
-                #[derive(serde::Deserialize)]
-                struct RestUser {
-                    login: String,
-                }
-                let rest_reviews: Vec<RestReview> = serde_json::from_str(&reviews_json).unwrap_or_default();
-
-                let comments_url = format!("repos/{}/issues/{}/comments", self.repo, pr);
-                let comments_json = run_tool("gh", &["api", &comments_url], 30).unwrap_or_else(|_| "[]".to_string());
-                #[derive(serde::Deserialize)]
-                struct RestComment {
-                    user: Option<RestUser>,
-                    body: String,
-                    #[serde(default)]
-                    created_at: String,
-                }
-                let rest_comments: Vec<RestComment> = serde_json::from_str(&comments_json).unwrap_or_default();
-
-                let files_url = format!("repos/{}/pulls/{}/files", self.repo, pr);
-                let files_json = run_tool("gh", &["api", &files_url], 30).unwrap_or_else(|_| "[]".to_string());
-                #[derive(serde::Deserialize)]
-                struct RestFile {
-                    filename: String,
-                    additions: u32,
-                    deletions: u32,
-                }
-                let rest_files: Vec<RestFile> = serde_json::from_str(&files_json).unwrap_or_default();
-
-                GhPrView {
-                    mergeable: if rest_pr.mergeable.unwrap_or(false) { "MERGEABLE".to_string() } else { "CONFLICTING".to_string() },
-                    reviews: rest_reviews.into_iter().map(|r| GhReview { author: GhAuthor { login: r.user.map(|u| u.login).unwrap_or_default() }, state: r.state }).collect(),
-                    head_ref_oid: rest_pr.head.sha,
-                    body: rest_pr.body.unwrap_or_default(),
-                    comments: rest_comments.into_iter().map(|c| GhComment { author: GhAuthor { login: c.user.map(|u| u.login).unwrap_or_default() }, body: c.body, created_at: c.created_at }).collect(),
-                    files: rest_files.into_iter().map(|f| GhFile { path: f.filename, additions: f.additions, deletions: f.deletions }).collect(),
-                    updated_at: rest_pr.updated_at,
+                Err(e) => {
+                    if let DaemonError::Tool { stderr, .. } = &e {
+                        if stderr.contains("rate limit") {
+                            mark_graphql_rate_limited(Duration::from_secs(60));
+                        }
+                    }
+                    self.fetch_pr_view_via_rest(pr)?
                 }
             }
         };
@@ -1603,112 +1993,23 @@ impl Scm for CliScm {
         };
         let coderabbit_approved = coderabbit_status == "green";
 
-        #[derive(serde::Deserialize, serde::Serialize, Clone)]
-        struct GhCheck {
-            state: String,
-            bucket: String,
-            name: String,
-        }
-        let checks_out = match run_tool(
-            "gh",
-            &["pr", "checks", &pr_str, "--repo", &self.repo, "--json", "state,bucket,name"],
-            30,
-        ) {
-            Ok(out) => out,
-            Err(primary_err) => {
-                // REST Fallback!
-                let ref_url = format!("repos/{}/commits/{}/check-runs", self.repo, view.head_ref_oid);
-                // jleechan-e7lp: the primary GraphQL `gh pr checks` call
-                // failed (commonly a GraphQL rate limit). If the REST
-                // fallback ALSO fails to execute, or returns a body that
-                // isn't valid JSON, that is a genuine "we could not
-                // determine CI status" outage — distinct from a PR that
-                // legitimately has zero checks yet (a successful REST call
-                // reports that as `{"check_runs": []}`, not an error).
-                // Previously both failure shapes were silently absorbed
-                // into an empty `checks` vec via `.unwrap_or(...)`, which
-                // collapsed into `ci_status = "unknown"` -> `ci_pending =
-                // true` even though the daemon had no idea what CI actually
-                // looked like. Live incident: bead jleechan-93ft / PR
-                // jleechanorg/worldarchitect.ai#7888 logged
-                // VERIFICATION_PENDING 244+ times in 10 minutes while
-                // GraphQL was rate-limited and the PR's CI was already 100%
-                // terminal. Propagate a `DaemonError::Tool` here instead so
-                // every existing `pr_snapshot` call site's jleechan-qdw
-                // `BEAD_SNAPSHOT_TRANSIENT_ERROR` per-bead-isolation
-                // handling takes over: the bead stays ATTESTED and is
-                // retried next tick, with honest "fetch failed" telemetry
-                // instead of misleading "CI still running" telemetry.
-                let cr_json = run_tool("gh", &["api", &ref_url], 30).map_err(|fallback_err| {
-                    DaemonError::Tool {
-                        tool: "gh".to_string(),
-                        rc: -1,
-                        stderr: format!(
-                            "CI check status unavailable for PR #{pr}: primary `gh pr checks` failed ({primary_err}) and REST check-runs fallback also failed ({fallback_err})"
-                        ),
-                    }
-                })?;
-
-                #[derive(serde::Deserialize)]
-                struct RestCheckRuns {
-                    check_runs: Vec<RestCheckRun>,
-                }
-                #[derive(serde::Deserialize)]
-                struct RestCheckRun {
-                    name: String,
-                    status: String,
-                    conclusion: Option<String>,
-                }
-                let rest_cr: RestCheckRuns = serde_json::from_str(&cr_json).map_err(|parse_err| {
-                    DaemonError::Tool {
-                        tool: "gh".to_string(),
-                        rc: -1,
-                        stderr: format!(
-                            "CI check status unavailable for PR #{pr}: primary `gh pr checks` failed ({primary_err}) and REST check-runs fallback returned non-JSON output: {parse_err}"
-                        ),
-                    }
-                })?;
-
-                let mut legacy_checks: Vec<GhCheck> = rest_cr.check_runs.into_iter().map(|cr| {
-                    let (state, bucket) = if cr.status == "completed" {
-                        match cr.conclusion.as_deref() {
-                            Some("success") | Some("neutral") => ("SUCCESS".to_string(), "pass".to_string()),
-                            Some("cancelled") => ("CANCELLED".to_string(), "cancel".to_string()),
-                            _ => ("FAILURE".to_string(), "fail".to_string()),
+        let checks_out = if gql_limited || is_graphql_rate_limited() {
+            self.fetch_pr_checks_via_rest(&view.head_ref_oid, pr)?
+        } else {
+            match run_tool(
+                "gh",
+                &["pr", "checks", &pr_str, "--repo", &self.repo, "--json", "state,bucket,name"],
+                30,
+            ) {
+                Ok(out) => out,
+                Err(primary_err) => {
+                    if let DaemonError::Tool { stderr, .. } = &primary_err {
+                        if stderr.contains("rate limit") {
+                            mark_graphql_rate_limited(Duration::from_secs(60));
                         }
-                    } else {
-                        ("PENDING".to_string(), "pending".to_string())
-                    };
-                    GhCheck { state, bucket, name: cr.name }
-                }).collect();
-
-                // Some third-party CI (and older GitHub Apps) still post via
-                // the legacy Commit Status API instead of the Checks API —
-                // merge `/commits/{sha}/statuses` in too so those don't
-                // silently vanish from `checks` when the GraphQL `gh pr
-                // checks` call is rate-limited.
-                let statuses_url = format!("repos/{}/commits/{}/statuses", self.repo, view.head_ref_oid);
-                if let Ok(statuses_json) = run_tool("gh", &["api", &statuses_url], 30) {
-                    #[derive(serde::Deserialize)]
-                    struct RestStatus {
-                        context: String,
-                        state: String,
                     }
-                    let rest_statuses: Vec<RestStatus> = serde_json::from_str(&statuses_json).unwrap_or_default();
-                    for s in rest_statuses {
-                        let bucket = match s.state.as_str() {
-                            "success" => "pass",
-                            "pending" => "pending",
-                            _ => "fail",
-                        };
-                        legacy_checks.push(GhCheck {
-                            state: s.state.to_uppercase(),
-                            bucket: bucket.to_string(),
-                            name: s.context,
-                        });
-                    }
+                    self.fetch_pr_checks_via_rest(&view.head_ref_oid, pr)?
                 }
-                serde_json::to_string(&legacy_checks).unwrap_or_else(|_| "[]".to_string())
             }
         };
         let json_start_c = checks_out.find('[').unwrap_or(0);
@@ -1800,54 +2101,70 @@ impl Scm for CliScm {
               }
             }
         }";
-        // No REST fallback exists for this query: GitHub's REST API does not
-        // expose per-thread resolution status (only GraphQL's
-        // `reviewThreads.isResolved` does), unlike the `pr view` / `pr
-        // checks` calls above which do have REST equivalents. If GraphQL is
-        // unavailable there is currently no alternate path to this data.
-        let gql_out = run_tool(
-            "gh",
-            &[
-                "api",
-                "graphql",
-                "-F",
-                &format!("owner={owner}"),
-                "-F",
-                &format!("repo={repo}"),
-                "-F",
-                &format!("pr={pr}"),
-                "-f",
-                &format!("query={query}"),
-            ],
-            30,
-        );
-        // jleechan-kk64: a GraphQL failure or parse failure here (rate
-        // limit, transient network, malformed/truncated response) must NOT
-        // report a false `0` unresolved-thread count — that would silently
-        // green-light the `CommentsResolved` gate (verifier.rs) while real
-        // unresolved review threads could still exist, exactly the
-        // fail-open bug this fix closes. Report `None` (unknown) instead;
-        // `verifier::assess` maps `None` to `GateResult::Unknown`, never
-        // `Green`. The rest of `pr_snapshot` still returns `Ok(snapshot)` so
-        // an isolated GraphQL hiccup doesn't take down every other gate —
-        // same discipline as the `head_committed_epoch` fallback below.
-        let unresolved_thread_count: Option<u32> = match gql_out {
-            Ok(gql_out_str) => match unresolved_thread_count_from_gql(&gql_out_str) {
-                Ok(count) => Some(count),
+        // Unresolved thread count: if GraphQL is rate-limited, attempt to
+        // reuse the cached thread count for the same head SHA if available,
+        // or check review states. Otherwise query GraphQL.
+        let unresolved_thread_count: Option<u32> = if gql_limited || is_graphql_rate_limited() {
+            let cached_count = {
+                let cache = self.pr_snapshot_cache.lock().unwrap();
+                cache.get(&(self.repo.clone(), pr)).and_then(|(s, _)| {
+                    if s.head_sha == view.head_ref_oid {
+                        s.unresolved_thread_count
+                    } else {
+                        None
+                    }
+                })
+            };
+            if let Some(count) = cached_count {
+                Some(count)
+            } else {
+                let has_changes_requested = view.reviews.iter().any(|r| r.state == "CHANGES_REQUESTED");
+                if has_changes_requested {
+                    Some(1)
+                } else {
+                    None
+                }
+            }
+        } else {
+            let gql_out = run_tool(
+                "gh",
+                &[
+                    "api",
+                    "graphql",
+                    "-F",
+                    &format!("owner={owner}"),
+                    "-F",
+                    &format!("repo={repo}"),
+                    "-F",
+                    &format!("pr={pr}"),
+                    "-f",
+                    &format!("query={query}"),
+                ],
+                30,
+            );
+            match gql_out {
+                Ok(gql_out_str) => match unresolved_thread_count_from_gql(&gql_out_str) {
+                    Ok(count) => Some(count),
+                    Err(e) => {
+                        eprintln!(
+                            "[warn] failed to parse unresolved-thread GraphQL response; \
+                             comments-resolved gate will report Unknown, not Green: {e:?}"
+                        );
+                        None
+                    }
+                },
                 Err(e) => {
+                    if let DaemonError::Tool { stderr, .. } = &e {
+                        if stderr.contains("rate limit") {
+                            mark_graphql_rate_limited(Duration::from_secs(60));
+                        }
+                    }
                     eprintln!(
-                        "[warn] failed to parse unresolved-thread GraphQL response; \
-                         comments-resolved gate will report Unknown, not Green: {e:?}"
+                        "[warn] GraphQL query failed; comments-resolved gate will report Unknown, \
+                         not Green: {e:?}"
                     );
                     None
                 }
-            },
-            Err(e) => {
-                eprintln!(
-                    "[warn] GraphQL query failed; comments-resolved gate will report Unknown, \
-                     not Green: {e:?}"
-                );
-                None
             }
         };
 
@@ -1933,10 +2250,11 @@ impl Scm for CliScm {
         };
         {
             let mut cache = self.pr_snapshot_cache.lock().unwrap();
-            cache.insert(pr, (snapshot.clone(), Instant::now()));
+            cache.insert((self.repo.clone(), pr), (snapshot.clone(), Instant::now()));
         }
         Ok(snapshot)
     }
+
 
     /// jleechan-9xrs Stage D: retarget the query at `repo` via `with_repo`
     /// instead of always fetching against `self.repo` (the daemon's global
@@ -2066,7 +2384,7 @@ impl Scm for CliScm {
             let _ = std::fs::remove_file(&offline_path);
             {
                 let mut pr_cache = self.pr_snapshot_cache.lock().unwrap();
-                pr_cache.remove(&pr);
+                pr_cache.remove(&(self.repo.clone(), pr));
                 let mut issues_cache = self.labeled_issues_cache.lock().unwrap();
                 issues_cache.clear();
             }
@@ -2080,7 +2398,7 @@ impl Scm for CliScm {
         )?;
         {
             let mut pr_cache = self.pr_snapshot_cache.lock().unwrap();
-            pr_cache.remove(&pr);
+            pr_cache.remove(&(self.repo.clone(), pr));
             let mut issues_cache = self.labeled_issues_cache.lock().unwrap();
             issues_cache.clear();
         }
@@ -2118,7 +2436,7 @@ impl Scm for CliScm {
         }
         {
             let cache = self.branch_commit_cache.lock().unwrap();
-            if let Some((val, timestamp)) = cache.get(branch) {
+            if let Some((val, timestamp)) = cache.get(&(self.repo.clone(), branch.to_string())) {
                 if timestamp.elapsed() < Duration::from_secs(60) {
                     return Ok(*val);
                 }
@@ -2130,7 +2448,7 @@ impl Scm for CliScm {
             Err(DaemonError::Tool { stderr, .. }) if stderr.contains("404") || stderr.contains("Not Found") || stderr.contains("not found") => {
                 {
                     let mut cache = self.branch_commit_cache.lock().unwrap();
-                    cache.insert(branch.to_string(), (None, Instant::now()));
+                    cache.insert((self.repo.clone(), branch.to_string()), (None, Instant::now()));
                 }
                 return Ok(None);
             }
@@ -2161,10 +2479,11 @@ impl Scm for CliScm {
         })?;
         {
             let mut cache = self.branch_commit_cache.lock().unwrap();
-            cache.insert(branch.to_string(), (Some(epoch), Instant::now()));
+            cache.insert((self.repo.clone(), branch.to_string()), (Some(epoch), Instant::now()));
         }
         Ok(Some(epoch))
     }
+
 
     /// jleechan-bqdv Stage C: retarget the query at `repo` via `with_repo`
     /// instead of always polling `self.repo` (the daemon's global
@@ -7432,6 +7751,7 @@ pub fn ci_success_from_check_buckets(buckets: &[&str], iteration_stub: bool) -> 
 #[cfg(test)]
 mod with_repo_tests {
     use super::{CliScm, CliVcs};
+    use crate::tools::Scm;
 
     #[test]
     fn cli_vcs_with_repo_targets_new_repo_and_leaves_original_untouched() {
@@ -7447,6 +7767,50 @@ mod with_repo_tests {
         let retargeted = original.with_repo("jleechanorg/dark-factory");
         assert_eq!(retargeted.repo, "jleechanorg/dark-factory");
         assert_eq!(original.repo, "jleechanorg/worldarchitect.ai");
+    }
+
+    #[test]
+    fn cli_scm_with_repo_shares_snapshot_cache_across_retargeted_instances() {
+        use std::time::Instant;
+        use crate::tools::PrSnapshot;
+
+        let scm = CliScm::new("jleechanorg/dark-factory".to_string());
+        let dummy_snapshot = PrSnapshot {
+            pr_number: 42,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "abcdef123456".to_string(),
+            body: "test body".to_string(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 1234567890,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 1234567890,
+        };
+
+        // Insert into scm cache for repo "jleechanorg/dark-factory"
+        {
+            let mut cache = scm.pr_snapshot_cache.lock().unwrap();
+            cache.insert(("jleechanorg/dark-factory".to_string(), 42), (dummy_snapshot.clone(), Instant::now()));
+        }
+
+        // An instance created via with_repo should see this snapshot without executing any subprocess
+        let retargeted = scm.with_repo("jleechanorg/dark-factory");
+        let fetched = retargeted.pr_snapshot(42).expect("must hit shared cache");
+        assert_eq!(fetched.head_sha, "abcdef123456");
+
+        // A retargeted instance for a different repo must NOT return the other repo's cached entry
+        let other_repo = scm.with_repo("jleechanorg/other-repo");
+        {
+            let cache = other_repo.pr_snapshot_cache.lock().unwrap();
+            assert!(cache.get(&("jleechanorg/other-repo".to_string(), 42)).is_none());
+        }
     }
 }
 
@@ -8012,6 +8376,10 @@ if [ "$1" = "api" ]; then
     esac
   done
   case "$url" in
+    *pulls/*)
+      echo '{"mergeable":true,"head":{"sha":"deadbeefcafefeed0123456789abcdef01234567"},"body":"test body","updated_at":"2026-07-08T12:00:00Z"}'
+      exit 0
+      ;;
     *check-runs*)
       case "${GH_TEST_FALLBACK_CHECKS:-}" in
         fail) echo "gh: network error" >&2; exit 1 ;;
@@ -8069,6 +8437,8 @@ exit 1
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
+        super::clear_graphql_rate_limited();
+
         let dir = make_fake_gh_dir(prefix);
         let bin = dir.join("bin");
 
@@ -8092,6 +8462,8 @@ exit 1
         let scm = CliScm::new("jleechanorg/dark-factory-test".to_string());
         let result = scm.pr_snapshot(pr);
 
+        super::clear_graphql_rate_limited();
+
         unsafe {
             if let Some(prior) = prior_path {
                 std::env::set_var("PATH", prior);
@@ -8114,6 +8486,7 @@ exit 1
         std::fs::remove_dir_all(&dir).ok();
         result
     }
+
 
     /// (a) Primary `gh pr checks` fails AND the REST `check-runs` fallback
     /// also fails to execute -> `pr_snapshot` must return `Err`, not a
