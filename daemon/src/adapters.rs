@@ -774,11 +774,11 @@ pub fn mark_graphql_rate_limited(duration: Duration) {
     *lock = Some(until);
 }
 
-#[cfg(test)]
 pub fn clear_graphql_rate_limited() {
     let mut lock = GRAPHQL_RATE_LIMITED_UNTIL.lock().unwrap();
     *lock = None;
 }
+
 
 #[derive(serde::Deserialize, serde::Serialize, Clone)]
 struct GhPrView {

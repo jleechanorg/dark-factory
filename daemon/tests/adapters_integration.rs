@@ -397,6 +397,10 @@ case "$args" in
         echo '{{"mergeable":"MERGEABLE","reviews":[],"headRefOid":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","body":"","comments":[],"files":[],"updatedAt":"2026-01-01T00:00:00Z"}}'
         exit 0
         ;;
+    *"pulls/"*)
+        echo '{{"mergeable":true,"head":{{"sha":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}},"body":"","updated_at":"2026-01-01T00:00:00Z"}}'
+        exit 0
+        ;;
     *"pr checks"*)
         echo '[{{"state":"SUCCESS","bucket":"pass","name":"build"}}]'
         exit 0
@@ -437,6 +441,7 @@ esac
 #[cfg(unix)]
 fn test_cli_scm_pr_snapshot_graphql_command_failure_reports_unknown_not_green() {
     let _lock = FAKE_GH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    daemon::adapters::clear_graphql_rate_limited();
 
     // Unique PR number to avoid cache/collision
     let pr_num = 900001;
@@ -465,6 +470,8 @@ fn test_cli_scm_pr_snapshot_graphql_command_failure_reports_unknown_not_green() 
     let scm = CliScm::new("jleechanorg/dark-factory".to_string());
     let result = scm.pr_snapshot(pr_num);
 
+    daemon::adapters::clear_graphql_rate_limited();
+
     // The snapshot fetch should succeed (only the thread count is unknown)
     assert!(result.is_ok(), "pr_snapshot should succeed even when GraphQL fails: {:?}", result);
     let snapshot = result.unwrap();
@@ -483,6 +490,7 @@ fn test_cli_scm_pr_snapshot_graphql_command_failure_reports_unknown_not_green() 
 #[cfg(unix)]
 fn test_cli_scm_pr_snapshot_graphql_malformed_output_reports_unknown_not_green() {
     let _lock = FAKE_GH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    daemon::adapters::clear_graphql_rate_limited();
 
     let pr_num = 900002;
 
@@ -506,6 +514,8 @@ fn test_cli_scm_pr_snapshot_graphql_malformed_output_reports_unknown_not_green()
 
     let scm = CliScm::new("jleechanorg/dark-factory".to_string());
     let result = scm.pr_snapshot(pr_num);
+
+    daemon::adapters::clear_graphql_rate_limited();
 
     assert!(result.is_ok(), "pr_snapshot should succeed even when GraphQL is malformed: {:?}", result);
     let snapshot = result.unwrap();
