@@ -4103,17 +4103,36 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 // commit.
                 let ready_to_promote = if overlay.is_adopted {
                     match &overlay.session_id {
-                        Some(session_id_str) => deps
-                            .sessions
-                            .is_quiescent(&SessionId(session_id_str.clone()))
-                            .unwrap_or(false),
-                        None => false,
+                        Some(session_id_str) => {
+                            let sid = SessionId(session_id_str.clone());
+                            if deps.sessions.is_quiescent(&sid).unwrap_or(false) {
+                                true
+                            } else {
+                                match deps.sessions.session_activity(&sid) {
+                                    Ok(crate::tools::SessionActivity::Idle) => {
+                                        let _ = deps.sessions.stop(&sid);
+                                        true
+                                    }
+                                    Ok(
+                                        crate::tools::SessionActivity::Terminal
+                                        | crate::tools::SessionActivity::NotFound,
+                                    ) => true,
+                                    _ => false,
+                                }
+                            }
+                        }
+                        None => true,
                     }
                 } else {
                     true
                 };
 
                 if ready_to_promote {
+                    // Reap completed worker session to immediately release AO worker slot
+                    if let Some(session_id_str) = overlay.session_id.take() {
+                        let sid = SessionId(session_id_str);
+                        let _ = deps.sessions.stop(&sid);
+                    }
                     // A positive branch-to-open-PR binding is the durable
                     // boundary between the deferred old attempt and this
                     // fresh attempt. Keep the marker while the old PR is the
