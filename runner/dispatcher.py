@@ -1,8 +1,9 @@
 from __future__ import annotations
 import concurrent.futures
+import dataclasses
 import fnmatch
 import re
-from typing import List, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any
 from runner.rule_loader import Rule
 from runner.skeptic_gate_cli import invoke_reviewer as _invoke_reviewer_module_ref
 from runner.skeptic_gate import SkepticResult
@@ -16,6 +17,45 @@ from runner import skeptic_gate_cli as _cli
 # `_cli.X` here makes the late-bound attribute lookup propagate. See
 # issue #386 r3 wiring + tests/test_skeptic_gate_cli_bead_id_r3.py and
 # tests/test_skeptic_gate_cli_contract_echo.py.
+
+
+# Substrings (case-insensitive) in the reviewer's captured error that
+# indicate a rate-limit / quota bust worth walking the priority queue
+# past. PR #9092 (2026-08-18): codex busts silently and the factory
+# dies; claudem/agy/cursor-agent do the same. The dispatcher now treats
+# these as a hint to try the next vendor in
+# `skeptic_reviewer_priority()` rather than failing the gate.
+_RATE_LIMIT_PATTERNS = (
+    "rate limit",
+    "rate_limit",
+    "ratelimit",
+    "quota",
+    "usage limit",
+    "usage_limit",
+    "429",
+    "too many requests",
+    "rate exceeded",
+    "exceeded your quota",
+    "hit your limit",
+    "exceeded your monthly",
+    "billing",
+    "insufficient_quota",
+    "insufficient quota",
+)
+
+
+def _detect_rate_limit(err: Optional[str]) -> bool:
+    """Return True if ``err`` looks like a rate-limit / quota bust.
+
+    Matches on substrings so a vendor's exact error wording is not
+    load-bearing. The fallback walker uses this to decide whether to
+    advance to the next vendor in the priority queue.
+    """
+    if not err:
+        return False
+    text = err.lower()
+    return any(p in text for p in _RATE_LIMIT_PATTERNS)
+
 
 class VerifierDispatcher:
     def __init__(self, cheap_reviewer: str = "gemini", cheap_model: str = "gemini-3.7-flash",
@@ -76,6 +116,126 @@ class VerifierDispatcher:
             f"{rule.prompt}\n"
         )
 
+    def _resolve_reviewer(self, rule: Rule) -> Tuple[str, str]:
+        """Return (reviewer, model) for the rule, falling back to the
+        tier defaults when the rule does not pin them."""
+        if rule.reviewer:
+            return rule.reviewer, (rule.model or "")
+        if rule.model_tier == "premium":
+            return self.premium_reviewer, self.premium_model
+        return self.cheap_reviewer, self.cheap_model
+
+    def _chain_walk_reviewer(
+        self,
+        *,
+        rule: Rule,
+        prompt: str,
+        original_reviewer: str,
+        original_model: str,
+        repo: str,
+        pr_number: int,
+        head_sha: str,
+        diff: str,
+        implementation_identity: str,
+        contract,
+    ) -> SkepticResult:
+        """Invoke the resolved reviewer; on rate-limit, walk the
+        ``skeptic_reviewer_priority()`` queue.
+
+        PR #9092 (2026-08-18): the factory used to die when a single
+        codex bust happened. The daemon side already walks the queue
+        inline (``daemon/src/er_runner.rs``); the GHA side did not.
+        This method is the GHA-side equivalent: it tries the configured
+        reviewer first, and on any error that matches
+        ``_detect_rate_limit`` it advances to the next vendor in the
+        canonical priority list. If the queue is exhausted, it returns
+        a failure whose reason names the last error and tags the
+        exhaustion so the operator can see the chain ran end-to-end.
+
+        The fallback is **annotated** on the result: when a successful
+        review comes from a vendor other than the original, the
+        ``reason`` is augmented with ``fallback_used=true; fallback_from=<original>``.
+        The provenance / bind checks still run on the fallback result
+        (see ``dispatch`` below) — the fallback path is NOT a bypass.
+        """
+        from runner.reviewer_priority import skeptic_reviewer_priority
+
+        priority = list(skeptic_reviewer_priority())
+        # The walker starts at the resolved reviewer's position in the
+        # priority list. If the resolved reviewer is not in the list
+        # (legacy rule pinning), we still try the resolved reviewer first
+        # and then walk the FULL priority list (skipping any duplicate).
+        if original_reviewer in priority:
+            start_idx = priority.index(original_reviewer)
+            queue = priority[start_idx:]
+        else:
+            queue = [original_reviewer] + [v for v in priority if v != original_reviewer]
+
+        original_vendor = original_reviewer
+        last_err: Optional[str] = None
+        last_vendor: str = original_vendor
+
+        for vendor in queue:
+            last_vendor = vendor
+            try:
+                stdout, err = _cli.invoke_reviewer(vendor, original_model, prompt)
+            except Exception as exc:
+                stdout = None
+                err = str(exc)
+            if err and _detect_rate_limit(err):
+                last_err = err
+                # Hard cap: the queue length is the upper bound on
+                # retries. The for-loop already enforces this.
+                continue
+            # Non-rate-limit outcome (success or a non-quota failure):
+            # record provenance so the operator can see who actually
+            # reviewed, and call evaluate to get the parse outcome.
+            result = _cli.evaluate(
+                review_output=stdout,
+                review_error=err,
+                repo=repo,
+                pr_number=pr_number,
+                head_sha=head_sha,
+                implementation_provenance=implementation_identity,
+                base_sha="unknown",
+                diff=diff,
+                reviewer=vendor,
+                contract=contract,
+            )
+            # Annotate the fallback path on the result. We freeze the
+            # original ``reason`` so the comment body still shows the
+            # evaluator's verdict-side message, and append a chain
+            # trail for the operator / read-back verifier.
+            if vendor != original_vendor:
+                fallback_note = (
+                    f"fallback_used=true; fallback_from={original_vendor}"
+                )
+                new_reason = (result.reason or "").rstrip()
+                if new_reason:
+                    new_reason = f"{new_reason} ({fallback_note})"
+                else:
+                    new_reason = fallback_note
+                result = dataclasses.replace(result, reason=new_reason)
+            return result
+
+        # All vendors exhausted. Return the last rate-limit error so the
+        # gate fails closed (the original behavior on a single busted
+        # reviewer) but the reason now tells the operator the chain was
+        # walked to the end.
+        vendors_tried = ", ".join(queue) if queue else last_vendor
+        reason = (
+            f"all reviewers exhausted (vendors tried: {vendors_tried}; "
+            f"last error: {last_err or 'unknown'})"
+        )
+        return SkepticResult(
+            check_state="failure",
+            verdict=None,
+            reason=reason,
+            comment_body="",
+            parsed=None,
+            reviewer=last_vendor,
+        )
+
     def dispatch(self, rules: List[Rule], changed_files: List[str], diff: str, repo: str, pr_number: int, head_sha: str, base_sha: str, implementation_identity: str, contract=None) -> List[Tuple[Rule, SkepticResult]]:
         matching_rules = [r for r in rules if self.rule_matches(r, changed_files)]
         if not matching_rules:
@@ -87,36 +247,40 @@ class VerifierDispatcher:
             prompt = self.build_rule_prompt(
                 rule, repo, pr_number, head_sha, base_sha, diff, implementation_identity, contract=contract
             )
-            reviewer = rule.reviewer
-            model = rule.model
-            if not reviewer:
-                if rule.model_tier == "premium":
-                    reviewer = self.premium_reviewer
-                    model = self.premium_model
-                else:
-                    reviewer = self.cheap_reviewer
-                    model = self.cheap_model
+            reviewer, model = self._resolve_reviewer(rule)
 
-            stdout, err = _cli.invoke_reviewer(reviewer, model, prompt)
-            res = _cli.evaluate(
-                review_output=stdout,
-                review_error=err,
+            # Chain-walk: try the resolved reviewer; on rate-limit,
+            # advance through ``skeptic_reviewer_priority()`` until one
+            # vendor returns a non-rate-limit outcome (or the queue is
+            # exhausted). The original invoke+evaluate single call is
+            # encapsulated in ``_chain_walk_reviewer`` so the surface
+            # here is just "invoke once, but resilient to vendor busts".
+            res = self._chain_walk_reviewer(
+                rule=rule,
+                prompt=prompt,
+                original_reviewer=reviewer,
+                original_model=model,
                 repo=repo,
                 pr_number=pr_number,
                 head_sha=head_sha,
-                implementation_provenance=implementation_identity,
-                base_sha="unknown",
                 diff=diff,
-                reviewer=reviewer,
+                implementation_identity=implementation_identity,
                 contract=contract,
             )
 
             # Enforce security checks: binding and provenance (self-review rejection)
             if res.check_state == "success" and res.parsed is not None:
                 from runner.skeptic_gate import bind_reviewer_identity, verify_provenance, format_comment
-                
+
+                # The reviewer that actually produced the verdict is
+                # whatever the chain-walk landed on (recorded in
+                # ``res.reviewer`` by ``_chain_walk_reviewer``). Use that
+                # for the bind check so the fallback path is still
+                # subject to the same identity binding.
+                actual_reviewer = res.reviewer or reviewer
+
                 # 1. CLI -> identity binding
-                ok_bind, why_bind = bind_reviewer_identity(reviewer, res.parsed.reviewer_identity)
+                ok_bind, why_bind = bind_reviewer_identity(actual_reviewer, res.parsed.reviewer_identity)
                 if not ok_bind:
                     body = format_comment(
                         verdict="FAIL",
@@ -124,7 +288,7 @@ class VerifierDispatcher:
                         expected_head_sha=head_sha,
                         repo=repo,
                         pr_number=pr_number,
-                        reviewer=reviewer,
+                        reviewer=actual_reviewer,
                         implementation_provenance=implementation_identity,
                         reason=why_bind,
                     )
@@ -134,9 +298,9 @@ class VerifierDispatcher:
                         reason=why_bind,
                         comment_body=body,
                         parsed=res.parsed,
-                        reviewer=reviewer,
+                        reviewer=actual_reviewer,
                     )
-                    
+
                 # 2. Implementer vs reviewer independence (provenance)
                 ok_prov, why_prov = verify_provenance(implementation_identity, res.parsed.reviewer_identity)
                 if not ok_prov:
@@ -146,7 +310,7 @@ class VerifierDispatcher:
                         expected_head_sha=head_sha,
                         repo=repo,
                         pr_number=pr_number,
-                        reviewer=reviewer,
+                        reviewer=actual_reviewer,
                         implementation_provenance=implementation_identity,
                         reason=why_prov,
                     )
@@ -156,7 +320,7 @@ class VerifierDispatcher:
                         reason=why_prov,
                         comment_body=body,
                         parsed=res.parsed,
-                        reviewer=reviewer,
+                        reviewer=actual_reviewer,
                     )
 
             return rule, res
