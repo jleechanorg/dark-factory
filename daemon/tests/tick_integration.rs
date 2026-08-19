@@ -14600,3 +14600,102 @@ fn test_non_default_repository_branch_collision_telemetry_attribution() {
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+/// Bead jleechan-w0r4: verify that when an adopted remediation session transitions
+/// to idle (finished prompt execution), the daemon reaps the worker session via
+/// stop() and promotes the bead to ATTESTED, clearing the session handle.
+#[test]
+fn test_dispatched_adopted_idle_session_reaped_and_promoted() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    // Non-terminal quiescence but idle activity
+    sessions.quiescent = false;
+    sessions.set_activity(daemon::tools::SessionActivity::Idle);
+
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_test_w0r4.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    store.overlays.borrow_mut().insert(
+        "bead-w0r4".into(),
+        BeadOverlay {
+            bead_id: "bead-w0r4".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(999),
+            branch: Some("fix/test-w0r4".into()),
+            session_id: Some("wa-9999".into()),
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+
+    store.register_branch("bead-w0r4", "fix/test-w0r4").unwrap();
+
+    scm.pr_numbers_for_branch.insert(("owner/repo".into(), "fix/test-w0r4".into()), Some(999));
+    scm.open_pr_head_refs.insert(("owner/repo".into(), 999), daemon::tools::PrHeadBranch::SameRepo("fix/test-w0r4".into()));
+    scm.pr_snapshots.insert(
+        999,
+        PrSnapshot {
+            pr_number: 999,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "head-999".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 0);
+
+    let o = store.load("bead-w0r4").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::Attested,
+        "idle adopted session must promote to ATTESTED"
+    );
+    assert_eq!(
+        o.session_id, None,
+        "session handle must be cleared after reaping"
+    );
+    assert!(
+        sessions.stop_succeeded.get(),
+        "sessions.stop() must be called to reap idle worker"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
