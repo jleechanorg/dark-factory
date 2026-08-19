@@ -5851,7 +5851,10 @@ fn session_activity(
     if is_terminal_ao_session(entry) {
         return Ok(SessionActivity::Terminal);
     }
-    if entry.get("activity").and_then(|value| value.as_str()) == Some("idle") {
+    if matches!(
+        entry.get("activity").and_then(|value| value.as_str()),
+        Some("idle" | "ready" | "waiting")
+    ) {
         return Ok(SessionActivity::Idle);
     }
     Ok(SessionActivity::Running)
@@ -5948,6 +5951,7 @@ mod active_session_count_tests {
         // stale `activity` lingers.
         let status = serde_json::json!([
             {"name": "idle-spawning", "status": "spawning", "activity": "idle"},
+            {"name": "ready-spawning", "status": "spawning", "activity": "ready"},
             {"name": "running", "status": "working", "activity": "working"},
             {"name": "killed-stale-idle", "status": "killed", "activity": "idle"},
             {"name": "exited", "status": "working", "activity": "exited"},
@@ -5956,6 +5960,10 @@ mod active_session_count_tests {
 
         assert_eq!(
             session_activity(&status, &SessionId("idle-spawning".into())).unwrap(),
+            SessionActivity::Idle
+        );
+        assert_eq!(
+            session_activity(&status, &SessionId("ready-spawning".into())).unwrap(),
             SessionActivity::Idle
         );
         assert_eq!(
