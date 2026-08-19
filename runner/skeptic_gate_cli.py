@@ -1094,9 +1094,22 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
             return 2
 
+    # PR #9092 (2026-08-18): the dispatcher's chain-walk in
+    # `VerifierDispatcher._chain_walk_reviewer` reads the full
+    # priority queue from `runner.reviewer_priority`. The default
+    # cheap/premium reviewers are still the head/tail of that list,
+    # so operator behavior for a fully-healthy pipeline is unchanged.
+    # The change is that the dispatcher now has the full queue
+    # available to walk on rate-limit / quota busts, instead of
+    # whatever the dispatcher was hardcoded to above.
+    from runner.reviewer_priority import skeptic_reviewer_priority
+    priority = skeptic_reviewer_priority()
+    premium = priority[0] if priority else "claudem"
+    cheap = priority[-1] if priority else "cursor-agent"
     dispatcher = VerifierDispatcher(
-        cheap_reviewer="gemini", cheap_model="gemini-3.7-flash",
-        premium_reviewer="gemini", premium_model="gemini-3.7-pro"
+        cheap_reviewer=cheap, cheap_model="",
+        premium_reviewer=premium,
+        premium_model="MiniMax-M3" if premium in ("claudem", "minimax") else "",
     )
     results = dispatcher.dispatch(
         rules, changed_files, diff, repo, args.pr_number, head_sha, "unknown",

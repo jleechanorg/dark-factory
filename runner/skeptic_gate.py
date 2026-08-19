@@ -144,6 +144,30 @@ REVIEWER_CLI_TO_IDENTITY = {
     "gemini": "gemini",
 }
 
+
+def _extend_bind_table_from_priority() -> None:
+    """Extend REVIEWER_CLI_TO_IDENTITY with each entry in
+    ``skeptic_reviewer_priority()`` (CLI -> CLI name).
+
+    PR #9092 (2026-08-18): the GHA skeptic gate's chain-walk in
+    ``runner/dispatcher.py:VerifierDispatcher._chain_walk_reviewer``
+    iterates ``skeptic_reviewer_priority()``. The bind-rejection path
+    (``runner.skeptic_gate:bind_reviewer_identity``) used to short-
+    circuit on every chain-walk vendor because only ``codex`` and
+    ``gemini`` were pinned. Binding each chain-walk vendor to its own
+    name is the minimal extension: each CLI still declares its own
+    identity, the rejection of "vendor claimed another vendor's
+    identity" still holds, and the chain-walk verdict reaches the
+    operator. The function is idempotent — it never overwrites an
+    existing binding.
+    """
+    try:
+        from runner.reviewer_priority import skeptic_reviewer_priority
+    except ImportError:
+        return
+    for vendor in skeptic_reviewer_priority():
+        REVIEWER_CLI_TO_IDENTITY.setdefault(vendor.strip(), vendor.strip())
+
 # Commit-subject prefixes that map to model identities. The mapping is
 # a deterministic prefix match — no ZFC keyword routing on free-form
 # text. A subject that does not start with one of these prefixes
@@ -1689,3 +1713,10 @@ __all__ = [
     "verify_published_comment",
     "verify_provenance",
 ]
+
+
+# PR #9092 (2026-08-18): keep the bind table in lockstep with the
+# chain-walk vendor list. Run at import time so any module that
+# imports ``skeptic_gate`` (the dispatcher, the GHA gate, the daemon's
+# python shims) sees the extended table immediately.
+_extend_bind_table_from_priority()
