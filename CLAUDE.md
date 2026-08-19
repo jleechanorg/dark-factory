@@ -152,6 +152,12 @@ pipeline before invoking `dark-factory`, unless the user passed `--pipeline`.
 
 This repo is layer 1 only.
 
+### Agent Orchestrator (AO) Repository Policy
+- The canonical AO engine used by dark-factory is upstream **Golang `agent-orchestrator`** (`https://github.com/strongdm/agent-orchestrator` / `jleechanorg/agent-orchestrator`). We do NOT use `agent-orchestrator-ts`.
+- The AO repository is **read-only / reference only**. We almost never want to modify or open PRs against AO; all session liveness interpretation, reaping triggers, timeout logic, and promotion handling must live within `dark-factory` itself (e.g. in `daemon/src/adapters.rs` and `daemon/src/tick.rs`).
+- **Hard Safety Gate**: Agents must **NEVER** write or modify `agent-orchestrator` code unless the human operator explicitly provides the verbatim authorization: `AO CODE APPROVED`.
+
+
 ### Durable artifacts vs. dorodango
 The `.dot` files under `pipelines/` are the artifact worth versioning — they encode the development process. The Python under `runner/` is treated as throwaway code: polish, discard, rebuild from spec. Learning accumulates in the **CXDB** event log, not in the runner code.
 
