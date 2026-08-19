@@ -826,14 +826,18 @@ struct GhCheck {
     name: String,
 }
 
+type SharedCache<K, V> = Arc<Mutex<HashMap<(String, K), (V, Instant)>>>;
+
 #[derive(Clone)]
+#[allow(clippy::type_complexity)]
 pub struct CliScm {
     pub repo: String,
-    labeled_issues_cache: Arc<Mutex<HashMap<(String, String), (Vec<Issue>, Instant)>>>,
-    permission_cache: Arc<Mutex<HashMap<(String, String), (Permission, Instant)>>>,
-    pr_snapshot_cache: Arc<Mutex<HashMap<(String, u64), (PrSnapshot, Instant)>>>,
-    branch_commit_cache: Arc<Mutex<HashMap<(String, String), (Option<u64>, Instant)>>>,
+    labeled_issues_cache: SharedCache<String, Vec<Issue>>,
+    permission_cache: SharedCache<String, Permission>,
+    pr_snapshot_cache: SharedCache<u64, PrSnapshot>,
+    branch_commit_cache: SharedCache<String, Option<u64>>,
 }
+
 
 impl CliScm {
     pub fn new(repo: String) -> Self {
