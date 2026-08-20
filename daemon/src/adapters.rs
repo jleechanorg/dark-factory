@@ -6105,7 +6105,7 @@ export const isTerminalSession = () => false;
 
 impl Sessions for CliSessions {
     fn active_count(&self) -> Result<usize, DaemonError> {
-        let out = run_tool("ao", &["status", "--json"], 30)?;
+        let out = run_tool("ao", &["status", "-p", &self.project, "--json"], 30)?;
         let json_start = out.find('[').unwrap_or(0);
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
@@ -6189,7 +6189,7 @@ impl Sessions for CliSessions {
         bead_id: &str,
         timeout_secs: u64,
     ) -> Result<SessionId, DaemonError> {
-        let out = run_tool("ao", &["status", "--json"], timeout_secs)?;
+        let out = run_tool("ao", &["status", "-p", &self.project, "--json"], timeout_secs)?;
         let json_start = out.find('[').unwrap_or(0);
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
@@ -6203,7 +6203,7 @@ impl Sessions for CliSessions {
     }
 
     fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError> {
-        let out = run_tool("ao", &["status", "--json"], 30)?;
+        let out = run_tool("ao", &["status", "-p", &self.project, "--json"], 30)?;
         let json_start = out.find('[').unwrap_or(0);
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
@@ -6231,7 +6231,7 @@ impl Sessions for CliSessions {
         id: &SessionId,
         timeout_secs: u64,
     ) -> Result<crate::tools::SessionActivity, DaemonError> {
-        let out = run_tool("ao", &["status", "--json"], timeout_secs)?;
+        let out = run_tool("ao", &["status", "-p", &self.project, "--json"], timeout_secs)?;
         let json_start = out.find('[').unwrap_or(0);
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
@@ -6251,7 +6251,7 @@ impl Sessions for CliSessions {
     /// callers only ever reject a dispatch on a *positive* mismatch, never
     /// on an inability to check.
     fn session_branch(&self, id: &SessionId) -> Result<Option<String>, DaemonError> {
-        let out = match run_tool("ao", &["status", "--json"], 30) {
+        let out = match run_tool("ao", &["status", "-p", &self.project, "--json"], 30) {
             Ok(o) => o,
             Err(_) => return Ok(None),
         };
