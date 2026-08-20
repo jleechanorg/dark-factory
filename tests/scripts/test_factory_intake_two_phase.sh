@@ -99,6 +99,9 @@ mapfile -t br_lines < <(grep '^br ' "$LOG")
   exit 1
 }
 
+printf 'verified br command log:\n'
+printf '%s\n' "${br_lines[@]}"
+
 case "${br_lines[2]}" in
   *' create '* ) ;;
   *) echo "expected create as third br call" >&2; exit 1 ;;
