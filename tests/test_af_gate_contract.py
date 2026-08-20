@@ -196,30 +196,18 @@ def test_no_direct_sqlite3_mutation_in_docs():
     print("✓ No direct sqlite3 mutation instructions in operator docs")
 
 
-def test_auto_factory_requires_generic_host_and_two_phase_intake():
-    """Pin factory intake to a capable current host and label only after proof."""
+def test_auto_factory_requires_linux_bead_authority_and_two_phase_intake():
+    """Pin factory intake to the authoritative Linux store and label after proof."""
     skill_path = ROOT / ".claude" / "skills" / "auto-factory" / "SKILL.md"
     content = skill_path.read_text()
     command_path = ROOT / ".claude" / "commands" / "auto-factory.md"
     command = command_path.read_text()
 
-    forbidden_personal_routing = [
-        "jeff-ubuntu",
-        "Every `/af` run operates through SSH",
-        "Production `/af` execution is Linux-only",
-    ]
-    assert not [
-        marker
-        for marker in forbidden_personal_routing
-        if marker in content or marker in command
-    ]
-
     required_contract = [
-        "invocation host is the candidate factory host",
-        "supports `target_repo`",
-        "DARK_FACTORY_ROOT",
-        "ai.dark-factory.af-tick",
+        "Every `/af` run operates through SSH on `jeff-ubuntu`",
+        "Production `/af` execution is Linux-only",
         "ai.dark-factory.daemon.service",
+        "systemctl --user is-active --quiet",
         'systemctl --user show "$unit" --property=WorkingDirectory --value',
         'br --db "$BR_DB" where',
         'br --db "$BR_DB" sync --status --json',
@@ -234,7 +222,7 @@ def test_auto_factory_requires_generic_host_and_two_phase_intake():
 
     missing = [entry for entry in required_contract if entry not in content]
     assert not missing, (
-        "auto-factory skill is missing generic intake safeguards: "
+        "auto-factory skill is missing Linux intake safeguards: "
         f"{missing}"
     )
     assert content.index("Execution host + Bead authority preflight") < content.index(
@@ -251,6 +239,8 @@ def test_auto_factory_requires_generic_host_and_two_phase_intake():
     ) < content.index("intake verified; adoption pending")
     assert "Wait for any spawned coder subagents" not in command
     assert not re.search(r"(?m)^br (?!--db )", content)
+    assert "launchctl print" not in content
+    assert "PlistBuddy" not in content
 
 
 def test_auto_factory_command_target_repo_default_and_override_execute():

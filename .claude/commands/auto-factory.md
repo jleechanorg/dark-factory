@@ -9,10 +9,8 @@ execution_mode: one-shot
 
 ## 🚨 EXECUTION WORKFLOW
 
-Run on the host selected by the caller. Treat the current host as the candidate
-factory host and follow the skill's capability, exact-DB, and two-phase intake
-preflight. If this host is not capable, stop without creating or labelling a
-Bead; routing to another host is a user-scoped concern.
+Production `/af` execution is Linux-only. Execute this workflow through `/linux`
+on `jeff-ubuntu`; do not run local Mac intake, overlay, or tick commands.
 
 ### Step 1: Run one tick of the auto-factory skill
 Select the repository explicitly. The normal command defaults to worldai; a
@@ -28,7 +26,7 @@ Skill("auto-factory", args="one tick: drive any factory-labeled beads to /green 
 ```
 
 ### Step 2: Verify tick completion
-Do not wait on coder subagents inside a tick. Inspect the local daemon service,
+Do not wait on coder subagents inside a tick. Inspect the Linux daemon service,
 telemetry, and live worker transcripts, then re-invoke the skill on a later tick
 to assess completed work.
 
