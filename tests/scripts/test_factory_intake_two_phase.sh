@@ -40,7 +40,11 @@ cat > "$SCRATCH_DIR/bin/gh" <<'GH'
 #!/usr/bin/env bash
 printf 'gh %s\n' "$*" >> "$COMMAND_LOG"
 if [ "${1:-}" = issue ] && [ "${2:-}" = list ]; then
-  printf '[{"number":9153,"title":"Small PR #9153","body":"factory follow-up"}]\n'
+  if [ "${BEAD_MODE:-new}" = closed_body ]; then
+    printf '[{"number":9153,"title":"Small PR #9153","body":"factory follow-up\\nBead: bead-closed"}]\n'
+  else
+    printf '[{"number":9153,"title":"Small PR #9153","body":"factory follow-up"}]\n'
+  fi
 else
   printf '{}\n'
 fi
@@ -58,8 +62,12 @@ printf '\n' >> "$COMMAND_LOG"
 while [ "${args[0]:-}" = --db ]; do args=("${args[@]:2}"); done
 case "${args[0]:-}" in
   list)
-    if [ "${BEAD_MODE:-new}" = closed ] && [ "${args[2]:-}" = closed ]; then
-      printf '{"issues":[{"id":"bead-closed","status":"closed","external_ref":"example/target#9153"}]}\n'
+    if [[ "${BEAD_MODE:-new}" = closed_* ]] && [ "${args[2]:-}" = closed ]; then
+      if [ "$BEAD_MODE" = closed_external ]; then
+        printf '{"issues":[{"id":"bead-closed","status":"closed","external_ref":"example/target#9153"}]}\n'
+      else
+        printf '{"issues":[{"id":"bead-closed","status":"closed"}]}\n'
+      fi
     else
       printf '{"issues":[]}\n'
     fi
@@ -78,7 +86,7 @@ case "${args[0]:-}" in
     labels='[]'
     if grep -qx factory "$LABELS_FILE" 2>/dev/null; then labels='["factory"]'; fi
     status='open'
-    if [ "${BEAD_MODE:-new}" = closed ]; then status='closed'; fi
+    if [[ "${BEAD_MODE:-new}" = closed_* ]]; then status='closed'; fi
     printf '{"id":"%s","status":"%s","labels":%s}\n' "${args[1]}" "$status" "$labels"
     ;;
   update)
@@ -160,23 +168,25 @@ fi
 
 echo "PASS: configured [repos] target is accepted and unconfigured target fails before Bead access"
 
-: > "$LOG"
 export TARGET_REPO="example/target"
-export BEAD_MODE="closed"
-closed_output="$($INTAKE)"
-case "$closed_output" in
-  *'bead-closed (closed; not adopted)'*'"closed_not_adopted": 1'*) ;;
-  *) echo "closed matching bead was not reported as non-adoptable" >&2; exit 1 ;;
-esac
-if grep -qE '^br .* (update .*--add-label factory|create )' "$LOG"; then
-  echo "closed matching bead was mutated or recreated" >&2
-  cat "$LOG" >&2
-  exit 1
-fi
-if grep -q '^overlay intake-upsert ' "$LOG"; then
-  echo "closed matching bead reached overlay adoption" >&2
-  cat "$LOG" >&2
-  exit 1
-fi
+for BEAD_MODE in closed_external closed_body; do
+  export BEAD_MODE
+  : > "$LOG"
+  closed_output="$($INTAKE)"
+  case "$closed_output" in
+    *'bead-closed (closed; not adopted)'*'"closed_not_adopted": 1'*) ;;
+    *) echo "$BEAD_MODE matching bead was not reported as non-adoptable" >&2; exit 1 ;;
+  esac
+  if grep -qE '^br .* (update .*--add-label factory|create )' "$LOG"; then
+    echo "$BEAD_MODE matching bead was mutated or recreated" >&2
+    cat "$LOG" >&2
+    exit 1
+  fi
+  if grep -q '^overlay intake-upsert ' "$LOG"; then
+    echo "$BEAD_MODE matching bead reached overlay adoption" >&2
+    cat "$LOG" >&2
+    exit 1
+  fi
+done
 
-echo "PASS: closed external-ref match is deduplicated without label or overlay adoption"
+echo "PASS: closed external-ref and body matches are deduplicated without mutation or adoption"
