@@ -219,7 +219,17 @@ def show_bead(bead_id):
         data = data[0] if data else {}
     if not isinstance(data, dict):
         raise SystemExit(f"br show returned invalid JSON for {bead_id}")
+    if data.get("id") != bead_id:
+        raise SystemExit(f"br show returned the wrong bead for {bead_id}")
     return data
+
+def bead_is_open(bead_id, shown):
+    status = shown.get("status")
+    if status == "open":
+        return True
+    if status == "closed":
+        return False
+    raise SystemExit(f"br show returned invalid status for {bead_id}: {status!r}")
 
 def bead_labels(data):
     labels = data.get("labels") or []
@@ -233,18 +243,23 @@ def bead_labels(data):
 
 def ensure_factory_label(bead_id):
     shown = show_bead(bead_id)
+    if not bead_is_open(bead_id, shown):
+        return False
     if factory_label not in bead_labels(shown):
         run(br_cmd(["update", bead_id, "--add-label", factory_label, "--json"]))
         shown = show_bead(bead_id)
+        if not bead_is_open(bead_id, shown):
+            raise SystemExit(f"bead closed during factory label update: {bead_id}")
     if factory_label not in bead_labels(shown):
         raise SystemExit(f"factory label was not persisted for {bead_id}")
+    return True
 
 def link_external_ref(bead_id, external_ref):
     run(br_cmd(["update", bead_id, "--external-ref", external_ref]))
 
 issues_gh = gh_issues()
 issues_br = br_issues()
-created = linked = upserted = skipped = 0
+created = linked = upserted = skipped = closed_skipped = 0
 
 for gh in issues_gh:
     number = gh["number"]
@@ -260,6 +275,11 @@ for gh in issues_gh:
     drive_mode = bool(pr_number)
 
     if bead_id:
+        shown = show_bead(bead_id)
+        if not bead_is_open(bead_id, shown):
+            closed_skipped += 1
+            print(f"issue #{number} -> {bead_id} (closed; not adopted) ext={external_ref}")
+            continue
         existing_ref = next(
             (i.get("external_ref") for i in issues_br if i.get("id") == bead_id),
             None,
@@ -291,7 +311,8 @@ for gh in issues_gh:
         created += 1
         issues_br.append({"id": bead_id, "external_ref": external_ref})
 
-    ensure_factory_label(bead_id)
+    if not ensure_factory_label(bead_id):
+        raise SystemExit(f"bead closed before factory label adoption: {bead_id}")
     result = intake_upsert(bead_id, title)
     if result == "created":
         upserted += 1
@@ -309,6 +330,7 @@ print(
             "external_ref_linked": linked,
             "overlay_created": upserted,
             "overlay_exists": skipped,
+            "closed_not_adopted": closed_skipped,
         }
     )
 )

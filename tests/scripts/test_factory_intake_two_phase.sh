@@ -58,7 +58,11 @@ printf '\n' >> "$COMMAND_LOG"
 while [ "${args[0]:-}" = --db ]; do args=("${args[@]:2}"); done
 case "${args[0]:-}" in
   list)
-    printf '{"issues":[]}\n'
+    if [ "${BEAD_MODE:-new}" = closed ] && [ "${args[2]:-}" = closed ]; then
+      printf '{"issues":[{"id":"bead-closed","status":"closed","external_ref":"example/target#9153"}]}\n'
+    else
+      printf '{"issues":[]}\n'
+    fi
     ;;
   create)
     for ((i = 0; i < ${#args[@]} - 1; i++)); do
@@ -73,7 +77,9 @@ case "${args[0]:-}" in
   show)
     labels='[]'
     if grep -qx factory "$LABELS_FILE" 2>/dev/null; then labels='["factory"]'; fi
-    printf '{"id":"%s","labels":%s}\n' "${args[1]}" "$labels"
+    status='open'
+    if [ "${BEAD_MODE:-new}" = closed ]; then status='closed'; fi
+    printf '{"id":"%s","status":"%s","labels":%s}\n' "${args[1]}" "$status" "$labels"
     ;;
   update)
     if [ "${args[2]:-}" = --add-label ] && [ "${args[3]:-}" = factory ]; then
@@ -153,3 +159,24 @@ if grep -q '^br ' "$LOG"; then
 fi
 
 echo "PASS: configured [repos] target is accepted and unconfigured target fails before Bead access"
+
+: > "$LOG"
+export TARGET_REPO="example/target"
+export BEAD_MODE="closed"
+closed_output="$($INTAKE)"
+case "$closed_output" in
+  *'bead-closed (closed; not adopted)'*'"closed_not_adopted": 1'*) ;;
+  *) echo "closed matching bead was not reported as non-adoptable" >&2; exit 1 ;;
+esac
+if grep -qE '^br .* (update .*--add-label factory|create )' "$LOG"; then
+  echo "closed matching bead was mutated or recreated" >&2
+  cat "$LOG" >&2
+  exit 1
+fi
+if grep -q '^overlay intake-upsert ' "$LOG"; then
+  echo "closed matching bead reached overlay adoption" >&2
+  cat "$LOG" >&2
+  exit 1
+fi
+
+echo "PASS: closed external-ref match is deduplicated without label or overlay adoption"
