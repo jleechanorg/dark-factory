@@ -428,10 +428,38 @@ To add a new sealed-holdout feature `foo`:
    passing `--feature foo`, or write `pipelines/factory/foo.dot` with custom
    nodes.
 
+## Review Verdict Interpretation Contract (Zero Inversion)
+
+- `status: "valid"` / `backend_returncode: 0`: Indicates only that the reviewer CLI/transport executed cleanly and emitted valid JSON matching the schema. It does **NOT** indicate that the code passed.
+- `verdict: "fail"` / `exit_code: 2`: Indicates the independent review **REJECTED** the change.
+- `verdict: "pass"` / `exit_code: 0`: Indicates the review **ACCEPTED** the change.
+- **NEVER** treat `status: "valid"` or a successful LLM invocation as a passing verdict when `verdict == "fail"`.
+
+### Review Result Surface Requirements
+
+Whenever `dark-factory review` completes, the agent MUST immediately report:
+- **If `verdict: fail` (exit code 2)**:
+  1. `VERDICT: REJECTED (FAIL)`
+  2. The exact reviewed `HEAD_SHA` and `BASE_SHA`.
+  3. List of all failing Criteria Gates (`C0`–`C7`) and Evidence Gates (`E0`–`E14`).
+  4. Full verbatim list of Critical, High, and Blocker findings from `reviewer.output.md`.
+  5. Explicit statement that the PR is NOT `/ready` and CANNOT be merged.
+- **If `verdict: pass` (exit code 0)**:
+  1. `VERDICT: ACCEPTED (PASS)`
+  2. The exact reviewed `HEAD_SHA` and `controller-receipt.json` digest.
+
+### Loop Exhaustion Invariant
+
+- Reaching the maximum cycle budget (e.g., 3/3 cycles) without achieving `verdict: pass` constitutes a **FAILED RUN**.
+- The agent MUST report `STATUS: REVIEW FAILED / EXHAUSTED AFTER N CYCLES` and halt.
+- An agent must **NEVER** summarize cycle exhaustion as "addressed findings", "all gates passing", or "/ready".
+
 ## Honesty rules
 
 - Always tell the user the **actual command** you ran (`dark-factory ...` or `df-healer ...`). No paraphrasing.
-- Always quote the **runner's exit code** verbatim.
+- Always quote the **runner's exit code** and **actual review verdict** (`pass` / `fail`) verbatim.
+- Never rewrite or summarize a failed review (`verdict: fail`, exit code 2) as a success, pass, or confirmation.
+- Never claim a PR is `/ready`, `/green`, or "All gates passing" when the review verdict is `fail` or when CI checks are pending/failing.
 - Never claim a holdout passed if you read the scenarios — that breaks the
   adversarial guarantee. If you read `~/projects/dark-factory-holdouts/`,
   declare the run **invalid** and rerun the pipeline.
