@@ -34,6 +34,62 @@ fn gh_env_test_lock() -> &'static Mutex<()> {
 
 pub struct CliTracker;
 
+impl CliTracker {
+    fn br_show_factory_state(bead_id: &str) -> Result<(bool, bool), DaemonError> {
+        let out = run_tool("br", &["show", bead_id, "--json"], 30)?;
+        #[derive(serde::Deserialize)]
+        struct BrShowIssue {
+            status: String,
+            #[serde(default)]
+            labels: Vec<String>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum BrShowOutput {
+            One(BrShowIssue),
+            Many(Vec<BrShowIssue>),
+        }
+
+        let json_start = out.find(['[', '{']).unwrap_or(0);
+        let issues = match serde_json::from_str::<BrShowOutput>(&out[json_start..])
+            .map_err(|e| DaemonError::Parse(format!("failed to parse br show JSON: {e}")))?
+        {
+            BrShowOutput::One(issue) => vec![issue],
+            BrShowOutput::Many(issues) => issues,
+        };
+        let issue = issues.first().ok_or_else(|| {
+            DaemonError::Parse(format!("br show returned no issue for Bead {bead_id}"))
+        })?;
+        Ok((
+            issue.status == "open",
+            issue.labels.iter().any(|label| label == "factory"),
+        ))
+    }
+
+    fn ensure_factory_label(bead_id: &str) -> Result<(), DaemonError> {
+        let (is_open, has_factory_label) = Self::br_show_factory_state(bead_id)?;
+        if !is_open {
+            return Err(DaemonError::Parse(format!(
+                "refusing to route non-open Bead {bead_id}"
+            )));
+        }
+        if !has_factory_label {
+            run_tool(
+                "br",
+                &["update", bead_id, "--add-label", "factory", "--json"],
+                30,
+            )?;
+        }
+        let (is_open, has_factory_label) = Self::br_show_factory_state(bead_id)?;
+        if !is_open || !has_factory_label {
+            return Err(DaemonError::Parse(format!(
+                "Bead {bead_id} was readable but factory label verification failed"
+            )));
+        }
+        Ok(())
+    }
+}
+
 impl Tracker for CliTracker {
     fn fetch_candidates(&self) -> Result<Vec<Bead>, DaemonError> {
         // `--limit 0` = unlimited: the default page size (50) silently truncates
@@ -100,7 +156,11 @@ impl Tracker for CliTracker {
         // `DaemonError::duplicate_external_ref_bead_id` and its call sites
         // in `intake.rs` for the authoritative write-time fallback that
         // makes create_bead idempotent even when this snapshot is stale.
-        let mut refs = parse_external_refs_from_br_list(&run_tool(
+        // An open, unlabelled Bead is a partially completed two-phase intake,
+        // not a duplicate to skip. Excluding it makes the next create attempt
+        // hit br's external-ref uniqueness check; create_bead then resumes
+        // phase two against the authoritative existing Bead id.
+        let mut refs = parse_factory_external_refs_from_br_list(&run_tool(
             "br",
             &["list", "--status", "open", "--json", "--limit", "0"],
             30,
@@ -119,7 +179,7 @@ impl Tracker for CliTracker {
         body: &str,
         external_ref: &str,
     ) -> Result<String, DaemonError> {
-        let out = run_tool(
+        let bead_id = match run_tool(
             "br",
             &[
                 "create",
@@ -132,8 +192,19 @@ impl Tracker for CliTracker {
                 "--silent",
             ],
             30,
-        )?;
-        let bead_id = out.trim().to_string();
+        ) {
+            Ok(out) => out.trim().to_string(),
+            Err(error) => match error.duplicate_external_ref_bead_id() {
+                Some(existing_bead_id) => {
+                    let (is_open, _) = Self::br_show_factory_state(&existing_bead_id)?;
+                    if !is_open {
+                        return Err(error);
+                    }
+                    existing_bead_id
+                }
+                None => return Err(error),
+            },
+        };
         if bead_id.is_empty() {
             return Err(DaemonError::Parse(
                 "br create returned an empty bead id".to_string(),
@@ -143,29 +214,7 @@ impl Tracker for CliTracker {
         // Factory routing is intentionally two phase. A new Bead must be
         // readable through the daemon's exact configured store before the
         // routing label makes it eligible for adoption.
-        run_tool("br", &["show", &bead_id, "--json"], 30)?;
-        run_tool(
-            "br",
-            &["update", &bead_id, "--add-label", "factory", "--json"],
-            30,
-        )?;
-        let verified = run_tool("br", &["show", &bead_id, "--json"], 30)?;
-        #[derive(serde::Deserialize)]
-        struct BrShowIssue {
-            #[serde(default)]
-            labels: Vec<String>,
-        }
-        let json_start = verified.find('[').unwrap_or(0);
-        let issues: Vec<BrShowIssue> = serde_json::from_str(&verified[json_start..])
-            .map_err(|e| DaemonError::Parse(format!("failed to parse br show JSON: {e}")))?;
-        let has_factory_label = issues
-            .iter()
-            .any(|issue| issue.labels.iter().any(|label| label == "factory"));
-        if !has_factory_label {
-            return Err(DaemonError::Parse(format!(
-                "new Bead {bead_id} was readable but factory label verification failed"
-            )));
-        }
+        Self::ensure_factory_label(&bead_id)?;
 
         Ok(bead_id)
     }
@@ -217,9 +266,9 @@ case "${1:-}" in
   create) printf 'bead-from-fake-br\n' ;;
   show)
     if [ -f "$DARK_FACTORY_BR_LABEL_STATE" ]; then
-      printf '[{"id":"bead-from-fake-br","labels":["factory"]}]\n'
+      printf '{"id":"bead-from-fake-br","status":"open","labels":["factory"]}\n'
     else
-      printf '[{"id":"bead-from-fake-br","labels":[]}]\n'
+      printf '{"id":"bead-from-fake-br","status":"open","labels":[]}\n'
     fi
     ;;
   update) : > "$DARK_FACTORY_BR_LABEL_STATE"; printf '{}\n' ;;
@@ -283,6 +332,126 @@ esac
         );
         std::fs::remove_dir_all(root).ok();
     }
+
+    #[test]
+    #[cfg(unix)]
+    fn cli_tracker_resumes_each_partial_two_phase_failure() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "dark_factory_cli_tracker_resume_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let br = root.join("br");
+        std::fs::write(
+            &br,
+            r#"#!/bin/sh
+set -eu
+if [ "$1" = "--db" ]; then shift 2; fi
+created="$DARK_FACTORY_STATE/created"
+labelled="$DARK_FACTORY_STATE/labelled"
+failed="$DARK_FACTORY_STATE/failed"
+case "${1:-}" in
+  list)
+    case " $* " in
+      *' --status closed '*) printf '{"issues":[],"has_more":false}\n'; exit 0 ;;
+    esac
+    labels='[]'; [ ! -f "$labelled" ] || labels='["factory"]'
+    printf '{"issues":[{"id":"bead-from-fake-br","external_ref":"owner/repo#1","labels":%s}],"has_more":false}\n' "$labels"
+    ;;
+  create)
+    if [ -f "$created" ]; then
+      echo "Error: Configuration error: External reference 'owner/repo#1' already exists on issue bead-from-fake-br" >&2
+      exit 7
+    fi
+    : > "$created"; printf 'bead-from-fake-br\n'
+    ;;
+  show)
+    if [ ! -f "$failed" ] && { [ "$DARK_FACTORY_FAIL_STAGE" = first_show ] || { [ "$DARK_FACTORY_FAIL_STAGE" = final_show ] && [ -f "$labelled" ]; }; }; then
+      : > "$failed"; exit 1
+    fi
+    labels='[]'; [ ! -f "$labelled" ] || labels='["factory"]'
+    printf '{"id":"bead-from-fake-br","status":"open","labels":%s}\n' "$labels"
+    ;;
+  update)
+    if [ ! -f "$failed" ] && [ "$DARK_FACTORY_FAIL_STAGE" = update ]; then
+      : > "$failed"; exit 1
+    fi
+    : > "$labelled"; printf '{}\n'
+    ;;
+  *) exit 64 ;;
+esac
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&br, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let prior_path = std::env::var_os("PATH");
+        let prior_db = std::env::var_os("DARK_FACTORY_BR_DB");
+        let prior_state = std::env::var_os("DARK_FACTORY_STATE");
+        let prior_stage = std::env::var_os("DARK_FACTORY_FAIL_STAGE");
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!("{}:{}", root.display(), prior_path.as_deref().unwrap_or_default().to_string_lossy()),
+            );
+            std::env::set_var("DARK_FACTORY_BR_DB", root.join("beads.db"));
+        }
+
+        for stage in ["first_show", "update", "final_show"] {
+            let state = root.join(stage);
+            std::fs::create_dir_all(&state).unwrap();
+            unsafe {
+                std::env::set_var("DARK_FACTORY_STATE", &state);
+                std::env::set_var("DARK_FACTORY_FAIL_STAGE", stage);
+            }
+            let tracker = CliTracker;
+            assert!(tracker
+                .create_bead("test", "body", "owner/repo#1")
+                .is_err());
+
+            let known = tracker.fetch_all_external_refs().unwrap();
+            if stage == "final_show" {
+                assert!(known.contains("owner/repo#1"));
+            } else {
+                assert!(!known.contains("owner/repo#1"));
+            }
+            assert_eq!(
+                tracker
+                    .create_bead("test", "body", "owner/repo#1")
+                    .unwrap(),
+                "bead-from-fake-br"
+            );
+        }
+
+        unsafe {
+            match prior_path {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
+            }
+            match prior_db {
+                Some(value) => std::env::set_var("DARK_FACTORY_BR_DB", value),
+                None => std::env::remove_var("DARK_FACTORY_BR_DB"),
+            }
+            match prior_state {
+                Some(value) => std::env::set_var("DARK_FACTORY_STATE", value),
+                None => std::env::remove_var("DARK_FACTORY_STATE"),
+            }
+            match prior_stage {
+                Some(value) => std::env::set_var("DARK_FACTORY_FAIL_STAGE", value),
+                None => std::env::remove_var("DARK_FACTORY_FAIL_STAGE"),
+            }
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
 }
 
 /// Parse `external_ref` values from `br list --json` output.
@@ -313,6 +482,40 @@ pub(crate) fn parse_external_refs_from_br_list(
     Ok(data
         .issues
         .into_iter()
+        .filter_map(|issue| issue.external_ref)
+        .collect())
+}
+
+/// Parse only fully-labelled open intake references. Unlabelled open Beads are
+/// deliberately omitted so a later tick can resume their phase-two labelling.
+fn parse_factory_external_refs_from_br_list(
+    out: &str,
+) -> Result<std::collections::HashSet<String>, DaemonError> {
+    let json_start = out.find('{').unwrap_or(0);
+    #[derive(serde::Deserialize)]
+    struct BrListOutput {
+        issues: Vec<BrIssue>,
+        #[serde(default)]
+        has_more: bool,
+    }
+    #[derive(serde::Deserialize)]
+    struct BrIssue {
+        external_ref: Option<String>,
+        #[serde(default)]
+        labels: Vec<String>,
+    }
+    let data: BrListOutput = serde_json::from_str(&out[json_start..]).map_err(|e| {
+        DaemonError::Parse(format!("failed to parse br list JSON: {e}"))
+    })?;
+    if data.has_more {
+        return Err(DaemonError::Parse(
+            "br list output truncated (has_more=true); refusing partial external-ref dedup — pass --limit 0".to_string(),
+        ));
+    }
+    Ok(data
+        .issues
+        .into_iter()
+        .filter(|issue| issue.labels.iter().any(|label| label == "factory"))
         .filter_map(|issue| issue.external_ref)
         .collect())
 }
