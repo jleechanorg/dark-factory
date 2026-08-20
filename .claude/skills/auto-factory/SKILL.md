@@ -7,7 +7,47 @@ description: End-to-end auto-factory driver — picks up beads + GH issues tagge
 
 The auto-factory is the agent-orchestrator-style system that drives worldai PRs to merge. This skill is its orchestrator: it picks up work (beads + GH issues), dispatches coder subagents, runs verifier ticks, and iterates until gates pass.
 
-## 0. Load contract + config
+## 0. Execution host + Bead authority preflight
+
+Every `/af` run operates through SSH on `jeff-ubuntu`, the sole production
+factory host. Run every `br` read/write, overlay command, daemon check, and
+manual tick there. Never run these operations on the Mac or write a local
+mirror and assume it will synchronize to Linux.
+
+Before any intake mutation, resolve the exact Bead DB configured on the running
+daemon. Bind `br`, the overlay, and any manual tick to that same path; ambient
+`br where` discovery is not authority:
+
+```bash
+BR_DB="$(systemctl --user show ai.dark-factory.daemon.service \
+  --property=Environment --value | tr ' ' '\n' | \
+  sed -n 's/^DARK_FACTORY_BR_DB=//p' | tail -1)"
+[ -n "$BR_DB" ] && [ "${BR_DB#/}" != "$BR_DB" ] && [ -f "$BR_DB" ] || exit 1
+export BR_DB
+command -v br >/dev/null
+br --db "$BR_DB" where
+br --db "$BR_DB" sync --status --json
+br --db "$BR_DB" doctor --quick
+```
+
+If the status is not healthy, or if both `jsonl_newer` and `db_newer` are true,
+stop before `br create`, `br update`, or a factory tick. Ask the operator to
+choose the authoritative representation, reconcile it with the Beads recovery
+workflow, and rerun both checks. A GitHub fallback does not authorize a write
+to an ambiguous Bead store.
+
+After creating or updating intake, verify it from the same host and store:
+
+```bash
+br --db "$BR_DB" show <bead_id>
+br --db "$BR_DB" list --status open --label factory --json
+```
+
+The Bead body must remain below the AO 4096-character task-description limit.
+
+### 0a. Load contract + config
+
+Only after the execution-host preflight passes:
 
 ```bash
 H=daemon/factory-overlay.sh
@@ -26,7 +66,7 @@ Pick up work from BOTH sources (bead store + GitHub):
 
 ### 1a. Bead pickup (primary)
 ```bash
-br list --status open --label factory --json
+br --db "$BR_DB" list --status open --label factory --json
 ```
 
 For each bead: read body, detect `drive-existing-pr` mode (fields `existing_pr`, `existing_branch`, `target_repo`). If present, this bead drives an existing PR — coder must push to existing branch via `git push wa <existing_branch>`. Otherwise default to new-work (create `factory/<bead>-r<attempt>` branch).
@@ -38,7 +78,7 @@ gh issue list --repo "$TARGET_REPO" --label factory --state open --json number,t
 
 If GH API rate-limited (returns error), skip this step — beads-only mode. Log the fallback: `[intake] GH API rate-limited, beads-only mode`.
 
-For each GH issue, treat as a bead: read body, file a local bead via `br create "<title>" --body "<body>" --label factory --label drive-existing-pr`, then continue with bead pickup.
+For each GH issue, treat as a bead: read body, file it in the production store via `br --db "$BR_DB" create "<title>" --body "<body>" --label factory --label drive-existing-pr`, then continue with bead pickup.
 
 ### 1c. Drive-existing-pr detection
 A bead/issue has `drive-existing-pr` mode if body contains ALL of:
@@ -205,7 +245,7 @@ result (cooldown handling is unchanged from the original 7-gate design).
 ## Failure modes & recovery
 
 - **GH API rate-limited**: skip GH pickup, use beads-only mode; continue.
-- **Daemon DOWN** (no auto-factory tick loop running): invoke `bash daemon/factory-af-tick.sh` for one tick; for a 24/7 poll loop, install the launchd plist from `daemon/launchd/ai.dark-factory.af-tick.plist` (bead jleechan-57h0) and `launchctl bootstrap gui/$UID <plist>`.
+- **Daemon DOWN** (no auto-factory tick loop running): on `jeff-ubuntu`, check `systemctl --user status ai.dark-factory.daemon.service`. Invoke `BR_DB="$BR_DB" bash daemon/factory-af-tick.sh` for one Linux-hosted tick only after the Bead authority preflight passes. Restore the daemon through the canonical systemd deployment workflow; do not start a Mac launchd factory loop.
 - **Bead stuck HUMAN_HELD**: `factory-af-tick.sh` already calls `$H recover-held` every tick, which requeues any `HUMAN_HELD` bead with `attempt < 10` back to `QUEUED` (incrementing `attempt`, resetting `autonomy_secs`) automatically. To force it immediately: `$H recover-held` (no bead-id argument — it processes every eligible `HUMAN_HELD` row). Never mutate `bead_overlay` with a raw `sqlite3` command.
 - **PR ci_green stuck on pre-existing infra**: document in PR comment, treat as known-issue; do NOT block readiness.
 - **File-overlap conflict across multiple PRs**: serialize per stacked-PR single-writer rule.

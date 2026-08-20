@@ -195,6 +195,42 @@ def test_no_direct_sqlite3_mutation_in_docs():
     print("✓ No direct sqlite3 mutation instructions in operator docs")
 
 
+def test_auto_factory_requires_linux_bead_authority_preflight():
+    """Pin cross-machine intake to the healthy authoritative Linux store."""
+    skill_path = ROOT / ".claude" / "skills" / "auto-factory" / "SKILL.md"
+    content = skill_path.read_text()
+    command_path = ROOT / ".claude" / "commands" / "auto-factory.md"
+    command = command_path.read_text()
+
+    required_contract = [
+        "Every `/af` run operates through SSH on `jeff-ubuntu`",
+        "DARK_FACTORY_BR_DB",
+        'br --db "$BR_DB" where',
+        'br --db "$BR_DB" sync --status --json',
+        'br --db "$BR_DB" doctor --quick',
+        'br --db "$BR_DB" show <bead_id>',
+        'br --db "$BR_DB" list --status open --label factory --json',
+        'br --db "$BR_DB" create "<title>"',
+        "jeff-ubuntu",
+        "jsonl_newer",
+        "db_newer",
+        "ai.dark-factory.daemon.service",
+    ]
+
+    missing = [entry for entry in required_contract if entry not in content]
+    assert not missing, (
+        "auto-factory skill is missing Linux Bead authority safeguards: "
+        f"{missing}"
+    )
+    assert "launchctl bootstrap" not in content
+    assert content.index("Execution host + Bead authority preflight") < content.index(
+        "$H init"
+    )
+    assert "Production `/af` execution is Linux-only" in command
+    assert "Wait for any spawned coder subagents" not in command
+    assert not re.search(r"(?m)^br (?!--db )", content)
+
+
 def test_auto_merge_guard_required_keys_match_verifier():
     """Pin daemon/scripts/auto-merge-guard.sh's predicate REQUIRED set to verifier.rs.
 
