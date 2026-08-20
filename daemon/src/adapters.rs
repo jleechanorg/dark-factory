@@ -39,6 +39,7 @@ impl CliTracker {
         let out = run_tool("br", &["show", bead_id, "--json"], 30)?;
         #[derive(serde::Deserialize)]
         struct BrShowIssue {
+            id: String,
             status: String,
             #[serde(default)]
             labels: Vec<String>,
@@ -57,9 +58,19 @@ impl CliTracker {
             BrShowOutput::One(issue) => vec![issue],
             BrShowOutput::Many(issues) => issues,
         };
-        let issue = issues.first().ok_or_else(|| {
-            DaemonError::Parse(format!("br show returned no issue for Bead {bead_id}"))
-        })?;
+        if issues.len() != 1 {
+            return Err(DaemonError::Parse(format!(
+                "br show returned {} issues for Bead {bead_id}; expected exactly one",
+                issues.len()
+            )));
+        }
+        let issue = &issues[0];
+        if issue.id != bead_id {
+            return Err(DaemonError::Parse(format!(
+                "br show returned Bead {} while verifying {bead_id}",
+                issue.id
+            )));
+        }
         Ok((
             issue.status == "open",
             issue.labels.iter().any(|label| label == "factory"),
@@ -450,6 +461,91 @@ esac
                 None => std::env::remove_var("DARK_FACTORY_FAIL_STAGE"),
             }
         }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cli_tracker_rejects_wrong_id_object_and_array_without_label_update() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "dark_factory_cli_tracker_wrong_id_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let log = root.join("br.log");
+        let br = root.join("br");
+        std::fs::write(
+            &br,
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$DARK_FACTORY_BR_LOG"
+if [ "$1" = "--db" ]; then shift 2; fi
+case "${1:-}" in
+  show) printf '%s\n' "$DARK_FACTORY_WRONG_ID_PAYLOAD" ;;
+  update) echo 'update must not run for a mismatched readback' >&2; exit 91 ;;
+  *) exit 64 ;;
+esac
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&br, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let prior_path = std::env::var_os("PATH");
+        let prior_db = std::env::var_os("DARK_FACTORY_BR_DB");
+        let prior_log = std::env::var_os("DARK_FACTORY_BR_LOG");
+        let prior_payload = std::env::var_os("DARK_FACTORY_WRONG_ID_PAYLOAD");
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    root.display(),
+                    prior_path.as_deref().unwrap_or_default().to_string_lossy()
+                ),
+            );
+            std::env::set_var("DARK_FACTORY_BR_DB", root.join("beads.db"));
+            std::env::set_var("DARK_FACTORY_BR_LOG", &log);
+        }
+
+        for payload in [
+            r#"{"id":"other-bead","status":"open","labels":["factory"]}"#,
+            r#"[{"id":"requested-bead","status":"open","labels":["factory"]},{"id":"other-bead","status":"open","labels":["factory"]}]"#,
+        ] {
+            unsafe { std::env::set_var("DARK_FACTORY_WRONG_ID_PAYLOAD", payload) };
+            assert!(CliTracker::ensure_factory_label("requested-bead").is_err());
+        }
+
+        unsafe {
+            match prior_path {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
+            }
+            match prior_db {
+                Some(value) => std::env::set_var("DARK_FACTORY_BR_DB", value),
+                None => std::env::remove_var("DARK_FACTORY_BR_DB"),
+            }
+            match prior_log {
+                Some(value) => std::env::set_var("DARK_FACTORY_BR_LOG", value),
+                None => std::env::remove_var("DARK_FACTORY_BR_LOG"),
+            }
+            match prior_payload {
+                Some(value) => std::env::set_var("DARK_FACTORY_WRONG_ID_PAYLOAD", value),
+                None => std::env::remove_var("DARK_FACTORY_WRONG_ID_PAYLOAD"),
+            }
+        }
+        assert!(std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .all(|line| !line.contains(" update ")));
         std::fs::remove_dir_all(root).ok();
     }
 }

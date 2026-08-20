@@ -23,7 +23,6 @@ registered host may provide explicit `DARK_FACTORY_ROOT` and
 `DARK_FACTORY_BR_DB` values:
 
 ```bash
-TARGET_REPO="${TARGET_REPO:?owner/repo required}"
 case "$(uname -s)" in
   Darwin)
     launchctl print "gui/$(id -u)/ai.dark-factory.af-tick" >/dev/null
@@ -47,6 +46,18 @@ esac
 [ -n "$BR_DB" ] && [ "${BR_DB#/}" != "$BR_DB" ] && [ -f "$BR_DB" ] || exit 1
 CONFIG="$FACTORY_ROOT/config/daemon.toml"
 [ -f "$CONFIG" ] || exit 1
+if [ -z "${TARGET_REPO:-}" ]; then
+  TARGET_REPO="$(python3 - "$CONFIG" <<'PY'
+import sys, tomllib
+from pathlib import Path
+
+target = tomllib.loads(Path(sys.argv[1]).read_text()).get("target_repo")
+if not isinstance(target, str) or not target:
+    raise SystemExit("factory config has no default target_repo")
+print(target)
+PY
+)"
+fi
 python3 - "$CONFIG" "$TARGET_REPO" <<'PY'
 import sys, tomllib
 from pathlib import Path

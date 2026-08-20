@@ -15,6 +15,13 @@ preflight. If this host is not capable, stop without creating or labelling a
 Bead; routing to another host is a user-scoped concern.
 
 ### Step 1: Run one tick of the auto-factory skill
+Select the repository explicitly. The normal command defaults to worldai; a
+caller may export another repository that the selected factory config supports:
+```bash
+: "${TARGET_REPO:=jleechanorg/worldarchitect.ai}"
+export TARGET_REPO
+```
+
 Invoke the `auto-factory` skill via the Skill tool:
 ```
 Skill("auto-factory", args="one tick: drive any factory-labeled beads to /green + /er + /code-standards; if no beads, pick up worldai GH issues labeled factory")
