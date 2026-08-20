@@ -15,14 +15,48 @@ supports `target_repo` (as the top-level target or in `[repos]`). If it is not
 capable, stop without mutating intake; host selection and remote routing belong
 to the user-scoped command that invoked this repository command.
 
-Before any intake mutation, resolve the exact Bead DB configured by the local
-factory supervisor into `DARK_FACTORY_BR_DB`. Bind `br`, the overlay, and any
-manual tick to that same path; ambient `br where` discovery is not authority:
+Before any intake mutation, resolve the exact Bead DB and checkout from the
+active local factory supervisor. Bind `br`, the overlay, and any manual tick to
+that same installation; ambient `br where` discovery is not authority. The
+known macOS and Linux supervisors are adapters, not placement policy. Another
+registered host may provide explicit `DARK_FACTORY_ROOT` and
+`DARK_FACTORY_BR_DB` values:
 
 ```bash
-BR_DB="${DARK_FACTORY_BR_DB:?resolve from the local factory supervisor}"
+TARGET_REPO="${TARGET_REPO:?owner/repo required}"
+case "$(uname -s)" in
+  Darwin)
+    launchctl print "gui/$(id -u)/ai.dark-factory.af-tick" >/dev/null
+    plist="$HOME/Library/LaunchAgents/ai.dark-factory.af-tick.plist"
+    tick="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:2' "$plist")"
+    FACTORY_ROOT="$(cd "$(dirname "$tick")/.." && pwd)"
+    BR_DB="$FACTORY_ROOT/.beads/beads.db"
+    ;;
+  Linux)
+    unit=ai.dark-factory.daemon.service
+    systemctl --user is-active --quiet "$unit"
+    FACTORY_ROOT="$(systemctl --user show "$unit" --property=WorkingDirectory --value)"
+    BR_DB="$(systemctl --user show "$unit" --property=Environment --value |
+      tr ' ' '\n' | sed -n 's/^DARK_FACTORY_BR_DB=//p' | tail -1)"
+    ;;
+  *)
+    FACTORY_ROOT="${DARK_FACTORY_ROOT:?registered factory checkout required}"
+    BR_DB="${DARK_FACTORY_BR_DB:?registered factory Bead DB required}"
+    ;;
+esac
 [ -n "$BR_DB" ] && [ "${BR_DB#/}" != "$BR_DB" ] && [ -f "$BR_DB" ] || exit 1
-export BR_DB
+CONFIG="$FACTORY_ROOT/config/daemon.toml"
+[ -f "$CONFIG" ] || exit 1
+python3 - "$CONFIG" "$TARGET_REPO" <<'PY'
+import sys, tomllib
+from pathlib import Path
+
+cfg = tomllib.loads(Path(sys.argv[1]).read_text())
+target = sys.argv[2]
+if target != cfg.get("target_repo") and target not in cfg.get("repos", {}):
+    raise SystemExit(f"factory does not support target_repo: {target}")
+PY
+export BR_DB CONFIG TARGET_REPO
 command -v br >/dev/null
 br --db "$BR_DB" where
 br --db "$BR_DB" sync --status --json
@@ -59,9 +93,8 @@ The Bead body must remain below the AO 4096-character task-description limit.
 Only after the execution-host preflight passes:
 
 ```bash
-H=daemon/factory-overlay.sh
-CONFIG=config/daemon.toml
-[ -f "$CONFIG" ] || CONFIG=daemon/contracts/daemon.toml.example
+cd "$FACTORY_ROOT"
+H="$FACTORY_ROOT/daemon/factory-overlay.sh"
 $H init  # idempotent
 ```
 

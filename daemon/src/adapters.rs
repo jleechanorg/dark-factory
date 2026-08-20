@@ -129,13 +129,45 @@ impl Tracker for CliTracker {
                 body,
                 "--external-ref",
                 external_ref,
-                "--labels",
-                "factory",
                 "--silent",
             ],
             30,
         )?;
-        Ok(out.trim().to_string())
+        let bead_id = out.trim().to_string();
+        if bead_id.is_empty() {
+            return Err(DaemonError::Parse(
+                "br create returned an empty bead id".to_string(),
+            ));
+        }
+
+        // Factory routing is intentionally two phase. A new Bead must be
+        // readable through the daemon's exact configured store before the
+        // routing label makes it eligible for adoption.
+        run_tool("br", &["show", &bead_id, "--json"], 30)?;
+        run_tool(
+            "br",
+            &["update", &bead_id, "--add-label", "factory", "--json"],
+            30,
+        )?;
+        let verified = run_tool("br", &["show", &bead_id, "--json"], 30)?;
+        #[derive(serde::Deserialize)]
+        struct BrShowIssue {
+            #[serde(default)]
+            labels: Vec<String>,
+        }
+        let json_start = verified.find('[').unwrap_or(0);
+        let issues: Vec<BrShowIssue> = serde_json::from_str(&verified[json_start..])
+            .map_err(|e| DaemonError::Parse(format!("failed to parse br show JSON: {e}")))?;
+        let has_factory_label = issues
+            .iter()
+            .any(|issue| issue.labels.iter().any(|label| label == "factory"));
+        if !has_factory_label {
+            return Err(DaemonError::Parse(format!(
+                "new Bead {bead_id} was readable but factory label verification failed"
+            )));
+        }
+
+        Ok(bead_id)
     }
 
     fn comment_external(&self, external_ref: &str, body: &str) -> Result<(), DaemonError> {
@@ -183,6 +215,14 @@ if [ "$1" = "--db" ]; then shift 2; fi
 case "${1:-}" in
   list) printf '{"issues":[],"has_more":false}\n' ;;
   create) printf 'bead-from-fake-br\n' ;;
+  show)
+    if [ -f "$DARK_FACTORY_BR_LABEL_STATE" ]; then
+      printf '[{"id":"bead-from-fake-br","labels":["factory"]}]\n'
+    else
+      printf '[{"id":"bead-from-fake-br","labels":[]}]\n'
+    fi
+    ;;
+  update) : > "$DARK_FACTORY_BR_LABEL_STATE"; printf '{}\n' ;;
   *) exit 64 ;;
 esac
 "#,
@@ -194,6 +234,8 @@ esac
         let prior_path = std::env::var_os("PATH");
         let prior_db = std::env::var_os("DARK_FACTORY_BR_DB");
         let prior_log = std::env::var_os("DARK_FACTORY_BR_LOG");
+        let prior_label_state = std::env::var_os("DARK_FACTORY_BR_LABEL_STATE");
+        let label_state = root.join("factory-labelled");
         unsafe {
             std::env::set_var(
                 "PATH",
@@ -201,6 +243,7 @@ esac
             );
             std::env::set_var("DARK_FACTORY_BR_DB", &db);
             std::env::set_var("DARK_FACTORY_BR_LOG", &log);
+            std::env::set_var("DARK_FACTORY_BR_LABEL_STATE", &label_state);
         }
 
         let tracker = CliTracker;
@@ -220,6 +263,10 @@ esac
                 Some(value) => std::env::set_var("DARK_FACTORY_BR_LOG", value),
                 None => std::env::remove_var("DARK_FACTORY_BR_LOG"),
             }
+            match prior_label_state {
+                Some(value) => std::env::set_var("DARK_FACTORY_BR_LABEL_STATE", value),
+                None => std::env::remove_var("DARK_FACTORY_BR_LABEL_STATE"),
+            }
         }
 
         assert!(reads.unwrap().is_empty());
@@ -228,7 +275,10 @@ esac
             std::fs::read_to_string(&log).unwrap().lines().collect::<Vec<_>>(),
             vec![
                 format!("--db {} list --status open --label factory --json --limit 0", db.display()),
-                format!("--db {} create --title test --description body --external-ref owner/repo#1 --labels factory --silent", db.display()),
+                format!("--db {} create --title test --description body --external-ref owner/repo#1 --silent", db.display()),
+                format!("--db {} show bead-from-fake-br --json", db.display()),
+                format!("--db {} update bead-from-fake-br --add-label factory --json", db.display()),
+                format!("--db {} show bead-from-fake-br --json", db.display()),
             ]
         );
         std::fs::remove_dir_all(root).ok();

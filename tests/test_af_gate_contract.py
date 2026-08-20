@@ -216,6 +216,10 @@ def test_auto_factory_requires_generic_host_and_two_phase_intake():
     required_contract = [
         "invocation host is the candidate factory host",
         "supports `target_repo`",
+        "DARK_FACTORY_ROOT",
+        "ai.dark-factory.af-tick",
+        "ai.dark-factory.daemon.service",
+        'systemctl --user show "$unit" --property=WorkingDirectory --value',
         'br --db "$BR_DB" where',
         'br --db "$BR_DB" sync --status --json',
         'br --db "$BR_DB" doctor --quick',
