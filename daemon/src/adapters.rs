@@ -3959,10 +3959,7 @@ export const isTerminalSession = () => false;
             .status()
             .unwrap();
 
-        // Source repo: two commits. main at A, contributor branch at B.
-        for (cmd_dir, _) in [(&source, &source as &std::path::Path)] {
-            let _ = cmd_dir;
-        }
+
         let commit_a = || -> String {
             std::process::Command::new("git")
                 .args(["init", "-q"])

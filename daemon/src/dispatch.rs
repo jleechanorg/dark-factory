@@ -1520,11 +1520,7 @@ mod tests {
                     .get(&spec.bead_id)
                     .cloned()
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                if let Err(err) =
-                    crate::tools::check_cwd_guard(spec.expected_cwd.as_deref(), &actual)
-                {
-                    return Err(err);
-                }
+                crate::tools::check_cwd_guard(spec.expected_cwd.as_deref(), &actual)?;
             }
             self.calls
                 .borrow_mut()
