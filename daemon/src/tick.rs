@@ -1182,7 +1182,24 @@ pub fn run_tick(
                         let is_stalled_or_dead =
                             if let Some(ref session_id_str) = overlay.session_id {
                                 let session_id = SessionId(session_id_str.clone());
-                                deps.sessions.is_quiescent(&session_id)?
+                                match deps.sessions.is_quiescent(&session_id) {
+                                    Ok(q) => q,
+                                    Err(e) => {
+                                        emit(
+                                            deps.telemetry_log,
+                                            &overlay.bead_id,
+                                            overlay.attempt,
+                                            OverlayState::Attested.as_str(),
+                                            "BEAD_QUIESCENCE_CHECK_TRANSIENT_ERROR",
+                                            serde_json::json!({}),
+                                            serde_json::json!({
+                                                "error": format!("{e:?}"),
+                                                "phase": "wedge_detection",
+                                            }),
+                                        )?;
+                                        false
+                                    }
+                                }
                             } else {
                                 emit(
                                     deps.telemetry_log,
@@ -3945,12 +3962,13 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         project = "worldarchitect".to_string();
                     }
 
-                    let r = crate::tools::run_tool("ao", &["status", "-p", &project, "--json"], 30);
+                    let r = crate::tools::run_tool(
+                        "ao",
+                        &["status", "-p", &project, "--json"],
+                        crate::adapters::AO_STATUS_TIMEOUT_SECS,
+                    );
                     if let Ok(out) = r {
-                        let json_start = out.find('[').unwrap_or(0);
-                        if let Ok(val) =
-                            serde_json::from_str::<serde_json::Value>(&out[json_start..])
-                        {
+                        if let Ok(val) = crate::adapters::parse_ao_status_payload(&out) {
                             if let Some(arr) = val.as_array() {
                                 if let Some(entry) = arr.iter().find(|e| {
                                     e.get("name").and_then(|v| v.as_str())

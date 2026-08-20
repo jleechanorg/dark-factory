@@ -5430,13 +5430,41 @@ export const isTerminalSession = () => false;
     }
 }
 
+/// Bounded timeout for AO status queries. Status probes must be bounded so
+/// rate-limit or GraphQL retry delays never stall a fast-tick cycle.
+pub const AO_STATUS_TIMEOUT_SECS: u64 = 10;
+
+/// Extract and parse the JSON array from `ao status --json` output.
+/// Tolerates leading log lines, warning banners, and notifier messages
+/// (e.g. `[notifier-discord]...`, `[notifier-openclaw]...`) that precede
+/// the valid JSON array payload.
+pub fn parse_ao_status_payload(out: &str) -> Result<serde_json::Value, DaemonError> {
+    for (idx, c) in out.char_indices() {
+        if c == '[' {
+            let slice = &out[idx..];
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(slice) {
+                if val.is_array() {
+                    return Ok(val);
+                }
+            }
+            let mut de = serde_json::Deserializer::from_str(slice);
+            use serde::Deserialize;
+            if let Ok(val) = serde_json::Value::deserialize(&mut de) {
+                if val.is_array() {
+                    return Ok(val);
+                }
+            }
+        }
+    }
+    let json_start = out.find('[').unwrap_or(0);
+    serde_json::from_str(&out[json_start..])
+        .map_err(|e| DaemonError::Parse(format!("failed to parse ao status: {e}")))
+}
+
 impl Sessions for CliSessions {
     fn active_count(&self) -> Result<usize, DaemonError> {
-        let out = run_tool("ao", &["status", "--json"], 30)?;
-        let json_start = out.find('[').unwrap_or(0);
-        let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse ao status: {e}"))
-        })?;
+        let out = run_tool("ao", &["status", "--json"], AO_STATUS_TIMEOUT_SECS)?;
+        let data = parse_ao_status_payload(&out)?;
         active_session_count(&data)
     }
 
@@ -5503,7 +5531,7 @@ impl Sessions for CliSessions {
     /// verbatim in telemetry a human reads, so the message names the branch
     /// and bead explicitly instead of a generic "not found".
     fn attach(&self, branch: &str, bead_id: &str) -> Result<SessionId, DaemonError> {
-        self.attach_within(branch, bead_id, 30)
+        self.attach_within(branch, bead_id, AO_STATUS_TIMEOUT_SECS)
     }
 
     /// Bead jleechan-zeij / issue #322 r4 P2: budget-bounded `attach` — the
@@ -5517,10 +5545,7 @@ impl Sessions for CliSessions {
         timeout_secs: u64,
     ) -> Result<SessionId, DaemonError> {
         let out = run_tool("ao", &["status", "--json"], timeout_secs)?;
-        let json_start = out.find('[').unwrap_or(0);
-        let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse ao status: {e}"))
-        })?;
+        let data = parse_ao_status_payload(&out)?;
         session_for_branch(&data, branch, bead_id)
     }
 
@@ -5530,11 +5555,8 @@ impl Sessions for CliSessions {
     }
 
     fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError> {
-        let out = run_tool("ao", &["status", "--json"], 30)?;
-        let json_start = out.find('[').unwrap_or(0);
-        let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse ao status: {e}"))
-        })?;
+        let out = run_tool("ao", &["status", "--json"], AO_STATUS_TIMEOUT_SECS)?;
+        let data = parse_ao_status_payload(&out)?;
         session_is_quiescent(&data, id)
     }
 
@@ -5548,7 +5570,7 @@ impl Sessions for CliSessions {
         &self,
         id: &SessionId,
     ) -> Result<crate::tools::SessionActivity, DaemonError> {
-        self.session_activity_within(id, 30)
+        self.session_activity_within(id, AO_STATUS_TIMEOUT_SECS)
     }
 
     /// Bead jleechan-zeij / issue #322 r4 P2: budget-bounded
@@ -5559,10 +5581,7 @@ impl Sessions for CliSessions {
         timeout_secs: u64,
     ) -> Result<crate::tools::SessionActivity, DaemonError> {
         let out = run_tool("ao", &["status", "--json"], timeout_secs)?;
-        let json_start = out.find('[').unwrap_or(0);
-        let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse ao status: {e}"))
-        })?;
+        let data = parse_ao_status_payload(&out)?;
         session_activity(&data, id)
     }
 
@@ -5574,12 +5593,11 @@ impl Sessions for CliSessions {
     /// callers only ever reject a dispatch on a *positive* mismatch, never
     /// on an inability to check.
     fn session_branch(&self, id: &SessionId) -> Result<Option<String>, DaemonError> {
-        let out = match run_tool("ao", &["status", "--json"], 30) {
+        let out = match run_tool("ao", &["status", "--json"], AO_STATUS_TIMEOUT_SECS) {
             Ok(o) => o,
             Err(_) => return Ok(None),
         };
-        let json_start = out.find('[').unwrap_or(0);
-        let data: serde_json::Value = match serde_json::from_str(&out[json_start..]) {
+        let data = match parse_ao_status_payload(&out) {
             Ok(v) => v,
             Err(_) => return Ok(None),
         };
@@ -5595,6 +5613,7 @@ impl Sessions for CliSessions {
         }
         Ok(None)
     }
+
 
     /// jleechan-bqdv Stage C: the spawn-time worktree remote assertion's data
     /// source. Uses the exact absolute `workspacePath` AO returned during
@@ -6044,6 +6063,62 @@ mod active_session_count_tests {
             session_for_branch(&ambiguous, "feat/shared", "bead"),
             Err(crate::errors::DaemonError::SessionAmbiguous { .. })
         ));
+    }
+
+    #[test]
+    fn parse_ao_status_payload_extracts_array_with_notifier_preamble() {
+        let raw_output = r#"
+[notifier-discord] No webhookUrl configured.
+  Set it in agent-orchestrator.yaml under notifiers.discord.webhookUrl
+  Create a webhook: Discord Server Settings > Integrations > Webhooks > New Webhook
+[notifier-mcp-mail] No endpoint configured — notifications will be no-ops
+[notifier-openclaw] No token configured (token or OPENCLAW_HOOKS_TOKEN). Sending without Authorization header.
+[
+  {
+    "name": "df-459",
+    "role": "worker",
+    "branch": "factory/dark-factory-w5xs-r1",
+    "status": "working",
+    "activity": "working"
+  }
+]
+"#;
+        let parsed = super::parse_ao_status_payload(raw_output).expect("must parse JSON array despite notifier preamble");
+        assert!(parsed.is_array());
+        assert_eq!(parsed.as_array().unwrap().len(), 1);
+        assert_eq!(active_session_count(&parsed).unwrap(), 1);
+        assert!(!session_is_quiescent(&parsed, &SessionId("df-459".into())).unwrap());
+        assert_eq!(
+            session_for_branch(&parsed, "factory/dark-factory-w5xs-r1", "bead-123").unwrap().0,
+            "df-459"
+        );
+    }
+
+    #[test]
+    fn parse_ao_status_payload_tolerates_trailing_output() {
+        let raw_output = r#"
+[
+  {"name": "s1", "status": "done", "activity": "exited"}
+]
+Done in 0.42s.
+"#;
+        let parsed = super::parse_ao_status_payload(raw_output).expect("must parse JSON array despite trailing text");
+        assert!(parsed.is_array());
+        assert_eq!(active_session_count(&parsed).unwrap(), 0);
+        assert!(session_is_quiescent(&parsed, &SessionId("s1".into())).unwrap());
+    }
+
+    #[test]
+    fn parse_ao_status_payload_empty_array() {
+        let parsed = super::parse_ao_status_payload("[]").expect("empty array must parse");
+        assert!(parsed.is_array());
+        assert_eq!(active_session_count(&parsed).unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_ao_status_payload_malformed_fails_closed() {
+        assert!(super::parse_ao_status_payload("[notifier-only] no array here").is_err());
+        assert!(super::parse_ao_status_payload("").is_err());
     }
 }
 

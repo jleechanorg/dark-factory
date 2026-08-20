@@ -14699,3 +14699,122 @@ fn test_dispatched_adopted_idle_session_reaped_and_promoted() {
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+#[test]
+fn test_quiescence_timeout_does_not_abort_tick_or_block_dispatch_of_queued_beads() {
+    let mut scm = FakeScm::new();
+    scm.issues.push(Issue {
+        number: 42,
+        title: "Fix rate-limit timeout".into(),
+        body: "fix daemon ao status timeout".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#42".into(),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    // Existing attested bead older than 1800s
+    let store = FakeStateStore::new();
+    store
+        .save(&BeadOverlay {
+            bead_id: "bead-attested".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(101),
+            branch: Some("factory/bead-attested-r1".into()),
+            session_id: Some("session-101".into()),
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        })
+        .unwrap();
+
+    scm.pr_snapshots.insert(
+        101,
+        PrSnapshot {
+            pr_number: 101,
+            ci_success: false,
+            mergeable: true,
+            coderabbit_approved: false,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(1),
+            head_sha: "head-101".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 0, // >= 1800s ago, triggers wedge detection quiescence check
+            ci_status: "pending".to_string(),
+            coderabbit_status: "unknown".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    // Simulate ao status / is_quiescent timeout during wedge check
+    sessions.fail_quiescence_check("ao exceeded 30s timeout");
+
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"STANDARD_PATH","justification":"standard task"}"#.into(),
+    ));
+
+    let cfg = test_cfg();
+    let vcs = test_vcs();
+    let telemetry_dir = std::env::temp_dir().join("afd_tick_timeout_isolation_test");
+    std::fs::create_dir_all(&telemetry_dir).unwrap();
+    let telemetry_log = telemetry_dir.join(format!("daemon-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    // Driven tick: slow tier is due (tick 0).
+    // The quiescence check for bead-attested encounters a transient timeout.
+    // The tick MUST NOT abort with Err; it should log the transient error and
+    // proceed to run_slow_tier, creating, routing, and dispatching the queued bead (Issue 42).
+    let summary = run_tick(&deps, 0, 10).expect("tick should succeed despite transient quiescence timeout");
+
+    assert_eq!(
+        summary.beads_created, 1,
+        "new issue should be intaken into a bead"
+    );
+    assert_eq!(
+        summary.beads_routed, 1,
+        "new bead should be routed"
+    );
+    assert_eq!(
+        summary.beads_dispatched, 1,
+        "new bead should be dispatched"
+    );
+
+    // Attested overlay remains ATTESTED (not erroneously parked on transient error)
+    let attested_overlay = store.load("bead-attested").unwrap().unwrap();
+    assert_eq!(attested_overlay.state, OverlayState::Attested);
+
+    // Verify transient error telemetry was emitted
+    let telemetry_content = std::fs::read_to_string(&telemetry_log).unwrap();
+    assert!(
+        telemetry_content.contains("BEAD_QUIESCENCE_CHECK_TRANSIENT_ERROR"),
+        "telemetry should record the transient quiescence check error"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
