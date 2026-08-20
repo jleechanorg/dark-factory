@@ -17,10 +17,25 @@ USE_HARNESS=1
 [ -f "$CONFIG" ] || CONFIG="$ROOT/daemon/contracts/daemon.toml.example"
 
 TARGET_REPO="$(python3 - "$CONFIG" <<'PY'
-import re, sys
-text = open(sys.argv[1]).read()
-m = re.search(r'^\s*target_repo\s*=\s*"([^"]+)"', text, re.M)
-print(m.group(1) if m else "jleechanorg/worldarchitect.ai")
+import os
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    config = tomllib.load(handle)
+
+default_repo = config.get("target_repo")
+requested_repo = os.environ.get("TARGET_REPO")
+repos = config.get("repos") or {}
+
+if not isinstance(default_repo, str) or not default_repo:
+    raise SystemExit("config must define a non-empty top-level target_repo")
+if requested_repo and requested_repo != default_repo and requested_repo not in repos:
+    raise SystemExit(
+        f"TARGET_REPO is not configured: {requested_repo}; "
+        "use the top-level target_repo or a [repos] key"
+    )
+print(requested_repo or default_repo)
 PY
 )"
 
@@ -197,12 +212,54 @@ def intake_upsert(bead_id, title):
     p = run([harness, "intake-upsert", bead_id, title])
     return p.stdout.strip()
 
+def show_bead(bead_id):
+    p = run(br_cmd(["show", bead_id, "--json"]))
+    data = json.loads(p.stdout or "{}")
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    if not isinstance(data, dict):
+        raise SystemExit(f"br show returned invalid JSON for {bead_id}")
+    if data.get("id") != bead_id:
+        raise SystemExit(f"br show returned the wrong bead for {bead_id}")
+    return data
+
+def bead_is_open(bead_id, shown):
+    status = shown.get("status")
+    if status == "open":
+        return True
+    if status == "closed":
+        return False
+    raise SystemExit(f"br show returned invalid status for {bead_id}: {status!r}")
+
+def bead_labels(data):
+    labels = data.get("labels") or []
+    if isinstance(labels, dict):
+        labels = labels.keys()
+    return {
+        label if isinstance(label, str) else label.get("name")
+        for label in labels
+        if isinstance(label, str) or isinstance(label, dict)
+    }
+
+def ensure_factory_label(bead_id):
+    shown = show_bead(bead_id)
+    if not bead_is_open(bead_id, shown):
+        return False
+    if factory_label not in bead_labels(shown):
+        run(br_cmd(["update", bead_id, "--add-label", factory_label, "--json"]))
+        shown = show_bead(bead_id)
+        if not bead_is_open(bead_id, shown):
+            raise SystemExit(f"bead closed during factory label update: {bead_id}")
+    if factory_label not in bead_labels(shown):
+        raise SystemExit(f"factory label was not persisted for {bead_id}")
+    return True
+
 def link_external_ref(bead_id, external_ref):
     run(br_cmd(["update", bead_id, "--external-ref", external_ref]))
 
 issues_gh = gh_issues()
 issues_br = br_issues()
-created = linked = upserted = skipped = 0
+created = linked = upserted = skipped = closed_skipped = 0
 
 for gh in issues_gh:
     number = gh["number"]
@@ -218,6 +275,11 @@ for gh in issues_gh:
     drive_mode = bool(pr_number)
 
     if bead_id:
+        shown = show_bead(bead_id)
+        if not bead_is_open(bead_id, shown):
+            closed_skipped += 1
+            print(f"issue #{number} -> {bead_id} (closed; not adopted) ext={external_ref}")
+            continue
         existing_ref = next(
             (i.get("external_ref") for i in issues_br if i.get("id") == bead_id),
             None,
@@ -229,27 +291,28 @@ for gh in issues_gh:
                 if i.get("id") == bead_id:
                     i["external_ref"] = external_ref
     else:
-        labels = ["factory"]
+        labels = []
         if drive_mode:
             labels.append("drive-existing-pr")
             branch = pr_head_branch(pr_number)
             if branch:
                 body = ensure_drive_fields(body, pr_number, branch)
-        p = run(br_cmd([
-                "create",
-                title,
-                "--description",
-                body,
-                "--labels",
-                ",".join(labels),
-                "--external-ref",
-                external_ref,
-                "--silent",
-            ]))
+        create_args = [
+            "create",
+            title,
+            "--description",
+            body,
+        ]
+        if labels:
+            create_args += ["--labels", ",".join(labels)]
+        create_args += ["--external-ref", external_ref, "--silent"]
+        p = run(br_cmd(create_args))
         bead_id = p.stdout.strip()
         created += 1
         issues_br.append({"id": bead_id, "external_ref": external_ref})
 
+    if not ensure_factory_label(bead_id):
+        raise SystemExit(f"bead closed before factory label adoption: {bead_id}")
     result = intake_upsert(bead_id, title)
     if result == "created":
         upserted += 1
@@ -267,6 +330,7 @@ print(
             "external_ref_linked": linked,
             "overlay_created": upserted,
             "overlay_exists": skipped,
+            "closed_not_adopted": closed_skipped,
         }
     )
 )

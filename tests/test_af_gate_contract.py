@@ -14,6 +14,7 @@ propagated from `PrEvidence.vacuous_red_green`.)
 
 Run: .venv/bin/python -m pytest tests/test_af_gate_contract.py -v
 """
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -195,40 +196,95 @@ def test_no_direct_sqlite3_mutation_in_docs():
     print("✓ No direct sqlite3 mutation instructions in operator docs")
 
 
-def test_auto_factory_requires_linux_bead_authority_preflight():
-    """Pin cross-machine intake to the healthy authoritative Linux store."""
+def test_auto_factory_requires_generic_host_and_two_phase_intake():
+    """Pin factory intake to a capable current host and label only after proof."""
     skill_path = ROOT / ".claude" / "skills" / "auto-factory" / "SKILL.md"
     content = skill_path.read_text()
     command_path = ROOT / ".claude" / "commands" / "auto-factory.md"
     command = command_path.read_text()
 
+    forbidden_personal_routing = [
+        "jeff-ubuntu",
+        "Every `/af` run operates through SSH",
+        "Production `/af` execution is Linux-only",
+    ]
+    assert not [
+        marker
+        for marker in forbidden_personal_routing
+        if marker in content or marker in command
+    ]
+
     required_contract = [
-        "Every `/af` run operates through SSH on `jeff-ubuntu`",
-        "DARK_FACTORY_BR_DB",
+        "invocation host is the candidate factory host",
+        "supports `target_repo`",
+        "DARK_FACTORY_ROOT",
+        "ai.dark-factory.af-tick",
+        "ai.dark-factory.daemon.service",
+        'systemctl --user show "$unit" --property=WorkingDirectory --value',
         'br --db "$BR_DB" where',
         'br --db "$BR_DB" sync --status --json',
         'br --db "$BR_DB" doctor --quick',
-        'br --db "$BR_DB" show <bead_id>',
-        'br --db "$BR_DB" list --status open --label factory --json',
-        'br --db "$BR_DB" create "<title>"',
-        "jeff-ubuntu",
+        "create without the `factory` label",
+        'br --db "$BR_DB" show "$bead_id" --json',
+        'br --db "$BR_DB" update "$bead_id" --add-label factory --json',
+        "intake verified; adoption pending",
         "jsonl_newer",
         "db_newer",
-        "ai.dark-factory.daemon.service",
     ]
 
     missing = [entry for entry in required_contract if entry not in content]
     assert not missing, (
-        "auto-factory skill is missing Linux Bead authority safeguards: "
+        "auto-factory skill is missing generic intake safeguards: "
         f"{missing}"
     )
-    assert "launchctl bootstrap" not in content
     assert content.index("Execution host + Bead authority preflight") < content.index(
         "$H init"
     )
-    assert "Production `/af` execution is Linux-only" in command
+    assert content.index("create without the `factory` label") < content.index(
+        'br --db "$BR_DB" show "$bead_id" --json'
+    )
+    assert content.index('br --db "$BR_DB" show "$bead_id" --json') < content.index(
+        'br --db "$BR_DB" update "$bead_id" --add-label factory --json'
+    )
+    assert content.index(
+        'br --db "$BR_DB" update "$bead_id" --add-label factory --json'
+    ) < content.index("intake verified; adoption pending")
     assert "Wait for any spawned coder subagents" not in command
     assert not re.search(r"(?m)^br (?!--db )", content)
+
+
+def test_auto_factory_command_target_repo_default_and_override_execute():
+    """The tracked command must provide a real default and preserve overrides."""
+    command_path = ROOT / ".claude" / "commands" / "auto-factory.md"
+    command = command_path.read_text()
+    match = re.search(
+        r"```bash\n(: \"\$\{TARGET_REPO:=jleechanorg/worldarchitect\.ai\}\"\n"
+        r"export TARGET_REPO)\n```",
+        command,
+    )
+    assert match, "tracked /auto-factory command has no executable target selection"
+    snippet = match.group(1) + '\nprintf "%s" "$TARGET_REPO"'
+
+    clean_env = os.environ.copy()
+    clean_env.pop("TARGET_REPO", None)
+    default = subprocess.run(
+        ["bash", "-c", snippet],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=clean_env,
+    )
+    assert default.stdout == "jleechanorg/worldarchitect.ai"
+
+    override_env = clean_env | {"TARGET_REPO": "example/secondary"}
+    override = subprocess.run(
+        ["bash", "-c", snippet],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=override_env,
+    )
+    assert override.stdout == "example/secondary"
 
 
 def test_auto_merge_guard_required_keys_match_verifier():
