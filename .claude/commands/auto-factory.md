@@ -9,6 +9,10 @@ execution_mode: one-shot
 
 ## 🚨 EXECUTION WORKFLOW
 
+Production `/af` execution is Linux-only. Follow the skill's execution-host and
+exact-DB preflight through SSH on `jeff-ubuntu`; do not run local Mac intake,
+overlay, or tick commands.
+
 ### Step 1: Run one tick of the auto-factory skill
 Invoke the `auto-factory` skill via the Skill tool:
 ```
@@ -16,7 +20,9 @@ Skill("auto-factory", args="one tick: drive any factory-labeled beads to /green 
 ```
 
 ### Step 2: Verify tick completion
-Wait for any spawned coder subagents to complete (they run in background). Then re-invoke the skill to run the verifier tick.
+Do not wait on coder subagents inside a tick. Inspect the Linux daemon service,
+telemetry, and live worker transcripts, then re-invoke the skill on a later tick
+to assess completed work.
 
 ### Step 3: Repeat until all beads reach READY
 Re-invoke the skill until `$H list QUEUED` and `$H list DISPATCHED` are empty AND all ATTESTED beads have all-green gate assessment.
