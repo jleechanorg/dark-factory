@@ -33,7 +33,7 @@ def _repo(tmp_path):
     return repo, base, head
 
 
-def _valid_response(prompt: str) -> str:
+def _valid_response(prompt: str, *, verdict: str = "pass") -> str:
     keys = (
         "PROMPT_ID",
         "PROMPT_SHA256",
@@ -52,8 +52,11 @@ def _valid_response(prompt: str) -> str:
     return "\n".join(
         [
             *(f"{key}: {values[key]}" for key in keys),
-            "VERDICT: pass",
-            *(f"{check_id}: pass" for check_id in CHECK_IDS),
+            f"VERDICT: {verdict}",
+            *(
+                f"{check_id}: {'pass' if verdict == 'pass' else 'fail'}"
+                for check_id in CHECK_IDS
+            ),
             "",
             "## Findings",
             "None; inspected the changed implementation and callers.",
@@ -67,7 +70,7 @@ def _valid_response(prompt: str) -> str:
     )
 
 
-def _valid_transport(prompt: str) -> str:
+def _valid_transport(prompt: str, *, verdict: str = "pass") -> str:
     return "\n".join(
         (
             json.dumps(
@@ -86,7 +89,7 @@ def _valid_transport(prompt: str) -> str:
                     "type": "item.completed",
                     "item": {
                         "type": "agent_message",
-                        "text": _valid_response(prompt),
+                        "text": _valid_response(prompt, verdict=verdict),
                     },
                 }
             ),
@@ -157,6 +160,58 @@ def test_review_command_writes_valid_digest_bound_receipt(tmp_path, monkeypatch,
     assert (output / "envelope.json").is_file()
     assert (output / "reviewer.output.md").is_file()
     assert json.loads(capsys.readouterr().out)["status"] == "valid"
+
+
+def test_review_command_returns_two_for_valid_fail_verdict(
+    tmp_path, monkeypatch, capsys
+):
+    """Transport validity must never be mistaken for review acceptance."""
+    repo, base, head = _repo(tmp_path)
+    task = tmp_path / "task.md"
+    task.write_text("Review the behavior change.", encoding="utf-8")
+    output = tmp_path / "review-output"
+    real_run = subprocess.run
+
+    monkeypatch.setattr(
+        "runner.review_cli._gate_subprocess_args",
+        lambda backend, prompt, ctx, timeout: ["codex", "exec", prompt],
+    )
+
+    def fake_run(command, **kwargs):
+        if command[0] == "git":
+            return real_run(command, **kwargs)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=_valid_transport(kwargs["input"], verdict="fail"),
+            stderr="",
+        )
+
+    monkeypatch.setattr("runner.review_cli.subprocess.run", fake_run)
+
+    rc = main(
+        [
+            "--workdir",
+            str(repo),
+            "--base-sha",
+            base,
+            "--head-sha",
+            head,
+            "--task-file",
+            str(task),
+            "--output-dir",
+            str(output),
+            "--backend",
+            "codex",
+        ]
+    )
+
+    assert rc == 2
+    receipt = json.loads((output / "controller-receipt.json").read_text())
+    assert receipt["status"] == "valid"
+    assert receipt["backend_returncode"] == 0
+    assert receipt["verdict"] == "fail"
+    assert json.loads(capsys.readouterr().out)["verdict"] == "fail"
 
 
 def test_review_command_fails_closed_on_unstructured_response(
@@ -253,4 +308,3 @@ def test_main_entrypoint_dispatches_review_subcommand(capsys):
     assert "--task-file" in captured.out
     assert "--output-dir" in captured.out
     assert "--backend" in captured.out
-
