@@ -656,6 +656,15 @@ fn run(args: Args) -> Result<(), DaemonError> {
             ),
         };
         let previous_failures = tick_loop.consecutive_failures;
+        if let TickLoopAction::TransientBackoff {
+            consecutive_failures,
+            sleep_secs,
+            ref error,
+        } = action
+        {
+            send_daemon_alert(consecutive_failures, sleep_secs, error);
+        }
+
         apply_tick_action(&mut tick_loop, &action, || store.reconcile_dispatching())?;
         let _ = systemd_notify(&watchdog_status);
 
@@ -669,14 +678,13 @@ fn run(args: Args) -> Result<(), DaemonError> {
                 std::thread::sleep(std::time::Duration::from_secs(cfg.fast_tick_secs));
             }
             TickLoopAction::TransientBackoff {
-                consecutive_failures,
+                consecutive_failures: _,
                 sleep_secs,
                 error,
             } => {
                 eprintln!(
                     "auto-factory daemon: transient tick error: {error}; sleeping {sleep_secs}s before retry"
                 );
-                send_daemon_alert(consecutive_failures, sleep_secs, &error);
                 std::thread::sleep(std::time::Duration::from_secs(sleep_secs));
             }
         }
@@ -716,7 +724,8 @@ fn send_slack_and_email_alert(message: &str, email_subject: &str) {
         let slack_token = std::env::var("HERMES_SLACK_BOT_TOKEN")
             .or_else(|_| std::env::var("OPENCLAW_SLACK_BOT_TOKEN"))
             .unwrap_or_default();
-        let slack_channel = std::env::var("DARK_FACTORY_SLACK_CHANNEL")
+        let slack_channel = std::env::var("FACTORY_SLACK_CHANNEL_ID")
+            .or_else(|_| std::env::var("DARK_FACTORY_SLACK_CHANNEL"))
             .or_else(|_| std::env::var("SLACK_ALERT_CHANNEL"))
             .unwrap_or_else(|_| "C0AH3RY3DK6".to_string());
 
@@ -728,6 +737,10 @@ fn send_slack_and_email_alert(message: &str, email_subject: &str) {
             let _ = std::process::Command::new("curl")
                 .args([
                     "-s",
+                    "--connect-timeout",
+                    "5",
+                    "--max-time",
+                    "10",
                     "-X",
                     "POST",
                     "https://slack.com/api/chat.postMessage",
@@ -745,6 +758,10 @@ fn send_slack_and_email_alert(message: &str, email_subject: &str) {
                 let _ = std::process::Command::new("curl")
                     .args([
                         "-s",
+                        "--connect-timeout",
+                        "5",
+                        "--max-time",
+                        "10",
                         "-X",
                         "POST",
                         "-H",
@@ -757,41 +774,42 @@ fn send_slack_and_email_alert(message: &str, email_subject: &str) {
             }
         }
 
-        // 2. Email alert via Gmail SMTP using python stdlib smtplib
+        // 2. Email alert via Gmail SMTP using python stdlib smtplib, passing credentials via environment
         if let (Ok(email_user), Ok(email_pass)) =
             (std::env::var("EMAIL_USER"), std::env::var("EMAIL_PASS"))
         {
             if !email_user.is_empty() && !email_pass.is_empty() {
                 let recipient =
                     std::env::var("BACKUP_EMAIL").unwrap_or_else(|_| email_user.clone());
-                let script = format!(
-                    r#"
-import smtplib, ssl
+                let script = r#"
+import os, smtplib, ssl
 from email.message import EmailMessage
 
-msg = EmailMessage()
-msg.set_content("""{}""")
-msg['Subject'] = '{}'
-msg['From'] = '{}'
-msg['To'] = '{}'
+user = os.environ.get('EMAIL_USER', '')
+pwd = os.environ.get('EMAIL_PASS', '')
+recipient = os.environ.get('ALERT_RECIPIENT', user)
+subject = os.environ.get('ALERT_SUBJECT', '')
+content = os.environ.get('ALERT_MSG', '')
 
-try:
-    context = ssl.create_default_context()
-    with smtplib.SMTP_SSL('smtp.gmail.com', 465, context=context, timeout=10) as server:
-        server.login('{}', '{}')
-        server.send_message(msg)
-except Exception:
-    pass
-"#,
-                    msg_email.replace('\\', "\\\\").replace('"', "\\\""),
-                    subject.replace('"', "\\\""),
-                    email_user,
-                    recipient,
-                    email_user,
-                    email_pass
-                );
+if user and pwd and recipient:
+    msg = EmailMessage()
+    msg.set_content(content)
+    msg['Subject'] = subject
+    msg['From'] = user
+    msg['To'] = recipient
+    try:
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465, context=context, timeout=10) as server:
+            server.login(user, pwd)
+            server.send_message(msg)
+    except Exception:
+        pass
+"#;
                 let _ = std::process::Command::new("python3")
-                    .args(["-c", &script])
+                    .args(["-c", script])
+                    .env("ALERT_RECIPIENT", recipient)
+                    .env("ALERT_SUBJECT", subject)
+                    .env("ALERT_MSG", msg_email)
                     .output();
             }
         }

@@ -997,6 +997,9 @@ impl CliScm {
                         Some("success") | Some("neutral") => {
                             ("SUCCESS".to_string(), "pass".to_string())
                         }
+                        Some("skipped") => {
+                            ("SKIPPED".to_string(), "skipping".to_string())
+                        }
                         Some("cancelled") => ("CANCELLED".to_string(), "cancel".to_string()),
                         _ => ("FAILURE".to_string(), "fail".to_string()),
                     }
@@ -1011,26 +1014,30 @@ impl CliScm {
             })
             .collect();
 
-        let statuses_url = format!("repos/{}/commits/{}/statuses", self.repo, head_sha);
+        let statuses_url = format!("repos/{}/commits/{}/status", self.repo, head_sha);
         if let Ok(statuses_json) = run_tool("gh", &["api", &statuses_url], 30) {
             #[derive(serde::Deserialize)]
-            struct RestStatus {
+            struct RestCombinedStatus {
+                statuses: Vec<RestStatusItem>,
+            }
+            #[derive(serde::Deserialize)]
+            struct RestStatusItem {
                 context: String,
                 state: String,
             }
-            let rest_statuses: Vec<RestStatus> =
-                serde_json::from_str(&statuses_json).unwrap_or_default();
-            for s in rest_statuses {
-                let bucket = match s.state.as_str() {
-                    "success" => "pass",
-                    "pending" => "pending",
-                    _ => "fail",
-                };
-                legacy_checks.push(GhCheck {
-                    state: s.state.to_uppercase(),
-                    bucket: bucket.to_string(),
-                    name: s.context,
-                });
+            if let Ok(combined) = serde_json::from_str::<RestCombinedStatus>(&statuses_json) {
+                for s in combined.statuses {
+                    let bucket = match s.state.as_str() {
+                        "success" => "pass",
+                        "pending" => "pending",
+                        _ => "fail",
+                    };
+                    legacy_checks.push(GhCheck {
+                        state: s.state.to_uppercase(),
+                        bucket: bucket.to_string(),
+                        name: s.context,
+                    });
+                }
             }
         }
         Ok(serde_json::to_string(&legacy_checks).unwrap_or_else(|_| "[]".to_string()))
@@ -1694,6 +1701,8 @@ impl Scm for CliScm {
             body: Option<String>,
             author: Option<GhAuthor>, // from GraphQL
             user: Option<GhAuthor>,   // from REST
+            #[serde(default)]
+            pull_request: Option<serde_json::Value>,
         }
         #[derive(serde::Deserialize)]
         struct GhAuthor {
@@ -1705,6 +1714,9 @@ impl Scm for CliScm {
         })?;
         let mut issues: Vec<Issue> = Vec::new();
         for item in gh_issues {
+            if item.pull_request.is_some() {
+                continue;
+            }
             if !issues.iter().any(|i| i.number == item.number) {
                 let author_login = item.author.as_ref().or(item.user.as_ref())
                     .map(|a| a.login.clone())
