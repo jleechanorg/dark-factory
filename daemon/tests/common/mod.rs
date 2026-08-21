@@ -453,6 +453,7 @@ pub struct FakeSessions {
     /// error — models a momentary `ao status` failure that must DEFER. Empty
     /// by default.
     pub fail_attach_transient_for: RefCell<Vec<String>>,
+    pub session_health_failure_for: RefCell<HashMap<String, String>>,
     /// Bead jleechan-zeij / issue #322 r3 (positive-death modeling): once
     /// `true`, a successful `stop()` does NOT terminate the session — it
     /// survives as a live orphan (`ao session kill` swallowed the tmux
@@ -525,6 +526,7 @@ impl Default for FakeSessions {
             transcript_activity_for: RefCell::new(HashMap::new()),
             worktree_ancestor_for: RefCell::new(HashMap::new()),
             worktree_ancestor_error_for: RefCell::new(HashMap::new()),
+            session_health_failure_for: RefCell::new(HashMap::new()),
         }
     }
 }
@@ -532,6 +534,12 @@ impl Default for FakeSessions {
 impl FakeSessions {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn set_session_health_failure(&self, session_id: &str, reason: &str) {
+        self.session_health_failure_for
+            .borrow_mut()
+            .insert(session_id.to_string(), reason.to_string());
     }
 
     pub fn fail_spawn_for(&self, bead_id: &str) {
@@ -859,6 +867,13 @@ impl Sessions for FakeSessions {
         } else {
             SessionActivity::Running
         })
+    }
+
+    fn check_session_health(&self, id: &SessionId) -> Result<Option<String>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("check_session_health({})", id.0));
+        Ok(self.session_health_failure_for.borrow().get(&id.0).cloned())
     }
 
     fn session_branch(&self, id: &SessionId) -> Result<Option<String>, DaemonError> {
