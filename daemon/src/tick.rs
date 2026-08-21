@@ -3935,6 +3935,45 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         // so NotProvided is the right answer (matches r5 contract).
         let is_test_repo = crate::config::is_fixture_repo(&repo);
 
+        if overlay.state == OverlayState::Dispatched {
+            if let Some(ref session_id_str) = overlay.session_id {
+                let sid = SessionId(session_id_str.clone());
+                if let Ok(Some(health_failure)) = deps.sessions.check_session_health(&sid) {
+                    emit(
+                        deps.telemetry_log,
+                        bead_id,
+                        overlay.attempt,
+                        OverlayState::Dispatched.as_str(),
+                        "SESSION_HEALTH_FAILED",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "session_id": session_id_str,
+                            "reason": health_failure,
+                            "branch": overlay.branch,
+                        }),
+                    )?;
+                    let _ = deps.sessions.stop(&sid);
+                    overlay.session_id = None;
+                    if overlay.pr_number.is_none() {
+                        overlay.spawn_failure_count += 1;
+                        if overlay.spawn_failure_count >= MAX_TRANSIENT_SPAWN_RETRY {
+                            overlay.state = OverlayState::HumanHeld;
+                            set_human_hold_reason(
+                                &mut overlay,
+                                HumanHoldReason::TransientSpawnRetryCapExceeded,
+                            );
+                        } else {
+                            overlay.state = OverlayState::Queued;
+                        }
+                        deps.store.save(&overlay)?;
+                        continue;
+                    } else {
+                        deps.store.save(&overlay)?;
+                    }
+                }
+            }
+        }
+
         if overlay.state == OverlayState::Dispatched
             && overlay.pr_number.is_none()
             && !is_test_repo
@@ -4105,7 +4144,23 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     match &overlay.session_id {
                         Some(session_id_str) => {
                             let sid = SessionId(session_id_str.clone());
-                            if deps.sessions.is_quiescent(&sid).unwrap_or(false) {
+                            if let Ok(Some(health_failure)) = deps.sessions.check_session_health(&sid) {
+                                emit(
+                                    deps.telemetry_log,
+                                    bead_id,
+                                    overlay.attempt,
+                                    OverlayState::Dispatched.as_str(),
+                                    "SESSION_HEALTH_FAILED",
+                                    serde_json::json!({}),
+                                    serde_json::json!({
+                                        "session_id": session_id_str,
+                                        "reason": health_failure,
+                                        "branch": overlay.branch,
+                                    }),
+                                )?;
+                                let _ = deps.sessions.stop(&sid);
+                                true
+                            } else if deps.sessions.is_quiescent(&sid).unwrap_or(false) {
                                 true
                             } else {
                                 match deps.sessions.session_activity(&sid) {
