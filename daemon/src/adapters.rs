@@ -2961,8 +2961,9 @@ impl CliSessions {
     }
 
     fn spawn_with_fallback(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
-        let fallback_str = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN")
-            .unwrap_or_else(|_| "agy->claudem".to_string());
+        let fallback_str = std::env::var("DARK_FACTORY_CODER_FALLBACK_CHAIN")
+            .or_else(|_| std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN"))
+            .unwrap_or_else(|_| "agy->minimax->claudem".to_string());
         let fallback_agents = build_runtime_fallback_chain(&self.agent, &fallback_str);
         fallback_spawn(&fallback_agents, |agent| self.run_spawn_process(agent, spec))
     }
@@ -5915,6 +5916,10 @@ impl Sessions for CliSessions {
         session_activity(&data, id)
     }
 
+    fn check_session_health(&self, id: &SessionId) -> Result<Option<String>, DaemonError> {
+        check_session_health_cli(&id.0)
+    }
+
     /// jleechan-5ia2: `ao status --json` already reports each session's
     /// `branch` field (verified live: `ao status --json | jq '.[].branch'`).
     /// Reuse the same parsing shape as `is_quiescent` above. Any failure to
@@ -6287,6 +6292,61 @@ fn active_session_count(data: &serde_json::Value) -> Result<usize, DaemonError> 
         .count())
 }
 
+/// Scans terminal output from an active agent tmux pane for fatal auth,
+/// quota exhaustion, or unrecoverable error markers.
+pub fn parse_session_health_pane(pane_content: &str) -> Option<String> {
+    let pane_lower = pane_content.to_ascii_lowercase();
+    let fatal_markers = [
+        "login expired",
+        "oauth session expired",
+        "individual quota reached",
+        "resource_exhausted",
+        "rate limit exceeded",
+        "usage limit reached",
+        "weekly limit",
+        "not logged in · run /login",
+        "not logged in",
+        "authentication_failed",
+        "failed to authenticate",
+        "quota exceeded",
+        "credit balance is too low",
+        "invalid_api_key",
+    ];
+
+    for marker in &fatal_markers {
+        if pane_lower.contains(marker) {
+            return Some(format!("terminal session error in tmux pane: {marker}"));
+        }
+    }
+    None
+}
+
+/// Probes the tmux pane buffer for a given AO session name to determine
+/// if the worker inside has suffered a terminal auth or quota error.
+pub fn check_session_health_cli(session_name: &str) -> Result<Option<String>, DaemonError> {
+    let out = match run_tool("tmux", &["list-sessions", "-F", "#{session_name}"], 5) {
+        Ok(o) => o,
+        Err(_) => return Ok(None),
+    };
+    let target_tmux_session = out.lines().find(|line| {
+        let trimmed = line.trim();
+        trimmed == session_name
+            || trimmed.ends_with(&format!("-{session_name}"))
+            || trimmed.contains(session_name)
+    });
+    let Some(tmux_session) = target_tmux_session else {
+        return Ok(None);
+    };
+
+    let pane_target = format!("{}:0", tmux_session.trim());
+    let pane_content = match run_tool("tmux", &["capture-pane", "-pt", &pane_target, "-S", "-50"], 5) {
+        Ok(o) => o,
+        Err(_) => return Ok(None),
+    };
+
+    Ok(parse_session_health_pane(&pane_content))
+}
+
 #[cfg(test)]
 mod active_session_count_tests {
     use super::{active_session_count, session_activity, session_for_branch, session_is_quiescent};
@@ -6393,6 +6453,30 @@ mod active_session_count_tests {
             session_for_branch(&ambiguous, "feat/shared", "bead"),
             Err(crate::errors::DaemonError::SessionAmbiguous { .. })
         ));
+    }
+
+    #[test]
+    fn parse_session_health_pane_detects_auth_and_quota_markers() {
+        use super::parse_session_health_pane;
+
+        let login_expired_sample = r#"
+            Claude Code v2.1.232
+            ● Login expired · Please run /login
+            Not logged in · Run /login
+        "#;
+        assert!(parse_session_health_pane(login_expired_sample).is_some());
+        assert!(parse_session_health_pane(login_expired_sample).unwrap().contains("login expired"));
+
+        let oauth_expired_sample = "Failed to authenticate: OAuth session expired and could not be refreshed";
+        assert!(parse_session_health_pane(oauth_expired_sample).is_some());
+        assert!(parse_session_health_pane(oauth_expired_sample).unwrap().contains("oauth session expired"));
+
+        let quota_reached_sample = "⚠ Individual quota reached. Please upgrade your subscription to increase your limits.";
+        assert!(parse_session_health_pane(quota_reached_sample).is_some());
+        assert!(parse_session_health_pane(quota_reached_sample).unwrap().contains("individual quota reached"));
+
+        let healthy_sample = "test_pr_description_gate.py: 41/41 Passed (100%)\nPR URL: https://github.com/...";
+        assert!(parse_session_health_pane(healthy_sample).is_none());
     }
 }
 

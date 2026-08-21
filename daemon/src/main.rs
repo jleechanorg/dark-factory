@@ -446,8 +446,9 @@ fn ao_runtime_binding(cfg: &Config) -> Result<(String, String), DaemonError> {
 /// plugin cannot pass preflight while failing the runtime fallback chain
 /// (or vice versa).
 fn configured_vendor_list(default_agent: &str) -> Vec<String> {
-    let fallback_str = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN")
-        .unwrap_or_else(|_| "agy->claudem".to_string());
+    let fallback_str = std::env::var("DARK_FACTORY_CODER_FALLBACK_CHAIN")
+        .or_else(|_| std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN"))
+        .unwrap_or_else(|_| "agy->minimax->claudem".to_string());
 
     let canonicalize = |vendor: &str| -> String {
         daemon::adapters::canonical_for_alias(vendor)

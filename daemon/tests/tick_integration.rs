@@ -14699,3 +14699,79 @@ fn test_dispatched_adopted_idle_session_reaped_and_promoted() {
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+#[test]
+fn session_health_failure_reaps_session_and_requeues_bead() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_test_session_health.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    store.overlays.borrow_mut().insert(
+        "bead-health-fail".into(),
+        BeadOverlay {
+            bead_id: "bead-health-fail".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/bead-health-fail-r1".into()),
+            session_id: Some("wa-dead-auth".into()),
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+    store.register_branch("bead-health-fail", "factory/bead-health-fail-r1").unwrap();
+
+    // Script session health failure (e.g. login expired)
+    sessions.set_session_health_failure("wa-dead-auth", "terminal session error in tmux pane: login expired");
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 0);
+
+    let o = store.load("bead-health-fail").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::Queued,
+        "session health failure must reset state to Queued so it can be re-dispatched"
+    );
+    assert_eq!(
+        o.session_id, None,
+        "dead session handle must be cleared"
+    );
+    assert_eq!(
+        o.spawn_failure_count, 1,
+        "spawn failure count must increment on session health failure"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("SESSION_HEALTH_FAILED"),
+        "SESSION_HEALTH_FAILED event must be emitted; telemetry:\n{telemetry}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}

@@ -790,6 +790,12 @@ pub trait Sessions {
             Ok(SessionActivity::Running)
         }
     }
+    /// Post-spawn session health monitor: checks if an active session died,
+    /// failed authentication, hit quota limits, or suffered terminal errors in its terminal.
+    fn check_session_health(&self, id: &SessionId) -> Result<Option<String>, DaemonError> {
+        let _ = id;
+        Ok(None)
+    }
     /// Returns the live branch AO reports for a given session, if known.
     ///
     /// jleechan-5ia2: a `bead_overlay` row was found with
