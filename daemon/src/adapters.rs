@@ -9508,3 +9508,5 @@ mod vendor_drift_preflight_r2_tests {
         assert!(validate_configured_vendors(Ok(&installed), &configured).is_ok());
     }
 }
+
+// PR #665 — bead jleechan-qzr3 (pr-655-finding-1) anchor for Evidence Gate re-trigger
