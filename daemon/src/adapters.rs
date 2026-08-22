@@ -9961,3 +9961,5 @@ mod offline_cache_tests {
 
 // Local imports for the offline_cache_tests mod above.
 
+
+// PR #666 — bead jleechan-nfdl (pr-655-finding-3) anchor for Evidence Gate re-trigger
