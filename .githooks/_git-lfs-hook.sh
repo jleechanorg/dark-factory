@@ -17,14 +17,23 @@
 # $(basename "$0") so the calling hook names itself when run via
 # `git hook` or directly, regardless of which shim invoked us.
 #
-# Env var:
-#   GIT_LFS_VERB = the git lfs subcommand verb (e.g., post-checkout,
-#                  post-commit, post-merge). Remaining args are
-#                  forwarded to `git lfs "$GIT_LFS_VERB"`.
+# Env var / Positional arg:
+#   GIT_LFS_VERB or $1 = the git lfs subcommand verb (e.g., post-checkout,
+#                        post-commit, post-merge). Remaining args are
+#                        forwarded to `git lfs "$verb"`.
 
 set -eu
 
-verb=${GIT_LFS_VERB:?GIT_LFS_VERB must be set by the calling shim}
+verb="${GIT_LFS_VERB:-${1:-}}"
+
+if [ -z "$verb" ]; then
+  echo >&2 "error: $(basename "$0"): hook verb must be set via GIT_LFS_VERB or positional argument"
+  exit 2
+fi
+
+if [ -z "${GIT_LFS_VERB:-}" ] && [ $# -gt 0 ]; then
+  shift
+fi
 
 command -v git-lfs >/dev/null 2>&1 || {
   echo >&2 "error: $(basename "$0"): git-lfs was not found on PATH (cannot run git lfs $verb)"
@@ -32,3 +41,4 @@ command -v git-lfs >/dev/null 2>&1 || {
 }
 
 exec git lfs "$verb" "$@"
+
