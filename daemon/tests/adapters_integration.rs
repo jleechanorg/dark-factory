@@ -337,34 +337,20 @@ fn live_ao_sessions_with_branch() -> Option<Vec<(String, String)>> {
     )
 }
 
-#[test]
-fn test_cli_scm_offline_fallback() {
-    let scm = CliScm::new("jleechanorg/dark-factory".to_string());
-    let offline_dir = std::path::Path::new(".beads/offline");
-    std::fs::create_dir_all(offline_dir).unwrap();
-
-    let pr_file = offline_dir.join("pr_9999.json");
-    std::fs::write(&pr_file, r#"{
-        "ci_success": true,
-        "mergeable": true,
-        "coderabbit_approved": false,
-        "bugbot_error_count": 2,
-        "unresolved_thread_count": 1,
-        "head_sha": "abc123sha",
-        "body": "offline body",
-        "comments": [],
-        "files": []
-    }"#).unwrap();
-    
-    let snap = scm.pr_snapshot(9999).unwrap();
-    assert_eq!(snap.head_sha, "abc123sha");
-    assert_eq!(snap.body, "offline body");
-    assert_eq!(snap.bugbot_error_count, 2);
-    assert!(!snap.coderabbit_approved);
-    
-    let _ = std::fs::remove_file(pr_file);
-}
-
+// jleechan-nfdl (PR #655 finding 3): the original
+// `test_cli_scm_offline_fallback` integration test has been MOVED into
+// `daemon::adapters::offline_cache_tests` (a `#[cfg(test)]` mod in
+// `daemon/src/adapters.rs`). The production `CliScm::pr_snapshot` no
+// longer consults `.beads/offline/*.json` at all — gating the offline
+// parser behind `#[cfg(test)]` removes it from the production binary
+// and from the library-as-dependency build used by this integration
+// test binary, so the test had to be relocated to a location that can
+// reach the `#[cfg(test)]` helper directly. The integration-level
+// `test_planted_offline_fixture_rejected_in_production` below covers
+// the production-side invariant that motivated the move: a planted
+// `.beads/offline/pr_<N>.json` MUST NOT be returned by
+// `CliScm::pr_snapshot`.
+//
 // ============================================================================
 // Tests for jleechan-kk64: GraphQL failure must report Unknown, not Green
 // ============================================================================
@@ -372,6 +358,200 @@ fn test_cli_scm_offline_fallback() {
 /// Guards every test in this file that needs to mutate process-wide env vars
 /// (`PATH`) so concurrent tests cannot race.
 static FAKE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// ============================================================================
+// jleechan-nfdl (PR #655 finding 3) — production must reject planted fixtures
+// ============================================================================
+//
+// Before this commit, `CliScm::pr_snapshot(N)` would read
+// `.beads/offline/pr_<N>.json` if it existed, with NO production guard:
+// a planted file (test residue, debug session, attacker write to the
+// daemon's CWD) was returned as if it were a real `gh pr view`
+// response, then memoised in `pr_snapshot_cache` for 30s. This test
+// proves the fix: the production entry point must NOT return planted
+// fixture data, even when the planted file is present in the daemon's
+// cwd.
+//
+// Strategy: plant a `.beads/offline/pr_<N>.json` with distinctive
+// sentinel strings, set cwd to that directory, call
+// `scm.pr_snapshot(N)`, and assert the returned snapshot is NOT the
+// planted data. Because we can't easily mock `gh` for a single call
+// from this layer (the production `pr_snapshot` shells out to real
+// `gh`), the result may be either `Ok(snapshot)` with sentinel-free
+// fields or `Err(...)` — both are acceptable outcomes, as long as the
+// planted body never appears.
+
+/// Planted-body sentinel chosen to be unique enough that an
+/// accidental code path returning it would clearly be the planted
+/// fixture, not a coincidence. Distinctive ASCII string with no
+/// overlap to real PR bodies (no `body:` field in any seeded
+/// fixture contains `NFDL_PLANTED`).
+const PLANTED_BODY_SENTINEL: &str = "NFDL_PLANTED_BODY_DO_NOT_LEAK";
+
+/// Planted-SHA sentinel chosen for the same reason — no real PR
+/// SHA in any test fixture ever has this prefix.
+const PLANTED_SHA_SENTINEL: &str = "nfdl_planted_sha_00000000000000000000";
+
+#[test]
+fn test_planted_offline_fixture_rejected_in_production() {
+    // Serialise against every other PATH-mutating integration test in
+    // this file. The FAKE_ENV_LOCK guards both `PATH` (so our planted
+    // cwd wins over any concurrent test's PATH shim) and the
+    // set_current_dir dance below.
+    let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Build a private temp cwd that holds `.beads/offline/pr_<N>.json`
+    // with distinctive planted values. Use a unique PR number so the
+    // (now-complied-out) offline cache branch would have been the only
+    // path that returned data for this PR — any real `gh` call will
+    // surface a different body (or fail) for `999999999`.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!(
+        "jleechan_nfdl_proof_{}_{nanos}",
+        std::process::id(),
+    ));
+    let offline_dir = dir.join(".beads/offline");
+    std::fs::create_dir_all(&offline_dir).expect("create .beads/offline");
+
+    // Use a PR number that is extremely unlikely to map to a real PR
+    // in `jleechanorg/dark-factory` AND that is unique to this test
+    // invocation so the `pr_snapshot_cache` memoisation never serves a
+    // stale entry. u64::MAX is unreachable for real GitHub PR numbers.
+    let pr = u64::MAX;
+
+    let planted_payload = serde_json::json!({
+        "ci_success": true,
+        "mergeable": true,
+        "coderabbit_approved": true,
+        "bugbot_error_count": 0,
+        "unresolved_thread_count": 0,
+        "head_sha": PLANTED_SHA_SENTINEL,
+        "body": PLANTED_BODY_SENTINEL,
+        "comments": [],
+        "files": [],
+    })
+    .to_string();
+    let planted_path = offline_dir.join(format!("pr_{pr}.json"));
+    std::fs::write(&planted_path, planted_payload).expect("write planted fixture");
+
+    // Save cwd, switch into the planted dir, run the production
+    // entry point, restore cwd, then clean up — in that order so a
+    // panic mid-test still restores cwd via the EnvVarGuard-style
+    // unwind pattern.
+    let prior_cwd = std::env::current_dir().expect("current_dir before");
+    std::env::set_current_dir(&dir).expect("set_current_dir to planted dir");
+
+    let scm = CliScm::new("jleechanorg/dark-factory".to_string());
+    let result = scm.pr_snapshot(pr);
+
+    // Always restore cwd and tear down the planted dir before any
+    // assertion failures, so a CI box doesn't accumulate planted
+    // dirs across re-runs.
+    std::env::set_current_dir(&prior_cwd).expect("restore cwd");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Whatever the result, the planted sentinels must NOT appear.
+    // `Err(_)` is an acceptable outcome — the production code did
+    // attempt to call real `gh` (which will fail for u64::MAX), and
+    // the planted fixture was correctly ignored. `Ok(snap)` is also
+    // acceptable if a sibling test or environment quirk made a real
+    // fetch succeed for some unrelated reason — what matters is that
+    // the body/head_sha don't carry the planted markers.
+    if let Ok(snap) = &result {
+        assert_ne!(
+            snap.body, PLANTED_BODY_SENTINEL,
+            "PRODUCTION LEAK: pr_snapshot({pr}) returned the planted fixture body \
+             `{PLANTED_BODY_SENTINEL}` — the .beads/offline read path is still \
+             compiled into the production binary"
+        );
+        assert_ne!(
+            snap.head_sha, PLANTED_SHA_SENTINEL,
+            "PRODUCTION LEAK: pr_snapshot({pr}) returned the planted fixture \
+             head_sha `{PLANTED_SHA_SENTINEL}`"
+        );
+        // If the call succeeded for some unrelated reason, sanity
+        // check the bugbot_pending field is the production default
+        // (false), not the planted value (also false in our fixture,
+        // so this is a non-strict smoke check).
+        assert!(
+            !snap.bugbot_pending,
+            "pr_snapshot({pr}) returned bugbot_pending=true without going through \
+             any planted fixture — investigate the snapshot source"
+        );
+    }
+    // `Err(_)` path is also a PASS — the production code tried to
+    // call real `gh` for an unreachable PR number, which is the
+    // expected behaviour when the offline path is gone.
+}
+
+/// Companion to `test_planted_offline_fixture_rejected_in_production`:
+/// plant the same fixture but call the LOWER-LEVEL `pr_snapshot`
+/// again after a successful fake-gh call. Proves the production
+/// entry point never memoises a planted-fixture value into the
+/// `pr_snapshot_cache` either — the 30s in-memory TTL would otherwise
+/// amplify a one-shot leak into a 30-second window.
+#[test]
+fn test_planted_offline_fixture_does_not_pollute_cache() {
+    let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!(
+        "jleechan_nfdl_cache_{}_{nanos}",
+        std::process::id(),
+    ));
+    let offline_dir = dir.join(".beads/offline");
+    std::fs::create_dir_all(&offline_dir).expect("create .beads/offline");
+
+    let pr = u64::MAX - 1;
+    let planted_payload = serde_json::json!({
+        "ci_success": true,
+        "head_sha": PLANTED_SHA_SENTINEL,
+        "body": PLANTED_BODY_SENTINEL,
+        "comments": [],
+        "files": [],
+    })
+    .to_string();
+    std::fs::write(offline_dir.join(format!("pr_{pr}.json")), planted_payload)
+        .expect("write planted fixture");
+
+    let prior_cwd = std::env::current_dir().expect("current_dir before");
+    std::env::set_current_dir(&dir).expect("set_current_dir");
+
+    let scm = CliScm::new("jleechanorg/dark-factory".to_string());
+    let _ = scm.pr_snapshot(pr); // first call (will err on real gh, that's fine)
+
+    std::env::set_current_dir(&prior_cwd).expect("restore cwd");
+
+    // Now REMOVE the planted fixture and verify a second call also
+    // doesn't surface it from cache. (Both calls should err because
+    // u64::MAX-1 is unreachable, so cache pollution would manifest
+    // as the second call returning Ok with the planted body.)
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let result2 = scm.pr_snapshot(pr);
+    if let Ok(snap) = &result2 {
+        assert_ne!(
+            snap.body, PLANTED_BODY_SENTINEL,
+            "PRODUCTION CACHE LEAK: second pr_snapshot({pr}) returned the planted \
+             fixture body — the offline cache fed into pr_snapshot_cache for 30s"
+        );
+        assert_ne!(
+            snap.head_sha, PLANTED_SHA_SENTINEL,
+            "PRODUCTION CACHE LEAK: second pr_snapshot({pr}) returned planted \
+             head_sha"
+        );
+    }
+}
+
+// ============================================================================
+// Tests for jleechan-kk64: GraphQL failure must report Unknown, not Green
+// ============================================================================
 
 /// Write a fake `gh` script into `dir` that responds to different commands.
 /// The script branches on its argv to return different responses for:
