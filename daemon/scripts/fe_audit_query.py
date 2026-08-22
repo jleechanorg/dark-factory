@@ -6,6 +6,8 @@ results for one of four queries:
   - g10_ticks    : last N TICK event timestamps
   - g11_attested : bead IDs with lifecycleState=ATTESTED in lookback
   - g11_dispatched : bead IDs with lifecycleState=DISPATCHED in lookback
+  - g11_human_held : bead IDs with lifecycleState=HUMAN_HELD in lookback
+  - g11_cancelled : bead IDs with lifecycleState=CANCELLED in lookback
   - g12_transient : bead IDs whose transient-error event count >= threshold
   - g13_dispatch_rate : hour-buckets whose dispatch count > cap
 
@@ -91,6 +93,23 @@ def g11_human_held(records, cutoff):
                 yield bid
 
 
+def g11_cancelled(records, cutoff):
+    """Unique bead IDs with lifecycleState=CANCELLED after cutoff.
+
+    A bead that was cancelled (e.g. via branch-collision dedup from PR #519)
+    is NOT stuck. The G11 audit subtracts this set from ATTESTED so cancelled
+    beads do not surface as a false stuck-bead surge.
+    """
+    for rec in records:
+        if (
+            rec.get("lifecycleState") == "CANCELLED"
+            and rec.get("timestamp", "") >= cutoff
+        ):
+            bid = rec.get("beadId", "")
+            if bid:
+                yield bid
+
+
 def g12_transient(records, cutoff, threshold):
     """Lines: '<count> <beadId>' for beads with >= threshold transient errors."""
     counter = Counter()
@@ -149,6 +168,9 @@ def main():
             print(bid)
     elif query == "g11_human_held":
         for bid in sorted(set(g11_human_held(records, cutoff))):
+            print(bid)
+    elif query == "g11_cancelled":
+        for bid in sorted(set(g11_cancelled(records, cutoff))):
             print(bid)
     elif query == "g12_transient":
         for line in g12_transient(records, cutoff, threshold):
