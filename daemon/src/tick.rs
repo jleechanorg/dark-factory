@@ -3080,6 +3080,14 @@ fn build_skeptic_prompt(
     for vendor in [Vendor::CodeRabbit, Vendor::Bugbot] {
         match vendor_health.health(vendor) {
             VendorHealth::Capped { observations, since_epoch } => {
+                if let Some(next) = crate::vendor_health::next_healthy_reviewer(vendor) {
+                    vendor_waiver_block.push_str(&format!(
+                        "\nREVIEWER_ROTATED vendor={} nextReviewer={} \
+                         chainWalked=true waiverSuppressed=true",
+                        vendor.as_str(), next
+                    ));
+                    continue;
+                }
                 vendor_waiver_block.push_str(&format!(
                     "\nVENDOR WAIVER CONTEXT\n\
                      The {vendor_name} check is structurally unavailable on this PR \
@@ -4672,9 +4680,27 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             }
         }
 
-        // Emit VENDOR_WAIVED telemetry on the Healthy -> Capped edge.
+        // Chain-walk past CodeRabbit when possible; only waive when no
+        // fallback reviewer is configured.
         for vendor in &recently_waived {
-            let _ = emit_vendor_waived(deps, bead_id, *vendor, overlay.attempt);
+            if let Some(next) = crate::vendor_health::next_healthy_reviewer(*vendor) {
+                let _ = emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    "REVIEWER_ROTATED",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "vendor": vendor.as_str(),
+                        "nextReviewer": next,
+                        "chainWalked": true,
+                        "waiverSuppressed": true,
+                    }),
+                );
+            } else {
+                let _ = emit_vendor_waived(deps, bead_id, *vendor, overlay.attempt);
+            }
         }
         // Emit VENDOR_RECOVERED telemetry on the Capped -> Healthy edge.
         for vendor in &recently_recovered {
@@ -6402,28 +6428,35 @@ mod skeptic_prompt_vendor_waiver_tests {
         );
     }
 
-    /// Symmetric guarantee for CodeRabbit — the prompt must surface a
-    /// CodeRabbit waiver block whenever CodeRabbit is Capped. The
-    /// waiver substitution is meaningless if the LLM is told one
-    /// vendor's waiver rule but not the other's.
+    /// A capped CodeRabbit routes to the fallback reviewer and does not add
+    /// the legacy waiver context to the skeptic prompt.
     #[test]
-    fn skeptic_prompt_contains_coderabbit_waiver_token_when_coderabbit_capped() {
+    fn chain_walk_routes_past_capped_coderabbit() {
+        let prev = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok();
+        std::env::remove_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN");
         let ledger = capped_ledger(Vendor::CodeRabbit, "bead-cr");
         let prompt = build_skeptic_prompt("bead-x", 124, "owner/repo", &ledger);
+        if let Some(v) = prev {
+            std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", v);
+        }
 
         assert!(
-            prompt.contains("coderabbit:waived_vendor_unavailable"),
-            "skeptic prompt must carry the canonical CodeRabbit waiver token when CodeRabbit is Capped; \
-             Got:\n{prompt}"
+            !prompt.contains("coderabbit:waived_vendor_unavailable"),
+            "CodeRabbit chain-walk must suppress the waiver token. Got:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("VENDOR WAIVER CONTEXT"),
+            "CodeRabbit chain-walk must suppress the entire waiver block. Got:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("REVIEWER_ROTATED"),
+            "CodeRabbit chain-walk must leave an auditable rotation marker. Got:\n{prompt}"
         );
     }
 
-    /// When both vendors are Capped, both waiver tokens land in the
-    /// prompt. (The most common production case is one vendor at a
-    /// time, but a coordinated outage can hit both; the prompt must
-    /// not silently drop the second one.)
+    /// CodeRabbit rotates while Bugbot retains its existing waiver behavior.
     #[test]
-    fn skeptic_prompt_contains_both_waiver_tokens_when_both_capped() {
+    fn skeptic_prompt_rotates_coderabbit_and_waives_bugbot_when_both_capped() {
         let mut ledger = capped_ledger(Vendor::CodeRabbit, "bead-cr");
         for ts in 4..=6 {
             ledger.record_cap(CapObservation {
@@ -6438,8 +6471,8 @@ mod skeptic_prompt_vendor_waiver_tests {
         let prompt = build_skeptic_prompt("bead-x", 125, "owner/repo", &ledger);
 
         assert!(
-            prompt.contains("coderabbit:waived_vendor_unavailable"),
-            "CodeRabbit waiver token must be present"
+            !prompt.contains("coderabbit:waived_vendor_unavailable"),
+            "CodeRabbit waiver token must be suppressed"
         );
         assert!(
             prompt.contains("bugbot:waived_vendor_unavailable"),
