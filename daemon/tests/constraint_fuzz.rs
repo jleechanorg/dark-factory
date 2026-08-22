@@ -75,9 +75,18 @@ fn feedback_hash(text: &str) -> String {
 
 /// One circuit-breaker corpus case: attempt N-1 was rejected by
 /// `reviewer_a` citing `text_a`; attempt N is rejected by `reviewer_b`
-/// citing `text_b`. `expect_impl_fire` is what the implementation should do
-/// after applying spec §4.2.6's "same semantic rejection reason" language;
-/// `expect_spec_fire` is the independently assigned semantic ground truth.
+/// citing `text_b`. `expect_rotated` / `expect_escalated` are what the
+/// implementation should do under the rev-ffb26 "rotate reviewer in
+/// circuit-breaker before park" semantics (bead rev-ffb26 / issue #671):
+///   - `expect_rotated`: the chain has a viable next reviewer, so the
+///     breaker should emit `CIRCUIT_BREAKER_ROTATED` and return
+///     `RerollOutcome::Deferred("circuit-breaker-rotated")`.
+///   - `expect_escalated`: the chain is exhausted (or otherwise cannot
+///     rotate), so the breaker should still emit
+///     `CIRCUIT_BREAKER_ESCALATED` and return
+///     `RerollOutcome::Held(CIRCUIT_BREAKER_PARK_REASON)`.
+/// `expect_spec_fire` is the independently assigned semantic ground truth
+/// (matches the spec §4.2.6 "same semantic rejection reason" language).
 struct CbCase {
     id: &'static str,
     group: &'static str,
@@ -85,79 +94,115 @@ struct CbCase {
     text_a: &'static str,
     reviewer_b: &'static str,
     text_b: &'static str,
-    expect_impl_fire: bool,
+    expect_rotated: bool,
+    expect_escalated: bool,
     expect_spec_fire: bool,
+}
+
+/// Tri-state outcome of a single circuit-breaker corpus case under the
+/// rev-ffb26 rotation-before-kill semantics:
+///   - `NoFire`: breaker did not trigger (different reason, different
+///     reviewer, or scripted LLM said `sameUnderlyingIssue: false`).
+///   - `Rotated`: breaker triggered, `try_rotate_for_bead` returned
+///     `Some(next_reviewer)`, and the reroll returned
+///     `RerollOutcome::Deferred("circuit-breaker-rotated")`.
+///   - `Escalated`: breaker triggered but the rotation chain is
+///     exhausted, so the reroll returned
+///     `RerollOutcome::Held(CIRCUIT_BREAKER_PARK_REASON)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CbResult {
+    NoFire,
+    Rotated,
+    Escalated,
+}
+
+impl CbResult {
+    /// True iff the breaker triggered at all (either rotated or
+    /// escalated). The original spec §4.2.6 axis — "did the breaker
+    /// catch a same-reason pair?" — maps to this; the rev-ffb26 split
+    /// into Rotated vs Escalated is an ADDITIONAL contract on top.
+    fn triggered(self) -> bool {
+        matches!(self, CbResult::Rotated | CbResult::Escalated)
+    }
 }
 
 fn cb_corpus() -> Vec<CbCase> {
     vec![
         // ---- Group A: cross-category, same reviewer, genuinely different
-        // reason. Breaker must NOT fire. (10 pairs / 20 comments)
-        CbCase { id: "A1", group: "cross-category", reviewer_a: "coderabbit", expect_impl_fire: false, expect_spec_fire: false,
+        // reason. Breaker must NOT fire. Under rev-ffb26 rotation-before-kill
+        // semantics: same as before — different reason → NoFire.
+        // (10 pairs / 20 comments)
+        CbCase { id: "A1", group: "cross-category", reviewer_a: "coderabbit", expect_rotated: false, expect_escalated: false, expect_spec_fire: false,
             text_a: "Please run rustfmt on this file — the indentation in the match arms is inconsistent and trailing whitespace was left on lines 42 and 58.",
             reviewer_b: "coderabbit",
             text_b: "No test exercises the timeout branch — please add a case that scripts is_quiescent to stay false the whole 60s window and confirms the HUMAN_HELD transition." },
-        CbCase { id: "A2", group: "cross-category", reviewer_a: "coderabbit", expect_impl_fire: false, expect_spec_fire: false,
+        CbCase { id: "A2", group: "cross-category", reviewer_a: "coderabbit", expect_rotated: false, expect_escalated: false, expect_spec_fire: false,
             text_a: "This loop terminates one iteration early — `i < len - 1` should be `i <= len - 1` given the off-by-one in how `len` is computed above, so the last element in the batch is silently dropped.",
             reviewer_b: "coderabbit",
             text_b: "This shells out with the raw PR title interpolated into the command string — a title containing `; rm -rf` would execute arbitrary shell. Use argv-array invocation, not string interpolation." },
-        CbCase { id: "A3", group: "cross-category", reviewer_a: "skeptic", expect_impl_fire: false, expect_spec_fire: false,
+        CbCase { id: "A3", group: "cross-category", reviewer_a: "skeptic", expect_rotated: false, expect_escalated: false, expect_spec_fire: false,
             text_a: "This re-implements what BeadOverlay::as_str() already does — please call the existing method instead of duplicating the match arms here.",
             reviewer_b: "skeptic",
             text_b: "Between the `is_quiescent` check and `stop()`, another tick could dispatch a second session for the same bead — there's no lock around the read-then-act sequence here." },
-        CbCase { id: "A4", group: "cross-category", reviewer_a: "skeptic", expect_impl_fire: false, expect_spec_fire: false,
+        CbCase { id: "A4", group: "cross-category", reviewer_a: "skeptic", expect_rotated: false, expect_escalated: false, expect_spec_fire: false,
             text_a: "This clones the entire `overlays` HashMap on every tick just to compute a count; a `.len()` on a reference would avoid the O(n) copy every 60 seconds.",
             reviewer_b: "skeptic",
             text_b: "This `.ok()`s the result of `comment_external` and moves on — if posting the escalation comment fails, the operator never finds out and the bead is stuck silently. Propagate or at least log the error." },
-        CbCase { id: "A5", group: "cross-category", reviewer_a: "verifier", expect_impl_fire: false, expect_spec_fire: false,
+        CbCase { id: "A5", group: "cross-category", reviewer_a: "verifier", expect_rotated: false, expect_escalated: false, expect_spec_fire: false,
             text_a: "No test exercises the timeout branch — please add a case that scripts is_quiescent to stay false the whole 60s window and confirms the HUMAN_HELD transition.",
             reviewer_b: "verifier",
             text_b: "Minor nit: this uses snake_case for one field and camelCase for the adjacent one; pick one convention within the struct." },
-        CbCase { id: "A6", group: "cross-category", reviewer_a: "verifier", expect_impl_fire: false, expect_spec_fire: false,
+        CbCase { id: "A6", group: "cross-category", reviewer_a: "verifier", expect_rotated: false, expect_escalated: false, expect_spec_fire: false,
             text_a: "The retry counter is incremented before the operation is attempted, not after, so a single real failure is being counted as two toward the max-retries budget.",
             reviewer_b: "verifier",
             text_b: "This new error variant has zero test coverage; at minimum add a unit test asserting the Display impl matches the expected message format." },
-        CbCase { id: "A7", group: "cross-category", reviewer_a: "coderabbit", expect_impl_fire: false, expect_spec_fire: false,
+        CbCase { id: "A7", group: "cross-category", reviewer_a: "coderabbit", expect_rotated: false, expect_escalated: false, expect_spec_fire: false,
             text_a: "Polling the file system every 500ms for quiescence is going to thrash under load; consider a listener/callback from the Sessions trait instead of a busy-wait loop.",
             reviewer_b: "coderabbit",
             text_b: "The webhook secret comparison uses `==` on a `String`, which isn't constant-time and is vulnerable to a timing side-channel; switch to a constant-time compare." },
-        CbCase { id: "A8", group: "cross-category", reviewer_a: "skeptic", expect_impl_fire: false, expect_spec_fire: false,
+        CbCase { id: "A8", group: "cross-category", reviewer_a: "skeptic", expect_rotated: false, expect_escalated: false, expect_spec_fire: false,
             text_a: "The circuit-breaker hash recomputation happens on every single reroll call even when bead.attempt <= 1, which is unreachable but still allocates a hasher — trivial, but move it inside the if guard.",
             reviewer_b: "skeptic",
             text_b: "The `unwrap_or_default()` here masks a genuine parse failure as an empty vec; a malformed constraint block would silently produce zero specs instead of surfacing the error." },
-        CbCase { id: "A9", group: "cross-category", reviewer_a: "verifier", expect_impl_fire: false, expect_spec_fire: false,
+        CbCase { id: "A9", group: "cross-category", reviewer_a: "verifier", expect_rotated: false, expect_escalated: false, expect_spec_fire: false,
             text_a: "Two ticks racing on save_rejection for the same (bead_id, attempt) key could interleave; this needs a transaction or a unique constraint, not just a plain INSERT.",
             reviewer_b: "verifier",
             text_b: "Please run rustfmt on this file — the indentation in the match arms is inconsistent and trailing whitespace was left on lines 42 and 58." },
-        CbCase { id: "A10", group: "cross-category", reviewer_a: "coderabbit", expect_impl_fire: false, expect_spec_fire: false,
+        CbCase { id: "A10", group: "cross-category", reviewer_a: "coderabbit", expect_rotated: false, expect_escalated: false, expect_spec_fire: false,
             text_a: "This shells out with the raw PR title interpolated into the command string — a title containing `; rm -rf` would execute arbitrary shell. Use argv-array invocation, not string interpolation.",
             reviewer_b: "coderabbit",
             text_b: "This clones the entire `overlays` HashMap on every tick just to compute a count; a `.len()` on a reference would avoid the O(n) copy every 60 seconds." },
 
         // ---- Group B: exact-duplicate text, same reviewer. Breaker MUST
-        // fire (sanity: the flip-side named case from the task brief — "a
-        // genuinely-repeating case DOES trigger"). (6 pairs / 12 comments)
-        CbCase { id: "B1", group: "exact-duplicate", reviewer_a: "coderabbit", expect_impl_fire: true, expect_spec_fire: true,
+        // trigger (sanity: the flip-side named case from the task brief —
+        // "a genuinely-repeating case DOES trigger"). Under rev-ffb26
+        // rotation-before-kill: the default rotation chain
+        // (agy->claudem->codex->gemini, canonicalized) has 4 viable
+        // reviewers, so on the FIRST trip the breaker ROTATES to the next
+        // one (Escaped is reserved for chain exhaustion, exercised
+        // separately by `circuit_breaker_escalates_when_chain_exhausted`).
+        // (6 pairs / 12 comments)
+        CbCase { id: "B1", group: "exact-duplicate", reviewer_a: "coderabbit", expect_rotated: true, expect_escalated: false, expect_spec_fire: true,
             text_a: "CI is red: `cargo test --test reroll_integration` fails on `test_circuit_breaker` — the HUMAN_HELD transition never happens.",
             reviewer_b: "coderabbit",
             text_b: "CI is red: `cargo test --test reroll_integration` fails on `test_circuit_breaker` — the HUMAN_HELD transition never happens." },
-        CbCase { id: "B2", group: "exact-duplicate", reviewer_a: "skeptic", expect_impl_fire: true, expect_spec_fire: true,
+        CbCase { id: "B2", group: "exact-duplicate", reviewer_a: "skeptic", expect_rotated: true, expect_escalated: false, expect_spec_fire: true,
             text_a: "The quiescence wait loop busy-polls at 500ms with no upper bound on CPU wakeups; please back off exponentially.",
             reviewer_b: "skeptic",
             text_b: "The quiescence wait loop busy-polls at 500ms with no upper bound on CPU wakeups; please back off exponentially." },
-        CbCase { id: "B3", group: "exact-duplicate", reviewer_a: "verifier", expect_impl_fire: true, expect_spec_fire: true,
+        CbCase { id: "B3", group: "exact-duplicate", reviewer_a: "verifier", expect_rotated: true, expect_escalated: false, expect_spec_fire: true,
             text_a: "Merge conflict against main in daemon/src/state.rs — please rebase before requesting another review.",
             reviewer_b: "verifier",
             text_b: "Merge conflict against main in daemon/src/state.rs — please rebase before requesting another review." },
-        CbCase { id: "B4", group: "exact-duplicate", reviewer_a: "coderabbit", expect_impl_fire: true, expect_spec_fire: true,
+        CbCase { id: "B4", group: "exact-duplicate", reviewer_a: "coderabbit", expect_rotated: true, expect_escalated: false, expect_spec_fire: true,
             text_a: "The new `spawn_failure_count` field is never reset on a successful dispatch, so one transient blip permanently inflates it across the bead's whole lifetime.",
             reviewer_b: "coderabbit",
             text_b: "The new `spawn_failure_count` field is never reset on a successful dispatch, so one transient blip permanently inflates it across the bead's whole lifetime." },
-        CbCase { id: "B5", group: "exact-duplicate", reviewer_a: "skeptic", expect_impl_fire: true, expect_spec_fire: true,
+        CbCase { id: "B5", group: "exact-duplicate", reviewer_a: "skeptic", expect_rotated: true, expect_escalated: false, expect_spec_fire: true,
             text_a: "Test `test_reroll_success` doesn't assert on the branch registry call log — a regression here would go undetected.",
             reviewer_b: "skeptic",
             text_b: "Test `test_reroll_success` doesn't assert on the branch registry call log — a regression here would go undetected." },
-        CbCase { id: "B6", group: "exact-duplicate", reviewer_a: "verifier", expect_impl_fire: true, expect_spec_fire: true,
+        CbCase { id: "B6", group: "exact-duplicate", reviewer_a: "verifier", expect_rotated: true, expect_escalated: false, expect_spec_fire: true,
             text_a: "bugbot: this PR still leaves `Cargo.lock` out of sync with `Cargo.toml` — commit the regenerated lockfile.",
             reviewer_b: "verifier",
             text_b: "bugbot: this PR still leaves `Cargo.lock` out of sync with `Cargo.toml` — commit the regenerated lockfile." },
@@ -165,81 +210,84 @@ fn cb_corpus() -> Vec<CbCase> {
         // ---- Group C: near-miss — same reviewer, SAME underlying reason,
         // materially different wording (the harder true-positive case per
         // the task brief). Spec's "semantic rejection reason" language
-        // implies these SHOULD fire; the byte-exact hash implementation
-        // will NOT. (6 pairs / 12 comments)
-        CbCase { id: "C1", group: "near-miss-paraphrase", reviewer_a: "coderabbit", expect_impl_fire: true, expect_spec_fire: true,
+        // implies these SHOULD trigger; rev-ffb26 routes them through
+        // the LLM `same_underlying_issue` comparator and then ROTATES
+        // rather than killing. (6 pairs / 12 comments)
+        CbCase { id: "C1", group: "near-miss-paraphrase", reviewer_a: "coderabbit", expect_rotated: true, expect_escalated: false, expect_spec_fire: true,
             text_a: "CI is red: `cargo test --test reroll_integration` fails on `test_circuit_breaker` — the HUMAN_HELD transition never happens.",
             reviewer_b: "coderabbit",
             text_b: "The reroll_integration suite is still failing on the circuit-breaker test — the bead isn't reaching HUMAN_HELD like it should. Please re-check this before the next review pass." },
-        CbCase { id: "C2", group: "near-miss-paraphrase", reviewer_a: "skeptic", expect_impl_fire: true, expect_spec_fire: true,
+        CbCase { id: "C2", group: "near-miss-paraphrase", reviewer_a: "skeptic", expect_rotated: true, expect_escalated: false, expect_spec_fire: true,
             text_a: "The quiescence wait loop busy-polls at 500ms with no upper bound on CPU wakeups; please back off exponentially.",
             reviewer_b: "skeptic",
             text_b: "Same concern as before — the polling interval in the quiescence wait is fixed at 500ms and never backs off, so it'll burn CPU under sustained load. Needs exponential backoff." },
-        CbCase { id: "C3", group: "near-miss-paraphrase", reviewer_a: "verifier", expect_impl_fire: true, expect_spec_fire: true,
+        CbCase { id: "C3", group: "near-miss-paraphrase", reviewer_a: "verifier", expect_rotated: true, expect_escalated: false, expect_spec_fire: true,
             text_a: "Merge conflict against main in daemon/src/state.rs — please rebase before requesting another review.",
             reviewer_b: "verifier",
             text_b: "This branch still hasn't been rebased onto main; state.rs conflicts. Can't proceed with review until that's resolved." },
-        CbCase { id: "C4", group: "near-miss-paraphrase", reviewer_a: "coderabbit", expect_impl_fire: true, expect_spec_fire: true,
+        CbCase { id: "C4", group: "near-miss-paraphrase", reviewer_a: "coderabbit", expect_rotated: true, expect_escalated: false, expect_spec_fire: true,
             text_a: "The new `spawn_failure_count` field is never reset on a successful dispatch, so one transient blip permanently inflates it across the bead's whole lifetime.",
             reviewer_b: "coderabbit",
             text_b: "spawn_failure_count still isn't cleared when a dispatch eventually succeeds — a single flaky spawn keeps counting against the bead forever. This is the same gap flagged last round." },
-        CbCase { id: "C5", group: "near-miss-paraphrase", reviewer_a: "skeptic", expect_impl_fire: true, expect_spec_fire: true,
+        CbCase { id: "C5", group: "near-miss-paraphrase", reviewer_a: "skeptic", expect_rotated: true, expect_escalated: false, expect_spec_fire: true,
             text_a: "Test `test_reroll_success` doesn't assert on the branch registry call log — a regression here would go undetected.",
             reviewer_b: "skeptic",
             text_b: "test_reroll_success is missing an assertion on the branch registry calls; without it a future regression in register_branch slips through silently." },
-        CbCase { id: "C6", group: "near-miss-paraphrase", reviewer_a: "verifier", expect_impl_fire: true, expect_spec_fire: true,
+        CbCase { id: "C6", group: "near-miss-paraphrase", reviewer_a: "verifier", expect_rotated: true, expect_escalated: false, expect_spec_fire: true,
             text_a: "bugbot: this PR still leaves `Cargo.lock` out of sync with `Cargo.toml` — commit the regenerated lockfile.",
             reviewer_b: "verifier",
             text_b: "Cargo.lock is out of date relative to Cargo.toml on this branch again — please regenerate and commit it." },
 
         // ---- Group D: byte-identical text, DIFFERENT reviewer. Breaker
         // must NOT fire (reviewer scoping). (4 pairs / 8 comments)
-        CbCase { id: "D1", group: "different-reviewer-same-text", reviewer_a: "coderabbit", expect_impl_fire: false, expect_spec_fire: false,
+        CbCase { id: "D1", group: "different-reviewer-same-text", reviewer_a: "coderabbit", expect_rotated: false, expect_escalated: false, expect_spec_fire: false,
             text_a: "CI is red: `cargo test --test reroll_integration` fails on `test_circuit_breaker` — the HUMAN_HELD transition never happens.",
             reviewer_b: "skeptic",
             text_b: "CI is red: `cargo test --test reroll_integration` fails on `test_circuit_breaker` — the HUMAN_HELD transition never happens." },
-        CbCase { id: "D2", group: "different-reviewer-same-text", reviewer_a: "skeptic", expect_impl_fire: false, expect_spec_fire: false,
+        CbCase { id: "D2", group: "different-reviewer-same-text", reviewer_a: "skeptic", expect_rotated: false, expect_escalated: false, expect_spec_fire: false,
             text_a: "Merge conflict against main in daemon/src/state.rs — please rebase before requesting another review.",
             reviewer_b: "verifier",
             text_b: "Merge conflict against main in daemon/src/state.rs — please rebase before requesting another review." },
-        CbCase { id: "D3", group: "different-reviewer-same-text", reviewer_a: "verifier", expect_impl_fire: false, expect_spec_fire: false,
+        CbCase { id: "D3", group: "different-reviewer-same-text", reviewer_a: "verifier", expect_rotated: false, expect_escalated: false, expect_spec_fire: false,
             text_a: "bugbot: this PR still leaves `Cargo.lock` out of sync with `Cargo.toml` — commit the regenerated lockfile.",
             reviewer_b: "coderabbit",
             text_b: "bugbot: this PR still leaves `Cargo.lock` out of sync with `Cargo.toml` — commit the regenerated lockfile." },
-        CbCase { id: "D4", group: "different-reviewer-same-text", reviewer_a: "coderabbit", expect_impl_fire: false, expect_spec_fire: false,
+        CbCase { id: "D4", group: "different-reviewer-same-text", reviewer_a: "coderabbit", expect_rotated: false, expect_escalated: false, expect_spec_fire: false,
             text_a: "The quiescence wait loop busy-polls at 500ms with no upper bound on CPU wakeups; please back off exponentially.",
             reviewer_b: "verifier",
             text_b: "The quiescence wait loop busy-polls at 500ms with no upper bound on CPU wakeups; please back off exponentially." },
 
-        // ---- Group E: whitespace-only diff, same reviewer/reason. Second
-        // adversarial pass — trying to break the corpus with the smallest
-        // possible textual delta that's still "different bytes". (2 pairs)
-        CbCase { id: "E1", group: "whitespace-only-diff", reviewer_a: "coderabbit", expect_impl_fire: true, expect_spec_fire: true,
+        // ---- Group E: whitespace-only diff, same reviewer/reason. Bytes
+        // differ → routed through the LLM comparator (ScriptedCbLlm
+        // returns `same_issue: true`) → Rotated. (2 pairs)
+        CbCase { id: "E1", group: "whitespace-only-diff", reviewer_a: "coderabbit", expect_rotated: true, expect_escalated: false, expect_spec_fire: true,
             text_a: "CI is red: `cargo test --test reroll_integration` fails on `test_circuit_breaker` — the HUMAN_HELD transition never happens.",
             reviewer_b: "coderabbit",
             text_b: "CI is red: `cargo test --test reroll_integration` fails on `test_circuit_breaker` —  the HUMAN_HELD transition never happens." },
-        CbCase { id: "E2", group: "whitespace-only-diff", reviewer_a: "skeptic", expect_impl_fire: true, expect_spec_fire: true,
+        CbCase { id: "E2", group: "whitespace-only-diff", reviewer_a: "skeptic", expect_rotated: true, expect_escalated: false, expect_spec_fire: true,
             text_a: "Merge conflict against main in daemon/src/state.rs — please rebase before requesting another review.",
             reviewer_b: "skeptic",
             text_b: "Merge conflict against main in daemon/src/state.rs — please rebase before requesting another review. " },
 
-        // ---- Group F: case-only diff, same reviewer/reason. (2 pairs)
-        CbCase { id: "F1", group: "case-only-diff", reviewer_a: "verifier", expect_impl_fire: true, expect_spec_fire: true,
+        // ---- Group F: case-only diff, same reviewer/reason. Bytes differ
+        // → LLM comparator → Rotated. (2 pairs)
+        CbCase { id: "F1", group: "case-only-diff", reviewer_a: "verifier", expect_rotated: true, expect_escalated: false, expect_spec_fire: true,
             text_a: "bugbot: this PR still leaves `Cargo.lock` out of sync with `Cargo.toml` — commit the regenerated lockfile.",
             reviewer_b: "verifier",
             text_b: "Bugbot: This PR still leaves `Cargo.lock` out of sync with `Cargo.toml` — commit the regenerated lockfile." },
-        CbCase { id: "F2", group: "case-only-diff", reviewer_a: "coderabbit", expect_impl_fire: true, expect_spec_fire: true,
+        CbCase { id: "F2", group: "case-only-diff", reviewer_a: "coderabbit", expect_rotated: true, expect_escalated: false, expect_spec_fire: true,
             text_a: "The new `spawn_failure_count` field is never reset on a successful dispatch, so one transient blip permanently inflates it across the bead's whole lifetime.",
             reviewer_b: "coderabbit",
             text_b: "The new `Spawn_Failure_Count` field is never reset on a successful dispatch, so one transient blip permanently inflates it across the bead's whole lifetime." },
 
         // ---- Group G: trailing "please fix" / punctuation-only append,
-        // same reviewer/reason. (2 pairs)
-        CbCase { id: "G1", group: "trailing-append-diff", reviewer_a: "skeptic", expect_impl_fire: true, expect_spec_fire: true,
+        // same reviewer/reason. Bytes differ → LLM comparator → Rotated.
+        // (2 pairs)
+        CbCase { id: "G1", group: "trailing-append-diff", reviewer_a: "skeptic", expect_rotated: true, expect_escalated: false, expect_spec_fire: true,
             text_a: "Test `test_reroll_success` doesn't assert on the branch registry call log — a regression here would go undetected.",
             reviewer_b: "skeptic",
             text_b: "Test `test_reroll_success` doesn't assert on the branch registry call log — a regression here would go undetected. Please fix before next review." },
-        CbCase { id: "G2", group: "trailing-append-diff", reviewer_a: "verifier", expect_impl_fire: true, expect_spec_fire: true,
+        CbCase { id: "G2", group: "trailing-append-diff", reviewer_a: "verifier", expect_rotated: true, expect_escalated: false, expect_spec_fire: true,
             text_a: "Merge conflict against main in daemon/src/state.rs — please rebase before requesting another review.",
             reviewer_b: "verifier",
             text_b: "Merge conflict against main in daemon/src/state.rs — please rebase before requesting another review!" },
@@ -270,8 +318,13 @@ impl Llm for ScriptedCbLlm {
 }
 
 /// Runs one circuit-breaker corpus case through the REAL `reroll::execute`.
-/// Returns (actually_fired, extraction_ok).
-fn run_cb_case(case: &CbCase, spec_dir: &std::path::Path, llm: &dyn Llm) -> bool {
+/// Returns the tri-state `CbResult` of the reroll:
+///   - `Rotated` if the breaker fired and `try_rotate_for_bead` produced a
+///     viable next reviewer (→ `Deferred("circuit-breaker-rotated")`);
+///   - `Escalated` if the breaker fired but the rotation chain is exhausted
+///     (→ `Held(CIRCUIT_BREAKER_PARK_REASON)`);
+///   - `NoFire` otherwise.
+fn run_cb_case(case: &CbCase, spec_dir: &std::path::Path, llm: &dyn Llm) -> CbResult {
     let scm = FakeScm::new();
     let mut sessions = FakeSessions::new();
     sessions.quiescent = true;
@@ -332,7 +385,11 @@ fn run_cb_case(case: &CbCase, spec_dir: &std::path::Path, llm: &dyn Llm) -> bool
     let outcome = reroll::execute(&deps, &mut bead).unwrap();
     let _ = std::fs::remove_file(&telemetry_log);
 
-    matches!(outcome, RerollOutcome::Held(ref r) if r.contains("circuit-breaker"))
+    match outcome {
+        RerollOutcome::Held(ref r) if r.contains("circuit-breaker") => CbResult::Escalated,
+        RerollOutcome::Deferred(ref r) if r.contains("circuit-breaker-rotated") => CbResult::Rotated,
+        _ => CbResult::NoFire,
+    }
 }
 
 #[test]
@@ -342,82 +399,164 @@ fn circuit_breaker_fuzz_corpus() {
     std::fs::create_dir_all(&spec_dir).unwrap();
 
     let corpus = cb_corpus();
-    let mut false_positives = Vec::new(); // impl fired but expect_spec_fire says it shouldn't have (different reason)
-    let mut impl_false_negatives_vs_spec = Vec::new(); // impl didn't fire but spec-intent says it should have
-    let mut sanity_failures = Vec::new(); // impl disagreed with the deterministic exact-hash prediction itself
+    let mut false_positives = Vec::new(); // impl triggered (rotated OR escalated) but expect_spec_fire says it shouldn't have (different reason)
+    let mut impl_false_negatives_vs_spec = Vec::new(); // impl NoFire but spec-intent says it should have triggered
+    let mut outcome_mismatches = Vec::new(); // impl's Rotated/Escalated vs the corpus's expected outcome
 
     println!(
         "\n=== Circuit-breaker fuzz corpus: {} cases ===",
         corpus.len()
     );
     println!(
-        "{:<5} {:<28} {:<6} {:<6} {:<6}",
-        "id", "group", "impl", "exp_i", "exp_s"
+        "{:<5} {:<28} {:<10} {:<10} {:<6}",
+        "id", "group", "actual", "expected", "exp_s"
     );
 
     for case in &corpus {
         let llm = ScriptedCbLlm {
             same_issue: case.expect_spec_fire,
         };
-        let fired = run_cb_case(case, &spec_dir, &llm);
+        let actual = run_cb_case(case, &spec_dir, &llm);
+        let expected = if case.expect_rotated {
+            CbResult::Rotated
+        } else if case.expect_escalated {
+            CbResult::Escalated
+        } else {
+            CbResult::NoFire
+        };
         println!(
-            "{:<5} {:<28} {:<6} {:<6} {:<6}",
-            case.id, case.group, fired, case.expect_impl_fire, case.expect_spec_fire
+            "{:<5} {:<28} {:<10} {:<10} {:<6}",
+            case.id, case.group, format!("{:?}", actual), format!("{:?}", expected), case.expect_spec_fire
         );
 
-        if fired != case.expect_impl_fire {
-            sanity_failures.push(case.id);
+        // rev-ffb26 split: was previously a single boolean
+        // (`fired != expect_impl_fire`); now we check the tri-state
+        // outcome matches what the corpus expected.
+        if actual != expected {
+            outcome_mismatches.push((case.id, actual, expected));
         }
-        // "Circuit-breaker false positive" per the task brief: breaker fired
-        // for a pair that is a GENUINELY different reason (expect_spec_fire
-        // == false) — this is the zero-tolerance axis the spec names
-        // explicitly.
-        if fired && !case.expect_spec_fire {
+        // "Circuit-breaker false positive" per the task brief: breaker
+        // triggered (rotated OR escalated) for a pair that is a GENUINELY
+        // different reason (expect_spec_fire == false) — this is the
+        // zero-tolerance axis the spec names explicitly. The rev-ffb26
+        // split does NOT relax this: rotation is still "the breaker
+        // caught a same-reason pair", just with a softer kill than the
+        // escalation branch.
+        if actual.triggered() && !case.expect_spec_fire {
             false_positives.push(case.id);
         }
-        // Flip side named in the task brief: a genuinely-same-reason pair
-        // should trigger. Track where the CURRENT implementation doesn't,
-        // even though spec-intent says it should (near-miss/whitespace/case
-        // groups) — this is the headline finding, not a literal spec
-        // violation of the explicitly-named "false positive" axis.
-        if !fired && case.expect_spec_fire {
+        // Flip side named in the task brief: a genuinely-same-reason
+        // pair should trigger. Track where the CURRENT implementation
+        // doesn't, even though spec-intent says it should — this is the
+        // headline finding, not a literal spec violation of the
+        // explicitly-named "false positive" axis.
+        if !actual.triggered() && case.expect_spec_fire {
             impl_false_negatives_vs_spec.push(case.id);
         }
+    }
+
+    // Phase 2 (chain-exhausted escalation): with the default rotation
+    // chain above, every same-reason case ROTATES to a viable next
+    // reviewer on the first trip, so the Escalated branch is never
+    // exercised. Verify it still works by emptying the rotation chain
+    // and re-running one same-reason case (B1 — exact duplicate,
+    // `coderabbit` not in the empty chain → `try_rotate_for_bead`
+    // returns `None` → falls through to the Held path).
+    //
+    // We do this in a SECOND phase rather than mixing it into the
+    // corpus loop because (a) it requires a process-global env var
+    // override, and (b) it tests a code path no other corpus case
+    // reaches, so reporting it separately keeps the summary readable.
+    let saved_chain = std::env::var("DARK_FACTORY_REVIEWER_ROTATION_CHAIN").ok();
+    std::env::set_var("DARK_FACTORY_REVIEWER_ROTATION_CHAIN", "");
+    let escalation_case_id = "Z1-chain-exhausted";
+    let escalation_corpus = CbCase {
+        id: escalation_case_id,
+        group: "chain-exhausted-escalation",
+        reviewer_a: "coderabbit",
+        text_a: "CI is red: `cargo test --test reroll_integration` fails on `test_circuit_breaker` — the HUMAN_HELD transition never happens.",
+        reviewer_b: "coderabbit",
+        text_b: "CI is red: `cargo test --test reroll_integration` fails on `test_circuit_breaker` — the HUMAN_HELD transition never happens.",
+        expect_rotated: false,
+        expect_escalated: true,
+        expect_spec_fire: true,
+    };
+    let escalation_llm = ScriptedCbLlm { same_issue: true };
+    let escalation_actual = run_cb_case(&escalation_corpus, &spec_dir, &escalation_llm);
+    println!(
+        "\n=== Chain-exhausted escalation (empty rotation chain): {} ===",
+        escalation_case_id
+    );
+    println!(
+        "{:<5} {:<28} {:<10} {:<10} {:<6}",
+        escalation_case_id,
+        "chain-exhausted-escalation",
+        format!("{:?}", escalation_actual),
+        "Escalated",
+        true
+    );
+    // Restore env so other tests in the same binary see the default
+    // chain. (cargo runs the integration-test binary's #[test]
+    // functions in parallel threads, but only this test in this
+    // binary touches this env var, so no race exists within the
+    // file's own #[test] set.)
+    if let Some(prev) = saved_chain {
+        std::env::set_var("DARK_FACTORY_REVIEWER_ROTATION_CHAIN", prev);
+    } else {
+        std::env::remove_var("DARK_FACTORY_REVIEWER_ROTATION_CHAIN");
     }
 
     std::fs::remove_dir_all(&spec_dir).ok();
 
     println!("\n--- Circuit-breaker corpus summary ---");
-    println!("total cases: {}", corpus.len());
+    println!("total cases: {}", corpus.len() + 1);
     println!(
-        "sanity mismatches (impl behavior != predicted exact-hash behavior): {:?}",
-        sanity_failures
+        "outcome mismatches (impl Rotated/Escalated vs expected): {:?} (count={})",
+        outcome_mismatches
+            .iter()
+            .map(|(id, actual, expected)| format!("{}(got={:?}, want={:?})", id, actual, expected))
+            .collect::<Vec<_>>(),
+        outcome_mismatches.len()
     );
     println!(
-        "circuit-breaker FALSE POSITIVES (fired on a genuinely different reason): {:?} (count={})",
+        "circuit-breaker FALSE POSITIVES (triggered on a genuinely different reason): {:?} (count={})",
         false_positives,
         false_positives.len()
     );
     println!(
-        "circuit-breaker false negatives vs. spec's 'semantic reason' intent (same reason, different wording, did NOT fire): {:?} (count={})",
+        "circuit-breaker false negatives vs. spec's 'semantic reason' intent (same reason, different wording, did NOT trigger): {:?} (count={})",
         impl_false_negatives_vs_spec,
         impl_false_negatives_vs_spec.len()
     );
+    println!(
+        "chain-exhausted escalation (Z1): actual={:?}, expected=Escalated",
+        escalation_actual
+    );
 
     assert!(
-        sanity_failures.is_empty(),
-        "implementation behavior differed from corpus expectation: {:?}",
-        sanity_failures
+        outcome_mismatches.is_empty(),
+        "circuit-breaker outcome did not match corpus expectation: {:?}",
+        outcome_mismatches
     );
     assert!(
         false_positives.is_empty(),
-        "circuit-breaker fired on genuinely different reasons: {:?}",
+        "circuit-breaker triggered on genuinely different reasons: {:?}",
         false_positives
     );
     assert!(
         impl_false_negatives_vs_spec.is_empty(),
         "circuit-breaker missed same-reason semantic matches: {:?}",
         impl_false_negatives_vs_spec
+    );
+    // rev-ffb26 contract: when the rotation chain has no viable next
+    // reviewer, the breaker must STILL park the bead via
+    // `CIRCUIT_BREAKER_ESCALATED`. Regression here means a fully-wedged
+    // same-reason rejection loop can no longer reach human-held.
+    assert_eq!(
+        escalation_actual,
+        CbResult::Escalated,
+        "rotation chain exhausted but breaker did not escalate to Held(CIRCUIT_BREAKER_PARK_REASON); got {:?}",
+        escalation_actual
     );
 }
 
@@ -443,18 +582,28 @@ fn circuit_breaker_fuzz_corpus_real_llm() {
         "\n=== Circuit-breaker fuzz corpus (REAL LLM via ChainLlm): {} cases ===",
         corpus.len()
     );
-    println!("{:<5} {:<28} {:<6} {:<6}", "id", "group", "fired", "expect");
+    println!(
+        "{:<5} {:<28} {:<10} {:<6}",
+        "id", "group", "actual", "expect"
+    );
 
     for case in &corpus {
-        let fired = run_cb_case(case, &spec_dir, &llm);
+        let actual = run_cb_case(case, &spec_dir, &llm);
         println!(
-            "{:<5} {:<28} {:<6} {:<6}",
-            case.id, case.group, fired, case.expect_spec_fire
+            "{:<5} {:<28} {:<10} {:<6}",
+            case.id,
+            case.group,
+            format!("{:?}", actual),
+            case.expect_spec_fire
         );
-        if fired && !case.expect_spec_fire {
+        // rev-ffb26: same-reason pairs now ROTATE rather than firing the
+        // kill switch. The "did the breaker trigger any way" axis maps
+        // to `actual.triggered()`; that's what we still track on the
+        // false-positive / false-negative axes below.
+        if actual.triggered() && !case.expect_spec_fire {
             false_positives.push(case.id);
         }
-        if !fired && case.expect_spec_fire {
+        if !actual.triggered() && case.expect_spec_fire {
             false_negatives.push(case.id);
         }
     }
@@ -463,12 +612,12 @@ fn circuit_breaker_fuzz_corpus_real_llm() {
 
     println!("\n--- Circuit-breaker REAL-LLM corpus summary ---");
     println!(
-        "false positives (fired on genuinely different reason): {:?} (count={})",
+        "false positives (triggered on genuinely different reason): {:?} (count={})",
         false_positives,
         false_positives.len()
     );
     println!(
-        "false negatives (same reason, did not fire): {:?} (count={})",
+        "false negatives (same reason, did not trigger): {:?} (count={})",
         false_negatives,
         false_negatives.len()
     );
