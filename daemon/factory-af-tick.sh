@@ -144,13 +144,13 @@ cd "$ROOT"
 # this — production ticks always run the check.
 if [ "${AFD_SKIP_DRIFT_CHECK:-0}" != "1" ]; then
     current_branch="$(git branch --show-current 2>/dev/null || true)"
-    if [ "$current_branch" != "main" ]; then
-        echo "factory-af-tick: REFUSING TICK — checkout at $ROOT is on branch '${current_branch:-<detached HEAD>}', not main. The daemon must run from main; switch back with 'git checkout main' or set AFD_SKIP_DRIFT_CHECK=1 for local dev runs." >&2
+    if [ -n "$current_branch" ] && [ "$current_branch" != "main" ]; then
+        echo "factory-af-tick: REFUSING TICK — checkout at $ROOT is on branch '$current_branch', not main. The daemon must run from main; switch back with 'git checkout main' or set AFD_SKIP_DRIFT_CHECK=1 for local dev runs." >&2
         exit 10
     fi
 
     if ! git diff --quiet HEAD -- 2>/dev/null || ! git diff --quiet --cached HEAD -- 2>/dev/null; then
-        echo "factory-af-tick: REFUSING TICK — checkout at $ROOT has uncommitted changes on main. Run 'git status' and clean the tree (stash/reset) before the daemon can tick again." >&2
+        echo "factory-af-tick: REFUSING TICK — checkout at $ROOT has uncommitted changes. Run 'git status' and clean the tree (stash/reset) before the daemon can tick again." >&2
         exit 10
     fi
 
@@ -308,13 +308,19 @@ while IFS='|' read -r bead_id pr branch bead_repo; do
 
     # Resolve AO project for this repo from config
     proj="$(python3 - "$CONFIG" "$repo" <<'PY'
-import sys, toml
+import sys
 config_path = sys.argv[1]
 target_repo = sys.argv[2]
 try:
-    cfg = toml.load(config_path)
+    import tomllib
+    with open(config_path, "rb") as f:
+        cfg = tomllib.load(f)
 except Exception:
-    cfg = {}
+    try:
+        import toml
+        cfg = toml.load(config_path)
+    except Exception:
+        cfg = {}
 
 # 1. Look in [repos]
 repos = cfg.get("repos", {})

@@ -199,13 +199,19 @@ while IFS=\$'\t' read -r bead_id pr branch bead_repo; do
 
   # Resolve AO project for this repo from config
   proj="\$(python3 - "\$CONFIG" "\$repo" <<'PY'
-import sys, toml
+import sys
 config_path = sys.argv[1]
 target_repo = sys.argv[2]
 try:
-    cfg = toml.load(config_path)
+    import tomllib
+    with open(config_path, "rb") as f:
+        cfg = tomllib.load(f)
 except Exception:
-    cfg = {}
+    try:
+        import toml
+        cfg = toml.load(config_path)
+    except Exception:
+        cfg = {}
 
 # 1. Look in [repos]
 repos = cfg.get("repos", {})

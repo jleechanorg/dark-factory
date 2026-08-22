@@ -208,6 +208,57 @@ case "$out" in
         ;;
 esac
 
+# Case 6: clean checkout on detached HEAD matching origin/main -> gate passes.
+(cd "$WORK" && git fetch -q origin main && git checkout -q --detach origin/main)
+out="$(run_drift_block "$WORK")"
+case "$out" in
+    *GATE_PASSED*RC=0*|*RC=0*GATE_PASSED*)
+        echo "PASS: drift gate passes on clean detached HEAD matching origin/main"
+        PASS=$((PASS + 1))
+        ;;
+    *)
+        echo "FAIL: drift gate should pass on clean detached HEAD matching origin/main. Output: $out"
+        FAIL=$((FAIL + 1))
+        ;;
+esac
+
+# Case 7: detached HEAD behind/drifted from origin/main -> gate refuses with rc=10.
+# Advance origin with a new commit so detached HEAD is behind origin/main.
+(
+    cd "$SECOND_CLONE"
+    echo z >> f.txt
+    git add f.txt
+    git commit -q -m third
+    git push -q origin HEAD:main
+)
+out="$(run_drift_block "$WORK")"
+case "$out" in
+    *"REFUSING TICK"*RC=10*)
+        echo "PASS: drift gate refuses (rc=10) when detached HEAD is behind origin/main"
+        PASS=$((PASS + 1))
+        ;;
+    *)
+        echo "FAIL: drift gate should refuse (rc=10) when detached HEAD is behind origin/main. Output: $out"
+        FAIL=$((FAIL + 1))
+        ;;
+esac
+
+# Case 8: dirty tree on detached HEAD -> gate refuses with rc=10.
+(cd "$WORK" && git fetch -q origin main && git checkout -q --detach origin/main && echo dirty >> f.txt)
+out="$(run_drift_block "$WORK")"
+case "$out" in
+    *"REFUSING TICK"*RC=10*)
+        echo "PASS: drift gate refuses (rc=10) on dirty working tree in detached HEAD"
+        PASS=$((PASS + 1))
+        ;;
+    *)
+        echo "FAIL: drift gate should refuse (rc=10) on dirty tree in detached HEAD. Output: $out"
+        FAIL=$((FAIL + 1))
+        ;;
+esac
+(cd "$WORK" && git checkout -q -- f.txt)
+
+
 # ---------------------------------------------------------------------------
 # The production launchd plist must never set AFD_SKIP_DRIFT_CHECK (the
 # opt-out is for local/dev invocation only).
