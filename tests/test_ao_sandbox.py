@@ -145,7 +145,9 @@ def test_codergen_ao_spawn_cli_arg_structure(monkeypatch, tmp_path):
     assert captured.get("calls"), "subprocess.run was not invoked"
     spawn_argv = captured["calls"][0]
     assert spawn_argv[:2] == ["ao", "spawn"]
-    assert "Goal: build feature XYZ" in spawn_argv[2]
+    assert ".factory/prompt.md" in spawn_argv[2]
+    assert (tmp_path / ".factory" / "prompt.md").exists()
+    assert "Goal: build feature XYZ" in (tmp_path / ".factory" / "prompt.md").read_text(encoding="utf-8")
 
     assert "--project" in spawn_argv
     assert spawn_argv[spawn_argv.index("--project") + 1] == "custom-project"

@@ -2836,6 +2836,13 @@ fn ao_spawn_command_with_mode(
         // fail safe instead of accidentally creating a worker.
         cmd.arg("--dark-factory-read-only-diagnostic");
     }
+    if let Some(target_checkout) = spec.local_checkout.as_ref() {
+        let factory_dir = target_checkout.join(".factory");
+        if std::fs::create_dir_all(&factory_dir).is_ok() {
+            let _ = std::fs::write(factory_dir.join("prompt.md"), &spec.prompt);
+        }
+    }
+
     cmd.arg("--")
         .arg(&spec.prompt)
         .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
@@ -3179,7 +3186,13 @@ impl CliSessions {
         self.spawned_session_worktrees
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(session.0.clone(), (spec.branch.clone(), workspace));
+            .insert(session.0.clone(), (spec.branch.clone(), workspace.clone()));
+
+        let factory_dir = workspace.join(".factory");
+        if std::fs::create_dir_all(&factory_dir).is_ok() {
+            let _ = std::fs::write(factory_dir.join("prompt.md"), &spec.prompt);
+        }
+
         Ok(session)
     }
 

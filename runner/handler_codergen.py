@@ -685,7 +685,17 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         agent = ctx.state.get("ao.agent", "claude-code")
         session = ctx.state.get("ao.session")
         if not session:
-            spawn_args = ["ao", "spawn", prompt_text, "--project", project, "--agent", agent]
+            # File-based prompt indirection (.factory/prompt.md) to preserve exact markdown formatting
+            # and prevent CLI 4096-character limit / newline stripping in external agent orchestrators.
+            factory_dir = ctx.workdir / ".factory"
+            try:
+                factory_dir.mkdir(parents=True, exist_ok=True)
+                (factory_dir / "prompt.md").write_text(prompt_text, encoding="utf-8")
+                spawn_prompt = "Execute the task specified in .factory/prompt.md"
+            except Exception:
+                spawn_prompt = prompt_text
+
+            spawn_args = ["ao", "spawn", spawn_prompt, "--project", project, "--agent", agent]
             spawn_args = _handlers_shim._sandboxed_args(spawn_args)
             if spawn_args is None:
                 return _finalize(Result(outcome="failure", output="sandbox-exec unavailable"))
@@ -750,6 +760,13 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             ctx.state["ao.session"] = sess_name
             if worktree:
                 ctx.state["ao.worktree"] = worktree
+                # Mirror prompt.md into the newly created worktree so worker has it locally
+                try:
+                    wt_factory = pathlib.Path(worktree) / ".factory"
+                    wt_factory.mkdir(parents=True, exist_ok=True)
+                    (wt_factory / "prompt.md").write_text(prompt_text, encoding="utf-8")
+                except Exception:
+                    pass
             ao_wait_timeout = _handlers_shim._coerce_timeout(node.attrs.get("wait_timeout", "900"), 900)
             activity = _handlers_shim._ao_wait_idle(sess_name, ctx.workdir, timeout=ao_wait_timeout, project=project)
             outcome = "success" if activity in ("exited", "ready") else "failure"
@@ -774,11 +791,20 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             ))
 
         ao_send_timeout = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "960"), 960)
+        target_dir = pathlib.Path(ctx.state.get("ao.worktree", ctx.workdir))
+        try:
+            wt_factory = target_dir / ".factory"
+            wt_factory.mkdir(parents=True, exist_ok=True)
+            (wt_factory / "prompt.md").write_text(prompt_text, encoding="utf-8")
+            send_prompt = "Execute the updated task specified in .factory/prompt.md"
+        except Exception:
+            send_prompt = prompt_text
+
         send_args = _handlers_shim._sandboxed_args([
             "ao",
             "send",
             session,
-            prompt_text,
+            send_prompt,
             "--timeout",
             str(ao_send_timeout),
         ])
