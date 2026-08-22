@@ -1,5 +1,5 @@
 use daemon::adapters::{ChainLlm, CliScm, CliSessions, CliTracker, CliVcs};
-use daemon::tools::{Llm, Scm, Sessions, SpawnSpec, Tracker, Vcs};
+use daemon::tools::{Llm, Scm, SessionActivity, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
 
 /// Guard for setting environment variables during tests.
 /// SAFETY: must be used with a mutex lock to prevent concurrent test interference.
@@ -369,9 +369,9 @@ fn test_cli_scm_offline_fallback() {
 // Tests for jleechan-kk64: GraphQL failure must report Unknown, not Green
 // ============================================================================
 
-/// Guards every test in this section that needs to mutate process-wide env vars
-/// (`PATH`) so a future second such test can't race this one.
-static FAKE_GH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Guards every test in this file that needs to mutate process-wide env vars
+/// (`PATH`) so concurrent tests cannot race.
+static FAKE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Write a fake `gh` script into `dir` that responds to different commands.
 /// The script branches on its argv to return different responses for:
@@ -395,6 +395,10 @@ args="$*"
 case "$args" in
     *"pr view"*)
         echo '{{"mergeable":"MERGEABLE","reviews":[],"headRefOid":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","body":"","comments":[],"files":[],"updatedAt":"2026-01-01T00:00:00Z"}}'
+        exit 0
+        ;;
+    *"pulls/"*)
+        echo '{{"mergeable":true,"head":{{"sha":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}},"body":"","updated_at":"2026-01-01T00:00:00Z"}}'
         exit 0
         ;;
     *"pr checks"*)
@@ -436,7 +440,8 @@ esac
 #[test]
 #[cfg(unix)]
 fn test_cli_scm_pr_snapshot_graphql_command_failure_reports_unknown_not_green() {
-    let _lock = FAKE_GH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    daemon::adapters::clear_graphql_rate_limited();
 
     // Unique PR number to avoid cache/collision
     let pr_num = 900001;
@@ -465,6 +470,8 @@ fn test_cli_scm_pr_snapshot_graphql_command_failure_reports_unknown_not_green() 
     let scm = CliScm::new("jleechanorg/dark-factory".to_string());
     let result = scm.pr_snapshot(pr_num);
 
+    daemon::adapters::clear_graphql_rate_limited();
+
     // The snapshot fetch should succeed (only the thread count is unknown)
     assert!(result.is_ok(), "pr_snapshot should succeed even when GraphQL fails: {:?}", result);
     let snapshot = result.unwrap();
@@ -482,7 +489,8 @@ fn test_cli_scm_pr_snapshot_graphql_command_failure_reports_unknown_not_green() 
 #[test]
 #[cfg(unix)]
 fn test_cli_scm_pr_snapshot_graphql_malformed_output_reports_unknown_not_green() {
-    let _lock = FAKE_GH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    daemon::adapters::clear_graphql_rate_limited();
 
     let pr_num = 900002;
 
@@ -507,6 +515,8 @@ fn test_cli_scm_pr_snapshot_graphql_malformed_output_reports_unknown_not_green()
     let scm = CliScm::new("jleechanorg/dark-factory".to_string());
     let result = scm.pr_snapshot(pr_num);
 
+    daemon::adapters::clear_graphql_rate_limited();
+
     assert!(result.is_ok(), "pr_snapshot should succeed even when GraphQL is malformed: {:?}", result);
     let snapshot = result.unwrap();
 
@@ -516,4 +526,170 @@ fn test_cli_scm_pr_snapshot_graphql_malformed_output_reports_unknown_not_green()
         "unresolved_thread_count should be None (Unknown) when GraphQL is malformed, but got: {:?}",
         snapshot.unresolved_thread_count
     );
+}
+
+// ============================================================================
+// Tests for CliSessions: ensure `ao status` calls include `-p <project>`
+// ============================================================================
+
+/// Write a fake `ao` script into `dir` that logs invocations and responds with valid status JSON.
+#[cfg(unix)]
+fn write_fake_ao(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("ao");
+    let script = r#"#!/bin/sh
+# Log all argv to the file designated by FAKE_AO_LOG
+if [ -n "$FAKE_AO_LOG" ]; then
+    echo "$@" >> "$FAKE_AO_LOG"
+fi
+
+args="$*"
+case "$args" in
+    *"status"*)
+        echo '[{"name":"session-1","branch":"feature-branch","status":"working","activity":"working"}]'
+        exit 0
+        ;;
+    *"session kill"*)
+        exit 0
+        ;;
+    *)
+        echo '[]'
+        exit 0
+        ;;
+esac
+"#;
+    std::fs::write(&path, script).unwrap_or_else(|e| panic!("failed to write fake ao: {e}"));
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+}
+
+/// Test: CliSessions must include `-p <project>` in its command args when calling `ao status --json`,
+/// ensuring unscoped status calls cannot be introduced across all query entry points
+/// (active_count, attach, attach_within, is_quiescent, session_activity, session_activity_within, session_branch).
+#[test]
+#[cfg(unix)]
+fn test_cli_sessions_ao_status_includes_project_arg_scoped() {
+    let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let fake_bin_dir = std::env::temp_dir().join(format!(
+        "afd_fake_ao_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&fake_bin_dir).unwrap();
+
+    let log_file = fake_bin_dir.join("ao_calls.log");
+    write_fake_ao(&fake_bin_dir);
+
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
+    let log_file_str = log_file.to_string_lossy().to_string();
+
+    let _env_guard = EnvVarGuard::set(&[
+        ("PATH", &new_path),
+        ("FAKE_AO_LOG", &log_file_str),
+    ]);
+
+    // Test 1: with a repo path that derives project name (e.g. "jleechanorg/dark-factory" -> "dark-factory")
+    let sessions_df = CliSessions::new("jleechanorg/dark-factory", "minimax");
+    assert_eq!(sessions_df.project, "dark-factory");
+
+    // Call active_count
+    let count = sessions_df.active_count().expect("active_count failed");
+    assert_eq!(count, 1);
+
+    // Call attach
+    let session = sessions_df
+        .attach("feature-branch", "bead-1")
+        .expect("attach failed");
+    assert_eq!(session.0, "session-1");
+
+    // Call attach_within
+    let session = sessions_df
+        .attach_within("feature-branch", "bead-1", 10)
+        .expect("attach_within failed");
+    assert_eq!(session.0, "session-1");
+
+    // Call is_quiescent
+    let quiescent = sessions_df
+        .is_quiescent(&SessionId("session-1".to_string()))
+        .expect("is_quiescent failed");
+    assert!(!quiescent);
+
+    // Call session_activity
+    let activity = sessions_df
+        .session_activity(&SessionId("session-1".to_string()))
+        .expect("session_activity failed");
+    assert_eq!(activity, SessionActivity::Running);
+
+    // Call session_activity_within
+    let activity = sessions_df
+        .session_activity_within(&SessionId("session-1".to_string()), 10)
+        .expect("session_activity_within failed");
+    assert_eq!(activity, SessionActivity::Running);
+
+    // Call session_branch
+    let branch = sessions_df
+        .session_branch(&SessionId("session-1".to_string()))
+        .expect("session_branch failed");
+    assert_eq!(branch.as_deref(), Some("feature-branch"));
+
+    // Verify logged calls for dark-factory
+    let log_content = std::fs::read_to_string(&log_file).expect("failed to read fake ao log");
+    let lines: Vec<&str> = log_content.lines().collect();
+    assert_eq!(
+        lines.len(),
+        7,
+        "expected exactly 7 calls to ao status, got: {lines:?}"
+    );
+
+    for line in &lines {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        assert!(
+            tokens.contains(&"status"),
+            "command should invoke status: {line}"
+        );
+        assert!(
+            tokens.contains(&"--json"),
+            "command should pass --json: {line}"
+        );
+        // Verify `-p dark-factory` is explicitly included and scoped
+        let p_idx = tokens
+            .iter()
+            .position(|&t| t == "-p")
+            .unwrap_or_else(|| panic!("unscoped status call detected without -p flag: {line}"));
+        assert_eq!(
+            tokens.get(p_idx + 1).copied(),
+            Some("dark-factory"),
+            "expected project 'dark-factory' following -p in call: {line}"
+        );
+    }
+
+    // Test 2: with custom project name (e.g. "worldarchitect.ai" -> "worldarchitect")
+    let _ = std::fs::remove_file(&log_file);
+    let sessions_wa = CliSessions::new("worldarchitect.ai", "claude-code");
+    assert_eq!(sessions_wa.project, "worldarchitect");
+
+    let count_wa = sessions_wa.active_count().expect("active_count failed");
+    assert_eq!(count_wa, 1);
+
+    let log_content_wa = std::fs::read_to_string(&log_file).expect("failed to read fake ao log");
+    let lines_wa: Vec<&str> = log_content_wa.lines().collect();
+    assert_eq!(lines_wa.len(), 1);
+    let wa_tokens: Vec<&str> = lines_wa[0].split_whitespace().collect();
+    let p_idx = wa_tokens
+        .iter()
+        .position(|&t| t == "-p")
+        .expect("unscoped status call detected without -p flag");
+    assert_eq!(
+        wa_tokens.get(p_idx + 1).copied(),
+        Some("worldarchitect"),
+        "expected project 'worldarchitect' following -p"
+    );
+
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
 }

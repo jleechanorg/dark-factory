@@ -655,6 +655,16 @@ fn run(args: Args) -> Result<(), DaemonError> {
                 attempt.tick_index, consecutive_failures, sleep_secs
             ),
         };
+        let previous_failures = tick_loop.consecutive_failures;
+        if let TickLoopAction::TransientBackoff {
+            consecutive_failures,
+            sleep_secs,
+            ref error,
+        } = action
+        {
+            send_daemon_alert(consecutive_failures, sleep_secs, error);
+        }
+
         apply_tick_action(&mut tick_loop, &action, || store.reconcile_dispatching())?;
         let _ = systemd_notify(&watchdog_status);
 
@@ -662,6 +672,9 @@ fn run(args: Args) -> Result<(), DaemonError> {
             TickLoopAction::Success {
                 consecutive_failures: _,
             } => {
+                if previous_failures >= 3 {
+                    send_daemon_recovery_alert(previous_failures);
+                }
                 std::thread::sleep(std::time::Duration::from_secs(cfg.fast_tick_secs));
             }
             TickLoopAction::TransientBackoff {
@@ -676,6 +689,131 @@ fn run(args: Args) -> Result<(), DaemonError> {
             }
         }
     }
+}
+
+/// Send Slack and Email alerts when consecutive tick failures reach thresholds (3, 5, 10, 20...).
+fn send_daemon_alert(consecutive_failures: u32, sleep_secs: u64, error: &str) {
+    if consecutive_failures != 3
+        && consecutive_failures != 5
+        && (consecutive_failures < 10 || !consecutive_failures.is_multiple_of(10))
+    {
+        return;
+    }
+    let msg = format!(
+        "🚨 *[Dark Factory Daemon Alert]*\nConsecutive tick failures: `{consecutive_failures}` (backoff: `{sleep_secs}s`)\nError: ```{error}```\nHost: `jeff-ubuntu`"
+    );
+    send_slack_and_email_alert(&msg, "[Dark Factory Alert] Daemon Tick Failure");
+}
+
+/// Send Slack and Email alerts when the daemon recovers from a failure streak (>= 3).
+fn send_daemon_recovery_alert(previous_failures: u32) {
+    let msg = format!(
+        "✅ *[Dark Factory Daemon Recovered]*\nDaemon recovered after `{previous_failures}` consecutive failures. Ticks are now executing normally on `jeff-ubuntu`."
+    );
+    send_slack_and_email_alert(&msg, "[Dark Factory Alert] Daemon Recovered");
+}
+
+/// Helper to dispatch notifications to Slack and Gmail SMTP in background threads without blocking.
+fn send_slack_and_email_alert(message: &str, email_subject: &str) {
+    let msg_slack = message.to_string();
+    let msg_email = message.to_string();
+    let subject = email_subject.to_string();
+
+    std::thread::spawn(move || {
+        // 1. Slack alert via HERMES_SLACK_BOT_TOKEN or SLACK_WEBHOOK_URL
+        let slack_token = std::env::var("HERMES_SLACK_BOT_TOKEN")
+            .or_else(|_| std::env::var("OPENCLAW_SLACK_BOT_TOKEN"))
+            .unwrap_or_default();
+        let slack_channel = std::env::var("FACTORY_SLACK_CHANNEL_ID")
+            .or_else(|_| std::env::var("DARK_FACTORY_SLACK_CHANNEL"))
+            .or_else(|_| std::env::var("SLACK_ALERT_CHANNEL"))
+            .unwrap_or_else(|_| "C0AH3RY3DK6".to_string());
+
+        if !slack_token.is_empty() {
+            let payload = serde_json::json!({
+                "channel": slack_channel,
+                "text": msg_slack,
+            });
+            let _ = std::process::Command::new("curl")
+                .args([
+                    "-s",
+                    "--connect-timeout",
+                    "5",
+                    "--max-time",
+                    "10",
+                    "-X",
+                    "POST",
+                    "https://slack.com/api/chat.postMessage",
+                    "-H",
+                    &format!("Authorization: Bearer {slack_token}"),
+                    "-H",
+                    "Content-Type: application/json; charset=utf-8",
+                    "--data",
+                    &payload.to_string(),
+                ])
+                .output();
+        } else if let Ok(webhook) = std::env::var("SLACK_WEBHOOK_URL") {
+            if !webhook.is_empty() {
+                let payload = serde_json::json!({ "text": msg_slack });
+                let _ = std::process::Command::new("curl")
+                    .args([
+                        "-s",
+                        "--connect-timeout",
+                        "5",
+                        "--max-time",
+                        "10",
+                        "-X",
+                        "POST",
+                        "-H",
+                        "Content-Type: application/json",
+                        "--data",
+                        &payload.to_string(),
+                        &webhook,
+                    ])
+                    .output();
+            }
+        }
+
+        // 2. Email alert via Gmail SMTP using python stdlib smtplib, passing credentials via environment
+        if let (Ok(email_user), Ok(email_pass)) =
+            (std::env::var("EMAIL_USER"), std::env::var("EMAIL_PASS"))
+        {
+            if !email_user.is_empty() && !email_pass.is_empty() {
+                let recipient =
+                    std::env::var("BACKUP_EMAIL").unwrap_or_else(|_| email_user.clone());
+                let script = r#"
+import os, smtplib, ssl
+from email.message import EmailMessage
+
+user = os.environ.get('EMAIL_USER', '')
+pwd = os.environ.get('EMAIL_PASS', '')
+recipient = os.environ.get('ALERT_RECIPIENT', user)
+subject = os.environ.get('ALERT_SUBJECT', '')
+content = os.environ.get('ALERT_MSG', '')
+
+if user and pwd and recipient:
+    msg = EmailMessage()
+    msg.set_content(content)
+    msg['Subject'] = subject
+    msg['From'] = user
+    msg['To'] = recipient
+    try:
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465, context=context, timeout=10) as server:
+            server.login(user, pwd)
+            server.send_message(msg)
+    except Exception:
+        pass
+"#;
+                let _ = std::process::Command::new("python3")
+                    .args(["-c", script])
+                    .env("ALERT_RECIPIENT", recipient)
+                    .env("ALERT_SUBJECT", subject)
+                    .env("ALERT_MSG", msg_email)
+                    .output();
+            }
+        }
+    });
 }
 
 fn run_recover_held(db: &Path, telemetry_log: &Path) -> Result<(), DaemonError> {

@@ -142,6 +142,8 @@ This repo is layer 1 only.
 - The canonical AO engine used by dark-factory is upstream **Golang `agent-orchestrator`** (`https://github.com/strongdm/agent-orchestrator` / `jleechanorg/agent-orchestrator`). We do NOT use `agent-orchestrator-ts`.
 - The AO repository is **read-only / reference only**. We almost never want to modify or open PRs against AO; all session liveness interpretation, reaping triggers, timeout logic, and promotion handling must live within `dark-factory` itself (e.g. in `daemon/src/adapters.rs` and `daemon/src/tick.rs`).
 - **Hard Safety Gate**: Agents must **NEVER** write or modify `agent-orchestrator` code unless the human operator explicitly provides the verbatim authorization: `AO CODE APPROVED`.
+- **AO CLI Wrapper Fidelity**: Host CLI wrappers for `ao` or any external tool must never modify, strip, or suppress machine-readable flags (such as `--json`, `--format`, `--porcelain`). Wrappers must pass through all arguments transparently to preserve downstream parsing contracts.
+- **Project Scoping**: All `ao status` and session management queries from `dark-factory` must be project-scoped using `-p <project>` to avoid scanning all registered host repositories and hitting rate limits or incurring unnecessary latency.
 
 
 ### Durable artifacts vs. dorodango
