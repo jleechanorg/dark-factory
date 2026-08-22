@@ -310,3 +310,23 @@ attack surface, not just the current criterion list.
 **Related:** [[factory-lite-decommission-decision]] (no further factory-lite investment;
 cutover is a supervised event), [[factory-latency-poll-bound]] (codergen p50 vs roadmap),
 [[factory-ops-guardrails]] (safe-push + auto-merge-guard scripts).
+
+## Supplementary: /web-advice fail-open advisory lane (2026-08-21)
+
+A non-blocking advisory reviewer (`type="web_advice"` in `runner/handlers.py`) sits between
+the strict gates and `exit` in the PR lane graph (see `pipelines/factory/pr_gates.dot` and
+the standalone test pipeline `pipelines/factory/web-advice-failopen.dot`).
+
+**Operational invariant:** the node ALWAYS returns `outcome=success` to the .dot engine.
+Its verdict — APPROVE / NOT MERGE / infrastructure-unavailable — is surfaced only through
+three out-of-band channels:
+
+1. CXDB structured event under `event_type: web_advice_review` (durable audit trail).
+2. PR comment via `gh pr comment` wrapped in `<!-- web-advice-review -->` markers.
+3. Follow-up bead via `br create` when the panel converges on infra-failure or ≥3-of-4
+   NOT MERGE with concrete findings; the bead body MUST start with
+   `target_repo: jleechanorg/dark-factory` per the phantom-dispatch guardrail.
+
+This advisory lane does not change any X-criterion above; the strict gates remain
+authoritative for blocking decisions. /web-advice is a lens, not a gate. For the design
+charter see `docs/web-advice-failopen-design.md`.
