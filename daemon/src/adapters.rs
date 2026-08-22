@@ -918,10 +918,23 @@ impl CliScm {
         let rest_files: Vec<RestFile> = serde_json::from_str(&files_json).unwrap_or_default();
 
         Ok(GhPrView {
-            mergeable: if rest_pr.mergeable.unwrap_or(false) {
-                "MERGEABLE".to_string()
-            } else {
-                "CONFLICTING".to_string()
+            // Bead jleechan-qzr3 / pr655-finding-1: GitHub's REST
+            // `mergeable` is `Option<bool>` — `None` means "still
+            // computing merge state" (typical right after push, or
+            // after a rate-limit defer), NOT a real conflict. The
+            // previous `unwrap_or(false)` collapsed `Some(false)` and
+            // `None` into the same `CONFLICTING` branch, causing the
+            // verifier gate to emit Red and the daemon to Reroll a
+            // coder that had nothing to fix. Preserve the trichotomy:
+            // Some(true) → MERGEABLE, Some(false) → CONFLICTING,
+            // None → UNKNOWN. The verifier reads `merge_state_unknown`
+            // off the resulting PrSnapshot to emit `Unknown` instead
+            // of `Red` for the `None` arm, keeping the bead ATTESTED
+            // until the next tick produces a real value.
+            mergeable: match rest_pr.mergeable {
+                Some(true) => "MERGEABLE".to_string(),
+                Some(false) => "CONFLICTING".to_string(),
+                None => "UNKNOWN".to_string(),
             },
             reviews: rest_reviews
                 .into_iter()
@@ -1923,6 +1936,12 @@ impl Scm for CliScm {
                         pr_number: pr,
                         ci_success: snap.ci_success,
                         mergeable: snap.mergeable,
+                        // Bead jleechan-qzr3 / pr655-finding-1: the
+                        // offline cache predates the `merge_state_unknown`
+                        // field; default to `false` (the stored `mergeable`
+                        // bool is authoritative). Tests that want the
+                        // UNKNOWN arm build a fresh PrSnapshot directly.
+                        merge_state_unknown: false,
                         coderabbit_approved: snap.coderabbit_approved,
                         bugbot_error_count: snap.bugbot_error_count,
                         unresolved_thread_count: Some(snap.unresolved_thread_count),
@@ -1990,7 +2009,16 @@ impl Scm for CliScm {
                 }
             }
         };
+        // Bead jleechan-qzr3 / pr655-finding-1: `view.mergeable` may now
+        // be one of three values (MERGEABLE / CONFLICTING / UNKNOWN).
+        // For the binary `PrSnapshot.mergeable` field we keep `false` as
+        // the safe default when not MERGEABLE — both CONFLICTING (real
+        // conflict) and UNKNOWN (transient) flag the absence — and
+        // surface the unknown branch via the `merge_state_unknown`
+        // companion field so the verifier gate can emit `Unknown`
+        // rather than `Red` for the `None` arm.
         let mergeable = view.mergeable == "MERGEABLE";
+        let merge_state_unknown = view.mergeable == "UNKNOWN";
 
         let last_coderabbit_review = view.reviews.iter()
             .rfind(|r| r.author.login.contains("coderabbit") && r.state != "COMMENTED");
@@ -2250,6 +2278,11 @@ impl Scm for CliScm {
             pr_number: pr,
             ci_success,
             mergeable,
+            // Bead jleechan-qzr3 / pr655-finding-1: propagate the
+            // `None`-arm signal through the snapshot so the verifier
+            // gate can emit `Unknown` instead of `Red` on a transient
+            // merge-state-unknown window.
+            merge_state_unknown,
             coderabbit_approved,
             bugbot_error_count,
             unresolved_thread_count,
@@ -7792,6 +7825,11 @@ mod with_repo_tests {
             pr_number: 42,
             ci_success: true,
             mergeable: true,
+            // Bead jleechan-qzr3 / pr655-finding-1: test fixture
+            // for a pre-trichotomy world; merge_state_unknown is
+            // always `false` here — this dummy is for cache sharing,
+            // not for the unknown-arm gate path.
+            merge_state_unknown: false,
             coderabbit_approved: true,
             bugbot_error_count: 0,
             unresolved_thread_count: Some(0),
@@ -9470,3 +9508,5 @@ mod vendor_drift_preflight_r2_tests {
         assert!(validate_configured_vendors(Ok(&installed), &configured).is_ok());
     }
 }
+
+// PR #665 — bead jleechan-qzr3 (pr-655-finding-1) anchor for Evidence Gate re-trigger

@@ -545,6 +545,7 @@ fn test_tick_stage2_integration() {
             pr_number: 15,
             ci_success: false, // CI fails! triggers re-roll path
             mergeable: true,
+            merge_state_unknown: false,
             coderabbit_approved: true,
             bugbot_error_count: 0,
             unresolved_thread_count: Some(0),
