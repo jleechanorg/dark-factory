@@ -1917,6 +1917,11 @@ impl Scm for CliScm {
             }
         };
         let mergeable = view.mergeable == "MERGEABLE";
+        // Bead jleechan-qzr3 / pr655-finding-1: when the REST fallback returns
+        // `UNKNOWN` (mergeable JSON was null at GitHub, still computing), surface
+        // it via `merge_state_unknown: true` so the verifier routes to
+        // `GateResult::Unknown` (transient) rather than `Red` (conflict).
+        let merge_state_unknown = view.mergeable == "UNKNOWN";
 
         let last_coderabbit_review = view.reviews.iter()
             .rfind(|r| r.author.login.contains("coderabbit") && r.state != "COMMENTED");
@@ -2189,6 +2194,7 @@ impl Scm for CliScm {
             ci_pending,
             bugbot_pending,
             head_committed_epoch,
+            merge_state_unknown,
         };
         {
             let mut cache = self.pr_snapshot_cache.lock().unwrap();
@@ -2565,6 +2571,7 @@ fn try_offline_pr_snapshot(pr: u64) -> Option<PrSnapshot> {
         ci_pending: false,
         bugbot_pending: false,
         head_committed_epoch: snap.head_committed_epoch.unwrap_or(0),
+        merge_state_unknown: false,
     })
 }
 
@@ -7902,6 +7909,7 @@ mod with_repo_tests {
             ci_pending: false,
             bugbot_pending: false,
             head_committed_epoch: 1234567890,
+            merge_state_unknown: false,
         };
 
         // Insert into scm cache for repo "jleechanorg/dark-factory"
