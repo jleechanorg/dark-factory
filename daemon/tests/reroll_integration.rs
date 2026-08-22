@@ -169,18 +169,43 @@ fn test_circuit_breaker() {
         review_text: feedback.into(),
     };
 
-    // 3. Execute should trigger circuit breaker, returning RerollOutcome::Held
+    // 3. Execute should trigger the circuit breaker.
+    //
+    // rev-ffb26: under rotation-before-kill semantics, the breaker first
+    // attempts to rotate the reviewer via `try_rotate_for_bead`. With the
+    // default rotation chain (agy->claudem->codex->gemini, canonicalized
+    // to [antigravity, minimax, codex, gemini]), `coderabbit` is not in
+    // the chain but the chain itself has 4 viable reviewers, so rotation
+    // succeeds and the reroll returns `Deferred("circuit-breaker-rotated")`
+    // instead of escalating to `Held`. We accept BOTH outcomes here —
+    // this test exercises the "breaker fires on the same reviewer citing
+    // the same feedback twice" contract; the specific path it takes
+    // (rotate vs escalate) is the subject of the `constraint_fuzz` and
+    // [`circuit_breaker_escalates_when_chain_exhausted`] tests, not this
+    // one. The previous assertion of Held-or-panic was written before
+    // rev-ffb26.
     let outcome = reroll::execute(&deps, &mut bead).unwrap();
-    match outcome {
-        RerollOutcome::Held(reason) => {
-            assert!(reason.contains("circuit-breaker"));
-        }
-        other => panic!("expected RerollOutcome::Held, got {:?}", other),
-    }
+    let breaker_triggered = match &outcome {
+        RerollOutcome::Held(reason) if reason.contains("circuit-breaker") => true,
+        RerollOutcome::Deferred(reason) if reason.contains("circuit-breaker-rotated") => true,
+        _ => false,
+    };
+    assert!(
+        breaker_triggered,
+        "expected the circuit breaker to fire (Rotated or Escalated), got {:?}",
+        outcome
+    );
 
-    // Verify overlay state is HUMAN_HELD
+    // Verify the overlay transitioned: rotate path leaves the bead in
+    // `ReRoll` (the reroll will be re-selected next tick), escalate path
+    // parks it to `HumanHeld`. Both are valid end states for this test;
+    // what's NOT valid is the breaker silently passing through.
     let final_state = store.load("bead-breaker").unwrap().unwrap();
-    assert_eq!(final_state.state, OverlayState::HumanHeld);
+    assert!(
+        final_state.state == OverlayState::ReRoll || final_state.state == OverlayState::HumanHeld,
+        "expected breaker to leave bead in ReRoll (rotated) or HumanHeld (escalated), got {:?}",
+        final_state.state
+    );
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
@@ -752,14 +777,31 @@ fn test_reroll_adopted_success_spawns_remediation_session_leaves_pr_open() {
 
     // The immediately following adopted attempt has the same reviewer and
     // feedback, so the durable marker must trip the semantic breaker.
+    //
+    // rev-ffb26: under rotation-before-kill semantics the breaker first
+    // tries to rotate the reviewer via `try_rotate_for_bead`. The same
+    // default-chain caveat from `test_circuit_breaker` applies here:
+    // rotation succeeds on the first trip (the chain has 4 viable
+    // reviewers, `coderabbit` not in it but rotation picks the first
+    // available entry), so the breaker returns
+    // `Deferred("circuit-breaker-rotated")` rather than escalating to
+    // `Held`. We accept BOTH outcomes — the contract under test is
+    // "marker causes the breaker to fire", not "marker causes an
+    // immediate park". The escalate-path contract is exercised by the
+    // dedicated chain-exhausted corpus case in `constraint_fuzz`.
     let mut retry = updated.clone();
     retry.state = OverlayState::Attested;
     retry.session_id = None;
     store.save(&retry).unwrap();
     let retry_outcome = reroll::execute(&deps, &mut retry).unwrap();
+    let breaker_triggered = match &retry_outcome {
+        RerollOutcome::Held(reason) if reason.contains("circuit-breaker") => true,
+        RerollOutcome::Deferred(reason) if reason.contains("circuit-breaker-rotated") => true,
+        _ => false,
+    };
     assert!(
-        matches!(retry_outcome, RerollOutcome::Held(ref reason) if reason.contains("circuit-breaker")),
-        "a genuinely remediated prior attempt must still trip the breaker: {retry_outcome:?}"
+        breaker_triggered,
+        "a genuinely remediated prior attempt must still trip the breaker (Rotated or Escalated), got {retry_outcome:?}"
     );
 
     // (c) Never force-pushes/rewrites history, never fabricates a branch or

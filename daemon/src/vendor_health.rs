@@ -139,6 +139,21 @@ pub fn is_global_vendor_capped(vendor: Vendor) -> bool {
     false
 }
 
+/// Return the first configured fallback when CodeRabbit is capped. This is
+/// intentionally only a routing signal; the next reviewer's health is checked
+/// by its own gate.
+pub fn next_healthy_reviewer(capped: Vendor) -> Option<String> {
+    if capped != Vendor::CodeRabbit {
+        return None;
+    }
+    let raw = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN")
+        .unwrap_or_else(|_| "codex->agy->gemini".to_string());
+    raw.split("->")
+        .map(str::trim)
+        .find(|entry| !entry.is_empty())
+        .map(str::to_string)
+}
+
 /// In-memory per-vendor ledger. The daemon owns one of these and consults
 /// it from `verifier::assess` (and from the skeptic prompt construction).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -378,5 +393,18 @@ mod tests {
         assert_eq!(body.lines().count(), 1);
         let _: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn next_healthy_reviewer_returns_default_chain_first_entry() {
+        let prev = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok();
+        std::env::remove_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN");
+        assert_eq!(
+            next_healthy_reviewer(Vendor::CodeRabbit),
+            Some("codex".to_string())
+        );
+        if let Some(v) = prev {
+            std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", v);
+        }
     }
 }
