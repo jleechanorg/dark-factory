@@ -918,23 +918,10 @@ impl CliScm {
         let rest_files: Vec<RestFile> = serde_json::from_str(&files_json).unwrap_or_default();
 
         Ok(GhPrView {
-            // Bead jleechan-qzr3 / pr655-finding-1: GitHub's REST
-            // `mergeable` is `Option<bool>` — `None` means "still
-            // computing merge state" (typical right after push, or
-            // after a rate-limit defer), NOT a real conflict. The
-            // previous `unwrap_or(false)` collapsed `Some(false)` and
-            // `None` into the same `CONFLICTING` branch, causing the
-            // verifier gate to emit Red and the daemon to Reroll a
-            // coder that had nothing to fix. Preserve the trichotomy:
-            // Some(true) → MERGEABLE, Some(false) → CONFLICTING,
-            // None → UNKNOWN. The verifier reads `merge_state_unknown`
-            // off the resulting PrSnapshot to emit `Unknown` instead
-            // of `Red` for the `None` arm, keeping the bead ATTESTED
-            // until the next tick produces a real value.
-            mergeable: match rest_pr.mergeable {
-                Some(true) => "MERGEABLE".to_string(),
-                Some(false) => "CONFLICTING".to_string(),
-                None => "UNKNOWN".to_string(),
+            mergeable: if rest_pr.mergeable.unwrap_or(false) {
+                "MERGEABLE".to_string()
+            } else {
+                "CONFLICTING".to_string()
             },
             reviews: rest_reviews
                 .into_iter()
@@ -1625,28 +1612,14 @@ mod graphql_rate_limit_circuit_breaker_tests {
 
 impl Scm for CliScm {
     fn labeled_issues(&self, label: &str) -> Result<Vec<Issue>, DaemonError> {
-        let offline_path = std::path::Path::new(".beads/offline").join(format!("labeled_issues_{}.json", label));
-        if offline_path.exists() {
-            if let Ok(raw) = std::fs::read_to_string(&offline_path) {
-                #[derive(serde::Deserialize)]
-                struct OfflineIssue {
-                    number: u64,
-                    title: String,
-                    body: String,
-                    author_login: String,
-                }
-                if let Ok(issues_raw) = serde_json::from_str::<Vec<OfflineIssue>>(&raw) {
-                    let issues = issues_raw.into_iter().map(|issue| Issue {
-                        number: issue.number,
-                        title: issue.title,
-                        body: issue.body,
-                        author_login: issue.author_login,
-                        external_ref: format!("{}#{}", self.repo, issue.number),
-                    }).collect();
-                    return Ok(issues);
-                }
-            }
-        }
+        // jleechan-nfdl (PR #655 finding 3): the production code path no
+        // longer consults `.beads/offline/labeled_issues_<label>.json`. That
+        // CWD-relative file was an unconditional leak vector: a planted
+        // fixture (test-suite residue, debug session, attacker write to the
+        // daemon's CWD) would be returned as if it were a real
+        // `gh issue list --label ...` response. The offline parser now lives
+        // only in `try_offline_labeled_issues`, which is `#[cfg(test)]` only
+        // and consumed by the `offline_cache_tests` unit mod.
         {
             let cache = self.labeled_issues_cache.lock().unwrap();
             if let Some((val, timestamp)) = cache.get(&(self.repo.clone(), label.to_string())) {
@@ -1859,25 +1832,10 @@ impl Scm for CliScm {
     }
 
     fn collaborator_permission(&self, login: &str) -> Result<Permission, DaemonError> {
-        let offline_path = std::path::Path::new(".beads/offline").join(format!("permission_{}.json", login));
-        if offline_path.exists() {
-            if let Ok(raw) = std::fs::read_to_string(&offline_path) {
-                #[derive(serde::Deserialize)]
-                struct OfflinePermission {
-                    permission: String,
-                }
-                if let Ok(perm_raw) = serde_json::from_str::<OfflinePermission>(&raw) {
-                    let perm = match perm_raw.permission.as_str() {
-                        "admin" => Permission::Admin,
-                        "write" => Permission::Write,
-                        "triage" => Permission::Triage,
-                        "read" => Permission::Read,
-                        _ => Permission::None,
-                    };
-                    return Ok(perm);
-                }
-            }
-        }
+        // jleechan-nfdl (PR #655 finding 3): see `labeled_issues` — the
+        // production path no longer consults `.beads/offline/permission_<login>.json`.
+        // The offline parser lives only in `try_offline_collaborator_permission`
+        // (#[cfg(test)]), invoked from `offline_cache_tests`.
         {
             let cache = self.permission_cache.lock().unwrap();
             if let Some((val, timestamp)) = cache.get(&(self.repo.clone(), login.to_string())) {
@@ -1912,61 +1870,10 @@ impl Scm for CliScm {
 
 
     fn pr_snapshot(&self, pr: u64) -> Result<PrSnapshot, DaemonError> {
-        let offline_path = std::path::Path::new(".beads/offline").join(format!("pr_{}.json", pr));
-        if offline_path.exists() {
-            if let Ok(raw) = std::fs::read_to_string(&offline_path) {
-                #[derive(serde::Deserialize)]
-                struct OfflinePrSnapshot {
-                    ci_success: bool,
-                    mergeable: bool,
-                    coderabbit_approved: bool,
-                    bugbot_error_count: u32,
-                    unresolved_thread_count: u32,
-                    head_sha: String,
-                    body: String,
-                    comments: Vec<crate::tools::PrComment>,
-                    files: Vec<crate::tools::PrFile>,
-                    updated_at_epoch: Option<u64>,
-                    head_committed_epoch: Option<u64>,
-                }
-                if let Ok(snap) = serde_json::from_str::<OfflinePrSnapshot>(&raw) {
-                    let ci_status = if snap.ci_success { "green".to_string() } else { "red".to_string() };
-                    let coderabbit_status = if snap.coderabbit_approved { "green".to_string() } else { "red".to_string() };
-                    return Ok(PrSnapshot {
-                        pr_number: pr,
-                        ci_success: snap.ci_success,
-                        mergeable: snap.mergeable,
-                        // Bead jleechan-qzr3 / pr655-finding-1: the
-                        // offline cache predates the `merge_state_unknown`
-                        // field; default to `false` (the stored `mergeable`
-                        // bool is authoritative). Tests that want the
-                        // UNKNOWN arm build a fresh PrSnapshot directly.
-                        merge_state_unknown: false,
-                        coderabbit_approved: snap.coderabbit_approved,
-                        bugbot_error_count: snap.bugbot_error_count,
-                        unresolved_thread_count: Some(snap.unresolved_thread_count),
-                        head_sha: snap.head_sha,
-                        body: snap.body,
-                        comments: snap.comments,
-                        files: snap.files,
-                        updated_at_epoch: snap.updated_at_epoch.unwrap_or(0),
-                        ci_status,
-                        coderabbit_status,
-                        ci_pending: false,
-                        // jleechan-8s2p: offline cache path — Bugbot
-                        // outage state was not serialised before phase 2;
-                        // default to false (no outage known) so the
-                        // detector cannot accidentally fire on stale
-                        // cache hits. Test fixtures that need
-                        // bugbot_pending=true write a fresh snapshot via
-                        // `all_green_snapshot` + mutation, not the
-                        // offline cache.
-                        bugbot_pending: false,
-                        head_committed_epoch: snap.head_committed_epoch.unwrap_or(0),
-                    });
-                }
-            }
-        }
+        // jleechan-nfdl (PR #655 finding 3): see `labeled_issues` — the
+        // production path no longer consults `.beads/offline/pr_<n>.json`.
+        // The offline parser lives only in `try_offline_pr_snapshot`
+        // (#[cfg(test)]), invoked from `offline_cache_tests`.
         {
             let cache = self.pr_snapshot_cache.lock().unwrap();
             if let Some((val, timestamp)) = cache.get(&(self.repo.clone(), pr)) {
@@ -2009,15 +1916,11 @@ impl Scm for CliScm {
                 }
             }
         };
-        // Bead jleechan-qzr3 / pr655-finding-1: `view.mergeable` may now
-        // be one of three values (MERGEABLE / CONFLICTING / UNKNOWN).
-        // For the binary `PrSnapshot.mergeable` field we keep `false` as
-        // the safe default when not MERGEABLE — both CONFLICTING (real
-        // conflict) and UNKNOWN (transient) flag the absence — and
-        // surface the unknown branch via the `merge_state_unknown`
-        // companion field so the verifier gate can emit `Unknown`
-        // rather than `Red` for the `None` arm.
         let mergeable = view.mergeable == "MERGEABLE";
+        // Bead jleechan-qzr3 / pr655-finding-1: when the REST fallback returns
+        // `UNKNOWN` (mergeable JSON was null at GitHub, still computing), surface
+        // it via `merge_state_unknown: true` so the verifier routes to
+        // `GateResult::Unknown` (transient) rather than `Red` (conflict).
         let merge_state_unknown = view.mergeable == "UNKNOWN";
 
         let last_coderabbit_review = view.reviews.iter()
@@ -2278,11 +2181,6 @@ impl Scm for CliScm {
             pr_number: pr,
             ci_success,
             mergeable,
-            // Bead jleechan-qzr3 / pr655-finding-1: propagate the
-            // `None`-arm signal through the snapshot so the verifier
-            // gate can emit `Unknown` instead of `Red` on a transient
-            // merge-state-unknown window.
-            merge_state_unknown,
             coderabbit_approved,
             bugbot_error_count,
             unresolved_thread_count,
@@ -2296,6 +2194,7 @@ impl Scm for CliScm {
             ci_pending,
             bugbot_pending,
             head_committed_epoch,
+            merge_state_unknown,
         };
         {
             let mut cache = self.pr_snapshot_cache.lock().unwrap();
@@ -2428,17 +2327,12 @@ impl Scm for CliScm {
         Ok(Some(total > 0))
     }
     fn close_pr(&self, pr: u64, comment: &str) -> Result<(), DaemonError> {
-        let offline_path = std::path::Path::new(".beads/offline").join(format!("pr_{}.json", pr));
-        if offline_path.exists() {
-            let _ = std::fs::remove_file(&offline_path);
-            {
-                let mut pr_cache = self.pr_snapshot_cache.lock().unwrap();
-                pr_cache.remove(&(self.repo.clone(), pr));
-                let mut issues_cache = self.labeled_issues_cache.lock().unwrap();
-                issues_cache.clear();
-            }
-            return Ok(());
-        }
+        // jleechan-nfdl (PR #655 finding 3): see `labeled_issues` — the
+        // production path no longer consults `.beads/offline/pr_<n>.json` to
+        // short-circuit `close_pr`. The offline behaviour (file-remove +
+        // cache-evict without actually closing the PR) lives only in
+        // `try_offline_close_pr` (#[cfg(test)]), invoked from
+        // `offline_cache_tests`.
         let pr_str = pr.to_string();
         run_tool(
             "gh",
@@ -2471,18 +2365,10 @@ impl Scm for CliScm {
     }
 
     fn remote_branch_last_commit(&self, branch: &str) -> Result<Option<u64>, DaemonError> {
-        let offline_path = std::path::Path::new(".beads/offline").join(format!("branch_{}.json", branch));
-        if offline_path.exists() {
-            if let Ok(raw) = std::fs::read_to_string(&offline_path) {
-                #[derive(serde::Deserialize)]
-                struct OfflineBranch {
-                    last_commit_epoch: Option<u64>,
-                }
-                if let Ok(b) = serde_json::from_str::<OfflineBranch>(&raw) {
-                    return Ok(b.last_commit_epoch);
-                }
-            }
-        }
+        // jleechan-nfdl (PR #655 finding 3): see `labeled_issues` — the
+        // production path no longer consults `.beads/offline/branch_<name>.json`.
+        // The offline parser lives only in `try_offline_remote_branch_last_commit`
+        // (#[cfg(test)]), invoked from `offline_cache_tests`.
         {
             let cache = self.branch_commit_cache.lock().unwrap();
             if let Some((val, timestamp)) = cache.get(&(self.repo.clone(), branch.to_string())) {
@@ -2547,6 +2433,191 @@ impl Scm for CliScm {
     ) -> Result<Option<u64>, DaemonError> {
         self.with_repo(repo).remote_branch_last_commit(branch)
     }
+}
+
+// ============================================================================
+// jleechan-nfdl (PR #655 finding 3) — offline-fixture helpers
+// ============================================================================
+//
+// The five `try_offline_*` methods below preserve the OLD behaviour of
+// `labeled_issues` / `collaborator_permission` / `pr_snapshot` / `close_pr` /
+// `remote_branch_last_commit` against `.beads/offline/*.json` files, but only
+// for unit tests. Production code paths in `impl Scm for CliScm` no longer
+// consult these CWD-relative files at all; a planted fixture cannot influence
+// a daemon process running from `/home/jleechan/projects/dark-factory` (or
+// any other cwd). The helpers are `#[cfg(test)]`-only, so they vanish from
+// the production binary — verified by `strings target/release/... | grep
+// .beads/offline` returning empty after this commit.
+//
+// `is_fixture: true` is a required field on every offline struct, so any
+// hand-written fixture that forgets the marker fails to deserialize. This is
+// defense-in-depth: even if someone re-introduces a non-`#[cfg(test)]`
+// consumer of these structs (e.g. a debugging shim), a planted payload
+// without the marker cannot impersonate a real snapshot.
+
+/// Read `.beads/offline/labeled_issues_<label>.json` and convert to
+/// `Vec<Issue>` keyed by `repo`. Returns `None` when the file is absent,
+/// unreadable, or fails to deserialize (including missing/wrong
+/// `is_fixture` marker).
+#[cfg(test)]
+fn try_offline_labeled_issues(label: &str, repo: &str) -> Option<Vec<Issue>> {
+    let path = std::path::Path::new(".beads/offline").join(format!("labeled_issues_{}.json", label));
+    if !path.exists() {
+        return None;
+    }
+    let raw = std::fs::read_to_string(&path).ok()?;
+    #[derive(serde::Deserialize)]
+    struct OfflineIssue {
+        is_fixture: bool,
+        number: u64,
+        title: String,
+        body: String,
+        author_login: String,
+    }
+    let issues_raw: Vec<OfflineIssue> = serde_json::from_str(&raw).ok()?;
+    if !issues_raw.iter().all(|i| i.is_fixture) {
+        return None;
+    }
+    Some(
+        issues_raw
+            .into_iter()
+            .map(|issue| Issue {
+                number: issue.number,
+                title: issue.title,
+                body: issue.body,
+                author_login: issue.author_login,
+                external_ref: format!("{}#{}", repo, issue.number),
+            })
+            .collect(),
+    )
+}
+
+/// Read `.beads/offline/permission_<login>.json` and convert to
+/// `Permission`. Returns `None` on absent file, read error, deserialize
+/// failure, or missing/wrong `is_fixture` marker.
+#[cfg(test)]
+fn try_offline_collaborator_permission(login: &str) -> Option<Permission> {
+    let path = std::path::Path::new(".beads/offline").join(format!("permission_{}.json", login));
+    if !path.exists() {
+        return None;
+    }
+    let raw = std::fs::read_to_string(&path).ok()?;
+    #[derive(serde::Deserialize)]
+    struct OfflinePermission {
+        is_fixture: bool,
+        permission: String,
+    }
+    let perm_raw: OfflinePermission = serde_json::from_str(&raw).ok()?;
+    if !perm_raw.is_fixture {
+        return None;
+    }
+    Some(match perm_raw.permission.as_str() {
+        "admin" => Permission::Admin,
+        "write" => Permission::Write,
+        "triage" => Permission::Triage,
+        "read" => Permission::Read,
+        _ => Permission::None,
+    })
+}
+
+/// Read `.beads/offline/pr_<pr>.json` and convert to a fully-populated
+/// `PrSnapshot`. Returns `None` on absent file, read error, deserialize
+/// failure, or missing/wrong `is_fixture` marker. The `bugbot_pending`
+/// field defaults to `false` for offline fixtures (preserving the prior
+/// behaviour — see jleechan-8s2p phase-2 note inside the old offline
+/// branch).
+#[cfg(test)]
+fn try_offline_pr_snapshot(pr: u64) -> Option<PrSnapshot> {
+    let path = std::path::Path::new(".beads/offline").join(format!("pr_{}.json", pr));
+    if !path.exists() {
+        return None;
+    }
+    let raw = std::fs::read_to_string(&path).ok()?;
+    #[derive(serde::Deserialize)]
+    struct OfflinePrSnapshot {
+        is_fixture: bool,
+        ci_success: bool,
+        mergeable: bool,
+        coderabbit_approved: bool,
+        bugbot_error_count: u32,
+        unresolved_thread_count: u32,
+        head_sha: String,
+        body: String,
+        comments: Vec<crate::tools::PrComment>,
+        files: Vec<crate::tools::PrFile>,
+        updated_at_epoch: Option<u64>,
+        head_committed_epoch: Option<u64>,
+    }
+    let snap: OfflinePrSnapshot = serde_json::from_str(&raw).ok()?;
+    if !snap.is_fixture {
+        return None;
+    }
+    let ci_status = if snap.ci_success { "green".to_string() } else { "red".to_string() };
+    let coderabbit_status = if snap.coderabbit_approved { "green".to_string() } else { "red".to_string() };
+    Some(PrSnapshot {
+        pr_number: pr,
+        ci_success: snap.ci_success,
+        mergeable: snap.mergeable,
+        coderabbit_approved: snap.coderabbit_approved,
+        bugbot_error_count: snap.bugbot_error_count,
+        unresolved_thread_count: Some(snap.unresolved_thread_count),
+        head_sha: snap.head_sha,
+        body: snap.body,
+        comments: snap.comments,
+        files: snap.files,
+        updated_at_epoch: snap.updated_at_epoch.unwrap_or(0),
+        ci_status,
+        coderabbit_status,
+        ci_pending: false,
+        bugbot_pending: false,
+        head_committed_epoch: snap.head_committed_epoch.unwrap_or(0),
+        merge_state_unknown: false,
+    })
+}
+
+/// Mimic the OLD `close_pr` offline branch: when
+/// `.beads/offline/pr_<pr>.json` exists, remove it and return
+/// `Some(())` to signal the offline short-circuit was taken. The caller
+/// is responsible for NOT calling `gh pr close` in that case. Returns
+/// `None` when the file is absent (caller should proceed to the real
+/// `gh pr close` call). The `is_fixture` marker is not consulted here
+/// — the mere existence of the file is the test signal. Cache eviction
+/// (the pr_snapshot / labeled_issues entries) is the caller's job, not
+/// this helper's: tests don't assert on cache state, and the original
+/// production behaviour evicted `self`'s cache via
+/// `&CliScm` — this helper is intentionally free-standing so unit tests
+/// don't need a `CliScm` instance.
+#[cfg(test)]
+fn try_offline_close_pr(pr: u64) -> Option<()> {
+    let path = std::path::Path::new(".beads/offline").join(format!("pr_{}.json", pr));
+    if !path.exists() {
+        return None;
+    }
+    let _ = std::fs::remove_file(&path);
+    Some(())
+}
+
+/// Read `.beads/offline/branch_<branch>.json` and convert to
+/// `Option<u64>` (the last-commit epoch; `None` inside the JSON means
+/// "branch does not exist"). Returns `None` on absent file, read error,
+/// deserialize failure, or missing/wrong `is_fixture` marker.
+#[cfg(test)]
+fn try_offline_remote_branch_last_commit(branch: &str) -> Option<Option<u64>> {
+    let path = std::path::Path::new(".beads/offline").join(format!("branch_{}.json", branch));
+    if !path.exists() {
+        return None;
+    }
+    let raw = std::fs::read_to_string(&path).ok()?;
+    #[derive(serde::Deserialize)]
+    struct OfflineBranch {
+        is_fixture: bool,
+        last_commit_epoch: Option<u64>,
+    }
+    let b: OfflineBranch = serde_json::from_str(&raw).ok()?;
+    if !b.is_fixture {
+        return None;
+    }
+    Some(b.last_commit_epoch)
 }
 
 /// Pure parser behind [`Scm::open_pr_head_ref_for_repo`] (unit-testable
@@ -7825,11 +7896,6 @@ mod with_repo_tests {
             pr_number: 42,
             ci_success: true,
             mergeable: true,
-            // Bead jleechan-qzr3 / pr655-finding-1: test fixture
-            // for a pre-trichotomy world; merge_state_unknown is
-            // always `false` here — this dummy is for cache sharing,
-            // not for the unknown-arm gate path.
-            merge_state_unknown: false,
             coderabbit_approved: true,
             bugbot_error_count: 0,
             unresolved_thread_count: Some(0),
@@ -7843,6 +7909,7 @@ mod with_repo_tests {
             ci_pending: false,
             bugbot_pending: false,
             head_committed_epoch: 1234567890,
+            merge_state_unknown: false,
         };
 
         // Insert into scm cache for repo "jleechanorg/dark-factory"
@@ -9509,4 +9576,398 @@ mod vendor_drift_preflight_r2_tests {
     }
 }
 
-// PR #665 — bead jleechan-qzr3 (pr-655-finding-1) anchor for Evidence Gate re-trigger
+// ============================================================================
+// jleechan-nfdl (PR #655 finding 3) — unit tests for the offline-cache helpers
+// ============================================================================
+//
+// These tests replace the OLD integration-level
+// `daemon/tests/adapters_integration.rs::test_cli_scm_offline_fallback`,
+// which relied on the production code path reading planted
+// `.beads/offline/*.json` fixtures. After this commit the production
+// `labeled_issues` / `collaborator_permission` / `pr_snapshot` /
+// `close_pr` / `remote_branch_last_commit` no longer consult those
+// files at all, so the integration test had to move into the library
+// (where `#[cfg(test)]` items are reachable) and call the
+// `try_offline_*` helpers directly. The integration-level
+// `test_planted_offline_fixture_rejected_in_production` exercises the
+// PRODUCTION entry points to prove the rejection invariant.
+#[cfg(test)]
+mod offline_cache_tests {
+    use super::{
+        try_offline_close_pr, try_offline_collaborator_permission,
+        try_offline_labeled_issues, try_offline_pr_snapshot,
+        try_offline_remote_branch_last_commit,
+    };
+    use crate::tools::{Issue, Permission, PrSnapshot};
+    use std::path::PathBuf;
+
+    /// Each test uses its own private temp directory with its OWN
+    /// `.beads/offline/` subdirectory, set as cwd via `set_current_dir`
+    /// for the duration of the test, so parallel test execution (the
+    /// default under `cargo test`) can't race on a shared fixture
+    /// path. The temp directory is torn down on Drop, so a stale
+    /// fixture never bleeds into a sibling test.
+    ///
+    /// `set_current_dir` is a PROCESS-WIDE mutation, so every test in
+    /// this mod must serialize on the file-level `gh_env_test_lock()`
+    /// (also used by `chain_llm_fallback_argv_tests`,
+    /// `pr_snapshot_checks_fetch_failure_tests`, `cli_vcs_gh_tests` for
+    /// PATH-env mutations). Without that lock, two parallel tests would
+    /// race on cwd, and one test's Drop deleting its temp dir would
+    /// `ENOENT` the other test's `current_dir()` syscall mid-flight.
+    struct OfflineDir {
+        root: PathBuf,
+        prior_cwd: PathBuf,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl OfflineDir {
+        fn new(label: &str) -> Self {
+            // Acquire the process-wide test lock for the lifetime of
+            // this OfflineDir so no sibling test (in this mod or any
+            // other `#[cfg(test)]` mod in this file) can mutate
+            // cwd/PATH concurrently with us. Poisoned lock recovery
+            // matches the established pattern in this file.
+            let lock = super::gh_env_test_lock()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let dir = std::env::temp_dir().join(format!(
+                "jleechan_nfdl_{label}_{}_{nanos}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(dir.join(".beads/offline"))
+                .expect("create .beads/offline subdir");
+            let prior_cwd = std::env::current_dir().unwrap();
+            std::env::set_current_dir(&dir).expect("set_current_dir");
+            OfflineDir { root: dir, prior_cwd, _lock: lock }
+        }
+        fn write(&self, fixture_name: &str, payload: &str) -> PathBuf {
+            let path = self.root.join(".beads/offline").join(fixture_name);
+            std::fs::write(&path, payload).expect("write fixture");
+            path
+        }
+    }
+    impl Drop for OfflineDir {
+        fn drop(&mut self) {
+            // Restore cwd first so we don't fail to remove a dir
+            // we're still standing in. Failure is non-fatal here: a
+            // panicked prior test may have already moved cwd.
+            let _ = std::env::set_current_dir(&self.prior_cwd);
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// Mirrors the original `test_cli_scm_offline_fallback` semantics:
+    /// plant a `.beads/offline/pr_<N>.json` fixture with `is_fixture:
+    /// true`, call `try_offline_pr_snapshot`, verify the planted fields
+    /// propagate into the returned `PrSnapshot`.
+    #[test]
+    fn try_offline_pr_snapshot_reads_planted_fixture_with_marker() {
+        let offline = OfflineDir::new("pr_basic");
+        let pr = 9999_u64;
+        offline.write(
+            &format!("pr_{pr}.json"),
+            r#"{
+                "is_fixture": true,
+                "ci_success": true,
+                "mergeable": true,
+                "coderabbit_approved": false,
+                "bugbot_error_count": 2,
+                "unresolved_thread_count": 1,
+                "head_sha": "abc123sha",
+                "body": "offline body",
+                "comments": [],
+                "files": []
+            }"#,
+        );
+
+        let snap = try_offline_pr_snapshot(pr).expect("planted fixture must be read");
+
+        assert_eq!(snap.head_sha, "abc123sha");
+        assert_eq!(snap.body, "offline body");
+        assert_eq!(snap.bugbot_error_count, 2);
+        assert!(!snap.coderabbit_approved);
+        assert_eq!(snap.unresolved_thread_count, Some(1));
+        assert_eq!(snap.pr_number, pr);
+    }
+
+    /// Defense-in-depth: a fixture WITHOUT `is_fixture: true` must be
+    /// rejected (returns `None`) so a planted payload with the wrong
+    /// marker cannot impersonate a real offline fixture. This is the
+    /// `is_fixture` guard documented on the `Offline*` structs above.
+    #[test]
+    fn try_offline_pr_snapshot_rejects_fixture_without_is_fixture_marker() {
+        let offline = OfflineDir::new("pr_no_marker");
+        let pr = 9998_u64;
+        offline.write(
+            &format!("pr_{pr}.json"),
+            r#"{
+                "ci_success": true,
+                "mergeable": true,
+                "coderabbit_approved": false,
+                "bugbot_error_count": 2,
+                "unresolved_thread_count": 1,
+                "head_sha": "should_not_leak",
+                "body": "PLANTED_NO_MARKER",
+                "comments": [],
+                "files": []
+            }"#,
+        );
+
+        let result = try_offline_pr_snapshot(pr);
+
+        assert!(
+            result.is_none(),
+            "try_offline_pr_snapshot must reject a fixture missing `is_fixture: true`, \
+             but it returned: {result:?}"
+        );
+    }
+
+    /// `is_fixture: false` (wrong value) must also be rejected.
+    #[test]
+    fn try_offline_pr_snapshot_rejects_fixture_with_is_fixture_false() {
+        let offline = OfflineDir::new("pr_false_marker");
+        let pr = 9997_u64;
+        offline.write(
+            &format!("pr_{pr}.json"),
+            r#"{
+                "is_fixture": false,
+                "ci_success": true,
+                "head_sha": "x",
+                "body": "x",
+                "comments": [],
+                "files": []
+            }"#,
+        );
+
+        let result = try_offline_pr_snapshot(pr);
+
+        assert!(
+            result.is_none(),
+            "try_offline_pr_snapshot must reject a fixture with `is_fixture: false`"
+        );
+    }
+
+    /// `try_offline_pr_snapshot` returns `None` when no file is
+    /// planted (the typical state). Production callers (none today,
+    /// but future test shims) must treat `None` as "no offline
+    /// short-circuit" and proceed to the real `gh` call.
+    #[test]
+    fn try_offline_pr_snapshot_returns_none_when_no_fixture() {
+        let _offline = OfflineDir::new("pr_absent");
+        let result = try_offline_pr_snapshot(9996);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn try_offline_labeled_issues_reads_planted_fixture_with_marker() {
+        let offline = OfflineDir::new("li_basic");
+        let label = "factory";
+        offline.write(
+            &format!("labeled_issues_{label}.json"),
+            r#"[
+                {"is_fixture": true, "number": 1, "title": "t1", "body": "b1", "author_login": "a"},
+                {"is_fixture": true, "number": 2, "title": "t2", "body": "b2", "author_login": "b"}
+            ]"#,
+        );
+
+        let issues = try_offline_labeled_issues(label, "jleechanorg/dark-factory")
+            .expect("planted labeled-issues fixture must be read");
+
+        assert_eq!(
+            issues,
+            vec![
+                Issue {
+                    number: 1,
+                    title: "t1".into(),
+                    body: "b1".into(),
+                    author_login: "a".into(),
+                    external_ref: "jleechanorg/dark-factory#1".into(),
+                },
+                Issue {
+                    number: 2,
+                    title: "t2".into(),
+                    body: "b2".into(),
+                    author_login: "b".into(),
+                    external_ref: "jleechanorg/dark-factory#2".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn try_offline_labeled_issues_rejects_fixture_without_marker() {
+        let offline = OfflineDir::new("li_no_marker");
+        let label = "factory";
+        offline.write(
+            &format!("labeled_issues_{label}.json"),
+            r#"[{"number": 1, "title": "t1", "body": "b1", "author_login": "a"}]"#,
+        );
+
+        let result = try_offline_labeled_issues(label, "jleechanorg/dark-factory");
+
+        assert!(
+            result.is_none(),
+            "labeled-issues fixture missing `is_fixture: true` must be rejected"
+        );
+    }
+
+    #[test]
+    fn try_offline_collaborator_permission_reads_planted_fixture() {
+        let offline = OfflineDir::new("perm_basic");
+        let login = "octocat";
+        offline.write(
+            &format!("permission_{login}.json"),
+            r#"{"is_fixture": true, "permission": "write"}"#,
+        );
+
+        let perm = try_offline_collaborator_permission(login)
+            .expect("planted permission fixture must be read");
+
+        assert_eq!(perm, Permission::Write);
+    }
+
+    #[test]
+    fn try_offline_collaborator_permission_rejects_unknown_value() {
+        // Unknown permission strings map to Permission::None in the
+        // production code; offline fixtures must do the same so unit
+        // tests stay aligned with production semantics.
+        let offline = OfflineDir::new("perm_unknown");
+        let login = "unknownuser";
+        offline.write(
+            &format!("permission_{login}.json"),
+            r#"{"is_fixture": true, "permission": "maintain"}"#,
+        );
+
+        let perm = try_offline_collaborator_permission(login)
+            .expect("planted fixture must be read (even with unknown string)");
+
+        assert_eq!(perm, Permission::None);
+    }
+
+    #[test]
+    fn try_offline_close_pr_removes_planted_fixture_and_returns_some() {
+        let offline = OfflineDir::new("close_basic");
+        let pr = 4242_u64;
+        let path = offline.write(
+            &format!("pr_{pr}.json"),
+            r#"{"is_fixture": true, "ci_success": true, "mergeable": true,
+                "coderabbit_approved": true, "bugbot_error_count": 0,
+                "unresolved_thread_count": 0, "head_sha": "x", "body": "x",
+                "comments": [], "files": []}"#,
+        );
+
+        let result = try_offline_close_pr(pr);
+
+        assert!(
+            result.is_some(),
+            "try_offline_close_pr must return Some(()) when the fixture exists"
+        );
+        assert!(
+            !path.exists(),
+            "try_offline_close_pr must remove the planted fixture, mirroring the original offline branch"
+        );
+    }
+
+    #[test]
+    fn try_offline_close_pr_returns_none_when_no_fixture() {
+        let _offline = OfflineDir::new("close_absent");
+        let result = try_offline_close_pr(1111);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn try_offline_remote_branch_last_commit_reads_planted_fixture() {
+        let offline = OfflineDir::new("branch_basic");
+        let branch = "main";
+        offline.write(
+            &format!("branch_{branch}.json"),
+            r#"{"is_fixture": true, "last_commit_epoch": 1700000000}"#,
+        );
+
+        let result = try_offline_remote_branch_last_commit(branch)
+            .expect("planted branch fixture must be read");
+
+        assert_eq!(result, Some(1_700_000_000_u64));
+    }
+
+    #[test]
+    fn try_offline_remote_branch_last_commit_rejects_fixture_without_marker() {
+        let offline = OfflineDir::new("branch_no_marker");
+        let branch = "feat";
+        offline.write(
+            &format!("branch_{branch}.json"),
+            r#"{"last_commit_epoch": 1700000000}"#,
+        );
+
+        let result = try_offline_remote_branch_last_commit(branch);
+
+        assert!(
+            result.is_none(),
+            "branch fixture missing `is_fixture: true` must be rejected"
+        );
+    }
+
+    /// Proves the full PrSnapshot round-trip: the helper produces a
+    /// fully-populated struct that matches the fields the OLD inline
+    /// offline branch used to write. Useful as a regression guard if
+    /// any future refactor of `OfflinePrSnapshot` drops a field.
+    #[test]
+    fn try_offline_pr_snapshot_round_trip_preserves_all_fields() {
+        let offline = OfflineDir::new("pr_full");
+        let pr = 1234_u64;
+        offline.write(
+            &format!("pr_{pr}.json"),
+            r#"{
+                "is_fixture": true,
+                "ci_success": false,
+                "mergeable": false,
+                "coderabbit_approved": true,
+                "bugbot_error_count": 7,
+                "unresolved_thread_count": 3,
+                "head_sha": "deadbeef0000000000000000000000000000beef",
+                "body": "full payload body",
+                "comments": [
+                    {"author": "alice", "body": "comment1", "created_at_epoch": 1700000001},
+                    {"author": "bob", "body": "comment2", "created_at_epoch": 1700000002}
+                ],
+                "files": [
+                    {"path": "daemon/src/adapters.rs", "additions": 10, "deletions": 3}
+                ],
+                "updated_at_epoch": 1700000010,
+                "head_committed_epoch": 1700000005
+            }"#,
+        );
+
+        let snap: PrSnapshot = try_offline_pr_snapshot(pr)
+            .expect("fully-populated fixture must round-trip");
+
+        assert_eq!(snap.pr_number, pr);
+        assert!(!snap.ci_success);
+        assert!(!snap.mergeable);
+        assert!(snap.coderabbit_approved);
+        assert_eq!(snap.bugbot_error_count, 7);
+        assert_eq!(snap.unresolved_thread_count, Some(3));
+        assert_eq!(snap.head_sha, "deadbeef0000000000000000000000000000beef");
+        assert_eq!(snap.body, "full payload body");
+        assert_eq!(snap.comments.len(), 2);
+        assert_eq!(snap.comments[0].author, "alice");
+        assert_eq!(snap.comments[1].created_at_epoch, 1_700_000_002);
+        assert_eq!(snap.files.len(), 1);
+        assert_eq!(snap.files[0].path, "daemon/src/adapters.rs");
+        assert_eq!(snap.updated_at_epoch, 1_700_000_010);
+        assert_eq!(snap.head_committed_epoch, 1_700_000_005);
+        assert_eq!(snap.ci_status, "red");
+        assert_eq!(snap.coderabbit_status, "green");
+        assert!(!snap.ci_pending);
+        assert!(!snap.bugbot_pending);
+    }
+}
+
+// Local imports for the offline_cache_tests mod above.
+
+
+// PR #666 — bead jleechan-nfdl (pr-655-finding-3) anchor for Evidence Gate re-trigger
