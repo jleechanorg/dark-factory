@@ -4,10 +4,74 @@ use crate::state::{
     set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore,
 };
 use crate::tools::{Llm, Scm, SessionActivity, Sessions, SpawnSpec, Vcs};
-use crate::telemetry::{self, TelemetryEvent};
 use crate::constraints;
-use std::path::Path;
+use crate::telemetry::{self, TelemetryEvent};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::path::Path;
+use std::sync::{Mutex, OnceLock};
+
+#[derive(Debug, Clone, Default)]
+struct RotationState {
+    attempt_count: u32,
+    last_reviewer: String,
+    last_rotated_at_epoch: u64,
+    consecutive_same_hash: u32,
+}
+
+static ROTATION_STATE: OnceLock<Mutex<HashMap<String, RotationState>>> = OnceLock::new();
+
+fn rotation_state_map() -> &'static Mutex<HashMap<String, RotationState>> {
+    ROTATION_STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn rotation_chain() -> Vec<String> {
+    let raw = std::env::var("DARK_FACTORY_REVIEWER_ROTATION_CHAIN")
+        .unwrap_or_else(|_| "agy->claudem->codex->gemini".to_string());
+    raw.split("->")
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            crate::adapters::canonical_for_alias(entry)
+                .unwrap_or(entry)
+                .to_string()
+        })
+        .collect()
+}
+
+fn rotation_backoff_secs() -> u64 {
+    let hours = std::env::var("DARK_FACTORY_CIRCUIT_BREAKER_BACKOFF_HOURS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(4);
+    hours.saturating_mul(3600)
+}
+
+fn try_rotate_for_bead(bead_id: &str, current_reviewer: &str, now_epoch: u64) -> Option<String> {
+    let chain = rotation_chain();
+    let backoff = rotation_backoff_secs();
+    let mut states = rotation_state_map().lock().ok()?;
+    let state = states.entry(bead_id.to_string()).or_default();
+    let current = if state.last_reviewer.is_empty() {
+        crate::adapters::canonical_for_alias(current_reviewer).unwrap_or(current_reviewer)
+    } else {
+        state.last_reviewer.as_str()
+    };
+    let start = chain
+        .iter()
+        .position(|reviewer| reviewer == current)
+        .map_or(0, |i| i + 1);
+    let next = chain.into_iter().skip(start).find(|reviewer| {
+        reviewer != &state.last_reviewer
+            || now_epoch.saturating_sub(state.last_rotated_at_epoch) >= backoff
+    })?;
+    state.attempt_count = state.attempt_count.saturating_add(1);
+    state.last_reviewer = next.clone();
+    state.last_rotated_at_epoch = now_epoch;
+    state.consecutive_same_hash = state.consecutive_same_hash.saturating_add(1);
+    Some(next)
+}
 
 pub struct RerollDeps<'a> {
     pub scm: &'a dyn Scm,
@@ -300,6 +364,35 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
                     None => false,
                 };
                 if same_issue {
+                    let now_epoch = now_epoch_secs();
+                    if let Some(rotated_to) =
+                        try_rotate_for_bead(&bead.bead_id, &deps.reviewer, now_epoch)
+                    {
+                        deps.store.save_rejection(
+                            &bead.bead_id,
+                            bead.attempt,
+                            &deps.reviewer,
+                            &feedback_hash,
+                            &deps.review_text,
+                        )?;
+                        emit_telemetry(
+                            deps.telemetry_log,
+                            &bead.bead_id,
+                            bead.attempt,
+                            OverlayState::ReRoll.as_str(),
+                            "CIRCUIT_BREAKER_ROTATED",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "beadId": bead.bead_id,
+                                "fromReviewer": deps.reviewer,
+                                "toReviewer": rotated_to,
+                                "attempt": bead.attempt,
+                                "feedbackHash": feedback_hash,
+                            }),
+                        )?;
+                        return Ok(RerollOutcome::Deferred("circuit-breaker-rotated".into()));
+                    }
+
                     bead.state = OverlayState::HumanHeld;
                     set_human_hold_reason(bead, HumanHoldReason::CircuitBreaker);
                     deps.store.save(bead)?;
@@ -329,13 +422,16 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
                         &bead.bead_id,
                         bead.attempt,
                         bead.state.as_str(),
-                        "CIRCUIT_BREAKER_TRIGGERED",
+                        "CIRCUIT_BREAKER_ESCALATED",
                         serde_json::json!({}),
                         serde_json::json!({
                             "healerScope": healer_scope,
                             "healerReport": healer_report,
                             "reviewer": deps.reviewer,
                             "feedbackHash": feedback_hash,
+                            "beadId": bead.bead_id,
+                            "attempt": bead.attempt,
+                            "triedReviewers": rotation_chain(),
                         }),
                     )?;
 
@@ -1443,6 +1539,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rotation_picks_next_reviewer_when_same_feedback_hash_repeats() {
+        let bead_id = format!("rotation-next-{}", std::process::id());
+
+        assert_eq!(
+            try_rotate_for_bead(&bead_id, "agy", 20_000),
+            Some("minimax".to_string())
+        );
+    }
+
+    #[test]
+    fn rotation_skips_reviewer_in_backoff_window() {
+        let bead_id = format!("rotation-backoff-{}", std::process::id());
+        rotation_state_map().lock().unwrap().insert(
+            bead_id.clone(),
+            RotationState {
+                attempt_count: 1,
+                last_reviewer: "codex".to_string(),
+                last_rotated_at_epoch: 19_999,
+                consecutive_same_hash: 1,
+            },
+        );
+
+        assert_eq!(
+            try_rotate_for_bead(&bead_id, "minimax", 20_000),
+            Some("gemini".to_string())
+        );
+    }
+
+    #[test]
     fn test_remediation_prompt_permits_forward_merge_and_forbids_force_push() {
         let prompt = build_remediation_prompt(
             "CodeRabbit",
@@ -1464,4 +1589,3 @@ mod tests {
         assert!(!prompt.contains("STOP and leave the branch exactly as-is"));
     }
 }
-
