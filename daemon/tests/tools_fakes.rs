@@ -62,6 +62,7 @@ fn fake_scm_returns_scripted_permission_and_records_call() {
             pr_number: 7,
             ci_success: true,
             mergeable: true,
+            merge_state_unknown: false,
             coderabbit_approved: true,
             bugbot_error_count: 0,
             unresolved_thread_count: Some(0),

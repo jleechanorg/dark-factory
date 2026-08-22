@@ -1219,10 +1219,21 @@ pub fn assess(
         GateResult::Green
     };
 
-    let no_conflicts = if snapshot.mergeable {
-        GateResult::Green
-    } else {
-        GateResult::Red("PR is not mergeable (conflicts)".to_string())
+    // Bead jleechan-qzr3 / pr655-finding-1: `mergeable=null` from GitHub
+    // (REST fallback returned `None` while GitHub was still computing
+    // merge state) must NOT collapse to Red — that's the
+    // fail-closed-stall path. Three-arm classification:
+    //   - `mergeable == true`         → Green
+    //   - `mergeable == false`, not
+    //     unknown: real conflict       → Red
+    //   - `mergeable == false`, IS
+    //     unknown: transient window    → Unknown (retry next tick).
+    let no_conflicts = match (snapshot.mergeable, snapshot.merge_state_unknown) {
+        (true, _) => GateResult::Green,
+        (false, true) => GateResult::Unknown(
+            "PR mergeable state not yet computed (transient) — retry next tick".to_string(),
+        ),
+        (false, false) => GateResult::Red("PR is not mergeable (conflicts)".to_string()),
     };
 
     let coderabbit = if !snapshot.coderabbit_approved {
@@ -1526,6 +1537,11 @@ mod tests {
             pr_number: pr,
             ci_success: true,
             mergeable: true,
+            // Bead jleechan-qzr3 / pr655-finding-1: all-green fixture
+            // means the merge state was already computed (no UNKNOWN
+            // window). The trichotomy-aware test lives at
+            // `classify_chain_mergeable_unknown_is_transient`.
+            merge_state_unknown: false,
             coderabbit_approved: true,
             bugbot_error_count: 0,
             unresolved_thread_count: Some(0),
@@ -1552,6 +1568,12 @@ mod tests {
             pr_number: pr,
             ci_success: true,
             mergeable: true,
+            // Bead jleechan-qzr3 / pr655-finding-1: this fixture
+            // exists to exercise the *thread-count* unknown arm;
+            // leave the merge-state unknown arm at `false` so the
+            // NoConflicts gate stays Green and only the targeted
+            // CommentsResolved gate flips to Unknown.
+            merge_state_unknown: false,
             coderabbit_approved: true,
             bugbot_error_count: 0,
             unresolved_thread_count: None, // Unknown - GraphQL failed
@@ -2797,6 +2819,52 @@ mod tests {
         let cfg = test_cfg();
         let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
         assert_eq!(classify_chain(&report), ChainDisposition::TransientOnly);
+    }
+
+    /// Bead jleechan-qzr3 / pr655-finding-1: `mergeable:null` from
+    /// GitHub's REST fallback (still computing merge state) MUST land
+    /// in `TransientOnly`, NOT `Reroll`. Before this fix, the REST
+    /// fallback collapsed `None` to CONFLICTING and the gate's
+    /// `if !mergeable { Red }` arm fired, causing the daemon to
+    /// spawn a coder that had nothing to fix (fail-closed stall).
+    /// Mirrors `classify_chain_ci_unknown_only_is_transient` but flips
+    /// `mergeable = false` via the new `merge_state_unknown = true`
+    /// arm and asserts `TransientOnly`.
+    #[test]
+    fn classify_chain_mergeable_unknown_is_transient() {
+        let mut scm = FakeScm::default();
+        let mut snapshot = all_green_snapshot(7);
+        // Simulate the GitHub REST fallback returning `mergeable: null`:
+        // the snapshot's `mergeable` field stays `false` (the safe
+        // default for "not MERGEABLE"), but `merge_state_unknown` is
+        // `true` so the gate emits `Unknown` instead of `Red`.
+        snapshot.mergeable = false;
+        snapshot.merge_state_unknown = true;
+        scm.snapshots.insert(7, snapshot);
+        let cfg = test_cfg();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
+
+        // The NoConflicts gate must be Unknown, not Red.
+        let no_conflicts = gate(&report, GateName::NoConflicts);
+        match no_conflicts {
+            GateResult::Unknown(reason) => {
+                assert!(
+                    reason.contains("mergeable state not yet computed")
+                        || reason.contains("transient"),
+                    "expected transient-unknown reason, got {reason:?}"
+                );
+            }
+            other => panic!(
+                "expected NoConflicts gate to be Unknown (transient), got {other:?}"
+            ),
+        }
+        // And the resulting chain disposition must NOT Reroll —
+        // a coder dispatch here would have nothing to fix.
+        assert_eq!(
+            classify_chain(&report),
+            ChainDisposition::TransientOnly,
+            "mergeable=null must classify as TransientOnly (no false-positive Reroll)"
+        );
     }
 
     // --- jleechan-yoqy / issue #323: canonical evidence contract tests ---

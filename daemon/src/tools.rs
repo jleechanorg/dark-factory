@@ -180,6 +180,15 @@ pub struct PrSnapshot {
     pub pr_number: u64,
     pub ci_success: bool,
     pub mergeable: bool,
+    /// Bead jleechan-qzr3 / pr655-finding-1: `true` when GitHub returned
+    /// `mergeable: null` from the REST fallback path (the merge-state
+    /// computation is still pending, or rate-limit deferred). The verifier
+    /// treats this arm as `GateResult::Unknown` rather than `Red` so the
+    /// daemon does not fail-closed-stall on a transient fetch. When `false`,
+    /// `mergeable` is authoritative; when `true`, `mergeable` is still
+    /// populated (current snapshot's guess from the prior tick) but the
+    /// gate emits `Unknown("PR mergeable state not yet computed (transient)")`.
+    pub merge_state_unknown: bool,
     pub coderabbit_approved: bool,
     pub bugbot_error_count: u32,
     /// Count of unresolved GitHub review threads, or `None` when the

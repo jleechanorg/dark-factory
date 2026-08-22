@@ -301,6 +301,10 @@ pub fn snapshot_with_comments(pr: u64, comments: Vec<PrComment>) -> PrSnapshot {
         pr_number: pr,
         ci_success: true,
         mergeable: true,
+        // Bead jleechan-qzr3 / pr655-finding-1: all-green profile by
+        // definition means the merge state was already computed;
+        // the trichotomy-aware test lives in verifier.rs.
+        merge_state_unknown: false,
         coderabbit_approved: true,
         bugbot_error_count: 0,
         unresolved_thread_count: Some(0),
