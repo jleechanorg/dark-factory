@@ -27,6 +27,7 @@ jobs:
     # rerouted; the PR author must open from a branch in the same org.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
     runs-on: ${{ fromJSON(vars.SELF_HOSTED_RUNNER_LABELS) }}
+    timeout-minutes: 15
     permissions:
       contents: read
     env:
@@ -102,6 +103,7 @@ jobs:
           echo "sqlite3 built from amalgamation and self-tested"
 
       - name: Fix Python 3.13 shared-library path (self-hosted runners)
+        timeout-minutes: 2
         # actions/setup-python installs Python 3.13 under a toolcache path
         # (`/home/runner/_work/_tool/Python/<ver>/<arch>/`) and ships
         # `libpython3.13.so` WITHOUT the versioned soname symlink
@@ -154,7 +156,7 @@ jobs:
           # 2) Locate the link-time libpython3.13.so in the toolchain's lib dir.
           SO_PATH="$TOOLCHAIN_ROOT/lib/libpython3.13.so"
           if [ ! -e "$SO_PATH" ]; then
-            SO_PATH="$(find "$TOOLCHAIN_ROOT" -maxdepth 4 -name 'libpython3.13.so' -not -name '*.so.*' 2>/dev/null | head -1)"
+            SO_PATH="$(timeout 10s find "$TOOLCHAIN_ROOT" -maxdepth 4 -name 'libpython3.13.so' -not -name '*.so.*' 2>/dev/null | head -1 || true)"
           fi
           if [ -z "$SO_PATH" ] || [ ! -e "$SO_PATH" ]; then
             echo "::warning::libpython3.13.so not found in toolchain ($TOOLCHAIN_ROOT) — subprocess python will fail."
@@ -170,20 +172,21 @@ jobs:
             # 4) Create the versioned soname symlink in the SAME directory as
             #    the link-time shared object so a bare `python3 -c ...` works
             #    without depending on LD_LIBRARY_PATH inheritance across steps.
-            if [ ! -e "${SO_DIR}/${VERSIONED}" ]; then
-              ln -s "$SO_NAME" "${SO_DIR}/${VERSIONED}"
+            if [ ! -e "${SO_DIR}/${VERSIONED}" ] && [ ! -L "${SO_DIR}/${VERSIONED}" ]; then
+              ln -sf "$SO_NAME" "${SO_DIR}/${VERSIONED}"
               echo "Created symlink ${SO_DIR}/${VERSIONED} -> ${SO_NAME}"
             else
-              echo "Versioned symlink ${SO_DIR}/${VERSIONED} already exists"
+              ln -sf "$SO_NAME" "${SO_DIR}/${VERSIONED}"
+              echo "Versioned symlink ${SO_DIR}/${VERSIONED} already exists (refreshed)"
             fi
             # 5) Self-test: invoke the toolchain python3 NOW, before the test step,
-            # so a remaining rc=127 surfaces as a step-level error here.
+            # so a remaining rc=127 or deadlock/hang surfaces as a step-level error here.
             PY_TEST="$TOOLCHAIN_ROOT/bin/python3"
             echo "Self-test: $PY_TEST -c 'import sys; sys.exit(0)'"
-            "$PY_TEST" -c 'import sys; sys.exit(0)'
+            timeout 15s "$PY_TEST" -c 'import sys; sys.exit(0)'
             rc=$?
             if [ "$rc" -ne 0 ]; then
-              echo "::error::subprocess python3 still fails after symlink fix (rc=$rc). libpython is not loadable."
+              echo "::error::subprocess python3 still fails after symlink fix (rc=$rc). libpython is not loadable or timed out."
               exit 1
             fi
             echo "Self-test ok (rc=$rc)"
@@ -229,6 +232,7 @@ jobs:
     # Self-hosted runners are persistent — fork PR code must not execute on them.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
     runs-on: ${{ fromJSON(vars.SELF_HOSTED_RUNNER_LABELS) }}
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:

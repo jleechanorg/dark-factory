@@ -35,6 +35,27 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 
 
+def _get_workflow_doc(workflow_text: str) -> dict:
+    """Return the single parsed document for ci.yml."""
+    docs = list(yaml.safe_load_all(workflow_text))
+    if len(docs) != 1:
+        raise AssertionError(
+            f"ci.yml should be a single YAML document; got {len(docs)} docs"
+        )
+    return docs[0]
+
+
+def _libpython_fix_step_dict(workflow_text: str) -> dict:
+    """Return the step dict of the libpython-fix step."""
+    doc = _get_workflow_doc(workflow_text)
+    steps = doc["jobs"]["test"]["steps"]
+    for step in steps:
+        name = step.get("name", "")
+        if "Python 3.13" in name and "shared-library path" in name:
+            return step
+    raise AssertionError("Could not find the Python 3.13 libpython fix step in ci.yml")
+
+
 def _libpython_fix_step(workflow_text: str) -> str:
     """Return the embedded shell script of the libpython-fix step.
 
@@ -42,17 +63,8 @@ def _libpython_fix_step(workflow_text: str) -> str:
     the libpython-fix intent. Returns its `run:` body verbatim so the shell
     assertions below are robust against future renames/refactors.
     """
-    docs = list(yaml.safe_load_all(workflow_text))
-    if len(docs) != 1:
-        raise AssertionError(
-            f"ci.yml should be a single YAML document; got {len(docs)} docs"
-        )
-    steps = docs[0]["jobs"]["test"]["steps"]
-    for step in steps:
-        name = step.get("name", "")
-        if "Python 3.13" in name and "shared-library path" in name:
-            return step.get("run", "")
-    raise AssertionError("Could not find the Python 3.13 libpython fix step in ci.yml")
+    step = _libpython_fix_step_dict(workflow_text)
+    return step.get("run", "")
 
 
 def test_fix_step_avoids_python3_for_self_discovery():
@@ -171,4 +183,77 @@ def test_fix_step_uses_action_aware_discovery():
         "libpython fix step must include a fallback (`command -v python3` "
         "and/or `readlink -f`) to discover the toolchain without invoking "
         "python and crashing on the missing libpython soname"
+    )
+
+
+def test_ci_jobs_have_timeout_guards():
+    """All jobs in ci.yml must define `timeout-minutes` to avoid wedging self-hosted runners.
+
+    Without a job-level timeout, a hung setup step or test suite defaults to
+    GitHub's 360-minute (6-hour) timeout, blocking the entire self-hosted
+    runner fleet for hours (as occurred on ez-runner-c-8 in run 30776197538).
+    """
+    doc = _get_workflow_doc(WORKFLOW.read_text())
+    jobs = doc.get("jobs", {})
+    assert "test" in jobs, "ci.yml must define a `test` job"
+    assert "daemon-tests" in jobs, "ci.yml must define a `daemon-tests` job"
+
+    for job_name in ("test", "daemon-tests"):
+        job = jobs[job_name]
+        timeout = job.get("timeout-minutes")
+        assert timeout is not None, (
+            f"ci.yml job `{job_name}` must define `timeout-minutes` to prevent "
+            "hung jobs from blocking self-hosted runners indefinitely"
+        )
+        assert isinstance(timeout, int) and 0 < timeout <= 30, (
+            f"ci.yml job `{job_name}` timeout-minutes must be between 1 and 30 minutes; got {timeout}"
+        )
+
+
+def test_fix_step_has_timeout_guard():
+    """The libpython fix step must define a step-level `timeout-minutes`.
+
+    A dedicated step timeout (e.g. 2 minutes) ensures that any hang inside the
+    step aborts immediately without waiting for the full job timeout.
+    """
+    step = _libpython_fix_step_dict(WORKFLOW.read_text())
+    timeout = step.get("timeout-minutes")
+    assert timeout is not None, (
+        "libpython fix step in ci.yml must define `timeout-minutes` (e.g. 2) "
+        "so any runner hang fails fast"
+    )
+    assert isinstance(timeout, int) and 0 < timeout <= 5, (
+        f"libpython fix step timeout-minutes must be <= 5 minutes; got {timeout}"
+    )
+
+
+def test_fix_step_uses_timeout_guard_on_subprocess_python():
+    """The libpython self-test and search commands must use command-level `timeout`.
+
+    If the toolchain python3 binary or dynamic linker deadlocks or hangs
+    on initialization, `timeout 15s "$PY_TEST"` guarantees the command
+    exits with rc=124 and surfaces a step failure immediately.
+    """
+    run = _libpython_fix_step(WORKFLOW.read_text())
+    # Assert timeout is used on the python self-test invocation
+    assert re.search(r'timeout\s+\d+s?\s+"?\$PY_TEST"?', run) or re.search(
+        r'timeout\s+\d+s?\s+"?\$TOOLCHAIN_ROOT/bin/python3"?', run
+    ), (
+        "libpython fix step self-test must wrap python3 invocation in "
+        '`timeout <N>s "$PY_TEST" -c ...` to fail fast on deadlocks/hangs'
+    )
+
+
+def test_fix_step_uses_atomic_force_symlink():
+    """The step must use `ln -sf` (or `ln -s -f`) to overwrite existing/broken symlinks.
+
+    If a broken symlink already exists from a previous runner state, `ln -s`
+    without force fails with 'File exists'.
+    """
+    run = _libpython_fix_step(WORKFLOW.read_text())
+    assert re.search(r"ln\s+-[a-zA-Z]*f[a-zA-Z]*\s+", run) or re.search(
+        r"ln\s+-[a-zA-Z]*s\s+-[a-zA-Z]*f", run
+    ), (
+        "libpython fix step must use `ln -sf` so existing or broken symlinks "
+        "are safely overwritten without error"
     )
