@@ -8259,7 +8259,7 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
     let predicate_block: String = guard_src
         .lines()
         .skip(84) // 0-indexed: line 85 (1-indexed) of auto-merge-guard.sh
-        .take(74) // lines 85..=158 inclusive, mirroring test_auto_merge_guard_gate_vocabulary.sh entry (sed -n '85,158p'; shifted from 41..=114 by the rev-1uno rate_limit preflight + dual-API routing block)
+        .take(73) // lines 85..=157 inclusive, mirroring test_auto_merge_guard_gate_vocabulary.sh entry (sed -n '85,157p')
         .map(|l| l.strip_prefix("  ").unwrap_or(l)) // mirror the shell test's sed s/^  // normalization
         .collect::<Vec<_>>()
         .join("\n");
@@ -13599,7 +13599,7 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
     let _ = std::fs::remove_dir_all(&telemetry_dir);
     std::fs::create_dir_all(&telemetry_dir).unwrap();
     let telemetry_log = telemetry_dir.join(format!("daemon-{}.jsonl", std::process::id()));
-    let _ = std::fs::remove_file(&telemetry_log);
+    let _chain_guard = EnvVarGuard::set(&[("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", " ")]);
 
     let ledger = Mutex::new(VendorHealthLedger::new());
 
