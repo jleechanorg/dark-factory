@@ -228,7 +228,17 @@ impl DaemonError {
         let lower = stderr.to_ascii_lowercase();
         lower.contains("api rate limit exceeded")
             || lower.contains("rate limit hit")
+            || lower.contains("rate limit exceeded")
+            || lower.contains("secondary rate limit")
+            || lower.contains("circuit breaker open")
+            || lower.contains("circuit breaker active")
+            || lower.contains("rate limit circuit breaker")
             || (lower.contains("403") && lower.contains("rate limit"))
+            || (lower.contains("403") && lower.contains("secondary"))
+            || (lower.contains("403") && lower.contains("please wait"))
+            || (lower.contains("403") && lower.contains("abuse"))
+            || (lower.contains("403") && lower.contains("try again"))
+            || (lower.contains("403") && lower.contains("temporarily blocked"))
     }
 
     /// Detects `br create --external-ref ...` failing because the ref is
@@ -536,5 +546,22 @@ mod tests {
     fn is_gh_rate_limit_returns_false_for_non_tool_error() {
         let err = DaemonError::Parse("unparseable gh response".to_string());
         assert!(!err.is_gh_rate_limit());
+    }
+
+    #[test]
+    fn is_gh_rate_limit_detects_secondary_rate_limit_and_circuit_breaker() {
+        let err_secondary = DaemonError::Tool {
+            tool: "gh".to_string(),
+            rc: 1,
+            stderr: "HTTP 403: You have exceeded a secondary rate limit. Please wait a few minutes before trying again.".to_string(),
+        };
+        assert!(err_secondary.is_gh_rate_limit());
+
+        let err_cb = DaemonError::Tool {
+            tool: "gh".to_string(),
+            rc: -1,
+            stderr: "gh rate limit circuit breaker open: cooldown active until 2026-08-22T19:00:00Z (suppressed calls: 3)".to_string(),
+        };
+        assert!(err_cb.is_gh_rate_limit());
     }
 }

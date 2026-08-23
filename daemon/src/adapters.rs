@@ -759,6 +759,9 @@ fn unresolved_thread_count_from_gql(gql_out: &str) -> Result<u32, DaemonError> {
 static GRAPHQL_RATE_LIMITED_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 
 pub fn is_graphql_rate_limited() -> bool {
+    if crate::gh_circuit_breaker::is_gh_circuit_breaker_open() {
+        return true;
+    }
     let lock = GRAPHQL_RATE_LIMITED_UNTIL.lock().unwrap();
     if let Some(until) = *lock {
         if Instant::now() < until {
@@ -777,6 +780,7 @@ pub fn mark_graphql_rate_limited(duration: Duration) {
 pub fn clear_graphql_rate_limited() {
     let mut lock = GRAPHQL_RATE_LIMITED_UNTIL.lock().unwrap();
     *lock = None;
+    crate::gh_circuit_breaker::reset_global_circuit_breaker();
 }
 
 
