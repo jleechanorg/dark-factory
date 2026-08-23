@@ -762,6 +762,7 @@ pub fn run_tick(
                     "reason": "autonomy_timebox_exceeded",
                     "attempt_id": park_attempt,
                     "started_at": started_at,
+                    "deadline": deadline_epoch,
                     "deadline_epoch": deadline_epoch,
                     "observed_at": now_epoch,
                     "elapsed_secs": observed_elapsed_secs,
@@ -2866,6 +2867,8 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     // jleechan-drive-pr-branch-binding-pcpr: "pr_head" vs
                     // "generated" — which branch-binding mode this dispatch used.
                     "branch_mode": success.branch_mode,
+                    // bze8.3 / issue #330: captured prior autonomy seconds before resetting to 0
+                    "prior_autonomy_secs": success.prior_autonomy_secs,
                 }),
             )?;
             let comment_body = format!(

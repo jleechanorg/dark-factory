@@ -1549,6 +1549,7 @@ impl StateStore for FakeStateStore {
                 overlay.park_reason = None;
                 overlay.pr_number = None;
                 overlay.session_id = None;
+                overlay.attempt_started_at = None;
                 recovered.push(overlay.clone());
             }
         }
@@ -1853,4 +1854,30 @@ impl StateStore for FakeStateStore {
         entry.terminal = true;
         Ok(())
     }
+
+    fn stamp_attempt_started_at(
+        &self,
+        bead_id: &str,
+        now_epoch: u64,
+    ) -> Result<(), DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("stamp_attempt_started_at({bead_id},{now_epoch})"));
+        if let Some(overlay) = self.overlays.borrow_mut().get_mut(bead_id) {
+            overlay.attempt_started_at = Some(now_epoch);
+            overlay.autonomy_secs = 0;
+        }
+        Ok(())
+    }
+
+    fn clear_attempt_started_at(&self, bead_id: &str) -> Result<(), DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("clear_attempt_started_at({bead_id})"));
+        if let Some(overlay) = self.overlays.borrow_mut().get_mut(bead_id) {
+            overlay.attempt_started_at = None;
+        }
+        Ok(())
+    }
 }
+

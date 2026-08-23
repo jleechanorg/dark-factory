@@ -3450,3 +3450,94 @@ fn test_reroll_quiescence_head_probe_transient_failure_never_escalates() {
     std::fs::remove_dir_all(spec_dir).ok();
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+#[test]
+fn adopted_remediation_resets_autonomy_secs_and_stamps_attempt_started_at() {
+    let scm = FakeScm::new();
+    let _tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.stage = 2;
+    let mut vcs = FakeVcs::new();
+    vcs.heads
+        .insert("alice/adopted-remediation-branch".into(), "head-sha-123".into());
+
+    let bead_id = "adopted-autonomy-reset";
+    let branch = "alice/adopted-remediation-branch";
+    let prior_autonomy_secs = 7200;
+
+    let mut bead = BeadOverlay {
+        bead_id: bead_id.into(),
+        state: OverlayState::Attested,
+        attempt: 2,
+        reroll_count: 1,
+        autonomy_secs: prior_autonomy_secs,
+        spend_usd: 0.0,
+        pr_number: Some(999),
+        branch: Some(branch.into()),
+        session_id: None,
+        is_adopted: true,
+        spawn_failure_count: 0,
+        pre_session_head_sha: Some("head-sha-123".into()),
+        park_reason: None,
+        target_repo: Some("owner/repo".into()),
+        attempt_started_at: None,
+    };
+    store.save(&bead).unwrap();
+    store.mark_remediation_session_spawned(bead_id, 1).unwrap();
+    store.register_branch(bead_id, branch).unwrap();
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_adopted_autonomy_reset.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = reroll::RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "skeptic".into(),
+        review_text: "Need fix for autonomy clock".into(),
+    };
+
+    let outcome = reroll::execute(&deps, &mut bead).unwrap();
+    assert!(
+        matches!(outcome, RerollOutcome::Rerolled { .. }),
+        "expected Rerolled outcome; got {:?}",
+        outcome
+    );
+
+    let loaded = store.load(bead_id).unwrap().unwrap();
+    assert_eq!(loaded.attempt, 3, "attempt must increment on remediation spawn");
+    assert_eq!(
+        loaded.autonomy_secs, 0,
+        "adopted remediation must reset active autonomy_secs to 0 for the fresh attempt"
+    );
+    assert!(
+        loaded.attempt_started_at.is_some(),
+        "adopted remediation must stamp attempt_started_at on the fresh attempt"
+    );
+    assert_eq!(
+        loaded.state,
+        OverlayState::Dispatched,
+        "adopted remediation state must be Dispatched"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("REROLL_ADOPTED_SESSION_SPAWNED"),
+        "expected REROLL_ADOPTED_SESSION_SPAWNED event in telemetry"
+    );
+    assert!(
+        telemetry.contains(&format!("\"elapsedAutonomySeconds\":{prior_autonomy_secs}"))
+            || telemetry.contains(&format!("\"priorAutonomySeconds\":{prior_autonomy_secs}")),
+        "telemetry must capture prior autonomy seconds before reset: {telemetry}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+

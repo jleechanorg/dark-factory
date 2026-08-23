@@ -767,13 +767,14 @@ impl HumanHoldReason {
             || reason.starts_with(ROUTER_PARSE_PARK_REASON_PREFIX)
     }
 
-    fn recoverable_exact_values() -> [String; 5] {
+    fn recoverable_exact_values() -> [String; 6] {
         [
             Self::TransientSpawnRetryCapExceeded,
             Self::AdoptedPreSessionShaCaptureFailed,
             Self::SessionStalled,
             Self::Stage1GateNotGreen,
             Self::SpecValidationFailed,
+            Self::AutonomyTimeboxExceeded,
         ]
         .map(|candidate| candidate.value())
     }
@@ -1908,8 +1909,8 @@ impl StateStore for SqliteStateStore {
              WHERE state = 'HUMAN_HELD' \
                AND attempt < ?2 \
                AND session_id IS NULL \
-               AND (park_reason IN (?3, ?4, ?5, ?6, ?7) \
-                    OR substr(park_reason, 1, length(?8)) = ?8) \
+               AND (park_reason IN (?3, ?4, ?5, ?6, ?7, ?8) \
+                    OR substr(park_reason, 1, length(?9)) = ?9) \
              RETURNING bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
                  pr_number, branch, session_id, is_adopted, spawn_failure_count, \
                  pre_session_head_sha, park_reason, target_repo, attempt_started_at",
@@ -1925,6 +1926,7 @@ impl StateStore for SqliteStateStore {
                     &recoverable[2],
                     &recoverable[3],
                     &recoverable[4],
+                    &recoverable[5],
                     ROUTER_PARSE_PARK_REASON_PREFIX,
                 ],
                 |row| {
