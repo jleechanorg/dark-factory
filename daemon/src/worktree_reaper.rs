@@ -26,7 +26,7 @@
 
 use crate::config::Config;
 use crate::errors::DaemonError;
-use crate::telemetry::{emit, TelemetryEvent};
+use crate::telemetry::{emit, local_hostname, TelemetryEvent};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -247,6 +247,7 @@ pub fn flush(
     if let Some(log) = telemetry_log {
         let event = TelemetryEvent {
             timestamp: crate::state::now_iso8601(),
+            host: local_hostname(),
             bead_id: format!("worktree-reaper:{}", repo),
             attempt_id: 0,
             lifecycle_state: "REAPER_FLUSH".to_string(),
