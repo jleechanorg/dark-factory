@@ -70,9 +70,12 @@ def test_gitignore_contains_branch_fail_step_pattern():
     "sample_path",
     [
         "failed_run_log.txt",
+        "failed_run_log2.txt",
         "failed_run_log_2026-07-15_run42.txt",
         "logs/failed_run_log_branch_a.txt",
         "branch_fail_step_a3k9",
+        "branch_fail_step__ayz83rw",
+        "branch_fail_step_hg0iohpa",
         "branch_fail_step_reproduce_42",
         "results/branch_fail_step_implement_3",
     ],
@@ -97,6 +100,7 @@ def test_gitignore_patterns_ignore_representative_paths(sample_path: str):
         "tests/test_gitignore_runner_diagnostics.py",
         "pipelines/factory/hello.dot",
         "README.md",
+        "docs/security/ci-runner-log-hygiene.md",
     ],
 )
 def test_gitignore_patterns_do_not_match_tracked_source(source_path: str):
@@ -115,3 +119,16 @@ def test_gitignore_patterns_do_not_match_tracked_source(source_path: str):
         f"Source file {source_path!r} is matched by .gitignore — "
         "the new diagnostic pattern is too broad."
     )
+
+
+def test_ci_runner_log_hygiene_doc_exists_and_covers_destinations():
+    """``docs/security/ci-runner-log-hygiene.md`` must exist and document log locations."""
+    doc = ROOT / "docs" / "security" / "ci-runner-log-hygiene.md"
+    assert doc.is_file(), (
+        f"Expected doc {doc} explaining where CI and runner logs belong to exist."
+    )
+    content = doc.read_text(encoding="utf-8")
+    assert "failed_run_log*.txt" in content
+    assert "branch_fail_step_*" in content
+    assert "Library/Logs/dark-factory" in content
+    assert "cxdb" in content.lower()
