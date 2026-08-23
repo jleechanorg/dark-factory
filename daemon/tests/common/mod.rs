@@ -229,6 +229,24 @@ impl Scm for FakeScm {
         Ok(self.issues.clone())
     }
 
+    fn labeled_issues_for_repo(&self, repo: &str, label: &str) -> Result<Vec<Issue>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("labeled_issues_for_repo({repo},{label})"));
+        let issues = self.labeled_issues(label)?;
+        Ok(issues
+            .into_iter()
+            .filter(|issue| {
+                if let Some(owner_repo) = daemon::tools::parse_external_ref_repo(&issue.external_ref) {
+                    owner_repo.eq_ignore_ascii_case(repo)
+                } else {
+                    false
+                }
+            })
+            .collect())
+    }
+
+
     fn labeled_prs(&self, label: &str, gh_calls: &mut u32) -> Result<Vec<LabeledPr>, DaemonError> {
         // jtg8-r5: count this list query toward the slow-tier
         // `gh_call_count` metric — the fake doesn't shell out, so a

@@ -8443,10 +8443,14 @@ fn cross_repo_bead_verification_loop_uses_its_own_repo_not_cfg_target_repo() {
         "expected pr_snapshot_for_repo with the bead's own repo, got: {scm_calls:?}"
     );
     assert!(
-        !scm_calls.iter().any(|c| c.contains("global-real-repo")),
+        !scm_calls
+            .iter()
+            .filter(|c| c.starts_with("pr_snapshot"))
+            .any(|c| c.contains("global-real-repo")),
         "verification loop must never fall back to cfg.target_repo for a \
          bead with an explicit target_repo, got: {scm_calls:?}"
     );
+
     assert!(
         !scm_calls.iter().any(|c| c.starts_with("pr_snapshot(")),
         "found a call to the plain (cfg-bound) pr_snapshot -- every \
@@ -10282,8 +10286,17 @@ fn run_slow_tier_pr_existence_probe_targets_bead_own_repo_not_global_cfg() {
         ))),
     };
     let store = FakeStateStore::new();
-    let cfg = test_cfg(); // target_repo == "owner/repo"
+    let mut cfg = test_cfg(); // target_repo == "owner/repo"
+    cfg.repos.insert(
+        "jleechanorg/dark-factory-holdouts".into(),
+        daemon::config::RepoConfig {
+            ao_project: "holdouts".into(),
+            push_remote: "origin".into(),
+            local_checkout: None,
+        },
+    );
     let vcs = test_vcs();
+
     let telemetry_log = std::env::temp_dir().join(format!(
         "afd_x8tf_probe_own_repo_{}.jsonl",
         std::process::id()
@@ -13595,7 +13608,10 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
     let store = FakeStateStore::new();
     let cfg = test_cfg();
     let vcs = test_vcs();
+    let prev_chain = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok();
+    std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "");
     let telemetry_dir = std::env::temp_dir().join("afd_vendor_waiver_r2_test");
+
     let _ = std::fs::remove_dir_all(&telemetry_dir);
     std::fs::create_dir_all(&telemetry_dir).unwrap();
     let telemetry_log = telemetry_dir.join(format!("daemon-{}.jsonl", std::process::id()));
@@ -13838,7 +13854,12 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
+    match prev_chain {
+        Some(v) => std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", v),
+        None => std::env::remove_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN"),
+    }
 }
+
 
 // ----------------------------------------------------------------------------
 // Bead jleechan-jsby (r2): CI-wait timeout. When the snapshot has
