@@ -43,6 +43,7 @@ _SUBPROCESS_NODE_TYPES = frozenset(
         "human_gate",
         "agy",
         "ao",
+        "web_advice",
     }
 )
 
@@ -84,7 +85,7 @@ def test_gates_dot_timeout_matches_sibling_pr_gates_dot() -> None:
     g_gates = parse(_pipeline("gates.dot"))
     g_pr = parse(_pipeline("pr_gates.dot"))
 
-    common = {"holdout", "gate_es", "gate_er", "gate_cs"}
+    common = {"holdout", "gate_es", "gate_er", "gate_cs", "web_advice"}
     for name in common:
         assert name in g_gates.nodes, f"gates.dot missing node {name}"
         assert name in g_pr.nodes, f"pr_gates.dot missing node {name}"
