@@ -241,6 +241,7 @@ pub fn dispatch_ready_with_vcs(
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                transient_error_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
             // jleechan-8jxr r2: pre-fill with cfg.target_repo so this
@@ -950,6 +951,7 @@ pub fn dispatch_ready_with_vcs(
         // transient tool error, ...) has cleared, so the retry-cap counter no
         // longer needs to remember it.
         overlay.spawn_failure_count = 0;
+        overlay.transient_error_count = 0;
         // Bead bze8.3: stamp `attempt_started_at` atomically alongside the
         // DISPATCHED save so a redispatch cannot inherit elapsed autonomy
         // from the prior attempt. The wall-clock anchor here is the single
@@ -2105,6 +2107,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                transient_error_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
             // jleechan-8jxr r2: a real intake-persisted overlay carries a
@@ -2158,6 +2161,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                transient_error_count: 0,
                 pre_session_head_sha: None,
                 park_reason: None,
                 // Neither cfg().target_repo ("owner/repo") nor any
@@ -2218,6 +2222,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                transient_error_count: 0,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: Some("other/repo".into()),
@@ -2269,6 +2274,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                transient_error_count: 0,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: Some("owner/production".into()),
@@ -2321,6 +2327,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                transient_error_count: 0,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: Some("owner/repo".into()),
@@ -2376,6 +2383,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                transient_error_count: 0,
                 pre_session_head_sha: None,
                 park_reason: None,
                 // The failure mode bead jleechan-8jxr r2 fixes: intake
@@ -2485,6 +2493,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                transient_error_count: 0,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: None,
@@ -2561,6 +2570,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                transient_error_count: 0,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: None,
@@ -2632,6 +2642,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                transient_error_count: 0,
                 pre_session_head_sha: None,
                 park_reason: None,
                 // Stage A: `external_ref` prefix "someorg/other-repo" becomes the
@@ -2717,6 +2728,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                transient_error_count: 0,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: Some("jleechanorg/worldarchitect.ai".to_string()),
@@ -3827,6 +3839,7 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+                transient_error_count: 0,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: Some("jleechanorg/worldarchitect.ai".to_string()),
@@ -4111,6 +4124,7 @@ mod tests {
             session_id: None,
             is_adopted: true,
             spawn_failure_count: 0,
+            transient_error_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: Some(cfg.target_repo.clone()),
@@ -4168,6 +4182,7 @@ mod tests {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            transient_error_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: Some(cfg.target_repo.clone()),
@@ -4234,6 +4249,7 @@ mod tests {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            transient_error_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: Some(cfg.target_repo.clone()),

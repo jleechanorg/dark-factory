@@ -1605,6 +1605,40 @@ impl StateStore for FakeStateStore {
         Ok(())
     }
 
+    fn transient_error_count(&self, bead_id: &str) -> Result<u32, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("transient_error_count({bead_id})"));
+        Ok(self
+            .overlays
+            .borrow()
+            .get(bead_id)
+            .map(|o| o.transient_error_count)
+            .unwrap_or(0))
+    }
+
+    fn incr_transient_error_count(&self, bead_id: &str) -> Result<u32, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("incr_transient_error_count({bead_id})"));
+        if let Some(o) = self.overlays.borrow_mut().get_mut(bead_id) {
+            o.transient_error_count += 1;
+            Ok(o.transient_error_count)
+        } else {
+            Ok(0)
+        }
+    }
+
+    fn reset_transient_error_count(&self, bead_id: &str) -> Result<(), DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("reset_transient_error_count({bead_id})"));
+        if let Some(o) = self.overlays.borrow_mut().get_mut(bead_id) {
+            o.transient_error_count = 0;
+        }
+        Ok(())
+    }
+
     fn reroll_head_permanent_failure_count(&self, bead_id: &str) -> Result<u32, DaemonError> {
         self.calls
             .borrow_mut()

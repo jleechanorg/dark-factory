@@ -1692,6 +1692,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 session_id: None,
                 is_adopted: true,
                 spawn_failure_count: 0,
+                transient_error_count: 0,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo,
@@ -1834,6 +1835,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            transient_error_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo,
@@ -1952,6 +1954,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         session_id: None,
                         is_adopted: false,
                         spawn_failure_count: 0,
+                transient_error_count: 0,
                         pre_session_head_sha: None,
                         park_reason: None,
                         target_repo,
@@ -2129,6 +2132,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     session_id: None,
                     is_adopted: false,
                     spawn_failure_count: 0,
+                transient_error_count: 0,
                     pre_session_head_sha: None,
                     park_reason: None,
                     target_repo,
@@ -4542,15 +4546,14 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         let mut snapshot = match deps.scm.pr_snapshot_for_repo(&repo, pr) {
             Ok(snap) => snap,
             Err(e) => {
-                let _ = emit(
-                    deps.telemetry_log,
-                    bead_id,
-                    overlay.attempt,
-                    OverlayState::Attested.as_str(),
+                handle_bead_transient_error(
+                    deps,
+                    summary,
+                    &mut overlay,
+                    "fast_tier",
                     "BEAD_SNAPSHOT_TRANSIENT_ERROR",
-                    serde_json::json!({}),
-                    serde_json::json!({"phase": "fast_tier", "error": format!("{e:?}")}),
-                );
+                    &format!("{e:?}"),
+                )?;
                 continue;
             }
         };
@@ -4573,6 +4576,10 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 })
                 .unwrap_or(false);
             if !vendor_capped {
+                if overlay.transient_error_count > 0 {
+                    overlay.transient_error_count = 0;
+                    let _ = deps.store.save(&overlay);
+                }
                 emit(
                     deps.telemetry_log,
                     bead_id,
@@ -4717,15 +4724,14 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         let mut evidence = match skeptic_evidence(deps, bead_id, pr, &repo, &snapshot, vendor_health) {
             Ok(e) => e,
             Err(e) => {
-                let _ = emit(
-                    deps.telemetry_log,
-                    bead_id,
-                    overlay.attempt,
-                    OverlayState::Attested.as_str(),
+                handle_bead_transient_error(
+                    deps,
+                    summary,
+                    &mut overlay,
+                    "skeptic_evidence",
                     "BEAD_PROCESSING_TRANSIENT_ERROR",
-                    serde_json::json!({}),
-                    serde_json::json!({"phase": "skeptic_evidence", "error": format!("{e:?}")}),
-                );
+                    &format!("{e:?}"),
+                )?;
                 continue;
             }
         };
@@ -4757,6 +4763,10 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         // the DEFERRED branch only.
         let reroll_deferral_count = deps.store.reroll_deferral_count(bead_id).unwrap_or(0);
         if reroll_deferral_count > 0 {
+            if overlay.transient_error_count > 0 {
+                overlay.transient_error_count = 0;
+                let _ = deps.store.save(&overlay);
+            }
             let _ = emit(
                 deps.telemetry_log,
                 bead_id,
@@ -4786,15 +4796,14 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         let runner_outcome = match crate::er_runner::maybe_run(deps, bead_id, pr, now_epoch) {
             Ok(out) => out,
             Err(e) => {
-                let _ = emit(
-                    deps.telemetry_log,
-                    bead_id,
-                    overlay.attempt,
-                    OverlayState::Attested.as_str(),
+                handle_bead_transient_error(
+                    deps,
+                    summary,
+                    &mut overlay,
+                    "er_runner",
                     "BEAD_PROCESSING_TRANSIENT_ERROR",
-                    serde_json::json!({}),
-                    serde_json::json!({"phase": "er_runner", "error": format!("{e:?}")}),
-                );
+                    &format!("{e:?}"),
+                )?;
                 continue;
             }
         };
@@ -4831,15 +4840,14 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 match deps.scm.pr_snapshot_for_repo(&repo, pr) {
                     Ok(snap) => snapshot = snap,
                     Err(e) => {
-                        let _ = emit(
-                            deps.telemetry_log,
-                            bead_id,
-                            overlay.attempt,
-                            OverlayState::Attested.as_str(),
+                        handle_bead_transient_error(
+                            deps,
+                            summary,
+                            &mut overlay,
+                            "post_er_refetch",
                             "BEAD_SNAPSHOT_TRANSIENT_ERROR",
-                            serde_json::json!({}),
-                            serde_json::json!({"phase": "post_er_refetch", "error": format!("{e:?}")}),
-                        );
+                            &format!("{e:?}"),
+                        )?;
                         continue;
                     }
                 }
@@ -5305,6 +5313,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
 
         if report.all_green {
             overlay.state = OverlayState::Ready;
+            overlay.transient_error_count = 0;
             deps.store.save(&overlay)?;
             summary.beads_ready += 1;
             emit(
@@ -5331,6 +5340,10 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 })
                 .collect();
             if red_reasons.is_empty() {
+                if overlay.transient_error_count > 0 {
+                    overlay.transient_error_count = 0;
+                    let _ = deps.store.save(&overlay);
+                }
                 // jleechan-zaga / issue #348: no coder-fixable RED gate, but
                 // is the chain blocked by a STRUCTURAL-pending gate (an
                 // external verifier a coder cannot drive — CodeRabbit
@@ -5765,15 +5778,14 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         // which used to abort the entire fast tier. The bead is
                         // re-selected next tick once it returns to ATTESTED (or
                         // via the transient's own retry path).
-                        let _ = emit(
-                            deps.telemetry_log,
-                            bead_id,
-                            overlay.attempt,
-                            overlay.state.as_str(),
+                        handle_bead_transient_error(
+                            deps,
+                            summary,
+                            &mut overlay,
+                            "reroll_execute",
                             "BEAD_PROCESSING_TRANSIENT_ERROR",
-                            serde_json::json!({}),
-                            serde_json::json!({"phase": "reroll_execute", "error": format!("{e:?}")}),
-                        );
+                            &format!("{e:?}"),
+                        )?;
                         continue;
                     }
                     Err(e) => {
@@ -6020,6 +6032,66 @@ fn post_scm_comment_by_bead_id(
     Err(DaemonError::Config(format!(
         "no SCM comment target found for bead {bead_id}"
     )))
+}
+
+pub const MAX_TRANSIENT_ERROR_RETRY: u32 = 10;
+
+/// Handle a transient processing/snapshot error for a bead (follow-up to #510/#517).
+/// Increments `overlay.transient_error_count`. If `transient_error_count >= MAX_TRANSIENT_ERROR_RETRY`,
+/// transitions the bead to `HUMAN_HELD` with reason `transient_error_retry_cap_exceeded`,
+/// emits `PARKED_HUMAN_HELD` telemetry, and posts an escalation comment.
+/// Otherwise, persists the incremented count and emits the transient error event.
+fn handle_bead_transient_error(
+    deps: &TickDeps,
+    summary: &mut TickSummary,
+    overlay: &mut BeadOverlay,
+    phase: &str,
+    event_type: &str,
+    error_str: &str,
+) -> Result<(), DaemonError> {
+    overlay.transient_error_count += 1;
+    if overlay.transient_error_count >= MAX_TRANSIENT_ERROR_RETRY {
+        overlay.state = OverlayState::HumanHeld;
+        set_human_hold_reason(overlay, HumanHoldReason::TransientErrorRetryCapExceeded);
+        deps.store.save(overlay)?;
+        summary.beads_parked_human_held += 1;
+        emit(
+            deps.telemetry_log,
+            &overlay.bead_id,
+            overlay.attempt,
+            OverlayState::HumanHeld.as_str(),
+            "PARKED_HUMAN_HELD",
+            serde_json::json!({}),
+            serde_json::json!({
+                "reason": "transient_error_retry_cap_exceeded",
+                "phase": phase,
+                "error": error_str,
+                "transient_error_count": overlay.transient_error_count,
+                "max_transient_error_retry": MAX_TRANSIENT_ERROR_RETRY,
+            }),
+        )?;
+        let comment_body = format!(
+            "🤖 **[dark-factory]** Coder session parked (human held): bead hit {} consecutive transient errors during processing (last phase: `{phase}`, error: {error_str}). Automation parked the bead to prevent infinite retry spinning.",
+            overlay.transient_error_count
+        );
+        let _ = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
+    } else {
+        deps.store.save(overlay)?;
+        let _ = emit(
+            deps.telemetry_log,
+            &overlay.bead_id,
+            overlay.attempt,
+            overlay.state.as_str(),
+            event_type,
+            serde_json::json!({}),
+            serde_json::json!({
+                "phase": phase,
+                "error": error_str,
+                "transient_error_count": overlay.transient_error_count,
+            }),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
