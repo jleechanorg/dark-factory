@@ -207,7 +207,7 @@ if [[ -f "${REPO_ROOT}/scripts/install-beads-hook.sh" && -d "${REPO_ROOT}/.beads
   bash "${REPO_ROOT}/scripts/install-beads-hook.sh"
 fi
 
-chmod +x "${BIN_DIR}/dark-factory" "${BIN_DIR}/df-healer" "${BIN_DIR}/df-validate"
+chmod +x "${BIN_DIR}/dark-factory" "${BIN_DIR}/df-healer" "${BIN_DIR}/df-validate" "${BIN_DIR}/df-funnel"
 
 if [[ "${ARTIFACT_CREATED}" -eq 1 ]]; then
   # Runtime code and the venv are complete before this point. Removing write
@@ -222,9 +222,11 @@ if [[ "${LINK}" -eq 1 ]]; then
   ln -sf "${BIN_DIR}/dark-factory" "${LOCAL_BIN}/dark-factory"
   ln -sf "${BIN_DIR}/df-healer" "${LOCAL_BIN}/df-healer"
   ln -sf "${BIN_DIR}/df-validate" "${LOCAL_BIN}/df-validate"
+  ln -sf "${BIN_DIR}/df-funnel" "${LOCAL_BIN}/df-funnel"
   echo "==> linked ${LOCAL_BIN}/dark-factory"
   echo "==> linked ${LOCAL_BIN}/df-healer"
   echo "==> linked ${LOCAL_BIN}/df-validate"
+  echo "==> linked ${LOCAL_BIN}/df-funnel"
 fi
 
 # Mirror repo-scope commands + skills to user-scope (~/.claude/) so /f /fs
