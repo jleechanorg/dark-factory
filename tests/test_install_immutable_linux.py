@@ -24,7 +24,7 @@ def test_linux_install_keeps_all_runtime_payloads_outside_git_checkout(tmp_path)
     seed_beads.parent.mkdir(parents=True, exist_ok=True)
     seed_beads.write_text('{"id":"factory-tdd"}\n')
 
-    for name in ("dark-factory", "df-healer", "df-validate"):
+    for name in ("dark-factory", "df-healer", "df-validate", "df-funnel"):
         destination = checkout / "bin" / name
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / "bin" / name, destination)
@@ -140,7 +140,7 @@ touch "$db"
 
     release = install_root / "releases" / RELEASE_SHA
     runtime_entries = [
-        *(home / ".local" / "bin" / name for name in ("dark-factory", "df-healer", "df-validate")),
+        *(home / ".local" / "bin" / name for name in ("dark-factory", "df-healer", "df-validate", "df-funnel")),
         *(home / ".claude" / "commands" / f"{name}.md" for name in ("f", "fs", "factory", "factory-spec")),
         *(home / ".claude" / "skills" / name for name in ("dark-factory", "factory-spec")),
     ]
