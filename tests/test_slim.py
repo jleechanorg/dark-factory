@@ -129,6 +129,7 @@ def test_minimal_pr_factory_runs_with_deterministic_gates(monkeypatch, tmp_path)
         "holdout",
         "gate_es",
         "gate_er",
+        "web_advice",
         "exit",
     ]
 

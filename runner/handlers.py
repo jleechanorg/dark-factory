@@ -190,6 +190,11 @@ from .handler_audit import (
     _gate_audit,
 )
 
+# /web-advice fail-open reviewer handler.
+from .handler_web_advice import (
+    _web_advice,
+)
+
 # Registries + dispatcher live at the bottom of the shim so they pick up
 # every re-exported handler above.
 from .parser import Node, is_start_node, is_exit_node
@@ -226,6 +231,7 @@ TYPE_REGISTRY: "dict[str, Handler]" = {
     "parallel": _parallel_fanout,       # fan-out type (type=parallel)
     "join": _join_handler,              # fan-in type (type=join)
     "parallel_reviewer": _parallel_reviewer,
+    "web_advice": _web_advice,
 }
 
 
