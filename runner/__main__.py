@@ -218,6 +218,30 @@ def _write_evidence_bundle(
     )
 
 
+def _write_dispatch_failure_stderr(*, history: list, ctx: Context) -> None:
+    """Print a clear one-line failure summary to stderr when the run's
+    final outcome is not `success` (bead rev-oswpo).
+
+    The stdout JSON summary already carries `final_outcome`, but an
+    operator or automation watching only the exit code + stderr (the
+    standard Unix contract) previously had no indication of *why* dispatch
+    failed or which run id to inspect — the CLI returned a non-zero exit
+    code silently. This makes the failure visible without requiring the
+    caller to parse JSON.
+    """
+    if not history:
+        sys.stderr.write("Dispatch failed: no steps executed.\n")
+        return
+    last = history[-1]
+    reason = (last.output_preview or "").strip().splitlines()[:1]
+    reason_text = reason[0] if reason else "no output"
+    run_id = ctx.run_id or "unknown"
+    sys.stderr.write(
+        f"Dispatch failed: node '{last.node}' ended in '{last.outcome}' "
+        f"({reason_text}). Check run id {run_id} for details.\n"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args_list = list(argv) if argv is not None else list(sys.argv[1:])
     if args_list and args_list[0] == "resume":
@@ -516,8 +540,11 @@ def main(argv: list[str] | None = None) -> int:
                 "repo": ctx.git_ctx.repo_slug,
                 "branch": ctx.git_ctx.branch_slug,
             }
+        dispatch_ok = bool(history) and history[-1].outcome == "success"
+        if not dispatch_ok:
+            _write_dispatch_failure_stderr(history=history, ctx=ctx)
         print(json.dumps(summary, indent=2))
-        return 0 if history and history[-1].outcome == "success" else 1
+        return 0 if dispatch_ok else 1
     except Exception:
         payload = _handle_panic(sys.exc_info()[1], args=args, ctx=ctx)
         if (
