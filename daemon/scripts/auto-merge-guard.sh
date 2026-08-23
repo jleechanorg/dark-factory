@@ -327,6 +327,172 @@ except Exception:
   echo "GREEN:REST"; return 0
 }
 
+# --- Human-approval marker gate (bead rev-iwywa, 2026-08-23 incident
+# follow-up): PR #735 added a fail-closed repo allowlist, but CLAUDE.md's
+# own "MERGE APPROVED" policy was, until now, enforced by session-prompt
+# convention ONLY — zero code-level check existed anywhere in this script
+# or gh-pr-merge-wrapper.sh. The moment a repo is re-added to
+# config/auto_merge_repo_allowlist.json (a one-line JSON edit -- that's
+# the whole point of PR #735's design), the exact unattended-merge gap
+# that caused the incident reopens with zero additional protection,
+# because the allowlist alone doesn't prove a human approved THIS PR.
+# This is a SECOND, INDEPENDENT gate — it augments, not replaces, the
+# repo-allowlist gate above and the no-red gate checks in
+# latest_assessment_no_red(). A PR is approved when EITHER:
+#   (a) a PR comment containing a standalone line that is exactly
+#       "MERGE APPROVED" (case-sensitive, anchored -- not merely a
+#       substring anywhere in the body, so a negation like "does NOT say
+#       MERGE APPROVED" or a quoted/code-block mention never satisfies
+#       this) was posted by a non-bot account that is NOT the PR's own
+#       author (an author commenting on their own PR must never satisfy
+#       the gate -- that would make the marker trivially self-spoofable), OR
+#   (b) the $AMG_APPROVAL_LABEL label ("auto-merge-approved" by default)
+#       was applied by a non-bot GitHub actor (checked via the issue
+#       events/timeline, not just current label presence, so we know WHO
+#       applied it).
+# Fail-closed throughout: any lookup failure, empty response, or
+# unparseable JSON means NOT approved.
+AMG_APPROVAL_LABEL="${AMG_APPROVAL_LABEL:-auto-merge-approved}"
+human_approval_marker_present() { # <pr_number> -> exit 0 iff a valid human approval marker is present
+  local pr="$1" author_login comments_json events_json
+  author_login="$(gh api "repos/$REPO/pulls/$pr" --jq '.user.login // ""' 2>/dev/null)"
+  # --slurp wraps each page's array as its own element (so multi-page
+  # results parse as valid JSON) -- without it, gh api --paginate prints
+  # each page as a SEPARATE, back-to-back JSON array/object for any
+  # endpoint with more than one page of results, which is not valid JSON
+  # on its own and made json.loads() silently fail (caught by a bare
+  # except, comments/events treated as empty) on any PR with a long
+  # comment or event history.
+  comments_json="$(gh api "repos/$REPO/issues/$pr/comments" --paginate --slurp 2>/dev/null)"
+  if [ -n "$comments_json" ]; then
+    if PR_AUTHOR="$author_login" python3 -c '
+import json, os, re, sys
+
+AUTHOR = os.environ.get("PR_AUTHOR", "")
+# Fail-closed: if we could not determine who the PR author is (the
+# earlier `gh api .../pulls/$pr` lookup failed or returned an empty
+# login), we cannot enforce the author-exclusion below, so refuse via
+# the comment path entirely rather than silently allowing the true
+# author (now indistinguishable from anyone else) to self-approve.
+if not AUTHOR:
+    sys.exit(1)
+
+# Anchored, standalone-line match only (mirrors this repo own
+# _parse_verdict marker convention, and CLAUDE.md rule that MERGE APPROVED
+# must appear verbatim) -- a bare substring search would let any comment
+# that merely contains the phrase satisfy the gate, including negations
+# ("does NOT say MERGE APPROVED"), quotes, or code-block embeddings.
+MARKER = re.compile(r"(?m)^\s*MERGE APPROVED\s*$")
+FENCE = re.compile(r"```.*?```", re.DOTALL)
+
+def is_bot(user):
+    if not isinstance(user, dict):
+        return True
+    if (user.get("type") or "") == "Bot":
+        return True
+    login = user.get("login") or ""
+    return login.endswith("[bot]") or login.endswith("-bot")
+
+try:
+    pages = json.loads(sys.stdin.read())
+except Exception:
+    pages = []
+if not isinstance(pages, list):
+    pages = []
+comments = []
+for page in pages:
+    if isinstance(page, list):
+        comments.extend(page)
+for c in comments:
+    body = c.get("body") or ""
+    # Strip fenced code blocks before matching so a reviewer quoting the
+    # marker as a documentation/policy example inside a ``` block never
+    # satisfies the gate -- only a real, unfenced approval line counts.
+    body_unfenced = FENCE.sub("", body)
+    if not MARKER.search(body_unfenced):
+        continue
+    user = c.get("user") or {}
+    if is_bot(user):
+        continue
+    login = user.get("login") or ""
+    if login == AUTHOR:
+        continue
+    print("APPROVED:COMMENT:" + login)
+    sys.exit(0)
+sys.exit(1)
+' <<<"$comments_json"; then
+      return 0
+    fi
+  fi
+  events_json="$(gh api "repos/$REPO/issues/$pr/events" --paginate --slurp 2>/dev/null)"
+  if [ -n "$events_json" ]; then
+    if LABEL="$AMG_APPROVAL_LABEL" PR_AUTHOR="$author_login" python3 -c '
+import json, os, sys
+
+LABEL = os.environ.get("LABEL", "")
+AUTHOR = os.environ.get("PR_AUTHOR", "")
+# Fail-closed for the same reason as the comment path above: if we could
+# not determine the PR author, we cannot enforce author-exclusion, so
+# refuse via the label path entirely.
+if not AUTHOR:
+    sys.exit(1)
+
+def is_bot(actor):
+    if not isinstance(actor, dict):
+        return True
+    if (actor.get("type") or "") == "Bot":
+        return True
+    login = actor.get("login") or ""
+    return login.endswith("[bot]") or login.endswith("-bot")
+
+try:
+    pages = json.loads(sys.stdin.read())
+except Exception:
+    pages = []
+if not isinstance(pages, list):
+    pages = []
+events = []
+for page in pages:
+    if isinstance(page, list):
+        events.extend(page)
+
+# Reconstruct CURRENT label state from the chronological event history
+# (the /issues/$pr/events endpoint returns events oldest-first) rather
+# than approving on the first "labeled" event found: a label that was
+# applied and later REMOVED must not still count as approval, and the
+# actor recorded must be whoever most recently (re-)applied it, not
+# whoever happened to apply it first.
+current_actor = None
+for e in events:
+    if e.get("event") not in ("labeled", "unlabeled"):
+        continue
+    label_name = (e.get("label") or {}).get("name") or ""
+    if label_name != LABEL:
+        continue
+    if e.get("event") == "unlabeled":
+        current_actor = None
+        continue
+    actor = e.get("actor") or {}
+    if is_bot(actor):
+        current_actor = None
+        continue
+    login = actor.get("login") or ""
+    if login == AUTHOR:
+        current_actor = None
+        continue
+    current_actor = login
+
+if current_actor:
+    print("APPROVED:LABEL:" + current_actor)
+    sys.exit(0)
+sys.exit(1)
+' <<<"$events_json"; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
 if [ "$USE_GRAPHQL" -eq 1 ]; then
   _pr_rows="$(gh pr list --repo "$REPO" --state open --json number,headRefName \
     --jq '.[]|select(.headRefName|startswith("factory/"))|"\(.number) \(.headRefName)"' 2>/dev/null)"
@@ -403,6 +569,18 @@ while read -r num branch; do
     _mergeable="$(gh api "repos/$REPO/pulls/$num" --jq '.mergeable' 2>/dev/null)"
     [ "$_mergeable" = "true" ] || { echo "PR $num: not MERGEABLE (conflicts) — skip"; continue; }
   fi
+  # bead rev-iwywa: SECOND, independent gate -- every other gate above can
+  # pass (CI green, assessment green, mergeable, repo-allowlisted) and this
+  # PR must still be refused without a human-posted approval marker. See
+  # human_approval_marker_present() above for the full anti-spoofing
+  # rationale (non-author, non-bot).
+  approval_reason="$(human_approval_marker_present "$num")"
+  approval_rc=$?
+  if [ "$approval_rc" -ne 0 ]; then
+    echo "PR $num: REFUSED:NO_APPROVAL_MARKER — no human-posted 'MERGE APPROVED' comment or '$AMG_APPROVAL_LABEL' label (non-author, non-bot) found — refusing merge"
+    continue
+  fi
+  echo "PR $num: approval marker ($approval_reason)"
   echo "PR $num: gates red-free + mergeable — merging"
   # bead rev-377j4: attribute the merge-provenance JSONL line (written by
   # gh-pr-merge-wrapper.sh, the sole caller of `gh pr merge`) to this
