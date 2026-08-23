@@ -7627,9 +7627,10 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
 // The test above proves gate 7 resolves when NEITHER gha nor sign-off has
 // evidence. It structurally cannot catch the round-3 residual: `tick.rs`'s
 // `!has_gha_evidence && !has_signoff_evidence` bypass only fires when BOTH
-// are absent. The moment a PR comment trips the (deliberately loose)
-// sign-off heuristic — any non-bot comment containing "sign-off",
-// "signoff", "verdict: pass", or "/skeptic pass" — `skeptic_evidence`
+// are absent. The moment a PR comment trips the sign-off signal — a
+// non-bot comment with an anchored `verdict:`/`overall:`/`normalized:`
+// declaration line or `/skeptic pass|fail` command line, per
+// `anchored_comment_verdict` (rev-gujs2) — `skeptic_evidence`
 // unconditionally wraps the dual-LLM verdict in the full 3-subsystem
 // grammar, padding the still-absent `gha` subsystem with the literal
 // `"verdict: absent"` placeholder. Before the round-3 fix,
@@ -7726,10 +7727,12 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
             body: String::new(),
             // No gha/skeptic-workflow comment at all (this target repo has
             // no equivalent CI workflow), but ONE human-looking comment
-            // trips the loose sign-off heuristic ("sign-off" substring,
-            // non-bot author) — the exact asymmetric scenario round 3
-            // proved was still deadlocked. An `/er PASS` comment is present
-            // purely so gate 6 resolves; this test only exercises gate 7.
+            // trips the sign-off signal via an anchored `verdict: pass`
+            // declaration line (non-bot author, rev-gujs2's
+            // `anchored_comment_verdict` grammar) — the exact asymmetric
+            // scenario round 3 proved was still deadlocked. An `/er PASS`
+            // comment is present purely so gate 6 resolves; this test only
+            // exercises gate 7.
             comments: vec![
                 PrComment {
                     author: "some-reviewer".into(),
@@ -7738,7 +7741,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
                 },
                 PrComment {
                     author: "jleechan".into(),
-                    body: "Looks good, sign-off from me.".into(),
+                    body: "Looks good, sign-off from me.\nverdict: pass".into(),
                     created_at_epoch: 0,
                 },
             ],
