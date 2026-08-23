@@ -3599,18 +3599,14 @@ fn skeptic_evidence(
         .or_else(|_| std::env::var("DARK_FACTORY_REVIEWER_DEFAULT"))
         .unwrap_or_else(|_| "agy".to_string());
 
-    let coder_vendor = match coder_agent.to_ascii_lowercase().as_str() {
-        // `claudem` contains `claude` — check MiniMax aliases first so a
-        // claudem coder is excluded from the claudem reviewer slot, not
-        // from a phantom Anthropic `claude` slot that is not in the queue.
-        a if a.contains("claudem") || a.contains("minimax") => "claudem",
-        a if a.contains("claude") => "claude",
-        a if a.contains("agy") || a.contains("antigravity") => "agy",
-        a if a.contains("codex") => "codex",
-        a if a.contains("gemini") => "gemini",
-        a if a.contains("cursor") || a.contains("agentf") => "cursor-agent",
-        _ => "",
-    };
+    // rev-9zrgs: was a hand-written ordered `.contains()` chain (fragile —
+    // "claudem" contains "claude" as a substring, so arm order mattered and
+    // a reorder would silently misclassify). `vendor_aliases::canonical_vendor`
+    // does an exact-match lookup against `config/vendor_aliases.json`
+    // instead, so ordering can no longer matter. See
+    // `daemon/src/vendor_aliases.rs` module doc for the alias set and the
+    // investigation behind the exact-match (vs token-based) design choice.
+    let coder_vendor = crate::vendor_aliases::canonical_vendor(&coder_agent);
 
     // Operator 2026-08-18: reviewer queue is claudem → agy → cursor-agent.
     // Default coder is agy (fallback claudem), so production exclusion
