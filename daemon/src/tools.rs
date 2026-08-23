@@ -1127,6 +1127,14 @@ fn run_tool_with_cwd(
     extra_env: &[(&str, &str)],
     timeout_secs: u64,
 ) -> Result<String, DaemonError> {
+    if cmd == "gh" {
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        crate::gh_circuit_breaker::check_gh_admission(now_epoch)?;
+    }
+
     let mut command = Command::new(cmd);
     if cmd == "br" {
         if let Ok(db) = std::env::var("DARK_FACTORY_BR_DB") {
@@ -1227,12 +1235,29 @@ fn run_tool_with_cwd(
 
     let stdout = String::from_utf8_lossy(&stdout_buf).into_owned();
     if status.success() {
+        if cmd == "gh" {
+            let now_epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            crate::gh_circuit_breaker::record_gh_success(now_epoch);
+        }
         return Ok(stdout);
     }
     let stderr = String::from_utf8_lossy(&stderr_buf).into_owned();
+    let rc = status.code().unwrap_or(-1);
+    if cmd == "gh" {
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if let Some(info) = crate::gh_circuit_breaker::detect_gh_rate_limit(&stderr, rc) {
+            crate::gh_circuit_breaker::record_gh_rate_limit(&info, now_epoch);
+        }
+    }
     Err(DaemonError::Tool {
         tool: cmd.to_string(),
-        rc: status.code().unwrap_or(-1),
+        rc,
         stderr,
     })
 }

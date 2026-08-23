@@ -219,16 +219,14 @@ impl DaemonError {
     /// transient failures, 300s backoff each, starving every other bead's
     /// fast-tier dispatch.
     pub fn is_gh_rate_limit(&self) -> bool {
-        let DaemonError::Tool { tool, stderr, .. } = self else {
+        let DaemonError::Tool { tool, stderr, rc } = self else {
             return false;
         };
         if tool != "gh" {
             return false;
         }
-        let lower = stderr.to_ascii_lowercase();
-        lower.contains("api rate limit exceeded")
-            || lower.contains("rate limit hit")
-            || (lower.contains("403") && lower.contains("rate limit"))
+        crate::gh_circuit_breaker::detect_gh_rate_limit(stderr, *rc).is_some()
+            || stderr.to_ascii_lowercase().contains("rate limit")
     }
 
     /// Detects `br create --external-ref ...` failing because the ref is
@@ -530,6 +528,26 @@ mod tests {
             stderr: "could not resolve host".to_string(),
         };
         assert!(!err.is_gh_rate_limit());
+    }
+
+    #[test]
+    fn is_gh_rate_limit_detects_secondary_rate_limit() {
+        let err = DaemonError::Tool {
+            tool: "gh".to_string(),
+            rc: 1,
+            stderr: "HTTP 403: You have exceeded a secondary rate limit. Please wait a few minutes before you try again.".to_string(),
+        };
+        assert!(err.is_gh_rate_limit());
+    }
+
+    #[test]
+    fn is_gh_rate_limit_detects_circuit_breaker_open_short_circuit() {
+        let err = DaemonError::Tool {
+            tool: "gh".to_string(),
+            rc: -1,
+            stderr: "gh rate limit circuit breaker open (cooldown active for 55s, 3 calls suppressed so far)".to_string(),
+        };
+        assert!(err.is_gh_rate_limit());
     }
 
     #[test]

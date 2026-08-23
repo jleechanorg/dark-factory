@@ -13595,6 +13595,7 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
     let store = FakeStateStore::new();
     let cfg = test_cfg();
     let vcs = test_vcs();
+    std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "");
     let telemetry_dir = std::env::temp_dir().join("afd_vendor_waiver_r2_test");
     let _ = std::fs::remove_dir_all(&telemetry_dir);
     std::fs::create_dir_all(&telemetry_dir).unwrap();

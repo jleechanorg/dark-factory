@@ -961,6 +961,60 @@ fn intake_rate_limit_during_labeled_prs_does_not_abort_dispatch() {
     );
 }
 
+#[test]
+fn intake_rate_limit_on_first_repo_stops_sweep_and_does_not_probe_remaining_repos() {
+    let scm = FakeScm::new();
+    *scm.rate_limit_next_labeled_prs.borrow_mut() = true;
+
+    let tracker = FakeTracker::new();
+    let mut cfg = test_cfg();
+    cfg.target_repo = "jleechanorg/dark-factory".to_string();
+    cfg.repos.insert(
+        "jleechanorg/worldarchitect.ai".to_string(),
+        daemon::config::RepoConfig {
+            ao_project: "worldarchitect".to_string(),
+            push_remote: "origin".to_string(),
+            local_checkout: None,
+        },
+    );
+    cfg.repos.insert(
+        "jleechanorg/third-repo".to_string(),
+        daemon::config::RepoConfig {
+            ao_project: "third-repo".to_string(),
+            push_remote: "origin".to_string(),
+            local_checkout: None,
+        },
+    );
+    let mut cache = AdoptionProbeCache::new();
+
+    let outcome = intake::normalize_labeled_prs_outcome(
+        &scm,
+        &tracker,
+        &cfg,
+        &mut cache,
+        1_700_000_000,
+        &test_telemetry_log(),
+    )
+    .unwrap();
+
+    assert!(outcome.rate_limited);
+    assert_eq!(outcome.metrics.rate_limited_skips, 1);
+    assert_eq!(outcome.metrics.gh_call_count, 1);
+
+    // Assert that only the first repo was queried and the sweep immediately stopped
+    let scm_calls = scm.calls.borrow();
+    let pr_list_calls: Vec<_> = scm_calls
+        .iter()
+        .filter(|c| c.starts_with("labeled_prs"))
+        .collect();
+    assert_eq!(
+        pr_list_calls.len(),
+        2, // labeled_prs(factory) + labeled_prs_rate_limited
+        "sweep must stop immediately on rate limit without probing remaining repos; got calls: {:?}",
+        pr_list_calls
+    );
+}
+
 /// r4 red test #2: zero per-PR probes on the second tick over an unchanged
 /// PR set. The cache MUST serve every PR's adoption/duplicate decision from
 /// disk (zero `collaborator_permission` invocations), and the only allowed
