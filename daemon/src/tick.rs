@@ -1300,30 +1300,36 @@ pub fn run_tick(
 
     run_fast_tier(deps, &mut summary)?;
 
-    // Bead dark-factory-14jt: on startup (tick 0), trigger a forced dispatch pass
-    // so that any beads queued or redispatched from startup intake / recovery /
-    // gate assessment reroll are dispatched immediately to worker slots rather
-    // than waiting for the next organic slow-tier tick.
+    // Bead dark-factory-14jt: on startup tick 0, if any beads were redispatched
+    // from fast-tier gate assessment, trigger a dispatch pass so they are dispatched
+    // immediately to worker slots rather than waiting for the next organic slow-tier tick.
     if tick_index == 0 {
-        let empty_pr_intake = HashSet::new();
-        let report = run_dispatch_pass(deps, &mut summary, &empty_pr_intake, &[])?;
-        if report.success_count() > 0 {
-            emit(
-                deps.telemetry_log,
-                "_startup_dispatch",
-                0,
-                "N/A",
-                "STARTUP_DISPATCH_PASS",
-                serde_json::json!({
-                    "dispatched": report.success_count(),
-                    "totalDispatched": summary.beads_dispatched,
-                }),
-                serde_json::json!({
-                    "tick_index": tick_index,
-                    "elapsed_secs": elapsed_secs,
-                    "forced": true,
-                }),
-            )?;
+        let has_redispatched = deps
+            .store
+            .list_active_overlays()
+            .map(|active| active.iter().any(|o| o.state == OverlayState::Redispatched))
+            .unwrap_or(false);
+        if has_redispatched {
+            let empty_pr_intake = HashSet::new();
+            let report = run_dispatch_pass(deps, &mut summary, &empty_pr_intake, &[])?;
+            if report.success_count() > 0 {
+                emit(
+                    deps.telemetry_log,
+                    "_startup_dispatch",
+                    0,
+                    "N/A",
+                    "STARTUP_DISPATCH_PASS",
+                    serde_json::json!({
+                        "dispatched": report.success_count(),
+                        "totalDispatched": summary.beads_dispatched,
+                    }),
+                    serde_json::json!({
+                        "tick_index": tick_index,
+                        "elapsed_secs": elapsed_secs,
+                        "forced": true,
+                    }),
+                )?;
+            }
         }
     }
 
