@@ -225,10 +225,7 @@ impl DaemonError {
         if tool != "gh" {
             return false;
         }
-        let lower = stderr.to_ascii_lowercase();
-        lower.contains("api rate limit exceeded")
-            || lower.contains("rate limit hit")
-            || (lower.contains("403") && lower.contains("rate limit"))
+        crate::gh_circuit_breaker::is_gh_rate_limit_text(stderr)
     }
 
     /// Detects `br create --external-ref ...` failing because the ref is
