@@ -57,6 +57,20 @@ digraph gates {
         timeout=600
     ]
 
+    // /web-advice fail-open advisory node
+    web_advice [
+        type="web_advice",
+        label="/web-advice (fail-open)",
+        prompt="@prompts/web_advice.txt",
+        backend="claude",
+        timeout=900,
+        min_diff_lines="5",
+        transport="auto",
+        decision="continue",
+        fail_open="true",
+        description="Multi-model browser review (gemini/grok/chatgpt/perplexity) via real authenticated browser sessions. FAIL-OPEN: never blocks. Signal goes to CXDB + PR comment."
+    ]
+
     // Bounded fix loop: any reviewer verdict other than success routes here
     // so the run can iterate on the artifact rather than terminating on a
     // first failure (per factory-evolve G2 fix-loop contract).
@@ -85,6 +99,9 @@ digraph gates {
     gate_er -> gate_cs [condition="outcome=success"]
     gate_er -> fix     [condition="outcome!=success"]
 
-    gate_cs -> exit
+    gate_cs -> web_advice [condition="outcome=success"]
+
+    // Fail-open heart: single unconditional edge to exit.
+    web_advice -> exit
     fix -> holdout
 }
