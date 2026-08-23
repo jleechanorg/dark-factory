@@ -324,6 +324,11 @@ def main(argv: list[str] | None = None) -> int:
             metavar="KEY=VALUE",
             help="Pre-seed ctx.state; repeatable. E.g. --state slim.test_command=true",
         )
+        p.add_argument(
+            "--require-holdouts",
+            action="store_true",
+            help="Fail fast if holdout scenarios.yaml does not exist for the feature",
+        )
         args = p.parse_args(argv)
         if args.resume:
             val = str(args.resume)
@@ -366,6 +371,19 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.preflight:
             graph, diagnostics = validate_pipeline(pipeline_path)
+            if args.require_holdouts:
+                feat = args.feature
+                from .preflight import _check_holdout_scenarios
+                h_ok, h_err = _check_holdout_scenarios(feat)
+                if not h_ok:
+                    diagnostics.append(
+                        {
+                            "code": "DF_MISSING_HOLDOUTS",
+                            "severity": "error",
+                            "node": "<holdouts>",
+                            "message": h_err or "missing holdouts",
+                        }
+                    )
             payload = {
                 "pipeline": str(pipeline_path),
                 "pipeline_name": graph.name if graph else pipeline_path.stem,
@@ -388,6 +406,12 @@ def main(argv: list[str] | None = None) -> int:
             initial_state[k] = v
         if args.feature:
             initial_state["feature"] = args.feature
+        if args.require_holdouts:
+            feat = args.feature or initial_state.get("feature")
+            from .preflight import _check_holdout_scenarios
+            h_ok, h_err = _check_holdout_scenarios(feat)
+            if not h_ok:
+                p.error(f"--require-holdouts failed: {h_err}")
         missing_feature_nodes = _missing_holdout_feature_nodes(graph, initial_state)
         if missing_feature_nodes:
             p.error(
