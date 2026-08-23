@@ -1199,141 +1199,222 @@ pub(crate) fn normalize_labeled_prs_with_cache(
 /// function via `return Err(..)`, which propagates through `run_slow_tier`
 /// to `main()` and calls `std::process::exit(1)`, so no candidate after the
 /// failing one in the same fetch batch was ever visited, let alone logged.
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Normalize labeled issues into beads across all configured repositories.
+///
+/// * Sweeps every configured repository (`target_repo` + all `[repos.*]` keys).
+/// * Fetches candidate issues labeled `factory` from each repository.
+/// * Skips any issue whose `external_ref` already appears among the tracker's
+///   known candidates (idempotency — no duplicate `create_bead` calls).
+/// * Checks the issue author's collaborator permission tier for that repo;
+///   only `Permission::Write` / `Permission::Admin` pass. Lower tiers are skipped.
+/// * For each newly-authorized issue, calls `create_bead` and collects the
+///   returned bead id.
+///
+/// Returns `(created, outcomes)`: `created` is the ids of beads newly
+/// created during this pass (empty if nothing new). `outcomes` carries exactly
+/// one `IntakeOutcome` for every candidate that did NOT result in a newly-created
+/// bead (skips + errors). Idempotent: running twice against an unchanged SCM/tracker
+/// produces no new beads on the second run.
 pub fn normalize(
     scm: &dyn Scm,
     tracker: &dyn Tracker,
     cfg: &Config,
 ) -> Result<(Vec<String>, Vec<IntakeOutcome>), DaemonError> {
-    let issues = scm.labeled_issues(FACTORY_LABEL)?;
-    if issues.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
+    normalize_with_telemetry(scm, tracker, cfg, now_epoch_secs(), None)
+}
+
+pub fn normalize_with_telemetry(
+    scm: &dyn Scm,
+    tracker: &dyn Tracker,
+    cfg: &Config,
+    now_epoch: u64,
+    telemetry_log: Option<&Path>,
+) -> Result<(Vec<String>, Vec<IntakeOutcome>), DaemonError> {
+    let target_repos = target_repositories_sweep_order(cfg, now_epoch);
+    let mut master_created = Vec::new();
+    let mut master_outcomes = Vec::new();
+
+    let full_universe_len = dedup_repo_universe(cfg).len();
+    if full_universe_len > MAX_INTAKE_REPOS_PER_SWEEP {
+        eprintln!(
+            "auto-factory daemon: WARNING intake sweep repo count={} exceeds maximum ({}); \
+             {} configured repositor(ies) rotate out of this tick's scanned window (full \
+             coverage is still guaranteed over successive sweeps — see \
+             INTAKE_REPO_SWEEP_TRUNCATED)",
+            full_universe_len,
+            MAX_INTAKE_REPOS_PER_SWEEP,
+            full_universe_len - MAX_INTAKE_REPOS_PER_SWEEP
+        );
+        if let Some(log) = telemetry_log {
+            emit_intake_sweep_truncated(log, full_universe_len, MAX_INTAKE_REPOS_PER_SWEEP);
+        }
     }
 
-    let known_refs = tracker.fetch_all_external_refs()?;
+    let mut tracker_snapshot_state: Option<Result<std::collections::HashSet<String>, ()>> = None;
 
-    let mut created = Vec::new();
-    let mut outcomes = Vec::new();
+    for repo in &target_repos {
+        let issues = match scm.labeled_issues_for_repo(repo, FACTORY_LABEL) {
+            Ok(issues) => issues,
+            Err(e) => {
+                eprintln!(
+                    "auto-factory daemon: WARNING intake failed for repository {repo}: {e}; continuing with remaining repositories"
+                );
+                if let Some(log) = telemetry_log {
+                    emit_intake_repo_sweep_failed(log, repo, "scm_error", &e.to_string());
+                }
+                continue;
+            }
+        };
 
-    for mut issue in issues {
-        // jleechan-r28r: normalize URL form to canonical owner/repo#N
-        // BEFORE the known_refs.contains check so two intake events for the
-        // same PR (one URL-shaped, one short-shaped) hit the same dedup
-        // key.
-        issue.external_ref = to_canonical_external_ref(&issue.external_ref);
-
-        // Idempotency: already-known external_ref -> skip silently, no create_bead call.
-        if known_refs.contains(&issue.external_ref) {
-            outcomes.push(IntakeOutcome {
-                external_ref: issue.external_ref.clone(),
-                verdict: IntakeVerdict::SkippedDuplicate,
-                repo: Some(cfg.target_repo.clone()),
-                pr_number: Some(issue.number),
-                branch: None,
-                head_sha: None,
-            });
+        if issues.is_empty() {
             continue;
         }
 
-        // Write-tier authorization gate (spec §4.2.3): only Write/Admin may
-        // trigger dispatch. Lower tiers are skipped, not errored — the skip
-        // itself is the audit trail the caller records via telemetry, keyed
-        // on issue.external_ref + issue.author_login. A failure to even
-        // *determine* the permission tier (e.g. a transient GitHub API
-        // error) is recorded as Errored for this candidate only — it must
-        // not abort the rest of the batch.
-        let permission = match scm.collaborator_permission_for_repo(&cfg.target_repo, &issue.author_login) {
-            Ok(p) => p,
-            Err(e) => {
-                outcomes.push(IntakeOutcome {
+        let snapshot_result = tracker_snapshot_state.get_or_insert_with(|| {
+            match tracker.fetch_all_external_refs() {
+                Ok(refs) => Ok(refs),
+                Err(e) => {
+                    eprintln!(
+                        "auto-factory daemon: WARNING intake tracker snapshot fetch failed \
+                         (first needed by repository {repo}): {e}; degrading issue intake for the \
+                         remainder of this sweep — dispatch still proceeds"
+                    );
+                    if let Some(log) = telemetry_log {
+                        emit_intake_repo_sweep_failed(log, repo, "tracker_snapshot", &e.to_string());
+                    }
+                    Err(())
+                }
+            }
+        });
+
+        let known_refs = match snapshot_result {
+            Ok(refs) => refs,
+            Err(()) => {
+                eprintln!(
+                    "auto-factory daemon: WARNING intake skipping repository {repo}: tracker \
+                     snapshot unavailable this sweep (see the earlier \
+                     INTAKE_REPO_SWEEP_FAILED tracker_snapshot event)"
+                );
+                continue;
+            }
+        };
+
+        for mut issue in issues {
+            // jleechan-r28r: normalize URL form to canonical owner/repo#N
+            // BEFORE the known_refs.contains check so two intake events for the
+            // same issue hit the same dedup key.
+            issue.external_ref = to_canonical_external_ref(&issue.external_ref);
+
+            // Idempotency: already-known external_ref -> skip silently, no create_bead call.
+            if known_refs.contains(&issue.external_ref) {
+                master_outcomes.push(IntakeOutcome {
                     external_ref: issue.external_ref.clone(),
-                    verdict: IntakeVerdict::Errored {
-                        reason: e.to_string(),
-                    },
-                    repo: Some(cfg.target_repo.clone()),
+                    verdict: IntakeVerdict::SkippedDuplicate,
+                    repo: Some(repo.to_string()),
                     pr_number: Some(issue.number),
                     branch: None,
                     head_sha: None,
                 });
                 continue;
             }
-        };
-        if !permission.is_write_tier() {
-            outcomes.push(IntakeOutcome {
-                external_ref: issue.external_ref.clone(),
-                verdict: IntakeVerdict::SkippedIneligible {
-                    precondition: format!("author_permission_below_write_tier:{permission:?}"),
-                },
-                repo: Some(cfg.target_repo.clone()),
-                pr_number: Some(issue.number),
-                branch: None,
-                head_sha: None,
-            });
-            continue;
-        }
 
-        let title = format!("{} ({})", issue.title, cfg.target_repo);
-        let bead_id = match tracker.create_bead(&title, &issue.body, &issue.external_ref) {
-            Ok(id) => id,
-            Err(e) => {
-                // jleechan-u4gb: the known_refs pre-check above is a bulk
-                // snapshot read that can race with a concurrent write (e.g.
-                // a duplicate labeled-issue entry within the same batch, or
-                // staleness/skew in the underlying `br list` snapshot) and
-                // miss a ref that was actually already tracked. `br create`'s
-                // own uniqueness constraint is authoritative and catches it
-                // at write time; treat that as "already tracked" (same
-                // outcome as the known_refs.contains skip above) instead of
-                // failing the whole tick and retrying forever — the ref will
-                // *always* already exist on retry, so propagating this as a
-                // transient error just burns exponential backoff for no
-                // benefit.
-                if let Some(existing_bead_id) = e.duplicate_external_ref_bead_id() {
-                    eprintln!(
-                        "auto-factory daemon: intake race recovered — external_ref {:?} already tracked by {existing_bead_id} (known_refs pre-check missed it); skipping create_bead",
-                        issue.external_ref
-                    );
-                    outcomes.push(IntakeOutcome {
+            // Write-tier authorization gate (spec §4.2.3): only Write/Admin may
+            // trigger dispatch. Lower tiers are skipped, not errored — the skip
+            // itself is the audit trail the caller records via telemetry, keyed
+            // on issue.external_ref + issue.author_login. A failure to even
+            // *determine* the permission tier (e.g. a transient GitHub API
+            // error) is recorded as Errored for this candidate only — it must
+            // not abort the rest of the batch.
+            let permission = match scm.collaborator_permission_for_repo(repo, &issue.author_login) {
+                Ok(p) => p,
+                Err(e) => {
+                    master_outcomes.push(IntakeOutcome {
                         external_ref: issue.external_ref.clone(),
-                        verdict: IntakeVerdict::SkippedDuplicate,
-                        repo: Some(cfg.target_repo.clone()),
+                        verdict: IntakeVerdict::Errored {
+                            reason: e.to_string(),
+                        },
+                        repo: Some(repo.to_string()),
                         pr_number: Some(issue.number),
                         branch: None,
                         head_sha: None,
                     });
                     continue;
                 }
-                // jleechan-eazj: do NOT `return Err(e)` here — that used to
-                // abort the whole `normalize` call (and, via `?` upstream,
-                // the whole daemon process) on the first non-duplicate
-                // `create_bead` failure, silently starving every subsequent
-                // candidate in this fetch batch of any telemetry at all.
-                // Record the real error and move on to the next candidate;
-                // an unresolved issue is retried again next slow tick since
-                // it never gets added to `known_refs`.
-                outcomes.push(IntakeOutcome {
+            };
+            if !permission.is_write_tier() {
+                master_outcomes.push(IntakeOutcome {
                     external_ref: issue.external_ref.clone(),
-                    verdict: IntakeVerdict::Errored {
-                        reason: e.to_string(),
+                    verdict: IntakeVerdict::SkippedIneligible {
+                        precondition: format!("author_permission_below_write_tier:{permission:?}"),
                     },
-                    repo: Some(cfg.target_repo.clone()),
+                    repo: Some(repo.to_string()),
                     pr_number: Some(issue.number),
                     branch: None,
                     head_sha: None,
                 });
                 continue;
             }
-        };
 
-        let comment_body = format!(
-            "🤖 **[dark-factory]** Auto-factory has picked up this task. Created tracking bead `{}`. Spawning worker session...",
-            bead_id
-        );
-        let _ = tracker.comment_external(&issue.external_ref, &comment_body);
+            let title = format!("{} ({})", issue.title, repo);
+            let bead_id = match tracker.create_bead(&title, &issue.body, &issue.external_ref) {
+                Ok(id) => id,
+                Err(e) => {
+                    // jleechan-u4gb: the known_refs pre-check above is a bulk
+                    // snapshot read that can race with a concurrent write and
+                    // miss a ref that was actually already tracked. `br create`'s
+                    // own uniqueness constraint is authoritative and catches it
+                    // at write time; treat that as "already tracked" instead of
+                    // failing the whole tick and retrying forever.
+                    if let Some(existing_bead_id) = e.duplicate_external_ref_bead_id() {
+                        eprintln!(
+                            "auto-factory daemon: intake race recovered — external_ref {:?} already tracked by {existing_bead_id} (known_refs pre-check missed it); skipping create_bead",
+                            issue.external_ref
+                        );
+                        master_outcomes.push(IntakeOutcome {
+                            external_ref: issue.external_ref.clone(),
+                            verdict: IntakeVerdict::SkippedDuplicate,
+                            repo: Some(repo.to_string()),
+                            pr_number: Some(issue.number),
+                            branch: None,
+                            head_sha: None,
+                        });
+                        continue;
+                    }
+                    // jleechan-eazj: do NOT `return Err(e)` here — that used to
+                    // abort the whole `normalize` call on the first non-duplicate
+                    // `create_bead` failure. Record the real error and move on.
+                    master_outcomes.push(IntakeOutcome {
+                        external_ref: issue.external_ref.clone(),
+                        verdict: IntakeVerdict::Errored {
+                            reason: e.to_string(),
+                        },
+                        repo: Some(repo.to_string()),
+                        pr_number: Some(issue.number),
+                        branch: None,
+                        head_sha: None,
+                    });
+                    continue;
+                }
+            };
 
-        created.push(bead_id);
+            let comment_body = format!(
+                "🤖 **[dark-factory]** Auto-factory has picked up this task. Created tracking bead `{}`. Spawning worker session...",
+                bead_id
+            );
+            let _ = tracker.comment_external(&issue.external_ref, &comment_body);
+
+            master_created.push(bead_id);
+        }
     }
 
-    Ok((created, outcomes))
+    Ok((master_created, master_outcomes))
 }
 
 /// Normalize open PRs labeled `factory` into beads that should attach to the
