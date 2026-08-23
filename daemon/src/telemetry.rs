@@ -14,6 +14,17 @@ pub struct TelemetryEvent {
     pub context: serde_json::Value,
 }
 
+pub fn default_telemetry_log() -> std::path::PathBuf {
+    std::env::var_os("DARK_FACTORY_TELEMETRY_LOG")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            Path::new(&home)
+                .join("Library/Logs/dark-factory")
+                .join("daemon.jsonl")
+        })
+}
+
 pub fn emit(log_path: &Path, ev: &TelemetryEvent) -> Result<(), DaemonError> {
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent).ok();

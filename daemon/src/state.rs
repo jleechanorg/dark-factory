@@ -806,6 +806,12 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+pub fn civil_from_days_pub(z: i64) -> (i64, u32, u32) {
+    civil_from_days(z)
+}
+
+
+
 impl SqliteStateStore {
     /// Open (or create) the on-disk store at `path`, apply WAL + busy_timeout=5000,
     /// and ensure the schema from `contracts/schema.sql` exists.
