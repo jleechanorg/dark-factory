@@ -56,6 +56,15 @@ CREATE TABLE IF NOT EXISTS bead_overlay (
   -- the idempotent `ensure_spawn_failure_count_column` migration in
   -- `SqliteStateStore::open` (same guard pattern as `ensure_is_adopted_column`).
   spawn_failure_count INTEGER NOT NULL DEFAULT 0,
+  -- Consecutive transient processing errors since the last successful fast-tier
+  -- progress (follow-up to #510/#517). PR #517 isolated per-bead transient
+  -- errors from incrementing global consecutive_failures, but a bead hitting
+  -- transient errors forever would spin indefinitely. This counter tracks
+  -- consecutive transient errors per bead and parks HUMAN_HELD once it reaches
+  -- MAX_TRANSIENT_PROCESSING_RETRY (10).
+  -- Older DBs pre-date this column and get it via the idempotent
+  -- `ensure_transient_error_count_column` migration in `SqliteStateStore::open`.
+  transient_error_count INTEGER NOT NULL DEFAULT 0,
   -- Pre-remediation-session HEAD SHA for adopted-branch force-push
   -- detection (bead jleechan-tfs1 amendment). Nullable: only set for
   -- adopted beads that have been through a remediation dispatch. Kept in

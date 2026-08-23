@@ -156,6 +156,76 @@ const EVIDENCE_HEAD_STALE_SENTINEL_ATTEMPT: u32 = u32::MAX - 1;
 // probe cache. 20 is a generous in-between signal.
 const INTAKE_GH_CALL_WARN_THRESHOLD: u32 = 20;
 
+/// Maximum consecutive transient processing errors before a bead is parked HUMAN_HELD (follow-up to #510/#517).
+pub const MAX_TRANSIENT_PROCESSING_RETRY: u32 = 10;
+
+/// Records a transient processing error for a bead, increments its per-bead
+/// `transient_error_count`, emits `BEAD_PROCESSING_TRANSIENT_ERROR`, and if the
+/// counter reaches `MAX_TRANSIENT_PROCESSING_RETRY` (10), parks the bead `HUMAN_HELD`
+/// with reason `transient_processing_retry_cap_exceeded`.
+fn handle_bead_processing_transient_error(
+    deps: &TickDeps,
+    summary: &mut TickSummary,
+    overlay: &mut BeadOverlay,
+    phase: &str,
+    error: &DaemonError,
+) -> Result<(), DaemonError> {
+    if let Ok(Some(latest)) = deps.store.load(&overlay.bead_id) {
+        *overlay = latest;
+    }
+    overlay.transient_error_count = overlay.transient_error_count.saturating_add(1);
+    emit(
+        deps.telemetry_log,
+        &overlay.bead_id,
+        overlay.attempt,
+        overlay.state.as_str(),
+        "BEAD_PROCESSING_TRANSIENT_ERROR",
+        serde_json::json!({}),
+        serde_json::json!({
+            "phase": phase,
+            "error": format!("{error:?}"),
+            "transient_error_count": overlay.transient_error_count,
+            "max_transient_processing_retry": MAX_TRANSIENT_PROCESSING_RETRY,
+        }),
+    )?;
+
+    if overlay.transient_error_count >= MAX_TRANSIENT_PROCESSING_RETRY {
+        overlay.state = OverlayState::HumanHeld;
+        overlay.session_id = None;
+        set_human_hold_reason(
+            overlay,
+            HumanHoldReason::TransientProcessingRetryCapExceeded,
+        );
+        deps.store.save(overlay)?;
+        summary.beads_parked_human_held += 1;
+
+        emit(
+            deps.telemetry_log,
+            &overlay.bead_id,
+            overlay.attempt,
+            OverlayState::HumanHeld.as_str(),
+            "PARKED_HUMAN_HELD",
+            serde_json::json!({}),
+            serde_json::json!({
+                "reason": HumanHoldReason::TransientProcessingRetryCapExceeded.value(),
+                "phase": phase,
+                "transient_error_count": overlay.transient_error_count,
+                "error": format!("{error:?}"),
+            }),
+        )?;
+
+        let comment = format!(
+            "🤖 **[dark-factory]** Bead `{}` parked in `HUMAN_HELD` after reaching {} consecutive transient processing errors (phase: `{phase}`). Last error: `{error:?}`. Manual inspection or auto-recovery required.",
+            overlay.bead_id,
+            overlay.transient_error_count,
+        );
+        let _ = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment);
+    } else {
+        deps.store.save(overlay)?;
+    }
+    Ok(())
+}
+
 /// Bead jleechan-msmq: an ATTESTED bead with `reroll_count > 0` is in the
 /// reroll pipeline. The OLD PR's gate verdict cannot advance the bead
 /// (the reroll branch IS the advancement); re-assessing it on every
@@ -1692,6 +1762,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 session_id: None,
                 is_adopted: true,
                 spawn_failure_count: 0,
+                transient_error_count: 0,
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo,
@@ -1834,6 +1905,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            transient_error_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo,
@@ -1952,6 +2024,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         session_id: None,
                         is_adopted: false,
                         spawn_failure_count: 0,
+                        transient_error_count: 0,
                         pre_session_head_sha: None,
                         park_reason: None,
                         target_repo,
@@ -2129,6 +2202,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     session_id: None,
                     is_adopted: false,
                     spawn_failure_count: 0,
+                    transient_error_count: 0,
                     pre_session_head_sha: None,
                     park_reason: None,
                     target_repo,
@@ -4297,6 +4371,10 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         if entered_as_ready {
             overlay.state = OverlayState::Attested; // in-memory only (NOT saved)
         }
+        let entered_as_reroll = overlay.state == OverlayState::ReRoll;
+        if entered_as_reroll {
+            overlay.state = OverlayState::Attested; // in-memory only (NOT saved)
+        }
         if overlay.state != OverlayState::Attested {
             continue;
         }
@@ -4717,15 +4795,13 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         let mut evidence = match skeptic_evidence(deps, bead_id, pr, &repo, &snapshot, vendor_health) {
             Ok(e) => e,
             Err(e) => {
-                let _ = emit(
-                    deps.telemetry_log,
-                    bead_id,
-                    overlay.attempt,
-                    OverlayState::Attested.as_str(),
-                    "BEAD_PROCESSING_TRANSIENT_ERROR",
-                    serde_json::json!({}),
-                    serde_json::json!({"phase": "skeptic_evidence", "error": format!("{e:?}")}),
-                );
+                handle_bead_processing_transient_error(
+                    deps,
+                    summary,
+                    &mut overlay,
+                    "skeptic_evidence",
+                    &e,
+                )?;
                 continue;
             }
         };
@@ -4786,15 +4862,13 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         let runner_outcome = match crate::er_runner::maybe_run(deps, bead_id, pr, now_epoch) {
             Ok(out) => out,
             Err(e) => {
-                let _ = emit(
-                    deps.telemetry_log,
-                    bead_id,
-                    overlay.attempt,
-                    OverlayState::Attested.as_str(),
-                    "BEAD_PROCESSING_TRANSIENT_ERROR",
-                    serde_json::json!({}),
-                    serde_json::json!({"phase": "er_runner", "error": format!("{e:?}")}),
-                );
+                handle_bead_processing_transient_error(
+                    deps,
+                    summary,
+                    &mut overlay,
+                    "er_runner",
+                    &e,
+                )?;
                 continue;
             }
         };
@@ -5304,6 +5378,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         // block at the top of this section.)
 
         if report.all_green {
+            overlay.transient_error_count = 0;
             overlay.state = OverlayState::Ready;
             deps.store.save(&overlay)?;
             summary.beads_ready += 1;
@@ -5750,30 +5825,13 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     }
                     Ok(crate::reroll::RerollOutcome::Aborted(_)) => {}
                     Err(e) if e.is_transient() => {
-                        // jleechan-cq8r: per-bead isolation, matching the
-                        // jleechan-qdw pattern used elsewhere in this same
-                        // loop (BEAD_SNAPSHOT_TRANSIENT_ERROR /
-                        // BEAD_PROCESSING_TRANSIENT_ERROR above). A single
-                        // bead's TRANSIENT re-roll engine failure -- e.g. the
-                        // circuit-breaker comparator's LLM call hitting a
-                        // rate limit or returning a malformed reply -- must
-                        // not abort processing for every OTHER in-flight
-                        // bead in this tick. `reroll::execute` already
-                        // persisted this bead as `ReRoll` before the
-                        // failure; emit telemetry and move on to the next
-                        // bead rather than propagating with `return Err`,
-                        // which used to abort the entire fast tier. The bead is
-                        // re-selected next tick once it returns to ATTESTED (or
-                        // via the transient's own retry path).
-                        let _ = emit(
-                            deps.telemetry_log,
-                            bead_id,
-                            overlay.attempt,
-                            overlay.state.as_str(),
-                            "BEAD_PROCESSING_TRANSIENT_ERROR",
-                            serde_json::json!({}),
-                            serde_json::json!({"phase": "reroll_execute", "error": format!("{e:?}")}),
-                        );
+                        handle_bead_processing_transient_error(
+                            deps,
+                            summary,
+                            &mut overlay,
+                            "reroll_execute",
+                            &e,
+                        )?;
                         continue;
                     }
                     Err(e) => {
