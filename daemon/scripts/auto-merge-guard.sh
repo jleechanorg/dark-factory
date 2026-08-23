@@ -369,7 +369,7 @@ while read -r num branch; do
     [ "$_mergeable" = "true" ] || { echo "PR $num: not MERGEABLE (conflicts) — skip"; continue; }
   fi
   echo "PR $num: gates red-free + mergeable — merging"
-  gh pr merge "$num" --repo "$REPO" --squash 2>&1 | tail -1
+  GH_REPO="$REPO" "$(dirname "${BASH_SOURCE[0]}")/gh-pr-merge-wrapper.sh" "$num" --squash 2>&1 | tail -2
   sleep 3
   if [ "$USE_GRAPHQL" -eq 1 ]; then
     _merged_state="$(gh pr view "$num" --repo "$REPO" --json state --jq .state 2>/dev/null)"
