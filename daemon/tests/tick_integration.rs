@@ -14808,3 +14808,334 @@ fn session_health_failure_reaps_session_and_requeues_bead() {
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+/// Bead dark-factory-14jt / issue #509: after daemon restart with ATTESTED/EXISTING_PR_WAITING beads,
+/// the daemon must immediately queue all ATTESTED beads for gate assessment rather than waiting for the
+/// next organic tick, and startup must trigger a forced dispatch pass within 30s to dispatch workers.
+#[test]
+fn test_startup_attested_beads_gate_assessed_and_forced_dispatch_pass_triggers() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    // Router returns SMALL_PATH for any routed beads, Skeptic returns red/rejection
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"single small change"}"#.into(),
+    ));
+
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.stage = 2; // Stage 2 so reroll / remediation executes
+    cfg.slow_tick_secs = 300; // 5 minute organic slow tick
+    cfg.fast_tick_secs = 60;  // 1 minute fast tick
+    let mut vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_test_startup_dispatch_14jt.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    // Seed ATTESTED beads (e.g. bead-1 and bead-2) representing adopted / existing PR beads after restart
+    for i in 1..=3 {
+        let bead_id = format!("bead-startup-{i}");
+        let branch = format!("factory/bead-startup-{i}-r1");
+        let pr = 200 + i;
+
+        vcs.heads.insert(branch.clone(), format!("sha-head-{pr}"));
+
+        store.overlays.borrow_mut().insert(
+            bead_id.clone(),
+            BeadOverlay {
+                bead_id: bead_id.clone(),
+                state: OverlayState::Attested,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: Some(pr),
+                branch: Some(branch.clone()),
+                session_id: None,
+                is_adopted: true,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
+                attempt_started_at: None,
+            },
+        );
+
+        store.register_branch(&bead_id, &branch).unwrap();
+        scm.pr_numbers_for_branch.insert(("owner/repo".into(), branch.clone()), Some(pr));
+        scm.open_pr_head_refs.insert(("owner/repo".into(), pr), daemon::tools::PrHeadBranch::SameRepo(branch));
+
+        // Create a failing PR snapshot so gates trigger reroll/redispatch
+        scm.pr_snapshots.insert(
+            pr,
+            PrSnapshot {
+                pr_number: pr,
+                ci_success: false, // Failing CI
+                mergeable: true,
+                merge_state_unknown: false,
+                coderabbit_approved: false,
+                bugbot_error_count: 1,
+                unresolved_thread_count: Some(1),
+                head_sha: format!("sha-head-{pr}"),
+                body: "".into(),
+                comments: vec![],
+                files: vec![daemon::tools::PrFile {
+                    path: "src/main.rs".into(),
+                    additions: 10,
+                    deletions: 2,
+                }],
+                updated_at_epoch: 100,
+                ci_status: "red".to_string(),
+                coderabbit_status: "red".to_string(),
+                ci_pending: false,
+                bugbot_pending: false,
+                head_committed_epoch: 0,
+            },
+        );
+
+        tracker.candidates.borrow_mut().push(Bead {
+            id: bead_id.clone(),
+            title: format!("Startup Task {i}"),
+            description: "Task description".into(),
+            notes: "".into(),
+            file_tree_summary: "".into(),
+            external_ref: Some(format!("owner/repo#{pr}")),
+        });
+    }
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    // Run startup tick (tick_index = 0, elapsed_secs = 0)
+    let summary = run_tick(&deps, 0, 0).expect("startup tick 0 must succeed");
+
+    // Acceptance criteria 1: Gate assessment must run on startup for all ATTESTED beads
+    assert_eq!(
+        summary.gates_assessed, 3,
+        "Startup tick must immediately queue and assess all 3 ATTESTED beads"
+    );
+
+    // Acceptance criteria 2: Startup must trigger forced dispatch pass within 30s to dispatch workers for rerolled/queued beads
+    assert_eq!(
+        summary.beads_dispatched, 3,
+        "Startup tick must trigger forced dispatch pass dispatching all 3 redispatched beads"
+    );
+
+    // Verify all 3 beads transitioned to DISPATCHED with active sessions spawned
+    for i in 1..=3 {
+        let bead_id = format!("bead-startup-{i}");
+        let o = store.load(&bead_id).unwrap().unwrap();
+        assert_eq!(
+            o.state,
+            OverlayState::Dispatched,
+            "Bead {bead_id} must be in DISPATCHED state after startup forced dispatch"
+        );
+        assert!(
+            o.session_id.is_some(),
+            "Bead {bead_id} must have an active session_id spawned"
+        );
+    }
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("REROLL_ADOPTED_SESSION_SPAWNED"),
+        "Telemetry must contain REROLL_ADOPTED_SESSION_SPAWNED on startup adopted dispatch; telemetry:\n{telemetry}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Bead dark-factory-14jt: verify that queued beads (from issue intake or redispatch)
+/// are dispatched on startup via the forced dispatch pass emitting TASK_DISPATCHED and STARTUP_DISPATCH_PASS.
+#[test]
+fn test_startup_forced_dispatch_pass_dispatches_queued_beads() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"single small change"}"#.into(),
+    ));
+
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.stage = 2;
+    cfg.slow_tick_secs = 300; // 5 minute organic slow tick
+    cfg.fast_tick_secs = 60;  // 1 minute fast tick
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert("main".into(), "base-sha-123".into());
+    let telemetry_log = std::env::temp_dir().join("afd_test_startup_queued_14jt.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    // Seed QUEUED beads left over from before restart
+    for i in 1..=2 {
+        let bead_id = format!("bead-queued-{i}");
+        store.overlays.borrow_mut().insert(
+            bead_id.clone(),
+            BeadOverlay {
+                bead_id: bead_id.clone(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("owner/repo".into()),
+                attempt_started_at: None,
+            },
+        );
+
+        tracker.candidates.borrow_mut().push(Bead {
+            id: bead_id.clone(),
+            title: format!("Queued Task {i}"),
+            description: "Task description\ntarget_repo: owner/repo".into(),
+            notes: "".into(),
+            file_tree_summary: "".into(),
+            external_ref: Some(format!("owner/repo#{}", 300 + i)),
+        });
+    }
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    // Run startup tick (tick_index = 0, elapsed_secs = 0)
+    let summary = run_tick(&deps, 0, 0).expect("startup tick 0 must succeed");
+
+    assert_eq!(
+        summary.beads_dispatched, 2,
+        "Startup tick must dispatch both queued beads"
+    );
+
+    for i in 1..=2 {
+        let bead_id = format!("bead-queued-{i}");
+        let o = store.load(&bead_id).unwrap().unwrap();
+        assert_eq!(
+            o.state,
+            OverlayState::Dispatched,
+            "Bead {bead_id} must be in DISPATCHED state"
+        );
+        assert!(
+            o.session_id.is_some(),
+            "Bead {bead_id} must have an active session_id spawned"
+        );
+    }
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("TASK_DISPATCHED"),
+        "Telemetry must contain TASK_DISPATCHED on startup dispatch; telemetry:\n{telemetry}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Bead dark-factory-14jt: verify that when ATTESTED beads on startup have all gates green,
+/// the startup tick immediately assesses and promotes them to READY/READY_FOR_MERGE.
+#[test]
+fn test_startup_attested_all_green_promotes_to_ready() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    // Skeptic pass
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.stage = 1;
+    cfg.slow_tick_secs = 300;
+    cfg.fast_tick_secs = 60;
+    let mut vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_test_startup_ready_14jt.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let bead_id = "bead-startup-green".to_string();
+    let branch = "factory/bead-startup-green-r1".to_string();
+    let pr = 401;
+
+    vcs.heads.insert(branch.clone(), "sha-green-401".into());
+
+    store.overlays.borrow_mut().insert(
+        bead_id.clone(),
+        BeadOverlay {
+            bead_id: bead_id.clone(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(pr),
+            branch: Some(branch.clone()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+
+    store.register_branch(&bead_id, &branch).unwrap();
+    scm.pr_numbers_for_branch.insert(("owner/repo".into(), branch.clone()), Some(pr));
+    scm.open_pr_head_refs.insert(("owner/repo".into(), pr), daemon::tools::PrHeadBranch::SameRepo(branch));
+
+    scm.pr_snapshots.insert(
+        pr,
+        qdw_green_snapshot(
+            pr,
+            vec![PrComment {
+                author: "dark-factory-er".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: 0,
+            }],
+        ),
+    );
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 0).expect("startup tick 0 must succeed");
+    assert_eq!(summary.gates_assessed, 1, "Must assess 1 bead on startup");
+    assert_eq!(summary.beads_ready, 1, "Must promote 1 bead to ready on startup");
+
+    let o = store.load(&bead_id).unwrap().unwrap();
+    assert_eq!(o.state, OverlayState::Ready, "Bead must be in READY state");
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+

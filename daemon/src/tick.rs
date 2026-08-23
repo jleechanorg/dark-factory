@@ -1300,6 +1300,33 @@ pub fn run_tick(
 
     run_fast_tier(deps, &mut summary)?;
 
+    // Bead dark-factory-14jt: on startup (tick 0), trigger a forced dispatch pass
+    // so that any beads queued or redispatched from startup intake / recovery /
+    // gate assessment reroll are dispatched immediately to worker slots rather
+    // than waiting for the next organic slow-tier tick.
+    if tick_index == 0 {
+        let empty_pr_intake = HashSet::new();
+        let report = run_dispatch_pass(deps, &mut summary, &empty_pr_intake, &[])?;
+        if report.success_count() > 0 {
+            emit(
+                deps.telemetry_log,
+                "_startup_dispatch",
+                0,
+                "N/A",
+                "STARTUP_DISPATCH_PASS",
+                serde_json::json!({
+                    "dispatched": report.success_count(),
+                    "totalDispatched": summary.beads_dispatched,
+                }),
+                serde_json::json!({
+                    "tick_index": tick_index,
+                    "elapsed_secs": elapsed_secs,
+                    "forced": true,
+                }),
+            )?;
+        }
+    }
+
     emit(
         deps.telemetry_log,
         "_tick",
@@ -1754,7 +1781,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         emit_intake_outcome(deps.telemetry_log, outcome)?;
     }
     let tracker_candidates = deps.tracker.fetch_candidates()?;
-    let mut routing_candidates: Vec<Bead> = Vec::new();
+    let mut created_candidates: Vec<Bead> = Vec::new();
     for bead_id in &created {
         let mut pr_number = None;
         let tracker_bead = tracker_candidates
@@ -1860,7 +1887,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         // bead on the very next call since `br` is durable. Prefer that real
         // bead payload so the worker prompt carries the tracker title rather than
         // an empty just-created stub; keep a non-empty fallback for static fakes.
-        routing_candidates.push(tracker_bead.unwrap_or(Bead {
+        created_candidates.push(tracker_bead.unwrap_or(Bead {
             id: bead_id.clone(),
             title: bead_id.clone(),
             description: String::new(),
@@ -1869,6 +1896,34 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             external_ref: None,
         }));
     }
+
+    let _ = run_dispatch_pass(deps, summary, &pr_intake_bead_ids, &created_candidates)?;
+
+    // jtg8-r4: persist the adoption-probe cache at the end of every
+    // slow-tier pass so a daemon restart doesn't re-probe the entire
+    // factory-labeled PR set on its first tick. Best-effort: a failed
+    // write logs but does not abort the tick (a missing cache file is
+    // the same as a cold cache).
+    if let Err(e) = adoption_cache.persist() {
+        eprintln!(
+            "auto-factory daemon: WARNING failed to persist adoption-probe cache: {e}"
+        );
+    }
+
+    Ok(())
+}
+
+/// Runs a dispatch pass: collects candidate beads in `QUEUED` or `REDISPATCHED` state,
+/// routes them through LLM router, applies claim guards, dispatches available worker slots
+/// via `dispatch::dispatch_ready_with_vcs`, and handles telemetry/escalations.
+pub fn run_dispatch_pass(
+    deps: &TickDeps,
+    summary: &mut TickSummary,
+    pr_intake_bead_ids: &HashSet<String>,
+    created_candidates: &[Bead],
+) -> Result<dispatch::DispatchReport, DaemonError> {
+    let tracker_candidates = deps.tracker.fetch_candidates()?;
+    let mut routing_candidates: Vec<Bead> = created_candidates.to_vec();
 
     // Also pick up any bead left over from a prior tick that reached QUEUED
     // but was never routed/dispatched (process restart resilience) — real
@@ -2252,7 +2307,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             );
         }
         if ready.is_empty() {
-            return Ok(());
+            return Ok(dispatch::DispatchReport::default());
         }
         let dispatch_report =
             dispatch::dispatch_ready_with_vcs(
@@ -2880,20 +2935,10 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 let _ = deps.tracker.comment_external(ext_ref, &comment_body);
             }
         }
+        return Ok(dispatch_report);
     }
 
-    // jtg8-r4: persist the adoption-probe cache at the end of every
-    // slow-tier pass so a daemon restart doesn't re-probe the entire
-    // factory-labeled PR set on its first tick. Best-effort: a failed
-    // write logs but does not abort the tick (a missing cache file is
-    // the same as a cold cache).
-    if let Err(e) = adoption_cache.persist() {
-        eprintln!(
-            "auto-factory daemon: WARNING failed to persist adoption-probe cache: {e}"
-        );
-    }
-
-    Ok(())
+    Ok(dispatch::DispatchReport::default())
 }
 
 /// Build gate 6/7's `PrEvidence` for one PR. Gate 7 (Skeptic) is Stage 1's
@@ -3915,6 +3960,14 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     for branch in &branches {
         if let Ok(Some(bead_id)) = deps.store.bead_id_for_branch(branch) {
             bead_ids.push(bead_id);
+        }
+    }
+    // Bead dark-factory-14jt: discover all active/attested beads from overlay store
+    // so beads re-attested on startup without an active branch_registry entry are
+    // immediately queued for gate assessment rather than stalling.
+    if let Ok(active) = deps.store.list_active_overlays() {
+        for overlay in active {
+            bead_ids.push(overlay.bead_id);
         }
     }
     bead_ids.sort();
@@ -5637,6 +5690,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 match crate::reroll::execute(&reroll_deps, &mut overlay) {
                     Ok(crate::reroll::RerollOutcome::Rerolled { new_branch }) => {
                         if overlay.is_adopted {
+                            summary.beads_dispatched += 1;
                             // `reroll::execute` already spawned a real coder
                             // session on the EXISTING contributor branch
                             // (bead.state is now DISPATCHED, not ATTESTED).
