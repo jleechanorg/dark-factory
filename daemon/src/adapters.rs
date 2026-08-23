@@ -1723,6 +1723,14 @@ impl Scm for CliScm {
         Ok(issues)
     }
 
+    fn labeled_issues_for_repo(
+        &self,
+        repo: &str,
+        label: &str,
+    ) -> Result<Vec<Issue>, DaemonError> {
+        self.with_repo(repo).labeled_issues(label)
+    }
+
     fn labeled_prs(&self, label: &str, gh_calls: &mut u32) -> Result<Vec<LabeledPr>, DaemonError> {
         if is_graphql_rate_limited() {
             return self.labeled_prs_via_rest(label, gh_calls);
