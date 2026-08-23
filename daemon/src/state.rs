@@ -767,13 +767,14 @@ impl HumanHoldReason {
             || reason.starts_with(ROUTER_PARSE_PARK_REASON_PREFIX)
     }
 
-    fn recoverable_exact_values() -> [String; 5] {
+    fn recoverable_exact_values() -> [String; 6] {
         [
             Self::TransientSpawnRetryCapExceeded,
             Self::AdoptedPreSessionShaCaptureFailed,
             Self::SessionStalled,
             Self::Stage1GateNotGreen,
             Self::SpecValidationFailed,
+            Self::AutonomyTimeboxExceeded,
         ]
         .map(|candidate| candidate.value())
     }
@@ -1908,8 +1909,8 @@ impl StateStore for SqliteStateStore {
              WHERE state = 'HUMAN_HELD' \
                AND attempt < ?2 \
                AND session_id IS NULL \
-               AND (park_reason IN (?3, ?4, ?5, ?6, ?7) \
-                    OR substr(park_reason, 1, length(?8)) = ?8) \
+               AND (park_reason IN (?3, ?4, ?5, ?6, ?7, ?8) \
+                    OR substr(park_reason, 1, length(?9)) = ?9) \
              RETURNING bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
                  pr_number, branch, session_id, is_adopted, spawn_failure_count, \
                  pre_session_head_sha, park_reason, target_repo, attempt_started_at",
@@ -1925,6 +1926,7 @@ impl StateStore for SqliteStateStore {
                     &recoverable[2],
                     &recoverable[3],
                     &recoverable[4],
+                    &recoverable[5],
                     ROUTER_PARSE_PARK_REASON_PREFIX,
                 ],
                 |row| {
@@ -4108,6 +4110,26 @@ mod tests {
                 attempt_started_at: None,
             },
         );
+        overlays.insert(
+            "timebox-exceeded".to_string(),
+            BeadOverlay {
+                bead_id: "timebox-exceeded".into(),
+                state: OverlayState::HumanHeld,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 10900,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: Some("factory/timebox-exceeded-r1".into()),
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: Some("autonomy_timebox_exceeded".to_string()),
+                target_repo: None,
+                attempt_started_at: None,
+            },
+        );
         for overlay in overlays.values() {
             store.save(overlay).unwrap();
         }
@@ -4115,10 +4137,11 @@ mod tests {
         let recovered = store.recover_human_held(10).unwrap();
         assert_eq!(
             recovered.len(),
-            1,
-            "only the transient park should be recovered; the circuit-breaker park must be excluded"
+            2,
+            "only transient and timebox-exceeded parks should be recovered; the circuit-breaker park must be excluded"
         );
-        assert_eq!(recovered[0].bead_id, "transient-stalled");
+        assert!(recovered.iter().any(|r| r.bead_id == "transient-stalled"));
+        assert!(recovered.iter().any(|r| r.bead_id == "timebox-exceeded"));
 
         // The circuit-breaker-parked bead is untouched: still HUMAN_HELD,
         // same attempt, park_reason preserved. This is the exact regression
@@ -4148,6 +4171,15 @@ mod tests {
         assert_eq!(
             transient.park_reason, None,
             "recover_human_held clears park_reason once a bead is back in play"
+        );
+
+        let timebox = store.load("timebox-exceeded").unwrap().unwrap();
+        assert_eq!(timebox.state, OverlayState::Queued);
+        assert_eq!(timebox.attempt, 2);
+        assert_eq!(timebox.autonomy_secs, 0);
+        assert_eq!(
+            timebox.park_reason, None,
+            "recover_human_held clears park_reason for autonomy_timebox_exceeded"
         );
     }
 

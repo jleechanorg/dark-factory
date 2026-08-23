@@ -14808,3 +14808,225 @@ fn session_health_failure_reaps_session_and_requeues_bead() {
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+#[test]
+fn regression_replay_requeued_bead_older_than_three_hours_does_not_immediately_park_and_over_budget_parks() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    tracker.candidates.borrow_mut().push(Bead {
+        id: "bead-replay".into(),
+        title: "replay test".into(),
+        description: "target_repo: owner/repo\ngoal".into(),
+        notes: String::new(),
+        file_tree_summary: String::new(),
+        external_ref: None,
+    });
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"replay"}"#.into(),
+    ));
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.fast_tick_secs = 10;
+    cfg.slow_tick_secs = 60;
+    cfg.autonomy_timebox_secs = 10800; // 3 hours
+
+    let start_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let old_branch = "factory/bead-replay-r1";
+    let new_branch = "factory/bead-replay-r2";
+
+    scm.remote_branches
+        .insert(old_branch.into(), Some(start_epoch));
+    scm.remote_branches
+        .insert(new_branch.into(), Some(start_epoch));
+
+    // Seed bead older than 3 hours (autonomy_secs = 12000 > 10800) parked HUMAN_HELD
+    store.overlays.borrow_mut().insert(
+        "bead-replay".into(),
+        BeadOverlay {
+            bead_id: "bead-replay".into(),
+            state: OverlayState::HumanHeld,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 12000,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some(old_branch.into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: Some("autonomy_timebox_exceeded".into()),
+            target_repo: Some("owner/repo".into()),
+            attempt_started_at: None,
+        },
+    );
+    store.register_branch("bead-replay", old_branch).unwrap();
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_regression_replay_timebox.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let vcs = test_vcs();
+
+    // 1. Tick 0 (slow tier due): recover_human_held recovers bead to QUEUED (attempt 2).
+    {
+        let deps = TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        };
+
+        let summary0 = run_tick(&deps, 0, 10).expect("tick 0 should succeed");
+        assert_eq!(
+            summary0.beads_recovered_from_held, 1,
+            "bead should be recovered from HUMAN_HELD"
+        );
+    }
+
+    let o0 = store.load("bead-replay").unwrap().unwrap();
+    assert_eq!(o0.state, OverlayState::Queued);
+    assert_eq!(o0.attempt, 2);
+    assert_eq!(o0.autonomy_secs, 0);
+    assert_eq!(o0.attempt_started_at, None);
+
+    // 2. Tick 6 (slow tier due): dispatch runs and dispatches the freshly QUEUED bead to DISPATCHED.
+    {
+        let deps = TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        };
+
+        let summary6 = run_tick(&deps, 6, 10).expect("tick 6 should succeed");
+        assert_eq!(
+            summary6.beads_dispatched, 1,
+            "bead should be dispatched on the next slow tick"
+        );
+    }
+
+    let o1 = store.load("bead-replay").unwrap().unwrap();
+    assert_eq!(o1.state, OverlayState::Dispatched);
+    assert_eq!(o1.attempt, 2);
+    assert_eq!(o1.autonomy_secs, 0, "autonomy_secs must be reset to 0 upon dispatch");
+    assert!(
+        o1.attempt_started_at.is_some(),
+        "attempt_started_at must be stamped upon dispatch"
+    );
+
+    // 3. Active beyond 60 seconds (65s elapsed on attempt 2, fast tick 7):
+    // Update commit time so silence check doesn't trip
+    scm.remote_branches
+        .insert(new_branch.into(), Some(start_epoch + 65));
+
+    {
+        let deps = TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        };
+
+        let summary7 = run_tick(&deps, 7, 65).expect("tick 7 should succeed");
+        assert_eq!(
+            summary7.beads_parked_human_held, 0,
+            "a freshly redispatched bead must NOT immediately park at 65s despite >3h historical lifetime"
+        );
+    }
+
+    let o2 = store.load("bead-replay").unwrap().unwrap();
+    assert_eq!(
+        o2.state,
+        OverlayState::Dispatched,
+        "bead must remain active (Dispatched) past 60 seconds"
+    );
+
+    // 4. Current attempt genuinely over budget (e.g. attempt_started_at was > 10800s ago, fast tick 8):
+    // Simulate attempt exceeding 10800s timebox
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if let Some(overlay) = store.overlays.borrow_mut().get_mut("bead-replay") {
+        overlay.attempt_started_at = Some(now_epoch.saturating_sub(10805));
+    }
+
+    {
+        let deps = TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        };
+
+        let summary8 = run_tick(&deps, 8, 10).expect("tick 8 should succeed");
+        assert_eq!(
+            summary8.beads_parked_human_held, 1,
+            "a genuinely over-budget current attempt MUST park"
+        );
+    }
+
+    let o3 = store.load("bead-replay").unwrap().unwrap();
+    assert_eq!(o3.state, OverlayState::HumanHeld);
+    assert_eq!(
+        o3.park_reason.as_deref(),
+        Some("autonomy_timebox_exceeded")
+    );
+    assert!(
+        o3.session_id.is_none(),
+        "park must clear session_id handle to avoid stranding"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("PARKED_HUMAN_HELD"),
+        "telemetry must contain PARKED_HUMAN_HELD; got:\n{telemetry}"
+    );
+    assert!(
+        telemetry.contains("\"reason\":\"autonomy_timebox_exceeded\""),
+        "telemetry must contain reason autonomy_timebox_exceeded"
+    );
+    assert!(
+        telemetry.contains("\"attempt_id\":2"),
+        "telemetry must record attempt_id 2"
+    );
+    assert!(
+        telemetry.contains("\"elapsed_secs\":"),
+        "telemetry must record elapsed_secs"
+    );
+    assert!(
+        telemetry.contains("\"deadline"),
+        "telemetry must record deadline"
+    );
+    assert!(
+        telemetry.contains("\"observed_at\":"),
+        "telemetry must record observed_at"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}

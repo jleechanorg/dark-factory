@@ -210,15 +210,14 @@ dispatch-record)
   if [ -n "$owner" ] && [ "$owner" != "$2" ]; then
     die_code $EX_BRANCH_CONFLICT "branch $3 already registered to $owner"
   fi
-  # CR-7: capture INSERT/UPDATE errors so missing tables / corrupt DBs surface
-  # as EX_IO instead of silently leaving state inconsistent. The `sql` helper
-  # runs sqlite3 directly; without an explicit error capture, sqlite errors go
-  # to stderr and the script exits 0.
+  prior_autonomy="$(get_field "$2" autonomy_secs)"
+  [[ "$prior_autonomy" =~ ^[0-9]+$ ]] || prior_autonomy=0
   sql_err="$(mktemp -t factory_overlay_err.XXXXXX)"
   set +e
+  now_epoch="$(date +%s)"
   sql "INSERT INTO branch_registry (branch,bead_id,created_at)
        VALUES ('$(q "$3")','$(q "$2")','$(now)') ON CONFLICT(branch) DO NOTHING;
-       UPDATE bead_overlay SET state='DISPATCHED', branch='$(q "$3")', updated_at='$(now)'
+       UPDATE bead_overlay SET state='DISPATCHED', branch='$(q "$3")', autonomy_secs=0, attempt_started_at=$now_epoch, updated_at='$(now)'
        WHERE bead_id='$(q "$2")';" 2>"$sql_err"
   sql_rc=$?
   set -e
@@ -229,7 +228,7 @@ dispatch-record)
   fi
   rm -f "$sql_err"
   cur_attempt="$(get_field "$2" attempt)"
-  emit "$2" "$cur_attempt" DISPATCHED TASK_DISPATCHED "{\"activeModel\":\"minimax\",\"branch\":$(js "$3")}"
+  emit "$2" "$cur_attempt" DISPATCHED TASK_DISPATCHED "{\"activeModel\":\"minimax\",\"branch\":$(js "$3"),\"prior_autonomy_secs\":$prior_autonomy}"
   echo "ok"
   ;;
 
@@ -533,7 +532,7 @@ redrive-pr)
   [[ "$attempt" =~ ^[0-9]+$ ]] || attempt=1
   sql "INSERT INTO bead_overlay (bead_id,state,attempt,pr_number,branch,is_adopted,updated_at)
        VALUES ('$bid','QUEUED',$attempt,$pr,'$branch',1,'$(now)')
-       ON CONFLICT(bead_id) DO UPDATE SET state='QUEUED', attempt=$attempt, pr_number=$pr, branch='$branch', is_adopted=1, session_id=NULL, autonomy_secs=0, updated_at='$(now)';"
+       ON CONFLICT(bead_id) DO UPDATE SET state='QUEUED', attempt=$attempt, pr_number=$pr, branch='$branch', is_adopted=1, session_id=NULL, autonomy_secs=0, attempt_started_at=NULL, updated_at='$(now)';"
   ctx="$(python3 -c 'import json,sys; print(json.dumps({"pr_number":int(sys.argv[1]),"branch":sys.argv[2]}))' "$pr" "$4")"
   emit "$2" "$attempt" QUEUED REDRIVE_RESET "$ctx"
   echo "redriven $2 PR #$pr"

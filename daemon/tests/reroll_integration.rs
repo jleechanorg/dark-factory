@@ -3450,3 +3450,88 @@ fn test_reroll_quiescence_head_probe_transient_failure_never_escalates() {
     std::fs::remove_dir_all(spec_dir).ok();
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+#[test]
+fn reroll_adopted_resets_active_autonomy_secs_and_stamps_attempt_started_at() {
+    let spec_dir = std::env::temp_dir().join("afd_spec_dir_adopted_autonomy");
+    std::fs::create_dir_all(&spec_dir).unwrap();
+    let mut cfg = test_cfg();
+    cfg.spec_dir = spec_dir.to_string_lossy().to_string();
+
+    let scm = FakeScm::new();
+    let sessions = FakeSessions::new();
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert(
+        "alice/my-cool-feature".into(),
+        "pre-session-sha-abc123".into(),
+    );
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    let telemetry_log = std::env::temp_dir().join("afd_telemetry_adopted_autonomy.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let mut bead = BeadOverlay {
+        bead_id: "bead-adopted-autonomy".into(),
+        state: OverlayState::Attested,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 5400,
+        spend_usd: 0.0,
+        pr_number: Some(777),
+        branch: Some("alice/my-cool-feature".into()),
+        session_id: None,
+        is_adopted: true,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: None,
+        attempt_started_at: None,
+    };
+    store.save(&bead).unwrap();
+    store
+        .register_branch("bead-adopted-autonomy", "alice/my-cool-feature")
+        .unwrap();
+
+    let deps = RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "verifier".into(),
+        review_text: "CI check-run(s) not all success".into(),
+    };
+
+    let outcome = reroll::execute(&deps, &mut bead).unwrap();
+    assert!(matches!(outcome, RerollOutcome::Rerolled { .. }));
+
+    // Assert bead has fresh attempt clock and reset autonomy_secs
+    assert_eq!(bead.attempt, 2);
+    assert_eq!(
+        bead.autonomy_secs, 0,
+        "active autonomy_secs must be reset to 0 upon adopted reroll"
+    );
+    assert!(
+        bead.attempt_started_at.is_some(),
+        "attempt_started_at must be stamped upon adopted reroll"
+    );
+
+    let saved = store.load("bead-adopted-autonomy").unwrap().unwrap();
+    assert_eq!(saved.autonomy_secs, 0);
+    assert!(saved.attempt_started_at.is_some());
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("REROLL_ADOPTED_SESSION_SPAWNED"),
+        "telemetry must record REROLL_ADOPTED_SESSION_SPAWNED; got:\n{telemetry}"
+    );
+    assert!(
+        telemetry.contains("\"priorAutonomySeconds\":5400"),
+        "telemetry must capture prior cumulative autonomy seconds before reset"
+    );
+
+    std::fs::remove_dir_all(spec_dir).ok();
+    let _ = std::fs::remove_file(&telemetry_log);
+}

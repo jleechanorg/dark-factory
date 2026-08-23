@@ -118,6 +118,9 @@ pub struct DispatchSuccess {
     /// Surfaced so `tick.rs`'s `TASK_DISPATCHED` telemetry records which
     /// mode fired.
     pub branch_mode: &'static str,
+    /// Prior `autonomy_secs` captured before resetting active clock to 0
+    /// (bead bze8.3 / issue #330). Surfaced for telemetry and metrics.
+    pub prior_autonomy_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -962,6 +965,7 @@ pub fn dispatch_ready_with_vcs(
         // cumulative column is preserved (and continues to be bumped
         // per-tick) so historical reporting still works; the timebox check
         // is the one place that reads the anchor instead.
+        let prior_autonomy_secs = overlay.autonomy_secs;
         let now_epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1008,6 +1012,7 @@ pub fn dispatch_ready_with_vcs(
             session_id: session_id.0,
             target_repo: repo,
             branch_mode,
+            prior_autonomy_secs,
         });
     }
 
@@ -1772,10 +1777,30 @@ mod tests {
                     overlay.state = OverlayState::Queued;
                     overlay.attempt += 1;
                     overlay.autonomy_secs = 0;
+                    overlay.attempt_started_at = None;
                     recovered.push(overlay.clone());
                 }
             }
             Ok(recovered)
+        }
+
+        fn stamp_attempt_started_at(
+            &self,
+            bead_id: &str,
+            now_epoch: u64,
+        ) -> Result<(), DaemonError> {
+            if let Some(overlay) = self.overlays.borrow_mut().get_mut(bead_id) {
+                overlay.attempt_started_at = Some(now_epoch);
+                overlay.autonomy_secs = 0;
+            }
+            Ok(())
+        }
+
+        fn clear_attempt_started_at(&self, bead_id: &str) -> Result<(), DaemonError> {
+            if let Some(overlay) = self.overlays.borrow_mut().get_mut(bead_id) {
+                overlay.attempt_started_at = None;
+            }
+            Ok(())
         }
 
         fn human_held_at_or_above_attempt(
@@ -4442,6 +4467,54 @@ mod tests {
         assert!(
             overlay.park_reason.is_none(),
             "matching cwd must not park the bead"
+        );
+    }
+
+    /// Bead bze8.3 / issue #330: dispatch reservation captures prior cumulative
+    /// autonomy seconds into the DispatchSuccess report and resets active
+    /// `autonomy_secs = 0` while stamping `attempt_started_at`.
+    #[test]
+    fn dispatch_reservation_captures_prior_autonomy_secs_in_success_report_and_resets_clock() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        // Pre-seed bead-0 with prior autonomy time
+        let overlay = BeadOverlay {
+            bead_id: "bead-0".into(),
+            state: OverlayState::Queued,
+            attempt: 2,
+            reroll_count: 0,
+            autonomy_secs: 4500,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: None,
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: Some("owner/repo".into()),
+            attempt_started_at: None,
+        };
+        store.save(&overlay).unwrap();
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        assert_eq!(report.successes.len(), 1);
+        assert_eq!(
+            report.successes[0].prior_autonomy_secs, 4500,
+            "DispatchSuccess must capture prior cumulative autonomy seconds"
+        );
+
+        let dispatched = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(
+            dispatched.autonomy_secs, 0,
+            "active autonomy_secs must be reset to 0 upon dispatch"
+        );
+        assert!(
+            dispatched.attempt_started_at.is_some(),
+            "attempt_started_at must be stamped upon dispatch"
         );
     }
 }
