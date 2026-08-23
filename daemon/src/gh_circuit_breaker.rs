@@ -452,7 +452,7 @@ impl GhCircuitBreaker {
     pub fn force_open(&self, duration: Duration, reason: &str) {
         let mut lock = self.inner.lock().unwrap();
         let now = now_epoch();
-        let cooldown_secs = duration.as_secs().max(1).min(MAX_COOLDOWN_SECS);
+        let cooldown_secs = duration.as_secs().clamp(1, MAX_COOLDOWN_SECS);
         lock.consecutive_rate_limits = lock.consecutive_rate_limits.saturating_add(1);
         let new_deadline = now + cooldown_secs;
         let was_open = lock.is_open;

@@ -84,9 +84,8 @@ fn feedback_hash(text: &str) -> String {
 ///   - `expect_escalated`: the chain is exhausted (or otherwise cannot
 ///     rotate), so the breaker should still emit
 ///     `CIRCUIT_BREAKER_ESCALATED` and return
-///     `RerollOutcome::Held(CIRCUIT_BREAKER_PARK_REASON)`.
-/// `expect_spec_fire` is the independently assigned semantic ground truth
-/// (matches the spec §4.2.6 "same semantic rejection reason" language).
+///   - `expect_spec_fire`: the independently assigned semantic ground truth
+///     (matches the spec §4.2.6 "same semantic rejection reason" language).
 struct CbCase {
     id: &'static str,
     group: &'static str,
