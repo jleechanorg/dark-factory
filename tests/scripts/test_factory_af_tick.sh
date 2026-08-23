@@ -199,11 +199,17 @@ while IFS=\$'\t' read -r bead_id pr branch bead_repo; do
 
   # Resolve AO project for this repo from config
   proj="\$(python3 - "\$CONFIG" "\$repo" <<'PY'
-import sys, toml
+import sys
 config_path = sys.argv[1]
 target_repo = sys.argv[2]
 try:
-    cfg = toml.load(config_path)
+    try:
+        import tomllib
+        with open(config_path, "rb") as f:
+            cfg = tomllib.load(f)
+    except ImportError:
+        import toml
+        cfg = toml.load(config_path)
 except Exception:
     cfg = {}
 
@@ -361,6 +367,33 @@ assert "bead-df state=DISPATCHED" "DISPATCHED" "$state_df"
 # Verify fake-R calls passed the correct repo and project to factory-ao-remediate.sh
 assert_grep "remediate bead-wa on WA project" "called:.*bead_id=bead-wa pr=56 repo=jleechanorg/worldarchitect.ai proj=worldarchitect" /tmp/test-af-tick-fake-r.log
 assert_grep "remediate bead-df on DF project" "called:.*bead_id=bead-df pr=56 repo=jleechanorg/dark-factory proj=dark-factory" /tmp/test-af-tick-fake-r.log
+
+# ---------------------------------------------------------------------------
+# Test 8: Fail-closed AO probe in factory-af-tick.sh
+# Verify that factory-af-tick.sh terminates nonzero (rc=11) when AO probe fails
+# ---------------------------------------------------------------------------
+fresh_db failclosed
+BROKEN_AO="$SCRATCH_DIR/broken-ao.sh"
+cat > "$BROKEN_AO" <<'BROKEN_AO_EOF'
+#!/usr/bin/env bash
+exit 127
+BROKEN_AO_EOF
+chmod +x "$BROKEN_AO"
+
+FAKE_INTAKE="$SCRATCH_DIR/fake-intake.sh"
+cat > "$FAKE_INTAKE" <<'FAKE_INTAKE_EOF'
+#!/usr/bin/env bash
+exit 0
+FAKE_INTAKE_EOF
+chmod +x "$FAKE_INTAKE"
+
+set +e
+AFD_INTAKE_BIN="$FAKE_INTAKE" AFD_SKIP_DRIFT_CHECK=1 AO_BIN="$BROKEN_AO" bash "$ROOT/daemon/factory-af-tick.sh" >"$SCRATCH_DIR/broken-ao.log" 2>&1
+broken_rc=$?
+set -e
+
+assert "factory-af-tick.sh exits 11 on broken/unreachable AO probe" "11" "$broken_rc"
+assert_grep "factory-af-tick.sh surfaces AO unreachable refusal" "AO CLI is unavailable or unreachable" "$SCRATCH_DIR/broken-ao.log"
 
 echo
 echo "=== RESULTS: $PASS passed, $FAIL failed ==="

@@ -223,14 +223,19 @@ if [ -z "${AO_PROJECT:-}" ] || [[ ! "$AO_PROJECT" =~ ^[A-Za-z0-9._-]+$ ]]; then
     echo "[af] WARN: AFD_AO_PROJECT='${AO_PROJECT:-}' is empty or malformed; defaulting to 'worldarchitect'" >&2
     AO_PROJECT="worldarchitect"
 fi
-if [ -n "$AO" ]; then
-    # CR: scope the --json probe to $AO_PROJECT the same way the non-JSON
-    # fallback below does (`-p "$AO_PROJECT"`). Without -p here, a successful
-    # --json call would count sessions across ALL AO projects, inflating
-    # ao_active and falsely tripping AO_MAX_CONCURRENT_SESSIONS for
-    # deployments using a non-default AFD_AO_PROJECT.
-    if "$AO" session ls -p "$AO_PROJECT" --json >/dev/null 2>&1; then
-        ao_active="$("$AO" session ls -p "$AO_PROJECT" --json 2>/dev/null | python3 -c '
+
+if [ -z "$AO" ] || [ ! -x "$AO" ] || (! timeout 5 "$AO" --version >/dev/null 2>&1 && ! timeout 5 "$AO" status >/dev/null 2>&1); then
+    echo "factory-af-tick: REFUSING TICK — AO CLI is unavailable or unreachable (probe failed, fail-closed)." >&2
+    exit 11
+fi
+
+# CR: scope the --json probe to $AO_PROJECT the same way the non-JSON
+# fallback below does (`-p "$AO_PROJECT"`). Without -p here, a successful
+# --json call would count sessions across ALL AO projects, inflating
+# ao_active and falsely tripping AO_MAX_CONCURRENT_SESSIONS for
+# deployments using a non-default AFD_AO_PROJECT.
+if timeout 5 "$AO" session ls -p "$AO_PROJECT" --json >/dev/null 2>&1; then
+    ao_active="$(timeout 5 "$AO" session ls -p "$AO_PROJECT" --json 2>/dev/null | python3 -c '
 import json,sys
 try:
     d = json.load(sys.stdin)
@@ -242,17 +247,16 @@ try:
     print(sum(1 for s in sessions if isinstance(s, dict) and not s.get("isTerminated")))
 except Exception:
     print(0)' 2>/dev/null || echo 0)"
-    else
-        ao_active="$("$AO" session ls -p "$AO_PROJECT" 2>/dev/null | rg -c '\[(spawning|running|active|working|pr_open)\]' || echo 0)"
-    fi
-    # Ensure ao_active is a non-negative integer (defensive: rg/race could leave empty)
-    case "${ao_active:-0}" in
-        ''|*[!0-9]*) ao_active=0 ;;
-    esac
-    if [ "${ao_active:-0}" -ge "$AO_CAP" ]; then
-        echo "[af] AO cap: ${ao_active} active >= ${AO_CAP} — skipping dispatch (intake done)" >&2
-        MAX_DISPATCH=0
-    fi
+else
+    ao_active="$(timeout 5 "$AO" session ls -p "$AO_PROJECT" 2>/dev/null | rg -c '\[(spawning|running|active|working|pr_open)\]' || echo 0)"
+fi
+# Ensure ao_active is a non-negative integer (defensive: rg/race could leave empty)
+case "${ao_active:-0}" in
+    ''|*[!0-9]*) ao_active=0 ;;
+esac
+if [ "${ao_active:-0}" -ge "$AO_CAP" ]; then
+    echo "[af] AO cap: ${ao_active} active >= ${AO_CAP} — skipping dispatch (intake done)" >&2
+    MAX_DISPATCH=0
 fi
 
 # ---------- build SELECT filters (no SQL injection; values validated above) ----------
@@ -308,11 +312,17 @@ while IFS='|' read -r bead_id pr branch bead_repo; do
 
     # Resolve AO project for this repo from config
     proj="$(python3 - "$CONFIG" "$repo" <<'PY'
-import sys, toml
+import sys
 config_path = sys.argv[1]
 target_repo = sys.argv[2]
 try:
-    cfg = toml.load(config_path)
+    try:
+        import tomllib
+        with open(config_path, "rb") as f:
+            cfg = tomllib.load(f)
+    except ImportError:
+        import toml
+        cfg = toml.load(config_path)
 except Exception:
     cfg = {}
 
@@ -347,7 +357,7 @@ PY
         continue
     fi
 
-    if [ -n "$AO" ] && "$AO" session ls -p "$proj" 2>/dev/null | rg "pulls/${pr}\\b" | rg -q '\[(spawning|running|active|working|pr_open)\]'; then
+    if timeout 5 "$AO" session ls -p "$proj" 2>/dev/null | rg "pulls/${pr}\b" | rg -q '\[(spawning|running|active|working|pr_open)\]'; then
         echo "[af] skip $bead_id PR #$pr (active session exists in project $proj)" >&2
         continue
     fi
