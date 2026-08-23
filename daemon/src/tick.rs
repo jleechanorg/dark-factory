@@ -588,6 +588,46 @@ fn kill_session_and_clear_handle(deps: &TickDeps, overlay: &mut BeadOverlay) {
             // recover_human_held and any operator-driven requeue without
             // risking a duplicate worker or AO dedup collision.
             overlay.session_id = None;
+            // Bead rev-3lm8k: the session is now provably dead, so its
+            // AO-managed worktree dir (if any) is stale immediately — do
+            // not wait for the TTL sweep. `clean_stale_worktree` is a
+            // no-op when `agent_worktree_root` is unset (legacy layout).
+            match crate::worktree_reaper::clean_stale_worktree(
+                deps.cfg,
+                overlay.repo(deps.cfg),
+                &session_id_str,
+            ) {
+                Ok(true) => {
+                    let _ = emit(
+                        deps.telemetry_log,
+                        &overlay.bead_id,
+                        overlay.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "WORKTREE_CLEANED_ON_SESSION_EXIT",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "session_id": session_id_str,
+                            "phase": "park_transition",
+                        }),
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    let _ = emit(
+                        deps.telemetry_log,
+                        &overlay.bead_id,
+                        overlay.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "WORKTREE_CLEAN_FAILED",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "session_id": session_id_str,
+                            "error": format!("{e:?}"),
+                            "phase": "park_transition",
+                        }),
+                    );
+                }
+            }
         }
         Err(stop_err) => {
             // Stop failed: the session may still be live. RETAIN the handle
@@ -4193,8 +4233,49 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 if ready_to_promote {
                     // Reap completed worker session to immediately release AO worker slot
                     if let Some(session_id_str) = overlay.session_id.take() {
-                        let sid = SessionId(session_id_str);
+                        let sid = SessionId(session_id_str.clone());
                         let _ = deps.sessions.stop(&sid);
+                        // Bead rev-3lm8k: the coder session has finished and
+                        // is being reaped right here — its AO-managed
+                        // worktree dir (if any) is stale immediately, so
+                        // clean it now rather than waiting on the next TTL
+                        // sweep (a no-op when `agent_worktree_root` is
+                        // unset). This is the exact "coder session exit"
+                        // moment the bead's incident describes: a leftover
+                        // worktree dir blocking every subsequent dispatch
+                        // hashing to the same orchestrator branch.
+                        match crate::worktree_reaper::clean_stale_worktree(
+                            deps.cfg,
+                            overlay.repo(deps.cfg),
+                            &session_id_str,
+                        ) {
+                            Ok(true) => {
+                                let _ = emit(
+                                    deps.telemetry_log,
+                                    bead_id,
+                                    overlay.attempt,
+                                    OverlayState::Attested.as_str(),
+                                    "WORKTREE_CLEANED_ON_SESSION_EXIT",
+                                    serde_json::json!({}),
+                                    serde_json::json!({"session_id": session_id_str}),
+                                );
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                let _ = emit(
+                                    deps.telemetry_log,
+                                    bead_id,
+                                    overlay.attempt,
+                                    OverlayState::Attested.as_str(),
+                                    "WORKTREE_CLEAN_FAILED",
+                                    serde_json::json!({}),
+                                    serde_json::json!({
+                                        "session_id": session_id_str,
+                                        "error": format!("{e:?}"),
+                                    }),
+                                );
+                            }
+                        }
                     }
                     // A positive branch-to-open-PR binding is the durable
                     // boundary between the deferred old attempt and this
