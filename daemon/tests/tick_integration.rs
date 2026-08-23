@@ -13632,6 +13632,11 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
         }
     }
 
+    let prev_chain = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok();
+    unsafe {
+        std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "");
+    }
+
     // Three distinct beads, each with a capped snapshot. The N-of-M
     // detector requires 3 distinct bead_ids to flip the vendor to
     // Capped. We script the FakeScm to return the same capped
@@ -13836,6 +13841,13 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
         log.contains("coderabbit:waived_vendor_unavailable"),
         "VENDOR_WAIVED telemetry must contain the canonical waiver token; log:\n{log}"
     );
+
+    unsafe {
+        match prev_chain {
+            Some(v) => std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", v),
+            None => std::env::remove_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN"),
+        }
+    }
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
