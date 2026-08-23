@@ -404,7 +404,11 @@ while read -r num branch; do
     [ "$_mergeable" = "true" ] || { echo "PR $num: not MERGEABLE (conflicts) — skip"; continue; }
   fi
   echo "PR $num: gates red-free + mergeable — merging"
-  GH_REPO="$REPO" "$(dirname "${BASH_SOURCE[0]}")/gh-pr-merge-wrapper.sh" "$num" --squash 2>&1 | tail -2
+  # bead rev-377j4: attribute the merge-provenance JSONL line (written by
+  # gh-pr-merge-wrapper.sh, the sole caller of `gh pr merge`) to this
+  # automated timer path rather than the "manual-wrapper-invocation"
+  # default a direct/manual wrapper call would get.
+  AMG_TRIGGERING_MECHANISM="auto-merge-guard.sh" GH_REPO="$REPO" "$(dirname "${BASH_SOURCE[0]}")/gh-pr-merge-wrapper.sh" "$num" --squash 2>&1 | tail -2
   sleep 3
   if [ "$USE_GRAPHQL" -eq 1 ]; then
     _merged_state="$(gh pr view "$num" --repo "$REPO" --json state --jq .state 2>/dev/null)"
