@@ -248,6 +248,18 @@ Check in THIS order — each layer can silently starve the ones below (2026-07-0
 
 Design rule: any queue between the daemon and AO must have dedup (one pending request per bead+attempt), TTL, depth telemetry, and a flush command. A queue with an unbounded producer and a stallable consumer is an outage timer.
 
+## Automation script config convention (empty-by-default, fail closed)
+
+Any new `daemon/scripts/auto-*.sh` or `daemon/scripts/*-merge-*.sh` script
+that performs an irreversible/outward-facing action (merge, push, delete,
+publish) must ship a matching `config/*_allowlist.json` with an **empty**
+default list — fail closed, not fail open. See
+[docs/automation-config-convention.md](docs/automation-config-convention.md)
+for the full rule (canonical example: `config/auto_merge_repo_allowlist.json`,
+from the 2026-08-23 PR-merge-storm incident). CI enforces it via
+`scripts/check_auto_script_configs.sh` (run locally with no args to dry-run
+against the real `daemon/scripts/`).
+
 ## Pipeline authoring rules
 
 1. `.dot` files are first-class — version them, review them in PRs.
