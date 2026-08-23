@@ -14421,17 +14421,16 @@ fn test_non_default_repository_labeled_pr_tick_telemetry_attribution() {
         updated_at_epoch: Some(1_700_000_000),
     });
     scm.permissions.insert("jleechan2015".into(), Permission::Write);
-    scm.pr_snapshots.insert(
+    let mut snapshot = qdw_green_snapshot(
         8843,
-        qdw_green_snapshot(
-            8843,
-            vec![PrComment {
-                author: "dark-factory-er".into(),
-                body: "/er PASS".into(),
-                created_at_epoch: 0,
-            }],
-        ),
+        vec![PrComment {
+            author: "dark-factory-er".into(),
+            body: "/er PASS".into(),
+            created_at_epoch: 0,
+        }],
     );
+    snapshot.ci_pending = true;
+    scm.pr_snapshots.insert(8843, snapshot);
 
     let tracker = FakeTracker::new();
     let sessions = FakeSessions::new();
@@ -14442,11 +14441,7 @@ fn test_non_default_repository_labeled_pr_tick_telemetry_attribution() {
     cfg.target_repo = "jleechanorg/dark-factory".into();
     cfg.repos.insert(
         "jleechanorg/worldarchitect.ai".into(),
-        daemon::config::RepoConfig {
-            ao_project: "worldarchitect".into(),
-            push_remote: "origin".into(),
-            local_checkout: None,
-        },
+        test_repo_cfg("worldarchitect"),
     );
     let vcs = test_vcs();
     let telemetry_log = std::env::temp_dir().join("afd_non_default_repo_adoption.jsonl");
@@ -14577,11 +14572,7 @@ fn test_non_default_repository_branch_collision_telemetry_attribution() {
     cfg.target_repo = "jleechanorg/dark-factory".into();
     cfg.repos.insert(
         "jleechanorg/worldarchitect.ai".into(),
-        daemon::config::RepoConfig {
-            ao_project: "worldarchitect".into(),
-            push_remote: "origin".into(),
-            local_checkout: None,
-        },
+        test_repo_cfg("worldarchitect"),
     );
     let vcs = test_vcs();
     let telemetry_log = std::env::temp_dir().join("afd_non_default_collision.jsonl");
@@ -14629,6 +14620,106 @@ fn test_non_default_repository_branch_collision_telemetry_attribution() {
         context["head_sha"], "sha-8731-colliding",
         "adoption_branch_collision context must contain head_sha attribution: {context:?}"
     );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn test_non_default_repository_fork_and_ineligible_blocked_telemetry_attribution() {
+    let mut scm = FakeScm::new();
+
+    // 1. Fork PR (WorldArchitect PR 8620)
+    scm.prs.push(LabeledPr {
+        number: 8620,
+        title: "Archive combat after reward delivery".into(),
+        body: "fork combat archival".into(),
+        author_login: "mallory".into(),
+        external_ref: "jleechanorg/worldarchitect.ai#8620".into(),
+        head_ref_name: "feature/fork-combat-archival".into(),
+        is_cross_repository: true,
+        head_repo_full_name: Some("mallory/worldarchitect.ai".into()),
+        head_repo_owner_login: Some("mallory".into()),
+        head_sha: Some("ac03e4caaade1e2acd8fc870739fd7baecd655c9".into()),
+        updated_at_epoch: Some(1_700_000_000),
+    });
+    scm.permissions.insert("mallory".into(), Permission::Write);
+
+    // 2. Ineligible (Read-tier permission: WorldArchitect PR 8828)
+    scm.prs.push(LabeledPr {
+        number: 8828,
+        title: "Calculate XP progress percentage".into(),
+        body: "progress percent calculation".into(),
+        author_login: "bob-read".into(),
+        external_ref: "jleechanorg/worldarchitect.ai#8828".into(),
+        head_ref_name: "fix/rewards-progress-percent".into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("jleechanorg/worldarchitect.ai".into()),
+        head_repo_owner_login: Some("jleechanorg".into()),
+        head_sha: Some("e1ad1cbf9e65a70d064c1d4a6e2234ba570013e8".into()),
+        updated_at_epoch: Some(1_700_000_000),
+    });
+    scm.permissions.insert("bob-read".into(), Permission::Read);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+
+    let mut cfg = test_cfg();
+    cfg.target_repo = "jleechanorg/dark-factory".into();
+    cfg.repos.insert(
+        "jleechanorg/worldarchitect.ai".into(),
+        test_repo_cfg("worldarchitect"),
+    );
+    let vcs = test_vcs();
+    let telemetry_log = std::env::temp_dir().join("afd_non_default_blocked_telemetry.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        0,
+        0,
+    )
+    .expect("tick with blocked PRs should succeed and emit telemetry");
+
+    assert_eq!(summary.beads_created, 0);
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap();
+
+    // 1. Verify SKIPPED_FORK for PR 8620
+    let fork_line = telemetry
+        .lines()
+        .find(|line| line.contains("SKIPPED_FORK") && line.contains("8620"))
+        .expect("telemetry log must contain SKIPPED_FORK for PR 8620");
+    let fork_parsed: serde_json::Value = serde_json::from_str(fork_line).unwrap();
+    let fork_ctx = &fork_parsed["context"];
+    assert_eq!(fork_ctx["repo"], "jleechanorg/worldarchitect.ai");
+    assert_eq!(fork_ctx["pr_number"], 8620);
+    assert_eq!(fork_ctx["branch"], "feature/fork-combat-archival");
+    assert_eq!(fork_ctx["head_sha"], "ac03e4caaade1e2acd8fc870739fd7baecd655c9");
+    assert_eq!(fork_ctx["external_ref"], "jleechanorg/worldarchitect.ai#8620");
+
+    // 2. Verify SKIPPED_INELIGIBLE for PR 8828
+    let read_line = telemetry
+        .lines()
+        .find(|line| line.contains("SKIPPED_INELIGIBLE") && line.contains("8828"))
+        .expect("telemetry log must contain SKIPPED_INELIGIBLE for PR 8828");
+    let read_parsed: serde_json::Value = serde_json::from_str(read_line).unwrap();
+    let read_ctx = &read_parsed["context"];
+    assert_eq!(read_ctx["repo"], "jleechanorg/worldarchitect.ai");
+    assert_eq!(read_ctx["pr_number"], 8828);
+    assert_eq!(read_ctx["branch"], "fix/rewards-progress-percent");
+    assert_eq!(read_ctx["head_sha"], "e1ad1cbf9e65a70d064c1d4a6e2234ba570013e8");
+    assert_eq!(read_ctx["external_ref"], "jleechanorg/worldarchitect.ai#8828");
 
     let _ = std::fs::remove_file(&telemetry_log);
 }

@@ -2155,34 +2155,47 @@ fn non_default_repository_labeled_pr_adoption_attribution() {
 fn non_default_repository_blocked_dispositions_attribution() {
     let mut scm = FakeScm::new();
 
-    // 1. Fork PR
+    // 1. Fork PR (WorldArchitect PR 8620)
     let mut fork_pr = labeled_pr_with_cache_key(
-        8001,
+        8620,
         "mallory",
-        "feature/fork-branch",
-        "sha-fork-8001",
+        "feature/fork-combat-archival",
+        "ac03e4caaade1e2acd8fc870739fd7baecd655c9",
         1_700_000_000,
     );
-    fork_pr.external_ref = "jleechanorg/worldarchitect.ai#8001".into();
+    fork_pr.external_ref = "jleechanorg/worldarchitect.ai#8620".into();
     fork_pr.is_cross_repository = true;
     fork_pr.head_repo_full_name = Some("mallory/worldarchitect.ai".into());
     scm.prs.push(fork_pr);
     scm.permissions.insert("mallory".into(), Permission::Write);
 
-    // 2. Ineligible (Read-tier permission)
+    // 2. Ineligible (Read-tier permission: WorldArchitect PR 8828)
     let mut read_pr = labeled_pr_with_cache_key(
-        8002,
+        8828,
         "bob-read",
-        "feature/read-branch",
-        "sha-read-8002",
+        "fix/rewards-progress-percent",
+        "e1ad1cbf9e65a70d064c1d4a6e2234ba570013e8",
         1_700_000_000,
     );
-    read_pr.external_ref = "jleechanorg/worldarchitect.ai#8002".into();
+    read_pr.external_ref = "jleechanorg/worldarchitect.ai#8828".into();
     read_pr.head_repo_full_name = Some("jleechanorg/worldarchitect.ai".into());
     scm.prs.push(read_pr);
     scm.permissions.insert("bob-read".into(), Permission::Read);
 
-    // 3. Ineligible (Empty head ref)
+    // 3. Duplicate PR (WorldArchitect PR 8731 in known_refs)
+    let mut dup_pr = labeled_pr_with_cache_key(
+        8731,
+        "alice",
+        "fix/rev-ilwk7-move-modal-validators",
+        "sha-8731-colliding",
+        1_700_000_000,
+    );
+    dup_pr.external_ref = "jleechanorg/worldarchitect.ai#8731".into();
+    dup_pr.head_repo_full_name = Some("jleechanorg/worldarchitect.ai".into());
+    scm.prs.push(dup_pr);
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    // 4. Ineligible (Empty head ref)
     let mut empty_ref_pr = labeled_pr_with_cache_key(
         8003,
         "alice",
@@ -2193,9 +2206,10 @@ fn non_default_repository_blocked_dispositions_attribution() {
     empty_ref_pr.external_ref = "jleechanorg/worldarchitect.ai#8003".into();
     empty_ref_pr.head_repo_full_name = Some("jleechanorg/worldarchitect.ai".into());
     scm.prs.push(empty_ref_pr);
-    scm.permissions.insert("alice".into(), Permission::Write);
 
     let tracker = FakeTracker::new();
+    *tracker.create_bead_duplicate_of.borrow_mut() = Some("existing-8731-bead".into());
+
     let mut cfg = test_cfg();
     cfg.target_repo = "jleechanorg/dark-factory".into();
     cfg.repos.insert(
@@ -2219,26 +2233,26 @@ fn non_default_repository_blocked_dispositions_attribution() {
     .unwrap();
 
     assert_eq!(outcome.adopted.len(), 0);
-    assert_eq!(outcome.outcomes.len(), 3);
+    assert_eq!(outcome.outcomes.len(), 4);
 
     let fork_outcome = outcome
         .outcomes
         .iter()
-        .find(|o| o.external_ref == "jleechanorg/worldarchitect.ai#8001")
+        .find(|o| o.external_ref == "jleechanorg/worldarchitect.ai#8620")
         .unwrap();
     assert_eq!(fork_outcome.verdict, IntakeVerdict::SkippedFork);
     assert_eq!(
         fork_outcome.repo.as_deref(),
         Some("jleechanorg/worldarchitect.ai")
     );
-    assert_eq!(fork_outcome.pr_number, Some(8001));
-    assert_eq!(fork_outcome.branch.as_deref(), Some("feature/fork-branch"));
-    assert_eq!(fork_outcome.head_sha.as_deref(), Some("sha-fork-8001"));
+    assert_eq!(fork_outcome.pr_number, Some(8620));
+    assert_eq!(fork_outcome.branch.as_deref(), Some("feature/fork-combat-archival"));
+    assert_eq!(fork_outcome.head_sha.as_deref(), Some("ac03e4caaade1e2acd8fc870739fd7baecd655c9"));
 
     let read_outcome = outcome
         .outcomes
         .iter()
-        .find(|o| o.external_ref == "jleechanorg/worldarchitect.ai#8002")
+        .find(|o| o.external_ref == "jleechanorg/worldarchitect.ai#8828")
         .unwrap();
     assert!(matches!(
         read_outcome.verdict,
@@ -2248,9 +2262,23 @@ fn non_default_repository_blocked_dispositions_attribution() {
         read_outcome.repo.as_deref(),
         Some("jleechanorg/worldarchitect.ai")
     );
-    assert_eq!(read_outcome.pr_number, Some(8002));
-    assert_eq!(read_outcome.branch.as_deref(), Some("feature/read-branch"));
-    assert_eq!(read_outcome.head_sha.as_deref(), Some("sha-read-8002"));
+    assert_eq!(read_outcome.pr_number, Some(8828));
+    assert_eq!(read_outcome.branch.as_deref(), Some("fix/rewards-progress-percent"));
+    assert_eq!(read_outcome.head_sha.as_deref(), Some("e1ad1cbf9e65a70d064c1d4a6e2234ba570013e8"));
+
+    let dup_outcome = outcome
+        .outcomes
+        .iter()
+        .find(|o| o.external_ref == "jleechanorg/worldarchitect.ai#8731")
+        .unwrap();
+    assert_eq!(dup_outcome.verdict, IntakeVerdict::SkippedDuplicate);
+    assert_eq!(
+        dup_outcome.repo.as_deref(),
+        Some("jleechanorg/worldarchitect.ai")
+    );
+    assert_eq!(dup_outcome.pr_number, Some(8731));
+    assert_eq!(dup_outcome.branch.as_deref(), Some("fix/rev-ilwk7-move-modal-validators"));
+    assert_eq!(dup_outcome.head_sha.as_deref(), Some("sha-8731-colliding"));
 
     let empty_outcome = outcome
         .outcomes
@@ -2269,4 +2297,89 @@ fn non_default_repository_blocked_dispositions_attribution() {
     );
     assert_eq!(empty_outcome.pr_number, Some(8003));
     assert_eq!(empty_outcome.head_sha.as_deref(), Some("sha-empty-8003"));
+}
+
+#[test]
+fn non_default_repository_cross_repo_and_duplicate_isolation() {
+    let mut scm = FakeScm::new();
+
+    // 1. Dark factory repo PR #495
+    let mut df_pr = labeled_pr_with_cache_key(
+        495,
+        "alice",
+        "factory/df-495-r1",
+        "sha-df-495",
+        1_700_000_000,
+    );
+    df_pr.external_ref = "jleechanorg/dark-factory#495".into();
+    df_pr.head_repo_full_name = Some("jleechanorg/dark-factory".into());
+    scm.prs.push(df_pr);
+
+    // 2. WorldArchitect repo PR #8843
+    let mut wa_pr = labeled_pr_with_cache_key(
+        8843,
+        "jleechan2015",
+        "fix/rewards-xp-anchor-followup",
+        "9dc2c198a445450d8fe455e7d691a0492deefe2e",
+        1_700_000_000,
+    );
+    wa_pr.external_ref = "jleechanorg/worldarchitect.ai#8843".into();
+    wa_pr.head_repo_full_name = Some("jleechanorg/worldarchitect.ai".into());
+    scm.prs.push(wa_pr);
+
+    scm.permissions.insert("alice".into(), Permission::Write);
+    scm.permissions.insert("jleechan2015".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let mut cfg = test_cfg();
+    cfg.target_repo = "jleechanorg/dark-factory".into();
+    cfg.repos.insert(
+        "jleechanorg/worldarchitect.ai".into(),
+        daemon::config::RepoConfig {
+            ao_project: "worldarchitect".into(),
+            push_remote: "origin".into(),
+            local_checkout: None,
+        },
+    );
+    let mut cache = AdoptionProbeCache::new();
+
+    // First pass: both PRs adopted with exact repo attribution
+    let outcome = intake::normalize_labeled_prs_outcome(
+        &scm,
+        &tracker,
+        &cfg,
+        &mut cache,
+        1_700_000_000,
+        &test_telemetry_log(),
+    )
+    .unwrap();
+
+    assert_eq!(outcome.adopted.len(), 2);
+    let df_adopted = outcome.adopted.iter().find(|a| a.pr_number == 495).unwrap();
+    assert_eq!(df_adopted.repo, "jleechanorg/dark-factory");
+    assert_eq!(df_adopted.external_ref, "jleechanorg/dark-factory#495");
+    assert_eq!(df_adopted.head_ref_name, "factory/df-495-r1");
+    assert_eq!(df_adopted.head_sha.as_deref(), Some("sha-df-495"));
+
+    let wa_adopted = outcome.adopted.iter().find(|a| a.pr_number == 8843).unwrap();
+    assert_eq!(wa_adopted.repo, "jleechanorg/worldarchitect.ai");
+    assert_eq!(wa_adopted.external_ref, "jleechanorg/worldarchitect.ai#8843");
+    assert_eq!(wa_adopted.head_ref_name, "fix/rewards-xp-anchor-followup");
+    assert_eq!(wa_adopted.head_sha.as_deref(), Some("9dc2c198a445450d8fe455e7d691a0492deefe2e"));
+
+    // Second pass: duplicate isolation (beads exist in tracker -> newly_created is false)
+    let outcome2 = intake::normalize_labeled_prs_outcome(
+        &scm,
+        &tracker,
+        &cfg,
+        &mut cache,
+        1_700_000_000,
+        &test_telemetry_log(),
+    )
+    .unwrap();
+
+    assert_eq!(outcome2.adopted.len(), 2);
+    for a in &outcome2.adopted {
+        assert!(!a.newly_created, "second pass must identify existing beads without creating duplicates");
+    }
 }
