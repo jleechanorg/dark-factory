@@ -180,6 +180,7 @@ fn emit_telemetry(
         log_path,
         &TelemetryEvent {
             timestamp: now_iso8601(),
+            host: telemetry::local_hostname(),
             bead_id: bead_id.to_string(),
             attempt_id,
             lifecycle_state: lifecycle_state.to_string(),
