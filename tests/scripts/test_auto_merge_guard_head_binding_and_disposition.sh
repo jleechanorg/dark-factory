@@ -76,7 +76,7 @@ emit_assessment() {
 # rate_limit quota preflight (44 lines) ahead of this function, shifting
 # the range to 85..=158 — keep this range in lockstep with any future
 # edits above `latest_assessment_no_red()` in auto-merge-guard.sh.
-predicate_block="$(sed -n '85,158p' "$GUARD" | sed 's/^  //')"
+predicate_block="$(sed -n '85,157p' "$GUARD" | sed 's/^  //')"
 [ -n "$predicate_block" ] || { echo "FATAL: could not extract predicate from $GUARD"; exit 2; }
 
 run_predicate() { # <input_json> [<live_head_sha>]
@@ -156,31 +156,39 @@ set -e
 assert "canonical set minus evidence_review -> exit 1 (BLOCK)" "1" "$rc"
 
 echo
-echo "=== P1 #3 operator_disposition round-trip ==="
+echo "=== P1 #3 operator_disposition cannot bypass missing/unknown/failing gates ==="
 
-# 3a. operator_disposition=operator_approved must survive the read.
+# 3a. operator_disposition=operator_approved on all-green gates succeeds.
 emit_assessment "$FULL8" "$LIVE_HEAD" "operator_approved"
 last="$(tail -1 "$LOG")"
 set +e
 out="$(run_predicate "$last")"; rc=$?
 set -e
-assert "operator_disposition=operator_accepted -> exit 0 (round-trip ok)" "0" "$rc"
+assert "operator_disposition=operator_accepted on all-green -> exit 0 (round-trip ok)" "0" "$rc"
 
-# 3b. operator_disposition=operator_held must survive the read.
-emit_assessment "$FULL8" "$LIVE_HEAD" "operator_held"
+# 3b. operator_disposition CANNOT bypass unknown gates.
+emit_assessment '{"ci_green":"pass","no_conflicts":"pass","coderabbit":"unknown","bugbot":"pass","comments_resolved":"pass","evidence_review":"pass","skeptic":"pass","vacuous_red_green":"pass"}' "$LIVE_HEAD" "operator_approved"
 last="$(tail -1 "$LOG")"
 set +e
 out="$(run_predicate "$last")"; rc=$?
 set -e
-assert "operator_disposition=operator_held -> exit 0 (round-trip ok)" "0" "$rc"
+assert "operator_disposition with unknown gate -> exit 1 (BLOCK, no disposition bypass)" "1" "$rc"
 
-# 3c. Absent operator_disposition -> defaults to standard no-red path.
+# 3c. operator_disposition CANNOT bypass failing gates.
+emit_assessment '{"ci_green":"pass","no_conflicts":"pass","coderabbit":"fail","bugbot":"pass","comments_resolved":"pass","evidence_review":"pass","skeptic":"pass","vacuous_red_green":"pass"}' "$LIVE_HEAD" "operator_approved"
+last="$(tail -1 "$LOG")"
+set +e
+out="$(run_predicate "$last")"; rc=$?
+set -e
+assert "operator_disposition with fail gate -> exit 1 (BLOCK, no disposition bypass)" "1" "$rc"
+
+# 3d. Absent operator_disposition -> defaults to strict green path.
 emit_assessment "$FULL8" "$LIVE_HEAD" ""
 last="$(tail -1 "$LOG")"
 set +e
 out="$(run_predicate "$last")"; rc=$?
 set -e
-assert "absent operator_disposition -> exit 0 (default no-red)" "0" "$rc"
+assert "absent operator_disposition -> exit 0 (default strict green)" "0" "$rc"
 
 echo
 echo "=== RESULTS: $PASS passed, $FAIL failed ==="

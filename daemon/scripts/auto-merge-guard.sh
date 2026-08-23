@@ -149,13 +149,12 @@ fails = [k for k,v in g.items() if verdict(v) == "fail"]
 if fails:
     print("FAIL:" + ",".join(fails)); sys.exit(1)   # any fail → block
 unknowns = [k for k,v in g.items() if verdict(v) == "unknown"]
+if unknowns:
+    print("FAIL:UNKNOWNS:" + ",".join(unknowns)); sys.exit(1)
 suffix = ""
 if operator_disposition:
     suffix = " operator_disposition=" + operator_disposition
-if unknowns:
-    print("no-fail (unknowns defer: " + ",".join(unknowns) + ")" + suffix)
-else:
-    print("no-fail (all gates cleared)" + suffix)
+print("no-fail (all gates cleared)" + suffix)
 sys.exit(0)' "$live_head"
 }
 

@@ -306,9 +306,9 @@ def normalize(v, key):
             raise AssertionError(f"gate[{key}] verdict must be pass|warn|fail|unknown (or alias green|red|unknown); got {v!r}")
         return ALIAS[v]
     if isinstance(v, dict):
-        unknown_keys = set(v.keys()) - {"verdict","evidence"}
+        unknown_keys = set(v.keys()) - {"verdict", "evidence", "source_actor", "source_id", "source_url", "observed_sha", "timestamp"}
         if unknown_keys:
-            raise AssertionError(f"gate[{key}] object may only have 'verdict'+'evidence'; got {sorted(v.keys())}")
+            raise AssertionError(f"gate[{key}] object may only have 'verdict'+'evidence'+telemetry fields; got {sorted(v.keys())}")
         if "verdict" not in v:
             raise AssertionError(f"gate[{key}] object must contain 'verdict'")
         verdict = v["verdict"]

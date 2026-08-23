@@ -3824,4 +3824,100 @@ mod tests {
         // happens on a fresh cap edge.
         assert_eq!(EVT_WAIVED, "VENDOR_WAIVED");
     }
+
+    // =========================================================================
+    // PR293/PR300 Regression Tests (fail-closed exact-head 7/8-green merge authority)
+    // =========================================================================
+
+    // 1. Merged-head CHANGES_REQUESTED review is RED and blocks merge authority.
+    #[test]
+    fn pr293_merged_head_changes_requested_is_red() {
+        let mut scm = FakeScm::default();
+        let mut snap = all_green_snapshot(293);
+        snap.coderabbit_approved = false;
+        snap.coderabbit_status = "red".to_string();
+        scm.snapshots.insert(293, snap);
+
+        let cfg = test_cfg();
+        let evidence = all_green_evidence();
+
+        let report = assess(&scm, 293, &cfg.target_repo, &cfg, &evidence).unwrap();
+
+        let coderabbit = gate(&report, GateName::CodeRabbitApproved);
+        assert!(
+            matches!(coderabbit, GateResult::Red(_)),
+            "CodeRabbit CHANGES_REQUESTED must be Red, got {coderabbit:?}"
+        );
+        assert!(!coderabbit.is_green());
+        assert!(!report.all_green, "all_green must be false when CodeRabbit requested changes");
+    }
+
+    // 2. Rate-limited reviewer (no review / unknown) fails closed.
+    #[test]
+    fn pr300_rate_limited_reviewer_is_unknown_fails_closed() {
+        let mut scm = FakeScm::default();
+        let mut snap = all_green_snapshot(300);
+        snap.coderabbit_approved = false;
+        snap.coderabbit_status = "unknown".to_string();
+        scm.snapshots.insert(300, snap);
+
+        let cfg = test_cfg();
+        let evidence = all_green_evidence();
+
+        let report = assess(&scm, 300, &cfg.target_repo, &cfg, &evidence).unwrap();
+
+        let coderabbit = gate(&report, GateName::CodeRabbitApproved);
+        assert!(
+            matches!(coderabbit, GateResult::Unknown(_)),
+            "Rate-limited / absent review must be Unknown, got {coderabbit:?}"
+        );
+        assert!(!coderabbit.is_green());
+        assert!(!report.all_green, "all_green must be false when reviewer is rate-limited/unknown");
+    }
+
+    // 3. Stale-SHA PASS (prior commit approved, but current head has no review) fails closed.
+    #[test]
+    fn pr300_stale_sha_pass_fails_closed() {
+        let mut scm = FakeScm::default();
+        let mut snap = all_green_snapshot(301);
+        snap.coderabbit_approved = false;
+        snap.coderabbit_status = "unknown".to_string();
+        scm.snapshots.insert(301, snap);
+
+        let cfg = test_cfg();
+        let evidence = all_green_evidence();
+
+        let report = assess(&scm, 301, &cfg.target_repo, &cfg, &evidence).unwrap();
+
+        let coderabbit = gate(&report, GateName::CodeRabbitApproved);
+        assert!(
+            matches!(coderabbit, GateResult::Unknown(_)),
+            "Stale-SHA approval must not approve current head; expected Unknown, got {coderabbit:?}"
+        );
+        assert!(!coderabbit.is_green());
+        assert!(!report.all_green, "all_green must be false when approval is on a stale SHA");
+    }
+
+    // 4. Status context / check-run without formal review fails closed (not an approval).
+    #[test]
+    fn pr300_status_context_without_review_fails_closed() {
+        let mut scm = FakeScm::default();
+        let mut snap = all_green_snapshot(302);
+        snap.coderabbit_approved = false;
+        snap.coderabbit_status = "unknown".to_string();
+        scm.snapshots.insert(302, snap);
+
+        let cfg = test_cfg();
+        let evidence = all_green_evidence();
+
+        let report = assess(&scm, 302, &cfg.target_repo, &cfg, &evidence).unwrap();
+
+        let coderabbit = gate(&report, GateName::CodeRabbitApproved);
+        assert!(
+            matches!(coderabbit, GateResult::Unknown(_)),
+            "Status context without formal review must not approve; expected Unknown, got {coderabbit:?}"
+        );
+        assert!(!coderabbit.is_green());
+        assert!(!report.all_green, "all_green must be false when formal review is absent");
+    }
 }
