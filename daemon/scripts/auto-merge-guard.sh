@@ -23,6 +23,46 @@ LOG="${AFD_LOG:-$HOME/Library/Logs/dark-factory/daemon.jsonl}"
 H="daemon/factory-overlay.sh"
 MAX_PER_HOUR="${1:-8}"
 
+# --- Repo auto-merge policy gate (2026-08-23 PR-merge-storm incident) ---
+# HARD DENY, not merely absent-from-allowlist: jleechanorg/worldarchitect.ai
+# must NEVER be auto-merged by this script regardless of config content.
+# Incident: 2026-08-23, a burst of unattended worldai merges (42 PRs in 12h,
+# most with no literal human MERGE APPROVED at time of merge) produced real
+# production regressions (PATCH /api/campaigns/<id> whitelist stripped,
+# context-compression pruning wiped). Root cause of THAT specific burst was
+# never conclusively pinned to one mechanism, but this script — the one
+# dark-factory component whose literal job is "merge-authority policy gate"
+# — had zero human-approval step for ANY repo it might ever run against.
+# This hard-denies the one repo where regressions are user-facing/production;
+# other repos still require the ALLOW list below (fail-closed default).
+if [ "$REPO" = "jleechanorg/worldarchitect.ai" ]; then
+  echo "auto-merge-guard: HARD DENY — $REPO auto-merge is permanently disabled pending a real human-approval gate (see nextsteps-2026-08-23-pr-merge-storm-remediation.md Work Item 1). Refusing to merge anything this pass." >&2
+  exit 0
+fi
+# Fail-closed allowlist for every other repo: a config file, not a code
+# change, controls which repos this script may auto-merge in. Absence of
+# the config file, an empty list, or $REPO not present in it all mean
+# "no merges this pass" — the safe default is off, not on.
+AMG_REPO_POLICY_FILE="${AMG_REPO_POLICY_FILE:-$(git rev-parse --show-toplevel 2>/dev/null)/config/auto_merge_repo_allowlist.json}"
+if [ ! -f "$AMG_REPO_POLICY_FILE" ]; then
+  echo "auto-merge-guard: no repo allowlist config at $AMG_REPO_POLICY_FILE — refusing to merge anything this pass (fail-closed default)" >&2
+  exit 0
+fi
+_repo_allowed="$(python3 -c "
+import json, sys
+try:
+    with open('$AMG_REPO_POLICY_FILE') as f:
+        cfg = json.load(f)
+    allowed = cfg.get('allowed_repos', [])
+    print('true' if '$REPO' in allowed else 'false')
+except Exception as e:
+    print('false')
+" 2>/dev/null)"
+if [ "$_repo_allowed" != "true" ]; then
+  echo "auto-merge-guard: $REPO is not in the allowed_repos list at $AMG_REPO_POLICY_FILE — refusing to merge anything this pass (fail-closed default)" >&2
+  exit 0
+fi
+
 # --- API quota preflight (bead rev-1uno): gh pr list/view/checks all call
 # GitHub's GraphQL API internally. A GraphQL-only sweep here previously
 # drove the shared org graphql quota (user 13840161) to 0/5000, starving
