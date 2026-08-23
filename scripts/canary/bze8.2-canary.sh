@@ -158,6 +158,7 @@ export AFD_SPAWN_STATE_DIR="$OUT_DIR/spawn-states"
 export AFD_LOG_DIR="$OUT_DIR/spawn-logs"
 export CONFIG="$OUT_DIR/daemon-multirepo.toml"
 mkdir -p "$(dirname "$AFD_DB")" "$AFD_SPAWN_STATE_DIR" "$AFD_LOG_DIR"
+rm -f "$AFD_DB"
 : > "$AFD_LOG"
 : > "$T_LOG"
 
@@ -333,7 +334,7 @@ seed_row() {
     local esc_bid
     esc_bid="$(printf '%s' "$bid" | sed "s/'/''/g")"
     local ts; ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    sqlite3 "$AFD_DB" "INSERT INTO bead_overlay (bead_id, state, attempt, pr_number, branch, updated_at) VALUES ('${esc_bid}', '${state}', 1, ${pr}, 'factory/${esc_bid}-r1', '${ts}');" >/dev/null
+    sqlite3 "$AFD_DB" "INSERT OR REPLACE INTO bead_overlay (bead_id, state, attempt, pr_number, branch, updated_at) VALUES ('${esc_bid}', '${state}', 1, ${pr}, 'factory/${esc_bid}-r1', '${ts}');" >/dev/null
 }
 DISPATCHED=0; QUEUED=0
 for k in $(seq 1 38); do seed_row "stale-dispatched-$k" DISPATCHED "$((100 + k))"; DISPATCHED=$((DISPATCHED + 1)); done
