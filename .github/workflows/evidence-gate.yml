@@ -274,6 +274,25 @@ jobs:
 
           marker_line="$(echo "$pr_body" | grep -E '^\*\*Evidence\*\*:[[:space:]]+' | head -1 || true)"
 
+          # Candidate D (Lane E/F remediation): when marker is absent in PR body,
+          # also scan commit messages in the PR for the canonical evidence marker.
+          if [ -z "$marker_line" ]; then
+            base_ref="${{ github.base_ref }}"
+            if [ -n "$base_ref" ] && [ -n "$current_head_sha" ]; then
+              commit_messages="$(git log --no-pager "origin/${base_ref}...${current_head_sha}" --pretty=%B 2>/dev/null || git log --no-pager -1 "${current_head_sha}" --pretty=%B 2>/dev/null || echo "")"
+            elif [ -n "$current_head_sha" ]; then
+              commit_messages="$(git log --no-pager -1 "${current_head_sha}" --pretty=%B 2>/dev/null || echo "")"
+            else
+              commit_messages="$(git log --no-pager -1 --pretty=%B 2>/dev/null || echo "")"
+            fi
+            marker_line="$(echo "$commit_messages" | grep -E '^\*\*Evidence\*\*:[[:space:]]+' | head -1 || true)"
+            if [ -n "$marker_line" ]; then
+              echo "signal_b_marker_source=commit_message"
+            fi
+          else
+            echo "signal_b_marker_source=pr_body"
+          fi
+
           if [ -n "$marker_line" ]; then
             gist_url="$(echo "$marker_line" | grep -oE 'https://gist\.github\.com/[A-Za-z0-9_-]+/[A-Za-z0-9]+' | head -1 || true)"
             marker_sha="$(echo "$marker_line" | grep -oE 'head[[:space:]]+[0-9a-f]{7,64}' | awk '{print $2}' | head -1 || true)"

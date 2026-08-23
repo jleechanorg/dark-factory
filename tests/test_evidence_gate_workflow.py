@@ -1008,3 +1008,48 @@ def test_signal_b_content_floor(
     assert (
         _simulate_signal_b_decision(files, pr, repo, declared, current) == expected
     ), f"Signal B (bytes={sum(len(c) for _,c in files)}, declared={declared!r}) should map to {expected}"
+
+
+# ---------------------------------------------------------------------------
+# Candidate D — Evidence Gate scans commit message for **Evidence**:
+# ---------------------------------------------------------------------------
+
+
+def test_evidence_gate_workflow_scans_commit_messages_when_pr_body_marker_absent() -> None:
+    """Candidate D: when the PR body does not contain the canonical marker,
+    the workflow MUST scan commit messages (e.g. via git log) for `**Evidence**:`.
+
+    PRs #665 and #666 placed interim evidence markers in the commit message.
+    The workflow must look in both PR body and commit messages so commits
+    carrying **Evidence**: markers are recognized by Signal B.
+    """
+    text = _verdict_step_text(_load_workflow())
+    has_git_log_scan = bool(
+        re.search(r"git\s+log[^\n]*\*\*Evidence\*\*|git\s+log[^\n]*commit_messages|commit_messages=.*git\s+log", text, re.DOTALL)
+    ) or ("git log" in text and "commit_messages" in text)
+    assert has_git_log_scan, (
+        "evidence-gate.yml verdict step must scan commit messages via `git log` "
+        "when `**Evidence**:` is absent from the PR body (Candidate D from Lane E/F remediation)."
+    )
+
+
+def test_simulate_marker_extraction_from_body_or_commit_messages() -> None:
+    """Verify simulation of marker extraction across PR body and commit message."""
+    pr_body_with_marker = "Some description\n\n**Evidence**: https://gist.github.com/user/123 (head abc1234)\n"
+    pr_body_without_marker = "Some description with no evidence marker.\n"
+    commit_msg_with_marker = "feat: add feature\n\n**Evidence**: https://gist.github.com/user/456 (head def5678)\n"
+    commit_msg_without_marker = "feat: add feature without marker\n"
+
+    def extract_marker(body: str, commit_msg: str) -> str:
+        match = re.search(r"^\*\*Evidence\*\*:[ \t]+.*$", body, re.MULTILINE)
+        if match:
+            return match.group(0)
+        match_commit = re.search(r"^\*\*Evidence\*\*:[ \t]+.*$", commit_msg, re.MULTILINE)
+        if match_commit:
+            return match_commit.group(0)
+        return ""
+
+    assert "https://gist.github.com/user/123" in extract_marker(pr_body_with_marker, commit_msg_without_marker)
+    assert "https://gist.github.com/user/456" in extract_marker(pr_body_without_marker, commit_msg_with_marker)
+    assert extract_marker(pr_body_without_marker, commit_msg_without_marker) == ""
+
