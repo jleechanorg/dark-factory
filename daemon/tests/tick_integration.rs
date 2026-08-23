@@ -10759,6 +10759,8 @@ fn autonomy_timebox_park_kills_associated_ao_session_and_clears_handle() {
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
     let mut cfg = test_cfg();
+    cfg.fast_tick_secs = 10;
+    cfg.slow_tick_secs = 60;
     cfg.autonomy_timebox_secs = 3600;
 
     let now_epoch = std::time::SystemTime::now()
