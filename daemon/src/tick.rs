@@ -116,6 +116,10 @@ pub struct TickSummary {
     /// full reroll cycle by the fast-rejection path" without re-deriving
     /// from telemetry.
     pub gates_assessed_fast_rejected: usize,
+    /// Bead rev-4ou1z: coder panes woken this tick by the quota watchdog
+    /// (an armed session whose recorded Gemini quota reset time, plus the
+    /// 60s wake grace, has passed).
+    pub quota_watchdog_wakes: usize,
 }
 
 /// Bounded retry cap for the automated HUMAN_HELD exit. Matches the shell
@@ -1338,6 +1342,13 @@ pub fn run_tick(
         run_recovery_step(deps, &mut summary)?;
     }
 
+    // rev-4ou1z: slow-tier cadence matches the hours-long Gemini quota
+    // reset window — no need to poll for a wake-due session every fast
+    // tick.
+    if slow_tier_due {
+        run_quota_watchdog_wake(deps, &mut summary)?;
+    }
+
     run_fast_tier(deps, &mut summary)?;
 
     emit(
@@ -1359,6 +1370,7 @@ pub fn run_tick(
             "beadsHeldDispositionRequired": summary.beads_held_disposition_required,
             "escalationsSuppressed": summary.escalations_suppressed,
             "escalationsUndeliverable": summary.escalations_undeliverable,
+            "quotaWatchdogWakes": summary.quota_watchdog_wakes,
         }),
         serde_json::json!({"tick_index": tick_index, "slow_tier_due": slow_tier_due}),
     )?;
@@ -1580,6 +1592,65 @@ fn run_recovery_step(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), D
                 now_epoch,
             )?;
         }
+    }
+    Ok(())
+}
+
+/// Bead rev-4ou1z: quota watchdog wake sweep. Slow-tier cadence matches the
+/// hours-long Gemini quota reset window (no need to poll every fast tick).
+/// For every `(bead_id, session_id)` armed by `run_fast_tier`'s
+/// SESSION_HEALTH_FAILED handling whose recorded reset time (plus the 60s
+/// wake grace) has passed, sends an Enter keypress to the paused coder pane
+/// via `Sessions::wake_pane` — the SAME session that was paused, no
+/// respawn.
+fn run_quota_watchdog_wake(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), DaemonError> {
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Deliberately scoped to bead ids THIS store owns (same
+    // `owned_branches` walk `run_fast_tier` uses) rather than a blind sweep
+    // of the whole process-wide ledger: the ledger is a single static
+    // shared by every `TickDeps`/`StateStore` pairing in the process (see
+    // the module doc comment on `health::quota_watchdog`), so scoping the
+    // query to this store's own bead ids is what keeps two independent
+    // tick loops from reacting to each other's armed entries.
+    let branches = deps.store.owned_branches()?;
+    let mut bead_ids: Vec<String> = Vec::new();
+    for branch in &branches {
+        if let Ok(Some(bead_id)) = deps.store.bead_id_for_branch(branch) {
+            bead_ids.push(bead_id);
+        }
+    }
+    bead_ids.sort();
+    bead_ids.dedup();
+
+    for bead_id in bead_ids {
+        let Some(session_id) = crate::health::quota_watchdog::take_due_wake(&bead_id, now_epoch)
+        else {
+            continue;
+        };
+        let attempt = deps
+            .store
+            .load(&bead_id)
+            .ok()
+            .flatten()
+            .map(|o| o.attempt)
+            .unwrap_or(0);
+        let woke = deps
+            .sessions
+            .wake_pane(&SessionId(session_id.clone()))
+            .unwrap_or(false);
+        emit(
+            deps.telemetry_log,
+            &bead_id,
+            attempt,
+            OverlayState::Dispatched.as_str(),
+            "QUOTA_WATCHDOG_WOKE_PANE",
+            serde_json::json!({}),
+            serde_json::json!({"session_id": session_id, "woke": woke}),
+        )?;
+        summary.quota_watchdog_wakes += 1;
     }
     Ok(())
 }
@@ -3987,6 +4058,24 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             if let Some(ref session_id_str) = overlay.session_id {
                 let sid = SessionId(session_id_str.clone());
                 if let Ok(Some(health_failure)) = deps.sessions.check_session_health(&sid) {
+                    // rev-4ou1z: a Gemini individual-quota exhaustion is
+                    // RECOVERABLE — the paused pane just needs an Enter
+                    // keypress once its quota window resets, not a
+                    // kill+respawn cycle. A fresh spawn would hit the same
+                    // quota wall immediately, burning
+                    // `MAX_TRANSIENT_SPAWN_RETRY` in minutes against a
+                    // window that can take hours to reset (live incident:
+                    // coder wa-3538 parked HUMAN_HELD well before its quota
+                    // actually cleared). Already-armed sessions skip
+                    // straight past the SESSION_HEALTH_FAILED emit + kill
+                    // path below so the pane is left untouched for the
+                    // slow-tier wake sweep (`run_quota_watchdog_wake`).
+                    if crate::health::quota_watchdog::parse_quota_reset_duration(&health_failure)
+                        .is_some()
+                        && crate::health::quota_watchdog::recorded_reset_at(bead_id).is_some()
+                    {
+                        continue;
+                    }
                     emit(
                         deps.telemetry_log,
                         bead_id,
@@ -4000,6 +4089,34 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             "branch": overlay.branch,
                         }),
                     )?;
+                    if let Some(reset_in) =
+                        crate::health::quota_watchdog::parse_quota_reset_duration(&health_failure)
+                    {
+                        let now_epoch = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let reset_at_epoch = now_epoch.saturating_add(reset_in.as_secs());
+                        crate::health::quota_watchdog::record_quota_reset(
+                            bead_id,
+                            session_id_str,
+                            reset_at_epoch,
+                        );
+                        emit(
+                            deps.telemetry_log,
+                            bead_id,
+                            overlay.attempt,
+                            OverlayState::Dispatched.as_str(),
+                            "QUOTA_WATCHDOG_ARMED",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "session_id": session_id_str,
+                                "reason": health_failure,
+                                "reset_at_epoch": reset_at_epoch,
+                            }),
+                        )?;
+                        continue;
+                    }
                     let _ = deps.sessions.stop(&sid);
                     overlay.session_id = None;
                     if overlay.pr_number.is_none() {

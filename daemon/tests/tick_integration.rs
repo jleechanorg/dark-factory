@@ -14934,3 +14934,198 @@ fn session_health_failure_reaps_session_and_requeues_bead() {
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+/// Bead rev-4ou1z ACCEPTANCE #1: a Gemini quota-reached health failure with
+/// a parseable "Resets in Xh Ym" countdown ARMS the quota watchdog instead
+/// of killing the session — no respawn cycle burning
+/// `MAX_TRANSIENT_SPAWN_RETRY` against an hours-long reset window.
+#[test]
+fn quota_reached_health_failure_arms_watchdog_without_killing_session() {
+    // The ledger is a process-wide static (see `health::quota_watchdog`'s
+    // module doc), but every accessor is scoped by `bead_id` and this
+    // bead id is unique to this test, so no lock is needed even though
+    // `cargo test` runs many tests concurrently in this process.
+    daemon::health::quota_watchdog::clear("bead-quota-arm");
+
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_test_quota_watchdog_arm.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    store.overlays.borrow_mut().insert(
+        "bead-quota-arm".into(),
+        BeadOverlay {
+            bead_id: "bead-quota-arm".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/bead-quota-arm-r1".into()),
+            session_id: Some("wa-quota-paused".into()),
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+    store
+        .register_branch("bead-quota-arm", "factory/bead-quota-arm-r1")
+        .unwrap();
+
+    sessions.set_session_health_failure(
+        "wa-quota-paused",
+        "terminal session error in tmux pane: individual quota reached (resets in 1h 23m.)",
+    );
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 0);
+
+    let o = store.load("bead-quota-arm").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::Dispatched,
+        "quota-armed bead must stay DISPATCHED — no kill+requeue cycle"
+    );
+    assert_eq!(
+        o.session_id,
+        Some("wa-quota-paused".into()),
+        "the paused session handle must be preserved for the watchdog to wake later"
+    );
+    assert_eq!(
+        o.spawn_failure_count, 0,
+        "arming the watchdog must not burn the transient-retry budget"
+    );
+    assert!(
+        !sessions
+            .calls
+            .borrow()
+            .iter()
+            .any(|c| c.starts_with("stop(")),
+        "quota-armed session must NOT be stopped; calls={:?}",
+        sessions.calls.borrow()
+    );
+    assert!(
+        daemon::health::quota_watchdog::recorded_reset_at("bead-quota-arm").is_some(),
+        "quota watchdog ledger must record the reset time for bead-quota-arm"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("QUOTA_WATCHDOG_ARMED"),
+        "QUOTA_WATCHDOG_ARMED event must be emitted; telemetry:\n{telemetry}"
+    );
+
+    daemon::health::quota_watchdog::clear("bead-quota-arm");
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Bead rev-4ou1z ACCEPTANCE #2: once a session's recorded reset time (plus
+/// the 60s wake grace) has passed, the slow-tier quota watchdog sweep sends
+/// an Enter keypress to the SAME paused pane via `Sessions::wake_pane` — no
+/// respawn — and the ledger entry is cleared so it fires exactly once.
+#[test]
+fn quota_watchdog_wakes_paused_pane_after_reset_grace_elapses() {
+    let bead_id = "bead-quota-wake";
+    let session_id = "wa-quota-wake-paused";
+    daemon::health::quota_watchdog::clear(bead_id);
+    // Reset "long past" — real wall-clock `now_epoch` used by the wake
+    // sweep is always far greater than epoch second 1, so the 60s grace
+    // has unconditionally elapsed by the time `run_tick` runs.
+    daemon::health::quota_watchdog::record_quota_reset(bead_id, session_id, 1);
+
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_test_quota_watchdog_wake.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    store.overlays.borrow_mut().insert(
+        bead_id.into(),
+        BeadOverlay {
+            bead_id: bead_id.into(),
+            state: OverlayState::Dispatched,
+            attempt: 2,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/bead-quota-wake-r1".into()),
+            session_id: Some(session_id.into()),
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+    store
+        .register_branch(bead_id, "factory/bead-quota-wake-r1")
+        .unwrap();
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+    assert_eq!(
+        summary.quota_watchdog_wakes, 1,
+        "exactly one due wake must fire this tick"
+    );
+    assert!(
+        sessions
+            .calls
+            .borrow()
+            .iter()
+            .any(|c| c == &format!("wake_pane({session_id})")),
+        "wake_pane must be called for the armed session; calls={:?}",
+        sessions.calls.borrow()
+    );
+    assert_eq!(
+        daemon::health::quota_watchdog::recorded_reset_at(bead_id),
+        None,
+        "ledger entry must be cleared after waking so it fires exactly once"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("QUOTA_WATCHDOG_WOKE_PANE"),
+        "QUOTA_WATCHDOG_WOKE_PANE event must be emitted; telemetry:\n{telemetry}"
+    );
+
+    daemon::health::quota_watchdog::clear(bead_id);
+    let _ = std::fs::remove_file(&telemetry_log);
+}

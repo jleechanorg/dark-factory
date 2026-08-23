@@ -6356,6 +6356,11 @@ impl Sessions for CliSessions {
         check_session_health_cli(&id.0)
     }
 
+    /// Bead rev-4ou1z: real tmux implementation of the quota-watchdog wake.
+    fn wake_pane(&self, id: &SessionId) -> Result<bool, DaemonError> {
+        crate::health::quota_watchdog::wake_session_pane_cli(&id.0)
+    }
+
     /// jleechan-5ia2: `ao status --json` already reports each session's
     /// `branch` field (verified live: `ao status --json | jq '.[].branch'`).
     /// Reuse the same parsing shape as `is_quiescent` above. Any failure to
@@ -6751,6 +6756,21 @@ pub fn parse_session_health_pane(pane_content: &str) -> Option<String> {
 
     for marker in &fatal_markers {
         if pane_lower.contains(marker) {
+            // Bead rev-4ou1z: a quota-reached marker is usually followed by
+            // a "Resets in Xh Ym" countdown elsewhere on the same pane line
+            // (e.g. "Individual quota reached. Resets in 1h 23m"). Fold a
+            // short window of that text into the reason so the quota
+            // watchdog (`health::quota_watchdog::parse_quota_reset_duration`)
+            // can recover the reset time downstream — this function stays
+            // the single source of truth for what the pane says.
+            if *marker == "individual quota reached" {
+                if let Some(reset_idx) = pane_lower.find("resets in") {
+                    let tail: String = pane_lower[reset_idx..].chars().take(40).collect();
+                    return Some(format!(
+                        "terminal session error in tmux pane: {marker} ({tail})"
+                    ));
+                }
+            }
             return Some(format!("terminal session error in tmux pane: {marker}"));
         }
     }
@@ -6913,6 +6933,27 @@ mod active_session_count_tests {
 
         let healthy_sample = "test_pr_description_gate.py: 41/41 Passed (100%)\nPR URL: https://github.com/...";
         assert!(parse_session_health_pane(healthy_sample).is_none());
+    }
+
+    /// Bead rev-4ou1z: when the pane shows a "Resets in Xh Ym" countdown
+    /// alongside the quota marker, the reason string must fold it in so the
+    /// quota watchdog can recover the reset duration downstream.
+    #[test]
+    fn parse_session_health_pane_folds_quota_reset_countdown_into_reason() {
+        use super::parse_session_health_pane;
+
+        let quota_reset_sample =
+            "⚠ Individual quota reached. Resets in 1h 23m. Please upgrade your subscription.";
+        let reason = parse_session_health_pane(quota_reset_sample).unwrap();
+        assert!(reason.contains("individual quota reached"));
+        assert!(
+            reason.contains("resets in 1h 23m"),
+            "reason must carry the reset countdown; got: {reason}"
+        );
+        assert!(
+            crate::health::quota_watchdog::parse_quota_reset_duration(&reason).is_some(),
+            "the folded reason must itself be parseable by the quota watchdog; got: {reason}"
+        );
     }
 }
 
