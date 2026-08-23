@@ -9,7 +9,11 @@ pub struct SpawnBatchCleanupFailure {
 #[derive(thiserror::Error, Debug)]
 pub enum DaemonError {
     #[error("tool {tool} failed (rc={rc}): {stderr}")]
-    Tool { tool: String, rc: i32, stderr: String },
+    Tool {
+        tool: String,
+        rc: i32,
+        stderr: String,
+    },
     #[error("parse: {0}")]
     Parse(String),
     #[error("timeout: {0}")]
@@ -229,6 +233,19 @@ impl DaemonError {
         lower.contains("api rate limit exceeded")
             || lower.contains("rate limit hit")
             || (lower.contains("403") && lower.contains("rate limit"))
+    }
+
+    /// Detects GitHub's "issue has too many comments" error (issue #507).
+    /// Surfaces as `Tool { stderr }` from gh GraphQL or `Config(msg)` from tracker.
+    pub fn is_github_comment_limit(&self) -> bool {
+        const MARKERS: &[&str] = &["2500 comments", "commenting is disabled"];
+        let haystack = match self {
+            DaemonError::Tool { stderr, .. } => stderr.as_str(),
+            DaemonError::Config(msg) => msg.as_str(),
+            _ => return false,
+        };
+        let lower = haystack.to_ascii_lowercase();
+        MARKERS.iter().any(|m| lower.contains(m))
     }
 
     /// Detects `br create --external-ref ...` failing because the ref is
@@ -536,5 +553,33 @@ mod tests {
     fn is_gh_rate_limit_returns_false_for_non_tool_error() {
         let err = DaemonError::Parse("unparseable gh response".to_string());
         assert!(!err.is_gh_rate_limit());
+    }
+
+    #[test]
+    fn is_github_comment_limit_detects_tool_stderr_2500_comments() {
+        let err = DaemonError::Tool {
+            tool: "gh".to_string(),
+            rc: 1,
+            stderr: "GraphQL: Issue has more than 2500 comments; commenting is disabled"
+                .to_string(),
+        };
+        assert!(err.is_github_comment_limit());
+    }
+
+    #[test]
+    fn is_github_comment_limit_detects_config_commenting_disabled() {
+        let err =
+            DaemonError::Config("Commenting is disabled on this repository or issue".to_string());
+        assert!(err.is_github_comment_limit());
+    }
+
+    #[test]
+    fn is_github_comment_limit_returns_false_for_rate_limit() {
+        let err = DaemonError::Tool {
+            tool: "gh".to_string(),
+            rc: 1,
+            stderr: "gh: API rate limit exceeded for installation ID 12345".to_string(),
+        };
+        assert!(!err.is_github_comment_limit());
     }
 }

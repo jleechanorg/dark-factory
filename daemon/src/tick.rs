@@ -27,9 +27,9 @@ use crate::state::{set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayS
 use crate::telemetry::{self, TelemetryEvent};
 use crate::tools::{Bead, Llm, PrHeadBranch, Scm, SessionId, Sessions, Tracker, Vcs};
 use crate::verifier::{self, PrEvidence};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 /// Everything one `run_tick` call needs: the five tool-boundary trait objects,
 /// config, state store, and the telemetry log path. Bundled into one struct so
@@ -629,14 +629,10 @@ fn kill_session_and_clear_handle(deps: &TickDeps, overlay: &mut BeadOverlay) {
 /// across 20 days; top offender jleechan-fpca at 23,012 re-emits).
 /// Pinned by the inline `existing_pr_adoption_dedup_tests` module
 /// below and by `tests/tick_integration.rs::existing_pr_adoption_*`.
-pub(crate) fn should_skip_existing_pr_adoption_emit(
-    pre_adopt_state: Option<OverlayState>,
-) -> bool {
+pub(crate) fn should_skip_existing_pr_adoption_emit(pre_adopt_state: Option<OverlayState>) -> bool {
     matches!(
         pre_adopt_state,
-        Some(OverlayState::Attested)
-            | Some(OverlayState::Ready)
-            | Some(OverlayState::HumanHeld)
+        Some(OverlayState::Attested) | Some(OverlayState::Ready) | Some(OverlayState::HumanHeld)
     )
 }
 
@@ -718,7 +714,10 @@ pub fn run_tick(
         let (deadline_epoch, observed_elapsed_secs) = match overlay.attempt_started_at {
             Some(started_at) => {
                 let elapsed = now_epoch.saturating_sub(started_at);
-                (started_at.saturating_add(deps.cfg.autonomy_timebox_secs), elapsed)
+                (
+                    started_at.saturating_add(deps.cfg.autonomy_timebox_secs),
+                    elapsed,
+                )
             }
             None => {
                 // Legacy fallback: timebox check still works against
@@ -818,11 +817,13 @@ pub fn run_tick(
                     if let (Some(branch), Some(pre_sha)) =
                         (overlay.branch.clone(), overlay.pre_session_head_sha.clone())
                     {
-                        let remote_verdict = || deps.vcs.remote_head_sha(&branch).and_then(|post_sha| {
-                            deps.vcs
-                                .is_ancestor(&pre_sha, &post_sha)
-                                .map(|ok| (ok, post_sha))
-                        });
+                        let remote_verdict = || {
+                            deps.vcs.remote_head_sha(&branch).and_then(|post_sha| {
+                                deps.vcs
+                                    .is_ancestor(&pre_sha, &post_sha)
+                                    .map(|ok| (ok, post_sha))
+                            })
+                        };
                         let local_verdict = match overlay.session_id.as_ref() {
                             Some(session_id) => deps.sessions.worktree_head_ancestry(
                                 &SessionId(session_id.clone()),
@@ -1724,8 +1725,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         // jleechan-7t2g: dedup set extracted into `should_skip_existing_pr_adoption_emit`
         // so the inline unit tests in `existing_pr_adoption_dedup_tests`
         // can pin the predicate directly.
-        let already_attested =
-            should_skip_existing_pr_adoption_emit(pre_adopt_state);
+        let already_attested = should_skip_existing_pr_adoption_emit(pre_adopt_state);
         if !already_attested {
             emit(
                 deps.telemetry_log,
@@ -2254,14 +2254,13 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         if ready.is_empty() {
             return Ok(());
         }
-        let dispatch_report =
-            dispatch::dispatch_ready_with_vcs(
-                deps.sessions,
-                deps.store,
-                deps.cfg,
-                &ready,
-                Some(deps.vcs),
-            )?;
+        let dispatch_report = dispatch::dispatch_ready_with_vcs(
+            deps.sessions,
+            deps.store,
+            deps.cfg,
+            &ready,
+            Some(deps.vcs),
+        )?;
         summary.beads_dispatched += dispatch_report.success_count();
 
         for failure in &dispatch_report.failures {
@@ -2590,11 +2589,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 if let Err(err) = post_scm_comment_by_bead_id(deps, &failure.bead_id, &comment_body)
                 {
                     if is_missing_scm_target_error(&err) {
-                        record_local_escalation_fallback(
-                            deps,
-                            &failure.bead_id,
-                            reason,
-                        )?;
+                        record_local_escalation_fallback(deps, &failure.bead_id, reason)?;
                         summary.beads_escalated_locally += 1;
                         emit(
                             deps.telemetry_log,
@@ -2660,13 +2655,8 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 summary.beads_escalated += 1;
                 let ctx = serde_json::json!({"reason": reason});
                 let now_epoch = now_epoch_secs();
-                let (should_emit, ctx_hash) = escalation_dedup_should_emit(
-                    deps,
-                    &failure.bead_id,
-                    reason,
-                    &ctx,
-                    now_epoch,
-                )?;
+                let (should_emit, ctx_hash) =
+                    escalation_dedup_should_emit(deps, &failure.bead_id, reason, &ctx, now_epoch)?;
                 if !should_emit {
                     summary.escalations_suppressed += 1;
                 } else {
@@ -2888,9 +2878,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     // write logs but does not abort the tick (a missing cache file is
     // the same as a cold cache).
     if let Err(e) = adoption_cache.persist() {
-        eprintln!(
-            "auto-factory daemon: WARNING failed to persist adoption-probe cache: {e}"
-        );
+        eprintln!("auto-factory daemon: WARNING failed to persist adoption-probe cache: {e}");
     }
 
     Ok(())
@@ -3014,11 +3002,9 @@ pub(crate) fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, Da
         // Default fallback reviewer (Cursor CLI, bashrc `agentf`). Invoked as
         // `cursor-agent -f <prompt>` (headless). Distinct family from
         // claudem/agy (see `verifier::vendor_model_family`).
-        "cursor-agent" | "cursor" | "agentf" => run_tool(
-            "cursor-agent",
-            &["-f", prompt],
-            REVIEWER_TIMEOUT_SECS,
-        ),
+        "cursor-agent" | "cursor" | "agentf" => {
+            run_tool("cursor-agent", &["-f", prompt], REVIEWER_TIMEOUT_SECS)
+        }
         other => Err(DaemonError::Tool {
             tool: other.to_string(),
             rc: -1,
@@ -3079,12 +3065,16 @@ fn build_skeptic_prompt(
     let mut vendor_waiver_block = String::new();
     for vendor in [Vendor::CodeRabbit, Vendor::Bugbot] {
         match vendor_health.health(vendor) {
-            VendorHealth::Capped { observations, since_epoch } => {
+            VendorHealth::Capped {
+                observations,
+                since_epoch,
+            } => {
                 if let Some(next) = crate::vendor_health::next_healthy_reviewer(vendor) {
                     vendor_waiver_block.push_str(&format!(
                         "\nREVIEWER_ROTATED vendor={} nextReviewer={} \
                          chainWalked=true waiverSuppressed=true",
-                        vendor.as_str(), next
+                        vendor.as_str(),
+                        next
                     ));
                     continue;
                 }
@@ -3677,7 +3667,9 @@ fn translate_error(e: crate::vacuous_red_green::RedGreenError) -> verifier::Vacu
         RedGreenError::RevertFailed(s) | RedGreenError::RestoreFailed(s) => {
             verifier::VacuousRedGreenStatus::GreenFailed(format!("working-tree revert failed: {s}"))
         }
-        RedGreenError::Git(s) => verifier::VacuousRedGreenStatus::GreenFailed(format!("git error: {s}")),
+        RedGreenError::Git(s) => {
+            verifier::VacuousRedGreenStatus::GreenFailed(format!("git error: {s}"))
+        }
         // Bead jleechan-sb4b: surface the missing toolchain as a
         // structured signal. The previous failure mode was a misleading
         // `GreenFailed: git error: spawn cargo test: No such file or
@@ -3713,9 +3705,9 @@ fn translate_verdict(
             "tests failed on pristine base_ref (before any revert)".to_string(),
         ),
         Verdict::NoChangedTests => verifier::VacuousRedGreenStatus::NoChangedTests,
-        Verdict::ManifestMissing => {
-            verifier::VacuousRedGreenStatus::ManifestMissing("detector could not find manifest".to_string())
-        }
+        Verdict::ManifestMissing => verifier::VacuousRedGreenStatus::ManifestMissing(
+            "detector could not find manifest".to_string(),
+        ),
     }
 }
 
@@ -3777,10 +3769,7 @@ fn resolve_pr_base_ref(deps: &TickDeps, pr: u64, repo: &str) -> Result<String, S
 /// spawning reviewer subprocesses. Unknown/empty-family vendor labels are
 /// excluded (they cannot lift the degraded flag; see
 /// `verifier::vendor_model_family`).
-pub fn second_family_candidates<'a>(
-    used: &[String],
-    priority: &[&'a str],
-) -> Vec<&'a str> {
+pub fn second_family_candidates<'a>(used: &[String], priority: &[&'a str]) -> Vec<&'a str> {
     let have: std::collections::BTreeSet<&str> = used
         .iter()
         .map(|u| verifier::vendor_model_family(u))
@@ -3792,9 +3781,7 @@ pub fn second_family_candidates<'a>(
         .copied()
         .filter(|v| {
             let fam = verifier::vendor_model_family(v);
-            !fam.is_empty()
-                && !have.contains(fam)
-                && !used.iter().any(|u| u.as_str() == *v)
+            !fam.is_empty() && !have.contains(fam) && !used.iter().any(|u| u.as_str() == *v)
         })
         .collect()
 }
@@ -3982,38 +3969,32 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             }
         }
 
-        if overlay.state == OverlayState::Dispatched
-            && overlay.pr_number.is_none()
-            && !is_test_repo
+        if overlay.state == OverlayState::Dispatched && overlay.pr_number.is_none() && !is_test_repo
         {
             if let Some(ref session_id) = overlay.session_id {
-                    let mut project = repo.split('/').next_back().unwrap_or(&repo).to_string();
-                    if project == "worldarchitect.ai" {
-                        project = "worldarchitect".to_string();
-                    }
+                let mut project = repo.split('/').next_back().unwrap_or(&repo).to_string();
+                if project == "worldarchitect.ai" {
+                    project = "worldarchitect".to_string();
+                }
 
-                    let r = crate::tools::run_tool("ao", &["status", "-p", &project, "--json"], 30);
-                    if let Ok(out) = r {
-                        let json_start = out.find('[').unwrap_or(0);
-                        if let Ok(val) =
-                            serde_json::from_str::<serde_json::Value>(&out[json_start..])
-                        {
-                            if let Some(arr) = val.as_array() {
-                                if let Some(entry) = arr.iter().find(|e| {
-                                    e.get("name").and_then(|v| v.as_str())
-                                        == Some(session_id.as_str())
-                                }) {
-                                    if let Some(pr_num) =
-                                        entry.get("prNumber").and_then(|v| v.as_u64())
-                                    {
-                                        overlay.pr_number = Some(pr_num);
-                                        deps.store.save(&overlay)?;
-                                    }
+                let r = crate::tools::run_tool("ao", &["status", "-p", &project, "--json"], 30);
+                if let Ok(out) = r {
+                    let json_start = out.find('[').unwrap_or(0);
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&out[json_start..]) {
+                        if let Some(arr) = val.as_array() {
+                            if let Some(entry) = arr.iter().find(|e| {
+                                e.get("name").and_then(|v| v.as_str()) == Some(session_id.as_str())
+                            }) {
+                                if let Some(pr_num) = entry.get("prNumber").and_then(|v| v.as_u64())
+                                {
+                                    overlay.pr_number = Some(pr_num);
+                                    deps.store.save(&overlay)?;
                                 }
                             }
                         }
                     }
                 }
+            }
         }
 
         // Promote DISPATCHED -> ATTESTED once a PR is open (spec §4.2.7).
@@ -4152,7 +4133,9 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     match &overlay.session_id {
                         Some(session_id_str) => {
                             let sid = SessionId(session_id_str.clone());
-                            if let Ok(Some(health_failure)) = deps.sessions.check_session_health(&sid) {
+                            if let Ok(Some(health_failure)) =
+                                deps.sessions.check_session_health(&sid)
+                            {
                                 emit(
                                     deps.telemetry_log,
                                     bead_id,
@@ -4568,9 +4551,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             let vendor_capped = deps
                 .vendor_health
                 .and_then(|m| m.lock().ok())
-                .map(|_l| {
-                    verifier::detect_vendor_cap(&snapshot)
-                })
+                .map(|_l| verifier::detect_vendor_cap(&snapshot))
                 .unwrap_or(false);
             if !vendor_capped {
                 emit(
@@ -4636,8 +4617,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             (crate::vendor_health::Vendor::Bugbot,),
                         ];
                         for (vendor,) in beads {
-                            let is_capped =
-                                verifier::detect_vendor_cap_for(&snapshot, vendor);
+                            let is_capped = verifier::detect_vendor_cap_for(&snapshot, vendor);
                             if is_capped && !ledger.health(vendor).is_capped() {
                                 ledger.record_cap(crate::vendor_health::CapObservation {
                                     vendor,
@@ -4645,7 +4625,10 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                     bead_id: bead_id.to_string(),
                                     pr_number: pr,
                                     ts_epoch: now,
-                                    note: format!("ci_pending={} coderabbit_status={}", snapshot.ci_pending, snapshot.coderabbit_status),
+                                    note: format!(
+                                        "ci_pending={} coderabbit_status={}",
+                                        snapshot.ci_pending, snapshot.coderabbit_status
+                                    ),
                                 });
                                 if ledger.health(vendor).is_capped() {
                                     recently_waived.push(vendor);
@@ -4656,8 +4639,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     // Recovery: clear the vendor if the snapshot is
                     // clean. `detect_vendor_recovery` keys on
                     // STRUCTURED fields only.
-                    let recovered =
-                        verifier::detect_vendor_recovery(&snapshot, &ledger);
+                    let recovered = verifier::detect_vendor_recovery(&snapshot, &ledger);
                     let prev_was_capped: Vec<crate::vendor_health::Vendor> = vec![
                         crate::vendor_health::Vendor::CodeRabbit,
                         crate::vendor_health::Vendor::Bugbot,
@@ -4714,21 +4696,22 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             }
         }
 
-        let mut evidence = match skeptic_evidence(deps, bead_id, pr, &repo, &snapshot, vendor_health) {
-            Ok(e) => e,
-            Err(e) => {
-                let _ = emit(
-                    deps.telemetry_log,
-                    bead_id,
-                    overlay.attempt,
-                    OverlayState::Attested.as_str(),
-                    "BEAD_PROCESSING_TRANSIENT_ERROR",
-                    serde_json::json!({}),
-                    serde_json::json!({"phase": "skeptic_evidence", "error": format!("{e:?}")}),
-                );
-                continue;
-            }
-        };
+        let mut evidence =
+            match skeptic_evidence(deps, bead_id, pr, &repo, &snapshot, vendor_health) {
+                Ok(e) => e,
+                Err(e) => {
+                    let _ = emit(
+                        deps.telemetry_log,
+                        bead_id,
+                        overlay.attempt,
+                        OverlayState::Attested.as_str(),
+                        "BEAD_PROCESSING_TRANSIENT_ERROR",
+                        serde_json::json!({}),
+                        serde_json::json!({"phase": "skeptic_evidence", "error": format!("{e:?}")}),
+                    );
+                    continue;
+                }
+            };
 
         // Bead jleechan-msmq: skip gate re-assessment when this bead's prior
         // reroll attempt DEFERRED (`reroll_deferral_count > 0`,
@@ -5092,10 +5075,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     })
                     .collect();
                 overlay.state = OverlayState::HumanHeld;
-                set_human_hold_reason(
-                    &mut overlay,
-                    HumanHoldReason::GateRegressionCapped,
-                );
+                set_human_hold_reason(&mut overlay, HumanHoldReason::GateRegressionCapped);
                 deps.store.save(&overlay)?;
                 summary.beads_parked_human_held += 1;
                 emit(
@@ -5147,9 +5127,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 .results
                 .iter()
                 .filter_map(|(gate_name, result)| match result {
-                    verifier::GateResult::Red(reason) => {
-                        Some(format!("{gate_name:?}: {reason}"))
-                    }
+                    verifier::GateResult::Red(reason) => Some(format!("{gate_name:?}: {reason}")),
                     _ => None,
                 })
                 .collect();
@@ -5286,14 +5264,10 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             .iter()
             .find(|(name, _)| *name == verifier::GateName::EvidenceFloor)
         {
-            let only_evidence_is_stale = report
-                .results
-                .iter()
-                .all(|(name, result)| {
-                    *name == verifier::GateName::EvidenceFloor
-                        || !matches!(result, verifier::GateResult::Red(_))
-                })
-                && reason.contains("does not match PR head");
+            let only_evidence_is_stale = report.results.iter().all(|(name, result)| {
+                *name == verifier::GateName::EvidenceFloor
+                    || !matches!(result, verifier::GateResult::Red(_))
+            }) && reason.contains("does not match PR head");
             if only_evidence_is_stale {
                 summary.gates_assessed_fast_rejected += 1;
                 continue;
@@ -5854,7 +5828,11 @@ fn evidence_head_stale_already_recorded(
 /// fired the rejection without re-running the parser, AND so the
 /// `evidence_head_stale_already_recorded` dedup key is the actual mismatch
 /// tuple (PR #463 round-1 Codex P2 finding #2).
-fn record_evidence_head_stale(deps: &TickDeps, bead_id: &str, reason: &str) -> Result<(), DaemonError> {
+fn record_evidence_head_stale(
+    deps: &TickDeps,
+    bead_id: &str,
+    reason: &str,
+) -> Result<(), DaemonError> {
     deps.store.save_rejection(
         bead_id,
         EVIDENCE_HEAD_STALE_SENTINEL_ATTEMPT,
@@ -5993,6 +5971,163 @@ fn resolve_drive_pr_head_branch(
     }
 }
 
+static OVERFLOW_REF_CACHE: OnceLock<Mutex<HashMap<(String, String), String>>> = OnceLock::new();
+
+fn overflow_ref_cache() -> &'static Mutex<HashMap<(String, String), String>> {
+    OVERFLOW_REF_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn get_cached_overflow_ref(bead_id: &str, ext_ref: &str) -> Option<String> {
+    overflow_ref_cache()
+        .lock()
+        .ok()?
+        .get(&(bead_id.to_string(), ext_ref.to_string()))
+        .cloned()
+}
+
+pub fn cache_overflow_ref(bead_id: &str, ext_ref: &str, overflow_ref: &str) {
+    if let Ok(mut map) = overflow_ref_cache().lock() {
+        map.insert(
+            (bead_id.to_string(), ext_ref.to_string()),
+            overflow_ref.to_string(),
+        );
+    }
+}
+
+#[cfg(test)]
+pub fn clear_overflow_ref_cache() {
+    if let Ok(mut map) = overflow_ref_cache().lock() {
+        map.clear();
+    }
+}
+
+/// Create a new overflow escalation issue on GitHub (issue #507).
+/// Returns the new issue's `owner/repo#N` ext_ref string on success.
+fn create_overflow_escalation_issue(
+    _deps: &TickDeps,
+    bead_id: &str,
+    original_ext_ref: &str,
+) -> Result<String, DaemonError> {
+    // Parse repo from original_ext_ref ("owner/repo#N" or "owner/repo#issue-N")
+    let repo = if let Some(idx) = original_ext_ref.find('#') {
+        &original_ext_ref[..idx]
+    } else {
+        return Err(DaemonError::Config(format!(
+            "cannot parse repo from ext_ref {original_ext_ref}"
+        )));
+    };
+    let title = format!(
+        "[dark-factory] Escalation overflow for bead {bead_id} (original: {original_ext_ref})"
+    );
+    let body = format!(
+        "Overflow escalation target.\n\nOriginal issue `{original_ext_ref}` hit GitHub's 2500-comment limit.\n\nBead: `{bead_id}`"
+    );
+    // Use pid+bead_id suffix to avoid race if two ticks hit this path concurrently.
+    let tmp = format!(
+        "/tmp/overflow_issue_body_{}_{bead_id}.md",
+        std::process::id()
+    );
+    std::fs::write(&tmp, &body)
+        .map_err(|e| DaemonError::Config(format!("write overflow body: {e}")))?;
+    // Use --json url -q .url for stable, parseable output (no title slug in URL).
+    let out = std::process::Command::new("gh")
+        .args([
+            "issue",
+            "create",
+            "--repo",
+            repo,
+            "--title",
+            &title,
+            "--label",
+            "factory",
+            "--body-file",
+            &tmp,
+            "--json",
+            "url",
+            "-q",
+            ".url",
+        ])
+        .output()
+        .map_err(|e| DaemonError::Tool {
+            tool: format!("gh issue create: {e}"),
+            rc: -1,
+            stderr: String::new(),
+        })?;
+    let _ = std::fs::remove_file(&tmp);
+    if !out.status.success() {
+        return Err(DaemonError::Tool {
+            tool: "gh issue create".to_string(),
+            rc: out.status.code().unwrap_or(-1),
+            stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+        });
+    }
+    // gh outputs the new issue URL, e.g. https://github.com/owner/repo/issues/123
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // Convert URL to ext_ref format: owner/repo#123
+    let new_ext_ref = url
+        .trim_start_matches("https://github.com/")
+        .replacen("/issues/", "#", 1);
+    if new_ext_ref.contains('#') {
+        Ok(new_ext_ref)
+    } else {
+        Err(DaemonError::Config(format!(
+            "unexpected gh issue create output: {url}"
+        )))
+    }
+}
+
+/// issue #507: post a comment to `ext_ref`, automatically creating an overflow
+/// issue and retrying there if the primary target has hit the GitHub 2500-comment
+/// limit. Never parks HUMAN_HELD just because a comment channel is full.
+/// Reuses cached overflow target for (bead_id, original_ext_ref) to avoid
+/// spawning duplicate overflow issues on repeated transient retries.
+fn post_scm_comment_with_overflow_retry(
+    deps: &TickDeps,
+    bead_id: &str,
+    ext_ref: &str,
+    body: &str,
+) -> Result<(), DaemonError> {
+    if let Some(overflow_ref) = get_cached_overflow_ref(bead_id, ext_ref) {
+        return deps.tracker.comment_external(&overflow_ref, body);
+    }
+
+    match deps.tracker.comment_external(ext_ref, body) {
+        Ok(()) => Ok(()),
+        Err(err) if err.is_github_comment_limit() => {
+            if let Some(overflow_ref) = get_cached_overflow_ref(bead_id, ext_ref) {
+                return deps.tracker.comment_external(&overflow_ref, body);
+            }
+            // Primary target is full — create an overflow issue and retry once.
+            match create_overflow_escalation_issue(deps, bead_id, ext_ref) {
+                Ok(overflow_ref) => {
+                    cache_overflow_ref(bead_id, ext_ref, &overflow_ref);
+                    emit(
+                        deps.telemetry_log,
+                        bead_id,
+                        0,
+                        "system",
+                        "ESCALATION_OVERFLOW_ISSUE_CREATED",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "original_ref": ext_ref,
+                            "overflow_ref": overflow_ref,
+                        }),
+                    )
+                    .ok(); // non-fatal telemetry
+                    deps.tracker.comment_external(&overflow_ref, body)
+                }
+                Err(create_err) => {
+                    // Can't create overflow issue either — return combined error.
+                    Err(DaemonError::Config(format!(
+                        "comment limit on {ext_ref} and overflow creation failed: {create_err:?}"
+                    )))
+                }
+            }
+        }
+        Err(other) => Err(other),
+    }
+}
+
 fn post_scm_comment_by_bead_id(
     deps: &TickDeps,
     bead_id: &str,
@@ -6008,13 +6143,13 @@ fn post_scm_comment_by_bead_id(
             // stage closes). `overlay` is already loaded here, so
             // `overlay.repo(cfg)` is free.
             let ext_ref = format!("{}#{}", overlay.repo(deps.cfg), pr);
-            return deps.tracker.comment_external(&ext_ref, body);
+            return post_scm_comment_with_overflow_retry(deps, bead_id, &ext_ref, body);
         }
     }
     let candidates = deps.tracker.fetch_candidates()?;
     if let Some(bead) = candidates.iter().find(|b| b.id == bead_id) {
         if let Some(ref ext_ref) = bead.external_ref {
-            return deps.tracker.comment_external(ext_ref, body);
+            return post_scm_comment_with_overflow_retry(deps, bead_id, ext_ref, body);
         }
     }
     Err(DaemonError::Config(format!(
@@ -6056,7 +6191,11 @@ mod escalation_context_hash_tests {
         let h3 = escalation_context_hash(&v);
         assert_eq!(h1, h2);
         assert_eq!(h2, h3);
-        assert_eq!(h1.len(), 16, "FNV-1a 64-bit must format as 16 lowercase hex chars");
+        assert_eq!(
+            h1.len(),
+            16,
+            "FNV-1a 64-bit must format as 16 lowercase hex chars"
+        );
     }
 
     /// (b) Canonical form — `serde_json::json!` macros lay fields out in
@@ -6152,7 +6291,11 @@ mod escalation_context_hash_tests {
         const EXPECTED_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
         const EXPECTED_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-        assert_eq!(fnv1a_64(b""), EXPECTED_OFFSET_BASIS, "FNV-1a 64-bit of empty input is the offset basis");
+        assert_eq!(
+            fnv1a_64(b""),
+            EXPECTED_OFFSET_BASIS,
+            "FNV-1a 64-bit of empty input is the offset basis"
+        );
 
         // Manually compute FNV-1a 64-bit of "a" (single byte 0x61).
         let mut expected = EXPECTED_OFFSET_BASIS;
@@ -6167,7 +6310,10 @@ mod escalation_context_hash_tests {
         // PRIME is encoded as a constant in `fnv1a_64`; this assertion is a
         // belt-and-braces guard against a future "let me use the 32-bit
         // variant" refactor silently shifting the hash space.
-        assert_ne!(EXPECTED_PRIME, 0x0100_0193, "FNV-1a 64-bit PRIME must NOT be the 32-bit variant (0x01000193)");
+        assert_ne!(
+            EXPECTED_PRIME, 0x0100_0193,
+            "FNV-1a 64-bit PRIME must NOT be the 32-bit variant (0x01000193)"
+        );
     }
 
     /// (e) Cross-process stability — the hash must NOT depend on any
@@ -6242,7 +6388,11 @@ mod existing_pr_adoption_dedup_tests {
     /// telemetry events across 30 attested beads (jleechan-mdun incident).
     #[test]
     fn suppresses_emit_for_dedup_states() {
-        for state in [OverlayState::Attested, OverlayState::Ready, OverlayState::HumanHeld] {
+        for state in [
+            OverlayState::Attested,
+            OverlayState::Ready,
+            OverlayState::HumanHeld,
+        ] {
             assert!(
                 should_skip_existing_pr_adoption_emit(Some(state)),
                 "overlay in {state:?} must suppress the EXISTING_PR_ADOPTED re-emit"
@@ -6306,7 +6456,11 @@ mod existing_pr_adoption_dedup_tests {
         }
         assert_eq!(
             dedup_states,
-            vec![OverlayState::Attested, OverlayState::Ready, OverlayState::HumanHeld],
+            vec![
+                OverlayState::Attested,
+                OverlayState::Ready,
+                OverlayState::HumanHeld
+            ],
             "EXISTING_PR_ADOPTED dedup set must remain exactly Attested+Ready+HumanHeld"
         );
     }
@@ -6379,9 +6533,7 @@ mod skeptic_prompt_vendor_waiver_tests {
         );
     }
 
-    use crate::vendor_health::{
-        CapObservation, CapSource, Vendor, VendorHealthLedger,
-    };
+    use crate::vendor_health::{CapObservation, CapSource, Vendor, VendorHealthLedger};
 
     fn capped_ledger(vendor: Vendor, bead_prefix: &str) -> VendorHealthLedger {
         let mut ledger = VendorHealthLedger::new();
@@ -6528,5 +6680,193 @@ mod skeptic_prompt_vendor_waiver_tests {
             prompt.contains("pass|warn <note>|fail <reason>"),
             "verdict grammar must remain in the base prompt"
         );
+    }
+}
+
+#[cfg(test)]
+mod overflow_escalation_tests {
+    use super::*;
+    use crate::tools::*;
+
+    static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn overflow_ref_cache_dedup_and_lookup() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        clear_overflow_ref_cache();
+        assert_eq!(get_cached_overflow_ref("bead-1", "owner/repo#100"), None);
+
+        cache_overflow_ref("bead-1", "owner/repo#100", "owner/repo#500");
+        assert_eq!(
+            get_cached_overflow_ref("bead-1", "owner/repo#100"),
+            Some("owner/repo#500".to_string())
+        );
+
+        // Different bead or different original ext_ref do not match
+        assert_eq!(get_cached_overflow_ref("bead-2", "owner/repo#100"), None);
+        assert_eq!(get_cached_overflow_ref("bead-1", "owner/repo#101"), None);
+
+        clear_overflow_ref_cache();
+        assert_eq!(get_cached_overflow_ref("bead-1", "owner/repo#100"), None);
+    }
+
+    #[test]
+    fn post_scm_comment_with_overflow_retry_routes_to_cached_overflow_ref() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        clear_overflow_ref_cache();
+        cache_overflow_ref("bead-test", "owner/repo#1", "owner/repo#999");
+
+        struct CountingTracker {
+            calls: std::sync::Mutex<Vec<(String, String)>>,
+        }
+        impl Tracker for CountingTracker {
+            fn fetch_candidates(&self) -> Result<Vec<Bead>, DaemonError> {
+                Ok(vec![])
+            }
+            fn fetch_all_external_refs(
+                &self,
+            ) -> Result<std::collections::HashSet<String>, DaemonError> {
+                Ok(std::collections::HashSet::new())
+            }
+            fn create_bead(
+                &self,
+                _title: &str,
+                _body: &str,
+                _external_ref: &str,
+            ) -> Result<String, DaemonError> {
+                Err(DaemonError::Config("stub".to_string()))
+            }
+            fn comment_external(&self, external_ref: &str, body: &str) -> Result<(), DaemonError> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((external_ref.to_string(), body.to_string()));
+                Ok(())
+            }
+        }
+
+        let tracker = CountingTracker {
+            calls: std::sync::Mutex::new(vec![]),
+        };
+        let cfg: Config = toml::from_str(include_str!("../contracts/daemon.toml.example")).unwrap();
+        let store = crate::state::SqliteStateStore::open_in_memory_with_schema(include_str!(
+            "../contracts/schema.sql"
+        ))
+        .unwrap();
+        let telem_path = std::path::Path::new("/tmp/test_overflow_telem.jsonl");
+
+        struct DummyScm;
+        impl Scm for DummyScm {
+            fn labeled_issues(&self, _label: &str) -> Result<Vec<Issue>, DaemonError> {
+                Ok(vec![])
+            }
+            fn labeled_prs(
+                &self,
+                _label: &str,
+                _gh_calls: &mut u32,
+            ) -> Result<Vec<LabeledPr>, DaemonError> {
+                Ok(vec![])
+            }
+            fn collaborator_permission(&self, _login: &str) -> Result<Permission, DaemonError> {
+                Ok(Permission::Admin)
+            }
+            fn pr_snapshot(&self, _pr: u64) -> Result<PrSnapshot, DaemonError> {
+                Err(DaemonError::Config("stub".to_string()))
+            }
+            fn remote_branch_last_commit(&self, _branch: &str) -> Result<Option<u64>, DaemonError> {
+                Ok(None)
+            }
+            fn close_pr(&self, _pr: u64, _comment: &str) -> Result<(), DaemonError> {
+                Ok(())
+            }
+        }
+        struct DummySessions;
+        impl Sessions for DummySessions {
+            fn active_count(&self) -> Result<usize, DaemonError> {
+                Ok(0)
+            }
+            fn spawn(&self, _spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
+                Err(DaemonError::Config("stub".to_string()))
+            }
+            fn attach(&self, _branch: &str, _bead_id: &str) -> Result<SessionId, DaemonError> {
+                Err(DaemonError::Config("stub".to_string()))
+            }
+            fn stop(&self, _id: &SessionId) -> Result<(), DaemonError> {
+                Ok(())
+            }
+            fn is_quiescent(&self, _id: &SessionId) -> Result<bool, DaemonError> {
+                Ok(true)
+            }
+        }
+        struct DummyLlm;
+        impl Llm for DummyLlm {
+            fn judge(&self, _prompt: &str) -> Result<String, DaemonError> {
+                Ok("{}".to_string())
+            }
+        }
+        struct DummyVcs;
+        impl Vcs for DummyVcs {
+            fn base_head(&self, _base_branch: &str) -> Result<String, DaemonError> {
+                Ok("head".to_string())
+            }
+            fn create_branch_at(&self, _name: &str, _sha: &str) -> Result<(), DaemonError> {
+                Ok(())
+            }
+            fn head_sha(&self, _branch: &str) -> Result<String, DaemonError> {
+                Ok("head".to_string())
+            }
+            fn is_remote_ahead(
+                &self,
+                _branch: &str,
+                _remote_sha: &str,
+            ) -> Result<bool, DaemonError> {
+                Ok(false)
+            }
+            fn remote_head_sha(&self, _branch: &str) -> Result<String, DaemonError> {
+                Ok("head".to_string())
+            }
+            fn is_ancestor(
+                &self,
+                _ancestor_sha: &str,
+                _descendant_sha: &str,
+            ) -> Result<bool, DaemonError> {
+                Ok(true)
+            }
+            fn push_fix_commit(&self, _branch: &str, _message: &str) -> Result<(), DaemonError> {
+                Ok(())
+            }
+        }
+
+        let scm = DummyScm;
+        let sessions = DummySessions;
+        let llm = DummyLlm;
+        let vcs = DummyVcs;
+
+        let deps = TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: telem_path,
+            vendor_health: None,
+        };
+
+        let res = post_scm_comment_with_overflow_retry(
+            &deps,
+            "bead-test",
+            "owner/repo#1",
+            "test comment",
+        );
+        assert!(res.is_ok());
+
+        let calls = tracker.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "owner/repo#999");
+        assert_eq!(calls[0].1, "test comment");
+
+        clear_overflow_ref_cache();
     }
 }
