@@ -489,18 +489,45 @@ pub trait Tracker {
 }
 
 pub fn parse_external_ref_repo(external_ref: &str) -> Option<String> {
-    let parts: Vec<&str> = external_ref.split('#').collect();
-    if parts.len() == 2 {
-        Some(parts[0].to_string())
-    } else {
-        None
+    if let Some((owner_repo, num)) = external_ref.split_once('#') {
+        if !owner_repo.is_empty() && !num.is_empty() {
+            return Some(owner_repo.to_string());
+        }
     }
+    if let Some(rest) = external_ref.strip_prefix("https://github.com/") {
+        let segments: Vec<&str> = rest.split('/').collect();
+        if segments.len() >= 2 && !segments[0].is_empty() && !segments[1].is_empty() {
+            return Some(format!("{}/{}", segments[0], segments[1]));
+        }
+    }
+    None
 }
 
 /// `gh` CLI (REST + GraphQL). Production adapters use short-lived in-memory
 /// TTL caches for repeated tick reads; a durable ETag cache is not wired yet.
 pub trait Scm {
     fn labeled_issues(&self, label: &str) -> Result<Vec<Issue>, DaemonError>;
+    /// Repo-scoped variant of [`labeled_issues`](Scm::labeled_issues). Default impl
+    /// filters `labeled_issues` for items matching `repo` in `external_ref`, avoiding
+    /// replaying identical issue lists across repositories on fake adapters. `CliScm`
+    /// overrides to retarget the query via `with_repo`.
+    fn labeled_issues_for_repo(
+        &self,
+        repo: &str,
+        label: &str,
+    ) -> Result<Vec<Issue>, DaemonError> {
+        let issues = self.labeled_issues(label)?;
+        Ok(issues
+            .into_iter()
+            .filter(|issue| {
+                if let Some(owner_repo) = parse_external_ref_repo(&issue.external_ref) {
+                    owner_repo.eq_ignore_ascii_case(repo)
+                } else {
+                    false
+                }
+            })
+            .collect())
+    }
     /// Fetch labeled PRs. `gh_calls` is incremented by every `gh` (or
     /// equivalent) subprocess the implementation makes — including the
     /// REST fallback's per-PR `pulls/{n}` calls. The intake code adds
