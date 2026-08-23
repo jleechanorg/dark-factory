@@ -8261,15 +8261,15 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", guard_script.display()));
     let predicate_block: String = guard_src
         .lines()
-        .skip(84) // 0-indexed: line 85 (1-indexed) of auto-merge-guard.sh
-        .take(74) // lines 85..=158 inclusive, mirroring test_auto_merge_guard_gate_vocabulary.sh entry (sed -n '85,158p'; shifted from 41..=114 by the rev-1uno rate_limit preflight + dual-API routing block)
+        .skip(119) // 0-indexed: line 120 (1-indexed) of auto-merge-guard.sh
+        .take(74) // lines 120..=193 inclusive, mirroring test_auto_merge_guard_gate_vocabulary.sh entry (sed -n '120,193p'; shifted from 85..=158 by PR #735's fail-closed repo-allowlist insertion)
         .map(|l| l.strip_prefix("  ").unwrap_or(l)) // mirror the shell test's sed s/^  // normalization
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
         predicate_block.contains("g.items()"),
         "extracted predicate block drifted from auto-merge-guard.sh's actual \
-         line range 85-158 (line numbers may have shifted); block:\n{predicate_block}"
+         line range 120-193 (line numbers may have shifted); block:\n{predicate_block}"
     );
 
     use std::io::Write as _;
