@@ -231,6 +231,36 @@ impl DaemonError {
             || (lower.contains("403") && lower.contains("rate limit"))
     }
 
+    /// True iff this error indicates that GitHub commenting has hit the comment
+    /// count limit (e.g. 2,500 comments per issue/PR limit on GitHub) or
+    /// commenting has been disabled on the target issue/PR.
+    pub fn is_github_comment_limit(&self) -> bool {
+        match self {
+            DaemonError::Tool { stderr, .. } => {
+                let lower = stderr.to_ascii_lowercase();
+                (lower.contains("2500") && lower.contains("comment"))
+                    || lower.contains("comment limit")
+                    || lower.contains("commenting is disabled")
+                    || lower.contains("commenting disabled")
+                    || lower.contains("comments are disabled")
+                    || lower.contains("comments disabled")
+                    || lower.contains("commenting has been disabled")
+                    || lower.contains("maximum limit of 2500 comments")
+                    || lower.contains("maximum limit of 2,500 comments")
+            }
+            DaemonError::Config(msg) => {
+                let lower = msg.to_ascii_lowercase();
+                lower.contains("commenting is disabled")
+                    || lower.contains("commenting disabled")
+                    || lower.contains("comments are disabled")
+                    || lower.contains("comments disabled")
+                    || lower.contains("commenting has been disabled")
+                    || lower.contains("comment limit")
+            }
+            _ => false,
+        }
+    }
+
     /// Detects `br create --external-ref ...` failing because the ref is
     /// already tracked (`br`'s own uniqueness constraint on `external_ref`),
     /// e.g. `Error: Configuration error: External reference 'owner/repo#42'
@@ -263,6 +293,87 @@ impl DaemonError {
             .split(|c: char| c.is_whitespace() || c == '\'' || c == '"')
             .find(|tok| !tok.is_empty())?;
         Some(id.to_string())
+    }
+}
+
+/// In-memory dedup cache mapping `(bead_id, original_ext_ref)` to
+/// the spawned `overflow_ref` (e.g. an overflow issue on GitHub), preventing
+/// repeated transient retries from spawning multiple overflow issues for the
+/// same bead and target ref.
+#[derive(Debug, Default, Clone)]
+pub struct OverflowDedupCache {
+    entries: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<(String, String), String>>>,
+}
+
+pub type CommentOverflowDedupCache = OverflowDedupCache;
+
+impl OverflowDedupCache {
+    pub fn new() -> Self {
+        Self {
+            entries: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// Look up an existing overflow ref for `(bead_id, original_ext_ref)`.
+    pub fn get(&self, bead_id: &str, original_ext_ref: &str) -> Option<String> {
+        let read = self.entries.read().ok()?;
+        read.get(&(bead_id.to_string(), original_ext_ref.to_string()))
+            .cloned()
+    }
+
+    /// Record an overflow ref for `(bead_id, original_ext_ref)`.
+    pub fn insert(&self, bead_id: &str, original_ext_ref: &str, overflow_ref: &str) {
+        if let Ok(mut write) = self.entries.write() {
+            write.insert(
+                (bead_id.to_string(), original_ext_ref.to_string()),
+                overflow_ref.to_string(),
+            );
+        }
+    }
+
+    /// Returns true if an overflow ref is already cached for `(bead_id, original_ext_ref)`.
+    pub fn contains(&self, bead_id: &str, original_ext_ref: &str) -> bool {
+        self.get(bead_id, original_ext_ref).is_some()
+    }
+
+    /// Remove a cached overflow ref for `(bead_id, original_ext_ref)`.
+    pub fn remove(&self, bead_id: &str, original_ext_ref: &str) -> Option<String> {
+        let mut write = self.entries.write().ok()?;
+        write.remove(&(bead_id.to_string(), original_ext_ref.to_string()))
+    }
+
+    /// Clear all cached entries.
+    pub fn clear(&self) {
+        if let Ok(mut write) = self.entries.write() {
+            write.clear();
+        }
+    }
+
+    /// Return the number of cached entries.
+    pub fn len(&self) -> usize {
+        self.entries.read().map(|r| r.len()).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Retrieves an existing cached overflow ref or computes it via `f` and inserts it.
+    pub fn get_or_insert_with<F, E>(
+        &self,
+        bead_id: &str,
+        original_ext_ref: &str,
+        f: F,
+    ) -> Result<String, E>
+    where
+        F: FnOnce() -> Result<String, E>,
+    {
+        if let Some(existing) = self.get(bead_id, original_ext_ref) {
+            return Ok(existing);
+        }
+        let created = f()?;
+        self.insert(bead_id, original_ext_ref, &created);
+        Ok(created)
     }
 }
 
@@ -536,5 +647,109 @@ mod tests {
     fn is_gh_rate_limit_returns_false_for_non_tool_error() {
         let err = DaemonError::Parse("unparseable gh response".to_string());
         assert!(!err.is_gh_rate_limit());
+    }
+
+    #[test]
+    fn is_github_comment_limit_detects_tool_stderr_2500_comments() {
+        let err = DaemonError::Tool {
+            tool: "gh".to_string(),
+            rc: 1,
+            stderr: "GraphQL: This issue has reached the maximum limit of 2500 comments (createIssueComment)".to_string(),
+        };
+        assert!(err.is_github_comment_limit());
+    }
+
+    #[test]
+    fn is_github_comment_limit_detects_config_commenting_disabled() {
+        let err = DaemonError::Config("commenting disabled for repository".to_string());
+        assert!(err.is_github_comment_limit());
+    }
+
+    #[test]
+    fn is_github_comment_limit_returns_false_for_rate_limit() {
+        let err = DaemonError::Tool {
+            tool: "gh".to_string(),
+            rc: 1,
+            stderr: "gh: API rate limit exceeded for installation ID 12345".to_string(),
+        };
+        assert!(!err.is_github_comment_limit());
+    }
+
+    #[test]
+    fn overflow_dedup_cache_insert_and_get() {
+        let cache = OverflowDedupCache::new();
+        assert_eq!(cache.get("bead-1", "owner/repo#100"), None);
+        assert!(!cache.contains("bead-1", "owner/repo#100"));
+        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty());
+
+        cache.insert("bead-1", "owner/repo#100", "owner/repo#200");
+        assert_eq!(
+            cache.get("bead-1", "owner/repo#100"),
+            Some("owner/repo#200".to_string())
+        );
+        assert!(cache.contains("bead-1", "owner/repo#100"));
+        assert_eq!(cache.len(), 1);
+        assert!(!cache.is_empty());
+    }
+
+    #[test]
+    fn overflow_dedup_cache_dedups_repeated_lookups_for_same_bead_and_ref() {
+        let cache = OverflowDedupCache::new();
+        cache.insert("bead-42", "org/repo#500", "org/repo#999");
+
+        // Subsequent queries return the exact same cached overflow ref
+        assert_eq!(cache.get("bead-42", "org/repo#500").as_deref(), Some("org/repo#999"));
+        assert_eq!(cache.get("bead-42", "org/repo#500").as_deref(), Some("org/repo#999"));
+    }
+
+    #[test]
+    fn overflow_dedup_cache_isolates_different_beads_and_refs() {
+        let cache = OverflowDedupCache::new();
+        cache.insert("bead-1", "org/repo#100", "org/repo#101");
+        cache.insert("bead-2", "org/repo#100", "org/repo#102");
+        cache.insert("bead-1", "org/repo#200", "org/repo#201");
+
+        assert_eq!(cache.get("bead-1", "org/repo#100").as_deref(), Some("org/repo#101"));
+        assert_eq!(cache.get("bead-2", "org/repo#100").as_deref(), Some("org/repo#102"));
+        assert_eq!(cache.get("bead-1", "org/repo#200").as_deref(), Some("org/repo#201"));
+        assert_eq!(cache.get("bead-2", "org/repo#200"), None);
+        assert_eq!(cache.len(), 3);
+    }
+
+    #[test]
+    fn overflow_dedup_cache_get_or_insert_with() {
+        let cache = OverflowDedupCache::new();
+        let mut calls = 0;
+
+        let result1 = cache.get_or_insert_with("bead-1", "org/repo#1", || {
+            calls += 1;
+            Ok::<_, DaemonError>("org/repo#overflow-1".to_string())
+        }).unwrap();
+        assert_eq!(result1, "org/repo#overflow-1");
+        assert_eq!(calls, 1);
+
+        // Second call should return cached ref without invoking generator closure
+        let result2 = cache.get_or_insert_with("bead-1", "org/repo#1", || {
+            calls += 1;
+            Ok::<_, DaemonError>("org/repo#overflow-duplicate".to_string())
+        }).unwrap();
+        assert_eq!(result2, "org/repo#overflow-1");
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn overflow_dedup_cache_clear_and_remove() {
+        let cache = OverflowDedupCache::new();
+        cache.insert("bead-1", "org/repo#1", "org/repo#2");
+        assert_eq!(cache.remove("bead-1", "org/repo#1"), Some("org/repo#2".to_string()));
+        assert_eq!(cache.get("bead-1", "org/repo#1"), None);
+
+        cache.insert("bead-1", "org/repo#1", "org/repo#2");
+        cache.insert("bead-2", "org/repo#3", "org/repo#4");
+        assert_eq!(cache.len(), 2);
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty());
     }
 }
