@@ -26,6 +26,8 @@ pub struct GhCircuitBreakerRecord {
     pub suppressed_calls_during_open: u64,
     pub total_suppressed_calls: u64,
     pub last_transition_epoch: u64,
+    #[serde(default)]
+    pub probe_in_flight: bool,
 }
 
 pub fn now_epoch() -> u64 {
@@ -57,7 +59,7 @@ pub fn epoch_to_iso8601(secs: u64) -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
-/// Checks whether stderr or stdout contains a rate limit phrase (primary, secondary, or breaker open).
+/// Checks whether stderr or stdout contains a rate limit phrase (primary, secondary, or breaker open/half-open).
 pub fn is_gh_rate_limit_text(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains("api rate limit exceeded")
@@ -70,6 +72,7 @@ pub fn is_gh_rate_limit_text(text: &str) -> bool {
         || (lower.contains("403") && lower.contains("rate limit"))
         || (lower.contains("429") && lower.contains("rate limit"))
         || lower.contains("gh rate limit circuit breaker is open")
+        || lower.contains("gh rate limit circuit breaker is half-open")
         || lower.contains("rate limit circuit breaker active")
 }
 
@@ -231,6 +234,7 @@ impl GhCircuitBreaker {
 
         let record = GhCircuitBreakerRecord {
             is_open,
+            probe_in_flight: false,
             ..initial_record
         };
 
@@ -290,34 +294,12 @@ impl GhCircuitBreaker {
     }
 
     pub fn is_open(&self) -> bool {
-        let mut lock = self.inner.lock().unwrap();
+        let lock = self.inner.lock().unwrap();
         let now = now_epoch();
-        if lock.is_open && now >= lock.deadline_epoch {
-            // Expired -> Transition from Open to Closed
-            let suppressed = lock.suppressed_calls_during_open;
-            let duration_open = now.saturating_sub(lock.last_transition_epoch);
-            let prev_deadline = epoch_to_iso8601(lock.deadline_epoch);
-            let last_reason = lock.last_reason.clone();
-
-            lock.is_open = false;
-            lock.suppressed_calls_during_open = 0;
-            lock.last_transition_epoch = now;
-            self.save_record(&lock);
-
-            self.emit_event(
-                "GH_RATE_LIMIT_BREAKER_CLOSED",
-                serde_json::json!({
-                    "suppressedCalls": suppressed,
-                    "openDurationSecs": duration_open,
-                }),
-                serde_json::json!({
-                    "previousDeadline": prev_deadline,
-                    "lastReason": last_reason,
-                }),
-            );
+        if lock.is_open && !lock.probe_in_flight && now >= lock.deadline_epoch {
             return false;
         }
-        lock.is_open
+        lock.is_open || lock.probe_in_flight
     }
 
     pub fn before_call(&self, tool: &str) -> Result<(), DaemonError> {
@@ -326,32 +308,30 @@ impl GhCircuitBreaker {
         }
 
         let mut lock = self.inner.lock().unwrap();
-        if lock.is_open {
+        if lock.is_open || lock.probe_in_flight {
             let now = now_epoch();
             if now >= lock.deadline_epoch {
-                // Cooldown expired: allow one probe request and transition to closed
-                let suppressed = lock.suppressed_calls_during_open;
-                let duration_open = now.saturating_sub(lock.last_transition_epoch);
-                let prev_deadline = epoch_to_iso8601(lock.deadline_epoch);
-                let last_reason = lock.last_reason.clone();
+                // Cooldown expired: allow exactly ONE probe request through while keeping the breaker half-open
+                if !lock.probe_in_flight {
+                    lock.probe_in_flight = true;
+                    self.save_record(&lock);
+                    return Ok(());
+                }
 
-                lock.is_open = false;
-                lock.suppressed_calls_during_open = 0;
-                lock.last_transition_epoch = now;
+                // A probe is already in flight! Short-circuit other concurrent callers until the probe completes
+                lock.suppressed_calls_during_open += 1;
+                lock.total_suppressed_calls += 1;
+                let suppressed = lock.suppressed_calls_during_open;
                 self.save_record(&lock);
 
-                self.emit_event(
-                    "GH_RATE_LIMIT_BREAKER_CLOSED",
-                    serde_json::json!({
-                        "suppressedCalls": suppressed,
-                        "openDurationSecs": duration_open,
-                    }),
-                    serde_json::json!({
-                        "previousDeadline": prev_deadline,
-                        "lastReason": last_reason,
-                    }),
-                );
-                return Ok(());
+                return Err(DaemonError::Tool {
+                    tool: "gh".to_string(),
+                    rc: 403,
+                    stderr: format!(
+                        "gh rate limit circuit breaker is half-open (probe in flight, {} calls suppressed)",
+                        suppressed
+                    ),
+                });
             }
 
             // Breaker is active: record suppressed call and short-circuit
@@ -385,19 +365,21 @@ impl GhCircuitBreaker {
         if let Some(detection) = detect_rate_limit(tool, rc, stderr, "") {
             let mut lock = self.inner.lock().unwrap();
             let now = now_epoch();
+            let was_open = lock.is_open;
+            lock.probe_in_flight = false;
             lock.consecutive_rate_limits = lock.consecutive_rate_limits.saturating_add(1);
             let cooldown = self.compute_next_cooldown(detection.retry_after, lock.consecutive_rate_limits);
             let cooldown_secs = cooldown.as_secs();
             let new_deadline = now + cooldown_secs;
-            if lock.is_open {
+            if was_open {
                 lock.deadline_epoch = std::cmp::max(lock.deadline_epoch, new_deadline);
             } else {
                 lock.deadline_epoch = new_deadline;
             }
             lock.last_reason = detection.reason.clone();
+            lock.is_open = true;
 
-            if !lock.is_open {
-                lock.is_open = true;
+            if !was_open {
                 lock.suppressed_calls_during_open = 0;
                 lock.last_transition_epoch = now;
                 self.save_record(&lock);
@@ -435,6 +417,35 @@ impl GhCircuitBreaker {
                     }),
                 );
             }
+        } else {
+            let mut lock = self.inner.lock().unwrap();
+            if lock.probe_in_flight {
+                // Non-rate-limit response during probe -> GitHub responded without rate limit, close breaker
+                let now = now_epoch();
+                let suppressed = lock.suppressed_calls_during_open;
+                let duration_open = now.saturating_sub(lock.last_transition_epoch);
+                let prev_deadline = epoch_to_iso8601(lock.deadline_epoch);
+                let last_reason = lock.last_reason.clone();
+
+                lock.is_open = false;
+                lock.probe_in_flight = false;
+                lock.consecutive_rate_limits = 0;
+                lock.suppressed_calls_during_open = 0;
+                lock.last_transition_epoch = now;
+                self.save_record(&lock);
+
+                self.emit_event(
+                    "GH_RATE_LIMIT_BREAKER_CLOSED",
+                    serde_json::json!({
+                        "suppressedCalls": suppressed,
+                        "openDurationSecs": duration_open,
+                    }),
+                    serde_json::json!({
+                        "previousDeadline": prev_deadline,
+                        "lastReason": last_reason,
+                    }),
+                );
+            }
         }
     }
 
@@ -443,7 +454,33 @@ impl GhCircuitBreaker {
             return;
         }
         let mut lock = self.inner.lock().unwrap();
-        if !lock.is_open && lock.consecutive_rate_limits > 0 {
+        let was_open_or_probing = lock.is_open || lock.probe_in_flight;
+        if was_open_or_probing {
+            let now = now_epoch();
+            let suppressed = lock.suppressed_calls_during_open;
+            let duration_open = now.saturating_sub(lock.last_transition_epoch);
+            let prev_deadline = epoch_to_iso8601(lock.deadline_epoch);
+            let last_reason = lock.last_reason.clone();
+
+            lock.is_open = false;
+            lock.probe_in_flight = false;
+            lock.consecutive_rate_limits = 0;
+            lock.suppressed_calls_during_open = 0;
+            lock.last_transition_epoch = now;
+            self.save_record(&lock);
+
+            self.emit_event(
+                "GH_RATE_LIMIT_BREAKER_CLOSED",
+                serde_json::json!({
+                    "suppressedCalls": suppressed,
+                    "openDurationSecs": duration_open,
+                }),
+                serde_json::json!({
+                    "previousDeadline": prev_deadline,
+                    "lastReason": last_reason,
+                }),
+            );
+        } else if lock.consecutive_rate_limits > 0 {
             lock.consecutive_rate_limits = 0;
             self.save_record(&lock);
         }
@@ -463,6 +500,7 @@ impl GhCircuitBreaker {
         }
         lock.last_reason = reason.to_string();
         lock.is_open = true;
+        lock.probe_in_flight = false;
 
         if !was_open {
             lock.suppressed_calls_during_open = 0;
@@ -506,7 +544,7 @@ impl GhCircuitBreaker {
 
     pub fn force_close(&self) {
         let mut lock = self.inner.lock().unwrap();
-        if lock.is_open {
+        if lock.is_open || lock.probe_in_flight {
             let now = now_epoch();
             let suppressed = lock.suppressed_calls_during_open;
             let duration_open = now.saturating_sub(lock.last_transition_epoch);
@@ -514,6 +552,8 @@ impl GhCircuitBreaker {
             let last_reason = lock.last_reason.clone();
 
             lock.is_open = false;
+            lock.probe_in_flight = false;
+            lock.consecutive_rate_limits = 0;
             lock.suppressed_calls_during_open = 0;
             lock.last_transition_epoch = now;
             self.save_record(&lock);

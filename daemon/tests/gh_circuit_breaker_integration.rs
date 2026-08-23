@@ -191,24 +191,57 @@ fn test_expiry_allows_exactly_one_request_and_second_403_extends_cooldown() {
 
     let breaker = GhCircuitBreaker::new_with_paths(state_file, Some(tel_log));
 
-    // Open breaker with minimum 5s cooldown
+    // Open breaker with cooldown
     breaker.force_open(Duration::from_secs(1), "test_cooldown");
     assert!(breaker.is_open());
 
     // Wait until deadline has passed
     std::thread::sleep(Duration::from_millis(1100));
 
-    // Expiry allows exactly one request through
+    // Expiry allows exactly one probe request through (transitions to HalfOpen)
     let res = breaker.before_call("gh");
     assert!(res.is_ok(), "expired breaker must allow admission probe");
-    assert!(!breaker.is_open(), "breaker should be marked closed after expiry");
+    assert!(breaker.is_open(), "breaker should remain half-open while probe is in flight");
 
-    // Probe returns 403 again -> extends / re-opens cooldown with backoff
+    // Concurrent call while probe is in flight is suppressed!
+    let concurrent_res = breaker.before_call("gh");
+    assert!(concurrent_res.is_err(), "concurrent callers while probe is in flight must be suppressed");
+
+    // Probe returns 403 again -> extends cooldown with backoff
     breaker.on_error("gh", 1, "HTTP 403: API rate limit exceeded");
     assert!(breaker.is_open());
     assert_eq!(breaker.consecutive_rate_limits(), 2);
     // Consecutive 2 hits -> 120s cooldown
     assert!(breaker.deadline_epoch() > daemon::gh_circuit_breaker::now_epoch() + 100);
+}
+
+#[test]
+fn test_half_open_probe_success_closes_breaker() {
+    let test_dir = std::env::temp_dir().join(format!("cb_half_open_success_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    fs::create_dir_all(&test_dir).unwrap();
+    let state_file = test_dir.join("gh_circuit_breaker.json");
+    let tel_log = test_dir.join("daemon.jsonl");
+
+    let breaker = GhCircuitBreaker::new_with_paths(state_file, Some(tel_log));
+
+    breaker.force_open(Duration::from_secs(1), "test_cooldown");
+    assert!(breaker.is_open());
+
+    std::thread::sleep(Duration::from_millis(1100));
+
+    // Exactly one caller gets admission
+    assert!(breaker.before_call("gh").is_ok());
+    // Concurrent callers suppressed
+    assert!(breaker.before_call("gh").is_err());
+    assert_eq!(breaker.suppressed_calls_during_open(), 1);
+
+    // Probe completes successfully
+    breaker.on_success("gh");
+    assert!(!breaker.is_open(), "successful probe must close the breaker");
+    assert_eq!(breaker.consecutive_rate_limits(), 0);
+
+    // Subsequent callers pass freely
+    assert!(breaker.before_call("gh").is_ok());
 }
 
 #[test]
