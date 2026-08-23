@@ -16344,3 +16344,162 @@ fn quota_watchdog_wakes_paused_pane_after_reset_grace_elapses() {
     daemon::health::quota_watchdog::clear(bead_id);
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+
+#[test]
+fn startup_intake_queues_attested_beads_for_gate_assessment_and_forces_dispatch_pass() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"inhibitionSpecs":["no print"],"positiveAssertions":["log errors"],"securityRedactionEncountered":false}"#.into()
+    ));
+    let store = FakeStateStore::new();
+
+    let mut cfg = test_cfg();
+    cfg.stage = 2;
+    cfg.fast_tick_secs = 60;
+    cfg.slow_tick_secs = 600; // ratio = 10, slow tier organic cadence is every 10 ticks (10m)
+
+    let spec_dir = std::env::temp_dir().join(format!("afd_spec_test_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&spec_dir);
+    cfg.spec_dir = spec_dir.to_str().unwrap().to_string();
+
+    let vcs = test_vcs();
+    let telemetry_log = std::env::temp_dir().join(format!("afd_startup_dispatch_{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    // Setup 3 beads with existing PRs in ATTESTED state in bead_overlay (simulating restart).
+    // Notably, do NOT pre-register in branch_registry to verify discovery from active overlays.
+    for i in 1..=3 {
+        let bead_id = format!("startup-bead-{i}");
+        let branch = format!("factory/startup-bead-{i}-r1");
+        let pr = 800 + i;
+
+        let overlay = BeadOverlay {
+            bead_id: bead_id.clone(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(pr),
+            branch: Some(branch.clone()),
+            session_id: None,
+            session_ao_project: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        };
+        store.save(&overlay).unwrap();
+
+        // Tracker candidate for re-routing and dispatch
+        tracker.candidates.borrow_mut().push(Bead {
+            id: bead_id.clone(),
+            title: format!("Startup bead {i}"),
+            description: "target_repo: owner/repo".to_string(),
+            notes: "".to_string(),
+            file_tree_summary: "".to_string(),
+            external_ref: Some(format!("owner/repo#{pr}")),
+        });
+
+        // Spec file on disk for spec validation in reroll
+        let spec_file = spec_dir.join(format!("{bead_id}.toml"));
+        std::fs::write(&spec_file, "title = \"test\"\n").unwrap();
+
+        // Setup SCM with a red snapshot so gate assessment triggers reroll
+        let mut red_snap = qdw_green_snapshot(pr, Vec::new());
+        red_snap.ci_success = false;
+        red_snap.ci_status = "red".to_string();
+        red_snap.head_sha = format!("sha-startup-{i}");
+        scm.pr_snapshots.insert(pr, red_snap);
+        scm.pr_numbers_for_branch.insert(("owner/repo".into(), branch.clone()), Some(pr));
+        // Deliberately do NOT script `open_pr_head_refs` for this PR: tick 0's
+        // gate-assessment reroll closes it (`REROLL_PR_CLOSED`), and a real
+        // closed/merged PR resolves to `PrHeadBranch::NotFound` on GitHub —
+        // `resolve_drive_pr_head_branch`'s documented fail-safe for that case
+        // is `DriveBranchDecision::Generated`. Scripting a stale `SameRepo`
+        // entry here would incorrectly resolve tick 1's dispatch back onto
+        // this now-superseded `-r1` branch instead of the reroll's `-r2`.
+        sessions.attach_not_found_for.borrow_mut().push(branch);
+    }
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    // ── Tick 0: Startup intake sweep and immediate gate assessment of all ATTESTED beads ──
+    let summary0 = run_tick(&deps, 0, 0).expect("tick 0 startup should succeed");
+
+    // All 3 ATTESTED beads MUST have been gate-assessed immediately rather than waiting
+    assert_eq!(
+        summary0.gates_assessed, 3,
+        "startup tick 0 must immediately assess all 3 ATTESTED beads; got {}",
+        summary0.gates_assessed
+    );
+
+    // Beads must have rerolled to Redispatched because gates were red
+    for i in 1..=3 {
+        let bead_id = format!("startup-bead-{i}");
+        let o = store.load(&bead_id).unwrap().unwrap();
+        let tele = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+        assert_eq!(
+            o.state,
+            OverlayState::Redispatched,
+            "bead {bead_id} must be Redispatched after failing gate assessment on tick 0; got {:?}, park_reason: {:?}, telemetry:\n{}",
+            o.state, o.park_reason, tele
+        );
+    }
+
+    let telemetry0 = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry0.contains("DISPATCH_REQUEST"),
+        "startup tick 0 must emit DISPATCH_REQUEST for ATTESTED beads; got:\n{telemetry0}"
+    );
+
+    // ── Tick 1: Startup forced dispatch pass within 30s ──
+    // Re-script LLM for router on tick 1
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"STANDARD_PATH","justification":"standard implementation"}"#.into()
+    ));
+    *sessions.terminal_at.borrow_mut() = Some(std::time::Instant::now() + std::time::Duration::from_secs(3600)); // Dispatched worker session is actively running
+    // Even though slow_tick_secs=600 (ratio=10), tick 1 MUST run a forced dispatch pass
+    let summary1 = run_tick(&deps, 1, 60).expect("tick 1 startup forced dispatch should succeed");
+
+    assert_eq!(
+        summary1.beads_dispatched, 3,
+        "tick 1 startup forced dispatch pass must dispatch all 3 Redispatched beads; got {}",
+        summary1.beads_dispatched
+    );
+
+    for i in 1..=3 {
+        let bead_id = format!("startup-bead-{i}");
+        let o = store.load(&bead_id).unwrap().unwrap();
+        assert_eq!(
+            o.state,
+            OverlayState::Dispatched,
+            "bead {bead_id} must be DISPATCHED after tick 1 forced dispatch pass; got {:?}",
+            o.state
+        );
+        assert!(
+            o.session_id.is_some(),
+            "bead {bead_id} must have an active session_id after dispatch"
+        );
+    }
+
+    let _ = std::fs::remove_file(&telemetry_log);
+    let _ = std::fs::remove_dir_all(&spec_dir);
+}
+

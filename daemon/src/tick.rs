@@ -733,7 +733,7 @@ pub fn run_tick(
 
     let slow_tier_due = {
         let ratio = (deps.cfg.slow_tick_secs / deps.cfg.fast_tick_secs.max(1)).max(1);
-        tick_index.is_multiple_of(ratio)
+        tick_index.is_multiple_of(ratio) || tick_index == 1
     };
 
     // jleechan-54ky / sub-fix for jleechan-gib: split the SQL-level "increment
@@ -742,6 +742,21 @@ pub fn run_tick(
     // operator/CI wall-clock, not coder session time we are budgeting against).
     let active_overlays = deps.store.list_active_overlays()?;
     for mut overlay in active_overlays {
+        if tick_index == 0 && overlay.state == OverlayState::Attested && overlay.session_id.is_none() {
+            let _ = emit(
+                deps.telemetry_log,
+                &overlay.bead_id,
+                overlay.attempt,
+                OverlayState::Attested.as_str(),
+                "DISPATCH_REQUEST",
+                serde_json::json!({}),
+                serde_json::json!({
+                    "reason": "startup_attested_dispatch_request",
+                    "pr_number": overlay.pr_number,
+                    "branch": overlay.branch,
+                }),
+            );
+        }
         // jleechan-qdw: per-overlay isolation. A snapshot fetch error in the
         // ci_pending lookup must not bump the autonomy clock AND must not
         // run the timebox-park / wedge-check branches for this overlay —
@@ -1285,6 +1300,20 @@ pub fn run_tick(
                                         "pr_number": pr_number,
                                     }),
                                 )?;
+                                if tick_index == 0 {
+                                    emit(
+                                        deps.telemetry_log,
+                                        &overlay.bead_id,
+                                        overlay.attempt,
+                                        OverlayState::Attested.as_str(),
+                                        "DISPATCH_REQUEST",
+                                        serde_json::json!({}),
+                                        serde_json::json!({
+                                            "reason": "startup_attested_dispatch_request",
+                                            "pr_number": pr_number,
+                                        }),
+                                    )?;
+                                }
                                 false
                             };
 
@@ -1972,6 +2001,21 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     "branch": adopted.head_ref_name,
                     "head_sha": adopted.head_sha,
                     "external_ref": adopted.external_ref,
+                    "newly_created": adopted.newly_created,
+                }),
+            )?;
+            emit(
+                deps.telemetry_log,
+                &adopted.bead_id,
+                attempt,
+                OverlayState::Attested.as_str(),
+                "DISPATCH_REQUEST",
+                serde_json::json!({}),
+                serde_json::json!({
+                    "reason": "startup_attested_dispatch_request",
+                    "repo": adopted.repo,
+                    "pr_number": adopted.pr_number,
+                    "branch": adopted.head_ref_name,
                     "newly_created": adopted.newly_created,
                 }),
             )?;
@@ -4892,18 +4936,26 @@ pub fn combine_dual_verdict(
 /// substitution rule: emit `REROLL_VERDICT_RECORDED` and park `HUMAN_HELD`,
 /// never enter `RE_ROLL` or execute the Re-Roll Engine.
 fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), DaemonError> {
-    // In-flight beads are discovered via the branch registry (populated by
-    // `dispatch::dispatch_ready`'s `register_branch` call), not
-    // `Tracker::fetch_candidates` — a bead can be DISPATCHED/ATTESTED long
-    // after it drops out of `br list --status open --label factory` filters,
-    // and `branch_registry` is this store's authoritative "beads we're
-    // actively tracking" set (deletion-guard doc comment on
-    // `StateStore::owned_branches`).
-    let branches = deps.store.owned_branches()?;
+    // In-flight beads are discovered via both the branch registry and
+    // active overlay states (DISPATCHED / ATTESTED in StateStore) so that
+    // restart cycles immediately queue all ATTESTED beads for gate assessment
+    // rather than waiting for next organic tick.
     let mut bead_ids: Vec<String> = Vec::new();
-    for branch in &branches {
-        if let Ok(Some(bead_id)) = deps.store.bead_id_for_branch(branch) {
-            bead_ids.push(bead_id);
+    if let Ok(branches) = deps.store.owned_branches() {
+        for branch in &branches {
+            if let Ok(Some(bead_id)) = deps.store.bead_id_for_branch(branch) {
+                bead_ids.push(bead_id);
+            }
+        }
+    }
+    if let Ok(active_overlays) = deps.store.list_active_overlays() {
+        for overlay in active_overlays {
+            if let Some(ref branch) = overlay.branch {
+                if let Ok(None) = deps.store.bead_id_for_branch(branch) {
+                    let _ = deps.store.register_branch(&overlay.bead_id, branch);
+                }
+            }
+            bead_ids.push(overlay.bead_id);
         }
     }
     bead_ids.sort();
