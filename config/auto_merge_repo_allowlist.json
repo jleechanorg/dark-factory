@@ -1,6 +1,4 @@
 {
-  "_comment": "Fail-closed allowlist for daemon/scripts/auto-merge-guard.sh. A repo NOT in this list is never auto-merged, regardless of CI/verifier gate state. jleechanorg/worldarchitect.ai is additionally hard-denied in the script itself (not just absent here) after the 2026-08-23 PR-merge-storm incident -- see ~/roadmap/nextsteps-2026-08-23-pr-merge-storm-remediation.md Work Item 1. Do not add worldarchitect.ai here until a real human-approval gate exists.",
-  "allowed_repos": [
-    "jleechanorg/dark-factory"
-  ]
+  "_comment": "Fail-closed allowlist for daemon/scripts/auto-merge-guard.sh. A repo NOT in this list is never auto-merged, regardless of CI/verifier gate state. Empty by design after the 2026-08-23 PR-merge-storm incident (~/roadmap/nextsteps-2026-08-23-pr-merge-storm-remediation.md) -- add a repo here (e.g. \"jleechanorg/dark-factory\") to resume its auto-merges. This is config-only by operator directive: never hardcode a repo allow/deny in the script itself, edit this file instead.",
+  "allowed_repos": []
 }

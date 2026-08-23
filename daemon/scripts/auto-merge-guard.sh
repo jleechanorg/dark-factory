@@ -24,25 +24,20 @@ H="daemon/factory-overlay.sh"
 MAX_PER_HOUR="${1:-8}"
 
 # --- Repo auto-merge policy gate (2026-08-23 PR-merge-storm incident) ---
-# HARD DENY, not merely absent-from-allowlist: jleechanorg/worldarchitect.ai
-# must NEVER be auto-merged by this script regardless of config content.
+# Config-only, not code: which repos this script may auto-merge in is
+# controlled ENTIRELY by config/auto_merge_repo_allowlist.json (or the
+# AMG_REPO_POLICY_FILE override) -- no repo name is ever hardcoded here.
 # Incident: 2026-08-23, a burst of unattended worldai merges (42 PRs in 12h,
 # most with no literal human MERGE APPROVED at time of merge) produced real
 # production regressions (PATCH /api/campaigns/<id> whitelist stripped,
-# context-compression pruning wiped). Root cause of THAT specific burst was
-# never conclusively pinned to one mechanism, but this script — the one
-# dark-factory component whose literal job is "merge-authority policy gate"
-# — had zero human-approval step for ANY repo it might ever run against.
-# This hard-denies the one repo where regressions are user-facing/production;
-# other repos still require the ALLOW list below (fail-closed default).
-if [ "$REPO" = "jleechanorg/worldarchitect.ai" ]; then
-  echo "auto-merge-guard: HARD DENY — $REPO auto-merge is permanently disabled pending a real human-approval gate (see nextsteps-2026-08-23-pr-merge-storm-remediation.md Work Item 1). Refusing to merge anything this pass." >&2
-  exit 0
-fi
-# Fail-closed allowlist for every other repo: a config file, not a code
-# change, controls which repos this script may auto-merge in. Absence of
-# the config file, an empty list, or $REPO not present in it all mean
-# "no merges this pass" — the safe default is off, not on.
+# context-compression pruning wiped). This script -- the one dark-factory
+# component whose literal job is "merge-authority policy gate" -- had zero
+# human-approval step or repo scoping for any repo it might run against.
+# Operator directive: keep the factory dispatch daemon running, stop only
+# the merges, and control the stop/resume purely via config so re-enabling
+# a repo never requires a code change or redeploy -- just an edit to the
+# allowlist file. Absence of the config file, an empty list, or $REPO not
+# present in it all mean "no merges this pass" -- the safe default is off.
 AMG_REPO_POLICY_FILE="${AMG_REPO_POLICY_FILE:-$(git rev-parse --show-toplevel 2>/dev/null)/config/auto_merge_repo_allowlist.json}"
 if [ ! -f "$AMG_REPO_POLICY_FILE" ]; then
   echo "auto-merge-guard: no repo allowlist config at $AMG_REPO_POLICY_FILE — refusing to merge anything this pass (fail-closed default)" >&2

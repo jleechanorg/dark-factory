@@ -65,10 +65,11 @@ emit_assessment() { # <gates_json> [head_sha]
 # line `sys.exit(0)'` and we extract up to and including that line.
 # Bead rev-1uno inserted a rate_limit quota preflight (44 lines) ahead of
 # this function, shifting the body start from line 41 to line 85. The
-# 2026-08-23 PR-merge-storm incident's repo-policy gate (40 more lines)
-# shifted it again, 85 -> 125 — keep this start line in lockstep with any
-# future edits above `latest_assessment_no_red()` in auto-merge-guard.sh.
-predicate_block="$(awk 'NR>=125 && /^sys\.exit\(0\)\x27/ { print; exit } NR>=125 { print }' "$GUARD" | sed 's/^  //')"
+# 2026-08-23 PR-merge-storm incident's config-driven repo-policy gate (35
+# more lines) shifted it again, 85 -> 120 — keep this start line in
+# lockstep with any future edits above `latest_assessment_no_red()` in
+# auto-merge-guard.sh.
+predicate_block="$(awk 'NR>=120 && /^sys\.exit\(0\)\x27/ { print; exit } NR>=120 { print }' "$GUARD" | sed 's/^  //')"
 # Strip the trailing `'` from `sys.exit(0)'` so the extracted block is
 # parseable Python on its own. We then re-append the close to keep the
 # block identical to the production heredoc body.

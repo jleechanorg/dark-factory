@@ -56,7 +56,7 @@ emit_assessment() { # <gates_json>
 # rate_limit quota preflight (44 lines) ahead of this function, shifting
 # the range to 85..=158 — keep this range in lockstep with any future
 # edits above `latest_assessment_no_red()` in auto-merge-guard.sh.
-predicate_block="$(sed -n '125,198p' "$GUARD" | sed 's/^  //')"
+predicate_block="$(sed -n '120,193p' "$GUARD" | sed 's/^  //')"
 
 run_predicate() { # <input_json>
   printf '%s' "$1" | python3 -c "$predicate_block" "$LIVE_HEAD"

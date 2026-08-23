@@ -80,6 +80,15 @@ mkdir -p "$FAKE_BIN_DIR"
 FAKE_HOME="$SCRATCH_DIR/home"
 mkdir -p "$FAKE_HOME"
 
+# This suite tests quota-routing/CI-evaluation behavior, not repo policy —
+# point AMG_REPO_POLICY_FILE at an isolated fixture that allows the fake
+# "jleechanorg/dark-factory" repo the gh shim reports below, so these tests
+# aren't coupled to (or broken by) the real shipped config's contents.
+FAKE_REPO_POLICY="$SCRATCH_DIR/repo_allowlist.json"
+cat > "$FAKE_REPO_POLICY" <<'EOF_POLICY'
+{"allowed_repos": ["jleechanorg/dark-factory"]}
+EOF_POLICY
+
 # --- Fake gh shim ------------------------------------------------------
 # Logs every invocation (raw args, one call per line) to GH_SHIM_LOG and
 # returns canned, already-filtered output for the exact subcommands
@@ -185,6 +194,7 @@ run_guard() {
     HOME="$FAKE_HOME" \
     PATH="$FAKE_BIN_DIR:$PATH" \
     AFD_LOG="$SCRATCH_DIR/daemon.jsonl" \
+    AMG_REPO_POLICY_FILE="$FAKE_REPO_POLICY" \
     GH_SHIM_LOG="$GH_SHIM_LOG" \
     GH_SHIM_RATE_LIMIT_JSON="$GH_SHIM_RATE_LIMIT_JSON" \
     GH_SHIM_PR_LIST_OUT="${GH_SHIM_PR_LIST_OUT:-/dev/null}" \
