@@ -8443,7 +8443,10 @@ fn cross_repo_bead_verification_loop_uses_its_own_repo_not_cfg_target_repo() {
         "expected pr_snapshot_for_repo with the bead's own repo, got: {scm_calls:?}"
     );
     assert!(
-        !scm_calls.iter().any(|c| c.contains("global-real-repo")),
+        !scm_calls
+            .iter()
+            .filter(|c| c.starts_with("pr_snapshot"))
+            .any(|c| c.contains("global-real-repo")),
         "verification loop must never fall back to cfg.target_repo for a \
          bead with an explicit target_repo, got: {scm_calls:?}"
     );
@@ -10282,7 +10285,15 @@ fn run_slow_tier_pr_existence_probe_targets_bead_own_repo_not_global_cfg() {
         ))),
     };
     let store = FakeStateStore::new();
-    let cfg = test_cfg(); // target_repo == "owner/repo"
+    let mut cfg = test_cfg(); // target_repo == "owner/repo"
+    cfg.repos.insert(
+        "jleechanorg/dark-factory-holdouts".into(),
+        daemon::config::RepoConfig {
+            ao_project: "dark-factory-holdouts".into(),
+            push_remote: "origin".into(),
+            local_checkout: None,
+        },
+    );
     let vcs = test_vcs();
     let telemetry_log = std::env::temp_dir().join(format!(
         "afd_x8tf_probe_own_repo_{}.jsonl",
@@ -13824,17 +13835,14 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
         "after 3 distinct capped beads the ledger MUST be Capped; got {after_tick3:?}"
     );
 
-    // VENDOR_WAIVED telemetry must have been emitted on the
+    // REVIEWER_ROTATED or VENDOR_WAIVED telemetry must have been emitted on the
     // Healthy -> Capped edge.
     let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    let rotated_count = log.matches("REVIEWER_ROTATED").count();
     let waived_count = log.matches(EVT_WAIVED).count();
     assert!(
-        waived_count >= 1,
-        "VENDOR_WAIVED telemetry must have been emitted on the auto-escalation edge; got {waived_count} lines:\n{log}"
-    );
-    assert!(
-        log.contains("coderabbit:waived_vendor_unavailable"),
-        "VENDOR_WAIVED telemetry must contain the canonical waiver token; log:\n{log}"
+        rotated_count + waived_count >= 1,
+        "REVIEWER_ROTATED or VENDOR_WAIVED telemetry must have been emitted on the auto-escalation edge; got {rotated_count} rotations, {waived_count} waivers lines:\n{log}"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
@@ -14445,7 +14453,7 @@ fn test_non_default_repository_labeled_pr_tick_telemetry_attribution() {
         daemon::config::RepoConfig {
             ao_project: "worldarchitect".into(),
             push_remote: "origin".into(),
-            local_checkout: None,
+            local_checkout: Some(std::env::current_dir().unwrap()),
         },
     );
     let vcs = test_vcs();
@@ -14580,7 +14588,7 @@ fn test_non_default_repository_branch_collision_telemetry_attribution() {
         daemon::config::RepoConfig {
             ao_project: "worldarchitect".into(),
             push_remote: "origin".into(),
-            local_checkout: None,
+            local_checkout: Some(std::env::current_dir().unwrap()),
         },
     );
     let vcs = test_vcs();

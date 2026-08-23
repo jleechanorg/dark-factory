@@ -1199,124 +1199,209 @@ pub(crate) fn normalize_labeled_prs_with_cache(
 /// function via `return Err(..)`, which propagates through `run_slow_tier`
 /// to `main()` and calls `std::process::exit(1)`, so no candidate after the
 /// failing one in the same fetch batch was ever visited, let alone logged.
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Normalize labeled issues into beads across all configured repositories.
+///
+/// * Sweeps every repository in `target_repositories_sweep_order(cfg)`.
+/// * Fetches candidate issues labeled `factory` per repository from the SCM.
+/// * Skips any issue whose `external_ref` already appears among the tracker's
+///   known candidates (idempotency — no duplicate `create_bead` calls).
+/// * Checks the issue author's collaborator permission tier per repository; only
+///   `Permission::Write` / `Permission::Admin` pass. Lower tiers are skipped
+///   (not an error) — the skip itself (issue external_ref + author_login) is
+///   the audit context callers/telemetry record.
+/// * For each newly-authorized issue, calls `create_bead` and collects the
+///   returned bead id.
+///
+/// Returns `(created, outcomes)`: `created` is the ids of beads newly
+/// created during this pass. `outcomes` carries exactly one `IntakeOutcome` for every
+/// candidate that did NOT result in a newly-created bead (skips + errors).
+///
+/// No single repository or candidate's failure can prevent the rest of the batch from
+/// being processed.
 pub fn normalize(
     scm: &dyn Scm,
     tracker: &dyn Tracker,
     cfg: &Config,
 ) -> Result<(Vec<String>, Vec<IntakeOutcome>), DaemonError> {
-    let issues = scm.labeled_issues(FACTORY_LABEL)?;
-    if issues.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
-    }
-
-    let known_refs = tracker.fetch_all_external_refs()?;
-
+    let now_epoch = now_epoch_secs();
+    let target_repos = target_repositories_sweep_order(cfg, now_epoch);
     let mut created = Vec::new();
     let mut outcomes = Vec::new();
+    let mut tracker_snapshot_state: Option<TrackerSweepFetchResult> = None;
 
-    for mut issue in issues {
-        // jleechan-r28r: normalize URL form to canonical owner/repo#N
-        // BEFORE the known_refs.contains check so two intake events for the
-        // same PR (one URL-shaped, one short-shaped) hit the same dedup
-        // key.
-        issue.external_ref = to_canonical_external_ref(&issue.external_ref);
-
-        // Idempotency: already-known external_ref -> skip silently, no create_bead call.
-        if known_refs.contains(&issue.external_ref) {
-            outcomes.push(IntakeOutcome {
-                external_ref: issue.external_ref.clone(),
-                verdict: IntakeVerdict::SkippedDuplicate,
-                repo: Some(cfg.target_repo.clone()),
-                pr_number: Some(issue.number),
-                branch: None,
-                head_sha: None,
-            });
-            continue;
-        }
-
-        // Write-tier authorization gate (spec §4.2.3): only Write/Admin may
-        // trigger dispatch. Lower tiers are skipped, not errored — the skip
-        // itself is the audit trail the caller records via telemetry, keyed
-        // on issue.external_ref + issue.author_login. A failure to even
-        // *determine* the permission tier (e.g. a transient GitHub API
-        // error) is recorded as Errored for this candidate only — it must
-        // not abort the rest of the batch.
-        let permission = match scm.collaborator_permission_for_repo(&cfg.target_repo, &issue.author_login) {
-            Ok(p) => p,
+    for repo in &target_repos {
+        let issues_result = scm.labeled_issues_for_repo(repo, FACTORY_LABEL);
+        let issues = match issues_result {
+            Ok(i) => i,
             Err(e) => {
+                eprintln!(
+                    "auto-factory daemon: WARNING issue intake failed for repository {repo}: {e}; continuing with remaining repositories"
+                );
                 outcomes.push(IntakeOutcome {
-                    external_ref: issue.external_ref.clone(),
+                    external_ref: repo.clone(),
                     verdict: IntakeVerdict::Errored {
                         reason: e.to_string(),
                     },
-                    repo: Some(cfg.target_repo.clone()),
-                    pr_number: Some(issue.number),
+                    repo: Some(repo.clone()),
+                    pr_number: None,
                     branch: None,
                     head_sha: None,
                 });
                 continue;
             }
         };
-        if !permission.is_write_tier() {
-            outcomes.push(IntakeOutcome {
-                external_ref: issue.external_ref.clone(),
-                verdict: IntakeVerdict::SkippedIneligible {
-                    precondition: format!("author_permission_below_write_tier:{permission:?}"),
-                },
-                repo: Some(cfg.target_repo.clone()),
-                pr_number: Some(issue.number),
-                branch: None,
-                head_sha: None,
-            });
+
+        if issues.is_empty() {
             continue;
         }
 
-        let title = format!("{} ({})", issue.title, cfg.target_repo);
-        let bead_id = match tracker.create_bead(&title, &issue.body, &issue.external_ref) {
-            Ok(id) => id,
-            Err(e) => {
-                // jleechan-u4gb: the known_refs pre-check above is a bulk
-                // snapshot read that can race with a concurrent write (e.g.
-                // a duplicate labeled-issue entry within the same batch, or
-                // staleness/skew in the underlying `br list` snapshot) and
-                // miss a ref that was actually already tracked. `br create`'s
-                // own uniqueness constraint is authoritative and catches it
-                // at write time; treat that as "already tracked" (same
-                // outcome as the known_refs.contains skip above) instead of
-                // failing the whole tick and retrying forever — the ref will
-                // *always* already exist on retry, so propagating this as a
-                // transient error just burns exponential backoff for no
-                // benefit.
-                if let Some(existing_bead_id) = e.duplicate_external_ref_bead_id() {
+        let snapshot_result = tracker_snapshot_state.get_or_insert_with(|| {
+            match (tracker.fetch_candidates(), tracker.fetch_all_external_refs()) {
+                (Ok(candidates), Ok(refs)) => Ok((candidates, refs)),
+                (Err(e), _) | (_, Err(e)) => {
                     eprintln!(
-                        "auto-factory daemon: intake race recovered — external_ref {:?} already tracked by {existing_bead_id} (known_refs pre-check missed it); skipping create_bead",
-                        issue.external_ref
+                        "auto-factory daemon: WARNING issue intake tracker snapshot fetch failed \
+                         (first needed by repository {repo}): {e}; degrading issue intake for the \
+                         remainder of this sweep"
                     );
+                    Err(())
+                }
+            }
+        });
+
+        let (_, known_refs): (&[Bead], &std::collections::HashSet<String>) = match snapshot_result {
+            Ok((candidates, refs)) => (candidates.as_slice(), &*refs),
+            Err(()) => {
+                continue;
+            }
+        };
+
+        for mut issue in issues {
+            issue.external_ref = to_canonical_external_ref(&issue.external_ref);
+
+            if known_refs.contains(&issue.external_ref) {
+                outcomes.push(IntakeOutcome {
+                    external_ref: issue.external_ref.clone(),
+                    verdict: IntakeVerdict::SkippedDuplicate,
+                    repo: Some(repo.clone()),
+                    pr_number: Some(issue.number),
+                    branch: None,
+                    head_sha: None,
+                });
+                continue;
+            }
+
+            let permission = match scm.collaborator_permission_for_repo(repo, &issue.author_login) {
+                Ok(p) => p,
+                Err(e) => {
                     outcomes.push(IntakeOutcome {
                         external_ref: issue.external_ref.clone(),
-                        verdict: IntakeVerdict::SkippedDuplicate,
-                        repo: Some(cfg.target_repo.clone()),
+                        verdict: IntakeVerdict::Errored {
+                            reason: e.to_string(),
+                        },
+                        repo: Some(repo.clone()),
                         pr_number: Some(issue.number),
                         branch: None,
                         head_sha: None,
                     });
                     continue;
                 }
-                // jleechan-eazj: do NOT `return Err(e)` here — that used to
-                // abort the whole `normalize` call (and, via `?` upstream,
-                // the whole daemon process) on the first non-duplicate
-                // `create_bead` failure, silently starving every subsequent
-                // candidate in this fetch batch of any telemetry at all.
-                // Record the real error and move on to the next candidate;
-                // an unresolved issue is retried again next slow tick since
-                // it never gets added to `known_refs`.
+            };
+            if !permission.is_write_tier() {
                 outcomes.push(IntakeOutcome {
                     external_ref: issue.external_ref.clone(),
+                    verdict: IntakeVerdict::SkippedIneligible {
+                        precondition: format!("author_permission_below_write_tier:{permission:?}"),
+                    },
+                    repo: Some(repo.clone()),
+                    pr_number: Some(issue.number),
+                    branch: None,
+                    head_sha: None,
+                });
+                continue;
+            }
+
+            let title = format!("{} ({})", issue.title, repo);
+            let bead_id = match tracker.create_bead(&title, &issue.body, &issue.external_ref) {
+                Ok(id) => id,
+                Err(e) => {
+                    if let Some(existing_bead_id) = e.duplicate_external_ref_bead_id() {
+                        eprintln!(
+                            "auto-factory daemon: intake race recovered — external_ref {:?} already tracked by {existing_bead_id} (known_refs pre-check missed it); skipping create_bead",
+                            issue.external_ref
+                        );
+                        outcomes.push(IntakeOutcome {
+                            external_ref: issue.external_ref.clone(),
+                            verdict: IntakeVerdict::SkippedDuplicate,
+                            repo: Some(repo.clone()),
+                            pr_number: Some(issue.number),
+                            branch: None,
+                            head_sha: None,
+                        });
+                        continue;
+                    }
+                    outcomes.push(IntakeOutcome {
+                        external_ref: issue.external_ref.clone(),
+                        verdict: IntakeVerdict::Errored {
+                            reason: e.to_string(),
+                        },
+                        repo: Some(repo.clone()),
+                        pr_number: Some(issue.number),
+                        branch: None,
+                        head_sha: None,
+                    });
+                    continue;
+                }
+            };
+
+            let comment_body = format!(
+                "🤖 **[dark-factory]** Auto-factory has picked up this task. Created tracking bead `{}`. Spawning worker session...",
+                bead_id
+            );
+            let _ = tracker.comment_external(&issue.external_ref, &comment_body);
+
+            created.push(bead_id);
+        }
+    }
+
+    Ok((created, outcomes))
+}
+
+/// Normalize open PRs labeled `factory` into beads across all configured repositories.
+pub fn normalize_labeled_prs(
+    scm: &dyn Scm,
+    tracker: &dyn Tracker,
+    cfg: &Config,
+) -> Result<(Vec<ExistingPrIntake>, Vec<IntakeOutcome>), DaemonError> {
+    let now_epoch = now_epoch_secs();
+    let target_repos = target_repositories_sweep_order(cfg, now_epoch);
+    let mut intakes = Vec::new();
+    let mut outcomes = Vec::new();
+    let mut tracker_snapshot_state: Option<TrackerSweepFetchResult> = None;
+
+    for repo in &target_repos {
+        let mut legacy_gh_calls: u32 = 0;
+        let prs_result = scm.labeled_prs_for_repo(repo, FACTORY_LABEL, &mut legacy_gh_calls);
+        let prs = match prs_result {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "auto-factory daemon: WARNING PR intake failed for repository {repo}: {e}; continuing with remaining repositories"
+                );
+                outcomes.push(IntakeOutcome {
+                    external_ref: repo.clone(),
                     verdict: IntakeVerdict::Errored {
                         reason: e.to_string(),
                     },
-                    repo: Some(cfg.target_repo.clone()),
-                    pr_number: Some(issue.number),
+                    repo: Some(repo.clone()),
+                    pr_number: None,
                     branch: None,
                     head_sha: None,
                 });
@@ -1324,195 +1409,168 @@ pub fn normalize(
             }
         };
 
-        let comment_body = format!(
-            "🤖 **[dark-factory]** Auto-factory has picked up this task. Created tracking bead `{}`. Spawning worker session...",
-            bead_id
-        );
-        let _ = tracker.comment_external(&issue.external_ref, &comment_body);
-
-        created.push(bead_id);
-    }
-
-    Ok((created, outcomes))
-}
-
-/// Normalize open PRs labeled `factory` into beads that should attach to the
-/// existing PR/head branch rather than dispatching a fresh factory branch.
-///
-/// Returns `(intakes, outcomes)` with the same jleechan-eazj guarantee as
-/// `normalize`: every PR `scm.labeled_prs` returns resolves to exactly one
-/// verdict this tick — either an `ExistingPrIntake` entry (ADOPTED, reported
-/// by the caller via EXISTING_PR_ADOPTED) or one `IntakeOutcome` here. No
-/// single PR's error aborts the rest of the batch.
-pub fn normalize_labeled_prs(
-    scm: &dyn Scm,
-    tracker: &dyn Tracker,
-    cfg: &Config,
-) -> Result<(Vec<ExistingPrIntake>, Vec<IntakeOutcome>), DaemonError> {
-    // jtg8-r5: pass a counter into `labeled_prs` so any REST-fallback
-    // per-PR pulls show up in the metric alongside the list query (the
-    // legacy `normalize_labeled_prs` path doesn't surface the metric to
-    // telemetry, but the trait signature must stay uniform across both
-    // callers to avoid drift).
-    let mut legacy_gh_calls: u32 = 0;
-    let prs = scm.labeled_prs_for_repo(&cfg.target_repo, FACTORY_LABEL, &mut legacy_gh_calls)?;
-    if prs.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
-    }
-
-    let tracker_candidates = tracker.fetch_candidates()?;
-    let known_refs = tracker.fetch_all_external_refs()?;
-    let mut intakes = Vec::new();
-    let mut outcomes = Vec::new();
-
-    for mut pr in prs {
-        // jleechan-r28r: normalize URL form to canonical owner/repo#N
-        // BEFORE the head_ref_name / tracker_candidates / known_refs /
-        // create_bead checks — see to_canonical_external_ref for the
-        // duplicate-pair rationale.
-        pr.external_ref = to_canonical_external_ref(&pr.external_ref);
-
-        if pr.head_ref_name.trim().is_empty() {
-            outcomes.push(IntakeOutcome {
-                external_ref: pr.external_ref.clone(),
-                verdict: IntakeVerdict::SkippedIneligible {
-                    precondition: "empty_head_ref_name".to_string(),
-                },
-                repo: Some(cfg.target_repo.clone()),
-                pr_number: Some(pr.number),
-                branch: Some(pr.head_ref_name.clone()),
-                head_sha: pr.head_sha.clone(),
-            });
+        if prs.is_empty() {
             continue;
         }
 
-        if !same_repo_pr(&pr, &cfg.target_repo) {
-            let comment_body = "🤖 **[dark-factory]** Escalation required: fork/cross-repository PR adoption is not supported in v1. Same-repo factory PRs can be verified automatically; fork remediation lands with bead `jleechan-tfs1`.";
-            let _ = tracker.comment_external(&pr.external_ref, comment_body);
-            outcomes.push(IntakeOutcome {
-                external_ref: pr.external_ref.clone(),
-                verdict: IntakeVerdict::SkippedFork,
-                repo: Some(cfg.target_repo.clone()),
-                pr_number: Some(pr.number),
-                branch: Some(pr.head_ref_name.clone()),
-                head_sha: pr.head_sha.clone(),
-            });
-            continue;
-        }
+        let snapshot_result = tracker_snapshot_state.get_or_insert_with(|| {
+            match (tracker.fetch_candidates(), tracker.fetch_all_external_refs()) {
+                (Ok(candidates), Ok(refs)) => Ok((candidates, refs)),
+                (Err(e), _) | (_, Err(e)) => {
+                    eprintln!(
+                        "auto-factory daemon: WARNING PR intake tracker snapshot fetch failed \
+                         (first needed by repository {repo}): {e}; degrading PR intake for the \
+                         remainder of this sweep"
+                    );
+                    Err(())
+                }
+            }
+        });
 
-        let permission = match scm.collaborator_permission_for_repo(&cfg.target_repo, &pr.author_login) {
-            Ok(p) => p,
-            Err(e) => {
+        let (tracker_candidates, known_refs): (&[Bead], &std::collections::HashSet<String>) =
+            match snapshot_result {
+                Ok((candidates, refs)) => (candidates.as_slice(), &*refs),
+                Err(()) => {
+                    continue;
+                }
+            };
+
+        for mut pr in prs {
+            pr.external_ref = to_canonical_external_ref(&pr.external_ref);
+
+            if pr.head_ref_name.trim().is_empty() {
                 outcomes.push(IntakeOutcome {
                     external_ref: pr.external_ref.clone(),
-                    verdict: IntakeVerdict::Errored {
-                        reason: e.to_string(),
+                    verdict: IntakeVerdict::SkippedIneligible {
+                        precondition: "empty_head_ref_name".to_string(),
                     },
-                    repo: Some(cfg.target_repo.clone()),
+                    repo: Some(repo.clone()),
                     pr_number: Some(pr.number),
                     branch: Some(pr.head_ref_name.clone()),
                     head_sha: pr.head_sha.clone(),
                 });
                 continue;
             }
-        };
-        if !permission.is_write_tier() {
-            outcomes.push(IntakeOutcome {
-                external_ref: pr.external_ref.clone(),
-                verdict: IntakeVerdict::SkippedIneligible {
-                    precondition: format!("author_permission_below_write_tier:{permission:?}"),
-                },
-                repo: Some(cfg.target_repo.clone()),
-                pr_number: Some(pr.number),
-                branch: Some(pr.head_ref_name.clone()),
-                head_sha: pr.head_sha.clone(),
-            });
-            continue;
-        }
 
-        if let Some(bead) = tracker_candidates
-            .iter()
-            .find(|bead| bead.external_ref.as_deref() == Some(pr.external_ref.as_str()))
-        {
-            intakes.push(ExistingPrIntake {
-                bead_id: bead.id.clone(),
-                pr_number: pr.number,
-                head_ref_name: pr.head_ref_name.clone(),
-                external_ref: pr.external_ref.clone(),
-                newly_created: false,
-                repo: cfg.target_repo.clone(),
-                head_sha: pr.head_sha.clone(),
-            });
-            continue;
-        }
+            if !same_repo_pr(&pr, repo) {
+                let comment_body = "🤖 **[dark-factory]** Escalation required: fork/cross-repository PR adoption is not supported in v1. Same-repo factory PRs can be verified automatically; fork remediation lands with bead `jleechan-tfs1`.";
+                let _ = tracker.comment_external(&pr.external_ref, comment_body);
+                outcomes.push(IntakeOutcome {
+                    external_ref: pr.external_ref.clone(),
+                    verdict: IntakeVerdict::SkippedFork,
+                    repo: Some(repo.clone()),
+                    pr_number: Some(pr.number),
+                    branch: Some(pr.head_ref_name.clone()),
+                    head_sha: pr.head_sha.clone(),
+                });
+                continue;
+            }
 
-        if known_refs.contains(&pr.external_ref) {
-            outcomes.push(IntakeOutcome {
-                external_ref: pr.external_ref.clone(),
-                verdict: IntakeVerdict::SkippedDuplicate,
-                repo: Some(cfg.target_repo.clone()),
-                pr_number: Some(pr.number),
-                branch: Some(pr.head_ref_name.clone()),
-                head_sha: pr.head_sha.clone(),
-            });
-            continue;
-        }
-
-        let title = format!("{} ({})", pr.title, cfg.target_repo);
-        let bead_id = match tracker.create_bead(&title, &pr.body, &pr.external_ref) {
-            Ok(id) => id,
-            Err(e) => {
-                // jleechan-u4gb: same write-time-vs-read-time race as
-                // intake::normalize above — `br create`'s uniqueness
-                // constraint is authoritative; treat a caught duplicate as
-                // already-adopted rather than failing the whole tick.
-                if let Some(existing_bead_id) = e.duplicate_external_ref_bead_id() {
-                    eprintln!(
-                        "auto-factory daemon: PR intake race recovered — external_ref {:?} already tracked by {existing_bead_id} (known_refs pre-check missed it); skipping create_bead",
-                        pr.external_ref
-                    );
+            let permission = match scm.collaborator_permission_for_repo(repo, &pr.author_login) {
+                Ok(p) => p,
+                Err(e) => {
                     outcomes.push(IntakeOutcome {
                         external_ref: pr.external_ref.clone(),
-                        verdict: IntakeVerdict::SkippedDuplicate,
-                        repo: Some(cfg.target_repo.clone()),
+                        verdict: IntakeVerdict::Errored {
+                            reason: e.to_string(),
+                        },
+                        repo: Some(repo.clone()),
                         pr_number: Some(pr.number),
                         branch: Some(pr.head_ref_name.clone()),
                         head_sha: pr.head_sha.clone(),
                     });
                     continue;
                 }
-                // jleechan-eazj: do NOT `return Err(e)` here — see the
-                // matching comment in `normalize` above. One PR's
-                // non-duplicate `create_bead` failure must not starve every
-                // other candidate in this fetch batch of telemetry (or crash
-                // the daemon process via the `?` upstream in `run_slow_tier`).
+            };
+            if !permission.is_write_tier() {
                 outcomes.push(IntakeOutcome {
                     external_ref: pr.external_ref.clone(),
-                    verdict: IntakeVerdict::Errored {
-                        reason: e.to_string(),
+                    verdict: IntakeVerdict::SkippedIneligible {
+                        precondition: format!("author_permission_below_write_tier:{permission:?}"),
                     },
-                    repo: Some(cfg.target_repo.clone()),
+                    repo: Some(repo.clone()),
                     pr_number: Some(pr.number),
                     branch: Some(pr.head_ref_name.clone()),
                     head_sha: pr.head_sha.clone(),
                 });
                 continue;
             }
-        };
-        let comment_body = format!(
-            "🤖 **[dark-factory]** Auto-factory has picked up this pull request. Created tracking bead `{}` and will verify the existing branch `{}`.",
-            bead_id, pr.head_ref_name
-        );
-        let _ = tracker.comment_external(&pr.external_ref, &comment_body);
-        intakes.push(ExistingPrIntake {
-            bead_id,
-            pr_number: pr.number,
-            head_ref_name: pr.head_ref_name,
-            external_ref: pr.external_ref,
-            newly_created: true,
-            repo: cfg.target_repo.clone(),
-            head_sha: pr.head_sha,
-        });
+
+            if let Some(bead) = tracker_candidates
+                .iter()
+                .find(|bead| bead.external_ref.as_deref() == Some(pr.external_ref.as_str()))
+            {
+                intakes.push(ExistingPrIntake {
+                    bead_id: bead.id.clone(),
+                    pr_number: pr.number,
+                    head_ref_name: pr.head_ref_name.clone(),
+                    external_ref: pr.external_ref.clone(),
+                    newly_created: false,
+                    repo: repo.clone(),
+                    head_sha: pr.head_sha.clone(),
+                });
+                continue;
+            }
+
+            if known_refs.contains(&pr.external_ref) {
+                outcomes.push(IntakeOutcome {
+                    external_ref: pr.external_ref.clone(),
+                    verdict: IntakeVerdict::SkippedDuplicate,
+                    repo: Some(repo.clone()),
+                    pr_number: Some(pr.number),
+                    branch: Some(pr.head_ref_name.clone()),
+                    head_sha: pr.head_sha.clone(),
+                });
+                continue;
+            }
+
+            let title = format!("{} ({})", pr.title, repo);
+            let bead_id = match tracker.create_bead(&title, &pr.body, &pr.external_ref) {
+                Ok(id) => id,
+                Err(e) => {
+                    if let Some(existing_bead_id) = e.duplicate_external_ref_bead_id() {
+                        eprintln!(
+                            "auto-factory daemon: PR intake race recovered — external_ref {:?} already tracked by {existing_bead_id} (known_refs pre-check missed it); skipping create_bead",
+                            pr.external_ref
+                        );
+                        outcomes.push(IntakeOutcome {
+                            external_ref: pr.external_ref.clone(),
+                            verdict: IntakeVerdict::SkippedDuplicate,
+                            repo: Some(repo.clone()),
+                            pr_number: Some(pr.number),
+                            branch: Some(pr.head_ref_name.clone()),
+                            head_sha: pr.head_sha.clone(),
+                        });
+                        continue;
+                    }
+                    outcomes.push(IntakeOutcome {
+                        external_ref: pr.external_ref.clone(),
+                        verdict: IntakeVerdict::Errored {
+                            reason: e.to_string(),
+                        },
+                        repo: Some(repo.clone()),
+                        pr_number: Some(pr.number),
+                        branch: Some(pr.head_ref_name.clone()),
+                        head_sha: pr.head_sha.clone(),
+                    });
+                    continue;
+                }
+            };
+            let comment_body = format!(
+                "🤖 **[dark-factory]** Auto-factory has picked up this pull request. Created tracking bead `{}` and will verify the existing branch `{}`.",
+                bead_id, pr.head_ref_name
+            );
+            let _ = tracker.comment_external(&pr.external_ref, &comment_body);
+            intakes.push(ExistingPrIntake {
+                bead_id,
+                pr_number: pr.number,
+                head_ref_name: pr.head_ref_name,
+                external_ref: pr.external_ref,
+                newly_created: true,
+                repo: repo.clone(),
+                head_sha: pr.head_sha,
+            });
+        }
     }
 
     Ok((intakes, outcomes))
