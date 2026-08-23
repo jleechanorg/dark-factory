@@ -1,0 +1,19 @@
+{
+  "markers": [
+    "login expired",
+    "oauth session expired",
+    "individual quota reached",
+    "resource_exhausted",
+    "rate limit exceeded",
+    "usage limit reached",
+    "weekly limit",
+    "not logged in · run /login",
+    "not logged in",
+    "authentication_failed",
+    "failed to authenticate",
+    "quota exceeded",
+    "credit balance is too low",
+    "invalid_api_key"
+  ],
+  "_comment": "Single source of truth for daemon::adapters::parse_session_health_pane (bead rev-cbzll). Fatal auth/quota/error substrings scraped from tmux pane text across vendor coding CLIs (Claude Code, Codex, agy, cursor-agent). Order matters only for the 'individual quota reached' special-case that folds a trailing 'resets in' countdown into the returned reason. ponytail: this is pane-text keyword scraping — false-negative risk if a vendor CLI changes its banner wording; the durable upgrade path is self-reported health from the coder process instead of scraping terminal output."
+}

@@ -6735,27 +6735,19 @@ fn active_session_count(data: &serde_json::Value) -> Result<usize, DaemonError> 
 
 /// Scans terminal output from an active agent tmux pane for fatal auth,
 /// quota exhaustion, or unrecoverable error markers.
+///
+/// ponytail: the marker list lives in `config/session_health_markers.json`
+/// (bead rev-cbzll) rather than an inline literal, but the classification
+/// itself is still pane-text substring scraping — a marker that doesn't
+/// match a vendor CLI's current wording is a silent false-negative. Upgrade
+/// path: self-reported health from the coder process instead of scraping
+/// tmux pane text.
 pub fn parse_session_health_pane(pane_content: &str) -> Option<String> {
     let pane_lower = pane_content.to_ascii_lowercase();
-    let fatal_markers = [
-        "login expired",
-        "oauth session expired",
-        "individual quota reached",
-        "resource_exhausted",
-        "rate limit exceeded",
-        "usage limit reached",
-        "weekly limit",
-        "not logged in · run /login",
-        "not logged in",
-        "authentication_failed",
-        "failed to authenticate",
-        "quota exceeded",
-        "credit balance is too low",
-        "invalid_api_key",
-    ];
+    let fatal_markers = crate::session_health_markers::session_health_markers();
 
-    for marker in &fatal_markers {
-        if pane_lower.contains(marker) {
+    for marker in fatal_markers {
+        if pane_lower.contains(marker.as_str()) {
             // Bead rev-4ou1z: a quota-reached marker is usually followed by
             // a "Resets in Xh Ym" countdown elsewhere on the same pane line
             // (e.g. "Individual quota reached. Resets in 1h 23m"). Fold a
@@ -6954,6 +6946,39 @@ mod active_session_count_tests {
             crate::health::quota_watchdog::parse_quota_reset_duration(&reason).is_some(),
             "the folded reason must itself be parseable by the quota watchdog; got: {reason}"
         );
+    }
+
+    /// Bead rev-cbzll: the fatal-marker list now lives in
+    /// `config/session_health_markers.json`. Assert the config parses to
+    /// exactly the expected marker count, and that every single marker is
+    /// exercised end-to-end by a minimal fixture transcript that
+    /// `parse_session_health_pane` correctly classifies as terminal.
+    #[test]
+    fn session_health_markers_config_parses_and_each_marker_is_exercised() {
+        use super::parse_session_health_pane;
+        use crate::session_health_markers::session_health_markers;
+
+        let markers = session_health_markers();
+        assert_eq!(
+            markers.len(),
+            14,
+            "expected 14 session-health markers, got {}: {markers:?}",
+            markers.len()
+        );
+
+        for marker in markers {
+            let fixture = format!("some pane preamble\n{marker}\nsome pane trailer");
+            let result = parse_session_health_pane(&fixture);
+            assert!(
+                result.is_some(),
+                "marker {marker:?} was not detected by parse_session_health_pane in fixture: {fixture:?}"
+            );
+            let reason = result.unwrap();
+            assert!(
+                reason.contains(marker.as_str()),
+                "reason for marker {marker:?} must contain the marker itself; got: {reason}"
+            );
+        }
     }
 }
 

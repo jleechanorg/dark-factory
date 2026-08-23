@@ -28,3 +28,4 @@ pub mod worktree_reaper;
 
 pub mod gates_compute;
 pub mod vendor_health;
+pub mod session_health_markers;
