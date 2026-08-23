@@ -171,6 +171,7 @@ pub struct FakeScm {
     pub issues: Vec<Issue>,
     pub prs: Vec<LabeledPr>,
     pub permissions: HashMap<String, Permission>,
+    pub repo_permissions: HashMap<(String, String), Permission>,
     pub pr_snapshots: HashMap<u64, PrSnapshot>,
     pub remote_branches: HashMap<String, Option<u64>>,
     /// jleechan-t40t (issue #326): scripted `pr_number_for_branch` lookups,
@@ -229,6 +230,23 @@ impl Scm for FakeScm {
         Ok(self.issues.clone())
     }
 
+    fn labeled_issues_for_repo(&self, repo: &str, label: &str) -> Result<Vec<Issue>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("labeled_issues_for_repo({repo},{label})"));
+        let issues = self.labeled_issues(label)?;
+        Ok(issues
+            .into_iter()
+            .filter(|issue| {
+                if let Some(owner_repo) = daemon::tools::parse_external_ref_repo(&issue.external_ref) {
+                    owner_repo.eq_ignore_ascii_case(repo)
+                } else {
+                    false
+                }
+            })
+            .collect())
+    }
+
     fn labeled_prs(&self, label: &str, gh_calls: &mut u32) -> Result<Vec<LabeledPr>, DaemonError> {
         // jtg8-r5: count this list query toward the slow-tier
         // `gh_call_count` metric — the fake doesn't shell out, so a
@@ -265,6 +283,20 @@ impl Scm for FakeScm {
             .get(login)
             .copied()
             .unwrap_or(Permission::None))
+    }
+
+    fn collaborator_permission_for_repo(
+        &self,
+        repo: &str,
+        login: &str,
+    ) -> Result<Permission, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("collaborator_permission_for_repo({repo},{login})"));
+        if let Some(&perm) = self.repo_permissions.get(&(repo.to_string(), login.to_string())) {
+            return Ok(perm);
+        }
+        self.collaborator_permission(login)
     }
 
     fn pr_snapshot(&self, pr: u64) -> Result<PrSnapshot, DaemonError> {
