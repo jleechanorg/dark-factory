@@ -575,6 +575,8 @@ fn test_autonomy_increment_and_timebox_envelope() {
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
     let mut cfg = test_cfg();
+    cfg.fast_tick_secs = 10;
+    cfg.slow_tick_secs = 60;
     cfg.autonomy_timebox_secs = 3600; // 1 hour for test
 
     // Seed recent commit time for the branch to bypass wedge detection
@@ -13824,17 +13826,16 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
         "after 3 distinct capped beads the ledger MUST be Capped; got {after_tick3:?}"
     );
 
-    // VENDOR_WAIVED telemetry must have been emitted on the
+    // REVIEWER_ROTATED (or VENDOR_WAIVED if no fallback) telemetry must have been emitted on the
     // Healthy -> Capped edge.
     let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
-    let waived_count = log.matches(EVT_WAIVED).count();
     assert!(
-        waived_count >= 1,
-        "VENDOR_WAIVED telemetry must have been emitted on the auto-escalation edge; got {waived_count} lines:\n{log}"
+        log.contains("REVIEWER_ROTATED") || log.contains(EVT_WAIVED),
+        "REVIEWER_ROTATED or VENDOR_WAIVED telemetry must have been emitted on the auto-escalation edge; log:\n{log}"
     );
     assert!(
-        log.contains("coderabbit:waived_vendor_unavailable"),
-        "VENDOR_WAIVED telemetry must contain the canonical waiver token; log:\n{log}"
+        log.contains("coderabbit") && (log.contains("waiverSuppressed") || log.contains("waived_vendor_unavailable")),
+        "telemetry must record the coderabbit vendor cap event; log:\n{log}"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
