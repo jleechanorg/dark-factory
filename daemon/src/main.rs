@@ -675,7 +675,14 @@ fn run(args: Args) -> Result<(), DaemonError> {
                 if previous_failures >= 3 {
                     send_daemon_recovery_alert(previous_failures);
                 }
-                std::thread::sleep(std::time::Duration::from_secs(cfg.fast_tick_secs));
+                // Bead dark-factory-14jt: after startup tick 0, trigger the forced
+                // dispatch pass on tick 1 within 30s.
+                let sleep_secs = if attempt.tick_index == 0 {
+                    cfg.fast_tick_secs.min(30)
+                } else {
+                    cfg.fast_tick_secs
+                };
+                std::thread::sleep(std::time::Duration::from_secs(sleep_secs));
             }
             TickLoopAction::TransientBackoff {
                 consecutive_failures: _,

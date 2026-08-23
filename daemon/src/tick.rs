@@ -654,9 +654,13 @@ pub fn run_tick(
 
     let mut summary = TickSummary::default();
 
+    // Bead dark-factory-14jt: on startup, tick 0 runs intake sweep and gate
+    // assessment. Tick 1 triggers a forced dispatch pass within 30s so that
+    // any beads newly queued, recovered, or redispatched by tick 0 are
+    // dispatched immediately rather than waiting for the next organic slow tick.
     let slow_tier_due = {
         let ratio = (deps.cfg.slow_tick_secs / deps.cfg.fast_tick_secs.max(1)).max(1);
-        tick_index.is_multiple_of(ratio)
+        tick_index.is_multiple_of(ratio) || tick_index == 1
     };
 
     // jleechan-54ky / sub-fix for jleechan-gib: split the SQL-level "increment
@@ -1874,12 +1878,34 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     // but was never routed/dispatched (process restart resilience) — real
     // `Tracker::fetch_candidates` reflects prior `create_bead` calls, so this
     // covers that path in production even though the static test fake can't.
-    for bead in tracker_candidates {
+    for bead in tracker_candidates.iter() {
         if pr_intake_bead_ids.contains(&bead.id) {
             continue;
         }
         if !routing_candidates.iter().any(|b| b.id == bead.id) {
-            routing_candidates.push(bead);
+            routing_candidates.push(bead.clone());
+        }
+    }
+
+    // Bead dark-factory-14jt: also pick up any bead in state QUEUED or
+    // REDISPATCHED from the store (e.g. from tick-0 reroll, recovery, or
+    // restart) so it is routed and dispatched even if not in tracker_candidates.
+    if let Ok(queued_overlays) = deps.store.list_queued_overlays() {
+        for overlay in queued_overlays {
+            if !routing_candidates.iter().any(|b| b.id == overlay.bead_id) {
+                let tracker_bead = tracker_candidates
+                    .iter()
+                    .find(|b| b.id == overlay.bead_id)
+                    .cloned();
+                routing_candidates.push(tracker_bead.unwrap_or(Bead {
+                    id: overlay.bead_id.clone(),
+                    title: overlay.bead_id.clone(),
+                    description: String::new(),
+                    notes: String::new(),
+                    file_tree_summary: String::new(),
+                    external_ref: None,
+                }));
+            }
         }
     }
 
@@ -3915,6 +3941,18 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     for branch in &branches {
         if let Ok(Some(bead_id)) = deps.store.bead_id_for_branch(branch) {
             bead_ids.push(bead_id);
+        }
+    }
+    // Bead dark-factory-14jt: on startup and subsequent ticks, ensure all
+    // ATTESTED and DISPATCHED beads from active overlays are immediately queued
+    // for gate assessment rather than waiting for next organic tick or being
+    // missed if not yet in branch_registry.
+    if let Ok(active) = deps.store.list_active_overlays() {
+        for overlay in active {
+            if let Some(ref branch) = overlay.branch {
+                let _ = deps.store.register_branch(&overlay.bead_id, branch);
+            }
+            bead_ids.push(overlay.bead_id);
         }
     }
     bead_ids.sort();

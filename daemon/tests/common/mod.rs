@@ -1506,6 +1506,18 @@ impl StateStore for FakeStateStore {
         Ok(out)
     }
 
+    fn list_queued_overlays(&self) -> Result<Vec<BeadOverlay>, DaemonError> {
+        self.calls.borrow_mut().push("list_queued_overlays".into());
+        let mut out = Vec::new();
+        for overlay in self.overlays.borrow().values() {
+            if overlay.state == OverlayState::Queued || overlay.state == OverlayState::Redispatched
+            {
+                out.push(overlay.clone());
+            }
+        }
+        Ok(out)
+    }
+
     fn bump_autonomy_secs(&self, bead_id: &str, delta_secs: u64) -> Result<(), DaemonError> {
         self.calls
             .borrow_mut()

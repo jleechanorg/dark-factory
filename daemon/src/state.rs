@@ -206,6 +206,12 @@ pub trait StateStore {
     /// instead of silently burning the 3h timebox against operator/CI
     /// wall-clock time and parking the bead `HUMAN_HELD`.
     fn list_active_overlays(&self) -> Result<Vec<BeadOverlay>, DaemonError>;
+    /// Return the overlay rows currently in `QUEUED` or `REDISPATCHED`. Used
+    /// by slow-tier dispatch to pick up all beads queued for dispatch,
+    /// including on startup and after recovery/reroll.
+    fn list_queued_overlays(&self) -> Result<Vec<BeadOverlay>, DaemonError> {
+        Ok(Vec::new())
+    }
     /// Increment a single overlay's `autonomy_secs` by `delta_secs` and
     /// refresh `updated_at`. Pair with [`list_active_overlays`] when the
     /// caller needs to skip the bump for specific rows (e.g.
@@ -1530,19 +1536,17 @@ impl SqliteStateStore {
         }
     }
 
-    /// Shared SELECT for `list_active_overlays` and `increment_active_autonomy`'s
-    /// "read after bump" return value. Filters to `DISPATCHED` + `ATTESTED`
-    /// (the only states where autonomy_secs is allowed to accumulate per
-    /// spec §4.2.8).
-    fn query_active_overlays(&self, op: &str) -> Result<Vec<BeadOverlay>, DaemonError> {
+    /// Shared SELECT for active and queued overlays.
+    fn query_overlays_by_states(&self, op: &str, states_sql: &str) -> Result<Vec<BeadOverlay>, DaemonError> {
+        let sql = format!(
+            "SELECT bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
+             pr_number, branch, session_id, is_adopted, spawn_failure_count, pre_session_head_sha, \
+             park_reason, target_repo, attempt_started_at \
+             FROM bead_overlay WHERE state IN ({states_sql})"
+        );
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
-                 pr_number, branch, session_id, is_adopted, spawn_failure_count, pre_session_head_sha, \
-                 park_reason, target_repo, attempt_started_at \
-                 FROM bead_overlay WHERE state IN ('DISPATCHED', 'ATTESTED')",
-            )
+            .prepare(&sql)
             .map_err(|e| tool_err(&format!("{op} prepare"), e))?;
         let rows = stmt
             .query_map([], |row| {
@@ -1603,6 +1607,19 @@ impl SqliteStateStore {
             });
         }
         Ok(out)
+    }
+
+    /// Shared SELECT for `list_active_overlays` and `increment_active_autonomy`'s
+    /// "read after bump" return value. Filters to `DISPATCHED` + `ATTESTED`
+    /// (the only states where autonomy_secs is allowed to accumulate per
+    /// spec §4.2.8).
+    fn query_active_overlays(&self, op: &str) -> Result<Vec<BeadOverlay>, DaemonError> {
+        self.query_overlays_by_states(op, "'DISPATCHED', 'ATTESTED'")
+    }
+
+    /// Shared SELECT for `list_queued_overlays`. Filters to `QUEUED` + `REDISPATCHED`.
+    fn query_queued_overlays(&self, op: &str) -> Result<Vec<BeadOverlay>, DaemonError> {
+        self.query_overlays_by_states(op, "'QUEUED', 'REDISPATCHED'")
     }
 }
 
@@ -1821,6 +1838,10 @@ impl StateStore for SqliteStateStore {
 
     fn list_active_overlays(&self) -> Result<Vec<BeadOverlay>, DaemonError> {
         self.query_active_overlays("list_active_overlays")
+    }
+
+    fn list_queued_overlays(&self) -> Result<Vec<BeadOverlay>, DaemonError> {
+        self.query_queued_overlays("list_queued_overlays")
     }
 
     fn bump_autonomy_secs(&self, bead_id: &str, delta_secs: u64) -> Result<(), DaemonError> {

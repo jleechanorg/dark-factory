@@ -110,6 +110,9 @@ impl StateStore for SqliteTestStore {
     fn list_active_overlays(&self) -> Result<Vec<BeadOverlay>, daemon::errors::DaemonError> {
         self.store.list_active_overlays()
     }
+    fn list_queued_overlays(&self) -> Result<Vec<BeadOverlay>, daemon::errors::DaemonError> {
+        self.store.list_queued_overlays()
+    }
     fn bump_autonomy_secs(&self, bead_id: &str, delta_secs: u64) -> Result<(), daemon::errors::DaemonError> {
         self.store.bump_autonomy_secs(bead_id, delta_secs)
     }
@@ -608,3 +611,60 @@ fn sqlite_escalation_dedup_terminal_marker_survives_real_upsert() {
         "record_escalation_emit after mark_escalation_undeliverable must NOT clear terminal"
     );
 }
+
+#[test]
+fn list_queued_overlays_returns_only_queued_and_redispatched_rows() {
+    let path = std::env::temp_dir().join(format!(
+        "dark-factory-queued-overlays-{}-{}.sqlite",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+    let store = SqliteStateStore::open(&path).unwrap();
+
+    let states = [
+        ("bead-queued", OverlayState::Queued),
+        ("bead-redispatched", OverlayState::Redispatched),
+        ("bead-attested", OverlayState::Attested),
+        ("bead-dispatched", OverlayState::Dispatched),
+        ("bead-human-held", OverlayState::HumanHeld),
+        ("bead-ready", OverlayState::Ready),
+    ];
+
+    for (bead_id, state) in states {
+        store
+            .save(&BeadOverlay {
+                bead_id: bead_id.into(),
+                state,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("owner/repo".into()),
+                attempt_started_at: None,
+            })
+            .unwrap();
+    }
+
+    let queued = store.list_queued_overlays().unwrap();
+    let mut queued_ids: Vec<String> = queued.into_iter().map(|o| o.bead_id).collect();
+    queued_ids.sort();
+
+    assert_eq!(
+        queued_ids,
+        vec!["bead-queued".to_string(), "bead-redispatched".to_string()],
+        "list_queued_overlays must return only QUEUED and REDISPATCHED overlays"
+    );
+
+    drop(store);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+

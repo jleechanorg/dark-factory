@@ -6865,6 +6865,10 @@ impl StateStore for QdwAttemptStore {
         self.inner.list_active_overlays()
     }
 
+    fn list_queued_overlays(&self) -> Result<Vec<BeadOverlay>, DaemonError> {
+        self.inner.list_queued_overlays()
+    }
+
     fn bump_autonomy_secs(&self, bead_id: &str, delta_secs: u64) -> Result<(), DaemonError> {
         self.inner.bump_autonomy_secs(bead_id, delta_secs)
     }
@@ -14808,3 +14812,157 @@ fn session_health_failure_reaps_session_and_requeues_bead() {
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+/// Bead dark-factory-14jt: verify that when a daemon restarts with ATTESTED beads in store,
+/// on startup (tick 0) all ATTESTED beads are immediately queued for 7-gate assessment
+/// in run_fast_tier (even if they were not in owned_branches), advancing to verification.
+#[test]
+fn test_startup_attested_beads_immediately_queued_for_gate_assessment() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.fast_tick_secs = 10;
+    cfg.slow_tick_secs = 600; // ratio = 60
+    let vcs = test_vcs();
+    let telemetry_log = std::env::temp_dir().join("afd_test_startup_attested_assessment.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    // Pre-populate store with an ATTESTED bead (e.g. from prior run or adopted PR),
+    // but DO NOT register it in branch_registry to test list_active_overlays discovery.
+    store.overlays.borrow_mut().insert(
+        "bead-startup-attested".into(),
+        BeadOverlay {
+            bead_id: "bead-startup-attested".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(777),
+            branch: Some("factory/bead-startup-attested-r1".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+
+    scm.pr_numbers_for_branch.insert(("owner/repo".into(), "factory/bead-startup-attested-r1".into()), Some(777));
+    scm.open_pr_head_refs.insert(("owner/repo".into(), 777), daemon::tools::PrHeadBranch::SameRepo("factory/bead-startup-attested-r1".into()));
+    scm.pr_snapshots.insert(
+        777,
+        qdw_green_snapshot(
+            777,
+            vec![PrComment {
+                author: "dark-factory-er".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: 0,
+            }],
+        ),
+    );
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 0).unwrap();
+    assert_eq!(summary.gates_assessed, 1, "startup tick 0 must immediately assess gates for ATTESTED beads");
+    assert_eq!(summary.beads_ready, 1, "green ATTESTED bead must become READY on startup");
+
+    let o = store.load("bead-startup-attested").unwrap().unwrap();
+    assert_eq!(o.state, OverlayState::Ready);
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("GATE_ASSESSMENT"),
+        "GATE_ASSESSMENT event must be emitted on startup; telemetry:\n{telemetry}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Bead dark-factory-14jt: verify that startup triggers a forced dispatch pass on tick 1
+/// (within 30s) even when slow_tick_secs / fast_tick_secs ratio > 1 (e.g. 600s / 10s = 60).
+#[test]
+fn test_startup_triggers_forced_dispatch_pass_on_tick_1() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"single small change"}"#.into(),
+    ));
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.fast_tick_secs = 10;
+    cfg.slow_tick_secs = 600; // ratio = 60 (organic slow tick at 0, 60, 120...)
+    let vcs = test_vcs();
+    let telemetry_log = std::env::temp_dir().join("afd_test_startup_forced_dispatch.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    // Pre-populate store with a REDISPATCHED bead (e.g. from tick 0 reroll or recovery)
+    store.overlays.borrow_mut().insert(
+        "bead-redispatched".into(),
+        BeadOverlay {
+            bead_id: "bead-redispatched".into(),
+            state: OverlayState::Redispatched,
+            attempt: 2,
+            reroll_count: 1,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/bead-redispatched-r2".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: Some("owner/repo".into()),
+            attempt_started_at: None,
+        },
+    );
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    // Tick 1 (elapsed 10s): ratio is 60, so normally 1 % 60 != 0.
+    // But startup forced dispatch must fire on tick 1, running slow tier and dispatching!
+    let summary = run_tick(&deps, 1, 10).unwrap();
+    assert_eq!(summary.beads_dispatched, 1, "startup forced dispatch on tick 1 must dispatch Redispatched bead");
+
+    let o = store.load("bead-redispatched").unwrap().unwrap();
+    assert_eq!(o.state, OverlayState::Dispatched);
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("TASK_DISPATCHED"),
+        "TASK_DISPATCHED event must be emitted on tick 1 forced dispatch; telemetry:\n{telemetry}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
