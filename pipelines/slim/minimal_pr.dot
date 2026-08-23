@@ -84,6 +84,20 @@ digraph MinimalPRFactory {
     timeout=600
   ]
 
+  // /web-advice fail-open advisory node (min_diff_lines="20" per slim lane policy)
+  web_advice [
+    type="web_advice",
+    label="/web-advice (fail-open)",
+    prompt="@prompts/web_advice.txt",
+    backend="claude",
+    timeout=900,
+    min_diff_lines="20",
+    transport="auto",
+    decision="continue",
+    fail_open="true",
+    description="Multi-model browser review (gemini/grok/chatgpt/perplexity) via real authenticated browser sessions. FAIL-OPEN: never blocks. Signal goes to CXDB + PR comment."
+  ]
+
   fix [
     type="codergen",
     label="Fix & Iterate",
@@ -111,8 +125,11 @@ digraph MinimalPRFactory {
   gate_es -> gate_er [condition="outcome=success"]
   gate_es -> fix [condition="outcome!=success"]
 
-  gate_er -> exit [condition="outcome=success"]
+  gate_er -> web_advice [condition="outcome=success"]
   gate_er -> fix [condition="outcome!=success"]
+
+  // Fail-open heart: single unconditional edge to exit.
+  web_advice -> exit
 
   fix -> test
 }

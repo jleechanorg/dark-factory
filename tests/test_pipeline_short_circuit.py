@@ -45,6 +45,7 @@ def test_pr_gates_runs_holdout_before_evidence_gates(monkeypatch):
         "gate_es",
         "gate_er",
         "gate_cs",
+        "web_advice",
         "exit",
     ]
     assert history[-1].outcome == "success"

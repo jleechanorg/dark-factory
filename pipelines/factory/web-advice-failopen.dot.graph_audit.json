@@ -1,0 +1,15 @@
+{
+  "pipeline": "pipelines/factory/web-advice-failopen.dot",
+  "audit_status": "parses_cleanly_with_expected_soft_tier_R1_until_Lane_B_lands",
+  "violations": [
+    {
+      "kind": "R1",
+      "pipeline": "pipelines/factory/web-advice-failopen.dot",
+      "location": "web_advice",
+      "message": "node 'web_advice' declares type='web_advice' but 'web_advice' is not in runner.handlers.TYPE_REGISTRY. Runtime resolver falls through to _codergen (silent regression)"
+    }
+  ],
+  "note": "R1 violation is the EXPECTED soft-tier warning (operator-decided 2026-08-21, /swarm Lane C coordination). Lane B (handler registration lane) adds 'web_advice' to runner.handlers.TYPE_REGISTRY + graph_audit._REVIEWER_TYPE_NAMES. After Lane B lands, audit returns 0 violations.",
+  "graph_audi_command": ".venv/bin/python -m runner.graph_audit pipelines",
+  "expected_after_lane_b": "OK: no graph-audit violations found."
+}
