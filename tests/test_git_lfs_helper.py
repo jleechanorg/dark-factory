@@ -128,11 +128,7 @@ def _git_lfs_absent() -> bool:
     return shutil.which("git-lfs") is None
 
 
-@pytest.mark.skipif(
-    shutil.which("git-lfs") is not None,
-    reason="requires git-lfs to be absent on PATH",
-)
-def test_helper_exits_two_when_git_lfs_missing(capsys) -> None:
+def test_helper_exits_two_when_git_lfs_missing() -> None:
     proc = subprocess.run(
         [str(HELPER), "post-checkout"],
         capture_output=True,
@@ -145,6 +141,22 @@ def test_helper_exits_two_when_git_lfs_missing(capsys) -> None:
     combined = (proc.stdout or "") + (proc.stderr or "")
     assert "_git-lfs-hook.sh" in combined, (
         f"error should name the helper file, got: {combined!r}"
+    )
+
+
+def test_helper_exits_two_when_verb_missing() -> None:
+    proc = subprocess.run(
+        [str(HELPER)],
+        capture_output=True,
+        text=True,
+        env={k: v for k, v in os.environ.items() if k != "GIT_LFS_VERB"},
+    )
+    assert proc.returncode == 2, (
+        f"helper should exit 2 when verb is missing, got {proc.returncode}"
+    )
+    combined = (proc.stdout or "") + (proc.stderr or "")
+    assert "GIT_LFS_VERB" in combined or "verb" in combined, (
+        f"error should mention verb requirement, got: {combined!r}"
     )
 
 
