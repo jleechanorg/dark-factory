@@ -56,7 +56,7 @@ emit_assessment() { # <gates_json>
 # rate_limit quota preflight (44 lines) ahead of this function, shifting
 # the range to 85..=158 — keep this range in lockstep with any future
 # edits above `latest_assessment_no_red()` in auto-merge-guard.sh.
-predicate_block="$(sed -n '85,158p' "$GUARD" | sed 's/^  //')"
+predicate_block="$(sed -n '85,157p' "$GUARD" | sed 's/^  //')"
 
 run_predicate() { # <input_json>
   printf '%s' "$1" | python3 -c "$predicate_block" "$LIVE_HEAD"
@@ -121,14 +121,31 @@ case "$out" in
   *) echo "note: warn verdict may or may not be listed; output: $out" ;;
 esac
 
-# 6. unknown verdict stays non-blocking (defers to next tick)
+# 6. unknown verdict fails closed (strict exact-head 7/8-green merge policy)
 emit_assessment '{"ci_green":"unknown","no_conflicts":"unknown","coderabbit":"unknown","bugbot":"unknown","comments_resolved":"unknown","evidence_review":"unknown","skeptic":"unknown","vacuous_red_green":"unknown","code_standards":"unknown","zfc":"unknown"}'
 last="$(tail -1 "$LOG")"
 set +e
 out="$(run_predicate "$last")"
 rc=$?
 set -e
-assert "all-unknown -> exit 0 (defers to next tick)" "0" "$rc"
+assert "all-unknown -> exit 1 (BLOCK, fail-closed on unknown)" "1" "$rc"
+case "$out" in
+  FAIL:UNKNOWNS:*) echo "PASS: all-unknown emits FAIL:UNKNOWNS reason"; PASS=$((PASS+1)) ;;
+  *) echo "FAIL: all-unknown output lacked FAIL:UNKNOWNS reason: $out"; FAIL=$((FAIL+1)) ;;
+esac
+
+# 6b. single unknown gate blocks merge (fail closed)
+emit_assessment '{"ci_green":"pass","no_conflicts":"pass","coderabbit":"unknown","bugbot":"pass","comments_resolved":"pass","evidence_review":"pass","skeptic":"pass","vacuous_red_green":"pass"}'
+last="$(tail -1 "$LOG")"
+set +e
+out="$(run_predicate "$last")"
+rc=$?
+set -e
+assert "single unknown gate (coderabbit=unknown) -> exit 1 (BLOCK)" "1" "$rc"
+case "$out" in
+  FAIL:UNKNOWNS:*coderabbit*) echo "PASS: single unknown gate emits FAIL:UNKNOWNS:coderabbit"; PASS=$((PASS+1)) ;;
+  *) echo "FAIL: single unknown gate output lacked FAIL:UNKNOWNS:coderabbit reason: $out"; FAIL=$((FAIL+1)) ;;
+esac
 
 # 7. Legacy "red" alias -> still blocks (back-compat)
 emit_assessment '{"ci_green":"green","no_conflicts":"green","coderabbit":"green","bugbot":"red","comments_resolved":"green","evidence_review":"green","skeptic":"green","vacuous_red_green":"green","code_standards":"green","zfc":"green"}'

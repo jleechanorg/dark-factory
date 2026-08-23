@@ -110,19 +110,31 @@ pub fn run_gates_compute(pr: u64, repo_opt: Option<String>) -> Result<(), Daemon
             "--repo",
             &repo,
             "--json",
-            "reviews",
+            "reviews,headRefOid",
         ],
         30,
     )?;
 
     #[derive(serde::Deserialize)]
     struct GhReviewsView {
+        #[serde(default, rename = "headRefOid")]
+        head_ref_oid: Option<String>,
+        #[serde(default)]
         reviews: Vec<GhReview>,
     }
     #[derive(serde::Deserialize)]
     struct GhReview {
         author: GhAuthor,
         state: String,
+        #[serde(default)]
+        commit: Option<GhCommit>,
+        #[serde(default, rename = "commit_id")]
+        commit_id: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct GhCommit {
+        #[serde(default)]
+        oid: String,
     }
     #[derive(serde::Deserialize)]
     struct GhAuthor {
@@ -134,20 +146,37 @@ pub fn run_gates_compute(pr: u64, repo_opt: Option<String>) -> Result<(), Daemon
         DaemonError::Parse(format!("failed to parse gh pr view reviews JSON: {e}"))
     })?;
 
-    let last_coderabbit_review = reviews_view.reviews.iter()
-        .rfind(|r| r.author.login.contains("coderabbit") && r.state != "COMMENTED");
+    let coderabbit_reviews: Vec<&GhReview> = reviews_view.reviews.iter()
+        .filter(|r| r.author.login.contains("coderabbit") && r.state != "COMMENTED")
+        .collect();
 
-    let coderabbit = match last_coderabbit_review {
-        Some(r) => {
-            if r.state == "APPROVED" {
-                "green".to_string()
-            } else if r.state == "CHANGES_REQUESTED" {
-                "red".to_string()
-            } else {
-                "unknown".to_string()
+    let head_sha = reviews_view.head_ref_oid.as_deref().unwrap_or("");
+    let head_coderabbit_review = coderabbit_reviews.iter()
+        .rfind(|r| {
+            let sha = r.commit.as_ref().map(|c| c.oid.as_str()).or(r.commit_id.as_deref());
+            match sha {
+                Some(s) => head_sha.is_empty() || s == head_sha,
+                None => true,
             }
-        }
-        None => "unknown".to_string(),
+        })
+        .copied();
+
+    let last_overall_coderabbit_review = coderabbit_reviews.last().copied();
+
+    let coderabbit = match last_overall_coderabbit_review {
+        Some(last_overall) if last_overall.state == "CHANGES_REQUESTED" => "red".to_string(),
+        _ => match head_coderabbit_review {
+            Some(r) => {
+                if r.state == "APPROVED" {
+                    "green".to_string()
+                } else if r.state == "CHANGES_REQUESTED" {
+                    "red".to_string()
+                } else {
+                    "unknown".to_string()
+                }
+            }
+            None => "unknown".to_string(),
+        },
     };
 
     // Gate 4: Bugbot clean

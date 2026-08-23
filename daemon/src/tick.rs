@@ -5242,6 +5242,70 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 "operator_disposition".to_string(),
                 serde_json::json!(overlay.park_reason.clone().unwrap_or_default()),
             );
+            let now_iso = now_iso8601();
+            let gate_telemetry = serde_json::json!({
+                "ci_green": {
+                    "source_actor": "github-actions",
+                    "source_id": snapshot.ci_status,
+                    "source_url": format!("https://github.com/{repo}/pull/{pr}/checks"),
+                    "observed_sha": snapshot.head_sha,
+                    "timestamp": if snapshot.updated_at_epoch > 0 { snapshot.updated_at_epoch.to_string() } else { now_iso.clone() },
+                },
+                "no_conflicts": {
+                    "source_actor": "github",
+                    "source_id": if snapshot.mergeable { "mergeable" } else { "conflicts" },
+                    "source_url": format!("https://github.com/{repo}/pull/{pr}"),
+                    "observed_sha": snapshot.head_sha,
+                    "timestamp": if snapshot.updated_at_epoch > 0 { snapshot.updated_at_epoch.to_string() } else { now_iso.clone() },
+                },
+                "coderabbit": {
+                    "source_actor": "coderabbitai[bot]",
+                    "source_id": format!("status={}", snapshot.coderabbit_status),
+                    "source_url": format!("https://github.com/{repo}/pull/{pr}"),
+                    "observed_sha": snapshot.head_sha,
+                    "timestamp": if snapshot.updated_at_epoch > 0 { snapshot.updated_at_epoch.to_string() } else { now_iso.clone() },
+                },
+                "bugbot": {
+                    "source_actor": "cursor[bot]",
+                    "source_id": format!("errors={}", snapshot.bugbot_error_count),
+                    "source_url": format!("https://github.com/{repo}/pull/{pr}"),
+                    "observed_sha": snapshot.head_sha,
+                    "timestamp": if snapshot.updated_at_epoch > 0 { snapshot.updated_at_epoch.to_string() } else { now_iso.clone() },
+                },
+                "comments_resolved": {
+                    "source_actor": "github",
+                    "source_id": format!("unresolved_threads={:?}", snapshot.unresolved_thread_count),
+                    "source_url": format!("https://github.com/{repo}/pull/{pr}"),
+                    "observed_sha": snapshot.head_sha,
+                    "timestamp": if snapshot.updated_at_epoch > 0 { snapshot.updated_at_epoch.to_string() } else { now_iso.clone() },
+                },
+                "evidence_review": {
+                    "source_actor": "er_runner",
+                    "source_id": format!("er_verdict={:?}", evidence.er_verdict),
+                    "source_url": format!("https://github.com/{repo}/pull/{pr}"),
+                    "observed_sha": snapshot.head_sha,
+                    "timestamp": if snapshot.head_committed_epoch > 0 { snapshot.head_committed_epoch.to_string() } else { now_iso.clone() },
+                },
+                "skeptic": {
+                    "source_actor": if evidence.skeptic_reviewers.is_empty() {
+                        "skeptic".to_string()
+                    } else {
+                        evidence.skeptic_reviewers.join(",")
+                    },
+                    "source_id": format!("verdict={:?}", evidence.skeptic_verdict),
+                    "source_url": format!("https://github.com/{repo}/pull/{pr}"),
+                    "observed_sha": snapshot.head_sha,
+                    "timestamp": now_iso.clone(),
+                },
+                "vacuous_red_green": {
+                    "source_actor": "vacuous_red_green_detector",
+                    "source_id": format!("{:?}", evidence.vacuous_red_green),
+                    "source_url": format!("https://github.com/{repo}/pull/{pr}"),
+                    "observed_sha": snapshot.head_sha,
+                    "timestamp": now_iso,
+                }
+            });
+            obj.insert("gate_telemetry".to_string(), gate_telemetry);
         }
         emit(
             deps.telemetry_log,

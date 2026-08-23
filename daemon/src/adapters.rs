@@ -793,10 +793,46 @@ struct GhPrView {
     updated_at: String,
 }
 
-#[derive(serde::Deserialize, serde::Serialize, Clone)]
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, Default)]
 struct GhReview {
+    #[serde(default)]
+    id: Option<serde_json::Value>,
     author: GhAuthor,
     state: String,
+    #[serde(default)]
+    commit: Option<GhCommit>,
+    #[serde(default, rename = "commit_id")]
+    commit_id: Option<String>,
+    #[serde(default, rename = "submittedAt")]
+    submitted_at: Option<String>,
+    #[serde(default, rename = "submitted_at")]
+    submitted_at_snake: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default, rename = "html_url")]
+    html_url: Option<String>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, Default)]
+struct GhCommit {
+    #[serde(default)]
+    oid: String,
+}
+
+impl GhReview {
+    fn commit_sha(&self) -> Option<&str> {
+        if let Some(c) = &self.commit {
+            if !c.oid.is_empty() {
+                return Some(c.oid.as_str());
+            }
+        }
+        if let Some(sha) = &self.commit_id {
+            if !sha.is_empty() {
+                return Some(sha.as_str());
+            }
+        }
+        None
+    }
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Clone)]
@@ -807,7 +843,7 @@ struct GhComment {
     created_at: String,
 }
 
-#[derive(serde::Deserialize, serde::Serialize, Clone)]
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, Default)]
 struct GhAuthor {
     login: String,
 }
@@ -887,8 +923,16 @@ impl CliScm {
         let reviews_json = run_tool("gh", &["api", &reviews_url], 30).unwrap_or_else(|_| "[]".to_string());
         #[derive(serde::Deserialize)]
         struct RestReview {
+            #[serde(default)]
+            id: Option<serde_json::Value>,
             user: Option<RestUser>,
             state: String,
+            #[serde(default)]
+            commit_id: Option<String>,
+            #[serde(default)]
+            submitted_at: Option<String>,
+            #[serde(default)]
+            html_url: Option<String>,
         }
         #[derive(serde::Deserialize)]
         struct RestUser {
@@ -926,10 +970,17 @@ impl CliScm {
             reviews: rest_reviews
                 .into_iter()
                 .map(|r| GhReview {
+                    id: r.id,
                     author: GhAuthor {
                         login: r.user.map(|u| u.login).unwrap_or_default(),
                     },
                     state: r.state,
+                    commit: None,
+                    commit_id: r.commit_id,
+                    submitted_at: r.submitted_at.clone(),
+                    submitted_at_snake: r.submitted_at,
+                    url: r.html_url.clone(),
+                    html_url: r.html_url,
                 })
                 .collect(),
             head_ref_oid: rest_pr.head.sha,
@@ -1923,20 +1974,43 @@ impl Scm for CliScm {
         // `GateResult::Unknown` (transient) rather than `Red` (conflict).
         let merge_state_unknown = view.mergeable == "UNKNOWN";
 
-        let last_coderabbit_review = view.reviews.iter()
-            .rfind(|r| r.author.login.contains("coderabbit") && r.state != "COMMENTED");
+        let coderabbit_reviews: Vec<&GhReview> = view.reviews.iter()
+            .filter(|r| r.author.login.contains("coderabbit") && r.state != "COMMENTED")
+            .collect();
 
-        let coderabbit_status = match last_coderabbit_review {
-            Some(r) => {
-                if r.state == "APPROVED" {
-                    "green".to_string()
-                } else if r.state == "CHANGES_REQUESTED" {
-                    "red".to_string()
-                } else {
-                    "unknown".to_string()
+        let head_coderabbit_review = coderabbit_reviews.iter()
+            .rfind(|r| {
+                match r.commit_sha() {
+                    Some(sha) => sha == view.head_ref_oid,
+                    None => true,
                 }
-            }
-            None => "unknown".to_string(),
+            })
+            .copied();
+
+        let last_overall_coderabbit_review = coderabbit_reviews.last().copied();
+
+        let coderabbit_status = match last_overall_coderabbit_review {
+            Some(last_overall) if last_overall.state == "CHANGES_REQUESTED" => "red".to_string(),
+            _ => match head_coderabbit_review {
+                Some(r) => {
+                    if r.state == "APPROVED" {
+                        if let Some(sha) = r.commit_sha() {
+                            if sha != view.head_ref_oid {
+                                "unknown".to_string()
+                            } else {
+                                "green".to_string()
+                            }
+                        } else {
+                            "green".to_string()
+                        }
+                    } else if r.state == "CHANGES_REQUESTED" {
+                        "red".to_string()
+                    } else {
+                        "unknown".to_string()
+                    }
+                }
+                None => "unknown".to_string(),
+            },
         };
         let coderabbit_approved = coderabbit_status == "green";
 
@@ -9597,6 +9671,7 @@ mod offline_cache_tests {
         try_offline_close_pr, try_offline_collaborator_permission,
         try_offline_labeled_issues, try_offline_pr_snapshot,
         try_offline_remote_branch_last_commit,
+        GhAuthor, GhCommit, GhReview,
     };
     use crate::tools::{Issue, Permission, PrSnapshot};
     use std::path::PathBuf;
@@ -9965,9 +10040,48 @@ mod offline_cache_tests {
         assert!(!snap.ci_pending);
         assert!(!snap.bugbot_pending);
     }
+
+    #[test]
+    fn gh_review_commit_sha_extraction() {
+        let r_graphql = GhReview {
+            id: None,
+            author: GhAuthor { login: "coderabbitai[bot]".into() },
+            state: "APPROVED".into(),
+            commit: Some(GhCommit { oid: "sha123456".into() }),
+            commit_id: None,
+            submitted_at: None,
+            submitted_at_snake: None,
+            url: None,
+            html_url: None,
+        };
+        assert_eq!(r_graphql.commit_sha(), Some("sha123456"));
+
+        let r_rest = GhReview {
+            id: None,
+            author: GhAuthor { login: "coderabbitai[bot]".into() },
+            state: "APPROVED".into(),
+            commit: None,
+            commit_id: Some("sha789012".into()),
+            submitted_at: None,
+            submitted_at_snake: None,
+            url: None,
+            html_url: None,
+        };
+        assert_eq!(r_rest.commit_sha(), Some("sha789012"));
+
+        let r_empty = GhReview {
+            id: None,
+            author: GhAuthor { login: "coderabbitai[bot]".into() },
+            state: "APPROVED".into(),
+            commit: None,
+            commit_id: None,
+            submitted_at: None,
+            submitted_at_snake: None,
+            url: None,
+            html_url: None,
+        };
+        assert_eq!(r_empty.commit_sha(), None);
+    }
 }
-
-// Local imports for the offline_cache_tests mod above.
-
 
 // PR #666 — bead jleechan-nfdl (pr-655-finding-3) anchor for Evidence Gate re-trigger
