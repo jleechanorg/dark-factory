@@ -13600,6 +13600,7 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
     std::fs::create_dir_all(&telemetry_dir).unwrap();
     let telemetry_log = telemetry_dir.join(format!("daemon-{}.jsonl", std::process::id()));
     let _ = std::fs::remove_file(&telemetry_log);
+    std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "");
 
     let ledger = Mutex::new(VendorHealthLedger::new());
 
@@ -13838,6 +13839,7 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
+    std::env::remove_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN");
 }
 
 // ----------------------------------------------------------------------------
