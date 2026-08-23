@@ -13586,6 +13586,7 @@ fn escalation_dedup_tick_level_identical_payload_suppressed_changed_context_re_e
 // VENDOR_WAIVED telemetry fires on the auto-escalation edge.
 #[test]
 fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
+    unsafe { std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "") };
     use std::sync::Mutex;
 
     use daemon::vendor_health::VendorHealthLedger;
