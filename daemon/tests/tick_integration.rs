@@ -14733,6 +14733,132 @@ fn test_dispatched_adopted_idle_session_reaped_and_promoted() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+/// Bead rev-3lm8k: when a coder session's worktree is auto-clean-enabled
+/// (`agent_worktree_root` set) and the session is reaped on promotion to
+/// ATTESTED (the same "coder session finished" moment PR #653/jleechan-w0r4
+/// reaps the session itself), the daemon must also remove the AO-managed
+/// worktree directory for that session — immediately, not on the next TTL
+/// sweep. This is the RED->GREEN reproduction of the bead's incident: a
+/// leftover worktree dir (e.g. `wa-3538`) blocked every later dispatch that
+/// hashed to the same orchestrator branch until a human manually deleted it.
+#[test]
+fn test_worktree_cleaned_up_on_coder_session_exit_promotion() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = false;
+    sessions.set_activity(daemon::tools::SessionActivity::Idle);
+
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let worktree_root = std::env::temp_dir().join(format!(
+        "afd_test_rev3lm8k_worktree_root_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let cfg = Config {
+        agent_worktree_root: Some(worktree_root.display().to_string()),
+        ..test_cfg()
+    };
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_test_rev3lm8k.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    // The stale AO-managed worktree the incident describes: laid down under
+    // `<agent_worktree_root>/<repo>/<session_id>`, matching the real
+    // `~/.worktrees/<repo>/<agent_id>` convention `Config::agent_worktree_path`
+    // encodes.
+    let stale_worktree = worktree_root.join("owner/repo/wa-3538");
+    std::fs::create_dir_all(&stale_worktree).unwrap();
+    std::fs::write(stale_worktree.join("marker"), b"leftover coder worktree").unwrap();
+    assert!(stale_worktree.is_dir(), "fixture must actually create the dir");
+
+    store.overlays.borrow_mut().insert(
+        "bead-rev3lm8k".into(),
+        BeadOverlay {
+            bead_id: "bead-rev3lm8k".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(998),
+            branch: Some("fix/test-rev3lm8k".into()),
+            session_id: Some("wa-3538".into()),
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+
+    store.register_branch("bead-rev3lm8k", "fix/test-rev3lm8k").unwrap();
+
+    scm.pr_numbers_for_branch.insert(("owner/repo".into(), "fix/test-rev3lm8k".into()), Some(998));
+    scm.open_pr_head_refs.insert(("owner/repo".into(), 998), daemon::tools::PrHeadBranch::SameRepo("fix/test-rev3lm8k".into()));
+    scm.pr_snapshots.insert(
+        998,
+        PrSnapshot {
+            pr_number: 998,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "head-998".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 0);
+
+    let o = store.load("bead-rev3lm8k").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::Attested,
+        "idle adopted session must promote to ATTESTED"
+    );
+    assert_eq!(o.session_id, None, "session handle must be cleared after reaping");
+    assert!(
+        !stale_worktree.exists(),
+        "worktree dir must be cleaned up within the same tick the session is reaped, \
+         not left for a future TTL sweep"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("WORKTREE_CLEANED_ON_SESSION_EXIT"),
+        "telemetry must record the worktree cleanup: {telemetry}"
+    );
+
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 #[test]
 fn session_health_failure_reaps_session_and_requeues_bead() {
     let scm = FakeScm::new();
