@@ -3270,6 +3270,313 @@ fn build_skeptic_prompt(
     )
 }
 
+/// rev-gujs2 (ZFC-1, HIGH): anchored-marker scan for a
+/// `verdict:`/`overall:`/`normalized:` declaration line, or a `/skeptic
+/// pass|warn|fail` command line, within free-text GitHub PR comments. Unlike
+/// `verifier::find_marker_verdict` (which anchors the marker to a LINE via
+/// `str::find`, so `"the old verdict: fail was wrong"` still parses as Fail
+/// — traced by hand: after the `"verdict:"` substring the remainder is
+/// `" fail was wrong"`, and `token_to_verdict` takes the first
+/// whitespace-delimited token `"fail"`), this scan requires the marker to be
+/// the START of the TRIMMED line, case-insensitively — text that merely
+/// discusses or quotes a verdict phrase mid-sentence does not match at all.
+/// `find_marker_verdict` stays correct for its own callers (parsing a
+/// trusted LLM reviewer's own single structured completion, per
+/// gate_es/gate_er/gate_code_standards in CLAUDE.md), but is not anchored
+/// enough for arbitrary free-text authored by untrusted GitHub commenters.
+/// Returns the LAST matching line's canonical `"verdict: pass"` /
+/// `"verdict: fail"` string (an authoritative closing line overrides
+/// earlier progress chatter, mirroring `find_marker_verdict`'s "last marker
+/// wins"), or `None` if no anchored declaration line is present. `warn` has
+/// no independent state in this enrichment-signal grammar (matching the
+/// pre-fix behavior, which never set gha/sign-off to anything but
+/// pass/fail/absent), so only `pass`/`success` and `fail`/`failure` tokens
+/// are recognized.
+fn anchored_comment_verdict(body: &str) -> Option<&'static str> {
+    const MARKERS: [&str; 3] = ["verdict:", "overall:", "normalized:"];
+
+    let mut found = None;
+    for line in body.lines() {
+        let trimmed_lower = line.trim().to_ascii_lowercase();
+        let after = MARKERS
+            .iter()
+            .find_map(|m| trimmed_lower.strip_prefix(m))
+            .or_else(|| trimmed_lower.strip_prefix("/skeptic "));
+        if let Some(after) = after {
+            let token = after.split_whitespace().next().unwrap_or("");
+            match token {
+                "pass" | "success" => found = Some("verdict: pass"),
+                "fail" | "failure" => found = Some("verdict: fail"),
+                _ => {}
+            }
+        }
+    }
+    found
+}
+
+/// rev-gujs2 (ZFC-1, HIGH): derive the OPTIONAL `gha`/`sign-off` enrichment
+/// signals from `snapshot.comments`. Extracted out of `skeptic_evidence`
+/// (which is private and has subprocess side effects) so this is directly
+/// unit-testable, mirroring the `build_skeptic_prompt` /
+/// `second_family_candidates` extraction precedent in this file.
+///
+/// Previously this loop used unanchored `.contains(...)` substring scans
+/// over the lower-cased comment body — banned ZFC-style keyword matching
+/// over free-text authored by arbitrary GitHub commenters. A comment merely
+/// containing the bare word "signoff"/"sign-off" ANYWHERE, or one that
+/// discussed/quoted a prior "verdict: fail" mid-sentence, would flip a
+/// signal and could escalate the combined gate-7 verdict (Fail beats Warn
+/// beats Pass) on an otherwise healthy PR. Both signals now require
+/// `anchored_comment_verdict` to find a genuine declaration line. The bare
+/// "sign-off"/"signoff" word trigger is DROPPED entirely rather than
+/// hardened, per the bead's own FIX note: `gha`/`sign-off` are optional
+/// enrichment signals most target repos never emit, and the bare word has
+/// no anchorable grammar — only `verdict:`/`overall:`/`normalized:` marker
+/// lines and `/skeptic pass|fail` command lines can flip a signal now.
+///
+/// The author/topic gates (gha must be `github-actions`/`gha` AND mention
+/// "skeptic"; sign-off must NOT be `github-actions`/`coderabbit`/`bugbot`/
+/// `cursor`) are unchanged — those are legitimate coarse filters, not the
+/// ZFC violation. Iterates `comments` in order; the LAST matching comment
+/// for each signal wins, matching the original loop's behavior.
+fn derive_enrichment_verdicts(
+    comments: &[crate::tools::PrComment],
+) -> (&'static str, &'static str) {
+    let mut gha_verdict = "verdict: absent";
+    let mut signoff_verdict = "verdict: absent";
+
+    for comment in comments {
+        let author_lower = comment.author.to_ascii_lowercase();
+
+        if (author_lower.contains("github-actions") || author_lower.contains("gha"))
+            && comment.body.to_ascii_lowercase().contains("skeptic")
+        {
+            if let Some(v) = anchored_comment_verdict(&comment.body) {
+                gha_verdict = v;
+            }
+        }
+
+        if !author_lower.contains("github-actions")
+            && !author_lower.contains("coderabbit")
+            && !author_lower.contains("bugbot")
+            && !author_lower.contains("cursor")
+        {
+            if let Some(v) = anchored_comment_verdict(&comment.body) {
+                signoff_verdict = v;
+            }
+        }
+    }
+
+    (gha_verdict, signoff_verdict)
+}
+
+#[cfg(test)]
+mod anchored_comment_verdict_tests {
+    //! rev-gujs2 (ZFC-1, HIGH): pins the false-positive scenarios the
+    //! unanchored `.contains(...)` scan let through, plus the anchored
+    //! declaration-line grammar that replaces it.
+    use super::anchored_comment_verdict;
+
+    #[test]
+    fn bare_signoff_word_in_unrelated_prose_does_not_match() {
+        // Pre-fix behavior: `body_lower.contains("signoff")` alone flipped
+        // `signoff_verdict` to "verdict: pass" here — zero structured
+        // marker required. The anchored scan requires a declaration line,
+        // so a bare word in ordinary prose must not match.
+        assert_eq!(
+            anchored_comment_verdict("let's schedule the signoff meeting for Friday"),
+            None
+        );
+        assert_eq!(
+            anchored_comment_verdict("still need sign-off from the team lead"),
+            None
+        );
+    }
+
+    #[test]
+    fn quoted_verdict_phrase_mid_sentence_does_not_match() {
+        // Pre-fix `find_marker_verdict`-style unanchored `.find()` scan
+        // would parse this as Fail (marker found mid-line, remainder
+        // " fail was wrong" tokenizes to "fail"). The anchored scan
+        // requires "verdict:" at the START of the trimmed line.
+        assert_eq!(
+            anchored_comment_verdict(
+                "note: the old verdict: fail was wrong, this PR fixes it"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn anchored_verdict_pass_line_matches() {
+        assert_eq!(
+            anchored_comment_verdict(
+                "Ran the checks locally, all green.\nverdict: pass\nMerging shortly."
+            ),
+            Some("verdict: pass")
+        );
+    }
+
+    #[test]
+    fn anchored_verdict_fail_line_matches() {
+        assert_eq!(
+            anchored_comment_verdict("verdict: fail missing test coverage"),
+            Some("verdict: fail")
+        );
+    }
+
+    #[test]
+    fn anchored_skeptic_command_line_matches() {
+        assert_eq!(anchored_comment_verdict("/skeptic fail"), Some("verdict: fail"));
+        assert_eq!(anchored_comment_verdict("/skeptic pass"), Some("verdict: pass"));
+    }
+
+    #[test]
+    fn overall_and_normalized_markers_match_parity_with_verdict() {
+        assert_eq!(
+            anchored_comment_verdict("overall: pass"),
+            Some("verdict: pass")
+        );
+        assert_eq!(
+            anchored_comment_verdict("normalized: fail"),
+            Some("verdict: fail")
+        );
+    }
+
+    #[test]
+    fn last_anchored_line_wins_when_multiple_present() {
+        assert_eq!(
+            anchored_comment_verdict("verdict: fail\nfixed now\nverdict: pass"),
+            Some("verdict: pass")
+        );
+    }
+
+    #[test]
+    fn indented_marker_line_still_anchors() {
+        // `trim()` strips leading whitespace before the prefix check, so a
+        // marker line indented inside a quoted block still counts as
+        // line-start, not mid-sentence.
+        assert_eq!(
+            anchored_comment_verdict("  verdict: pass  "),
+            Some("verdict: pass")
+        );
+    }
+}
+
+#[cfg(test)]
+mod derive_enrichment_verdicts_tests {
+    //! rev-gujs2 (ZFC-1, HIGH): pins the author/topic gates plus the
+    //! "last matching comment wins" iteration order, now layered on top of
+    //! `anchored_comment_verdict` instead of bare substring scans.
+    use super::derive_enrichment_verdicts;
+    use crate::tools::PrComment;
+
+    fn comment(author: &str, body: &str) -> PrComment {
+        PrComment {
+            author: author.to_string(),
+            body: body.to_string(),
+            created_at_epoch: 0,
+        }
+    }
+
+    #[test]
+    fn no_comments_yields_both_absent() {
+        assert_eq!(
+            derive_enrichment_verdicts(&[]),
+            ("verdict: absent", "verdict: absent")
+        );
+    }
+
+    #[test]
+    fn bare_signoff_word_from_human_reviewer_no_longer_flips_signoff() {
+        // Pre-fix: this exact body flipped signoff_verdict to
+        // "verdict: pass" via `body_lower.contains("signoff")`. Confirmed
+        // by hand against the removed loop in tick.rs prior to rev-gujs2 —
+        // there was no marker requirement at all.
+        let comments = [comment(
+            "some-reviewer",
+            "let's schedule the signoff meeting for Friday",
+        )];
+        let (_, signoff) = derive_enrichment_verdicts(&comments);
+        assert_eq!(signoff, "verdict: absent");
+    }
+
+    #[test]
+    fn quoted_verdict_phrase_from_human_reviewer_does_not_flip_signoff() {
+        let comments = [comment(
+            "some-reviewer",
+            "note: the old verdict: fail was wrong, this PR fixes it",
+        )];
+        let (_, signoff) = derive_enrichment_verdicts(&comments);
+        assert_eq!(signoff, "verdict: absent");
+    }
+
+    #[test]
+    fn anchored_signoff_pass_from_human_reviewer_flips_verdict() {
+        let comments = [comment("some-reviewer", "verdict: pass")];
+        let (_, signoff) = derive_enrichment_verdicts(&comments);
+        assert_eq!(signoff, "verdict: pass");
+    }
+
+    #[test]
+    fn anchored_skeptic_command_from_human_reviewer_flips_signoff() {
+        let comments = [comment("some-reviewer", "/skeptic fail")];
+        let (_, signoff) = derive_enrichment_verdicts(&comments);
+        assert_eq!(signoff, "verdict: fail");
+    }
+
+    #[test]
+    fn excluded_authors_never_contribute_to_signoff_even_when_anchored() {
+        for author in ["github-actions[bot]", "coderabbitai", "bugbot", "cursor-agent"] {
+            let comments = [comment(author, "verdict: pass")];
+            let (_, signoff) = derive_enrichment_verdicts(&comments);
+            assert_eq!(signoff, "verdict: absent", "author={author}");
+        }
+    }
+
+    #[test]
+    fn gha_requires_actions_author_skeptic_topic_and_anchored_marker() {
+        // Right author/topic, no anchored marker -> stays absent.
+        let comments = [comment(
+            "github-actions[bot]",
+            "skeptic run kicked off, results pending",
+        )];
+        let (gha, _) = derive_enrichment_verdicts(&comments);
+        assert_eq!(gha, "verdict: absent");
+
+        // Right author/topic AND anchored marker -> flips.
+        let comments = [comment(
+            "github-actions[bot]",
+            "skeptic run complete\nverdict: fail\nsee log for details",
+        )];
+        let (gha, _) = derive_enrichment_verdicts(&comments);
+        assert_eq!(gha, "verdict: fail");
+
+        // Anchored marker but body never mentions "skeptic" -> stays absent.
+        let comments = [comment("github-actions[bot]", "verdict: pass")];
+        let (gha, _) = derive_enrichment_verdicts(&comments);
+        assert_eq!(gha, "verdict: absent");
+
+        // Anchored marker + skeptic topic, but wrong author -> stays absent.
+        let comments = [comment("some-other-bot", "skeptic verdict: pass")];
+        let (gha, _) = derive_enrichment_verdicts(&comments);
+        assert_eq!(gha, "verdict: absent");
+    }
+
+    #[test]
+    fn last_matching_comment_wins_per_signal_independently() {
+        let comments = [
+            comment("github-actions[bot]", "skeptic run\nverdict: pass"),
+            comment("some-reviewer", "verdict: fail"),
+            comment("github-actions[bot]", "skeptic run\nverdict: fail"),
+            comment("some-reviewer", "verdict: pass"),
+        ];
+        let (gha, signoff) = derive_enrichment_verdicts(&comments);
+        assert_eq!(gha, "verdict: fail");
+        assert_eq!(signoff, "verdict: pass");
+    }
+}
+
 fn skeptic_evidence(
     deps: &TickDeps,
     bead_id: &str,
@@ -3320,41 +3627,10 @@ fn skeptic_evidence(
     // correctly instead of by the daemon-global repo.
     let is_test_repo = crate::config::is_fixture_repo(repo);
 
-    let mut gha_verdict = "verdict: absent";
-    let mut signoff_verdict = "verdict: absent";
-
-    for comment in &snapshot.comments {
-        let body_lower = comment.body.to_ascii_lowercase();
-        let author_lower = comment.author.to_ascii_lowercase();
-
-        if (author_lower.contains("github-actions") || author_lower.contains("gha"))
-            && body_lower.contains("skeptic")
-        {
-            if body_lower.contains("verdict: pass") || body_lower.contains("verdict: success") {
-                gha_verdict = "verdict: pass";
-            } else if body_lower.contains("verdict: fail")
-                || body_lower.contains("verdict: failure")
-            {
-                gha_verdict = "verdict: fail";
-            }
-        }
-
-        if !author_lower.contains("github-actions")
-            && !author_lower.contains("coderabbit")
-            && !author_lower.contains("bugbot")
-            && !author_lower.contains("cursor")
-        {
-            if body_lower.contains("sign-off")
-                || body_lower.contains("signoff")
-                || body_lower.contains("verdict: pass")
-                || body_lower.contains("/skeptic pass")
-            {
-                signoff_verdict = "verdict: pass";
-            } else if body_lower.contains("verdict: fail") || body_lower.contains("/skeptic fail") {
-                signoff_verdict = "verdict: fail";
-            }
-        }
-    }
+    // rev-gujs2 (ZFC-1, HIGH): derivation now anchors to declaration lines
+    // instead of scanning for substrings anywhere in the comment body — see
+    // `derive_enrichment_verdicts` and `anchored_comment_verdict` above.
+    let (gha_verdict, signoff_verdict) = derive_enrichment_verdicts(&snapshot.comments);
 
     // jleechan-wzgl: track which reviewer vendor(s) actually contributed a
     // parseable verdict to `skeptic_verdict`, so GATE_ASSESSMENT telemetry
