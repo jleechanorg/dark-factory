@@ -14808,3 +14808,120 @@ fn session_health_failure_reaps_session_and_requeues_bead() {
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+#[test]
+fn startup_tick_1_triggers_forced_dispatch_pass_and_attested_gate_assessment() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.slow_tick_secs = 600;
+    cfg.fast_tick_secs = 60;
+    let vcs = test_vcs();
+    let telemetry_log = std::env::temp_dir().join("afd_test_startup_dispatch.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    // 1. Pre-seed an ATTESTED bead with an open PR (e.g. from intake/restart)
+    store.overlays.borrow_mut().insert(
+        "bead-startup-attested".into(),
+        BeadOverlay {
+            bead_id: "bead-startup-attested".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(101),
+            branch: Some("factory/bead-startup-attested-r1".into()),
+            session_id: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+    store.register_branch("bead-startup-attested", "factory/bead-startup-attested-r1").unwrap();
+
+    let mut snap = qdw_green_snapshot(
+        101,
+        vec![PrComment {
+            author: "dark-factory-er".into(),
+            body: "/er PASS".into(),
+            created_at_epoch: 0,
+        }],
+    );
+    snap.body = "**Evidence**: https://gist.github.com/test/101 (head sha-101)".into();
+    scm.pr_snapshots.insert(101, snap);
+    scm.gists.insert("101".into(), true);
+
+    // 2. Pre-seed a HUMAN_HELD bead that gets recovered on tick 0 and dispatched on tick 1
+    tracker.candidates.borrow_mut().push(Bead {
+        id: "bead-startup-held".into(),
+        title: "bead-startup-held".into(),
+        description: "target_repo: owner/repo\nNeed fix".into(),
+        notes: String::new(),
+        file_tree_summary: String::new(),
+        external_ref: Some("owner/repo#201".into()),
+    });
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"verdict: pass {"routingVerdict":"SMALL_PATH","justification":"small"}"#.into(),
+    ));
+    store.overlays.borrow_mut().insert(
+        "bead-startup-held".into(),
+        BeadOverlay {
+            bead_id: "bead-startup-held".into(),
+            state: OverlayState::HumanHeld,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: None,
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: Some("session_stalled".into()),
+            target_repo: Some("owner/repo".into()),
+            attempt_started_at: None,
+        },
+    );
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    // Run tick 0 (startup tick)
+    let summary_0 = run_tick(&deps, 0, 0).unwrap();
+    assert_eq!(summary_0.gates_assessed, 1, "ATTESTED bead must be gate-assessed on tick 0");
+    assert_eq!(summary_0.beads_recovered_from_held, 1, "HUMAN_HELD bead must be recovered on tick 0");
+    assert_eq!(summary_0.beads_dispatched, 0, "no beads dispatched on tick 0 before recovery");
+    let o_attested = store.load("bead-startup-attested").unwrap().unwrap();
+    assert_eq!(o_attested.state, OverlayState::Ready, "all-green ATTESTED bead transitions to Ready");
+    let o_recovered = store.load("bead-startup-held").unwrap().unwrap();
+    assert_eq!(o_recovered.state, OverlayState::Queued, "recovered bead is Queued after tick 0");
+
+    // Run tick 1 (startup forced dispatch tick within 30s)
+    let summary_1 = run_tick(&deps, 1, 20).unwrap();
+    assert_eq!(summary_1.beads_dispatched, 1, "queued bead must be dispatched on startup tick 1");
+    let o_dispatched = store.load("bead-startup-held").unwrap().unwrap();
+    assert_eq!(o_dispatched.state, OverlayState::Dispatched, "bead transitioned to Dispatched");
+
+    // Run tick 2 (organic fast-tier tick: slow tier should NOT run here because 2 % 10 != 0)
+    let summary_2 = run_tick(&deps, 2, 20).unwrap();
+    assert_eq!(summary_2.beads_dispatched, 0, "slow tier is not due on tick 2");
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}

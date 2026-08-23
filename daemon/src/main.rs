@@ -413,6 +413,33 @@ fn classify_tick_result<T>(
     }
 }
 
+/// Compute the sleep duration after a successful tick. On startup (tick_index == 0),
+/// cap sleep to at most 20 seconds (within 30s) and emit STARTUP_DISPATCH_PASS telemetry
+/// to trigger a fast follow-up dispatch pass on tick 1.
+fn compute_tick_sleep_secs(
+    tick_index: u64,
+    fast_tick_secs: u64,
+    telemetry_log: &Path,
+) -> u64 {
+    if tick_index == 0 {
+        let _ = daemon::telemetry::emit(
+            telemetry_log,
+            &daemon::telemetry::TelemetryEvent {
+                timestamp: daemon::state::now_iso8601(),
+                bead_id: "system".to_string(),
+                attempt_id: 0,
+                lifecycle_state: "N/A".to_string(),
+                event_type: "STARTUP_DISPATCH_PASS".to_string(),
+                metrics: serde_json::json!({}),
+                context: serde_json::json!({}),
+            },
+        );
+        std::cmp::min(fast_tick_secs, 20)
+    } else {
+        fast_tick_secs
+    }
+}
+
 type DaemonAdapters = (
     Box<dyn Scm>,
     Box<dyn Tracker>,
@@ -675,7 +702,12 @@ fn run(args: Args) -> Result<(), DaemonError> {
                 if previous_failures >= 3 {
                     send_daemon_recovery_alert(previous_failures);
                 }
-                std::thread::sleep(std::time::Duration::from_secs(cfg.fast_tick_secs));
+                let sleep_secs = compute_tick_sleep_secs(
+                    attempt.tick_index,
+                    cfg.fast_tick_secs,
+                    deps.telemetry_log,
+                );
+                std::thread::sleep(std::time::Duration::from_secs(sleep_secs));
             }
             TickLoopAction::TransientBackoff {
                 consecutive_failures: _,
@@ -1314,6 +1346,33 @@ mod tests {
         assert_eq!(reconcile_count, 0);
         assert_eq!(state.tick_index, 1);
         assert_eq!(state.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn compute_tick_sleep_secs_emits_startup_dispatch_pass_on_first_tick_and_caps_sleep() {
+        let dir = std::env::temp_dir().join("afd_startup_dispatch_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let telemetry_log = dir.join("daemon.jsonl");
+        let _ = std::fs::remove_file(&telemetry_log);
+
+        // tick_index == 0: caps at 20s (<= 30s) and emits STARTUP_DISPATCH_PASS
+        let sleep_0 = compute_tick_sleep_secs(0, 60, &telemetry_log);
+        assert_eq!(sleep_0, 20);
+
+        let content = std::fs::read_to_string(&telemetry_log).unwrap();
+        assert!(content.contains("STARTUP_DISPATCH_PASS"));
+        assert!(content.contains("\"beadId\":\"system\""));
+
+        // tick_index > 0: returns fast_tick_secs without emitting event
+        let _ = std::fs::remove_file(&telemetry_log);
+        let sleep_1 = compute_tick_sleep_secs(1, 60, &telemetry_log);
+        assert_eq!(sleep_1, 60);
+        assert!(!telemetry_log.exists());
+
+        let sleep_small = compute_tick_sleep_secs(0, 10, &telemetry_log);
+        assert_eq!(sleep_small, 10);
+
+        let _ = std::fs::remove_file(&telemetry_log);
     }
 
     #[cfg(unix)]

@@ -656,7 +656,7 @@ pub fn run_tick(
 
     let slow_tier_due = {
         let ratio = (deps.cfg.slow_tick_secs / deps.cfg.fast_tick_secs.max(1)).max(1);
-        tick_index.is_multiple_of(ratio)
+        tick_index == 0 || tick_index == 1 || tick_index.is_multiple_of(ratio)
     };
 
     // jleechan-54ky / sub-fix for jleechan-gib: split the SQL-level "increment
@@ -3910,11 +3910,16 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     // and `branch_registry` is this store's authoritative "beads we're
     // actively tracking" set (deletion-guard doc comment on
     // `StateStore::owned_branches`).
-    let branches = deps.store.owned_branches()?;
+    let branches = deps.store.owned_branches().unwrap_or_default();
     let mut bead_ids: Vec<String> = Vec::new();
     for branch in &branches {
         if let Ok(Some(bead_id)) = deps.store.bead_id_for_branch(branch) {
             bead_ids.push(bead_id);
+        }
+    }
+    if let Ok(active) = deps.store.list_active_overlays() {
+        for overlay in active {
+            bead_ids.push(overlay.bead_id);
         }
     }
     bead_ids.sort();
