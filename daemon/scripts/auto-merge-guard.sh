@@ -339,10 +339,13 @@ except Exception:
 # This is a SECOND, INDEPENDENT gate — it augments, not replaces, the
 # repo-allowlist gate above and the no-red gate checks in
 # latest_assessment_no_red(). A PR is approved when EITHER:
-#   (a) a PR comment matching /MERGE APPROVED/ (case-sensitive) was
-#       posted by a non-bot account that is NOT the PR's own author (an
-#       author commenting on their own PR must never satisfy the gate --
-#       that would make the marker trivially self-spoofable), OR
+#   (a) a PR comment containing a standalone line that is exactly
+#       "MERGE APPROVED" (case-sensitive, anchored -- not merely a
+#       substring anywhere in the body, so a negation like "does NOT say
+#       MERGE APPROVED" or a quoted/code-block mention never satisfies
+#       this) was posted by a non-bot account that is NOT the PR's own
+#       author (an author commenting on their own PR must never satisfy
+#       the gate -- that would make the marker trivially self-spoofable), OR
 #   (b) the $AMG_APPROVAL_LABEL label ("auto-merge-approved" by default)
 #       was applied by a non-bot GitHub actor (checked via the issue
 #       events/timeline, not just current label presence, so we know WHO
@@ -359,7 +362,12 @@ human_approval_marker_present() { # <pr_number> -> exit 0 iff a valid human appr
 import json, os, re, sys
 
 AUTHOR = os.environ.get("PR_AUTHOR", "")
-MARKER = re.compile(r"MERGE APPROVED")
+# Anchored, standalone-line match only (mirrors this repo own
+# _parse_verdict marker convention, and CLAUDE.md rule that MERGE APPROVED
+# must appear verbatim) -- a bare substring search would let any comment
+# that merely contains the phrase satisfy the gate, including negations
+# ("does NOT say MERGE APPROVED"), quotes, or code-block embeddings.
+MARKER = re.compile(r"(?m)^\s*MERGE APPROVED\s*$")
 
 def is_bot(user):
     if not isinstance(user, dict):

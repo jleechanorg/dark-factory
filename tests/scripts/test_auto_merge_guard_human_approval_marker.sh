@@ -242,6 +242,32 @@ echo "$out5b"
 assert_contains "case5b: bot-applied label REFUSED:NO_APPROVAL_MARKER" "REFUSED:NO_APPROVAL_MARKER" "$out5b"
 assert_not_contains "case5b: gh pr merge never called (bot-label spoof blocked)" "pr merge" "$(cat "$GH_SHIM_LOG")"
 
+echo
+echo "=== CASE 6 (anti-spoof): negated mention of the phrase -> REFUSED, not a false-positive match ==="
+GH_SHIM_LOG="$SCRATCH_DIR/gh-case6.log"; : > "$GH_SHIM_LOG"
+COMMENTS6="$SCRATCH_DIR/comments6.json"
+cat > "$COMMENTS6" <<'EOF_C6'
+[{"body":"I do NOT think this should say MERGE APPROVED yet -- needs more review first.","user":{"login":"jleechan2015","type":"User"}}]
+EOF_C6
+GH_SHIM_AUTHOR_LOGIN="some-factory-bot-author" GH_SHIM_COMMENTS_OUT="$COMMENTS6" GH_SHIM_EVENTS_OUT="/dev/null" \
+  out6="$(run_guard)"
+echo "$out6"
+assert_contains "case6: negated mention REFUSED:NO_APPROVAL_MARKER (substring match must not satisfy the gate)" "REFUSED:NO_APPROVAL_MARKER" "$out6"
+assert_not_contains "case6: gh pr merge never called (negation spoof blocked)" "pr merge" "$(cat "$GH_SHIM_LOG")"
+
+echo
+echo "=== CASE 7 (anti-spoof): phrase embedded mid-sentence / inside a quote -> REFUSED ==="
+GH_SHIM_LOG="$SCRATCH_DIR/gh-case7.log"; : > "$GH_SHIM_LOG"
+COMMENTS7="$SCRATCH_DIR/comments7.json"
+cat > "$COMMENTS7" <<'EOF_C7'
+[{"body":"Quoting the policy doc: \"...requires a literal MERGE APPROVED comment before...\" -- not doing that here, just referencing it.","user":{"login":"jleechan2015","type":"User"}}]
+EOF_C7
+GH_SHIM_AUTHOR_LOGIN="some-factory-bot-author" GH_SHIM_COMMENTS_OUT="$COMMENTS7" GH_SHIM_EVENTS_OUT="/dev/null" \
+  out7="$(run_guard)"
+echo "$out7"
+assert_contains "case7: mid-sentence/quoted mention REFUSED:NO_APPROVAL_MARKER (must be a standalone line)" "REFUSED:NO_APPROVAL_MARKER" "$out7"
+assert_not_contains "case7: gh pr merge never called (embedded-mention spoof blocked)" "pr merge" "$(cat "$GH_SHIM_LOG")"
+
 echo ""
 echo "=== RESULTS: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ]
