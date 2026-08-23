@@ -9,9 +9,9 @@ When the `dark-factory` pipeline runner executes tasks or exhausts retries on br
 
 ## Security & Repository Hygiene Policy
 
-These files contain runtime infrastructure details (such as host OS configurations, runner versions, cloud region data, and runtime environment headers). They are strictly ephemeral diagnostics and **must never be committed to source control**.
+These files contain runtime infrastructure details (such as host OS configurations, runner versions, cloud region data, and runtime environment headers). They are strictly ephemeral diagnostics and must not be committed to source control.
 
-The root `.gitignore` enforces this with patterns:
+The root `.gitignore` excludes matching untracked diagnostic paths from standard Git operations:
 ```gitignore
 failed_run_log*.txt
 branch_fail_step_*
@@ -19,15 +19,15 @@ branch_fail_step_*
 
 ## Where CI and Runner Logs Belong Instead
 
-1. **Performance and Run Logs (`~/Library/Logs/dark-factory/`)**:
-   - Structured JSONL and human-readable run logs are stored outside the repository tree under `~/Library/Logs/dark-factory/<repo-slug>/<branch-slug>/` (macOS default and Linux standard path).
+1. **Performance and Run Logs (`~/Library/Logs/dark-factory/<repo-slug>/<branch-slug>/`)**:
+   - Structured JSONL and human-readable run logs are stored outside the repository tree under `~/Library/Logs/dark-factory/<repo-slug>/<branch-slug>/`. This is macOS's standard per-app log directory, and is mirrored as the project-standard log root across hosts (including Linux `jeff-ubuntu`).
    - This location survives reboots, worktree teardowns, and retag cycles without polluting the git index.
 
 2. **CXDB Event Store (`~/.dark-factory/cxdb.sqlite`)**:
-   - Structured step-by-step execution traces, step hashes, verdicts, and failure classifications are recorded in SQLite WAL database files for Healer analysis.
+   - Structured step-by-step execution traces, step hashes, verdicts, and failure classifications are recorded in SQLite WAL database files (`~/.dark-factory/cxdb.sqlite` or `--cxdb <path>`) for Healer analysis.
 
 3. **CI Run Artifacts (GitHub Actions)**:
    - In automated GitHub Actions workflows, ephemeral logs and test reports should be uploaded via `actions/upload-artifact` with standard retention periods rather than written into the repository worktree.
 
 4. **Evidence Gists & Public Attestations**:
-   - Sanitized verification bundles and test evidence required for gate promotions are published to public Gists referenced in pull request descriptions.
+   - Only sanitized verification summaries and test evidence required for gate promotions are published to public Gists. Raw runner boot logs or unredacted environment dumps must never be published to Gists.

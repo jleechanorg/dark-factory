@@ -130,5 +130,5 @@ def test_ci_runner_log_hygiene_doc_exists_and_covers_destinations():
     content = doc.read_text(encoding="utf-8")
     assert "failed_run_log*.txt" in content
     assert "branch_fail_step_*" in content
-    assert "Library/Logs/dark-factory" in content
-    assert "cxdb" in content.lower()
+    assert "~/Library/Logs/dark-factory/<repo-slug>/<branch-slug>/" in content
+    assert "~/.dark-factory/cxdb.sqlite" in content
