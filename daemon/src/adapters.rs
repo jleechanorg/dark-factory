@@ -756,27 +756,22 @@ fn unresolved_thread_count_from_gql(gql_out: &str) -> Result<u32, DaemonError> {
         .count() as u32)
 }
 
-static GRAPHQL_RATE_LIMITED_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
-
 pub fn is_graphql_rate_limited() -> bool {
-    let lock = GRAPHQL_RATE_LIMITED_UNTIL.lock().unwrap();
-    if let Some(until) = *lock {
-        if Instant::now() < until {
-            return true;
-        }
-    }
-    false
+    crate::gh_circuit_breaker::is_open()
 }
 
 pub fn mark_graphql_rate_limited(duration: Duration) {
-    let mut lock = GRAPHQL_RATE_LIMITED_UNTIL.lock().unwrap();
-    let until = Instant::now() + duration;
-    *lock = Some(until);
+    let now = crate::gh_circuit_breaker::now_epoch_secs();
+    let _ = crate::gh_circuit_breaker::record_gh_result(
+        1,
+        "",
+        &format!("HTTP 403: Rate limit exceeded. Retry-After: {}", duration.as_secs()),
+        Some(now),
+    );
 }
 
 pub fn clear_graphql_rate_limited() {
-    let mut lock = GRAPHQL_RATE_LIMITED_UNTIL.lock().unwrap();
-    *lock = None;
+    crate::gh_circuit_breaker::reset_global();
 }
 
 
@@ -1628,56 +1623,40 @@ impl Scm for CliScm {
                 }
             }
         }
-        let out_issues = if is_graphql_rate_limited() {
-            run_tool(
-                "gh",
-                &[
-                    "api",
-                    &format!(
-                        "repos/{}/issues?labels={label}&state=open&per_page=100",
-                        self.repo
-                    ),
-                ],
-                30,
-            )?
-        } else {
-            match run_tool(
-                "gh",
-                &[
-                    "issue",
-                    "list",
-                    "--repo",
-                    &self.repo,
-                    "--label",
-                    label,
-                    "--state",
-                    "open",
-                    "--limit",
-                    "1000",
-                    "--json",
-                    "number,title,body,author",
-                ],
-                30,
-            ) {
-                Ok(out) => out,
-                Err(e) => {
-                    if let DaemonError::Tool { stderr, .. } = &e {
-                        if stderr.contains("rate limit") {
-                            mark_graphql_rate_limited(Duration::from_secs(60));
-                        }
-                    }
-                    run_tool(
-                        "gh",
-                        &[
-                            "api",
-                            &format!(
-                                "repos/{}/issues?labels={label}&state=open&per_page=100",
-                                self.repo
-                            ),
-                        ],
-                        30,
-                    )?
+        let out_issues = match run_tool(
+            "gh",
+            &[
+                "issue",
+                "list",
+                "--repo",
+                &self.repo,
+                "--label",
+                label,
+                "--state",
+                "open",
+                "--limit",
+                "1000",
+                "--json",
+                "number,title,body,author",
+            ],
+            30,
+        ) {
+            Ok(out) => out,
+            Err(e) => {
+                if e.is_gh_rate_limit() {
+                    return Err(e);
                 }
+                run_tool(
+                    "gh",
+                    &[
+                        "api",
+                        &format!(
+                            "repos/{}/issues?labels={label}&state=open&per_page=100",
+                            self.repo
+                        ),
+                    ],
+                    30,
+                )?
             }
         };
         #[derive(serde::Deserialize)]
@@ -1724,9 +1703,6 @@ impl Scm for CliScm {
     }
 
     fn labeled_prs(&self, label: &str, gh_calls: &mut u32) -> Result<Vec<LabeledPr>, DaemonError> {
-        if is_graphql_rate_limited() {
-            return self.labeled_prs_via_rest(label, gh_calls);
-        }
         *gh_calls += 1;
         let out = match run_tool(
             "gh",
@@ -1751,10 +1727,8 @@ impl Scm for CliScm {
         ) {
             Ok(out) => out,
             Err(e) => {
-                if let DaemonError::Tool { stderr, .. } = &e {
-                    if stderr.contains("rate limit") {
-                        mark_graphql_rate_limited(Duration::from_secs(60));
-                    }
+                if e.is_gh_rate_limit() {
+                    return Err(e);
                 }
                 return self.labeled_prs_via_rest(label, gh_calls);
             }
@@ -1883,37 +1857,30 @@ impl Scm for CliScm {
             }
         }
         let pr_str = pr.to_string();
-        let gql_limited = is_graphql_rate_limited();
-        let view: GhPrView = if gql_limited {
-            self.fetch_pr_view_via_rest(pr)?
-        } else {
-            match run_tool(
-                "gh",
-                &[
-                    "pr",
-                    "view",
-                    &pr_str,
-                    "--repo",
-                    &self.repo,
-                    "--json",
-                    "mergeable,reviews,headRefOid,body,comments,files,updatedAt",
-                ],
-                30,
-            ) {
-                Ok(view_out) => {
-                    let json_start = view_out.find('{').unwrap_or(0);
-                    serde_json::from_str(&view_out[json_start..]).map_err(|e| {
-                        DaemonError::Parse(format!("failed to parse gh pr view JSON: {e}"))
-                    })?
+        let view: GhPrView = match run_tool(
+            "gh",
+            &[
+                "pr",
+                "view",
+                &pr_str,
+                "--repo",
+                &self.repo,
+                "--json",
+                "mergeable,reviews,headRefOid,body,comments,files,updatedAt",
+            ],
+            30,
+        ) {
+            Ok(view_out) => {
+                let json_start = view_out.find('{').unwrap_or(0);
+                serde_json::from_str(&view_out[json_start..]).map_err(|e| {
+                    DaemonError::Parse(format!("failed to parse gh pr view JSON: {e}"))
+                })?
+            }
+            Err(e) => {
+                if e.is_gh_rate_limit() {
+                    return Err(e);
                 }
-                Err(e) => {
-                    if let DaemonError::Tool { stderr, .. } = &e {
-                        if stderr.contains("rate limit") {
-                            mark_graphql_rate_limited(Duration::from_secs(60));
-                        }
-                    }
-                    self.fetch_pr_view_via_rest(pr)?
-                }
+                self.fetch_pr_view_via_rest(pr)?
             }
         };
         let mergeable = view.mergeable == "MERGEABLE";
@@ -1940,23 +1907,17 @@ impl Scm for CliScm {
         };
         let coderabbit_approved = coderabbit_status == "green";
 
-        let checks_out = if gql_limited || is_graphql_rate_limited() {
-            self.fetch_pr_checks_via_rest(&view.head_ref_oid, pr)?
-        } else {
-            match run_tool(
-                "gh",
-                &["pr", "checks", &pr_str, "--repo", &self.repo, "--json", "state,bucket,name"],
-                30,
-            ) {
-                Ok(out) => out,
-                Err(primary_err) => {
-                    if let DaemonError::Tool { stderr, .. } = &primary_err {
-                        if stderr.contains("rate limit") {
-                            mark_graphql_rate_limited(Duration::from_secs(60));
-                        }
-                    }
-                    self.fetch_pr_checks_via_rest(&view.head_ref_oid, pr)?
+        let checks_out = match run_tool(
+            "gh",
+            &["pr", "checks", &pr_str, "--repo", &self.repo, "--json", "state,bucket,name"],
+            30,
+        ) {
+            Ok(out) => out,
+            Err(primary_err) => {
+                if primary_err.is_gh_rate_limit() {
+                    return Err(primary_err);
                 }
+                self.fetch_pr_checks_via_rest(&view.head_ref_oid, pr)?
             }
         };
         let json_start_c = checks_out.find('[').unwrap_or(0);
@@ -2051,7 +2012,7 @@ impl Scm for CliScm {
         // Unresolved thread count: if GraphQL is rate-limited, attempt to
         // reuse the cached thread count for the same head SHA if available,
         // or check review states. Otherwise query GraphQL.
-        let unresolved_thread_count: Option<u32> = if gql_limited || is_graphql_rate_limited() {
+        let unresolved_thread_count: Option<u32> = if is_graphql_rate_limited() {
             let cached_count = {
                 let cache = self.pr_snapshot_cache.lock().unwrap();
                 cache.get(&(self.repo.clone(), pr)).and_then(|(s, _)| {
@@ -2101,11 +2062,6 @@ impl Scm for CliScm {
                     }
                 },
                 Err(e) => {
-                    if let DaemonError::Tool { stderr, .. } = &e {
-                        if stderr.contains("rate limit") {
-                            mark_graphql_rate_limited(Duration::from_secs(60));
-                        }
-                    }
                     eprintln!(
                         "[warn] GraphQL query failed; comments-resolved gate will report Unknown, \
                          not Green: {e:?}"

@@ -219,16 +219,13 @@ impl DaemonError {
     /// transient failures, 300s backoff each, starving every other bead's
     /// fast-tier dispatch.
     pub fn is_gh_rate_limit(&self) -> bool {
-        let DaemonError::Tool { tool, stderr, .. } = self else {
+        let DaemonError::Tool { tool, rc, stderr } = self else {
             return false;
         };
         if tool != "gh" {
             return false;
         }
-        let lower = stderr.to_ascii_lowercase();
-        lower.contains("api rate limit exceeded")
-            || lower.contains("rate limit hit")
-            || (lower.contains("403") && lower.contains("rate limit"))
+        crate::gh_circuit_breaker::is_gh_rate_limit_error(*rc, stderr, "")
     }
 
     /// Detects `br create --external-ref ...` failing because the ref is
