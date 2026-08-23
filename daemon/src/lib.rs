@@ -27,3 +27,4 @@ pub mod worktree_reaper;
 
 pub mod gates_compute;
 pub mod vendor_health;
+pub mod lock;

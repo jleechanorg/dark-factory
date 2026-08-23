@@ -61,16 +61,22 @@ fn systemd_notify(_message: &str) -> Result<(), DaemonError> {
 
 /// Parsed CLI flags (manual `std::env::args` parsing per Task 10 — no `clap`,
 /// staying inside the five-dependency budget from design doc §2).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Args {
     /// Run exactly one tick then exit, instead of looping forever.
     once: bool,
     /// Construct every tool-boundary trait as a no-op stub that performs zero
     /// subprocess calls, zero SCM writes, zero session spawns.
     dry_run: bool,
+    /// Override default config path.
+    config: Option<PathBuf>,
+    /// Override default state database path.
+    db: Option<PathBuf>,
+    /// Override default telemetry log path.
+    telemetry_log: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CommandMode {
     Daemon(Args),
     RecoverHeld {
@@ -81,17 +87,53 @@ enum CommandMode {
         pr: u64,
         repo: Option<String>,
     },
+    Help(String),
+    Version,
 }
+
+const MAIN_HELP: &str = r#"Dark Factory daemon - automated pipeline runner
+
+Usage: daemon [OPTIONS] [COMMAND]
+
+Commands:
+  recover-held    Recover human-held overlay beads
+  gates-compute   Compute gate verdicts for a PR
+
+Options:
+  --once                  Run exactly one tick then exit
+  --dry-run               Run with no-op adapters (zero external writes)
+  --config <PATH>         Override path to config file
+  --db <PATH>             Override path to SQLite state database
+  --telemetry-log <PATH>  Override path to JSONL telemetry log
+  -h, --help              Print help information
+  -V, --version           Print version information"#;
+
+const RECOVER_HELD_HELP: &str = r#"Usage: daemon recover-held --db <PATH> --telemetry-log <PATH>
+
+Options:
+  --db <PATH>             Path to SQLite CXDB database
+  --telemetry-log <PATH>  Path to daemon JSONL telemetry log
+  -h, --help              Print help information"#;
+
+const GATES_COMPUTE_HELP: &str = r#"Usage: daemon gates-compute --pr <PR_NUMBER> [--repo <REPO>]
+
+Options:
+  --pr <PR_NUMBER>  Target pull request number
+  --repo <REPO>     Target repository (optional, e.g. owner/repo)
+  -h, --help        Print help information"#;
 
 fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<CommandMode, String> {
     let _bin_name = argv.next();
     let next_arg = argv.next();
     match next_arg.as_deref() {
+        Some("-h" | "--help") => Ok(CommandMode::Help(MAIN_HELP.to_string())),
+        Some("-V" | "--version") => Ok(CommandMode::Version),
         Some("recover-held") => {
             let mut db = None;
             let mut telemetry_log = None;
             while let Some(arg) = argv.next() {
                 match arg.as_str() {
+                    "-h" | "--help" => return Ok(CommandMode::Help(RECOVER_HELD_HELP.to_string())),
                     "--db" => {
                         db = Some(PathBuf::from(
                             argv.next()
@@ -122,6 +164,7 @@ fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<CommandMode, Str
             let mut repo = None;
             while let Some(arg) = argv.next() {
                 match arg.as_str() {
+                    "-h" | "--help" => return Ok(CommandMode::Help(GATES_COMPUTE_HELP.to_string())),
                     "--pr" => {
                         if let Some(val) = argv.next() {
                             let parsed_pr = val.parse::<u64>().map_err(|_| format!("Invalid PR number: {}", val))?;
@@ -149,11 +192,26 @@ fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<CommandMode, Str
             let mut args = Args::default();
             let mut all_args = vec![first_flag.to_string()];
             all_args.extend(argv);
-            for arg in all_args {
+            let mut iter = all_args.into_iter();
+            while let Some(arg) = iter.next() {
                 match arg.as_str() {
                     "--once" => args.once = true,
                     "--dry-run" => args.dry_run = true,
-                    _ => {}
+                    "--config" => {
+                        let val = iter.next().ok_or_else(|| "Missing value for --config".to_string())?;
+                        args.config = Some(PathBuf::from(val));
+                    }
+                    "--db" => {
+                        let val = iter.next().ok_or_else(|| "Missing value for --db".to_string())?;
+                        args.db = Some(PathBuf::from(val));
+                    }
+                    "--telemetry-log" => {
+                        let val = iter.next().ok_or_else(|| "Missing value for --telemetry-log".to_string())?;
+                        args.telemetry_log = Some(PathBuf::from(val));
+                    }
+                    "-h" | "--help" => return Ok(CommandMode::Help(MAIN_HELP.to_string())),
+                    "-V" | "--version" => return Ok(CommandMode::Version),
+                    other => return Err(format!("Unknown argument: {other}")),
                 }
             }
             Ok(CommandMode::Daemon(args))
@@ -475,7 +533,7 @@ fn configured_vendor_list(default_agent: &str) -> Vec<String> {
 }
 
 fn verify_startup_ao_compatibility(
-    args: Args,
+    args: &Args,
     ao_project: &str,
     configured_vendors: &[String],
     verify: impl FnOnce(&str, &[String]) -> Result<(), DaemonError>,
@@ -502,10 +560,11 @@ fn verify_startup_ao_compatibility(
 ///
 /// Skipped under `--dry-run` because tests construct synthetic envs that
 /// don't necessarily have cargo.
-fn verify_startup_cargo_toolchain(args: Args) {
+fn verify_startup_cargo_toolchain(args: &Args) {
     if args.dry_run {
         return;
     }
+
     let cargo_home = std::env::var_os("CARGO_HOME")
         .map(PathBuf::from)
         .or_else(|| {
@@ -530,7 +589,7 @@ fn verify_startup_cargo_toolchain(args: Args) {
 }
 
 fn run(args: Args) -> Result<(), DaemonError> {
-    let cfg_path = default_config_path();
+    let cfg_path = args.config.clone().unwrap_or_else(default_config_path);
     let cfg = load_config(&cfg_path)?;
     let (ao_project, default_agent) = ao_runtime_binding(&cfg)?;
     let configured_vendors = configured_vendor_list(&default_agent);
@@ -538,26 +597,20 @@ fn run(args: Args) -> Result<(), DaemonError> {
     // healthy tick when the installed AO/Node adapter is incompatible. The
     // diagnostic exits before AO preflight, locking, workspace creation, or
     // worker launch.
-    verify_startup_ao_compatibility(args, &ao_project, &configured_vendors, |project, vendors| {
+    verify_startup_ao_compatibility(&args, &ao_project, &configured_vendors, |project, vendors| {
         daemon::adapters::verify_ao_bridge_compatibility(project, vendors.first().map(String::as_str).unwrap_or("agy"), vendors)
     })?;
-    // Bead jleechan-sb4b: emit a loud config warning at startup if the
-    // runtime red-green detector's toolchain is missing. The previous
-    // behavior was silent: every assessment reported a misleading
-    // `GreenFailed: git error: spawn cargo test: No such file or
-    // directory` and operators had no upfront signal that the daemon's
-    // systemd environment lacked cargo. This emit is non-fatal — the
-    // daemon can still run other gates — but loud enough that the
-    // operator sees it in the journalctl output before the first
-    // assessment.
-    verify_startup_cargo_toolchain(args);
-    // Verify the telemetry log path is writable BEFORE we start polling
-    // ticks — every assessment writes here, and a churning 7-green false
-    // alarm usually traces back to a silent telemetry write failure.
-    let telemetry_log = default_telemetry_log();
-    let db_path = default_state_db_path();
+    verify_startup_cargo_toolchain(&args);
 
-    let store: Box<dyn StateStore> = if args.dry_run {
+    let telemetry_log = args.telemetry_log.clone().unwrap_or_else(default_telemetry_log);
+    let db_path = args.db.clone().unwrap_or_else(default_state_db_path);
+    let lock_path = db_path.with_extension("lock");
+
+    let _lock = daemon::lock::DaemonLock::acquire(&lock_path, &cfg.target_repo)?;
+    daemon::telemetry::set_instance_id(&_lock.metadata.instance_id);
+    daemon::telemetry::emit_startup(&telemetry_log, &_lock)?;
+
+    let store: Box<dyn StateStore> = if args.dry_run && args.db.is_none() {
         Box::new(SqliteStateStore::open_in_memory_with_schema(include_str!(
             "../contracts/schema.sql"
         ))?)
@@ -566,6 +619,7 @@ fn run(args: Args) -> Result<(), DaemonError> {
     };
 
     store.reconcile_dispatching()?;
+
 
     let (scm, tracker, sessions, llm, vcs): DaemonAdapters = if args.dry_run {
         #[cfg(any(test, debug_assertions))]
@@ -853,6 +907,14 @@ fn main() {
     };
 
     match mode {
+        CommandMode::Help(msg) => {
+            println!("{msg}");
+            std::process::exit(0);
+        }
+        CommandMode::Version => {
+            println!("daemon {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
         CommandMode::Daemon(args) => {
             if let Err(e) = run(args) {
                 eprintln!("auto-factory daemon: fatal: {e}");
@@ -873,6 +935,7 @@ fn main() {
         }
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -895,7 +958,7 @@ mod tests {
         let mut observed = None;
         let vendors = vec!["minimax".to_string()];
         let error = verify_startup_ao_compatibility(
-            Args::default(),
+            &Args::default(),
             "dark-factory",
             &vendors,
             |project, list| {
@@ -990,9 +1053,10 @@ mod tests {
         let mut called = false;
         let vendors = vec!["minimax".to_string()];
         let result = verify_startup_ao_compatibility(
-            Args {
+            &Args {
                 once: true,
                 dry_run: true,
+                ..Default::default()
             },
             "dark-factory",
             &vendors,
@@ -1031,16 +1095,68 @@ mod tests {
     }
 
     #[test]
-    fn parse_args_ignores_unknown_flags() {
+    fn parse_args_rejects_unknown_flags() {
         let argv = vec!["daemon".to_string(), "--bogus".to_string(), "--once".to_string()];
+        assert!(parse_args(argv.into_iter()).is_err());
+    }
+
+    #[test]
+    fn parse_args_recognizes_help_and_version() {
+        let help_mode = parse_args(vec!["daemon".to_string(), "--help".to_string()].into_iter()).unwrap();
+        assert!(matches!(help_mode, CommandMode::Help(_)));
+
+        let h_mode = parse_args(vec!["daemon".to_string(), "-h".to_string()].into_iter()).unwrap();
+        assert!(matches!(h_mode, CommandMode::Help(_)));
+
+        let ver_mode = parse_args(vec!["daemon".to_string(), "--version".to_string()].into_iter()).unwrap();
+        assert!(matches!(ver_mode, CommandMode::Version));
+
+        let v_mode = parse_args(vec!["daemon".to_string(), "-V".to_string()].into_iter()).unwrap();
+        assert!(matches!(v_mode, CommandMode::Version));
+    }
+
+    #[test]
+    fn parse_args_recognizes_config_db_telemetry_overrides() {
+        let argv = vec![
+            "daemon".to_string(),
+            "--config".to_string(),
+            "/tmp/custom_config.toml".to_string(),
+            "--db".to_string(),
+            "/tmp/custom.sqlite".to_string(),
+            "--telemetry-log".to_string(),
+            "/tmp/custom.jsonl".to_string(),
+            "--once".to_string(),
+        ];
         let mode = parse_args(argv.into_iter()).unwrap();
         if let CommandMode::Daemon(args) = mode {
+            assert_eq!(args.config, Some(PathBuf::from("/tmp/custom_config.toml")));
+            assert_eq!(args.db, Some(PathBuf::from("/tmp/custom.sqlite")));
+            assert_eq!(args.telemetry_log, Some(PathBuf::from("/tmp/custom.jsonl")));
             assert!(args.once);
             assert!(!args.dry_run);
         } else {
             panic!("expected Daemon mode");
         }
     }
+
+    #[test]
+    fn parse_args_subcommand_help() {
+        let rec_h = parse_args(vec!["daemon".to_string(), "recover-held".to_string(), "--help".to_string()].into_iter()).unwrap();
+        assert!(matches!(rec_h, CommandMode::Help(_)));
+
+        let gates_h = parse_args(vec!["daemon".to_string(), "gates-compute".to_string(), "-h".to_string()].into_iter()).unwrap();
+        assert!(matches!(gates_h, CommandMode::Help(_)));
+    }
+
+    #[test]
+    fn parse_args_rejects_unknown_subcommand_flags() {
+        let rec_err = parse_args(vec!["daemon".to_string(), "recover-held".to_string(), "--bogus".to_string()].into_iter());
+        assert!(rec_err.is_err());
+
+        let gates_err = parse_args(vec!["daemon".to_string(), "gates-compute".to_string(), "--bogus".to_string()].into_iter());
+        assert!(gates_err.is_err());
+    }
+
 
     #[test]
     fn parse_args_recognizes_gates_compute_with_repo() {
@@ -1389,10 +1505,10 @@ mod tests {
         let prev_cargo_home = std::env::var_os("CARGO_HOME");
         std::env::set_var("PATH", "/tmp/vacuous_dry_run_empty");
         std::env::remove_var("CARGO_HOME");
-        let args = Args { dry_run: true, once: false };
+        let args = Args { dry_run: true, once: false, ..Default::default() };
         // No panic / no assertion of stderr content — the test simply
         // asserts the function returns without effect.
-        verify_startup_cargo_toolchain(args);
+        verify_startup_cargo_toolchain(&args);
         match prev_path {
             Some(p) => std::env::set_var("PATH", p),
             None => std::env::remove_var("PATH"),

@@ -282,6 +282,7 @@ All existing operator policies bind the daemon:
 *   **Branch deletion:** Only refs in the daemon's own creation registry.
 *   **Merge is never an automatic daemon side effect.** The daemon's own role stops at READY-state computation and a `READY_FOR_MERGE` readiness signal — `verifier::assess` runs every tick and `tick.rs` sets `overlay.state = OverlayState::Ready` only when `report.all_green` (verifier.rs's `all_green` requires every one of the 8 gates to be Green; a single Unknown forces `false`). The daemon process itself never calls a merge API. Actual merge execution is a separate, explicitly authorized action outside the daemon: either a human clicking merge, or an operator-granted, session-scoped authority for a coding-agent session to merge via `gh api -X PUT .../pulls/N/merge`, conditional on a per-PR adversarial review/`/advice` PASS verdict. Terminal state on the automated path remains ready-to-merge + readiness report, not an automatic merge.
 *   **Holdout isolation:** Sanitized environments and holdout-leak screens remain active.
+*   **Single-instance locking & CLI boundaries:** The daemon acquires an OS-level single-instance exclusive lease (`flock(2)`) on `<cxdb>.lock` before executing any mutations, timers, or dispatch loops. If a second daemon process is spawned against the same CXDB, it immediately exits nonzero with the owning PID and start time without mutating state or writing telemetry. Diagnostic flags (`--help`, `--version`) print and exit 0 without side effects, and unrecognized CLI arguments exit nonzero immediately.
 
 #### 4.2.9 Two-Stage Pilot Deployment
 *   **Runtime:** macOS launchd agent on the operator's workstation. The plist ships as a template committed to this repo (placeholder home paths, e.g. `@HOME@`), installed via an installer script — never a hand-edited file in `~/Library/LaunchAgents` with hardcoded absolute paths.
@@ -291,7 +292,7 @@ All existing operator policies bind the daemon:
     2.  Constraint-extraction fuzz run: ≥ 50 synthetic rejection comments processed without circuit-breaker false positives or holdout-leak false negatives.
     3.  Quiescence timeout validated: confirm the 60s hard timeout correctly aborts mid-push races in a controlled test.
 *   **Pilot scope:** Exactly one target repo named in a single config file: `config/daemon.toml` (TOML; operational thresholds, model chains, worker caps, tick rates).
-*   **Telemetry Log:** Logs structured JSON payloads to `~/Library/Logs/dark-factory/daemon.jsonl` classifying actions as human-initiated vs. automated, alongside diffs and verdicts. Event schema (one JSON object per line; for non-bead events such as `TICK`, `lifecycleState` is set to the sentinel value `"N/A"`):
+*   **Telemetry Log:** Logs structured JSON payloads to `~/Library/Logs/dark-factory/daemon.jsonl` classifying actions as human-initiated vs. automated, alongside diffs and verdicts. Startup emits `DAEMON_STARTED` recording the instance UUID, PID, binary executable SHA, and config identity; every `TICK` event carries the instance UUID. Event schema (one JSON object per line; for non-bead events such as `TICK`, `lifecycleState` is set to the sentinel value `"N/A"`):
 
     ```json
     {
@@ -308,6 +309,9 @@ All existing operator policies bind the daemon:
       "context": { "targetBranch": "factory/<bead_id>-r<n>", "baseCommit": "<sha>", "activeModel": "minimax" }
     }
     ```
+
+*   **Telemetry Contamination Exclusions:** Telemetry from `2026-07-18T18:35Z–18:41Z` is contaminated and excluded from unattended autonomy evidence due to an accidental concurrent diagnostic invocation (`daemon --help` as PID 3486748 while systemd daemon PID 1621182 was active, interleaving ticks 0..5 and 748..755).
+
 
 ---
 

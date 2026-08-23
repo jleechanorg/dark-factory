@@ -1320,7 +1320,11 @@ pub fn run_tick(
             "escalationsSuppressed": summary.escalations_suppressed,
             "escalationsUndeliverable": summary.escalations_undeliverable,
         }),
-        serde_json::json!({"tick_index": tick_index, "slow_tier_due": slow_tier_due}),
+        serde_json::json!({
+            "tick_index": tick_index,
+            "slow_tier_due": slow_tier_due,
+            "instance_id": crate::telemetry::get_instance_id(),
+        }),
     )?;
 
     Ok(summary)

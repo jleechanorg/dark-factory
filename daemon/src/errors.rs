@@ -99,8 +99,7 @@ pub enum DaemonError {
     },
     /// A later item in a serialized batch failed after earlier items had
     /// spawned, and at least one compensating session kill failed.
-    #[error(
-        "batch spawn failed: {spawn_error}; cleanup also failed for {} session(s): {}",
+    #[error("batch spawn failed: {spawn_error}; cleanup also failed for {} session(s): {}",
         .cleanup_errors.len(),
         format_cleanup_errors(.cleanup_errors)
     )]
@@ -108,7 +107,10 @@ pub enum DaemonError {
         spawn_error: Box<DaemonError>,
         cleanup_errors: Vec<SpawnBatchCleanupFailure>,
     },
+    #[error("lock acquisition: {0}")]
+    LockAcquisition(String),
 }
+
 
 /// Renders every `(vendor, error)` pair collected by
 /// `CliSessions::spawn_with_fallback` into a single semicolon-joined string,
@@ -204,6 +206,7 @@ impl DaemonError {
             DaemonError::SpawnCleanupFailed { .. } => "spawn_cleanup_failed",
             DaemonError::SpawnBatchCleanupFailed { .. } => "spawn_batch_cleanup_failed",
             DaemonError::WorktreeCwdMismatch { .. } => "worktree_cwd_mismatch",
+            DaemonError::LockAcquisition(_) => "lock_acquisition",
         }
     }
 

@@ -1,6 +1,50 @@
 use crate::errors::DaemonError;
 use std::io::Write;
 use std::path::Path;
+use std::sync::RwLock;
+
+static GLOBAL_INSTANCE_ID: RwLock<Option<String>> = RwLock::new(None);
+
+pub fn set_instance_id(id: &str) {
+    if let Ok(mut lock) = GLOBAL_INSTANCE_ID.write() {
+        *lock = Some(id.to_string());
+    }
+}
+
+pub fn get_instance_id() -> String {
+    if let Ok(lock) = GLOBAL_INSTANCE_ID.read() {
+        if let Some(ref id) = *lock {
+            return id.clone();
+        }
+    }
+    "00000000-0000-0000-0000-000000000000".to_string()
+}
+
+pub fn emit_startup(
+    telemetry_log: &Path,
+    lock: &crate::lock::DaemonLock,
+) -> Result<(), DaemonError> {
+    emit(
+        telemetry_log,
+        &TelemetryEvent {
+            timestamp: crate::state::now_iso8601(),
+            bead_id: "_daemon".to_string(),
+            attempt_id: 0,
+            lifecycle_state: "RUNNING".to_string(),
+            event_type: "DAEMON_STARTED".to_string(),
+            metrics: serde_json::json!({}),
+            context: serde_json::json!({
+                "instance_id": lock.metadata.instance_id,
+                "pid": lock.metadata.pid,
+                "executable_sha": lock.metadata.executable_sha,
+                "config_identity": lock.metadata.config_identity,
+                "lock_acquired": true,
+                "lock_path": lock.path.display().to_string(),
+            }),
+        },
+    )
+}
+
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]

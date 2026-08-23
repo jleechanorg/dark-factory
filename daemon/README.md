@@ -70,10 +70,35 @@ Every tick emits JSONL to one flat file:
 per-repo/branch tree the Python pipeline runner's perf-log uses — spec
 §4.2.9). Each event is `{timestamp, bead_id, attempt_id, lifecycle_state,
 event_type, metrics, context}`, matching design doc §5's `TelemetryEvent`.
-The 10 canonical `event_type` values (`TICK`, `INTAKE_BEAD_CREATED`,
+The canonical `event_type` values (`DAEMON_STARTED`, `TICK`, `INTAKE_BEAD_CREATED`,
 `TASK_ROUTED`, `TASK_DISPATCHED`, `PR_OPENED`, `GATE_ASSESSMENT`,
 `READY_FOR_MERGE`, `REROLL_VERDICT_RECORDED`, `PARKED_HUMAN_HELD`,
-`BUDGET_WARNING`) are enumerated in `CONTRACT.md` §2; none may be invented.
+`BUDGET_WARNING`) are recorded in telemetry. Startup emits `DAEMON_STARTED`
+with instance UUID, PID, executable SHA, config identity, and lock path; every
+subsequent `TICK` carries the instance UUID.
+
+### Telemetry Contamination Exclusion (2026-07-18T18:35Z–18:41Z)
+
+Telemetry recorded between `2026-07-18T18:35Z` and `2026-07-18T18:41Z` is contaminated
+and excluded from unattended autonomy evidence. During this interval, a diagnostic command
+`daemon --help` ignored `--help` and entered the production tick loop as PID 3486748 while
+the systemd daemon PID 1621182 was already active, interleaving tick indices 0..5 and 748..755
+and dispatching df-184/185/186. The accidental process was terminated, and strict CLI argument
+boundaries plus kernel-level single-instance locking were instituted.
+
+## CLI Boundaries & Single-Instance Lock
+
+The daemon enforces strict CLI argument boundaries:
+- `--help` (`-h`) and `--version` (`-V`) print usage/version to stdout and exit 0 without side effects.
+- Unknown arguments exit nonzero without opening CXDB, starting timers, routing, or emitting telemetry.
+- Supported commands: `daemon [--once] [--dry-run] [--config <path>] [--db <path>] [--telemetry-log <path>]`, `recover-held`, and `gates-compute`.
+
+Before any state mutation or tick execution, the daemon acquires an OS-level single-instance
+kernel lock (`flock(2)`) on `<cxdb>.lock`. If a second daemon process attempts to run against the same
+control plane, it immediately exits nonzero with the owning PID and start timestamp, preventing
+duplicate dispatch, overlay mutation, and telemetry contamination. Crashed or terminated processes
+automatically release kernel locks without leaving orphaned lock states.
+
 
 ## Linux user service
 
