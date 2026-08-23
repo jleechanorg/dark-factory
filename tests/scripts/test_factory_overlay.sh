@@ -108,6 +108,10 @@ out="$("$OVERLAY" dispatch-record test-roundtrip fix/test-branch)"
 assert "dispatch-record ok" "ok" "$out"
 state="$(sqlite3 "$AFD_DB" "SELECT state FROM bead_overlay WHERE bead_id='test-roundtrip';")"
 assert "state after dispatch-record" "DISPATCHED" "$state"
+autonomy_secs="$(sqlite3 "$AFD_DB" "SELECT autonomy_secs FROM bead_overlay WHERE bead_id='test-roundtrip';")"
+assert "autonomy_secs reset after dispatch-record" "0" "$autonomy_secs"
+started_at="$(sqlite3 "$AFD_DB" "SELECT attempt_started_at FROM bead_overlay WHERE bead_id='test-roundtrip';")"
+[[ "$started_at" =~ ^[0-9]+$ ]] && assert "attempt_started_at stamped after dispatch-record" "1" "1"
 
 # 9. dispatch-record same branch different bead should fail (already registered)
 set +e

@@ -14808,3 +14808,294 @@ fn session_health_failure_reaps_session_and_requeues_bead() {
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+/// Regression replay for bead bze8.3 / issue #330:
+/// A bead older than three hours (e.g. 11,500s of lifetime/prior autonomy)
+/// is requeued, dispatched, remains active beyond 60 seconds (e.g. 100s elapsed on attempt 2),
+/// and is NOT immediately parked.
+#[test]
+fn test_redispatch_older_than_three_hours_resets_attempt_clock_and_does_not_park_immediately() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"STANDARD_PATH","justification":"scripted"}"#.into(),
+    ));
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.autonomy_timebox_secs = 10_800; // 3 hours
+
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Pre-seed a bead on attempt 2 that was requeued after a prior 3-hour attempt (autonomy_secs was 11,500s)
+    store.overlays.borrow_mut().insert(
+        "bead-2sxl".into(),
+        BeadOverlay {
+            bead_id: "bead-2sxl".into(),
+            state: OverlayState::Queued,
+            attempt: 2,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/bead-2sxl-r1".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: Some("owner/repo".into()),
+            attempt_started_at: None,
+        },
+    );
+
+    // Add bead to tracker candidates list
+    tracker.candidates.borrow_mut().push(Bead {
+        id: "bead-2sxl".into(),
+        title: "Redispatch older than three hours".into(),
+        description: String::new(),
+        notes: String::new(),
+        file_tree_summary: String::new(),
+        external_ref: None,
+    });
+
+    let telemetry_log = std::env::temp_dir().join(format!("afd_test_redispatch_clock_{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    // Step 2: Tick 1 — dispatch the bead on attempt 2
+    scm.remote_branches
+        .insert("factory/bead-2sxl-r2".into(), Some(now_epoch));
+
+    let vcs = test_vcs();
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary1 = run_tick(&deps, 1, 10).expect("tick 1 should succeed");
+    assert_eq!(summary1.beads_parked_human_held, 0);
+
+    let dispatched_overlay = store.load("bead-2sxl").unwrap().unwrap();
+    assert_eq!(dispatched_overlay.state, OverlayState::Dispatched);
+    assert_eq!(dispatched_overlay.attempt, 2);
+    assert!(dispatched_overlay.attempt_started_at.is_some());
+    let attempt_started = dispatched_overlay.attempt_started_at.unwrap();
+
+    // Step 3: Tick 2 — remains active beyond 60s (e.g. 100s elapsed on attempt 2)
+    let summary2 = run_tick(&deps, 2, 100).expect("tick 2 should succeed");
+    assert_eq!(summary2.beads_parked_human_held, 0, "bead must not be immediately parked after 60s");
+
+    let active_overlay = store.load("bead-2sxl").unwrap().unwrap();
+    assert_eq!(active_overlay.state, OverlayState::Dispatched, "bead must remain DISPATCHED");
+    assert_eq!(active_overlay.attempt_started_at, Some(attempt_started));
+
+    // Step 4: Verify TASK_DISPATCHED telemetry captured inheritedAutonomySeconds
+    let body = std::fs::read_to_string(&telemetry_log).unwrap();
+    let events: Vec<serde_json::Value> = body
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let task_dispatched = events
+        .iter()
+        .find(|e| e["eventType"] == "TASK_DISPATCHED")
+        .expect("TASK_DISPATCHED event must be emitted");
+    assert_eq!(task_dispatched["metrics"]["inheritedAutonomySeconds"], 0);
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Regression replay for bead bze8.3 / issue #330:
+/// A genuinely over-budget current attempt (attempt_started_at exceeds autonomy_timebox_secs)
+/// still parks HUMAN_HELD with reason autonomy_timebox_exceeded, records full metadata in telemetry,
+/// and cleans up the session.
+#[test]
+fn test_redispatch_attempt_clock_genuinely_over_budget_parks() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.autonomy_timebox_secs = 3600;
+
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    scm.remote_branches
+        .insert("factory/bead-overbudget-r2".into(), Some(now_epoch));
+
+    // Pre-seed an attempt 2 bead whose attempt_started_at was 4000s ago (> 3600s timebox)
+    let started_at = now_epoch - 4000;
+    store.overlays.borrow_mut().insert(
+        "bead-overbudget".into(),
+        BeadOverlay {
+            bead_id: "bead-overbudget".into(),
+            state: OverlayState::Dispatched,
+            attempt: 2,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/bead-overbudget-r2".into()),
+            session_id: Some("df-overbudget-sess".into()),
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: Some(started_at),
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join(format!("afd_test_overbudget_{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let vcs = test_vcs();
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 1, 10).expect("tick should succeed");
+    assert_eq!(summary.beads_parked_human_held, 1);
+
+    let overlay = store.load("bead-overbudget").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::HumanHeld);
+    assert_eq!(overlay.park_reason.as_deref(), Some("autonomy_timebox_exceeded"));
+    assert!(overlay.session_id.is_none(), "AO session handle must be cleared");
+    assert!(overlay.attempt_started_at.is_none(), "attempt_started_at must be cleared on park");
+
+    // Verify PARKED_HUMAN_HELD telemetry metadata
+    let body = std::fs::read_to_string(&telemetry_log).unwrap();
+    let events: Vec<serde_json::Value> = body
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let parked_event = events
+        .iter()
+        .find(|e| e["eventType"] == "PARKED_HUMAN_HELD")
+        .expect("PARKED_HUMAN_HELD event must be emitted");
+    assert_eq!(parked_event["context"]["reason"], "autonomy_timebox_exceeded");
+    assert_eq!(parked_event["context"]["attempt_id"], 2);
+    assert_eq!(parked_event["context"]["started_at"], started_at);
+    assert!(parked_event["context"]["deadline"].is_number() || parked_event["context"]["deadline_epoch"].is_number());
+    assert!(parked_event["context"]["observed_at"].is_number());
+    assert!(parked_event["context"]["elapsed_secs"].as_u64().unwrap() >= 4000);
+    assert_eq!(parked_event["context"]["budget_secs"], 3600);
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Bead bze8.3 acceptance: Failed/transient spawn attempts do not consume the later successful attempt budget.
+#[test]
+fn test_failed_transient_spawn_does_not_consume_successful_attempt_budget() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"STANDARD_PATH","justification":"scripted"}"#.into(),
+    ));
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.autonomy_timebox_secs = 3600;
+
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    store.overlays.borrow_mut().insert(
+        "bead-transient-spawn".into(),
+        BeadOverlay {
+            bead_id: "bead-transient-spawn".into(),
+            state: OverlayState::Queued,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: None,
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: Some("owner/repo".into()),
+            attempt_started_at: None,
+        },
+    );
+
+    tracker.candidates.borrow_mut().push(Bead {
+        id: "bead-transient-spawn".into(),
+        title: "Transient spawn test".into(),
+        description: String::new(),
+        notes: String::new(),
+        file_tree_summary: String::new(),
+        external_ref: None,
+    });
+
+    let telemetry_log = std::env::temp_dir().join(format!("afd_test_transient_spawn_{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    scm.remote_branches
+        .insert("factory/bead-transient-spawn-r1".into(), Some(now_epoch));
+
+    let vcs = test_vcs();
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    // Configure sessions to fail transiently (e.g. rate limit / deferred)
+    sessions.fail_spawn_deferred_for.borrow_mut().push("bead-transient-spawn".into());
+
+    // Tick 1: Spawn fails transiently
+    let summary1 = run_tick(&deps, 1, 10).expect("tick 1 should succeed");
+    assert_eq!(summary1.beads_parked_human_held, 0);
+
+    let overlay_after_fail = store.load("bead-transient-spawn").unwrap().unwrap();
+    assert_eq!(overlay_after_fail.state, OverlayState::Queued);
+    assert_eq!(overlay_after_fail.attempt_started_at, None, "transient spawn failure must not stamp attempt_started_at");
+
+    // Clear transient failure for next tick
+    sessions.fail_spawn_deferred_for.borrow_mut().clear();
+
+    // Tick 2: Spawn succeeds
+    let summary2 = run_tick(&deps, 2, 10).expect("tick 2 should succeed");
+    assert_eq!(summary2.beads_parked_human_held, 0);
+
+    let overlay_after_success = store.load("bead-transient-spawn").unwrap().unwrap();
+    assert_eq!(overlay_after_success.state, OverlayState::Dispatched);
+    assert!(overlay_after_success.attempt_started_at.is_some(), "successful spawn must stamp attempt_started_at");
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+

@@ -118,6 +118,8 @@ pub struct DispatchSuccess {
     /// Surfaced so `tick.rs`'s `TASK_DISPATCHED` telemetry records which
     /// mode fired.
     pub branch_mode: &'static str,
+    /// Inherited autonomy seconds from prior attempts before reset (bead bze8.3 / issue #330).
+    pub inherited_autonomy_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -962,6 +964,7 @@ pub fn dispatch_ready_with_vcs(
         // cumulative column is preserved (and continues to be bumped
         // per-tick) so historical reporting still works; the timebox check
         // is the one place that reads the anchor instead.
+        let inherited_autonomy_secs = overlay.autonomy_secs;
         let now_epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1008,6 +1011,7 @@ pub fn dispatch_ready_with_vcs(
             session_id: session_id.0,
             target_repo: repo,
             branch_mode,
+            inherited_autonomy_secs,
         });
     }
 
@@ -4444,5 +4448,44 @@ mod tests {
             "matching cwd must not park the bead"
         );
     }
+
+    /// Bead bze8.3 / issue #330: dispatch_ready must stamp attempt_started_at
+    /// atomically, reset autonomy_secs to 0 in store, and report inherited_autonomy_secs.
+    #[test]
+    fn dispatch_ready_stamps_attempt_started_at_and_captures_inherited_autonomy_secs() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 2,
+                reroll_count: 1,
+                autonomy_secs: 12_500, // prior/inherited autonomy
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("owner/repo".to_string()),
+                attempt_started_at: None,
+            })
+            .unwrap();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        assert_eq!(report.success_count(), 1);
+        assert_eq!(report.successes[0].inherited_autonomy_secs, 12_500);
+
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::Dispatched);
+        assert_eq!(overlay.autonomy_secs, 0);
+        assert!(overlay.attempt_started_at.is_some());
+    }
 }
+
 

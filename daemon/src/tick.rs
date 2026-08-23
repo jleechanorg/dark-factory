@@ -762,6 +762,7 @@ pub fn run_tick(
                     "reason": "autonomy_timebox_exceeded",
                     "attempt_id": park_attempt,
                     "started_at": started_at,
+                    "deadline": deadline_epoch,
                     "deadline_epoch": deadline_epoch,
                     "observed_at": now_epoch,
                     "elapsed_secs": observed_elapsed_secs,
@@ -2857,7 +2858,9 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 success.attempt,
                 OverlayState::Dispatched.as_str(),
                 "TASK_DISPATCHED",
-                serde_json::json!({}),
+                serde_json::json!({
+                    "inheritedAutonomySeconds": success.inherited_autonomy_secs,
+                }),
                 serde_json::json!({
                     "branch": success.branch.as_str(),
                     "sessionId": success.session_id.as_str(),

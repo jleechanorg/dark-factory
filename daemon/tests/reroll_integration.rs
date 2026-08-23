@@ -774,6 +774,24 @@ fn test_reroll_adopted_success_spawns_remediation_session_leaves_pr_open() {
         Some(&1),
         "semantic marker must identify the attempt that actually spawned remediation"
     );
+    assert_eq!(
+        updated.autonomy_secs, 0,
+        "adopted remediation must reset autonomy_secs on new attempt"
+    );
+    assert!(
+        updated.attempt_started_at.is_some(),
+        "adopted remediation must stamp attempt_started_at on new attempt"
+    );
+
+    let telemetry_content = std::fs::read_to_string(&telemetry_log).unwrap();
+    assert!(
+        telemetry_content.contains("REROLL_ADOPTED_SESSION_SPAWNED"),
+        "telemetry must record REROLL_ADOPTED_SESSION_SPAWNED"
+    );
+    assert!(
+        telemetry_content.contains("\"elapsedAutonomySeconds\":5"),
+        "telemetry must record elapsedAutonomySeconds prior to reset"
+    );
 
     // The immediately following adopted attempt has the same reviewer and
     // feedback, so the durable marker must trip the semantic breaker.

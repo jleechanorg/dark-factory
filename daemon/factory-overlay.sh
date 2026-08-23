@@ -214,11 +214,13 @@ dispatch-record)
   # as EX_IO instead of silently leaving state inconsistent. The `sql` helper
   # runs sqlite3 directly; without an explicit error capture, sqlite errors go
   # to stderr and the script exits 0.
+  prior_autonomy="$(get_field "$2" autonomy_secs)"
+  now_epoch="$(date +%s)"
   sql_err="$(mktemp -t factory_overlay_err.XXXXXX)"
   set +e
   sql "INSERT INTO branch_registry (branch,bead_id,created_at)
        VALUES ('$(q "$3")','$(q "$2")','$(now)') ON CONFLICT(branch) DO NOTHING;
-       UPDATE bead_overlay SET state='DISPATCHED', branch='$(q "$3")', updated_at='$(now)'
+       UPDATE bead_overlay SET state='DISPATCHED', branch='$(q "$3")', autonomy_secs=0, attempt_started_at=$now_epoch, updated_at='$(now)'
        WHERE bead_id='$(q "$2")';" 2>"$sql_err"
   sql_rc=$?
   set -e
@@ -229,7 +231,7 @@ dispatch-record)
   fi
   rm -f "$sql_err"
   cur_attempt="$(get_field "$2" attempt)"
-  emit "$2" "$cur_attempt" DISPATCHED TASK_DISPATCHED "{\"activeModel\":\"minimax\",\"branch\":$(js "$3")}"
+  emit "$2" "$cur_attempt" DISPATCHED TASK_DISPATCHED "{\"activeModel\":\"minimax\",\"branch\":$(js "$3"),\"inheritedAutonomySeconds\":${prior_autonomy:-0}}"
   echo "ok"
   ;;
 
