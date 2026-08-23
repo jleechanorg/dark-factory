@@ -49,6 +49,48 @@ from .parser import Graph, Node, is_exit_node
 # Set DARK_FACTORY_CROSS_RUN_CIRCUIT_THRESHOLD=0 to disable.
 CB_THRESHOLD = int(os.environ.get("DARK_FACTORY_CROSS_RUN_CIRCUIT_THRESHOLD", "3"))
 
+# Time decay (rev-vl3zr): a streak of N exhausted runs caused by a
+# transient condition (e.g. upstream LLM quota exhaustion) looks
+# identical in CXDB to N genuinely-stuck runs. Without decay, the breaker
+# stays tripped forever even after the quota resets. Every
+# CB_DECAY_HALF_LIFE_SECS of idle time since the most recent exhausted
+# run, the effective streak count is halved — so a long-enough gap
+# (default 30 min) drops the effective streak below CB_THRESHOLD and lets
+# the next dispatch proceed. Set DARK_FACTORY_CROSS_RUN_CIRCUIT_DECAY_HALF_LIFE_SECS=0
+# to disable decay (streak never decays, matching pre-rev-vl3zr behavior).
+CB_DECAY_HALF_LIFE_SECS = float(
+    os.environ.get("DARK_FACTORY_CROSS_RUN_CIRCUIT_DECAY_HALF_LIFE_SECS", "1800")
+)
+
+
+def _decayed_exhausted_streak(
+    streak_count: int,
+    most_recent_ended_ts: Optional[float],
+    now: Optional[float] = None,
+) -> float:
+    """Apply idle-time decay to a cross-run exhausted streak.
+
+    Returns ``streak_count`` unchanged when there's nothing to decay
+    against (no streak, no timestamp, decay disabled, or less than one
+    full half-life of idle time has elapsed). Otherwise halves the
+    effective streak for every *complete* ``CB_DECAY_HALF_LIFE_SECS`` of
+    idle time elapsed since ``most_recent_ended_ts``.
+
+    Decay is stepped (not continuous) so that ordinary sub-second
+    scheduling jitter between ``end_run`` and the next dispatch's
+    breaker check never nudges a genuine same-instant streak below the
+    integer threshold — the original v4 protection must still fire for
+    back-to-back exhaustion with no meaningful idle gap.
+    """
+    if streak_count <= 0 or not most_recent_ended_ts or CB_DECAY_HALF_LIFE_SECS <= 0:
+        return float(streak_count)
+    now = time.time() if now is None else now
+    idle_secs = max(0.0, now - most_recent_ended_ts)
+    half_lives_elapsed = int(idle_secs // CB_DECAY_HALF_LIFE_SECS)
+    if half_lives_elapsed <= 0:
+        return float(streak_count)
+    return streak_count / (2.0**half_lives_elapsed)
+
 
 def _auto_wip_commit_on_exhaustion(ctx: "Context", reason: str) -> None:
     """If workdir is a git repo with uncommitted changes, commit as WIP.
@@ -360,30 +402,50 @@ def run(
             # (collision-free with real .dot node names) so the Healer can
             # cluster it distinctly from real exhaustion.
             if cxdb is not None and CB_THRESHOLD > 0:
-                _prior_finals = cxdb.recent_run_finals(graph.name, CB_THRESHOLD)
+                _prior_runs = cxdb.recent_run_finals_with_ts(graph.name, CB_THRESHOLD)
+                _prior_finals = [f for f, _ts in _prior_runs]
                 if (
                     len(_prior_finals) >= CB_THRESHOLD
                     and all(f == "exhausted" for f in _prior_finals)
                 ):
-                    _cb_record = _persist.StepRecord(
-                        node="__cross_run_circuit__",
-                        outcome="exhausted",
-                        ts=time.time(),
-                        output_preview=(
-                            f"cross_run_circuit_breaker: last {CB_THRESHOLD} "
-                            f"runs of pipeline {graph.name!r} all ended "
-                            f"exhausted; skipping run"
-                        ),
-                        metadata={
-                            "cross_run_circuit_breaker": "true",
-                            "threshold": str(CB_THRESHOLD),
-                            "prior_finals": json.dumps(_prior_finals),
-                        },
+                    # Time decay (rev-vl3zr): a streak that looks stuck can
+                    # actually be N transient failures (e.g. upstream quota
+                    # exhaustion) separated by idle time. Halve the
+                    # effective streak per CB_DECAY_HALF_LIFE_SECS of idle
+                    # time since the most recent exhausted run — once it
+                    # decays below CB_THRESHOLD, let this run proceed
+                    # instead of short-circuiting forever.
+                    _most_recent_ts = _prior_runs[0][1]
+                    _effective_streak = _decayed_exhausted_streak(
+                        len(_prior_finals), _most_recent_ts
                     )
-                    seq = _persist._append_record(
-                        history, checkpoint, cxdb, ctx, seq, _cb_record, "",
-                    )
-                    break
+                    if _effective_streak >= CB_THRESHOLD:
+                        _idle_secs = (
+                            max(0.0, time.time() - _most_recent_ts)
+                            if _most_recent_ts
+                            else 0.0
+                        )
+                        _cb_record = _persist.StepRecord(
+                            node="__cross_run_circuit__",
+                            outcome="exhausted",
+                            ts=time.time(),
+                            output_preview=(
+                                f"cross_run_circuit_breaker: last {CB_THRESHOLD} "
+                                f"runs of pipeline {graph.name!r} all ended "
+                                f"exhausted; skipping run"
+                            ),
+                            metadata={
+                                "cross_run_circuit_breaker": "true",
+                                "threshold": str(CB_THRESHOLD),
+                                "prior_finals": json.dumps(_prior_finals),
+                                "effective_streak": f"{_effective_streak:.4f}",
+                                "idle_secs": f"{_idle_secs:.1f}",
+                            },
+                        )
+                        seq = _persist._append_record(
+                            history, checkpoint, cxdb, ctx, seq, _cb_record, "",
+                        )
+                        break
 
             if len(history) - _parallel_overhead >= max_steps:
                 record = _persist.StepRecord(

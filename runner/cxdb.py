@@ -150,10 +150,12 @@ class CXDB:
         )
         self._conn.commit()
 
-    def end_run(self, run_id: str, final: str) -> None:
+    def end_run(
+        self, run_id: str, final: str, ended_ts: Optional[float] = None
+    ) -> None:
         self._conn.execute(
             "UPDATE runs SET ended_ts = ?, final = ? WHERE run_id = ?",
-            (time.time(), final, run_id),
+            (ended_ts if ended_ts is not None else time.time(), final, run_id),
         )
         self._conn.commit()
 
@@ -234,6 +236,27 @@ class CXDB:
             (pipeline, n),
         )
         return [row[0] for row in cur.fetchall()]
+
+    def recent_run_finals_with_ts(self, pipeline: str, n: int) -> list:
+        """Like ``recent_run_finals`` but also returns each run's ``ended_ts``.
+
+        Returns ``[(final, ended_ts), ...]``, newest first. Used by the
+        cross-run circuit breaker's time-decay check (rev-vl3zr) so a long
+        idle gap since the most recent exhausted run (e.g. an upstream
+        quota window resetting) can decay the streak instead of blocking
+        dispatch forever.
+
+        Returns ``[]`` when no completed runs match.
+        """
+        if n <= 0:
+            return []
+        cur = self._conn.cursor()
+        cur.execute(
+            "SELECT final, ended_ts FROM runs WHERE pipeline = ? AND final IS NOT NULL "
+            "ORDER BY started_ts DESC LIMIT ?",
+            (pipeline, n),
+        )
+        return [(row[0], row[1]) for row in cur.fetchall()]
 
     def failed_steps(self, run_id: Optional[str] = None) -> Iterable[sqlite3.Row]:
         cur = self._conn.cursor()
