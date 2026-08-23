@@ -13601,6 +13601,9 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
     let telemetry_log = telemetry_dir.join(format!("daemon-{}.jsonl", std::process::id()));
     let _ = std::fs::remove_file(&telemetry_log);
 
+    let prev_chain = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok();
+    std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "");
+
     let ledger = Mutex::new(VendorHealthLedger::new());
 
     // Stage a CAPPED PR snapshot: CodeRabbit status "unknown" +
@@ -13836,6 +13839,12 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
         log.contains("coderabbit:waived_vendor_unavailable"),
         "VENDOR_WAIVED telemetry must contain the canonical waiver token; log:\n{log}"
     );
+
+    if let Some(v) = prev_chain {
+        std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", v);
+    } else {
+        std::env::remove_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN");
+    }
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
