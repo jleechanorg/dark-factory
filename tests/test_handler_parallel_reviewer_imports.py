@@ -167,3 +167,44 @@ def test_handlers_module_imports_without_swallowing_import_errors():
         "handler_parallel_reviewer.py still swallows ImportError — the "
         "cycle must be broken structurally, not via exception handling."
     )
+
+
+def test_handler_parallel_reviewer_no_module_level_handlers_import():
+    """Issue #258 / bead dark-factory-8a2s: module-level import of runner.handlers is forbidden.
+
+    Module-level import creates a load-time cycle with runner.handlers.
+    Imports of runner.handlers must be deferred / lazy inside function bodies.
+    """
+    import ast
+
+    repo_root = pathlib.Path(__file__).resolve().parent.parent
+    src = (repo_root / "runner" / "handler_parallel_reviewer.py").read_text()
+    tree = ast.parse(src)
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                assert alias.name != "runner.handlers", (
+                    "runner/handler_parallel_reviewer.py contains module-level "
+                    f"import {alias.name} (must be lazy inside functions to avoid circular import)"
+                )
+        elif isinstance(node, ast.ImportFrom):
+            assert node.module != "runner.handlers", (
+                "runner/handler_parallel_reviewer.py contains module-level "
+                f"from {node.module} import ... (must be lazy inside functions)"
+            )
+
+
+def test_reviewer_outcome_verdict_consistency_runs_standalone_in_subprocess():
+    """Issue #258 / bead dark-factory-8a2s: test_reviewer_outcome_verdict_consistency.py runs standalone."""
+    repo_root = pathlib.Path(__file__).resolve().parent.parent
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "tests/test_reviewer_outcome_verdict_consistency.py", "--no-header", "-q"],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, (
+        f"Standalone pytest execution failed (rc={proc.returncode}):\nSTDOUT: {proc.stdout}\nSTDERR: {proc.stderr}"
+    )
+    assert "passed" in proc.stdout
