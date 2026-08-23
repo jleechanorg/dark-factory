@@ -1127,6 +1127,10 @@ fn run_tool_with_cwd(
     extra_env: &[(&str, &str)],
     timeout_secs: u64,
 ) -> Result<String, DaemonError> {
+    if cmd == "gh" {
+        crate::gh_circuit_breaker::check_gh_admission()?;
+    }
+
     let mut command = Command::new(cmd);
     if cmd == "br" {
         if let Ok(db) = std::env::var("DARK_FACTORY_BR_DB") {
@@ -1227,12 +1231,19 @@ fn run_tool_with_cwd(
 
     let stdout = String::from_utf8_lossy(&stdout_buf).into_owned();
     if status.success() {
+        if cmd == "gh" {
+            crate::gh_circuit_breaker::record_gh_success();
+        }
         return Ok(stdout);
     }
     let stderr = String::from_utf8_lossy(&stderr_buf).into_owned();
+    let rc = status.code().unwrap_or(-1);
+    if cmd == "gh" {
+        crate::gh_circuit_breaker::record_gh_failure(&stderr, rc);
+    }
     Err(DaemonError::Tool {
         tool: cmd.to_string(),
-        rc: status.code().unwrap_or(-1),
+        rc,
         stderr,
     })
 }

@@ -756,27 +756,16 @@ fn unresolved_thread_count_from_gql(gql_out: &str) -> Result<u32, DaemonError> {
         .count() as u32)
 }
 
-static GRAPHQL_RATE_LIMITED_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
-
 pub fn is_graphql_rate_limited() -> bool {
-    let lock = GRAPHQL_RATE_LIMITED_UNTIL.lock().unwrap();
-    if let Some(until) = *lock {
-        if Instant::now() < until {
-            return true;
-        }
-    }
-    false
+    crate::gh_circuit_breaker::is_gh_rate_limited()
 }
 
 pub fn mark_graphql_rate_limited(duration: Duration) {
-    let mut lock = GRAPHQL_RATE_LIMITED_UNTIL.lock().unwrap();
-    let until = Instant::now() + duration;
-    *lock = Some(until);
+    crate::gh_circuit_breaker::trip_gh_rate_limit_with_duration(duration);
 }
 
 pub fn clear_graphql_rate_limited() {
-    let mut lock = GRAPHQL_RATE_LIMITED_UNTIL.lock().unwrap();
-    *lock = None;
+    crate::gh_circuit_breaker::clear_gh_circuit_breaker();
 }
 
 
@@ -8477,7 +8466,7 @@ JSON
 fi
 if [ "$1" = "pr" ] && [ "$2" = "checks" ]; then
   case "${GH_TEST_PRIMARY_CHECKS:-}" in
-    fail) echo "gh: GraphQL API rate limit already exceeded" >&2; exit 1 ;;
+    fail) echo "gh: network error" >&2; exit 1 ;;
     badjson) echo "not json"; exit 0 ;;
     coderabbit_pending) echo '[{"state":"SUCCESS","bucket":"pass","name":"build"},{"state":"PENDING","bucket":"pending","name":"CodeRabbit"}]'; exit 0 ;;
     bugbot_pending) echo '[{"state":"SUCCESS","bucket":"pass","name":"build"},{"state":"PENDING","bucket":"pending","name":"Bugbot"}]'; exit 0 ;;
