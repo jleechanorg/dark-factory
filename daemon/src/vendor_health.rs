@@ -148,7 +148,11 @@ pub fn next_healthy_reviewer(capped: Vendor) -> Option<String> {
     }
     let raw = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN")
         .unwrap_or_else(|_| "codex->agy->gemini".to_string());
-    raw.split("->")
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") || trimmed.eq_ignore_ascii_case("off") || trimmed.eq_ignore_ascii_case("disabled") {
+        return None;
+    }
+    trimmed.split("->")
         .map(str::trim)
         .find(|entry| !entry.is_empty())
         .map(str::to_string)

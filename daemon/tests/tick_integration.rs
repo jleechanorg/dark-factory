@@ -13588,6 +13588,8 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
     use daemon::vendor_health::VendorHealthLedger;
     use daemon::vendor_health::EVT_WAIVED;
 
+    std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "none");
+
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
     let sessions = FakeSessions::new();

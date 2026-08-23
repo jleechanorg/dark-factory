@@ -387,8 +387,15 @@ exit 0
 FAKE_INTAKE_EOF
 chmod +x "$FAKE_INTAKE"
 
+FAKE_DAEMON="$SCRATCH_DIR/fake-daemon.sh"
+cat > "$FAKE_DAEMON" <<'FAKE_DAEMON_EOF'
+#!/usr/bin/env bash
+exit 0
+FAKE_DAEMON_EOF
+chmod +x "$FAKE_DAEMON"
+
 set +e
-AFD_INTAKE_BIN="$FAKE_INTAKE" AFD_SKIP_DRIFT_CHECK=1 AO_BIN="$BROKEN_AO" bash "$ROOT/daemon/factory-af-tick.sh" >"$SCRATCH_DIR/broken-ao.log" 2>&1
+AFD_DAEMON_BIN="$FAKE_DAEMON" AFD_INTAKE_BIN="$FAKE_INTAKE" AFD_SKIP_DRIFT_CHECK=1 AO_BIN="$BROKEN_AO" bash "$ROOT/daemon/factory-af-tick.sh" >"$SCRATCH_DIR/broken-ao.log" 2>&1
 broken_rc=$?
 set -e
 
