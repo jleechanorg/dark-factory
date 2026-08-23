@@ -756,27 +756,16 @@ fn unresolved_thread_count_from_gql(gql_out: &str) -> Result<u32, DaemonError> {
         .count() as u32)
 }
 
-static GRAPHQL_RATE_LIMITED_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
-
 pub fn is_graphql_rate_limited() -> bool {
-    let lock = GRAPHQL_RATE_LIMITED_UNTIL.lock().unwrap();
-    if let Some(until) = *lock {
-        if Instant::now() < until {
-            return true;
-        }
-    }
-    false
+    crate::circuit_breaker::is_gh_circuit_breaker_open()
 }
 
 pub fn mark_graphql_rate_limited(duration: Duration) {
-    let mut lock = GRAPHQL_RATE_LIMITED_UNTIL.lock().unwrap();
-    let until = Instant::now() + duration;
-    *lock = Some(until);
+    crate::circuit_breaker::mark_gh_circuit_breaker_open(duration, "manual_graphql_rate_limit");
 }
 
 pub fn clear_graphql_rate_limited() {
-    let mut lock = GRAPHQL_RATE_LIMITED_UNTIL.lock().unwrap();
-    *lock = None;
+    crate::circuit_breaker::clear_gh_circuit_breaker();
 }
 
 
@@ -1660,12 +1649,7 @@ impl Scm for CliScm {
                 30,
             ) {
                 Ok(out) => out,
-                Err(e) => {
-                    if let DaemonError::Tool { stderr, .. } = &e {
-                        if stderr.contains("rate limit") {
-                            mark_graphql_rate_limited(Duration::from_secs(60));
-                        }
-                    }
+                Err(_) => {
                     run_tool(
                         "gh",
                         &[
@@ -1750,12 +1734,7 @@ impl Scm for CliScm {
             30,
         ) {
             Ok(out) => out,
-            Err(e) => {
-                if let DaemonError::Tool { stderr, .. } = &e {
-                    if stderr.contains("rate limit") {
-                        mark_graphql_rate_limited(Duration::from_secs(60));
-                    }
-                }
+            Err(_) => {
                 return self.labeled_prs_via_rest(label, gh_calls);
             }
         };
@@ -1906,12 +1885,7 @@ impl Scm for CliScm {
                         DaemonError::Parse(format!("failed to parse gh pr view JSON: {e}"))
                     })?
                 }
-                Err(e) => {
-                    if let DaemonError::Tool { stderr, .. } = &e {
-                        if stderr.contains("rate limit") {
-                            mark_graphql_rate_limited(Duration::from_secs(60));
-                        }
-                    }
+                Err(_) => {
                     self.fetch_pr_view_via_rest(pr)?
                 }
             }
@@ -1949,12 +1923,7 @@ impl Scm for CliScm {
                 30,
             ) {
                 Ok(out) => out,
-                Err(primary_err) => {
-                    if let DaemonError::Tool { stderr, .. } = &primary_err {
-                        if stderr.contains("rate limit") {
-                            mark_graphql_rate_limited(Duration::from_secs(60));
-                        }
-                    }
+                Err(_) => {
                     self.fetch_pr_checks_via_rest(&view.head_ref_oid, pr)?
                 }
             }
@@ -2101,11 +2070,6 @@ impl Scm for CliScm {
                     }
                 },
                 Err(e) => {
-                    if let DaemonError::Tool { stderr, .. } = &e {
-                        if stderr.contains("rate limit") {
-                            mark_graphql_rate_limited(Duration::from_secs(60));
-                        }
-                    }
                     eprintln!(
                         "[warn] GraphQL query failed; comments-resolved gate will report Unknown, \
                          not Green: {e:?}"

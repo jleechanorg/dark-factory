@@ -1120,6 +1120,10 @@ pub fn run_tool_with_env(
     run_tool_with_cwd(cmd, args, None, extra_env, timeout_secs)
 }
 
+fn is_gh_cmd(cmd: &str) -> bool {
+    cmd == "gh" || cmd.ends_with("/gh") || cmd.ends_with("\\gh")
+}
+
 fn run_tool_with_cwd(
     cmd: &str,
     args: &[&str],
@@ -1127,6 +1131,26 @@ fn run_tool_with_cwd(
     extra_env: &[(&str, &str)],
     timeout_secs: u64,
 ) -> Result<String, DaemonError> {
+    if is_gh_cmd(cmd) {
+        match crate::circuit_breaker::check_gh_admission() {
+            crate::circuit_breaker::Admission::Denied {
+                deadline_epoch,
+                retry_after_secs,
+                suppressed_calls,
+                reason,
+            } => {
+                return Err(DaemonError::Tool {
+                    tool: cmd.to_string(),
+                    rc: 403,
+                    stderr: format!(
+                        "gh rate limit circuit breaker open until epoch {deadline_epoch} ({retry_after_secs}s remaining, {suppressed_calls} calls suppressed): {reason}"
+                    ),
+                });
+            }
+            crate::circuit_breaker::Admission::Allowed => {}
+        }
+    }
+
     let mut command = Command::new(cmd);
     if cmd == "br" {
         if let Ok(db) = std::env::var("DARK_FACTORY_BR_DB") {
@@ -1227,12 +1251,19 @@ fn run_tool_with_cwd(
 
     let stdout = String::from_utf8_lossy(&stdout_buf).into_owned();
     if status.success() {
+        if is_gh_cmd(cmd) {
+            crate::circuit_breaker::record_gh_success();
+        }
         return Ok(stdout);
     }
     let stderr = String::from_utf8_lossy(&stderr_buf).into_owned();
+    let rc = status.code().unwrap_or(-1);
+    if is_gh_cmd(cmd) {
+        crate::circuit_breaker::check_and_record_gh_rate_limit(&stderr, &stdout, rc);
+    }
     Err(DaemonError::Tool {
         tool: cmd.to_string(),
-        rc: status.code().unwrap_or(-1),
+        rc,
         stderr,
     })
 }

@@ -3726,27 +3726,24 @@ fn translate_verdict(
 fn resolve_pr_base_ref(deps: &TickDeps, pr: u64, repo: &str) -> Result<String, String> {
     // Use gh pr view to get the base ref name. Fail closed on any error
     // — the gate cannot meaningfully run the detector without a base ref.
-    let out = std::process::Command::new("gh")
-        .args([
+    let pr_str = pr.to_string();
+    let out = crate::tools::run_tool(
+        "gh",
+        &[
             "pr",
             "view",
-            &pr.to_string(),
+            &pr_str,
             "--repo",
             repo,
             "--json",
             "baseRefName",
             "-q",
             ".baseRefName",
-        ])
-        .output()
-        .map_err(|e| format!("spawn gh pr view: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "gh pr view failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
-    let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        ],
+        30,
+    )
+    .map_err(|e| format!("gh pr view failed: {e}"))?;
+    let branch = out.trim().to_string();
     if branch.is_empty() {
         return Err("gh pr view returned empty baseRefName".to_string());
     }
