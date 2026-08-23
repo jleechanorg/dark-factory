@@ -159,19 +159,22 @@ ATTESTED_IDS="${ATTESTED_IDS:-}"
 DISPATCHED_IDS="$(python3 "$QUERY_PY" g11_dispatched "$LOG_FILE" "$CUTOFF_ISO" 2>/dev/null)" || DISPATCHED_IDS=""
 DISPATCHED_IDS="${DISPATCHED_IDS:-}"
 
-# Subtract beads that have legitimately escalated to HUMAN_HELD — those
+# Subtract beads that have legitimately escalated to HUMAN_HELD or CANCELLED — those
 # are parked for operator action (branch-conflict recovery limit, external
-# blocker, etc.) per the dispatch-health triage flow, NOT stuck. Without
-# this subtraction, every legitimate HOLD fires a phantom factory-labeled
-# bead that /af dutifully re-dispatches, reproducing the 2026-08-01
-# phantom-dispatch cluster (74wt/lwte/z284/bze8.4).
+# blocker, etc.) per the dispatch-health triage flow or intentionally cancelled
+# (e.g. branch-collision dedup where a live sibling bead owns the branch),
+# NOT stuck. Without this subtraction, legitimate holds or dedup cancellations
+# fire phantom factory-labeled beads that surface as false stuck-bead surges.
 HUMAN_HELD_IDS="$(python3 "$QUERY_PY" g11_human_held "$LOG_FILE" "$CUTOFF_ISO" 2>/dev/null)" || HUMAN_HELD_IDS=""
 HUMAN_HELD_IDS="${HUMAN_HELD_IDS:-}"
 
+CANCELLED_IDS="$(python3 "$QUERY_PY" g11_cancelled "$LOG_FILE" "$CUTOFF_ISO" 2>/dev/null)" || CANCELLED_IDS=""
+CANCELLED_IDS="${CANCELLED_IDS:-}"
+
 # Find beads in ATTESTED that have NO dispatch follow-up AND have NOT
-# legitimately escalated to HUMAN_HELD. Sort explicitly because comm
-# requires lexically sorted input.
-STUCK_BEADS="$(comm -23 <(printf '%s\n' "$ATTESTED_IDS" | sort -u) <(printf '%s\n' "$DISPATCHED_IDS" | sort -u) | comm -23 - <(printf '%s\n' "$HUMAN_HELD_IDS" | sort -u) || true)"
+# legitimately escalated to HUMAN_HELD AND have NOT been CANCELLED. Sort explicitly
+# because comm requires lexically sorted input.
+STUCK_BEADS="$(comm -23 <(printf '%s\n' "$ATTESTED_IDS" | sort -u) <(printf '%s\n' "$DISPATCHED_IDS" | sort -u) | comm -23 - <(printf '%s\n' "$HUMAN_HELD_IDS" | sort -u) | comm -23 - <(printf '%s\n' "$CANCELLED_IDS" | sort -u) || true)"
 STUCK_COUNT=0
 if [ -n "$STUCK_BEADS" ]; then
     STUCK_COUNT="$(echo "$STUCK_BEADS" | wc -l | tr -d ' ')"
