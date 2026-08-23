@@ -2270,3 +2270,274 @@ fn non_default_repository_blocked_dispositions_attribution() {
     assert_eq!(empty_outcome.pr_number, Some(8003));
     assert_eq!(empty_outcome.head_sha.as_deref(), Some("sha-empty-8003"));
 }
+
+#[test]
+fn two_repositories_sharing_an_issue_number() {
+    let mut scm = FakeScm::new();
+    let mut issue_a = issue(100, "alice");
+    issue_a.external_ref = "jleechanorg/dark-factory#100".into();
+    let mut issue_b = issue(100, "alice");
+    issue_b.external_ref = "jleechanorg/worldarchitect.ai#100".into();
+
+    scm.issues.push(issue_a);
+    scm.issues.push(issue_b);
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let mut cfg = test_cfg();
+    cfg.target_repo = "jleechanorg/dark-factory".into();
+    cfg.repos.insert(
+        "jleechanorg/worldarchitect.ai".into(),
+        daemon::config::RepoConfig {
+            ao_project: "worldarchitect".into(),
+            push_remote: "worldai".into(),
+            local_checkout: None,
+        },
+    );
+
+    let (created, outcomes) = intake::normalize(&scm, &tracker, &cfg).unwrap();
+
+    assert_eq!(created.len(), 2, "must create beads for issue 100 from both repos without colliding: {:?}", created);
+    assert!(outcomes.is_empty(), "expected zero failure outcomes, got: {:?}", outcomes);
+
+    let calls = tracker.calls.borrow();
+    let create_calls: Vec<_> = calls.iter().filter(|c| c.starts_with("create_bead(")).collect();
+    assert_eq!(create_calls.len(), 2);
+    assert!(create_calls.iter().any(|c| c.contains("issue 100 (jleechanorg/dark-factory)") && c.contains("jleechanorg/dark-factory#100")));
+    assert!(create_calls.iter().any(|c| c.contains("issue 100 (jleechanorg/worldarchitect.ai)") && c.contains("jleechanorg/worldarchitect.ai#100")));
+
+    let scm_calls = scm.calls.borrow();
+    assert!(scm_calls.iter().any(|c| c.contains("labeled_issues_for_repo(jleechanorg/dark-factory")));
+    assert!(scm_calls.iter().any(|c| c.contains("labeled_issues_for_repo(jleechanorg/worldarchitect.ai")));
+}
+
+#[test]
+fn one_repository_failing_while_another_succeeds_for_issues() {
+    struct FailingRepoIssuesScm {
+        inner: FakeScm,
+    }
+    impl Scm for FailingRepoIssuesScm {
+        fn labeled_issues(&self, label: &str) -> Result<Vec<Issue>, DaemonError> {
+            self.inner.labeled_issues(label)
+        }
+        fn labeled_issues_for_repo(&self, repo: &str, label: &str) -> Result<Vec<Issue>, DaemonError> {
+            if repo == "jleechanorg/failing-repo" {
+                return Err(DaemonError::Tool {
+                    tool: "gh".into(),
+                    rc: 1,
+                    stderr: "gh: API rate limit exceeded".into(),
+                });
+            }
+            self.inner.labeled_issues_for_repo(repo, label)
+        }
+        fn labeled_prs(&self, label: &str, gh_calls: &mut u32) -> Result<Vec<LabeledPr>, DaemonError> {
+            self.inner.labeled_prs(label, gh_calls)
+        }
+        fn collaborator_permission(&self, login: &str) -> Result<Permission, DaemonError> {
+            self.inner.collaborator_permission(login)
+        }
+        fn pr_snapshot(&self, pr: u64) -> Result<PrSnapshot, DaemonError> {
+            self.inner.pr_snapshot(pr)
+        }
+        fn close_pr(&self, pr: u64, comment: &str) -> Result<(), DaemonError> {
+            self.inner.close_pr(pr, comment)
+        }
+        fn remote_branch_last_commit(&self, branch: &str) -> Result<Option<u64>, DaemonError> {
+            self.inner.remote_branch_last_commit(branch)
+        }
+    }
+
+    let mut inner = FakeScm::new();
+    let mut issue_a = issue(50, "alice");
+    issue_a.external_ref = "jleechanorg/dark-factory#50".into();
+    inner.issues.push(issue_a);
+    inner.permissions.insert("alice".into(), Permission::Write);
+
+    let scm = FailingRepoIssuesScm { inner };
+    let tracker = FakeTracker::new();
+    let mut cfg = test_cfg();
+    cfg.target_repo = "jleechanorg/dark-factory".into();
+    cfg.repos.insert(
+        "jleechanorg/failing-repo".into(),
+        daemon::config::RepoConfig {
+            ao_project: "failing".into(),
+            push_remote: "origin".into(),
+            local_checkout: None,
+        },
+    );
+
+    let (created, outcomes) = intake::normalize(&scm, &tracker, &cfg).unwrap();
+
+    assert_eq!(created.len(), 1, "must preserve successful repo dark-factory issue intake despite failing-repo error");
+    let calls = tracker.calls.borrow();
+    let create_calls: Vec<_> = calls.iter().filter(|c| c.starts_with("create_bead(")).collect();
+    assert_eq!(create_calls.len(), 1);
+    assert!(create_calls[0].contains("jleechanorg/dark-factory#50"));
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].external_ref, "jleechanorg/failing-repo");
+    assert!(matches!(outcomes[0].verdict, IntakeVerdict::Errored { .. }));
+}
+
+#[test]
+fn duplicate_config_entries_case_insensitive_issue_intake() {
+    let mut scm = FakeScm::new();
+    let mut issue_a = issue(42, "alice");
+    issue_a.external_ref = "jleechanorg/dark-factory#42".into();
+    scm.issues.push(issue_a);
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let mut cfg = test_cfg();
+    cfg.target_repo = "jleechanorg/dark-factory".into();
+    cfg.repos.insert(
+        "JLEECHANORG/DARK-FACTORY".into(),
+        daemon::config::RepoConfig {
+            ao_project: "dark-factory".into(),
+            push_remote: "origin".into(),
+            local_checkout: None,
+        },
+    );
+
+    let (created, outcomes) = intake::normalize(&scm, &tracker, &cfg).unwrap();
+
+    assert_eq!(created.len(), 1, "target_repo case duplicate must be swept exactly once");
+    assert!(outcomes.is_empty());
+}
+
+#[test]
+fn collaborator_permission_checked_per_repository_for_issues() {
+    let mut scm = FakeScm::new();
+    let mut issue_a = issue(10, "alice");
+    issue_a.external_ref = "jleechanorg/dark-factory#10".into();
+    let mut issue_b = issue(20, "alice");
+    issue_b.external_ref = "jleechanorg/worldarchitect.ai#20".into();
+
+    scm.issues.push(issue_a);
+    scm.issues.push(issue_b);
+    scm.repo_permissions.insert(("jleechanorg/dark-factory".into(), "alice".into()), Permission::Write);
+    scm.repo_permissions.insert(("jleechanorg/worldarchitect.ai".into(), "alice".into()), Permission::Read);
+
+    let tracker = FakeTracker::new();
+    let mut cfg = test_cfg();
+    cfg.target_repo = "jleechanorg/dark-factory".into();
+    cfg.repos.insert(
+        "jleechanorg/worldarchitect.ai".into(),
+        daemon::config::RepoConfig {
+            ao_project: "worldarchitect".into(),
+            push_remote: "worldai".into(),
+            local_checkout: None,
+        },
+    );
+
+    let (created, outcomes) = intake::normalize(&scm, &tracker, &cfg).unwrap();
+
+    assert_eq!(created.len(), 1, "only write-tier issue on dark-factory should create bead");
+    assert_eq!(outcomes.len(), 1, "read-tier issue on worldarchitect.ai should produce skip outcome");
+    assert_eq!(outcomes[0].external_ref, "jleechanorg/worldarchitect.ai#20");
+    assert!(matches!(outcomes[0].verdict, IntakeVerdict::SkippedIneligible { .. }));
+}
+
+#[test]
+fn mixed_prs_and_issues_across_multiple_repositories() {
+    let mut scm = FakeScm::new();
+    // Repo A: Issue 10, PR 20
+    let mut issue_a = issue(10, "alice");
+    issue_a.external_ref = "jleechanorg/dark-factory#10".into();
+    let mut pr_a = labeled_pr_with_cache_key(20, "alice", "feature/pr-20", "sha-20", 1_700_000_000);
+    pr_a.external_ref = "jleechanorg/dark-factory#20".into();
+    pr_a.head_repo_full_name = Some("jleechanorg/dark-factory".into());
+
+    // Repo B: Issue 20, PR 10
+    let mut issue_b = issue(20, "alice");
+    issue_b.external_ref = "jleechanorg/worldarchitect.ai#20".into();
+    let mut pr_b = labeled_pr_with_cache_key(10, "alice", "feature/pr-10", "sha-10", 1_700_000_000);
+    pr_b.external_ref = "jleechanorg/worldarchitect.ai#10".into();
+    pr_b.head_repo_full_name = Some("jleechanorg/worldarchitect.ai".into());
+
+    scm.issues.push(issue_a);
+    scm.issues.push(issue_b);
+    scm.prs.push(pr_a);
+    scm.prs.push(pr_b);
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let mut cfg = test_cfg();
+    cfg.target_repo = "jleechanorg/dark-factory".into();
+    cfg.repos.insert(
+        "jleechanorg/worldarchitect.ai".into(),
+        daemon::config::RepoConfig {
+            ao_project: "worldarchitect".into(),
+            push_remote: "worldai".into(),
+            local_checkout: None,
+        },
+    );
+
+    // 1. Run PR intake
+    let mut cache = AdoptionProbeCache::new();
+    let pr_outcome = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000, &test_telemetry_log()).unwrap();
+    assert_eq!(pr_outcome.adopted.len(), 2, "both PRs should be adopted across repos");
+    let pr_refs: Vec<_> = pr_outcome.adopted.iter().map(|a| a.external_ref.as_str()).collect();
+    assert!(pr_refs.contains(&"jleechanorg/dark-factory#20"));
+    assert!(pr_refs.contains(&"jleechanorg/worldarchitect.ai#10"));
+
+    // 2. Run Issue intake
+    let (created_issues, issue_outcomes) = intake::normalize(&scm, &tracker, &cfg).unwrap();
+    assert_eq!(created_issues.len(), 2, "both issues should be created across repos");
+    assert!(issue_outcomes.is_empty());
+
+    let calls = tracker.calls.borrow();
+    let create_calls: Vec<_> = calls.iter().filter(|c| c.starts_with("create_bead(")).collect();
+    assert_eq!(create_calls.len(), 4, "total 4 beads (2 PRs, 2 issues) created across 2 repos");
+    assert!(create_calls.iter().any(|c| c.contains("jleechanorg/dark-factory#10")));
+    assert!(create_calls.iter().any(|c| c.contains("jleechanorg/dark-factory#20")));
+    assert!(create_calls.iter().any(|c| c.contains("jleechanorg/worldarchitect.ai#10")));
+    assert!(create_calls.iter().any(|c| c.contains("jleechanorg/worldarchitect.ai#20")));
+}
+
+#[test]
+fn colliding_issue_and_pr_number_in_same_and_different_repos() {
+    let mut scm = FakeScm::new();
+    // Repo A has Issue #42 and PR #42
+    let mut issue_a = issue(42, "alice");
+    issue_a.external_ref = "jleechanorg/dark-factory#42".into();
+    let mut pr_a = labeled_pr_with_cache_key(42, "alice", "feature/pr-42-a", "sha-42-a", 1_700_000_000);
+    pr_a.external_ref = "jleechanorg/dark-factory#42".into();
+    pr_a.head_repo_full_name = Some("jleechanorg/dark-factory".into());
+
+    // Repo B has Issue #42 and PR #42
+    let mut issue_b = issue(42, "alice");
+    issue_b.external_ref = "jleechanorg/worldarchitect.ai#42".into();
+    let mut pr_b = labeled_pr_with_cache_key(42, "alice", "feature/pr-42-b", "sha-42-b", 1_700_000_000);
+    pr_b.external_ref = "jleechanorg/worldarchitect.ai#42".into();
+    pr_b.head_repo_full_name = Some("jleechanorg/worldarchitect.ai".into());
+
+    scm.issues.push(issue_a);
+    scm.issues.push(issue_b);
+    scm.prs.push(pr_a);
+    scm.prs.push(pr_b);
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let mut cfg = test_cfg();
+    cfg.target_repo = "jleechanorg/dark-factory".into();
+    cfg.repos.insert(
+        "jleechanorg/worldarchitect.ai".into(),
+        daemon::config::RepoConfig {
+            ao_project: "worldarchitect".into(),
+            push_remote: "worldai".into(),
+            local_checkout: None,
+        },
+    );
+
+    // Run PR intake first
+    let mut cache = AdoptionProbeCache::new();
+    let pr_outcome = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000, &test_telemetry_log()).unwrap();
+    assert_eq!(pr_outcome.adopted.len(), 2);
+
+    // Now run issue intake: issue #42 has the same external_ref string as PR #42 in the same repo,
+    // so tracker already knows external_ref -> SkippedDuplicate
+    let (created_issues, issue_outcomes) = intake::normalize(&scm, &tracker, &cfg).unwrap();
+    assert_eq!(created_issues.len(), 0, "issue #42 sharing external_ref with already-adopted PR #42 should be deduplicated");
+    assert_eq!(issue_outcomes.len(), 2);
+    assert!(issue_outcomes.iter().all(|o| o.verdict == IntakeVerdict::SkippedDuplicate));
+}
