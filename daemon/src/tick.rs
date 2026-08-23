@@ -1746,7 +1746,13 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         }
     }
 
-    let (created, issue_skip_outcomes) = intake::normalize(deps.scm, deps.tracker, deps.cfg)?;
+    let (created, issue_skip_outcomes) = intake::normalize_issues_outcome(
+        deps.scm,
+        deps.tracker,
+        deps.cfg,
+        slow_tick_now,
+        deps.telemetry_log,
+    )?;
     // jleechan-eazj: same unconditional per-candidate guarantee as the PR
     // path above — every factory-labeled issue that did NOT result in a
     // newly-created bead still gets exactly one verdict event.

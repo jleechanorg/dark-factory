@@ -63,6 +63,14 @@ impl Scm for UnfilteredFakeScm {
         self.inner.labeled_issues(label)
     }
 
+    fn labeled_issues_for_repo(
+        &self,
+        _repo: &str,
+        label: &str,
+    ) -> Result<Vec<Issue>, daemon::errors::DaemonError> {
+        self.inner.labeled_issues(label)
+    }
+
     fn labeled_prs(
         &self,
         label: &str,
