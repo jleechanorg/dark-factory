@@ -356,6 +356,13 @@ while read -r num branch; do
   checks_reason="$(checks_all_green "$num" "$live_head_sha")"
   checks_rc=$?
   if [ "$checks_rc" -ne 0 ]; then
+    _online_runners="$(gh api "repos/$REPO/actions/runners" --jq '[.runners[]? | select(.status=="online")] | length' 2>/dev/null || echo "")"
+    if [ "$_online_runners" = "0" ]; then
+      echo "PR $num: RUNNER OUTAGE — consider --admin or wait (0 online runners in pool)"
+      if ! gh pr view "$num" --repo "$REPO" --comments --json comments --jq '.comments[].body' 2>/dev/null | grep -qF "RUNNER OUTAGE — consider --admin or wait"; then
+        gh pr comment "$num" --repo "$REPO" --body "RUNNER OUTAGE — consider --admin or wait" 2>/dev/null || true
+      fi
+    fi
     echo "PR $num: CI not green ($checks_reason) — skip"; continue
   fi
   verdict="$(latest_assessment_no_red "$num" "$live_head_sha")" || { echo "PR $num: verifier assessment ${verdict:-missing} — refusing merge (green CI is insufficient)"; continue; }
