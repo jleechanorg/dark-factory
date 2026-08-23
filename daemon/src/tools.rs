@@ -1153,7 +1153,7 @@ fn run_tool_with_cwd(
     timeout_secs: u64,
 ) -> Result<String, DaemonError> {
     let mut command = Command::new(cmd);
-    if cmd == "br" && !args.iter().any(|arg| *arg == "--db") {
+    if cmd == "br" && !args.contains(&"--db") {
         if let Some(db) = resolve_beads_db() {
             command.args(["--db", db.to_str().unwrap_or_default()]);
         }
