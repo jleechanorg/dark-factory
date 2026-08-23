@@ -117,6 +117,15 @@ esac
 STUB_DAEMON_EOF
 chmod +x "$FAKE_DAEMON"
 
+# Stub for AO binary probe
+FAKE_AO="$SCRATCH_DIR/fake-ao.sh"
+cat > "$FAKE_AO" <<'STUB_AO_EOF'
+#!/usr/bin/env bash
+echo "ao 0.1.0"
+exit 0
+STUB_AO_EOF
+chmod +x "$FAKE_AO"
+
 fresh_db() {
   local tag="${1:-main}"
   export AFD_DB="$SCRATCH_DIR/cxdb-$tag.sqlite"
@@ -137,6 +146,7 @@ TOML_EOF
 
 run_tick() { # <tick_script_path> -> real invocation of factory-af-tick.sh (or a reverted scratch copy)
   local tick_bin="$1"
+  AO_BIN="$FAKE_AO" \
   AFD_REMEDIATE_BIN="$FAKE_R" \
   AFD_INTAKE_BIN="$FAKE_I" \
   AFD_DAEMON_BIN="$FAKE_DAEMON" \
