@@ -212,6 +212,9 @@ pub struct FakeScm {
     /// also recorded in the call log as `labeled_prs_rate_limited(...)`
     /// so tests can prove the rate-limit branch fired.
     pub rate_limit_next_labeled_prs: RefCell<bool>,
+    pub fail_labeled_issues_for_repo: RefCell<HashMap<String, String>>,
+    pub fail_labeled_prs_for_repo: RefCell<HashMap<String, String>>,
+    pub permissions_for_repo: HashMap<(String, String), Permission>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -227,6 +230,34 @@ impl Scm for FakeScm {
             .borrow_mut()
             .push(format!("labeled_issues({label})"));
         Ok(self.issues.clone())
+    }
+
+    fn labeled_issues_for_repo(
+        &self,
+        repo: &str,
+        label: &str,
+    ) -> Result<Vec<Issue>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("labeled_issues_for_repo({repo},{label})"));
+        if let Some(stderr) = self.fail_labeled_issues_for_repo.borrow_mut().remove(repo) {
+            return Err(DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr,
+            });
+        }
+        let issues = self.labeled_issues(label)?;
+        Ok(issues
+            .into_iter()
+            .filter(|issue| {
+                if let Some(owner_repo) = daemon::tools::parse_external_ref_repo(&issue.external_ref) {
+                    owner_repo.eq_ignore_ascii_case(repo)
+                } else {
+                    false
+                }
+            })
+            .collect())
     }
 
     fn labeled_prs(&self, label: &str, gh_calls: &mut u32) -> Result<Vec<LabeledPr>, DaemonError> {
@@ -256,6 +287,35 @@ impl Scm for FakeScm {
         Ok(self.prs.clone())
     }
 
+    fn labeled_prs_for_repo(
+        &self,
+        repo: &str,
+        label: &str,
+        gh_calls: &mut u32,
+    ) -> Result<Vec<LabeledPr>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("labeled_prs_for_repo({repo},{label})"));
+        if let Some(stderr) = self.fail_labeled_prs_for_repo.borrow_mut().remove(repo) {
+            return Err(DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr,
+            });
+        }
+        let prs = self.labeled_prs(label, gh_calls)?;
+        Ok(prs
+            .into_iter()
+            .filter(|pr| {
+                if let Some(owner_repo) = daemon::tools::parse_external_ref_repo(&pr.external_ref) {
+                    owner_repo.eq_ignore_ascii_case(repo)
+                } else {
+                    false
+                }
+            })
+            .collect())
+    }
+
     fn collaborator_permission(&self, login: &str) -> Result<Permission, DaemonError> {
         self.calls
             .borrow_mut()
@@ -265,6 +325,20 @@ impl Scm for FakeScm {
             .get(login)
             .copied()
             .unwrap_or(Permission::None))
+    }
+
+    fn collaborator_permission_for_repo(
+        &self,
+        repo: &str,
+        login: &str,
+    ) -> Result<Permission, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("collaborator_permission_for_repo({repo},{login})"));
+        if let Some(perm) = self.permissions_for_repo.get(&(repo.to_string(), login.to_string())) {
+            return Ok(*perm);
+        }
+        self.collaborator_permission(login)
     }
 
     fn pr_snapshot(&self, pr: u64) -> Result<PrSnapshot, DaemonError> {

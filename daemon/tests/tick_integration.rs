@@ -8443,7 +8443,9 @@ fn cross_repo_bead_verification_loop_uses_its_own_repo_not_cfg_target_repo() {
         "expected pr_snapshot_for_repo with the bead's own repo, got: {scm_calls:?}"
     );
     assert!(
-        !scm_calls.iter().any(|c| c.contains("global-real-repo")),
+        !scm_calls
+            .iter()
+            .any(|c| c.starts_with("pr_snapshot_for_repo(myorg/global-real-repo")),
         "verification loop must never fall back to cfg.target_repo for a \
          bead with an explicit target_repo, got: {scm_calls:?}"
     );
@@ -10282,7 +10284,15 @@ fn run_slow_tier_pr_existence_probe_targets_bead_own_repo_not_global_cfg() {
         ))),
     };
     let store = FakeStateStore::new();
-    let cfg = test_cfg(); // target_repo == "owner/repo"
+    let mut cfg = test_cfg(); // target_repo == "owner/repo"
+    cfg.repos.insert(
+        "jleechanorg/dark-factory-holdouts".into(),
+        daemon::config::RepoConfig {
+            ao_project: "holdouts".into(),
+            push_remote: "origin".into(),
+            local_checkout: None,
+        },
+    );
     let vcs = test_vcs();
     let telemetry_log = std::env::temp_dir().join(format!(
         "afd_x8tf_probe_own_repo_{}.jsonl",

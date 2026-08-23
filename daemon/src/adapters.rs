@@ -1814,6 +1814,14 @@ impl Scm for CliScm {
             .collect())
     }
 
+    fn labeled_issues_for_repo(
+        &self,
+        repo: &str,
+        label: &str,
+    ) -> Result<Vec<Issue>, DaemonError> {
+        self.with_repo(repo).labeled_issues(label)
+    }
+
     fn labeled_prs_for_repo(
         &self,
         repo: &str,
