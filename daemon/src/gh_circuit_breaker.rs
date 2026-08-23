@@ -106,7 +106,7 @@ pub fn parse_retry_after(text: &str) -> Option<u64> {
         if let Some(idx) = lower.find(marker) {
             let after = &lower[idx + marker.len()..];
             // Skip non-digit characters up to a reasonable distance
-            let trimmed = after.trim_start_matches(|c: char| c == ':' || c == '=' || c == '"' || c == ' ' || c == '\'' || c == '\t');
+            let trimmed = after.trim_start_matches([':', '=', '"', ' ', '\'', '\t']);
             let digits: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
             if !digits.is_empty() {
                 if let Ok(secs) = digits.parse::<u64>() {
