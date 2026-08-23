@@ -356,18 +356,34 @@ AMG_APPROVAL_LABEL="${AMG_APPROVAL_LABEL:-auto-merge-approved}"
 human_approval_marker_present() { # <pr_number> -> exit 0 iff a valid human approval marker is present
   local pr="$1" author_login comments_json events_json
   author_login="$(gh api "repos/$REPO/pulls/$pr" --jq '.user.login // ""' 2>/dev/null)"
-  comments_json="$(gh api "repos/$REPO/issues/$pr/comments" --paginate 2>/dev/null)"
+  # --slurp wraps each page's array as its own element (so multi-page
+  # results parse as valid JSON) -- without it, gh api --paginate prints
+  # each page as a SEPARATE, back-to-back JSON array/object for any
+  # endpoint with more than one page of results, which is not valid JSON
+  # on its own and made json.loads() silently fail (caught by a bare
+  # except, comments/events treated as empty) on any PR with a long
+  # comment or event history.
+  comments_json="$(gh api "repos/$REPO/issues/$pr/comments" --paginate --slurp 2>/dev/null)"
   if [ -n "$comments_json" ]; then
     if PR_AUTHOR="$author_login" python3 -c '
 import json, os, re, sys
 
 AUTHOR = os.environ.get("PR_AUTHOR", "")
+# Fail-closed: if we could not determine who the PR author is (the
+# earlier `gh api .../pulls/$pr` lookup failed or returned an empty
+# login), we cannot enforce the author-exclusion below, so refuse via
+# the comment path entirely rather than silently allowing the true
+# author (now indistinguishable from anyone else) to self-approve.
+if not AUTHOR:
+    sys.exit(1)
+
 # Anchored, standalone-line match only (mirrors this repo own
 # _parse_verdict marker convention, and CLAUDE.md rule that MERGE APPROVED
 # must appear verbatim) -- a bare substring search would let any comment
 # that merely contains the phrase satisfy the gate, including negations
 # ("does NOT say MERGE APPROVED"), quotes, or code-block embeddings.
 MARKER = re.compile(r"(?m)^\s*MERGE APPROVED\s*$")
+FENCE = re.compile(r"```.*?```", re.DOTALL)
 
 def is_bot(user):
     if not isinstance(user, dict):
@@ -378,20 +394,28 @@ def is_bot(user):
     return login.endswith("[bot]") or login.endswith("-bot")
 
 try:
-    comments = json.loads(sys.stdin.read())
+    pages = json.loads(sys.stdin.read())
 except Exception:
-    comments = []
-if not isinstance(comments, list):
-    comments = []
+    pages = []
+if not isinstance(pages, list):
+    pages = []
+comments = []
+for page in pages:
+    if isinstance(page, list):
+        comments.extend(page)
 for c in comments:
     body = c.get("body") or ""
-    if not MARKER.search(body):
+    # Strip fenced code blocks before matching so a reviewer quoting the
+    # marker as a documentation/policy example inside a ``` block never
+    # satisfies the gate -- only a real, unfenced approval line counts.
+    body_unfenced = FENCE.sub("", body)
+    if not MARKER.search(body_unfenced):
         continue
     user = c.get("user") or {}
     if is_bot(user):
         continue
     login = user.get("login") or ""
-    if AUTHOR and login == AUTHOR:
+    if login == AUTHOR:
         continue
     print("APPROVED:COMMENT:" + login)
     sys.exit(0)
@@ -400,12 +424,18 @@ sys.exit(1)
       return 0
     fi
   fi
-  events_json="$(gh api "repos/$REPO/issues/$pr/events" --paginate 2>/dev/null)"
+  events_json="$(gh api "repos/$REPO/issues/$pr/events" --paginate --slurp 2>/dev/null)"
   if [ -n "$events_json" ]; then
-    if LABEL="$AMG_APPROVAL_LABEL" python3 -c '
+    if LABEL="$AMG_APPROVAL_LABEL" PR_AUTHOR="$author_login" python3 -c '
 import json, os, sys
 
 LABEL = os.environ.get("LABEL", "")
+AUTHOR = os.environ.get("PR_AUTHOR", "")
+# Fail-closed for the same reason as the comment path above: if we could
+# not determine the PR author, we cannot enforce author-exclusion, so
+# refuse via the label path entirely.
+if not AUTHOR:
+    sys.exit(1)
 
 def is_bot(actor):
     if not isinstance(actor, dict):
@@ -416,21 +446,44 @@ def is_bot(actor):
     return login.endswith("[bot]") or login.endswith("-bot")
 
 try:
-    events = json.loads(sys.stdin.read())
+    pages = json.loads(sys.stdin.read())
 except Exception:
-    events = []
-if not isinstance(events, list):
-    events = []
+    pages = []
+if not isinstance(pages, list):
+    pages = []
+events = []
+for page in pages:
+    if isinstance(page, list):
+        events.extend(page)
+
+# Reconstruct CURRENT label state from the chronological event history
+# (the /issues/$pr/events endpoint returns events oldest-first) rather
+# than approving on the first "labeled" event found: a label that was
+# applied and later REMOVED must not still count as approval, and the
+# actor recorded must be whoever most recently (re-)applied it, not
+# whoever happened to apply it first.
+current_actor = None
 for e in events:
-    if e.get("event") != "labeled":
+    if e.get("event") not in ("labeled", "unlabeled"):
         continue
     label_name = (e.get("label") or {}).get("name") or ""
     if label_name != LABEL:
         continue
+    if e.get("event") == "unlabeled":
+        current_actor = None
+        continue
     actor = e.get("actor") or {}
     if is_bot(actor):
+        current_actor = None
         continue
-    print("APPROVED:LABEL:" + (actor.get("login") or ""))
+    login = actor.get("login") or ""
+    if login == AUTHOR:
+        current_actor = None
+        continue
+    current_actor = login
+
+if current_actor:
+    print("APPROVED:LABEL:" + current_actor)
     sys.exit(0)
 sys.exit(1)
 ' <<<"$events_json"; then

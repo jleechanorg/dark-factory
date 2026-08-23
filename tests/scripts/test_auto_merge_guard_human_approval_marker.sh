@@ -129,7 +129,10 @@ if [ "${1:-}" = "api" ]; then
     *"/pulls/"*)
       for a in "$@"; do
         case "$a" in
-          *user.login*) echo "${GH_SHIM_AUTHOR_LOGIN:-pr-author}"; exit 0 ;;
+          # run_guard() always exports this (defaulted to "pr-author" or
+          # explicitly empty for CASE 10's author-lookup-failure
+          # simulation) -- echo it verbatim, no further defaulting here.
+          *user.login*) echo "$GH_SHIM_AUTHOR_LOGIN"; exit 0 ;;
         esac
       done
       echo "{}"; exit 0
@@ -151,6 +154,16 @@ emit_assessment() {
 run_guard() {
   local afd_log="$SCRATCH_DIR/daemon.jsonl"
   emit_assessment "$afd_log"
+  # ${GH_SHIM_AUTHOR_LOGIN+set} distinguishes "caller didn't pass this at
+  # all" (default to "pr-author") from "caller explicitly passed an empty
+  # string" (propagate the empty value through unchanged -- CASE 10 needs
+  # this to simulate an author-lookup that returned no login).
+  local author_login
+  if [ -z "${GH_SHIM_AUTHOR_LOGIN+set}" ]; then
+    author_login="pr-author"
+  else
+    author_login="$GH_SHIM_AUTHOR_LOGIN"
+  fi
   ( cd "$ROOT" && \
     HOME="$FAKE_HOME" \
     PATH="$FAKE_BIN_DIR:$PATH" \
@@ -161,7 +174,7 @@ run_guard() {
     GH_SHIM_PR_LIST_OUT="$PR_LIST_OUT" \
     GH_SHIM_CHECKS_OUT="$CHECKS_OUT" \
     GH_SHIM_HEAD_SHA="$LIVE_HEAD" \
-    GH_SHIM_AUTHOR_LOGIN="${GH_SHIM_AUTHOR_LOGIN:-pr-author}" \
+    GH_SHIM_AUTHOR_LOGIN="$author_login" \
     GH_SHIM_COMMENTS_OUT="${GH_SHIM_COMMENTS_OUT:-/dev/null}" \
     GH_SHIM_EVENTS_OUT="${GH_SHIM_EVENTS_OUT:-/dev/null}" \
     bash "$GUARD" 2>&1 )
@@ -180,7 +193,7 @@ echo "=== CASE 2: valid human, non-author, non-bot comment -> merges (existing b
 GH_SHIM_LOG="$SCRATCH_DIR/gh-case2.log"; : > "$GH_SHIM_LOG"
 COMMENTS2="$SCRATCH_DIR/comments2.json"
 cat > "$COMMENTS2" <<'EOF_C2'
-[{"body":"looks good\nMERGE APPROVED","user":{"login":"jleechan2015","type":"User"}}]
+[[{"body":"looks good\nMERGE APPROVED","user":{"login":"jleechan2015","type":"User"}}]]
 EOF_C2
 GH_SHIM_AUTHOR_LOGIN="some-factory-bot-author" GH_SHIM_COMMENTS_OUT="$COMMENTS2" GH_SHIM_EVENTS_OUT="/dev/null" \
   out2="$(run_guard)"
@@ -194,7 +207,7 @@ echo "=== CASE 3 (anti-spoof): PR's own author posting MERGE APPROVED -> REFUSED
 GH_SHIM_LOG="$SCRATCH_DIR/gh-case3.log"; : > "$GH_SHIM_LOG"
 COMMENTS3="$SCRATCH_DIR/comments3.json"
 cat > "$COMMENTS3" <<'EOF_C3'
-[{"body":"MERGE APPROVED","user":{"login":"pr-self-author","type":"User"}}]
+[[{"body":"MERGE APPROVED","user":{"login":"pr-self-author","type":"User"}}]]
 EOF_C3
 GH_SHIM_AUTHOR_LOGIN="pr-self-author" GH_SHIM_COMMENTS_OUT="$COMMENTS3" GH_SHIM_EVENTS_OUT="/dev/null" \
   out3="$(run_guard)"
@@ -207,8 +220,8 @@ echo "=== CASE 4 (anti-spoof): bot account posting MERGE APPROVED -> REFUSED ===
 GH_SHIM_LOG="$SCRATCH_DIR/gh-case4.log"; : > "$GH_SHIM_LOG"
 COMMENTS4="$SCRATCH_DIR/comments4.json"
 cat > "$COMMENTS4" <<'EOF_C4'
-[{"body":"MERGE APPROVED","user":{"login":"github-actions[bot]","type":"Bot"}},
- {"body":"MERGE APPROVED","user":{"login":"some-ci-bot","type":"User"}}]
+[[{"body":"MERGE APPROVED","user":{"login":"github-actions[bot]","type":"Bot"}},
+ {"body":"MERGE APPROVED","user":{"login":"some-ci-bot","type":"User"}}]]
 EOF_C4
 GH_SHIM_AUTHOR_LOGIN="pr-author" GH_SHIM_COMMENTS_OUT="$COMMENTS4" GH_SHIM_EVENTS_OUT="/dev/null" \
   out4="$(run_guard)"
@@ -221,7 +234,7 @@ echo "=== CASE 5a: 'auto-merge-approved' label applied by a HUMAN actor -> merge
 GH_SHIM_LOG="$SCRATCH_DIR/gh-case5a.log"; : > "$GH_SHIM_LOG"
 EVENTS5A="$SCRATCH_DIR/events5a.json"
 cat > "$EVENTS5A" <<'EOF_E5A'
-[{"event":"labeled","label":{"name":"auto-merge-approved"},"actor":{"login":"jleechan2015","type":"User"}}]
+[[{"event":"labeled","label":{"name":"auto-merge-approved"},"actor":{"login":"jleechan2015","type":"User"}}]]
 EOF_E5A
 GH_SHIM_AUTHOR_LOGIN="pr-author" GH_SHIM_COMMENTS_OUT="/dev/null" GH_SHIM_EVENTS_OUT="$EVENTS5A" \
   out5a="$(run_guard)"
@@ -234,7 +247,7 @@ echo "=== CASE 5b: 'auto-merge-approved' label applied by a BOT actor -> REFUSED
 GH_SHIM_LOG="$SCRATCH_DIR/gh-case5b.log"; : > "$GH_SHIM_LOG"
 EVENTS5B="$SCRATCH_DIR/events5b.json"
 cat > "$EVENTS5B" <<'EOF_E5B'
-[{"event":"labeled","label":{"name":"auto-merge-approved"},"actor":{"login":"dependabot[bot]","type":"Bot"}}]
+[[{"event":"labeled","label":{"name":"auto-merge-approved"},"actor":{"login":"dependabot[bot]","type":"Bot"}}]]
 EOF_E5B
 GH_SHIM_AUTHOR_LOGIN="pr-author" GH_SHIM_COMMENTS_OUT="/dev/null" GH_SHIM_EVENTS_OUT="$EVENTS5B" \
   out5b="$(run_guard)"
@@ -247,7 +260,7 @@ echo "=== CASE 6 (anti-spoof): negated mention of the phrase -> REFUSED, not a f
 GH_SHIM_LOG="$SCRATCH_DIR/gh-case6.log"; : > "$GH_SHIM_LOG"
 COMMENTS6="$SCRATCH_DIR/comments6.json"
 cat > "$COMMENTS6" <<'EOF_C6'
-[{"body":"I do NOT think this should say MERGE APPROVED yet -- needs more review first.","user":{"login":"jleechan2015","type":"User"}}]
+[[{"body":"I do NOT think this should say MERGE APPROVED yet -- needs more review first.","user":{"login":"jleechan2015","type":"User"}}]]
 EOF_C6
 GH_SHIM_AUTHOR_LOGIN="some-factory-bot-author" GH_SHIM_COMMENTS_OUT="$COMMENTS6" GH_SHIM_EVENTS_OUT="/dev/null" \
   out6="$(run_guard)"
@@ -260,13 +273,98 @@ echo "=== CASE 7 (anti-spoof): phrase embedded mid-sentence / inside a quote -> 
 GH_SHIM_LOG="$SCRATCH_DIR/gh-case7.log"; : > "$GH_SHIM_LOG"
 COMMENTS7="$SCRATCH_DIR/comments7.json"
 cat > "$COMMENTS7" <<'EOF_C7'
-[{"body":"Quoting the policy doc: \"...requires a literal MERGE APPROVED comment before...\" -- not doing that here, just referencing it.","user":{"login":"jleechan2015","type":"User"}}]
+[[{"body":"Quoting the policy doc: \"...requires a literal MERGE APPROVED comment before...\" -- not doing that here, just referencing it.","user":{"login":"jleechan2015","type":"User"}}]]
 EOF_C7
 GH_SHIM_AUTHOR_LOGIN="some-factory-bot-author" GH_SHIM_COMMENTS_OUT="$COMMENTS7" GH_SHIM_EVENTS_OUT="/dev/null" \
   out7="$(run_guard)"
 echo "$out7"
 assert_contains "case7: mid-sentence/quoted mention REFUSED:NO_APPROVAL_MARKER (must be a standalone line)" "REFUSED:NO_APPROVAL_MARKER" "$out7"
 assert_not_contains "case7: gh pr merge never called (embedded-mention spoof blocked)" "pr merge" "$(cat "$GH_SHIM_LOG")"
+
+echo
+echo "=== CASE 8 (anti-spoof, adversarial-review finding): PR author self-applies the approval LABEL -> REFUSED ==="
+GH_SHIM_LOG="$SCRATCH_DIR/gh-case8.log"; : > "$GH_SHIM_LOG"
+EVENTS8="$SCRATCH_DIR/events8.json"
+cat > "$EVENTS8" <<'EOF_E8'
+[[{"event":"labeled","label":{"name":"auto-merge-approved"},"actor":{"login":"pr-self-author","type":"User"}}]]
+EOF_E8
+GH_SHIM_AUTHOR_LOGIN="pr-self-author" GH_SHIM_COMMENTS_OUT="/dev/null" GH_SHIM_EVENTS_OUT="$EVENTS8" \
+  out8="$(run_guard)"
+echo "$out8"
+assert_contains "case8: author self-applied label REFUSED:NO_APPROVAL_MARKER (label path must exclude the author too)" "REFUSED:NO_APPROVAL_MARKER" "$out8"
+assert_not_contains "case8: gh pr merge never called (label self-approval spoof blocked)" "pr merge" "$(cat "$GH_SHIM_LOG")"
+
+echo
+echo "=== CASE 9 (adversarial-review finding): approval label applied then REMOVED -> REFUSED, revocation respected ==="
+GH_SHIM_LOG="$SCRATCH_DIR/gh-case9.log"; : > "$GH_SHIM_LOG"
+EVENTS9="$SCRATCH_DIR/events9.json"
+cat > "$EVENTS9" <<'EOF_E9'
+[[{"event":"labeled","label":{"name":"auto-merge-approved"},"actor":{"login":"jleechan2015","type":"User"}},
+  {"event":"unlabeled","label":{"name":"auto-merge-approved"},"actor":{"login":"jleechan2015","type":"User"}}]]
+EOF_E9
+GH_SHIM_AUTHOR_LOGIN="pr-author" GH_SHIM_COMMENTS_OUT="/dev/null" GH_SHIM_EVENTS_OUT="$EVENTS9" \
+  out9="$(run_guard)"
+echo "$out9"
+assert_contains "case9: revoked label REFUSED:NO_APPROVAL_MARKER (a removed approval must not still count)" "REFUSED:NO_APPROVAL_MARKER" "$out9"
+assert_not_contains "case9: gh pr merge never called (revoked-label spoof blocked)" "pr merge" "$(cat "$GH_SHIM_LOG")"
+
+echo
+echo "=== CASE 9b: label applied, removed, then RE-applied by a different human -> merges (latest state wins) ==="
+GH_SHIM_LOG="$SCRATCH_DIR/gh-case9b.log"; : > "$GH_SHIM_LOG"
+EVENTS9B="$SCRATCH_DIR/events9b.json"
+cat > "$EVENTS9B" <<'EOF_E9B'
+[[{"event":"labeled","label":{"name":"auto-merge-approved"},"actor":{"login":"reviewer-one","type":"User"}},
+  {"event":"unlabeled","label":{"name":"auto-merge-approved"},"actor":{"login":"reviewer-one","type":"User"}},
+  {"event":"labeled","label":{"name":"auto-merge-approved"},"actor":{"login":"reviewer-two","type":"User"}}]]
+EOF_E9B
+GH_SHIM_AUTHOR_LOGIN="pr-author" GH_SHIM_COMMENTS_OUT="/dev/null" GH_SHIM_EVENTS_OUT="$EVENTS9B" \
+  out9b="$(run_guard)"
+echo "$out9b"
+assert_not_contains "case9b: no REFUSED:NO_APPROVAL_MARKER (re-applied label is a valid current approval)" "REFUSED:NO_APPROVAL_MARKER" "$out9b"
+assert_contains "case9b: gh pr merge WAS called (latest labeled state approves)" "pr merge" "$(cat "$GH_SHIM_LOG")"
+
+echo
+echo "=== CASE 10 (adversarial-review finding): PR author lookup fails (empty login) -> REFUSED, fail-closed not fail-open ==="
+GH_SHIM_LOG="$SCRATCH_DIR/gh-case10.log"; : > "$GH_SHIM_LOG"
+COMMENTS10="$SCRATCH_DIR/comments10.json"
+cat > "$COMMENTS10" <<'EOF_C10'
+[[{"body":"MERGE APPROVED","user":{"login":"jleechan2015","type":"User"}}]]
+EOF_C10
+GH_SHIM_AUTHOR_LOGIN="" GH_SHIM_COMMENTS_OUT="$COMMENTS10" GH_SHIM_EVENTS_OUT="/dev/null" \
+  out10="$(run_guard)"
+echo "$out10"
+assert_contains "case10: unknown-author REFUSED:NO_APPROVAL_MARKER (cannot enforce author-exclusion, must fail closed)" "REFUSED:NO_APPROVAL_MARKER" "$out10"
+assert_not_contains "case10: gh pr merge never called (unknown-author fail-open blocked)" "pr merge" "$(cat "$GH_SHIM_LOG")"
+
+echo
+echo "=== CASE 11 (adversarial-review finding): marker present only on a LATER paginated page -> still merges ==="
+GH_SHIM_LOG="$SCRATCH_DIR/gh-case11.log"; : > "$GH_SHIM_LOG"
+COMMENTS11="$SCRATCH_DIR/comments11.json"
+cat > "$COMMENTS11" <<'EOF_C11'
+[[{"body":"first page, no marker here","user":{"login":"jleechan2015","type":"User"}}],
+ [{"body":"MERGE APPROVED","user":{"login":"jleechan2015","type":"User"}}]]
+EOF_C11
+GH_SHIM_AUTHOR_LOGIN="some-factory-bot-author" GH_SHIM_COMMENTS_OUT="$COMMENTS11" GH_SHIM_EVENTS_OUT="/dev/null" \
+  out11="$(run_guard)"
+echo "$out11"
+assert_not_contains "case11: no REFUSED:NO_APPROVAL_MARKER (marker on page 2 must still be found -- --slurp page flattening)" "REFUSED:NO_APPROVAL_MARKER" "$out11"
+assert_contains "case11: gh pr merge WAS called (multi-page comments parsed correctly)" "pr merge" "$(cat "$GH_SHIM_LOG")"
+
+echo
+echo "=== CASE 12 (adversarial-review finding): marker quoted inside a fenced code block (doc example, not a real approval) -> REFUSED ==="
+GH_SHIM_LOG="$SCRATCH_DIR/gh-case12.log"; : > "$GH_SHIM_LOG"
+COMMENTS12="$SCRATCH_DIR/comments12.json"
+python3 -c '
+import json
+fence = chr(96) * 3
+body = "Per the policy, reviewers should post exactly this:\n\n" + fence + "\nMERGE APPROVED\n" + fence + "\n\nas a standalone comment. I have not done that yet."
+print(json.dumps([[{"body": body, "user": {"login": "jleechan2015", "type": "User"}}]]))
+' > "$COMMENTS12"
+GH_SHIM_AUTHOR_LOGIN="some-factory-bot-author" GH_SHIM_COMMENTS_OUT="$COMMENTS12" GH_SHIM_EVENTS_OUT="/dev/null" \
+  out12="$(run_guard)"
+echo "$out12"
+assert_contains "case12: fenced-code-block mention REFUSED:NO_APPROVAL_MARKER (documentation example must not satisfy the gate)" "REFUSED:NO_APPROVAL_MARKER" "$out12"
+assert_not_contains "case12: gh pr merge never called (code-fence spoof blocked)" "pr merge" "$(cat "$GH_SHIM_LOG")"
 
 echo ""
 echo "=== RESULTS: $PASS passed, $FAIL failed ==="
