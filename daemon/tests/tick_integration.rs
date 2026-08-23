@@ -13588,6 +13588,9 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
     use daemon::vendor_health::VendorHealthLedger;
     use daemon::vendor_health::EVT_WAIVED;
 
+    let _prev_chain = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok();
+    std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "");
+
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
     let sessions = FakeSessions::new();
@@ -13838,6 +13841,11 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
+    if let Some(prev) = _prev_chain {
+        std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", prev);
+    } else {
+        std::env::remove_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN");
+    }
 }
 
 // ----------------------------------------------------------------------------
