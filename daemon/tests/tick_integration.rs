@@ -10282,7 +10282,15 @@ fn run_slow_tier_pr_existence_probe_targets_bead_own_repo_not_global_cfg() {
         ))),
     };
     let store = FakeStateStore::new();
-    let cfg = test_cfg(); // target_repo == "owner/repo"
+    let mut cfg = test_cfg(); // target_repo == "owner/repo"
+    cfg.repos.insert(
+        "jleechanorg/dark-factory-holdouts".into(),
+        daemon::config::RepoConfig {
+            ao_project: "df-holdouts".into(),
+            push_remote: "origin".into(),
+            local_checkout: None,
+        },
+    );
     let vcs = test_vcs();
     let telemetry_log = std::env::temp_dir().join(format!(
         "afd_x8tf_probe_own_repo_{}.jsonl",
@@ -13647,6 +13655,9 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
             PrHeadBranch::SameRepo(format!("factory/test-bead-{pr}")),
         );
     }
+
+    // Disable fallback chain so the test exercises the legacy VENDOR_WAIVED path
+    let _fallback_chain_guard = EnvVarGuard::set(&[("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "")]);
 
     // Drive 3 ticks, each one carrying a DIFFERENT bead_id through the
     // gate-assessment path. The simplest way to do this is to script
