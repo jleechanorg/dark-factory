@@ -73,6 +73,7 @@ def test_gate_echo_seeded_outcome(monkeypatch):
         "gate_es",
         "gate_er",
         "gate_cs",
+        "web_advice",
         "exit",
     ]
     assert history[-1].outcome == "success"
@@ -111,6 +112,7 @@ def test_cxdb_records_steps(tmp_path, monkeypatch):
         "gate_es",
         "gate_er",
         "gate_cs",
+        "web_advice",
         "exit",
         "__run_end__",
     ]
