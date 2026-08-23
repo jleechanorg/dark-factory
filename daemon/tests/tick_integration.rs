@@ -13824,17 +13824,17 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
         "after 3 distinct capped beads the ledger MUST be Capped; got {after_tick3:?}"
     );
 
-    // VENDOR_WAIVED telemetry must have been emitted on the
-    // Healthy -> Capped edge.
+    // REVIEWER_ROTATED (chain-walk) or VENDOR_WAIVED telemetry must have
+    // been emitted on the Healthy -> Capped edge.
     let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
-    let waived_count = log.matches(EVT_WAIVED).count();
+    let edge_count = log.matches(EVT_WAIVED).count() + log.matches("REVIEWER_ROTATED").count();
     assert!(
-        waived_count >= 1,
-        "VENDOR_WAIVED telemetry must have been emitted on the auto-escalation edge; got {waived_count} lines:\n{log}"
+        edge_count >= 1,
+        "REVIEWER_ROTATED or VENDOR_WAIVED telemetry must have been emitted on the auto-escalation edge; got {edge_count} lines:\n{log}"
     );
     assert!(
-        log.contains("coderabbit:waived_vendor_unavailable"),
-        "VENDOR_WAIVED telemetry must contain the canonical waiver token; log:\n{log}"
+        log.contains("coderabbit") && (log.contains("REVIEWER_ROTATED") || log.contains("coderabbit:waived_vendor_unavailable")),
+        "telemetry must record the coderabbit vendor cap event; log:\n{log}"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);

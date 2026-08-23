@@ -43,18 +43,19 @@ assert_grep() {
 
 # Scratch files (per-test re-created so each test starts with a clean slate).
 SCRATCH_DIR="$(mktemp -d -t test-af-tick.XXXXXX)"
-cleanup() { rm -rf "$SCRATCH_DIR" /tmp/test-af-tick-fake-r.log; }
+FAKE_R_LOG="$SCRATCH_DIR/fake-r.log"
+cleanup() { rm -rf "$SCRATCH_DIR"; }
 trap cleanup EXIT
 
 # Stub for factory-ao-remediate.sh: records the call, exits 0.
 FAKE_R="$SCRATCH_DIR/fake-r.sh"
-cat > "$FAKE_R" <<'STUB_R_EOF'
+cat > "$FAKE_R" <<STUB_R_EOF
 #!/usr/bin/env bash
-echo "[fake-R] called: bead_id=$1 pr=$2 repo=${3:-} proj=${4:-}" >> /tmp/test-af-tick-fake-r.log
+echo "[fake-R] called: bead_id=\$1 pr=\$2 repo=\${3:-} proj=\${4:-}" >> "$FAKE_R_LOG"
 exit 0
 STUB_R_EOF
 chmod +x "$FAKE_R"
-: > /tmp/test-af-tick-fake-r.log
+: > "$FAKE_R_LOG"
 
 # Helper: fresh DB + log + apply schema; sets AFD_DB / AFD_LOG accordingly.
 fresh_db() {
@@ -199,11 +200,20 @@ while IFS=\$'\t' read -r bead_id pr branch bead_repo; do
 
   # Resolve AO project for this repo from config
   proj="\$(python3 - "\$CONFIG" "\$repo" <<'PY'
-import sys, toml
+import sys
+try:
+    import tomllib
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        import toml as tomllib
+
 config_path = sys.argv[1]
 target_repo = sys.argv[2]
 try:
-    cfg = toml.load(config_path)
+    with open(config_path, "rb") as f:
+        cfg = tomllib.load(f)
 except Exception:
     cfg = {}
 
@@ -271,13 +281,13 @@ echo "af_dispatched=\$dispatched"
 WRAP_EOF
 chmod +x "$WRAPPER"
 
-: > /tmp/test-af-tick-fake-r.log
+: > "$FAKE_R_LOG"
 out="$(AFD_WRAPPER_BEAD=test-integ CONFIG="$(write_config 30 15)" bash "$WRAPPER" 2>&1)"
 af_dispatched="$(echo "$out" | grep -oE 'af_dispatched=[0-9]+' | head -1 | cut -d= -f2)"
 assert "integration: af_dispatched=1" "1" "$af_dispatched"
 state="$(sqlite3 "$AFD_DB" "SELECT state FROM bead_overlay WHERE bead_id='test-integ';")"
 assert "integration: state=DISPATCHED via overlay" "DISPATCHED" "$state"
-fake_calls="$(grep -c 'fake-R.*called' /tmp/test-af-tick-fake-r.log || true)"
+fake_calls="$(grep -c 'fake-R.*called' "$FAKE_R_LOG" || true)"
 assert "integration: bash R (ao spawn) called" "1" "$fake_calls"
 assert_grep "integration: TASK_DISPATCHED telemetry" '"eventType": "TASK_DISPATCHED"' "$AFD_LOG"
 owner="$(sqlite3 "$AFD_DB" "SELECT bead_id FROM branch_registry WHERE branch='fix/test-integ-branch';")"
@@ -294,10 +304,10 @@ sqlite3 "$AFD_DB" "UPDATE bead_overlay SET pr_number=8117, branch='fix/test-capl
 "$OVERLAY" route-record test-caploop STANDARD_PATH 'drive-existing-pr' >/dev/null
 export CONFIG="$(write_config 0 0)"
 
-: > /tmp/test-af-tick-fake-r.log
-AFD_WRAPPER_BEAD=test-caploop bash "$WRAPPER" >/tmp/test-af-tick-caploop.log 2>&1 || true
+: > "$FAKE_R_LOG"
+AFD_WRAPPER_BEAD=test-caploop bash "$WRAPPER" >"$SCRATCH_DIR/caploop.log" 2>&1 || true
 # Filter the wrapper output; it should contain "[af] over capacity" message.
-out="$(cat /tmp/test-af-tick-caploop.log)"
+out="$(cat "$SCRATCH_DIR/caploop.log")"
 case "$out" in
   *over\ capacity*)
     echo "PASS: factory-af-tick surfaces '[af] over capacity' message"
@@ -305,7 +315,7 @@ case "$out" in
     ;;
   *)
     echo "FAIL: factory-af-tick did not surface '[af] over capacity'. Output was:"
-    cat /tmp/test-af-tick-caploop.log
+    cat "$SCRATCH_DIR/caploop.log"
     FAIL=$((FAIL + 1))
     ;;
 esac
@@ -348,8 +358,8 @@ sqlite3 "$AFD_DB" "UPDATE bead_overlay SET pr_number=56, branch='fix/wa-56', tar
 sqlite3 "$AFD_DB" "UPDATE bead_overlay SET pr_number=56, branch='fix/df-56', target_repo='jleechanorg/dark-factory' WHERE bead_id='bead-df';"
 "$OVERLAY" route-record bead-df STANDARD_PATH 'drive-existing-pr' >/dev/null
 
-: > /tmp/test-af-tick-fake-r.log
-AFD_WRAPPER_BEAD="bead-wa','bead-df" bash "$WRAPPER" >/tmp/test-af-tick-multirepo.log 2>&1 || true
+: > "$FAKE_R_LOG"
+AFD_WRAPPER_BEAD="bead-wa','bead-df" bash "$WRAPPER" >"$SCRATCH_DIR/multirepo.log" 2>&1 || true
 
 # Verify they both got dispatched
 state_wa="$(sqlite3 "$AFD_DB" "SELECT state FROM bead_overlay WHERE bead_id='bead-wa';")"
@@ -359,8 +369,8 @@ state_df="$(sqlite3 "$AFD_DB" "SELECT state FROM bead_overlay WHERE bead_id='bea
 assert "bead-df state=DISPATCHED" "DISPATCHED" "$state_df"
 
 # Verify fake-R calls passed the correct repo and project to factory-ao-remediate.sh
-assert_grep "remediate bead-wa on WA project" "called:.*bead_id=bead-wa pr=56 repo=jleechanorg/worldarchitect.ai proj=worldarchitect" /tmp/test-af-tick-fake-r.log
-assert_grep "remediate bead-df on DF project" "called:.*bead_id=bead-df pr=56 repo=jleechanorg/dark-factory proj=dark-factory" /tmp/test-af-tick-fake-r.log
+assert_grep "remediate bead-wa on WA project" "called:.*bead_id=bead-wa pr=56 repo=jleechanorg/worldarchitect.ai proj=worldarchitect" "$FAKE_R_LOG"
+assert_grep "remediate bead-df on DF project" "called:.*bead_id=bead-df pr=56 repo=jleechanorg/dark-factory proj=dark-factory" "$FAKE_R_LOG"
 
 echo
 echo "=== RESULTS: $PASS passed, $FAIL failed ==="

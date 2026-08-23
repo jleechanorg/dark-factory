@@ -48,21 +48,30 @@ rm -f "$help_out_file"
 SCRATCH="$(mktemp -d -t test-deploy-extra.XXXXXX)"
 cleanup() { rm -rf "$SCRATCH"; }
 trap cleanup EXIT
+SEED="$SCRATCH/seed"
+mkdir -p "$SEED"
+(
+    cd "$SEED"
+    git init -q
+    git config user.email t@t.com
+    git config user.name t
+    echo hi > a.txt
+    git add a.txt
+    git commit -q -m init
+    git branch -M main
+)
 ORIGIN="$SCRATCH/origin.git"
-git init -q --bare "$ORIGIN"
+git clone -q --bare "$SEED" "$ORIGIN"
+git --git-dir="$ORIGIN" symbolic-ref HEAD refs/heads/main
+rm -rf "$SEED"
+
 WORK="$SCRATCH/work"
 git clone -q "$ORIGIN" "$WORK"
 (
     cd "$WORK"
     git config user.email t@t.com
     git config user.name t
-    echo hi > a.txt
-    git add .
-    git commit -q -m init
-    git branch -m main
-    git push -q origin main
 )
-git --git-dir="$ORIGIN" symbolic-ref HEAD refs/heads/main
 
 # --dry-run should NOT touch the bze8 log (the legacy --dry-run contract is
 # "no side effects" — adding the bze8 row would violate that).

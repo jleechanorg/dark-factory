@@ -95,28 +95,30 @@ run_drift_block() {
 }
 
 # Fixture: bare origin + working clone, both on main.
+SEED="$SCRATCH_DIR/seed"
+mkdir -p "$SEED"
+(
+    cd "$SEED"
+    git init -q
+    git config user.email test@test.com
+    git config user.name test
+    echo x > f.txt
+    git add f.txt
+    git commit -q -m init
+    git branch -M main
+)
 ORIGIN="$SCRATCH_DIR/origin.git"
-git init -q --bare "$ORIGIN"
-git -C "$ORIGIN" symbolic-ref HEAD refs/heads/main
+git clone -q --bare "$SEED" "$ORIGIN"
+git --git-dir="$ORIGIN" symbolic-ref HEAD refs/heads/main
+rm -rf "$SEED"
+
 WORK="$SCRATCH_DIR/work"
 git clone -q "$ORIGIN" "$WORK"
 (
     cd "$WORK"
     git config user.email test@test.com
     git config user.name test
-    git checkout -q -b main 2>/dev/null || true
-    echo x > f.txt
-    git add f.txt
-    git commit -q -m init
-    git push -q origin main
 )
-# The bare origin's HEAD symref is set at `git init --bare` time from the
-# host's init.defaultBranch (defaulting to "master" when unset). It is NOT
-# automatically repointed by a later push of a "main" branch, so any
-# subsequent `git clone` of $ORIGIN lands on a dangling/wrong-named unborn
-# branch instead of "main" -- explicitly repoint it so later clones (e.g.
-# $SECOND_CLONE below) always land on main regardless of host git config.
-git --git-dir="$ORIGIN" symbolic-ref HEAD refs/heads/main
 
 # Case 1: clean checkout on main, in sync with origin -> gate passes.
 out="$(run_drift_block "$WORK")"
