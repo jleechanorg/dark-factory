@@ -876,6 +876,13 @@ impl Sessions for FakeSessions {
         Ok(self.session_health_failure_for.borrow().get(&id.0).cloned())
     }
 
+    /// Bead rev-4ou1z: records the poke so quota-watchdog tests can assert
+    /// the SAME paused session was woken (not stopped/respawned).
+    fn wake_pane(&self, id: &SessionId) -> Result<bool, DaemonError> {
+        self.calls.borrow_mut().push(format!("wake_pane({})", id.0));
+        Ok(true)
+    }
+
     fn session_branch(&self, id: &SessionId) -> Result<Option<String>, DaemonError> {
         self.calls
             .borrow_mut()

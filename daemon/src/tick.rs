@@ -116,6 +116,10 @@ pub struct TickSummary {
     /// full reroll cycle by the fast-rejection path" without re-deriving
     /// from telemetry.
     pub gates_assessed_fast_rejected: usize,
+    /// Bead rev-4ou1z: coder panes woken this tick by the quota watchdog
+    /// (an armed session whose recorded Gemini quota reset time, plus the
+    /// 60s wake grace, has passed).
+    pub quota_watchdog_wakes: usize,
 }
 
 /// Bounded retry cap for the automated HUMAN_HELD exit. Matches the shell
@@ -269,6 +273,7 @@ fn emit(
         telemetry_log,
         &TelemetryEvent {
             timestamp: now_iso8601(),
+            host: telemetry::local_hostname(),
             bead_id: bead_id.to_string(),
             attempt_id,
             lifecycle_state: lifecycle_state.to_string(),
@@ -588,6 +593,46 @@ fn kill_session_and_clear_handle(deps: &TickDeps, overlay: &mut BeadOverlay) {
             // recover_human_held and any operator-driven requeue without
             // risking a duplicate worker or AO dedup collision.
             overlay.session_id = None;
+            // Bead rev-3lm8k: the session is now provably dead, so its
+            // AO-managed worktree dir (if any) is stale immediately — do
+            // not wait for the TTL sweep. `clean_stale_worktree` is a
+            // no-op when `agent_worktree_root` is unset (legacy layout).
+            match crate::worktree_reaper::clean_stale_worktree(
+                deps.cfg,
+                overlay.repo(deps.cfg),
+                &session_id_str,
+            ) {
+                Ok(true) => {
+                    let _ = emit(
+                        deps.telemetry_log,
+                        &overlay.bead_id,
+                        overlay.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "WORKTREE_CLEANED_ON_SESSION_EXIT",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "session_id": session_id_str,
+                            "phase": "park_transition",
+                        }),
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    let _ = emit(
+                        deps.telemetry_log,
+                        &overlay.bead_id,
+                        overlay.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "WORKTREE_CLEAN_FAILED",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "session_id": session_id_str,
+                            "error": format!("{e:?}"),
+                            "phase": "park_transition",
+                        }),
+                    );
+                }
+            }
         }
         Err(stop_err) => {
             // Stop failed: the session may still be live. RETAIN the handle
@@ -1298,6 +1343,13 @@ pub fn run_tick(
         run_recovery_step(deps, &mut summary)?;
     }
 
+    // rev-4ou1z: slow-tier cadence matches the hours-long Gemini quota
+    // reset window — no need to poll for a wake-due session every fast
+    // tick.
+    if slow_tier_due {
+        run_quota_watchdog_wake(deps, &mut summary)?;
+    }
+
     run_fast_tier(deps, &mut summary)?;
 
     emit(
@@ -1319,6 +1371,7 @@ pub fn run_tick(
             "beadsHeldDispositionRequired": summary.beads_held_disposition_required,
             "escalationsSuppressed": summary.escalations_suppressed,
             "escalationsUndeliverable": summary.escalations_undeliverable,
+            "quotaWatchdogWakes": summary.quota_watchdog_wakes,
         }),
         serde_json::json!({"tick_index": tick_index, "slow_tier_due": slow_tier_due}),
     )?;
@@ -1540,6 +1593,65 @@ fn run_recovery_step(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), D
                 now_epoch,
             )?;
         }
+    }
+    Ok(())
+}
+
+/// Bead rev-4ou1z: quota watchdog wake sweep. Slow-tier cadence matches the
+/// hours-long Gemini quota reset window (no need to poll every fast tick).
+/// For every `(bead_id, session_id)` armed by `run_fast_tier`'s
+/// SESSION_HEALTH_FAILED handling whose recorded reset time (plus the 60s
+/// wake grace) has passed, sends an Enter keypress to the paused coder pane
+/// via `Sessions::wake_pane` — the SAME session that was paused, no
+/// respawn.
+fn run_quota_watchdog_wake(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), DaemonError> {
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Deliberately scoped to bead ids THIS store owns (same
+    // `owned_branches` walk `run_fast_tier` uses) rather than a blind sweep
+    // of the whole process-wide ledger: the ledger is a single static
+    // shared by every `TickDeps`/`StateStore` pairing in the process (see
+    // the module doc comment on `health::quota_watchdog`), so scoping the
+    // query to this store's own bead ids is what keeps two independent
+    // tick loops from reacting to each other's armed entries.
+    let branches = deps.store.owned_branches()?;
+    let mut bead_ids: Vec<String> = Vec::new();
+    for branch in &branches {
+        if let Ok(Some(bead_id)) = deps.store.bead_id_for_branch(branch) {
+            bead_ids.push(bead_id);
+        }
+    }
+    bead_ids.sort();
+    bead_ids.dedup();
+
+    for bead_id in bead_ids {
+        let Some(session_id) = crate::health::quota_watchdog::take_due_wake(&bead_id, now_epoch)
+        else {
+            continue;
+        };
+        let attempt = deps
+            .store
+            .load(&bead_id)
+            .ok()
+            .flatten()
+            .map(|o| o.attempt)
+            .unwrap_or(0);
+        let woke = deps
+            .sessions
+            .wake_pane(&SessionId(session_id.clone()))
+            .unwrap_or(false);
+        emit(
+            deps.telemetry_log,
+            &bead_id,
+            attempt,
+            OverlayState::Dispatched.as_str(),
+            "QUOTA_WATCHDOG_WOKE_PANE",
+            serde_json::json!({}),
+            serde_json::json!({"session_id": session_id, "woke": woke}),
+        )?;
+        summary.quota_watchdog_wakes += 1;
     }
     Ok(())
 }
@@ -3159,6 +3271,313 @@ fn build_skeptic_prompt(
     )
 }
 
+/// rev-gujs2 (ZFC-1, HIGH): anchored-marker scan for a
+/// `verdict:`/`overall:`/`normalized:` declaration line, or a `/skeptic
+/// pass|warn|fail` command line, within free-text GitHub PR comments. Unlike
+/// `verifier::find_marker_verdict` (which anchors the marker to a LINE via
+/// `str::find`, so `"the old verdict: fail was wrong"` still parses as Fail
+/// — traced by hand: after the `"verdict:"` substring the remainder is
+/// `" fail was wrong"`, and `token_to_verdict` takes the first
+/// whitespace-delimited token `"fail"`), this scan requires the marker to be
+/// the START of the TRIMMED line, case-insensitively — text that merely
+/// discusses or quotes a verdict phrase mid-sentence does not match at all.
+/// `find_marker_verdict` stays correct for its own callers (parsing a
+/// trusted LLM reviewer's own single structured completion, per
+/// gate_es/gate_er/gate_code_standards in CLAUDE.md), but is not anchored
+/// enough for arbitrary free-text authored by untrusted GitHub commenters.
+/// Returns the LAST matching line's canonical `"verdict: pass"` /
+/// `"verdict: fail"` string (an authoritative closing line overrides
+/// earlier progress chatter, mirroring `find_marker_verdict`'s "last marker
+/// wins"), or `None` if no anchored declaration line is present. `warn` has
+/// no independent state in this enrichment-signal grammar (matching the
+/// pre-fix behavior, which never set gha/sign-off to anything but
+/// pass/fail/absent), so only `pass`/`success` and `fail`/`failure` tokens
+/// are recognized.
+fn anchored_comment_verdict(body: &str) -> Option<&'static str> {
+    const MARKERS: [&str; 3] = ["verdict:", "overall:", "normalized:"];
+
+    let mut found = None;
+    for line in body.lines() {
+        let trimmed_lower = line.trim().to_ascii_lowercase();
+        let after = MARKERS
+            .iter()
+            .find_map(|m| trimmed_lower.strip_prefix(m))
+            .or_else(|| trimmed_lower.strip_prefix("/skeptic "));
+        if let Some(after) = after {
+            let token = after.split_whitespace().next().unwrap_or("");
+            match token {
+                "pass" | "success" => found = Some("verdict: pass"),
+                "fail" | "failure" => found = Some("verdict: fail"),
+                _ => {}
+            }
+        }
+    }
+    found
+}
+
+/// rev-gujs2 (ZFC-1, HIGH): derive the OPTIONAL `gha`/`sign-off` enrichment
+/// signals from `snapshot.comments`. Extracted out of `skeptic_evidence`
+/// (which is private and has subprocess side effects) so this is directly
+/// unit-testable, mirroring the `build_skeptic_prompt` /
+/// `second_family_candidates` extraction precedent in this file.
+///
+/// Previously this loop used unanchored `.contains(...)` substring scans
+/// over the lower-cased comment body — banned ZFC-style keyword matching
+/// over free-text authored by arbitrary GitHub commenters. A comment merely
+/// containing the bare word "signoff"/"sign-off" ANYWHERE, or one that
+/// discussed/quoted a prior "verdict: fail" mid-sentence, would flip a
+/// signal and could escalate the combined gate-7 verdict (Fail beats Warn
+/// beats Pass) on an otherwise healthy PR. Both signals now require
+/// `anchored_comment_verdict` to find a genuine declaration line. The bare
+/// "sign-off"/"signoff" word trigger is DROPPED entirely rather than
+/// hardened, per the bead's own FIX note: `gha`/`sign-off` are optional
+/// enrichment signals most target repos never emit, and the bare word has
+/// no anchorable grammar — only `verdict:`/`overall:`/`normalized:` marker
+/// lines and `/skeptic pass|fail` command lines can flip a signal now.
+///
+/// The author/topic gates (gha must be `github-actions`/`gha` AND mention
+/// "skeptic"; sign-off must NOT be `github-actions`/`coderabbit`/`bugbot`/
+/// `cursor`) are unchanged — those are legitimate coarse filters, not the
+/// ZFC violation. Iterates `comments` in order; the LAST matching comment
+/// for each signal wins, matching the original loop's behavior.
+fn derive_enrichment_verdicts(
+    comments: &[crate::tools::PrComment],
+) -> (&'static str, &'static str) {
+    let mut gha_verdict = "verdict: absent";
+    let mut signoff_verdict = "verdict: absent";
+
+    for comment in comments {
+        let author_lower = comment.author.to_ascii_lowercase();
+
+        if (author_lower.contains("github-actions") || author_lower.contains("gha"))
+            && comment.body.to_ascii_lowercase().contains("skeptic")
+        {
+            if let Some(v) = anchored_comment_verdict(&comment.body) {
+                gha_verdict = v;
+            }
+        }
+
+        if !author_lower.contains("github-actions")
+            && !author_lower.contains("coderabbit")
+            && !author_lower.contains("bugbot")
+            && !author_lower.contains("cursor")
+        {
+            if let Some(v) = anchored_comment_verdict(&comment.body) {
+                signoff_verdict = v;
+            }
+        }
+    }
+
+    (gha_verdict, signoff_verdict)
+}
+
+#[cfg(test)]
+mod anchored_comment_verdict_tests {
+    //! rev-gujs2 (ZFC-1, HIGH): pins the false-positive scenarios the
+    //! unanchored `.contains(...)` scan let through, plus the anchored
+    //! declaration-line grammar that replaces it.
+    use super::anchored_comment_verdict;
+
+    #[test]
+    fn bare_signoff_word_in_unrelated_prose_does_not_match() {
+        // Pre-fix behavior: `body_lower.contains("signoff")` alone flipped
+        // `signoff_verdict` to "verdict: pass" here — zero structured
+        // marker required. The anchored scan requires a declaration line,
+        // so a bare word in ordinary prose must not match.
+        assert_eq!(
+            anchored_comment_verdict("let's schedule the signoff meeting for Friday"),
+            None
+        );
+        assert_eq!(
+            anchored_comment_verdict("still need sign-off from the team lead"),
+            None
+        );
+    }
+
+    #[test]
+    fn quoted_verdict_phrase_mid_sentence_does_not_match() {
+        // Pre-fix `find_marker_verdict`-style unanchored `.find()` scan
+        // would parse this as Fail (marker found mid-line, remainder
+        // " fail was wrong" tokenizes to "fail"). The anchored scan
+        // requires "verdict:" at the START of the trimmed line.
+        assert_eq!(
+            anchored_comment_verdict(
+                "note: the old verdict: fail was wrong, this PR fixes it"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn anchored_verdict_pass_line_matches() {
+        assert_eq!(
+            anchored_comment_verdict(
+                "Ran the checks locally, all green.\nverdict: pass\nMerging shortly."
+            ),
+            Some("verdict: pass")
+        );
+    }
+
+    #[test]
+    fn anchored_verdict_fail_line_matches() {
+        assert_eq!(
+            anchored_comment_verdict("verdict: fail missing test coverage"),
+            Some("verdict: fail")
+        );
+    }
+
+    #[test]
+    fn anchored_skeptic_command_line_matches() {
+        assert_eq!(anchored_comment_verdict("/skeptic fail"), Some("verdict: fail"));
+        assert_eq!(anchored_comment_verdict("/skeptic pass"), Some("verdict: pass"));
+    }
+
+    #[test]
+    fn overall_and_normalized_markers_match_parity_with_verdict() {
+        assert_eq!(
+            anchored_comment_verdict("overall: pass"),
+            Some("verdict: pass")
+        );
+        assert_eq!(
+            anchored_comment_verdict("normalized: fail"),
+            Some("verdict: fail")
+        );
+    }
+
+    #[test]
+    fn last_anchored_line_wins_when_multiple_present() {
+        assert_eq!(
+            anchored_comment_verdict("verdict: fail\nfixed now\nverdict: pass"),
+            Some("verdict: pass")
+        );
+    }
+
+    #[test]
+    fn indented_marker_line_still_anchors() {
+        // `trim()` strips leading whitespace before the prefix check, so a
+        // marker line indented inside a quoted block still counts as
+        // line-start, not mid-sentence.
+        assert_eq!(
+            anchored_comment_verdict("  verdict: pass  "),
+            Some("verdict: pass")
+        );
+    }
+}
+
+#[cfg(test)]
+mod derive_enrichment_verdicts_tests {
+    //! rev-gujs2 (ZFC-1, HIGH): pins the author/topic gates plus the
+    //! "last matching comment wins" iteration order, now layered on top of
+    //! `anchored_comment_verdict` instead of bare substring scans.
+    use super::derive_enrichment_verdicts;
+    use crate::tools::PrComment;
+
+    fn comment(author: &str, body: &str) -> PrComment {
+        PrComment {
+            author: author.to_string(),
+            body: body.to_string(),
+            created_at_epoch: 0,
+        }
+    }
+
+    #[test]
+    fn no_comments_yields_both_absent() {
+        assert_eq!(
+            derive_enrichment_verdicts(&[]),
+            ("verdict: absent", "verdict: absent")
+        );
+    }
+
+    #[test]
+    fn bare_signoff_word_from_human_reviewer_no_longer_flips_signoff() {
+        // Pre-fix: this exact body flipped signoff_verdict to
+        // "verdict: pass" via `body_lower.contains("signoff")`. Confirmed
+        // by hand against the removed loop in tick.rs prior to rev-gujs2 —
+        // there was no marker requirement at all.
+        let comments = [comment(
+            "some-reviewer",
+            "let's schedule the signoff meeting for Friday",
+        )];
+        let (_, signoff) = derive_enrichment_verdicts(&comments);
+        assert_eq!(signoff, "verdict: absent");
+    }
+
+    #[test]
+    fn quoted_verdict_phrase_from_human_reviewer_does_not_flip_signoff() {
+        let comments = [comment(
+            "some-reviewer",
+            "note: the old verdict: fail was wrong, this PR fixes it",
+        )];
+        let (_, signoff) = derive_enrichment_verdicts(&comments);
+        assert_eq!(signoff, "verdict: absent");
+    }
+
+    #[test]
+    fn anchored_signoff_pass_from_human_reviewer_flips_verdict() {
+        let comments = [comment("some-reviewer", "verdict: pass")];
+        let (_, signoff) = derive_enrichment_verdicts(&comments);
+        assert_eq!(signoff, "verdict: pass");
+    }
+
+    #[test]
+    fn anchored_skeptic_command_from_human_reviewer_flips_signoff() {
+        let comments = [comment("some-reviewer", "/skeptic fail")];
+        let (_, signoff) = derive_enrichment_verdicts(&comments);
+        assert_eq!(signoff, "verdict: fail");
+    }
+
+    #[test]
+    fn excluded_authors_never_contribute_to_signoff_even_when_anchored() {
+        for author in ["github-actions[bot]", "coderabbitai", "bugbot", "cursor-agent"] {
+            let comments = [comment(author, "verdict: pass")];
+            let (_, signoff) = derive_enrichment_verdicts(&comments);
+            assert_eq!(signoff, "verdict: absent", "author={author}");
+        }
+    }
+
+    #[test]
+    fn gha_requires_actions_author_skeptic_topic_and_anchored_marker() {
+        // Right author/topic, no anchored marker -> stays absent.
+        let comments = [comment(
+            "github-actions[bot]",
+            "skeptic run kicked off, results pending",
+        )];
+        let (gha, _) = derive_enrichment_verdicts(&comments);
+        assert_eq!(gha, "verdict: absent");
+
+        // Right author/topic AND anchored marker -> flips.
+        let comments = [comment(
+            "github-actions[bot]",
+            "skeptic run complete\nverdict: fail\nsee log for details",
+        )];
+        let (gha, _) = derive_enrichment_verdicts(&comments);
+        assert_eq!(gha, "verdict: fail");
+
+        // Anchored marker but body never mentions "skeptic" -> stays absent.
+        let comments = [comment("github-actions[bot]", "verdict: pass")];
+        let (gha, _) = derive_enrichment_verdicts(&comments);
+        assert_eq!(gha, "verdict: absent");
+
+        // Anchored marker + skeptic topic, but wrong author -> stays absent.
+        let comments = [comment("some-other-bot", "skeptic verdict: pass")];
+        let (gha, _) = derive_enrichment_verdicts(&comments);
+        assert_eq!(gha, "verdict: absent");
+    }
+
+    #[test]
+    fn last_matching_comment_wins_per_signal_independently() {
+        let comments = [
+            comment("github-actions[bot]", "skeptic run\nverdict: pass"),
+            comment("some-reviewer", "verdict: fail"),
+            comment("github-actions[bot]", "skeptic run\nverdict: fail"),
+            comment("some-reviewer", "verdict: pass"),
+        ];
+        let (gha, signoff) = derive_enrichment_verdicts(&comments);
+        assert_eq!(gha, "verdict: fail");
+        assert_eq!(signoff, "verdict: pass");
+    }
+}
+
 fn skeptic_evidence(
     deps: &TickDeps,
     bead_id: &str,
@@ -3181,18 +3600,14 @@ fn skeptic_evidence(
         .or_else(|_| std::env::var("DARK_FACTORY_REVIEWER_DEFAULT"))
         .unwrap_or_else(|_| "agy".to_string());
 
-    let coder_vendor = match coder_agent.to_ascii_lowercase().as_str() {
-        // `claudem` contains `claude` — check MiniMax aliases first so a
-        // claudem coder is excluded from the claudem reviewer slot, not
-        // from a phantom Anthropic `claude` slot that is not in the queue.
-        a if a.contains("claudem") || a.contains("minimax") => "claudem",
-        a if a.contains("claude") => "claude",
-        a if a.contains("agy") || a.contains("antigravity") => "agy",
-        a if a.contains("codex") => "codex",
-        a if a.contains("gemini") => "gemini",
-        a if a.contains("cursor") || a.contains("agentf") => "cursor-agent",
-        _ => "",
-    };
+    // rev-9zrgs: was a hand-written ordered `.contains()` chain (fragile —
+    // "claudem" contains "claude" as a substring, so arm order mattered and
+    // a reorder would silently misclassify). `vendor_aliases::canonical_vendor`
+    // does an exact-match lookup against `config/vendor_aliases.json`
+    // instead, so ordering can no longer matter. See
+    // `daemon/src/vendor_aliases.rs` module doc for the alias set and the
+    // investigation behind the exact-match (vs token-based) design choice.
+    let coder_vendor = crate::vendor_aliases::canonical_vendor(&coder_agent);
 
     // Operator 2026-08-18: reviewer queue is claudem → agy → cursor-agent.
     // Default coder is agy (fallback claudem), so production exclusion
@@ -3209,41 +3624,10 @@ fn skeptic_evidence(
     // correctly instead of by the daemon-global repo.
     let is_test_repo = crate::config::is_fixture_repo(repo);
 
-    let mut gha_verdict = "verdict: absent";
-    let mut signoff_verdict = "verdict: absent";
-
-    for comment in &snapshot.comments {
-        let body_lower = comment.body.to_ascii_lowercase();
-        let author_lower = comment.author.to_ascii_lowercase();
-
-        if (author_lower.contains("github-actions") || author_lower.contains("gha"))
-            && body_lower.contains("skeptic")
-        {
-            if body_lower.contains("verdict: pass") || body_lower.contains("verdict: success") {
-                gha_verdict = "verdict: pass";
-            } else if body_lower.contains("verdict: fail")
-                || body_lower.contains("verdict: failure")
-            {
-                gha_verdict = "verdict: fail";
-            }
-        }
-
-        if !author_lower.contains("github-actions")
-            && !author_lower.contains("coderabbit")
-            && !author_lower.contains("bugbot")
-            && !author_lower.contains("cursor")
-        {
-            if body_lower.contains("sign-off")
-                || body_lower.contains("signoff")
-                || body_lower.contains("verdict: pass")
-                || body_lower.contains("/skeptic pass")
-            {
-                signoff_verdict = "verdict: pass";
-            } else if body_lower.contains("verdict: fail") || body_lower.contains("/skeptic fail") {
-                signoff_verdict = "verdict: fail";
-            }
-        }
-    }
+    // rev-gujs2 (ZFC-1, HIGH): derivation now anchors to declaration lines
+    // instead of scanning for substrings anywhere in the comment body — see
+    // `derive_enrichment_verdicts` and `anchored_comment_verdict` above.
+    let (gha_verdict, signoff_verdict) = derive_enrichment_verdicts(&snapshot.comments);
 
     // jleechan-wzgl: track which reviewer vendor(s) actually contributed a
     // parseable verdict to `skeptic_verdict`, so GATE_ASSESSMENT telemetry
@@ -3947,6 +4331,24 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             if let Some(ref session_id_str) = overlay.session_id {
                 let sid = SessionId(session_id_str.clone());
                 if let Ok(Some(health_failure)) = deps.sessions.check_session_health(&sid) {
+                    // rev-4ou1z: a Gemini individual-quota exhaustion is
+                    // RECOVERABLE — the paused pane just needs an Enter
+                    // keypress once its quota window resets, not a
+                    // kill+respawn cycle. A fresh spawn would hit the same
+                    // quota wall immediately, burning
+                    // `MAX_TRANSIENT_SPAWN_RETRY` in minutes against a
+                    // window that can take hours to reset (live incident:
+                    // coder wa-3538 parked HUMAN_HELD well before its quota
+                    // actually cleared). Already-armed sessions skip
+                    // straight past the SESSION_HEALTH_FAILED emit + kill
+                    // path below so the pane is left untouched for the
+                    // slow-tier wake sweep (`run_quota_watchdog_wake`).
+                    if crate::health::quota_watchdog::parse_quota_reset_duration(&health_failure)
+                        .is_some()
+                        && crate::health::quota_watchdog::recorded_reset_at(bead_id).is_some()
+                    {
+                        continue;
+                    }
                     emit(
                         deps.telemetry_log,
                         bead_id,
@@ -3960,6 +4362,34 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             "branch": overlay.branch,
                         }),
                     )?;
+                    if let Some(reset_in) =
+                        crate::health::quota_watchdog::parse_quota_reset_duration(&health_failure)
+                    {
+                        let now_epoch = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let reset_at_epoch = now_epoch.saturating_add(reset_in.as_secs());
+                        crate::health::quota_watchdog::record_quota_reset(
+                            bead_id,
+                            session_id_str,
+                            reset_at_epoch,
+                        );
+                        emit(
+                            deps.telemetry_log,
+                            bead_id,
+                            overlay.attempt,
+                            OverlayState::Dispatched.as_str(),
+                            "QUOTA_WATCHDOG_ARMED",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "session_id": session_id_str,
+                                "reason": health_failure,
+                                "reset_at_epoch": reset_at_epoch,
+                            }),
+                        )?;
+                        continue;
+                    }
                     let _ = deps.sessions.stop(&sid);
                     overlay.session_id = None;
                     if overlay.pr_number.is_none() {
@@ -4193,8 +4623,49 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 if ready_to_promote {
                     // Reap completed worker session to immediately release AO worker slot
                     if let Some(session_id_str) = overlay.session_id.take() {
-                        let sid = SessionId(session_id_str);
+                        let sid = SessionId(session_id_str.clone());
                         let _ = deps.sessions.stop(&sid);
+                        // Bead rev-3lm8k: the coder session has finished and
+                        // is being reaped right here — its AO-managed
+                        // worktree dir (if any) is stale immediately, so
+                        // clean it now rather than waiting on the next TTL
+                        // sweep (a no-op when `agent_worktree_root` is
+                        // unset). This is the exact "coder session exit"
+                        // moment the bead's incident describes: a leftover
+                        // worktree dir blocking every subsequent dispatch
+                        // hashing to the same orchestrator branch.
+                        match crate::worktree_reaper::clean_stale_worktree(
+                            deps.cfg,
+                            overlay.repo(deps.cfg),
+                            &session_id_str,
+                        ) {
+                            Ok(true) => {
+                                let _ = emit(
+                                    deps.telemetry_log,
+                                    bead_id,
+                                    overlay.attempt,
+                                    OverlayState::Attested.as_str(),
+                                    "WORKTREE_CLEANED_ON_SESSION_EXIT",
+                                    serde_json::json!({}),
+                                    serde_json::json!({"session_id": session_id_str}),
+                                );
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                let _ = emit(
+                                    deps.telemetry_log,
+                                    bead_id,
+                                    overlay.attempt,
+                                    OverlayState::Attested.as_str(),
+                                    "WORKTREE_CLEAN_FAILED",
+                                    serde_json::json!({}),
+                                    serde_json::json!({
+                                        "session_id": session_id_str,
+                                        "error": format!("{e:?}"),
+                                    }),
+                                );
+                            }
+                        }
                     }
                     // A positive branch-to-open-PR binding is the durable
                     // boundary between the deferred old attempt and this

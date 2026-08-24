@@ -826,6 +826,7 @@ fn run_recover_held(db: &Path, telemetry_log: &Path) -> Result<(), DaemonError> 
             telemetry_log,
             &daemon::telemetry::TelemetryEvent {
                 timestamp: daemon::state::now_iso8601(),
+                host: daemon::telemetry::local_hostname(),
                 bead_id: overlay.bead_id.clone(),
                 attempt_id: overlay.attempt,
                 lifecycle_state: "QUEUED".to_string(),

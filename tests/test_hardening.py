@@ -14,6 +14,7 @@ import pathlib
 import sqlite3
 import sys
 import tempfile
+import time
 
 import pytest
 
@@ -952,3 +953,146 @@ def test_cross_run_circuit_breaker_only_affects_matching_pipeline(
     assert handler_calls["count"] >= 1
     assert history[-1].outcome == "success"
     assert history[-1].node == "exit"
+
+
+# ---------------------------------------------------------------------------
+# Cross-run circuit breaker — time decay / quota classification (rev-vl3zr)
+# ---------------------------------------------------------------------------
+#
+# ROOT-CAUSE: the v4 breaker above treats "3 consecutive exhausted runs
+# because of a transient upstream quota exhaustion" identically to "3
+# genuinely-stuck runs" — once tripped, it blocks forever even after the
+# quota resets. Fix: decay the effective streak count by half for every
+# CB_DECAY_HALF_LIFE_SECS (default 30 min) of idle time since the most
+# recent exhausted run, so a long-enough gap unblocks dispatch again.
+
+from runner.engine_run import (  # noqa: E402
+    CB_DECAY_HALF_LIFE_SECS,
+    _decayed_exhausted_streak,
+)
+
+
+def test_decayed_exhausted_streak_unchanged_at_zero_idle():
+    """No idle time → no decay; the raw streak count is returned."""
+    now = 1_000_000.0
+    assert _decayed_exhausted_streak(3, now, now=now) == pytest.approx(3.0)
+
+
+def test_decayed_exhausted_streak_halves_after_one_half_life():
+    """Exactly one half-life of idle time (default 30 min) halves the streak —
+    matches the ACCEPTANCE wording verbatim: '30 min of idle reduces
+    exhausted_streak by half'."""
+    now = 1_000_000.0
+    most_recent_ended_ts = now - CB_DECAY_HALF_LIFE_SECS
+    assert _decayed_exhausted_streak(3, most_recent_ended_ts, now=now) == pytest.approx(1.5)
+
+
+def test_decayed_exhausted_streak_quarters_after_two_half_lives():
+    now = 1_000_000.0
+    most_recent_ended_ts = now - (2 * CB_DECAY_HALF_LIFE_SECS)
+    assert _decayed_exhausted_streak(3, most_recent_ended_ts, now=now) == pytest.approx(0.75)
+
+
+def test_decayed_exhausted_streak_noop_when_no_timestamp():
+    assert _decayed_exhausted_streak(3, None) == 3.0
+
+
+def test_decayed_exhausted_streak_noop_when_disabled(monkeypatch):
+    monkeypatch.setattr("runner.engine_run.CB_DECAY_HALF_LIFE_SECS", 0)
+    now = 1_000_000.0
+    assert _decayed_exhausted_streak(3, now - 999999, now=now) == 3.0
+
+
+def test_cross_run_circuit_breaker_does_not_block_after_quota_reset_idle_gap(
+    monkeypatch, tmp_path
+):
+    """ACCEPTANCE: after 3 consecutive exhausted runs due to quota, the 4th
+    dispatch is NOT blocked if quota reset happened in between (i.e. a long
+    idle gap has elapsed since the last exhausted run)."""
+    cxdb_path = tmp_path / "cxdb.sqlite"
+
+    # 3 prior exhausted runs, all ended long enough ago (2x half-life) that
+    # the effective streak has decayed below CB_THRESHOLD.
+    stale_ended_ts = time.time() - (2 * CB_DECAY_HALF_LIFE_SECS)
+    seed = CXDB(cxdb_path)
+    try:
+        for _ in range(_CB_THRESHOLD):
+            rid = seed.start_run(pipeline="hello", goal="seed")
+            seed.record_step(
+                run_id=rid, seq=0, node="start", outcome="success",
+                ts=0.0, output="start", metadata={},
+            )
+            seed.end_run(rid, "exhausted", ended_ts=stale_ended_ts)
+    finally:
+        seed.close()
+
+    handler_calls = {"count": 0}
+
+    def fake_holdout(node, ctx):
+        handler_calls["count"] += 1
+        return Result(outcome="success", output="mock pass")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+
+    g = parse(_pipeline("hello.dot"))
+    ctx = Context(
+        goal="quota reset idle gap test",
+        workdir=SCRATCH,
+        backend="echo",
+        cxdb_path=cxdb_path,
+    )
+    history = run(g, ctx, max_steps=50)
+
+    # The streak has decayed below threshold — the 4th dispatch must proceed
+    # to normal execution instead of short-circuiting.
+    assert handler_calls["count"] >= 1, (
+        "expected the run to proceed past the decayed circuit breaker, "
+        f"but no handler was invoked; history={[r.node for r in history]}"
+    )
+    assert history[-1].outcome == "success"
+    assert history[-1].node == "exit"
+
+
+def test_cross_run_circuit_breaker_still_fires_without_idle_gap(monkeypatch, tmp_path):
+    """Regression guard: with no meaningful idle time (runs ended just now),
+    the breaker must still fire — decay must not defeat the original v4
+    protection for genuinely back-to-back exhaustion."""
+    cxdb_path = tmp_path / "cxdb.sqlite"
+
+    seed = CXDB(cxdb_path)
+    try:
+        for _ in range(_CB_THRESHOLD):
+            rid = seed.start_run(pipeline="hello", goal="seed")
+            seed.record_step(
+                run_id=rid, seq=0, node="start", outcome="success",
+                ts=0.0, output="start", metadata={},
+            )
+            seed.end_run(rid, "exhausted")  # ended_ts defaults to now
+    finally:
+        seed.close()
+
+    handler_calls = {"count": 0}
+
+    def fake_holdout(node, ctx):
+        handler_calls["count"] += 1
+        return Result(outcome="success", output="mock pass")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+
+    g = parse(_pipeline("hello.dot"))
+    ctx = Context(
+        goal="no idle gap regression test",
+        workdir=SCRATCH,
+        backend="echo",
+        cxdb_path=cxdb_path,
+    )
+    history = run(g, ctx, max_steps=50)
+
+    assert handler_calls["count"] == 0
+    assert len(history) == 1
+    assert history[0].outcome == "exhausted"
+    assert history[0].node == "__cross_run_circuit__"
+    assert history[0].metadata.get("cross_run_circuit_breaker") == "true"
+    # New observability fields proving decay was evaluated, not skipped.
+    assert "effective_streak" in history[0].metadata
+    assert float(history[0].metadata["effective_streak"]) >= _CB_THRESHOLD

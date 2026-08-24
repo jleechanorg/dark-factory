@@ -10,6 +10,7 @@ pub mod constraints;
 pub mod reroll;
 pub mod dispatch;
 pub mod errors;
+pub mod health;
 pub mod intake;
 pub mod router;
 pub mod state;
@@ -27,3 +28,5 @@ pub mod worktree_reaper;
 
 pub mod gates_compute;
 pub mod vendor_health;
+pub mod session_health_markers;
+pub mod vendor_aliases;

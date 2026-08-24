@@ -1,0 +1,9 @@
+{
+  "_comment": "Exemptions for scripts/check_auto_script_configs.sh (bead rev-r8vb1). Only add an entry when the script performs no independent merge/push/delete/publish POLICY decision of its own -- it must be invoked exclusively by a caller whose own config/*_allowlist.json gate has already run. Document the caller + gate for every entry so the exemption stays auditable.",
+  "exempt_scripts": [
+    {
+      "script": "gh-pr-merge-wrapper.sh",
+      "reason": "Thin `gh pr merge` wrapper (draft-promote-then-merge mechanism only, no policy decision). Invoked exclusively by daemon/scripts/auto-merge-guard.sh:407 AFTER auto-merge-guard.sh's own config/auto_merge_repo_allowlist.json fail-closed gate has already passed for the target repo."
+    }
+  ]
+}

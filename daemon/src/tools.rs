@@ -805,6 +805,16 @@ pub trait Sessions {
         let _ = id;
         Ok(None)
     }
+    /// Bead rev-4ou1z: wakes a session paused at a benign prompt (e.g. a
+    /// Gemini "Individual quota reached" message whose reset time has
+    /// passed) by sending an Enter keypress to its tmux pane. Returns
+    /// `Ok(true)` when a pane was found and poked. Default no-op — fakes
+    /// and tests that don't model tmux panes are unaffected; `CliSessions`
+    /// overrides this with the real tmux `send-keys` call.
+    fn wake_pane(&self, id: &SessionId) -> Result<bool, DaemonError> {
+        let _ = id;
+        Ok(false)
+    }
     /// Returns the live branch AO reports for a given session, if known.
     ///
     /// jleechan-5ia2: a `bead_overlay` row was found with

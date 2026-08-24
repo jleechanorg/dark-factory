@@ -7627,9 +7627,10 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
 // The test above proves gate 7 resolves when NEITHER gha nor sign-off has
 // evidence. It structurally cannot catch the round-3 residual: `tick.rs`'s
 // `!has_gha_evidence && !has_signoff_evidence` bypass only fires when BOTH
-// are absent. The moment a PR comment trips the (deliberately loose)
-// sign-off heuristic — any non-bot comment containing "sign-off",
-// "signoff", "verdict: pass", or "/skeptic pass" — `skeptic_evidence`
+// are absent. The moment a PR comment trips the sign-off signal — a
+// non-bot comment with an anchored `verdict:`/`overall:`/`normalized:`
+// declaration line or `/skeptic pass|fail` command line, per
+// `anchored_comment_verdict` (rev-gujs2) — `skeptic_evidence`
 // unconditionally wraps the dual-LLM verdict in the full 3-subsystem
 // grammar, padding the still-absent `gha` subsystem with the literal
 // `"verdict: absent"` placeholder. Before the round-3 fix,
@@ -7726,10 +7727,12 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
             body: String::new(),
             // No gha/skeptic-workflow comment at all (this target repo has
             // no equivalent CI workflow), but ONE human-looking comment
-            // trips the loose sign-off heuristic ("sign-off" substring,
-            // non-bot author) — the exact asymmetric scenario round 3
-            // proved was still deadlocked. An `/er PASS` comment is present
-            // purely so gate 6 resolves; this test only exercises gate 7.
+            // trips the sign-off signal via an anchored `verdict: pass`
+            // declaration line (non-bot author, rev-gujs2's
+            // `anchored_comment_verdict` grammar) — the exact asymmetric
+            // scenario round 3 proved was still deadlocked. An `/er PASS`
+            // comment is present purely so gate 6 resolves; this test only
+            // exercises gate 7.
             comments: vec![
                 PrComment {
                     author: "some-reviewer".into(),
@@ -7738,7 +7741,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
                 },
                 PrComment {
                     author: "jleechan".into(),
-                    body: "Looks good, sign-off from me.".into(),
+                    body: "Looks good, sign-off from me.\nverdict: pass".into(),
                     created_at_epoch: 0,
                 },
             ],
@@ -8258,15 +8261,15 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", guard_script.display()));
     let predicate_block: String = guard_src
         .lines()
-        .skip(84) // 0-indexed: line 85 (1-indexed) of auto-merge-guard.sh
-        .take(74) // lines 85..=158 inclusive, mirroring test_auto_merge_guard_gate_vocabulary.sh entry (sed -n '85,158p'; shifted from 41..=114 by the rev-1uno rate_limit preflight + dual-API routing block)
+        .skip(119) // 0-indexed: line 120 (1-indexed) of auto-merge-guard.sh
+        .take(74) // lines 120..=193 inclusive, mirroring test_auto_merge_guard_gate_vocabulary.sh entry (sed -n '120,193p'; shifted from 85..=158 by PR #735's fail-closed repo-allowlist insertion)
         .map(|l| l.strip_prefix("  ").unwrap_or(l)) // mirror the shell test's sed s/^  // normalization
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
         predicate_block.contains("g.items()"),
         "extracted predicate block drifted from auto-merge-guard.sh's actual \
-         line range 85-158 (line numbers may have shifted); block:\n{predicate_block}"
+         line range 120-193 (line numbers may have shifted); block:\n{predicate_block}"
     );
 
     use std::io::Write as _;
@@ -14735,6 +14738,132 @@ fn test_dispatched_adopted_idle_session_reaped_and_promoted() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+/// Bead rev-3lm8k: when a coder session's worktree is auto-clean-enabled
+/// (`agent_worktree_root` set) and the session is reaped on promotion to
+/// ATTESTED (the same "coder session finished" moment PR #653/jleechan-w0r4
+/// reaps the session itself), the daemon must also remove the AO-managed
+/// worktree directory for that session — immediately, not on the next TTL
+/// sweep. This is the RED->GREEN reproduction of the bead's incident: a
+/// leftover worktree dir (e.g. `wa-3538`) blocked every later dispatch that
+/// hashed to the same orchestrator branch until a human manually deleted it.
+#[test]
+fn test_worktree_cleaned_up_on_coder_session_exit_promotion() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = false;
+    sessions.set_activity(daemon::tools::SessionActivity::Idle);
+
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let worktree_root = std::env::temp_dir().join(format!(
+        "afd_test_rev3lm8k_worktree_root_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let cfg = Config {
+        agent_worktree_root: Some(worktree_root.display().to_string()),
+        ..test_cfg()
+    };
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_test_rev3lm8k.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    // The stale AO-managed worktree the incident describes: laid down under
+    // `<agent_worktree_root>/<repo>/<session_id>`, matching the real
+    // `~/.worktrees/<repo>/<agent_id>` convention `Config::agent_worktree_path`
+    // encodes.
+    let stale_worktree = worktree_root.join("owner/repo/wa-3538");
+    std::fs::create_dir_all(&stale_worktree).unwrap();
+    std::fs::write(stale_worktree.join("marker"), b"leftover coder worktree").unwrap();
+    assert!(stale_worktree.is_dir(), "fixture must actually create the dir");
+
+    store.overlays.borrow_mut().insert(
+        "bead-rev3lm8k".into(),
+        BeadOverlay {
+            bead_id: "bead-rev3lm8k".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(998),
+            branch: Some("fix/test-rev3lm8k".into()),
+            session_id: Some("wa-3538".into()),
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+
+    store.register_branch("bead-rev3lm8k", "fix/test-rev3lm8k").unwrap();
+
+    scm.pr_numbers_for_branch.insert(("owner/repo".into(), "fix/test-rev3lm8k".into()), Some(998));
+    scm.open_pr_head_refs.insert(("owner/repo".into(), 998), daemon::tools::PrHeadBranch::SameRepo("fix/test-rev3lm8k".into()));
+    scm.pr_snapshots.insert(
+        998,
+        PrSnapshot {
+            pr_number: 998,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "head-998".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 0);
+
+    let o = store.load("bead-rev3lm8k").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::Attested,
+        "idle adopted session must promote to ATTESTED"
+    );
+    assert_eq!(o.session_id, None, "session handle must be cleared after reaping");
+    assert!(
+        !stale_worktree.exists(),
+        "worktree dir must be cleaned up within the same tick the session is reaped, \
+         not left for a future TTL sweep"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("WORKTREE_CLEANED_ON_SESSION_EXIT"),
+        "telemetry must record the worktree cleanup: {telemetry}"
+    );
+
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 #[test]
 fn session_health_failure_reaps_session_and_requeues_bead() {
     let scm = FakeScm::new();
@@ -14808,5 +14937,200 @@ fn session_health_failure_reaps_session_and_requeues_bead() {
         "SESSION_HEALTH_FAILED event must be emitted; telemetry:\n{telemetry}"
     );
 
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Bead rev-4ou1z ACCEPTANCE #1: a Gemini quota-reached health failure with
+/// a parseable "Resets in Xh Ym" countdown ARMS the quota watchdog instead
+/// of killing the session — no respawn cycle burning
+/// `MAX_TRANSIENT_SPAWN_RETRY` against an hours-long reset window.
+#[test]
+fn quota_reached_health_failure_arms_watchdog_without_killing_session() {
+    // The ledger is a process-wide static (see `health::quota_watchdog`'s
+    // module doc), but every accessor is scoped by `bead_id` and this
+    // bead id is unique to this test, so no lock is needed even though
+    // `cargo test` runs many tests concurrently in this process.
+    daemon::health::quota_watchdog::clear("bead-quota-arm");
+
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_test_quota_watchdog_arm.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    store.overlays.borrow_mut().insert(
+        "bead-quota-arm".into(),
+        BeadOverlay {
+            bead_id: "bead-quota-arm".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/bead-quota-arm-r1".into()),
+            session_id: Some("wa-quota-paused".into()),
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+    store
+        .register_branch("bead-quota-arm", "factory/bead-quota-arm-r1")
+        .unwrap();
+
+    sessions.set_session_health_failure(
+        "wa-quota-paused",
+        "terminal session error in tmux pane: individual quota reached (resets in 1h 23m.)",
+    );
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 0);
+
+    let o = store.load("bead-quota-arm").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::Dispatched,
+        "quota-armed bead must stay DISPATCHED — no kill+requeue cycle"
+    );
+    assert_eq!(
+        o.session_id,
+        Some("wa-quota-paused".into()),
+        "the paused session handle must be preserved for the watchdog to wake later"
+    );
+    assert_eq!(
+        o.spawn_failure_count, 0,
+        "arming the watchdog must not burn the transient-retry budget"
+    );
+    assert!(
+        !sessions
+            .calls
+            .borrow()
+            .iter()
+            .any(|c| c.starts_with("stop(")),
+        "quota-armed session must NOT be stopped; calls={:?}",
+        sessions.calls.borrow()
+    );
+    assert!(
+        daemon::health::quota_watchdog::recorded_reset_at("bead-quota-arm").is_some(),
+        "quota watchdog ledger must record the reset time for bead-quota-arm"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("QUOTA_WATCHDOG_ARMED"),
+        "QUOTA_WATCHDOG_ARMED event must be emitted; telemetry:\n{telemetry}"
+    );
+
+    daemon::health::quota_watchdog::clear("bead-quota-arm");
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Bead rev-4ou1z ACCEPTANCE #2: once a session's recorded reset time (plus
+/// the 60s wake grace) has passed, the slow-tier quota watchdog sweep sends
+/// an Enter keypress to the SAME paused pane via `Sessions::wake_pane` — no
+/// respawn — and the ledger entry is cleared so it fires exactly once.
+#[test]
+fn quota_watchdog_wakes_paused_pane_after_reset_grace_elapses() {
+    let bead_id = "bead-quota-wake";
+    let session_id = "wa-quota-wake-paused";
+    daemon::health::quota_watchdog::clear(bead_id);
+    // Reset "long past" — real wall-clock `now_epoch` used by the wake
+    // sweep is always far greater than epoch second 1, so the 60s grace
+    // has unconditionally elapsed by the time `run_tick` runs.
+    daemon::health::quota_watchdog::record_quota_reset(bead_id, session_id, 1);
+
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_test_quota_watchdog_wake.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    store.overlays.borrow_mut().insert(
+        bead_id.into(),
+        BeadOverlay {
+            bead_id: bead_id.into(),
+            state: OverlayState::Dispatched,
+            attempt: 2,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/bead-quota-wake-r1".into()),
+            session_id: Some(session_id.into()),
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+    store
+        .register_branch(bead_id, "factory/bead-quota-wake-r1")
+        .unwrap();
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+    assert_eq!(
+        summary.quota_watchdog_wakes, 1,
+        "exactly one due wake must fire this tick"
+    );
+    assert!(
+        sessions
+            .calls
+            .borrow()
+            .iter()
+            .any(|c| c == &format!("wake_pane({session_id})")),
+        "wake_pane must be called for the armed session; calls={:?}",
+        sessions.calls.borrow()
+    );
+    assert_eq!(
+        daemon::health::quota_watchdog::recorded_reset_at(bead_id),
+        None,
+        "ledger entry must be cleared after waking so it fires exactly once"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("QUOTA_WATCHDOG_WOKE_PANE"),
+        "QUOTA_WATCHDOG_WOKE_PANE event must be emitted; telemetry:\n{telemetry}"
+    );
+
+    daemon::health::quota_watchdog::clear(bead_id);
     let _ = std::fs::remove_file(&telemetry_log);
 }

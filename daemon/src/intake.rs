@@ -832,6 +832,7 @@ pub fn normalize_labeled_prs_outcome(
 fn emit_intake_repo_sweep_failed(telemetry_log: &Path, repo: &str, error_class: &str, error: &str) {
     let event = TelemetryEvent {
         timestamp: now_iso8601(),
+        host: telemetry::local_hostname(),
         bead_id: repo.to_string(),
         attempt_id: 1,
         lifecycle_state: "INTAKE".to_string(),
@@ -861,6 +862,7 @@ fn emit_intake_repo_sweep_failed(telemetry_log: &Path, repo: &str, error_class: 
 fn emit_intake_sweep_truncated(telemetry_log: &Path, configured_repo_count: usize, cap: usize) {
     let event = TelemetryEvent {
         timestamp: now_iso8601(),
+        host: telemetry::local_hostname(),
         bead_id: "intake_sweep".to_string(),
         attempt_id: 1,
         lifecycle_state: "INTAKE".to_string(),
