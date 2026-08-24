@@ -2,6 +2,7 @@
 
 ## Recent activity (by day)
 
+- [2026-08-24](activity/2026-08-24.md) — PR #714 merged; 100% AO prompt indirection verified; runner pool outage (0 online) & 4 follow-up beads triaged (jleechan-azso/57ym/gagl/xn4n)
 - [2026-08-22](activity/2026-08-22.md) — PR #665 + #666 merged via --admin (dark-factory runner outage); PR #655 /web-advice verdict follow-up complete (chatgpt INCOMPLETE-AGAIN, 5 grok findings triaged, fail-open /web-advice integration built + verified); 3 follow-up beads filed (jleechan-azso/57ym/gagl)
 - [2026-08-21](activity/2026-08-21.md) — 100% AO standardization & prompt indirection specification; multi-model advice verification panel (jleechan-s779)
 - [2026-08-20](activity/2026-08-20.md) — /af factory audit + Claude pipeline missing-fallbacks root cause (3 login-expired + 1 quota-wedged sessions; 2 child beads filed for coder fallback chain + session-health probe)
