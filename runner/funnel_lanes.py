@@ -126,53 +126,77 @@ class LaneReport:
     lanes: list  # list[LaneStat]
 
 
-def classify_origin(events: list[dict]) -> dict[tuple, str]:
-    """First INTAKE_BEAD_CREATED / EXISTING_PR_ADOPTED event per
-    (bead_id, attempt_id) determines that lifecycle's lane. Events are
-    assumed roughly time-ordered as read from the log (daemon.jsonl is
-    append-only); the first classifying event wins."""
-    origin: dict[tuple, str] = {}
+def classify_origin(events: list[dict]) -> dict[str, str]:
+    """First INTAKE_BEAD_CREATED / EXISTING_PR_ADOPTED event per **bead_id**
+    (NOT per (bead_id, attempt_id)) determines that bead's lane. Origin is a
+    property of the bead itself, not of an individual reroll attempt.
+
+    BUG FIXED 2026-08-24 (found live, before this was true the numbers were
+    silently wrong): keying by (bead_id, attempt_id) here caused every
+    lifecycle whose origin event fired on one attempt but whose downstream
+    stage events (GATE_ASSESSMENT, READY_FOR_MERGE, ...) fired on a LATER
+    reroll attempt to be silently excluded from every lane — the join key
+    never matched. Confirmed on real data: bead ``dark-factory-4sey`` had
+    ``EXISTING_PR_ADOPTED`` only at attempts 1-2, but its ``READY_FOR_MERGE``
+    fired at attempt 3; bead ``jleechan-l3r6`` had ``INTAKE_BEAD_CREATED``
+    only at attempt 1, but ``READY_FOR_MERGE`` fired at attempts 2 AND 4.
+    Both were invisibly dropped from the 2026-08-24 initial 30d report,
+    which claimed 0 READY_FOR_MERGE across all lanes when the correct
+    number (keying by bead_id) is non-zero. Events are assumed roughly
+    time-ordered as read from the log (daemon.jsonl is append-only); the
+    first classifying event wins."""
+    origin: dict[str, str] = {}
     for evt in events:
-        key = (evt["bead_id"], evt["attempt_id"])
-        if key in origin:
+        bead_id = evt["bead_id"]
+        if bead_id in origin:
             continue
         et = evt["event_type"]
         ctx = evt["context"]
         if et == "INTAKE_BEAD_CREATED":
-            origin[key] = "gh_issue_start" if ctx.get("external_ref") else "bead_start"
+            origin[bead_id] = "gh_issue_start" if ctx.get("external_ref") else "bead_start"
         elif et == "EXISTING_PR_ADOPTED" and ctx.get("newly_created"):
-            origin[key] = "pr_adopted_start"
+            origin[bead_id] = "pr_adopted_start"
     return origin
 
 
 def compute_lane_report(events: list[dict], since_label: str = "") -> LaneReport:
-    origin = classify_origin(events)
+    """Reports are aggregated at the **bead level** — across ALL reroll
+    attempts of a bead, not per-(bead_id, attempt_id) lifecycle. A bead's
+    lane origin is fixed once (first classifying event); "furthest
+    milestone reached" is the max stage that bead EVER reached on any
+    attempt; "terminal divert" reflects the bead's LATEST (highest
+    attempt_id) attempt only, so a bead that parked on attempt 2 but was
+    successfully rerolled and reached READY_FOR_MERGE on attempt 3 is NOT
+    misreported as still-parked."""
+    origin = classify_origin(events)  # bead_id -> lane
 
-    # Collect main/side stage events per lifecycle (mirrors funnel_report's
-    # grouping, but scoped to lifecycles we could classify).
-    stage_events: dict[tuple, list[str]] = {}
+    bead_events: dict[str, list[tuple[int, str]]] = {}
     for evt in events:
         et = evt["event_type"]
         if et not in _MAIN_SET and et not in _SIDE_SET:
             continue
-        key = (evt["bead_id"], evt["attempt_id"])
-        if key not in origin:
+        bead_id = evt["bead_id"]
+        if bead_id not in origin:
             continue
-        stage_events.setdefault(key, []).append(et)
+        bead_events.setdefault(bead_id, []).append((evt["attempt_id"], et))
 
     lane_stats: dict[str, LaneStat] = {lane: LaneStat(lane=lane, total=0) for lane in LANES}
 
-    for key, lane in origin.items():
+    for bead_id, lane in origin.items():
         stat = lane_stats[lane]
         stat.total += 1
-        ets = stage_events.get(key, [])
+        evs = bead_events.get(bead_id, [])
 
-        main_hit = [et for et in ets if et in _MAIN_SET]
+        main_hit = [et for (_a, et) in evs if et in _MAIN_SET]
         furthest = max(main_hit, key=lambda x: _STAGE_RANK[x]) if main_hit else "INTAKE_ONLY"
         stat.furthest[furthest] = stat.furthest.get(furthest, 0) + 1
 
-        side_hit = [et for et in ets if et in _SIDE_SET]
-        terminal = side_hit[-1] if side_hit else "none"
+        if evs:
+            latest_attempt = max(a for a, _et in evs)
+            latest_side = [et for (a, et) in evs if a == latest_attempt and et in _SIDE_SET]
+            terminal = latest_side[-1] if latest_side else "none"
+        else:
+            terminal = "none"
         stat.terminal[terminal] = stat.terminal.get(terminal, 0) + 1
 
     return LaneReport(since_label=since_label, lanes=[lane_stats[lane] for lane in LANES])

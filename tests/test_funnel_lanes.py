@@ -114,18 +114,79 @@ def _write_recent_fixture(tmp_path):
 
 def test_classify_origin_three_lanes():
     # Load directly from in-memory rows via the normalize path (no file I/O needed).
+    # NOTE: classify_origin is keyed by bead_id ONLY (not (bead_id, attempt_id)) —
+    # see the 2026-08-24 bug fix documented in the function's docstring.
     import runner.funnel_lanes as fl
 
     normalized = [fl._normalize_full(r) for r in FIXTURE_ROWS]
     normalized = [e for e in normalized if e is not None]
     origin = classify_origin(normalized)
 
-    assert origin[("rev-bead-stop", 1)] == "bead_start"
-    assert origin[("rev-bead-go", 1)] == "bead_start"
-    assert origin[("rev-issue-stop", 1)] == "gh_issue_start"
-    assert origin[("rev-issue-go", 1)] == "gh_issue_start"
-    assert origin[("rev-pr-adopt", 1)] == "pr_adopted_start"
-    assert ("rev-unclassified", 1) not in origin
+    assert origin["rev-bead-stop"] == "bead_start"
+    assert origin["rev-bead-go"] == "bead_start"
+    assert origin["rev-issue-stop"] == "gh_issue_start"
+    assert origin["rev-issue-go"] == "gh_issue_start"
+    assert origin["rev-pr-adopt"] == "pr_adopted_start"
+    assert "rev-unclassified" not in origin
+
+
+# ---------------------------------------------------------------------------
+# Regression: origin event on one attempt, downstream stage events on a
+# LATER reroll attempt (bug found live 2026-08-24 against real daemon.jsonl
+# — bead dark-factory-4sey / jleechan-l3r6 pattern). Confirms the bead-level
+# (not per-attempt) join actually connects them.
+# ---------------------------------------------------------------------------
+
+
+def test_cross_attempt_origin_join_regression(tmp_path):
+    """A bead's origin-classifying event fires on attempt 1 (or attempt 2),
+    but its READY_FOR_MERGE fires on a LATER reroll attempt (3, or 4) after
+    the earlier attempt(s) parked. The lane report must still attribute the
+    bead to its lane and count READY_FOR_MERGE as its furthest stage — not
+    silently drop it because the (bead_id, attempt_id) join key never
+    matched the origin event's attempt_id."""
+    rows = [
+        # PR-adopted bead: EXISTING_PR_ADOPTED only at attempts 1-2 (parked
+        # both times), READY_FOR_MERGE fires on attempt 3.
+        _row(
+            "rev-cross-pr", 1, "EXISTING_PR_ADOPTED", 0,
+            context={"newly_created": True, "pr_number": 100},
+        ),
+        _row("rev-cross-pr", 1, "GATE_ASSESSMENT", 10),
+        _row("rev-cross-pr", 1, "PARKED_HUMAN_HELD", 20),
+        _row(
+            "rev-cross-pr", 2, "EXISTING_PR_ADOPTED", 30,
+            context={"newly_created": False, "pr_number": 100},
+        ),
+        _row("rev-cross-pr", 2, "GATE_ASSESSMENT", 40),
+        _row("rev-cross-pr", 2, "PARKED_HUMAN_HELD", 50),
+        _row("rev-cross-pr", 3, "GATE_ASSESSMENT", 60),
+        _row("rev-cross-pr", 3, "READY_FOR_MERGE", 70),
+        # Hand-created bead: INTAKE_BEAD_CREATED only at attempt 1, dispatched
+        # + parked, then rerolled to attempt 2 which reaches READY_FOR_MERGE.
+        _row("rev-cross-bead", 1, "INTAKE_BEAD_CREATED", 0, context={}),
+        _row("rev-cross-bead", 1, "TASK_DISPATCHED", 5),
+        _row("rev-cross-bead", 1, "PARKED_HUMAN_HELD", 15),
+        _row("rev-cross-bead", 2, "TASK_DISPATCHED", 25),
+        _row("rev-cross-bead", 2, "PR_OPENED", 35),
+        _row("rev-cross-bead", 2, "GATE_ASSESSMENT", 45),
+        _row("rev-cross-bead", 2, "READY_FOR_MERGE", 55),
+    ]
+    path = _write_fixture(tmp_path, rows=rows)
+    events = load_events_full(path, since=None, now=T0 + timedelta(days=1))
+    report = compute_lane_report(events, since_label="test")
+    by_lane = {stat.lane: stat for stat in report.lanes}
+
+    pr_stat = by_lane["pr_adopted_start"]
+    assert pr_stat.total == 1
+    assert pr_stat.furthest.get("READY_FOR_MERGE") == 1
+    # Bead's LATEST attempt (3) reached READY, no terminal divert on that attempt.
+    assert pr_stat.terminal.get("none") == 1
+
+    bead_stat = by_lane["bead_start"]
+    assert bead_stat.total == 1
+    assert bead_stat.furthest.get("READY_FOR_MERGE") == 1
+    assert bead_stat.terminal.get("none") == 1
 
 
 # ---------------------------------------------------------------------------
