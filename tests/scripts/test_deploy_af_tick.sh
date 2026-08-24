@@ -33,28 +33,30 @@ SCRATCH_DIR="$(mktemp -d -t test-deploy-af-tick.XXXXXX)"
 cleanup() { rm -rf "$SCRATCH_DIR"; }
 trap cleanup EXIT
 
+SEED="$SCRATCH_DIR/seed"
+mkdir -p "$SEED"
+(
+    cd "$SEED"
+    git init -q
+    git config user.email test@test.com
+    git config user.name test
+    echo a > f.txt
+    git add f.txt
+    git commit -q -m init
+    git branch -M main
+)
 ORIGIN="$SCRATCH_DIR/origin.git"
-git init -q --bare "$ORIGIN"
-git -C "$ORIGIN" symbolic-ref HEAD refs/heads/main
+git clone -q --bare "$SEED" "$ORIGIN"
+git --git-dir="$ORIGIN" symbolic-ref HEAD refs/heads/main
+rm -rf "$SEED"
+
 WORK="$SCRATCH_DIR/work"
 git clone -q "$ORIGIN" "$WORK"
 (
     cd "$WORK"
     git config user.email test@test.com
     git config user.name test
-    git checkout -q -b main 2>/dev/null || true
-    echo a > f.txt
-    git add f.txt
-    git commit -q -m init
-    git push -q origin main
 )
-# The bare origin's HEAD symref is set at `git init --bare` time from the
-# host's init.defaultBranch (defaulting to "master" when unset). It is NOT
-# automatically repointed by a later push of a "main" branch, so any
-# subsequent `git clone` of $ORIGIN lands on a dangling/wrong-named unborn
-# branch instead of "main" -- explicitly repoint it so later clones (e.g.
-# $SECOND below) always land on main regardless of host git config.
-git --git-dir="$ORIGIN" symbolic-ref HEAD refs/heads/main
 DEPLOY_LOG="$SCRATCH_DIR/deploy.jsonl"
 
 # ---------------------------------------------------------------------------
