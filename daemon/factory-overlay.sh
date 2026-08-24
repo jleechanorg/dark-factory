@@ -36,8 +36,16 @@ export BR_DB="${BR_DB:-$ROOT/.beads/beads.db}"
 br() { command br --db "$BR_DB" "$@"; }
 DB="${AFD_DB:-$HOME/.dark-factory/daemon-cxdb.sqlite}"
 LOG="${AFD_LOG:-$HOME/Library/Logs/dark-factory/daemon.jsonl}"
-DAEMON_BIN="${AFD_DAEMON_BIN:-$ROOT/daemon/target/release/daemon}"
 BR_BIN="${AFD_BR_BIN:-${BR_BIN:-br}}"
+if [ -n "${AFD_DAEMON_BIN:-}" ]; then
+  DAEMON_BIN="$AFD_DAEMON_BIN"
+elif [ -x "$ROOT/daemon/target/release/daemon" ]; then
+  DAEMON_BIN="$ROOT/daemon/target/release/daemon"
+elif [ -x "$ROOT/daemon/target/debug/daemon" ]; then
+  DAEMON_BIN="$ROOT/daemon/target/debug/daemon"
+else
+  DAEMON_BIN="$ROOT/daemon/target/release/daemon"
+fi
 SCHEMA="$ROOT/daemon/contracts/schema.sql"
 CONFIG="${CONFIG:-$ROOT/config/daemon.toml}"
 [ -f "$CONFIG" ] || CONFIG="$ROOT/daemon/contracts/daemon.toml.example"
