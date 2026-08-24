@@ -130,22 +130,22 @@ def test_web_advice_failopen_e2e_log_section_5_triages_all_candidates() -> None:
     content = e2e_log.read_text(encoding="utf-8")
     assert "## 5. Operator actions" in content, "Must contain section 5"
     assert "### 5.2 Lane E/F Remediation Candidates" in content, "Must contain section 5.2 triage"
-    
+
     # Candidate A
     assert "Candidate A" in content or "**A**" in content
     assert "runner outage" in content.lower()
     assert "FIX" in content
-    
+
     # Candidate B
     assert "Candidate B" in content or "**B**" in content
     assert "anchor-comment" in content.lower() or "anchor comment" in content.lower()
     assert "docs/code-standards.md" in content
-    
+
     # Candidate C
     assert "Candidate C" in content or "**C**" in content
     assert "ACCEPT-AS-DEGRADED" in content
     assert "external_ref" in content
-    
+
     # Candidate D
     assert "Candidate D" in content or "**D**" in content
     assert "Evidence Gate workflow" in content or "commit message" in content
