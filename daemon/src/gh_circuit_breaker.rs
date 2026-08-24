@@ -205,6 +205,7 @@ fn emit_transition_telemetry(
     };
     let event = TelemetryEvent {
         timestamp: ts,
+        host: telemetry::local_hostname(),
         bead_id: "system".to_string(),
         attempt_id: 0,
         lifecycle_state: "SYSTEM".to_string(),
