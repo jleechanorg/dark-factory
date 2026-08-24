@@ -80,6 +80,19 @@ def _block_external_side_effects(monkeypatch):
 
     def guarded_run(cmd, *args, **kwargs):
         argv = [str(item) for item in cmd] if isinstance(cmd, (list, tuple)) else [str(cmd)]
+        if argv[:3] == ["git", "rev-parse", "HEAD"]:
+            return subprocess.CompletedProcess(cmd, 0, "f" * 40 + "\n", "")
+        if argv[:3] == ["gh", "pr", "view"]:
+            requested_url = next(
+                (item for item in argv[3:] if item.startswith("https://github.com/")),
+                "https://github.com/jleechanorg/dark-factory/pull/655",
+            )
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                json.dumps({"url": requested_url, "headRefOid": "f" * 40}),
+                "",
+            )
         if argv and pathlib.Path(argv[0]).name in {"gh", "br"}:
             raise AssertionError("external gh/br side effect requires an explicit test mock")
         return original_run(cmd, *args, **kwargs)
@@ -772,25 +785,65 @@ class TestWebAdviceStateSeeding:
         assert ctx.state["target_repo"] == "o/r"
         assert seen[0][1]["cwd"] == str(tmp_path)
 
-    def test_explicit_state_wins_without_gh_lookup(self, tmp_path, monkeypatch):
+    def test_explicit_state_still_binds_remote_identity(self, tmp_path, monkeypatch):
+        pr_url = "https://github.com/o/r/pull/7"
+        local_head = "a" * 40
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            if cmd[:3] == ["git", "rev-parse", "HEAD"]:
+                return subprocess.CompletedProcess(cmd, 0, local_head + "\n", "")
+            assert cmd[:3] == ["gh", "pr", "view"]
+            return subprocess.CompletedProcess(
+                cmd, 0, json.dumps({"url": pr_url, "headRefOid": local_head}), ""
+            )
+
         monkeypatch.setattr("runner.handler_web_advice._target_worktree", lambda ctx: tmp_path)
-        monkeypatch.setattr("runner.handler_web_advice.subprocess.run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("unexpected gh")))
+        monkeypatch.setattr("runner.handler_web_advice.subprocess.run", fake_run)
         ctx = Context(goal="seed", workdir=tmp_path, backend="echo")
-        ctx.state.update({"pr_url": "https://github.com/o/r/pull/7", "pr_head_sha": "abc"})
+        ctx.state.update({"pr_url": pr_url, "pr_head_sha": local_head})
         result = _seed_web_advice_state(ctx)
-        assert result["source"] == "explicit"
+        assert result["source"] == "gh"
         assert ctx.state["target_repo"] == "o/r"
+        assert [call[0][0] for call in calls] == ["git", "gh"]
 
     def test_head_sha_mismatch_is_distinct_failure(self, tmp_path, monkeypatch):
         monkeypatch.setattr("runner.handler_web_advice._target_worktree", lambda ctx: tmp_path)
-        monkeypatch.setattr(
-            "runner.handler_web_advice.subprocess.run",
-            lambda *a, **k: subprocess.CompletedProcess(a[0], 0, '{"url":"https://github.com/o/r/pull/7","headRefOid":"new"}', ""),
-        )
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:3] == ["git", "rev-parse", "HEAD"]:
+                return subprocess.CompletedProcess(cmd, 0, "a" * 40 + "\n", "")
+            return subprocess.CompletedProcess(
+                cmd, 0, json.dumps({"url": "https://github.com/o/r/pull/7", "headRefOid": "b" * 40}), ""
+            )
+
+        monkeypatch.setattr("runner.handler_web_advice.subprocess.run", fake_run)
         ctx = Context(goal="seed", workdir=tmp_path, backend="echo")
-        ctx.state["pr_head_sha"] = "old"
+        ctx.state["pr_url"] = "https://github.com/o/r/pull/7"
         result = _seed_web_advice_state(ctx)
         assert result["mode"] == "head_sha_mismatch"
+
+    def test_supplied_head_sha_mismatch_is_rejected(self, tmp_path, monkeypatch):
+        pr_url = "https://github.com/o/r/pull/7"
+        local_head = "a" * 40
+        monkeypatch.setattr("runner.handler_web_advice._target_worktree", lambda ctx: tmp_path)
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:3] == ["git", "rev-parse", "HEAD"]:
+                return subprocess.CompletedProcess(cmd, 0, local_head + "\n", "")
+            return subprocess.CompletedProcess(
+                cmd, 0, json.dumps({"url": pr_url, "headRefOid": local_head}), ""
+            )
+
+        monkeypatch.setattr("runner.handler_web_advice.subprocess.run", fake_run)
+        ctx = Context(goal="seed", workdir=tmp_path, backend="echo")
+        ctx.state.update({"pr_url": pr_url, "head_sha": "b" * 40, "pr_head_sha": local_head})
+
+        result = _seed_web_advice_state(ctx)
+
+        assert result["mode"] == "head_sha_mismatch"
+        assert "head_sha" in result["error"]
 
     def test_explicit_pr_without_head_binds_exact_url_and_local_head(self, tmp_path, monkeypatch):
         pr_url = "https://github.com/o/r/pull/7"
@@ -1029,7 +1082,8 @@ class TestSkipOnSmallDiff:
 class TestAllTransportsDown:
     def test_head_mismatch_returns_without_external_side_effects(self, tmp_path, monkeypatch):
         local_head = "a" * 40
-        remote_head = "b" * 40
+        remote_head = local_head
+        supplied_head = "b" * 40
         calls = []
 
         def fake_run(cmd, **kwargs):
@@ -1055,6 +1109,7 @@ class TestAllTransportsDown:
         ctx = Context(goal="web advice review", workdir=tmp_path, backend="echo")
         ctx.state.update({
             "pr_url": "https://github.com/jleechanorg/dark-factory/pull/655",
+            "pr_head_sha": supplied_head,
             "repo_dir": str(tmp_path),
         })
 

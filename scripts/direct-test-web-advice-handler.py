@@ -38,6 +38,7 @@ import os
 import pathlib
 import sqlite3
 import sys
+import subprocess
 import tempfile
 import time
 
@@ -165,6 +166,20 @@ print(f"    diff_path={ctx.state['diff_path']} (exists={pathlib.Path(ctx.state['
 # bead filing, or network request is allowed to escape the temporary root.
 from runner import handler_web_advice as web_advice_module  # noqa: E402
 
+def _hermetic_identity_run(cmd, *args, **kwargs):
+    argv = [str(item) for item in cmd]
+    if argv[:3] == ["git", "rev-parse", "HEAD"]:
+        return subprocess.CompletedProcess(cmd, 0, f"{TEST_HEAD_SHA}\n", "")
+    if argv[:3] == ["gh", "pr", "view"]:
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            json.dumps({"url": TEST_PR_URL, "headRefOid": TEST_HEAD_SHA}),
+            "",
+        )
+    raise AssertionError(f"unexpected subprocess in hermetic smoke: {argv!r}")
+
+web_advice_module.subprocess.run = _hermetic_identity_run
 web_advice_module._compute_diff_lines = lambda _repo_dir: 100
 web_advice_module._run_transport_probe = lambda *_args, **_kwargs: {
     "probes": {"aside_mcp": False, "aside_cli": False, "chrome_extension": False, "cdp_port": False},

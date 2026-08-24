@@ -136,6 +136,11 @@ def _seed_web_advice_state(ctx: "Context") -> dict:
         ctx.state["repo_dir"] = str(worktree)
     explicit_pr = bool(ctx.state.get("pr_url"))
     explicit_head = str(ctx.state.get("head_sha") or ctx.state.get("pr_head_sha") or "")
+    supplied_heads = {
+        field: str(ctx.state.get(field)).strip()
+        for field in ("head_sha", "pr_head_sha")
+        if ctx.state.get(field)
+    }
     # Validate explicit identity before any gh lookup.  A malformed PR URL or
     # repository mismatch is an input error, not an invitation to discover a
     # different PR from the checkout (which would create an unintended side
@@ -152,10 +157,6 @@ def _seed_web_advice_state(ctx: "Context") -> dict:
                 "mode": "target_repo_mismatch",
                 "error": f"target_repo {requested_repo!r} does not match PR repository {explicit_repo!r}",
             }
-    if explicit_pr and explicit_head:
-        if not ctx.state.get("target_repo"):
-            ctx.state["target_repo"] = _extract_pr_repo(str(ctx.state["pr_url"])) or ""
-        return {"ok": True, "source": "explicit"}
     explicit_repo = _extract_pr_repo(str(ctx.state.get("pr_url") or "")) if explicit_pr else None
     local_head = ""
     if explicit_pr:
@@ -213,6 +214,13 @@ def _seed_web_advice_state(ctx: "Context") -> dict:
                 "mode": "head_sha_mismatch",
                 "error": f"head SHA mismatch: local={local_head} gh={discovered_head}",
             }
+        for field, supplied_head in supplied_heads.items():
+            if supplied_head.lower() != discovered_head.lower():
+                return {
+                    "ok": False,
+                    "mode": "head_sha_mismatch",
+                    "error": f"head SHA mismatch: {field}={supplied_head} gh={discovered_head}",
+                }
         ctx.state["pr_head_sha"] = discovered_head
         if not ctx.state.get("target_repo"):
             ctx.state["target_repo"] = explicit_repo or ""
