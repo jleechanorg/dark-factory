@@ -35,17 +35,21 @@ Implementation boundaries:
 from __future__ import annotations
 
 import json
+import ipaddress
 import os
 import pathlib
+import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 from typing import TYPE_CHECKING, Any, Optional
 
-from .handler_core import Result
+from .handler_core import Result, _target_worktree
 from .handler_render import _render_prompt
 
 if TYPE_CHECKING:
@@ -83,6 +87,15 @@ _WEB_ADVICE_E2E_SMOKE = pathlib.Path(
 
 PANEL_SEATS = ("chatgpt", "gemini", "grok", "perplexity")
 
+_SHARE_PATH_PATTERNS = {
+    "g.co": re.compile(r"^/gemini/share/[A-Za-z0-9_-]+$"),
+    "share.gemini.google": re.compile(r"^/[A-Za-z0-9_-]+$"),
+    "gemini.google.com": re.compile(r"^/share/[A-Za-z0-9_-]+$"),
+    "grok.com": re.compile(r"^/share/[A-Za-z0-9_-]+$"),
+    "chatgpt.com": re.compile(r"^/share/[A-Za-z0-9_-]+$"),
+    "perplexity.ai": re.compile(r"^/search/[A-Za-z0-9_-]+$"),
+}
+
 
 # ---------------------------------------------------------------------------
 # Pure helpers
@@ -99,6 +112,73 @@ def _coerce_int(value: Any, default: int) -> int:
         return default
 
 
+def _seed_web_advice_state(ctx: "Context") -> dict:
+    """Fill missing PR identity from the target worktree without overriding state."""
+    worktree = _target_worktree(ctx)
+    if not ctx.state.get("repo_dir"):
+        ctx.state["repo_dir"] = str(worktree)
+    explicit_pr = bool(ctx.state.get("pr_url"))
+    explicit_head = str(ctx.state.get("head_sha") or ctx.state.get("pr_head_sha") or "")
+    if explicit_pr and explicit_head:
+        if not ctx.state.get("target_repo"):
+            ctx.state["target_repo"] = _extract_pr_repo(str(ctx.state["pr_url"])) or ""
+        return {"ok": True, "source": "explicit"}
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "view", "--json", "url,headRefOid"],
+            cwd=str(worktree), capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "error": f"gh pr view unavailable: {type(exc).__name__}: {exc}"[:500]}
+    if result.returncode != 0 or not result.stdout:
+        return {"ok": False, "error": (result.stderr or "gh pr view returned no PR")[:500]}
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        return {"ok": False, "error": f"invalid gh pr view JSON: {exc}"[:500]}
+    discovered_pr = payload.get("url")
+    discovered_head = payload.get("headRefOid")
+    if not explicit_pr and isinstance(discovered_pr, str) and _parse_pr_number(discovered_pr):
+        ctx.state["pr_url"] = discovered_pr
+    if not explicit_head and isinstance(discovered_head, str) and discovered_head:
+        ctx.state["pr_head_sha"] = discovered_head
+    pr_url = str(ctx.state.get("pr_url") or "")
+    if not ctx.state.get("target_repo"):
+        ctx.state["target_repo"] = _extract_pr_repo(pr_url) or ""
+    if explicit_head and isinstance(discovered_head, str) and discovered_head and explicit_head.lower() != discovered_head.lower():
+        return {
+            "ok": False,
+            "error": f"head SHA mismatch: state={explicit_head} gh={discovered_head}",
+            "mode": "head_sha_mismatch",
+        }
+    return {"ok": True, "source": "gh"}
+
+
+def _prepare_diff_path(repo_dir: pathlib.Path, pr_number: int) -> dict:
+    """Create an owner-only temporary committed diff attachment."""
+    try:
+        merge_base = subprocess.run(
+            ["git", "merge-base", "origin/main", "HEAD"],
+            cwd=str(repo_dir), capture_output=True, text=True, timeout=10, check=False,
+        )
+        base = (merge_base.stdout or "").strip()
+        if merge_base.returncode != 0 or not base or any(char not in "0123456789abcdefABCDEF" for char in base):
+            return {"ok": False, "error": "could not resolve committed PR merge-base"}
+        diff = subprocess.run(
+            ["git", "diff", "--binary", f"{base}..HEAD"],
+            cwd=str(repo_dir), capture_output=True, text=False, timeout=30, check=False,
+        )
+        if diff.returncode != 0:
+            return {"ok": False, "error": (diff.stderr or b"git diff failed").decode(errors="replace")[:500]}
+        fd, name = tempfile.mkstemp(prefix=f"pr_{pr_number}_", suffix="_full_diff.patch")
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(diff.stdout or b"")
+            handle.flush()
+            os.fsync(handle.fileno())
+        return {"ok": True, "path": pathlib.Path(name)}
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:500]}
 def _parse_pr_number(pr_url: str) -> Optional[int]:
     """Extract the PR number from a GitHub PR URL.
 
@@ -140,14 +220,14 @@ def _extract_pr_repo(pr_url: str) -> Optional[str]:
     """
     if not isinstance(pr_url, str) or not pr_url:
         return None
-    # Match ``https://github.com/<owner>/<repo>/pull/<n>``.
-    marker = "github.com/"
-    idx = pr_url.find(marker)
-    if idx == -1:
+    try:
+        parsed = urllib.parse.urlsplit(pr_url)
+    except ValueError:
         return None
-    tail = pr_url[idx + len(marker):]
-    parts = tail.split("/")
-    if len(parts) < 2:
+    if parsed.scheme.lower() != "https" or parsed.hostname.lower() != "github.com" or parsed.port is not None:
+        return None
+    parts = parsed.path.strip("/").split("/")
+    if len(parts) < 4 or parts[2] != "pull" or not parts[3].isdigit():
         return None
     owner, repo = parts[0], parts[1]
     if not owner or not repo:
@@ -155,6 +235,19 @@ def _extract_pr_repo(pr_url: str) -> Optional[str]:
     # Strip trailing ".git" if present (rare on PR URLs, but harmless).
     repo = repo[:-4] if repo.endswith(".git") else repo
     return f"{owner}/{repo}"
+
+
+def _target_repo_error(target_repo: str, pr_repo: Optional[str]) -> Optional[str]:
+    """Return a side-effect safety error for an unscoped target repository."""
+    if not target_repo:
+        return None
+    if any(ord(char) < 32 for char in target_repo) or not re.fullmatch(
+        r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", target_repo
+    ):
+        return "target_repo must be a single owner/repo value without control characters"
+    if not pr_repo or target_repo != pr_repo:
+        return f"target_repo {target_repo!r} does not match PR repository {pr_repo!r}"
+    return None
 
 
 def _compute_diff_lines(repo_dir: pathlib.Path, base_ref: str = "origin/main") -> Optional[int]:
@@ -495,14 +588,59 @@ def _parse_structured_panel_result(output: str) -> Optional[dict]:
         "panel_seats_attempted", "panel_seats_live", "panel_seats_unavailable",
         "panel_seats_unavailable_reasons", "panel_verdict_summary", "decision",
     }
-    for value in reversed(candidates):
-        if required.issubset(value):
-            return value
-    return None
+    qualifying = [value for value in candidates if required.issubset(value)]
+    if len(qualifying) != 1:
+        return None
+    return qualifying[0]
+
+
+def _validate_share_url(url: str) -> tuple[bool, str]:
+    """Validate a share URL before any network request is attempted."""
+    if not isinstance(url, str) or any(ord(char) < 32 for char in url):
+        return False, "URL is not a safe string"
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        hostname = parsed.hostname.lower() if parsed.hostname else ""
+        port = parsed.port
+    except ValueError:
+        return False, "URL has invalid credentials or port"
+    if parsed.scheme.lower() != "https":
+        return False, "share URL must use https"
+    if parsed.username is not None or parsed.password is not None:
+        return False, "share URL credentials are forbidden"
+    if port is not None:
+        return False, "custom share URL ports are forbidden"
+    pattern = _SHARE_PATH_PATTERNS.get(hostname)
+    if pattern is None or not pattern.fullmatch(parsed.path) or parsed.query or parsed.fragment:
+        return False, "share URL host or path is not an approved provider shape"
+    try:
+        addresses = socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        return False, f"share URL DNS resolution failed: {exc}"
+    if not addresses:
+        return False, "share URL DNS resolution returned no addresses"
+    for address in addresses:
+        try:
+            ip = ipaddress.ip_address(address[4][0])
+        except (IndexError, ValueError, TypeError):
+            return False, "share URL DNS returned an invalid address"
+        if (
+            ip.is_loopback
+            or ip.is_private
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_unspecified
+            or ip.is_multicast
+        ):
+            return False, f"share URL resolves to unsafe private/reserved address {ip}"
+    return True, ""
 
 
 def _probe_share_url(url: str, *, timeout: float = 10.0) -> dict:
     """Probe a public Share URL without credentials or cookie persistence."""
+    valid, validation_error = _validate_share_url(url)
+    if not valid:
+        return {"ok": False, "status": None, "final_url": "", "error": validation_error}
     # A fresh urllib request has no CookieJar/session attached. Use GET so a
     # provider's HTML auth/consent wall can be identified, while deliberately
     # ignoring benign anonymous tracking/presentation Set-Cookie headers.
@@ -523,6 +661,9 @@ def _probe_share_url(url: str, *, timeout: float = 10.0) -> dict:
     lowered_url = final_url.lower()
     if any(marker in lowered_url for marker in ("/login", "/signin", "/sign-in", "/auth/", "/account", "consent", "accounts.google.com")):
         return {"ok": False, "status": status, "final_url": final_url, "error": f"login redirect: {final_url}"}
+    final_valid, final_error = _validate_share_url(final_url)
+    if not final_valid:
+        return {"ok": False, "status": status, "final_url": final_url, "error": final_error}
     lowered_content = content.decode("utf-8", errors="ignore").lower()
     wall_markers = (
         "sign in to continue", "log in to continue", "authentication required",
@@ -541,11 +682,26 @@ def _persist_share_evidence(
     evidence_dir: pathlib.Path,
     seats: dict,
     *,
+    root_dir: pathlib.Path,
     pr_url: str = "",
     head_sha: str = "",
 ) -> pathlib.Path:
     """Atomically persist the per-seat public-share evidence JSON."""
+    root_dir = pathlib.Path(root_dir).resolve()
     evidence_dir = pathlib.Path(evidence_dir)
+    if evidence_dir.is_absolute():
+        raise ValueError("evidence_dir must be relative to the repository root")
+    if not evidence_dir.parts or any(part in ("", ".", "..") for part in evidence_dir.parts):
+        raise ValueError("evidence_dir must name a repository-relative directory")
+    candidate = (root_dir / evidence_dir).resolve(strict=False)
+    if candidate == root_dir or root_dir not in candidate.parents:
+        raise ValueError("evidence_dir escapes the repository root")
+    current = root_dir
+    for part in evidence_dir.parts:
+        current /= part
+        if current.is_symlink():
+            raise ValueError("evidence_dir contains a symlink")
+    evidence_dir = candidate
     evidence_dir.mkdir(parents=True, exist_ok=True)
     target = evidence_dir / "web-advice-share-urls.json"
     payload = {"schema_version": 1, "pr_url": pr_url, "head_sha": head_sha, **seats}
@@ -557,6 +713,11 @@ def _persist_share_evidence(
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_name, target)
+        dir_fd = os.open(evidence_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     except Exception:
         try:
             os.unlink(temp_name)
@@ -601,31 +762,52 @@ def _extract_share_urls(output: str) -> list[str]:
 
 def _normalise_panel_result(verdict_data: dict) -> dict:
     """Apply transport-safe shape normalization without semantic triage."""
-    attempted = [seat for seat in verdict_data.get("panel_seats_attempted", PANEL_SEATS) if seat in PANEL_SEATS]
-    live = [seat for seat in verdict_data.get("panel_seats_live", []) if seat in attempted]
-    unavailable = [seat for seat in verdict_data.get("panel_seats_unavailable", []) if seat in attempted and seat not in live]
-    unavailable.extend(seat for seat in attempted if seat not in live and seat not in unavailable)
+    raw_attempted = verdict_data.get("panel_seats_attempted")
+    raw_live = verdict_data.get("panel_seats_live")
+    raw_unavailable = verdict_data.get("panel_seats_unavailable")
+    raw_reasons = verdict_data.get("panel_seats_unavailable_reasons")
+    raw_summaries = verdict_data.get("panel_verdict_summary")
+    contract_error = ""
+    if not isinstance(raw_attempted, list) or len(raw_attempted) != len(PANEL_SEATS) or set(raw_attempted) != set(PANEL_SEATS):
+        contract_error = "panel_seats_attempted must contain each canonical seat exactly once"
+    elif not isinstance(raw_live, list) or not isinstance(raw_unavailable, list):
+        contract_error = "panel seat live/unavailable partitions must be lists"
+    elif len(set(raw_live)) != len(raw_live) or len(set(raw_unavailable)) != len(raw_unavailable):
+        contract_error = "panel seat live/unavailable partitions must be unique"
+    elif set(raw_live) | set(raw_unavailable) != set(PANEL_SEATS) or set(raw_live) & set(raw_unavailable):
+        contract_error = "panel seat live/unavailable partitions must be an exact disjoint partition"
+    elif not isinstance(raw_reasons, dict) or any(
+        not isinstance(raw_reasons.get(seat), str) or not raw_reasons[seat].strip()
+        for seat in raw_unavailable
+    ):
+        contract_error = "every unavailable panel seat requires a non-empty reason"
+    elif not isinstance(raw_summaries, dict) or any(seat not in set(raw_live) for seat in raw_summaries):
+        contract_error = "panel verdict summaries may only contain live seats"
+
+    attempted = [seat for seat in (raw_attempted or []) if seat in PANEL_SEATS]
+    live = [seat for seat in (raw_live or []) if seat in attempted]
+    unavailable = [seat for seat in (raw_unavailable or []) if seat in attempted and seat not in live]
     reasons = dict(verdict_data.get("panel_seats_unavailable_reasons") or {})
-    for seat in unavailable:
-        reasons.setdefault(seat, "unavailable reason not provided by structured panel result")
     summaries = dict(verdict_data.get("panel_verdict_summary") or {})
     probes: dict[str, dict] = {}
-    for seat, summary in summaries.items():
-        if not isinstance(summary, dict):
-            continue
-        url = summary.get("share_url")
-        if not url:
-            continue
-        probe = _probe_share_url(str(url))
-        probes[seat] = probe
-        summary["share_url_probe"] = probe
-        if not probe.get("ok"):
-            summary["share_url"] = None
+    if not contract_error:
+        for seat, summary in summaries.items():
+            if not isinstance(summary, dict):
+                contract_error = "panel verdict summaries must be objects"
+                break
+            url = summary.get("share_url")
+            if not url:
+                continue
+            probe = _probe_share_url(str(url))
+            probes[seat] = probe
+            summary["share_url_probe"] = probe
+            if not probe.get("ok"):
+                summary["share_url"] = None
 
     # Transitional flat URL support still probes every emitted URL, but does
     # not claim those URLs belong to all four seats.
     flat_urls = [str(url) for url in (verdict_data.get("share_urls") or []) if url]
-    flat_probes = [_probe_share_url(url) for url in flat_urls]
+    flat_probes = [_probe_share_url(url) for url in flat_urls] if not contract_error else []
     return {
         **verdict_data,
         "panel_seats_attempted": attempted,
@@ -633,6 +815,8 @@ def _normalise_panel_result(verdict_data: dict) -> dict:
         "panel_seats_unavailable": unavailable,
         "panel_seats_unavailable_reasons": reasons,
         "panel_verdict_summary": summaries,
+        "panel_contract_valid": not bool(contract_error),
+        "panel_contract_error": contract_error,
         "share_url_probes": probes,
         "flat_share_url_probes": flat_probes,
         "share_urls": [url for url, probe in zip(flat_urls, flat_probes) if probe.get("ok")],
@@ -643,6 +827,8 @@ def _file_followup_bead(*, target_repo: str, pr_number: int, decision: str, summ
     """File the model-requested follow-up bead with an unambiguous repo scope."""
     if not target_repo:
         return {"ok": False, "bead_id": None, "error": "missing target_repo"}
+    if _target_repo_error(target_repo, target_repo):
+        return {"ok": False, "bead_id": None, "error": "invalid target_repo"}
     title = f"PR #{pr_number} /web-advice panel follow-up"
     body = f"target_repo: {target_repo}\n\nDecision: {decision}\n\n{summary[:3000]}"
     try:
@@ -821,6 +1007,13 @@ def _web_advice(node: "Node", ctx: "Context") -> "Result":
                 "web_advice.verdict": metadata["verdict"],
             },
         )
+    finally:
+        temp_path = ctx.state.pop("_web_advice_temp_diff_path", None)
+        if temp_path:
+            try:
+                pathlib.Path(str(temp_path)).unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _web_advice_inner(node: "Node", ctx: "Context", metadata: dict, started_ts: float) -> "Result":
@@ -829,6 +1022,25 @@ def _web_advice_inner(node: "Node", ctx: "Context", metadata: dict, started_ts: 
     # ------------------------------------------------------------------
     # 1. Inputs
     # ------------------------------------------------------------------
+    seed = _seed_web_advice_state(ctx)
+    if seed.get("mode") == "head_sha_mismatch":
+        metadata.update({
+            "web_advice_outcome": "infrastructure_failure",
+            "infrastructure_failure_mode": "head_sha_mismatch",
+            "side_effect_error": seed.get("error", "head SHA mismatch"),
+            "decision": "continue",
+            "elapsed_seconds": round(time.time() - started_ts, 3),
+        })
+        _record_state(ctx, metadata)
+        return Result(
+            outcome="success",
+            output=f"web_advice head_sha_mismatch: {seed.get('error', '')}",
+            metadata={k: _coerce_meta(v) for k, v in metadata.items()},
+            context_updates={
+                "web_advice.outcome": "infrastructure_failure",
+                "web_advice.infrastructure_failure_mode": "head_sha_mismatch",
+            },
+        )
     pr_url = str(ctx.state.get("pr_url") or "")
     pr_head_sha = str(ctx.state.get("head_sha") or ctx.state.get("pr_head_sha") or "")
     repo_dir_str = str(ctx.state.get("repo_dir") or ctx.workdir or "")
@@ -861,6 +1073,9 @@ def _web_advice_inner(node: "Node", ctx: "Context", metadata: dict, started_ts: 
     pr_number = _parse_pr_number(pr_url)
     pr_repo = _extract_pr_repo(pr_url)
     target_repo = str(ctx.state.get("target_repo") or "")
+    target_repo_error = _target_repo_error(target_repo, pr_repo)
+    if target_repo_error:
+        metadata["target_repo_error"] = target_repo_error
     if pr_number is None:
         metadata.update({
             "web_advice_outcome": "unparseable_pr_url",
@@ -898,6 +1113,60 @@ def _web_advice_inner(node: "Node", ctx: "Context", metadata: dict, started_ts: 
             },
         )
 
+    target_repo_valid = bool(target_repo) and not target_repo_error
+
+    def _persist_evidence(seats: dict) -> Optional[pathlib.Path]:
+        requested = ctx.state.get("evidence_dir")
+        relative_dir = pathlib.Path(str(requested)) if requested else pathlib.Path("docs") / f"pr{pr_number}-evidence"
+        try:
+            return _persist_share_evidence(
+                relative_dir,
+                seats,
+                root_dir=repo_dir,
+                pr_url=pr_url,
+                head_sha=pr_head_sha,
+            )
+        except (OSError, ValueError) as exc:
+            metadata["evidence_side_effect_error"] = f"{type(exc).__name__}: {exc}"[:500]
+            return None
+
+    def _emit_infra(mode: str, summary: str, *, smoke: Optional[dict] = None) -> dict:
+        comment_result = _post_pr_comment(
+            pr_number,
+            _build_infra_disclosure_comment(summary, pr_url),
+            repo=pr_repo,
+        )
+        decision = "continue_with_bead" if target_repo_valid else "continue"
+        bead_result = (
+            _file_followup_bead(
+                target_repo=target_repo,
+                pr_number=pr_number,
+                decision=decision,
+                summary=summary,
+            )
+            if target_repo_valid
+            else {"ok": False, "bead_id": None, "error": target_repo_error or "missing target_repo"}
+        )
+        evidence_path = _persist_evidence({})
+        metadata.update({
+            "web_advice_outcome": "infrastructure_failure",
+            "infrastructure_failure_mode": mode,
+            "decision": decision,
+            "panel_decision": decision,
+            "bead_id": bead_result.get("bead_id"),
+            "bead_filed": bead_result.get("ok", False),
+            "share_urls_persisted_to": str(evidence_path) if evidence_path else None,
+            "pr_comment_posted": comment_result["ok"],
+            "pr_comment_rc": comment_result["returncode"],
+            "pr_comment_url": comment_result.get("url"),
+        })
+        if smoke is not None:
+            metadata.update({
+                "e2e_smoke_returncode": smoke.get("returncode"),
+                "e2e_smoke_stderr": smoke.get("stderr", ""),
+            })
+        return comment_result
+
     # ------------------------------------------------------------------
     # 3. Transport probe (≤10s)
     # ------------------------------------------------------------------
@@ -910,29 +1179,8 @@ def _web_advice_inner(node: "Node", ctx: "Context", metadata: dict, started_ts: 
     if not live_transport:
         # No transport → infra disclosure path. Still always succeed.
         elapsed = round(time.time() - started_ts, 3)
-        comment_body = _build_infra_disclosure_comment(probe["summary"], pr_url)
-        comment_result = _post_pr_comment(pr_number, comment_body, repo=pr_repo)
-        bead_result = _file_followup_bead(
-            target_repo=target_repo,
-            pr_number=pr_number,
-            decision="continue_with_bead",
-            summary=probe["summary"],
-        ) if target_repo else {"ok": False, "bead_id": None, "error": "missing target_repo"}
-        evidence_dir = pathlib.Path(str(ctx.state.get("evidence_dir") or repo_dir / f"docs/pr{pr_number}-evidence"))
-        evidence_path = _persist_share_evidence(evidence_dir, {}, pr_url=pr_url, head_sha=pr_head_sha)
-        metadata.update({
-            "web_advice_outcome": "infrastructure_failure",
-            "infrastructure_failure_mode": "all_transports_down",
-            "decision": "continue_with_bead" if target_repo else "continue",
-            "panel_decision": "continue_with_bead" if target_repo else "continue",
-            "bead_id": bead_result.get("bead_id"),
-            "bead_filed": bead_result.get("ok", False),
-            "share_urls_persisted_to": str(evidence_path),
-            "elapsed_seconds": elapsed,
-            "pr_comment_posted": comment_result["ok"],
-            "pr_comment_rc": comment_result["returncode"],
-            "pr_comment_url": comment_result.get("url"),
-        })
+        comment_result = _emit_infra("all_transports_down", probe["summary"])
+        metadata["elapsed_seconds"] = elapsed
         _record_state(ctx, metadata)
         return Result(
             outcome="success",
@@ -948,11 +1196,37 @@ def _web_advice_inner(node: "Node", ctx: "Context", metadata: dict, started_ts: 
             },
         )
 
+    if not ctx.state.get("diff_path"):
+        diff_attachment = _prepare_diff_path(repo_dir, pr_number)
+        if diff_attachment.get("ok"):
+            ctx.state["diff_path"] = str(diff_attachment["path"])
+            ctx.state["_web_advice_temp_diff_path"] = str(diff_attachment["path"])
+        else:
+            metadata["diff_side_effect_error"] = diff_attachment.get("error", "diff attachment unavailable")
+
     # ------------------------------------------------------------------
     # 4. e2e_smoke pre-flight (best-effort)
     # ------------------------------------------------------------------
     smoke = _run_e2e_smoke()
     metadata["e2e_smoke_ok"] = smoke["ok"]
+    if not smoke.get("ok") and not smoke.get("skipped"):
+        elapsed = round(time.time() - started_ts, 3)
+        summary = (
+            f"Authoritative e2e_smoke failed (returncode={smoke.get('returncode')}, "
+            f"stderr={smoke.get('stderr', '')!r})"
+        )
+        comment_result = _emit_infra("e2e_smoke_failed", summary, smoke=smoke)
+        metadata["elapsed_seconds"] = elapsed
+        _record_state(ctx, metadata)
+        return Result(
+            outcome="success",
+            output=f"web_advice e2e_smoke_failed: {summary}",
+            metadata={k: _coerce_meta(v) for k, v in metadata.items()},
+            context_updates={
+                "web_advice.outcome": "infrastructure_failure",
+                "web_advice.infrastructure_failure_mode": "e2e_smoke_failed",
+            },
+        )
 
     # ------------------------------------------------------------------
     # 5. Run the actual /web-advice subprocess
@@ -977,6 +1251,22 @@ def _web_advice_inner(node: "Node", ctx: "Context", metadata: dict, started_ts: 
         "share_url_probes": verdict_data.get("share_url_probes", {}),
     })
 
+    if verdict_data.get("ok") and not verdict_data.get("panel_contract_valid", False):
+        elapsed = round(time.time() - started_ts, 3)
+        error = verdict_data.get("panel_contract_error") or "invalid panel contract"
+        _emit_infra("panel_contract_invalid", f"Structured panel contract invalid: {error}")
+        metadata.update({"verdict": "unknown", "elapsed_seconds": elapsed})
+        _record_state(ctx, metadata)
+        return Result(
+            outcome="success",
+            output=f"web_advice panel_contract_invalid: {error}",
+            metadata={k: _coerce_meta(v) for k, v in metadata.items()},
+            context_updates={
+                "web_advice.outcome": "infrastructure_failure",
+                "web_advice.infrastructure_failure_mode": "panel_contract_invalid",
+            },
+        )
+
     # ------------------------------------------------------------------
     # 6. Post verdict PR comment
     # ------------------------------------------------------------------
@@ -995,21 +1285,17 @@ def _web_advice_inner(node: "Node", ctx: "Context", metadata: dict, started_ts: 
     else:
         metadata["web_advice_outcome"] = "verdict_captured"
 
-    evidence_dir = pathlib.Path(str(ctx.state.get("evidence_dir") or repo_dir / f"docs/pr{pr_number}-evidence"))
-    evidence_path = _persist_share_evidence(
-        evidence_dir,
+    evidence_path = _persist_evidence(
         metadata["panel_verdict_summary"],
-        pr_url=pr_url,
-        head_sha=pr_head_sha,
     )
-    metadata["share_urls_persisted_to"] = str(evidence_path)
+    metadata["share_urls_persisted_to"] = str(evidence_path) if evidence_path else None
     if metadata["decision"] == "continue_with_bead":
         bead_result = _file_followup_bead(
             target_repo=target_repo,
             pr_number=pr_number,
             decision=metadata["decision"],
             summary=json.dumps(metadata["panel_verdict_summary"], ensure_ascii=False),
-        ) if target_repo else {"ok": False, "bead_id": None, "error": "missing target_repo"}
+        ) if target_repo_valid else {"ok": False, "bead_id": None, "error": target_repo_error or "missing target_repo"}
         metadata["bead_id"] = bead_result.get("bead_id")
         metadata["bead_filed"] = bead_result.get("ok", False)
 

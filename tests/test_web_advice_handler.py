@@ -56,6 +56,8 @@ from runner.handler_web_advice import (  # noqa: E402
     _post_pr_comment,
     _probe_share_url,
     _persist_share_evidence,
+    _normalise_panel_result,
+    _prepare_diff_path,
     _probe_aside_cli,
     _probe_aside_mcp,
     _probe_cdp_port,
@@ -63,6 +65,7 @@ from runner.handler_web_advice import (  # noqa: E402
     _run_e2e_smoke,
     _run_transport_probe,
     _run_web_advice_subprocess,
+    _seed_web_advice_state,
     PANEL_SEATS,
     DEFAULT_MIN_DIFF_LINES,
     PROBE_TIMEOUT_SECONDS,
@@ -207,6 +210,21 @@ class TestCoerceMeta:
 
 
 class TestStructuredPanelContract:
+    def test_rejects_multiple_qualifying_panel_json_objects(self, monkeypatch):
+        payload = {
+            "decision": "continue",
+            "panel_seats_attempted": list(PANEL_SEATS),
+            "panel_seats_live": ["chatgpt"],
+            "panel_seats_unavailable": ["gemini", "grok", "perplexity"],
+            "panel_seats_unavailable_reasons": {"gemini": "down", "grok": "down", "perplexity": "down"},
+            "panel_verdict_summary": {"chatgpt": {"verdict": "approve"}},
+        }
+        fake = subprocess.CompletedProcess(args=[], returncode=0, stdout=json.dumps(payload) + "\n" + json.dumps(payload), stderr="")
+        monkeypatch.setattr("runner.handler_web_advice.subprocess.run", lambda *a, **k: fake)
+        result = _run_web_advice_subprocess("aside_mcp", "prompt")
+        assert result["ok"] is False
+        assert result["verdict"] == "unknown"
+
     def test_subprocess_parses_json_panel_result_without_keyword_triage(self, monkeypatch):
         payload = {
             "ok": True,
@@ -292,18 +310,112 @@ class TestShareUrlProbe:
         assert result["ok"] is True
         assert result["final_url"] == "https://share.gemini.google/abc123"
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://g.co/gemini/share/abc",
+            "file:///etc/passwd",
+            "https://127.0.0.1/gemini/share/abc",
+            "https://192.168.1.10/gemini/share/abc",
+            "https://169.254.169.254/gemini/share/abc",
+            "https://g.co:8443/gemini/share/abc",
+            "https://user:pass@g.co/gemini/share/abc",
+            "https://evil.example/share/abc",
+        ],
+    )
+    def test_rejects_unsafe_or_unapproved_urls_before_network(self, monkeypatch, url):
+        called = []
+        monkeypatch.setattr(
+            "runner.handler_web_advice.urllib.request.urlopen",
+            lambda *a, **k: called.append((a, k)),
+        )
+        result = _probe_share_url(url)
+        assert result["ok"] is False
+        assert called == []
+
+    def test_rejects_dns_resolution_to_private_address(self, monkeypatch):
+        monkeypatch.setattr(
+            "runner.handler_web_advice.socket.getaddrinfo",
+            lambda *a, **k: [(2, 1, 6, "", ("169.254.169.254", 443))],
+        )
+        result = _probe_share_url("https://g.co/gemini/share/abc")
+        assert result["ok"] is False
+        assert "private" in result["error"] or "unsafe" in result["error"]
+
+    def test_rejects_off_provider_final_redirect(self, monkeypatch):
+        class Response:
+            status = 200
+            def geturl(self): return "https://evil.example/share/abc"
+            def read(self, _limit=-1): return b"public"
+            def __enter__(self): return self
+            def __exit__(self, *args): return None
+        monkeypatch.setattr("runner.handler_web_advice.urllib.request.urlopen", lambda *a, **k: Response())
+        result = _probe_share_url("https://g.co/gemini/share/abc")
+        assert result["ok"] is False
+        assert "approved" in result["error"] or "host" in result["error"]
+
 
 class TestShareEvidencePersistence:
     def test_persists_atomically_with_seat_keys(self, tmp_path):
         path = _persist_share_evidence(
-            tmp_path,
+            pathlib.Path("evidence"),
             {"chatgpt": {"share_url": "https://chatgpt.com/share/a", "share_url_probe": {"ok": True}}},
             pr_url="https://github.com/o/r/pull/1", head_sha="abc",
+            root_dir=tmp_path,
         )
-        assert path == tmp_path / "web-advice-share-urls.json"
+        assert path == tmp_path / "evidence/web-advice-share-urls.json"
         data = json.loads(path.read_text())
         assert data["chatgpt"]["share_url"] == "https://chatgpt.com/share/a"
-        assert not list(tmp_path.glob("*.tmp"))
+        assert not list((tmp_path / "evidence").glob("*.tmp"))
+
+    @pytest.mark.parametrize("requested", [pathlib.Path("/tmp/evidence"), pathlib.Path("../escape")])
+    def test_rejects_absolute_or_traversal_evidence_dir(self, tmp_path, requested):
+        with pytest.raises(ValueError):
+            _persist_share_evidence(requested, {}, root_dir=tmp_path)
+
+    def test_rejects_symlink_escape_evidence_dir(self, tmp_path):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (tmp_path / "link").symlink_to(outside, target_is_directory=True)
+        with pytest.raises(ValueError):
+            _persist_share_evidence(pathlib.Path("link/sub"), {}, root_dir=tmp_path)
+
+
+class TestPanelResultContract:
+    def test_requires_exact_four_seat_partition_and_live_only_summaries(self):
+        result = _normalise_panel_result({
+            "panel_seats_attempted": list(PANEL_SEATS),
+            "panel_seats_live": ["chatgpt", "gemini"],
+            "panel_seats_unavailable": ["grok", "perplexity"],
+            "panel_seats_unavailable_reasons": {"grok": "down", "perplexity": "down"},
+            "panel_verdict_summary": {"chatgpt": {"verdict": "approve"}},
+        })
+        assert result["panel_contract_valid"] is True
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"panel_seats_attempted": ["chatgpt"]},
+            {
+                "panel_seats_attempted": list(PANEL_SEATS),
+                "panel_seats_live": ["chatgpt"],
+                "panel_seats_unavailable": ["gemini"],
+                "panel_seats_unavailable_reasons": {"gemini": "down"},
+                "panel_verdict_summary": {},
+            },
+            {
+                "panel_seats_attempted": list(PANEL_SEATS),
+                "panel_seats_live": ["chatgpt"],
+                "panel_seats_unavailable": ["gemini", "grok", "perplexity"],
+                "panel_seats_unavailable_reasons": {"gemini": "down", "grok": "down", "perplexity": "down"},
+                "panel_verdict_summary": {"gemini": {"verdict": "approve"}},
+            },
+        ],
+    )
+    def test_marks_invalid_panel_contract(self, payload):
+        result = _normalise_panel_result(payload)
+        assert result["panel_contract_valid"] is False
+        assert result["panel_contract_error"]
 
 
 def test_followup_bead_body_starts_with_target_repo(monkeypatch):
@@ -577,6 +689,74 @@ class TestComputeDiffLines:
         )
         assert _compute_diff_lines(pathlib.Path("/tmp/repo")) is None
 
+
+class TestWebAdviceStateSeeding:
+    def test_discovers_pr_identity_from_ao_worktree(self, tmp_path, monkeypatch):
+        seen = []
+        monkeypatch.setattr("runner.handler_web_advice._target_worktree", lambda ctx: tmp_path)
+        monkeypatch.setattr(
+            "runner.handler_web_advice.subprocess.run",
+            lambda cmd, **kwargs: seen.append((cmd, kwargs)) or subprocess.CompletedProcess(
+                cmd, 0, '{"url":"https://github.com/o/r/pull/7","headRefOid":"abc"}', ""
+            ),
+        )
+        ctx = Context(goal="seed", workdir=tmp_path, backend="echo")
+        result = _seed_web_advice_state(ctx)
+        assert result["ok"] is True
+        assert ctx.state["pr_url"].endswith("/pull/7")
+        assert ctx.state["pr_head_sha"] == "abc"
+        assert ctx.state["target_repo"] == "o/r"
+        assert seen[0][1]["cwd"] == str(tmp_path)
+
+    def test_explicit_state_wins_without_gh_lookup(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("runner.handler_web_advice._target_worktree", lambda ctx: tmp_path)
+        monkeypatch.setattr("runner.handler_web_advice.subprocess.run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("unexpected gh")))
+        ctx = Context(goal="seed", workdir=tmp_path, backend="echo")
+        ctx.state.update({"pr_url": "https://github.com/o/r/pull/7", "pr_head_sha": "abc"})
+        result = _seed_web_advice_state(ctx)
+        assert result["source"] == "explicit"
+        assert ctx.state["target_repo"] == "o/r"
+
+    def test_head_sha_mismatch_is_distinct_failure(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("runner.handler_web_advice._target_worktree", lambda ctx: tmp_path)
+        monkeypatch.setattr(
+            "runner.handler_web_advice.subprocess.run",
+            lambda *a, **k: subprocess.CompletedProcess(a[0], 0, '{"url":"https://github.com/o/r/pull/7","headRefOid":"new"}', ""),
+        )
+        ctx = Context(goal="seed", workdir=tmp_path, backend="echo")
+        ctx.state["pr_head_sha"] = "old"
+        result = _seed_web_advice_state(ctx)
+        assert result["mode"] == "head_sha_mismatch"
+
+
+class TestDiffAttachment:
+    def test_writes_committed_diff_with_owner_only_mode(self, tmp_path, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "runner.handler_web_advice.subprocess.run",
+            lambda cmd, **kwargs: calls.append(cmd) or (
+                subprocess.CompletedProcess(cmd, 0, "a" * 40, "")
+                if cmd[1] == "merge-base"
+                else subprocess.CompletedProcess(cmd, 0, b"diff --git a/a b/a\n", b"")
+            ),
+        )
+        result = _prepare_diff_path(tmp_path, 7)
+        assert result["ok"] is True
+        path = result["path"]
+        assert path.read_bytes().startswith(b"diff --git")
+        assert path.stat().st_mode & 0o777 == 0o600
+        path.unlink()
+        assert calls[0][1] == "merge-base"
+        assert calls[1][1] == "diff"
+
+    def test_reports_patch_generation_failure_without_file(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "runner.handler_web_advice.subprocess.run",
+            lambda *a, **k: subprocess.CompletedProcess(a[0], 1, "", "no merge base"),
+        )
+        result = _prepare_diff_path(tmp_path, 7)
+        assert result["ok"] is False
+
     def test_returns_none_on_timeout(self, monkeypatch):
         def _fake_run(*a, **k):
             raise subprocess.TimeoutExpired(cmd="git", timeout=5)
@@ -806,7 +986,7 @@ class TestAllTransportsDown:
         # Metadata is JSON-encoded by _coerce_meta for complex values.
         assert result.metadata["web_advice_outcome"] == "infrastructure_failure"
         assert result.metadata["infrastructure_failure_mode"] == "all_transports_down"
-        assert result.metadata["decision"] == "continue"
+        assert result.metadata["decision"] == "continue_with_bead"
         # transport_probes dict is JSON-encoded.
         probe_meta = result.metadata["transport_probes"]
         if isinstance(probe_meta, str):
@@ -816,6 +996,75 @@ class TestAllTransportsDown:
 
 
 class TestSuccessfulRun:
+    def test_failed_authoritative_smoke_short_circuits_subprocess(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("runner.handler_web_advice._probe_aside_mcp", lambda c: True)
+        monkeypatch.setattr("runner.handler_web_advice._compute_diff_lines", lambda repo_dir: 100)
+        monkeypatch.setattr(
+            "runner.handler_web_advice._run_e2e_smoke",
+            lambda *a, **k: {"ok": False, "skipped": False, "returncode": 7, "stderr": "smoke failed"},
+        )
+        subprocess_calls = []
+        monkeypatch.setattr(
+            "runner.handler_web_advice._run_web_advice_subprocess",
+            lambda **kw: subprocess_calls.append(kw),
+        )
+        comment_calls = []
+        monkeypatch.setattr(
+            "runner.handler_web_advice._post_pr_comment",
+            lambda *a, **kw: comment_calls.append((a, kw)) or {"ok": True, "returncode": 0, "stderr": ""},
+        )
+        bead_calls = []
+        monkeypatch.setattr(
+            "runner.handler_web_advice._file_followup_bead",
+            lambda **kw: bead_calls.append(kw) or {"ok": True, "bead_id": "jleechan-smoke"},
+        )
+        ctx = _make_ctx(tmp_path, target_repo="jleechanorg/dark-factory")
+        result = _web_advice(Node(name="web_advice", attrs={"type": "web_advice"}), ctx)
+        assert result.outcome == "success"
+        assert result.metadata["web_advice_outcome"] == "infrastructure_failure"
+        assert result.metadata["infrastructure_failure_mode"] == "e2e_smoke_failed"
+        assert result.metadata["e2e_smoke_stderr"] == "smoke failed"
+        assert subprocess_calls == []
+        assert comment_calls and "smoke failed" in comment_calls[0][0][1]
+        assert bead_calls and bead_calls[0]["target_repo"] == "jleechanorg/dark-factory"
+
+    def test_invalid_panel_contract_is_infrastructure_failure(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("runner.handler_web_advice._probe_aside_mcp", lambda c: True)
+        monkeypatch.setattr("runner.handler_web_advice._compute_diff_lines", lambda repo_dir: 100)
+        monkeypatch.setattr("runner.handler_web_advice._run_e2e_smoke", lambda *a, **k: {"ok": True, "skipped": True})
+        monkeypatch.setattr("runner.handler_web_advice._post_pr_comment", lambda *a, **k: {"ok": True, "returncode": 0, "stderr": ""})
+        monkeypatch.setattr(
+            "runner.handler_web_advice._run_web_advice_subprocess",
+            lambda **kw: {
+                "ok": True,
+                "verdict": "approve",
+                "decision": "continue",
+                "panel_seats_attempted": ["chatgpt"],
+                "panel_seats_live": ["chatgpt"],
+                "panel_seats_unavailable": [],
+                "panel_seats_unavailable_reasons": {},
+                "panel_verdict_summary": {"chatgpt": {"verdict": "approve"}},
+                "returncode": 0,
+            },
+        )
+        result = _web_advice(Node(name="web_advice", attrs={"type": "web_advice"}), _make_ctx(tmp_path))
+        assert result.outcome == "success"
+        assert result.metadata["web_advice_outcome"] == "infrastructure_failure"
+        assert result.metadata["infrastructure_failure_mode"] == "panel_contract_invalid"
+        assert result.metadata["verdict"] == "unknown"
+
+    def test_target_repo_mismatch_records_error_and_does_not_file_bead(self, tmp_path, monkeypatch):
+        _stub_all_transports_down(monkeypatch)
+        monkeypatch.setattr("runner.handler_web_advice._compute_diff_lines", lambda repo_dir: 100)
+        bead_calls = []
+        monkeypatch.setattr("runner.handler_web_advice._file_followup_bead", lambda **kw: bead_calls.append(kw))
+        ctx = _make_ctx(tmp_path, target_repo="other-owner/other-repo")
+        result = _web_advice(Node(name="web_advice", attrs={"type": "web_advice"}), ctx)
+        assert result.outcome == "success"
+        assert result.metadata["target_repo_error"]
+        assert result.metadata["bead_filed"] is False
+        assert bead_calls == []
+
     def test_structured_panel_preserves_seats_probes_evidence_and_bead(self, tmp_path, monkeypatch):
         monkeypatch.setattr("runner.handler_web_advice._probe_aside_mcp", lambda c: True)
         monkeypatch.setattr("runner.handler_web_advice._compute_diff_lines", lambda repo_dir: 100)
@@ -835,7 +1084,7 @@ class TestSuccessfulRun:
                 "grok": {"verdict": "NOT MERGE", "share_url": "https://grok.com/share/c"},
             }, "returncode": 0, "transport": "aside_mcp",
         })
-        ctx = _make_ctx(tmp_path, feature="web-advice-failopen-test-pr", target_repo="jleechanorg/dark-factory", evidence_dir=str(tmp_path / "evidence"))
+        ctx = _make_ctx(tmp_path, feature="web-advice-failopen-test-pr", target_repo="jleechanorg/dark-factory", evidence_dir="evidence")
         node = Node(name="web_advice", attrs={"type": "web_advice", "prompt": "@prompts/web_advice.txt", "min_diff_lines": "5"})
         result = _web_advice(node, ctx)
         assert result.outcome == "success"
@@ -870,6 +1119,13 @@ class TestSuccessfulRun:
             "verdict": "approve",
             "summary": "Diff looks clean. VERDICT: APPROVE",
             "share_urls": ["https://g.co/gemini/share/abc123"],
+            "panel_seats_attempted": list(PANEL_SEATS),
+            "panel_seats_live": ["gemini"],
+            "panel_seats_unavailable": ["chatgpt", "grok", "perplexity"],
+            "panel_seats_unavailable_reasons": {
+                "chatgpt": "not returned", "grok": "not returned", "perplexity": "not returned",
+            },
+            "panel_verdict_summary": {"gemini": {"verdict": "approve", "share_url": "https://g.co/gemini/share/abc123"}},
             "returncode": 0,
             "stderr": "",
             "transport": "aside_mcp",
