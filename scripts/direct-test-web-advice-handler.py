@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Direct invocation test for the /web-advice fail-open handler.
+"""Hermetic direct invocation test for the /web-advice fail-open handler.
 
 The full `dark-factory` pipeline (`pipelines/factory/web-advice-failopen.dot`)
 starts at the `holdout_eval` node, which is a sealed behavioral validator
@@ -21,10 +21,11 @@ end-to-end:
      reference to non-existent `append_step`).
   5. Node is constructed with `attrs["type"]="web_advice"` (fixing
      earlier `Node.__init__` `type=` kwarg error).
-  6. PR comment is posted via `gh api -X POST .../comments` (REST).
+  6. PR comment and follow-up bead integrations are mocked; all artifacts stay
+     below a temporary directory and no network or live PR is touched.
 
-Run from DARK_FACTORY_HOME = this worktree so Lane B/C artifacts resolve
-correctly.
+This is intentionally safe to run from any checkout. It uses a synthetic PR
+identity and patches all external integrations before invoking the handler.
 
 Refs:
   - docs/web-advice-failopen-design.md §3 (handler contract), §4 (pipeline),
@@ -36,22 +37,21 @@ import json
 import os
 import pathlib
 import sqlite3
-import subprocess
 import sys
+import tempfile
 import time
+
+# Keep the executable smoke from creating bytecode in the checkout.
+sys.dont_write_bytecode = True
 
 # Make `runner` importable when this script is run from anywhere.
 HERE = pathlib.Path(__file__).resolve().parent
-LANE_D_REPO = HERE.parent  # /home/jleechan/projects/worktree_factory_clean_code
+LANE_D_REPO = HERE.parent
 if str(LANE_D_REPO) not in sys.path:
     sys.path.insert(0, str(LANE_D_REPO))
 
-# Ensure env so DARK_FACTORY_HOLDOUTS is in scope if anywhere reads it.
+# Ensure imports and runner-relative assets resolve from this checkout.
 os.environ.setdefault("DARK_FACTORY_HOME", str(LANE_D_REPO))
-os.environ.setdefault(
-    "DARK_FACTORY_HOLDOUTS",
-    str(pathlib.Path.home() / "projects" / "dark-factory-holdouts"),
-)
 _home_bin = pathlib.Path.home() / ".local" / "bin"
 os.environ["PATH"] = f"{_home_bin}:{os.environ.get('PATH', '')}"
 
@@ -66,18 +66,18 @@ from runner.parser import Node  # noqa: E402
 # Test parameters
 # ---------------------------------------------------------------------------
 
-TEST_PR_NUMBER = 664
-TEST_PR_URL = "https://github.com/jleechanorg/dark-factory/pull/664"
-TEST_HEAD_SHA = "f3caec5ca33b10d5b759266487f479d187188159"
-TEST_DIFF_PATH = "/tmp/pr_664_full.patch"
+TEST_PR_NUMBER = 1
+TEST_PR_URL = "https://github.com/example/repo/pull/1"
+TEST_HEAD_SHA = "0" * 40
 TEST_FEATURE = "web-advice-failopen-test-pr"
-TEST_TARGET_REPO = "jleechanorg/dark-factory"
+TEST_TARGET_REPO = "example/repo"
 
-CXDB_PATH = "/tmp/web-advice-failopen-direct-test-cxdb.sqlite"
+TEMP_ROOT = pathlib.Path(tempfile.mkdtemp(prefix="web-advice-direct-test-"))
+CXDB_PATH = str(TEMP_ROOT / "web-advice-failopen-direct-test-cxdb.sqlite")
 RUN_ID = f"direct-web-advice-{int(time.time())}"
 
 # Path mirroring the design doc §6.2 durable binding artifact.
-EVIDENCE_DIR = pathlib.Path("/tmp") / "web-advice-direct-test-evidence"
+EVIDENCE_DIR = TEMP_ROOT / "web-advice-direct-test-evidence"
 EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -91,9 +91,10 @@ def build_context_and_node() -> tuple[Context, Node]:
     if pathlib.Path(CXDB_PATH).exists():
         pathlib.Path(CXDB_PATH).unlink()
 
-    workdir = pathlib.Path("/home/jleechan/.worktrees/dark-factory/test-web-advice-failopen")
+    workdir = TEMP_ROOT / "repo"
+    workdir.mkdir(parents=True, exist_ok=True)
     ctx = Context(
-        goal="Direct-invoke fail-open test for PR #664",
+        goal="Direct-invoke fail-open test for synthetic PR #1",
         workdir=workdir,
         backend="echo",
         cxdb_path=pathlib.Path(CXDB_PATH),
@@ -104,10 +105,10 @@ def build_context_and_node() -> tuple[Context, Node]:
         {
             "pr_url": TEST_PR_URL,
             "head_sha": TEST_HEAD_SHA,
-            "diff_path": TEST_DIFF_PATH,
+            "diff_path": str(TEMP_ROOT / "synthetic.patch"),
             "feature": TEST_FEATURE,
             "target_repo": TEST_TARGET_REPO,
-            "evidence_dir": str(EVIDENCE_DIR),
+            "evidence_dir": "web-advice-evidence",
         }
     )
 
@@ -158,7 +159,29 @@ ctx, node = build_context_and_node()
 print(f"[3] context built: run_id={RUN_ID} cxdb={CXDB_PATH}")
 print(f"    pr_url={ctx.state['pr_url']}")
 print(f"    head_sha={ctx.state['head_sha']}")
-print(f"    diff_path={ctx.state['diff_path']} (exists={pathlib.Path(TEST_DIFF_PATH).exists()})")
+print(f"    diff_path={ctx.state['diff_path']} (exists={pathlib.Path(ctx.state['diff_path']).exists()})")
+
+# Keep this executable smoke hermetic: no transport probing, GitHub comment,
+# bead filing, or network request is allowed to escape the temporary root.
+from runner import handler_web_advice as web_advice_module  # noqa: E402
+
+web_advice_module._compute_diff_lines = lambda _repo_dir: 100
+web_advice_module._run_transport_probe = lambda *_args, **_kwargs: {
+    "probes": {"aside_mcp": False, "aside_cli": False, "chrome_extension": False, "cdp_port": False},
+    "live_transport": None,
+    "elapsed_seconds": 0.0,
+    "summary": "synthetic hermetic probe: all transports absent",
+}
+web_advice_module._post_pr_comment = lambda *_args, **_kwargs: {
+    "ok": True,
+    "returncode": 0,
+    "stderr": "",
+    "url": f"{TEST_PR_URL}#issuecomment-1",
+}
+web_advice_module._file_followup_bead = lambda **_kwargs: {
+    "ok": True,
+    "bead_id": "synthetic-bead",
+}
 
 start = time.monotonic()
 result = _web_advice(node, ctx)
@@ -177,7 +200,7 @@ print("[5] FAIL-OPEN INVARIANT VERIFIED: outcome=success regardless of probe sta
 
 
 # ---------------------------------------------------------------------------
-# Section 3 — state writes + CXDB + PR comment verification
+# Section 3 — state writes + CXDB + mocked PR comment verification
 # ---------------------------------------------------------------------------
 
 state_keys = sorted(k for k in ctx.state if k.startswith("web_advice."))
@@ -211,7 +234,7 @@ metadata = {
     ),
     "comments_posted": {
         "pr_comment_url": ctx.state.get("web_advice.pr_comment_url"),
-        "comment_strategy": "gh_api_post_comment (REST)",
+        "comment_strategy": "mocked_pr_comment (hermetic smoke)",
     },
     "pr_comment_url": ctx.state.get("web_advice.pr_comment_url"),
     "bead_filed": ctx.state.get("web_advice.bead_id"),
@@ -282,31 +305,14 @@ assert rows, "CXDB has no row for web_advice — audit trail broken"
 
 
 # ---------------------------------------------------------------------------
-# Section 4 — PR comment verification
+# Section 4 — mocked PR comment verification
 # ---------------------------------------------------------------------------
 
 pr_comment_url = ctx.state.get("web_advice.pr_comment_url")
 print()
-print(f"[11] PR comment URL: {pr_comment_url!r}")
-if pr_comment_url and not pr_comment_url.startswith("("):
-    # Try to fetch the comment body via gh to confirm the marker is present.
-    api_path = pr_comment_url.split("#issuecomment-")[0]
-    comment_id = pr_comment_url.split("#issuecomment-")[-1]
-    api_url = f"{api_path}/issues/comments/{comment_id}"
-    try:
-        body_json = json.loads(
-            subprocess.run(
-                ["gh", "api", api_url], capture_output=True, text=True, check=True
-            ).stdout
-        )
-        body = body_json.get("body", "")
-        has_marker = "<!-- web-advice-review -->" in body and "<!-- /web-advice-review -->" in body
-        print(f"[12] PR comment body length={len(body)}; markers present={has_marker}")
-        assert has_marker, "PR comment missing web-advice-review markers"
-    except Exception as exc:  # pragma: no cover
-        print(f"[12] PR comment body fetch failed: {exc!r}")
-else:
-    print("[12] PR comment not posted (deferred infra-disclosure or post-error) — see state")
+print(f"[11] Mocked PR comment URL: {pr_comment_url!r}")
+assert pr_comment_url == f"{TEST_PR_URL}#issuecomment-1"
+print("[12] PR comment integration remained hermetic (no gh/network call)")
 
 
 # ---------------------------------------------------------------------------

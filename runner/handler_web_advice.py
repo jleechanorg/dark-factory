@@ -156,9 +156,38 @@ def _seed_web_advice_state(ctx: "Context") -> dict:
         if not ctx.state.get("target_repo"):
             ctx.state["target_repo"] = _extract_pr_repo(str(ctx.state["pr_url"])) or ""
         return {"ok": True, "source": "explicit"}
+    explicit_repo = _extract_pr_repo(str(ctx.state.get("pr_url") or "")) if explicit_pr else None
+    local_head = ""
+    if explicit_pr:
+        try:
+            local_head_result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(worktree), capture_output=True, text=True, timeout=10, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {
+                "ok": False,
+                "mode": "local_head_unavailable",
+                "error": f"could not resolve checked-out local HEAD: {type(exc).__name__}: {exc}"[:500],
+            }
+        local_head = (local_head_result.stdout or "").strip()
+        if local_head_result.returncode != 0 or not re.fullmatch(r"[0-9a-fA-F]{40}", local_head):
+            return {
+                "ok": False,
+                "mode": "local_head_unavailable",
+                "error": "could not resolve checked-out local HEAD",
+            }
     try:
+        view_args = ["gh", "pr", "view"]
+        if explicit_pr:
+            # Bind discovery to the caller's exact URL and repository. Never
+            # fall back to whichever PR happens to be associated with HEAD.
+            view_args.append(str(ctx.state["pr_url"]))
+            if explicit_repo:
+                view_args.extend(["--repo", explicit_repo])
+        view_args.extend(["--json", "url,headRefOid"])
         result = subprocess.run(
-            ["gh", "pr", "view", "--json", "url,headRefOid"],
+            view_args,
             cwd=str(worktree), capture_output=True, text=True, timeout=10, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -171,6 +200,23 @@ def _seed_web_advice_state(ctx: "Context") -> dict:
         return {"ok": False, "error": f"invalid gh pr view JSON: {exc}"[:500]}
     discovered_pr = payload.get("url")
     discovered_head = payload.get("headRefOid")
+    if explicit_pr:
+        if discovered_pr != str(ctx.state["pr_url"]):
+            return {
+                "ok": False,
+                "mode": "canonical_url_mismatch",
+                "error": f"canonical PR URL mismatch: requested={ctx.state['pr_url']!r} gh={discovered_pr!r}",
+            }
+        if not isinstance(discovered_head, str) or not discovered_head or discovered_head.lower() != local_head.lower():
+            return {
+                "ok": False,
+                "mode": "head_sha_mismatch",
+                "error": f"head SHA mismatch: local={local_head} gh={discovered_head}",
+            }
+        ctx.state["pr_head_sha"] = discovered_head
+        if not ctx.state.get("target_repo"):
+            ctx.state["target_repo"] = explicit_repo or ""
+        return {"ok": True, "source": "gh", "canonical_url": discovered_pr}
     if not explicit_pr and isinstance(discovered_pr, str) and _parse_pr_number(discovered_pr):
         ctx.state["pr_url"] = discovered_pr
     if not explicit_head and isinstance(discovered_head, str) and discovered_head:
@@ -213,15 +259,10 @@ def _prepare_diff_path(repo_dir: pathlib.Path, pr_number: int) -> dict:
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:500]}
 def _parse_pr_number(pr_url: str) -> Optional[int]:
-    """Extract the PR number from a GitHub PR URL.
+    """Extract a PR number from an exact canonical GitHub PR URL.
 
-    Accepts forms like:
-      - https://github.com/jleechanorg/dark-factory/pull/655
-      - https://github.com/jleechanorg/dark-factory/pull/655/files
-      - git@github.com:jleechanorg/dark-factory.git (ref form)
-
-    Returns ``None`` for unparseable / non-numeric inputs so the handler
-    can short-circuit cleanly without raising.
+    URL suffixes, query strings, and Git remote-style references are rejected.
+    Returns ``None`` for unparseable or non-numeric inputs.
     """
     if not isinstance(pr_url, str) or not pr_url:
         return None
@@ -639,6 +680,8 @@ def _validated_share_target(url: str) -> tuple[bool, str, list[str], str]:
         except (IndexError, ValueError, TypeError):
             return False, hostname, [], "share URL DNS returned an invalid address"
         if (
+            not ip.is_global
+            or
             ip.is_loopback
             or ip.is_private
             or ip.is_link_local
@@ -653,15 +696,26 @@ def _validated_share_target(url: str) -> tuple[bool, str, list[str], str]:
 
 def _curl_pinned_get(url: str, hostname: str, address: str, timeout: float) -> dict:
     """Fetch one URL with curl pinned to a validated address, no redirects."""
+    # A pinned request must not escape through inherited proxy settings. Strip
+    # all proxy variables in addition to curl's explicit no-proxy wildcard.
+    clean_env = {
+        key: value
+        for key, value in os.environ.items()
+        if "proxy" not in key.lower()
+    }
+    resolve_address = f"[{address}]" if ":" in address and not address.startswith("[") else address
     cmd = [
         "curl", "--silent", "--show-error", "--proto", "=https",
+        "--noproxy", "*",
         "--connect-timeout", str(max(1, min(int(timeout), 10))),
         "--max-time", str(max(1, min(int(timeout), 10))),
         "--max-filesize", "65536",
-        "--resolve", f"{hostname}:443:{address}", "--dump-header", "-", url,
+        "--resolve", f"{hostname}:443:{resolve_address}", "--dump-header", "-", url,
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=False, timeout=timeout + 1, check=False)
+        result = subprocess.run(
+            cmd, capture_output=True, text=False, timeout=timeout + 1, check=False, env=clean_env,
+        )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"ok": False, "status": None, "headers": {}, "body": b"", "error": f"{type(exc).__name__}: {exc}"[:300]}
     raw = result.stdout or b""
@@ -1128,7 +1182,12 @@ def _web_advice_inner(node: "Node", ctx: "Context", metadata: dict, started_ts: 
     # 1. Inputs
     # ------------------------------------------------------------------
     seed = _seed_web_advice_state(ctx)
-    if not seed.get("ok", True) and seed.get("mode") in {"invalid_pr_identity", "target_repo_mismatch"}:
+    if not seed.get("ok", True) and seed.get("mode") in {
+        "invalid_pr_identity",
+        "target_repo_mismatch",
+        "canonical_url_mismatch",
+        "local_head_unavailable",
+    }:
         mode = seed.get("mode", "invalid_pr_identity")
         metadata.update({
             "web_advice_outcome": mode,

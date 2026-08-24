@@ -249,6 +249,7 @@ class TestStructuredPanelContract:
             "panel_seats_unavailable": ["gemini", "grok", "perplexity"],
             "panel_seats_unavailable_reasons": {"gemini": "down", "grok": "down", "perplexity": "down"},
             "panel_verdict_summary": {"chatgpt": {"verdict": "approve"}},
+            "panel_convergence": {},
         }
         fake = subprocess.CompletedProcess(args=[], returncode=0, stdout=json.dumps(payload) + "\n" + json.dumps(payload), stderr="")
         monkeypatch.setattr("runner.handler_web_advice.subprocess.run", lambda *a, **k: fake)
@@ -349,6 +350,42 @@ class TestShareUrlProbe:
         result = _probe_share_url("https://g.co/gemini/share/abc")
         assert result["ok"] is False
         assert "private" in result["error"] or "unsafe" in result["error"]
+
+    def test_rejects_cgnat_dns_resolution(self, monkeypatch):
+        monkeypatch.setattr(
+            "runner.handler_web_advice.socket.getaddrinfo",
+            lambda *a, **k: [(2, 1, 6, "", ("100.64.0.1", 443))],
+        )
+        result = _probe_share_url("https://g.co/gemini/share/abc")
+        assert result["ok"] is False
+        assert "unsafe" in result["error"] or "private" in result["error"]
+
+    def test_curl_pinned_get_brackets_ipv6_and_ignores_proxies(self, monkeypatch):
+        seen = {}
+        monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:8080")
+        monkeypatch.setenv("ALL_PROXY", "http://proxy.invalid:8080")
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"] = cmd
+            seen["kwargs"] = kwargs
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout=b"HTTP/1.1 200 OK\r\n\r\nbody",
+                stderr=b"",
+            )
+
+        monkeypatch.setattr("runner.handler_web_advice.subprocess.run", fake_run)
+        from runner.handler_web_advice import _curl_pinned_get
+
+        result = _curl_pinned_get("https://g.co/gemini/share/abc", "g.co", "2001:db8::1", 2)
+        assert result["ok"] is True
+        assert "--noproxy" in seen["cmd"]
+        assert seen["cmd"][seen["cmd"].index("--noproxy") + 1] == "*"
+        resolve = seen["cmd"][seen["cmd"].index("--resolve") + 1]
+        assert resolve == "g.co:443:[2001:db8::1]"
+        assert "HTTPS_PROXY" not in seen["kwargs"]["env"]
+        assert "ALL_PROXY" not in seen["kwargs"]["env"]
 
     def test_private_redirect_is_rejected_before_connection(self, monkeypatch):
         calls = []
@@ -755,6 +792,78 @@ class TestWebAdviceStateSeeding:
         result = _seed_web_advice_state(ctx)
         assert result["mode"] == "head_sha_mismatch"
 
+    def test_explicit_pr_without_head_binds_exact_url_and_local_head(self, tmp_path, monkeypatch):
+        pr_url = "https://github.com/o/r/pull/7"
+        local_head = "a" * 40
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            if cmd[:3] == ["git", "rev-parse", "HEAD"]:
+                return subprocess.CompletedProcess(cmd, 0, local_head + "\n", "")
+            assert cmd[:3] == ["gh", "pr", "view"]
+            assert pr_url in cmd
+            assert "--repo" in cmd
+            assert cmd[cmd.index("--repo") + 1] == "o/r"
+            return subprocess.CompletedProcess(
+                cmd, 0, json.dumps({"url": pr_url, "headRefOid": local_head}), ""
+            )
+
+        monkeypatch.setattr("runner.handler_web_advice._target_worktree", lambda ctx: tmp_path)
+        monkeypatch.setattr("runner.handler_web_advice.subprocess.run", fake_run)
+        ctx = Context(goal="seed", workdir=tmp_path, backend="echo")
+        ctx.state["pr_url"] = pr_url
+
+        result = _seed_web_advice_state(ctx)
+
+        assert result == {"ok": True, "source": "gh", "canonical_url": pr_url}
+        assert ctx.state["pr_head_sha"] == local_head
+        assert ctx.state["target_repo"] == "o/r"
+        assert [call[0][0] for call in calls] == ["git", "gh"]
+
+    def test_explicit_pr_head_mismatch_is_rejected_before_side_effects(self, tmp_path, monkeypatch):
+        pr_url = "https://github.com/o/r/pull/7"
+        local_head = "a" * 40
+        remote_head = "b" * 40
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[:3] == ["git", "rev-parse", "HEAD"]:
+                return subprocess.CompletedProcess(cmd, 0, local_head + "\n", "")
+            return subprocess.CompletedProcess(
+                cmd, 0, json.dumps({"url": pr_url, "headRefOid": remote_head}), ""
+            )
+
+        monkeypatch.setattr("runner.handler_web_advice._target_worktree", lambda ctx: tmp_path)
+        monkeypatch.setattr("runner.handler_web_advice.subprocess.run", fake_run)
+        ctx = Context(goal="seed", workdir=tmp_path, backend="echo")
+        ctx.state.update({"pr_url": pr_url, "repo_dir": str(tmp_path)})
+        result = _seed_web_advice_state(ctx)
+
+        assert result["mode"] == "head_sha_mismatch"
+        assert "local" in result["error"]
+        assert calls[0][:3] == ["git", "rev-parse", "HEAD"]
+        assert calls[1][:3] == ["gh", "pr", "view"]
+
+    def test_canonical_url_mismatch_is_rejected(self, tmp_path, monkeypatch):
+        requested = "https://github.com/o/r/pull/7"
+        local_head = "a" * 40
+        monkeypatch.setattr("runner.handler_web_advice._target_worktree", lambda ctx: tmp_path)
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:3] == ["git", "rev-parse", "HEAD"]:
+                return subprocess.CompletedProcess(cmd, 0, local_head + "\n", "")
+            return subprocess.CompletedProcess(
+                cmd, 0, json.dumps({"url": requested + "/files", "headRefOid": local_head}), ""
+            )
+
+        monkeypatch.setattr("runner.handler_web_advice.subprocess.run", fake_run)
+        ctx = Context(goal="seed", workdir=tmp_path, backend="echo")
+        ctx.state["pr_url"] = requested
+        result = _seed_web_advice_state(ctx)
+        assert result["mode"] == "canonical_url_mismatch"
+
 
 class TestDiffAttachment:
     def test_writes_committed_diff_with_owner_only_mode(self, tmp_path, monkeypatch):
@@ -918,6 +1027,45 @@ class TestSkipOnSmallDiff:
 
 
 class TestAllTransportsDown:
+    def test_head_mismatch_returns_without_external_side_effects(self, tmp_path, monkeypatch):
+        local_head = "a" * 40
+        remote_head = "b" * 40
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[:3] == ["git", "rev-parse", "HEAD"]:
+                return subprocess.CompletedProcess(cmd, 0, local_head + "\n", "")
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                json.dumps({
+                    "url": "https://github.com/jleechanorg/dark-factory/pull/655",
+                    "headRefOid": remote_head,
+                }),
+                "",
+            )
+
+        side_effects = []
+        monkeypatch.setattr("runner.handler_web_advice._target_worktree", lambda ctx: tmp_path)
+        monkeypatch.setattr("runner.handler_web_advice.subprocess.run", fake_run)
+        monkeypatch.setattr("runner.handler_web_advice._post_pr_comment", lambda *a, **k: side_effects.append("comment"))
+        monkeypatch.setattr("runner.handler_web_advice._file_followup_bead", lambda **k: side_effects.append("bead"))
+        monkeypatch.setattr("runner.handler_web_advice._persist_share_evidence", lambda *a, **k: side_effects.append("evidence"))
+        ctx = Context(goal="web advice review", workdir=tmp_path, backend="echo")
+        ctx.state.update({
+            "pr_url": "https://github.com/jleechanorg/dark-factory/pull/655",
+            "repo_dir": str(tmp_path),
+        })
+
+        result = _web_advice(Node(name="web_advice", attrs={"type": "web_advice"}), ctx)
+
+        assert result.outcome == "success"
+        assert ctx.state["web_advice.infrastructure_failure_mode"] == "head_sha_mismatch"
+        assert side_effects == []
+        assert calls[0][:3] == ["git", "rev-parse", "HEAD"]
+        assert calls[1][:3] == ["gh", "pr", "view"]
+
     def test_infra_files_target_repo_scoped_bead(self, tmp_path, monkeypatch):
         _stub_all_transports_down(monkeypatch)
         monkeypatch.setattr("runner.handler_web_advice._compute_diff_lines", lambda repo_dir: 100)
