@@ -224,7 +224,7 @@ def _extract_pr_repo(pr_url: str) -> Optional[str]:
         parsed = urllib.parse.urlsplit(pr_url)
     except ValueError:
         return None
-    if parsed.scheme.lower() != "https" or parsed.hostname.lower() != "github.com" or parsed.port is not None:
+    if parsed.scheme.lower() != "https" or (parsed.hostname or "").lower() != "github.com" or parsed.port is not None:
         return None
     parts = parsed.path.strip("/").split("/")
     if len(parts) < 4 or parts[2] != "pull" or not parts[3].isdigit():
