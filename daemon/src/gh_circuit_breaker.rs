@@ -225,6 +225,12 @@ pub struct GhCircuitBreaker {
     pub telemetry_log_path: Option<PathBuf>,
 }
 
+impl Default for GhCircuitBreaker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GhCircuitBreaker {
     pub fn new() -> Self {
         let mut cb = Self {
