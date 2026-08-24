@@ -144,6 +144,10 @@ class TestExtractShareUrls:
         out = "see https://perplexity.ai/search/aaabbbccc"
         assert _extract_share_urls(out) == ["https://perplexity.ai/search/aaabbbccc"]
 
+    def test_gemini_share_host(self):
+        out = "see https://share.gemini.google/abc123"
+        assert _extract_share_urls(out) == ["https://share.gemini.google/abc123"]
+
     def test_empty(self):
         assert _extract_share_urls("") == []
         assert _extract_share_urls("no url here") == []
@@ -262,17 +266,31 @@ class TestShareUrlProbe:
         assert result["ok"] is False
         assert "login" in result["error"] or "signin" in result["error"]
 
-    def test_rejects_set_cookie(self, monkeypatch):
+    def test_accepts_anonymous_tracking_set_cookie(self, monkeypatch):
         class Response:
             status = 200
             def geturl(self): return "https://g.co/gemini/share/abc"
-            def getheaders(self): return [("Set-Cookie", "session=secret")]
+            def getheaders(self): return [("Set-Cookie", "NID=tracking"), ("Set-Cookie", "COMPASS=presentation")]
+            def read(self, _limit=-1): return b"Gemini shared conversation"
             def __enter__(self): return self
             def __exit__(self, *args): return None
         monkeypatch.setattr("runner.handler_web_advice.urllib.request.urlopen", lambda *a, **k: Response())
         result = _probe_share_url("https://g.co/gemini/share/abc")
-        assert result["ok"] is False
-        assert "Set-Cookie" in result["error"]
+        assert result["ok"] is True
+        assert result["status"] == 200
+
+    def test_accepts_final_gemini_share_after_301_with_cookies(self, monkeypatch):
+        class Response:
+            status = 200
+            def geturl(self): return "https://share.gemini.google/abc123"
+            def getheaders(self): return [("Set-Cookie", "NID=tracking")]
+            def read(self, _limit=-1): return b"Public Gemini conversation"
+            def __enter__(self): return self
+            def __exit__(self, *args): return None
+        monkeypatch.setattr("runner.handler_web_advice.urllib.request.urlopen", lambda *a, **k: Response())
+        result = _probe_share_url("https://g.co/gemini/share/abc123")
+        assert result["ok"] is True
+        assert result["final_url"] == "https://share.gemini.google/abc123"
 
 
 class TestShareEvidencePersistence:

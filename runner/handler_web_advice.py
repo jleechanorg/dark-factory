@@ -503,7 +503,10 @@ def _parse_structured_panel_result(output: str) -> Optional[dict]:
 
 def _probe_share_url(url: str, *, timeout: float = 10.0) -> dict:
     """Probe a public Share URL without credentials or cookie persistence."""
-    request = urllib.request.Request(url, method="HEAD", headers={"Accept": "text/html"})
+    # A fresh urllib request has no CookieJar/session attached. Use GET so a
+    # provider's HTML auth/consent wall can be identified, while deliberately
+    # ignoring benign anonymous tracking/presentation Set-Cookie headers.
+    request = urllib.request.Request(url, method="GET", headers={"Accept": "text/html"})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             status_value = getattr(response, "status", None)
@@ -511,17 +514,22 @@ def _probe_share_url(url: str, *, timeout: float = 10.0) -> dict:
                 status_value = response.getcode()
             status = int(status_value)
             final_url = str(response.geturl())
-            headers = response.getheaders()
+            reader = getattr(response, "read", None)
+            content = reader(65_536) if callable(reader) else b""
     except urllib.error.HTTPError as exc:
         return {"ok": False, "status": int(exc.code), "final_url": str(exc.geturl()), "error": f"HTTP {exc.code}"}
     except (OSError, ValueError, urllib.error.URLError) as exc:
         return {"ok": False, "status": None, "final_url": "", "error": f"{type(exc).__name__}: {exc}"[:300]}
-    header_names = {str(k).lower() for k, _ in headers}
     lowered_url = final_url.lower()
-    if "set-cookie" in header_names:
-        return {"ok": False, "status": status, "final_url": final_url, "error": "Set-Cookie header present"}
-    if any(marker in lowered_url for marker in ("/login", "/signin", "/sign-in", "/auth/")):
+    if any(marker in lowered_url for marker in ("/login", "/signin", "/sign-in", "/auth/", "/account", "consent", "accounts.google.com")):
         return {"ok": False, "status": status, "final_url": final_url, "error": f"login redirect: {final_url}"}
+    lowered_content = content.decode("utf-8", errors="ignore").lower()
+    wall_markers = (
+        "sign in to continue", "log in to continue", "authentication required",
+        "consent required", "accounts.google.com/signin", "name=\"password\"",
+    )
+    if any(marker in lowered_content for marker in wall_markers):
+        return {"ok": False, "status": status, "final_url": final_url, "error": "authentication/consent wall in response content"}
     # urllib follows ordinary redirects; a valid probe therefore ends at
     # 200. A bare 3xx is not evidence of a public unauthenticated page.
     if status != 200:
@@ -582,6 +590,8 @@ def _extract_share_urls(output: str) -> list[str]:
         return []
     pattern = _re.compile(
         r"https?://(?:g\.co/gemini/share/[A-Za-z0-9_-]+|"
+        r"share\.gemini\.google/[A-Za-z0-9_-]+|"
+        r"gemini\.google\.com/share/[A-Za-z0-9_-]+|"
         r"grok\.com/share/[A-Za-z0-9_-]+|"
         r"chatgpt\.com/share/[A-Za-z0-9_-]+|"
         r"perplexity\.ai/search/[A-Za-z0-9_-]+)"
