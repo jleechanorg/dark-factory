@@ -35,10 +35,10 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import sqlite3
 import subprocess
 import sys
 import time
-from typing import Any
 
 # Make `runner` importable when this script is run from anywhere.
 HERE = pathlib.Path(__file__).resolve().parent
@@ -56,10 +56,7 @@ _home_bin = pathlib.Path.home() / ".local" / "bin"
 os.environ["PATH"] = f"{_home_bin}:{os.environ.get('PATH', '')}"
 
 # Imports must come after env is set.
-from runner.handler_web_advice import (  # noqa: E402
-    _web_advice,
-    _run_transport_probe,
-)
+from runner.handler_web_advice import _web_advice  # noqa: E402
 from runner.handler_core import Context  # noqa: E402
 from runner.cxdb import CXDB  # noqa: E402
 from runner.parser import Node  # noqa: E402
@@ -247,8 +244,6 @@ try:
 except Exception as exc:  # pragma: no cover
     print(f"[7] CXDB.record_step failed ({exc!r}); falling back to direct INSERT")
     try:
-        import sqlite3
-
         with sqlite3.connect(CXDB_PATH) as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO steps "
@@ -276,8 +271,6 @@ except Exception as exc:  # pragma: no cover
 print(f"[9] CXDB event mirror persisted to {binding_path}")
 
 # Verify the CXDB file actually contains an event for web_advice.
-import sqlite3
-
 with sqlite3.connect(CXDB_PATH) as conn:
     rows = list(
         conn.execute(
