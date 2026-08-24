@@ -2,9 +2,9 @@
 
 ## Recent activity (by day)
 
-- [2026-08-24](activity/2026-08-24.md) — PR #714 merged; 100% AO prompt indirection verified; runner pool outage (0 online) & 4 follow-up beads triaged (jleechan-azso/57ym/gagl/xn4n)
+- [2026-08-24](activity/2026-08-24.md) — PR #740 handoff corrected: org-level runner fleet healthy; #734 rate-limit repair, canonical #693 web-advice fold, #694 Lane E/F, and stale #286 tracked in executable order
 - [2026-08-22](activity/2026-08-22.md) — PR #665 + #666 merged via --admin (dark-factory runner outage); PR #655 /web-advice verdict follow-up complete (chatgpt INCOMPLETE-AGAIN, 5 grok findings triaged, fail-open /web-advice integration built + verified); 3 follow-up beads filed (jleechan-azso/57ym/gagl)
-- [2026-08-21](activity/2026-08-21.md) — 100% AO standardization & prompt indirection specification; multi-model advice verification panel (jleechan-s779)
+- 2026-08-21 — 100% AO standardization & prompt indirection specification; multi-model advice verification panel (`jleechan-s779`; no retained daily activity file)
 - [2026-08-20](activity/2026-08-20.md) — /af factory audit + Claude pipeline missing-fallbacks root cause (3 login-expired + 1 quota-wedged sessions; 2 child beads filed for coder fallback chain + session-health probe)
 - [2026-08-14](activity/2026-08-14.md)
 - [2026-07-06](activity/2026-07-06.md)
@@ -376,8 +376,8 @@
 
 ### 2026-05-31 - runner crash-resilience and reviewer-gate roadmap
 
-- Opened/organized the crash-resilience roadmap under [jleechan-o8q](br show jleechan-o8q), with PR #13 at `411676d5c634ec6d5902529dd8d50dfbffbf6428` for the first engine boundary/per-run-log slice.
-- Added [jleechan-x33](br show jleechan-x33) for a repo-agnostic reviewer-node miss class: file-backed current-head diff/evidence audits require `target_repo`, `target_pr`, `target_head_sha`, `base_sha`, PR description snapshot, evidence paths/SHA, and fail-closed checks for brownfield delete-first, net-LOC, and dead-code in any target repo. PR #7178 is evidence only, not scope.
+- Opened/organized the crash-resilience roadmap under bead `jleechan-o8q`, with PR #13 at `411676d5c634ec6d5902529dd8d50dfbffbf6428` for the first engine boundary/per-run-log slice.
+- Added bead `jleechan-x33` for a repo-agnostic reviewer-node miss class: file-backed current-head diff/evidence audits require `target_repo`, `target_pr`, `target_head_sha`, `base_sha`, PR description snapshot, evidence paths/SHA, and fail-closed checks for brownfield delete-first, net-LOC, and dead-code in any target repo. PR #7178 is evidence only, not scope.
 - Verification: targeted crash/engine tests passed (`17 passed`); full suite remains at `101 passed, 2 failed` on conformance score and malformed-edge fail-closed hardening.
 - Handoff: `/Users/jleechan/roadmap/nextsteps-2026-05-31-dark-factory-resilience.md`.
 

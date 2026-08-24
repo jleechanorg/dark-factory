@@ -1,99 +1,92 @@
-# Nextsteps — dark-factory — 2026-08-24
+# Next steps — dark-factory — 2026-08-24
 
 ## Table of contents
 
 - [Executive summary](#executive-summary)
-- [Context](#context)
-- [Bead index](#bead-index)
-- [Work queue](#work-queue)
-- [PR / merge state](#pr--merge-state)
-- [Learnings pointer](#learnings-pointer)
-- [Roadmap pointer](#roadmap-pointer)
+- [Evidence snapshot](#evidence-snapshot)
+- [Bead and issue index](#bead-and-issue-index)
+- [Executable handoff sequence](#executable-handoff-sequence)
+- [Pull-request state](#pull-request-state)
+- [Learnings and roadmap pointers](#learnings-and-roadmap-pointers)
 
 ## Executive summary
 
-- **Accomplishments**: 
-  - Standardized 100% on Agent Orchestrator (AO) with file-based prompt indirection (`.factory/prompt.md`), bypassing AO CLI 4096-character limit and newline flattening.
-  - Successfully merged [PR #714](https://github.com/jleechanorg/dark-factory/pull/714) (`docs(roadmap): sync activity log and nextsteps (2026-08-22)`) into `origin/main`.
-  - Conducted full priority triage and live operational audit across the 4 factory follow-up work items.
-- **Risks & Blockers**:
-  - **Runner Pool Offline (P0 Blocker)**: `gh api /repos/jleechanorg/dark-factory/actions/runners` returns 0 online runners. Self-hosted CI checks cannot execute without runners being brought back online.
-- **Key Open Beads / Issues**:
-  - [Issue #668](https://github.com/jleechanorg/dark-factory/issues/668) / [`jleechan-azso`](https://github.com/jleechanorg/dark-factory/issues/jleechan-azso) (P1: Fold `web-advice-failopen.dot` into existing pipelines)
-  - [Issue #669](https://github.com/jleechanorg/dark-factory/issues/669) / [`jleechan-57ym`](https://github.com/jleechanorg/dark-factory/issues/jleechan-57ym) (P2: Lane D 5 cosmetic/structural items)
-  - [Issue #670](https://github.com/jleechanorg/dark-factory/issues/670) / [`jleechan-gagl`](https://github.com/jleechanorg/dark-factory/issues/jleechan-gagl) (P3: Lane E/F remediation candidates)
+The earlier “runner pool offline” conclusion was a scope error, not an infrastructure outage. The repository-scoped Actions endpoint returns zero because this project’s self-hosted runners are registered at the organization level. The organization endpoint currently reports 14 matching online runners (1 busy), and the repository has no queued or in-progress workflow runs.
 
-## Context
+The handoff therefore has no runner-restoration blocker. The next execution unit is the open rate-limit circuit-breaker PR (#734), followed by one canonical web-advice/Lane-D implementation, then the independent Lane E/F remediation. Duplicate PR generations must not be merged in parallel.
 
-This work block concluded the 100% Agent Orchestrator (AO) standardization and roadmap synchronization for `dark-factory`. After merging [PR #714](https://github.com/jleechanorg/dark-factory/pull/714), we audited factory telemetry, remote commit cadence, and active AO sessions on `jeff-ubuntu`. A comprehensive priority triage was performed on the remaining backlog items to prepare an actionable handoff queue for incoming agents.
+## Evidence snapshot
 
-## Bead index
+Point-in-time checks run on 2026-08-24:
 
-| Bead | Title | Priority / Status | Link |
-| :--- | :--- | :---: | :--- |
-| **`jleechan-azso`** | fold web-advice-failopen.dot into pr_gates.dot + gates.dot + slim/minimal_pr.dot | **P1 (OPEN)** | [Issue #668](https://github.com/jleechanorg/dark-factory/issues/668) |
-| **`jleechan-57ym`** | Lane D 5 cosmetic/structural items from E2E log §5 | **P2 (OPEN)** | [Issue #669](https://github.com/jleechanorg/dark-factory/issues/669) |
-| **`jleechan-gagl`** | Lane E/F remediation candidates from E2E log | **P3 (OPEN)** | [Issue #670](https://github.com/jleechanorg/dark-factory/issues/670) |
-| **`jleechan-xn4n`** | Linux container runners lack sqlite3 / runner pool restoration | **P0 (OPEN)** | [Issue #287](https://github.com/jleechanorg/dark-factory/issues/287) |
-| **`jleechan-18mu`** | Parent goal bead: PR #655 web-advice follow-up | **P2 (OPEN)** | [br show jleechan-18mu](https://github.com/jleechanorg/dark-factory) |
+```text
+gh api /repos/jleechanorg/dark-factory/actions/runners
+  total_count=0 (expected for repo-scoped registration)
 
-## Work queue
+gh api /orgs/jleechanorg/actions/runners
+  total_count=14, online=14, busy=1
 
-### 1. **Restore `dark-factory` Self-Hosted Runner Pool (P0 Blocker)**
-- **Goal**: Restore dark-factory self-hosted CI runner pool so future PRs can run Evidence Gate, `daemon-tests`, and `test` checks without timing out or requiring `--admin` manual overrides.
-- **Current State**: 0 registered / online runners in `dark-factory`.
-- **Acceptance Criteria**:
-  - `gh api /repos/jleechanorg/dark-factory/actions/runners` returns >= 1 online runner.
-  - A sample PR reaches `mergeStateStatus=CLEAN` autonomously through GitHub Actions.
-- **Dependencies / Blockers**: Host infrastructure / SRE task on `jeff-ubuntu`.
-- **Reference Bead**: [`jleechan-xn4n`](https://github.com/jleechanorg/dark-factory/issues/jleechan-xn4n) / [`jleechan-lssy`](https://github.com/jleechanorg/dark-factory/issues/jleechan-lssy).
+gh run list --repo jleechanorg/dark-factory --status queued
+  []
+gh run list --repo jleechanorg/dark-factory --status in_progress
+  []
+```
 
-### 2. **Fold `web-advice-failopen.dot` into Existing Pipelines (P1 Feature)**
-- **Goal**: Integrate the proven `web_advice` fail-open node from `pipelines/factory/web-advice-failopen.dot` into the canonical target pipelines.
-- **Target Pipelines**:
-  1. `pipelines/factory/pr_gates.dot` (min 5 lines diff)
-  2. `pipelines/factory/gates.dot` (min 5 lines diff)
-  3. `pipelines/slim/minimal_pr.dot` (min 20 lines diff)
-- **Acceptance Criteria**:
-  - Unconditional downstream edge from `web_advice` to next node (fail-open guarantee).
-  - Graph audit clean (`cargo test` + `graph_audit.py`).
-  - PR opened with `[antig]` prefix.
-- **Dependencies / Blockers**: Low risk; can be authored locally and tested.
-- **Reference Bead**: [`jleechan-azso`](https://github.com/jleechanorg/dark-factory/issues/jleechan-azso) ([Issue #668](https://github.com/jleechanorg/dark-factory/issues/668)).
+The canonical selector is documented in [docs/self-hosted-runner-selector.md](../docs/self-hosted-runner-selector.md). Re-run the organization-scoped probe before calling CI unavailable; do not open a runner-restoration task from the repository endpoint alone.
 
-### 3. **Address Lane D 5 Cosmetic/Structural Follow-ups (P2 Resilience)**
-- **Goal**: Triage and resolve the 5 structural items from `docs/web-advice-failopen-e2e-log.md` §5.
-- **Items**:
-  1. Tighten `cdp_port` probe to check Aside CLI responsiveness rather than bare TCP port 9222.
-  2. Fix JSON heredoc escape sequence in `scripts/af-test-web-advice-failopen.sh`.
-  3. Update direct-invocation script module docstrings for import compatibility.
-  4. Add `preflight --require-holdouts` fail-fast flag.
-- **Acceptance Criteria**: All 5 items resolved via code fix + test, or marked `ACCEPT-AS-DEGRADED` with rationale.
-- **Reference Bead**: [`jleechan-57ym`](https://github.com/jleechanorg/dark-factory/issues/jleechan-57ym) ([Issue #669](https://github.com/jleechanorg/dark-factory/issues/669)).
+## Bead and issue index
 
-### 4. **Address Lane E/F Remediation Candidates (P3 Hygiene)**
-- **Goal**: Implement operational ergonomics improvements identified post `--admin` merges.
-- **Items**:
-  - Surface runner pool outage warnings in PR comments when `mergeStateStatus` stays UNSTABLE > 10m.
-  - Document cross-language anchor comment conventions (`//` vs `#`).
-  - Clean up legacy beads missing `target_repo` metadata.
-- **Acceptance Criteria**: Triage into code change vs documentation.
-- **Reference Bead**: [`jleechan-gagl`](https://github.com/jleechanorg/dark-factory/issues/jleechan-gagl) ([Issue #670](https://github.com/jleechanorg/dark-factory/issues/670)).
+Bead IDs below are Beads identifiers, not GitHub issue URLs. GitHub links point only to the corresponding issue or pull request.
 
-## PR / merge state
+| Bead | Bead status | GitHub tracking | Handoff role |
+| :--- | :--- | :--- | :--- |
+| `jleechan-xn4n` | **CLOSED** — restoration was not needed | [Issue #286](https://github.com/jleechanorg/dark-factory/issues/286) remains OPEN and stale; [PR #287](https://github.com/jleechanorg/dark-factory/pull/287) is MERGED | P3 cleanup; do not restore runners |
+| `jleechan-azso` | OPEN | [Issue #668](https://github.com/jleechanorg/dark-factory/issues/668) | Pipeline fold (PR #693 family) |
+| `jleechan-57ym` | OPEN | [Issue #669](https://github.com/jleechanorg/dark-factory/issues/669) | Lane D follow-ups, included by the canonical fold candidate |
+| `jleechan-gagl` | OPEN | [Issue #670](https://github.com/jleechanorg/dark-factory/issues/670) | Lane E/F remediation (PR #694) |
+| `jleechan-18mu` | OPEN parent bead | No GitHub URL asserted here | Parent tracking only |
 
-- [PR #714](https://github.com/jleechanorg/dark-factory/pull/714): **MERGED** (`f5d0c7fd` / `425cd517`) — `[antig] docs(roadmap): sync activity log and nextsteps (2026-08-22)`
-- [PR #671](https://github.com/jleechanorg/dark-factory/pull/671): **MERGED** (`0f5a077e`) — `feat(daemon): af end-to-end W1 gaps (rev-ffb26 + rev-6i2kp)`
-- [PR #667](https://github.com/jleechanorg/dark-factory/pull/667): **OPEN** — `[antig] feat(ao): standardize 100% on AO via prompt indirection (.factory/prompt.md)`
-- [PR #666](https://github.com/jleechanorg/dark-factory/pull/666): **MERGED** (`bc8a779d`) — `fix(adapters): gate offline fixture reads behind #[cfg(test)]`
-- [PR #665](https://github.com/jleechanorg/dark-factory/pull/665): **MERGED** (`aac9bc23`) — `fix(adapters): preserve mergeable=null as UNKNOWN`
-- [PR #664](https://github.com/jleechanorg/dark-factory/pull/664): **OPEN (DRAFT)** (`f3caec5c`) — Lane D /af test fixture (do not merge)
+“Handoff priority” below is the order an incoming operator should execute work. It is intentionally separate from Bead priority metadata; a closed bead or an issue’s label does not make a stale PR canonical.
 
-## Learnings pointer
+## Executable handoff sequence
 
-- Appended to [`~/roadmap/learnings-2026-08.md`](file:///home/jleechan/roadmap/learnings-2026-08.md): `## 2026-08-24 — AO 100% Standardization via Prompt Indirection & Runner Pool Blocker Triage`.
+### P0 — repair the rate-limit circuit breaker (PR #734)
 
-## Roadmap pointer
+1. Inspect [PR #734](https://github.com/jleechanorg/dark-factory/pull/734), the latest rate-limit generation. It is OPEN and currently UNSTABLE; older generations (#692, #698, #702, #706, #710, #713, #717, #720, #727) are duplicate/obsolete candidates with DIRTY or superseded bases.
+2. Fix the reported Rust/API issues (including the `GhCircuitBreaker` constructor/default contract), run the focused daemon tests and clippy, and provide a recognized Evidence Gate verdict.
+3. Rebase only the selected branch onto current `origin/main`; do not merge or close duplicates until the selected PR is green and reviewed.
 
-- Appended [`roadmap/activity/2026-08-24.md`](file:///home/jleechan/projects/dark-factory/roadmap/activity/2026-08-24.md) with session summary.
-- Updated [`roadmap/README.md`](file:///home/jleechan/projects/dark-factory/roadmap/README.md) `## Recent activity (by day)` section with `2026-08-24` link.
+### P1 — land one web-advice/Lane-D superset
+
+1. Use [PR #693](https://github.com/jleechanorg/dark-factory/pull/693) as the current canonical candidate: it is OPEN/CLEAN and contains the web-advice handler, prompt, fail-open integration in all three target pipelines, Lane-D files, tests, and the E2E artifact.
+2. Treat [PR #691](https://github.com/jleechanorg/dark-factory/pull/691) as the Lane-D-only subset; do not merge it independently of #693.
+3. Treat #700, #701, #707, #708, #711, #715, #718, and #723 as later duplicate generations of the same pipeline fold. Their current states range from CLEAN to UNSTABLE; select one branch, rebase it, and supersede the rest after verification.
+4. Before merge, make the canonical E2E/full-pipeline invocation pass `--require-holdouts` and add a regression test for that exact command. Run targeted Python tests, graph audit, Rust tests, and the sealed holdout evaluator where available.
+
+### P2 — land Lane E/F remediation
+
+1. Rebase [PR #694](https://github.com/jleechanorg/dark-factory/pull/694) after the selected P1 branch is established. It is OPEN/CLEAN and covers the runner-warning, anchor-comment, and related hygiene changes.
+2. Run its shell/Python tests and documentation checks independently; update the E2E disposition if the canonical P1 branch changes the referenced artifact.
+
+### P3 — tracking hygiene
+
+1. Close or annotate stale [Issue #286](https://github.com/jleechanorg/dark-factory/issues/286) with the organization-vs-repository runner-scope explanation, subject to the normal operator authorization.
+2. Keep Bead IDs as Bead IDs; never manufacture `github.com/.../issues/jleechan-*` links.
+3. Record future cross-machine documentation synchronization as a process improvement only when independently verified; no Mac-session or SKILL-sync causal claim is part of this handoff.
+
+## Pull-request state
+
+- [PR #740](https://github.com/jleechanorg/dark-factory/pull/740): **MERGED** — this roadmap handoff.
+- [PR #714](https://github.com/jleechanorg/dark-factory/pull/714): **MERGED** — prior roadmap synchronization.
+- [PR #734](https://github.com/jleechanorg/dark-factory/pull/734): **OPEN / UNSTABLE** — selected rate-limit circuit-breaker generation.
+- [PR #693](https://github.com/jleechanorg/dark-factory/pull/693): **OPEN / CLEAN** — selected web-advice/Lane-D superset candidate.
+- [PR #691](https://github.com/jleechanorg/dark-factory/pull/691): **OPEN / CLEAN** — Lane-D subset; superseded by #693.
+- [PR #694](https://github.com/jleechanorg/dark-factory/pull/694): **OPEN / CLEAN** — Lane E/F remediation.
+- [PR #700](https://github.com/jleechanorg/dark-factory/pull/700), [#701](https://github.com/jleechanorg/dark-factory/pull/701), [#707](https://github.com/jleechanorg/dark-factory/pull/707), [#708](https://github.com/jleechanorg/dark-factory/pull/708), [#711](https://github.com/jleechanorg/dark-factory/pull/711), [#715](https://github.com/jleechanorg/dark-factory/pull/715), [#718](https://github.com/jleechanorg/dark-factory/pull/718), [#723](https://github.com/jleechanorg/dark-factory/pull/723): **OPEN duplicate generations** of the pipeline fold; do not merge in parallel.
+- [PR #287](https://github.com/jleechanorg/dark-factory/pull/287): **MERGED** — selector/drift fix; it is not an open runner-restoration task.
+
+## Learnings and roadmap pointers
+
+- The runner-scope correction is recorded in the user-scope learnings ledger as `feedback_2026-08-24_runner_pool_repo_vs_org_scope.md`.
+- [Activity log](activity/2026-08-24.md) records the verified status and this corrected execution order.
+- [Roadmap index](README.md) links this day’s activity.
