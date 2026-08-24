@@ -536,6 +536,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_constructor_matches_new() {
+        let from_default = GhCircuitBreaker::default();
+        let from_new = GhCircuitBreaker::new();
+
+        assert_eq!(from_default.deadline.is_some(), from_new.deadline.is_some());
+        assert_eq!(from_default.consecutive_trips, from_new.consecutive_trips);
+        assert_eq!(from_default.suppressed_calls, from_new.suppressed_calls);
+        assert_eq!(from_default.last_reason, from_new.last_reason);
+        assert_eq!(from_default.last_retry_after, from_new.last_retry_after);
+        assert_eq!(from_default.state_file_path, from_new.state_file_path);
+        assert_eq!(from_default.telemetry_log_path, from_new.telemetry_log_path);
+    }
+
+    #[test]
     fn test_parse_primary_rate_limit() {
         let stderr = "gh: API rate limit exceeded for installation ID 123456";
         let signal = parse_rate_limit_error(stderr, 1).expect("should parse primary rate limit");
