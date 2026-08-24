@@ -43,6 +43,8 @@ FAKE_HOME="$SCRATCH_DIR/home"
 mkdir -p "$FAKE_HOME/.dark-factory"
 
 LOG_FILE="$SCRATCH_DIR/gh_calls.log"
+POLICY_FILE="$SCRATCH_DIR/auto_merge_repo_allowlist.json"
+printf '%s\n' '{"allowed_repos":["jleechanorg/dark-factory"]}' > "$POLICY_FILE"
 
 cat > "$FAKE_BIN_DIR/gh" <<'EOGH'
 #!/usr/bin/env bash
@@ -120,7 +122,7 @@ assert_contains "check_runner_health reports online runner count" "Online runner
 
 echo "=== TEST CASE 3: auto-merge-guard surfaces runner outage on non-green CI ==="
 set +e
-out3="$(GH_SHIM_LOG="$LOG_FILE" GH_SHIM_ONLINE_RUNNERS="0" HOME="$FAKE_HOME" PATH="$FAKE_BIN_DIR:$PATH" bash "$GUARD" 2>&1)"
+out3="$(GH_SHIM_LOG="$LOG_FILE" GH_SHIM_ONLINE_RUNNERS="0" AMG_REPO_POLICY_FILE="$POLICY_FILE" HOME="$FAKE_HOME" PATH="$FAKE_BIN_DIR:$PATH" bash "$GUARD" 2>&1)"
 set -e
 
 assert_contains "auto-merge-guard surfaces RUNNER OUTAGE in output" "RUNNER OUTAGE — consider --admin or wait" "$out3"
