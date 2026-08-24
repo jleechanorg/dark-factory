@@ -54,6 +54,8 @@ from runner.handler_web_advice import (  # noqa: E402
     _extract_verdict_token,
     _parse_pr_number,
     _post_pr_comment,
+    _probe_share_url,
+    _persist_share_evidence,
     _probe_aside_cli,
     _probe_aside_mcp,
     _probe_cdp_port,
@@ -61,6 +63,7 @@ from runner.handler_web_advice import (  # noqa: E402
     _run_e2e_smoke,
     _run_transport_probe,
     _run_web_advice_subprocess,
+    PANEL_SEATS,
     DEFAULT_MIN_DIFF_LINES,
     PROBE_TIMEOUT_SECONDS,
 )
@@ -196,7 +199,106 @@ class TestCoerceMeta:
     def test_complex_to_json(self):
         d = {"a": 1, "b": [1, 2]}
         out = _coerce_meta(d)
-        assert json.loads(out) == d
+        assert out == d
+
+
+class TestStructuredPanelContract:
+    def test_subprocess_parses_json_panel_result_without_keyword_triage(self, monkeypatch):
+        payload = {
+            "ok": True,
+            "decision": "continue_with_pr_warning",
+            "panel_seats_attempted": ["chatgpt", "gemini"],
+            "panel_seats_live": ["chatgpt"],
+            "panel_seats_unavailable": ["gemini"],
+            "panel_seats_unavailable_reasons": {"gemini": "transport absent"},
+            "panel_verdict_summary": {
+                "chatgpt": {"verdict": "NOT MERGE", "reasoning": "file.py:7"}
+            },
+        }
+        fake = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout="narrative NOT MERGE\n" + json.dumps(payload), stderr=""
+        )
+        monkeypatch.setattr("runner.handler_web_advice.subprocess.run", lambda *a, **k: fake)
+        result = _run_web_advice_subprocess("aside_mcp", "prompt")
+        assert result["decision"] == "continue_with_pr_warning"
+        assert result["panel_seats_live"] == ["chatgpt"]
+        assert result["panel_verdict_summary"]["chatgpt"]["reasoning"] == "file.py:7"
+        assert "verdict" not in result
+
+    def test_malformed_json_does_not_fall_back_to_verdict_keywords(self, monkeypatch):
+        fake = subprocess.CompletedProcess(args=[], returncode=0, stdout="VERDICT: NOT MERGE", stderr="")
+        monkeypatch.setattr("runner.handler_web_advice.subprocess.run", lambda *a, **k: fake)
+        result = _run_web_advice_subprocess("aside_mcp", "prompt")
+        assert result["ok"] is False
+        assert result["verdict"] == "unknown"
+
+
+class TestShareUrlProbe:
+    def test_accepts_public_200_without_cookie(self, monkeypatch):
+        class Response:
+            status = 200
+            def geturl(self):
+                return "https://g.co/gemini/share/abc"
+            def getheaders(self):
+                return [("Content-Type", "text/html")]
+            def __enter__(self): return self
+            def __exit__(self, *args): return None
+        monkeypatch.setattr("runner.handler_web_advice.urllib.request.urlopen", lambda *a, **k: Response())
+        result = _probe_share_url("https://g.co/gemini/share/abc")
+        assert result["ok"] is True
+        assert result["status"] == 200
+
+    @pytest.mark.parametrize("final_url", ["https://accounts.example.com/login", "https://example.com/signin"])
+    def test_rejects_login_redirect(self, monkeypatch, final_url):
+        class Response:
+            status = 200
+            def geturl(self): return final_url
+            def getheaders(self): return []
+            def __enter__(self): return self
+            def __exit__(self, *args): return None
+        monkeypatch.setattr("runner.handler_web_advice.urllib.request.urlopen", lambda *a, **k: Response())
+        result = _probe_share_url("https://g.co/gemini/share/abc")
+        assert result["ok"] is False
+        assert "login" in result["error"] or "signin" in result["error"]
+
+    def test_rejects_set_cookie(self, monkeypatch):
+        class Response:
+            status = 200
+            def geturl(self): return "https://g.co/gemini/share/abc"
+            def getheaders(self): return [("Set-Cookie", "session=secret")]
+            def __enter__(self): return self
+            def __exit__(self, *args): return None
+        monkeypatch.setattr("runner.handler_web_advice.urllib.request.urlopen", lambda *a, **k: Response())
+        result = _probe_share_url("https://g.co/gemini/share/abc")
+        assert result["ok"] is False
+        assert "Set-Cookie" in result["error"]
+
+
+class TestShareEvidencePersistence:
+    def test_persists_atomically_with_seat_keys(self, tmp_path):
+        path = _persist_share_evidence(
+            tmp_path,
+            {"chatgpt": {"share_url": "https://chatgpt.com/share/a", "share_url_probe": {"ok": True}}},
+            pr_url="https://github.com/o/r/pull/1", head_sha="abc",
+        )
+        assert path == tmp_path / "web-advice-share-urls.json"
+        data = json.loads(path.read_text())
+        assert data["chatgpt"]["share_url"] == "https://chatgpt.com/share/a"
+        assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_followup_bead_body_starts_with_target_repo(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        "runner.handler_web_advice.subprocess.run",
+        lambda cmd, **kwargs: seen.append((cmd, kwargs)) or subprocess.CompletedProcess(cmd, 0, "jleechan-xyz\n", ""),
+    )
+    from runner.handler_web_advice import _file_followup_bead
+    result = _file_followup_bead(target_repo="jleechanorg/dark-factory", pr_number=742, decision="continue_with_bead", summary="infra")
+    assert result["bead_id"] == "jleechan-xyz"
+    body = seen[0][1]["input"] if "input" in seen[0][1] else seen[0][0][-1]
+    assert body.startswith("target_repo: jleechanorg/dark-factory\n")
 
 
 # ---------------------------------------------------------------------------
@@ -587,6 +689,16 @@ class TestSkipOnSmallDiff:
 
 
 class TestAllTransportsDown:
+    def test_infra_files_target_repo_scoped_bead(self, tmp_path, monkeypatch):
+        _stub_all_transports_down(monkeypatch)
+        monkeypatch.setattr("runner.handler_web_advice._compute_diff_lines", lambda repo_dir: 100)
+        calls = []
+        monkeypatch.setattr("runner.handler_web_advice._file_followup_bead", lambda **kw: calls.append(kw) or {"ok": True, "bead_id": "jleechan-infra"})
+        ctx = _make_ctx(tmp_path, target_repo="jleechanorg/dark-factory")
+        result = _web_advice(Node(name="web_advice", attrs={"type": "web_advice"}), ctx)
+        assert result.outcome == "success"
+        assert result.metadata["decision"] == "continue_with_bead"
+        assert calls[0]["target_repo"] == "jleechanorg/dark-factory"
     def test_returns_success_with_infra_note(self, tmp_path, monkeypatch):
         _stub_all_transports_down(monkeypatch)
         monkeypatch.setattr(
@@ -686,6 +798,46 @@ class TestAllTransportsDown:
 
 
 class TestSuccessfulRun:
+    def test_structured_panel_preserves_seats_probes_evidence_and_bead(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("runner.handler_web_advice._probe_aside_mcp", lambda c: True)
+        monkeypatch.setattr("runner.handler_web_advice._compute_diff_lines", lambda repo_dir: 100)
+        monkeypatch.setattr("runner.handler_web_advice._run_e2e_smoke", lambda *a, **k: {"ok": True})
+        monkeypatch.setattr("runner.handler_web_advice._probe_share_url", lambda url: {"ok": True, "status": 200, "final_url": url, "error": ""})
+        monkeypatch.setattr("runner.handler_web_advice._render_prompt", lambda node, ctx: "rendered " + ctx.state["feature"])
+        monkeypatch.setattr("runner.handler_web_advice._post_pr_comment", lambda *a, **k: {"ok": True, "returncode": 0, "stderr": ""})
+        bead_calls = []
+        monkeypatch.setattr("runner.handler_web_advice._file_followup_bead", lambda **kw: bead_calls.append(kw) or {"ok": True, "bead_id": "jleechan-abc"})
+        monkeypatch.setattr("runner.handler_web_advice._run_web_advice_subprocess", lambda **kw: {
+            "ok": True, "decision": "continue_with_bead", "panel_seats_attempted": list(PANEL_SEATS),
+            "panel_seats_live": ["chatgpt", "gemini", "grok"], "panel_seats_unavailable": ["perplexity"],
+            "panel_seats_unavailable_reasons": {"perplexity": "provider unavailable"},
+            "panel_verdict_summary": {
+                "chatgpt": {"verdict": "NOT MERGE", "share_url": "https://chatgpt.com/share/a"},
+                "gemini": {"verdict": "NOT MERGE", "share_url": "https://g.co/gemini/share/b"},
+                "grok": {"verdict": "NOT MERGE", "share_url": "https://grok.com/share/c"},
+            }, "returncode": 0, "transport": "aside_mcp",
+        })
+        ctx = _make_ctx(tmp_path, feature="web-advice-failopen-test-pr", target_repo="jleechanorg/dark-factory", evidence_dir=str(tmp_path / "evidence"))
+        node = Node(name="web_advice", attrs={"type": "web_advice", "prompt": "@prompts/web_advice.txt", "min_diff_lines": "5"})
+        result = _web_advice(node, ctx)
+        assert result.outcome == "success"
+        assert result.metadata["panel_seats_live"] == ["chatgpt", "gemini", "grok"]
+        assert result.metadata["panel_seats_unavailable"] == ["perplexity"]
+        assert result.metadata["bead_id"] == "jleechan-abc"
+        assert json.loads((tmp_path / "evidence/web-advice-share-urls.json").read_text())["chatgpt"]["share_url_probe"]["ok"] is True
+        assert bead_calls and bead_calls[0]["target_repo"] == "jleechanorg/dark-factory"
+
+    def test_prompt_is_rendered_before_subprocess(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("runner.handler_web_advice._compute_diff_lines", lambda repo_dir: 100)
+        monkeypatch.setattr("runner.handler_web_advice._probe_aside_mcp", lambda c: True)
+        monkeypatch.setattr("runner.handler_web_advice._run_e2e_smoke", lambda *a, **k: {"ok": True})
+        monkeypatch.setattr("runner.handler_web_advice._post_pr_comment", lambda *a, **k: {"ok": True, "returncode": 0, "stderr": ""})
+        seen = []
+        monkeypatch.setattr("runner.handler_web_advice._render_prompt", lambda node, ctx: "RENDERED ${state.feature}")
+        monkeypatch.setattr("runner.handler_web_advice._run_web_advice_subprocess", lambda **kw: seen.append(kw) or {"ok": False, "returncode": 1, "transport": "aside_mcp"})
+        _web_advice(Node(name="web_advice", attrs={"type": "web_advice"}), _make_ctx(tmp_path, feature="f"))
+        assert seen[0]["prompt"] == "RENDERED ${state.feature}"
+
     def test_captures_verdict_and_share_url(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
             "runner.handler_web_advice._probe_aside_mcp", lambda c: True
@@ -711,6 +863,10 @@ class TestSuccessfulRun:
         monkeypatch.setattr(
             "runner.handler_web_advice._run_e2e_smoke",
             lambda *a, **kw: {"ok": True, "skipped": True, "returncode": 0, "stderr": ""},
+        )
+        monkeypatch.setattr(
+            "runner.handler_web_advice._probe_share_url",
+            lambda url: {"ok": True, "status": 200, "final_url": url, "error": ""},
         )
 
         comment_calls: list[dict] = []

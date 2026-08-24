@@ -22,6 +22,37 @@ Hard rules (per `~/.claude/skills/web-advice/SKILL.md` §1 HARD-FAIL CONTRACT):
    Every missing seat needs an entry in `panel_seats_unavailable_reasons`
    citing the exact transport failure from the §3.5 probe matrix.
 
+### Machine-readable return contract
+
+After completing the browser work, emit exactly one final JSON object (it may
+follow brief human-readable progress text). Do not encode the decision in
+prose for the runner to infer. The object MUST contain:
+
+```json
+{
+  "decision": "continue | continue_with_pr_warning | continue_with_bead",
+  "panel_seats_attempted": ["chatgpt", "gemini", "grok", "perplexity"],
+  "panel_seats_live": [],
+  "panel_seats_unavailable": [],
+  "panel_seats_unavailable_reasons": {},
+  "panel_verdict_summary": {
+    "seat": {
+      "verdict": "APPROVE | NOT MERGE | INSUFFICIENT | INCOMPLETE",
+      "confidence": "high | medium | low",
+      "reasoning": "concrete evidence or transport reason",
+      "share_url": null,
+      "share_url_probe": {}
+    }
+  },
+  "panel_convergence": {}
+}
+```
+
+`panel_seats_live` must contain only seats that actually completed their UI
+review. `continue_with_bead` is the model-owned decision for an infrastructure
+failure or a concrete 3-of-4 NOT-MERGE result; the runner will execute that
+side effect without keyword-based triage.
+
 Inputs (read from `ctx.state` — never invent these):
 
   - `${state.pr_url}` — the PR under review (required)

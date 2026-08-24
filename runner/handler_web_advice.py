@@ -39,11 +39,14 @@ import os
 import pathlib
 import shutil
 import subprocess
+import tempfile
 import time
 import urllib.request
+import urllib.error
 from typing import TYPE_CHECKING, Any, Optional
 
 from .handler_core import Result
+from .handler_render import _render_prompt
 
 if TYPE_CHECKING:
     from .parser import Node
@@ -77,6 +80,8 @@ _CDP_PORT = 9222
 _WEB_ADVICE_E2E_SMOKE = pathlib.Path(
     os.path.expanduser("~/.claude/skills/web-advice/scripts/e2e_smoke.sh")
 )
+
+PANEL_SEATS = ("chatgpt", "gemini", "grok", "perplexity")
 
 
 # ---------------------------------------------------------------------------
@@ -374,12 +379,14 @@ def _post_pr_comment(pr_number: int, body: str, *, repo: Optional[str] = None,
             "ok": res.returncode == 0,
             "returncode": res.returncode,
             "stderr": (res.stderr or "")[:500],
+            "url": next((token for token in (res.stdout or "").split() if token.startswith("https://github.com/") and "#issuecomment-" in token), None),
         }
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {
             "ok": False,
             "returncode": -1,
             "stderr": f"{type(exc).__name__}: {exc}"[:500],
+            "url": None,
         }
 
 
@@ -422,13 +429,9 @@ def _run_web_advice_subprocess(transport: str, prompt: str, *,
                                timeout: int = WEB_ADVICE_SUBPROCESS_TIMEOUT) -> dict:
     """Run the actual /web-advice flow via ``claude --print``.
 
-    Per SKILL.md §3 — the LLM (this Claude invocation) drives the
-    Share-URL capture and probe itself. The runner does NOT validate
-    share URLs (per §1b #3 the capturing LLM does) — we just relay the
-    output back to the handler, which forwards verdict summary to CXDB
-    and the PR comment.
-
-    Returns ``{"ok": bool, "verdict": str, "summary": str, "share_urls": list[str], "stderr": str}``.
+    The subprocess owns the semantic panel decision and must emit a JSON
+    object conforming to the prompt contract. The runner only parses and
+    transports that structured result; it does not infer policy from prose.
 
     Mockable: tests patch this symbol to return a canned result.
     """
@@ -442,17 +445,21 @@ def _run_web_advice_subprocess(transport: str, prompt: str, *,
             check=False,
         )
         stdout = res.stdout or ""
-        verdict = _extract_verdict_token(stdout)
-        share_urls = _extract_share_urls(stdout)
-        return {
-            "ok": res.returncode == 0,
-            "verdict": verdict,
-            "summary": stdout[-2000:] if len(stdout) > 2000 else stdout,
-            "share_urls": share_urls,
+        payload = _parse_structured_panel_result(stdout)
+        diagnostics = {
             "returncode": res.returncode,
             "stderr": (res.stderr or "")[:500],
             "transport": transport,
+            "raw_output": stdout[-2000:] if len(stdout) > 2000 else stdout,
         }
+        if payload is None or res.returncode != 0:
+            return {
+                "ok": False, "verdict": "unknown", "summary": "", "share_urls": [],
+                "panel_seats_attempted": [], "panel_seats_live": [],
+                "panel_seats_unavailable": [], "panel_seats_unavailable_reasons": {},
+                "panel_verdict_summary": {}, "decision": "continue", **diagnostics,
+            }
+        return {"ok": True, **payload, **diagnostics}
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {
             "ok": False,
@@ -463,6 +470,92 @@ def _run_web_advice_subprocess(transport: str, prompt: str, *,
             "stderr": f"{type(exc).__name__}: {exc}"[:500],
             "transport": transport,
         }
+
+
+def _parse_structured_panel_result(output: str) -> Optional[dict]:
+    """Parse the last JSON object emitted by /web-advice.
+
+    Malformed output is an explicit subprocess failure. We intentionally do
+    not recover a verdict from narrative text or keyword matching.
+    """
+    if not output:
+        return None
+    decoder = json.JSONDecoder()
+    candidates: list[dict] = []
+    for idx, char in enumerate(output):
+        if char != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(output[idx:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            candidates.append(value)
+    required = {
+        "panel_seats_attempted", "panel_seats_live", "panel_seats_unavailable",
+        "panel_seats_unavailable_reasons", "panel_verdict_summary", "decision",
+    }
+    for value in reversed(candidates):
+        if required.issubset(value):
+            return value
+    return None
+
+
+def _probe_share_url(url: str, *, timeout: float = 10.0) -> dict:
+    """Probe a public Share URL without credentials or cookie persistence."""
+    request = urllib.request.Request(url, method="HEAD", headers={"Accept": "text/html"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            status_value = getattr(response, "status", None)
+            if status_value is None:
+                status_value = response.getcode()
+            status = int(status_value)
+            final_url = str(response.geturl())
+            headers = response.getheaders()
+    except urllib.error.HTTPError as exc:
+        return {"ok": False, "status": int(exc.code), "final_url": str(exc.geturl()), "error": f"HTTP {exc.code}"}
+    except (OSError, ValueError, urllib.error.URLError) as exc:
+        return {"ok": False, "status": None, "final_url": "", "error": f"{type(exc).__name__}: {exc}"[:300]}
+    header_names = {str(k).lower() for k, _ in headers}
+    lowered_url = final_url.lower()
+    if "set-cookie" in header_names:
+        return {"ok": False, "status": status, "final_url": final_url, "error": "Set-Cookie header present"}
+    if any(marker in lowered_url for marker in ("/login", "/signin", "/sign-in", "/auth/")):
+        return {"ok": False, "status": status, "final_url": final_url, "error": f"login redirect: {final_url}"}
+    # urllib follows ordinary redirects; a valid probe therefore ends at
+    # 200. A bare 3xx is not evidence of a public unauthenticated page.
+    if status != 200:
+        return {"ok": False, "status": status, "final_url": final_url, "error": f"HTTP {status}"}
+    return {"ok": True, "status": status, "final_url": final_url, "error": ""}
+
+
+def _persist_share_evidence(
+    evidence_dir: pathlib.Path,
+    seats: dict,
+    *,
+    pr_url: str = "",
+    head_sha: str = "",
+) -> pathlib.Path:
+    """Atomically persist the per-seat public-share evidence JSON."""
+    evidence_dir = pathlib.Path(evidence_dir)
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    target = evidence_dir / "web-advice-share-urls.json"
+    payload = {"schema_version": 1, "pr_url": pr_url, "head_sha": head_sha, **seats}
+    fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=evidence_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, target)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+    return target
 
 
 def _extract_verdict_token(output: str) -> str:
@@ -496,6 +589,68 @@ def _extract_share_urls(output: str) -> list[str]:
     return pattern.findall(output)
 
 
+def _normalise_panel_result(verdict_data: dict) -> dict:
+    """Apply transport-safe shape normalization without semantic triage."""
+    attempted = [seat for seat in verdict_data.get("panel_seats_attempted", PANEL_SEATS) if seat in PANEL_SEATS]
+    live = [seat for seat in verdict_data.get("panel_seats_live", []) if seat in attempted]
+    unavailable = [seat for seat in verdict_data.get("panel_seats_unavailable", []) if seat in attempted and seat not in live]
+    unavailable.extend(seat for seat in attempted if seat not in live and seat not in unavailable)
+    reasons = dict(verdict_data.get("panel_seats_unavailable_reasons") or {})
+    for seat in unavailable:
+        reasons.setdefault(seat, "unavailable reason not provided by structured panel result")
+    summaries = dict(verdict_data.get("panel_verdict_summary") or {})
+    probes: dict[str, dict] = {}
+    for seat, summary in summaries.items():
+        if not isinstance(summary, dict):
+            continue
+        url = summary.get("share_url")
+        if not url:
+            continue
+        probe = _probe_share_url(str(url))
+        probes[seat] = probe
+        summary["share_url_probe"] = probe
+        if not probe.get("ok"):
+            summary["share_url"] = None
+
+    # Transitional flat URL support still probes every emitted URL, but does
+    # not claim those URLs belong to all four seats.
+    flat_urls = [str(url) for url in (verdict_data.get("share_urls") or []) if url]
+    flat_probes = [_probe_share_url(url) for url in flat_urls]
+    return {
+        **verdict_data,
+        "panel_seats_attempted": attempted,
+        "panel_seats_live": live,
+        "panel_seats_unavailable": unavailable,
+        "panel_seats_unavailable_reasons": reasons,
+        "panel_verdict_summary": summaries,
+        "share_url_probes": probes,
+        "flat_share_url_probes": flat_probes,
+        "share_urls": [url for url, probe in zip(flat_urls, flat_probes) if probe.get("ok")],
+    }
+
+
+def _file_followup_bead(*, target_repo: str, pr_number: int, decision: str, summary: str) -> dict:
+    """File the model-requested follow-up bead with an unambiguous repo scope."""
+    if not target_repo:
+        return {"ok": False, "bead_id": None, "error": "missing target_repo"}
+    title = f"PR #{pr_number} /web-advice panel follow-up"
+    body = f"target_repo: {target_repo}\n\nDecision: {decision}\n\n{summary[:3000]}"
+    try:
+        res = subprocess.run(
+            ["br", "create", "--title", title, "--body", body],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "bead_id": None, "error": f"{type(exc).__name__}: {exc}"[:300]}
+    output = (res.stdout or "").strip()
+    bead_id = None
+    for token in output.split():
+        if token.startswith("jleechan-"):
+            bead_id = token.strip("` ,.:;()")
+            break
+    return {"ok": res.returncode == 0, "bead_id": bead_id, "error": (res.stderr or "")[:300], "body": body}
+
+
 # ---------------------------------------------------------------------------
 # PR comment builders
 # ---------------------------------------------------------------------------
@@ -505,13 +660,17 @@ def _build_verdict_comment(verdict_data: dict, pr_url: str) -> str:
     """Build the §6.1 verdict-captured PR comment body."""
     verdict = verdict_data.get("verdict", "unknown")
     summary = verdict_data.get("summary", "")
+    decision = verdict_data.get("decision", "continue")
+    panel_live = verdict_data.get("panel_seats_live", []) or []
+    panel_attempted = verdict_data.get("panel_seats_attempted", []) or []
     share_urls = verdict_data.get("share_urls", []) or []
     transport = verdict_data.get("transport", "auto")
     lines = [
         "<!-- web-advice-review -->",
         "## /web-advice panel review",
         "",
-        f"**Decision:** `continue` (verdict captured — fail-open)",
+        f"**Decision:** `{decision}` (verdict captured — fail-open)",
+        f"**Panel seats:** {len(panel_live)}/{len(panel_attempted)} live",
         f"**Transport:** `{transport}`",
         f"**PR:** {pr_url}",
         "",
@@ -527,6 +686,12 @@ def _build_verdict_comment(verdict_data: dict, pr_url: str) -> str:
         lines.extend(["", "**Public share URLs:**"])
         for url in share_urls:
             lines.append(f"- {url}")
+    summaries = verdict_data.get("panel_verdict_summary") or {}
+    if summaries:
+        lines.extend(["", "**Per-seat summaries:**"])
+        for seat, seat_data in summaries.items():
+            if isinstance(seat_data, dict):
+                lines.append(f"- `{seat}`: `{seat_data.get('verdict', 'unknown')}`")
     lines.append("")
     lines.append("<!-- /web-advice-review -->")
     return "\n".join(lines)
@@ -538,7 +703,7 @@ def _build_infra_disclosure_comment(probe_summary: str, pr_url: str) -> str:
         "<!-- web-advice-review -->\n"
         "## /web-advice unavailable on this host\n"
         "\n"
-        "**Decision:** `continue` — /web-advice could not run (fail-open).\n"
+        "**Decision:** `continue_with_bead` — /web-advice could not run (fail-open).\n"
         "\n"
         f"**PR:** {pr_url}\n"
         "\n"
@@ -571,11 +736,19 @@ def _record_state(ctx: "Context", metadata: dict) -> None:
     """
     ctx.state["web_advice.outcome"] = str(metadata.get("web_advice_outcome", "unknown"))
     ctx.state["web_advice.verdict"] = str(metadata.get("verdict", "unknown"))
+    for field in ("panel_seats_live", "panel_seats_attempted", "panel_decision", "bead_id", "pr_comment_url", "share_urls_persisted_to"):
+        if field in metadata:
+            ctx.state[f"web_advice.{field}"] = metadata[field]
+    if "panel_verdict_summary" in metadata:
+        ctx.state["web_advice.verdict_summary"] = metadata["panel_verdict_summary"]
     if metadata.get("infrastructure_failure_mode"):
         ctx.state["web_advice.infrastructure_failure_mode"] = str(
             metadata["infrastructure_failure_mode"]
         )
-    share_urls = metadata.get("share_urls") or []
+    share_urls = list(metadata.get("share_urls") or [])
+    for summary in (metadata.get("panel_verdict_summary") or {}).values():
+        if isinstance(summary, dict) and summary.get("share_url"):
+            share_urls.append(str(summary["share_url"]))
     if share_urls:
         ctx.state["web_advice.share_url"] = ",".join(share_urls)
     elapsed = metadata.get("elapsed_seconds")
@@ -608,7 +781,11 @@ def _web_advice(node: "Node", ctx: "Context") -> "Result":
         "elapsed_seconds": 0,
         "panel_seats_attempted": [],
         "panel_seats_live": [],
+        "panel_seats_unavailable": [],
+        "panel_seats_unavailable_reasons": {},
         "panel_verdict_summary": {},
+        "panel_decision": "continue",
+        "panel_convergence": {},
         "transport_probes": {},
     }
 
@@ -643,7 +820,7 @@ def _web_advice_inner(node: "Node", ctx: "Context", metadata: dict, started_ts: 
     # 1. Inputs
     # ------------------------------------------------------------------
     pr_url = str(ctx.state.get("pr_url") or "")
-    pr_head_sha = str(ctx.state.get("pr_head_sha") or "")
+    pr_head_sha = str(ctx.state.get("head_sha") or ctx.state.get("pr_head_sha") or "")
     repo_dir_str = str(ctx.state.get("repo_dir") or ctx.workdir or "")
     repo_dir = pathlib.Path(repo_dir_str) if repo_dir_str else ctx.workdir
 
@@ -673,6 +850,7 @@ def _web_advice_inner(node: "Node", ctx: "Context", metadata: dict, started_ts: 
 
     pr_number = _parse_pr_number(pr_url)
     pr_repo = _extract_pr_repo(pr_url)
+    target_repo = str(ctx.state.get("target_repo") or "")
     if pr_number is None:
         metadata.update({
             "web_advice_outcome": "unparseable_pr_url",
@@ -724,13 +902,26 @@ def _web_advice_inner(node: "Node", ctx: "Context", metadata: dict, started_ts: 
         elapsed = round(time.time() - started_ts, 3)
         comment_body = _build_infra_disclosure_comment(probe["summary"], pr_url)
         comment_result = _post_pr_comment(pr_number, comment_body, repo=pr_repo)
+        bead_result = _file_followup_bead(
+            target_repo=target_repo,
+            pr_number=pr_number,
+            decision="continue_with_bead",
+            summary=probe["summary"],
+        ) if target_repo else {"ok": False, "bead_id": None, "error": "missing target_repo"}
+        evidence_dir = pathlib.Path(str(ctx.state.get("evidence_dir") or repo_dir / f"docs/pr{pr_number}-evidence"))
+        evidence_path = _persist_share_evidence(evidence_dir, {}, pr_url=pr_url, head_sha=pr_head_sha)
         metadata.update({
             "web_advice_outcome": "infrastructure_failure",
             "infrastructure_failure_mode": "all_transports_down",
-            "decision": "continue",
+            "decision": "continue_with_bead" if target_repo else "continue",
+            "panel_decision": "continue_with_bead" if target_repo else "continue",
+            "bead_id": bead_result.get("bead_id"),
+            "bead_filed": bead_result.get("ok", False),
+            "share_urls_persisted_to": str(evidence_path),
             "elapsed_seconds": elapsed,
             "pr_comment_posted": comment_result["ok"],
             "pr_comment_rc": comment_result["returncode"],
+            "pr_comment_url": comment_result.get("url"),
         })
         _record_state(ctx, metadata)
         return Result(
@@ -756,26 +947,24 @@ def _web_advice_inner(node: "Node", ctx: "Context", metadata: dict, started_ts: 
     # ------------------------------------------------------------------
     # 5. Run the actual /web-advice subprocess
     # ------------------------------------------------------------------
-    prompt_text = str(node.attrs.get("prompt") or f"Review PR {pr_url} (head={pr_head_sha})")
+    prompt_text = _render_prompt(node, ctx)
     verdict_data = _run_web_advice_subprocess(
         transport=live_transport or "auto",
         prompt=prompt_text,
     )
+    verdict_data = _normalise_panel_result(verdict_data)
     metadata.update({
         "verdict": verdict_data.get("verdict", "unknown"),
         "share_urls": verdict_data.get("share_urls", []) or [],
         "subprocess_rc": verdict_data.get("returncode", -1),
-        "panel_seats_attempted": ["chatgpt", "gemini", "grok", "perplexity"],
-        "panel_seats_live": (
-            ["chatgpt", "gemini", "grok", "perplexity"]
-            if verdict_data.get("ok")
-            else []
-        ),
-        "panel_verdict_summary": (
-            {"_synthesized": verdict_data.get("summary", "")}
-            if verdict_data.get("ok")
-            else {}
-        ),
+        "panel_seats_attempted": verdict_data.get("panel_seats_attempted", []),
+        "panel_seats_live": verdict_data.get("panel_seats_live", []),
+        "panel_seats_unavailable": verdict_data.get("panel_seats_unavailable", []),
+        "panel_seats_unavailable_reasons": verdict_data.get("panel_seats_unavailable_reasons", {}),
+        "panel_verdict_summary": verdict_data.get("panel_verdict_summary", {}),
+        "panel_convergence": verdict_data.get("panel_convergence", {}),
+        "panel_decision": verdict_data.get("decision", "continue"),
+        "share_url_probes": verdict_data.get("share_url_probes", {}),
     })
 
     # ------------------------------------------------------------------
@@ -785,15 +974,34 @@ def _web_advice_inner(node: "Node", ctx: "Context", metadata: dict, started_ts: 
     comment_result = _post_pr_comment(pr_number, comment_body, repo=pr_repo)
     metadata["pr_comment_posted"] = comment_result["ok"]
     metadata["pr_comment_rc"] = comment_result["returncode"]
+    metadata["pr_comment_url"] = comment_result.get("url")
 
     elapsed = round(time.time() - started_ts, 3)
     metadata["elapsed_seconds"] = elapsed
-    metadata["decision"] = "continue"
+    metadata["decision"] = verdict_data.get("decision", "continue")
     if not verdict_data.get("ok"):
         metadata["web_advice_outcome"] = "subprocess_failed"
         metadata["decision"] = "continue"
     else:
         metadata["web_advice_outcome"] = "verdict_captured"
+
+    evidence_dir = pathlib.Path(str(ctx.state.get("evidence_dir") or repo_dir / f"docs/pr{pr_number}-evidence"))
+    evidence_path = _persist_share_evidence(
+        evidence_dir,
+        metadata["panel_verdict_summary"],
+        pr_url=pr_url,
+        head_sha=pr_head_sha,
+    )
+    metadata["share_urls_persisted_to"] = str(evidence_path)
+    if metadata["decision"] == "continue_with_bead":
+        bead_result = _file_followup_bead(
+            target_repo=target_repo,
+            pr_number=pr_number,
+            decision=metadata["decision"],
+            summary=json.dumps(metadata["panel_verdict_summary"], ensure_ascii=False),
+        ) if target_repo else {"ok": False, "bead_id": None, "error": "missing target_repo"}
+        metadata["bead_id"] = bead_result.get("bead_id")
+        metadata["bead_filed"] = bead_result.get("ok", False)
 
     _record_state(ctx, metadata)
     return Result(
@@ -814,17 +1022,8 @@ def _web_advice_inner(node: "Node", ctx: "Context", metadata: dict, started_ts: 
 
 
 def _coerce_meta(value: Any) -> Any:
-    """Coerce a metadata value into a CXDB-safe scalar/JSON form.
-
-    ``Result.metadata`` is typed as ``dict[str, str]`` in the dataclass
-    but cxdb.record_step accepts any JSON-serializable value via
-    ``json.dumps``. Keep simple scalars as-is; coerce complex objects
-    to JSON strings so the dataclass invariant doesn't break while
-    preserving structured data in CXDB.
-    """
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    try:
-        return json.dumps(value, sort_keys=True)
-    except (TypeError, ValueError):
-        return str(value)[:200]
+    """Preserve a metadata value for CXDB's native JSON serialization."""
+    # CXDB serializes the complete metadata mapping as JSON. Preserve nested
+    # values here so consumers receive the documented schema rather than a
+    # JSON string requiring a second decode.
+    return value
