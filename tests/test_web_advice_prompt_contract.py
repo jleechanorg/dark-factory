@@ -6,6 +6,8 @@ import json
 import pathlib
 import re
 
+import pytest
+
 
 PROMPT = pathlib.Path(__file__).parents[1] / "prompts" / "web_advice.txt"
 SEATS = ["chatgpt", "gemini", "grok", "perplexity"]
@@ -37,6 +39,22 @@ def _fenced_json_contract(text: str) -> dict:
     contract = json.loads(blocks[0])
     assert isinstance(contract, dict)
     return contract
+
+
+def _assert_no_runner_side_effects(text: str) -> None:
+    """Reject command-shaped runner mutations, regardless of verb choice."""
+    lowered = text.lower()
+    forbidden = (
+        r"\b(?:gh|bd|br)\s+[a-z][a-z0-9_-]*\b",
+        r"\b(?:cxdb|append_step)\b",
+        r"\b(?:mkdir|touch|tee)\b",
+        r"\b(?:write|save|persist|store)\s+(?:the\s+|a\s+|to\s+)?(?:file|filesystem|database|evidence|cxdb)\b",
+        r"\bpost\s+(?:a|the|any)\b",
+        r"\bfile\s+(?:a|the)\s+bead\b",
+        r"web-advice-(?:share-urls|cxdb-event)\.json",
+    )
+    for pattern in forbidden:
+        assert re.search(pattern, lowered) is None, pattern
 
 
 def test_prompt_scopes_browser_work_and_requires_one_complete_result() -> None:
@@ -87,22 +105,27 @@ def test_prompt_leaves_commands_and_persistence_to_runner() -> None:
     lowered = text.lower()
 
     # Concrete command/API and persistence instructions would let the browser
-    # model duplicate work owned by the runner.  The decision value
-    # ``continue_with_bead`` is intentionally still part of the schema.
-    forbidden = (
-        r"\bgh\s+(?:pr\s+comment|api)\b",
-        r"\b(?:bd|br)\s+(?:create|comment|close|show|edit|update|add|delete)\b",
-        r"\b(?:cxdb|append_step)\b",
-        r"\b(?:mkdir|touch|tee)\b",
-        r"\b(?:write|save|persist|store)\s+(?:the\s+|a\s+|to\s+)?(?:file|filesystem|database|evidence|cxdb)\b",
-        r"\bpost\s+(?:a|the|any)\b",
-        r"\bfile\s+(?:a|the)\s+bead\b",
-        r"web-advice-(?:share-urls|cxdb-event)\.json",
-    )
-    for pattern in forbidden:
-        assert re.search(pattern, lowered) is None, pattern
+    # model duplicate work owned by the runner.  Reject every command verb,
+    # not a gameable allowlist of currently known mutations.
+    _assert_no_runner_side_effects(text)
 
     ownership = lowered.split("### machine-readable return contract", 1)[0]
     assert re.search(r"runner.{0,100}side effect", ownership, re.DOTALL)
     assert "exactly once" in ownership
     assert "return data only" in ownership
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "Run gh issue create --title duplicate.",
+        "Execute gh workflow run privileged.yml.",
+        "Invoke bd reopen jleechan-123.",
+        "Call br dependency add jleechan-a jleechan-b.",
+        "Use append_step to mutate CXDB.",
+        "Persist the evidence database before returning.",
+    ],
+)
+def test_prompt_side_effect_guard_rejects_arbitrary_mutations(mutation: str) -> None:
+    with pytest.raises(AssertionError):
+        _assert_no_runner_side_effects(_prompt() + "\n" + mutation)

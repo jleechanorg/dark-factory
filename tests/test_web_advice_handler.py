@@ -38,7 +38,7 @@ import sys
 ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-import pytest
+import pytest  # noqa: E402
 
 # Prime the import cycle: runner.handlers -> handler_web_advice
 from runner.handlers import _web_advice  # noqa: F401, E402
