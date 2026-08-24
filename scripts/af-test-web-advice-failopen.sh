@@ -98,6 +98,7 @@ INVOCATION=(
   --workdir "${TEST_PR_WORKTREE}"
   --backend echo
   --feature "${FEATURE_NAME}"
+  --require-holdouts
   --state "pr_url=${TEST_PR_URL}"
   --state "head_sha=${HEAD_SHA}"
   --state "diff_path=${DIFF_PATH}"

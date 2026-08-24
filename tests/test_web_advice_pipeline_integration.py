@@ -36,6 +36,16 @@ def test_handler_and_prompt_reused():
     assert "web_advice" in TYPE_REGISTRY, "web_advice must be registered in TYPE_REGISTRY"
 
 
+def test_lane_d_e2e_invocation_requires_holdouts():
+    """The canonical full-pipeline replay must fail closed when holdouts are absent."""
+    script = ROOT / "scripts" / "af-test-web-advice-failopen.sh"
+    text = script.read_text(encoding="utf-8")
+    assert "INVOCATION=(" in text
+    invocation = text.split("INVOCATION=(", 1)[1].split(")", 1)[0]
+    assert "--require-holdouts" in invocation
+    assert '--feature "${FEATURE_NAME}"' in invocation
+
+
 def test_pr_gates_dot_web_advice_integration():
     """pr_gates.dot contains web_advice after strict gates with min_diff_lines=5 and unconditional exit edge."""
     pipeline_path = ROOT / "pipelines" / "factory" / "pr_gates.dot"
