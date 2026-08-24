@@ -262,10 +262,11 @@ above `jleechan2015` web-advice review). Both visible at `gh pr view 664 --comme
    cross-Model lens — verdict=fail because the CDP transport on this host produced
    no usable panel data, NOT because of any defect in the docs change.
 2. **Do NOT merge PR #664.** It is a test fixture.
-3. **Item #2 §3.5 probe accepts cdp_port as live — FIXED:**
-   Tightened `_probe_aside_cli` to require Aside CLI to be present and responding (`aside --version` rc=0),
-   and `_probe_cdp_port` to require `_probe_aside_cli()` to return `True` in addition to TCP port 9222 listening.
-   On Linux hosts without Aside CLI, `cdp_port` is immediately recognized as absent, preventing doomed 3-minute CDP attempts.
+3. **Item #2 §3.5 probe accepts an arbitrary TCP listener as CDP — FIXED:**
+   `_probe_cdp_port` now validates Chrome's `/json/version` response and requires
+   both the browser identity and a DevTools browser WebSocket URL. CDP remains an
+   independent Linux transport rung, so a healthy headless Chrome session works
+   when Aside CLI is not installed while a non-CDP service on port 9222 is rejected.
 4. **Item #3 JSON heredoc escape bug — FIXED:**
    Fixed in `scripts/af-test-web-advice-failopen.sh` by passing `SUMMARY_JSON` via `sys.stdin` to `json.load` rather
    than expanding bash variables inside python raw triple-quoted code blocks.

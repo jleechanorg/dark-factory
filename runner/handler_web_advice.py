@@ -38,9 +38,9 @@ import json
 import os
 import pathlib
 import shutil
-import socket
 import subprocess
 import time
+import urllib.request
 from typing import TYPE_CHECKING, Any, Optional
 
 from .handler_core import Result
@@ -243,14 +243,31 @@ def _probe_chrome_extension(ctx: "Context") -> bool:
 
 
 def _probe_cdp_port() -> bool:
-    """Probe whether Chrome DevTools is listening on ``127.0.0.1:9222`` AND Aside CLI is responding."""
-    if not _probe_aside_cli():
-        return False
+    """Probe the local Chrome DevTools protocol endpoint.
+
+    CDP is an independent Linux transport rung: Aside may be unavailable while
+    a headless Chrome session is healthy.  Checking ``/json/version`` avoids
+    treating an arbitrary TCP listener on port 9222 as Chrome DevTools.
+    """
     try:
-        with socket.create_connection(("127.0.0.1", _CDP_PORT), timeout=0.5):
-            return True
-    except OSError:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{_CDP_PORT}/json/version",
+            headers={"Accept": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=0.5) as response:
+            payload = json.loads(response.read(65_536))
+    except (OSError, ValueError, json.JSONDecodeError, UnicodeDecodeError):
         return False
+
+    browser = payload.get("Browser") if isinstance(payload, dict) else None
+    websocket_url = payload.get("webSocketDebuggerUrl") if isinstance(payload, dict) else None
+    return (
+        isinstance(browser, str)
+        and bool(browser.strip())
+        and isinstance(websocket_url, str)
+        and websocket_url.startswith(("ws://", "wss://"))
+        and "/devtools/browser/" in websocket_url
+    )
 
 
 def _run_transport_probe(node: "Node", ctx: "Context", max_seconds: int = PROBE_TIMEOUT_SECONDS) -> dict:

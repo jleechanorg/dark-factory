@@ -335,28 +335,40 @@ class TestProbePerTransport:
         monkeypatch.setattr("subprocess.run", _timeout)
         assert _probe_aside_cli() is False
 
-    def test_probe_cdp_port_requires_aside_cli(self, monkeypatch):
-        monkeypatch.setattr("runner.handler_web_advice._probe_aside_cli", lambda: False)
-        assert _probe_cdp_port() is False
-
-    def test_probe_cdp_port_aside_cli_and_socket_ok(self, monkeypatch):
-        class FakeSocket:
+    def test_probe_cdp_port_is_independent_of_aside_cli(self, monkeypatch):
+        class FakeResponse:
             def __enter__(self):
                 return self
 
             def __exit__(self, *args):
                 pass
 
-        monkeypatch.setattr("runner.handler_web_advice._probe_aside_cli", lambda: True)
-        monkeypatch.setattr("socket.create_connection", lambda addr, timeout: FakeSocket())
+            def read(self, _limit):
+                return b'{"Browser":"Chrome/148","webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/browser/id"}'
+
+        monkeypatch.setattr("runner.handler_web_advice._probe_aside_cli", lambda: False)
+        monkeypatch.setattr("urllib.request.urlopen", lambda request, timeout: FakeResponse())
         assert _probe_cdp_port() is True
 
-    def test_probe_cdp_port_aside_cli_ok_socket_error(self, monkeypatch):
-        def _err(addr, timeout):
+    def test_probe_cdp_port_rejects_non_cdp_http_listener(self, monkeypatch):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def read(self, _limit):
+                return b'{"status":"ok"}'
+
+        monkeypatch.setattr("urllib.request.urlopen", lambda request, timeout: FakeResponse())
+        assert _probe_cdp_port() is False
+
+    def test_probe_cdp_port_connection_error(self, monkeypatch):
+        def _err(request, timeout):
             raise OSError("Connection refused")
 
-        monkeypatch.setattr("runner.handler_web_advice._probe_aside_cli", lambda: True)
-        monkeypatch.setattr("socket.create_connection", _err)
+        monkeypatch.setattr("urllib.request.urlopen", _err)
         assert _probe_cdp_port() is False
 
 
