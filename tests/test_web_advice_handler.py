@@ -1075,20 +1075,40 @@ class TestFailOpenContract:
 
 
 class TestRunE2ESmoke:
-    def test_skipped_when_script_absent(self, monkeypatch):
-        # _WEB_ADVICE_E2E_SMOKE points at the real ~/.claude path which may
-        # not exist on the test host — the wrapper must short-circuit cleanly.
+    def test_skipped_when_script_absent(self, monkeypatch, tmp_path):
+        # Select an explicitly absent path so the result is independent of
+        # whether the developer's ~/.claude skill is installed.
+        monkeypatch.setattr(
+            "runner.handler_web_advice._WEB_ADVICE_E2E_SMOKE",
+            tmp_path / "missing-e2e-smoke.sh",
+        )
         result = _run_e2e_smoke()
-        # Either skipped (script absent) or ok=True with skipped=True.
-        assert "ok" in result
-        assert "returncode" in result
+        assert result == {
+            "ok": True,
+            "skipped": True,
+            "returncode": 0,
+            "stderr": "e2e_smoke.sh not present (skipped)",
+        }
 
-    def test_handles_timeout(self, monkeypatch):
-        # Point the constant at a non-existent fake script so we never
-        # actually invoke anything; verify timeout path is not triggered
-        # for the absent-script branch.
-        result = _run_e2e_smoke()
-        assert result["ok"] is True  # absent -> ok=True with skipped=True
+    def test_handles_timeout(self, monkeypatch, tmp_path):
+        # Make the script appear present, then force subprocess timeout so
+        # this exercises the timeout branch without running host commands.
+        script = tmp_path / "e2e_smoke.sh"
+        script.touch()
+        monkeypatch.setattr(
+            "runner.handler_web_advice._WEB_ADVICE_E2E_SMOKE", script
+        )
+
+        def _raise_timeout(*args, **kwargs):
+            raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+
+        monkeypatch.setattr("runner.handler_web_advice.subprocess.run", _raise_timeout)
+
+        result = _run_e2e_smoke(timeout=7)
+        assert result["ok"] is False
+        assert result["skipped"] is False
+        assert result["returncode"] == -1
+        assert result["stderr"].startswith("TimeoutExpired:")
 
 
 # ---------------------------------------------------------------------------
