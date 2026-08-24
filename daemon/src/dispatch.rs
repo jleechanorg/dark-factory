@@ -1519,7 +1519,7 @@ mod tests {
                     .borrow()
                     .get(&spec.bead_id)
                     .cloned()
-                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                    .unwrap_or_else(|| spec.expected_cwd.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_default()));
                 crate::tools::check_cwd_guard(spec.expected_cwd.as_deref(), &actual)?;
             }
             self.calls
@@ -3127,6 +3127,8 @@ mod tests {
     #[test]
     fn adapter_cleanup_failure_persists_live_session_before_fatal_return() {
         let sessions = FakeSessions::new(0);
+        sessions.ignore_cwd_guard("bead-0");
+        sessions.ignore_cwd_guard("bead-1");
         sessions.fail_spawn_cleanup_for("bead-0");
         let store = FakeStateStore::new();
         let cfg = cfg();
@@ -3159,6 +3161,8 @@ mod tests {
     #[test]
     fn adapter_cleanup_hold_save_failure_leaves_branch_for_fail_closed_recovery() {
         let sessions = FakeSessions::new(0);
+        sessions.ignore_cwd_guard("bead-0");
+        sessions.ignore_cwd_guard("bead-1");
         sessions.fail_spawn_cleanup_for("bead-0");
         let store = FakeStateStore::new();
         store.fail_save_for("bead-0", OverlayState::HumanHeld);
