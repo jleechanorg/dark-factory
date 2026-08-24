@@ -134,9 +134,7 @@ pub fn parse_rate_limit_error(stderr: &str, rc: i32) -> Option<RateLimitSignal> 
         || (rc == 403
             && (lower.contains("secondary")
                 || lower.contains("abuse")
-                || lower.contains("wait")
-                || lower.contains("retry-after")
-                || lower.contains("forbidden")));
+                || lower.contains("retry-after")));
 
     if !is_secondary && !is_primary {
         return None;
@@ -556,6 +554,12 @@ mod tests {
         let signal = parse_rate_limit_error(stderr, 1).expect("should parse primary rate limit");
         assert!(!signal.is_secondary);
         assert_eq!(signal.reason, "primary_rate_limit");
+    }
+
+    #[test]
+    fn test_generic_forbidden_is_not_rate_limit() {
+        let stderr = "HTTP 403 Forbidden: repository access denied";
+        assert!(parse_rate_limit_error(stderr, 403).is_none());
     }
 
     #[test]
