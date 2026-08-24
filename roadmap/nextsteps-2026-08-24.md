@@ -52,21 +52,21 @@ Bead IDs below are Beads identifiers, not GitHub issue URLs. GitHub links point 
 
 ### P0 — repair the rate-limit circuit breaker (PR #734)
 
-1. Inspect [PR #734](https://github.com/jleechanorg/dark-factory/pull/734), the latest rate-limit generation. It is OPEN and currently UNSTABLE; older generations (#692, #698, #702, #706, #710, #713, #717, #720, #727) are duplicate/obsolete candidates with DIRTY or superseded bases.
-2. Fix the reported Rust/API issues (including the `GhCircuitBreaker` constructor/default contract), run the focused daemon tests and clippy, and provide a recognized Evidence Gate verdict.
-3. Rebase only the selected branch onto current `origin/main`; do not merge or close duplicates until the selected PR is green and reviewed.
+1. Keep [PR #734](https://github.com/jleechanorg/dark-factory/pull/734) as the canonical rate-limit generation; older generations (#692, #698, #702, #706, #710, #713, #717, #720, #727) remain duplicate/obsolete candidates.
+2. The constructor/API and telemetry compatibility repairs are pushed and CI is green. The remaining independent-review blocker is false-positive classification of a generic `HTTP 403 Forbidden` as a global rate limit. Narrow detection to explicit GitHub rate-limit, secondary-limit, abuse, or `Retry-After` signals and add a negative regression test.
+3. Rerun the focused daemon tests, clippy, `/er`, `/advice`, `/green`, and real-browser `/web-advice` against the exact repaired head. Do not merge or close duplicates until those head-bound gates approve.
 
 ### P1 — land one web-advice/Lane-D superset
 
-1. Use [PR #693](https://github.com/jleechanorg/dark-factory/pull/693) as the current canonical candidate: it is OPEN/CLEAN and contains the web-advice handler, prompt, fail-open integration in all three target pipelines, Lane-D files, tests, and the E2E artifact.
-2. Treat [PR #691](https://github.com/jleechanorg/dark-factory/pull/691) as the Lane-D-only subset; do not merge it independently of #693.
-3. Treat #700, #701, #707, #708, #711, #715, #718, and #723 as later duplicate generations of the same pipeline fold. Their current states range from CLEAN to UNSTABLE; select one branch, rebase it, and supersede the rest after verification.
-4. Before merge, make the canonical E2E/full-pipeline invocation pass `--require-holdouts` and add a regression test for that exact command. Run targeted Python tests, graph audit, Rust tests, and the sealed holdout evaluator where available.
+1. Use [PR #742](https://github.com/jleechanorg/dark-factory/pull/742) as the current canonical candidate. It rebases the complete handler, prompt, production-pipeline fold, Lane-D files, tests, and E2E artifact onto current `main`; it also makes the canonical invocation pass `--require-holdouts` with a regression test.
+2. Treat #691, #693, #700, #701, #707, #708, #711, #715, #718, and #723 as duplicate/subset generations; do not merge them independently of #742.
+3. A real Grok browser review found that CDP liveness was incorrectly coupled to Aside CLI. Head `2b63cf0cd658f0bcc3884a4d3c68c3f32f51fad2` replaces the bare-port/Aside check with validation of Chrome's `/json/version`; focused Python evidence is 147 passing tests and the live Linux probe reports Aside absent with CDP healthy.
+4. Before merge, resolve the remaining design/implementation review, rerun all exact-head gates, and obtain a valid real-browser panel result with honest four-provider attempt and public-share accounting. APIs, CLIs, and subagents are not substitutes for `/web-advice` seats.
 
 ### P2 — land Lane E/F remediation
 
-1. Rebase [PR #694](https://github.com/jleechanorg/dark-factory/pull/694) after the selected P1 branch is established. It is OPEN/CLEAN and covers the runner-warning, anchor-comment, and related hygiene changes.
-2. Run its shell/Python tests and documentation checks independently; update the E2E disposition if the canonical P1 branch changes the referenced artifact.
+1. [PR #694](https://github.com/jleechanorg/dark-factory/pull/694) is the rebased Lane E/F candidate. Its production behavior passed independent review; remaining cleanup is test-environment restoration/serialization and removal of four trailing-whitespace additions.
+2. Rerun its shell/Python/Rust checks and exact-head review after cleanup. Land #742 first or rebase #694 afterward because both reference `docs/web-advice-failopen-e2e-log.md`.
 
 ### P3 — tracking hygiene
 
@@ -78,10 +78,10 @@ Bead IDs below are Beads identifiers, not GitHub issue URLs. GitHub links point 
 
 - [PR #740](https://github.com/jleechanorg/dark-factory/pull/740): **MERGED** — this roadmap handoff.
 - [PR #714](https://github.com/jleechanorg/dark-factory/pull/714): **MERGED** — prior roadmap synchronization.
-- [PR #734](https://github.com/jleechanorg/dark-factory/pull/734): **OPEN / UNSTABLE** — selected rate-limit circuit-breaker generation.
-- [PR #693](https://github.com/jleechanorg/dark-factory/pull/693): **OPEN / CLEAN** — selected web-advice/Lane-D superset candidate.
-- [PR #691](https://github.com/jleechanorg/dark-factory/pull/691): **OPEN / CLEAN** — Lane-D subset; superseded by #693.
-- [PR #694](https://github.com/jleechanorg/dark-factory/pull/694): **OPEN / CLEAN** — Lane E/F remediation.
+- [PR #734](https://github.com/jleechanorg/dark-factory/pull/734): **OPEN / CI-GREEN / REVIEW CHANGES REQUESTED** — selected rate-limit circuit-breaker generation; generic-403 classification remains to fix.
+- [PR #742](https://github.com/jleechanorg/dark-factory/pull/742): **OPEN / CANONICAL** — rebased web-advice/Lane-D superset; exact-head review and browser-panel work remain.
+- [PR #693](https://github.com/jleechanorg/dark-factory/pull/693) and [PR #691](https://github.com/jleechanorg/dark-factory/pull/691): **OPEN / SUPERSEDED CANDIDATES** — do not merge independently of #742.
+- [PR #694](https://github.com/jleechanorg/dark-factory/pull/694): **OPEN / CONDITIONAL REVIEW** — Lane E/F remediation with small test-hygiene cleanup pending.
 - [PR #700](https://github.com/jleechanorg/dark-factory/pull/700), [#701](https://github.com/jleechanorg/dark-factory/pull/701), [#707](https://github.com/jleechanorg/dark-factory/pull/707), [#708](https://github.com/jleechanorg/dark-factory/pull/708), [#711](https://github.com/jleechanorg/dark-factory/pull/711), [#715](https://github.com/jleechanorg/dark-factory/pull/715), [#718](https://github.com/jleechanorg/dark-factory/pull/718), [#723](https://github.com/jleechanorg/dark-factory/pull/723): **OPEN duplicate generations** of the pipeline fold; do not merge in parallel.
 - [PR #287](https://github.com/jleechanorg/dark-factory/pull/287): **MERGED** — selector/drift fix; it is not an open runner-restoration task.
 
