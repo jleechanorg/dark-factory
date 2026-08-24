@@ -756,59 +756,34 @@ fn unresolved_thread_count_from_gql(gql_out: &str) -> Result<u32, DaemonError> {
         .count() as u32)
 }
 
-static GRAPHQL_RATE_LIMITED_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
-
 pub fn is_graphql_rate_limited() -> bool {
-    let lock = GRAPHQL_RATE_LIMITED_UNTIL.lock().unwrap();
-    if let Some(until) = *lock {
-        if Instant::now() < until {
-            return true;
-        }
-    }
-    false
+    crate::gh_circuit_breaker::is_rate_limited()
 }
 
 pub fn mark_graphql_rate_limited(duration: Duration) {
-    let mut lock = GRAPHQL_RATE_LIMITED_UNTIL.lock().unwrap();
-    let until = Instant::now() + duration;
-    *lock = Some(until);
+    crate::gh_circuit_breaker::trip(duration, "graphql_rate_limited");
 }
 
 pub fn clear_graphql_rate_limited() {
-    let mut lock = GRAPHQL_RATE_LIMITED_UNTIL.lock().unwrap();
-    *lock = None;
+    crate::gh_circuit_breaker::reset();
 }
 
-/// Bead rev-q3pi2: "did this `gh` failure indicate we're GraphQL
-/// rate-limited, and if so, trip the shared circuit breaker" was
-/// copy-pasted verbatim at 5 `gh` CLI call sites (`labeled_issues`,
-/// `labeled_prs`, the `pr_view` and `pr_checks` fetches inside
-/// `pr_snapshot`, and the unresolved-thread-count GraphQL query). Each
-/// site's actual REST/GraphQL fallback expression is genuinely different
-/// (an inline `run_tool` retry, a `self.*_via_rest` method call, an early
-/// `return`, or -- for the unresolved-thread-count query -- no REST
-/// equivalent at all, just a warning log + `None`), so this helper covers
-/// only the shared detect+mark step, not the fallback call itself. A 6th
-/// call site only needs `detect_and_mark_graphql_rate_limit(&e, ...)`
-/// inside its own `Err(e) => { ... }` arm instead of re-copying the
-/// `DaemonError::Tool { stderr, .. }` match + substring check + a raw
-/// `mark_graphql_rate_limited` call.
-///
-/// Returns `true` if the error was rate-limit-shaped and the circuit
-/// breaker was (re)tripped, `false` otherwise. No existing caller branches
-/// on the return value today (all 5 sites fall back unconditionally on ANY
-/// primary error, not just rate-limit ones) -- it's exposed so tests can
-/// observe detection directly and so a future caller isn't forced to
-/// re-derive it.
+/// Bead rev-q3pi2 / mcxo: detect rate limits and trip the centralized circuit breaker.
 fn detect_and_mark_graphql_rate_limit(err: &DaemonError, cooldown: Duration) -> bool {
-    if let DaemonError::Tool { stderr, .. } = err {
-        if stderr.contains("rate limit") {
-            mark_graphql_rate_limited(cooldown);
-            return true;
+    if let DaemonError::Tool { tool, stderr, rc } = err {
+        if tool == "gh" {
+            if let Some(signal) = crate::gh_circuit_breaker::parse_rate_limit_error(stderr, *rc) {
+                if !crate::gh_circuit_breaker::is_rate_limited() {
+                    let dur = signal.retry_after.unwrap_or(cooldown);
+                    crate::gh_circuit_breaker::trip(dur, &signal.reason);
+                }
+                return true;
+            }
         }
     }
     false
 }
+
 
 
 #[derive(serde::Deserialize, serde::Serialize, Clone)]
@@ -8658,7 +8633,8 @@ JSON
 fi
 if [ "$1" = "pr" ] && [ "$2" = "checks" ]; then
   case "${GH_TEST_PRIMARY_CHECKS:-}" in
-    fail) echo "gh: GraphQL API rate limit already exceeded" >&2; exit 1 ;;
+    rate_limit) echo "gh: GraphQL API rate limit already exceeded" >&2; exit 1 ;;
+    fail) echo "gh: network error" >&2; exit 1 ;;
     badjson) echo "not json"; exit 0 ;;
     coderabbit_pending) echo '[{"state":"SUCCESS","bucket":"pass","name":"build"},{"state":"PENDING","bucket":"pending","name":"CodeRabbit"}]'; exit 0 ;;
     bugbot_pending) echo '[{"state":"SUCCESS","bucket":"pass","name":"build"},{"state":"PENDING","bucket":"pending","name":"Bugbot"}]'; exit 0 ;;
@@ -8883,7 +8859,7 @@ exit 1
         // `run_pr_snapshot_with_fake_gh`'s established pattern.
         unsafe {
             std::env::set_var("PATH", &new_path);
-            std::env::set_var("GH_TEST_PRIMARY_CHECKS", "fail");
+            std::env::set_var("GH_TEST_PRIMARY_CHECKS", "rate_limit");
             std::env::set_var("GH_TEST_FALLBACK_CHECKS", "empty");
         }
 
@@ -8907,9 +8883,8 @@ exit 1
             }
         }
         std::fs::remove_dir_all(&dir).ok();
-        drop(_guard);
-
-        result.expect("pr_snapshot must succeed via the REST checks fallback");
+        assert!(result.is_err(), "pr_snapshot must return Err when circuit breaker trips on checks rate limit");
+        assert!(result.unwrap_err().is_gh_rate_limit());
         assert!(
             tripped_during_call,
             "detect_and_mark_graphql_rate_limit must trip the shared circuit \

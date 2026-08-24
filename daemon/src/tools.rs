@@ -1137,114 +1137,122 @@ fn run_tool_with_cwd(
     extra_env: &[(&str, &str)],
     timeout_secs: u64,
 ) -> Result<String, DaemonError> {
-    let mut command = Command::new(cmd);
-    if cmd == "br" {
-        if let Ok(db) = std::env::var("DARK_FACTORY_BR_DB") {
-            command.args(["--db", db.as_str()]);
+    // Centralized GitHub rate-limit circuit-breaker admission check.
+    crate::gh_circuit_breaker::admit_or_suppress(cmd)?;
+
+    let res = (|| {
+        let mut command = Command::new(cmd);
+        if cmd == "br" {
+            if let Ok(db) = std::env::var("DARK_FACTORY_BR_DB") {
+                command.args(["--db", db.as_str()]);
+            }
         }
-    }
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // Reviewer CLIs such as Codex spawn helper processes. Give every tool
-    // invocation a dedicated process group so a timeout cannot leave those
-    // helpers running after their direct parent has been killed.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    if let Some(dir) = cwd {
-        command.current_dir(dir);
-    }
-    for (key, value) in extra_env {
-        command.env(key, value);
-    }
-    let mut child = command
-        .spawn()
-        .map_err(|e| DaemonError::Tool {
-            tool: cmd.to_string(),
-            rc: -1,
-            stderr: format!("spawn failed: {e}"),
-        })?;
-
-    // Take the pipes and hand them to dedicated reader threads immediately so
-    // they drain concurrently with the wait/poll loop below. Readers run to
-    // EOF, which naturally occurs once the child exits (or is killed) and its
-    // pipe ends close — they never block the timeout path.
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
-
-    let stdout_reader = thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut pipe) = stdout_pipe {
-            let _ = pipe.read_to_end(&mut buf);
+        command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // Reviewer CLIs such as Codex spawn helper processes. Give every tool
+        // invocation a dedicated process group so a timeout cannot leave those
+        // helpers running after their direct parent has been killed.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
         }
-        buf
-    });
-    let stderr_reader = thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut pipe) = stderr_pipe {
-            let _ = pipe.read_to_end(&mut buf);
+        if let Some(dir) = cwd {
+            command.current_dir(dir);
         }
-        buf
-    });
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|e| DaemonError::Tool {
+                tool: cmd.to_string(),
+                rc: -1,
+                stderr: format!("spawn failed: {e}"),
+            })?;
 
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    let poll_interval = Duration::from_millis(100);
+        // Take the pipes and hand them to dedicated reader threads immediately so
+        // they drain concurrently with the wait/poll loop below. Readers run to
+        // EOF, which naturally occurs once the child exits (or is killed) and its
+        // pipe ends close — they never block the timeout path.
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
 
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    #[cfg(unix)]
-                    {
-                        // POSIX kill accepts a negative PID to signal the
-                        // process group created above. This leaves the
-                        // daemon's own group untouched.
-                        unsafe {
-                            unix_signals::kill(-(child.id() as unix_signals::Pid), unix_signals::SIGKILL);
+        let stdout_reader = thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = stdout_pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        });
+        let stderr_reader = thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = stderr_pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        let poll_interval = Duration::from_millis(100);
+
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        #[cfg(unix)]
+                        {
+                            // POSIX kill accepts a negative PID to signal the
+                            // process group created above. This leaves the
+                            // daemon's own group untouched.
+                            unsafe {
+                                unix_signals::kill(-(child.id() as unix_signals::Pid), unix_signals::SIGKILL);
+                            }
                         }
+                        #[cfg(not(unix))]
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break Err(DaemonError::Timeout(format!(
+                            "{cmd} exceeded {timeout_secs}s timeout"
+                        )));
                     }
-                    #[cfg(not(unix))]
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break Err(DaemonError::Timeout(format!(
-                        "{cmd} exceeded {timeout_secs}s timeout"
-                    )));
+                    std::thread::sleep(poll_interval);
                 }
-                std::thread::sleep(poll_interval);
+                Err(e) => {
+                    break Err(DaemonError::Tool {
+                        tool: cmd.to_string(),
+                        rc: -1,
+                        stderr: format!("try_wait failed: {e}"),
+                    });
+                }
             }
-            Err(e) => {
-                break Err(DaemonError::Tool {
-                    tool: cmd.to_string(),
-                    rc: -1,
-                    stderr: format!("try_wait failed: {e}"),
-                });
-            }
+        };
+
+        // Join the readers regardless of outcome: once the child has exited (or
+        // been killed) its pipe fds close, so `read_to_end` returns promptly.
+        let stdout_buf = stdout_reader.join().unwrap_or_default();
+        let stderr_buf = stderr_reader.join().unwrap_or_default();
+
+        let status = status?;
+
+        let stdout = String::from_utf8_lossy(&stdout_buf).into_owned();
+        if status.success() {
+            return Ok(stdout);
         }
-    };
+        let stderr = String::from_utf8_lossy(&stderr_buf).into_owned();
+        Err(DaemonError::Tool {
+            tool: cmd.to_string(),
+            rc: status.code().unwrap_or(-1),
+            stderr,
+        })
+    })();
 
-    // Join the readers regardless of outcome: once the child has exited (or
-    // been killed) its pipe fds close, so `read_to_end` returns promptly.
-    let stdout_buf = stdout_reader.join().unwrap_or_default();
-    let stderr_buf = stderr_reader.join().unwrap_or_default();
-
-    let status = status?;
-
-    let stdout = String::from_utf8_lossy(&stdout_buf).into_owned();
-    if status.success() {
-        return Ok(stdout);
-    }
-    let stderr = String::from_utf8_lossy(&stderr_buf).into_owned();
-    Err(DaemonError::Tool {
-        tool: cmd.to_string(),
-        rc: status.code().unwrap_or(-1),
-        stderr,
-    })
+    crate::gh_circuit_breaker::record_result(cmd, &res);
+    res
 }
 
 #[cfg(test)]
