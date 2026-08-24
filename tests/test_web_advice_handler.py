@@ -73,6 +73,27 @@ from runner.handler_web_advice import (  # noqa: E402
 from runner.parser import Node  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _block_external_side_effects(monkeypatch):
+    """Tests may opt in by monkeypatching; defaults cannot hit gh/br or repo docs."""
+    original_run = subprocess.run
+
+    def guarded_run(cmd, *args, **kwargs):
+        argv = [str(item) for item in cmd] if isinstance(cmd, (list, tuple)) else [str(cmd)]
+        if argv and pathlib.Path(argv[0]).name in {"gh", "br"}:
+            raise AssertionError("external gh/br side effect requires an explicit test mock")
+        return original_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr("runner.handler_web_advice.subprocess.run", guarded_run)
+    original_persist = _persist_share_evidence
+
+    def guarded_persist(evidence_dir, seats, *, root_dir, **kwargs):
+        assert pathlib.Path(root_dir).resolve() != ROOT.resolve(), "tests must contain evidence under tmp_path"
+        return original_persist(evidence_dir, seats, root_dir=root_dir, **kwargs)
+
+    monkeypatch.setattr("runner.handler_web_advice._persist_share_evidence", guarded_persist)
+
+
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------
@@ -82,8 +103,18 @@ class TestParsePrNumber:
     def test_https_url(self):
         assert _parse_pr_number("https://github.com/jleechanorg/dark-factory/pull/655") == 655
 
-    def test_https_url_with_path(self):
-        assert _parse_pr_number("https://github.com/jleechanorg/dark-factory/pull/655/files") == 655
+    def test_url_with_suffix_is_rejected(self):
+        assert _parse_pr_number("https://github.com/jleechanorg/dark-factory/pull/655/files") is None
+
+    @pytest.mark.parametrize("value", [
+        "prefix https://github.com/o/r/pull/7",
+        "https://github.com/o/r/pull/7?x=1",
+        "https://github.com/o/r/pull/7/evil",
+        "https://github.com/o/r/notpull/7",
+        "https://github.com/o/r/pull/7x",
+    ])
+    def test_malformed_pull_strings_are_rejected(self, value):
+        assert _parse_pr_number(value) is None
 
     def test_invalid_returns_none(self):
         assert _parse_pr_number("not-a-url") is None
@@ -227,15 +258,15 @@ class TestStructuredPanelContract:
 
     def test_subprocess_parses_json_panel_result_without_keyword_triage(self, monkeypatch):
         payload = {
-            "ok": True,
             "decision": "continue_with_pr_warning",
-            "panel_seats_attempted": ["chatgpt", "gemini"],
+            "panel_seats_attempted": list(PANEL_SEATS),
             "panel_seats_live": ["chatgpt"],
-            "panel_seats_unavailable": ["gemini"],
-            "panel_seats_unavailable_reasons": {"gemini": "transport absent"},
+            "panel_seats_unavailable": ["gemini", "grok", "perplexity"],
+            "panel_seats_unavailable_reasons": {"gemini": "transport absent", "grok": "transport absent", "perplexity": "transport absent"},
             "panel_verdict_summary": {
-                "chatgpt": {"verdict": "NOT MERGE", "reasoning": "file.py:7"}
+                "chatgpt": {"verdict": "not_merge", "confidence": "high", "reasoning": "file.py:7", "share_url": None, "share_url_probe": None}
             },
+            "panel_convergence": {"status": "split"},
         }
         fake = subprocess.CompletedProcess(
             args=[], returncode=0,
@@ -258,54 +289,34 @@ class TestStructuredPanelContract:
 
 class TestShareUrlProbe:
     def test_accepts_public_200_without_cookie(self, monkeypatch):
-        class Response:
-            status = 200
-            def geturl(self):
-                return "https://g.co/gemini/share/abc"
-            def getheaders(self):
-                return [("Content-Type", "text/html")]
-            def __enter__(self): return self
-            def __exit__(self, *args): return None
-        monkeypatch.setattr("runner.handler_web_advice.urllib.request.urlopen", lambda *a, **k: Response())
+        monkeypatch.setattr("runner.handler_web_advice._validated_share_target", lambda url: (True, "g.co", ["93.184.216.34"], ""))
+        monkeypatch.setattr("runner.handler_web_advice._curl_pinned_get", lambda *a, **k: {"ok": True, "status": 200, "headers": {}, "body": b"public"})
         result = _probe_share_url("https://g.co/gemini/share/abc")
         assert result["ok"] is True
         assert result["status"] == 200
 
     @pytest.mark.parametrize("final_url", ["https://accounts.example.com/login", "https://example.com/signin"])
     def test_rejects_login_redirect(self, monkeypatch, final_url):
-        class Response:
-            status = 200
-            def geturl(self): return final_url
-            def getheaders(self): return []
-            def __enter__(self): return self
-            def __exit__(self, *args): return None
-        monkeypatch.setattr("runner.handler_web_advice.urllib.request.urlopen", lambda *a, **k: Response())
+        monkeypatch.setattr("runner.handler_web_advice._validated_share_target", lambda url: (True, "g.co", ["93.184.216.34"], "") if url.startswith("https://g.co") else (False, "", [], "login redirect"))
+        monkeypatch.setattr("runner.handler_web_advice._curl_pinned_get", lambda *a, **k: {"ok": True, "status": 302, "headers": {"location": final_url}, "body": b""})
         result = _probe_share_url("https://g.co/gemini/share/abc")
         assert result["ok"] is False
         assert "login" in result["error"] or "signin" in result["error"]
 
     def test_accepts_anonymous_tracking_set_cookie(self, monkeypatch):
-        class Response:
-            status = 200
-            def geturl(self): return "https://g.co/gemini/share/abc"
-            def getheaders(self): return [("Set-Cookie", "NID=tracking"), ("Set-Cookie", "COMPASS=presentation")]
-            def read(self, _limit=-1): return b"Gemini shared conversation"
-            def __enter__(self): return self
-            def __exit__(self, *args): return None
-        monkeypatch.setattr("runner.handler_web_advice.urllib.request.urlopen", lambda *a, **k: Response())
+        monkeypatch.setattr("runner.handler_web_advice._validated_share_target", lambda url: (True, "g.co", ["93.184.216.34"], ""))
+        monkeypatch.setattr("runner.handler_web_advice._curl_pinned_get", lambda *a, **k: {"ok": True, "status": 200, "headers": {"set-cookie": "NID=tracking"}, "body": b"Gemini shared conversation"})
         result = _probe_share_url("https://g.co/gemini/share/abc")
         assert result["ok"] is True
         assert result["status"] == 200
 
     def test_accepts_final_gemini_share_after_301_with_cookies(self, monkeypatch):
-        class Response:
-            status = 200
-            def geturl(self): return "https://share.gemini.google/abc123"
-            def getheaders(self): return [("Set-Cookie", "NID=tracking")]
-            def read(self, _limit=-1): return b"Public Gemini conversation"
-            def __enter__(self): return self
-            def __exit__(self, *args): return None
-        monkeypatch.setattr("runner.handler_web_advice.urllib.request.urlopen", lambda *a, **k: Response())
+        calls = iter([
+            {"ok": True, "status": 302, "headers": {"location": "https://share.gemini.google/abc123"}, "body": b""},
+            {"ok": True, "status": 200, "headers": {"set-cookie": "NID=tracking"}, "body": b"Public Gemini conversation"},
+        ])
+        monkeypatch.setattr("runner.handler_web_advice._validated_share_target", lambda url: (True, "g.co", ["93.184.216.34"], "") if url.startswith("https://g.co") else (True, "share.gemini.google", ["93.184.216.34"], ""))
+        monkeypatch.setattr("runner.handler_web_advice._curl_pinned_get", lambda *a, **k: next(calls))
         result = _probe_share_url("https://g.co/gemini/share/abc123")
         assert result["ok"] is True
         assert result["final_url"] == "https://share.gemini.google/abc123"
@@ -325,10 +336,7 @@ class TestShareUrlProbe:
     )
     def test_rejects_unsafe_or_unapproved_urls_before_network(self, monkeypatch, url):
         called = []
-        monkeypatch.setattr(
-            "runner.handler_web_advice.urllib.request.urlopen",
-            lambda *a, **k: called.append((a, k)),
-        )
+        monkeypatch.setattr("runner.handler_web_advice._curl_pinned_get", lambda *a, **k: called.append((a, k)))
         result = _probe_share_url(url)
         assert result["ok"] is False
         assert called == []
@@ -342,14 +350,31 @@ class TestShareUrlProbe:
         assert result["ok"] is False
         assert "private" in result["error"] or "unsafe" in result["error"]
 
+    def test_private_redirect_is_rejected_before_connection(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr("runner.handler_web_advice._validated_share_target", lambda url: (False, "", [], "unsafe private/reserved address 127.0.0.1") if "private" in url else (True, "g.co", ["93.184.216.34"], ""))
+        monkeypatch.setattr("runner.handler_web_advice._curl_pinned_get", lambda *a, **k: calls.append(a) or {"ok": True, "status": 302, "headers": {"location": "https://g.co/gemini/share/private"}, "body": b""})
+        result = _probe_share_url("https://g.co/gemini/share/abc")
+        assert result["ok"] is False
+        assert "before connection" in result["error"]
+        assert len(calls) == 1
+
+    def test_dns_rebind_private_second_hop_is_never_connected(self, monkeypatch):
+        calls = []
+        resolutions = iter([
+            [(2, 1, 6, "", ("93.184.216.34", 443))],
+            [(2, 1, 6, "", ("10.0.0.1", 443))],
+        ])
+        monkeypatch.setattr("runner.handler_web_advice.socket.getaddrinfo", lambda *a, **k: next(resolutions))
+        monkeypatch.setattr("runner.handler_web_advice._curl_pinned_get", lambda *a, **k: calls.append(a) or {"ok": True, "status": 302, "headers": {"location": "https://g.co/gemini/share/next"}, "body": b""})
+        result = _probe_share_url("https://g.co/gemini/share/abc")
+        assert result["ok"] is False
+        assert "private" in result["error"] or "unsafe" in result["error"]
+        assert len(calls) == 1
+
     def test_rejects_off_provider_final_redirect(self, monkeypatch):
-        class Response:
-            status = 200
-            def geturl(self): return "https://evil.example/share/abc"
-            def read(self, _limit=-1): return b"public"
-            def __enter__(self): return self
-            def __exit__(self, *args): return None
-        monkeypatch.setattr("runner.handler_web_advice.urllib.request.urlopen", lambda *a, **k: Response())
+        monkeypatch.setattr("runner.handler_web_advice._validated_share_target", lambda url: (True, "g.co", ["93.184.216.34"], "") if url.startswith("https://g.co") else (False, "", [], "host not approved"))
+        monkeypatch.setattr("runner.handler_web_advice._curl_pinned_get", lambda *a, **k: {"ok": True, "status": 302, "headers": {"location": "https://evil.example/share/abc"}, "body": b""})
         result = _probe_share_url("https://g.co/gemini/share/abc")
         assert result["ok"] is False
         assert "approved" in result["error"] or "host" in result["error"]
@@ -388,7 +413,9 @@ class TestPanelResultContract:
             "panel_seats_live": ["chatgpt", "gemini"],
             "panel_seats_unavailable": ["grok", "perplexity"],
             "panel_seats_unavailable_reasons": {"grok": "down", "perplexity": "down"},
-            "panel_verdict_summary": {"chatgpt": {"verdict": "approve"}},
+            "panel_verdict_summary": {"chatgpt": {"verdict": "approve", "confidence": "high", "reasoning": "clean", "share_url": None, "share_url_probe": None}, "gemini": {"verdict": "approve", "confidence": "medium", "reasoning": "clean", "share_url": None, "share_url_probe": None}},
+            "panel_convergence": {"status": "agree"},
+            "decision": "continue",
         })
         assert result["panel_contract_valid"] is True
 
@@ -803,6 +830,10 @@ def _stub_all_transports_down(monkeypatch):
         "runner.handler_web_advice._run_e2e_smoke",
         lambda *a, **kw: {"ok": True, "skipped": True, "returncode": 0, "stderr": ""},
     )
+    monkeypatch.setattr(
+        "runner.handler_web_advice._file_followup_bead",
+        lambda **kw: {"ok": True, "bead_id": "jleechan-test"},
+    )
 
 
 class TestSkipOnSmallDiff:
@@ -959,6 +990,7 @@ class TestAllTransportsDown:
             return {"ok": False, "returncode": 1, "stderr": "rate-limited"}
 
         monkeypatch.setattr("runner.handler_web_advice._post_pr_comment", _failing_post)
+        monkeypatch.setattr("runner.handler_web_advice._file_followup_bead", lambda **kw: {"ok": True, "bead_id": "jleechan-test"})
         monkeypatch.setattr(
             "runner.handler_web_advice._compute_diff_lines",
             lambda repo_dir: 50,
@@ -1033,6 +1065,7 @@ class TestSuccessfulRun:
         monkeypatch.setattr("runner.handler_web_advice._compute_diff_lines", lambda repo_dir: 100)
         monkeypatch.setattr("runner.handler_web_advice._run_e2e_smoke", lambda *a, **k: {"ok": True, "skipped": True})
         monkeypatch.setattr("runner.handler_web_advice._post_pr_comment", lambda *a, **k: {"ok": True, "returncode": 0, "stderr": ""})
+        monkeypatch.setattr("runner.handler_web_advice._file_followup_bead", lambda **kw: {"ok": True, "bead_id": "jleechan-test"})
         monkeypatch.setattr(
             "runner.handler_web_advice._run_web_advice_subprocess",
             lambda **kw: {
@@ -1062,7 +1095,7 @@ class TestSuccessfulRun:
         result = _web_advice(Node(name="web_advice", attrs={"type": "web_advice"}), ctx)
         assert result.outcome == "success"
         assert result.metadata["target_repo_error"]
-        assert result.metadata["bead_filed"] is False
+        assert result.metadata.get("bead_filed") is None
         assert bead_calls == []
 
     def test_structured_panel_preserves_seats_probes_evidence_and_bead(self, tmp_path, monkeypatch):
@@ -1079,10 +1112,11 @@ class TestSuccessfulRun:
             "panel_seats_live": ["chatgpt", "gemini", "grok"], "panel_seats_unavailable": ["perplexity"],
             "panel_seats_unavailable_reasons": {"perplexity": "provider unavailable"},
             "panel_verdict_summary": {
-                "chatgpt": {"verdict": "NOT MERGE", "share_url": "https://chatgpt.com/share/a"},
-                "gemini": {"verdict": "NOT MERGE", "share_url": "https://g.co/gemini/share/b"},
-                "grok": {"verdict": "NOT MERGE", "share_url": "https://grok.com/share/c"},
+                "chatgpt": {"verdict": "not_merge", "confidence": "high", "reasoning": "finding", "share_url": "https://chatgpt.com/share/a", "share_url_probe": None},
+                "gemini": {"verdict": "not_merge", "confidence": "high", "reasoning": "finding", "share_url": "https://g.co/gemini/share/b", "share_url_probe": None},
+                "grok": {"verdict": "not_merge", "confidence": "high", "reasoning": "finding", "share_url": "https://grok.com/share/c", "share_url_probe": None},
             }, "returncode": 0, "transport": "aside_mcp",
+            "panel_convergence": {"status": "split"},
         })
         ctx = _make_ctx(tmp_path, feature="web-advice-failopen-test-pr", target_repo="jleechanorg/dark-factory", evidence_dir="evidence")
         node = Node(name="web_advice", attrs={"type": "web_advice", "prompt": "@prompts/web_advice.txt", "min_diff_lines": "5"})
@@ -1125,7 +1159,9 @@ class TestSuccessfulRun:
             "panel_seats_unavailable_reasons": {
                 "chatgpt": "not returned", "grok": "not returned", "perplexity": "not returned",
             },
-            "panel_verdict_summary": {"gemini": {"verdict": "approve", "share_url": "https://g.co/gemini/share/abc123"}},
+            "panel_verdict_summary": {"gemini": {"verdict": "approve", "confidence": "high", "reasoning": "clean", "share_url": "https://g.co/gemini/share/abc123", "share_url_probe": None}},
+            "panel_convergence": {"status": "agree"},
+            "decision": "continue",
             "returncode": 0,
             "stderr": "",
             "transport": "aside_mcp",
@@ -1201,6 +1237,7 @@ class TestSuccessfulRun:
             "runner.handler_web_advice._post_pr_comment",
             lambda *a, **kw: {"ok": True, "returncode": 0, "stderr": ""},
         )
+        monkeypatch.setattr("runner.handler_web_advice._file_followup_bead", lambda **kw: {"ok": True, "bead_id": "jleechan-test"})
 
         ctx = _make_ctx(tmp_path)
         node = Node(name="web_advice", attrs={"type": "web_advice", "min_diff_lines": "5"})
@@ -1209,6 +1246,25 @@ class TestSuccessfulRun:
 
         assert result.outcome == "success", "FAIL-OPEN: subprocess failure must not block"
         assert ctx.state["web_advice.outcome"] == "subprocess_failed"
+
+    def test_subprocess_failure_emits_infra_and_one_bead_without_verdict_comment(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("runner.handler_web_advice._compute_diff_lines", lambda repo_dir: 100)
+        monkeypatch.setattr("runner.handler_web_advice._probe_aside_mcp", lambda c: True)
+        monkeypatch.setattr("runner.handler_web_advice._run_e2e_smoke", lambda *a, **k: {"ok": True, "skipped": True})
+        monkeypatch.setattr("runner.handler_web_advice._run_web_advice_subprocess", lambda **kw: {"ok": False, "returncode": 1, "stderr": "boom", "transport": "aside_mcp"})
+        comments = []
+        beads = []
+        monkeypatch.setattr("runner.handler_web_advice._post_pr_comment", lambda *a, **kw: comments.append(a[1]) or {"ok": True, "returncode": 0, "stderr": ""})
+        monkeypatch.setattr("runner.handler_web_advice._file_followup_bead", lambda **kw: beads.append(kw) or {"ok": True, "bead_id": "jleechan-one"})
+        ctx = _make_ctx(tmp_path, target_repo="jleechanorg/dark-factory")
+        result = _web_advice(Node(name="web_advice", attrs={"type": "web_advice"}), ctx)
+        assert result.outcome == "success"
+        assert result.metadata["infrastructure_failure_mode"] == "subprocess_failed"
+        assert result.metadata["decision"] == "continue_with_bead"
+        assert len(beads) == 1
+        assert len(comments) == 1
+        assert "unavailable" in comments[0].lower()
+        assert "0/0" not in comments[0]
 
 
 class TestOuterExceptionGuard:
@@ -1228,9 +1284,11 @@ class TestOuterExceptionGuard:
 
 
 class TestMissingPrUrl:
-    def test_missing_pr_url_succeeds(self, tmp_path):
+    def test_missing_pr_url_succeeds(self, tmp_path, monkeypatch):
         ctx = Context(goal="test", workdir=tmp_path, backend="echo")
         # No pr_url set in ctx.state.
+        # Explicitly disable discovery for this input-validation test.
+        monkeypatch.setattr("runner.handler_web_advice._seed_web_advice_state", lambda _ctx: {"ok": True})
         node = Node(name="web_advice", attrs={"type": "web_advice", "min_diff_lines": "5"})
 
         result = _web_advice(node, ctx)
@@ -1238,9 +1296,10 @@ class TestMissingPrUrl:
         assert result.outcome == "success"
         assert ctx.state["web_advice.outcome"] == "missing_pr_url"
 
-    def test_unparseable_pr_url_succeeds(self, tmp_path):
+    def test_unparseable_pr_url_succeeds(self, tmp_path, monkeypatch):
         ctx = Context(goal="test", workdir=tmp_path, backend="echo")
         ctx.state["pr_url"] = "not-a-valid-url"
+        monkeypatch.setattr("runner.handler_web_advice._seed_web_advice_state", lambda _ctx: {"ok": True})
         node = Node(name="web_advice", attrs={"type": "web_advice", "min_diff_lines": "5"})
 
         result = _web_advice(node, ctx)

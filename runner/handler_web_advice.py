@@ -96,6 +96,23 @@ _SHARE_PATH_PATTERNS = {
     "perplexity.ai": re.compile(r"^/search/[A-Za-z0-9_-]+$"),
 }
 
+_PR_URL_RE = re.compile(
+    r"^https://github\.com/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/pull/(?P<number>[0-9]+)$"
+)
+_PANEL_CONTRACT_KEYS = {
+    "panel_seats_attempted",
+    "panel_seats_live",
+    "panel_seats_unavailable",
+    "panel_seats_unavailable_reasons",
+    "panel_verdict_summary",
+    "panel_convergence",
+    "decision",
+}
+_PANEL_VERDICTS = {"approve", "not_merge", "insufficient"}
+_PANEL_CONFIDENCE = {"low", "medium", "high"}
+_PANEL_DECISIONS = {"continue", "continue_with_bead", "continue_with_pr_warning"}
+_PANEL_SUMMARY_KEYS = {"verdict", "confidence", "reasoning", "share_url", "share_url_probe"}
+
 
 # ---------------------------------------------------------------------------
 # Pure helpers
@@ -119,6 +136,22 @@ def _seed_web_advice_state(ctx: "Context") -> dict:
         ctx.state["repo_dir"] = str(worktree)
     explicit_pr = bool(ctx.state.get("pr_url"))
     explicit_head = str(ctx.state.get("head_sha") or ctx.state.get("pr_head_sha") or "")
+    # Validate explicit identity before any gh lookup.  A malformed PR URL or
+    # repository mismatch is an input error, not an invitation to discover a
+    # different PR from the checkout (which would create an unintended side
+    # effect and defeat the caller's identity binding).
+    if explicit_pr:
+        explicit_url = str(ctx.state.get("pr_url") or "")
+        explicit_repo = _extract_pr_repo(explicit_url)
+        if _parse_pr_number(explicit_url) is None or explicit_repo is None:
+            return {"ok": False, "mode": "invalid_pr_identity", "error": "pr_url must be an exact GitHub PR URL"}
+        requested_repo = str(ctx.state.get("target_repo") or "")
+        if requested_repo and requested_repo != explicit_repo:
+            return {
+                "ok": False,
+                "mode": "target_repo_mismatch",
+                "error": f"target_repo {requested_repo!r} does not match PR repository {explicit_repo!r}",
+            }
     if explicit_pr and explicit_head:
         if not ctx.state.get("target_repo"):
             ctx.state["target_repo"] = _extract_pr_repo(str(ctx.state["pr_url"])) or ""
@@ -192,22 +225,11 @@ def _parse_pr_number(pr_url: str) -> Optional[int]:
     """
     if not isinstance(pr_url, str) or not pr_url:
         return None
-    # Look for /pull/N where N is an integer.
-    marker = "/pull/"
-    idx = pr_url.find(marker)
-    if idx == -1:
-        return None
-    tail = pr_url[idx + len(marker):]
-    digits: list[str] = []
-    for ch in tail:
-        if ch.isdigit():
-            digits.append(ch)
-        elif digits:
-            break
-    if not digits:
+    match = _PR_URL_RE.fullmatch(pr_url)
+    if match is None:
         return None
     try:
-        return int("".join(digits))
+        return int(match.group("number"))
     except ValueError:
         return None
 
@@ -220,21 +242,10 @@ def _extract_pr_repo(pr_url: str) -> Optional[str]:
     """
     if not isinstance(pr_url, str) or not pr_url:
         return None
-    try:
-        parsed = urllib.parse.urlsplit(pr_url)
-    except ValueError:
+    match = _PR_URL_RE.fullmatch(pr_url)
+    if match is None:
         return None
-    if parsed.scheme.lower() != "https" or (parsed.hostname or "").lower() != "github.com" or parsed.port is not None:
-        return None
-    parts = parsed.path.strip("/").split("/")
-    if len(parts) < 4 or parts[2] != "pull" or not parts[3].isdigit():
-        return None
-    owner, repo = parts[0], parts[1]
-    if not owner or not repo:
-        return None
-    # Strip trailing ".git" if present (rare on PR URLs, but harmless).
-    repo = repo[:-4] if repo.endswith(".git") else repo
-    return f"{owner}/{repo}"
+    return f"{match.group('owner')}/{match.group('repo')}"
 
 
 def _target_repo_error(target_repo: str, pr_repo: Optional[str]) -> Optional[str]:
@@ -584,11 +595,7 @@ def _parse_structured_panel_result(output: str) -> Optional[dict]:
             continue
         if isinstance(value, dict):
             candidates.append(value)
-    required = {
-        "panel_seats_attempted", "panel_seats_live", "panel_seats_unavailable",
-        "panel_seats_unavailable_reasons", "panel_verdict_summary", "decision",
-    }
-    qualifying = [value for value in candidates if required.issubset(value)]
+    qualifying = [value for value in candidates if set(value) == _PANEL_CONTRACT_KEYS]
     if len(qualifying) != 1:
         return None
     return qualifying[0]
@@ -596,34 +603,41 @@ def _parse_structured_panel_result(output: str) -> Optional[dict]:
 
 def _validate_share_url(url: str) -> tuple[bool, str]:
     """Validate a share URL before any network request is attempted."""
+    valid, _host, _addresses, error = _validated_share_target(url)
+    return valid, error
+
+
+def _validated_share_target(url: str) -> tuple[bool, str, list[str], str]:
+    """Validate URL shape and resolve every address before connecting."""
     if not isinstance(url, str) or any(ord(char) < 32 for char in url):
-        return False, "URL is not a safe string"
+        return False, "", [], "URL is not a safe string"
     try:
         parsed = urllib.parse.urlsplit(url)
         hostname = parsed.hostname.lower() if parsed.hostname else ""
         port = parsed.port
     except ValueError:
-        return False, "URL has invalid credentials or port"
+        return False, "", [], "URL has invalid credentials or port"
     if parsed.scheme.lower() != "https":
-        return False, "share URL must use https"
+        return False, hostname, [], "share URL must use https"
     if parsed.username is not None or parsed.password is not None:
-        return False, "share URL credentials are forbidden"
+        return False, hostname, [], "share URL credentials are forbidden"
     if port is not None:
-        return False, "custom share URL ports are forbidden"
+        return False, hostname, [], "custom share URL ports are forbidden"
     pattern = _SHARE_PATH_PATTERNS.get(hostname)
     if pattern is None or not pattern.fullmatch(parsed.path) or parsed.query or parsed.fragment:
-        return False, "share URL host or path is not an approved provider shape"
+        return False, hostname, [], "share URL host or path is not an approved provider shape"
     try:
         addresses = socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)
     except OSError as exc:
-        return False, f"share URL DNS resolution failed: {exc}"
+        return False, hostname, [], f"share URL DNS resolution failed: {exc}"
     if not addresses:
-        return False, "share URL DNS resolution returned no addresses"
+        return False, hostname, [], "share URL DNS resolution returned no addresses"
+    approved: list[str] = []
     for address in addresses:
         try:
             ip = ipaddress.ip_address(address[4][0])
         except (IndexError, ValueError, TypeError):
-            return False, "share URL DNS returned an invalid address"
+            return False, hostname, [], "share URL DNS returned an invalid address"
         if (
             ip.is_loopback
             or ip.is_private
@@ -632,50 +646,87 @@ def _validate_share_url(url: str) -> tuple[bool, str]:
             or ip.is_unspecified
             or ip.is_multicast
         ):
-            return False, f"share URL resolves to unsafe private/reserved address {ip}"
-    return True, ""
+            return False, hostname, [], f"share URL resolves to unsafe private/reserved address {ip}"
+        approved.append(str(ip))
+    return True, hostname, approved, ""
+
+
+def _curl_pinned_get(url: str, hostname: str, address: str, timeout: float) -> dict:
+    """Fetch one URL with curl pinned to a validated address, no redirects."""
+    cmd = [
+        "curl", "--silent", "--show-error", "--proto", "=https",
+        "--connect-timeout", str(max(1, min(int(timeout), 10))),
+        "--max-time", str(max(1, min(int(timeout), 10))),
+        "--max-filesize", "65536",
+        "--resolve", f"{hostname}:443:{address}", "--dump-header", "-", url,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=False, timeout=timeout + 1, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "status": None, "headers": {}, "body": b"", "error": f"{type(exc).__name__}: {exc}"[:300]}
+    raw = result.stdout or b""
+    if isinstance(raw, str):
+        raw = raw.encode()
+    marker = raw.find(b"\r\n\r\n")
+    separator_len = 4
+    if marker < 0:
+        marker = raw.find(b"\n\n")
+        separator_len = 2
+    header_bytes = raw[:marker] if marker >= 0 else raw
+    body = raw[marker + separator_len: marker + separator_len + 65_536] if marker >= 0 else b""
+    lines = header_bytes.decode("iso-8859-1", errors="replace").splitlines()
+    status = None
+    headers: dict[str, str] = {}
+    if lines and lines[0].startswith("HTTP/"):
+        parts = lines[0].split()
+        if len(parts) >= 2 and parts[1].isdigit():
+            status = int(parts[1])
+        for line in lines[1:]:
+            if ":" in line:
+                key, value = line.split(":", 1)
+                headers[key.strip().lower()] = value.strip()
+    if result.returncode != 0:
+        stderr = result.stderr or b"curl failed"
+        if isinstance(stderr, str):
+            stderr = stderr.encode()
+        return {"ok": False, "status": status, "headers": headers, "body": body, "error": stderr.decode(errors="replace")[:300]}
+    return {"ok": True, "status": status, "headers": headers, "body": body, "error": ""}
 
 
 def _probe_share_url(url: str, *, timeout: float = 10.0) -> dict:
-    """Probe a public Share URL without credentials or cookie persistence."""
-    valid, validation_error = _validate_share_url(url)
+    """Probe a public Share URL with pinned-IP, manual no-follow requests."""
+    valid, hostname, addresses, validation_error = _validated_share_target(url)
     if not valid:
         return {"ok": False, "status": None, "final_url": "", "error": validation_error}
-    # A fresh urllib request has no CookieJar/session attached. Use GET so a
-    # provider's HTML auth/consent wall can be identified, while deliberately
-    # ignoring benign anonymous tracking/presentation Set-Cookie headers.
-    request = urllib.request.Request(url, method="GET", headers={"Accept": "text/html"})
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            status_value = getattr(response, "status", None)
-            if status_value is None:
-                status_value = response.getcode()
-            status = int(status_value)
-            final_url = str(response.geturl())
-            reader = getattr(response, "read", None)
-            content = reader(65_536) if callable(reader) else b""
-    except urllib.error.HTTPError as exc:
-        return {"ok": False, "status": int(exc.code), "final_url": str(exc.geturl()), "error": f"HTTP {exc.code}"}
-    except (OSError, ValueError, urllib.error.URLError) as exc:
-        return {"ok": False, "status": None, "final_url": "", "error": f"{type(exc).__name__}: {exc}"[:300]}
-    lowered_url = final_url.lower()
-    if any(marker in lowered_url for marker in ("/login", "/signin", "/sign-in", "/auth/", "/account", "consent", "accounts.google.com")):
-        return {"ok": False, "status": status, "final_url": final_url, "error": f"login redirect: {final_url}"}
-    final_valid, final_error = _validate_share_url(final_url)
-    if not final_valid:
-        return {"ok": False, "status": status, "final_url": final_url, "error": final_error}
-    lowered_content = content.decode("utf-8", errors="ignore").lower()
-    wall_markers = (
-        "sign in to continue", "log in to continue", "authentication required",
-        "consent required", "accounts.google.com/signin", "name=\"password\"",
-    )
-    if any(marker in lowered_content for marker in wall_markers):
-        return {"ok": False, "status": status, "final_url": final_url, "error": "authentication/consent wall in response content"}
-    # urllib follows ordinary redirects; a valid probe therefore ends at
-    # 200. A bare 3xx is not evidence of a public unauthenticated page.
-    if status != 200:
-        return {"ok": False, "status": status, "final_url": final_url, "error": f"HTTP {status}"}
-    return {"ok": True, "status": status, "final_url": final_url, "error": ""}
+    current_url = url
+    for _hop in range(4):
+        response = _curl_pinned_get(current_url, hostname, addresses[0], timeout)
+        status = response.get("status")
+        headers = response.get("headers") or {}
+        content = response.get("body") or b""
+        if not response.get("ok"):
+            return {"ok": False, "status": status, "final_url": current_url, "error": response.get("error", "curl failed")}
+        if status in {301, 302, 303, 307, 308}:
+            location = headers.get("location")
+            if not location:
+                return {"ok": False, "status": status, "final_url": current_url, "error": "redirect missing Location"}
+            next_url = urllib.parse.urljoin(current_url, location)
+            next_valid, next_host, next_addresses, next_error = _validated_share_target(next_url)
+            if not next_valid:
+                return {"ok": False, "status": status, "final_url": next_url, "error": f"redirect rejected before connection: {next_error}"}
+            current_url, hostname, addresses = next_url, next_host, next_addresses
+            continue
+        lowered_url = current_url.lower()
+        if any(marker in lowered_url for marker in ("/login", "/signin", "/sign-in", "/auth/", "/account", "consent", "accounts.google.com")):
+            return {"ok": False, "status": status, "final_url": current_url, "error": f"login redirect: {current_url}"}
+        lowered_content = content.decode("utf-8", errors="ignore").lower()
+        wall_markers = ("sign in to continue", "log in to continue", "authentication required", "consent required", "accounts.google.com/signin", "name=\"password\"")
+        if any(marker in lowered_content for marker in wall_markers):
+            return {"ok": False, "status": status, "final_url": current_url, "error": "authentication/consent wall in response content"}
+        if status != 200:
+            return {"ok": False, "status": status, "final_url": current_url, "error": f"HTTP {status}"}
+        return {"ok": True, "status": status, "final_url": current_url, "error": ""}
+    return {"ok": False, "status": None, "final_url": current_url, "error": "too many redirects"}
 
 
 def _persist_share_evidence(
@@ -686,45 +737,71 @@ def _persist_share_evidence(
     pr_url: str = "",
     head_sha: str = "",
 ) -> pathlib.Path:
-    """Atomically persist the per-seat public-share evidence JSON."""
-    root_dir = pathlib.Path(root_dir).resolve()
+    """Persist evidence using held directory fds to prevent symlink TOCTOU."""
+    root_dir = pathlib.Path(root_dir)
     evidence_dir = pathlib.Path(evidence_dir)
     if evidence_dir.is_absolute():
         raise ValueError("evidence_dir must be relative to the repository root")
     if not evidence_dir.parts or any(part in ("", ".", "..") for part in evidence_dir.parts):
         raise ValueError("evidence_dir must name a repository-relative directory")
-    candidate = (root_dir / evidence_dir).resolve(strict=False)
-    if candidate == root_dir or root_dir not in candidate.parents:
-        raise ValueError("evidence_dir escapes the repository root")
-    current = root_dir
-    for part in evidence_dir.parts:
-        current /= part
-        if current.is_symlink():
-            raise ValueError("evidence_dir contains a symlink")
-    evidence_dir = candidate
-    evidence_dir.mkdir(parents=True, exist_ok=True)
-    target = evidence_dir / "web-advice-share-urls.json"
-    payload = {"schema_version": 1, "pr_url": pr_url, "head_sha": head_sha, **seats}
-    fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=evidence_dir)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    root_fd = os.open(root_dir, os.O_RDONLY | directory | nofollow)
+    dir_fd = root_fd
+    opened: list[int] = []
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_name, target)
-        dir_fd = os.open(evidence_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        for part in evidence_dir.parts:
+            try:
+                next_fd = os.open(part, os.O_RDONLY | directory | nofollow, dir_fd=dir_fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(part, 0o755, dir_fd=dir_fd)
+                except FileExistsError:
+                    pass
+                next_fd = os.open(part, os.O_RDONLY | directory | nofollow, dir_fd=dir_fd)
+            except (NotADirectoryError, OSError) as exc:
+                raise ValueError("evidence_dir contains a symlink or non-directory component") from exc
+            dir_fd = next_fd
+            opened.append(next_fd)
+        payload = {"schema_version": 1, "pr_url": pr_url, "head_sha": head_sha, **seats}
+        target_name = "web-advice-share-urls.json"
+        temp_name = None
+        for attempt in range(20):
+            candidate = f".{target_name}.{os.getpid()}.{attempt}.tmp"
+            try:
+                fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o600, dir_fd=dir_fd)
+                temp_name = candidate
+                break
+            except FileExistsError:
+                continue
+        if temp_name is None:
+            raise FileExistsError("could not allocate evidence tempfile")
         try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, target_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            temp_name = None
             os.fsync(dir_fd)
         finally:
-            os.close(dir_fd)
-    except Exception:
+            if temp_name is not None:
+                try:
+                    os.unlink(temp_name, dir_fd=dir_fd)
+                except OSError:
+                    pass
+    finally:
+        for fd in reversed(opened):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
-            os.unlink(temp_name)
+            os.close(root_fd)
         except OSError:
             pass
-        raise
-    return target
+    return root_dir.joinpath(*evidence_dir.parts, "web-advice-share-urls.json")
 
 
 def _extract_verdict_token(output: str) -> str:
@@ -761,28 +838,35 @@ def _extract_share_urls(output: str) -> list[str]:
 
 
 def _normalise_panel_result(verdict_data: dict) -> dict:
-    """Apply transport-safe shape normalization without semantic triage."""
+    """Validate the exact seven-key panel envelope and its seat summaries."""
+    if not isinstance(verdict_data, dict):
+        return {"ok": False, "panel_contract_valid": False, "panel_contract_error": "panel result must be an object"}
+    envelope = {key: verdict_data.get(key) for key in _PANEL_CONTRACT_KEYS}
     raw_attempted = verdict_data.get("panel_seats_attempted")
     raw_live = verdict_data.get("panel_seats_live")
     raw_unavailable = verdict_data.get("panel_seats_unavailable")
     raw_reasons = verdict_data.get("panel_seats_unavailable_reasons")
     raw_summaries = verdict_data.get("panel_verdict_summary")
     contract_error = ""
-    if not isinstance(raw_attempted, list) or len(raw_attempted) != len(PANEL_SEATS) or set(raw_attempted) != set(PANEL_SEATS):
-        contract_error = "panel_seats_attempted must contain each canonical seat exactly once"
+    if set(verdict_data) != _PANEL_CONTRACT_KEYS:
+        contract_error = "panel envelope must contain exactly the seven canonical keys"
+    elif raw_attempted != list(PANEL_SEATS):
+        contract_error = "panel_seats_attempted must equal the canonical seat order"
     elif not isinstance(raw_live, list) or not isinstance(raw_unavailable, list):
         contract_error = "panel seat live/unavailable partitions must be lists"
     elif len(set(raw_live)) != len(raw_live) or len(set(raw_unavailable)) != len(raw_unavailable):
         contract_error = "panel seat live/unavailable partitions must be unique"
     elif set(raw_live) | set(raw_unavailable) != set(PANEL_SEATS) or set(raw_live) & set(raw_unavailable):
         contract_error = "panel seat live/unavailable partitions must be an exact disjoint partition"
-    elif not isinstance(raw_reasons, dict) or any(
+    elif not isinstance(raw_reasons, dict) or set(raw_reasons) != set(raw_unavailable) or any(
         not isinstance(raw_reasons.get(seat), str) or not raw_reasons[seat].strip()
         for seat in raw_unavailable
     ):
         contract_error = "every unavailable panel seat requires a non-empty reason"
-    elif not isinstance(raw_summaries, dict) or any(seat not in set(raw_live) for seat in raw_summaries):
-        contract_error = "panel verdict summaries may only contain live seats"
+    elif not isinstance(verdict_data.get("panel_convergence"), dict):
+        contract_error = "panel_convergence must be an object"
+    elif not isinstance(raw_summaries, dict) or set(raw_summaries) != set(raw_live):
+        contract_error = "panel verdict summaries must have exactly the live seat keys"
 
     attempted = [seat for seat in (raw_attempted or []) if seat in PANEL_SEATS]
     live = [seat for seat in (raw_live or []) if seat in attempted]
@@ -792,11 +876,28 @@ def _normalise_panel_result(verdict_data: dict) -> dict:
     probes: dict[str, dict] = {}
     if not contract_error:
         for seat, summary in summaries.items():
-            if not isinstance(summary, dict):
-                contract_error = "panel verdict summaries must be objects"
+            if not isinstance(summary, dict) or set(summary) != _PANEL_SUMMARY_KEYS:
+                contract_error = "panel verdict summaries must have the exact summary keys"
+                break
+            if summary.get("verdict") not in _PANEL_VERDICTS:
+                contract_error = "panel verdict verdict must be approve, not_merge, or insufficient"
+                break
+            if summary.get("confidence") not in _PANEL_CONFIDENCE:
+                contract_error = "panel confidence must be low, medium, or high"
+                break
+            if not isinstance(summary.get("reasoning"), str) or not summary["reasoning"].strip():
+                contract_error = "panel reasoning must be a non-empty string"
                 break
             url = summary.get("share_url")
+            if url is not None and not isinstance(url, str):
+                contract_error = "panel share_url must be a string or null"
+                break
             if not url:
+                if summary.get("share_url_probe") is not None and not isinstance(summary.get("share_url_probe"), dict):
+                    contract_error = "panel share_url_probe must be an object or null"
+                if summary.get("share_url_probe") is not None:
+                    # A probe without a URL is semantically meaningless.
+                    contract_error = "panel share_url_probe requires share_url"
                 continue
             probe = _probe_share_url(str(url))
             probes[seat] = probe
@@ -808,7 +909,11 @@ def _normalise_panel_result(verdict_data: dict) -> dict:
     # not claim those URLs belong to all four seats.
     flat_urls = [str(url) for url in (verdict_data.get("share_urls") or []) if url]
     flat_probes = [_probe_share_url(url) for url in flat_urls] if not contract_error else []
+    decision = verdict_data.get("decision")
+    if decision not in _PANEL_DECISIONS:
+        contract_error = contract_error or "decision is not a permitted fail-open value"
     return {
+        **envelope,
         **verdict_data,
         "panel_seats_attempted": attempted,
         "panel_seats_live": live,
@@ -1023,6 +1128,24 @@ def _web_advice_inner(node: "Node", ctx: "Context", metadata: dict, started_ts: 
     # 1. Inputs
     # ------------------------------------------------------------------
     seed = _seed_web_advice_state(ctx)
+    if not seed.get("ok", True) and seed.get("mode") in {"invalid_pr_identity", "target_repo_mismatch"}:
+        mode = seed.get("mode", "invalid_pr_identity")
+        metadata.update({
+            "web_advice_outcome": mode,
+            "infrastructure_failure_mode": mode,
+            "side_effect_error": seed.get("error", mode),
+            "decision": "continue",
+            "elapsed_seconds": round(time.time() - started_ts, 3),
+        })
+        if seed.get("mode") == "target_repo_mismatch":
+            metadata["target_repo_error"] = seed.get("error", "target repository mismatch")
+        _record_state(ctx, metadata)
+        return Result(
+            outcome="success",
+            output=f"web_advice skipped: {seed.get('error', mode)}",
+            metadata={k: _coerce_meta(v) for k, v in metadata.items()},
+            context_updates={"web_advice.outcome": mode},
+        )
     if seed.get("mode") == "head_sha_mismatch":
         metadata.update({
             "web_advice_outcome": "infrastructure_failure",
@@ -1236,7 +1359,14 @@ def _web_advice_inner(node: "Node", ctx: "Context", metadata: dict, started_ts: 
         transport=live_transport or "auto",
         prompt=prompt_text,
     )
-    verdict_data = _normalise_panel_result(verdict_data)
+    # The subprocess wrapper adds transport diagnostics around the exact
+    # seven-key panel envelope. Validate only that envelope, then retain the
+    # diagnostics for CXDB metadata and comments.
+    raw_verdict_data = verdict_data
+    verdict_data = {
+        **raw_verdict_data,
+        **_normalise_panel_result({key: raw_verdict_data.get(key) for key in _PANEL_CONTRACT_KEYS}),
+    }
     metadata.update({
         "verdict": verdict_data.get("verdict", "unknown"),
         "share_urls": verdict_data.get("share_urls", []) or [],
@@ -1250,6 +1380,34 @@ def _web_advice_inner(node: "Node", ctx: "Context", metadata: dict, started_ts: 
         "panel_decision": verdict_data.get("decision", "continue"),
         "share_url_probes": verdict_data.get("share_url_probes", {}),
     })
+
+    # A failed claude invocation is infrastructure, not a captured verdict.
+    # Emit the infra template immediately; do not post a misleading 0/0
+    # verdict comment or persist an evidence artifact before this branch.
+    if not verdict_data.get("ok"):
+        elapsed = round(time.time() - started_ts, 3)
+        summary = (
+            f"/web-advice subprocess failed (returncode={verdict_data.get('returncode', -1)}, "
+            f"stderr={verdict_data.get('stderr', '')!r})"
+        )
+        comment_result = _emit_infra("subprocess_failed", summary)
+        metadata.update({
+            "web_advice_outcome": "subprocess_failed",
+            "infrastructure_failure_mode": "subprocess_failed",
+            "decision": "continue_with_bead" if target_repo_valid else "continue",
+            "panel_decision": "continue_with_bead" if target_repo_valid else "continue",
+            "elapsed_seconds": elapsed,
+        })
+        _record_state(ctx, metadata)
+        return Result(
+            outcome="success",
+            output=f"web_advice subprocess_failed: {summary}",
+            metadata={k: _coerce_meta(v) for k, v in metadata.items()},
+            context_updates={
+                "web_advice.outcome": "subprocess_failed",
+                "web_advice.infrastructure_failure_mode": "subprocess_failed",
+            },
+        )
 
     if verdict_data.get("ok") and not verdict_data.get("panel_contract_valid", False):
         elapsed = round(time.time() - started_ts, 3)
