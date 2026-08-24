@@ -45,7 +45,7 @@ mkdir -p "$FAKE_HOME/.dark-factory"
 LOG_FILE="$SCRATCH_DIR/gh_calls.log"
 POLICY_FILE="$SCRATCH_DIR/auto_merge_repo_allowlist.json"
 # Current main defaults this allowlist to empty; opt the fixture in so the
-# test reaches the runner-outage probe instead of the policy gate.
+# test reaches the post-policy runner-outage probe instead of the policy gate.
 printf '%s\n' '{"allowed_repos":["jleechanorg/dark-factory"]}' > "$POLICY_FILE"
 
 cat > "$FAKE_BIN_DIR/gh" <<'EOGH'
