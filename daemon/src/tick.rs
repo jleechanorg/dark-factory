@@ -3282,6 +3282,7 @@ pub(crate) fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, Da
 #[cfg(test)]
 mod direct_claude_scope_tests {
     use super::{direct_claude_config_dir, dispatch_reviewer};
+    use std::path::Path;
     use std::sync::Mutex;
 
     fn env_lock() -> &'static Mutex<()> {
@@ -3306,6 +3307,18 @@ mod direct_claude_scope_tests {
         fn remove(key: &'static str) {
             unsafe { std::env::remove_var(key) };
         }
+    }
+
+    /// Put a test shim first while retaining the host tools needed by sibling
+    /// tests (notably `git`).  Replacing PATH outright lets process-global env
+    /// mutations make unrelated tests fail with ENOENT under parallel cargo
+    /// test execution.
+    fn prepend_path(dir: &Path) -> std::ffi::OsString {
+        let mut paths = vec![dir.to_path_buf()];
+        if let Some(path) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&path));
+        }
+        std::env::join_paths(paths).expect("test shim path must be joinable")
     }
 
     impl Drop for EnvRestore {
@@ -3336,7 +3349,14 @@ mod direct_claude_scope_tests {
         std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let _env = EnvRestore::capture(&["PATH", "DARK_FACTORY_CLAUDE_CONFIG_DIR"]);
-        EnvRestore::set("PATH", root.join("bin"));
+        EnvRestore::set("PATH", prepend_path(&root.join("bin")));
+        assert!(
+            std::process::Command::new("git")
+                .arg("--version")
+                .status()
+                .expect("system git must remain discoverable with the fake Claude shim")
+                .success()
+        );
         EnvRestore::remove("DARK_FACTORY_CLAUDE_CONFIG_DIR");
         let result = dispatch_reviewer("claude", "scope-test");
         let _ = std::fs::remove_dir_all(&root);
@@ -3489,7 +3509,7 @@ mod direct_claude_scope_tests {
             "MINIMAX_MODEL",
             "DARK_FACTORY_MINIMAX_MODEL",
         ]);
-        EnvRestore::set("PATH", &bin);
+        EnvRestore::set("PATH", prepend_path(&bin));
         EnvRestore::set("HOME", &home);
         EnvRestore::set("DARK_FACTORY_CLAUDE_CONFIG_DIR", &config);
         EnvRestore::set("ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic");
@@ -3545,7 +3565,7 @@ mod direct_claude_scope_tests {
         std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let _env = EnvRestore::capture(&["PATH", "MINIMAX_API_KEY"]);
-        EnvRestore::set("PATH", &bin);
+        EnvRestore::set("PATH", prepend_path(&bin));
         EnvRestore::remove("MINIMAX_API_KEY");
         let result = dispatch_reviewer("claudem", "scope-test");
         let _ = std::fs::remove_dir_all(&root);
@@ -3589,7 +3609,7 @@ mod direct_claude_scope_tests {
             "MINIMAX_MODEL",
             "DARK_FACTORY_MINIMAX_MODEL",
         ]);
-        EnvRestore::set("PATH", &bin);
+        EnvRestore::set("PATH", prepend_path(&bin));
         EnvRestore::set("CLAUDE_CONFIG_DIR", "/home/operator/.claude");
         EnvRestore::set("MINIMAX_API_KEY", "minimax-key");
         EnvRestore::set("ANTHROPIC_BASE_URL", "https://personal.invalid");
