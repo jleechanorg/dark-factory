@@ -342,6 +342,221 @@ def test_compute_lane_report_furthest_and_terminal(tmp_path):
     assert grand_total == 5  # 2 bead + 2 issue + 1 pr-adopt, NOT 6
 
 
+def test_coderabbit_gate_outcomes_are_separate_and_reconcile(tmp_path):
+    """Every gate assessment contributes exactly one honest CodeRabbit bucket.
+
+    A plain pass is direct evidence, while the waiver token remains visible as
+    a separate bucket. Missing/non-object gates are unobserved; malformed
+    present values are unknown rather than silently counted as passes.
+    """
+    rows = [
+        _row("rev-cr-direct", 1, "INTAKE_BEAD_CREATED", 0, context={}),
+        _row(
+            "rev-cr-direct", 1, "GATE_ASSESSMENT", 1,
+            context={"gates": {"coderabbit": "pass"}},
+        ),
+        _row("rev-cr-waived", 1, "INTAKE_BEAD_CREATED", 2, context={}),
+        _row(
+            "rev-cr-waived", 1, "GATE_ASSESSMENT", 3,
+            context={"gates": {"coderabbit": {
+                "verdict": "pass",
+                "evidence": ["coderabbit:waived_vendor_unavailable"],
+            }}},
+        ),
+        _row("rev-cr-unknown", 1, "INTAKE_BEAD_CREATED", 4, context={}),
+        _row(
+            "rev-cr-unknown", 1, "GATE_ASSESSMENT", 5,
+            context={"gates": {"coderabbit": {"verdict": "unknown"}}},
+        ),
+        _row("rev-cr-fail", 1, "INTAKE_BEAD_CREATED", 6, context={}),
+        _row(
+            "rev-cr-fail", 1, "GATE_ASSESSMENT", 7,
+            context={"gates": {"coderabbit": {"verdict": "fail"}}},
+        ),
+        _row("rev-cr-unobserved", 1, "INTAKE_BEAD_CREATED", 8, context={}),
+        _row("rev-cr-unobserved", 1, "GATE_ASSESSMENT", 9, context={}),
+        _row("rev-cr-malformed", 1, "INTAKE_BEAD_CREATED", 10, context={}),
+        _row(
+            "rev-cr-malformed", 1, "GATE_ASSESSMENT", 11,
+            context={"gates": {"coderabbit": []}},
+        ),
+        # No intake origin in the window: it is excluded from lane totals but
+        # must remain in the report-wide exact-head CodeRabbit denominator.
+        _row(
+            "rev-cr-unassigned", 1, "GATE_ASSESSMENT", 12,
+            context={
+                "pr_number": 9010,
+                "head_sha": "unassigned-head",
+                "gates": {"coderabbit": "fail"},
+            },
+        ),
+    ]
+    path = _write_fixture(tmp_path, rows=rows)
+    events = load_events_full(path, since=None, now=T0 + timedelta(days=1))
+    report = compute_lane_report(events, since_label="test")
+    stat = next(item for item in report.lanes if item.lane == "bead_start")
+
+    assert stat.coderabbit == {
+        "direct_approved": 1,
+        "waived_unavailable": 1,
+        "unknown": 2,
+        "fail": 1,
+        "unobserved": 1,
+    }
+    assert stat.coderabbit_total == 6
+    assert sum(stat.coderabbit.values()) == 6
+
+    assert report.coderabbit == {
+        "direct_approved": 1,
+        "waived_unavailable": 1,
+        "unknown": 2,
+        "fail": 2,
+        "unobserved": 1,
+    }
+    assert report.coderabbit_total == 7
+
+    payload = render_json(report)
+    assert payload["coderabbit_total"] == 7
+    assert payload["coderabbit"] == {
+        "direct_approved": 1,
+        "waived_unavailable": 1,
+        "unknown": 2,
+        "fail": 2,
+        "unobserved": 1,
+    }
+    lane = next(item for item in payload["lanes"] if item["lane"] == "bead_start")
+    assert lane["coderabbit"] == stat.coderabbit
+    assert lane["coderabbit_total"] == sum(lane["coderabbit"].values())
+
+
+def test_coderabbit_recovery_counts_each_assessment(tmp_path):
+    """CodeRabbit outcomes are assessment observations, not bead stages."""
+    rows = [
+        _row("rev-cr-reroll", 1, "INTAKE_BEAD_CREATED", 0, context={}),
+        _row(
+            "rev-cr-reroll", 1, "GATE_ASSESSMENT", 1,
+            context={"gates": {"coderabbit": {"verdict": "fail"}}},
+        ),
+        _row(
+            "rev-cr-reroll", 2, "GATE_ASSESSMENT", 2,
+            context={"gates": {"coderabbit": "pass"}},
+        ),
+    ]
+    events = load_events_full(
+        _write_fixture(tmp_path, rows=rows),
+        since=None,
+        now=T0 + timedelta(days=1),
+    )
+    stat = next(
+        item for item in compute_lane_report(events).lanes if item.lane == "bead_start"
+    )
+    assert stat.total == 1
+    assert stat.coderabbit == {
+        "direct_approved": 1,
+        "waived_unavailable": 0,
+        "unknown": 0,
+        "fail": 1,
+        "unobserved": 0,
+    }
+    assert stat.coderabbit_total == 2
+
+
+def test_coderabbit_deduplicates_pr_head_and_keeps_latest(tmp_path):
+    rows = [
+        _row("rev-cr-head", 1, "INTAKE_BEAD_CREATED", 0, context={}),
+        _row(
+            "rev-cr-head", 1, "GATE_ASSESSMENT", 1,
+            context={
+                "pr_number": 9005,
+                "head_sha": "abc123",
+                "gates": {"coderabbit": {"verdict": "unknown"}},
+            },
+        ),
+        # Same immutable PR head, later assessment: it replaces the earlier
+        # unknown rather than inflating the denominator.
+        _row(
+            "rev-cr-head", 1, "GATE_ASSESSMENT", 2,
+            context={
+                "pr_number": 9005,
+                "head_sha": "abc123",
+                "gates": {"coderabbit": {
+                    "verdict": "pass",
+                    "evidence": ["coderabbit:waived_vendor_unavailable"],
+                }},
+            },
+        ),
+        _row(
+            "rev-cr-head", 1, "GATE_ASSESSMENT", 3,
+            context={
+                "pr_number": 9005,
+                "head_sha": "def456",
+                "gates": {"coderabbit": "pass"},
+            },
+        ),
+    ]
+    events = load_events_full(
+        _write_fixture(tmp_path, rows=rows),
+        since=None,
+        now=T0 + timedelta(days=1),
+    )
+    stat = next(
+        item for item in compute_lane_report(events).lanes if item.lane == "bead_start"
+    )
+    assert stat.coderabbit == {
+        "direct_approved": 1,
+        "waived_unavailable": 1,
+        "unknown": 0,
+        "fail": 0,
+        "unobserved": 0,
+    }
+    assert stat.coderabbit_total == 2
+
+
+@pytest.mark.parametrize(
+    ("verdict", "evidence", "expected"),
+    [
+        ("fail", ["coderabbit:waived_vendor_unavailable"], "fail"),
+        ("unknown", ["coderabbit:waived_vendor_unavailable"], "unknown"),
+        ("pass", ["coderabbit:waived_vendor_unavailable"], "waived_unavailable"),
+    ],
+)
+def test_coderabbit_waiver_requires_green_verdict(verdict, evidence, expected):
+    from runner.funnel_lanes import classify_coderabbit
+
+    assert classify_coderabbit({
+        "gates": {"coderabbit": {"verdict": verdict, "evidence": evidence}}
+    }) == expected
+
+
+def test_legacy_same_second_rows_keep_distinct_observations(tmp_path):
+    rows = [
+        _row("rev-cr-legacy", 1, "INTAKE_BEAD_CREATED", 0, context={}),
+        _row(
+            "rev-cr-legacy", 1, "GATE_ASSESSMENT", 1,
+            context={"gates": {"coderabbit": "fail"}},
+        ),
+        # Same bead, attempt, and second as the prior row; input sequence is
+        # the only stable identity for legacy telemetry without PR/head data.
+        _row(
+            "rev-cr-legacy", 1, "GATE_ASSESSMENT", 1,
+            context={"gates": {"coderabbit": "pass"}},
+        ),
+    ]
+    events = load_events_full(
+        _write_fixture(tmp_path, rows=rows),
+        since=None,
+        now=T0 + timedelta(days=1),
+    )
+    report = compute_lane_report(events)
+    assert report.coderabbit == {
+        "direct_approved": 1,
+        "waived_unavailable": 0,
+        "unknown": 0,
+        "fail": 1,
+        "unobserved": 0,
+    }
+    assert report.coderabbit_total == 2
+
 def test_compute_lane_report_since_label_passthrough(tmp_path):
     path = _write_fixture(tmp_path)
     events = load_events_full(path, since=None, now=T0 + timedelta(days=1))
