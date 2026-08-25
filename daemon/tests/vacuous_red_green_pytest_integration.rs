@@ -253,7 +253,11 @@ def classify_score(n):
 "#;
 
 const VACUOUS_TEST: &str = r#"
-def test_two_plus_two_is_four():
+import pytest
+
+
+@pytest.mark.parametrize("value", [2])
+def test_two_plus_two_is_four(value):
     assert 2 + 2 == 4
 
 
@@ -268,7 +272,11 @@ def test_range_check():
 "#;
 
 const BASE_VACUOUS_TEST: &str = r#"
-def test_two_plus_two_is_four():
+import pytest
+
+
+@pytest.mark.parametrize("value", [3])
+def test_two_plus_two_is_four(value):
     assert 3 + 3 == 6
 
 

@@ -1868,10 +1868,10 @@ fn run_pytest_tests(
             target.path.to_string_lossy().into_owned()
         });
         let node = format!("{rel}::{}", target.name);
-        let passed = stdout.lines().any(|line| line.contains(&format!("{node} PASSED")));
-        let failed = stdout.lines().any(|line| line.contains(&format!("{node} FAILED")));
-        let skipped = stdout.lines().any(|line| line.contains(&format!("{node} SKIPPED")));
-        let errored = stdout.lines().any(|line| line.contains(&format!("{node} ERROR")));
+        let passed = pytest_output_has_status(&stdout, &node, "PASSED");
+        let failed = pytest_output_has_status(&stdout, &node, "FAILED");
+        let skipped = pytest_output_has_status(&stdout, &node, "SKIPPED");
+        let errored = pytest_output_has_status(&stdout, &node, "ERROR");
         if failed || errored {
             failing.push(format!("{node}:FAILED"));
         } else if !passed && !skipped {
@@ -1889,6 +1889,43 @@ fn run_pytest_tests(
     Ok(CargoOutcome {
         failing,
         compile_errored,
+    })
+}
+
+/// Match a pytest verbose result for one exact selected function.  Pytest
+/// appends parameter IDs (`node[param] STATUS`) for parametrized tests; the
+/// suffix must be accepted without relaxing file/function association (so
+/// `test_x` cannot match `test_xyz`).
+fn pytest_output_has_status(stdout: &str, node: &str, status: &str) -> bool {
+    stdout.lines().any(|line| {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix(node) else {
+            return false;
+        };
+
+        let has_status = |candidate: &str| {
+            let candidate = candidate.trim_start();
+            let Some(tail) = candidate.strip_prefix(status) else {
+                return false;
+            };
+            tail.is_empty()
+                || tail
+                    .chars()
+                    .next()
+                    .is_some_and(|character| character.is_whitespace())
+        };
+
+        if rest.starts_with('[') {
+            // The progress suffix (`[ 33%]`) can contain a later closing
+            // bracket than the parameter ID.  Accept the bracket whose
+            // following token is the requested terminal status instead of
+            // blindly taking the last `]`.
+            return rest
+                .char_indices()
+                .filter(|(_, character)| *character == ']')
+                .any(|(close, _)| has_status(&rest[close + 1..]));
+        }
+        has_status(rest)
     })
 }
 
@@ -3073,6 +3110,21 @@ def test_b():
             vec!["test_added".to_string()],
             "decorators on a new async test must not retarget its unchanged predecessor"
         );
+    }
+
+    #[test]
+    fn pytest_output_status_accepts_params_and_all_terminal_states_without_prefix_collisions() {
+        let stdout = "tests/test_mod.py::test_x[case] PASSED\n"
+            .to_owned()
+            + "tests/test_mod.py::test_failed[param] FAILED\n"
+            + "tests/test_mod.py::test_skipped SKIPPED\n"
+            + "tests/test_mod.py::test_error[repr] ERROR\n"
+            + "tests/test_mod.py::test_xyz PASSED\n";
+        assert!(pytest_output_has_status(&stdout, "tests/test_mod.py::test_x", "PASSED"));
+        assert!(pytest_output_has_status(&stdout, "tests/test_mod.py::test_failed", "FAILED"));
+        assert!(pytest_output_has_status(&stdout, "tests/test_mod.py::test_skipped", "SKIPPED"));
+        assert!(pytest_output_has_status(&stdout, "tests/test_mod.py::test_error", "ERROR"));
+        assert!(!pytest_output_has_status(&stdout, "tests/test_mod.py::test", "PASSED"));
     }
 
     #[test]
