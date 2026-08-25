@@ -249,6 +249,11 @@ def test_pinned_sha_matches_caller_self_pin() -> None:
 
 GATE_PATH = REPO_ROOT / ".github" / "workflows" / "skeptic-gate.yml"
 PINNED_CALLEE_FIXTURES = REPO_ROOT / "tests" / "fixtures"
+EXPECTED_SKEPTIC_PERMISSIONS = {
+    "contents": "read",
+    "pull-requests": "write",
+    "statuses": "write",
+}
 
 
 def _assert_caller_permission_lattice(caller_text: str, callee_text: str) -> None:
@@ -268,8 +273,18 @@ def _assert_caller_permission_lattice(caller_text: str, callee_text: str) -> Non
     callee_permissions = callee.get("permissions") or {}
     assert isinstance(caller_permissions, dict), "caller permissions must be a mapping"
     assert isinstance(callee_permissions, dict), "callee permissions must be a mapping"
+    assert callee_permissions == EXPECTED_SKEPTIC_PERMISSIONS, (
+        "the audited pinned callee permission contract changed; re-audit the "
+        "immutable SHA and update the explicit expected contract deliberately"
+    )
 
-    for scope, required in callee_permissions.items():
+    for scope, required in EXPECTED_SKEPTIC_PERMISSIONS.items():
+        if scope == "contents":
+            assert caller_permissions.get(scope) == required, (
+                "caller must keep contents read-only; the gate does not need "
+                "write access"
+            )
+            continue
         if required != "write":
             continue
         assert caller_permissions.get(scope) == "write", (
@@ -277,9 +292,6 @@ def _assert_caller_permission_lattice(caller_text: str, callee_text: str) -> Non
             f"callee declares `{scope}: write`; GitHub cannot elevate a caller "
             "token across the workflow boundary"
         )
-    assert caller_permissions.get("contents") == "read", (
-        "caller must keep contents read-only; the gate does not need write access"
-    )
 
 
 def _pinned_callee_contract(caller_text: str) -> str:
@@ -596,3 +608,19 @@ def test_red_first_permission_lattice_catches_read_downgrade() -> None:
         assert mutated != caller, f"test mutation failed to find {scope} permission"
         with pytest.raises(AssertionError, match=rf"{re.escape(scope)}.*write"):
             _assert_caller_permission_lattice(mutated, callee)
+
+
+def test_red_first_permission_lattice_catches_pinned_fixture_downgrade() -> None:
+    """A weakened audited fixture must fail independently of the caller."""
+    caller = _caller_text()
+    callee = _pinned_callee_contract(caller)
+    for scope in ("pull-requests", "statuses"):
+        mutated = re.sub(
+            rf"(?m)^(\s*{re.escape(scope)}:)\s*write\s*$",
+            rf"\1 read",
+            callee,
+            count=1,
+        )
+        assert mutated != callee, f"test mutation failed to find {scope} permission"
+        with pytest.raises(AssertionError, match="audited pinned callee"):
+            _assert_caller_permission_lattice(caller, mutated)
