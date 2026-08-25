@@ -623,16 +623,24 @@ pub fn dispatch_ready_with_vcs(
         overlay.pre_session_head_sha = Some(expected_revision.clone());
         store.save(&overlay)?;
         let preamble = dispatch_prompt_preamble(&repo, &routing.push_remote, &branch);
+        let route_label = routing_verdict_label(*verdict);
+        let pipeline = factory_pipeline_for(*verdict, branch_mode);
+        // Bead rev-z7wua CHANGE 1: this match is EXHAUSTIVE on purpose. It
+        // previously ended in a `_` catch-all, which silently swallowed
+        // `SmallPath` and `StandardPath` — the two code-implementing
+        // verdicts — so they never ran a `.dot` graph at all while the two
+        // read-only verdicts did. An exhaustive match makes any future
+        // `RoutingVerdict` variant a compile error here rather than another
+        // silent non-routing regression.
         let prompt = match verdict {
-            RoutingVerdict::ResearchPath => {
+            RoutingVerdict::ResearchPath | RoutingVerdict::GenericPath => {
+                let verb = if *verdict == RoutingVerdict::ResearchPath {
+                    "research"
+                } else {
+                    "handle"
+                };
                 format!(
-                    "{preamble}Route to RESEARCH_PATH: Run /factory with pipelines/slim/minimal_research.dot to research: {}",
-                    bead.title
-                )
-            }
-            RoutingVerdict::GenericPath => {
-                format!(
-                    "{preamble}Route to GENERIC_PATH: Run /factory with pipelines/slim/spec_gen.dot to handle: {}",
+                    "{preamble}Route to {route_label}: Run /factory with {pipeline} to {verb}: {}",
                     bead.title
                 )
             }
@@ -642,7 +650,22 @@ pub fn dispatch_ready_with_vcs(
             // interim mitigation before this bead's `[repos]` plumbing
             // existed) plus the exact `routing.push_remote`, closing the
             // gap #247's doc comment explicitly deferred to this bead.
-            _ => build_coder_prompt(bead, &branch, &repo, &routing.push_remote),
+            //
+            // rev-z7wua: the `ROUTE:` line is rendered INSIDE
+            // `build_coder_prompt` rather than prepended here, so it counts
+            // against `CODER_PROMPT_TOTAL_CAP` (4,000 — only ~96 chars of
+            // headroom under AO's hard 4,096 spawn ceiling). Prepending it
+            // afterwards would reintroduce the deterministic
+            // "Prompt must be at most 4096 characters" spawn failure that
+            // canary bead jleechan-j4i8 hit.
+            RoutingVerdict::SmallPath | RoutingVerdict::StandardPath => build_coder_prompt(
+                bead,
+                &branch,
+                &repo,
+                &routing.push_remote,
+                route_label,
+                pipeline,
+            ),
         };
 
         let spec = SpawnSpec {
@@ -1121,6 +1144,64 @@ fn truncate_at_char_boundary(s: &mut String, cap: usize) {
     s.truncate(n);
 }
 
+/// Pipeline (`.dot` graph) the spawned coder must run via `/factory` for a
+/// code-implementing routing verdict.
+///
+/// Bead rev-z7wua CHANGE 1: `SMALL_PATH` and `STANDARD_PATH` used to fall
+/// into `dispatch_ready`'s catch-all `_` arm and therefore never ran a graph
+/// at all — the coder got a bare instruction prompt while `RESEARCH_PATH` and
+/// `GENERIC_PATH` (the two verdicts that already had explicit arms) were the
+/// only ones that reached the runner. Every verdict now names a pipeline.
+///
+/// Selection rationale (see `docs/pipeline-selection.md`):
+///
+/// * The dimension that actually picks the graph is *is there already a PR to
+///   iterate on?*, not the router's complexity judgment. `branch_mode ==
+///   "pr_head"` is exactly `DriveBranchDecision::PrHead` — the coder is bound
+///   to an open PR's own head ref — which is the doc's "In-flight PR
+///   iteration" row: `pipelines/slim/minimal_pr.dot`.
+/// * Otherwise this is create-new-work (`Generated` / `ForkFallback`), the
+///   doc's "New feature, full production loop" row:
+///   `pipelines/slim/minimal_feature.dot`.
+/// * `SMALL_PATH` deliberately gets the SAME graph as `STANDARD_PATH` rather
+///   than a lighter one. The holdout-always policy (`docs/pipeline-selection.md`
+///   §"Holdout-always policy") requires every implement-bearing lane to run
+///   the sealed behavioral holdouts, and the only implement-bearing lanes that
+///   carry both a holdout node and a bounded fix loop are `minimal_feature.dot`
+///   and `minimal_pr.dot`. `hello.dot` is the `--backend echo` wiring smoke,
+///   and `gates.dot` / `pr_gates.dot` are validate-only (no fix loop), so
+///   neither is a legitimate "small implementation" lane. The router verdict
+///   still reaches the coder as the `SMALL_PATH`/`STANDARD_PATH` label in the
+///   prompt.
+/// * Both graphs pin their reviewer through `backend_priority=` (rather than a
+///   hard `backend=`), which is the attribute `DARK_FACTORY_ADVERSARIAL_PRIORITY`
+///   overrides — this is why they, and not `two_node.dot` (whose
+///   `parallel_reviewer` is codex-only by transport), are the right targets.
+fn factory_pipeline_for(verdict: RoutingVerdict, branch_mode: &str) -> &'static str {
+    match verdict {
+        RoutingVerdict::ResearchPath => "pipelines/slim/minimal_research.dot",
+        RoutingVerdict::GenericPath => "pipelines/slim/spec_gen.dot",
+        RoutingVerdict::SmallPath | RoutingVerdict::StandardPath => {
+            if branch_mode == "pr_head" {
+                "pipelines/slim/minimal_pr.dot"
+            } else {
+                "pipelines/slim/minimal_feature.dot"
+            }
+        }
+    }
+}
+
+/// Stable `SMALL_PATH` / `STANDARD_PATH` / ... token for a verdict, used both
+/// in the dispatch prompt and (via `tick.rs`) in telemetry.
+fn routing_verdict_label(verdict: RoutingVerdict) -> &'static str {
+    match verdict {
+        RoutingVerdict::SmallPath => "SMALL_PATH",
+        RoutingVerdict::StandardPath => "STANDARD_PATH",
+        RoutingVerdict::ResearchPath => "RESEARCH_PATH",
+        RoutingVerdict::GenericPath => "GENERIC_PATH",
+    }
+}
+
 /// Render the full coder prompt template from already-capped `description`,
 /// `notes`, and `tree` text. Split out of `build_coder_prompt` so the
 /// total-budget reconciliation pass (jleechan-niqz) can re-render cheaply
@@ -1136,15 +1217,30 @@ fn truncate_at_char_boundary(s: &mut String, cap: usize) {
 /// dominates the description (it's the operator's per-attempt override of
 /// the bead body), and the repo-map tree drops first when the AO 4,096-char
 /// ceiling forces a cut.
+/// The three already-capped, shrinkable text sections of a coder prompt,
+/// grouped so `render_coder_prompt` stays within clippy's 7-argument limit
+/// after bead rev-z7wua added the `route_label` / `pipeline` pair. They
+/// travel together through every budget-reconciliation pass anyway.
+struct CoderPromptSections<'a> {
+    description: &'a str,
+    notes: &'a str,
+    tree: &'a str,
+}
+
 fn render_coder_prompt(
     bead: &crate::tools::Bead,
     branch: &str,
     target_repo: &str,
     remote: &str,
-    description: &str,
-    notes: &str,
-    tree: &str,
+    route_label: &str,
+    pipeline: &str,
+    sections: CoderPromptSections<'_>,
 ) -> String {
+    let CoderPromptSections {
+        description,
+        notes,
+        tree,
+    } = sections;
     let description_block = if description.is_empty() {
         String::new()
     } else {
@@ -1193,6 +1289,10 @@ fn render_coder_prompt(
         "You are an autonomous factory coder working bead {id}.\n\
          \n\
          TASK: {title}\n\
+         \n\
+         ROUTE: {route_label} — run /factory with {pipeline}. That graph owns \
+         the review, holdout, and evidence gates; do not hand-implement \
+         outside it.\n\
          {description_block}{notes_block}{external_block}\
          \n\
          REPO: {target_repo} — all commits, pushes, and the PR belong to this \
@@ -1267,7 +1367,14 @@ fn shrink_by(text: &mut String, excess: usize, marker: &str) {
     }
 }
 
-fn build_coder_prompt(bead: &crate::tools::Bead, branch: &str, target_repo: &str, remote: &str) -> String {
+fn build_coder_prompt(
+    bead: &crate::tools::Bead,
+    branch: &str,
+    target_repo: &str,
+    remote: &str,
+    route_label: &str,
+    pipeline: &str,
+) -> String {
     let mut description = bead.description.trim().to_string();
     if description.len() > CODER_PROMPT_DESCRIPTION_CAP {
         truncate_at_char_boundary(&mut description, CODER_PROMPT_DESCRIPTION_CAP);
@@ -1286,7 +1393,15 @@ fn build_coder_prompt(bead: &crate::tools::Bead, branch: &str, target_repo: &str
         tree.push_str("\n[tree truncated]");
     }
 
-    let mut prompt = render_coder_prompt(bead, branch, target_repo, remote, &description, &notes, &tree);
+    let mut prompt = render_coder_prompt(
+            bead,
+            branch,
+            target_repo,
+            remote,
+            route_label,
+            pipeline,
+            CoderPromptSections { description: &description, notes: &notes, tree: &tree },
+        );
 
     // jleechan-niqz: the per-section caps above bound `description`, `notes`,
     // and `tree` independently but never reconciled their SUM (plus the fixed
@@ -1305,19 +1420,43 @@ fn build_coder_prompt(bead: &crate::tools::Bead, branch: &str, target_repo: &str
     if prompt.len() > CODER_PROMPT_TOTAL_CAP && !tree.is_empty() {
         let excess = prompt.len() - CODER_PROMPT_TOTAL_CAP;
         shrink_by(&mut tree, excess, "\n[tree truncated]");
-        prompt = render_coder_prompt(bead, branch, target_repo, remote, &description, &notes, &tree);
+        prompt = render_coder_prompt(
+            bead,
+            branch,
+            target_repo,
+            remote,
+            route_label,
+            pipeline,
+            CoderPromptSections { description: &description, notes: &notes, tree: &tree },
+        );
     }
 
     if prompt.len() > CODER_PROMPT_TOTAL_CAP && !description.is_empty() {
         let excess = prompt.len() - CODER_PROMPT_TOTAL_CAP;
         shrink_by(&mut description, excess, "\n[description truncated]");
-        prompt = render_coder_prompt(bead, branch, target_repo, remote, &description, &notes, &tree);
+        prompt = render_coder_prompt(
+            bead,
+            branch,
+            target_repo,
+            remote,
+            route_label,
+            pipeline,
+            CoderPromptSections { description: &description, notes: &notes, tree: &tree },
+        );
     }
 
     if prompt.len() > CODER_PROMPT_TOTAL_CAP && !notes.is_empty() {
         let excess = prompt.len() - CODER_PROMPT_TOTAL_CAP;
         shrink_by(&mut notes, excess, "\n[notes truncated]");
-        prompt = render_coder_prompt(bead, branch, target_repo, remote, &description, &notes, &tree);
+        prompt = render_coder_prompt(
+            bead,
+            branch,
+            target_repo,
+            remote,
+            route_label,
+            pipeline,
+            CoderPromptSections { description: &description, notes: &notes, tree: &tree },
+        );
     }
 
     prompt
@@ -1330,6 +1469,28 @@ mod tests {
     use crate::tools::SessionId;
     use std::cell::RefCell;
     use std::collections::HashMap;
+
+    /// `build_coder_prompt` with the ordinary new-work STANDARD_PATH route
+    /// arguments (bead rev-z7wua added `route_label` / `pipeline`). The
+    /// pre-existing prompt-shape and cap-reconciliation tests below care
+    /// about description/notes/tree budgeting, not about which graph the
+    /// coder is told to run, so they all go through this shim rather than
+    /// repeating the same two literals nine times.
+    fn coder_prompt(
+        bead: &crate::tools::Bead,
+        branch: &str,
+        target_repo: &str,
+        remote: &str,
+    ) -> String {
+        build_coder_prompt(
+            bead,
+            branch,
+            target_repo,
+            remote,
+            "STANDARD_PATH",
+            "pipelines/slim/minimal_feature.dot",
+        )
+    }
 
     /// Local unit-test fake mirroring `tests/common/mod.rs`'s `FakeSessions`
     /// (same call-log shape) without the `daemon::` crate-qualified imports
@@ -3290,7 +3451,7 @@ mod tests {
             file_tree_summary: "src/\n  flux.rs\n  main.rs".into(),
             external_ref: Some("jleechanorg/delorean#42".into()),
         };
-        let prompt = build_coder_prompt(&bead, "factory/bead-x-r1", "jleechanorg/delorean", "worldai");
+        let prompt = coder_prompt(&bead, "factory/bead-x-r1", "jleechanorg/delorean", "worldai");
 
         assert!(prompt.contains("Fix the flux capacitor"), "title missing");
         assert!(
@@ -3362,7 +3523,7 @@ mod tests {
             file_tree_summary: String::new(),
             external_ref: None,
         };
-        let prompt = build_coder_prompt(
+        let prompt = coder_prompt(
             &bead,
             "factory/bead-rln6-r1",
             "jleechanorg/dark-factory",
@@ -3431,7 +3592,7 @@ mod tests {
             file_tree_summary: String::new(),
             external_ref: None,
         };
-        let prompt = build_coder_prompt(&bead, "factory/bead-y-r1", "owner/repo", "origin");
+        let prompt = coder_prompt(&bead, "factory/bead-y-r1", "owner/repo", "origin");
 
         assert!(
             prompt.contains("[description truncated]"),
@@ -3462,7 +3623,7 @@ mod tests {
             external_ref: None,
         };
         // Must not panic.
-        let prompt = build_coder_prompt(&bead, "factory/bead-u-r1", "owner/repo", "origin");
+        let prompt = coder_prompt(&bead, "factory/bead-u-r1", "owner/repo", "origin");
         assert!(prompt.contains("[description truncated]"));
     }
 
@@ -3500,7 +3661,7 @@ mod tests {
             external_ref: Some("jleechanorg/dark-factory#999".into()),
         };
 
-        let prompt = build_coder_prompt(
+        let prompt = coder_prompt(
             &bead,
             "factory/jleechan-j4i8-r1",
             "jleechanorg/dark-factory",
@@ -3566,7 +3727,7 @@ mod tests {
         };
 
         // Must not panic.
-        let prompt = build_coder_prompt(&bead, "factory/bead-total-unicode-r1", "owner/repo", "origin");
+        let prompt = coder_prompt(&bead, "factory/bead-total-unicode-r1", "owner/repo", "origin");
         assert!(prompt.len() <= CODER_PROMPT_TOTAL_CAP);
     }
 
@@ -3590,7 +3751,7 @@ mod tests {
             file_tree_summary: String::new(),
             external_ref: Some("jleechanorg/dark-factory#338".into()),
         };
-        let prompt = build_coder_prompt(
+        let prompt = coder_prompt(
             &bead,
             "factory/jleechan-0hqx-r2",
             "jleechanorg/dark-factory",
@@ -3639,7 +3800,7 @@ mod tests {
             file_tree_summary: String::new(),
             external_ref: None,
         };
-        let prompt = build_coder_prompt(
+        let prompt = coder_prompt(
             &bead,
             "factory/jleechan-no-notes-r1",
             "owner/repo",
@@ -3665,23 +3826,40 @@ mod tests {
         let bead = Bead {
             id: "jleechan-0hqx-budget".into(),
             title: "Reconciliation priority".into(),
-            // Sized so each section sits under its own per-section cap (no
-            // pre-truncation marker) yet their SUM pushes the rendered
-            // prompt past the 4,000-char total cap — forcing the
-            // reconciliation pass to do real work in the documented
-            // priority order. With tree=3,500 + description=500 +
-            // notes=1,400 + boilerplate~1,100 (the rln6 EVIDENCE block grew
-            // the fixed boilerplate from ~700 to ~1,100 chars) ≈ 6,500 chars
-            // total, the excess (~2,500) absorbs entirely into the tree's
-            // first shrink pass; tree survives with the `[tree truncated]`
-            // marker appended, while description and notes stay intact
-            // (no further shrink passes needed).
+            // Sized so their SUM pushes the rendered prompt well past the
+            // 4,000-char total cap, forcing the reconciliation pass to do
+            // real work in the documented priority order (tree, then
+            // description, then notes).
+            //
+            // How the cascade ACTUALLY runs (bead rev-z7wua corrected this
+            // comment, which previously claimed the excess "absorbs entirely
+            // into the tree's first shrink pass" — it never did): `shrink_by`
+            // charges the WHOLE remaining excess against a single section, so
+            // when the excess exceeds that section's length the section is
+            // annihilated down to its bare truncation marker and the leftover
+            // excess cascades to the next one. Here the tree is annihilated
+            // first, then the description, and only the residue reaches the
+            // notes. The assertions below are the invariant: notes — the
+            // operator's per-attempt override — must be the section that
+            // survives.
+            //
+            // rev-z7wua also RE-CALIBRATED `notes` from 35 repeats (1,470
+            // chars) to 25 (1,050). The fixed boilerplate is now 2,345 chars
+            // (it grew by the ~180-char `ROUTE:` line that tells the coder
+            // which `.dot` graph to run), and at 35 repeats the notes block
+            // alone consumed the entire remaining budget — the residue
+            // reached notes and tripped the `[notes truncated]` assertion.
+            // 25 repeats restores ~200 chars of genuine headroom so this test
+            // asserts the priority ORDER rather than sitting on a byte-exact
+            // boundary. If a future change to the fixed boilerplate trips the
+            // `[notes truncated]` assertion again, shrink this repeat count —
+            // do not weaken the assertion.
             description: "D".repeat(500),
-            notes: "OPERATOR_GUIDANCE_SENTINEL_DO_NOT_TRUNCATE".repeat(35), // ~1,400 chars
+            notes: "OPERATOR_GUIDANCE_SENTINEL_DO_NOT_TRUNCATE".repeat(25), // ~1,050 chars
             file_tree_summary: "x/".repeat(1_750), // 3,500 chars pre-render
             external_ref: None,
         };
-        let prompt = build_coder_prompt(
+        let prompt = coder_prompt(
             &bead,
             "factory/jleechan-0hqx-budget-r1",
             "owner/repo",
@@ -3738,6 +3916,188 @@ mod tests {
             "routed paths keep their pipeline prompts: {}",
             prompts[0].1
         );
+    }
+
+    // ---- bead rev-z7wua CHANGE 1: every verdict routes to /factory ----
+
+    /// Dispatch one bead with the given verdict + drive decision and return
+    /// the exact prompt handed to `Sessions::spawn`.
+    fn dispatched_prompt_for(
+        verdict: RoutingVerdict,
+        drive: DriveBranchDecision,
+    ) -> String {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::default();
+        let cfg = cfg();
+        let ready = vec![(
+            Bead {
+                id: "bead-z7wua".into(),
+                title: "wire the widget".into(),
+                description: "acceptance: the widget is wired".into(),
+                notes: String::new(),
+                file_tree_summary: String::new(),
+                external_ref: None,
+            },
+            verdict,
+            drive,
+        )];
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        assert_eq!(
+            report.success_count(),
+            1,
+            "dispatch must succeed for {verdict:?}; failures: {:?}",
+            report.failures
+        );
+        let prompts = sessions.spawn_prompts.borrow();
+        assert_eq!(prompts.len(), 1);
+        prompts[0].1.clone()
+    }
+
+    /// RED-proof for the reported defect: before this bead `SmallPath` and
+    /// `StandardPath` fell into a `_` catch-all whose prompt never mentioned
+    /// `/factory` or any `.dot` graph at all, so those two verdicts — the
+    /// only two that actually produce code — were the ONLY ones that never
+    /// ran a pipeline. All four must now name a pipeline.
+    #[test]
+    fn all_four_routing_verdicts_dispatch_a_factory_pipeline() {
+        let cases = [
+            (
+                RoutingVerdict::ResearchPath,
+                "RESEARCH_PATH",
+                "pipelines/slim/minimal_research.dot",
+            ),
+            (
+                RoutingVerdict::GenericPath,
+                "GENERIC_PATH",
+                "pipelines/slim/spec_gen.dot",
+            ),
+            (
+                RoutingVerdict::SmallPath,
+                "SMALL_PATH",
+                "pipelines/slim/minimal_feature.dot",
+            ),
+            (
+                RoutingVerdict::StandardPath,
+                "STANDARD_PATH",
+                "pipelines/slim/minimal_feature.dot",
+            ),
+        ];
+
+        for (verdict, label, pipeline) in cases {
+            let prompt = dispatched_prompt_for(verdict, DriveBranchDecision::Generated);
+            assert!(
+                prompt.contains("/factory"),
+                "{label} must be told to run /factory, got:\n{prompt}"
+            );
+            assert!(
+                prompt.contains(pipeline),
+                "{label} must name {pipeline}, got:\n{prompt}"
+            );
+            assert!(
+                prompt.contains(label),
+                "{label} prompt must carry its own verdict label, got:\n{prompt}"
+            );
+        }
+    }
+
+    /// The graph is picked by *is there already a PR to iterate on*, not by
+    /// the router's complexity judgment: a bead bound to an open PR's head
+    /// ref gets the in-flight-PR lane, and this holds for BOTH code verdicts.
+    #[test]
+    fn code_verdicts_bound_to_a_pr_head_get_the_pr_iteration_pipeline() {
+        for (verdict, label) in [
+            (RoutingVerdict::SmallPath, "SMALL_PATH"),
+            (RoutingVerdict::StandardPath, "STANDARD_PATH"),
+        ] {
+            let prompt = dispatched_prompt_for(
+                verdict,
+                DriveBranchDecision::PrHead("feat/live-pr-branch".to_string()),
+            );
+            assert!(
+                prompt.contains("pipelines/slim/minimal_pr.dot"),
+                "{label} driving an existing PR head must use the PR-iteration lane, got:\n{prompt}"
+            );
+            assert!(
+                !prompt.contains("pipelines/slim/minimal_feature.dot"),
+                "{label} driving an existing PR head must NOT use the new-feature lane, got:\n{prompt}"
+            );
+        }
+    }
+
+    /// A fork-head PR falls back to a generated branch (`ForkFallback`), which
+    /// is create-new-work — so it must get the new-feature lane, not the
+    /// PR-iteration lane whose graph assumes an existing PR to iterate on.
+    #[test]
+    fn fork_fallback_uses_the_new_feature_pipeline_not_the_pr_pipeline() {
+        let prompt =
+            dispatched_prompt_for(RoutingVerdict::StandardPath, DriveBranchDecision::ForkFallback);
+        assert!(
+            prompt.contains("pipelines/slim/minimal_feature.dot"),
+            "fork fallback is create-new-work, got:\n{prompt}"
+        );
+    }
+
+    /// The `/factory` route line must not push a maxed-out coder prompt past
+    /// AO's hard 4,096-char spawn ceiling — the deterministic
+    /// "Prompt must be at most 4096 characters" failure canary bead
+    /// jleechan-j4i8 hit. Rendering it inside `build_coder_prompt` (rather
+    /// than prepending it at the dispatch site) is what keeps it inside the
+    /// budget reconciliation; this test fails if that ever regresses.
+    #[test]
+    fn route_line_stays_inside_the_total_prompt_budget() {
+        let bead = Bead {
+            id: "bead-z7wua-cap".into(),
+            title: "oversized bead".into(),
+            description: "d".repeat(CODER_PROMPT_DESCRIPTION_CAP + 5_000),
+            notes: "n".repeat(CODER_PROMPT_NOTES_CAP + 5_000),
+            file_tree_summary: "t".repeat(CODER_PROMPT_TREE_CAP + 5_000),
+            external_ref: None,
+        };
+        let prompt = build_coder_prompt(
+            &bead,
+            "factory/bead-z7wua-cap-r1",
+            "owner/repo",
+            "origin",
+            "STANDARD_PATH",
+            "pipelines/slim/minimal_feature.dot",
+        );
+        assert!(
+            prompt.len() <= CODER_PROMPT_TOTAL_CAP,
+            "prompt with the ROUTE line must still fit the {CODER_PROMPT_TOTAL_CAP}-char budget, got {}",
+            prompt.len()
+        );
+        assert!(
+            prompt.contains("pipelines/slim/minimal_feature.dot"),
+            "the ROUTE line is a FIXED section and must survive every truncation pass, got:\n{prompt}"
+        );
+    }
+
+    /// Pure-helper coverage for the selection rule, independent of the
+    /// dispatch plumbing.
+    #[test]
+    fn factory_pipeline_for_maps_every_verdict() {
+        assert_eq!(
+            factory_pipeline_for(RoutingVerdict::ResearchPath, "generated"),
+            "pipelines/slim/minimal_research.dot"
+        );
+        assert_eq!(
+            factory_pipeline_for(RoutingVerdict::GenericPath, "generated"),
+            "pipelines/slim/spec_gen.dot"
+        );
+        for verdict in [RoutingVerdict::SmallPath, RoutingVerdict::StandardPath] {
+            assert_eq!(
+                factory_pipeline_for(verdict, "generated"),
+                "pipelines/slim/minimal_feature.dot"
+            );
+            assert_eq!(
+                factory_pipeline_for(verdict, "generated_fork_fallback"),
+                "pipelines/slim/minimal_feature.dot"
+            );
+            assert_eq!(
+                factory_pipeline_for(verdict, "pr_head"),
+                "pipelines/slim/minimal_pr.dot"
+            );
+        }
     }
 
     // Wiring test: a STANDARD_PATH dispatch must hand the ENRICHED prompt to
