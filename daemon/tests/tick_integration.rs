@@ -7480,6 +7480,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
     let _env_guard = EnvVarGuard::set(&[
         ("PATH", &new_path),
         ("DARK_FACTORY_CODER_DEFAULT", "agy"),
+        ("MINIMAX_API_KEY", "test-minimax-key"),
     ]);
 
     let mut scm = FakeScm::new();
@@ -7672,6 +7673,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
     let _env_guard = EnvVarGuard::set(&[
         ("PATH", &new_path),
         ("DARK_FACTORY_CODER_DEFAULT", "agy"),
+        ("MINIMAX_API_KEY", "test-minimax-key"),
     ]);
 
     let mut scm = FakeScm::new();
@@ -8070,6 +8072,7 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
     let _env_guard = EnvVarGuard::set(&[
         ("PATH", &new_path),
         ("DARK_FACTORY_CODER_DEFAULT", "agy"),
+        ("MINIMAX_API_KEY", "test-minimax-key"),
     ]);
 
     let mut scm = FakeScm::new();
@@ -8992,6 +8995,7 @@ fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
     let _env_guard = EnvVarGuard::set(&[
         ("PATH", &new_path),
         ("DARK_FACTORY_CODER_DEFAULT", "agy"),
+        ("MINIMAX_API_KEY", "test-minimax-key"),
     ]);
 
     let mut scm = FakeScm::new();
