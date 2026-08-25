@@ -28,8 +28,9 @@ import re
 import subprocess
 import sys
 
-# Anchor comment pattern: matches lines that declare PR or Evidence or anchor markers
-ANCHOR_PATTERN = re.compile(r"(?:PR\s*#?\d+|Evidence:|anchor\b)", re.IGNORECASE)
+# Match only concrete PR/evidence markers. The generic English word "anchor" is
+# intentionally excluded: it appears legitimately in strings, prose, and heredocs.
+ANCHOR_PATTERN = re.compile(r"(?:PR\s*#?\d+|Evidence:)", re.IGNORECASE)
 
 # Mapping of file extension to allowed comment prefix tokens and human-readable name
 SYNTAX_RULES: dict[str, dict[str, object]] = {
@@ -144,6 +145,24 @@ SYNTAX_RULES: dict[str, dict[str, object]] = {
 }
 
 
+def _inside_quoted_string(text: str, index: int) -> bool:
+    """Return whether ``index`` is inside a simple single/double-quoted string."""
+    quote: str | None = None
+    escaped = False
+    for char in text[:index]:
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if quote is None and char in {"'", '"'}:
+            quote = char
+        elif quote == char:
+            quote = None
+    return quote is not None
+
+
 def check_line(file_path: str, line_no: int, line_text: str) -> list[str]:
     """Check a single line in a file. Returns error messages if invalid."""
     errors: list[str] = []
@@ -160,32 +179,49 @@ def check_line(file_path: str, line_no: int, line_text: str) -> list[str]:
     if not ANCHOR_PATTERN.search(stripped):
         return errors
 
-    # In Rust, ignore attribute macros like #[cfg(test)] or #[derive(...)]
-    if ext == ".rs" and (stripped.startswith("#[") or stripped.startswith("#![")):
-        return errors
-
     valid_prefixes: tuple[str, ...] = rule["valid_prefixes"]  # type: ignore
     invalid_prefixes: tuple[str, ...] = rule["invalid_prefixes"]  # type: ignore
     lang: str = rule["lang"]  # type: ignore
     expected_example: str = rule["expected_example"]  # type: ignore
 
-    # Check if line starts with an invalid comment prefix
-    for inv in invalid_prefixes:
-        if stripped.startswith(inv):
+    # Inspect the token immediately before every concrete marker, rather than
+    # only the start of the line. This catches `let x = 1; # PR #742` and a
+    # second invalid marker after a valid Rust attribute.
+    for marker in ANCHOR_PATTERN.finditer(stripped):
+        if _inside_quoted_string(stripped, marker.start()):
+            continue
+        prefix = stripped[: marker.start()].rstrip()
+        token = next(
+            (
+                candidate
+                for candidate in sorted(
+                    set(valid_prefixes + invalid_prefixes), key=len, reverse=True
+                )
+                if prefix.endswith(candidate)
+            ),
+            None,
+        )
+        if token in invalid_prefixes:
             errors.append(
                 f"{file_path}:{line_no}: Invalid comment syntax for {lang} file. "
-                f"Line uses '{inv}' comment syntax instead of '{valid_prefixes[0]}'. "
+                f"Line uses '{token}' comment syntax instead of '{valid_prefixes[0]}'. "
                 f"Expected format: '{expected_example}' (found: {stripped!r})"
             )
             return errors
-
-    # Check if line starts with a standalone anchor pattern without any comment delimiter
-    # (e.g. `PR #666` bare on a line)
-    if re.match(r"^PR\s*#?\d+", stripped, re.IGNORECASE):
-        errors.append(
-            f"{file_path}:{line_no}: Anchor line in {lang} file is missing comment delimiter. "
-            f"Expected format: '{expected_example}' (found: {stripped!r})"
-        )
+        if token in valid_prefixes:
+            continue
+        # Bare markers at the start of any line are malformed anchors. In code
+        # files, also reject a bare marker appended after a statement/block
+        # delimiter. Markdown prose such as "see PR #742" remains untouched.
+        if marker.start() == 0 or (
+            ext != ".md" and prefix and prefix[-1] in ";{}"
+        ):
+            errors.append(
+                f"{file_path}:{line_no}: Anchor marker in {lang} file is missing "
+                f"a comment delimiter. Expected format: '{expected_example}' "
+                f"(found: {stripped!r})"
+            )
+            return errors
 
     return errors
 

@@ -67,6 +67,79 @@ def test_validator_accepts_slash_comment_in_rust(tmp_path: pathlib.Path) -> None
     assert proc.returncode == 0, f"Validator must accept '//' comment in Rust: {proc.stdout} {proc.stderr}"
 
 
+@pytest.mark.parametrize(
+    "line",
+    ["let value = 1; # PR #666\n", "#[cfg(test)] # PR #666\n"],
+)
+def test_validator_rejects_inline_hash_anchor_in_rust(
+    tmp_path: pathlib.Path, line: str
+) -> None:
+    rs_file = tmp_path / "test.rs"
+    rs_file.write_text(line, encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(CHECK_SCRIPT), "--file", str(rs_file)],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0
+
+
+def test_validator_accepts_inline_slash_anchor_in_rust(tmp_path: pathlib.Path) -> None:
+    rs_file = tmp_path / "test.rs"
+    rs_file.write_text("let value = 1; // PR #666\n", encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(CHECK_SCRIPT), "--file", str(rs_file)],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_validator_rejects_inline_bare_anchor_after_statement(
+    tmp_path: pathlib.Path,
+) -> None:
+    rs_file = tmp_path / "test.rs"
+    rs_file.write_text("let value = 1; PR #666\n", encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(CHECK_SCRIPT), "--file", str(rs_file)],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0
+
+
+def test_generic_anchor_word_in_string_is_not_a_marker(tmp_path: pathlib.Path) -> None:
+    shell_file = tmp_path / "test.sh"
+    shell_file.write_text('echo "// anchor text"\n', encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(CHECK_SCRIPT), "--file", str(shell_file)],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'message = "// PR #666"\n',
+        "message = '# PR #666'\n",
+        'message = "let value = 1; PR #666"\n',
+    ],
+)
+def test_anchor_examples_inside_python_strings_are_not_comments(
+    tmp_path: pathlib.Path, line: str
+) -> None:
+    py_file = tmp_path / "test.py"
+    py_file.write_text(line, encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(CHECK_SCRIPT), "--file", str(py_file)],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
 def test_validator_rejects_slash_comment_in_python(tmp_path: pathlib.Path) -> None:
     """Python files with `// PR #N` anchor comments must be rejected."""
     assert CHECK_SCRIPT.exists(), f"{CHECK_SCRIPT} must exist"
