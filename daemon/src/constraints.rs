@@ -155,13 +155,22 @@ pub fn resolve_runtime_spec_path(cfg: &Config, bead_id: &str) -> PathBuf {
 /// OR if the dir exists but the kernel denies our write attempt (root in
 /// a non-POSIX namespace, mode 0o555, immutable bit, etc.). The sentinel
 /// is deleted immediately so the resolver is read-only with respect to
-/// the configured dir on a successful call.
+/// the configured dir on a successful call. The probe filename is
+/// namespaced by PID + nanos so parallel resolver calls (parallel tests
+/// sharing `runtime_state_dir()`) cannot race on the same sentinel.
 fn dir_is_writable(dir: &Path) -> bool {
     match std::fs::create_dir_all(dir) {
         Ok(()) => {}
         Err(_) => return false,
     }
-    let sentinel = dir.join(".dark_factory_writable_probe");
+    let sentinel = dir.join(format!(
+        ".dark_factory_writable_probe.{}.{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
     let res = OpenOptions::new()
         .create(true)
         .write(true)
@@ -532,10 +541,10 @@ mod tests {
         // Restore + cleanup.
         std::fs::set_permissions(&configured, prev_perms).unwrap();
         std::fs::remove_dir_all(&configured).ok();
+        // Only remove the resolved file (not the parent `specs/` dir) so
+        // parallel resolver tests sharing `runtime_state_dir()` cannot
+        // race the cleanup against an in-flight `resolve_runtime_spec_path`.
         let _ = std::fs::remove_file(&resolved_a);
-        if let Some(parent) = resolved_a.parent() {
-            std::fs::remove_dir_all(parent).ok();
-        }
     }
 
     /// PR #755 Slice 3: append-mutation must use the resolved path so a
@@ -573,10 +582,10 @@ mod tests {
 
         std::fs::set_permissions(&configured, prev_perms).unwrap();
         std::fs::remove_dir_all(&configured).ok();
+        // Only remove the resolved file (not the parent `specs/` dir) so
+        // parallel resolver tests sharing `runtime_state_dir()` cannot
+        // race the cleanup against an in-flight `append_mutation`.
         let _ = std::fs::remove_file(&resolved);
-        if let Some(parent) = resolved.parent() {
-            std::fs::remove_dir_all(parent).ok();
-        }
     }
 
     #[test]
