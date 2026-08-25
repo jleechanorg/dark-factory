@@ -81,6 +81,7 @@ class _ShadowGateReview:
     backend: str = "codex"
     prompt_is_complete: bool = False
     json_transport: bool = False
+    launch_error_classification: str = ""
 
 
 def _resolved_minimax_model() -> str:
@@ -243,16 +244,27 @@ def _launch_shadow_gate_review(
     probe_bin = "codex" if backend == "codex" else ("agy" if backend == "agy" else _handlers_shim._get_claude_executable())
     if shutil.which(probe_bin) is None:
         shadow.launch_error = f"{backend} executable not found"
+        shadow.launch_error_classification = "backend_missing"
         return shadow
-    args = _gate_subprocess_args(backend, shadow_prompt, ctx, timeout)
+    try:
+        args = _gate_subprocess_args(backend, shadow_prompt, ctx, timeout)
+    except ValueError as exc:
+        # MiniMax model/API validation happens while constructing argv.  Keep
+        # an invalid optional shadow from aborting the primary gate, and do
+        # not misreport a provider configuration error as a missing sandbox.
+        shadow.launch_error = f"{backend} configuration invalid: {exc}"
+        shadow.launch_error_classification = "config_error"
+        return shadow
     if args is None:
         shadow.launch_error = "sandbox-exec unavailable"
+        shadow.launch_error_classification = "sandbox_unavailable"
         return shadow
     if prompt_is_complete and backend == "codex":
         try:
             args = _controller_codex_args(args)
         except ValueError as exc:
             shadow.launch_error = str(exc)
+            shadow.launch_error_classification = "config_error"
             return shadow
         shadow.json_transport = True
     review_cwd = ctx.workdir
@@ -271,8 +283,12 @@ def _launch_shadow_gate_review(
             start_new_session=True,
             env=_gate_subprocess_env(backend),
         )
+    except ValueError as exc:
+        shadow.launch_error = f"{backend} configuration invalid: {exc}"
+        shadow.launch_error_classification = "config_error"
     except Exception as exc:
         shadow.launch_error = f"{type(exc).__name__}: {exc}"
+        shadow.launch_error_classification = "launch_error"
     return shadow
 
 
@@ -324,7 +340,7 @@ def _finish_shadow_gate_review(
     returncode = ""
     timed_out = False
     if shadow.launch_error:
-        output = f"shadow codex gate review did not run: {shadow.launch_error}"
+        output = f"shadow {backend} gate review did not run: {shadow.launch_error}"
         verdict = "unknown"
         shadow_outcome = "error"
         head_sha_status = "missing"
@@ -419,6 +435,8 @@ def _finish_shadow_gate_review(
                 "shadow_verdict": verdict,
                 "shadow_returncode": returncode,
                 "shadow_head_sha_status": head_sha_status,
+                "shadow_launch_error": shadow.launch_error,
+                "shadow_launch_error_classification": shadow.launch_error_classification,
                 "shadow_output_path": output_path or "",
                 "shadow_output_sha256": output_sha or "",
             },
@@ -435,6 +453,8 @@ def _finish_shadow_gate_review(
             f"{prefix}verdict": verdict,
             f"{prefix}returncode": returncode,
             f"{prefix}head_sha_status": head_sha_status,
+            f"{prefix}launch_error": shadow.launch_error,
+            f"{prefix}launch_error_classification": shadow.launch_error_classification,
             f"{prefix}timed_out": "true" if timed_out else "false",
             f"{prefix}prompt_path": shadow.prompt_path,
             f"{prefix}prompt_sha256": shadow.prompt_sha256,

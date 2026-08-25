@@ -598,13 +598,6 @@ def invoke_reviewer(
         reviewer, model, codex_bin=codex_bin, gemini_bin=gemini_bin
     )
     stdin_input = prompt
-    if reviewer == "codex" and cmd:
-        if "--sandbox" in cmd:
-            idx = cmd.index("--sandbox")
-            cmd.pop(idx)
-            if idx < len(cmd) and cmd[idx] == "read-only":
-                cmd.pop(idx)
-        stdin_input = prompt
 
     # Per-reviewer env: each reviewer only sees the credentials it
     # actually needs (codex → OPENAI_API_KEY, gemini → GOOGLE_API_KEY).

@@ -64,6 +64,52 @@ def test_gate_subprocess_env_routes_minimax_through_minimax_gateway(monkeypatch)
     assert env.get("ANTHROPIC_BASE_URL") == "https://api.minimax.io/anthropic"
 
 
+def test_optional_minimax_shadow_config_error_is_not_sandbox_error(tmp_path, monkeypatch):
+    """Invalid optional MiniMax config is recorded without aborting launch."""
+    from runner.handler_core import Result
+    from runner.handlers import Context as HCtx
+    from runner.handler_dispatch import (
+        _finish_shadow_gate_review,
+        _launch_shadow_gate_review,
+    )
+
+    config_error = "MINIMAX_API_KEY must be non-empty for the minimax backend"
+    monkeypatch.setattr(
+        "runner.handlers._minimax_env",
+        lambda: (_ for _ in ()).throw(ValueError(config_error)),
+    )
+    monkeypatch.setattr("runner.handlers._get_claude_executable", lambda: "claude")
+    monkeypatch.setattr("runner.handler_dispatch.shutil.which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(
+        "runner.handler_dispatch.subprocess.Popen",
+        lambda *args, **kwargs: pytest.fail("invalid optional shadow must not spawn"),
+    )
+    ctx = HCtx(goal="test", workdir=tmp_path, backend="codex")
+
+    shadow = _launch_shadow_gate_review(
+        "gate", "PROMPT", "a" * 40, 30, ctx, backend="minimax"
+    )
+
+    assert shadow is not None
+    assert shadow.proc is None
+    assert shadow.launch_error
+    assert config_error in shadow.launch_error
+    assert shadow.launch_error_classification == "config_error"
+
+    result = _finish_shadow_gate_review(
+        Result(outcome="success", output="primary", metadata={}),
+        shadow,
+        "gate",
+        "a" * 40,
+        30,
+        ctx,
+    )
+    assert result.outcome == "failure"
+    assert result.metadata["shadow_minimax_gate_launch_error_classification"] == "config_error"
+    assert result.metadata["shadow_minimax_gate_launch_error"]
+    assert result.metadata.get("shadow_minimax_gate_sandbox") != "unavailable"
+
+
 @pytest.mark.parametrize(
     ("configured", "expected"),
     [("   ", "MiniMax-M3"), ("  MiniMax-M2  ", "MiniMax-M3"), ("MiniMax-M1", "MiniMax-M3")],

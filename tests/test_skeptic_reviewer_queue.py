@@ -76,7 +76,16 @@ def test_parse_reviewers_rejects_legacy_unsupported_vendor():
 @pytest.mark.parametrize(
     ("reviewer", "parent_env", "expected_cmd", "expects_stdin"),
     [
-        ("codex", {"PATH": "/bin"}, ["codex", "exec", "--ephemeral", "--skip-git-repo-check", "--json", "-c", "shell.enable=false", "-c", 'web_search="disabled"', "-"], True),
+        (
+            "codex",
+            {"PATH": "/bin"},
+            [
+                "codex", "exec", "--sandbox", "read-only", "--ephemeral",
+                "--skip-git-repo-check", "--json", "-c", "shell.enable=false",
+                "-c", 'web_search="disabled"', "-",
+            ],
+            True,
+        ),
         ("gemini", {"PATH": "/bin"}, ["gemini", "-m", "gemini-3.7-pro", "-s", "--approval-mode", "default", "-p", "-"], True),
     ],
 )
@@ -90,8 +99,8 @@ def test_invoke_reviewer_dispatches_vendor_contracts(
         stdout = "review output"
         stderr = ""
 
-    def fake_run(cmd, *, input, env, **kwargs):
-        seen.update(cmd=cmd, input=input, env=env)
+    def fake_run(cmd, **kwargs):
+        seen.update(cmd=cmd, input=kwargs.get("input"), env=kwargs.get("env"))
         return Completed()
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
