@@ -819,12 +819,12 @@ fn unresolved_threads_from_gql(gql_out: &str) -> Result<Vec<UnresolvedReviewThre
     #[derive(serde::Deserialize)]
     struct GhGqlReviewThreads {
         nodes: Vec<GhGqlNode>,
-        #[serde(rename = "pageInfo", default)]
+        #[serde(rename = "pageInfo")]
         page_info: GhGqlPageInfo,
     }
     #[derive(serde::Deserialize, Default)]
     struct GhGqlPageInfo {
-        #[serde(rename = "hasNextPage", default)]
+        #[serde(rename = "hasNextPage")]
         has_next_page: bool,
     }
     #[derive(serde::Deserialize)]
@@ -10348,7 +10348,8 @@ mod external_ref_tests {
                                 {"isResolved": true},
                                 {"isResolved": false},
                                 {"isResolved": false}
-                            ]
+                            ],
+                            "pageInfo": {"hasNextPage": false}
                         }
                     }
                 }
@@ -10384,7 +10385,8 @@ mod external_ref_tests {
                                     "line": null,
                                     "comments": {"nodes": [{"body": "please fix this", "author": {"login": "reviewer"}}]}
                                 }
-                            ]
+                            ],
+                            "pageInfo": {"hasNextPage": false}
                         }
                     }
                 }
@@ -10449,6 +10451,49 @@ mod external_ref_tests {
 
         let err = unresolved_thread_count_from_gql(json)
             .expect_err("an incomplete reviewThreads page must fail closed");
+        assert!(
+            matches!(err, crate::errors::DaemonError::Parse(_)),
+            "expected parse error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn graphql_thread_page_without_page_info_is_unknown_not_zero() {
+        let json = r#"{
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {"nodes": []}
+                    }
+                }
+            }
+        }"#;
+
+        let err = unresolved_thread_count_from_gql(json)
+            .expect_err("missing pageInfo must fail closed");
+        assert!(
+            matches!(err, crate::errors::DaemonError::Parse(_)),
+            "expected parse error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn graphql_thread_page_without_has_next_page_is_unknown_not_zero() {
+        let json = r#"{
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "nodes": [],
+                            "pageInfo": {}
+                        }
+                    }
+                }
+            }
+        }"#;
+
+        let err = unresolved_thread_count_from_gql(json)
+            .expect_err("missing pageInfo.hasNextPage must fail closed");
         assert!(
             matches!(err, crate::errors::DaemonError::Parse(_)),
             "expected parse error, got {err:?}"
@@ -10840,7 +10885,7 @@ if [ "$1" = "api" ]; then
       echo "[]"; exit 0
       ;;
     graphql)
-      echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}'
+      echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}'
       exit 0
       ;;
     *)
