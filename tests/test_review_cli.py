@@ -40,7 +40,6 @@ def _valid_response(prompt: str, *, verdict: str = "pass") -> str:
         "ENVELOPE_SHA256",
         "HEAD_SHA",
         "TASK_SHA256",
-        "DIFF_SHA256",
         "CHANGED_FILES_SHA256",
         "EVIDENCE_MANIFEST_SHA256",
     )

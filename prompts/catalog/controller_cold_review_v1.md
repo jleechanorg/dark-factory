@@ -25,12 +25,14 @@ section. Decode it as UTF-8 JSON to identify the target repository, exact revisi
 requested change, and evidence manifest. Use parallel subagents when available.
 
 The envelope points at the unit of work; it does not contain it. `target` gives the
-repository, workspace path, and the pinned base, head, and tree revisions.
-`snapshots.diff` gives a digest, a byte count, and the exact `command` that produced
-them — run that command in the workspace yourself, confirm its output is `bytes` long
-and hashes to `sha256`, and review what it returns. That reproduced output, not any
-quoted excerpt, is the diff under review. Read the changed files at the pinned head
-for context the diff omits.
+repository, workspace path, and the pinned base, head, and tree revisions. Confirm the
+workspace stands at exactly that head and tree, then derive the change under review
+yourself from those pinned revisions, by whatever inspection you judge best. No change
+text is supplied and no command is prescribed: the pinned tree is a commitment to the
+entire target state, so anything you derive from it is bound to the same target.
+`snapshots.changed_files` is the controller's claim about which paths changed — verify
+it rather than trusting it, and read those files at the pinned head for context a
+change listing omits.
 
 Before reviewing, discover and faithfully use relevant user-scope and repository-scope
 skills, commands, and policy instructions made available by the active CLI: search its
@@ -67,7 +69,7 @@ are findings, and missing applicable evidence remains `fail`. The overall verdic
 - C6 — Target is maintainable, minimal, dependency-conscious, and free of stale or unreachable scaffolding.
 - C7 — Goals, tenets, descriptions and claims, target content or code, and callers and consumers cross-examined for omissions, scope creep, and contradictions.
 - E0 — Repository, branch, base, head, and tree provenance verified against the workspace itself.
-- E1 — The diff was reproduced by running `snapshots.diff.command` in the workspace, its output matched the pointer's `sha256` and `bytes`, and the changed-file list is complete.
+- E1 — The change under review was derived from the pinned base, head, and tree revisions in the inspected workspace, and the changed-file list was verified complete against them.
 - E2 — Verification actions and commands actually executed are recorded.
 - E3 — Real exit code recorded and inspected for every executed command.
 - E4 — Test collection and scenario counts verified; zero-test success rejected.

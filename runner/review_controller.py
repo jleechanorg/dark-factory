@@ -52,13 +52,13 @@ _TEMPLATE_PATH = (
     _SOURCE_ROOT / "prompts" / "catalog" / "controller_cold_review_v1.md"
 )
 _EXPECTED_TEMPLATE_SHA256 = (
-    "51503c6f7af95cc1a838fdff0259f61ceb31e2d553ccf07ca65d825f81d5ee6f"
+    "d013aa36dc26439edba7d5b33bf3f716f1fc97ecd11ddf3e73580e4f52b0b328"
 )
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _FIELD_RE = re.compile(
     r"^(PROMPT_ID|PROMPT_SHA256|ENVELOPE_SHA256|HEAD_SHA|TASK_SHA256|"
-    r"DIFF_SHA256|CHANGED_FILES_SHA256|EVIDENCE_MANIFEST_SHA256|VERDICT|[CE]\d+):"
+    r"CHANGED_FILES_SHA256|EVIDENCE_MANIFEST_SHA256|VERDICT|[CE]\d+):"
     r"[ \t]*(\S+)[ \t]*$",
     re.MULTILINE,
 )
@@ -70,22 +70,14 @@ _REQUIRED_RESPONSE_SECTIONS = (
 )
 _MAX_INPUT_BYTES = 1024 * 1024
 
-#: Envelope schema. v2 replaced the inlined diff snapshot with a pointer
-#: (digest + byte count + reproduce command). There is deliberately no v1
-#: reader: an envelope that still carries ``snapshots.diff.text`` fails closed
-#: rather than being verified against a shape this module no longer emits.
+#: Envelope schema. v2 carries no diff snapshot at all -- neither the text nor
+#: a digest pointer. ``target.tree_sha`` is a cryptographic commitment to the
+#: entire tree at ``target.head_sha``, and both are reverified before the review
+#: is accepted; with a pinned ``base_sha`` the reviewed diff is a pure function
+#: of those two values, so a separate diff digest proves nothing they do not.
+#: An envelope that still carries ``snapshots.diff`` fails closed rather than
+#: being verified against a shape this module no longer emits.
 ENVELOPE_SCHEMA = 2
-
-#: The single source of truth for how the reviewed diff is derived. The
-#: controller hashes the output of this command; the reviewer re-runs it and
-#: must reproduce ``DIFF_SHA256``. Any drift between producer and reviewer
-#: silently breaks that binding, so both sides read it from here.
-DIFF_ARGV: tuple[str, ...] = ("git", "diff", "--no-ext-diff", "--binary")
-
-
-def diff_command(base_sha: str, head_sha: str) -> str:
-    """Return the exact command whose output the diff digest is taken over."""
-    return " ".join((*DIFF_ARGV, f"{base_sha}..{head_sha}"))
 
 
 class ReviewContractError(ValueError):
@@ -128,7 +120,6 @@ class ReviewInputs:
     head_sha: str
     tree_sha: str
     task_text: str
-    diff_text: str
     changed_files: tuple[str, ...] = ()
     evidence: tuple[EvidenceArtifact, ...] = ()
     evidence_origin: EvidenceOrigin | None = None
@@ -148,7 +139,6 @@ class ReviewRequest:
     prompt: str
     head_sha: str
     task_sha256: str
-    diff_sha256: str
     changed_files_sha256: str
     evidence_manifest_sha256: str
 
@@ -360,7 +350,6 @@ def _normalized_inputs(inputs: ReviewInputs) -> ReviewInputs:
         "head_sha": inputs.head_sha,
         "tree_sha": inputs.tree_sha,
         "task_text": inputs.task_text,
-        "diff_text": inputs.diff_text,
         "run_id": inputs.run_id,
     }
     invalid_text_fields = [
@@ -385,9 +374,9 @@ def _normalized_inputs(inputs: ReviewInputs) -> ReviewInputs:
         raise ReviewContractError("changed_files must not contain duplicates")
     if len(inputs.task_text.encode("utf-8")) > _MAX_INPUT_BYTES:
         raise ReviewContractError("task_text must be at most 1 MiB before Base64 encoding")
-    # diff_text is deliberately uncapped: since v2 it is hashed but never
-    # shipped, so its size no longer bounds the prompt. Capping it here is what
-    # made large or binary-carrying diffs fail the review outright.
+    # The change itself has no size ceiling here because it is never carried:
+    # the reviewer derives it from the pinned revisions. Capping it is what made
+    # large or binary-carrying changes fail the review outright.
 
     normalized_evidence: list[EvidenceArtifact] = []
     seen_paths: set[str] = set()
@@ -483,7 +472,6 @@ def validate_evidence_origin(
             head_sha=normalized_head,
             tree_sha="0" * 40,
             task_text="",
-            diff_text="",
             evidence=evidence,
             evidence_origin=origin,
         )
@@ -543,7 +531,6 @@ def _build_envelope(inputs: ReviewInputs, *, template_sha256: str) -> str:
     ]
     changed_files_sha256 = _sha256(_canonical_json(changed_files).encode("utf-8"))
     evidence_manifest_sha256 = _sha256(_canonical_json(evidence_payload).encode("utf-8"))
-    diff_bytes = normalized.diff_text.encode("utf-8")
     payload = {
         "schema": ENVELOPE_SCHEMA,
         "prompt": {
@@ -558,28 +545,21 @@ def _build_envelope(inputs: ReviewInputs, *, template_sha256: str) -> str:
             "tree_sha": normalized.tree_sha,
         },
         "snapshots": {
-            # The task statement is carried inline: unlike the diff, it is not
-            # recoverable from the workspace, so a pointer would leave the
-            # reviewer with no statement of what was asked for.
+            # The task statement is carried inline because, unlike the change
+            # itself, it is not recoverable from the workspace: a pointer would
+            # leave the reviewer with no statement of what was asked for.
             "task": {
                 "sha256": _sha256(normalized.task_text.encode("utf-8")),
                 "text": normalized.task_text,
             },
-            # The diff is a pointer, not a payload. The reviewer re-runs
-            # `command` in `target.workspace_path` and must reproduce `sha256`.
-            "diff": {
-                "sha256": _sha256(diff_bytes),
-                "bytes": len(diff_bytes),
-                "command": diff_command(
-                    normalized.base_sha, normalized.head_sha
-                ),
-            },
+            # No diff entry, by design: `target.tree_sha` already commits to the
+            # reviewed state, so the reviewer derives the change from the pinned
+            # revisions with whatever inspection it judges best.
             "changed_files": changed_files,
         },
         "evidence": evidence_payload,
         "digests": {
             "task_sha256": _sha256(normalized.task_text.encode("utf-8")),
-            "diff_sha256": _sha256(normalized.diff_text.encode("utf-8")),
             "changed_files_sha256": changed_files_sha256,
             "evidence_manifest_sha256": evidence_manifest_sha256,
         },
@@ -629,8 +609,8 @@ def _render_prompt(
 
     Kept a pure function of the envelope so ``verify_request_integrity`` can
     rebuild it from ``envelope_json`` alone, with no access to the reviewed
-    diff. That is what lets the envelope carry a diff pointer instead of the
-    diff itself without weakening the tamper check.
+    change. That is what lets the envelope omit the change entirely without
+    weakening the tamper check.
     """
     checklist_lines = "\n".join(f"{check_id}: <pass|fail>" for check_id in CHECK_IDS)
     return (
@@ -644,7 +624,6 @@ def _render_prompt(
         + f"ENVELOPE_SHA256: {envelope_sha256}\n"
         + f"HEAD_SHA: {head_sha}\n"
         + f"TASK_SHA256: {digests['task_sha256']}\n"
-        + f"DIFF_SHA256: {digests['diff_sha256']}\n"
         + f"CHANGED_FILES_SHA256: {digests['changed_files_sha256']}\n"
         + f"EVIDENCE_MANIFEST_SHA256: {digests['evidence_manifest_sha256']}\n"
         + "VERDICT: <pass|fail>\n"
@@ -680,7 +659,6 @@ def create_review_request(inputs: ReviewInputs) -> ReviewRequest:
         prompt=prompt,
         head_sha=normalized.head_sha,
         task_sha256=envelope_digests["task_sha256"],
-        diff_sha256=envelope_digests["diff_sha256"],
         changed_files_sha256=envelope_digests["changed_files_sha256"],
         evidence_manifest_sha256=envelope_digests["evidence_manifest_sha256"],
     )
@@ -725,7 +703,6 @@ def verify_request_integrity(request: ReviewRequest) -> None:
     request_digests = envelope["digests"]
     for name in (
         "task_sha256",
-        "diff_sha256",
         "changed_files_sha256",
         "evidence_manifest_sha256",
     ):
@@ -734,37 +711,25 @@ def verify_request_integrity(request: ReviewRequest) -> None:
         _require_digest(f"request envelope digest {name}", request_digests[name])
     if request_digests["task_sha256"] != request.task_sha256:
         raise ReviewContractError("request task digest mismatch")
-    if request_digests["diff_sha256"] != request.diff_sha256:
-        raise ReviewContractError("request diff digest mismatch")
     if request_digests["changed_files_sha256"] != request.changed_files_sha256:
         raise ReviewContractError("request changed-files digest mismatch")
     if request_digests["evidence_manifest_sha256"] != request.evidence_manifest_sha256:
         raise ReviewContractError("request evidence manifest digest mismatch")
     if _sha256(request.prompt_payload.encode("utf-8")) != request.prompt_sha256:
         raise ReviewContractError("request prompt digest mismatch")
-    # Validate the diff pointer outside the try below: ReviewContractError
-    # subclasses ValueError, so raising it inside would be swallowed and
-    # re-reported as the generic "schema is invalid".
+    # Checked outside the try below: ReviewContractError subclasses ValueError,
+    # so raising it inside would be swallowed and re-reported as the generic
+    # "schema is invalid". The reviewed change is never carried in any form --
+    # neither text nor digest pointer -- so any `snapshots.diff` is a stale or
+    # forged producer and fails closed.
     snapshots = envelope.get("snapshots")
-    if not isinstance(snapshots, dict) or not isinstance(
-        snapshots.get("diff"), dict
-    ):
+    if not isinstance(snapshots, dict):
         raise ReviewContractError("request envelope schema is invalid")
-    diff_pointer = snapshots["diff"]
-    if "text" in diff_pointer:
+    if "diff" in snapshots:
         raise ReviewContractError(
-            "request envelope carries an inlined diff; schema "
-            f"{ENVELOPE_SCHEMA} requires a diff pointer"
+            "request envelope carries a diff snapshot; schema "
+            f"{ENVELOPE_SCHEMA} derives the change from the pinned revisions"
         )
-    if diff_pointer.get("sha256") != request.diff_sha256:
-        raise ReviewContractError("request envelope diff pointer mismatch")
-    if diff_pointer.get("command") != diff_command(
-        target.get("base_sha", ""), target.get("head_sha", "")
-    ):
-        raise ReviewContractError("request envelope diff command mismatch")
-    diff_bytes = diff_pointer.get("bytes")
-    if not isinstance(diff_bytes, int) or isinstance(diff_bytes, bool) or diff_bytes < 0:
-        raise ReviewContractError("request envelope diff size is invalid")
     try:
         expected_payload = _render_prompt_payload(template, request.envelope_json)
         expected_prompt = _render_prompt(
@@ -799,7 +764,6 @@ def validate_review_response(
         "ENVELOPE_SHA256",
         "HEAD_SHA",
         "TASK_SHA256",
-        "DIFF_SHA256",
         "CHANGED_FILES_SHA256",
         "EVIDENCE_MANIFEST_SHA256",
         "VERDICT",
@@ -833,7 +797,6 @@ def validate_review_response(
         "ENVELOPE_SHA256": request.envelope_sha256,
         "HEAD_SHA": request.head_sha,
         "TASK_SHA256": request.task_sha256,
-        "DIFF_SHA256": request.diff_sha256,
         "CHANGED_FILES_SHA256": request.changed_files_sha256,
         "EVIDENCE_MANIFEST_SHA256": request.evidence_manifest_sha256,
     }
@@ -1035,7 +998,6 @@ def run_controller_review(
         "envelope_sha256": request.envelope_sha256,
         "head_sha": request.head_sha,
         "task_sha256": request.task_sha256,
-        "diff_sha256": request.diff_sha256,
         "changed_files_sha256": request.changed_files_sha256,
         "evidence_manifest_sha256": request.evidence_manifest_sha256,
         "response_sha256": review.response_sha256,

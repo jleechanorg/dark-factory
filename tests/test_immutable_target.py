@@ -9,7 +9,6 @@ catch mutations between request creation and lane return.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import subprocess
@@ -72,7 +71,6 @@ def _base_inputs(repo: Path, holdouts: tuple[str, ...], task: str = "task") -> R
         head_sha=head,
         tree_sha=tree,
         task_text=task,
-        diff_text="",
         changed_files=("README.md",),
         evidence=(),
         run_id="test",
@@ -281,6 +279,67 @@ class PostReviewReverifyTests(unittest.TestCase):
 
         _verify_controller_workspace(_FakeCtx(self.repo), request)  # type: ignore[arg-type]
 
+    def test_head_and_tree_alone_detect_a_changed_diff(self) -> None:
+        """head_sha + tree_sha are why no separate diff digest is needed.
+
+        The reviewed change is ``base..head`` with ``base_sha`` pinned in the
+        envelope, so it is a pure function of the head commit's tree. Any
+        rewrite that changes what the reviewer would see must move the head
+        commit or its tree, and the reverifier already compares both. That is
+        the whole argument for dropping DIFF_SHA256: a diff digest could only
+        restate what these two already prove, while binding the reviewer to one
+        byte-exact rendering that a git config or version bump can break.
+        """
+        from runner.handler_parallel_reviewer import _verify_controller_workspace
+
+        class _FakeCtx:
+            def __init__(self, workdir: Path) -> None:
+                self.workdir = workdir
+
+        base = _git(self.repo, "rev-parse", "HEAD").strip()
+        (self.repo / "README.md").write_text("worker change\n")
+        _git(self.repo, "add", "README.md")
+        _git(self.repo, "commit", "-q", "-m", "worker change")
+
+        request = create_review_request(
+            ReviewInputs(
+                repository="example/repo",
+                workspace_path=str(self.repo),
+                base_sha=base,
+                head_sha=_git(self.repo, "rev-parse", "HEAD").strip(),
+                tree_sha=_git(self.repo, "rev-parse", "HEAD^{tree}").strip(),
+                task_text="task",
+                changed_files=("README.md",),
+                evidence=(),
+                run_id="test",
+            )
+        )
+        envelope = json.loads(request.envelope_json)
+        # Nothing in the envelope describes the change itself.
+        self.assertNotIn("diff", envelope["snapshots"])
+        self.assertNotIn("diff_sha256", envelope["digests"])
+        _verify_controller_workspace(_FakeCtx(self.repo), request)  # type: ignore[arg-type]
+
+        before_diff = _git(self.repo, "diff", "--no-ext-diff", f"{base}..HEAD")
+
+        # Rewrite the head commit in place so the pinned range now yields a
+        # different change. `base` stays reachable, so the range still resolves
+        # and the workspace stays clean -- the status check cannot catch this.
+        (self.repo / "README.md").write_text("a different worker change\n")
+        _git(self.repo, "add", "README.md")
+        _git(self.repo, "commit", "-q", "--amend", "--no-edit")
+
+        self.assertEqual(_git(self.repo, "status", "--porcelain=v1"), "")
+        after_diff = _git(self.repo, "diff", "--no-ext-diff", f"{base}..HEAD")
+        self.assertNotEqual(before_diff, after_diff)
+        self.assertNotEqual(
+            _git(self.repo, "rev-parse", "HEAD^{tree}").strip(),
+            envelope["target"]["tree_sha"],
+        )
+
+        with self.assertRaises(ReviewContractError):
+            _verify_controller_workspace(_FakeCtx(self.repo), request)  # type: ignore[arg-type]
+
 
 class ControllerSnapshotTests(unittest.TestCase):
     """Worker output must be reviewed through a clean frozen Git target."""
@@ -355,15 +414,14 @@ class ControllerSnapshotTests(unittest.TestCase):
         self.assertEqual(_git(snapshot, "status", "--porcelain=v1"), "")
         self.assertFalse((snapshot / ".dark-factory" / "agy-task-worker.md").exists())
         self.assertEqual(_git(snapshot, "rev-parse", "HEAD").strip(), request.head_sha)
-        # A no-op worker produces an empty diff, so the pointer reports zero
-        # bytes and the digest of the empty string.
-        self.assertNotIn("text", envelope["snapshots"]["diff"])
-        self.assertEqual(envelope["snapshots"]["diff"]["bytes"], 0)
-        self.assertEqual(
-            envelope["snapshots"]["diff"]["sha256"],
-            hashlib.sha256(b"").hexdigest(),
-        )
+        # A no-op worker changes nothing, and the envelope carries no diff
+        # snapshot at all -- the pinned head/tree are the whole commitment.
+        self.assertNotIn("diff", envelope["snapshots"])
         self.assertEqual(envelope["snapshots"]["changed_files"], [])
+        self.assertEqual(
+            envelope["target"]["tree_sha"],
+            _git(snapshot, "rev-parse", "HEAD^{tree}").strip(),
+        )
 
     def test_declared_evidence_is_bound_without_copying_unrelated_ignored_files(self) -> None:
         """Snapshot includes declared evidence, but not unrelated ignored runtime data."""
@@ -635,7 +693,6 @@ def replace_evidence(
         head_sha=inputs.head_sha,
         tree_sha=inputs.tree_sha,
         task_text=inputs.task_text,
-        diff_text=inputs.diff_text,
         changed_files=inputs.changed_files,
         evidence=evidence,
         run_id=inputs.run_id,

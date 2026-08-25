@@ -60,7 +60,7 @@ from .handler_dispatch import (
     _parse_priority_env,
     _start_shadow_gate_review,
 )
-from .review_controller import DIFF_ARGV, EvidenceDelta, EvidenceOrigin
+from .review_controller import EvidenceDelta, EvidenceOrigin
 
 if TYPE_CHECKING:
     from .handler_core import Context
@@ -482,7 +482,6 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
         head_sha=expected_sha,
         tree_sha=_git_output(source_workdir, "rev-parse", f"{expected_sha}^{{tree}}"),
         task_text="",
-        diff_text="",
         changed_files=(),
         evidence=_controller_evidence(node, ctx, source_workdir),
         run_id=str(ctx.run_id or ""),
@@ -496,12 +495,6 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
     )
     base_sha = _git_output(workdir, "merge-base", "origin/main", expected_sha)
     tree_sha = _git_output(workdir, "rev-parse", f"{expected_sha}^{{tree}}")
-    diff_text = _git_output(
-        workdir,
-        *DIFF_ARGV[1:],
-        f"{base_sha}..{expected_sha}",
-        allow_empty=True,
-    )
     changed_text = _git_output(
         workdir,
         "diff",
@@ -531,7 +524,6 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
         head_sha=expected_sha,
         tree_sha=tree_sha,
         task_text=task_text,
-        diff_text=diff_text,
         changed_files=tuple(changed),
         evidence=_controller_evidence(node, ctx, workdir),
         evidence_origin=evidence_origin,
@@ -557,7 +549,6 @@ def _verify_controller_workspace(ctx: "Context", request) -> None:
 
     envelope = json.loads(request.envelope_json)
     target = envelope["target"]
-    snapshots = envelope["snapshots"]
     workdir = pathlib.Path(str(target["workspace_path"])).resolve()
     status = subprocess.run(
 
@@ -578,26 +569,18 @@ def _verify_controller_workspace(ctx: "Context", request) -> None:
         raise ReviewContractError("reviewed workspace status could not be read")
     if status.stdout.strip():
         raise ReviewContractError("reviewed workspace is not clean")
+    # These two comparisons are the whole change check. `base_sha` is pinned in
+    # the envelope and `tree_sha` commits to every byte of the tree at
+    # `head_sha`, so if both still match, the reviewed `base..head` change is
+    # provably the one the reviewer was bound to. Re-deriving the change here
+    # and comparing its digest could only restate that, at the cost of pinning
+    # one byte-exact rendering of it.
     observed_head = _git_output(workdir, "rev-parse", "HEAD^{commit}").lower()
     observed_tree = _git_output(workdir, "rev-parse", "HEAD^{tree}").lower()
     if observed_head != target["head_sha"]:
         raise ReviewContractError("reviewed workspace head changed")
     if observed_tree != target["tree_sha"]:
         raise ReviewContractError("reviewed workspace tree changed")
-    # The envelope carries a diff pointer, not the diff. Re-derive it here from
-    # the pinned base..head range and confirm it still hashes to the digest the
-    # reviewer was bound to.
-    diff_text = _git_output(
-        workdir,
-        *DIFF_ARGV[1:],
-        f"{target['base_sha']}..{target['head_sha']}",
-        allow_empty=True,
-    )
-    diff_bytes = diff_text.encode("utf-8")
-    if hashlib.sha256(diff_bytes).hexdigest() != snapshots["diff"]["sha256"]:
-        raise ReviewContractError("reviewed diff changed")
-    if len(diff_bytes) != snapshots["diff"]["bytes"]:
-        raise ReviewContractError("reviewed diff size does not match the pointer")
     root = workdir.resolve()
     for artifact in envelope.get("evidence", []):
         path = (root / str(artifact["path"])).resolve()
