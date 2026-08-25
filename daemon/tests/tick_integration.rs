@@ -10002,6 +10002,9 @@ impl Llm for IsoRerollLlm {
             Ok("pass".to_string())
         }
     }
+    fn judge_read_only(&self, prompt: &str) -> Result<String, DaemonError> {
+        self.judge(prompt)
+    }
 }
 
 #[test]
