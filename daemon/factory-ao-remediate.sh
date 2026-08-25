@@ -18,10 +18,10 @@
 #   - Pre-flight probe (≤5s wallclock): ensure AO daemon is reachable; if not,
 #     kick the Go daemon with a bounded retry loop. Fail loud if unreachable.
 #   - Detach the real spawn into a background process. Return 0 immediately
-#     with an "[remediate] async-spawned" message that includes pid + log path
-#     so the AF tick can record the dispatch state without waiting.
-#   - The background process writes its result to a state file so the NEXT
-#     tick can detect failures via the existing `ao session ls` check.
+#     with an "[remediate] async-spawned" message that includes pid + log path.
+#   - With AFD_REQUIRE_SESSION=1, the background process writes `ok` only after
+#     the exact project-scoped AO session is visible. The next AF tick then
+#     reconciles that session and records DISPATCHED without blocking here.
 #
 # Sync behavior (SYNC=1):
 #   - Preserves the original blocking behavior for tests and manual callers.
@@ -162,7 +162,7 @@ classify_spawn_outcome() {
   if echo "$out" | grep -Eq 'spawned session |Session [a-z0-9_-]+ created|✓ Session|pr_open|working|spawning|claimed https://'; then
     return 0
   fi
-  if "$AO" session ls 2>/dev/null | grep -E "pulls/${PR}\b" | grep -Eq "\[(spawning|running|active|working|pr_open)\]"; then
+  if "$AO" session ls -p "$AO_PROJECT" 2>/dev/null | grep -E "pulls/${PR}\b" | grep -Eq "\[(spawning|running|active|working|pr_open)\]"; then
     return 0
   fi
   return 1
@@ -235,10 +235,15 @@ echo "pending" > "$STATE_FILE"
   rc="${result%%$'\t'*}"
   out="${result#*$'\t'}"
   printf '%s' "$out" > "$SPAWN_LOG"
-  if classify_spawn_outcome "$rc" "$out" >/dev/null; then
+  if classify_spawn_outcome "$rc" "$out" >/dev/null \
+     && { [ "${AFD_REQUIRE_SESSION:-0}" != "1" ] || verify_active_session; }; then
     echo "ok" > "$STATE_FILE"
   else
-    echo "fail:rc=$rc" > "$STATE_FILE"
+    if [ "${AFD_REQUIRE_SESSION:-0}" = "1" ]; then
+      echo "fail:rc=$rc:session_unverified" > "$STATE_FILE"
+    else
+      echo "fail:rc=$rc" > "$STATE_FILE"
+    fi
   fi
 ) >/dev/null 2>&1 &
 SPAWN_PID=$!

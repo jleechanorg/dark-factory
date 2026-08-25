@@ -36,6 +36,9 @@ O="$ROOT/daemon/factory-overlay.sh"
 I="${AFD_INTAKE_BIN:-$ROOT/daemon/factory-intake-from-gh.sh}"
 R="${AFD_REMEDIATE_BIN:-$ROOT/daemon/factory-ao-remediate.sh}"
 DB="${AFD_DB:-$HOME/.dark-factory/daemon-cxdb.sqlite}"
+SPAWN_STATE_DIR="${AFD_SPAWN_STATE_DIR:-$HOME/Library/Application Support/dark-factory/spawns}"
+PENDING_MAX_AGE="${AFD_PENDING_MAX_AGE_SEC:-180}"
+case "$PENDING_MAX_AGE" in ''|*[!0-9]*) PENDING_MAX_AGE=180 ;; esac
 MAX_DISPATCH="${MAX_DISPATCH:-2}"
 AO_PROJECT="${AFD_AO_PROJECT:-worldarchitect}"
 # CONFIG/TARGET_REPO mirror the sibling scripts' pattern (daemon/factory-overlay.sh,
@@ -292,6 +295,26 @@ fi
 dispatched=0
 ERR_TMP="$(mktemp -t af_dispatch_err.XXXXXX)"
 trap 'rm -f "$ERR_TMP"' EXIT
+
+dispatch_block() { # bead pr branch repo reason detail
+    local ctx
+    ctx="$(python3 - "$2" "$3" "$4" "$5" "$6" <<'PY'
+import json, sys
+pr = int(sys.argv[1]) if sys.argv[1].isdigit() else None
+print(json.dumps({"pr_number": pr, "branch": sys.argv[2], "repo": sys.argv[3], "reason": sys.argv[4], "detail": sys.argv[5]}))
+PY
+)"
+    "$O" dispatch-blocked "$1" "$5" "$ctx" >/dev/null
+    echo "[af] dispatch blocked $1: $5 ($6)" >&2
+}
+
+active_pr_session() { # project pr
+    [ -n "$AO" ] || return 1
+    "$AO" session ls -p "$1" 2>/dev/null \
+      | grep -E "pulls/${2}\\b" \
+      | grep -Eq '\[(spawning|running|active|working|pr_open)\]'
+}
+
 while IFS='|' read -r bead_id pr branch bead_repo; do
     [ -n "$bead_id" ] || continue
     [ "$dispatched" -ge "$MAX_DISPATCH" ] && break
@@ -302,7 +325,8 @@ while IFS='|' read -r bead_id pr branch bead_repo; do
     # this per-bead repo resolution exists to prevent.
     repo="${bead_repo:-${TARGET_REPO:-}}"
     if [ -z "$repo" ]; then
-        echo "[af] skip $bead_id: no repo mapping (fail-closed, no bead_repo or TARGET_REPO)" >&2
+        dispatch_block "$bead_id" "$pr" "$branch" "" missing_target_repo \
+          "no bead target_repo or configured TARGET_REPO fallback"
         continue
     fi
 
@@ -342,9 +366,14 @@ PY
 )"
 
     if [ -z "$proj" ]; then
-        echo "[af] fail closed: target repo '$repo' has no matching configured AO project. Parking bead $bead_id." >&2
-        "$O" park "$bead_id" "unmapped_target_repo" >/dev/null || true
+        dispatch_block "$bead_id" "$pr" "$branch" "$repo" unmapped_target_repo \
+          "target repo has no matching configured AO project"
         continue
+    fi
+
+    has_active_session=0
+    if active_pr_session "$proj" "$pr"; then
+        has_active_session=1
     fi
 
     # A claim-pr spawn must receive an exact target checkout so we can prove
@@ -353,14 +382,23 @@ PY
     # branch is free; the legacy CLI provides no safe "reuse this arbitrary
     # worktree" argument, so a pre-existing checkout is a fail-closed block.
     checkout="$(python3 - "$CONFIG" "$repo" <<'PY'
-import sys, toml
+import os, pathlib, sys, toml
 try:
     cfg = toml.load(sys.argv[1])
 except Exception:
     cfg = {}
 repo = sys.argv[2]
 entry = (cfg.get("repos") or {}).get(repo) or {}
-print(entry.get("local_checkout", ""))
+explicit = entry.get("local_checkout", "")
+if explicit:
+    print(explicit)
+elif repo.count("/") == 1 and all(part not in ("", ".", "..") for part in repo.split("/")):
+    root = os.environ.get("DARK_FACTORY_TARGET_WORKTREE_ROOT")
+    if not root:
+        root = str(pathlib.Path.home() / ".dark-factory" / "target-worktrees")
+    print(str(pathlib.Path(root) / repo))
+else:
+    print("")
 PY
 )"
     block_reason=""
@@ -370,38 +408,82 @@ PY
         block_detail="no exact branch was recorded for this PR"
     elif [ -z "$checkout" ] || ! git -C "$checkout" rev-parse --git-dir >/dev/null 2>&1; then
         block_reason="target_checkout_unavailable"
-        block_detail="configured local_checkout is required for worktree ownership preflight"
+        block_detail="configured or managed target checkout is unavailable for worktree ownership preflight"
+    elif ! git -C "$checkout" remote get-url origin 2>/dev/null | python3 -c '
+import re, sys
+repo = sys.argv[1]
+url = sys.stdin.read().strip().rstrip("/")
+url = re.sub(r"\.git$", "", url)
+ok = url.endswith("github.com/" + repo) or url.endswith("github.com:" + repo)
+raise SystemExit(0 if ok else 1)
+' "$repo"; then
+        block_reason="target_checkout_mismatch"
+        block_detail="target checkout origin does not match $repo"
     else
         owner_path="$(git -C "$checkout" worktree list --porcelain 2>/dev/null | awk -v want="refs/heads/$branch" '
           /^worktree / { path=substr($0, 10) }
           /^branch / && substr($0, 8) == want { print path; exit }
         ')"
-        if [ -n "$owner_path" ]; then
+        if [ -n "$owner_path" ] && [ "$has_active_session" -ne 1 ]; then
             block_reason="branch_checked_out"
             block_detail="branch is checked out at $owner_path"
         fi
     fi
     if [ -n "$block_reason" ]; then
-        block_ctx="$(python3 - "$pr" "$branch" "$repo" "$block_reason" "$block_detail" <<'PY'
-import json, sys
-print(json.dumps({"pr_number": int(sys.argv[1]), "branch": sys.argv[2], "repo": sys.argv[3], "reason": sys.argv[4], "detail": sys.argv[5]}))
-PY
-)"
-        "$O" dispatch-blocked "$bead_id" "$block_reason" "$block_ctx" >/dev/null || true
-        echo "[af] dispatch blocked $bead_id: $block_reason ($block_detail)" >&2
+        dispatch_block "$bead_id" "$pr" "$branch" "$repo" "$block_reason" "$block_detail"
         continue
     fi
 
-    if [ -n "$AO" ] && "$AO" session ls -p "$proj" 2>/dev/null | rg "pulls/${pr}\\b" | rg -q '\[(spawning|running|active|working|pr_open)\]'; then
-        echo "[af] skip $bead_id PR #$pr (active session exists in project $proj)" >&2
+    spawn_verified=0
+    if [ "$has_active_session" -eq 1 ]; then
+        # Reconcile an asynchronously-created session (or safely reuse an
+        # already-active compatible AO claim) before recording DISPATCHED.
+        spawn_verified=1
+    else
+        state_file="$SPAWN_STATE_DIR/${bead_id}-${pr}.state"
+        spawn_state="$(cat "$state_file" 2>/dev/null || true)"
+        case "$spawn_state" in
+            pending*)
+                state_mtime="$(stat -c %Y "$state_file" 2>/dev/null || stat -f %m "$state_file" 2>/dev/null || echo 0)"
+                now_epoch="$(date +%s)"
+                if [[ "$state_mtime" =~ ^[0-9]+$ ]] && [ $((now_epoch - state_mtime)) -lt "$PENDING_MAX_AGE" ]; then
+                    echo "[af] pending verified spawn $bead_id PR #$pr in project $proj" >&2
+                    continue
+                fi
+                dispatch_block "$bead_id" "$pr" "$branch" "$repo" pending_spawn_stale \
+                  "spawn remained pending beyond ${PENDING_MAX_AGE}s; retrying"
+                ;;
+            ok)
+                # Background spawn completed but the exact project-scoped AO
+                # session is not visible yet. Allow a bounded visibility
+                # window, then emit a structured block and retry async.
+                state_mtime="$(stat -c %Y "$state_file" 2>/dev/null || stat -f %m "$state_file" 2>/dev/null || echo 0)"
+                now_epoch="$(date +%s)"
+                if [[ "$state_mtime" =~ ^[0-9]+$ ]] && [ $((now_epoch - state_mtime)) -lt "$PENDING_MAX_AGE" ]; then
+                    echo "[af] awaiting session visibility $bead_id PR #$pr in project $proj" >&2
+                    continue
+                fi
+                dispatch_block "$bead_id" "$pr" "$branch" "$repo" verified_session_missing \
+                  "verified spawn has no visible project-scoped session after ${PENDING_MAX_AGE}s; retrying"
+                ;;
+            fail:*)
+                dispatch_block "$bead_id" "$pr" "$branch" "$repo" async_spawn_failed "$spawn_state"
+                ;;
+        esac
+
+        echo "[af] remediate $bead_id PR #$pr on $repo in project $proj"
+        # Spawn stays detached. The background wrapper writes `ok` only after
+        # exact project-scoped session verification; this tick remains bounded
+        # by daemon readiness rather than AO_SPAWN_TIMEOUT_SEC.
+        if ! ASYNC=1 AFD_ASYNC_WAIT_SEC=0 AFD_REQUIRE_SESSION=1 \
+          bash "$R" "$bead_id" "$pr" "$repo" "$proj" 2>&1; then
+            dispatch_block "$bead_id" "$pr" "$branch" "$repo" ao_spawn_rejected \
+              "AO remediation wrapper rejected the asynchronous spawn"
+        fi
         continue
     fi
-    echo "[af] remediate $bead_id PR #$pr on $repo in project $proj"
-    # CX-2: thread proj and repo through to factory-ao-remediate.sh so the spawned
-    # session lives in the same AO project.
-    # Do not accept async/pending acknowledgement here. The remediation
-    # wrapper must return only after its project-scoped session verification.
-    if SYNC=1 AFD_REQUIRE_SESSION=1 bash "$R" "$bead_id" "$pr" "$repo" "$proj" 2>&1; then
+
+    if [ "$spawn_verified" -eq 1 ]; then
         cur_state="$(sqlite3 "$DB" "SELECT state FROM bead_overlay WHERE bead_id='$(printf "%s" "$bead_id" | sed "s/'/''/g")';" 2>/dev/null || true)"
         if [ "$cur_state" = "QUEUED" ]; then
             if [ -n "$branch" ]; then
