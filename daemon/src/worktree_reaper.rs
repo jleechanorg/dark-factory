@@ -315,6 +315,17 @@ fn sync_directory(parent: &DirectoryFd) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
+fn directory_identity(parent: &DirectoryFd) -> std::io::Result<(libc::dev_t, libc::ino_t)> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let rc = unsafe { libc::fstat(parent.0, stat.as_mut_ptr()) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok((stat.st_dev, stat.st_ino))
+}
+
+#[cfg(unix)]
 fn write_manifest_line(
     parent: &DirectoryFd,
     manifest_name: &str,
@@ -557,8 +568,6 @@ fn quarantine_worktree_inner(
         let prepared = serde_json::json!({
             "state": "prepared",
             "agent_id": agent_id,
-            "original_path": path.display().to_string(),
-            "quarantined_path": destination.display().to_string(),
             "recorded_at_epoch_secs": stamp,
         });
         write_manifest_line(&quarantine_fd, &manifest_name, &prepared, true).map_err(|e| {
