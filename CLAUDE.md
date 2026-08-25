@@ -277,24 +277,32 @@ against the real `daemon/scripts/`).
    template; `_codergen` captures it automatically and stashes in
    `ctx.state['<node>.diff']` and `ctx.state['_last_diff']`.
 
-## CLI account scoping — never dispatch a bare `claude`/`codex` process
+## CLI account scoping — mandatory policy for every AI CLI launch
 
-A bare `claude` or `codex` invocation with no env override authenticates as
-whatever account is logged into this host's default `~/.claude.json` /
-`~/.codex/auth.json` — currently the operator's **personal** account, not a
-project-scoped one. `dispatch_reviewer`/`run_tool` calling `run_tool("claude",
-[...])` with zero env passthrough is exactly this trap: confirmed on
-2026-08-24, 9 real `backend="claude"` gate runs (`gates.dot`,
-`adversarial_reviewer`/`gate_skeptic`) against a test fixture (`goal="t"`,
-6 of the 9 fired within 14 seconds — a debug/retry burst, not real feature
-work) billed to the personal Claude Max account with no per-project
-isolation. This is why `SKEPTIC_REVIEWER_PRIORITY` already excludes plain
-`"claude"` from the default reviewer chain — but it was never blocked as a
-selectable **coder** backend, so the same leak is still reachable.
+This is a mandatory launch policy, not a claim that every current runtime path
+already enforces it. `Command::new` inherits the daemon environment unless the
+launch code explicitly removes inherited variables and builds a scoped child
+environment. A launch is compliant only when its account/provider scope is
+validated before the process starts.
 
-Rule: every code path that shells out to `claude` or `codex` must pass an
-explicit account/provider scope in the child process env — `CLAUDE_CONFIG_DIR`
-pointed at a project-scoped config dir (mirroring the `claudewa`-style
-convention), or a provider override (`ANTHROPIC_BASE_URL`/`ANTHROPIC_API_KEY`,
-as the MiniMax arm already does) — never inherit the bare host default.
-Treat an un-scoped `claude`/`codex` dispatch as a bug, not a fallback.
+Every direct Claude launch (`claude` or `claude-sonnet`) MUST validate
+`DARK_FACTORY_CLAUDE_CONFIG_DIR` as an existing project-scoped directory, pass
+that directory to the child as `CLAUDE_CONFIG_DIR`, and scrub inherited Claude
+and provider authentication variables. Keep this environment construction and
+provider scrubbing centralized; do not rely on a bare host `~/.claude` account.
+
+MiniMax is a separate provider lane. It MUST require a nonblank
+`MINIMAX_API_KEY`, pin `ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic` and
+`ANTHROPIC_MODEL=MiniMax-M3`, and remove Claude account state/configuration from
+the child environment. A MiniMax launch must never inherit `CLAUDE_CONFIG_DIR`
+or another host Claude login as an implicit credential.
+
+Every Codex launch, including `codex exec`, MUST use an intended existing
+`CODEX_HOME` or an explicitly supported provider credential/configuration such
+as `OPENAI_API_KEY` or `CODEX_ACCESS_TOKEN` where that launch mode supports it.
+Do not let Codex silently fall back to the operator's default `~/.codex`
+account.
+
+Unscoped or unsupported dispatch MUST fail closed. Fallback is allowed only to
+another lane that has its own explicit, validated scope; never fall back to an
+unscoped Claude, MiniMax, or Codex process.
