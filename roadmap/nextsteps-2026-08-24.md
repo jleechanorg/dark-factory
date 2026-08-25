@@ -12,6 +12,7 @@
 - [2026-08-24 (later) — existing-PR dispatch/worktree failure](#2026-08-24-later--existing-pr-dispatchworktree-failure)
 - [2026-08-24 (historical snapshot) — Funnel metrics and draft remediation](#2026-08-24-historical-snapshot--funnel-metrics-and-draft-remediation)
 - [2026-08-24 (current, verified refresh) — Funnel metrics and PR readiness](#2026-08-24-current-verified-refresh--funnel-metrics-and-pr-readiness)
+- [2026-08-25 (final verified refresh) — Funnel metrics, five ready PRs, and ironclad status](#2026-08-25-final-verified-refresh--funnel-metrics-five-ready-prs-and-ironclad-status)
 
 ## Executive summary
 
@@ -266,3 +267,66 @@ No new bead or GitHub issue was created in this update; the existing four beads 
 - `~/roadmap/learnings-2026-08.md` records this corrected baseline, the account-level quota/rate-limit blocker, and the rule that #748–#750 evidence is not CodeRabbit substantive review.
 - Claude auto-memory `project_2026-08-24_funnel_metrics_pr748_750.md` records the exact heads/readiness and external quota blocker; `MEMORY.md` points to it.
 - mem0 remains unavailable because `/home/jleechan/.hermes/scripts/mem0_shared_client.py` is absent; do not claim a sync.
+
+## 2026-08-25 (final verified refresh) — Funnel metrics, five ready PRs, and ironclad status
+
+### Executive summary
+
+- The measurement baseline is unchanged in direction: fresh 3-day throughput is **0/38 `READY_FOR_MERGE`**, and no funnel improvement is claimed. Fresh 30-day throughput is **2/413 = 0.484%**; `pr_adopted_start` is **1/114 = 0.877%**.
+- Five independent remediation PRs are now exact-head ready candidates: #748, #749, #750, #751, and #752 are all **OPEN / non-draft / mergeable `CLEAN`**, with green applicable checks, exact-head evidence, Gemini/Grok approvals, and zero unresolved threads. **None is merged or deployed.**
+- CodeRabbit observations remain separate from browser approvals: all five PRs are **rate-limited/non-substantive** for CodeRabbit; no CodeRabbit approval is claimed.
+- The organization-scoped runner fleet is healthy at **16/16 online**, with **0 queued** runs. The earlier repository-scope “runner outage” was a false alarm; preserve that correction.
+- Merge/deploy authority is still absent from this handoff. After authorized landing/deployment, recompute all windows and start the independent 48-hour sustain check; do not call the ironclad goal achieved before that.
+
+### Funnel metrics (fresh, independently re-run)
+
+```text
+3d:  READY_FOR_MERGE 0/38
+     CodeRabbit: 1/61 direct, 4 waived_unavailable, 56 unknown
+
+7d:  READY_FOR_MERGE 1/104 = 0.962%
+     pr_adopted_start 1/18 = 5.56%
+     CodeRabbit 4/147 = 2.72%
+     all_green=true: 3
+
+30d: READY_FOR_MERGE 2/413 = 0.484%
+     bead_start 1/142; gh_issue_start 0/157; pr_adopted_start 1/114 = 0.877%
+     CodeRabbit 37/359 = 10.31%; 13 waived_unavailable; 294 unknown; 16 fail
+```
+
+These are measurements only. The higher 7-day CodeRabbit percentage does not satisfy criterion 1, which requires a fresh 3-day window at ≥50%; no criterion is promoted by a favorable window.
+
+### Exact PR state (verified 2026-08-25)
+
+| PR | Exact head | Live state | Evidence and scope |
+|---|---|---|---|
+| [#748](https://github.com/jleechanorg/dark-factory/pull/748) | `155d344ed1de5c64c6df8c9baef34e4b910810b4` | OPEN / non-draft / CLEAN; green checks; 0 threads | CodeRabbit evidence-reporting lane; exact-head gist plus Gemini/Grok public approvals. |
+| [#749](https://github.com/jleechanorg/dark-factory/pull/749) | `673ab1104d892df9b6333216b5f941f4eb41ff7f` | OPEN / non-draft / CLEAN; green checks; 0 threads | Exact-head CodeRabbit attribution; exact-head gist plus Gemini/Grok public approvals. |
+| [#750](https://github.com/jleechanorg/dark-factory/pull/750) | `84bb15ab069b2e99ab127203a20f675869582cb5` | OPEN / non-draft / CLEAN; green checks; 0 threads | Gate-8 pytest routing plus fixture/helper materialization correction; exact-head evidence and Gemini/Grok approvals. |
+| [#751](https://github.com/jleechanorg/dark-factory/pull/751) | `c8110484e1efb0f7da84bbb7c0932b688b92936e` | OPEN / non-draft / CLEAN; green checks; 0 threads | Skeptic gate write-permission correction; exact-head evidence and Gemini/Grok approvals. |
+| [#752](https://github.com/jleechanorg/dark-factory/pull/752) | `c4eb4793d1533d599163b89b44fdb0309c657d4c` | OPEN / non-draft / CLEAN; green checks; 0 threads | Full untrusted-feedback transport, read-only/bounded preflight, fail-closed pagination, and TOML-safe reroll remediation; exact-head evidence and Gemini/Grok approvals. |
+
+CodeRabbit is rate-limited/non-substantive on all five. Browser approvals are independent evidence, not CodeRabbit approvals. None of these PRs is merged or deployed.
+
+### Ironclad goal status (latest evidence)
+
+| Criterion | Latest result | Reason |
+|---|---|---|
+| C1 — CodeRabbit ≥50% fresh 3d | **FAIL** | 1/61 direct (1.64%); 4 waived and 56 unknown are not direct approvals. |
+| C2 — `all_green` ≥3 in fresh 7d | **PASS, caveated** | 3 observed; independently re-check after landing because current PRs are not deployed. |
+| C3 — READY_FOR_MERGE ≥5% fresh 30d | **FAIL** | 2/413 = 0.484%. |
+| C4 — `pr_adopted_start` ≥10% fresh 30d | **FAIL** | 1/114 = 0.877%. |
+| C5 — no gate weakening | **Evidence clean, not landed** | Exact-head reviews found no weakening, but no remediation PR has landed/deployed. |
+| C6 — 48-hour sustain | **NOT STARTED** | Requires post-landing first-pass criteria and a different verifier at T+48h. |
+| C7 — CodeRabbit structural precondition | **BLOCKED by quota** | Account remains rate-limited/non-substantive; do not “fix” daemon semantics to reinterpret quota responses. |
+
+### Follow-up and parked work
+
+- `jleechan-uqgu` maps to [PR #751](https://github.com/jleechanorg/dark-factory/pull/751), the skeptic caller permission/config contract correction.
+- `jleechan-cqaf` maps to [PR #752](https://github.com/jleechanorg/dark-factory/pull/752), the structured untrusted-feedback/read-only/preflight/TOML remediation.
+- Keep `jleechan-4n2e` (goal) and `jleechan-evtv` (CodeRabbit structural precondition) open with the FAIL/blocker evidence above.
+- Keep [Issue #743](https://github.com/jleechanorg/dark-factory/issues/743) **OPEN**; factory labels/routing remain removed from the four parked beads. Do not re-enable routing until the ownership canary passes.
+
+### Next action
+
+No merge or deploy is authorized by this handoff. The next authorized operator should land/deploy the selected PR set, independently verify exact heads and live checks, recompute 3d/7d/30d funnel metrics, and only then start the 48-hour sustain timer. Do not claim funnel improvement or ironclad completion before those post-landing measurements.
