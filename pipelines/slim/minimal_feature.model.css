@@ -8,15 +8,15 @@
  *
  * Plan tier: dedicated MiniMax model for architecture/spec work (design phase).
  * Explicit node attrs win over stylesheet rules; tests pin plan to echo.
- * The `model_name` honors `DARK_FACTORY_MINIMAX_MODEL` via `${VAR:-default}`
- * env-var substitution (see runner/parser.py:_substitute_env_in_value).
+ * The plan model is pinned to `MiniMax-M3`; model selection is a provider
+ * policy decision, not an ambient environment override.
  *
  * Review tier: independent adversarial backend (Antigravity), separate from
  * the coder --backend.
  */
 .plan {
   backend: minimax;
-  model_name: ${DARK_FACTORY_MINIMAX_MODEL:-MiniMax-M3};
+  model_name: MiniMax-M3;
 }
 
 .review {

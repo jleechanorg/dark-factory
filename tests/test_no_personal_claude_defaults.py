@@ -99,30 +99,32 @@ def test_pilot_minimax_scrubber_removes_inherited_routing_state() -> None:
     )
     assert match, "pilot must expose a testable MiniMax environment scrubber"
 
-    inherited = os.environ.copy()
-    inherited.update(
-        {
-            "MINIMAX_API_KEY": "pilot-key",
-            "MINIMAX_MODEL": "stale-model",
-            "MINIMAX_BASE_URL": "https://stale.minimax.example",
-            "DARK_FACTORY_MINIMAX_MODEL": "stale-factory-model",
-            "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
-            "ANTHROPIC_MODEL": "stale-model",
-            "CLAUDE_CONFIG_DIR": "/Users/personal/.claude",
-            "DARK_FACTORY_CLAUDE_CONFIG_DIR": "/Users/personal/.claude-config",
-            "CLAUDEM_MODE": "personal",
-            "ANTHROPIC_SMALL_FAST_MODEL": "stale-fast-model",
-            "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL": "1",
-            "AWS_PROFILE": "personal",
-            "GOOGLE_APPLICATION_CREDENTIALS": "/tmp/personal.json",
-            "VERTEXAI_PROJECT": "personal-project",
-            "BEDROCK_MODEL_ID": "personal-bedrock",
-            "CLOUD_ML_REGION": "us-east1",
-            "AZURE_OPENAI_API_KEY": "personal-azure-key",
-            "FOUNDRY_ENDPOINT": "https://personal.foundry.invalid",
-            "OPENAI_API_KEY": "personal-openai-key",
-        }
-    )
+    inherited = {
+        name: os.environ[name]
+        for name in ("HOME", "PATH")
+        if name in os.environ
+    }
+    inherited.update({
+        "MINIMAX_API_KEY": "pilot-key",
+        "MINIMAX_MODEL": "stale-model",
+        "MINIMAX_BASE_URL": "https://stale.minimax.example",
+        "DARK_FACTORY_MINIMAX_MODEL": "stale-factory-model",
+        "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+        "ANTHROPIC_MODEL": "stale-model",
+        "CLAUDE_CONFIG_DIR": "/Users/personal/.claude",
+        "DARK_FACTORY_CLAUDE_CONFIG_DIR": "/Users/personal/.claude-config",
+        "CLAUDEM_MODE": "personal",
+        "ANTHROPIC_SMALL_FAST_MODEL": "stale-fast-model",
+        "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL": "1",
+        "AWS_PROFILE": "personal",
+        "GOOGLE_APPLICATION_CREDENTIALS": "/tmp/personal.json",
+        "VERTEXAI_PROJECT": "personal-project",
+        "BEDROCK_MODEL_ID": "personal-bedrock",
+        "CLOUD_ML_REGION": "us-east1",
+        "AZURE_OPENAI_API_KEY": "personal-azure-key",
+        "FOUNDRY_ENDPOINT": "https://personal.foundry.invalid",
+        "OPENAI_API_KEY": "personal-openai-key",
+    })
     probe = (
         "configure_minimax_env() {"
         + match.group("body")
@@ -163,3 +165,34 @@ def test_pilot_minimax_scrubber_removes_inherited_routing_state() -> None:
     assert "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL=0" in env_lines
     assert "ANTHROPIC_API_KEY=pilot-key" in env_lines
     assert "ANTHROPIC_AUTH_TOKEN=pilot-key" in env_lines
+
+
+def test_pilot_minimax_scrubber_rejects_whitespace_only_key() -> None:
+    script = (ROOT / "daemon/qw5-pilot-dispatch.sh").read_text()
+    match = re.search(
+        r"configure_minimax_env\(\) \{(?P<body>.*?)\n\}\n\nconfigure_minimax_env",
+        script,
+        flags=re.DOTALL,
+    )
+    assert match, "pilot must expose a testable MiniMax environment scrubber"
+
+    probe = (
+        "set -e\n"
+        "configure_minimax_env() {"
+        + match.group("body")
+        + "\n}\n"
+        "configure_minimax_env\n"
+    )
+    result = subprocess.run(
+        ["bash", "-c", probe],
+        env={
+            "HOME": os.environ.get("HOME", "/tmp"),
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "MINIMAX_API_KEY": " \t\n",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 66
+    assert "MINIMAX_API_KEY must be nonblank" in result.stderr

@@ -231,7 +231,7 @@ Honor these flags inside `$ARGUMENTS`:
   when the goal has no more specific holdout, but confirm the directory
   exists before passing it rather than defaulting unconditionally — see
   Honesty rules below on not inventing `--feature` values)
-- `--backend echo|claude|codex|ao|agy` — default `ao` (Antigravity via AO). Use `echo` for cost-free
+- `--backend echo|claude|codex|ao|agy|minimax` — default `ao` (Antigravity via AO). Use `echo` for cost-free
   dry-runs that verify wiring without LLM calls.
 - `--max-steps <N>` — default 100
 - `--cxdb <path>` — default `~/.dark-factory/cxdb.sqlite` (shared across runs

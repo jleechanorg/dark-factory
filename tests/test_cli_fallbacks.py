@@ -6,7 +6,7 @@ This file locks in the *current* missing-CLI behavior of every backend
   1. The **coder** path — ``_codergen`` in ``runner/handlers.py``.
   2. The **reviewer-gate** path — ``_execute_gate`` / ``_run_gate_once``,
      reached via the priority queue (``backend_priority=...``) and the
-     claude infra-fallback chain.
+     explicit infrastructure-fallback chain.
 
 The audit doc (``docs/cli-fallback-audit-2026-06-12.md``) is the
 companion document. Each test name references the audit table row it
@@ -454,9 +454,9 @@ def test_reviewer_gate_priority_queue_with_codex_missing_picks_codex(monkeypatch
         seen.append(first)
         if first in ("codex", "agy"):
             # codex: probe said installed but binary missing at run time.
-            # agy: also simulated missing to force walk to claude.
+            # agy: also simulated missing to force the gate to fail closed.
             raise FileNotFoundError(2, f"No such file or directory: {first}")
-        # claude fallback: succeed with a real verdict + SHA echo.
+        # Any unexpected transport is treated as a successful stand-in.
         return _fake_completed(
             cmd, returncode=0,
             stdout=f"head_sha: {fake_sha}\nverdict: pass\n", stderr="",
@@ -480,8 +480,8 @@ def test_reviewer_gate_priority_queue_with_codex_missing_picks_codex(monkeypatch
     assert meta["adversarial_resolved"] == "codex"
     assert meta["adversarial_skipped"] == ""
 
-    # Run the gate. codex raises FileNotFoundError -> claude fallback
-    # fires (recorded in metadata) and succeeds with a real verdict.
+    # Run the gate. codex raises FileNotFoundError -> the explicit agy
+    # infrastructure fallback is attempted and also fails closed.
     result = _execute_gate("PROMPT", fake_sha, 300, ctx, "ev", resolved)
 
     assert result.outcome == "error"
@@ -489,8 +489,7 @@ def test_reviewer_gate_priority_queue_with_codex_missing_picks_codex(monkeypatch
     assert result.metadata["fallback_from"] == "codex"
     assert result.metadata["reviewer_backend"] == "agy"
     # Confirm the dispatch order: codex (FileNotFoundError) -> agy (also
-    # missing) -> claude (succeeds). The agy→claude fallback walks every
-    # entry until one is not an infra failure (handler_dispatch.py:_execute_gate).
+    # missing). No implicit personal-Claude transport is attempted.
     assert seen == ["codex", "agy"]
 
 
@@ -499,16 +498,14 @@ def test_reviewer_gate_priority_queue_all_uninstalled_falls_through(monkeypatch,
     falls through to the LAST entry (per
     ``_resolve_adversarial_backend`` lines 1346-1347). The gate then
     runs that last entry, which raises FileNotFoundError, and the
-    claude fallback engages.
+    explicit infrastructure fallback remains disabled for an agy terminal.
 
     The metadata records the full skip list so the operator can see
     which backends were attempted via probe but not at run time.
 
-    Implementation note: we use a non-claude-routed last entry (``agy``)
-    because ``_execute_gate`` short-circuits the fallback when the
-    resolved backend is ``claude`` / ``claude-sonnet`` (it IS the
-    fallback). The audit's "claude-sonnet falls through" path is
-    exercised in the test_gate_per_backend_missing test.
+    Implementation note: we use a non-Claude-routed last entry (``agy``)
+    so this test exercises the explicit infrastructure-fallback boundary
+    without launching a personal Claude transport.
     """
     fake_sha = "0" * 40
     seen: list[str] = []
@@ -546,7 +543,7 @@ def test_reviewer_gate_priority_queue_all_uninstalled_falls_through(monkeypatch,
     # All three entries show up in the skip list.
     assert meta["adversarial_skipped"] == "codex,minimax,agy"
 
-    # agy is missing -> claude fallback fires.
+    # agy is a terminal reviewer lane: a missing CLI fails closed.
     result = _execute_gate("PROMPT", fake_sha, 300, ctx, "ev", resolved)
     assert result.outcome == "error"
     assert result.metadata["fallback_used"] == "false"
@@ -554,11 +551,10 @@ def test_reviewer_gate_priority_queue_all_uninstalled_falls_through(monkeypatch,
     assert seen == ["agy"]
 
 
-def test_reviewer_gate_agy_missing_falls_back_to_claude_cleanly(monkeypatch, tmp_path):
+def test_reviewer_gate_agy_missing_fails_closed_cleanly(monkeypatch, tmp_path):
     """agy is the reviewer, FileNotFoundError, ``backend_missing="true"``
-    in the first-attempt result, then claude fallback succeeds. This is
-    the canonical "agy missing → claude" path the gate infrastructure
-    was built to support.
+    in the first-attempt result. There is no implicit Claude fallback; the
+    gate reports the infrastructure failure directly.
     """
     fake_sha = "0" * 40
     seen: list[str] = []
@@ -587,8 +583,7 @@ def test_reviewer_gate_agy_missing_falls_back_to_claude_cleanly(monkeypatch, tmp
 
 
 def test_reviewer_gate_all_backends_missing_tags_infra_failure(monkeypatch, tmp_path):
-    """Every entry in the priority queue is missing AND the claude
-    fallback is also missing → ``verdict="infra_failure"`` so the
+    """Every configured reviewer entry is missing → ``verdict="infra_failure"`` so the
     operator can distinguish "no reviewer ever graded the diff" from a
     real FAIL. This is the contract
     ``_execute_gate`` documents at lines 1453-1455.
@@ -611,18 +606,18 @@ def test_reviewer_gate_all_backends_missing_tags_infra_failure(monkeypatch, tmp_
     ctx = Context(goal="t", workdir=tmp_path, backend="claude")
     result = _execute_gate("PROMPT", fake_sha, 300, ctx, "ev", "codex")
 
-    # Both codex and the claude fallback raised FileNotFoundError.
+    # The configured reviewer transport raised FileNotFoundError.
     assert result.outcome == "error"
     assert result.metadata["verdict"] == "infra_failure", (
-        f"expected verdict='infra_failure' when both codex and claude "
-        f"fallback are missing, got {result.metadata!r}"
+        f"expected verdict='infra_failure' when reviewer transports are "
+        f"missing, got {result.metadata!r}"
     )
     assert result.metadata["fallback_used"] == "true"
     assert result.metadata["fallback_from"] == "codex"
     assert result.metadata["reviewer_backend"] == "agy"
     assert result.metadata["backend_missing"] == "true", (
         "the FINAL result should still surface backend_missing='true' from "
-        "the claude fallback attempt (it's an infra failure, after all)"
+        "the final reviewer attempt still surfaces the infrastructure failure"
     )
     # Both backends were attempted.
     assert "codex" in seen
