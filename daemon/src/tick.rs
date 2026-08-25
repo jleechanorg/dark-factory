@@ -6214,8 +6214,8 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             continue;
                         }
                         // Perform recovery validation: check if spec is valid TOML
-                        let spec_path = std::path::Path::new(&deps.cfg.spec_dir)
-                            .join(format!("{}.toml", overlay.bead_id));
+                        let spec_path =
+                            crate::constraints::resolve_runtime_spec_path(deps.cfg, &overlay.bead_id);
                         let validation_pass = if spec_path.exists() {
                             if let Ok(c) = std::fs::read_to_string(&spec_path) {
                                 toml::from_str::<serde_json::Value>(&c).is_ok()

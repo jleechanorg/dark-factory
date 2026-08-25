@@ -782,7 +782,7 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
         deps.review_text
     );
 
-    let spec_path = Path::new(&deps.cfg.spec_dir).join(format!("{}.toml", bead.bead_id));
+    let spec_path = constraints::resolve_runtime_spec_path(deps.cfg, &bead.bead_id);
     constraints::append_mutation(&spec_path, &block)?;
 
     // Transition to RECOVERY

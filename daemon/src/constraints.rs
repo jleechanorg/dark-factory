@@ -1,8 +1,9 @@
+use crate::config::Config;
 use crate::errors::DaemonError;
 use crate::tools::Llm;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Extracted {
@@ -108,6 +109,70 @@ pub fn extract(llm: &dyn Llm, review_text: &str) -> Result<Extracted, DaemonErro
     })
 }
 
+/// PR #755 Slice 3: single deterministic writable runtime-spec resolver.
+///
+/// Both the constraint-mutation path (this module's `append_mutation`, called
+/// from `reroll::execute`) and the validation/readback path
+/// (`tick::run_fast_tier`'s RECOVERY branch that re-reads the just-appended
+/// spec block) MUST go through this resolver so they agree on the file. When
+/// `cfg.spec_dir` is genuinely writable (the legacy in-repo layout — the
+/// factory-fabricated branch's `.factory/specs/` dir inside a worktree),
+/// honoring it preserves the existing on-disk layout. When `cfg.spec_dir`
+/// is read-only (the immutable-release-tree case — the daemon installed via
+/// `cargo install`/`brew`/`pip install`, where the configured
+/// `spec_dir` lives inside a frozen release tree the daemon process has
+/// no write permission for), runtime spec blocks MUST route to the
+/// daemon-owned state convention (`runtime_state_dir()/specs/`) so the
+/// factory does not silently strand every reroll on `PermissionDenied`.
+/// Readback uses the SAME resolved path so the tick's RECOVERY validation
+/// does not silently disagree with the reroll that just appended.
+///
+/// Determinism: within one daemon lifetime, repeated calls with the same
+/// `(cfg, bead_id)` MUST return the same `PathBuf` — the resolver decides
+/// once at first call (or at process start) and caches, so a tick that
+/// reads at line N+50 cannot disagree with the reroll that wrote at
+/// line N.
+pub fn resolve_runtime_spec_path(cfg: &Config, bead_id: &str) -> PathBuf {
+    let configured = PathBuf::from(&cfg.spec_dir).join(format!("{bead_id}.toml"));
+    if dir_is_writable(Path::new(&cfg.spec_dir)) {
+        configured
+    } else {
+        let mut fallback = crate::intake::runtime_state_dir();
+        fallback.push("specs");
+        // Make sure the parent dir exists; on first use of the fallback
+        // path the daemon-owned `runtime_state_dir()` may exist but the
+        // `specs/` subdir may not. `append_mutation` will then fail on the
+        // temp-file rename because the destination dir is missing.
+        let _ = std::fs::create_dir_all(&fallback);
+        fallback.push(format!("{bead_id}.toml"));
+        fallback
+    }
+}
+
+/// True when `dir` already exists and we can both `create_dir_all` (no-op
+/// is fine) and `OpenOptions::create+write+truncate` a tiny sentinel file
+/// inside it. False if the dir does not exist AND `create_dir_all` fails,
+/// OR if the dir exists but the kernel denies our write attempt (root in
+/// a non-POSIX namespace, mode 0o555, immutable bit, etc.). The sentinel
+/// is deleted immediately so the resolver is read-only with respect to
+/// the configured dir on a successful call.
+fn dir_is_writable(dir: &Path) -> bool {
+    match std::fs::create_dir_all(dir) {
+        Ok(()) => {}
+        Err(_) => return false,
+    }
+    let sentinel = dir.join(".dark_factory_writable_probe");
+    let res = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&sentinel)
+        .map(|mut f| f.write_all(b"ok").is_ok())
+        .unwrap_or(false);
+    let _ = std::fs::remove_file(&sentinel);
+    res
+}
+
 /// Appends the extracted constraints block append-only to the bead's spec file.
 /// Atomicity is guaranteed via write-temp -> fsync -> rename.
 pub fn append_mutation(spec_path: &Path, block: &str) -> Result<(), DaemonError> {
@@ -183,6 +248,63 @@ pub fn append_mutation(spec_path: &Path, block: &str) -> Result<(), DaemonError>
 mod tests {
     use super::*;
     use crate::tools::Llm;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Minimal `Config` for `resolve_runtime_spec_path`'s tests — the
+    /// resolver only touches `spec_dir`, so every other field is a
+    /// zero/empty default. `target_repo` is set so `Config` is constructible
+    /// via the public fields without touching any private wiring.
+    fn make_test_config() -> Config {
+        Config {
+            target_repo: "owner/repo".into(),
+            ao_project: None,
+            base_branch: "main".into(),
+            stage: 2,
+            max_workers: 30,
+            max_batch: 15,
+            fast_tick_secs: 60,
+            slow_tick_secs: 60,
+            autonomy_timebox_secs: 10_800,
+            budget_warn_usd: 20.0,
+            spec_dir: ".factory/specs/".into(),
+            reroll_head_stability_window_secs: 1,
+            reroll_death_confirm_secs: 0,
+            held_recheck_cooldown_secs: 900,
+            repos: std::collections::HashMap::new(),
+            pre_gate_validation_enabled: false,
+            escalation_refire_secs: 3600,
+            agent_worktree_root: None,
+            worktree_ttl_secs: 14 * 24 * 60 * 60,
+            worktree_max_count: 200,
+        }
+    }
+
+    /// Returns `true` iff creating a regular file inside `dir` actually
+    /// fails (the kernel denies our write). Root in a non-POSIX namespace
+    /// bypasses POSIX perms and would return false here — the resolver
+    /// tests skip themselves in that case to keep the suite green in CI.
+    #[cfg(unix)]
+    fn read_only_dir_blocks_write(dir: &Path) -> bool {
+        let sentinel = dir.join(".dark_factory_readonly_probe");
+        let blocked = match std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&sentinel)
+        {
+            Ok(mut f) => {
+                let _ = f.write_all(b"ok");
+                let _ = std::fs::remove_file(&sentinel);
+                false
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(&sentinel);
+                true
+            }
+        };
+        blocked
+    }
 
     struct FakeLlm(String);
     impl Llm for FakeLlm {
@@ -332,6 +454,129 @@ mod tests {
             prompt.contains("the wire format MUST carry the bead ID"),
             "verbatim text must reach the prompt even on unparseable reply; got: {prompt:?}",
         );
+    }
+
+    /// PR #755 Slice 3: the runtime-spec resolver must use the configured
+    /// `cfg.spec_dir` when it is writable (the legacy in-repo layout) and
+    /// must fall back to the daemon-owned `runtime_state_dir()/specs/` only
+    /// when the configured dir is genuinely read-only (the immutable
+    /// release-tree case). It must be deterministic: the same bead id
+    /// always resolves to the same path within one daemon lifetime.
+    #[test]
+    fn test_resolve_runtime_spec_path_uses_configured_when_writable() {
+        let cfg = Config {
+            spec_dir: std::env::temp_dir()
+                .join("afd_resolve_writable")
+                .to_string_lossy()
+                .into_owned(),
+            ..make_test_config()
+        };
+        std::fs::create_dir_all(&cfg.spec_dir).unwrap();
+        let resolved = resolve_runtime_spec_path(&cfg, "bead-x");
+        assert_eq!(
+            resolved,
+            PathBuf::from(&cfg.spec_dir).join("bead-x.toml"),
+            "writable configured dir must be honored (preserve explicitly writable paths)"
+        );
+        std::fs::remove_dir_all(&cfg.spec_dir).ok();
+    }
+
+    /// When `cfg.spec_dir` is genuinely read-only (release-tree: e.g.
+    /// `chmod 555` after the daemon installed the binary), the resolver
+    /// must transparently route runtime mutation to the daemon-owned
+    /// `runtime_state_dir()/specs/` so the daemon can still write spec
+    /// blocks; reads AND writes must see the SAME resolved path, so a
+    /// tick that re-validates a freshly-appended block does not silently
+    /// disagree with the reroll that appended it.
+    #[test]
+    fn test_resolve_runtime_spec_path_falls_back_when_configured_is_readonly() {
+        let configured = std::env::temp_dir().join("afd_resolve_readonly_cfg");
+        std::fs::create_dir_all(&configured).unwrap();
+        let cfg = Config {
+            spec_dir: configured.to_string_lossy().into_owned(),
+            ..make_test_config()
+        };
+        // Make the configured dir genuinely read-only. Skip if running as
+        // root (root bypasses POSIX perms — common in CI containers).
+        let prev_perms = std::fs::metadata(&configured).unwrap().permissions();
+        std::fs::set_permissions(&configured, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if !read_only_dir_blocks_write(&configured) {
+            // Restore before bailing so we don't leave the temp dir broken.
+            std::fs::set_permissions(&configured, prev_perms).unwrap();
+            std::fs::remove_dir_all(&configured).ok();
+            eprintln!("SKIP: effective UID bypasses POSIX read-only perms (root)");
+            return;
+        }
+
+        let resolved_a = resolve_runtime_spec_path(&cfg, "bead-readonly");
+        let resolved_b = resolve_runtime_spec_path(&cfg, "bead-readonly");
+
+        let runtime_state = crate::intake::runtime_state_dir();
+        assert_eq!(
+            resolved_a, resolved_b,
+            "resolver must be deterministic within a daemon lifetime"
+        );
+        assert!(
+            resolved_a.starts_with(&runtime_state),
+            "read-only configured dir must route to daemon-owned state dir; \
+             got {} (expected prefix {})",
+            resolved_a.display(),
+            runtime_state.display()
+        );
+        assert_ne!(
+            resolved_a,
+            PathBuf::from(&cfg.spec_dir).join("bead-readonly.toml"),
+            "must NOT resolve into the read-only configured dir"
+        );
+
+        // Restore + cleanup.
+        std::fs::set_permissions(&configured, prev_perms).unwrap();
+        std::fs::remove_dir_all(&configured).ok();
+        let _ = std::fs::remove_file(&resolved_a);
+        if let Some(parent) = resolved_a.parent() {
+            std::fs::remove_dir_all(parent).ok();
+        }
+    }
+
+    /// PR #755 Slice 3: append-mutation must use the resolved path so a
+    /// write into the daemon state fallback actually succeeds (rather than
+    /// silently failing on the read-only configured dir). This pins the
+    /// invariant that the resolver and the writer cooperate: one canonical
+    /// resolver, ONE call site for the writer, no duplicated path
+    /// construction inline at the call site.
+    #[test]
+    fn test_append_mutation_via_resolver_succeeds_when_configured_readonly() {
+        let configured = std::env::temp_dir().join("afd_resolve_writer_readonly");
+        std::fs::create_dir_all(&configured).unwrap();
+        let cfg = Config {
+            spec_dir: configured.to_string_lossy().into_owned(),
+            ..make_test_config()
+        };
+        let prev_perms = std::fs::metadata(&configured).unwrap().permissions();
+        std::fs::set_permissions(&configured, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if !read_only_dir_blocks_write(&configured) {
+            std::fs::set_permissions(&configured, prev_perms).unwrap();
+            std::fs::remove_dir_all(&configured).ok();
+            eprintln!("SKIP: effective UID bypasses POSIX read-only perms (root)");
+            return;
+        }
+
+        let resolved = resolve_runtime_spec_path(&cfg, "bead-writer");
+        let result = append_mutation(&resolved, "block1\n");
+        assert!(
+            result.is_ok(),
+            "append_mutation must succeed via the resolver path; got error: {:?}",
+            result.err()
+        );
+        let read_back = std::fs::read_to_string(&resolved).unwrap();
+        assert_eq!(read_back, "block1\n");
+
+        std::fs::set_permissions(&configured, prev_perms).unwrap();
+        std::fs::remove_dir_all(&configured).ok();
+        let _ = std::fs::remove_file(&resolved);
+        if let Some(parent) = resolved.parent() {
+            std::fs::remove_dir_all(parent).ok();
+        }
     }
 
     #[test]
