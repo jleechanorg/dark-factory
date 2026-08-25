@@ -7886,20 +7886,37 @@ const FALLBACK_CWD: &str = ".";
 /// does (bead `jleechan-g1k`) — MiniMax is still driving the `claude` CLI, so
 /// it still reads AGENTS.md / `.claude/` from the invocation cwd.
 fn run_minimax_judge(claude_bin: &str, prompt: &str) -> Result<String, DaemonError> {
-    let minimax_key = std::env::var("MINIMAX_API_KEY").map_err(|e| {
-        DaemonError::Tool {
-            tool: "minimax".into(),
-            rc: -1,
-            stderr: format!("MINIMAX_API_KEY not set: {e}"),
-        }
+    let minimax_key = std::env::var("MINIMAX_API_KEY").map_err(|e| DaemonError::Tool {
+        tool: "minimax".into(),
+        rc: -1,
+        stderr: format!("MINIMAX_API_KEY not set: {e}"),
     })?;
+    let minimax_model = std::env::var("DARK_FACTORY_MINIMAX_MODEL")
+        .ok()
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or_else(|| "MiniMax-M3".to_string());
 
     let mut cmd = std::process::Command::new(claude_bin);
-    cmd.args(["--print", "--dangerously-skip-permissions", "--setting-sources", "", prompt])
-        .current_dir(FALLBACK_CWD)
-        .stdin(std::process::Stdio::null())
-        .env("ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic")
-        .env("ANTHROPIC_API_KEY", minimax_key);
+    cmd.args([
+        "--print",
+        "--dangerously-skip-permissions",
+        "--setting-sources",
+        "",
+        "--model",
+        minimax_model.as_str(),
+        prompt,
+    ])
+    .current_dir(FALLBACK_CWD)
+    .stdin(std::process::Stdio::null())
+    .env("ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic")
+    .env("ANTHROPIC_API_KEY", &minimax_key)
+    .env("ANTHROPIC_MODEL", &minimax_model)
+    .env_remove("CLAUDE_CONFIG_DIR")
+    .env_remove("ANTHROPIC_AUTH_TOKEN")
+    .env_remove("ANTHROPIC_SMALL_FAST_MODEL")
+    .env_remove("CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL")
+    .env_remove("CLAUDEM_MODE")
+    .env_remove("MINIMAX_API_KEY");
 
     let output = cmd.output().map_err(|e| DaemonError::Tool {
         tool: "minimax".into(),
@@ -8335,7 +8352,7 @@ mod ci_dedicated_gate_ownership_tests {
 /// keeps it isolated from production builds (the `#[cfg(test)]` gate).
 #[cfg(test)]
 mod chain_llm_fallback_argv_tests {
-    use super::ChainLlm;
+    use super::{run_minimax_judge, ChainLlm};
     use crate::tools::Llm;
     use std::sync::Mutex;
 
@@ -8608,6 +8625,88 @@ mod chain_llm_fallback_argv_tests {
         let output = result.expect("agy shim should be the final fallback");
         assert_eq!(output, "agy-fallback-success");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// MiniMax is an explicit provider lane, not direct Claude. Pin its
+    /// model and scrub account/provider state inherited from a prior direct
+    /// Claude invocation while preserving the explicit MiniMax key and
+    /// endpoint.
+    #[test]
+    #[cfg(unix)]
+    fn minimax_judge_pins_model_and_scrubs_direct_claude_environment() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("minimax_env_{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let claude = dir.join("claude");
+        std::fs::write(
+            &claude,
+            "#!/bin/sh\nprintf 'args='; for arg in \"$@\"; do printf '<%s>' \"$arg\"; done; printf '\\nmodel=%s\\nbase=%s\\nkey=%s\\nauth=%s\\nconfig=%s\\n' \"$ANTHROPIC_MODEL\" \"$ANTHROPIC_BASE_URL\" \"$ANTHROPIC_API_KEY\" \"$ANTHROPIC_AUTH_TOKEN\" \"$CLAUDE_CONFIG_DIR\"\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let keys = [
+            "MINIMAX_API_KEY",
+            "DARK_FACTORY_MINIMAX_MODEL",
+            "ANTHROPIC_MODEL",
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CONFIG_DIR",
+        ];
+        let prior: Vec<_> = keys
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect();
+        unsafe {
+            std::env::set_var("MINIMAX_API_KEY", "explicit-minimax-key");
+            std::env::set_var("DARK_FACTORY_MINIMAX_MODEL", "MiniMax-Test-Model");
+            std::env::set_var("ANTHROPIC_MODEL", "stale-direct-model");
+            std::env::set_var("ANTHROPIC_BASE_URL", "https://stale.example");
+            std::env::set_var("ANTHROPIC_API_KEY", "stale-direct-key");
+            std::env::set_var("ANTHROPIC_AUTH_TOKEN", "stale-direct-token");
+            std::env::set_var("CLAUDE_CONFIG_DIR", "/home/operator/.claude");
+        }
+
+        let result = run_minimax_judge(claude.to_str().unwrap(), "minimax-prompt");
+
+        unsafe {
+            for (key, value) in prior {
+                if let Some(value) = value {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let output = result.expect("MiniMax shim should succeed");
+        assert!(
+            output.contains("args=<--print><--dangerously-skip-permissions><--setting-sources><><--model><MiniMax-Test-Model><minimax-prompt>"),
+            "MiniMax argv must pin the configured model: {output}"
+        );
+        assert!(output.contains("model=MiniMax-Test-Model"), "{output}");
+        assert!(
+            output.contains("base=https://api.minimax.io/anthropic"),
+            "{output}"
+        );
+        assert!(output.contains("key=explicit-minimax-key"), "{output}");
+        assert!(
+            output.contains("auth=\n"),
+            "direct Claude auth token leaked: {output}"
+        );
+        assert!(
+            output.contains("config=\n"),
+            "direct Claude config leaked: {output}"
+        );
     }
 }
 
