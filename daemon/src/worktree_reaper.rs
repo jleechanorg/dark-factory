@@ -599,6 +599,17 @@ fn quarantine_worktree_inner(
                 destination.display()
             ))
         })?;
+        // A cross-directory rename mutates both parent directories. Persist
+        // the source-name removal before recording the move as durable; a
+        // destination-only fsync can otherwise resurrect the old worktree
+        // name after a crash while leaving the quarantine copy visible.
+        // On failure the prepared manifest remains for startup reconciliation.
+        sync_directory(&root_fd).map_err(|e| {
+            DaemonError::Config(format!(
+                "worktree reaper: sync worktree root {} after move: {e}",
+                root.display()
+            ))
+        })?;
         sync_directory(&quarantine_fd).map_err(|e| {
             DaemonError::Config(format!(
                 "worktree reaper: sync quarantine {} after move: {e}",
