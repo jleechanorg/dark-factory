@@ -3348,7 +3348,11 @@ impl CliSessions {
             }
         };
         if let Some(spawn_error) = spawn_error {
-            return match run_tool("ao", &["session", "kill", &session.0], 30) {
+            return match run_tool(
+                "ao",
+                &["session", "kill", &session.0, "-p", &spec.ao_project],
+                30,
+            ) {
                 Ok(_) => Err(spawn_error),
                 Err(cleanup_error) => Err(DaemonError::SpawnCleanupFailed {
                     session: session.0,
@@ -3830,7 +3834,7 @@ mod spawn_classification_tests {
 mod ao_spawn_contract_tests {
     use super::{ao_spawn_bridge_path, gh_env_test_lock, CliSessions};
     use crate::errors::DaemonError;
-    use crate::tools::{Sessions, SpawnSpec};
+    use crate::tools::{SessionId, Sessions, SpawnSpec};
     use std::os::unix::fs::PermissionsExt;
 
     fn spec(prompt: &str, branch: &str) -> SpawnSpec {
@@ -3898,7 +3902,8 @@ import os
 import sys
 
 args = sys.argv[1:]
-if args[:2] == ["session", "kill"] and len(args) == 3:
+if args[:2] == ["session", "kill"] and len(args) == 5:
+    assert args[3:] == ["-p", "dark-factory"], args
     with open(os.environ["AO_FAKE_LOG"], "a", encoding="utf-8") as handle:
         handle.write(json.dumps({"kind": "kill", "args": args, "session": args[2]}) + "\n")
     if os.environ.get("AO_FAKE_KILL_FAIL") == "1":
@@ -4907,7 +4912,13 @@ export const isTerminalSession = () => false;
         assert_eq!(kills.len(), successful_spawns.len(), "calls={calls}");
         assert_eq!(
             kills[0]["args"],
-            serde_json::json!(["session", "kill", kills[0]["session"]])
+            serde_json::json!([
+                "session",
+                "kill",
+                kills[0]["session"],
+                "-p",
+                "dark-factory"
+            ])
         );
     }
 
@@ -5019,7 +5030,7 @@ with open(os.environ["AO_FAKE_CLEANUP_LOG"], "a", encoding="utf-8") as handle:
 if sys.argv[1] == "spawn":
     print("SESSION=missing-worktree-session")
     raise SystemExit(0)
-if sys.argv[1:] == ["session", "kill", "missing-worktree-session"]:
+if sys.argv[1:] == ["session", "kill", "missing-worktree-session", "-p", "dark-factory"]:
     raise SystemExit(0)
 raise SystemExit(9)
 "#,
@@ -5059,9 +5070,78 @@ raise SystemExit(9)
         assert!(result.is_err(), "missing Worktree must fail closed");
         assert_eq!(
             calls.last().unwrap(),
-            &serde_json::json!(["session", "kill", "missing-worktree-session"])
+            &serde_json::json!([
+                "session",
+                "kill",
+                "missing-worktree-session",
+                "-p",
+                "dark-factory"
+            ])
         );
         assert!(!calls.iter().any(|call| call == &serde_json::json!(["stop", "missing-worktree-session"])));
+    }
+
+    #[test]
+    fn session_stop_scopes_kill_to_configured_project() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "afd_ao_project_scoped_stop_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let log = root.join("calls.jsonl");
+        let fake_ao = root.join("ao");
+        std::fs::write(
+            &fake_ao,
+            r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+with open(os.environ["AO_FAKE_STOP_LOG"], "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(sys.argv[1:]) + "\n")
+if sys.argv[1:] == ["session", "kill", "scoped-session", "-p", "dark-factory"]:
+    raise SystemExit(0)
+raise SystemExit(9)
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_ao).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_ao, permissions).unwrap();
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_log = std::env::var("AO_FAKE_STOP_LOG").ok();
+        std::env::set_var("PATH", format!("{}:{old_path}", root.display()));
+        std::env::set_var("AO_FAKE_STOP_LOG", &log);
+
+        let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+        let result = sessions.stop(&SessionId("scoped-session".to_string()));
+
+        std::env::set_var("PATH", old_path);
+        match old_log {
+            Some(value) => std::env::set_var("AO_FAKE_STOP_LOG", value),
+            None => std::env::remove_var("AO_FAKE_STOP_LOG"),
+        }
+        let calls: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(result.is_ok(), "project-scoped kill must succeed: {result:?}");
+        assert_eq!(
+            calls,
+            vec![serde_json::json!([
+                "session",
+                "kill",
+                "scoped-session",
+                "-p",
+                "dark-factory"
+            ])]
+        );
     }
 
     #[test]
@@ -5086,7 +5166,7 @@ with open(os.environ["AO_FAKE_CLEANUP_LOG"], "a", encoding="utf-8") as handle:
 if sys.argv[1] == "spawn":
     print("SESSION=untracked-session")
     raise SystemExit(0)
-if sys.argv[1:] == ["session", "kill", "untracked-session"]:
+if sys.argv[1:] == ["session", "kill", "untracked-session", "-p", "dark-factory"]:
     print("scripted kill failure", file=sys.stderr)
     raise SystemExit(8)
 raise SystemExit(9)
@@ -5131,7 +5211,13 @@ raise SystemExit(9)
         );
         assert_eq!(
             calls.last().unwrap(),
-            &serde_json::json!(["session", "kill", "untracked-session"])
+            &serde_json::json!([
+                "session",
+                "kill",
+                "untracked-session",
+                "-p",
+                "dark-factory"
+            ])
         );
     }
 
@@ -6401,7 +6487,7 @@ impl Sessions for CliSessions {
     }
 
     fn stop(&self, id: &SessionId) -> Result<(), DaemonError> {
-        run_tool("ao", &["session", "kill", &id.0], 30)?;
+        run_tool("ao", &["session", "kill", &id.0, "-p", &self.project], 30)?;
         Ok(())
     }
 
