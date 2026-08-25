@@ -15614,6 +15614,12 @@ fn adopted_session_health_failure_with_succeeding_stop_clears_and_reaps() {
 
     let worktree = worktree_root.join("owner/repo/adopted-stop-ok");
     std::fs::create_dir_all(&worktree).unwrap();
+    let git_init = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&worktree)
+        .status()
+        .unwrap();
+    assert!(git_init.success());
     std::fs::write(worktree.join("marker"), b"reaped worker worktree").unwrap();
 
     store.overlays.borrow_mut().insert(
