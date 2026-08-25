@@ -25,12 +25,9 @@ from __future__ import annotations
 import json
 import pathlib
 import subprocess
-import sys
 from datetime import datetime, timedelta, timezone
 
 import pytest
-
-REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 from runner.funnel_lanes import (
     classify_origin,
@@ -41,6 +38,8 @@ from runner.funnel_lanes import (
     render_markdown,
 )
 from runner.funnel_report import parse_since
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 T0 = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 
@@ -105,6 +104,17 @@ def _write_fixture(tmp_path, rows=None):
 def _write_recent_fixture(tmp_path):
     base = datetime.now(timezone.utc) - timedelta(hours=1)
     return _write_fixture(tmp_path, rows=_build_rows(base))
+
+
+@pytest.mark.parametrize("non_object", [[], None, "valid JSON string"])
+def test_load_events_full_skips_valid_non_object_json(tmp_path, non_object):
+    path = tmp_path / "daemon.jsonl"
+    valid = _row("rev-after-non-object", 1, "INTAKE_BEAD_CREATED", 0)
+    path.write_text(f"{json.dumps(non_object)}\n{json.dumps(valid)}\n")
+
+    events = load_events_full(path, since=None, now=T0 + timedelta(days=1))
+
+    assert [event["bead_id"] for event in events] == ["rev-after-non-object"]
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +197,27 @@ def test_cross_attempt_origin_join_regression(tmp_path):
     assert bead_stat.total == 1
     assert bead_stat.furthest.get("READY_FOR_MERGE") == 1
     assert bead_stat.terminal.get("none") == 1
+
+
+def test_latest_recovery_routing_attempt_clears_older_terminal_divert(tmp_path):
+    rows = [
+        _row("rev-recovered", 1, "INTAKE_BEAD_CREATED", 0, context={}),
+        _row("rev-recovered", 1, "TASK_DISPATCHED", 10),
+        _row("rev-recovered", 1, "PARKED_HUMAN_HELD", 20),
+        # Attempt 2 has lifecycle activity but has not reached a main or side
+        # funnel event yet. Its existence makes attempt 1's park historical.
+        _row("rev-recovered", 2, "RECOVERED_FROM_HELD", 30),
+        _row("rev-recovered", 2, "TASK_ROUTED", 40),
+    ]
+    path = _write_fixture(tmp_path, rows=rows)
+    events = load_events_full(path, since=None, now=T0 + timedelta(days=1))
+
+    report = compute_lane_report(events, since_label="test")
+    bead_stat = next(stat for stat in report.lanes if stat.lane == "bead_start")
+
+    assert bead_stat.total == 1
+    assert bead_stat.furthest.get("TASK_DISPATCHED") == 1
+    assert bead_stat.terminal == {"none": 1}
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +332,6 @@ def test_main_invalid_since(tmp_path):
 
 
 def test_main_default_since_is_30d():
-    import runner.funnel_lanes as fl
     import argparse
 
     p = argparse.ArgumentParser()

@@ -103,6 +103,8 @@ def load_events_full(path: pathlib.Path, since=None, now=None) -> list[dict]:
                 raw = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(raw, dict):
+                continue
             evt = _normalize_full(raw)
             if evt is None:
                 continue
@@ -171,12 +173,17 @@ def compute_lane_report(events: list[dict], since_label: str = "") -> LaneReport
     origin = classify_origin(events)  # bead_id -> lane
 
     bead_events: dict[str, list[tuple[int, str]]] = {}
+    latest_attempt_by_bead: dict[str, int] = {}
     for evt in events:
-        et = evt["event_type"]
-        if et not in _MAIN_SET and et not in _SIDE_SET:
-            continue
         bead_id = evt["bead_id"]
         if bead_id not in origin:
+            continue
+        latest_attempt_by_bead[bead_id] = max(
+            latest_attempt_by_bead.get(bead_id, evt["attempt_id"]),
+            evt["attempt_id"],
+        )
+        et = evt["event_type"]
+        if et not in _MAIN_SET and et not in _SIDE_SET:
             continue
         bead_events.setdefault(bead_id, []).append((evt["attempt_id"], et))
 
@@ -191,8 +198,8 @@ def compute_lane_report(events: list[dict], since_label: str = "") -> LaneReport
         furthest = max(main_hit, key=lambda x: _STAGE_RANK[x]) if main_hit else "INTAKE_ONLY"
         stat.furthest[furthest] = stat.furthest.get(furthest, 0) + 1
 
-        if evs:
-            latest_attempt = max(a for a, _et in evs)
+        latest_attempt = latest_attempt_by_bead.get(bead_id)
+        if latest_attempt is not None:
             latest_side = [et for (a, et) in evs if a == latest_attempt and et in _SIDE_SET]
             terminal = latest_side[-1] if latest_side else "none"
         else:
