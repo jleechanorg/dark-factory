@@ -240,6 +240,17 @@ fn sync_directory(parent: &DirectoryFd) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
+fn directory_identity(parent: &DirectoryFd) -> std::io::Result<(libc::dev_t, libc::ino_t)> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let rc = unsafe { libc::fstat(parent.0, stat.as_mut_ptr()) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok((stat.st_dev, stat.st_ino))
+}
+
+#[cfg(unix)]
 fn write_manifest_line(
     parent: &DirectoryFd,
     manifest_name: &str,
@@ -395,6 +406,9 @@ fn quarantine_worktree_inner(
             )));
         }
     };
+    let quarantine_identity = directory_identity(&quarantine_fd).map_err(|e| {
+        DaemonError::Config(format!("worktree reaper: identify quarantine directory: {e}"))
+    })?;
     #[cfg(test)]
     if let Some(outside) = swap_after_open {
         let backup = root.join(".quarantine-original");
@@ -418,8 +432,6 @@ fn quarantine_worktree_inner(
         let prepared = serde_json::json!({
             "state": "prepared",
             "agent_id": agent_id,
-            "original_path": path.display().to_string(),
-            "quarantined_path": destination.display().to_string(),
             "recorded_at_epoch_secs": stamp,
         });
         write_manifest_line(&quarantine_fd, &manifest_name, &prepared, true).map_err(|e| {
@@ -450,6 +462,19 @@ fn quarantine_worktree_inner(
         })?;
         if linked {
             repair_linked_worktree(&quarantine_fd, &stem)?;
+        }
+        let current_quarantine = open_directory(&quarantine_root).map_err(|e| {
+            DaemonError::Config(format!(
+                "worktree reaper: quarantine directory changed during move: {e}"
+            ))
+        })?;
+        let current_identity = directory_identity(&current_quarantine).map_err(|e| {
+            DaemonError::Config(format!("worktree reaper: identify quarantine after move: {e}"))
+        })?;
+        if current_identity != quarantine_identity {
+            return Err(DaemonError::Config(
+                "worktree reaper: quarantine directory changed during move; recovery remains in the verified directory".into(),
+            ));
         }
         let moved = serde_json::json!({
             "state": "moved",
@@ -602,6 +627,9 @@ fn reconcile_quarantine(root: &Path) -> Result<(), DaemonError> {
             )))
         }
     };
+    let quarantine_identity = directory_identity(&quarantine_fd).map_err(|e| {
+        DaemonError::Config(format!("worktree reaper: identify reconciliation directory: {e}"))
+    })?;
     for manifest_name in directory_names(&quarantine_fd).map_err(|e| {
         DaemonError::Config(format!("worktree reaper: enumerate quarantine: {e}"))
     })? {
@@ -635,11 +663,23 @@ fn reconcile_quarantine(root: &Path) -> Result<(), DaemonError> {
         })? {
             repair_linked_worktree(&quarantine_fd, stem)?;
         }
+        let current_quarantine = open_directory(&root.join(QUARANTINE_DIR_NAME)).map_err(|e| {
+            DaemonError::Config(format!(
+                "worktree reaper: quarantine directory changed during reconciliation: {e}"
+            ))
+        })?;
+        if directory_identity(&current_quarantine).map_err(|e| {
+            DaemonError::Config(format!("worktree reaper: identify reconciliation directory: {e}"))
+        })? != quarantine_identity
+        {
+            return Err(DaemonError::Config(
+                "worktree reaper: quarantine directory changed during reconciliation".into(),
+            ));
+        }
         let moved = serde_json::json!({
             "state": "moved",
             "agent_id": record.get("agent_id").cloned().unwrap_or(serde_json::Value::Null),
-            "original_path": record.get("original_path").cloned().unwrap_or(serde_json::Value::Null),
-            "quarantined_path": record.get("quarantined_path").cloned().unwrap_or(serde_json::Value::Null),
+            "quarantined_path": root.join(QUARANTINE_DIR_NAME).join(stem).display().to_string(),
             "reconciled": true,
         });
         write_manifest_line(&quarantine_fd, &manifest_name, &moved, false).map_err(|e| {
@@ -1449,7 +1489,7 @@ mod tests {
         init_git_worktree(&target);
         fs::write(target.join("tracked.txt"), "must survive handle swap\n").unwrap();
 
-        quarantine_worktree_inner(&repo_root, &target, "df-handle-race", Some(&outside)).unwrap();
+        assert!(quarantine_worktree_inner(&repo_root, &target, "df-handle-race", Some(&outside)).is_err());
         assert!(!target.exists());
         assert!(fs::read_dir(&outside).unwrap().next().is_none());
         let backup = repo_root.join(".quarantine-original");
@@ -1462,6 +1502,16 @@ mod tests {
         assert_eq!(
             fs::read_to_string(recovered.join("tracked.txt")).unwrap(),
             "must survive handle swap\n"
+        );
+        let manifest = fs::read_dir(&backup)
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| entry.path().is_file())
+            .map(|entry| fs::read_to_string(entry.path()).unwrap())
+            .unwrap();
+        assert!(
+            !manifest.contains("quarantined_path"),
+            "a swapped pathname must never be published as a recovery path"
         );
         let _ = fs::remove_file(repo_root.join(".quarantine"));
         let _ = fs::remove_dir_all(&root);
