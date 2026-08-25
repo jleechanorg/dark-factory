@@ -14993,6 +14993,300 @@ fn test_worktree_cleaned_up_on_coder_session_exit_promotion() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+/// PR #755 Slice 4: Idle promotion must NOT delete a still-running worker.
+/// The fast-tier DISPATCHED->ATTESTED promotion path on
+/// `tick::run_fast_tier` calls `deps.sessions.stop(&sid)` when
+/// `session_activity` reports `Idle` and IGNORES the result
+/// (`let _ = deps.sessions.stop(&sid); true`) — if `stop()` fails
+/// transiently (e.g. AO still has the session alive but our RPC timed
+/// out), the code below still proceeds to `clean_stale_worktree` which
+/// deletes the AO-managed worktree dir while the worker is still
+/// running. This is the U4-class zero-touch blocker: a deleted
+/// worktree + a still-running worker is an undefined-state wedge. The
+/// fix: when `stop()` returns Err, treat the Idle signal as
+/// unconfirmed — DO NOT promote (return false), DO NOT clean the
+/// worktree, preserve the session handle, and emit
+/// `IDLE_STOP_FAILED_NO_PROMOTION` telemetry so the wedge is auditable.
+/// A subsequent fresh `Terminal`/`NotFound` observation (or successful
+/// stop) is the ONLY signal that authorizes promotion.
+#[test]
+fn tick_idle_promotion_with_failing_stop_does_not_promote_or_clean_worktree() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = false; // force the Idle branch (default true would short-circuit)
+    sessions.set_activity(daemon::tools::SessionActivity::Idle);
+    sessions.fail_stop_for("idle-stop-fail");
+
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let worktree_root = std::env::temp_dir().join(format!(
+        "afd_slice4_idle_stop_fail_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let cfg = Config {
+        agent_worktree_root: Some(worktree_root.display().to_string()),
+        ..test_cfg()
+    };
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_slice4_idle_stop_fail.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    // A live AO-managed worktree the still-running worker depends on.
+    // The slice 4 fix must NOT delete this even though session_activity
+    // said "Idle" — the failing stop() means the worker is still live.
+    let live_worktree = worktree_root.join("owner/repo/idle-stop-fail");
+    std::fs::create_dir_all(&live_worktree).unwrap();
+    std::fs::write(live_worktree.join("marker"), b"live coder worktree").unwrap();
+
+    store.overlays.borrow_mut().insert(
+        "idle-stop-fail-bead".into(),
+        BeadOverlay {
+            bead_id: "idle-stop-fail-bead".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(1101),
+            branch: Some("fix/slice4-idle-stop".into()),
+            session_id: Some("idle-stop-fail".into()),
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+    store
+        .register_branch("idle-stop-fail-bead", "fix/slice4-idle-stop")
+        .unwrap();
+
+    scm.pr_numbers_for_branch.insert(
+        ("owner/repo".into(), "fix/slice4-idle-stop".into()),
+        Some(1101),
+    );
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 1101),
+        daemon::tools::PrHeadBranch::SameRepo("fix/slice4-idle-stop".into()),
+    );
+    scm.pr_snapshots.insert(
+        1101,
+        PrSnapshot {
+            pr_number: 1101,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "head-1101".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        0,
+        10,
+    )
+    .expect("tick must isolate the failing stop and continue");
+
+    let overlay = store.load("idle-stop-fail-bead").unwrap().unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::Dispatched,
+        "Idle promotion with failing stop() must NOT promote to ATTESTED — \
+         the worker is still live; got {:?}",
+        overlay.state
+    );
+    assert_eq!(
+        overlay.session_id.as_deref(),
+        Some("idle-stop-fail"),
+        "session handle MUST be preserved so the next tick (with a fresh \
+         Terminal/NotFound probe) can retry; got {:?}",
+        overlay.session_id
+    );
+    assert!(
+        live_worktree.is_dir(),
+        "live worktree MUST NOT be deleted when stop() failed — the worker \
+         is still running and depends on this dir; deleted-by-bug would \
+         leave an undefined-state wedge (live worker, missing worktree)"
+    );
+
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("IDLE_STOP_FAILED_NO_PROMOTION"),
+        "the safety action MUST emit IDLE_STOP_FAILED_NO_PROMOTION telemetry so \
+         the wedge is auditable from the daemon log alone; full log: {log}"
+    );
+    assert!(
+        !log.contains("WORKTREE_CLEANED_ON_SESSION_EXIT"),
+        "WORKTREE_CLEANED_ON_SESSION_EXIT must NOT fire when stop() failed; full log: {log}"
+    );
+    assert!(
+        summary.beads_parked_human_held == 0,
+        "the safety action must NOT park the bead — it must stay DISPATCHED \
+         with the session handle preserved; got {} HUMAN_HELD",
+        summary.beads_parked_human_held
+    );
+
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Slice 4 control: when the Idle path's `stop()` succeeds (the common
+/// case), the bead DOES promote to ATTESTED and the worktree IS cleaned
+/// in the same tick. This pins the regression — the slice 4 fix must
+/// narrow the safety guard to ONLY the failure path, not break the
+/// happy path.
+#[test]
+fn tick_idle_promotion_with_succeeding_stop_promotes_and_cleans() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    sessions.set_activity(daemon::tools::SessionActivity::Idle);
+    // No fail_stop_for("idle-ok") — stop() succeeds.
+
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let worktree_root = std::env::temp_dir().join(format!(
+        "afd_slice4_idle_ok_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let cfg = Config {
+        agent_worktree_root: Some(worktree_root.display().to_string()),
+        ..test_cfg()
+    };
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_slice4_idle_ok.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let worktree = worktree_root.join("owner/repo/idle-ok");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(worktree.join("marker"), b"idle worker worktree").unwrap();
+
+    store.overlays.borrow_mut().insert(
+        "idle-ok-bead".into(),
+        BeadOverlay {
+            bead_id: "idle-ok-bead".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(1102),
+            branch: Some("fix/slice4-idle-ok".into()),
+            session_id: Some("idle-ok".into()),
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+    store.register_branch("idle-ok-bead", "fix/slice4-idle-ok").unwrap();
+
+    scm.pr_numbers_for_branch.insert(
+        ("owner/repo".into(), "fix/slice4-idle-ok".into()),
+        Some(1102),
+    );
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 1102),
+        daemon::tools::PrHeadBranch::SameRepo("fix/slice4-idle-ok".into()),
+    );
+    scm.pr_snapshots.insert(
+        1102,
+        PrSnapshot {
+            pr_number: 1102,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "head-1102".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let _ = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        0,
+        10,
+    )
+    .expect("happy-path tick must succeed");
+
+    let overlay = store.load("idle-ok-bead").unwrap().unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::Attested,
+        "Idle promotion with successful stop() MUST still promote; got {:?}",
+        overlay.state
+    );
+    assert_eq!(
+        overlay.session_id, None,
+        "session handle MUST be cleared after a successful reap"
+    );
+    assert!(
+        !worktree.is_dir(),
+        "worktree MUST be cleaned on the successful-stop happy path"
+    );
+
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("WORKTREE_CLEANED_ON_SESSION_EXIT"),
+        "happy path must emit WORKTREE_CLEANED_ON_SESSION_EXIT; full log: {log}"
+    );
+    assert!(
+        !log.contains("IDLE_STOP_FAILED_NO_PROMOTION"),
+        "happy path must NOT emit IDLE_STOP_FAILED_NO_PROMOTION; full log: {log}"
+    );
+
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 #[test]
 fn session_health_failure_reaps_session_and_requeues_bead() {
     let scm = FakeScm::new();

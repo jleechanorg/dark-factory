@@ -4651,8 +4651,44 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             } else {
                                 match deps.sessions.session_activity(&sid) {
                                     Ok(crate::tools::SessionActivity::Idle) => {
-                                        let _ = deps.sessions.stop(&sid);
-                                        true
+                                        // PR #755 Slice 4: a successful stop() is the
+                                        // ONLY signal that authorizes the Idle
+                                        // promotion to ATTESTED + the worktree
+                                        // reap below. If stop() returns Err, the
+                                        // worker is still live (transient RPC
+                                        // failure, AO still has the session,
+                                        // etc.); promoting + cleaning the
+                                        // worktree would leave a U4-class
+                                        // undefined-state wedge (live worker,
+                                        // missing worktree). Treat the Idle
+                                        // signal as unconfirmed — preserve the
+                                        // session handle, DO NOT promote, DO
+                                        // NOT clean the worktree, and emit
+                                        // IDLE_STOP_FAILED_NO_PROMOTION so the
+                                        // wedge is auditable. A subsequent
+                                        // fresh `Terminal`/`NotFound`
+                                        // observation (or a successful stop)
+                                        // is the only path to promotion.
+                                        match deps.sessions.stop(&sid) {
+                                            Ok(()) => true,
+                                            Err(stop_err) => {
+                                                let _ = emit(
+                                                    deps.telemetry_log,
+                                                    bead_id,
+                                                    overlay.attempt,
+                                                    OverlayState::Dispatched.as_str(),
+                                                    "IDLE_STOP_FAILED_NO_PROMOTION",
+                                                    serde_json::json!({}),
+                                                    serde_json::json!({
+                                                        "session_id": session_id_str,
+                                                        "branch": overlay.branch,
+                                                        "stop_error": format!("{stop_err:?}"),
+                                                        "action": "kept_dispatched_session_handle_preserved_worktree_not_cleaned",
+                                                    }),
+                                                );
+                                                false
+                                            }
+                                        }
                                     }
                                     Ok(
                                         crate::tools::SessionActivity::Terminal
@@ -4714,6 +4750,21 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                 );
                             }
                         }
+                    }
+                    // PR #755 Slice 4: when an adopted bead's session
+                    // reap was blocked because stop() returned Err
+                    // (see the IDLE_STOP_FAILED_NO_PROMOTION branch
+                    // above), `ready_to_promote` is false. The bead
+                    // stays DISPATCHED with its session handle intact —
+                    // we MUST skip BOTH the worktree clean (the live
+                    // worker depends on it) AND the PR_OPENED promotion
+                    // below (which would mark the bead Attested and
+                    // route gate assessment at a session that is still
+                    // live). The bead re-enters this branch on the next
+                    // tick once `stop()` succeeds or a fresh
+                    // Terminal/NotFound observation arrives.
+                    if overlay.is_adopted && !ready_to_promote {
+                        continue;
                     }
                     // A positive branch-to-open-PR binding is the durable
                     // boundary between the deferred old attempt and this
