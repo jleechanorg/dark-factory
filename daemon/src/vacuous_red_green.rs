@@ -1863,17 +1863,20 @@ fn run_pytest_baseline_check(
         )));
     }
 
-    let baseline_manifest = manifest.map(|m| {
-        if m.is_absolute() {
-            m.to_path_buf()
-        } else {
-            tmp.join(m)
-        }
-    });
+    // `test_files` and `manifest` are resolved against the PR target
+    // worktree. Rebase them into the detached baseline before invoking
+    // pytest; retaining absolute head paths here would silently execute the
+    // PR checkout during the baseline phase and invalidate red/green's
+    // baseline contract.
+    let baseline_test_files: Vec<PathBuf> = test_files
+        .iter()
+        .map(|path| rebase_worktree_path(repo_root, &tmp, path))
+        .collect();
+    let baseline_manifest = manifest.map(|path| rebase_worktree_path(repo_root, &tmp, path));
 
     let result = run_pytest_tests(
         &tmp,
-        test_files,
+        &baseline_test_files,
         targeted_tests,
         baseline_manifest.as_deref(),
         pytest_loc,
@@ -1894,6 +1897,20 @@ fn run_pytest_baseline_check(
     let _ = std::fs::remove_dir_all(&tmp);
 
     result
+}
+
+/// Rebase a path resolved in `repo_root` into a detached worktree. Relative
+/// paths are interpreted from the repository root; absolute paths outside the
+/// repository are preserved because callers may intentionally pass an
+/// external interpreter/configuration path.
+fn rebase_worktree_path(repo_root: &Path, worktree: &Path, path: &Path) -> PathBuf {
+    if let Ok(relative) = path.strip_prefix(repo_root) {
+        worktree.join(relative)
+    } else if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        worktree.join(path)
+    }
 }
 
 // Tiny smoke test — the integration suite under `tests/` is the real proof.
@@ -2245,6 +2262,89 @@ fn b() {
         );
         let found = find_cargo_manifest_recursive(&dir, 6).unwrap();
         assert!(found.ends_with("Cargo.toml"));
+    }
+
+    #[test]
+    fn pytest_baseline_rebases_head_paths_into_detached_worktree() {
+        // This fixture intentionally has different head imports/configuration
+        // from base. Only the detached base worktree can collect and pass the
+        // test; using the original absolute head paths must fail.
+        let dir = tempdir_unique("pytest-baseline-rebase");
+        std::fs::create_dir_all(dir.join("src/pkg")).unwrap();
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            "[project]\nname='baseline-rebase'\n\n[tool.pytest.ini_options]\npythonpath=['src']\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/pkg/__init__.py"), "").unwrap();
+        std::fs::write(dir.join("src/pkg/value.py"), "def value():\n    return 'base'\n").unwrap();
+        std::fs::write(
+            dir.join("tests/test_value.py"),
+            "from pkg.value import value\n\ndef test_value():\n    assert value() == 'base'\n",
+        )
+        .unwrap();
+        let run = |args: &[&str]| {
+            let out = Command::new(args[0])
+                .current_dir(&dir)
+                .args(&args[1..])
+                .output()
+                .expect("spawn fixture command");
+            assert!(
+                out.status.success(),
+                "fixture command {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["git", "init", "-q", "-b", "main"]);
+        run(&["git", "config", "user.email", "pytest@example.com"]);
+        run(&["git", "config", "user.name", "pytest"]);
+        run(&["git", "add", "."]);
+        run(&["git", "commit", "-q", "-m", "base"]);
+        let base = String::from_utf8(
+            Command::new("git")
+                .current_dir(&dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+
+        // Head deliberately changes both pytest configuration and the test
+        // import/assertion. It is not expected to pass; the regression calls
+        // only the baseline phase and must use the detached base files.
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            "[project]\nname='baseline-rebase-head'\n\n[tool.pytest.ini_options]\npythonpath=['.']\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tests/test_value.py"),
+            "from pkg.value import value\n\ndef test_value():\n    assert value() == 'head'\n",
+        )
+        .unwrap();
+        run(&["git", "add", "."]);
+        run(&["git", "commit", "-q", "-m", "head"]);
+
+        let test_files = vec![dir.join("tests/test_value.py")];
+        let manifest = dir.join("pyproject.toml");
+        let result = run_pytest_baseline_check(
+            &dir,
+            &base,
+            &test_files,
+            &["test_value".to_owned()],
+            Some(&manifest),
+            PytestLocation::OnPath,
+        )
+        .expect("detached baseline pytest should run");
+        assert!(
+            result.all_passed(),
+            "detached base test must pass after path rebasing: {result:?}"
+        );
     }
 
     /// Create a unique temp directory under `std::env::temp_dir()`. The

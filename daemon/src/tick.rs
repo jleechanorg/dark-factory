@@ -4068,11 +4068,15 @@ fn vacuous_red_green_for_pr(
 /// routed as `Test` so `compute_targeted_python_test_fns` can select the
 /// changed test functions.
 fn classify_vacuous_changed_file(path: &str) -> crate::vacuous_red_green::FileClass {
+    let basename = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path);
     if path.contains("/tests/")
         || path.starts_with("tests/")
         || path.ends_with("_test.rs")
-        || path.starts_with("test_")
-        || path.ends_with("_test.py")
+        || basename.starts_with("test_")
+        || basename.ends_with("_test.py")
     {
         crate::vacuous_red_green::FileClass::Test
     } else {
@@ -4117,10 +4121,14 @@ mod vacuous_red_green_routing_tests {
 
     #[test]
     fn python_target_worktree_routes_to_pytest_and_runs_targeted_test() {
-        if Command::new("pytest").arg("--version").output().is_err() {
-            eprintln!("pytest not on PATH; skipping routed Python gate regression");
-            return;
-        }
+        assert!(
+            Command::new("pytest")
+                .arg("--version")
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false),
+            "pytest is required for the routed Python gate regression"
+        );
 
         let root = temp_fixture("python_gate8");
         std::fs::create_dir_all(root.join("pkg")).unwrap();
@@ -4165,6 +4173,18 @@ mod vacuous_red_green_routing_tests {
         assert_eq!(manifest.file_name().and_then(|n| n.to_str()), Some("pyproject.toml"));
         assert_eq!(classify_vacuous_changed_file("pkg/value.py"), FileClass::Production);
         assert_eq!(classify_vacuous_changed_file("tests/test_value.py"), FileClass::Test);
+        assert_eq!(
+            classify_vacuous_changed_file("pkg/test_widget.py"),
+            FileClass::Test
+        );
+        assert_eq!(
+            classify_vacuous_changed_file("test_root.py"),
+            FileClass::Test
+        );
+        assert_eq!(
+            classify_vacuous_changed_file("pkg/widget.py"),
+            FileClass::Production
+        );
 
         let changed = vec![
             (root.join("pkg/value.py"), FileClass::Production),

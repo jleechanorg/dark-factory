@@ -78,9 +78,10 @@ requires-python = ">=3.11"
 "#;
     std::fs::write(root.join("pyproject.toml"), pyproject).unwrap();
 
-    // Base tree: an empty package + no production code. The "production
-    // diff" added by the PR is the body of `classify_score`; the test
-    // diff is the test file.
+    // Base tree: a package with the pre-PR implementation and its baseline
+    // tests. Keeping both files in the base commit is important: the pytest
+    // baseline phase must execute the detached base paths, not accidentally
+    // reuse absolute paths from the PR head.
     std::fs::create_dir_all(root.join("vacuous_py")).unwrap();
     std::fs::write(
         root.join("vacuous_py").join("__init__.py"),
@@ -89,7 +90,17 @@ requires-python = ">=3.11"
     .unwrap();
     std::fs::write(
         root.join("vacuous_py").join("score.py"),
-        "\"\"\"base stub — production code is added by the PR.\"\"\"\n",
+        BASE_PROD,
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    std::fs::write(root.join("tests").join("__init__.py"), "").unwrap();
+    std::fs::write(
+        root.join("tests").join("test_scenario.py"),
+        match kind {
+            ProjectKind::GenuineRedGreen => BASE_GENUINE_TEST,
+            ProjectKind::VacuousAlwaysGreen => BASE_VACUOUS_TEST,
+        },
     )
     .unwrap();
 
@@ -112,9 +123,8 @@ requires-python = ">=3.11"
     .trim()
     .to_string();
 
-    // PR delta: the production code goes into the package, the test goes
-    // into a top-level `tests/` directory. pytest's default discovery
-    // finds both naming conventions.
+    // PR delta: update the production code and targeted tests. pytest's
+    // default discovery finds the top-level test module in both commits.
     let prod_src = match kind {
         ProjectKind::GenuineRedGreen => GENUINE_PROD,
         ProjectKind::VacuousAlwaysGreen => VACUOUS_PROD,
@@ -125,10 +135,7 @@ requires-python = ">=3.11"
     };
     std::fs::write(root.join("vacuous_py").join("score.py"), prod_src).unwrap();
 
-    let tests_dir = root.join("tests");
-    std::fs::create_dir_all(&tests_dir).unwrap();
-    std::fs::write(tests_dir.join("__init__.py"), "").unwrap();
-    let test_path = tests_dir.join("test_scenario.py");
+    let test_path = root.join("tests").join("test_scenario.py");
     std::fs::write(&test_path, test_src).unwrap();
 
     MiniPythonProject { root, base_sha }
@@ -185,10 +192,30 @@ fn classify_changed_files(proj: &MiniPythonProject) -> Vec<(PathBuf, FileClass)>
         .collect()
 }
 
-// The Python "production" function is identical for both kinds — the
-// vacuous verdict is about what the test asserts, not what the prod
-// function does. This mirrors the Rust fixture where both kinds ship
-// the same `classify_score` body.
+// The baseline implementation deliberately returns "low" for every input;
+// the genuine PR changes it to the threshold implementation below. Keeping
+// a passing baseline test in the base commit proves the detached-baseline
+// phase is actually running base files.
+const BASE_PROD: &str = r#"
+def classify_score(_n):
+    return "low"
+"#;
+
+const BASE_GENUINE_TEST: &str = r#"from vacuous_py.score import classify_score
+
+
+def test_classify_high():
+    assert classify_score(95) == "low"
+
+
+def test_classify_medium():
+    assert classify_score(70) == "low"
+
+
+def test_classify_low():
+    assert classify_score(10) == "low"
+"#;
+
 const GENUINE_PROD: &str = r#"
 def classify_score(n):
     if n >= 90:
@@ -237,6 +264,21 @@ def test_string_literal_length():
 
 def test_range_check():
     x = 50
+    assert 0 <= x <= 200
+"#;
+
+const BASE_VACUOUS_TEST: &str = r#"
+def test_two_plus_two_is_four():
+    assert 3 + 3 == 6
+
+
+def test_string_literal_length():
+    s = "world"
+    assert len(s) == 5
+
+
+def test_range_check():
+    x = 51
     assert 0 <= x <= 200
 "#;
 
