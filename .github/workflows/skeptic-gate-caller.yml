@@ -70,8 +70,11 @@ on:
 
 permissions:
   contents: read
-  pull-requests: read
-  statuses: read
+  # Reusable-workflow calls may only retain (not elevate) the caller's
+  # token permissions.  The SHA-bound callee posts the skeptic comment and
+  # commit status, so both scopes must be write-capable here as well.
+  pull-requests: write
+  statuses: write
 
 jobs:
   config-check:

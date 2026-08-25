@@ -39,6 +39,7 @@ import pathlib
 import re
 
 import pytest
+import yaml
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 CALLER_PATH = REPO_ROOT / ".github" / "workflows" / "skeptic-gate-caller.yml"
@@ -247,6 +248,36 @@ def test_pinned_sha_matches_caller_self_pin() -> None:
 # ---------------------------------------------------------------------------
 
 GATE_PATH = REPO_ROOT / ".github" / "workflows" / "skeptic-gate.yml"
+
+def _assert_caller_permission_lattice(caller_text: str, callee_text: str) -> None:
+    """Require caller permissions to retain every write scope the callee needs.
+
+    GitHub intersects permissions across a reusable-workflow boundary; a
+    caller cannot elevate a read grant to the callee's declared write grant.
+    The gate's top-level contract therefore makes ``pull-requests`` and
+    ``statuses`` write-capable in both files.  Contents remains read-only.
+    """
+    caller = yaml.safe_load(caller_text)
+    callee = yaml.safe_load(callee_text)
+    assert isinstance(caller, dict) and isinstance(callee, dict), (
+        "caller and callee workflows must both parse as YAML mappings"
+    )
+    caller_permissions = caller.get("permissions") or {}
+    callee_permissions = callee.get("permissions") or {}
+    assert isinstance(caller_permissions, dict), "caller permissions must be a mapping"
+    assert isinstance(callee_permissions, dict), "callee permissions must be a mapping"
+
+    for scope, required in callee_permissions.items():
+        if required != "write":
+            continue
+        assert caller_permissions.get(scope) == "write", (
+            f"caller permission {scope!r} must be `write` because the reusable "
+            f"callee declares `{scope}: write`; GitHub cannot elevate a caller "
+            "token across the workflow boundary"
+        )
+    assert caller_permissions.get("contents") == "read", (
+        "caller must keep contents read-only; the gate does not need write access"
+    )
 
 SIX_PIN_VARS = (
     "SKEPTIC_CODEX_BIN",
@@ -509,3 +540,33 @@ def test_red_first_fail_closed_check_catches_removed_exit_or_reintroduced_defaul
         _assert_fail_closed_pin_var_step_unmodified(
             reintroduced_default, "synthetic-mutated-reintroduced-default"
         )
+
+
+def test_caller_retains_callee_write_permission_lattice() -> None:
+    """A reusable caller cannot downgrade the gate's API permissions.
+
+    ``skeptic-gate.yml`` posts a pull-request comment and a commit status.
+    GitHub rejects the workflow before jobs start when this caller grants
+    either scope only ``read`` (the callee's ``write`` request cannot elevate
+    the caller token).  Parse both workflow files so this catches the actual
+    startup failure rather than merely checking a text fragment.
+    """
+    _assert_caller_permission_lattice(_caller_text(), _gate_text())
+
+
+def test_red_first_permission_lattice_catches_read_downgrade() -> None:
+    """The permission assertion must fail when either write scope regresses."""
+    caller = _caller_text()
+    callee = _gate_text()
+    _assert_caller_permission_lattice(caller, callee)
+
+    for scope in ("pull-requests", "statuses"):
+        mutated = re.sub(
+            rf"(?m)^(\s*{re.escape(scope)}:)\s*write\s*$",
+            rf"\1 read",
+            caller,
+            count=1,
+        )
+        assert mutated != caller, f"test mutation failed to find {scope} permission"
+        with pytest.raises(AssertionError, match=rf"{re.escape(scope)}.*write"):
+            _assert_caller_permission_lattice(mutated, callee)
