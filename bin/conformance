@@ -107,7 +107,7 @@ def _diagnostic(rule: str, severity: str, message: str, node_id: str | None = No
 # are exempt so iteration lanes don't fight the rule.
 
 _LEVEL5_HARD_TIER_REVIEWERS = ("codex exec", "agy --print", "claude -p")
-_LEVEL5_PARALLEL_REVIEWER_PRIORITY = ("codex", "minimax", "agy", "claude-sonnet")
+_LEVEL5_PARALLEL_REVIEWER_PRIORITY = ("codex", "minimax", "agy")
 
 
 def _vendor_name(name: str) -> str:

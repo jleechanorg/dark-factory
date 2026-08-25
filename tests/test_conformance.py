@@ -4,6 +4,7 @@ import json
 import pathlib
 import subprocess
 import sys
+import re
 
 ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
@@ -65,6 +66,16 @@ def test_conformance_list_handlers():
     text = json.dumps(payload)
     assert "codergen" in text
     assert "holdout_eval" in text
+
+
+def test_level5_parallel_priority_excludes_claude_sonnet_but_keeps_vocabulary():
+    source = (ROOT / "bin" / "conformance").read_text(encoding="utf-8")
+    match = re.search(
+        r"_LEVEL5_PARALLEL_REVIEWER_PRIORITY\s*=\s*\(([^)]*)\)", source
+    )
+    assert match, "parallel reviewer priority tuple missing"
+    assert "claude-sonnet" not in match.group(1)
+    assert '"claude-sonnet"' in source  # recognition remains available
 
 
 import pytest

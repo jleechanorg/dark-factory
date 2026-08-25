@@ -19,8 +19,8 @@ from __future__ import annotations
 from .catalog import load_catalog
 from .graph_ir import GUARANTEED_NODES, EdgeIR, GraphIR, NodeIR
 
-DEFAULT_CODER_BACKEND = "claude"
-DEFAULT_CODER_MODEL = "claude-sonnet-4-6"
+DEFAULT_CODER_BACKEND = "codex"
+DEFAULT_CODER_MODEL = None
 
 
 def deterministic_generator(

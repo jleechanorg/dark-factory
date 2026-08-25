@@ -42,8 +42,10 @@ def main(argv: list[str] | None = None) -> int:
                          "so the core measurement isolates the middle and runs at large n)")
     ap.add_argument("--no-spine", dest="spine", action="store_false",
                     help="skip the reviewer spine (default)")
-    ap.add_argument("--backend", default="claude")
-    ap.add_argument("--model", dest="model_name", default="claude-sonnet-4-6")
+    ap.add_argument("--backend", default="codex",
+                    help="coder backend (default: codex; Claude requires explicit opt-in)")
+    ap.add_argument("--model", dest="model_name", default=None,
+                    help="optional coder model (no implicit Sonnet default)")
     ap.add_argument("--workroot", type=pathlib.Path, default=pathlib.Path("/tmp/wfgg-smoke"))
     ap.add_argument("--out", dest="out_path", type=pathlib.Path,
                     default=pathlib.Path("/tmp/wfgg-smoke/records.jsonl"))
