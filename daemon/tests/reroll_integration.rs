@@ -223,7 +223,7 @@ fn test_reroll_success() {
     let llm = FakeLlm::new();
     // mock LLM reply for constraint extraction
     *llm.response.borrow_mut() = Some(Ok(
-        r#"{"inhibitionSpecs":["no print"],"positiveAssertions":["log errors"],"securityRedactionEncountered":false}"#.into()
+        r#"{"inhibitionSpecs":["no \\ path\nline\r\n\t\u0001 🦀"],"positiveAssertions":["log \"quoted\" [table] = 1"],"securityRedactionEncountered":false}"#.into()
     ));
 
     let mut cfg = test_cfg();
@@ -266,8 +266,8 @@ fn test_reroll_success() {
         llm: &llm,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        reviewer: "skeptic".into(),
-        review_text: "Don't \"\"\" print to stdout, log errors.".into(),
+        reviewer: "skeptic\"\n[forged]".into(),
+        review_text: "Don't \"\"\" print\r\n\\tab\t🦀\n[[forged]]".into(),
     };
 
     let outcome = reroll::execute(&deps, &mut bead).unwrap();
@@ -285,7 +285,10 @@ fn test_reroll_success() {
     assert_eq!(updated.reroll_count, 1);
     let spec = std::fs::read_to_string(spec_dir.join("bead-success.toml")).unwrap();
     let parsed: toml::Value = toml::from_str(&spec).expect("reroll spec remains valid TOML");
-    assert_eq!(parsed["reroll"][0]["raw_feedback"].as_str(), Some("Don't \"\"\" print to stdout, log errors."));
+    assert_eq!(parsed["reroll"][0]["reviewer"].as_str(), Some("skeptic\"\n[forged]"));
+    assert_eq!(parsed["reroll"][0]["raw_feedback"].as_str(), Some("Don't \"\"\" print\r\n\\tab\t🦀\n[[forged]]"));
+    assert_eq!(parsed["reroll"][0]["inhibition_specs"][0].as_str(), Some("no \\ path\nline\r\n\t\u{1} 🦀"));
+    assert_eq!(parsed["reroll"][0]["positive_assertions"][0].as_str(), Some("log \"quoted\" [table] = 1"));
     assert_eq!(updated.branch, Some("factory/bead-success-r2".into()));
     assert_eq!(updated.pr_number, None); // Old PR number cleared
 
@@ -339,12 +342,39 @@ fn test_reroll_success() {
     let spec_path = spec_dir.join("bead-success.toml");
     assert!(spec_path.exists());
     let spec_content = std::fs::read_to_string(&spec_path).unwrap();
-    assert!(spec_content.contains("reviewer = \"skeptic\""));
+    assert!(spec_content.contains("reviewer = "));
     assert!(spec_content.contains("inhibition_specs = ["));
-    assert!(spec_content.contains("\"no print\""));
+    assert!(spec_content.contains("inhibition_specs"));
 
     std::fs::remove_dir_all(spec_dir).ok();
     let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn extractor_outage_precedes_factory_reroll_supersession() {
+    let scm = FakeScm::new();
+    let sessions = FakeSessions::new();
+    let vcs = FakeVcs::new();
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Err("read-only extractor unavailable".into()));
+    let cfg = test_cfg();
+    let telemetry_log = std::env::temp_dir().join("afd_reroll_extractor_outage.jsonl");
+    let mut bead = BeadOverlay {
+        bead_id: "bead-extractor-outage".into(), state: OverlayState::Attested,
+        attempt: 1, reroll_count: 0, autonomy_secs: 0, spend_usd: 0.0,
+        pr_number: Some(99), branch: Some("factory/bead-extractor-outage-r1".into()),
+        session_id: None, is_adopted: false, spawn_failure_count: 0,
+        pre_session_head_sha: None, park_reason: None, target_repo: None, attempt_started_at: None,
+    };
+    store.save(&bead).unwrap();
+    let deps = RerollDeps { scm: &scm, sessions: &sessions, vcs: &vcs, store: &store,
+        llm: &llm, cfg: &cfg, telemetry_log: &telemetry_log, reviewer: "reviewer".into(), review_text: "untrusted feedback".into() };
+    assert!(reroll::execute(&deps, &mut bead).is_err());
+    assert!(vcs.calls.borrow().is_empty(), "extractor failure must precede VCS branch/base effects");
+    assert!(scm.calls.borrow().is_empty(), "extractor failure must precede PR closure");
+    assert!(store.branches.borrow().is_empty(), "extractor failure must not register a replacement branch");
+    let _ = std::fs::remove_file(telemetry_log);
 }
 
 /// Regression test for issue #349 / bead jleechan-wuts — the
