@@ -3048,30 +3048,109 @@ const REVIEWER_TIMEOUT_SECS: u64 = 300;
 /// guarantee; `cursor-agent` is the fallback second family.
 pub(crate) const SKEPTIC_REVIEWER_PRIORITY: &[&str] = &["claudem", "agy", "cursor-agent"];
 
+/// Provider variables that are meaningful to the MiniMax-compatible
+/// `claudem` lane but must not leak into a direct Anthropic Claude process.
+/// The daemon can dispatch reviewer lanes in parallel, so these are removed
+/// from the child environment rather than mutated in the parent process.
+const DIRECT_CLAUDE_PROVIDER_ENV: &[&str] = &[
+    "CLAUDEM_MODE",
+    "MINIMAX_API_KEY",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL",
+];
+
+/// Resolve the explicitly configured Claude account directory, refusing the
+/// operator's default `~/.claude` account. Direct Claude is an opt-in reviewer
+/// lane; an unset, relative, missing, non-directory, or default-home path is
+/// a configuration error rather than an invitation to inherit host state.
+fn direct_claude_config_dir() -> Result<std::path::PathBuf, DaemonError> {
+    let raw = std::env::var_os("DARK_FACTORY_CLAUDE_CONFIG_DIR").ok_or_else(|| {
+        DaemonError::Config(
+            "direct Claude reviewer requires DARK_FACTORY_CLAUDE_CONFIG_DIR pointing to a project-scoped config directory"
+                .to_string(),
+        )
+    })?;
+    let configured = std::path::PathBuf::from(raw);
+    if !configured.is_absolute() {
+        return Err(DaemonError::Config(
+            "DARK_FACTORY_CLAUDE_CONFIG_DIR must be an absolute path".to_string(),
+        ));
+    }
+    if !configured.is_dir() {
+        return Err(DaemonError::Config(format!(
+            "DARK_FACTORY_CLAUDE_CONFIG_DIR must name an existing directory: {}",
+            configured.display()
+        )));
+    }
+    let resolved = std::fs::canonicalize(&configured).map_err(|error| {
+        DaemonError::Config(format!(
+            "DARK_FACTORY_CLAUDE_CONFIG_DIR could not be resolved: {error}"
+        ))
+    })?;
+    let home = std::env::var_os("HOME").ok_or_else(|| {
+        DaemonError::Config(
+            "direct Claude reviewer cannot validate the operator home because HOME is unset"
+                .to_string(),
+        )
+    })?;
+    let home_claude = std::path::PathBuf::from(home).join(".claude");
+    if let Ok(default_dir) = std::fs::canonicalize(&home_claude) {
+        if resolved == default_dir {
+            return Err(DaemonError::Config(
+                "DARK_FACTORY_CLAUDE_CONFIG_DIR must not resolve to the operator's ~/.claude directory"
+                    .to_string(),
+            ));
+        }
+    } else if configured == home_claude {
+        // The configured path is required to exist above, so this lexical
+        // comparison covers a HOME/.claude spelling whose canonicalization
+        // failed due to a transient filesystem race.
+        return Err(DaemonError::Config(
+            "DARK_FACTORY_CLAUDE_CONFIG_DIR must not point to the operator's ~/.claude directory"
+                .to_string(),
+        ));
+    }
+    Ok(resolved)
+}
+
 /// Dispatch one independent reviewer subprocess by vendor name. Extracted
 /// from `skeptic_evidence` so two vendors can be dispatched in parallel
 /// threads (PR#163 finding 2) without duplicating the per-vendor argv
 /// construction. `pub(crate)` so `/er` reuses the same argv table instead
 /// of hardcoding Claude.
 pub(crate) fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, DaemonError> {
-    use crate::tools::run_tool;
+    use crate::tools::{run_tool, run_tool_with_env_and_remove};
     match vendor {
         "codex" => run_tool(
             "codex",
             &["exec", "--yolo", "--skip-git-repo-check", prompt],
             REVIEWER_TIMEOUT_SECS,
         ),
-        "claude" => run_tool(
-            "claude",
-            &[
-                "--print",
-                "--dangerously-skip-permissions",
-                "--setting-sources",
-                "",
-                prompt,
-            ],
-            REVIEWER_TIMEOUT_SECS,
-        ),
+        "claude" => {
+            let config_dir = direct_claude_config_dir()?;
+            let config_dir = config_dir.to_str().ok_or_else(|| {
+                DaemonError::Config(
+                    "DARK_FACTORY_CLAUDE_CONFIG_DIR must be valid UTF-8".to_string(),
+                )
+            })?;
+            run_tool_with_env_and_remove(
+                "claude",
+                &[
+                    "--print",
+                    "--dangerously-skip-permissions",
+                    "--setting-sources",
+                    "",
+                    prompt,
+                ],
+                &[("CLAUDE_CONFIG_DIR", config_dir)],
+                DIRECT_CLAUDE_PROVIDER_ENV,
+                REVIEWER_TIMEOUT_SECS,
+            )
+        }
         // bashrc `claudem()`: MiniMax via the Claude Code CLI. Headless
         // factory review uses `--print` (never `--teammate-mode=tmux`,
         // which is interactive and would hang the daemon). Env is applied
@@ -3136,6 +3215,186 @@ pub(crate) fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, Da
             rc: -1,
             stderr: "unknown reviewer vendor".to_string(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod direct_claude_scope_tests {
+    use super::dispatch_reviewer;
+    use std::sync::Mutex;
+
+    fn env_lock() -> &'static Mutex<()> {
+        crate::adapters::gh_env_test_lock()
+    }
+
+    struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl EnvRestore {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self(
+                keys.iter()
+                    .map(|key| (*key, std::env::var_os(key)))
+                    .collect(),
+            )
+        }
+
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) {
+            unsafe { std::env::set_var(key, value) };
+        }
+
+        fn remove(key: &'static str) {
+            unsafe { std::env::remove_var(key) };
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                unsafe {
+                    if let Some(value) = value {
+                        std::env::set_var(key, value);
+                    } else {
+                        std::env::remove_var(key);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn direct_claude_reviewer_fails_closed_without_project_config() {
+        let _guard = env_lock().lock().unwrap();
+        let root =
+            std::env::temp_dir().join(format!("afd_direct_claude_scope_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        let claude = root.join("bin").join("claude");
+        std::fs::write(&claude, "#!/bin/sh\nprintf unexpected-success\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _env = EnvRestore::capture(&["PATH", "DARK_FACTORY_CLAUDE_CONFIG_DIR"]);
+        EnvRestore::set("PATH", root.join("bin"));
+        EnvRestore::remove("DARK_FACTORY_CLAUDE_CONFIG_DIR");
+        let result = dispatch_reviewer("claude", "scope-test");
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(
+            result.is_err(),
+            "direct Claude must require an explicit project config"
+        );
+    }
+
+    #[test]
+    fn direct_claude_reviewer_rejects_relative_config_path() {
+        let _guard = env_lock().lock().unwrap();
+        let _env = EnvRestore::capture(&["DARK_FACTORY_CLAUDE_CONFIG_DIR"]);
+        EnvRestore::set("DARK_FACTORY_CLAUDE_CONFIG_DIR", "relative/project-claude");
+
+        let result = dispatch_reviewer("claude", "scope-test");
+
+        assert!(
+            result.is_err(),
+            "relative Claude config paths must fail closed"
+        );
+    }
+
+    #[test]
+    fn direct_claude_reviewer_rejects_missing_absolute_config_path() {
+        let _guard = env_lock().lock().unwrap();
+        let _env = EnvRestore::capture(&["DARK_FACTORY_CLAUDE_CONFIG_DIR"]);
+        let missing = std::env::temp_dir().join(format!(
+            "afd_missing_direct_claude_config_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&missing);
+        EnvRestore::set("DARK_FACTORY_CLAUDE_CONFIG_DIR", &missing);
+
+        let result = dispatch_reviewer("claude", "scope-test");
+
+        assert!(
+            result.is_err(),
+            "missing Claude config directories must fail closed"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn direct_claude_reviewer_rejects_operator_default_config_dir() {
+        let _guard = env_lock().lock().unwrap();
+        let root =
+            std::env::temp_dir().join(format!("afd_direct_claude_default_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home_claude = root.join("home").join(".claude");
+        std::fs::create_dir_all(&home_claude).unwrap();
+        let _env = EnvRestore::capture(&["HOME", "DARK_FACTORY_CLAUDE_CONFIG_DIR"]);
+        EnvRestore::set("HOME", root.join("home"));
+        EnvRestore::set("DARK_FACTORY_CLAUDE_CONFIG_DIR", &home_claude);
+
+        let result = dispatch_reviewer("claude", "scope-test");
+
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(result.is_err(), "operator ~/.claude must not be accepted");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn direct_claude_reviewer_scrubs_minimax_provider_environment() {
+        let _guard = env_lock().lock().unwrap();
+        let root =
+            std::env::temp_dir().join(format!("afd_direct_claude_env_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bin = root.join("bin");
+        let home = root.join("home");
+        let config = root.join("project-claude");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        let claude = bin.join("claude");
+        std::fs::write(
+            &claude,
+            "#!/bin/sh\nprintf 'config=%s\\nbase=%s\\napi=%s\\nauth=%s\\nmodel=%s\\nmode=%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$ANTHROPIC_BASE_URL\" \"$ANTHROPIC_API_KEY\" \"$ANTHROPIC_AUTH_TOKEN\" \"$ANTHROPIC_MODEL\" \"$CLAUDEM_MODE\"\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _env = EnvRestore::capture(&[
+            "PATH",
+            "HOME",
+            "DARK_FACTORY_CLAUDE_CONFIG_DIR",
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_MODEL",
+            "CLAUDEM_MODE",
+        ]);
+        EnvRestore::set("PATH", &bin);
+        EnvRestore::set("HOME", &home);
+        EnvRestore::set("DARK_FACTORY_CLAUDE_CONFIG_DIR", &config);
+        EnvRestore::set("ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic");
+        EnvRestore::set("ANTHROPIC_API_KEY", "stale-minimax-key");
+        EnvRestore::set("ANTHROPIC_AUTH_TOKEN", "stale-minimax-token");
+        EnvRestore::set("ANTHROPIC_MODEL", "MiniMax-M3");
+        EnvRestore::set("CLAUDEM_MODE", "1");
+
+        let result =
+            dispatch_reviewer("claude", "scope-test").expect("scoped Claude shim succeeds");
+
+        let expected_config = std::fs::canonicalize(&config).unwrap();
+        let expected_config = expected_config.to_string_lossy();
+        assert!(
+            result.contains(&format!("config={expected_config}")),
+            "{result}"
+        );
+        for line in ["base=", "api=", "auth=", "model=", "mode="] {
+            assert!(
+                result.lines().any(|candidate| candidate == line),
+                "{line:?} leaked in {result:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
