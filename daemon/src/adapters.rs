@@ -882,7 +882,7 @@ struct GhPrView {
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Clone)]
-struct GhReview {
+pub(crate) struct GhReview {
     author: GhAuthor,
     state: String,
     /// Commit reviewed by this review. `gh pr view --json reviews` exposes
@@ -894,7 +894,7 @@ struct GhReview {
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Clone)]
-struct GhReviewCommit {
+pub(crate) struct GhReviewCommit {
     #[serde(default)]
     /// Keep malformed/non-string payloads representable so one bad review
     /// cannot make the entire PR snapshot fail to parse. Classification below
@@ -910,7 +910,7 @@ struct GhReviewCommit {
 /// substantive review. This keeps stale approvals from silently satisfying
 /// the gate after a push while preserving the existing red treatment for an
 /// explicit changes-requested review.
-fn coderabbit_status_for_head(reviews: &[GhReview], head_ref_oid: &str) -> &'static str {
+pub(crate) fn coderabbit_status_for_head(reviews: &[GhReview], head_ref_oid: &str) -> &'static str {
     for review in reviews.iter().rev() {
         if !review.author.login.contains("coderabbit") || review.state == "COMMENTED" {
             continue;
