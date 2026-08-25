@@ -272,6 +272,7 @@ mod tests {
         fn judge(&self, _prompt: &str) -> Result<String, DaemonError> {
             Ok(self.0.clone())
         }
+        fn judge_read_only(&self, prompt: &str) -> Result<String, DaemonError> { self.judge(prompt) }
     }
 
     #[test]
@@ -366,6 +367,7 @@ mod tests {
             *self.last_prompt.lock().unwrap() = prompt.to_string();
             Ok(self.reply.clone())
         }
+        fn judge_read_only(&self, prompt: &str) -> Result<String, DaemonError> { self.judge(prompt) }
     }
 
     #[test]
