@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# The detached remediation path may report success only after the exact
+# project-scoped PR session is visible. This exercises the production wrapper,
+# not a mirrored dispatch loop.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+REMEDIATE="$ROOT/daemon/factory-ao-remediate.sh"
+SCRATCH="$(mktemp -d -t remediate-verified.XXXXXX)"
+trap 'rm -rf "$SCRATCH"' EXIT
+
+PASS=0; FAIL=0
+assert() {
+  local name="$1" expected="$2" actual="$3"
+  if [ "$expected" = "$actual" ]; then
+    echo "PASS: $name"; PASS=$((PASS + 1))
+  else
+    echo "FAIL: $name (expected '$expected', got '$actual')"; FAIL=$((FAIL + 1))
+  fi
+}
+
+FAKE_AO="$SCRATCH/ao-ts"
+AO_LOG="$SCRATCH/ao.log"
+cat > "$FAKE_AO" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$AFD_TEST_AO_LOG"
+case "${1:-}" in
+  spawn)
+    if [ "${2:-}" = "--help" ]; then printf '%s\n' '--name'; exit 0; fi
+    printf '%s\n' 'spawned session ao-verified'
+    ;;
+  session)
+    if [ "${FAKE_VISIBLE_PR:-}" = "9002" ] && [ "$*" = 'session ls -p expected-project' ]; then
+      printf '%s\n' 'ao-verified pulls/9002 [running]'
+    fi
+    ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$FAKE_AO"
+
+wait_for_final() {
+  local state_file="$1" state="" i
+  for i in 1 2 3 4 5 6 7 8; do
+    state="$(cat "$state_file" 2>/dev/null || true)"
+    case "$state" in pending|'') sleep 1;; *) printf '%s' "$state"; return 0;; esac
+  done
+  printf '%s' "$state"
+}
+
+export AO_BIN="$FAKE_AO"
+export AFD_TEST_AO_LOG="$AO_LOG"
+export AFD_LOG_DIR="$SCRATCH/logs"
+export AFD_SPAWN_STATE_DIR="$SCRATCH/states"
+
+# Spawn output alone is insufficient: with no project-scoped session row the
+# detached completion must become fail:* and remain ineligible for DISPATCHED.
+AFD_REQUIRE_SESSION=1 AFD_ASYNC_WAIT_SEC=0 bash "$REMEDIATE" no-session 9001 owner/repo expected-project >/dev/null
+state="$(wait_for_final "$AFD_SPAWN_STATE_DIR/no-session-9001.state")"
+case "$state" in fail:*session_unverified) actual=fail;; *) actual="$state";; esac
+assert "unverified async spawn writes failure state" "fail" "$actual"
+
+# The same spawn succeeds only when session ls is scoped to the expected AO
+# project and returns the exact PR.
+export FAKE_VISIBLE_PR=9002
+: > "$AO_LOG"
+AFD_REQUIRE_SESSION=1 AFD_ASYNC_WAIT_SEC=0 bash "$REMEDIATE" visible-session 9002 owner/repo expected-project >/dev/null
+state="$(wait_for_final "$AFD_SPAWN_STATE_DIR/visible-session-9002.state")"
+assert "project-scoped visible session writes ok" "ok" "$state"
+queries="$(grep -c '^session ls -p expected-project$' "$AO_LOG" || true)"
+assert "verification query is project scoped" "yes" "$( [ "$queries" -ge 1 ] && echo yes || echo no )"
+
+echo "=== RESULTS: $PASS passed, $FAIL failed ==="
+[ "$FAIL" -eq 0 ]

@@ -241,11 +241,12 @@ dispatch-blocked)
   [ $# -eq 4 ] || die "usage: dispatch-blocked <bead_id> <reason> <context-json>"
   valid_bead_id "$2"
   [[ "$3" =~ ^[a-z0-9_]+$ ]] || die_code $EX_VALID_INPUT "invalid dispatch block reason: $3"
-  require_state "$2" QUEUED
+  require_state "$2" QUEUED ATTESTED
   printf '%s' "$4" | python3 -c 'import json,sys; json.load(sys.stdin)' >/dev/null 2>&1 \
     || die_code $EX_VALID_INPUT "dispatch-blocked context must be JSON"
   cur_attempt="$(get_field "$2" attempt)"
-  emit "$2" "$cur_attempt" QUEUED TASK_DISPATCH_BLOCKED "$4"
+  cur_state="$(get_field "$2" state)"
+  emit "$2" "$cur_attempt" "$cur_state" TASK_DISPATCH_BLOCKED "$4"
   echo "blocked"
   ;;
 
@@ -562,6 +563,6 @@ list)
   ;;
 
 *)
-  die "unknown: ${1:-}. Valid: init intake-upsert route-record capacity dispatch-record pr-opened autonomy-tick gate-assessment prev-gate-assessment ready reroll-verdict park park-duplicate bead-closed-check tick-summary recover-held unstick-dispatching rollback-dispatched redrive-pr list"
+  die "unknown: ${1:-}. Valid: init intake-upsert route-record capacity dispatch-record dispatch-blocked pr-opened autonomy-tick gate-assessment prev-gate-assessment ready reroll-verdict park park-duplicate bead-closed-check tick-summary recover-held unstick-dispatching rollback-dispatched redrive-pr list"
   ;;
 esac
