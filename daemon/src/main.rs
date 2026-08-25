@@ -434,7 +434,7 @@ fn ao_runtime_binding(cfg: &Config) -> Result<(String, String), DaemonError> {
             ))
         })?
         .ao_project;
-    let default_agent = std::env::var("DARK_FACTORY_REVIEWER_DEFAULT")
+    let default_agent = std::env::var("DARK_FACTORY_CODER_DEFAULT")
         .unwrap_or_else(|_| "agy".to_string());
     Ok((ao_project, default_agent))
 }
@@ -983,6 +983,87 @@ mod tests {
         assert_eq!(
             vendors,
             vec!["antigravity".to_string(), "minimax".to_string(), "claude-code".to_string()]
+        );
+    }
+
+    // jleechan-72hp r1 defect (1): `ao_runtime_binding` must source the
+    // default agent from `DARK_FACTORY_CODER_DEFAULT` (the env the spawn
+    // fallback chain consults), NOT `DARK_FACTORY_REVIEWER_DEFAULT`.
+    // Previously, configured `MiniMax` coders were silently replaced by
+    // `agy` because startup read the REVIEWER variable, so production
+    // `CliSessions::new(..., "minimax")` never actually launched a MiniMax
+    // coder — it spawned Antigravity through the configured-reviewer path.
+    #[test]
+    fn startup_binding_uses_coder_default_not_reviewer_default() {
+        // Build a minimal Config with a repo routing entry so
+        // `cfg.resolve_repo` returns Some(...) and `ao_runtime_binding`
+        // reaches the env-var read.
+        let repos = std::collections::HashMap::from([(
+            "owner/repo".to_string(),
+            crate::config::RepoConfig {
+                ao_project: "repo".to_string(),
+                push_remote: "origin".to_string(),
+                local_checkout: Some(std::env::current_dir().unwrap()),
+            },
+        )]);
+        let cfg = Config {
+            target_repo: "owner/repo".to_string(),
+            ao_project: None,
+            base_branch: "main".to_string(),
+            stage: 1,
+            max_workers: 30,
+            max_batch: 15,
+            fast_tick_secs: 60,
+            slow_tick_secs: 60,
+            autonomy_timebox_secs: 10_800,
+            budget_warn_usd: 20.0,
+            spec_dir: ".factory/specs/".to_string(),
+            reroll_head_stability_window_secs: 1,
+            reroll_death_confirm_secs: 0,
+            held_recheck_cooldown_secs: 900,
+            repos,
+            pre_gate_validation_enabled: false,
+            escalation_refire_secs: 3600,
+            agent_worktree_root: None,
+            worktree_ttl_secs: 14 * 24 * 60 * 60,
+            worktree_max_count: 200,
+        };
+
+        // Isolate env mutations to this test; serialize against other tests
+        // that may also touch DARK_FACTORY_*_DEFAULT.
+        let _env_lock = NOTIFY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let prior_coder = std::env::var("DARK_FACTORY_CODER_DEFAULT").ok();
+        let prior_reviewer = std::env::var("DARK_FACTORY_REVIEWER_DEFAULT").ok();
+
+        unsafe {
+            std::env::set_var("DARK_FACTORY_CODER_DEFAULT", "minimax");
+            // Deliberately set REVIEWER to a different value to prove the
+            // CODER env wins — if the bug regresses and the binding still
+            // reads REVIEWER, this test returns "agy" (the legacy fallback)
+            // and fails.
+            std::env::set_var("DARK_FACTORY_REVIEWER_DEFAULT", "agy");
+        }
+
+        let result = ao_runtime_binding(&cfg);
+
+        unsafe {
+            match prior_coder {
+                Some(v) => std::env::set_var("DARK_FACTORY_CODER_DEFAULT", v),
+                None => std::env::remove_var("DARK_FACTORY_CODER_DEFAULT"),
+            }
+            match prior_reviewer {
+                Some(v) => std::env::set_var("DARK_FACTORY_REVIEWER_DEFAULT", v),
+                None => std::env::remove_var("DARK_FACTORY_REVIEWER_DEFAULT"),
+            }
+        }
+
+        let (_project, default_agent) = result.expect("binding must succeed");
+        assert_eq!(
+            default_agent, "minimax",
+            "ao_runtime_binding must read DARK_FACTORY_CODER_DEFAULT, not DARK_FACTORY_REVIEWER_DEFAULT (got {default_agent:?})"
         );
     }
 
