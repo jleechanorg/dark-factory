@@ -663,6 +663,9 @@ fn test_tick_stage2_integration() {
                 Ok(r#"{"routingVerdict":"SMALL_PATH","justification":"x"}"#.into())
             }
         }
+        fn judge_read_only(&self, prompt: &str) -> Result<String, DaemonError> {
+            self.judge(prompt)
+        }
     }
     let smart_llm = SmartLlm {
         state: std::cell::RefCell::new(0),
