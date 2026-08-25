@@ -15140,3 +15140,160 @@ fn quota_watchdog_wakes_paused_pane_after_reset_grace_elapses() {
     daemon::health::quota_watchdog::clear(bead_id);
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+/// PR #755 Slice 1 ACCEPTANCE #1: a DISPATCHED overlay with BOTH session_id=None
+/// AND pr_number=None (the "orphaned DISPATCHED" shape) must not strand forever.
+/// After exhausting spawn_failure_count cap, it must be parked HUMAN_HELD with
+/// TransientSpawnRetryCapExceeded and emit DISPATCHED_NO_SESSION_OR_PR telemetry.
+#[test]
+fn dispatched_orphan_no_session_no_pr_parks_human_held_after_cap() {
+    let bead_id = "bead-orphan-dispatched";
+    daemon::health::quota_watchdog::clear(bead_id);
+
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir()
+        .join("afd_test_dispatched_orphan_parks.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    use daemon::dispatch::MAX_TRANSIENT_SPAWN_RETRY;
+    store.overlays.borrow_mut().insert(
+        bead_id.into(),
+        BeadOverlay {
+            bead_id: bead_id.into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/bead-orphan-dispatched-r1".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: MAX_TRANSIENT_SPAWN_RETRY - 1,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+    store
+        .register_branch(bead_id, "factory/bead-orphan-dispatched-r1")
+        .unwrap();
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+
+    let overlay = store.load(bead_id).unwrap().unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::HumanHeld,
+        "orphaned DISPATCHED (no session, no PR) must be parked HUMAN_HELD after cap; got: {:?}",
+        overlay.state
+    );
+    assert_eq!(
+        summary.beads_parked_human_held, 1,
+        "one bead must be parked human held"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("DISPATCHED_NO_SESSION_OR_PR"),
+        "DISPATCHED_NO_SESSION_OR_PR event must be emitted; telemetry:\n{telemetry}"
+    );
+
+    daemon::health::quota_watchdog::clear(bead_id);
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// PR #755 Slice 1 ACCEPTANCE #2: a DISPATCHED overlay with both session_id=None
+/// and pr_number=None BUT with a live quota watchdog arm must be LEFT UNTOUCHED.
+#[test]
+fn dispatched_orphan_with_quota_arm_is_preserved_untouched() {
+    let bead_id = "bead-orphan-quota-armed";
+    daemon::health::quota_watchdog::clear(bead_id);
+    daemon::health::quota_watchdog::record_quota_reset(
+        bead_id,
+        "wa-paused-session",
+        u64::MAX,
+    );
+
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir()
+        .join("afd_test_dispatched_orphan_quota_preserved.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    store.overlays.borrow_mut().insert(
+        bead_id.into(),
+        BeadOverlay {
+            bead_id: bead_id.into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/bead-orphan-quota-armed-r1".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+    store
+        .register_branch(bead_id, "factory/bead-orphan-quota-armed-r1")
+        .unwrap();
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+
+    let overlay = store.load(bead_id).unwrap().unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::Dispatched,
+        "quota-armed orphaned DISPATCHED must remain DISPATCHED"
+    );
+    assert_eq!(
+        summary.beads_parked_human_held, 0,
+        "no park must occur for quota-armed orphan"
+    );
+
+    daemon::health::quota_watchdog::clear(bead_id);
+    let _ = std::fs::remove_file(&telemetry_log);
+}
