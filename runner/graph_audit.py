@@ -606,25 +606,28 @@ def audit_graphs(pipeline_dir: pathlib.Path) -> list[Violation]:
 def _is_authored_graph(repo_root: pathlib.Path, path: pathlib.Path) -> bool:
     """Return whether ``path`` is an authored repository pipeline graph.
 
-    Production graphs live below a top-level ``pipelines/`` directory and
-    benchmark graphs either use that conventional directory or are a direct
-    ``.dot`` file below ``benchmarks/<name>/``. Generated evidence and test
-    fixtures intentionally sit outside those structural roots and are not
-    shipped pipeline inputs.
+Production graphs live below top-level ``pipelines/`` and ``.dark-factory/``
+    directories, while benchmark graphs either use that conventional directory
+    or are a direct ``.dot`` file below ``benchmarks/<name>/``. Generated
+    evidence and test fixtures intentionally sit outside those structural roots
+    and are not shipped pipeline inputs.
     """
     try:
         relative = path.resolve().relative_to(repo_root.resolve())
     except ValueError:
         return False
     parts = relative.parts
-    return bool(parts) and (parts[0] == "pipelines" or parts[0] == "benchmarks")
+    return bool(parts) and (
+        parts[0] in {"pipelines", ".dark-factory"} or parts[0] == "benchmarks"
+    )
 
 
 def audit_repository(repo_root: pathlib.Path) -> list[Violation]:
     """Audit every authored graph discoverable in a repository tree.
 
     Unlike ``audit_graphs(pipelines/)``, this boundary includes nested
-    benchmark pipeline families as well as the production graph root. The
+    benchmark pipeline families, hidden ``.dark-factory/`` slice graphs, and
+    the production graph root. The
     production root receives the complete G1-G5 audit. Benchmark graphs are
     checked for the cross-cutting direct-Claude scope invariant (G5) and
     parse failures, while their intentionally varied reviewer topologies are

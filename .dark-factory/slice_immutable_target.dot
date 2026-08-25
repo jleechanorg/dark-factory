@@ -27,7 +27,7 @@ digraph ControllerReviewImmutableTargetSlice {
   review [
     type="gate_er"
     prompt="@.dark-factory/review-immutable-target.md"
-    backend_priority="minimax,agy,claude-sonnet,codex"
+    backend_priority="minimax,agy,codex"
     prefer_adversarial="true"
     timeout=300
   ]

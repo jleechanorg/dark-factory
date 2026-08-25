@@ -245,6 +245,43 @@ def test_audit_repository_does_not_block_on_benchmark_g1_g4(tmp_path):
     assert not [v for v in violations if v.pipeline.endswith("legacy.dot")], violations
 
 
+def test_audit_repository_discovers_hidden_dark_factory_slices(tmp_path):
+    """Authored slice graphs under ``.dark-factory/`` are route-audited.
+
+    These files are tracked factory inputs, unlike generated ``evidence/``
+    captures and test fixtures.  Keep the discovery contract at the repository
+    boundary so a future slice cannot reintroduce an unscoped Claude route.
+    """
+    hidden = tmp_path / ".dark-factory"
+    hidden.mkdir()
+    (hidden / "future-slice.dot").write_text(textwrap.dedent("""
+        digraph future_slice {
+            start [shape=Mdiamond]
+            exit [shape=Msquare]
+            coder [type="codergen", backend="codex"]
+            reviewer [type="gate_er", backend_priority="minimax,claude-sonnet"]
+            start -> coder -> reviewer -> exit
+        }
+    """), encoding="utf-8")
+
+    violations = graph_audit.audit_repository(tmp_path)
+    g5 = [v for v in violations if v.kind == "G5"]
+    assert len(g5) == 1, f"expected hidden slice G5 violation, got {violations}"
+    assert g5[0].pipeline.endswith(".dark-factory/future-slice.dot")
+    assert g5[0].location == "reviewer"
+
+
+def test_tracked_dark_factory_slices_have_no_unscoped_claude_routes():
+    """The two checked-in slices stay on the canonical non-personal queue."""
+    repo_root = pathlib.Path(__file__).resolve().parent.parent
+    violations = graph_audit.audit_repository(repo_root)
+    hidden_g5 = [
+        v for v in violations
+        if v.kind == "G5" and v.pipeline.startswith(".dark-factory/")
+    ]
+    assert hidden_g5 == [], hidden_g5
+
+
 # ---------------------------------------------------------------------------
 # Condition normalisation — pin that "outcome != success" is the only
 # pattern G2 matches. A bare "outcome=success" edge is success routing

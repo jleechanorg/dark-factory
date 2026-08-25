@@ -71,7 +71,7 @@ adversarial_reviewer -> fix
 
 **After** (N-shadow parallel):
 ```
-holdout -> review_parallel [type="parallel_reviewer", n_shadows="3", reviewers="skeptic,adversarial,er", backend_priority="codex,minimax,agy,claude-sonnet"]
+holdout -> review_parallel [type="parallel_reviewer", n_shadows="3", reviewers="skeptic,adversarial,er", backend_priority="codex,minimax,agy"]
 holdout -> fix
 review_parallel -> gate_es (success)
 review_parallel -> fix
@@ -98,7 +98,7 @@ export ANTHROPIC_API_KEY=$MINIMAX_API_KEY
 .venv/bin/python -m dark-factory \
   --pipeline pipelines/factory/gates.dot \
   --goal "qw5 pilot: validate fan-out" \
-  --backend claude \
+  --backend minimax \
   --feature qw5_pilot \
   --cxdb /tmp/cxdb-qw5-pilot-$(date +%Y%m%d-%H%M%S).sqlite \
   --workdir /tmp/qw5-coder-wt
