@@ -1102,7 +1102,7 @@ pub trait Llm {
 /// be picked up — a stray `/tmp` cwd was the root cause of bead
 /// `jleechan-g1k`).
 pub fn run_tool(cmd: &str, args: &[&str], timeout_secs: u64) -> Result<String, DaemonError> {
-    run_tool_with_cwd(cmd, args, None, &[], timeout_secs)
+    run_tool_with_cwd(cmd, args, None, &[], &[], timeout_secs)
 }
 
 /// Explicit-cwd variant of `run_tool`. `cwd = None` leaves the child's cwd
@@ -1115,7 +1115,7 @@ pub fn run_tool_in_dir(
     cwd: &str,
     timeout_secs: u64,
 ) -> Result<String, DaemonError> {
-    run_tool_with_cwd(cmd, args, Some(cwd), &[], timeout_secs)
+    run_tool_with_cwd(cmd, args, Some(cwd), &[], &[], timeout_secs)
 }
 
 /// Like `run_tool`, but overlays extra environment variables on the child
@@ -1127,7 +1127,23 @@ pub fn run_tool_with_env(
     extra_env: &[(&str, &str)],
     timeout_secs: u64,
 ) -> Result<String, DaemonError> {
-    run_tool_with_cwd(cmd, args, None, extra_env, timeout_secs)
+    run_tool_with_env_and_remove(cmd, args, extra_env, &[], timeout_secs)
+}
+
+/// Like [`run_tool_with_env`], but removes inherited environment variables
+/// before applying the explicit overlay. This is used when invoking the
+/// direct Anthropic Claude reviewer: a daemon process that previously ran the
+/// MiniMax-compatible `claudem` lane may still carry provider overrides in its
+/// environment, and inheriting those would silently route direct Claude to a
+/// different account or endpoint.
+pub fn run_tool_with_env_and_remove(
+    cmd: &str,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+    remove_env: &[&str],
+    timeout_secs: u64,
+) -> Result<String, DaemonError> {
+    run_tool_with_cwd(cmd, args, None, extra_env, remove_env, timeout_secs)
 }
 
 fn run_tool_with_cwd(
@@ -1135,6 +1151,7 @@ fn run_tool_with_cwd(
     args: &[&str],
     cwd: Option<&str>,
     extra_env: &[(&str, &str)],
+    remove_env: &[&str],
     timeout_secs: u64,
 ) -> Result<String, DaemonError> {
     // Centralized GitHub rate-limit circuit-breaker admission check.
@@ -1162,6 +1179,9 @@ fn run_tool_with_cwd(
         }
         if let Some(dir) = cwd {
             command.current_dir(dir);
+        }
+        for key in remove_env {
+            command.env_remove(key);
         }
         for (key, value) in extra_env {
             command.env(key, value);

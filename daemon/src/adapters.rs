@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 static GH_ENV_TEST_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
 #[cfg(test)]
-fn gh_env_test_lock() -> &'static Mutex<()> {
+pub(crate) fn gh_env_test_lock() -> &'static Mutex<()> {
     GH_ENV_TEST_LOCK.get_or_init(|| Mutex::new(()))
 }
 
@@ -7944,6 +7944,10 @@ impl Llm for ChainLlm {
         if let Ok(out) = r {
             return Ok(out);
         }
+        // Direct Claude is intentionally not an automatic fallback. Its
+        // account scope is an explicit reviewer policy enforced by
+        // `tick::dispatch_reviewer`; ChainLlm must never inherit the host's
+        // personal `~/.claude` account when codex is unavailable.
         let home = std::env::var("HOME").unwrap_or_default();
         let nvm_claude = format!("{}/.nvm/versions/node/v22.22.0/bin/claude", home);
         let claude_bin = if std::path::Path::new(&nvm_claude).exists() {
@@ -7951,21 +7955,6 @@ impl Llm for ChainLlm {
         } else {
             "claude".to_string()
         };
-        let r = run_tool_in_dir(
-            &claude_bin,
-            &[
-                "--dangerously-skip-permissions",
-                "--print",
-                "--setting-sources",
-                "",
-                prompt,
-            ],
-            FALLBACK_CWD,
-            120,
-        );
-        if let Ok(out) = r {
-            return Ok(out);
-        }
         let r = run_minimax_judge(&claude_bin, prompt);
         if let Ok(out) = r {
             return Ok(out);
@@ -8559,6 +8548,65 @@ mod chain_llm_fallback_argv_tests {
             "codex argv must keep each flag as a separate argv slot — the structural invariant that prevents --dangerously-skip-permissions from becoming message text"
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The automatic ChainLlm path may use Claude only through the explicit
+    /// MiniMax-compatible lane (which requires MINIMAX_API_KEY). A missing
+    /// codex binary must not fall through to an unscoped direct Claude
+    /// invocation that inherits the operator's personal account.
+    #[test]
+    #[cfg(unix)]
+    fn chain_llm_never_uses_unscoped_claude_fallback() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = make_argv_dump_dir(&format!("no_claude_{nanos}"), "codex");
+        let bin = dir.join("bin");
+        let codex = bin.join("codex");
+        std::fs::write(&codex, "#!/bin/sh\nexit 1\n").unwrap();
+        let claude = bin.join("claude");
+        std::fs::write(&claude, "#!/bin/sh\nprintf unscoped-claude-success\n").unwrap();
+        let agy = bin.join("agy");
+        std::fs::write(&agy, "#!/bin/sh\nprintf agy-fallback-success\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&codex, &claude, &agy] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let prior_path = std::env::var_os("PATH");
+        let prior_home = std::env::var_os("HOME");
+        let prior_minimax_key = std::env::var_os("MINIMAX_API_KEY");
+        unsafe {
+            std::env::set_var("PATH", &bin);
+            std::env::set_var("HOME", &dir);
+            std::env::remove_var("MINIMAX_API_KEY");
+        }
+        let result = ChainLlm.judge("no-unscoped-claude");
+        unsafe {
+            if let Some(path) = prior_path {
+                std::env::set_var("PATH", path);
+            } else {
+                std::env::remove_var("PATH");
+            }
+            if let Some(home) = prior_home {
+                std::env::set_var("HOME", home);
+            } else {
+                std::env::remove_var("HOME");
+            }
+            if let Some(key) = prior_minimax_key {
+                std::env::set_var("MINIMAX_API_KEY", key);
+            } else {
+                std::env::remove_var("MINIMAX_API_KEY");
+            }
+        }
+
+        let output = result.expect("agy shim should be the final fallback");
+        assert_eq!(output, "agy-fallback-success");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
