@@ -144,6 +144,65 @@ def test_normalize_full_rejects_malformed_required_fields(field, value):
     assert fl._normalize_full(row) is None
 
 
+@pytest.mark.parametrize(
+    "context",
+    [
+        {"external_ref": ["jleechanorg/dark-factory#9003"]},
+        {"external_ref": {"issue": 9003}},
+        {"external_ref": 9003},
+        None,
+        ["not an object"],
+    ],
+)
+def test_classify_origin_skips_malformed_intake_context(context):
+    import runner.funnel_lanes as fl
+
+    row = _row("rev-malformed-intake", 1, "INTAKE_BEAD_CREATED", 0, context={})
+    row["context"] = context
+    event = fl._normalize_full(row)
+
+    assert event is not None
+    assert "rev-malformed-intake" not in classify_origin([event])
+
+
+@pytest.mark.parametrize("newly_created", [False, "true", 1, [], {}, None])
+def test_classify_origin_requires_boolean_newly_created(newly_created):
+    import runner.funnel_lanes as fl
+
+    row = _row(
+        "rev-malformed-adoption",
+        1,
+        "EXISTING_PR_ADOPTED",
+        0,
+        context={"newly_created": newly_created},
+    )
+    event = fl._normalize_full(row)
+
+    assert event is not None
+    assert "rev-malformed-adoption" not in classify_origin([event])
+
+
+def test_classify_origin_accepts_only_non_empty_string_external_ref():
+    import runner.funnel_lanes as fl
+
+    rows = [
+        _row("rev-issue-valid", 1, "INTAKE_BEAD_CREATED", 0, context={"external_ref": "#9004"}),
+        _row("rev-bead-missing", 1, "INTAKE_BEAD_CREATED", 0, context={}),
+        _row("rev-bead-null", 1, "INTAKE_BEAD_CREATED", 0, context={"external_ref": None}),
+        _row("rev-bead-empty", 1, "INTAKE_BEAD_CREATED", 0, context={"external_ref": ""}),
+        _row("rev-adopt-valid", 1, "EXISTING_PR_ADOPTED", 0, context={"newly_created": True}),
+    ]
+    events = [fl._normalize_full(row) for row in rows]
+
+    assert classify_origin([event for event in events if event is not None]) == {
+        "rev-issue-valid": "gh_issue_start",
+        "rev-bead-missing": "bead_start",
+        "rev-bead-null": "bead_start",
+        "rev-bead-empty": "bead_start",
+        "rev-adopt-valid": "pr_adopted_start",
+    }
+
+
 # ---------------------------------------------------------------------------
 # classify_origin
 # ---------------------------------------------------------------------------

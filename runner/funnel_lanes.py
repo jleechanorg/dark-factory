@@ -88,8 +88,14 @@ def _normalize_full(raw: dict) -> Optional[dict]:
         attempt_id = int(attempt) if attempt is not None else 0
     except (TypeError, ValueError):
         attempt_id = 0
-    context = raw.get("context") or {}
-    if not isinstance(context, dict):
+    context_present = "context" in raw
+    context_raw = raw.get("context")
+    context_valid = isinstance(context_raw, dict) or not context_present
+    context = context_raw if isinstance(context_raw, dict) else {}
+    if not context_valid:
+        # Keep the normalized shape stable for callers, but retain validity so
+        # classification cannot mistake malformed list/scalar context for an
+        # omitted context object.
         context = {}
     return {
         "event_type": event_type,
@@ -97,6 +103,7 @@ def _normalize_full(raw: dict) -> Optional[dict]:
         "attempt_id": attempt_id,
         "ts": ts,
         "context": context,
+        "context_valid": context_valid,
     }
 
 
@@ -167,10 +174,18 @@ def classify_origin(events: list[dict]) -> dict[str, str]:
         if bead_id in origin:
             continue
         et = evt["event_type"]
-        ctx = evt["context"]
+        if not evt.get("context_valid", True):
+            continue
+        ctx = evt.get("context")
+        if not isinstance(ctx, dict):
+            continue
         if et == "INTAKE_BEAD_CREATED":
-            origin[bead_id] = "gh_issue_start" if ctx.get("external_ref") else "bead_start"
-        elif et == "EXISTING_PR_ADOPTED" and ctx.get("newly_created"):
+            external_ref = ctx.get("external_ref")
+            if external_ref is None or external_ref == "":
+                origin[bead_id] = "bead_start"
+            elif isinstance(external_ref, str):
+                origin[bead_id] = "gh_issue_start"
+        elif et == "EXISTING_PR_ADOPTED" and ctx.get("newly_created") is True:
             origin[bead_id] = "pr_adopted_start"
     return origin
 
