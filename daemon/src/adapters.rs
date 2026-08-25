@@ -737,6 +737,13 @@ fn unresolved_threads_from_gql(gql_out: &str) -> Result<Vec<UnresolvedReviewThre
     #[derive(serde::Deserialize)]
     struct GhGqlReviewThreads {
         nodes: Vec<GhGqlNode>,
+        #[serde(rename = "pageInfo", default)]
+        page_info: GhGqlPageInfo,
+    }
+    #[derive(serde::Deserialize, Default)]
+    struct GhGqlPageInfo {
+        #[serde(rename = "hasNextPage", default)]
+        has_next_page: bool,
     }
     #[derive(serde::Deserialize)]
     struct GhGqlNode {
@@ -770,6 +777,11 @@ fn unresolved_threads_from_gql(gql_out: &str) -> Result<Vec<UnresolvedReviewThre
     let pr_data = gql.data.repository.pull_request.ok_or_else(|| {
         DaemonError::Parse("gh graphql response omitted pullRequest".into())
     })?;
+    if pr_data.review_threads.page_info.has_next_page {
+        return Err(DaemonError::Parse(
+            "gh graphql reviewThreads page is incomplete (hasNextPage=true); refusing to infer a zero/unbounded result".into(),
+        ));
+    }
     Ok(pr_data
         .review_threads
         .nodes
@@ -2194,6 +2206,9 @@ impl Scm for CliScm {
                         author { login }
                       }
                     }
+                  }
+                  pageInfo {
+                    hasNextPage
                   }
                 }
               }
@@ -8395,6 +8410,29 @@ mod external_ref_tests {
         let err = unresolved_thread_count_from_gql(json)
             .expect_err("missing pullRequest must fail closed");
 
+        assert!(
+            matches!(err, crate::errors::DaemonError::Parse(_)),
+            "expected parse error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn graphql_thread_page_with_more_results_is_unknown_not_zero() {
+        let json = r#"{
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "nodes": [{"isResolved": true}],
+                            "pageInfo": {"hasNextPage": true}
+                        }
+                    }
+                }
+            }
+        }"#;
+
+        let err = unresolved_thread_count_from_gql(json)
+            .expect_err("an incomplete reviewThreads page must fail closed");
         assert!(
             matches!(err, crate::errors::DaemonError::Parse(_)),
             "expected parse error, got {err:?}"
