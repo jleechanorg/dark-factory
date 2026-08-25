@@ -4119,6 +4119,75 @@ mod vacuous_red_green_routing_tests {
         root
     }
 
+    fn build_nested_mvp_project(vacuous: bool) -> (PathBuf, String, PathBuf, Vec<(PathBuf, FileClass)>) {
+        let root = temp_fixture(if vacuous { "nested_mvp_vacuous" } else { "nested_mvp_genuine" });
+        let project = root.join("mvp_site");
+        std::fs::create_dir_all(project.join("pkg")).unwrap();
+        std::fs::create_dir_all(project.join("tests")).unwrap();
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[project]\nname='mvp-site'\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("pkg/__init__.py"), "").unwrap();
+        std::fs::write(project.join("pkg/value.py"), "def value():\n    return 'old'\n").unwrap();
+        std::fs::write(project.join("tests/__init__.py"), "").unwrap();
+        std::fs::write(
+            project.join("tests/test_value.py"),
+            "from pkg.value import value\n\ndef test_value():\n    assert value() == 'old'\n",
+        )
+        .unwrap();
+        let run = |args: &[&str]| {
+            let out = Command::new(args[0])
+                .current_dir(&root)
+                .args(&args[1..])
+                .output()
+                .expect("spawn nested fixture command");
+            assert!(out.status.success(), "fixture command {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["git", "init", "-q", "-b", "main"]);
+        run(&["git", "config", "user.email", "nested@example.com"]);
+        run(&["git", "config", "user.name", "nested"]);
+        run(&["git", "add", "."]);
+        run(&["git", "commit", "-q", "-m", "base"]);
+        let base = String::from_utf8(
+            Command::new("git")
+                .current_dir(&root)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+
+        std::fs::write(project.join("pkg/value.py"), "def value():\n    return 'new'\n").unwrap();
+        std::fs::write(
+            project.join("tests/test_value.py"),
+            if vacuous {
+                "def test_value():\n    assert 2 + 2 == 4\n"
+            } else {
+                "from pkg.value import value\n\ndef test_value():\n    assert value() == 'new'\n"
+            },
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("tests/test_new.py"),
+            "def test_new():\n    assert 3 + 3 == 6\n",
+        )
+        .unwrap();
+        run(&["git", "add", "."]);
+        run(&["git", "commit", "-q", "-m", "head"]);
+
+        let changed = vec![
+            (project.join("pkg/value.py"), FileClass::Production),
+            (project.join("tests/test_value.py"), FileClass::Test),
+            (project.join("tests/test_new.py"), FileClass::Test),
+        ];
+        (root, base, project.join("pyproject.toml"), changed)
+    }
+
     #[test]
     fn python_target_worktree_routes_to_pytest_and_runs_targeted_test() {
         assert!(
@@ -4208,6 +4277,28 @@ mod vacuous_red_green_routing_tests {
         let vacuous = check_red_green_with_manifest(&root, &base, &changed, Some(&manifest))
             .expect("pytest backend should execute vacuous test");
         assert_eq!(vacuous.verdict, Verdict::Vacuous, "report={vacuous:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nested_mvp_site_routes_genuine_pytest_with_new_test_file() {
+        let (root, base, manifest, changed) = build_nested_mvp_project(false);
+        let (backend, detected_manifest) =
+            resolve_vacuous_red_green_manifest(&root).expect("nested route");
+        assert_eq!(backend, Backend::Pytest);
+        assert_eq!(detected_manifest, manifest);
+        let report = check_red_green_with_manifest(&root, &base, &changed, Some(&manifest))
+            .expect("nested pytest backend should execute");
+        assert_eq!(report.verdict, Verdict::Genuine, "report={report:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nested_mvp_site_routes_vacuous_pytest_with_new_test_file() {
+        let (root, base, manifest, changed) = build_nested_mvp_project(true);
+        let report = check_red_green_with_manifest(&root, &base, &changed, Some(&manifest))
+            .expect("nested pytest backend should execute");
+        assert_eq!(report.verdict, Verdict::Vacuous, "report={report:?}");
         let _ = std::fs::remove_dir_all(root);
     }
 

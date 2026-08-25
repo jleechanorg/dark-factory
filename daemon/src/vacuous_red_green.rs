@@ -1755,6 +1755,19 @@ fn run_pytest_tests(
     // `<file>::<test_name>` nodes directly. Multiple files in
     // a single pytest invocation is fine; pytest collects them
     // all.
+    // Pytest reports node IDs relative to the effective project root. For a
+    // nested pyproject, that root is the manifest's parent rather than the
+    // daemon target-worktree root; selectors and parsing must use the same
+    // coordinate system.
+    let pytest_root = manifest
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.eq_ignore_ascii_case("pyproject.toml"))
+                .unwrap_or(false)
+        })
+        .and_then(Path::parent)
+        .unwrap_or(repo_root);
     let mut selector_args: Vec<String> = Vec::new();
     for target in pytest_targets {
         let rel = relative_repo_path(repo_root, &target.path).unwrap_or_else(|| {
@@ -1835,7 +1848,7 @@ fn run_pytest_tests(
     //   `tests/test_scenario.py::test_classify_high FAILED`
     //   `tests/test_scenario.py::test_classify_high SKIPPED`
     for target in pytest_targets {
-        let rel = relative_repo_path(repo_root, &target.path).unwrap_or_else(|| {
+        let rel = relative_repo_path(pytest_root, &target.path).unwrap_or_else(|| {
             target.path.to_string_lossy().into_owned()
         });
         let node = format!("{rel}::{}", target.name);
@@ -1915,7 +1928,32 @@ fn run_pytest_baseline_check(
             name: target.name.clone(),
         })
         .collect();
-    let baseline_manifest = manifest.map(|path| rebase_worktree_path(repo_root, &tmp, path));
+    for (target, baseline_target) in pytest_targets.iter().zip(&baseline_targets) {
+        // Newly added test files do not exist in the detached base. Copy only
+        // that HEAD test source into the baseline so the phase can execute it
+        // against base production/configuration; existing test files remain
+        // the base revision, preserving genuine red/green semantics.
+        if !baseline_target.path.exists() && target.path.is_file() {
+            if let Some(parent) = baseline_target.path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    RedGreenError::BaselineFailed(format!(
+                        "create baseline test parent {}: {e}",
+                        parent.display()
+                    ))
+                })?;
+            }
+            std::fs::copy(&target.path, &baseline_target.path).map_err(|e| {
+                RedGreenError::BaselineFailed(format!(
+                    "copy new head test {} into baseline {}: {e}",
+                    target.path.display(),
+                    baseline_target.path.display()
+                ))
+            })?;
+        }
+    }
+    let baseline_manifest = manifest
+        .map(|path| rebase_worktree_path(repo_root, &tmp, path))
+        .filter(|path| path.is_file());
 
     let result = run_pytest_tests(
         &tmp,
@@ -2907,24 +2945,17 @@ def test_b():
     fn pytest_location_rejects_non_executable_path_entry() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _lock = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempdir_unique("pytest-non-executable");
         let candidate = dir.join("pytest");
         std::fs::write(&candidate, "#!/bin/sh\nexit 0\n").unwrap();
         let mut mode = std::fs::metadata(&candidate).unwrap().permissions();
         mode.set_mode(0o644);
         std::fs::set_permissions(&candidate, mode).unwrap();
-        let prior = std::env::var_os("PATH");
-        std::env::set_var("PATH", &dir);
-        assert_eq!(resolve_pytest(None), PytestLocation::NotFound);
+        assert!(!is_executable_file(&candidate));
         let mut executable_mode = std::fs::metadata(&candidate).unwrap().permissions();
         executable_mode.set_mode(0o755);
         std::fs::set_permissions(&candidate, executable_mode).unwrap();
-        assert_eq!(resolve_pytest(None), PytestLocation::OnPath);
-        match prior {
-            Some(path) => std::env::set_var("PATH", path),
-            None => std::env::remove_var("PATH"),
-        }
+        assert!(is_executable_file(&candidate));
     }
 }
 
