@@ -196,3 +196,11 @@ def test_pilot_minimax_scrubber_rejects_whitespace_only_key() -> None:
     )
     assert result.returncode == 66
     assert "MINIMAX_API_KEY must be nonblank" in result.stderr
+
+
+def test_pilot_dispatch_uses_bare_and_pinned_minimax_model() -> None:
+    """The unattended QW5 wrapper must not consult OAuth/keychain or wrapper defaults."""
+    script = (ROOT / "daemon/qw5-pilot-dispatch.sh").read_text()
+    assert "claudem --bare -p" in script
+    assert "--model MiniMax-M3" in script
+    assert "\nclaudem -p" not in script

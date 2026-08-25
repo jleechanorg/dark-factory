@@ -126,6 +126,7 @@ def test_minimax_gate_argv_model_matches_normalized_env(monkeypatch, configured,
     argv = _gate_subprocess_args("minimax", "PROMPT", ctx, 300)
     env = _gate_subprocess_env("minimax")
 
+    assert "--bare" in argv
     assert argv[argv.index("--model") + 1] == expected
     assert env["ANTHROPIC_MODEL"] == expected
     assert argv[argv.index("--model") + 1] == env["ANTHROPIC_MODEL"]
@@ -167,9 +168,25 @@ def test_minimax_codergen_argv_model_matches_normalized_env(
     env = observed["env"]
     assert isinstance(argv, list)
     assert isinstance(env, dict)
+    assert "--bare" in argv
     assert argv[argv.index("--model") + 1] == expected
     assert env["ANTHROPIC_MODEL"] == expected
     assert argv[argv.index("--model") + 1] == env["ANTHROPIC_MODEL"]
+
+
+def test_direct_claude_routes_do_not_inherit_minimax_bare_flag(monkeypatch, tmp_path):
+    """Explicit direct-Claude routes remain scoped, but are not MiniMax lanes."""
+    from runner.handlers import _gate_subprocess_args, Context as HCtx
+
+    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda args: args)
+    monkeypatch.setattr(
+        "runner.handlers._claude_config_dir",
+        lambda: tmp_path / "project-claude-config",
+    )
+    ctx = HCtx(goal="test", workdir=tmp_path, backend="claude")
+    for backend in ("claude", "claude-sonnet"):
+        argv = _gate_subprocess_args(backend, "PROMPT", ctx, 300)
+        assert "--bare" not in argv
 
 
 def test_run_gate_once_reports_claude_scope_error_distinct_from_sandbox(monkeypatch, tmp_path):

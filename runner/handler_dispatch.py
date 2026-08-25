@@ -565,7 +565,13 @@ def _gate_subprocess_args(
         claude_bin = _handlers_shim._get_claude_executable()
         claude_args = [claude_bin, "--print", "--dangerously-skip-permissions"]
         if backend == "minimax":
-            claude_args += ["--model", _resolved_minimax_model()]
+            # MiniMax is an unattended Claude Code transport.  ``--bare`` is
+            # mandatory here: it prevents Claude Code from reading OAuth
+            # credentials or the system keychain.  The trade-off is that
+            # Claude Code does not load CLAUDE.md; this lane already supplies
+            # its prompt and explicit provider environment, so that is
+            # intentional account isolation rather than a prompt dependency.
+            claude_args += ["--bare", "--model", _resolved_minimax_model()]
         claude_args.append(prompt)
         return sealed_args_builder(claude_args, workdir)
     if backend == "agy":
@@ -586,7 +592,9 @@ def _gate_subprocess_args(
     claude_bin = _handlers_shim._get_claude_executable()
     claude_args = [claude_bin, "--print", "--dangerously-skip-permissions"]
     if backend == "minimax":
-        claude_args += ["--model", _resolved_minimax_model()]
+        # See the workdir path above: every unattended MiniMax launch must
+        # opt out of OAuth/keychain discovery with ``--bare``.
+        claude_args += ["--bare", "--model", _resolved_minimax_model()]
     claude_args.append(prompt)
     return _handlers_shim._sandboxed_args(claude_args)
 

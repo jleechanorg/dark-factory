@@ -898,7 +898,11 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             # validation, whitespace normalization, and the default model.
             # Reuse its resolved value so argv and ANTHROPIC_MODEL cannot
             # diverge when DARK_FACTORY_MINIMAX_MODEL contains whitespace.
-            claude_cmd += ["--model", subprocess_env["ANTHROPIC_MODEL"]]
+            # ``--bare`` prevents the Claude Code CLI from reading OAuth
+            # credentials/system keychain.  It also skips CLAUDE.md, which is
+            # intentional for this unattended provider lane: prompt and
+            # MiniMax endpoint/model are supplied explicitly above.
+            claude_cmd += ["--bare", "--model", subprocess_env["ANTHROPIC_MODEL"]]
         claude_cmd.append(prompt_text)
         args = _handlers_shim._sandboxed_args_for_workdir(claude_cmd, ctx.workdir)
         if args is None:

@@ -7901,6 +7901,11 @@ fn run_minimax_judge(claude_bin: &str, prompt: &str) -> Result<String, DaemonErr
     let args = [
         "--print",
         "--dangerously-skip-permissions",
+        // This unattended MiniMax fallback must never read OAuth credentials
+        // or the system keychain.  --bare also skips CLAUDE.md; the fallback
+        // supplies its prompt and provider configuration explicitly, so that
+        // trade-off is deliberate account isolation.
+        "--bare",
         "--setting-sources",
         "",
         "--model",
@@ -8699,7 +8704,7 @@ mod chain_llm_fallback_argv_tests {
 
         let output = result.expect("MiniMax shim should succeed");
         assert!(
-            output.contains("args=<--print><--dangerously-skip-permissions><--setting-sources><><--model><MiniMax-M3><minimax-prompt>"),
+            output.contains("args=<--print><--dangerously-skip-permissions><--bare><--setting-sources><><--model><MiniMax-M3><minimax-prompt>"),
             "MiniMax argv must pin MiniMax-M3: {output}"
         );
         assert!(output.contains("model=MiniMax-M3"), "{output}");

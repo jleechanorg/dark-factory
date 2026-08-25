@@ -3370,6 +3370,9 @@ pub(crate) fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, Da
                 &[
                     "--print",
                     "--dangerously-skip-permissions",
+                    // See the MiniMax reviewer arm above: --bare prevents
+                    // fallback to a host Claude account/keychain.
+                    "--bare",
                     "--setting-sources",
                     "",
                     "--effort",
@@ -3772,7 +3775,7 @@ mod direct_claude_scope_tests {
         let claude = bin.join("claude");
         std::fs::write(
             &claude,
-            "#!/bin/sh\nprintf 'config=%s\\nbase=%s\\napi=%s\\nauth=%s\\nmodel=%s\\nmode=%s\\nminimax_base=%s\\nminimax_model=%s\\ndark_minimax_model=%s\\naws=%s\\nvertex=%s\\nopenai=%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$ANTHROPIC_BASE_URL\" \"$ANTHROPIC_API_KEY\" \"$ANTHROPIC_AUTH_TOKEN\" \"$ANTHROPIC_MODEL\" \"$CLAUDEM_MODE\" \"$MINIMAX_BASE_URL\" \"$MINIMAX_MODEL\" \"$DARK_FACTORY_MINIMAX_MODEL\" \"$AWS_PROFILE\" \"$VERTEXAI_PROJECT\" \"$OPENAI_API_KEY\"\n",
+            "#!/bin/sh\nprintf 'config=%s\\nbase=%s\\napi=%s\\nauth=%s\\nmodel=%s\\nmode=%s\\nminimax_base=%s\\nminimax_model=%s\\ndark_minimax_model=%s\\naws=%s\\nvertex=%s\\nopenai=%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$ANTHROPIC_BASE_URL\" \"$ANTHROPIC_API_KEY\" \"$ANTHROPIC_AUTH_TOKEN\" \"$ANTHROPIC_MODEL\" \"$CLAUDEM_MODE\" \"$MINIMAX_BASE_URL\" \"$MINIMAX_MODEL\" \"$DARK_FACTORY_MINIMAX_MODEL\" \"$AWS_PROFILE\" \"$VERTEXAI_PROJECT\" \"$OPENAI_API_KEY\"\nprintf 'args='; for arg in \"$@\"; do printf '<%s>' \"$arg\"; done; printf '\\n'\n",
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -3836,6 +3839,10 @@ mod direct_claude_scope_tests {
                 "{line:?} leaked in {result:?}"
             );
         }
+        assert!(
+            !result.contains("<--bare>"),
+            "explicit direct-Claude route must retain configured account semantics: {result}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3930,6 +3937,7 @@ mod direct_claude_scope_tests {
         assert!(result.contains("api=minimax-key"), "{result}");
         assert!(result.contains("model=MiniMax-M3"), "{result}");
         assert!(result.contains("small="), "{result}");
+        assert!(result.contains("<--bare>"), "MiniMax reviewer must use Claude Code --bare: {result}");
         assert!(result.contains("<--model><MiniMax-M3>"), "{result}");
     }
 }

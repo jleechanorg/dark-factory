@@ -116,9 +116,14 @@ log "minimax env vars set; ANTHROPIC_MODEL=${ANTHROPIC_MODEL}"
 
 cd "$WT"
 
-log "dispatching coder via claudem -p \$(cat ${REPO}/daemon/qw5-coder-prompt.md)"
+log "dispatching coder via claudem --bare -p \$(cat ${REPO}/daemon/qw5-coder-prompt.md)"
 # Run with stdin closed to avoid interactive prompts in launchd context.
-claudem -p "$(cat "${REPO}/daemon/qw5-coder-prompt.md")" \
+# --bare prevents the wrapper's Claude Code transport from consulting OAuth
+# credentials/system keychain. It skips CLAUDE.md as a deliberate trade-off:
+# this pilot supplies its prompt and MiniMax environment explicitly. The
+# trailing --model wins over claudem's own wrapper default (MiniMax-M3[1m]).
+claudem --bare -p "$(cat "${REPO}/daemon/qw5-coder-prompt.md")" \
+  --model MiniMax-M3 \
   </dev/null \
   || log "claudem exited non-zero (continuing; coder log in claude session output)"
 
