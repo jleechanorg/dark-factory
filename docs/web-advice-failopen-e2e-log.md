@@ -1,8 +1,13 @@
 # /web-advice Fail-Open End-to-End Log (Lane D)
 
-Status: **EXECUTED** — one pipeline run (blocked at holdout) + one direct handler invocation
-(succeeded). Both runs exercised the new `type="web_advice"` handler against a real draft
-PR on `jleechanorg/dark-factory`. The §3.4 fail-open invariant is **verified**.
+Status: **HISTORICAL / INVALID FOR PANEL EVIDENCE** — one pipeline run (blocked at
+holdout) + one direct handler invocation (returned `outcome=success`) are retained for
+forensic history. The direct run did **not** produce a valid `/web-advice` panel verdict
+or compliant evidence: its empty panel, `verdict_captured` label, and
+`all_transports_down` failure mode are internally contradictory. It demonstrates only
+the fail-open outcome routing, not a cross-model review or production readiness. It is
+superseded by the current strict panel schema, which classifies this shape as
+`panel_contract_invalid` / infrastructure failure.
 
 Authors: Lane D test-invocation agent, 2026-08-21.
 Refs: `docs/web-advice-failopen-design.md`, `pipelines/factory/web-advice-failopen.dot`,
@@ -143,12 +148,13 @@ forbids touching sealed holdouts).
 
 - Final pipeline outcome: **exhausted** (3 fix visits, no `fix`→`holdout` recovery).
 - `web_advice` reached: **NO**.
-- Fail-open invariant verified at pipeline layer: **N/A** (the relevant code path was
-  not exercised by this run; verified in §3 via direct invocation).
+- Fail-open routing at pipeline layer: **N/A** (the relevant code path was not
+  exercised by this run; §3's direct invocation only observed a success return,
+  not a valid panel or verdict).
 
 ---
 
-## 3. Direct handler invocation (proves the fail-open invariant end-to-end)
+## 3. Direct handler invocation (historical fail-open routing smoke; invalid panel evidence)
 
 Because the pipeline run could not reach `web_advice` without operator-approved
 holdouts, a direct handler invocation was added at
@@ -156,9 +162,11 @@ holdouts, a direct handler invocation was added at
 
 The script bypasses `holdout_eval` and the strict gates; it constructs a minimal
 `Context` + `Node` and calls `_web_advice(node, ctx)` directly, mirroring what the
-runner engine does on node visit (minus the upstream routing).
+runner engine does on node visit (minus the upstream routing). This is useful only for
+the historical fail-open return path. It is **not** a valid panel capture, verdict, or
+cross-model lens, and its artifacts must not be used as production evidence.
 
-### 3.1 Run summary
+### 3.1 Run summary (raw historical output; superseded)
 
 ```
 [1] handler registration: web_advice -> runner.handler_web_advice._web_advice OK
@@ -174,20 +182,26 @@ runner engine does on node visit (minus the upstream routing).
 ```
 
 The handler ran the §3.5 transport probe, detected `cdp_port` (Chrome DevTools
-Protocol at `127.0.0.1:9222` was listening on `Jeff-Ubuntu`), attempted to drive
-the panel via CDP, and — because the host has no real /web-advice transport
-attached to a working browser session — extracted a non-AUTH `verdict='fail'`
-with no `share_urls`. **It returned `outcome='success'` regardless.**
+Protocol at `127.0.0.1:9222` was listening on `Jeff-Ubuntu`), and returned
+`outcome='success'`. The historical record simultaneously reports no live panel
+seats, `panel_decision=verdict_captured`, and `infrastructure_failure_mode=all_transports_down`.
+That contradiction means no panel verdict was captured. Under the current strict schema,
+this is `panel_contract_invalid` / infrastructure failure. **Only the fail-open return
+path was demonstrated.**
 
-### 3.2 Three side effects (per design §3.3)
+### 3.2 Raw side-effect log (not a compliant §3.3 result)
+
+These writes are preserved as historical artifacts, but they do not establish a valid
+panel review or evidence bundle. The current schema rejects the contradictory envelope
+as `panel_contract_invalid` / infrastructure failure.
 
 | Channel | Status | Evidence |
 |---|---|---|
-| CXDB structured event | **WRITTEN** | `/tmp/web-advice-failopen-direct-test-cxdb.sqlite` — 1 row for `web_advice`, `outcome=success`, 824 bytes of `metadata_json`. Mirror persisted to `/tmp/web-advice-direct-test-evidence/web-advice-cxdb-event-direct.json`. |
-| PR comment (`<!-- web-advice-review -->`) | **POSTED** | Comment by `jleechan2015` at `2026-08-22T02:34:16Z` on PR #664, `body` length 200+ chars, opens with `<!-- web-advice-review -->` and contains the §6.1 verdict-captured template (`Decision: continue (verdict captured — fail-open)`, `Transport: cdp_port`, `Verdict: fail`). |
-| Follow-up bead via `br create` | **FILED (skipped — not required)** | Skipped because decision != `continue_with_bead` here and verdict was not 3-of-4 NOT MERGE. The handler's metadata includes `"bead_filed": null`. |
+| CXDB structured event | **WRITTEN, INVALID** | `/tmp/web-advice-failopen-direct-test-cxdb.sqlite` — 1 row for `web_advice`, `outcome=success`, with contradictory panel fields. Mirror persisted to `/tmp/web-advice-direct-test-evidence/web-advice-cxdb-event-direct.json`; neither is compliant panel evidence. |
+| PR comment (`<!-- web-advice-review -->`) | **POSTED, SUPERSEDED** | A historical comment was posted on PR #664, but its verdict-captured template is misleading for the contradictory empty-panel/infrastructure result. Do not treat it as a valid panel verdict or cross-model review. |
+| Follow-up bead via `br create` | **NOT FILED** | No bead was required or filed for this invalid historical run. |
 
-### 3.3 CXDB event body (truncated, for shape verification)
+### 3.3 CXDB event body (truncated; demonstrates the invalid contradiction)
 
 ```json
 {
@@ -208,7 +222,11 @@ with no `share_urls`. **It returned `outcome='success'` regardless.**
 }
 ```
 
-### 3.4 Per §6.1 comment template on PR #664 (excerpt)
+The combination of `panel_seats_live: []`, `panel_decision: verdict_captured`, and
+`infrastructure_failure_mode: all_transports_down` is not a valid `/web-advice` panel
+envelope. It is retained to explain the historical run, not to verify the §5 schema.
+
+### 3.4 Historical PR comment (superseded; not a valid §6.1 verdict)
 
 ```markdown
 <!-- web-advice-review -->
@@ -225,16 +243,16 @@ with no `share_urls`. **It returned `outcome='success'` regardless.**
 Comments counter after the run: 2 (CodeRabbit's "draft detected" auto-message + the
 above `jleechan2015` web-advice review). Both visible at `gh pr view 664 --comments`.
 
-### 3.5 Fail-open invariant verified
+### 3.5 Fail-open routing only (panel/verdict evidence invalid)
 
 | Property | Required by design | Observed |
 |---|---|---|
 | `outcome` returned to the .dot engine | always `"success"` | **`"success"`** |
 | §3.5 transport probe runs | ≤10s | ran, detected `cdp_port` |
-| `panel_seats_attempted` always the full 4 | full list | full list |
-| `decision` field | one of `continue \| continue_with_bead \| continue_with_pr_warning`, never `block` | `"continue"` |
-| PR comment markers present | `<!-- web-advice-review --> ... <!-- /web-advice-review -->` | present in the posted comment |
-| Handler never raises | outer `except Exception` returns success | verified by 64 unit tests |
+| `panel_seats_attempted` always the full 4 | full list | raw field present, but the envelope is invalid because no seats were live while it claimed a captured verdict |
+| `decision` field | one of `continue \| continue_with_bead \| continue_with_pr_warning`, never `block` | raw `"continue"` field in the historical comment; this does not make the invalid envelope compliant |
+| PR comment markers present | `<!-- web-advice-review --> ... <!-- /web-advice-review -->` | markers were present, but the comment is superseded and is not valid panel evidence |
+| Handler never raises | outer `except Exception` returns success | covered by the revision's unit tests; this historical artifact adds no panel evidence |
 
 ---
 
@@ -258,9 +276,10 @@ above `jleechan2015` web-advice review). Both visible at `gh pr view 664 --comme
 ## 5. Operator actions & follow-up dispositions
 
 1. **Review PR #664** at `https://github.com/jleechanorg/dark-factory/pull/664`. The PR
-   is in `OPEN`, `isDraft: true` state. The §6.1 web-advice review comment is the
-   cross-Model lens — verdict=fail because the CDP transport on this host produced
-   no usable panel data, NOT because of any defect in the docs change.
+   is in `OPEN`, `isDraft: true` state. The historical web-advice comment is
+   superseded and must **not** be treated as a cross-model lens or a valid verdict:
+   the CDP path produced no usable panel data, and the empty-panel metadata was
+   contradictory. It says nothing about the docs change.
 2. **Do NOT merge PR #664.** It is a test fixture.
 3. **Item #2 §3.5 probe accepts an arbitrary TCP listener as CDP — FIXED:**
    `_probe_cdp_port` now validates Chrome's `/json/version` response and requires
@@ -281,19 +300,21 @@ above `jleechan2015` web-advice review). Both visible at `gh pr view 664 --comme
 
 ---
 
-## 6. Fail-open invariant: VERIFIED
+## 6. Fail-open routing outcome (limited; panel evidence invalid)
 
-- ✅ Handler returns `outcome=success` regardless of probe state, verdict, transport.
-- ✅ §3.5 transport probe runs and detects host capability.
-- ✅ CXDB event written with full §5 schema.
-- ✅ PR comment posted with `<!-- web-advice-review -->` markers (GH API REST).
-- ✅ No banned substitutes (no provider API fallback, no fabricated share URL).
-- ✅ Handler never raises (64 unit tests + direct invocation both confirm).
+- ✅ Handler returned `outcome=success` on the historical direct path.
+- ✅ §3.5 transport probe ran and detected host capability.
+- ⚠️ CXDB event and PR comment were written, but their contradictory panel fields
+  are invalid under the current strict schema (`panel_contract_invalid` /
+  infrastructure failure); they are not compliant §5/§6 evidence.
+- ⚠️ No cross-model panel verdict, valid share evidence, or production-readiness
+  claim is supported by this run.
+- ✅ Handler non-raising behavior is covered by the revision's unit tests.
 - ⚠️  Full pipeline never reached `web_advice` due to test-feature/holdouts mismatch.
-  This is a test-environment gap, not a fail-open regression — the handler
-  itself proved the invariant end-to-end when invoked directly.
+  This is a test-environment gap; the direct run only exercised the fail-open
+  return routing and did not prove panel behavior.
 
-The new `pipelines/factory/web-advice-failopen.dot` + `runner/handler_web_advice.py`
-+ `runner/handlers.py::TYPE_REGISTRY["web_advice"]` + `runner/graph_audit.py
-::_REVIEWER_TYPE_NAMES` are **ready for production insertion** behind the strict
-gates of the operator-approved `pr_gates.dot`.
+The pipeline and handler references above may be reviewed independently, but this
+historical log is **not** production evidence and does not establish readiness for
+insertion into `pr_gates.dot` or any other production pipeline. A fresh run with a
+valid strict-schema panel envelope and compliant evidence is required.
