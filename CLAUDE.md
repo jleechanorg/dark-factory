@@ -75,6 +75,20 @@ no coding sub-agent lanes. The session's ONLY jobs:
    label→merge E2E proof unfalsifiable (2026-07-11/12 incidents: hand-driven
    PRs masked a dead coder loop for a full day).
 
+## Environment normalization for test runs
+
+An env var in operator sessions (particularly cmux CLI shim vars like `CLAUDE_CODE_ENTRYPOINT`, `CMUX_CLAUDE_WRAPPER_SHIM_ROOT`, `CLAUDE_PID`, `NODE_OPTIONS` injected through `cmux-claude-node-options`) can make `subprocess.run(["claude", "--print", ...])` route into an interactive path when called from a non-interactive subprocess.
+
+Verification command to run BEFORE attributing a test hang to code changes:
+
+```bash
+env -i PATH="$PATH" HOME="$HOME" USER="$USER" .venv/bin/python -m pytest <path> -q -p no:cacheprovider --timeout=120
+```
+
+If the test passes under clean env but fails in the operator session, the failure is environmental, not code, and the change should NOT be rolled back on this evidence.
+
+Evidence: `feedback_2026-08-25_cmux_session_env_hangs_subprocess_claude.md`.
+
 ## Factory host placement (Linux-only)
 
 `jeff-ubuntu` is the sole Auto-Factory host. Start, stop, inspect, and deploy
