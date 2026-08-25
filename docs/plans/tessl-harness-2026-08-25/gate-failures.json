@@ -1,0 +1,71 @@
+{
+  "schema": "gate-failures.json",
+  "mined_at": "2026-08-25T09:18:00Z",
+  "branch": "research/tessl-harness-applied-to-dark-factory",
+  "head_sha": "422e86bc5e",
+  "source": "lane-2-mine-cxdb",
+  "cxdb_path": "~/.dark-factory/cxdb.sqlite",
+  "all_time": {
+    "total_steps": 2495,
+    "total_runs": 152,
+    "ts_min": "2026-05-21",
+    "ts_max": "2026-08-19"
+  },
+  "last_30_days": {
+    "top_failure_clusters": [
+      {"node": "gate_red", "outcome": "failure", "count": 24, "interpretation": "TOP FAILING NODE: gate_es / gate_red-style review catches substantive defects; gate_red is a hard block. 24 failures in 30 days is the dominant single-node failure."},
+      {"node": "explore_stitch", "outcome": "failure", "count": 11, "interpretation": "Single parallel-fanout node; 11 fails among 26 successes = 30% failure rate."},
+      {"node": "explore_auth", "outcome": "failure", "count": 10, "interpretation": "Sibling of explore_stitch; same pattern."},
+      {"node": "explore_concept", "outcome": "failure", "count": 10, "interpretation": "Sibling; same pattern."},
+      {"node": "explore_in", "outcome": "failure", "count": 10, "interpretation": "Sibling; same pattern."},
+      {"node": "explore_join", "outcome": "failure", "count": 10, "interpretation": "Sibling; same pattern."},
+      {"node": "explore_reuse", "outcome": "failure", "count": 10, "interpretation": "Sibling; same pattern."},
+      {"node": "explore_risks", "outcome": "failure", "count": 10, "interpretation": "Sibling; same pattern."},
+      {"node": "reproduce", "outcome": "failure", "count": 10, "interpretation": "Sibling of explore_*."},
+      {"node": "explore_out", "outcome": "failure", "count": 9, "interpretation": "Sibling of explore_*."},
+      {"node": "gate_skeptic", "outcome": "failure", "count": 7, "interpretation": "Skeptic gate fails 7/30d. Critical because skeptic + /er + cross-model are the three compensating signals for vendor waivers (verifier.rs:1008-1012). If skeptic is unreliable, the waiver contract collapses."},
+      {"node": "__run_end__", "outcome": "exhausted", "count": 6, "interpretation": "Circuit breaker tripping — repeated exhaustion. Per bead 2026-06-27 v4: CXDB streak short-circuits before handler when last 3 runs all exhausted."},
+      {"node": "cold_reviewer", "outcome": "error", "count": 3, "interpretation": "Distinct from 'failure' — review subprocess died. Likely rate-limit (HTTP 429) or quota exhaustion."},
+      {"node": "cold_reviewer", "outcome": "failure", "count": 3, "interpretation": "Real review verdict failure."},
+      {"node": "review", "outcome": "failure", "count": 2, "interpretation": "Review node failure."},
+      {"node": "worker", "outcome": "exhausted", "count": 2, "interpretation": "Worker exhaustion."},
+      {"node": "__run_end__", "outcome": "error", "count": 1, "interpretation": "Run-end error."},
+      {"node": "exit", "outcome": "error", "count": 1, "interpretation": "Exit error."},
+      {"node": "fix", "outcome": "exhausted", "count": 1, "interpretation": "Fix-loop exhaustion — max_visits=3 reached."},
+      {"node": "fix", "outcome": "failure", "count": 1, "interpretation": "Fix-loop failure."}
+    ],
+    "tessl_attack_vectors": [
+      {
+        "vector": "T01-shared-failure-pattern",
+        "evidence": "9 explore_* nodes + reproduce all fail at 9-11 each in same 30d window. High covariance suggests they share a downstream dependency (likely base worktree state, common parent).",
+        "tessl_pillar": "P2_analytics",
+        "invariant_opportunity": "Add a parallel-fanout shared-failure detector: when N sibling nodes fail with overlapping fingerprints (same error hash, same metadata_json prefix), classify as 'shared dependency failure' not 9 independent defects. Reduce noise in CXDB."
+      },
+      {
+        "vector": "T02-gate-es-error-vs-failure",
+        "evidence": "gate_es has 36 'error' + 22 'failure' all-time. Error vs failure distinction is critical: 'error' = infra (Claude process died, network), 'failure' = substantive (verdict=fail). CXDB doesn't currently cluster these.",
+        "tessl_pillar": "P2_analytics",
+        "invariant_opportunity": "Healer cluster should split 'error' from 'failure' before reporting; the user's diagnostic pattern (per MEMORY.md) was to distinguish infra crashes from real defects. Without the split, Healer recommends patches for infra issues."
+      },
+      {
+        "vector": "T03-skeptic-as-load-bearing",
+        "evidence": "gate_skeptic fails 7/30d. Skeptic verdict is a load-bearing input to vendor waivers (verifier.rs:1009). 7 skeptic failures in 30d = 7 beads stuck at vendor-waiver path. Each blocked bead is a missed merge.",
+        "tessl_pillar": "P3_risk_ladder",
+        "invariant_opportunity": "Skeptic gate should be at the TOP of the risk ladder, not the middle. A flake here can block everything; needs a fallback chain (cold_reviewer retry, then codex, then human). Per MEMORY.md Coder pipeline missing fallbacks (2026-08-20 rev-tj5qh/rev-a8t5l/rev-k8hp4) this is a known gap."
+      },
+      {
+        "vector": "T04-circuit-breaker-tripping",
+        "evidence": "__run_end__|exhausted = 6 in 30d. v4 circuit breaker fires on 3 consecutive exhausted runs. 6 exhausted runs in 30d suggests the breaker is firing every ~5 days, not catching a one-off.",
+        "tessl_pillar": "P2_analytics",
+        "invariant_opportunity": "Add a Healer pre-flight check: when circuit breaker trips, write the LAST-3-RUNS' node outcomes + metadata to a structured breaker-trip.md for the next session to read before relaunch. Without this, every breaker-fire loses context."
+      },
+      {
+        "vector": "T05-fanout-cold-reviewer-rate-limit",
+        "evidence": "cold_reviewer:error = 3 in 30d. These are likely 429s. MEMORY.md notes 'CodeRabbit rate-limited + BugBot usage-limited' caused ironclad audit matrix failure (2026-08-17).",
+        "tessl_pillar": "P3_risk_ladder",
+        "invariant_opportunity": "Before launching cold_reviewer fan-out, probe a 1-agent canary (per swarm skill rule 4 rate-limit resilience). Probe failure = use human-review fallback, not 'just retry'."
+      }
+    ],
+    "cluster_summary": "Two failure modes dominate: (1) parallel-fanout shared-failure covariance (9-11 per node, 9 sibling nodes), and (2) load-bearing gate flakes (gate_skeptic, gate_es) cascading into vendor-waiver path. Both are candidates for Tessl-style invariants: (1) -> P2 analytics dashboard with shared-failure clustering; (2) -> P3 risk-ladder with gate-skeptic at the top tier + fallback chain."
+  }
+}

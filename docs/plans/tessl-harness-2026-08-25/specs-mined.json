@@ -1,0 +1,128 @@
+{
+  "schema": "specs-mined.json",
+  "mined_at": "2026-08-25T09:18:00Z",
+  "branch": "research/tessl-harness-applied-to-dark-factory",
+  "head_sha": "422e86bc5e",
+  "source": "lane-1-mine-specs",
+  "purpose": "Inventory the bead-shaped invariants the daemon enforces today, with file:line evidence",
+  "invariants": [
+    {
+      "id": "I01-gate-1-ci-green",
+      "name": "ci_green",
+      "category": "scm",
+      "enforcement": "gates_compute.rs:33-70",
+      "verdict_shape": {"green": "no pending + no fail/cancel", "red": "any fail/cancel", "unknown": "empty list or any pending"},
+      "input": "gh pr checks --json state,bucket",
+      "vacuous_risk": "EMPTY checks list -> 'unknown' (NOT red). Pending checks mask failures. The 30s run_tool timeout can yield empty 'unknown' on slow gh.",
+      "current_passes": "429/3h edge cases common"
+    },
+    {
+      "id": "I02-gate-2-no-conflicts",
+      "name": "no_conflicts",
+      "category": "scm",
+      "enforcement": "gates_compute.rs:72-101",
+      "verdict_shape": {"green": "MERGEABLE", "red": "CONFLICTING", "unknown": "any other value"},
+      "input": "gh pr view --json mergeable",
+      "vacuous_risk": "GitHub returns 'UNKNOWN' while computing -> mapped to 'unknown' (NOT red). Old branches with stale mergeable can stay UNKNOWN.",
+      "current_passes": "Stable; subject to gh-side latency"
+    },
+    {
+      "id": "I03-gate-3-coderabbit",
+      "name": "coderabbit",
+      "category": "scm",
+      "enforcement": "gates_compute.rs:103-151; filtering MEMORY.md 2026-07-06:138",
+      "verdict_shape": {"green": "last non-COMMENTED review is APPROVED", "red": "last non-COMMENTED review is CHANGES_REQUESTED", "unknown": "no review or other state"},
+      "input": "gh pr view --json reviews",
+      "vacuous_risk": "ALL-COMMENTED reviews filtered out (line 138) -> no reviews left -> 'unknown' (NOT red). PR without any CodeRabbit review (e.g. small diffs, private fork) vacuously passes.",
+      "current_passes": "Vendored; subject to CodeRabbit outage"
+    },
+    {
+      "id": "I04-gate-4-bugbot",
+      "name": "bugbot",
+      "category": "scm",
+      "enforcement": "gates_compute.rs:153-190 (substring body match)",
+      "verdict_shape": {"green": "0 comments matching cursor|bugbot AND body containing 'error' or 'fail'", "red": ">=1 such comment"},
+      "input": "gh pr view --json comments",
+      "vacuous_risk": "Body substring 'fail' matches ANY word containing those letters: 'failure-rate', 'failing test', 'feasibility', 'failover'. FALSE POSITIVE: substantive BugBot advice containing 'no failures detected' trips red. FALSE NEGATIVE: BugBot posts no comment at all -> 0 -> green (vacuous).",
+      "current_passes": "Falsely red on routine reviews"
+    },
+    {
+      "id": "I05-gate-5-comments-resolved",
+      "name": "comments_resolved",
+      "category": "scm",
+      "enforcement": "gates_compute.rs:192-266 (GraphQL reviewThreads, first:100)",
+      "verdict_shape": {"green": "0 unresolved review threads", "red": ">=1 unresolved thread"},
+      "input": "gh api graphql query with reviewThreads(first:100)",
+      "vacuous_risk": "first:100 caps the page; PRs with 100+ unresolved threads (long-lived PRs) silently get 'green' on the first page. Missing pullRequest in response (deleted PR / no auth) -> unresolved_thread_count = 0 -> green (vacuous).",
+      "current_passes": "Stable; pagination bug a known risk"
+    },
+    {
+      "id": "I06-gate-6-evidence-review",
+      "name": "evidence_review",
+      "category": "evidence",
+      "enforcement": "verifier.rs:578-640 (evidence_floor_gate)",
+      "verdict_shape": {
+        "green": "(/er Pass AND evidence_gist Verified) OR (non_test_changed_loc <= 100 AND no marker needed)",
+        "red": "EvidenceGistStatus::Failed (r5 fail-closed) OR /er Fail/Inconclusive/Partial (PRODUCTION) OR above LOC floor with NotProvided",
+        "unknown": "/er Absent OR EvidenceGistStatus::Pending (transient)"
+      },
+      "input": "PrEvidence.er_verdict + PrEvidence.evidence_gist_status + PrEvidence.non_test_changed_loc",
+      "vacuous_risk": "non_test_changed_loc <= 100 unconditionally green (no evidence required). A 99-LOC production bug PR bypasses all evidence requirements.",
+      "current_passes": "Tightened r5; previously bypassed via substring floor (bead jleechan-yoqy)"
+    },
+    {
+      "id": "I07-gate-7-skeptic",
+      "name": "skeptic",
+      "category": "cross-model",
+      "enforcement": "verifier.rs:905-921 (skeptic_gate) + assess:1178-1184 (cross-model downgrade)",
+      "verdict_shape": {
+        "green": "Pass OR Warn",
+        "red": "Fail OR (Pass/Warn + review_degraded=true: cross-model guarantee violated, issue #385)",
+        "unknown": "None (no verdict recorded)"
+      },
+      "input": "PrEvidence.skeptic_verdict + PrEvidence.review_degraded",
+      "vacuous_risk": "Warn is non-blocking (line 909) — skeptic can say 'I see problems' and gate stays green. If a vendor ran with degraded review (single-model), Pass->Red (good); if no vendor ran at all (total outage), review_degraded=true AND skeptic=None -> Unknown. BUT if reviewer pool has 1+ entries with overlapping model families, single-family detection may miss.",
+      "current_passes": "Subtle; depends on vendor_health ledger"
+    },
+    {
+      "id": "I08-gate-8-vacuous-red-green",
+      "name": "vacuous_red_green",
+      "category": "test-quality",
+      "enforcement": "verifier.rs:955-986 (vacuous_red_green_gate) + vacuous_red_green.rs (detector)",
+      "verdict_shape": {
+        "green": "NotProvided (test-repo fast lane) OR Genuine OR BaselineFailed",
+        "red": "Vacuous (tests pass on reverted production tree)",
+        "unknown": "GreenFailed OR NoChangedTests OR ManifestMissing OR CargoNotFound OR PytestNotFound"
+      },
+      "input": "PrEvidence.vacuous_red_green (VacuousRedGreenStatus)",
+      "vacuous_risk": "BaselineFailed -> GREEN (line 965): infra can't materialize base worktree (no GH_TOKEN, gh pr view failed) -> vacuous detector returns BaselineFailed -> gate passes green. A PR where the detector CAN'T actually run still passes the gate. test-repo PRs (NotProvided) get unconditional green.",
+      "current_passes": "intentional per design (PR #413 incident 2026-07-21)"
+    },
+    {
+      "id": "I09-waiver-substitution",
+      "name": "vendor_waiver",
+      "category": "cross-model",
+      "enforcement": "verifier.rs:1118-1147 (apply_vendor_waiver) + compensating_coverage_green (1008-1012)",
+      "verdict_shape": {"green-equivalent": "compensating_coverage_green(evidence) == true", "preserves_audit": "waiver token 'vendor:waived_vendor_unavailable' in reason"},
+      "input": "VendorHealth (Capped) + SkepticVerdict::Pass + ErVerdict::Pass + review_degraded=false",
+      "vacuous_risk": "If Skeptic returns Pass from a single-family review but review_degraded=false (e.g. fall-through bug), compensating coverage is asserted green -> vendor waiver silently substitutes. The three signals must all three be green per the contract, but bug in compute_review_degraded could leak through.",
+      "current_passes": "Strict but fragile"
+    },
+    {
+      "id": "I10-pipeline-gate-contract",
+      "name": "pipeline_gate_strict",
+      "category": "pipeline",
+      "enforcement": "pipelines/factory/gates.dot:35-58 (gate_strict=true on all nodes)",
+      "verdict_shape": {"green": "outcome=success", "red": "outcome!=success", "routing": "all !success edges route to fix (max_visits=3)"},
+      "input": "node outcome strings",
+      "vacuous_risk": "All 6 gates set gate_strict=true but the ONLY enforced consequence is 'route to fix'. After 3 fix iterations (max_visits=3) the run terminates regardless of remaining defects. gate_cs at line 102 has no !success edge -> vacuous: gate_cs fail path goes UNROUTED.",
+      "current_passes": "Pipeline shape; not auto-detected by graph_audit"
+    }
+  ],
+  "tessl_pillar_mapping": {
+    "P1_systems_invariants": ["I06", "I08", "I10"],
+    "P2_analytics": ["I04", "I05", "I07"],
+    "P3_risk_ladder": ["I09", "I03 (CodeRabbit fail-open vs strict)", "I06 (LOC floor bypass)"]
+  },
+  "summary": "10 invariants currently enforced. Vacuous-risk items cluster in: substring-based body matching (I04), pagination caps (I05), 'unknown != red' uncertainty gaps (I01, I02, I03, I07), and infra-failure -> green paths (I08 BaselineFailed, I09 waiver chain). Tessl would re-shape each: replace substring matching with structured fields (P1), add a per-gate analytics dashboard (P2), and tier the gate-block vs gate-warn vs gate-noop (P3)."
+}

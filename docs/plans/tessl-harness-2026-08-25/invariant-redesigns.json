@@ -1,0 +1,94 @@
+{
+  "schema": "invariant-redesigns.json",
+  "mined_at": "2026-08-25T09:24:00Z",
+  "branch": "research/tessl-harness-applied-to-dark-factory",
+  "head_sha": "422e86bc5e",
+  "source": "lane-5-redesign-invariants",
+  "method": "Tessl pillars (P1 systems invariants, P2 analytics, P3 risk ladder) applied to surviving attacks",
+  "redesigns": [
+    {
+      "id": "R1",
+      "title": "Replace BugBot substring matching with structured verdict",
+      "tessl_pillar": "P1+P2",
+      "attacks_addressed": ["A-4.1", "A-4.2"],
+      "risk_tier": "HIGH",
+      "invariant_statement": "A vendor verdict is a structured field, not free-text. Free-text is never used to compute a verdict.",
+      "enforcement": ["CI gate (structural-marker check)", "AST-grep rule", "LLM verifier", ".dot pipeline node"],
+      "migration_prs": 3,
+      "critical_path": true,
+      "blast_radius_control": "substring kept as legacy_warning telemetry for 2 release cycles"
+    },
+    {
+      "id": "R2",
+      "title": "Separate detector-didnt-run from detector-ran-and-passed",
+      "tessl_pillar": "P1",
+      "attacks_addressed": ["A-8.1"],
+      "risk_tier": "CRITICAL",
+      "invariant_statement": "The vacuous-test detector's absence is distinct from its absence-of-finding. Infra failure -> Red, not Green.",
+      "enforcement": ["Type system (DetectorSkipped variant)", "Detective trigger in tick.rs", "Operator-visible INFRA-VERIFICATION-NEEDED state", "Daily telemetry"],
+      "migration_prs": 3,
+      "critical_path": true,
+      "blast_radius_control": "kill-switch DARK_FACTORY_DISABLE_DETECTOR_SKIP_RED=1 for emergency rollback",
+      "priority_rank": 1
+    },
+    {
+      "id": "R3",
+      "title": "Surface Skeptic::Warn text in to_json() telemetry",
+      "tessl_pillar": "P2",
+      "attacks_addressed": ["A-7.1"],
+      "risk_tier": "HIGH",
+      "invariant_statement": "Every non-passing verdict carries its reason in operator-visible telemetry.",
+      "enforcement": ["Type-level change in GateResult::to_json", "Schema test", "Daily CXDB grep digest"],
+      "migration_prs": 1,
+      "critical_path": false,
+      "blast_radius_control": "purely additive; no production behavior change"
+    },
+    {
+      "id": "R4",
+      "title": "Tiered LOC floor keyed on file-class",
+      "tessl_pillar": "P3",
+      "attacks_addressed": ["A-6.1"],
+      "risk_tier": "HIGH",
+      "invariant_statement": "The evidence floor is tiered by risk-class, not a single LOC threshold.",
+      "enforcement": ["TouchedFileClass enum in PrEvidence", "config/daemon.toml tier map", "Schema test per tier"],
+      "migration_prs": 3,
+      "critical_path": false,
+      "blast_radius_control": "phase 3 opt-in via DARK_FACTORY_STRICT_EVIDENCE_FLOOR=1"
+    },
+    {
+      "id": "R5",
+      "title": "Vendor identity is configuration + every reviewer has availability invariant",
+      "tessl_pillar": "P1+P3",
+      "attacks_addressed": ["A-2.1", "A-3.2", "A-5.1", "A-5.2", "C-1"],
+      "risk_tier": "HIGH",
+      "invariant_statement": "Vendor identity is configuration; every reviewer has an availability invariant.",
+      "enforcement": ["config/reviewers.toml alias table", "ReviewerHealth ledger parallel to VendorHealth", "Gate-level alias resolution"],
+      "migration_prs": 3,
+      "critical_path": true,
+      "blast_radius_control": "kill-switch DARK_FACTORY_DISABLE_REVIEWER_HEALTH_LEDGER=1",
+      "priority_rank": 2
+    },
+    {
+      "id": "R6",
+      "title": "Invariant adherence dashboard (analytics meta-redesign)",
+      "tessl_pillar": "P2",
+      "attacks_addressed": ["(meta)"],
+      "risk_tier": "LOW",
+      "invariant_statement": "Every invariant has a measurable adherence signal surfaced daily.",
+      "enforcement": ["Daily Healer cron at 04:00 UTC", "docs/heuristic/invariant-adherence-<date>.md output", "Alert on 0-fires-in-7-days"],
+      "migration_prs": 1,
+      "critical_path": false
+    }
+  ],
+  "summary": {
+    "total_redesigns": 6,
+    "total_migration_prs": 14,
+    "critical_path_redesigns": ["R1", "R2", "R5"],
+    "priority_order_for_bead_authoring": ["R2", "R1", "R5", "R3", "R4", "R6"],
+    "tessl_pillar_coverage": {
+      "P1_systems_invariants": ["R1", "R2", "R5"],
+      "P2_analytics": ["R1", "R3", "R6"],
+      "P3_risk_ladder": ["R4", "R5"]
+    }
+  }
+}

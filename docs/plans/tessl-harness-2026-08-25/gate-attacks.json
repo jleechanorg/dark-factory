@@ -1,0 +1,131 @@
+{
+  "schema": "gate-attacks.json",
+  "mined_at": "2026-08-25T09:21:00Z",
+  "branch": "research/tessl-harness-applied-to-dark-factory",
+  "head_sha": "422e86bc5e",
+  "source": "lane-4-attack-spec-gen",
+  "method": "3-lens refute-by-default per attack (evidence / severity / design); survives at >=2/3",
+  "attack_count": 17,
+  "surviving_count": 10,
+  "attacks": [
+    {
+      "id": "A-2.1",
+      "gate": "no_conflicts",
+      "title": "UNKNOWN mergeable wedges indefinitely",
+      "file_line": "gates_compute.rs:97-101",
+      "lens_survival": [true, true, false],
+      "severity": "MEDIUM",
+      "verdict": "BYPASS_CANDIDATE",
+      "tessl_pillar": "P2_analytics"
+    },
+    {
+      "id": "A-4.1",
+      "gate": "bugbot",
+      "title": "Substring 'fail' false-positive matches 'feasibility', 'failure-rate', etc.",
+      "file_line": "gates_compute.rs:179-181",
+      "lens_survival": [true, true, true],
+      "severity": "HIGH",
+      "verdict": "BYPASS_CANDIDATE_INVERSE",
+      "tessl_pillar": "P1_systems_invariants",
+      "note": "Inverse bypass: false-positive RED drives churn, not false-green"
+    },
+    {
+      "id": "A-4.2",
+      "gate": "bugbot",
+      "title": "Zero BugBot comments -> vacuous green",
+      "file_line": "gates_compute.rs:175-184",
+      "lens_survival": [true, true, true],
+      "severity": "HIGH",
+      "verdict": "BYPASS_CANDIDATE",
+      "tessl_pillar": "P1_systems_invariants"
+    },
+    {
+      "id": "A-5.1",
+      "gate": "comments_resolved",
+      "title": "GraphQL first:100 pagination cap",
+      "file_line": "gates_compute.rs:198-199",
+      "lens_survival": [true, true, false],
+      "severity": "MEDIUM",
+      "verdict": "BYPASS_CANDIDATE",
+      "tessl_pillar": "P1_systems_invariants"
+    },
+    {
+      "id": "A-5.2",
+      "gate": "comments_resolved",
+      "title": "None pullRequest -> 0 unresolved -> green",
+      "file_line": "gates_compute.rs:258-260",
+      "lens_survival": [true, false, true],
+      "severity": "LOW",
+      "verdict": "BYPASS_CANDIDATE",
+      "tessl_pillar": "P1_systems_invariants"
+    },
+    {
+      "id": "A-6.1",
+      "gate": "evidence_review",
+      "title": "100-LOC floor hardcoded, no tiered risk",
+      "file_line": "verifier.rs:21, 631-639",
+      "lens_survival": [true, true, false],
+      "severity": "HIGH",
+      "verdict": "BYPASS_CANDIDATE",
+      "tessl_pillar": "P3_risk_ladder"
+    },
+    {
+      "id": "A-7.1",
+      "gate": "skeptic",
+      "title": "SkepticVerdict::Warn text dropped from to_json() telemetry",
+      "file_line": "verifier.rs:909, 159-160",
+      "lens_survival": [true, true, false],
+      "severity": "HIGH",
+      "verdict": "BYPASS_CANDIDATE",
+      "tessl_pillar": "P2_analytics"
+    },
+    {
+      "id": "A-7.2",
+      "gate": "skeptic",
+      "title": "compute_review_degraded vendor_aliases edge cases",
+      "file_line": "verifier.rs:316, 1178-1184",
+      "lens_survival": [true, false, false],
+      "severity": "PLAUSIBLE",
+      "verdict": "PLAUSIBLE_BYPASS",
+      "tessl_pillar": "P1_systems_invariants",
+      "note": "Needs vendor_aliases.rs verification"
+    },
+    {
+      "id": "A-8.1",
+      "gate": "vacuous_red_green",
+      "title": "BaselineFailed -> Green (infra failure = vacuous-pass)",
+      "file_line": "verifier.rs:965",
+      "lens_survival": [true, true, true],
+      "severity": "CRITICAL",
+      "verdict": "BYPASS_CANDIDATE",
+      "tessl_pillar": "P1_systems_invariants",
+      "note": "Acknowledged in comment lines 946-954 (PR #413 2026-07-21)"
+    },
+    {
+      "id": "C-1",
+      "gate": "vendor_waiver_compound",
+      "title": "Compound: CodeRabbit waiver + Skeptic Warn + detector BaselineFailed + BugBot silent",
+      "file_line": "verifier.rs:1008-1012, 1118-1147",
+      "lens_survival": [true, true, false],
+      "severity": "HIGH",
+      "verdict": "COMPOUND_BYPASS",
+      "tessl_pillar": "P3_risk_ladder",
+      "note": "Depends on Skeptic::Pass + /er::Pass + !review_degraded SLA"
+    }
+  ],
+  "summary": {
+    "by_pillar": {
+      "P1_systems_invariants": ["A-4.1", "A-4.2", "A-5.1", "A-5.2", "A-7.2", "A-8.1"],
+      "P2_analytics": ["A-2.1", "A-7.1"],
+      "P3_risk_ladder": ["A-6.1", "C-1"]
+    },
+    "by_severity": {
+      "CRITICAL": ["A-8.1"],
+      "HIGH": ["A-4.1", "A-4.2", "A-6.1", "A-7.1", "C-1"],
+      "MEDIUM": ["A-2.1", "A-5.1"],
+      "LOW": ["A-5.2"],
+      "PLAUSIBLE": ["A-7.2"]
+    },
+    "top_5_critical_for_redesign": ["A-8.1", "A-4.2", "A-4.1", "A-7.1", "C-1", "A-6.1"]
+  }
+}

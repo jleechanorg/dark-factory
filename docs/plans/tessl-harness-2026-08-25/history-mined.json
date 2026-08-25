@@ -1,0 +1,63 @@
+{
+  "schema": "history-mined.json",
+  "mined_at": "2026-08-25T09:18:00Z",
+  "branch": "research/tessl-harness-applied-to-dark-factory",
+  "head_sha": "422e86bc5e",
+  "source": "lane-3-mine-history",
+  "scope": "~/.claude/projects/-Users-jleechan-*/<session>.jsonl",
+  "terms_searched": ["tessl", "harness.engineer", "invariant", "analytics", "risk.ladder", "adherence", "vacuous", "gate[1-8]"],
+  "summary": {
+    "files_matched": 14,
+    "files_inspected_sample": 5,
+    "total_keyword_hits": 18,
+    "earliest_hit": "2026-06-08",
+    "latest_hit": "2026-08-25"
+  },
+  "sessions_touching_theme": [
+    {
+      "session_path": "~/.claude/projects/-Users-jleechan--ao-data-worktrees-claude-commands-claude-commands-5/931d92fc-fe6e-5f72-9619-0b68957129a0.jsonl",
+      "anchor_excerpt": "tessl__brainstorming / tessl__verification-before-completion / tessl__using-superpowers",
+      "context": "Session referencing tessl-prefixed skill names from ~/.tessl/plugins/obra/superpowers/skills/",
+      "interpretation": "Tessl skills loaded as part of superpowers plugin in this worktree's Claude session; not deep Tessl-thesis engagement."
+    },
+    {
+      "session_path": "~/.claude/projects/-Users-jleechan--ao-data-worktrees-dark-factory-dark-factory-10/13eb31c2-cc13-5329-ae88-9618aa4a0e27.jsonl",
+      "anchor_excerpt": "ironclad + cmux-goal audit setup",
+      "context": "MEMORY entry 2026-08-17 — first attempt at structured exit criteria, found 17-PR matrix systematically overstated.",
+      "interpretation": "Closer to Tessl P3 risk-ladder; realized that '7/7 PASS' was a false claim when the supporting reviewers (CodeRabbit, BugBot, Skeptic) were themselves rate-limited or capped."
+    },
+    {
+      "session_path": "~/.claude/projects/-Users-jleechan--ao-data-worktrees-dark-factory-dark-factory-12/9b8c1b35-d520-562d-aad6-e889d76a1624.jsonl",
+      "anchor_excerpt": "cold-reviewer pointer envelope + /af audit",
+      "context": "MEMORY entry 2026-08-25 — DIFF_SHA256 dropped as redundant, 122KB -> 10KB prompt envelope.",
+      "interpretation": "Direct Tessl P1 systems-thinking: capturing an invariant (head_sha matches) and enforcing it via a strict envelope schema. The 'schema 2' envelope is an instance of Tessl's 'capture the invariant and enforce it' pattern."
+    },
+    {
+      "session_path": "~/.claude/projects/-Users-jleechan--ao-data-worktrees-dark-factory-dark-factory-7/97523563-f70d-5bae-9bbe-cda95c4356a5.jsonl",
+      "anchor_excerpt": "verify before asserting root cause",
+      "context": "MEMORY entry 2026-08-25 — three plausible diagnoses were all wrong; verify by running the falsifying command first.",
+      "interpretation": "Tessl P2 analytics: hypotheses must be MEASURED, not asserted. Direct Tessl-thesis alignment."
+    },
+    {
+      "session_path": "~/.claude/projects/-Users-jleechan--ao-data-worktrees-jleechanclaw-jleechanclaw-25/05ce31eb-fbc5-5da1-8f1d-4546e2320e5f.jsonl",
+      "anchor_excerpt": "ironclad audit results — 17-PR matrix systematically overstated",
+      "context": "Sidekick + ironclad + cmux-goal pipeline surfaced 1 PASS / 2 WARN / 14 FAIL. Operators '7/7 PASS' claim fails at CodeRabbit rate-limited + BugBot usage-limited + no Skeptic transcripts.",
+      "interpretation": "Strong Tessl P3 risk-ladder evidence: a 'PASS' was awarded despite the underlying reviewers being unavailable. The audit caught this only because it explicitly checked reviewer transcripts. Without that audit, the false-PASS would have shipped. **This is THE primary Tessl-attack-vector in this repo: claims of 'verified' that depend on reviewers whose own state is unknown.**"
+    }
+  ],
+  "tessl_pillar_relevance": {
+    "P1_systems_invariants": {
+      "evidence_in_history": "pointer-based envelope (2026-08-25), ZFC patterns",
+      "gap": "No formal invariant registry; invariants are scattered across verifier.rs, gates_compute.rs, and pipelines/*.dot comments."
+    },
+    "P2_analytics": {
+      "evidence_in_history": "verify-before-asserting (2026-08-25); CXDB Healer clustering",
+      "gap": "Healer exists but is offline-only (run manually); no live dashboard; Healer doesn't distinguish infra-error from verdict-failure."
+    },
+    "P3_risk_ladder": {
+      "evidence_in_history": "ironclad audit revealed false-PASS at 7/7 PR matrix",
+      "gap": "Vendor reviewers (CodeRabbit, BugBot) don't have an availability invariant; their outage cascades silently into the vendor-waiver path which depends on Skeptic + /er + cross-model — but those are ALSO subject to outage."
+    }
+  },
+  "key_finding": "The repo has multiple accidental Tessl-P1 invariants (gate verdicts, evidence floor, vacuous detector) but they are NOT explicitly REGISTERED as invariants. The fact that 'false-PASS at 7/7' slipped through (MEMORY 2026-08-17) is direct evidence that the current invariant surface is opaque — operators couldn't see what was actually being checked. Tessl would propose: (a) an explicit invariants registry, (b) live availability telemetry for every reviewer, (c) a 'verified-by' column on every claim."
+}
