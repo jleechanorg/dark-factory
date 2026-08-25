@@ -69,6 +69,15 @@ pub struct Candidate {
 const QUARANTINE_DIR_NAME: &str = ".quarantine";
 const RECOVERY_PARENT_DIR_NAME: &str = "worktree-recovery";
 
+fn git_command() -> Command {
+    let system_git = Path::new("/usr/bin/git");
+    if system_git.is_file() {
+        Command::new(system_git)
+    } else {
+        Command::new("git")
+    }
+}
+
 #[cfg(unix)]
 fn stable_recovery_hash(root: &Path) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
@@ -114,7 +123,7 @@ fn linked_worktree_metadata(path: &Path) -> Result<bool, DaemonError> {
 /// mistaken for a clean one.
 fn is_dirty_worktree(path: &Path) -> Result<bool, DaemonError> {
     let _ = linked_worktree_metadata(path)?;
-    let output = Command::new("git")
+    let output = git_command()
         .args([
             "-C",
             path.to_string_lossy().as_ref(),
@@ -431,7 +440,7 @@ fn repair_linked_worktree(parent: &DirectoryFd, destination_name: &str) -> Resul
     })?;
     let repair_fd = destination_fd.0;
     let output = unsafe {
-        Command::new("git")
+        git_command()
             .args(["worktree", "repair"])
             .pre_exec(move || {
                 if libc::fchdir(repair_fd) < 0 {
@@ -453,7 +462,7 @@ fn repair_linked_worktree(parent: &DirectoryFd, destination_name: &str) -> Resul
     })?;
     let status_cwd = status_fd.0;
     let status = unsafe {
-        Command::new("git")
+        git_command()
             .args(["status", "--porcelain=v1"])
             .pre_exec(move || {
                 if libc::fchdir(status_cwd) < 0 {
@@ -475,7 +484,7 @@ fn repair_linked_worktree(parent: &DirectoryFd, destination_name: &str) -> Resul
 
 fn remove_worktree(path: &Path) -> Result<(), DaemonError> {
     if linked_worktree_metadata(path)? {
-        let output = Command::new("git")
+        let output = git_command()
             .args([
                 "-C",
                 path.to_string_lossy().as_ref(),

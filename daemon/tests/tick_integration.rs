@@ -91,6 +91,23 @@ impl Sessions for StopFailsOnSecond {
     }
 }
 
+fn init_cleanup_test_repo(path: &std::path::Path) {
+    let git = if std::path::Path::new("/usr/bin/git").is_file() {
+        "/usr/bin/git"
+    } else {
+        "git"
+    };
+    let status = std::process::Command::new(git)
+        .args(["init", "--quiet"])
+        .current_dir(path)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
 fn test_repo_cfg(project: &str) -> RepoConfig {
     RepoConfig {
         ao_project: project.into(),
@@ -14961,6 +14978,7 @@ fn test_worktree_cleaned_up_on_coder_session_exit_promotion() {
     // encodes.
     let stale_worktree = worktree_root.join("owner/repo/wa-3538");
     std::fs::create_dir_all(&stale_worktree).unwrap();
+    init_cleanup_test_repo(&stale_worktree);
     std::fs::write(stale_worktree.join("marker"), b"leftover coder worktree").unwrap();
     assert!(stale_worktree.is_dir(), "fixture must actually create the dir");
 
@@ -15244,12 +15262,7 @@ fn tick_idle_promotion_with_succeeding_stop_promotes_and_cleans() {
 
     let worktree = worktree_root.join("owner/repo/idle-ok");
     std::fs::create_dir_all(&worktree).unwrap();
-    let git_init = std::process::Command::new("git")
-        .args(["init", "--quiet"])
-        .current_dir(&worktree)
-        .status()
-        .unwrap();
-    assert!(git_init.success());
+    init_cleanup_test_repo(&worktree);
     std::fs::write(worktree.join("marker"), b"idle worker worktree").unwrap();
 
     store.overlays.borrow_mut().insert(
@@ -15614,12 +15627,7 @@ fn adopted_session_health_failure_with_succeeding_stop_clears_and_reaps() {
 
     let worktree = worktree_root.join("owner/repo/adopted-stop-ok");
     std::fs::create_dir_all(&worktree).unwrap();
-    let git_init = std::process::Command::new("git")
-        .args(["init", "--quiet"])
-        .current_dir(&worktree)
-        .status()
-        .unwrap();
-    assert!(git_init.success());
+    init_cleanup_test_repo(&worktree);
     std::fs::write(worktree.join("marker"), b"reaped worker worktree").unwrap();
 
     store.overlays.borrow_mut().insert(
