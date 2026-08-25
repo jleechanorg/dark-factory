@@ -155,6 +155,33 @@ run_tick pending >/dev/null
 unset AFD_TEST_ACTIVE_PR
 assert "matching nonce plus exact active session reconciles DISPATCHED" "DISPATCHED" "$(sqlite3 "$AFD_DB" "SELECT state FROM bead_overlay WHERE bead_id='pending';")"
 
+# A fresh compatible session can still lose branch registration at completion.
+# The tick must not die under set -e or leave its reservation wedged.
+git -C "$TARGET" branch fix/fresh-complete-conflict
+"$OVERLAY" intake-upsert fresh-complete-conflict 'fresh completion conflict' >/dev/null
+sqlite3 "$AFD_DB" "UPDATE bead_overlay SET pr_number=753, branch='fix/fresh-complete-conflict', target_repo='owner/target' WHERE bead_id='fresh-complete-conflict'; INSERT INTO branch_registry(branch,bead_id,created_at) VALUES('fix/fresh-complete-conflict','other-owner',datetime('now'));"
+export AFD_TEST_ACTIVE_PR=753
+set +e
+fresh_complete_out="$(run_tick fresh-complete-conflict)"
+fresh_complete_rc=$?
+set -e
+unset AFD_TEST_ACTIVE_PR
+assert "fresh completion conflict does not crash tick" "0" "$fresh_complete_rc"
+assert "fresh completion conflict releases reservation" "QUEUED" "$(sqlite3 "$AFD_DB" "SELECT state FROM bead_overlay WHERE bead_id='fresh-complete-conflict';")"
+assert_grep "fresh completion conflict emits structured block" '"beadId": "fresh-complete-conflict".*"state": "QUEUED".*"reason": "dispatch_complete_failed"' "$AFD_LOG"
+
+# The detached reconciliation path has the same completion failure contract.
+git -C "$TARGET" branch fix/reconcile-complete-conflict
+"$OVERLAY" intake-upsert reconcile-complete-conflict 'reconciliation completion conflict' >/dev/null
+sqlite3 "$AFD_DB" "UPDATE bead_overlay SET pr_number=754, branch='fix/reconcile-complete-conflict', target_repo='owner/target' WHERE bead_id='reconcile-complete-conflict'; INSERT INTO branch_registry(branch,bead_id,created_at) VALUES('fix/reconcile-complete-conflict','other-owner',datetime('now'));"
+"$OVERLAY" dispatch-reserve reconcile-complete-conflict nonce-reconcile-conflict >/dev/null
+printf 'ok\n' > "$AFD_SPAWN_STATE_DIR/reconcile-complete-conflict-754-nonce-reconcile-conflict.state"
+export AFD_TEST_ACTIVE_PR=754
+run_tick reconcile-complete-conflict >/dev/null
+unset AFD_TEST_ACTIVE_PR
+assert "reconciliation completion conflict releases reservation" "QUEUED" "$(sqlite3 "$AFD_DB" "SELECT state FROM bead_overlay WHERE bead_id='reconcile-complete-conflict';")"
+assert_grep "reconciliation completion conflict emits structured block" '"beadId": "reconcile-complete-conflict".*"state": "QUEUED".*"reason": "dispatch_complete_failed"' "$AFD_LOG"
+
 # An `ok` state without a visible session is allowed a bounded visibility
 # window, then becomes a structured retry instead of wedging QUEUED forever.
 git -C "$TARGET" branch fix/orphaned

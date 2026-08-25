@@ -160,11 +160,16 @@ route-record)
   ;;
 
 capacity)
-  active="$(sql "SELECT count(*) FROM bead_overlay WHERE state IN ('DISPATCHED','ATTESTED');")"
+  counts="$(sql -separator '|' "SELECT
+       (SELECT count(*) FROM bead_overlay WHERE state IN ('DISPATCHED','ATTESTED'))
+         + (SELECT count(*) FROM bead_overlay WHERE state='DISPATCHING'),
+       (SELECT count(*) FROM bead_overlay WHERE state='DISPATCHING');")"
+  IFS='|' read -r active dispatching <<< "$counts"
   mw="$(cfg max_workers)"; mb="$(cfg max_batch)"
   mw="${mw:-30}"; mb="${mb:-15}"
   free=$(( mw - active )); [ "$free" -lt 0 ] && free=0
-  [ "$free" -gt "$mb" ] && free="$mb"
+  batch_free=$(( mb - dispatching )); [ "$batch_free" -lt 0 ] && batch_free=0
+  [ "$free" -gt "$batch_free" ] && free="$batch_free"
   echo "$free"
   ;;
 
@@ -241,11 +246,30 @@ dispatch-reserve)
   [ $# -eq 3 ] || die "usage: dispatch-reserve <bead_id> <nonce>"
   valid_bead_id "$2"
   [[ "$3" =~ ^[A-Za-z0-9._-]+$ ]] || die_code $EX_VALID_INPUT "invalid dispatch nonce: $3"
-  changed="$(sql "UPDATE bead_overlay
+  mw="$(cfg max_workers)"; mb="$(cfg max_batch)"
+  mw="${mw:-30}"; mb="${mb:-15}"
+  case "$mw:$mb" in *[!0-9:]*) die_code $EX_IO "invalid dispatch capacity configuration" ;; esac
+  set +e
+  changed="$(sql "BEGIN IMMEDIATE;
+       UPDATE bead_overlay
        SET state='DISPATCHING', session_id='$(q "$3")', updated_at='$(now)'
-       WHERE bead_id='$(q "$2")' AND state IN ('QUEUED','ATTESTED');
-       SELECT changes();")"
-  [ "$changed" = "1" ] || die_code $EX_NOOP "dispatch reservation lost for $2"
+       WHERE bead_id='$(q "$2")' AND state IN ('QUEUED','ATTESTED')
+         AND (SELECT count(*) FROM bead_overlay
+              WHERE state IN ('DISPATCHING','DISPATCHED','ATTESTED')) < $mw
+         AND (SELECT count(*) FROM bead_overlay
+              WHERE state='DISPATCHING') < $mb;
+       SELECT changes();
+       COMMIT;")"
+  sql_rc=$?
+  set -e
+  [ "$sql_rc" -eq 0 ] || die_code $EX_IO "dispatch reservation transaction failed (rc=$sql_rc) for $2"
+  if [ "$changed" != "1" ]; then
+    cur_state="$(get_field "$2" state)"
+    case " QUEUED ATTESTED " in
+      *" $cur_state "*) die_code $EX_OVER_CAP "over capacity — dispatch reservation refused" ;;
+      *) die_code $EX_NOOP "dispatch reservation lost for $2" ;;
+    esac
+  fi
   cur_attempt="$(get_field "$2" attempt)"
   emit "$2" "$cur_attempt" DISPATCHING TASK_DISPATCH_RESERVED \
     "{\"nonce\":$(js "$3")}"

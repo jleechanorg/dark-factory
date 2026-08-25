@@ -301,19 +301,52 @@ ERR_TMP="$(mktemp -t af_dispatch_err.XXXXXX)"
 trap 'rm -f "$ERR_TMP"' EXIT
 
 record_dispatch_block() { # bead row_state nonce pr branch repo reason detail
-    local ctx
+    local ctx transition_rc
     ctx="$(python3 - "$4" "$5" "$6" "$7" "$8" <<'PY'
 import json, sys
 pr = int(sys.argv[1]) if sys.argv[1].isdigit() else None
 print(json.dumps({"pr_number": pr, "branch": sys.argv[2], "repo": sys.argv[3], "reason": sys.argv[4], "detail": sys.argv[5]}))
 PY
-)"
+    )"
     if [ "$2" = "DISPATCHING" ] && [ -n "$3" ]; then
-        "$O" dispatch-release "$1" "$3" "$7" "$ctx" >/dev/null
+        if "$O" dispatch-release "$1" "$3" "$7" "$ctx" >/dev/null; then
+            transition_rc=0
+        else
+            transition_rc=$?
+        fi
     else
-        "$O" dispatch-blocked "$1" "$7" "$ctx" >/dev/null
+        if "$O" dispatch-blocked "$1" "$7" "$ctx" >/dev/null; then
+            transition_rc=0
+        else
+            transition_rc=$?
+        fi
     fi
+    case "$transition_rc" in
+        0) ;;
+        10)
+            echo "[af] dispatch block transition lost for $1; reservation/state changed concurrently" >&2
+            return 0
+            ;;
+        *)
+            echo "[af] dispatch block transition failed for $1 (rc=$transition_rc)" >&2
+            return "$transition_rc"
+            ;;
+    esac
     echo "[af] dispatch blocked $1: $7 ($8)" >&2
+}
+
+complete_dispatch_reservation() { # bead branch nonce pr repo
+    local rc detail
+    if "$O" dispatch-complete "$1" "$2" "$3" 2>"$ERR_TMP"; then
+        return 0
+    else
+        rc=$?
+    fi
+    detail="dispatch-complete rc=$rc: $(cat "$ERR_TMP" 2>/dev/null || true)"
+    if ! record_dispatch_block "$1" DISPATCHING "$3" "$4" "$2" "$5" dispatch_complete_failed "$detail"; then
+        echo "[af] failed to release completion reservation $1 nonce=$3" >&2
+    fi
+    return 1
 }
 
 active_pr_session() { # project pr
@@ -465,14 +498,8 @@ raise SystemExit(0 if ok else 1)
         case "$spawn_state" in
             ok)
                 if [ "$has_active_session" -eq 1 ]; then
-                    set +e
-                    "$O" dispatch-complete "$bead_id" "$branch" "$dispatch_nonce" 2>"$ERR_TMP"
-                    rc=$?
-                    set -e
-                    if [ "$rc" -eq 0 ]; then
+                    if complete_dispatch_reservation "$bead_id" "$branch" "$dispatch_nonce" "$pr" "$repo"; then
                         dispatched=$((dispatched + 1))
-                    elif [ "$rc" -ne 10 ]; then
-                        echo "[af] dispatch-complete failed for $bead_id (rc=$rc): $(cat "$ERR_TMP" 2>/dev/null || true)" >&2
                     fi
                     continue
                 fi
@@ -534,8 +561,9 @@ raise SystemExit(0 if ok else 1)
     if [ "$has_active_session" -eq 1 ]; then
         # Compatible already-active PR claim: the reservation serializes the
         # state transition, and the exact project-scoped session is verified.
-        "$O" dispatch-complete "$bead_id" "$branch" "$dispatch_nonce" >/dev/null
-        dispatched=$((dispatched + 1))
+        if complete_dispatch_reservation "$bead_id" "$branch" "$dispatch_nonce" "$pr" "$repo"; then
+            dispatched=$((dispatched + 1))
+        fi
         continue
     fi
 

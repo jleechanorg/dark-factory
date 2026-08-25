@@ -87,5 +87,52 @@ elapsed=$(( $(date +%s) - start ))
 assert "hanging AO readiness fails instead of acknowledging spawn" "no" "$( [ "$rc" -eq 0 ] && echo yes || echo no )"
 assert "all readiness probes stay within one deadline budget" "yes" "$( [ "$elapsed" -le 4 ] && echo yes || echo no )"
 
+# Synchronous callers that require a verified session use the same readiness
+# deadline. A successful spawn followed by a hanging session query must not
+# escape the wrapper's bounded verification contract.
+HANG_SESSION_AO="$SCRATCH/hang-session-ao-ts"
+cat > "$HANG_SESSION_AO" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  'spawn --help') printf '%s\n' '--name' ;;
+  spawn*) printf '%s\n' 'spawned session ao-sync' ;;
+  'session ls -p expected-project') sleep 30 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$HANG_SESSION_AO"
+start="$(date +%s)"
+set +e
+SYNC=1 AFD_AO_READY_TIMEOUT_SEC=2 AO_BIN="$HANG_SESSION_AO" AFD_REQUIRE_SESSION=1 \
+  timeout 6 bash "$REMEDIATE" hanging-sync-session 9004 owner/repo expected-project >/dev/null 2>&1
+rc=$?
+set -e
+elapsed=$(( $(date +%s) - start ))
+assert "hanging sync verification rejects dispatch" "1" "$rc"
+assert "hanging sync verification stays within readiness deadline" "yes" "$( [ "$elapsed" -le 4 ] && echo yes || echo no )"
+
+# `ao spawn --help` is a capability probe, not the spawn itself, and must
+# consume the same bounded probe budget as session verification.
+HANG_HELP_AO="$SCRATCH/hang-help-ao-ts"
+cat > "$HANG_HELP_AO" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  '--version'|'status') exit 0 ;;
+  'spawn --help') sleep 30 ;;
+  spawn*) exit 1 ;;
+  'session ls -p expected-project') sleep 30 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$HANG_HELP_AO"
+start="$(date +%s)"
+AFD_AO_READY_TIMEOUT_SEC=2 AO_BIN="$HANG_HELP_AO" AFD_REQUIRE_SESSION=1 AFD_ASYNC_WAIT_SEC=0 \
+  bash "$REMEDIATE" hanging-help 9005 owner/repo expected-project nonce-9005 >/dev/null 2>&1
+state="$(wait_for_final "$AFD_SPAWN_STATE_DIR/hanging-help-9005-nonce-9005.state")"
+elapsed=$(( $(date +%s) - start ))
+case "$state" in fail:*) actual=fail;; *) actual="$state";; esac
+assert "hanging spawn help records bounded failure" "fail" "$actual"
+assert "spawn help and verification share one deadline" "yes" "$( [ "$elapsed" -le 4 ] && echo yes || echo no )"
+
 echo "=== RESULTS: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ]
