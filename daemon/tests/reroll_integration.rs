@@ -837,6 +837,77 @@ fn test_reroll_adopted_success_spawns_remediation_session_leaves_pr_open() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+/// A trusted branch identifier can exceed the remediation payload budget even
+/// when review feedback is tiny. The daemon must park the bead before calling
+/// VCS or AO, returning a structured over-budget outcome rather than looping
+/// in feedback truncation or dispatching an oversized spawn request.
+#[test]
+fn test_reroll_adopted_oversized_trusted_prompt_parks_without_dispatch() {
+    let scm = FakeScm::new();
+    let sessions = FakeSessions::new();
+    let mut vcs = FakeVcs::new();
+    let branch = (0..20)
+        .map(|index| format!("segment{index:02}{}", "x".repeat(200)))
+        .collect::<Vec<_>>()
+        .join("/");
+    assert!(branch.len() > 4_015, "regression branch must exceed baseline budget");
+    vcs.heads.insert(branch.clone(), "pre-session-sha-long".into());
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    let cfg = test_cfg();
+    let telemetry_log = std::env::temp_dir().join("afd_reroll_prompt_over_budget_telemetry.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let mut bead = BeadOverlay {
+        bead_id: "bead-prompt-over-budget".into(),
+        state: OverlayState::Attested,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 5,
+        spend_usd: 0.0,
+        pr_number: Some(778),
+        branch: Some(branch.clone()),
+        session_id: None,
+        is_adopted: true,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: None,
+        attempt_started_at: None,
+    };
+    store.save(&bead).unwrap();
+    store.register_branch(&bead.bead_id, &branch).unwrap();
+
+    let deps = RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "verifier".into(),
+        review_text: "short feedback".into(),
+    };
+
+    let outcome = reroll::execute(&deps, &mut bead).unwrap();
+    assert!(
+        matches!(outcome, RerollOutcome::Held(ref reason) if reason.contains("remediation prompt rejected before spawn") && reason.contains("trusted remediation prompt baseline")),
+        "expected structured fail-closed outcome, got {outcome:?}"
+    );
+    let updated = store.load(&bead.bead_id).unwrap().unwrap();
+    assert_eq!(updated.state, OverlayState::HumanHeld);
+    assert_eq!(updated.park_reason.as_deref(), Some("remediation_prompt_over_budget"));
+    assert!(sessions.spawn_prompts.borrow().is_empty(), "oversized prompt must never dispatch");
+    assert!(
+        vcs.calls.borrow().iter().all(|call| !call.starts_with("remote_head_sha(")),
+        "pre-session VCS capture must not run after prompt rejection: {:?}",
+        vcs.calls.borrow()
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 /// An adopted remediation may target a repository that has no explicit
 /// `[repos]` entry. That is distinct from an explicitly invalid checkout:
 /// the daemon owns the isolated checkout path for this case.
