@@ -4,6 +4,8 @@ import pathlib
 import sys
 import tempfile
 
+import pytest
+
 import runner.handlers as handlers_mod
 from runner.handlers import Context, Result, TYPE_REGISTRY
 from runner.engine import run
@@ -47,6 +49,58 @@ def test_slim_stylesheet_routes_roles_by_class():
 
     assert review.get("class") == "review"
     assert review["backend"] == "agy"
+
+
+@pytest.mark.parametrize(
+    ("pipeline", "plan", "success_target"),
+    [
+        ("minimal_feature.dot", "plan", "implement"),
+        ("minimal_pr.dot", "plan", "implement"),
+        ("minimal_feature_cs.dot", "plan", "implement"),
+        ("brownfield_delete_first.dot", "plan", "delete_first"),
+        ("spec_gen.dot", "plan_main", "review_main"),
+        ("spec_gen.dot", "plan_attractor", "review_attractor"),
+    ],
+)
+def test_minimax_plan_has_explicit_fail_closed_edges(pipeline, plan, success_target):
+    """Every MiniMax plan must gate continuation on a successful result.
+
+    An unconditional edge would let a missing ``MINIMAX_API_KEY`` (or any
+    other planner failure) reach implementation/review.  The failure edge is
+    intentionally the Msquare exit: ``_exit`` preserves the previous
+    non-success outcome, so the run cannot be reported green.
+    """
+    graph = parse(ROOT / "pipelines" / "slim" / pipeline)
+    outgoing = graph.outgoing(plan)
+    success_edges = [
+        edge for edge in outgoing if edge.condition == "outcome=success"
+    ]
+    failure_edges = [
+        edge for edge in outgoing if edge.condition == "outcome!=success"
+    ]
+    assert [(edge.dst, edge.condition) for edge in success_edges] == [
+        (success_target, "outcome=success")
+    ]
+    assert [(edge.dst, edge.condition) for edge in failure_edges] == [
+        ("exit", "outcome!=success")
+    ]
+    assert not any(edge.condition is None for edge in outgoing)
+
+
+def test_minimax_plan_missing_key_never_visits_implement(monkeypatch, tmp_path):
+    """A missing MiniMax key is a terminal failed run, not an implementation run."""
+    monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
+    graph = parse(ROOT / "pipelines" / "slim" / "minimal_feature.dot")
+    ctx = Context(goal="planner key fail-closed", workdir=SCRATCH, backend="echo")
+
+    history = run(graph, ctx, checkpoint=tmp_path / "checkpoint.json")
+    nodes = [step.node for step in history]
+
+    assert "plan" in nodes
+    assert "implement" not in nodes
+    assert nodes[-1] == "exit"
+    assert history[-1].outcome == "failure"
+    assert "MINIMAX_API_KEY" in history[nodes.index("plan")].output_preview
 
 
 def test_minimal_feature_factory_runs_with_deterministic_gates(monkeypatch, tmp_path):

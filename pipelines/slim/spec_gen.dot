@@ -84,13 +84,18 @@ digraph SpecGenFactory {
   // ---- Edges ----
   start -> explore_in
   explore_out -> plan_main
-  plan_main -> review_main
+  // MiniMax is required for each spec plan.  A missing key or other backend
+  // failure must stop at the failure exit rather than entering review with no
+  // generated spec.
+  plan_main -> review_main [condition="outcome=success"]
+  plan_main -> exit        [condition="outcome!=success"]
 
   review_main -> plan_attractor [condition="outcome=success"]
   review_main -> fix_main       [condition="outcome!=success"]
   fix_main -> review_main
 
-  plan_attractor -> review_attractor
+  plan_attractor -> review_attractor [condition="outcome=success"]
+  plan_attractor -> exit             [condition="outcome!=success"]
   review_attractor -> exit          [condition="outcome=success"]
   review_attractor -> fix_attractor [condition="outcome!=success"]
   fix_attractor -> review_attractor

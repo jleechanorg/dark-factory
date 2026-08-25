@@ -322,6 +322,25 @@ def test_clean_graph_has_no_violations():
     assert violations == [], f"expected no violations, got {violations}"
 
 
+def test_failure_terminal_exit_is_not_an_unreviewed_success_path(tmp_path):
+    """A fail-closed planner branch may terminate at exit without G1 noise."""
+    p = _write_dot(tmp_path, "planner_failure_exit.dot", """
+        digraph planner_failure_exit {
+            start [shape=Mdiamond]
+            exit [shape=Msquare]
+            plan [type="codergen", backend="minimax"]
+            reviewer [type="gate_er"]
+            start -> plan
+            plan -> reviewer [condition="outcome=success"]
+            plan -> exit [condition="outcome!=success"]
+            reviewer -> exit [condition="outcome=success"]
+            reviewer -> plan [condition="outcome!=success"]
+        }
+    """)
+    violations = graph_audit.audit_graph(p)
+    assert not [v for v in violations if v.kind == "G1"], violations
+
+
 def test_g1_violator_has_g1_violation_only():
     violations = graph_audit.audit_graph(FIXTURES / "g1_violator.dot")
     kinds = [v.kind for v in violations]

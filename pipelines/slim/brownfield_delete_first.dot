@@ -110,7 +110,11 @@ digraph BrownfieldDeleteFirstFactory {
 
   start -> explore_in
   explore_out -> plan
-  plan -> delete_first
+  // MiniMax is a required planning dependency.  Never continue into the
+  // destructive delete-first tier when plan cannot run; preserve the failure
+  // at exit instead of silently proceeding without a plan.
+  plan -> delete_first [condition="outcome=success"]
+  plan -> exit [condition="outcome!=success"]
   delete_first -> gate_net_loc
   
   gate_net_loc -> gate_dead_code [condition="outcome=success"]

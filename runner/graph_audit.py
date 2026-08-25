@@ -397,12 +397,14 @@ def _dfs_witness(
             if is_exit_node(graph.nodes[dst]) and saw_code and not current_saw_reviewer:
                 out.append(new_path + (dst,))
             continue
-        # If dst is exit and condition blocks success, follow it ONLY
-        # as a witness when the conditional branch itself is the
-        # failure path. For G1 we treat any routing into exit as a
-        # candidate witness — the question is "does the branch contain
-        # a code-producer and zero reviewers?", not "would the engine
-        # actually take it on a successful run?"
+        # Failure-terminal edges are intentionally excluded from the G1
+        # happy-path search.  A planner/backend failure may route to the
+        # Msquare exit so the engine preserves a non-success result; that is
+        # not an unreviewed *successful* merge path.  G2 separately audits
+        # reviewer failure -> exit edges, so skipping these here does not
+        # weaken the review-failure contract.
+        if _is_outcome_failure_condition(edge.condition):
+            continue
         _dfs_witness(graph, dst, new_path, current_saw_reviewer, out)
 
 

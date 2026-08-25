@@ -113,7 +113,10 @@ digraph MinimalPRFactory {
   start -> explore_in
   explore_out -> research
   research -> plan
-  plan -> implement
+  // MiniMax is a required planning dependency.  Never continue into the
+  // implementation tier when plan cannot run; preserve the failure at exit.
+  plan -> implement [condition="outcome=success"]
+  plan -> exit [condition="outcome!=success"]
   implement -> test
 
   test -> review [condition="outcome=success"]

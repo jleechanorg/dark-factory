@@ -87,7 +87,12 @@ digraph MinimalFeatureFactory {
 
   start -> explore_in
   explore_out -> plan
-  plan -> implement
+  // MiniMax is a required planning dependency.  Never continue into the
+  // implementation tier when plan cannot run (for example, a missing
+  // MINIMAX_API_KEY); route that non-success to the failure exit so the run
+  // remains visibly unsuccessful and cannot ship an unplanned change.
+  plan -> implement [condition="outcome=success"]
+  plan -> exit [condition="outcome!=success"]
   implement -> test
 
   test -> review [condition="outcome=success"]
