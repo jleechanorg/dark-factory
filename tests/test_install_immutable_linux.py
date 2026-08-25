@@ -24,10 +24,14 @@ def test_linux_install_keeps_all_runtime_payloads_outside_git_checkout(tmp_path)
     seed_beads.parent.mkdir(parents=True, exist_ok=True)
     seed_beads.write_text('{"id":"factory-tdd"}\n')
 
-    for name in ("dark-factory", "df-healer", "df-validate", "df-funnel"):
+    for name in ("dark-factory", "df-healer", "df-validate", "df-funnel", "df-funnel-lanes"):
         destination = checkout / "bin" / name
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / "bin" / name, destination)
+        if name == "df-funnel-lanes":
+            # The installer must make every advertised CLI executable in the
+            # immutable release; do not inherit this guarantee from Git mode.
+            destination.chmod(destination.stat().st_mode & ~stat.S_IXUSR)
     for name in ("f", "fs", "factory", "factory-spec"):
         path = checkout / ".claude" / "commands" / f"{name}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -140,7 +144,7 @@ touch "$db"
 
     release = install_root / "releases" / RELEASE_SHA
     runtime_entries = [
-        *(home / ".local" / "bin" / name for name in ("dark-factory", "df-healer", "df-validate", "df-funnel")),
+        *(home / ".local" / "bin" / name for name in ("dark-factory", "df-healer", "df-validate", "df-funnel", "df-funnel-lanes")),
         *(home / ".claude" / "commands" / f"{name}.md" for name in ("f", "fs", "factory", "factory-spec")),
         *(home / ".claude" / "skills" / name for name in ("dark-factory", "factory-spec")),
     ]
@@ -148,6 +152,7 @@ touch "$db"
         resolved = entry.resolve()
         assert resolved.is_relative_to(release), f"{entry} resolves outside release: {resolved}"
         assert not resolved.is_relative_to(checkout), f"{entry} resolves into Git checkout"
+    assert (release / "bin" / "df-funnel-lanes").stat().st_mode & stat.S_IXUSR
 
     assert not (release / ".git").exists()
     assert not ((release / "install.sh").stat().st_mode & stat.S_IWUSR)
