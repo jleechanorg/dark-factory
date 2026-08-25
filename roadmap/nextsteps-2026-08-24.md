@@ -8,12 +8,15 @@
 - [Executable handoff sequence](#executable-handoff-sequence)
 - [Pull-request state](#pull-request-state)
 - [Learnings and roadmap pointers](#learnings-and-roadmap-pointers)
+- [2026-08-24 (later) — Three-lane funnel analysis + repeatable df-funnel-lanes CLI](#2026-08-24-later--three-lane-funnel-analysis--repeatable-df-funnel-lanes-cli)
+- [2026-08-24 (later) — existing-PR dispatch/worktree failure](#2026-08-24-later--existing-pr-dispatchworktree-failure)
+- [2026-08-24 (current) — Funnel metrics and draft remediation](#2026-08-24-current--funnel-metrics-and-draft-remediation)
 
 ## Executive summary
 
 The earlier “runner pool offline” conclusion was a scope error, not an infrastructure outage. The repository-scoped Actions endpoint returns zero because this project’s self-hosted runners are registered at the organization level. The organization endpoint currently reports 14 matching online runners (1 busy), and the repository has no queued or in-progress workflow runs.
 
-The handoff therefore has no runner-restoration blocker. The next execution unit is the open rate-limit circuit-breaker PR (#734), followed by one canonical web-advice/Lane-D implementation, then the independent Lane E/F remediation. Duplicate PR generations must not be merged in parallel.
+The handoff therefore has no runner-restoration blocker. PRs #734, #742, and #744 are already merged. The current critical path is funnel measurement and remediation: independently review draft PRs #748 (honest CodeRabbit reporting), #749 (exact-head attribution), and #750 (gate-8 pytest routing), then re-run the corrected 24h/3d/30d metrics. PR #746 and issue #743 remain preserved but are explicitly deprioritized behind this funnel work; no ironclad criterion or 48-hour sustain check has passed.
 
 ## Evidence snapshot
 
@@ -40,7 +43,7 @@ Bead IDs below are Beads identifiers, not GitHub issue URLs. GitHub links point 
 
 | Bead | Bead status | GitHub tracking | Handoff role |
 | :--- | :--- | :--- | :--- |
-| `jleechan-xn4n` | **CLOSED** — restoration was not needed | [Issue #286](https://github.com/jleechanorg/dark-factory/issues/286) remains OPEN and stale; [PR #287](https://github.com/jleechanorg/dark-factory/pull/287) is MERGED | P3 cleanup; do not restore runners |
+| `jleechan-xn4n` | **OPEN** | [Issue #286](https://github.com/jleechanorg/dark-factory/issues/286) is CLOSED; [PR #287](https://github.com/jleechanorg/dark-factory/pull/287) is MERGED | Unrelated Linux-container `sqlite3` portability work associated with PR #577; never use this bead as runner-restoration tracking |
 | `jleechan-azso` | OPEN | [Issue #668](https://github.com/jleechanorg/dark-factory/issues/668) | Pipeline fold (PR #693 family) |
 | `jleechan-57ym` | OPEN | [Issue #669](https://github.com/jleechanorg/dark-factory/issues/669) | Lane D follow-ups, included by the canonical fold candidate |
 | `jleechan-gagl` | OPEN | [Issue #670](https://github.com/jleechanorg/dark-factory/issues/670) | Lane E/F remediation (PR #694) |
@@ -69,7 +72,7 @@ Bead IDs below are Beads identifiers, not GitHub issue URLs. GitHub links point 
 
 ### P2 — tracking hygiene
 
-1. Close or annotate stale [Issue #286](https://github.com/jleechanorg/dark-factory/issues/286) with the organization-vs-repository runner-scope explanation, subject to the normal operator authorization.
+1. Keep closed [Issue #286](https://github.com/jleechanorg/dark-factory/issues/286) closed; its organization-vs-repository runner-scope explanation is complete.
 2. Keep Bead IDs as Bead IDs; never manufacture `github.com/.../issues/jleechan-*` links.
 3. Record future cross-machine documentation synchronization as a process improvement only when independently verified; no Mac-session or SKILL-sync causal claim is part of this handoff.
 
@@ -90,3 +93,141 @@ Bead IDs below are Beads identifiers, not GitHub issue URLs. GitHub links point 
 - The runner-scope correction is recorded in the user-scope learnings ledger as `feedback_2026-08-24_runner_pool_repo_vs_org_scope.md`.
 - [Activity log](activity/2026-08-24.md) records the verified status and this corrected execution order.
 - [Roadmap index](README.md) links this day’s activity.
+
+---
+
+## 2026-08-24 (later) — Three-lane funnel analysis + repeatable df-funnel-lanes CLI
+
+### Executive summary
+
+Ran `/factory-funnel` for the last 24h, then 3d, then a 30-day 3-lane breakdown split by intake origin. Converted the analysis into a tested CLI (`runner/funnel_lanes.py` + `bin/df-funnel-lanes`, [PR #744](https://github.com/jleechanorg/dark-factory/pull/744), OPEN). The first implementation incorrectly joined origin and downstream events by `(bead_id, attempt_id)`; the corrected bead-level join finds **2 of 409 beads (0.5%)** reaching `READY_FOR_MERGE` in 30 days. The earlier 0/359 and July-24-last-event claims are superseded, not current findings.
+
+### Evidence snapshot
+
+```text
+runner.funnel_report --since 3d
+  TASK_DISPATCHED=82, PR_OPENED=58, GATE_ASSESSMENT=68, READY_FOR_MERGE=0
+  PARKED_HUMAN_HELD=72 (88% of dispatched), ESCALATION_REQUIRED=42 (51%)
+
+Per-gate breakdown (context.gates, 3d, 68 GATE_ASSESSMENT events):
+  all_green: 0 true
+  bugbot: pass=68
+  ci_green: pass=36, unknown=24, fail=8
+  no_conflicts: pass=63, fail=5
+  evidence_review: pass=30, fail=35
+  skeptic: pass=21, fail=47
+  vacuous_red_green: pass=7, unknown=55, fail=6
+  coderabbit: pass=4, unknown=64
+  comments_resolved: pass=15, fail=53
+
+runner.funnel_lanes --since 30d
+  bead_start: 1/142 reach READY_FOR_MERGE
+  gh_issue_start: 0/156 reach READY_FOR_MERGE
+  pr_adopted_start: 1/111 reach READY_FOR_MERGE
+  total: 2/409 (0.5%)
+
+Last READY_FOR_MERGE daemon event: 2026-08-19 (schema-tolerant `timestamp`/`ts` lookup)
+```
+
+### Bead and issue index (this section's additions)
+
+| Bead | Bead status | GitHub tracking | Handoff role |
+| :--- | :--- | :--- | :--- |
+| `jleechan-evtv` | OPEN, P1 | not yet issue-linked | CodeRabbit gate stuck at 94% unknown — previously untracked, likely a top-3 contributor to 0% READY_FOR_MERGE |
+| `jleechan-4n2e` | OPEN goal | [PR #744](https://github.com/jleechanorg/dark-factory/pull/744) supplies the measurement tool | Ironclad funnel-improvement target; default FAIL until its seven externally anchored criteria and 48-hour sustain check pass |
+
+`comments_resolved` (78% fail in 3d) is flagged but NOT yet filed as a bead — cross-reference with `jleechan-evtv` before filing; may share root cause (external service polling).
+
+### Executable handoff sequence (this section's addition)
+
+1. **Drive [PR #744](https://github.com/jleechanorg/dark-factory/pull/744) to `/ready` before landing it** — at exact head `b7502224391933d482dfd317a1f05986e2098554`, the focused funnel suite reports 34 passed and 1 skipped, and normal CI is green. Evidence Gate is red; CodeRabbit/Bugbot returned quota-limit notices rather than substantive reviews; and an unresolved current review thread correctly notes that `bin/df-funnel-lanes` is missing from `install.sh`'s chmod/symlink lists. Wire the installer, correct the PR body from the original 0% figures, resolve both threads, and bind fresh evidence/reviews to the new exact head.
+2. **Investigate `jleechan-evtv` only after its structural precondition** — current #744 comments prove at least one live CodeRabbit rate-limit event, so distinguish external service availability from daemon polling defects before changing daemon code.
+3. **File a bead for `comments_resolved`** (78% fail) once `jleechan-evtv`'s root cause is known — if they share a cause, one fix may resolve both.
+4. **Re-run `/factory-funnel --since 3d` and `--since 30d`** after any gate fix lands — target: `all_green=true` starts appearing, `READY_FOR_MERGE > 0`.
+
+### Pull-request state (this section's addition)
+
+- [PR #744](https://github.com/jleechanorg/dark-factory/pull/744): **OPEN / NOT READY** — corrected bead-level lane join; 34 focused tests pass and 1 is skipped; Evidence Gate is red, `df-funnel-lanes` is not installed by `install.sh`, and external-review quota notices are not approvals.
+
+---
+
+## 2026-08-24 (later) — existing-PR dispatch/worktree failure
+
+[Issue #743](https://github.com/jleechanorg/dark-factory/issues/743) tracks a distinct factory defect: drive-existing-PR intake marks work `DISPATCHED` before AO proves that it can safely attach to a branch already owned by another worktree. A failed forced checkout leaves false dispatched state and requires manual redrive.
+
+The four affected WorldArchitect beads had their `factory` labels removed and were parked `HUMAN_HELD`; do not silently re-add routing labels before #743's pre-dispatch ownership regression passes:
+
+| Bead | Existing PR | Existing branch | Live state at audit | Direct-work scope from the parked handoff |
+| :--- | :--- | :--- | :--- | :--- |
+| `dark-factory-cfla` | #8931 | `worktree_resource_prs` | OPEN / DIRTY / CONFLICTING at `cb0fcbd…` | After #8935, strengthen real streamed rest-choice and provenance evidence |
+| `dark-factory-a98p` | #8934 | `fix/8913-normalize-spell-slot-keys` | OPEN / DIRTY / CONFLICTING at `4d023a…` | Canonicalize `/spells` aliases, make collision coalescing depletion-aware, add endpoint tests |
+| `dark-factory-vavc` | #8935 | `fix/8911-8914-rest-timestamp-spell-consumption` | OPEN / DIRTY / CONFLICTING at `14d4fe…` | Correct timestamp prompting to canonical structured `world_time`, add regressions |
+| `dark-factory-3al0` | #9300 | `feat/dice-roll-34pct-xp` | OPEN / CLEAN / MERGEABLE at `611ce96…` | Apply deterministic XP from authoritative tool results at streaming/persistence boundary; test multi-roll, suppression, idempotency |
+
+These are daemon overlay identifiers, not rows in the local dark-factory Bead store. The parked-handoff scopes and #8935→#8931 ordering come from the product review session; issue #743 proves only the dispatch/worktree-ownership failure.
+
+### Executable sequence
+
+1. Fix #743 in dark-factory with a pre-dispatch branch/worktree ownership check, safe reuse/allocation behavior, structured requeue reason, and an integration test proving no force-checkout or false `DISPATCHED` state.
+2. Keep the four beads unlabelled/parked while direct PR owners work in their existing worktrees; no new PR and no merge from factory workers. If work is re-entered through `/af`, that session is tracking/telemetry-only and must not hand-fix product or daemon code.
+3. Execute the product fixes in dependency order: #8935 before #8931; #8934 and #9300 are otherwise independent.
+4. Re-enable factory routing only after #743 is merged/deployed and a live canary proves an already-owned existing branch can be adopted without branch mutation or stale dispatch state.
+
+### Learnings and roadmap pointers (this section's addition)
+
+- `~/roadmap/learnings-2026-08.md` — new entry `2026-08-24 (later) — Three-lane factory funnel + repeatable CLI`
+- `.claude/skills/factory-funnel/SKILL.md` (user-scope) updated with §4 (3-lane methodology) and the "always run 24h AND 3d" mandatory rule
+
+## 2026-08-24 (current) — Funnel metrics and draft remediation
+
+### Executive summary
+
+- **Measurement foundation landed:** [PR #744](https://github.com/jleechanorg/dark-factory/pull/744) is **MERGED** at `422e86bc5e2c04df3af23c27ebbece5b2d000c31`. Its corrected bead-level join is the source of truth for lane metrics.
+- **Current corrected baseline:** 2 of 412 classified lifecycles reached `READY_FOR_MERGE` in the fresh 30-day window (**0.485%**): `bead_start` 1/142, `gh_issue_start` 0/156, and `pr_adopted_start` 1/114 (**0.877%**).
+- **CodeRabbit is not healthy by the ironclad criterion:** fresh 3-day exact-head telemetry is 68 unique PR-heads = 1 direct approval, 3 `waived_unavailable`, 64 unknown (**1.47% direct; FAIL**). Fresh 30-day telemetry is 356 = 37 direct, 12 waived, 291 unknown, 16 fail.
+- **Active funnel work:** [PR #748](https://github.com/jleechanorg/dark-factory/pull/748) (honest reporting), [PR #749](https://github.com/jleechanorg/dark-factory/pull/749) (exact-head attribution), and [PR #750](https://github.com/jleechanorg/dark-factory/pull/750) (gate-8 pytest routing) are draft candidates. Focused checks are green, but Evidence Gate is not green and no ironclad criterion is complete.
+- **Deprioritized but preserved:** [PR #746](https://github.com/jleechanorg/dark-factory/pull/746) remains a draft with a verified dispatch-race test failure; keep it behind the funnel lanes. [Issue #743](https://github.com/jleechanorg/dark-factory/issues/743) remains open.
+
+### Context
+
+This update supersedes stale status in earlier sections without deleting the historical corrections. It covers the dark-factory repository after the funnel CLI merge and the three parallel remediation drafts. The runner fleet is healthy at organization scope; no runner-restoration work is authorized or needed. This session owns measurement integrity, exact-head review attribution, and gate-8 routing evidence—not merge authorization or product-repository work.
+
+### Bead index
+
+| Bead | Status | Tracking / fallback | Current role |
+| :--- | :--- | :--- | :--- |
+| [jleechan-4n2e](br%20show%20jleechan-4n2e) | OPEN, P1 goal | `br show jleechan-4n2e` | Ironclad funnel target; all seven criteria remain FAIL or NOT-YET. |
+| [jleechan-evtv](br%20show%20jleechan-evtv) | OPEN, P1 | `br show jleechan-evtv` | Root-cause CodeRabbit unknown/waiver telemetry only after structural precondition. |
+| [jleechan-6xje](https://github.com/jleechanorg/dark-factory/issues/570) | OPEN, P0 | Issue #570 / existing PR lineage | Gate-8 pytest routing candidate is #750; do not close from focused tests alone. |
+| [jleechan-sk55](br%20show%20jleechan-sk55) | OPEN, P0 | `br show jleechan-sk55` | Cross-repo target-worktree path diagnosis; #750 is the current candidate. |
+
+No new bead or GitHub issue was created in this update; the existing four beads were annotated with the corrected evidence. Do not create duplicate tracking rows for #748–#750.
+
+### Work queue
+
+1. **Verify the honest CodeRabbit metric and exact-head binding.** Review [PR #749](https://github.com/jleechanorg/dark-factory/pull/749) against the adapter tests and [PR #748](https://github.com/jleechanorg/dark-factory/pull/748) against the report schema. Acceptance requires direct approval, vendor-unavailable waiver, unknown, fail, and unobserved observations remain distinct; stale or absent review OIDs cannot count as direct approval; existing waiver/is-green/merge semantics remain unchanged. This tracks [jleechan-evtv](br%20show%20jleechan-evtv) and [jleechan-4n2e](br%20show%20jleechan-4n2e). Blocker: Evidence Gate and fresh public evidence are still pending.
+2. **Complete gate-8 target-worktree routing.** Review [PR #750](https://github.com/jleechanorg/dark-factory/pull/750) at exact head `c0cadf76f4edde2c2c0ce234ffcba301fa2889d4`. Acceptance requires Cargo precedence for mixed repositories, pytest routing for Python targets, genuine/vacuous regression coverage, exact-head CI, and independent evidence. This tracks [jleechan-6xje](https://github.com/jleechanorg/dark-factory/issues/570) and [jleechan-sk55](br%20show%20jleechan-sk55). Blocker: CI/evidence is not complete.
+3. **Re-run the funnel after candidates land.** Use the merged `df-funnel-lanes` CLI for 24h plus 3d operational windows and 30d origin-lane analysis. Independently cross-check every counted `READY_FOR_MERGE` against GitHub merge state and reject admin/bypass merges. Do not call criteria 1–4 complete until the external anchors and independent verifier checks in the ironclad goal pass.
+4. **Preserve and defer the dispatch/worktree fix.** Keep [PR #746](https://github.com/jleechanorg/dark-factory/pull/746) open as draft and [Issue #743](https://github.com/jleechanorg/dark-factory/issues/743) tracked, but do not let its current failing verified-state test displace the funnel work. Reassess after #748–#750 produce fresh funnel evidence.
+5. **Run the 48-hour sustain check.** Even if criteria 1–4 pass, re-run them at least 48 hours later with a different verifier. Until then the ironclad goal is explicitly **not achieved**.
+
+### PR / merge state
+
+- [PR #734](https://github.com/jleechanorg/dark-factory/pull/734): **MERGED** at `96f8d82055b9530324c861ef57620aedbf99847f`.
+- [PR #742](https://github.com/jleechanorg/dark-factory/pull/742): **MERGED** at `61c69efb1a7ee3fa886b076126dd74c90d4ad717`.
+- [PR #744](https://github.com/jleechanorg/dark-factory/pull/744): **MERGED** at `422e86bc5e2c04df3af23c27ebbece5b2d000c31`.
+- [PR #746](https://github.com/jleechanorg/dark-factory/pull/746): **OPEN / DRAFT** at `f25647a4132705258164e31c4fdec4472a95c0e9`; test check failed on the verified-state race; explicitly deprioritized.
+- [PR #748](https://github.com/jleechanorg/dark-factory/pull/748): **OPEN / DRAFT** at `ad29150d5627652430d97a9a237a954899c111a7`; independent approval captured, CI green except Evidence Gate; Gemini/Grok browser approvals captured, public share URLs still pending.
+- [PR #749](https://github.com/jleechanorg/dark-factory/pull/749): **OPEN / DRAFT** at `4035ba0dbd4274f43846420abc400f62c2e91377`; independent `APPROVE`, CI green except Evidence Gate.
+- [PR #750](https://github.com/jleechanorg/dark-factory/pull/750): **OPEN / DRAFT** at `c0cadf76f4edde2c2c0ce234ffcba301fa2889d4`; independent `APPROVE`, CI running/evidence pending.
+- [Issue #743](https://github.com/jleechanorg/dark-factory/issues/743): **OPEN**; factory routing remains removed from the four parked product beads.
+
+### Learnings pointer
+
+- `~/roadmap/learnings-2026-08.md` — appended `2026-08-24 — Corrected funnel baseline and draft remediation state`; records the 2/412 baseline, direct-vs-waived CodeRabbit accounting, and the rule that focused tests do not satisfy external evidence or sustain criteria.
+- Claude auto-memory: `project_2026-08-24_funnel_metrics_pr748_750.md`, linked from the project `MEMORY.md`.
+- mem0: unavailable because `/home/jleechan/.hermes/scripts/mem0_shared_client.py` is absent; no silent success claim was made.
+
+### Roadmap pointer
+
+- `roadmap/activity/2026-08-24.md` was appended with this funnel refresh and live PR state. The README date link already exists, so `roadmap/README.md` did not require a new entry.
