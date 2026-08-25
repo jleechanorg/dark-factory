@@ -138,8 +138,36 @@ elapsed=$(( $(date +%s) - start ))
 assert "hanging sync status rejects dispatch" "1" "$rc"
 assert "sync status shares readiness deadline" "yes" "$( [ "$elapsed" -le 4 ] && echo yes || echo no )"
 
-# `ao spawn --help` is a capability probe, not the spawn itself, and must
-# consume the same bounded probe budget as session verification.
+# The spawn itself has its own AO_SPAWN_TIMEOUT budget. A successful cold
+# spawn may legitimately exceed the readiness-probe budget; post-spawn session
+# verification must receive a fresh bounded window and must not spawn twice.
+SLOW_SPAWN_AO="$SCRATCH/slow-spawn-ao-ts"
+SLOW_SPAWN_LOG="$SCRATCH/slow-spawn.log"
+cat > "$SLOW_SPAWN_AO" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$AFD_TEST_SLOW_SPAWN_LOG"
+case "$*" in
+  'spawn --help') printf '%s\n' '--name' ;;
+  spawn*) sleep 3; printf '%s\n' 'spawned session ao-slow' ;;
+  'session ls -p expected-project') printf '%s\n' 'ao-slow pulls/9007 [running]' ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$SLOW_SPAWN_AO"
+set +e
+AFD_TEST_SLOW_SPAWN_LOG="$SLOW_SPAWN_LOG" SYNC=1 AFD_AO_READY_TIMEOUT_SEC=1 \
+  AO_SPAWN_TIMEOUT_SEC=5 AO_BIN="$SLOW_SPAWN_AO" AFD_REQUIRE_SESSION=1 \
+  timeout 8 bash "$REMEDIATE" slow-success 9007 owner/repo expected-project >/dev/null 2>&1
+rc=$?
+set -e
+assert "slow successful spawn receives fresh verification budget" "0" "$rc"
+spawn_calls="$(grep -c '^spawn --project ' "$SLOW_SPAWN_LOG" || true)"
+assert "slow successful spawn is invoked exactly once" "1" "$spawn_calls"
+session_calls="$(grep -c '^session ls -p expected-project$' "$SLOW_SPAWN_LOG" || true)"
+assert "slow successful spawn verifies the active session" "yes" "$( [ "$session_calls" -ge 1 ] && echo yes || echo no )"
+
+# `ao spawn --help` is a pre-spawn capability probe, not the spawn itself.
+# It and the post-spawn failure verification each have bounded phase budgets.
 HANG_HELP_AO="$SCRATCH/hang-help-ao-ts"
 cat > "$HANG_HELP_AO" <<'EOF'
 #!/usr/bin/env bash
@@ -159,7 +187,7 @@ state="$(wait_for_final "$AFD_SPAWN_STATE_DIR/hanging-help-9005-nonce-9005.state
 elapsed=$(( $(date +%s) - start ))
 case "$state" in fail:*) actual=fail;; *) actual="$state";; esac
 assert "hanging spawn help records bounded failure" "fail" "$actual"
-assert "spawn help and verification share one deadline" "yes" "$( [ "$elapsed" -le 4 ] && echo yes || echo no )"
+assert "spawn help and failure verification stay phase-bounded" "yes" "$( [ "$elapsed" -le 6 ] && echo yes || echo no )"
 
 echo "=== RESULTS: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ]

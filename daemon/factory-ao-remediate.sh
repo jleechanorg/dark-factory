@@ -226,6 +226,9 @@ if [ "$MODE" = "sync" ]; then
   result="$(run_spawn_foreground)"
   rc="${result%%$'\t'*}"
   out="${result#*$'\t'}"
+  # Spawn has its own SPAWN_TIMEOUT budget. Give outcome/session probes a
+  # fresh bounded window so a legitimate cold spawn cannot consume it.
+  start_ready_deadline
   if classify_spawn_outcome "$rc" "$out" >/dev/null \
      && { [ "${AFD_REQUIRE_SESSION:-0}" != "1" ] || verify_active_session; }; then
     [ "$rc" -eq 0 ] || echo "[remediate] spawn accepted for PR #$PR (timeout=${SPAWN_TIMEOUT}s, rc=$rc)" >&2
@@ -260,6 +263,9 @@ echo "pending" > "$STATE_FILE"
   rc="${result%%$'\t'*}"
   out="${result#*$'\t'}"
   printf '%s' "$out" > "$SPAWN_LOG"
+  # Keep post-spawn verification independent from both daemon readiness and
+  # the separately bounded spawn duration.
+  start_ready_deadline
   if classify_spawn_outcome "$rc" "$out" >/dev/null \
      && { [ "${AFD_REQUIRE_SESSION:-0}" != "1" ] || verify_active_session; }; then
     echo "ok" > "$STATE_FILE"
