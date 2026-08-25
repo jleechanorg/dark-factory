@@ -1075,14 +1075,26 @@ def _resolve_gate_backend(node: "Node", ctx: "Context") -> tuple[str, dict[str, 
             # When prefer_adversarial is set, exclude the run-level coder
             # backend from the priority list (so a `claude` run with an
             # `agy` coder cannot accidentally get a `claude` reviewer).
+            # ``prefer_adversarial`` is an ORDERING preference, not a hard
+            # filter. Demoting the coder's own backend to last still yields a
+            # different vendor whenever any other entry is installed, but when
+            # it is the only one available the lane reviews on it rather than
+            # erroring or escaping to an expensive vendor nobody asked for.
+            # It used to DROP ``ctx.backend`` outright, which had two costs:
+            # a same-coder-and-lane graph emptied the list (see below), and a
+            # cheap-but-same vendor was skipped in favour of whatever came
+            # next in the queue — frequently the priciest entry.
             if prefer_adversarial and ctx.backend and ctx.backend in priority:
-                priority = [p for p in priority if p != ctx.backend]
-            # Empty post-filter list (e.g. lane says ``backend_priority=agy``
-            # and the coder is agy) must NOT short-circuit straight to
-            # ``claude-sonnet`` — that would skip probing codex / minimax /
-            # agy in the default queue and silently collapse cross-vendor
-            # review back onto Anthropic. Fall back to the full default
-            # priority so every entry gets a real ``which``/``--version`` probe.
+                priority = [p for p in priority if p != ctx.backend] + [ctx.backend]
+            # Reached only by a graph that names no usable entry at all (an
+            # empty or whitespace-only ``backend_priority``). The demotion
+            # above is order-preserving and never removes an entry, so it
+            # cannot empty the list. A lane whose entries are all uninstalled
+            # deliberately resolves to its own last entry -- ``_execute_gate``
+            # then treats the missing binary as an infra failure and runs its
+            # agy -> claude fallback. Do not add a second safety net here: it
+            # would override a controller-review lane's codex-only queue and
+            # break its fail-closed guarantee.
             if not priority:
                 priority = list(_DEFAULT_ADVERSARIAL_PRIORITY)
             controller_review = bool(node.attrs.get("review_contract")) or str(ctx.state.get("_df_controller_review_json") or "").lower() in {"true", "1", "yes", "on"}

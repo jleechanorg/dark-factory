@@ -12,6 +12,7 @@ import pytest
 
 from runner.review_controller import (
     CHECK_IDS,
+    ENVELOPE_SCHEMA,
     PROMPT_ID,
     EvidenceArtifact,
     EvidenceDelta,
@@ -22,6 +23,7 @@ from runner.review_controller import (
     _stub_mode_requested,
     build_envelope,
     create_review_request,
+    diff_command,
     parse_codex_jsonl,
     run_controller_review,
     validate_execution_receipts,
@@ -211,8 +213,13 @@ def test_untrusted_content_is_base64_data_not_prompt_authority():
         "BEGIN_CONTROLLER_ENVELOPE_BASE64\n", 1
     )[1].split("\nEND_CONTROLLER_ENVELOPE_BASE64", 1)[0]
     envelope = json.loads(base64.b64decode(encoded).decode("utf-8"))
+    # The task statement is still carried, but only as Base64 data.
     assert envelope["snapshots"]["task"]["text"] == attack
-    assert envelope["snapshots"]["diff"]["text"] == attack
+    # The diff is a pointer, so hostile diff content never reaches the prompt
+    # in any form -- not even Base64-encoded.
+    assert "text" not in envelope["snapshots"]["diff"]
+    assert attack not in json.dumps(envelope["snapshots"]["diff"])
+    assert envelope["snapshots"]["diff"]["sha256"] == request.diff_sha256
 
 
 def test_envelope_binds_template_target_snapshots_and_evidence():
@@ -236,8 +243,13 @@ def test_envelope_binds_template_target_snapshots_and_evidence():
         "module.py",
         "tests/test_module.py",
     ]
+    assert envelope["schema"] == ENVELOPE_SCHEMA
     assert envelope["snapshots"]["task"]["text"] == _inputs().task_text
-    assert envelope["snapshots"]["diff"]["text"] == _inputs().diff_text
+    assert envelope["snapshots"]["diff"] == {
+        "sha256": request.diff_sha256,
+        "bytes": len(_inputs().diff_text.encode("utf-8")),
+        "command": diff_command("a" * 40, "b" * 40),
+    }
     assert envelope["evidence"] == [
         {
             "path": "evidence/test.log",
@@ -399,16 +411,58 @@ def test_request_integrity_rejects_tampered_envelope_prompt_and_head():
             verify_request_integrity(tampered)
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    (
-        pytest.param("task_text", "x" * (1024 * 1024 + 1), id="task_text"),
-        pytest.param("diff_text", "x" * (1024 * 1024 + 1), id="diff_text"),
-    ),
-)
-def test_rejects_oversized_task_and_diff_inputs(field, value):
+def test_rejects_oversized_task_input():
     with pytest.raises(ReviewContractError, match="1 MiB"):
-        create_review_request(replace(_inputs(), **{field: value}))
+        create_review_request(
+            replace(_inputs(), task_text="x" * (1024 * 1024 + 1))
+        )
+
+
+def test_oversized_diff_is_accepted_and_does_not_grow_the_prompt():
+    """A diff far past the old 1 MiB ceiling must review, not fail closed.
+
+    Capping diff_text is what made large or binary-carrying diffs crash the
+    review outright. Since the envelope carries a pointer, prompt size is
+    independent of diff size.
+    """
+    huge = "x" * (8 * 1024 * 1024)
+    baseline = create_review_request(replace(_inputs(), diff_text=""))
+    request = create_review_request(replace(_inputs(), diff_text=huge))
+
+    # An 8 MiB diff may only grow the prompt by the digits of the `bytes`
+    # field. Under v1 this same input grew the prompt by ~11 MiB after Base64.
+    growth = len(request.prompt) - len(baseline.prompt)
+    assert 0 <= growth < 64, growth
+    assert huge not in request.prompt
+    envelope = json.loads(request.envelope_json)
+    assert envelope["snapshots"]["diff"]["bytes"] == len(huge)
+    assert envelope["snapshots"]["diff"]["sha256"] == request.diff_sha256
+    verify_request_integrity(request)
+
+
+def test_integrity_rejects_an_envelope_that_reinlines_the_diff():
+    request = create_review_request(_inputs())
+    envelope = json.loads(request.envelope_json)
+    envelope["snapshots"]["diff"]["text"] = "spoofed diff"
+    tampered = replace(request, envelope_json=json.dumps(envelope))
+
+    with pytest.raises(ReviewContractError):
+        verify_request_integrity(tampered)
+
+
+def test_integrity_rejects_a_mismatched_diff_command():
+    request = create_review_request(_inputs())
+    envelope = json.loads(request.envelope_json)
+    envelope["snapshots"]["diff"]["command"] = "git diff HEAD~1"
+    envelope_json = json.dumps(envelope, sort_keys=True, separators=(",", ":"))
+    tampered = replace(
+        request,
+        envelope_json=envelope_json,
+        envelope_sha256=hashlib.sha256(envelope_json.encode("utf-8")).hexdigest(),
+    )
+
+    with pytest.raises(ReviewContractError, match="diff command mismatch"):
+        verify_request_integrity(tampered)
 
 
 @pytest.mark.parametrize(
