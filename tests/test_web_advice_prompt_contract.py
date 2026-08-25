@@ -8,6 +8,8 @@ import re
 
 import pytest
 
+from runner.handler_web_advice import PANEL_SEATS, _PANEL_VERDICTS, _normalise_panel_result
+
 
 PROMPT = pathlib.Path(__file__).parents[1] / "prompts" / "web_advice.txt"
 SEATS = ["chatgpt", "gemini", "grok", "perplexity"]
@@ -90,14 +92,30 @@ def test_prompt_scopes_browser_work_and_requires_one_complete_result() -> None:
 
     contract = _fenced_json_contract(text)
     assert set(contract) == REQUIRED_RESULT_FIELDS
-    assert contract["decision"] == "continue | continue_with_pr_warning | continue_with_bead"
+    assert contract["decision"] == "continue"
     assert contract["panel_seats_attempted"] == SEATS
-    assert contract["panel_seats_live"] == []
-    assert contract["panel_seats_unavailable"] == []
-    assert contract["panel_seats_unavailable_reasons"] == {}
+    assert contract["panel_seats_live"] == ["chatgpt"]
+    assert contract["panel_seats_unavailable"] == ["gemini", "grok", "perplexity"]
+    assert set(contract["panel_seats_unavailable_reasons"]) == {
+        "gemini", "grok", "perplexity",
+    }
     assert contract["panel_convergence"] == {}
-    assert set(contract["panel_verdict_summary"]) == {"seat"}
-    assert set(contract["panel_verdict_summary"]["seat"]) == REQUIRED_SEAT_FIELDS
+    assert set(contract["panel_verdict_summary"]) == set(contract["panel_seats_live"])
+    assert set(contract["panel_verdict_summary"]["chatgpt"]) == REQUIRED_SEAT_FIELDS
+
+
+def test_prompt_verdict_enum_and_live_summary_match_runtime() -> None:
+    text = _prompt()
+    assert "INCOMPLETE" not in text
+    assert all(f"`{verdict}`" in text for verdict in sorted(_PANEL_VERDICTS))
+    assert "exactly for seats listed in" in text
+    assert "Unavailable seats belong only" in text
+
+    contract = _fenced_json_contract(text)
+    normalised = _normalise_panel_result(contract)
+    assert normalised["panel_contract_valid"] is True
+    assert set(normalised["panel_verdict_summary"]) == set(normalised["panel_seats_live"])
+    assert set(normalised["panel_seats_unavailable"]) == set(PANEL_SEATS) - set(normalised["panel_seats_live"])
 
 
 def test_prompt_leaves_commands_and_persistence_to_runner() -> None:

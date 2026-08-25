@@ -62,20 +62,33 @@ follow brief human-readable progress text). Do not emit a second result
 envelope, and do not encode the decision in prose for the runner to infer. The
 object MUST contain:
 
+Use the runtime's exact canonical values: `verdict` must be lowercase
+`approve`, `not_merge`, or `insufficient` (no other verdict token is accepted).
+`decision` must be exactly one of `continue`, `continue_with_pr_warning`, or
+`continue_with_bead`.
+`panel_verdict_summary` must contain entries **exactly for seats listed in
+`panel_seats_live`**. Unavailable seats belong only in
+`panel_seats_unavailable` and `panel_seats_unavailable_reasons`; do not add
+summary entries for unavailable seats.
+
 ```json
 {
-  "decision": "continue | continue_with_pr_warning | continue_with_bead",
+  "decision": "continue",
   "panel_seats_attempted": ["chatgpt", "gemini", "grok", "perplexity"],
-  "panel_seats_live": [],
-  "panel_seats_unavailable": [],
-  "panel_seats_unavailable_reasons": {},
+  "panel_seats_live": ["chatgpt"],
+  "panel_seats_unavailable": ["gemini", "grok", "perplexity"],
+  "panel_seats_unavailable_reasons": {
+    "gemini": "transport unavailable",
+    "grok": "transport unavailable",
+    "perplexity": "transport unavailable"
+  },
   "panel_verdict_summary": {
-    "seat": {
-      "verdict": "APPROVE | NOT MERGE | INSUFFICIENT | INCOMPLETE",
-      "confidence": "high | medium | low",
-      "reasoning": "concrete evidence or transport reason",
+    "chatgpt": {
+      "verdict": "approve",
+      "confidence": "high",
+      "reasoning": "No blocking finding in the reviewed diff.",
       "share_url": null,
-      "share_url_probe": {}
+      "share_url_probe": null
     }
   },
   "panel_convergence": {}
@@ -83,9 +96,10 @@ object MUST contain:
 ```
 
 `panel_seats_live` must contain only seats that actually completed their UI
-review. Include one `panel_verdict_summary` entry for every attempted seat,
-including unavailable seats when possible; use a concrete transport reason for
-an unavailable seat. Keep each share URL and probe result attached to its seat.
+review. In the example, only `chatgpt` is live, so it is the only summary key;
+the other three seats would be listed in `panel_seats_unavailable` with a
+concrete reason in `panel_seats_unavailable_reasons`. Keep each share URL and
+probe result attached to its live seat.
 
 If a hard-fail condition would be violated, stop that seat's review, record the
 observed failure in the JSON fields above, and continue with the remaining

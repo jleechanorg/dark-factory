@@ -544,13 +544,12 @@ def _post_pr_comment(pr_number: int, body: str, *, repo: Optional[str] = None,
 
 
 def _run_e2e_smoke(timeout: int = 30) -> dict:
-    """Run ``e2e_smoke.sh`` to validate that a transport is non-destructively live.
+    """Run the authoritative ``e2e_smoke.sh`` pre-flight check.
 
-    Per SKILL.md §1: the e2e smoke is a non-destructive probe that prints
-    the full matrix and exits 0 even when most rungs are down. We invoke
-    it as a pre-flight check; its exit code is informational only —
-    the handler treats the smoke's verdict as advisory and continues
-    if the underlying probe gate has already confirmed a transport.
+    The smoke is non-destructive and prints the full transport matrix. When
+    present, a non-zero exit is authoritative: the handler records an
+    infrastructure failure and short-circuits before invoking `/web-advice`.
+    A missing script is explicitly reported as skipped.
     """
     if not _WEB_ADVICE_E2E_SMOKE.exists():
         return {"ok": True, "skipped": True, "returncode": 0,
