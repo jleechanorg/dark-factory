@@ -1,6 +1,6 @@
 ---
 bead_id: tessl-harness-1-detector-skipped-red
-title: "vacuous_red_green: separate DetectorSkipped from BaselineFailed (R2 redesign)"
+title: "vacuous_red_green: flip BaselineFailed from Green to Unknown/Red (R2 redesign, simplified per codex review)"
 target_repo: jleechanorg/dark-factory
 labels: factory
 priority: P1
@@ -14,50 +14,39 @@ refs:
   prior_beads: jleechan-ijod, jleechan-yoqy, jleechan-6xje, jleechan-sb4b
   prior_prs: "#387 (r5), #413 (2026-07-21 CI failure)"
   plan_doc: docs/plans/tessl-harness-2026-08-25/invariant-redesigns.md#redesign-r2
-  memory: project_2026-08-25_factory_destructive_session_reap
+  codex_review: ac2f46420d36a8511 (PLAUSIBLE; revised to extend infra, not duplicate)
 ---
 
-# vacuous_red_green: separate DetectorSkipped from BaselineFailed
+# vacuous_red_green: flip BaselineFailed from Green to Unknown/Red
 
 ## Problem (Tessl P1 violation)
 
-`daemon/src/verifier.rs:965` maps `VacuousRedGreenStatus::BaselineFailed(_reason) => GateResult::Green`. The vacuous-test detector (issue #387) cannot materialize the base worktree (no GH_TOKEN, gh pr view failed, rustup missing cargo) → the gate that EXISTS to catch vacuous tests PASSES.
+`daemon/src/verifier.rs:965` maps `VacuousRedGreenStatus::BaselineFailed(_reason) => GateResult::Green`. The vacuous-test detector can't materialize the base worktree (no GH_TOKEN, gh pr view failed) → the gate that EXISTS to catch vacuous tests PASSES.
 
-Per MEMORY.md `project_2026-08-25_factory_destructive_session_reap`, this is a known design intent acknowledged in the comment at lines 946-954 (PR #413 2026-07-21). But the EFFECT is: any infra failure = universal vacuous-pass. A misconfigured runner means the entire vacuous-detection gate is nullified for that PR.
+The other infra-fail variants (`CargoNotFound`, `PytestNotFound`, `ManifestMissing`, `GreenFailed`, `NoChangedTests`) correctly map to `Unknown`. Only `BaselineFailed` is anomalous.
 
-The Tessl invariant is "absence of finding ≠ absence of measurement". Today, those two are conflated.
+**Codex-review finding (incorporated):** no new enum variant is needed. The existing `VacuousRedGreenStatus::BaselineFailed(String)` is fine; only the gate mapping needs to flip. This collapses 3 PRs into 1.
 
 ## Acceptance — 5 Green
 
-### G1 — Type system
-`VacuousRedGreenStatus` (vacuous_red_green.rs:64-90) gains a new variant:
-```rust
-/// Detector subprocess could not start (GH_TOKEN missing, gh pr view failed,
-/// cargo/rustup missing). Distinct from BaselineFailed (targeted test ran on
-/// base tree and failed) and from Vacuous (targeted tests passed on reverted
-/// production tree). Maps to Red.
-DetectorSkipped(String),
-```
+### G1 — Single-line gate flip
+`daemon/src/verifier.rs:965`: `BaselineFailed(_reason) => GateResult::Green` becomes `BaselineFailed(reason) => GateResult::Red(format!("vacuous detector baseline failed: {reason}"))`. Operator-visible Red.
 
-### G2 — Gate verdict
-`daemon/src/verifier.rs` `vacuous_red_green_gate` (line 955-986) maps `DetectorSkipped(reason) => GateResult::Red(format!("vacuous detector did not run: {reason}"))`. Per-bead `assess` aggregator (line 1162) propagates Red to `all_green=false`.
+### G2 — Aggregator propagation
+The aggregator at `verifier.rs::GateReport::all_green` already treats Red as fail-closed (line 128-129). No aggregator change needed.
 
-### G3 — Pre-detection trigger
-`daemon/src/tick.rs` (around line 5523 where `verifier::assess` is called) inspects the detector's pre-flight conditions BEFORE mapping `BaselineFailed` to its current Green. Conditions checked: `GH_TOKEN` env present, `gh pr view --json mergeable` succeeds on the PR, `rustup which cargo` resolves. ANY failure → `DetectorSkipped` reason recorded → `vacuous_red_green_gate` returns Red.
+### G3 — Healer surface
+`daemon/src/healer.rs` adds a cluster branch for `vacuous_red_green: BaselineFailed` events. Operator dashboard distinguishes "infra-baseline-failed" from "tests vacuous".
 
-### G4 — Telemetry + Healer
-- `gate_assessment.jsonl` emits a new event type `DETECTOR_SKIPPED` with the reason.
-- `df-healer` (daemon/src/healer.rs) clusters `DETECTOR_SKIPPED` events separately from `vacuous=true` events. Operator dashboard surfaces infra-fix-needed PRs vs real-vacuous PRs.
-- New bead state `INFRA_VERIFICATION_NEEDED` separates these beads from Attested.
+### G4 — Telemetry
+`gate_assessment.jsonl` already serializes `verdict: "fail"` for Red (lines 161-164). No new telemetry shape; the existing `evidence: [reason]` carries the baseline-failure string.
 
 ### G5 — Migration safety
-- Phase 1 (this PR): add `DetectorSkipped` variant; keep `BaselineFailed => Green` for backward compat.
-- Phase 2 (next PR): flip `BaselineFailed` to map to `DetectorSkipped`. Gate `DARK_FACTORY_DISABLE_DETECTOR_SKIP_RED=1` env var reverts to current Green behavior. Required kill-switch per bead authoring contract.
-- Phase 3 (final PR): remove kill-switch after 2 weeks of stable operation.
+- Phase 1 (this PR): flip the mapping. Add kill-switch `DARK_FACTORY_LEGACY_BASELINE_FAILED_GREEN=1` reverts to current behavior. Default OFF.
 
-## Migration contract (3 PRs)
+## Migration contract (1 PR)
 
-This bead covers G1+G3+G5 (Phase 1 + kill-switch infra). Each PR passes `cargo test --workspace` + 5 daemon-test runs; each includes a `test_detector_skipped_*` integration test.
+Single PR with kill-switch. Pass `cargo test --workspace` + 5 daemon-test runs locally. Includes `test_baseline_failed_to_red` integration test that flips kill-switch and asserts gate output.
 
 ## Out of scope
 
@@ -68,14 +57,14 @@ R1 (BugBot structured), R5 (ReviewerHealth ledger), Healer dashboard — separat
 ```
 $ cargo build --workspace
 $ cargo test --workspace -- --skip slow
-$ env DARK_FACTORY_DISABLE_DETECTOR_SKIP_RED=1 cargo run --bin dark-factory-daemon -- --smoke
+$ env DARK_FACTORY_LEGACY_BASELINE_FAILED_GREEN=1 cargo run --bin dark-factory-daemon -- --smoke
 ```
 
-Local-run proof: 5 consecutive daemon-test passes with and without kill-switch.
+Local-run proof: 5 consecutive daemon-test passes with kill-switch ON and OFF.
 
 ## Why now
 
 1. **Critical risk-tier** per Tessl P1: gate's purpose negated by infra failure.
 2. **Known incident** (PR #413 2026-07-21): design acknowledged gap, didn't fix.
 3. **Cutover charter R3+R5**: explicit invariant + measurable enforcement.
-4. **Direct Tessl alignment**: capture invariant, enforce via type system, surface via telemetry.
+4. **Direct Tessl alignment**: capture invariant, enforce via type system, surface via telemetry. Codex-verified attack vector (PLAUSIBLE) with simplified fix (extend existing infra, not duplicate).
