@@ -333,16 +333,6 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
         return Ok(RerollOutcome::Aborted("bead not found in store".into()));
     }
 
-    // Constraint extraction consumes untrusted review text via a read-only
-    // agent. Complete it before any non-adopted reroll can create a branch or
-    // close the superseded PR; an outage must leave those irreversible effects
-    // untouched.
-    let preflight_extracted = if bead.is_adopted {
-        None
-    } else {
-        Some(constraints::extract(deps.llm, &deps.review_text)?)
-    };
-
     // `pre_session_head_sha` is a pre-spawn crash-recovery intent and is not
     // evidence that a remediation worker ever started. The separate marker
     // is written only after sessions.spawn succeeds and the DISPATCHED
@@ -614,6 +604,13 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
         )?;
     }
 
+    // Constraint extraction consumes untrusted review text via a read-only
+    // agent. Complete it after every non-mutating quiescence/circuit-breaker
+    // decision, but before this factory reroll can create a branch or close
+    // the superseded PR; an outage must leave those irreversible effects
+    // untouched.
+    let preflight_extracted = constraints::extract(deps.llm, &deps.review_text)?;
+
     // 4. Compute baseline. jleechan-wuts / issue #349: was
     // `deps.vcs.base_head(&deps.cfg.base_branch)` — which is CWD-bound
     // (the `git rev-parse` shellout runs in the daemon's own cwd, its
@@ -783,7 +780,7 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
         serde_json::json!({}),
     )?;
 
-    let extracted = preflight_extracted.expect("non-adopted reroll preflight extracted constraints");
+    let extracted = preflight_extracted;
 
     let reviewer = toml::Value::String(deps.reviewer.clone()).to_string();
     let inhibition_specs = toml::Value::Array(extracted.inhibition_specs.iter().cloned().map(toml::Value::String).collect()).to_string();
