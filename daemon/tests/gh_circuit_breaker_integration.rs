@@ -334,7 +334,11 @@ exit 1
     let deadline = gh_circuit_breaker::current_deadline().unwrap();
     let remaining = deadline.duration_since(SystemTime::now()).unwrap().as_secs();
     // Should be approximately 360 seconds (allow 5s slack)
-    assert!(remaining >= 350 && remaining <= 365, "remaining seconds should be ~360, got {}", remaining);
+    assert!(
+        (350..=365).contains(&remaining),
+        "remaining seconds should be ~360, got {}",
+        remaining
+    );
 
     let events = env.read_telemetry_events();
     assert_eq!(events[0]["eventType"], "GH_CIRCUIT_BREAKER_OPENED");
@@ -364,7 +368,11 @@ exit 1
     let deadline = gh_circuit_breaker::current_deadline().unwrap();
     let remaining = deadline.duration_since(SystemTime::now()).unwrap().as_secs();
     // 10 minutes = 600s
-    assert!(remaining >= 590 && remaining <= 605, "remaining seconds should be ~600, got {}", remaining);
+    assert!(
+        (590..=605).contains(&remaining),
+        "remaining seconds should be ~600, got {}",
+        remaining
+    );
 
     let events = env.read_telemetry_events();
     assert_eq!(events[0]["eventType"], "GH_CIRCUIT_BREAKER_OPENED");

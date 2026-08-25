@@ -1,8 +1,8 @@
-digraph pr_gates {
+digraph web_advice_failopen {
     graph [
-        goal="PR validation: sealed holdouts + 3 adversarial gates."
+        goal="PR validation: sealed holdouts + 3 adversarial gates + /web-advice fail-open advisory."
         level5="true"
-        label="PR Gates"
+        label="PR Gates + /web-advice (fail-open)"
         skip_explore="true"
         skip_plan="true"
         skip_implement="true"
@@ -57,7 +57,28 @@ digraph pr_gates {
         timeout=600
     ]
 
-    // /web-advice fail-open advisory node
+    // /web-advice fail-open advisory node (Lane B registers `type="web_advice"`
+    // in runner.handlers.TYPE_REGISTRY and adds it to graph_audit._REVIEWER_TYPE_NAMES
+    // as SOFT tier; missing handler is R1-warned, not G3-hard-stopped).
+    //
+    // Fail-open contract: this node ALWAYS returns outcome=success at the .dot
+    // layer. The actual /web-advice verdict (APPROVE / NOT MERGE / INCOMPLETE /
+    // infrastructure-failure) is surfaced out-of-band:
+    //   1. CXDB structured event (runner/cxdb.append_step),
+    //   2. PR comment via gh pr comment (REST, not GraphQL),
+    //   3. Follow-up bead via br create (when outcome is infra-failure or 3-of-4
+    //      NOT MERGE with concrete findings).
+    //
+    // Per docs/web-advice-failopen-design.md §3.5 the handler runs a ≤10s
+    // transport probe (aside-mcp / aside-cli / claude-in-chrome / cdp-9222)
+    // BEFORE opening any browser tab; when no transport is live it posts the
+    // §6.2 infra-disclosure and returns success — host-capability gaps NEVER
+    // block this PR.
+    //
+    // `min_diff_lines="5"` is the strict-lane default; cheap slim lanes can
+    // override to `min_diff_lines="20"` per lane. Below the threshold, the
+    // handler records `panel_decision="skipped_trivial_diff"` and posts no PR
+    // comment (silent skip).
     web_advice [
         type="web_advice",
         label="/web-advice (fail-open)",
@@ -99,9 +120,18 @@ digraph pr_gates {
     gate_er -> gate_cs [condition="outcome=success"]
     gate_er -> fix     [condition="outcome!=success"]
 
+    // Strict gates still terminate on failure. Only after gate_cs succeeds do
+    // we hand off to /web-advice for the advisory lens.
     gate_cs -> web_advice [condition="outcome=success"]
 
-    // Fail-open heart: single unconditional edge to exit.
+    // The fail-open heart: web_advice routes unconditionally to exit. The
+    // engine sees outcome=success at the .dot layer regardless of the
+    // panel's verdict; the signal travels via CXDB + PR comment + bead
+    // instead. This is structurally identical to graph_audit G2's safe
+    // shape — a reviewer that never produces outcome!=success cannot
+    // trigger G2 because there is no `reviewer -> exit [outcome!=success]`
+    // edge.
     web_advice -> exit
+
     fix -> holdout
 }

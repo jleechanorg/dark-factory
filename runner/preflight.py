@@ -24,10 +24,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import shutil
 import sys
-from typing import Optional
+from typing import Any, Optional
 
 
 # Backends we probe. ``echo`` is always considered available — it is
@@ -66,7 +67,39 @@ def _probe(name: str) -> Optional[str]:
     return _shutil.which(name)
 
 
-def preflight_check(backend: str, workdir: pathlib.Path | None = None) -> dict:
+def _check_holdout_scenarios(
+    feature: str | None,
+    holdouts_path: pathlib.Path | None = None,
+) -> tuple[bool, str | None]:
+    """Check if holdout scenarios.yaml exists for a given feature."""
+    if not feature or not str(feature).strip():
+        return False, "feature name is required when require_holdouts is True"
+    feature_name = str(feature).strip()
+    if holdouts_path is None:
+        import os
+        repo = os.environ.get(
+            "DARK_FACTORY_HOLDOUTS",
+            str(pathlib.Path.home() / "projects" / "dark-factory-holdouts"),
+        )
+        holdouts_path = pathlib.Path(repo).expanduser().resolve()
+    else:
+        holdouts_path = pathlib.Path(holdouts_path).expanduser().resolve()
+    if not holdouts_path.is_dir():
+        return False, f"Sealed holdouts repo not found at {holdouts_path}"
+    scenarios_yaml = holdouts_path / "holdouts" / feature_name / "scenarios.yaml"
+    scenarios_yml = holdouts_path / "holdouts" / feature_name / "scenarios.yml"
+    if scenarios_yaml.is_file() or scenarios_yml.is_file():
+        return True, None
+    return False, f"no holdout scenarios found for feature '{feature_name}' at {scenarios_yaml}"
+
+
+def preflight_check(
+    backend: str,
+    workdir: pathlib.Path | None = None,
+    feature: str | None = None,
+    require_holdouts: bool = False,
+    holdouts_path: pathlib.Path | None = None,
+) -> dict:
     """Probe the configured backend and alternates; return structured status.
 
     Parameters
@@ -78,6 +111,13 @@ def preflight_check(backend: str, workdir: pathlib.Path | None = None) -> dict:
         Reserved for future per-workdir probing. Currently unused; included
         in the API so the signature matches the spec and the bash wrapper
         can pass ``--workdir`` if it ever wants to.
+    feature:
+        Optional feature name to check holdout scenarios for.
+    require_holdouts:
+        If True, validates that scenarios.yaml exists for the specified feature
+        and fails preflight if absent.
+    holdouts_path:
+        Optional override for holdouts directory.
 
     Returns
     -------
@@ -87,6 +127,7 @@ def preflight_check(backend: str, workdir: pathlib.Path | None = None) -> dict:
         ``configured_ok``    bool — whether the configured backend resolved
         ``backends``         dict[cli] -> {"ok": bool, "path": str|None, "hint": str|None}
         ``transitive``       dict[cli] -> {"ok": bool, ...} for transitive deps
+        ``holdouts``         dict -> {"required": bool, "feature": str|None, "ok": bool, "error": str|None}
         ``fallback_recommendation`` first available CLI in FALLBACK_PRIORITY
         ``message``          human-readable summary line
     """
@@ -183,12 +224,27 @@ def preflight_check(backend: str, workdir: pathlib.Path | None = None) -> dict:
     else:
         message = "no backends reachable"
 
+    holdouts_info: dict[str, Any] = {
+        "required": bool(require_holdouts),
+        "feature": feature,
+        "ok": True,
+        "error": None,
+    }
+    if require_holdouts:
+        h_ok, h_err = _check_holdout_scenarios(feature, holdouts_path=holdouts_path)
+        holdouts_info["ok"] = h_ok
+        holdouts_info["error"] = h_err
+        if not h_ok:
+            status = "fail"
+            message = h_err or "holdout scenarios missing"
+
     return {
         "status": status,
         "configured": backend,
         "configured_ok": configured_present,
         "backends": backends,
         "transitive": transitive,
+        "holdouts": holdouts_info,
         "fallback_recommendation": fallback,
         "message": message,
     }
@@ -198,7 +254,7 @@ def main(argv: list[str] | None = None) -> int:
     """CLI entry point. Returns process exit code (0, 2)."""
     p = argparse.ArgumentParser(
         prog="runner.preflight",
-        description="Probe configured backend CLI availability.",
+        description="Probe configured backend CLI availability and holdouts.",
     )
     p.add_argument(
         "--backend",
@@ -212,13 +268,28 @@ def main(argv: list[str] | None = None) -> int:
         help="Reserved for future per-workdir probing",
     )
     p.add_argument(
+        "--feature",
+        default=None,
+        help="Feature name to check holdout scenarios for",
+    )
+    p.add_argument(
+        "--require-holdouts",
+        action="store_true",
+        help="Fail fast if holdout scenarios.yaml does not exist for the feature",
+    )
+    p.add_argument(
         "--json",
         action="store_true",
         help="Emit JSON to stdout (default: human-readable summary)",
     )
     args = p.parse_args(argv)
 
-    result = preflight_check(args.backend, args.workdir)
+    result = preflight_check(
+        args.backend,
+        args.workdir,
+        feature=args.feature,
+        require_holdouts=args.require_holdouts,
+    )
 
     if args.json:
         json.dump(result, sys.stdout, indent=2, sort_keys=True)

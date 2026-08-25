@@ -13590,6 +13590,14 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
 
     use daemon::vendor_health::VendorHealthLedger;
     use daemon::vendor_health::EVT_WAIVED;
+    use daemon::vendor_health::{next_healthy_reviewer_from_config, Vendor};
+
+    // Exercise the pure seam directly; do not mutate the process-global
+    // fallback-chain environment while this integration test runs.
+    assert_eq!(
+        next_healthy_reviewer_from_config(Vendor::CodeRabbit, Some("")),
+        None
+    );
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
