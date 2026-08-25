@@ -51,12 +51,17 @@ BEAD_ID="${1:?bead_id required}"
 PR="${2:?pr_number required}"
 TARGET_REPO="${3:-jleechanorg/worldarchitect.ai}"
 AO_PROJECT="${4:-worldarchitect}"
+DISPATCH_NONCE="${5:-}"
+[ -z "$DISPATCH_NONCE" ] || [[ "$DISPATCH_NONCE" =~ ^[A-Za-z0-9._-]+$ ]] \
+  || { echo "[remediate] invalid dispatch nonce" >&2; exit 2; }
 SPAWN_TIMEOUT="${AO_SPAWN_TIMEOUT_SEC:-120}"
+READY_TIMEOUT="${AFD_AO_READY_TIMEOUT_SEC:-5}"
+case "$READY_TIMEOUT" in ''|*[!0-9]*|0) READY_TIMEOUT=5 ;; esac
 DISPLAY_NAME="$(python3 -c 'import sys; print(sys.argv[1][:20])' "$BEAD_ID")"
 LOG_DIR="${AFD_LOG_DIR:-$HOME/Library/Logs/dark-factory}"
 STATE_DIR="${AFD_SPAWN_STATE_DIR:-$HOME/Library/Application Support/dark-factory/spawns}"
 SPAWN_LOG="$LOG_DIR/remediate-${BEAD_ID}-$(date -u +%Y%m%dT%H%M%SZ).log"
-STATE_FILE="$STATE_DIR/${BEAD_ID}-${PR}.state"
+STATE_FILE="$STATE_DIR/${BEAD_ID}-${PR}${DISPATCH_NONCE:+-$DISPATCH_NONCE}.state"
 
 # Mode resolution: SYNC=1 OR ASYNC=0 → sync; otherwise async (default).
 if [ "${SYNC:-0}" = "1" ] || [ "${ASYNC:-1}" = "0" ]; then
@@ -117,26 +122,33 @@ fi
 #      so the tick can skip the bead instead of silently queueing a doomed
 #      spawn that will never produce an `ao session ls` row.
 ensure_ao_daemon() {
+  local deadline remaining
+  deadline=$(( $(date +%s) + READY_TIMEOUT ))
+  ao_ready_probe() {
+    remaining=$(( deadline - $(date +%s) ))
+    [ "$remaining" -gt 0 ] || return 124
+    timeout "$remaining" "$AO" "$@"
+  }
   # Catch broken AO binary first: a 127 exit on any command means the
   # CLI is misconfigured (wrong path, missing exec bit, broken install).
   # Don't queue a doomed spawn in that case.
-  if ! "$AO" --version >/dev/null 2>&1 && ! "$AO" status >/dev/null 2>&1; then
+  if ! ao_ready_probe --version >/dev/null 2>&1 && ! ao_ready_probe status >/dev/null 2>&1; then
     return 1
   fi
   if [[ "$(basename "$AO")" != "ao-go" ]]; then
     # ao-ts manages its own lifecycle; binary is the daemon.
     return 0
   fi
-  if "$AO" status >/dev/null 2>&1; then
+  if ao_ready_probe status >/dev/null 2>&1; then
     return 0
   fi
   echo "[remediate] starting Go AO daemon" >&2
   nohup "$AO" daemon >> /tmp/ao-go-daemon.log 2>&1 &
-  for _ in 1 2 3 4 5; do
-    if "$AO" status >/dev/null 2>&1; then
+  while [ $((deadline - $(date +%s))) -gt 0 ]; do
+    if ao_ready_probe status >/dev/null 2>&1; then
       return 0
     fi
-    sleep 1
+    [ $((deadline - $(date +%s))) -gt 0 ] && sleep 1
   done
   return 1
 }
@@ -219,7 +231,7 @@ fi
 # Pre-flight: bounded 5s probe. Fail loud if AO is unreachable so the tick
 # can skip the bead instead of silently queueing a doomed spawn.
 if ! ensure_ao_daemon; then
-  echo "[remediate] AO unreachable after 5s probe — refusing to async-spawn" >&2
+  echo "[remediate] AO unreachable after ${READY_TIMEOUT}s readiness deadline — refusing to async-spawn" >&2
   exit 1
 fi
 
@@ -274,7 +286,7 @@ while [ $(( $(date +%s) - start_ts )) -lt "$ASYNC_WAIT_SEC" ]; do
   sleep 0.2
 done
 
-echo "[remediate] async-spawned PR #$PR bead=${BEAD_ID} pid=${SPAWN_PID} log=${SPAWN_LOG} state=${final_state:-pending}"
+echo "[remediate] async-spawned PR #$PR bead=${BEAD_ID} nonce=${DISPATCH_NONCE:-legacy} pid=${SPAWN_PID} log=${SPAWN_LOG} state=${final_state:-pending}"
 case "$final_state" in
   fail:*)
     # Fast-fail detected within wait window. Refuse so dispatch-record is
