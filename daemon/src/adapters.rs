@@ -929,7 +929,11 @@ pub(crate) fn coderabbit_status_for_head(reviews: &[GhReview], head_ref_oid: &st
                 // substantive rejection (or exact-head approval).
             }
             "CHANGES_REQUESTED" => return "red",
-            _ => continue,
+            // A newer non-comment review state is substantive but not an
+            // approval/rejection we understand. Do not fall through to an
+            // older approval and accidentally report green; only stale or
+            // malformed APPROVED entries are intentionally fail-soft.
+            _ => return "unknown",
         }
     }
     "unknown"
@@ -10172,6 +10176,34 @@ mod coderabbit_exact_head_tests {
                 "head-2"
             ),
             "red"
+        );
+    }
+
+    #[test]
+    fn newer_pending_review_does_not_fall_through_to_older_approval() {
+        assert_eq!(
+            coderabbit_status_for_head(
+                &[
+                    review("APPROVED", Some("head-2")),
+                    review("PENDING", Some("head-2")),
+                ],
+                "head-2"
+            ),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn newer_dismissed_review_does_not_fall_through_to_older_approval() {
+        assert_eq!(
+            coderabbit_status_for_head(
+                &[
+                    review("APPROVED", Some("head-2")),
+                    review("DISMISSED", Some("head-2")),
+                ],
+                "head-2"
+            ),
+            "unknown"
         );
     }
 }
