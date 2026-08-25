@@ -896,7 +896,10 @@ struct GhReview {
 #[derive(serde::Deserialize, serde::Serialize, Clone)]
 struct GhReviewCommit {
     #[serde(default)]
-    oid: Option<String>,
+    /// Keep malformed/non-string payloads representable so one bad review
+    /// cannot make the entire PR snapshot fail to parse. Classification below
+    /// accepts only a string that exactly matches the current head.
+    oid: Option<serde_json::Value>,
 }
 
 /// Classify the latest non-comment CodeRabbit review for a PR head.
@@ -913,7 +916,12 @@ fn coderabbit_status_for_head(reviews: &[GhReview], head_ref_oid: &str) -> &'sta
 
     match last_coderabbit_review {
         Some(r) if r.state == "APPROVED" => {
-            match r.commit.as_ref().and_then(|commit| commit.oid.as_deref()) {
+            match r
+                .commit
+                .as_ref()
+                .and_then(|commit| commit.oid.as_ref())
+                .and_then(serde_json::Value::as_str)
+            {
                 Some(reviewed_oid) if reviewed_oid == head_ref_oid => "green",
                 _ => "unknown",
             }
@@ -1056,7 +1064,9 @@ impl CliScm {
                         login: r.user.map(|u| u.login).unwrap_or_default(),
                     },
                     state: r.state,
-                    commit: r.commit_id.map(|oid| GhReviewCommit { oid: Some(oid) }),
+                    commit: r.commit_id.map(|oid| GhReviewCommit {
+                        oid: Some(serde_json::Value::String(oid)),
+                    }),
                 })
                 .collect(),
             head_ref_oid: rest_pr.head.sha,
@@ -10067,7 +10077,7 @@ mod coderabbit_exact_head_tests {
             },
             state: state.to_string(),
             commit: oid.map(|oid| GhReviewCommit {
-                oid: Some(oid.to_string()),
+                oid: Some(serde_json::Value::String(oid.to_string())),
             }),
         }
     }
@@ -10099,9 +10109,9 @@ mod coderabbit_exact_head_tests {
     #[test]
     fn malformed_commit_object_is_fail_soft_unknown() {
         let malformed: GhReview = serde_json::from_str(
-            r#"{"author":{"login":"coderabbitai[bot]"},"state":"APPROVED","commit":{}}"#,
+            r#"{"author":{"login":"coderabbitai[bot]"},"state":"APPROVED","commit":{"oid":123}}"#,
         )
-        .expect("missing commit oid should remain deserializable");
+        .expect("non-string commit oid should remain deserializable");
         assert_eq!(coderabbit_status_for_head(&[malformed], "head-2"), "unknown");
     }
 
