@@ -123,6 +123,52 @@ def test_validator_accepts_dash_comment_in_sql(tmp_path: pathlib.Path) -> None:
     assert proc.returncode == 0, f"Validator must accept '--' in SQL: {proc.stdout} {proc.stderr}"
 
 
+@pytest.mark.parametrize("suffix", [".c", ".h", ".cpp", ".hpp"])
+def test_validator_rejects_hash_anchor_in_c_family(
+    tmp_path: pathlib.Path, suffix: str
+) -> None:
+    source = tmp_path / f"anchor{suffix}"
+    source.write_text("# PR #742\n", encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(CHECK_SCRIPT), "--file", str(source)],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0
+
+
+def test_validator_rejects_bare_markdown_anchor(tmp_path: pathlib.Path) -> None:
+    markdown = tmp_path / "evidence.md"
+    markdown.write_text("PR #742\n", encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(CHECK_SCRIPT), "--file", str(markdown)],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0
+
+
+def test_validator_accepts_markdown_comment_anchor(tmp_path: pathlib.Path) -> None:
+    markdown = tmp_path / "evidence.md"
+    markdown.write_text("<!-- PR #742 -->\n", encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(CHECK_SCRIPT), "--file", str(markdown)],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_diff_option_is_implemented() -> None:
+    proc = subprocess.run(
+        [sys.executable, str(CHECK_SCRIPT), "--diff", "HEAD"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
 def test_web_advice_failopen_e2e_log_section_5_triages_all_candidates() -> None:
     """Verify docs/web-advice-failopen-e2e-log.md §5 triages all Lane E/F candidates (A-D)."""
     e2e_log = REPO_ROOT / "docs" / "web-advice-failopen-e2e-log.md"

@@ -77,7 +77,20 @@ if [ "${1:-}" = "pr" ] && [ "${2:-}" = "view" ]; then
   for a in "$@"; do
     case "$a" in
       *headRefOid*) echo "7017017017017017017017017017017017017017"; exit 0 ;;
-      *comments*) echo "[]"; exit 0 ;;
+      *comments*)
+        if [ "${GH_SHIM_COMMENTS_FAIL:-0}" = "1" ]; then
+          echo "comment lookup failed" >&2
+          exit 1
+        fi
+        if [ "${GH_SHIM_EXISTING_WARNING:-0}" = "1" ]; then
+          i=0
+          while [ "$i" -lt 500 ]; do echo "unrelated comment $i"; i=$((i + 1)); done
+          echo "RUNNER FLEET DOWN — wait for org runner recovery; merge policy remains enforced"
+        else
+          echo "[]"
+        fi
+        exit 0
+        ;;
     esac
   done
   echo "{}"
@@ -161,6 +174,29 @@ if printf '%s' "$out4" | grep -q "RUNNER FLEET DOWN"; then
   echo "FAIL: API failure must not be classified as fleet down"; FAIL=$((FAIL + 1))
 else
   echo "PASS: API failure is not classified as fleet down"; PASS=$((PASS + 1))
+fi
+
+echo "=== TEST CASE 5: failed comment lookup never posts a duplicate ==="
+LOG_FILE5="$SCRATCH_DIR/gh_calls_case5.log"
+set +e
+out5="$(GH_SHIM_LOG="$LOG_FILE5" GH_SHIM_RUNNER_MODE="down" GH_SHIM_COMMENTS_FAIL="1" AMG_REPO_POLICY_FILE="$POLICY_FILE" HOME="$FAKE_HOME" PATH="$FAKE_BIN_DIR:$PATH" bash "$GUARD" 2>&1)"
+set -e
+assert_contains "failed comment lookup is inconclusive" "RUNNER WARNING DEDUP INCONCLUSIVE" "$out5"
+if grep -q "pr comment" "$LOG_FILE5"; then
+  echo "FAIL: failed comment lookup must not post"; FAIL=$((FAIL + 1))
+else
+  echo "PASS: failed comment lookup does not post"; PASS=$((PASS + 1))
+fi
+
+echo "=== TEST CASE 6: existing warning in large output remains deduplicated ==="
+LOG_FILE6="$SCRATCH_DIR/gh_calls_case6.log"
+set +e
+GH_SHIM_LOG="$LOG_FILE6" GH_SHIM_RUNNER_MODE="down" GH_SHIM_EXISTING_WARNING="1" AMG_REPO_POLICY_FILE="$POLICY_FILE" HOME="$FAKE_HOME" PATH="$FAKE_BIN_DIR:$PATH" bash "$GUARD" >/dev/null 2>&1
+set -e
+if grep -q "pr comment" "$LOG_FILE6"; then
+  echo "FAIL: existing large-output warning must not be duplicated"; FAIL=$((FAIL + 1))
+else
+  echo "PASS: existing large-output warning is not duplicated"; PASS=$((PASS + 1))
 fi
 
 echo "=== RESULTS: $PASS passed, $FAIL failed ==="

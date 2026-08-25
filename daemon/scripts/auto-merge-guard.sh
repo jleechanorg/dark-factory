@@ -562,7 +562,11 @@ while read -r num branch; do
     if [ "$_runner_probe_rc" -eq 3 ]; then
       _runner_warning="RUNNER FLEET DOWN — wait for org runner recovery; merge policy remains enforced"
       echo "PR $num: $_runner_warning"
-      if ! gh pr view "$num" --repo "$REPO" --comments --json comments --jq '.comments[].body' 2>/dev/null | grep -qF "$_runner_warning"; then
+      _runner_comments="$(gh pr view "$num" --repo "$REPO" --comments --json comments --jq '.comments[].body' 2>/dev/null)"
+      _runner_comments_rc=$?
+      if [ "$_runner_comments_rc" -ne 0 ]; then
+        echo "PR $num: RUNNER WARNING DEDUP INCONCLUSIVE — comment lookup failed; not posting"
+      elif [[ "$_runner_comments" != *"$_runner_warning"* ]]; then
         gh pr comment "$num" --repo "$REPO" --body "$_runner_warning" 2>/dev/null || true
       fi
     elif [ "$_runner_probe_rc" -eq 1 ]; then

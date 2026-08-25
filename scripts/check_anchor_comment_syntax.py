@@ -111,6 +111,36 @@ SYNTAX_RULES: dict[str, dict[str, object]] = {
         "invalid_prefixes": ("#", "--"),
         "expected_example": "// PR #<N>",
     },
+    ".c": {
+        "lang": "C",
+        "valid_prefixes": ("//", "/*"),
+        "invalid_prefixes": ("#", "--"),
+        "expected_example": "// PR #<N>",
+    },
+    ".h": {
+        "lang": "C/C++ header",
+        "valid_prefixes": ("//", "/*"),
+        "invalid_prefixes": ("#", "--"),
+        "expected_example": "// PR #<N>",
+    },
+    ".cpp": {
+        "lang": "C++",
+        "valid_prefixes": ("//", "/*"),
+        "invalid_prefixes": ("#", "--"),
+        "expected_example": "// PR #<N>",
+    },
+    ".hpp": {
+        "lang": "C++ header",
+        "valid_prefixes": ("//", "/*"),
+        "invalid_prefixes": ("#", "--"),
+        "expected_example": "// PR #<N>",
+    },
+    ".md": {
+        "lang": "Markdown",
+        "valid_prefixes": ("<!--", "#"),
+        "invalid_prefixes": ("//", "--"),
+        "expected_example": "<!-- PR #<N> -->",
+    },
 }
 
 
@@ -203,6 +233,33 @@ def check_staged_diff() -> list[str]:
     return errors
 
 
+def check_diff(ref: str) -> list[str]:
+    """Check added lines in the working-tree diff against ``ref``."""
+    errors: list[str] = []
+    proc = subprocess.run(
+        ["git", "diff", "-U0", ref, "--"],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return [f"git diff {ref} failed: {proc.stderr}"]
+
+    current_file = None
+    current_line_no = 0
+    for line in proc.stdout.splitlines():
+        if line.startswith("+++ b/"):
+            current_file = line[6:]
+        elif line.startswith("@@ "):
+            match = re.search(r"\+(\d+)", line)
+            if match:
+                current_line_no = int(match.group(1)) - 1
+        elif line.startswith("+") and not line.startswith("+++"):
+            current_line_no += 1
+            if current_file:
+                errors.extend(check_line(current_file, current_line_no, line[1:]))
+    return errors
+
+
 def check_doc() -> list[str]:
     """Verify docs/code-standards.md exists and contains required rules."""
     doc_path = pathlib.Path(__file__).resolve().parents[1] / "docs" / "code-standards.md"
@@ -219,6 +276,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Validate anchor comment syntax by file extension.")
     parser.add_argument("--file", type=pathlib.Path, help="Check a specific file.")
     parser.add_argument("--staged", action="store_true", help="Check staged git diff.")
+    parser.add_argument(
+        "--diff",
+        nargs="?",
+        const="HEAD",
+        metavar="REF",
+        help="Check added working-tree lines against REF (default: HEAD).",
+    )
     parser.add_argument("--check-doc", action="store_true", help="Check code standards document.")
     args = parser.parse_args()
 
@@ -228,6 +292,8 @@ def main() -> int:
         all_errors.extend(check_file(args.file))
     elif args.staged:
         all_errors.extend(check_staged_diff())
+    elif args.diff:
+        all_errors.extend(check_diff(args.diff))
     elif args.check_doc:
         all_errors.extend(check_doc())
     else:
