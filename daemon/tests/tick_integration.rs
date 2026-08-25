@@ -31,8 +31,65 @@ use daemon::state::{BeadOverlay, OverlayState, StateStore};
 use daemon::tick::{combine_dual_verdict, run_tick, TickDeps};
 use daemon::tools::{
     Bead, Issue, LabeledPr, Llm, Permission, PrComment, PrHeadBranch, PrSnapshot, Scm,
+    SessionId, Sessions, SpawnSpec,
 };
 use daemon::verifier::SkepticVerdict;
+use std::cell::Cell;
+
+/// Models AO's non-idempotent `session kill`: the first stop succeeds, while
+/// any accidental second stop fails so promotion cannot hide a duplicate kill
+/// behind a stale DISPATCHED handle.
+struct StopFailsOnSecond {
+    inner: FakeSessions,
+    stop_calls: Cell<usize>,
+}
+
+impl StopFailsOnSecond {
+    fn new(inner: FakeSessions) -> Self {
+        Self {
+            inner,
+            stop_calls: Cell::new(0),
+        }
+    }
+}
+
+impl Sessions for StopFailsOnSecond {
+    fn active_count(&self) -> Result<usize, DaemonError> {
+        self.inner.active_count()
+    }
+
+    fn spawn(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
+        self.inner.spawn(spec)
+    }
+
+    fn attach(&self, branch: &str, bead_id: &str) -> Result<SessionId, DaemonError> {
+        self.inner.attach(branch, bead_id)
+    }
+
+    fn stop(&self, id: &SessionId) -> Result<(), DaemonError> {
+        let calls = self.stop_calls.get() + 1;
+        self.stop_calls.set(calls);
+        if calls > 1 {
+            return Err(DaemonError::Tool {
+                tool: "ao".into(),
+                rc: 1,
+                stderr: "scripted second stop failure".into(),
+            });
+        }
+        self.inner.stop(id)
+    }
+
+    fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError> {
+        self.inner.is_quiescent(id)
+    }
+
+    fn session_activity(
+        &self,
+        id: &SessionId,
+    ) -> Result<daemon::tools::SessionActivity, DaemonError> {
+        self.inner.session_activity(id)
+    }
+}
 
 fn test_repo_cfg(project: &str) -> RepoConfig {
     RepoConfig {
@@ -15164,9 +15221,11 @@ fn tick_idle_promotion_with_failing_stop_does_not_promote_or_clean_worktree() {
 fn tick_idle_promotion_with_succeeding_stop_promotes_and_cleans() {
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
-    let mut sessions = FakeSessions::new();
-    sessions.set_activity(daemon::tools::SessionActivity::Idle);
-    // No fail_stop_for("idle-ok") — stop() succeeds.
+    let scripted_sessions = FakeSessions::new();
+    scripted_sessions.set_activity(daemon::tools::SessionActivity::Idle);
+    // The first stop succeeds; a second stop would fail like non-idempotent
+    // production `ao session kill`.
+    let sessions = StopFailsOnSecond::new(scripted_sessions);
 
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
@@ -15267,6 +15326,11 @@ fn tick_idle_promotion_with_succeeding_stop_promotes_and_cleans() {
     assert_eq!(
         overlay.session_id, None,
         "session handle MUST be cleared after a successful reap"
+    );
+    assert_eq!(
+        sessions.stop_calls.get(),
+        1,
+        "adopted Idle promotion must stop the session exactly once"
     );
     assert!(
         !worktree.is_dir(),
