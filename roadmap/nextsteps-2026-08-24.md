@@ -10,7 +10,8 @@
 - [Learnings and roadmap pointers](#learnings-and-roadmap-pointers)
 - [2026-08-24 (later) — Three-lane funnel analysis + repeatable df-funnel-lanes CLI](#2026-08-24-later--three-lane-funnel-analysis--repeatable-df-funnel-lanes-cli)
 - [2026-08-24 (later) — existing-PR dispatch/worktree failure](#2026-08-24-later--existing-pr-dispatchworktree-failure)
-- [2026-08-24 (current) — Funnel metrics and draft remediation](#2026-08-24-current--funnel-metrics-and-draft-remediation)
+- [2026-08-24 (historical snapshot) — Funnel metrics and draft remediation](#2026-08-24-historical-snapshot--funnel-metrics-and-draft-remediation)
+- [2026-08-24 (current, verified refresh) — Funnel metrics and PR readiness](#2026-08-24-current-verified-refresh--funnel-metrics-and-pr-readiness)
 
 ## Executive summary
 
@@ -178,7 +179,7 @@ These are daemon overlay identifiers, not rows in the local dark-factory Bead st
 - `~/roadmap/learnings-2026-08.md` — new entry `2026-08-24 (later) — Three-lane factory funnel + repeatable CLI`
 - `.claude/skills/factory-funnel/SKILL.md` (user-scope) updated with §4 (3-lane methodology) and the "always run 24h AND 3d" mandatory rule
 
-## 2026-08-24 (current) — Funnel metrics and draft remediation
+## 2026-08-24 (historical snapshot) — Funnel metrics and draft remediation
 
 ### Executive summary
 
@@ -231,3 +232,37 @@ No new bead or GitHub issue was created in this update; the existing four beads 
 ### Roadmap pointer
 
 - `roadmap/activity/2026-08-24.md` was appended with this funnel refresh and live PR state. The README date link already exists, so `roadmap/README.md` did not require a new entry.
+
+---
+
+## 2026-08-24 (current, verified refresh) — Funnel metrics and PR readiness
+
+### Executive summary
+
+- **Measurement foundation:** [PR #744](https://github.com/jleechanorg/dark-factory/pull/744) is **MERGED** at `422e86bc5e2c04df3af23c27ebbece5b2d000c31`; its corrected bead-level join remains the source of truth.
+- **Current funnel baseline:** the fresh 3-day window has **0 `READY_FOR_MERGE`** events; the 30-day window has **2/412 = 0.485%**, with `pr_adopted_start` at **1/114 = 0.877%**. These are operational measurements, not ironclad success criteria.
+- **CodeRabbit structural blocker:** current 3-day direct substantive observations are **1/58 = 1.72%**. CodeRabbit is operational, but this account is quota/rate-limited; vendor-unavailable, unknown, fail, and direct approval observations remain separate. Do not reinterpret quota responses as substantive reviews or as a daemon defect.
+- **Funnel remediation status:** #748, #749, and #750 are all **OPEN/non-draft** with exact-head evidence and green Evidence Gate checks. None claims a substantive CodeRabbit review; each has independent/browser evidence appropriate to its scope. No ironclad criterion is complete.
+- **Preserved blocker:** [Issue #743](https://github.com/jleechanorg/dark-factory/issues/743) remains **OPEN**; factory routing is removed and the four affected beads remain parked. The 48-hour sustain check has not started.
+
+### Work queue
+
+1. **Preserve exact-head reporting and evidence.** #748 is the reporting lane; #749 binds CodeRabbit attribution to the exact head; #750 routes gate 8 through the correct target-worktree backend. Keep direct approval, vendor-unavailable/quota, unknown, fail, and unobserved observations distinct. Evidence Gate is green on all three current heads, but this does not claim a CodeRabbit substantive review.
+2. **Treat the CodeRabbit quota/rate-limit as an external blocker.** Verify service/account availability before changing daemon polling. Do not grind on `jleechan-evtv` or recast quota responses as pass. Once the structural precondition clears, re-run the 3-day metric and sample real GitHub reviews independently.
+3. **Attack the next internal bottlenecks without weakening gates.** Prioritize `comments_resolved` and skeptic calibration after the quota blocker, then re-run `df-funnel-lanes` on 24h + 3d operational windows and 30d origin lanes. New non-factory P1 bead `jleechan-cqaf` tracks the bounded comments-resolved fix: 56/71 failures (78.9%) are real GraphQL counts, but remediation currently receives only a numeric count; enrich thread bodies/paths/IDs as untrusted feedback, preserve Unknown on GraphQL errors, and add filtering/prompt-propagation tests. New non-factory P1 bead `jleechan-uqgu` tracks skeptic startup: 149/149 fresh 3d/7d caller runs are `startup_failure` with `jobs=[]`, all six pin variables are absent, and this must be fixed/reclassified before calling it a policy failure. Add a CI contract for config-check materialization; absent pins may skip only the real skeptic gate. Cross-check every counted `READY_FOR_MERGE` against non-admin GitHub merge state.
+4. **Preserve and defer the dispatch/worktree fix.** Keep [Issue #743](https://github.com/jleechanorg/dark-factory/issues/743) open and its four factory-routed beads parked/unlabelled until a pre-dispatch ownership check and live canary prove safe existing-branch adoption. Do not re-add routing labels from this handoff.
+5. **Run the 48-hour sustain check.** Criteria 1–4 must first pass independently; then re-run them at least 48 hours later with a different verifier. Until that happens, the ironclad goal is explicitly **not achieved**.
+
+### Exact PR state (verified 2026-08-25)
+
+- [PR #748](https://github.com/jleechanorg/dark-factory/pull/748): **OPEN / NON-DRAFT / CLEAN** at `155d344ed1de5c64c6df8c9baef34e4b910810b4`; Evidence Gate, test, daemon-tests, and runner-selector checks passed; evidence gist and no-cookie Gemini/Grok shares are in the PR body; 0 unresolved threads.
+- [PR #749](https://github.com/jleechanorg/dark-factory/pull/749): **OPEN / NON-DRAFT / CLEAN** at `4035ba0dbd4274f43846420abc400f62c2e91377`; Evidence Gate, test, daemon-tests, and runner-selector checks passed; exact-head evidence gist contains Gemini/Grok browser evidence. This is not a CodeRabbit substantive review.
+- [PR #750](https://github.com/jleechanorg/dark-factory/pull/750): **OPEN / NON-DRAFT / CLEAN** at `c0cadf76f4edde2c2c0ce234ffcba301fa2889d4`; Evidence Gate, test, daemon-tests, and runner-selector checks passed; exact-head evidence gist contains Gemini/Grok browser evidence. This is not a CodeRabbit substantive review.
+- [PR #746](https://github.com/jleechanorg/dark-factory/pull/746): **OPEN / DRAFT**, preserved and deprioritized behind the funnel lanes.
+- [Issue #743](https://github.com/jleechanorg/dark-factory/issues/743): **OPEN**; factory routing remains removed from the four parked product beads.
+
+### Learnings and memory pointers
+
+- `~/roadmap/learnings-2026-08.md` records this corrected baseline, the account-level quota/rate-limit blocker, and the rule that #748–#750 evidence is not CodeRabbit substantive review.
+- Claude auto-memory `project_2026-08-24_funnel_metrics_pr748_750.md` records the exact heads/readiness and external quota blocker; `MEMORY.md` points to it.
+- mem0 remains unavailable because `/home/jleechan/.hermes/scripts/mem0_shared_client.py` is absent; do not claim a sync.
