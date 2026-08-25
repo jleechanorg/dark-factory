@@ -97,7 +97,7 @@ For real-LLM reviews (not webhook pings), reviewer-gate nodes (`gate_er`,
 `gate_es`) accept a **`backend_priority=...`** attribute (comma-separated
 list) that picks the **first installed** entry via `which <name> +
 <name> --version`. The default dark-factory priority is
-`codex > minimax > agy > claude-sonnet`; set
+`codex > minimax > agy`; set
 `DARK_FACTORY_ADVERSARIAL_PRIORITY` (comma-separated) to override per-run.
 Setting **`prefer_adversarial: true`** drops the run-level coder backend
 from the queue so a `claude` coder run never gets a `claude` reviewer
@@ -108,7 +108,7 @@ from the queue so a `claude` coder run never gets a `claude` reviewer
 ```dot
 evidence [
     type="gate_er",
-    backend_priority="codex,minimax,agy,claude-sonnet",
+    backend_priority="codex,minimax,agy",
     prefer_adversarial="true"
 ]
 ```

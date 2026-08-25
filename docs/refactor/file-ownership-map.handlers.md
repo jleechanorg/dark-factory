@@ -134,13 +134,13 @@ Public: `_codergen` is registered in TYPE_REGISTRY under "codergen". Also import
 
 | Symbol | Lines | Role | Called by |
 |---|---|---|---|
-| `_DEFAULT_ADVERSARIAL_PRIORITY` | 1257 | `["codex", "minimax", "agy", "claude-sonnet"]` | `_resolve_adversarial_backend` |
+| `_DEFAULT_ADVERSARIAL_PRIORITY` | 1257 | `["codex", "minimax", "agy"]` | `_resolve_adversarial_backend` |
 | `_parse_priority_env` | 1260 | parse `DARK_FACTORY_ADVERSARIAL_PRIORITY` env var | `_resolve_adversarial_backend` |
 | `_probe_backend_installed` | 1272 | `which <name>` + `<name> --version` with 5s ceiling | `_resolve_adversarial_backend`; tests monkeypatch heavily |
 | `_resolve_adversarial_backend` | 1297 | pick first installed from priority queue; metadata audit | `_resolve_gate_backend` |
 | `_resolve_gate_backend` | 1352 | resolve node-level priority OR explicit backend OR run-level; cross-visit pin | every gate handler; tests `test_adversarial_priority_*` |
 | `_coerce_bool_attr` | 1419 | truthy/falsy parser for DOT attributes | `_resolve_gate_backend` |
-| `_execute_gate` | 1435 | run gate; agy→claude infra fallback (no reviewer-shopping) | every gate handler; tests `test_execute_gate_*` |
+| `_execute_gate` | 1435 | run gate; codex/minimax→agy infra fallback (no reviewer-shopping) | every gate handler; tests `test_execute_gate_*` |
 
 ### Universal prompt gates (L1474–L1730)
 

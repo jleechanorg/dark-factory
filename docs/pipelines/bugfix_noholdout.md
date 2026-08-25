@@ -32,7 +32,7 @@ Every implement-bearing lane normally runs the sealed behavioral holdouts
 `bugfix_noholdout.dot` is a **deliberate, narrow exception**: the only
 behavioral gate it can run is the cross-vendor adversarial reviewer
 (`gate_er`, resolved through the priority queue
-`codex > minimax > agy > claude-sonnet` with `prefer_adversarial="true"`
+`codex > minimax > agy` with `prefer_adversarial="true"`
 so the run-level coder backend is excluded). `gate_es` (evidence standards)
 precedes it. The lane is not for "I forgot to write a holdout" — it is for
 branches where the underlying feature predates the holdout program and

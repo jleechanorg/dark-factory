@@ -128,8 +128,8 @@ task, not a deterministic rule table (no `if is_draft then X`, no
 5. Report the verdict per **Output contract** below.
 
 `/f-pr` honesty rules (in addition to the shared ones under **Honesty
-rules**): the `gate_er` priority queue (`codex > minimax > agy >
-claude-sonnet`) independently resolves the reviewer even when
+rules**): the `gate_er` priority queue (`codex > minimax > agy`)
+independently resolves the reviewer even when
 `--backend claude` was passed for the run itself — an explicit Claude run
 does not alter the reviewer queue.
 
@@ -373,7 +373,7 @@ later-confirmed blocker the delegated reviewer missed. If calibration is
 disabled, the final response must say `Reviewer calibration: disabled` and
 give the explicit reason.
 
-The `gate_er` priority queue is `codex > minimax > agy > claude-sonnet`;
+The `gate_er` priority queue is `codex > minimax > agy`;
 passing `--backend claude` for the run itself does not change how `gate_er`
 resolves its reviewer.
 
