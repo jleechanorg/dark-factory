@@ -372,22 +372,15 @@ def _find_start_node(graph: Graph) -> Optional[str]:
 def _is_failure_terminal_node(node: Node) -> bool:
     """Return whether ``node`` terminates a non-success branch.
 
-    ``Msquare``/``exit`` is the canonical terminal in a runnable graph.  A
-    graph may also mark an explicit failure sink with ``failure_terminal`` or
-    ``terminal="failure"``; those sinks are terminal for G1's happy-path
-    witness search as well.  Keeping this predicate separate makes the edge
-    lookup safe and ensures continuation targets (for example ``implement``
-    or ``review``) are never mistaken for terminal failure handling.
+    ``exit`` is the only terminal recognized by the graph engine.  Do not
+    infer terminal semantics from arbitrary DOT attributes such as
+    ``failure_terminal`` or ``terminal="failure"``: those attributes have no
+    runtime meaning and could hide a continuation stage from G1's witness
+    search.  Keeping this predicate separate makes the edge lookup safe and
+    ensures continuation targets (for example ``implement`` or ``review``)
+    are never mistaken for terminal failure handling.
     """
-    if is_exit_node(node):
-        return True
-    if str(node.attrs.get("failure_terminal") or "").strip().lower() == "true":
-        return True
-    return str(node.attrs.get("terminal") or "").strip().lower() in {
-        "failure",
-        "failed",
-        "error",
-    }
+    return is_exit_node(node)
 
 
 def _dfs_witness(

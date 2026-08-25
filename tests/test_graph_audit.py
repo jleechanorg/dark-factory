@@ -363,6 +363,37 @@ def test_failure_edge_to_continuation_still_requires_review(tmp_path):
     assert any(v.kind == "G1" for v in violations), violations
 
 
+@pytest.mark.parametrize(
+    "marker",
+    [
+        'failure_terminal="true"',
+        'terminal="failure"',
+    ],
+)
+def test_failure_marker_on_nonexit_does_not_hide_unreviewed_continuation(
+    tmp_path, marker
+):
+    """Only the engine's real ``exit`` node is a failure terminal.
+
+    Arbitrary DOT attributes that look terminal are not interpreted by the
+    runtime.  The audit must therefore retain a planner-failure path through
+    a marked continuation stage and report its missing reviewer.
+    """
+    p = _write_dot(tmp_path, "planner_failure_marker_continuation.dot", f"""
+        digraph planner_failure_marker_continuation {{
+            start [shape=Mdiamond]
+            exit [shape=Msquare]
+            plan [type="codergen", backend="minimax"]
+            pseudo_terminal [type="codergen", backend="minimax", {marker}]
+            start -> plan
+            plan -> pseudo_terminal [condition="outcome!=success"]
+            pseudo_terminal -> exit [condition="outcome=success"]
+        }}
+    """)
+    violations = graph_audit.audit_graph(p)
+    assert any(v.kind == "G1" for v in violations), violations
+
+
 def test_g1_violator_has_g1_violation_only():
     violations = graph_audit.audit_graph(FIXTURES / "g1_violator.dot")
     kinds = [v.kind for v in violations]
