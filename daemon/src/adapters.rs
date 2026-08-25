@@ -1022,7 +1022,10 @@ impl CliScm {
             user: Option<RestUser>,
             state: String,
             #[serde(default)]
-            commit_id: Option<String>,
+            // Preserve non-string/null values so one malformed review cannot
+            // make the whole REST review list fail to parse. Classification
+            // accepts only a string matching the current head.
+            commit_id: Option<serde_json::Value>,
         }
         #[derive(serde::Deserialize)]
         struct RestUser {
@@ -1064,9 +1067,7 @@ impl CliScm {
                         login: r.user.map(|u| u.login).unwrap_or_default(),
                     },
                     state: r.state,
-                    commit: r.commit_id.map(|oid| GhReviewCommit {
-                        oid: Some(serde_json::Value::String(oid)),
-                    }),
+                    commit: r.commit_id.map(|oid| GhReviewCommit { oid: Some(oid) }),
                 })
                 .collect(),
             head_ref_oid: rest_pr.head.sha,
@@ -10116,6 +10117,29 @@ mod coderabbit_exact_head_tests {
     }
 
     #[test]
+    fn null_commit_object_is_fail_soft_unknown() {
+        let null_commit: GhReview = serde_json::from_str(
+            r#"{"author":{"login":"coderabbitai[bot]"},"state":"APPROVED","commit":null}"#,
+        )
+        .expect("null commit should remain deserializable");
+        assert_eq!(coderabbit_status_for_head(&[null_commit], "head-2"), "unknown");
+    }
+
+    #[test]
+    fn latest_exact_head_approval_supersedes_old_changes_requested() {
+        assert_eq!(
+            coderabbit_status_for_head(
+                &[
+                    review("CHANGES_REQUESTED", Some("head-1")),
+                    review("APPROVED", Some("head-2")),
+                ],
+                "head-2"
+            ),
+            "green"
+        );
+    }
+
+    #[test]
     fn latest_changes_requested_review_remains_red() {
         assert_eq!(
             coderabbit_status_for_head(
@@ -10741,6 +10765,10 @@ mod pr_snapshot_checks_fetch_failure_tests {
         let script = r#"#!/usr/bin/env bash
 set -u
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  if [ "${GH_TEST_FORCE_REST:-}" = "1" ]; then
+    echo "gh: forced REST fallback" >&2
+    exit 1
+  fi
   cat <<'JSON'
 {"mergeable":"MERGEABLE","reviews":[],"headRefOid":"deadbeefcafefeed0123456789abcdef01234567","body":"test body","comments":[],"files":[],"updatedAt":"2026-07-08T12:00:00Z"}
 JSON
@@ -10766,6 +10794,10 @@ if [ "$1" = "api" ]; then
     esac
   done
   case "$url" in
+    *pulls/*/reviews)
+      printf '%s' "${GH_TEST_REST_REVIEWS:-[]}"
+      exit 0
+      ;;
     *pulls/*)
       echo '{"mergeable":true,"head":{"sha":"deadbeefcafefeed0123456789abcdef01234567"},"body":"test body","updated_at":"2026-07-08T12:00:00Z"}'
       exit 0
@@ -10874,6 +10906,74 @@ exit 1
         }
         std::fs::remove_dir_all(&dir).ok();
         result
+    }
+
+    /// Force `gh pr view` to fail so `CliScm::pr_snapshot` uses the REST
+    /// fallback, returning a caller-provided review payload from the fake
+    /// `pulls/<n>/reviews` endpoint. This keeps malformed-review coverage on
+    /// the same path that production uses during GraphQL/CLI outages.
+    fn run_pr_snapshot_with_rest_reviews(
+        reviews_json: &str,
+        pr: u64,
+    ) -> Result<crate::tools::PrSnapshot, DaemonError> {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        super::clear_graphql_rate_limited();
+        let dir = make_fake_gh_dir("rest_reviews");
+        let bin = dir.join("bin");
+        let prior_path = std::env::var_os("PATH");
+        let mut new_path = std::ffi::OsString::from(bin.to_str().unwrap());
+        if let Some(prior) = prior_path.as_ref() {
+            new_path.push(":");
+            new_path.push(prior);
+        }
+        let prior_force_rest = std::env::var_os("GH_TEST_FORCE_REST");
+        let prior_reviews = std::env::var_os("GH_TEST_REST_REVIEWS");
+        unsafe {
+            std::env::set_var("PATH", &new_path);
+            std::env::set_var("GH_TEST_FORCE_REST", "1");
+            std::env::set_var("GH_TEST_REST_REVIEWS", reviews_json);
+        }
+
+        let scm = CliScm::new("jleechanorg/dark-factory-test".to_string());
+        let result = scm.pr_snapshot(pr);
+
+        super::clear_graphql_rate_limited();
+        unsafe {
+            if let Some(prior) = prior_path {
+                std::env::set_var("PATH", prior);
+            } else {
+                std::env::remove_var("PATH");
+            }
+            if let Some(prior) = prior_force_rest {
+                std::env::set_var("GH_TEST_FORCE_REST", prior);
+            } else {
+                std::env::remove_var("GH_TEST_FORCE_REST");
+            }
+            if let Some(prior) = prior_reviews {
+                std::env::set_var("GH_TEST_REST_REVIEWS", prior);
+            } else {
+                std::env::remove_var("GH_TEST_REST_REVIEWS");
+            }
+        }
+        drop(_guard);
+        std::fs::remove_dir_all(&dir).ok();
+        result
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn rest_reviews_keep_valid_latest_changes_requested_after_malformed_oid() {
+        let reviews = r#"[
+          {"user":{"login":"coderabbitai[bot]"},"state":"APPROVED","commit_id":123},
+          {"user":{"login":"coderabbitai[bot]"},"state":"CHANGES_REQUESTED","commit_id":"deadbeefcafefeed0123456789abcdef01234567"}
+        ]"#;
+        let snapshot = run_pr_snapshot_with_rest_reviews(reviews, 749)
+            .expect("REST fallback review payload should remain parseable");
+        assert_eq!(snapshot.coderabbit_status, "red");
+        assert!(!snapshot.coderabbit_approved);
     }
 
 
