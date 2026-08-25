@@ -295,17 +295,20 @@ above `jleechan2015` web-advice review). Both visible at `gh pr view 664 --comme
 6. **Item #5 Holdout deadlock at full-pipeline path — FIXED:**
    Added `--require-holdouts` flag to `runner/preflight.py` and `runner/__main__.py`. Fails fast with clear error
    when `holdouts/<feature>/scenarios.yaml` is missing, preventing the 3-iteration `holdout -> fix -> holdout` deadlock loop.
-7. **Item #6 Fold web-advice-failopen.dot into production pipelines — MERGED:**
-   PR #742 merged the canonical node into `pr_gates.dot`, `gates.dot`, and
-   `slim/minimal_pr.dot` with strict structured panel validation and exact-head
-   real-browser evidence.
+7. **Item #6 Fold web-advice-failopen.dot into production pipelines — TRACKED:**
+   Tracked separately under follow-up bead `jleechan-azso` (fold
+   `web-advice-failopen.dot` into `pr_gates.dot` + `gates.dot` +
+   `slim/minimal_pr.dot`).
+
+**Current-state update (2026-08-24):** PR #742 later merged this tracked work
+with strict structured panel validation and exact-head real-browser evidence.
 
 ### 5.2 Lane E/F Remediation Candidates
 
 | Candidate | Decision | Disposition |
 |---|---|---|
 | **A** — surface runner outage truthfully | **FIX** | `scripts/check_runner_health.sh` reuses the canonical org-scoped selector verifier and the configured `SELF_HOSTED_RUNNER_LABELS`. It distinguishes fleet-down, selector drift, and probe/auth failure. `auto-merge-guard.sh` posts a deduplicated warning only for a verified org-fleet outage and never recommends bypassing merge policy. |
-| **B** — language-correct anchor comments | **FIX** | `docs/code-standards.md` documents native comment forms and `scripts/check_anchor_comment_syntax.py` validates explicit file/staged checks. The validator remains an explicit check rather than an implicit hook. |
+| **B** — language-correct anchor comments | **FIX** | `docs/code-standards.md` documents native comment forms. Changed source is validated by its real parser/compiler/linter; no cross-language regex validator is used because multiline strings, block comments, heredocs, and prose make that approach unsound. |
 | **C** — legacy bead bodies missing `external_ref` | **ACCEPT-AS-DEGRADED** | Historical records remain immutable. Forward intake validation in `daemon/src/intake.rs` and the factory preflights enforce repository and external-reference identity. |
 | **D** — Evidence Gate commit-message scan | **ACCEPT-AS-DEGRADED** | The Evidence Gate workflow remains bound to the current PR head through a trusted `/er` signal or canonical PR-body public-gist marker. Scanning arbitrary historical commit messages would introduce stale-evidence ambiguity. |
 

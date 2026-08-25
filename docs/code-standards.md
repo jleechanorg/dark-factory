@@ -20,12 +20,13 @@ Anchor comments are inserted into watched paths (such as `daemon/src/adapters.rs
 ### Root Cause / History
 In PR #665 and PR #666, an anchor-commit push erroneously used `# PR #N` in `daemon/src/adapters.rs`, which broke Rust compilation (`cargo check` / `cargo build`) because `#` is invalid syntax outside attribute macros (`#[...]` / `#![...]`).
 
-### Manual Validation (not an automatic hook)
-The script `scripts/check_anchor_comment_syntax.py` manually validates staged or modified anchor comments against file extensions:
-```bash
-python3 scripts/check_anchor_comment_syntax.py --staged
-```
-The repository's tracked Git pre-push hook does not invoke this validator; run it explicitly (or from CI) when checking anchor comments.
+### Validation
+
+Use the language's real parser, compiler, formatter, or linter for changed
+source files. A cross-language line-regex is intentionally not provided: it
+cannot reliably distinguish comments from multiline strings, block comments,
+heredocs, or prose and would create false confidence. For the Rust incident
+above, `cargo check --manifest-path daemon/Cargo.toml` is authoritative.
 
 ---
 

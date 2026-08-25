@@ -34,10 +34,6 @@ use daemon::tools::{
 };
 use daemon::verifier::SkepticVerdict;
 
-// Tests in this module may run concurrently; serialize mutation of the
-// process-wide reviewer fallback-chain environment variable.
-static REVIEWER_FALLBACK_CHAIN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 fn test_repo_cfg(project: &str) -> RepoConfig {
     RepoConfig {
         ao_project: project.into(),
@@ -13615,12 +13611,6 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
     std::fs::create_dir_all(&telemetry_dir).unwrap();
     let telemetry_log = telemetry_dir.join(format!("daemon-{}.jsonl", std::process::id()));
     let _ = std::fs::remove_file(&telemetry_log);
-    let _env_guard = REVIEWER_FALLBACK_CHAIN_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let previous_fallback_chain =
-        std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok();
-    std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "");
 
     let ledger = Mutex::new(VendorHealthLedger::new());
 
@@ -13859,10 +13849,6 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
-    match previous_fallback_chain {
-        Some(value) => std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", value),
-        None => std::env::remove_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN"),
-    }
 }
 
 // ----------------------------------------------------------------------------
