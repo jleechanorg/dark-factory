@@ -126,7 +126,7 @@ class Violation:
     ``message``     — human-readable explanation; one short line.
     """
 
-    kind: Literal["G1", "G2", "G3", "G4", "R1"]
+    kind: Literal["G1", "G2", "G3", "G4", "G5", "R1"]
     pipeline: str
     location: str
     message: str
@@ -204,6 +204,43 @@ def _is_reviewer(node: Node) -> bool:
     handler; the class is a styling hint, not a dispatch contract.
     """
     return _resolved_type_label(node) in _REVIEWER_TYPE_NAMES
+
+
+_CLAUDE_ROUTE_TOKENS: frozenset[str] = frozenset({"claude", "claude-sonnet"})
+
+
+def _is_direct_claude_route(node: Node) -> bool:
+    """Return whether ``node`` statically selects a Claude execution lane.
+
+    Only exact backend/model tokens count.  ``model_name`` is deliberately
+    ignored because it can name a model on a non-Claude backend.  Gate
+    priorities are comma-separated backend tokens; substring lookalikes such
+    as ``claudem`` and ``claude-sonnet-4-6`` are not direct routes.
+    """
+    resolved = _resolved_type_label(node)
+    if resolved == "web_advice":
+        return True
+    if resolved == "codergen":
+        for key in ("backend", "model"):
+            token = str(node.attrs.get(key) or "").strip().lower()
+            if token in _CLAUDE_ROUTE_TOKENS:
+                return True
+        return False
+    priority = str(node.attrs.get("backend_priority") or "")
+    tokens = {part.strip().lower() for part in priority.split(",") if part.strip()}
+    return bool(tokens & _CLAUDE_ROUTE_TOKENS)
+
+
+def _has_claude_scope_markers(node: Node) -> bool:
+    """Return whether both explicit Claude-scope markers are truthy."""
+    def truthy(value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+    return truthy(node.attrs.get("explicit_claude_lane")) and truthy(
+        node.attrs.get("requires_claude_config")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +489,23 @@ def audit_graph(path: pathlib.Path) -> list[Violation]:
         ]
 
     violations: list[Violation] = []
+
+    # G5 — every statically direct Claude route must be explicitly scoped.
+    # The markers are node-local so a graph-level/default backend cannot make
+    # an implicit route appear authorized.
+    for node_name, node in graph.nodes.items():
+        if _is_direct_claude_route(node) and not _has_claude_scope_markers(node):
+            violations.append(
+                Violation(
+                    kind="G5",
+                    pipeline=relpath,
+                    location=node_name,
+                    message=(
+                        f"node {node_name!r} directly routes to Claude but is missing "
+                        "explicit_claude_lane=true and requires_claude_config=true"
+                    ),
+                )
+            )
 
     # G3 / R1 — node explicitly references a handler type the runner
     # cannot resolve. Two flavors:

@@ -115,6 +115,64 @@ def test_classification_table(attrs, is_code, is_review):
     assert graph_audit._is_reviewer(node) is is_review
 
 
+@pytest.mark.parametrize(
+    "attrs, expected",
+    [
+        ({"type": "codergen", "backend": "claude"}, True),
+        ({"type": "codergen", "backend": "claude-sonnet"}, True),
+        ({"type": "codergen", "model": "claude"}, True),
+        ({"type": "codergen", "model": "claude-sonnet"}, True),
+        ({"type": "codergen", "backend": "claudem"}, False),
+        ({"type": "codergen", "backend": "minimax"}, False),
+        ({"type": "codergen", "model_name": "claude-sonnet-4-6"}, False),
+        ({"type": "gate_er", "backend_priority": "codex,claude"}, True),
+        ({"type": "gate_er", "backend_priority": "codex,claude-sonnet"}, True),
+        ({"type": "gate_er", "backend_priority": "codex,claude", "explicit_claude_lane": "true"}, True),
+        ({"type": "web_advice"}, True),
+    ],
+)
+def test_direct_claude_route_detection_is_exact(attrs, expected):
+    node = make_node("n", **attrs)
+    assert graph_audit._is_direct_claude_route(node) is expected
+
+
+def test_direct_claude_route_requires_both_scope_markers(tmp_path):
+    p = _write_dot(tmp_path, "claude_scope.dot", """
+        digraph claude_scope {
+            start [shape=Mdiamond]
+            exit [shape=Msquare]
+            coder [type="codergen", backend="claude", explicit_claude_lane="true", requires_claude_config="false"]
+            reviewer [type="gate_er"]
+            start -> coder -> reviewer -> exit
+        }
+    """)
+    violations = graph_audit.audit_graph(p)
+    g5 = [v for v in violations if v.kind == "G5"]
+    assert len(g5) == 1
+    assert g5[0].location == "coder"
+
+
+def test_direct_claude_route_with_both_scope_markers_passes(tmp_path):
+    p = _write_dot(tmp_path, "claude_scope_ok.dot", """
+        digraph claude_scope_ok {
+            start [shape=Mdiamond]
+            exit [shape=Msquare]
+            coder [type="codergen", backend="claude", explicit_claude_lane="true", requires_claude_config="true"]
+            reviewer [type="gate_er"]
+            start -> coder -> reviewer -> exit
+        }
+    """)
+    assert not [v for v in graph_audit.audit_graph(p) if v.kind == "G5"]
+
+
+def test_audit_amazon_clone_pipelines_is_clean():
+    violations = graph_audit.audit_graphs(ROOT / "benchmarks" / "amazon-clone" / "pipelines")
+    # The benchmark bundle intentionally contains legacy graphs with unrelated
+    # G1/G4 findings; this contract only asserts every direct Claude route is
+    # explicitly scoped.
+    assert not [v for v in violations if v.kind == "G5"], violations
+
+
 # ---------------------------------------------------------------------------
 # Condition normalisation — pin that "outcome != success" is the only
 # pattern G2 matches. A bare "outcome=success" edge is success routing

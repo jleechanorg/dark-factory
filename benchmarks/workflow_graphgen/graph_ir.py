@@ -189,6 +189,9 @@ def _render_middle_node(n: NodeIR) -> str:
         attrs.append(f'backend={_q(n.backend)}')
     if n.model_name:
         attrs.append(f'model_name={_q(n.model_name)}')
+    if (n.backend or "").strip().lower() in {"claude", "claude-sonnet"}:
+        attrs.append('explicit_claude_lane="true"')
+        attrs.append('requires_claude_config="true"')
     return f'    {n.name} [{", ".join(attrs)}]'
 
 

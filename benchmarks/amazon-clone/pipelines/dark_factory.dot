@@ -6,11 +6,11 @@ digraph amazon_fullstack {
     exit  [shape=Msquare, label="Exit"]
 
     spec_review [type="codergen", backend="codex", label="Spec Review", prompt="@benchmarks/amazon-clone/prompts/spec_review.md", timeout=600]
-    architect   [type="codergen", backend="claude", label="Architecture", prompt="@benchmarks/amazon-clone/prompts/architect.md", timeout=600]
+    architect   [type="codergen", backend="claude", explicit_claude_lane="true", requires_claude_config="true", label="Architecture", prompt="@benchmarks/amazon-clone/prompts/architect.md", timeout=600]
 
     data_model      [type="codergen", backend="codex", label="Data Model + Firestore", prompt="@benchmarks/amazon-clone/prompts/data_model.md", timeout=600]
     backend         [type="codergen", backend="codex", label="Backend API", prompt="@benchmarks/amazon-clone/prompts/backend.md", timeout=600]
-    frontend        [type="codergen", backend="claude", label="Frontend App", prompt="@benchmarks/amazon-clone/prompts/frontend.md", timeout=600]
+    frontend        [type="codergen", backend="claude", explicit_claude_lane="true", requires_claude_config="true", label="Frontend App", prompt="@benchmarks/amazon-clone/prompts/frontend.md", timeout=600]
     firestore_rules [type="codergen", backend="codex", label="Firestore Rules", prompt="@benchmarks/amazon-clone/prompts/firestore_rules.md", timeout=600]
     seed_data       [type="codergen", backend="codex", label="Seed + Reset", prompt="@benchmarks/amazon-clone/prompts/seed_data.md", timeout=600]
     validation      [type="codergen", backend="codex", label="Validation Harness", prompt="@benchmarks/amazon-clone/prompts/validation_harness.md", timeout=600]
