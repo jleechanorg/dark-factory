@@ -517,10 +517,19 @@ def _post_pr_comment(pr_number: int, body: str, *, repo: Optional[str] = None,
     Failures are NEVER raised — the caller treats ``ok=False`` as
     best-effort and the handler still returns ``outcome=success``.
     """
-    cmd = ["gh", "pr", "comment", str(pr_number), "--body", body]
-    if repo:
-        cmd += ["--repo", repo]
+    body_path: Optional[str] = None
+    body_fd: Optional[int] = None
     try:
+        body_fd, body_path = tempfile.mkstemp(prefix="web-advice-comment-", suffix=".md")
+        os.fchmod(body_fd, 0o600)
+        with os.fdopen(body_fd, "w", encoding="utf-8") as handle:
+            body_fd = None
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        cmd = ["gh", "pr", "comment", str(pr_number), "--body-file", body_path]
+        if repo:
+            cmd += ["--repo", repo]
         res = subprocess.run(
             cmd,
             capture_output=True,
@@ -541,6 +550,17 @@ def _post_pr_comment(pr_number: int, body: str, *, repo: Optional[str] = None,
             "stderr": f"{type(exc).__name__}: {exc}"[:500],
             "url": None,
         }
+    finally:
+        if body_fd is not None:
+            try:
+                os.close(body_fd)
+            except OSError:
+                pass
+        if body_path is not None:
+            try:
+                os.unlink(body_path)
+            except OSError:
+                pass
 
 
 def _run_e2e_smoke(timeout: int = 30) -> dict:

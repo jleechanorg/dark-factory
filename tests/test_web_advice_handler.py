@@ -704,6 +704,41 @@ class TestPostPrComment:
         assert "--repo" in seen[0]
         assert "jleechanorg/dark-factory" in seen[0]
 
+    def test_large_body_uses_owner_only_body_file_and_cleans_up(self, monkeypatch):
+        seen = {}
+        body = "line\n" * 50_000
+
+        def _fake_run(cmd, **kwargs):
+            seen["cmd"] = cmd
+            body_file = pathlib.Path(cmd[cmd.index("--body-file") + 1])
+            seen["content"] = body_file.read_text(encoding="utf-8")
+            seen["mode"] = body_file.stat().st_mode & 0o777
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="ok", stderr="")
+
+        monkeypatch.setattr("runner.handler_web_advice.subprocess.run", _fake_run)
+        result = _post_pr_comment(655, body, repo="jleechanorg/dark-factory")
+
+        assert result["ok"] is True
+        assert "--body-file" in seen["cmd"]
+        assert "--body" not in seen["cmd"]
+        assert seen["content"] == body
+        assert seen["mode"] == 0o600
+        assert not pathlib.Path(seen["cmd"][seen["cmd"].index("--body-file") + 1]).exists()
+
+    def test_body_file_is_cleaned_up_on_timeout(self, monkeypatch):
+        seen = {}
+
+        def _timeout(cmd, **kwargs):
+            seen["path"] = cmd[cmd.index("--body-file") + 1]
+            raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+        monkeypatch.setattr("runner.handler_web_advice.subprocess.run", _timeout)
+        result = _post_pr_comment(655, "body", timeout=3)
+
+        assert result["ok"] is False
+        assert result["returncode"] == -1
+        assert not pathlib.Path(seen["path"]).exists()
+
     def test_post_pr_comment_failure_returns_dict(self, monkeypatch):
         def _fake_run(cmd, **kwargs):
             return subprocess.CompletedProcess(
@@ -717,13 +752,17 @@ class TestPostPrComment:
         assert "rate-limited" in result["stderr"]
 
     def test_post_pr_comment_handles_missing_gh(self, monkeypatch):
+        seen = {}
+
         def _fake_run(cmd, **kwargs):
+            seen["path"] = cmd[cmd.index("--body-file") + 1]
             raise FileNotFoundError("gh: command not found")
 
         monkeypatch.setattr("runner.handler_web_advice.subprocess.run", _fake_run)
         result = _post_pr_comment(655, "hello")
         assert result["ok"] is False
         assert "FileNotFoundError" in result["stderr"]
+        assert not pathlib.Path(seen["path"]).exists()
 
 
 # ---------------------------------------------------------------------------

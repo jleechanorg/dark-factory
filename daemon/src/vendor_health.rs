@@ -142,16 +142,23 @@ pub fn is_global_vendor_capped(vendor: Vendor) -> bool {
 /// Return the first configured fallback when CodeRabbit is capped. This is
 /// intentionally only a routing signal; the next reviewer's health is checked
 /// by its own gate.
-pub fn next_healthy_reviewer(capped: Vendor) -> Option<String> {
+pub fn next_healthy_reviewer_from_config(capped: Vendor, raw: Option<&str>) -> Option<String> {
     if capped != Vendor::CodeRabbit {
         return None;
     }
-    let raw = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN")
-        .unwrap_or_else(|_| "codex->agy->gemini".to_string());
+    let raw = raw.unwrap_or("codex->agy->gemini");
     raw.split("->")
         .map(str::trim)
         .find(|entry| !entry.is_empty())
         .map(str::to_string)
+}
+
+/// Production wrapper for the pure fallback-chain parser. Keeping environment
+/// access here preserves runtime configuration without making tests mutate the
+/// process-global environment.
+pub fn next_healthy_reviewer(capped: Vendor) -> Option<String> {
+    let configured = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok();
+    next_healthy_reviewer_from_config(capped, configured.as_deref())
 }
 
 /// In-memory per-vendor ledger. The daemon owns one of these and consults
@@ -396,15 +403,26 @@ mod tests {
     }
 
     #[test]
-    fn next_healthy_reviewer_returns_default_chain_first_entry() {
-        let prev = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok();
-        std::env::remove_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN");
+    fn next_healthy_reviewer_empty_config_returns_none() {
         assert_eq!(
-            next_healthy_reviewer(Vendor::CodeRabbit),
+            next_healthy_reviewer_from_config(Vendor::CodeRabbit, Some("")),
+            None
+        );
+    }
+
+    #[test]
+    fn next_healthy_reviewer_returns_default_chain_first_entry() {
+        assert_eq!(
+            next_healthy_reviewer_from_config(Vendor::CodeRabbit, None),
             Some("codex".to_string())
         );
-        if let Some(v) = prev {
-            std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", v);
-        }
+    }
+
+    #[test]
+    fn next_healthy_reviewer_uses_configured_chain_first_nonempty_entry() {
+        assert_eq!(
+            next_healthy_reviewer_from_config(Vendor::CodeRabbit, Some(" -> minimax -> codex")),
+            Some("minimax".to_string())
+        );
     }
 }

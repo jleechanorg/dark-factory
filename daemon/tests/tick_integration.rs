@@ -13586,11 +13586,18 @@ fn escalation_dedup_tick_level_identical_payload_suppressed_changed_context_re_e
 // VENDOR_WAIVED telemetry fires on the auto-escalation edge.
 #[test]
 fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
-    unsafe { std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "") };
     use std::sync::Mutex;
 
     use daemon::vendor_health::VendorHealthLedger;
     use daemon::vendor_health::EVT_WAIVED;
+    use daemon::vendor_health::{next_healthy_reviewer_from_config, Vendor};
+
+    // Exercise the pure seam directly; do not mutate the process-global
+    // fallback-chain environment while this integration test runs.
+    assert_eq!(
+        next_healthy_reviewer_from_config(Vendor::CodeRabbit, Some("")),
+        None
+    );
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
