@@ -62,13 +62,37 @@ fn is_plain_directory(path: &Path) -> std::io::Result<bool> {
     Ok(std::fs::symlink_metadata(path)?.file_type().is_dir())
 }
 
-/// Return whether git reports tracked or untracked changes. A directory
-/// without a `.git` entry is retained as a legacy synthetic worktree and is
-/// treated as clean; a present but unusable repository fails closed.
-fn is_dirty_worktree(path: &Path) -> Result<bool, DaemonError> {
-    if !path.join(".git").exists() {
+fn linked_worktree_metadata(path: &Path) -> Result<bool, DaemonError> {
+    let metadata = std::fs::symlink_metadata(path.join(".git")).map_err(|e| {
+        DaemonError::Config(format!(
+            "worktree reaper: inspect git metadata {}: {e}",
+            path.display()
+        ))
+    })?;
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(DaemonError::Config(format!(
+            "worktree reaper: git metadata {} is a symlink",
+            path.join(".git").display()
+        )));
+    }
+    if file_type.is_file() {
+        return Ok(true);
+    }
+    if file_type.is_dir() {
         return Ok(false);
     }
+    Err(DaemonError::Config(format!(
+        "worktree reaper: unsupported git metadata {}",
+        path.join(".git").display()
+    )))
+}
+
+/// Return whether git reports tracked, untracked, or ignored changes. Missing
+/// or malformed Git metadata fails closed so an unknown worktree is never
+/// mistaken for a clean one.
+fn is_dirty_worktree(path: &Path) -> Result<bool, DaemonError> {
+    let _ = linked_worktree_metadata(path)?;
     let output = Command::new("git")
         .args([
             "-C",
@@ -76,6 +100,7 @@ fn is_dirty_worktree(path: &Path) -> Result<bool, DaemonError> {
             "status",
             "--porcelain=v1",
             "--untracked-files=all",
+            "--ignored",
         ])
         .output()
         .map_err(|e| {
@@ -94,6 +119,103 @@ fn is_dirty_worktree(path: &Path) -> Result<bool, DaemonError> {
     Ok(!output.stdout.is_empty())
 }
 
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+fn write_manifest_line(
+    manifest_path: &Path,
+    record: &serde_json::Value,
+    create_new: bool,
+) -> std::io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true);
+    if create_new {
+        options.create_new(true);
+    } else {
+        options.append(true);
+    }
+    let mut manifest = options.open(manifest_path)?;
+    serde_json::to_writer(&mut manifest, record)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    manifest.write_all(b"\n")?;
+    manifest.sync_all()
+}
+
+fn move_worktree(path: &Path, destination: &Path) -> Result<(), DaemonError> {
+    if linked_worktree_metadata(path)? {
+        let output = Command::new("git")
+            .args([
+                "-C",
+                path.to_string_lossy().as_ref(),
+                "worktree",
+                "move",
+                path.to_string_lossy().as_ref(),
+                destination.to_string_lossy().as_ref(),
+            ])
+            .output()
+            .map_err(|e| {
+                DaemonError::Config(format!(
+                    "worktree reaper: git worktree move {} -> {}: {e}",
+                    path.display(),
+                    destination.display()
+                ))
+            })?;
+        if !output.status.success() {
+            return Err(DaemonError::Config(format!(
+                "worktree reaper: git worktree move {} -> {} failed with {}",
+                path.display(),
+                destination.display(),
+                output.status
+            )));
+        }
+        Ok(())
+    } else {
+        std::fs::rename(path, destination).map_err(|e| {
+            DaemonError::Config(format!(
+                "worktree reaper: quarantine {} -> {}: {e}",
+                path.display(),
+                destination.display()
+            ))
+        })
+    }
+}
+
+fn remove_worktree(path: &Path) -> Result<(), DaemonError> {
+    if linked_worktree_metadata(path)? {
+        let output = Command::new("git")
+            .args([
+                "-C",
+                path.to_string_lossy().as_ref(),
+                "worktree",
+                "remove",
+                path.to_string_lossy().as_ref(),
+            ])
+            .output()
+            .map_err(|e| {
+                DaemonError::Config(format!(
+                    "worktree reaper: git worktree remove {}: {e}",
+                    path.display()
+                ))
+            })?;
+        if !output.status.success() {
+            return Err(DaemonError::Config(format!(
+                "worktree reaper: git worktree remove {} failed with {}",
+                path.display(),
+                output.status
+            )));
+        }
+        Ok(())
+    } else {
+        std::fs::remove_dir_all(path).map_err(|e| {
+            DaemonError::Config(format!(
+                "worktree reaper: remove {}: {e}",
+                path.display()
+            ))
+        })
+    }
+}
+
 fn quarantine_worktree(root: &Path, path: &Path, agent_id: &str) -> Result<(), DaemonError> {
     if agent_id.is_empty() || agent_id.contains('/') || agent_id.contains("..") {
         return Err(DaemonError::Config(format!(
@@ -101,61 +223,100 @@ fn quarantine_worktree(root: &Path, path: &Path, agent_id: &str) -> Result<(), D
         )));
     }
     let quarantine_root = root.join(QUARANTINE_DIR_NAME);
-    std::fs::create_dir_all(&quarantine_root).map_err(|e| {
-        DaemonError::Config(format!(
-            "worktree reaper: create quarantine {}: {e}",
+    match std::fs::symlink_metadata(&quarantine_root) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(DaemonError::Config(format!(
+                "worktree reaper: quarantine root {} is not a real directory",
+                quarantine_root.display()
+            )));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&quarantine_root).map_err(|e| {
+                DaemonError::Config(format!(
+                    "worktree reaper: create quarantine {}: {e}",
+                    quarantine_root.display()
+                ))
+            })?;
+        }
+        Err(e) => {
+            return Err(DaemonError::Config(format!(
+                "worktree reaper: inspect quarantine {}: {e}",
+                quarantine_root.display()
+            )));
+        }
+    }
+    if !std::fs::symlink_metadata(&quarantine_root)
+        .map(|metadata| metadata.file_type().is_dir())
+        .unwrap_or(false)
+    {
+        return Err(DaemonError::Config(format!(
+            "worktree reaper: quarantine root {} is not a real directory",
             quarantine_root.display()
-        ))
-    })?;
+        )));
+    }
     let stamp = now_epoch_secs();
     for sequence in 0..1000u32 {
         let stem = format!("{agent_id}-{stamp}-{}-{sequence}", std::process::id());
         let destination = quarantine_root.join(&stem);
         let manifest_path = quarantine_root.join(format!("{stem}.json"));
-        if destination.exists() || manifest_path.exists() {
+        if std::fs::symlink_metadata(&destination).is_ok()
+            || std::fs::symlink_metadata(&manifest_path).is_ok()
+        {
             continue;
         }
-        let record = serde_json::json!({
+        let prepared = serde_json::json!({
+            "state": "prepared",
             "agent_id": agent_id,
             "original_path": path.display().to_string(),
             "quarantined_path": destination.display().to_string(),
             "recorded_at_epoch_secs": stamp,
         });
-        let mut manifest = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&manifest_path)
-            .map_err(|e| {
-                DaemonError::Config(format!(
-                    "worktree reaper: record quarantine {}: {e}",
-                    manifest_path.display()
-                ))
-            })?;
-        let write_result = serde_json::to_writer(&mut manifest, &record)
-            .map_err(|e| std::io::Error::other(e.to_string()))
-            .and_then(|_| manifest.write_all(b"\n"))
-            .and_then(|_| manifest.sync_all());
-        if let Err(e) = write_result {
-            let _ = std::fs::remove_file(&manifest_path);
-            return Err(DaemonError::Config(format!(
+        write_manifest_line(&manifest_path, &prepared, true).map_err(|e| {
+            DaemonError::Config(format!(
                 "worktree reaper: record quarantine {}: {e}",
                 manifest_path.display()
-            )));
-        }
-        match std::fs::rename(path, &destination) {
-            Ok(()) => return Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let _ = std::fs::remove_file(&manifest_path);
-            }
+            ))
+        })?;
+        sync_directory(&quarantine_root).map_err(|e| {
+            DaemonError::Config(format!(
+                "worktree reaper: sync quarantine {}: {e}",
+                quarantine_root.display()
+            ))
+        })?;
+        match move_worktree(path, &destination) {
+            Ok(()) => {}
             Err(e) => {
                 let _ = std::fs::remove_file(&manifest_path);
-                return Err(DaemonError::Config(format!(
-                    "worktree reaper: quarantine {} -> {}: {e}",
-                    path.display(),
-                    destination.display()
-                )));
+                return Err(e);
             }
         }
+        sync_directory(&quarantine_root).map_err(|e| {
+            DaemonError::Config(format!(
+                "worktree reaper: sync quarantine {} after move: {e}",
+                quarantine_root.display()
+            ))
+        })?;
+        let moved = serde_json::json!({
+            "state": "moved",
+            "agent_id": agent_id,
+            "original_path": path.display().to_string(),
+            "quarantined_path": destination.display().to_string(),
+            "recorded_at_epoch_secs": stamp,
+        });
+        write_manifest_line(&manifest_path, &moved, false).map_err(|e| {
+            DaemonError::Config(format!(
+                "worktree reaper: record moved quarantine {}: {e}",
+                manifest_path.display()
+            ))
+        })?;
+        sync_directory(&quarantine_root).map_err(|e| {
+            DaemonError::Config(format!(
+                "worktree reaper: sync quarantine {} after record: {e}",
+                quarantine_root.display()
+            ))
+        })?;
+        return Ok(());
     }
     Err(DaemonError::Config(format!(
         "worktree reaper: no available quarantine name for {}",
@@ -416,12 +577,7 @@ pub fn reap(report: &ReaperReport, candidates: &[Candidate]) -> Result<usize, Da
         if is_dirty_worktree(&candidate.path)? {
             quarantine_worktree(&report.root, &candidate.path, &candidate.agent_id)?;
         } else {
-            std::fs::remove_dir_all(&candidate.path).map_err(|e| {
-                DaemonError::Config(format!(
-                    "worktree reaper: remove {}: {e}",
-                    candidate.path.display()
-                ))
-            })?;
+            remove_worktree(&candidate.path)?;
         }
         removed += 1;
     }
@@ -465,12 +621,7 @@ pub fn clean_stale_worktree(
     if is_dirty_worktree(&path)? {
         quarantine_worktree(&root, &path, agent_id)?;
     } else {
-        std::fs::remove_dir_all(&path).map_err(|e| {
-            DaemonError::Config(format!(
-                "worktree reaper: clean_stale_worktree remove {}: {e}",
-                path.display()
-            ))
-        })?;
+        remove_worktree(&path)?;
     }
     Ok(true)
 }
@@ -566,6 +717,50 @@ mod tests {
         assert!(status.success());
     }
 
+    fn init_linked_worktree(repo: &Path, worktree: &Path) {
+        fs::create_dir_all(repo).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        fs::write(repo.join("tracked.txt"), "original\n").unwrap();
+        let status = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "user.name=Test",
+                "add",
+                "tracked.txt",
+            ])
+            .current_dir(repo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-qm",
+                "initial",
+            ])
+            .current_dir(repo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .args(["worktree", "add", "-q", "-b", "agent-branch", worktree.to_str().unwrap()])
+            .current_dir(repo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
     #[test]
     fn sweep_does_not_enumerate_when_root_is_unset() {
         let cfg = Config {
@@ -641,7 +836,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let cfg = make_cfg(&root);
         let target = root.join("owner/repo/df-r1");
-        touch_dir(&target, 0);
+        init_git_worktree(&target);
         let outside = std::env::temp_dir().join(format!("afd_outside_{}", std::process::id()));
         touch_dir(&outside, 0);
         let candidates = vec![
@@ -748,6 +943,159 @@ mod tests {
     }
 
     #[test]
+    fn reap_fails_closed_when_git_metadata_is_absent_or_dangling() {
+        for suffix in ["absent", "dangling"] {
+            let root = std::env::temp_dir().join(format!("afd_reaper_git_meta_{suffix}_{}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            let cfg = make_cfg(&root);
+            let target = root.join(format!("owner/repo/df-{suffix}"));
+            touch_dir(&target, 0);
+            if suffix == "dangling" {
+                fs::write(target.join(".git"), "gitdir: /does/not/exist\n").unwrap();
+            }
+            let report = sweep(&cfg, "owner/repo", now_epoch_secs(), &InactiveProbe).unwrap();
+            let candidates = enumerate_candidates(&report.root).unwrap();
+
+            assert!(reap(&report, &candidates).is_err());
+            assert!(target.exists(), "worktree with invalid Git metadata must survive");
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn reap_quarantines_ignored_file_as_dirty() {
+        let root = std::env::temp_dir().join(format!("afd_reaper_ignored_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let cfg = make_cfg(&root);
+        let target = root.join("owner/repo/df-ignored");
+        init_git_worktree(&target);
+        fs::write(target.join(".gitignore"), "*.secret\n").unwrap();
+        let status = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "user.name=Test",
+                "add",
+                ".gitignore",
+            ])
+            .current_dir(&target)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-qm",
+                "ignore",
+            ])
+            .current_dir(&target)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        fs::write(target.join("credentials.secret"), "must preserve\n").unwrap();
+        let report = sweep(&cfg, "owner/repo", now_epoch_secs(), &InactiveProbe).unwrap();
+        let candidates = enumerate_candidates(&report.root).unwrap();
+
+        assert_eq!(reap(&report, &candidates).unwrap(), 1);
+        let recovered = fs::read_dir(root.join("owner/repo/.quarantine"))
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| entry.path().is_dir())
+            .unwrap()
+            .path();
+        assert_eq!(fs::read_to_string(recovered.join("credentials.secret")).unwrap(), "must preserve\n");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reap_uses_git_worktree_move_for_dirty_linked_worktree() {
+        let root = std::env::temp_dir().join(format!("afd_reaper_linked_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let cfg = make_cfg(&root);
+        let repo = root.join("source-repo");
+        let target = root.join("owner/repo/df-linked");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        init_linked_worktree(&repo, &target);
+        fs::write(target.join("tracked.txt"), "linked dirty\n").unwrap();
+        let report = sweep(&cfg, "owner/repo", now_epoch_secs(), &InactiveProbe).unwrap();
+        let candidates = enumerate_candidates(&report.root).unwrap();
+
+        assert_eq!(reap(&report, &candidates).unwrap(), 1);
+        let recovered = fs::read_dir(root.join("owner/repo/.quarantine"))
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| entry.path().is_dir())
+            .unwrap()
+            .path();
+        assert_eq!(fs::read_to_string(recovered.join("tracked.txt")).unwrap(), "linked dirty\n");
+        let status = std::process::Command::new("git")
+            .args(["-C", recovered.to_str().unwrap(), "status", "--porcelain=v1"])
+            .status()
+            .unwrap();
+        assert!(status.success(), "quarantined linked worktree must retain Git metadata");
+        let list = std::process::Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        let list = String::from_utf8(list.stdout).unwrap();
+        assert!(list.contains(recovered.to_str().unwrap()));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reap_uses_git_worktree_remove_for_clean_linked_worktree() {
+        let root = std::env::temp_dir().join(format!("afd_reaper_clean_linked_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let cfg = make_cfg(&root);
+        let repo = root.join("source-repo");
+        let target = root.join("owner/repo/df-linked-clean");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        init_linked_worktree(&repo, &target);
+        let report = sweep(&cfg, "owner/repo", now_epoch_secs(), &InactiveProbe).unwrap();
+        let candidates = enumerate_candidates(&report.root).unwrap();
+
+        assert_eq!(reap(&report, &candidates).unwrap(), 1);
+        assert!(!target.exists());
+        let list = std::process::Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        let list = String::from_utf8(list.stdout).unwrap();
+        assert!(!list.contains(target.to_str().unwrap()));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_stale_worktree_rejects_symlinked_quarantine_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("afd_reaper_quarantine_link_{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("afd_reaper_quarantine_outside_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+        let cfg = make_cfg(&root);
+        let target = root.join("owner/repo/wa-link");
+        init_git_worktree(&target);
+        fs::write(target.join("tracked.txt"), "dirty\n").unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join("owner/repo/.quarantine")).unwrap();
+
+        assert!(clean_stale_worktree(&cfg, "owner/repo", "wa-link").is_err());
+        assert!(target.exists());
+        assert!(!outside.join("wa-link").exists());
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
     fn dirty_status_failure_is_fail_closed() {
         let root = std::env::temp_dir().join(format!("afd_reaper_status_failure_{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -842,7 +1190,7 @@ mod tests {
         // `clean_stale_worktree` must remove it anyway because the caller
         // already knows the session exited.
         let target = root.join("owner/repo/wa-500");
-        touch_dir(&target, 0);
+        init_git_worktree(&target);
         assert!(target.is_dir());
         let removed = clean_stale_worktree(&cfg, "owner/repo", "wa-500").unwrap();
         assert!(removed, "a fresh but session-dead worktree must still be removed");
