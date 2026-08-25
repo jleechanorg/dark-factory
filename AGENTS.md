@@ -236,3 +236,25 @@ Each node emits `ENTER` on visit and `EXIT` with classified outcome (`success`, 
    `tool` nodes when separating coder and reviewer/evaluator CLIs.
 6. Use `model_stylesheet="path.model.css"` when a graph needs CSS-like
    backend/model routing without cluttering every node.
+
+## CLI account scoping — never dispatch a bare `claude`/`codex` process
+
+A bare `claude` or `codex` invocation with no env override authenticates as
+whatever account is logged into this host's default `~/.claude.json` /
+`~/.codex/auth.json` — currently the operator's **personal** account, not a
+project-scoped one. `dispatch_reviewer`/`run_tool` calling `run_tool("claude",
+[...])` with zero env passthrough is exactly this trap: confirmed on
+2026-08-24, 9 real `backend="claude"` gate runs (`gates.dot`,
+`adversarial_reviewer`/`gate_skeptic`) against a test fixture (`goal="t"`,
+6 of the 9 fired within 14 seconds — a debug/retry burst, not real feature
+work) billed to the personal Claude Max account with no per-project
+isolation. This is why `SKEPTIC_REVIEWER_PRIORITY` already excludes plain
+`"claude"` from the default reviewer chain — but it was never blocked as a
+selectable **coder** backend, so the same leak is still reachable.
+
+Rule: every code path that shells out to `claude` or `codex` must pass an
+explicit account/provider scope in the child process env — `CLAUDE_CONFIG_DIR`
+pointed at a project-scoped config dir (mirroring the `claudewa`-style
+convention), or a provider override (`ANTHROPIC_BASE_URL`/`ANTHROPIC_API_KEY`,
+as the MiniMax arm already does) — never inherit the bare host default.
+Treat an un-scoped `claude`/`codex` dispatch as a bug, not a fallback.
