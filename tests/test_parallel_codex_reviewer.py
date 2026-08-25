@@ -171,6 +171,7 @@ def test_parallel_reviewer_maps_shadow_errors_to_error(tmp_path, monkeypatch):
 
 def test_parallel_reviewer_launches_all_shadows_before_awaiting(tmp_path, monkeypatch):
     """N shadow lanes are Popen-launched before any communicate() (true concurrency)."""
+    monkeypatch.setenv("MINIMAX_API_KEY", "test-minimax-key")
     node = _node_with_prompt(tmp_path)
     ctx = _mock_ctx(tmp_path)
     ctx.state["_df_shadow_backends"] = "codex,minimax"
@@ -223,6 +224,7 @@ def test_parallel_reviewer_launches_all_shadows_before_awaiting(tmp_path, monkey
 
 def test_parallel_reviewer_one_shadow_real_fail_maps_to_failure_not_error(tmp_path, monkeypatch):
     """One shadow passing + one shadow real-fail (not infra) => failure, not error."""
+    monkeypatch.setenv("MINIMAX_API_KEY", "test-minimax-key")
     node = _node_with_prompt(tmp_path)
     ctx = _mock_ctx(tmp_path)
     ctx.state["_df_shadow_backends"] = "codex,minimax"

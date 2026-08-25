@@ -59,6 +59,7 @@ def test_gate_subprocess_args_routes_bare_claude_to_claude_cli(monkeypatch):
 def test_gate_subprocess_env_routes_minimax_through_minimax_gateway(monkeypatch):
     """backend='minimax' → ANTHROPIC_BASE_URL is set to the minimax gateway."""
     from runner.handlers import _gate_subprocess_env
+    monkeypatch.setenv("MINIMAX_API_KEY", "test-minimax-key")
     env = _gate_subprocess_env("minimax")
     assert env.get("ANTHROPIC_BASE_URL") == "https://api.minimax.io/anthropic"
 
@@ -67,6 +68,7 @@ def test_gate_subprocess_env_minimax_is_sanitized(monkeypatch):
     """The minimax override must layer on _sanitized_env, not raw os.environ —
     holdout vars must never reach a reviewer subprocess (jleechan-4pa)."""
     from runner.handlers import _gate_subprocess_env
+    monkeypatch.setenv("MINIMAX_API_KEY", "test-minimax-key")
     monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", "/secret/holdouts")
     monkeypatch.setenv("MY_HOLDOUT_SECRET", "sealed")
     env = _gate_subprocess_env("minimax")
@@ -149,6 +151,7 @@ def test_unknown_gate_backend_fails_closed_without_claude_fallback(tmp_path, mon
 def test_minimax_is_endpoint_and_model_scoped_without_claude_config(tmp_path, monkeypatch):
     from runner.handlers import _gate_subprocess_args, _gate_subprocess_env, Context as HCtx
 
+    monkeypatch.setenv("MINIMAX_API_KEY", "test-minimax-key")
     monkeypatch.delenv("DARK_FACTORY_CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda args: args)
     ctx = HCtx(goal="test", workdir=tmp_path, backend="minimax")
@@ -595,6 +598,7 @@ def test_execute_gate_runs_minimax_with_correct_env(monkeypatch, tmp_path):
     subprocess is the claude binary."""
     import subprocess as _sp
     from runner.handlers import _execute_gate, Context as HCtx
+    monkeypatch.setenv("MINIMAX_API_KEY", "test-minimax-key")
     fake_sha = "e" * 40
     seen_cmds: list[list[str]] = []
     seen_envs: list[dict] = []

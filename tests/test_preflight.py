@@ -102,6 +102,9 @@ def test_configured_backend_missing_others_available_returns_warn(
     monkeypatch, which_claude_only
 ):
     """Configured (codex) missing but claude present => status=warn, exit 0."""
+    # MiniMax is the intended alternate route when only the Claude transport
+    # is installed; provide an explicit fake credential for this fixture.
+    monkeypatch.setenv("MINIMAX_API_KEY", "test-minimax-key")
     result = preflight.preflight_check("codex")
 
     assert result["status"] == "warn"

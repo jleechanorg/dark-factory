@@ -156,6 +156,10 @@ def test_gate_correct_head_sha_echo_is_success(tmp_path, monkeypatch):
     that honoured the SHA-binding directive in the prompt.
     """
     fake_holdout = lambda node, ctx: Result(outcome="success", output="ok")
+    # The gates graph resolves its adversarial reviewer to MiniMax when the
+    # fake Claude transport is installed; use a fixture credential so the
+    # test exercises SHA binding rather than provider preflight failure.
+    monkeypatch.setenv("MINIMAX_API_KEY", "test-minimax-key")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
     _mock_adversarial_reviewer(monkeypatch)
 
