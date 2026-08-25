@@ -24,6 +24,7 @@ from .handler_dispatch import (
     _gate_subprocess_env,
 )
 from .review_controller import (
+    DIFF_ARGV,
     EvidenceArtifact,
     ReviewContractError,
     ReviewInputs,
@@ -142,9 +143,7 @@ def _snapshot(workdir: pathlib.Path, base_sha: str, head_sha: str) -> dict[str, 
     tree_sha = _git(workdir, "rev-parse", f"{head_sha}^{{tree}}").lower()
     diff_text = _git(
         workdir,
-        "diff",
-        "--no-ext-diff",
-        "--binary",
+        *DIFF_ARGV[1:],
         f"{base_sha}..{head_sha}",
         allow_empty=True,
     )

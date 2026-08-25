@@ -50,7 +50,8 @@ from tests.test_gate_agy_fallback import (  # noqa: F401
 )
 from tests.test_gate_priority_queue import (  # noqa: F401
     test_adversarial_priority_picks_first_installed,
-    test_adversarial_priority_skips_coder_backend_when_prefer_adversarial,
+    test_adversarial_priority_demotes_coder_backend_when_prefer_adversarial,
+    test_prefer_adversarial_reviews_on_coder_backend_when_it_is_the_only_option,
     test_adversarial_priority_env_override_honored,
     test_adversarial_priority_falls_through_to_claude_sonnet_when_nothing_else,
     test_adversarial_priority_pinned_across_visits,

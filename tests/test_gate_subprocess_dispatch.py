@@ -549,10 +549,14 @@ def test_execute_gate_runs_minimax_with_correct_env(monkeypatch, tmp_path):
 def test_resolve_adversarial_backend_falls_back_to_default_when_post_filter_empty(
     monkeypatch,
 ):
-    """When prefer_adversarial empties the post-filter priority list, the
-    resolver must NOT short-circuit to ``claude-sonnet``; it must probe the
-    default priority (codex, minimax, agy, claude-sonnet) so cross-vendor
-    review is a real subprocess, not a label."""
+    """A lane naming ONLY the coder's own backend keeps that entry.
+
+    ``prefer_adversarial`` demotes rather than drops, so the single entry
+    survives and the resolver returns it even though it is uninstalled.
+    Recovery is ``_execute_gate``'s job: a missing binary is an infra failure
+    that triggers its agy -> claude fallback. Resolving to an installed-but-
+    unrequested vendor here would silently override a controller-review
+    lane's codex-only queue."""
     from runner.handlers import _resolve_gate_backend, Context as HCtx
     from runner.parser import Node
     # All non-claude-sonnet backends are uninstalled; only claude-sonnet
@@ -581,15 +585,19 @@ def test_resolve_adversarial_backend_falls_back_to_default_when_post_filter_empt
         },
     )
     resolved, meta = _resolve_gate_backend(node, ctx)
-    assert resolved == "claude-sonnet"
-    # If the resolver had used the empty-list short-circuit, the skip
-    # list would be empty (nothing was probed). With the default-priority
-    # fallback, the skip list records codex, minimax, agy, and any
-    # earlier default entries that were probed and skipped.
-    skipped = meta["adversarial_skipped"].split(",") if meta["adversarial_skipped"] else []
-    assert "codex" in skipped, (
-        f"empty-list fallback must probe the default priority; "
-        f"skipped list missing 'codex': {skipped!r}"
+
+    # The lane's own entry survives demotion and is returned even though it
+    # is uninstalled -- the resolver never substitutes a vendor the lane did
+    # not ask for. `_execute_gate` owns recovery from the missing binary.
+    assert resolved == "claude", (
+        f"the lane's only entry must survive demotion; got {resolved!r}"
     )
-    assert "minimax" in skipped
-    assert "agy" in skipped
+    assert meta["adversarial_priority"] == "claude", (
+        "the queue must stay exactly what the lane declared; got "
+        f"{meta['adversarial_priority']!r}"
+    )
+    # It was really probed, not assumed present.
+    skipped = meta["adversarial_skipped"].split(",") if meta["adversarial_skipped"] else []
+    assert skipped == ["claude"], (
+        f"the single entry must be probed and recorded as skipped; got {skipped!r}"
+    )

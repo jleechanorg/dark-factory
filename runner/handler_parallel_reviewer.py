@@ -60,7 +60,7 @@ from .handler_dispatch import (
     _parse_priority_env,
     _start_shadow_gate_review,
 )
-from .review_controller import EvidenceDelta, EvidenceOrigin
+from .review_controller import DIFF_ARGV, EvidenceDelta, EvidenceOrigin
 
 if TYPE_CHECKING:
     from .handler_core import Context
@@ -498,9 +498,7 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
     tree_sha = _git_output(workdir, "rev-parse", f"{expected_sha}^{{tree}}")
     diff_text = _git_output(
         workdir,
-        "diff",
-        "--no-ext-diff",
-        "--binary",
+        *DIFF_ARGV[1:],
         f"{base_sha}..{expected_sha}",
         allow_empty=True,
     )
@@ -586,16 +584,20 @@ def _verify_controller_workspace(ctx: "Context", request) -> None:
         raise ReviewContractError("reviewed workspace head changed")
     if observed_tree != target["tree_sha"]:
         raise ReviewContractError("reviewed workspace tree changed")
+    # The envelope carries a diff pointer, not the diff. Re-derive it here from
+    # the pinned base..head range and confirm it still hashes to the digest the
+    # reviewer was bound to.
     diff_text = _git_output(
         workdir,
-        "diff",
-        "--no-ext-diff",
-        "--binary",
+        *DIFF_ARGV[1:],
         f"{target['base_sha']}..{target['head_sha']}",
         allow_empty=True,
     )
-    if hashlib.sha256(diff_text.encode("utf-8")).hexdigest() != snapshots["diff"]["sha256"]:
+    diff_bytes = diff_text.encode("utf-8")
+    if hashlib.sha256(diff_bytes).hexdigest() != snapshots["diff"]["sha256"]:
         raise ReviewContractError("reviewed diff changed")
+    if len(diff_bytes) != snapshots["diff"]["bytes"]:
+        raise ReviewContractError("reviewed diff size does not match the pointer")
     root = workdir.resolve()
     for artifact in envelope.get("evidence", []):
         path = (root / str(artifact["path"])).resolve()

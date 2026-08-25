@@ -9,6 +9,7 @@ catch mutations between request creation and lane return.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -354,7 +355,14 @@ class ControllerSnapshotTests(unittest.TestCase):
         self.assertEqual(_git(snapshot, "status", "--porcelain=v1"), "")
         self.assertFalse((snapshot / ".dark-factory" / "agy-task-worker.md").exists())
         self.assertEqual(_git(snapshot, "rev-parse", "HEAD").strip(), request.head_sha)
-        self.assertEqual(envelope["snapshots"]["diff"]["text"], "")
+        # A no-op worker produces an empty diff, so the pointer reports zero
+        # bytes and the digest of the empty string.
+        self.assertNotIn("text", envelope["snapshots"]["diff"])
+        self.assertEqual(envelope["snapshots"]["diff"]["bytes"], 0)
+        self.assertEqual(
+            envelope["snapshots"]["diff"]["sha256"],
+            hashlib.sha256(b"").hexdigest(),
+        )
         self.assertEqual(envelope["snapshots"]["changed_files"], [])
 
     def test_declared_evidence_is_bound_without_copying_unrelated_ignored_files(self) -> None:
