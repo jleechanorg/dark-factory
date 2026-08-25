@@ -65,6 +65,7 @@ from runner.skeptic_gate import (
     verify_published_comment,
     verify_provenance,
 )
+from runner.reviewer_priority import gha_default_reviewers_json, gha_mandatory_reviewers
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +77,10 @@ from runner.skeptic_gate import (
 MAX_DIFF_BYTES = 1024 * 1024  # 1 MiB
 
 # Default reviewer list. Both must PASS.
-DEFAULT_REVIEWERS_JSON = '[["codex", ""], ["gemini", "gemini-3.7-pro"]]'
+# The config file is the authority shared with the daemon.  Keeping the GHA
+# gate's default and mandatory set derived from it prevents a decorative queue
+# from drifting away from the subprocess implementations below.
+DEFAULT_REVIEWERS_JSON = gha_default_reviewers_json()
 
 # Expected actor on the freshly-published comment. The read-back step
 # refuses anything else (defense against a reviewer-bound identity
@@ -151,7 +155,6 @@ REVIEWER_ENV_PROVIDER_ALLOWLIST = {
     "codex": {"OPENAI_API_KEY"},
     "gemini": {"GOOGLE_API_KEY"},
 }
-
 
 # ---------------------------------------------------------------------------
 # Sanitized reviewer env
@@ -514,7 +517,7 @@ def _build_reviewer_cmd(
         return [
             gemini_bin or "gemini",
             "-m",
-            model,
+            model or "gemini-3.7-pro",
             "-s",
             "--approval-mode",
             "default",
@@ -595,17 +598,7 @@ def invoke_reviewer(
         reviewer, model, codex_bin=codex_bin, gemini_bin=gemini_bin
     )
     stdin_input = prompt
-    if reviewer == "gemini" and cmd and cmd[0].endswith("gemini"):
-        cmd = [
-            gemini_bin or "agy",
-            "--model",
-            model,
-            "--dangerously-skip-permissions",
-            "--print",
-            prompt,
-        ]
-        stdin_input = None
-    elif reviewer == "codex" and cmd:
+    if reviewer == "codex" and cmd:
         if "--sandbox" in cmd:
             idx = cmd.index("--sandbox")
             cmd.pop(idx)
@@ -616,9 +609,15 @@ def invoke_reviewer(
     # Per-reviewer env: each reviewer only sees the credentials it
     # actually needs (codex → OPENAI_API_KEY, gemini → GOOGLE_API_KEY).
     # See CodeRabbit MAJOR finding on PR #281 round 2.
-    env = _reviewer_env(
-        parent_env if parent_env is not None else os.environ, reviewer
-    )
+    try:
+        env = _reviewer_env(
+            parent_env if parent_env is not None else os.environ, reviewer
+        )
+    except ValueError as exc:
+        # Keep invoke_reviewer's public contract `(stdout, error)` intact;
+        # callers such as the dispatcher can then record a fail-closed vendor
+        # error without accidentally spawning an unscoped Claude process.
+        return None, str(exc)
     if reviewer == "gemini":
         env["HOME"] = "/tmp"
 
@@ -650,12 +649,11 @@ def invoke_reviewer(
 # ---------------------------------------------------------------------------
 
 
-# Mandatory reviewer set. Per CodeRabbit CRITICAL finding on
-# PR #281 round 2: the gate MUST run BOTH codex and gemini on
-# every PR. A subset (e.g. only codex, or only gemini) is rejected
-# at every boundary so a misconfigured workflow cannot downgrade
-# the policy by truncating --reviewers-json.
-MANDATORY_REVIEWERS = ("codex", "gemini")
+# Mandatory reviewer set. The configured queue is authoritative for defaults.
+# Keep the former codex+gemini pair accepted as an explicit compatibility
+# override for older workflow callers; it is never selected by the default.
+MANDATORY_REVIEWERS = tuple(gha_mandatory_reviewers())
+_LEGACY_REVIEWERS = ("codex", "gemini")
 
 
 def _parse_reviewers(reviewers_json: str) -> List[Tuple[str, str]]:
@@ -691,10 +689,10 @@ def _parse_reviewers(reviewers_json: str) -> List[Tuple[str, str]]:
             raise SystemExit(
                 f"invalid reviewer entry: {item!r}; expected [reviewer, model]"
             )
-        if item[0] not in MANDATORY_REVIEWERS:
+        if item[0] not in MANDATORY_REVIEWERS and item[0] not in _LEGACY_REVIEWERS:
             raise SystemExit(
                 f"reviewer {item[0]!r} not allowed; expected exactly "
-                f"{list(MANDATORY_REVIEWERS)} (the gate requires BOTH)"
+                f"{list(MANDATORY_REVIEWERS)} or legacy {_LEGACY_REVIEWERS}"
             )
         if item[0] in seen:
             raise SystemExit(
@@ -703,6 +701,10 @@ def _parse_reviewers(reviewers_json: str) -> List[Tuple[str, str]]:
             )
         seen.add(item[0])
         out.append((item[0], item[1]))
+    # A legacy pair is accepted only as the complete pair, never as a way to
+    # combine one legacy vendor with a configured vendor or to omit a default.
+    if set(seen) == set(_LEGACY_REVIEWERS):
+        return out
     missing = [r for r in MANDATORY_REVIEWERS if r not in seen]
     if missing:
         raise SystemExit(
@@ -1095,17 +1097,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 2
 
     # PR #9092 (2026-08-18): the dispatcher's chain-walk in
-    # `VerifierDispatcher._chain_walk_reviewer` reads the full
-    # priority queue from `runner.reviewer_priority`. The default
-    # cheap/premium reviewers are still the head/tail of that list,
-    # so operator behavior for a fully-healthy pipeline is unchanged.
-    # The change is that the dispatcher now has the full queue
-    # available to walk on rate-limit / quota busts, instead of
-    # whatever the dispatcher was hardcoded to above.
-    from runner.reviewer_priority import skeptic_reviewer_priority
-    priority = skeptic_reviewer_priority()
-    premium = priority[0] if priority else "claudem"
-    cheap = priority[-1] if priority else "cursor-agent"
+    # `VerifierDispatcher._chain_walk_reviewer` reads the configured GHA
+    # capability queue. The daemon's separate reviewer queue can contain
+    # transports that this Python process deliberately cannot execute.
+    from runner.reviewer_priority import gha_reviewer_priority
+    priority = gha_reviewer_priority()
+    premium = priority[0] if priority else "codex"
+    cheap = priority[-1] if priority else "gemini"
     dispatcher = VerifierDispatcher(
         cheap_reviewer=cheap, cheap_model="",
         premium_reviewer=premium,
