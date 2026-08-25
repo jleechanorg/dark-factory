@@ -15363,6 +15363,260 @@ fn session_health_failure_reaps_session_and_requeues_bead() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+/// PR #755 Slice 4 r3 (P0): the EARLY adopted-session path inside
+/// `run_fast_tier` (around the `check_session_health Ok(Some(...))` arm)
+/// still did `let _ = deps.sessions.stop(&sid); overlay.session_id = None; …`,
+/// which on a transient `stop()` failure would (a) clear the durable handle,
+/// (b) skip the spawn-failure increment / retry logic that needs the handle,
+/// (c) leave a live worker running against a missing worktree if the
+/// nearby idle/health-stop branches later decided to clean. Every path
+/// that calls `stop()` MUST require `Ok` before removing `session_id`,
+/// promoting, or cleaning the worktree. On `Err`, keep DISPATCHED and
+/// `session_id`, preserve the worktree, emit
+/// `ADOPTED_HEALTH_STOP_FAILED_NO_PROMOTION`, and let the next tick's
+/// fresh liveness probe decide whether the session is finally dead.
+#[test]
+fn adopted_session_health_failure_with_failing_stop_preserves_session_and_worktree() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    sessions.set_session_health_failure(
+        "adopted-stop-fail",
+        "terminal session error in tmux pane: login expired",
+    );
+    // `fail_stop_for` makes EVERY call to `stop("adopted-stop-fail")` Err —
+    // mirrors the AO-RPC-failed transient case.
+    sessions.fail_stop_for("adopted-stop-fail");
+
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let worktree_root = std::env::temp_dir().join(format!(
+        "afd_slice4_adopted_stop_fail_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let cfg = Config {
+        agent_worktree_root: Some(worktree_root.display().to_string()),
+        ..test_cfg()
+    };
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_slice4_adopted_stop_fail.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    // A live AO-managed worktree the still-running worker depends on.
+    // The slice 4 r3 fix MUST NOT delete this even though health said
+    // "session dead" — the failing stop() means the worker may still be live.
+    let live_worktree = worktree_root.join("owner/repo/adopted-stop-fail");
+    std::fs::create_dir_all(&live_worktree).unwrap();
+    std::fs::write(live_worktree.join("marker"), b"live coder worktree").unwrap();
+
+    store.overlays.borrow_mut().insert(
+        "adopted-stop-fail-bead".into(),
+        BeadOverlay {
+            bead_id: "adopted-stop-fail-bead".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(1115),
+            branch: Some("fix/slice4-adopted-stop".into()),
+            session_id: Some("adopted-stop-fail".into()),
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+    store
+        .register_branch(
+            "adopted-stop-fail-bead",
+            "fix/slice4-adopted-stop",
+        )
+        .unwrap();
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        0,
+        10,
+    )
+    .expect("tick must isolate the failing stop and continue");
+
+    let overlay = store
+        .load("adopted-stop-fail-bead")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::Dispatched,
+        "adopted-session health failure with failing stop() must NOT park \
+         HUMAN_HELD and must NOT auto-requeue — the worker is still live; \
+         got {:?}",
+        overlay.state
+    );
+    assert_eq!(
+        overlay.session_id.as_deref(),
+        Some("adopted-stop-fail"),
+        "session handle MUST be preserved so the next tick (with a fresh \
+         Terminal/NotFound probe) can retry; got {:?}",
+        overlay.session_id
+    );
+    assert_eq!(
+        overlay.spawn_failure_count, 0,
+        "spawn_failure_count MUST NOT increment when stop() failed — \
+         preserved until a fresh liveness probe confirms the worker is dead"
+    );
+    assert!(
+        live_worktree.is_dir(),
+        "live worktree MUST NOT be deleted when stop() failed — the worker \
+         may still be running and depends on this dir; deleted-by-bug would \
+         leave an undefined-state wedge (live worker, missing worktree)"
+    );
+
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("ADOPTED_HEALTH_STOP_FAILED_NO_PROMOTION"),
+        "the safety action MUST emit ADOPTED_HEALTH_STOP_FAILED_NO_PROMOTION \
+         telemetry so the wedge is auditable from the daemon log alone; \
+         full log: {log}"
+    );
+    assert!(
+        !log.contains("WORKTREE_CLEANED_ON_SESSION_EXIT"),
+        "WORKTREE_CLEANED_ON_SESSION_EXIT must NOT fire when stop() failed; \
+         full log: {log}"
+    );
+    assert!(
+        summary.beads_parked_human_held == 0
+            && summary.beads_dispatched == 0,
+        "the safety action must NOT park and must NOT spawn a replacement — \
+         it must stay DISPATCHED with the session handle preserved; \
+         got parked={} dispatched={}",
+        summary.beads_parked_human_held,
+        summary.beads_dispatched
+    );
+
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// PR #755 Slice 4 r3 (P0) control: the EARLY adopted-session path
+/// with a SUCCESSFUL `stop()` MUST clear the handle, reap the worktree,
+/// and run the existing retry / park bookkeeping exactly as before.
+/// This pins the slice 4 r3 fix to the failure path only — the happy
+/// path is unchanged.
+#[test]
+fn adopted_session_health_failure_with_succeeding_stop_clears_and_reaps() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    sessions.set_session_health_failure(
+        "adopted-stop-ok",
+        "terminal session error in tmux pane: login expired",
+    );
+    // No fail_stop_for("adopted-stop-ok") — stop() succeeds.
+
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let worktree_root = std::env::temp_dir().join(format!(
+        "afd_slice4_adopted_stop_ok_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let cfg = Config {
+        agent_worktree_root: Some(worktree_root.display().to_string()),
+        ..test_cfg()
+    };
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_slice4_adopted_stop_ok.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let worktree = worktree_root.join("owner/repo/adopted-stop-ok");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(worktree.join("marker"), b"reaped worker worktree").unwrap();
+
+    store.overlays.borrow_mut().insert(
+        "adopted-stop-ok-bead".into(),
+        BeadOverlay {
+            bead_id: "adopted-stop-ok-bead".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(1116),
+            branch: Some("fix/slice4-adopted-ok".into()),
+            session_id: Some("adopted-stop-ok".into()),
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+    store
+        .register_branch("adopted-stop-ok-bead", "fix/slice4-adopted-ok")
+        .unwrap();
+
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        0,
+        10,
+    )
+    .expect("happy-path tick must succeed");
+
+    let overlay = store.load("adopted-stop-ok-bead").unwrap().unwrap();
+    // pr_number is set, so the post-stop path goes through the
+    // `else { deps.store.save(&overlay)?; }` arm — state stays
+    // Dispatched but the handle is cleared.
+    assert_eq!(
+        overlay.session_id, None,
+        "successful stop() MUST clear the session handle so the next retry \
+         does not collide with the dead session; got {:?}",
+        overlay.session_id
+    );
+    assert!(
+        !worktree.is_dir(),
+        "happy path: worktree MUST be reaped after a successful stop()"
+    );
+
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("WORKTREE_CLEANED_ON_SESSION_EXIT"),
+        "happy path must emit WORKTREE_CLEANED_ON_SESSION_EXIT; full log: {log}"
+    );
+    assert!(
+        !log.contains("ADOPTED_HEALTH_STOP_FAILED_NO_PROMOTION"),
+        "happy path must NOT emit ADOPTED_HEALTH_STOP_FAILED_NO_PROMOTION; \
+         full log: {log}"
+    );
+
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 /// Bead rev-4ou1z ACCEPTANCE #1: a Gemini quota-reached health failure with
 /// a parseable "Resets in Xh Ym" countdown ARMS the quota watchdog instead
 /// of killing the session — no respawn cycle burning
