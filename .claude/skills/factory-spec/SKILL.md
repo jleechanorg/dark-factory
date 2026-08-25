@@ -179,8 +179,14 @@ Execution command (from target repo cwd):
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
-dark-factory --pipeline pipelines/slim/minimal_pr.dot --goal "..." --backend claude
+dark-factory --pipeline pipelines/slim/minimal_pr.dot --goal "..." --backend minimax
 ```
+
+The `minimax` backend uses MiniMax-M3 over the Claude transport in `--bare`
+mode. Use `--backend claude` only for an explicit, operator-selected
+direct-Claude lane, and set `DARK_FACTORY_CLAUDE_CONFIG_DIR` to a validated
+project-scoped config directory; never rely on the host's personal Claude
+profile as an implicit default.
 
 ## Purpose
 
@@ -305,9 +311,9 @@ start ──▶ holdout_eval ──(success)──▶ gate_es ──(success)─
 | Node | Type | Handler | What it does |
 |------|------|---------|-------------|
 | `holdout` | `holdout_eval` | Sealed evaluator at `$DARK_FACTORY_HOLDOUTS/evaluator/run.py` | Runs hidden test scenarios against the diff |
-| `gate_es` | `gate_es` | `claude --print /es` | Evidence standards check |
-| `gate_er` | `gate_er` | `claude --print /er` | Evidence review check |
-| `gate_cs` | `gate_code_standards` | `claude --print /code_standards` | ZFC + leveling + root-cause-first |
+| `gate_es` | `gate_es` | Selected reviewer backend; MiniMax uses Claude transport `--bare` pinned M3 | Evidence standards check |
+| `gate_er` | `gate_er` | Selected reviewer backend; MiniMax uses Claude transport `--bare` pinned M3 | Evidence review check |
+| `gate_cs` | `gate_code_standards` | Selected reviewer backend; MiniMax uses Claude transport `--bare` pinned M3 | ZFC + leveling + root-cause-first |
 
 **Use when:** already-implemented diff needs Attractor-style 4-gate validation (requires holdout).
 
@@ -321,9 +327,9 @@ start ──▶ gate_es ──(success)──▶ gate_er ──(success)──�
 
 | Node | Type | Handler | What it does |
 |------|------|---------|-------------|
-| `gate_es` | `gate_es` | `claude --print /es` | Evidence standards check |
-| `gate_er` | `gate_er` | `claude --print /er` | Evidence review check |
-| `gate_cs` | `gate_code_standards` | `claude --print /code_standards` | ZFC + leveling + root-cause-first |
+| `gate_es` | `gate_es` | Selected reviewer backend; MiniMax uses Claude transport `--bare` pinned M3 | Evidence standards check |
+| `gate_er` | `gate_er` | Selected reviewer backend; MiniMax uses Claude transport `--bare` pinned M3 | Evidence review check |
+| `gate_cs` | `gate_code_standards` | Selected reviewer backend; MiniMax uses Claude transport `--bare` pinned M3 | ZFC + leveling + root-cause-first |
 
 **Use when:** validating an in-flight PR diff (like gates.dot; the actual `.dot` runs holdout as the first node per the Holdout-always policy, so pass `--feature <name>`).
 
@@ -367,12 +373,12 @@ fix ──▶ test (loop)
 
 | Node `type` attr | Handler function | Behavior |
 |-------------------|-----------------|----------|
-| `codergen` | `_codergen` | Render prompt template, dispatch to backend (claude/codex/ao/agy) |
+| `codergen` | `_codergen` | Render prompt template, dispatch to backend (minimax/claude/codex/ao/agy) |
 | `tool` | `_tool` | Shell out to `command="..."` attribute |
 | `holdout_eval` | `_holdout_eval` | Run sealed evaluator from `$DARK_FACTORY_HOLDOUTS` |
-| `gate_es` | `_gate_es` | Shell out to `claude --print /es` |
-| `gate_er` | `_gate_er` | Shell out to `claude --print /er` |
-| `gate_code_standards` | `_gate_code_standards` | Shell out to `claude --print /code_standards` |
+| `gate_es` | `_gate_es` | Selected scoped reviewer; MiniMax uses Claude transport in `--bare` mode pinned M3 |
+| `gate_er` | `_gate_er` | Selected scoped reviewer; MiniMax uses Claude transport in `--bare` mode pinned M3 |
+| `gate_code_standards` | `_gate_code_standards` | Selected scoped reviewer; MiniMax uses Claude transport in `--bare` mode pinned M3 |
 | `human_gate` | `_human_gate` | Block on stdin or use `ctx.state["<node>.outcome"]` |
 | `conditional` | `_conditional` | Hexagon decision node; outcome from `ctx.state[decision_key]` |
 
@@ -393,10 +399,16 @@ fix ──▶ test (loop)
 
 ## Backend routing
 
+The `minimax` backend uses MiniMax-M3 through the Claude transport in `--bare`
+mode. The `claude` backend remains available only as an explicit opt-in lane and
+must validate `DARK_FACTORY_CLAUDE_CONFIG_DIR` before launch; it must never
+inherit the operator's personal Claude account.
+
 | `--backend` flag | Per-node `backend` attr | CLI invoked |
 |------------------|------------------------|-------------|
 | `echo` | — | Deterministic mock, no LLM |
-| `claude` | `claude` | `claude --print --dangerously-skip-permissions` |
+| `minimax` | `minimax` | Claude transport `--bare`, pinned to MiniMax-M3 |
+| `claude` | `claude` | Direct Claude CLI (explicit opt-in; requires validated `DARK_FACTORY_CLAUDE_CONFIG_DIR`) |
 | `codex` | `codex` | `codex exec --yolo` |
 | `ao` | `ao` | Agent Orchestrator `ao spawn` |
 | `agy` | `agy` | `agy --print --dangerously-skip-permissions` |

@@ -188,7 +188,7 @@ flowchart LR
 </code></pre>
 <p>1. <strong>Spec generation — the scarce artifact.</strong> You author a detailed <code>spec.md</code> (under    <code>specs/</code> or <code>benchmarks/&lt;project&gt;/</code>) — or let the pipeline's <code>plan</code> node generate it    from your <code>--goal</code>. Make it complete enough that a coding agent can build with <strong>no    hidden product requirements</strong>. Optionally validate it first with the spec-review    pipeline before spending build tokens. 2. <strong>Factory execution — agents build, agents review.</strong> <code>dark-factory</code> walks a <code>.dot</code>    graph sized to the project: <code>plan → implement → test → adversarial review → gates /    sealed holdout</code>, looping through <code>fix</code> on failure. Every node visit is recorded to an    SQLite event log (<strong>CXDB</strong>); the <strong>Healer</strong> clusters failures into an actionable    diagnosis.</p>
 <p><strong>Why it's different.</strong> Merge confidence comes from <em>outcome artifacts</em> — sealed holdouts, adversarial cross-review, CXDB history — not from a human reading the diff. The implementing agent is <strong>structurally blind</strong> to the holdouts and evaluator (<a href="#-the-operator-agent-isolation-rule">isolation rule</a>), so it cannot pass tests by reading them. You version the <code>.dot</code> graph and the specs/holdouts/scoring contracts; the Python under <code>runner/</code> is disposable <em>dorodango</em> — polish, discard, rebuild from spec.</p>
-<p>| | | |---|---| | <strong>Two phases</strong> | spec generation → factory execution | | <strong>Runtime</strong> | Python 3.13 (uv-managed) | | <strong>Entry point</strong> | <code>dark-factory</code> binary (not <code>python -m runner</code>) | | <strong>Backends</strong> | <code>ao</code> (default), <code>claude</code>, <code>codex</code>, <code>agy</code>, <code>mock_llm</code>/<code>echo</code> | | <strong>Durable artifacts</strong> | <code>.dot</code> pipeline graphs + <code>spec.md</code> (process + intent) | | <strong>Observability</strong> | CXDB SQLite event log + <code>df-healer</code> failure clustering |</p>
+<p>| | | |---|---| | <strong>Two phases</strong> | spec generation → factory execution | | <strong>Runtime</strong> | Python 3.13 (uv-managed) | | <strong>Entry point</strong> | <code>dark-factory</code> binary (not <code>python -m runner</code>) | | <strong>Backends</strong> | <code>ao</code> (default), <code>minimax</code> (MiniMax-M3 via Claude transport <code>--bare</code>), explicit <code>claude</code>, <code>codex</code>, <code>agy</code>, <code>mock_llm</code>/<code>echo</code> | | <strong>Durable artifacts</strong> | <code>.dot</code> pipeline graphs + <code>spec.md</code> (process + intent) | | <strong>Observability</strong> | CXDB SQLite event log + <code>df-healer</code> failure clustering |</p>
 <hr />
 <h2 id="table-of-contents">📑 Table of Contents</h2>
 <p>1. <a href="#-executive-summary">Executive Summary</a> 2. <a href="#-quick-start">Quick Start</a> 3. <a href="#-example-projects-at-a-glance">Example Projects at a Glance</a> 4. <a href="#-the-operator-agent-isolation-rule">The Operator-Agent Isolation Rule</a> 5. <a href="#-architecture-3-layer-convergence">Architecture: 3-Layer Convergence</a> 6. <a href="#-how-dark-factory-works">How Dark Factory works</a> 7. <a href="#-state-of-the-art-execution-backends">State-of-the-Art Execution Backends</a> 8. <a href="#-pipeline-catalog">Pipeline Catalog</a> 9. <a href="#-fail-closed-observability-cxdb--healer">Fail-Closed Observability: CXDB + Healer</a> 10. <a href="#-directory-layout">Directory Layout</a> 11. <a href="#-recommended-default-agent-orchestrator-ao-with-antigravity">Recommended default: Agent Orchestrator (AO) with Antigravity</a> 12. <a href="#-execution-cookbook">Execution Cookbook</a> 13. <a href="#-sources--references">Sources &amp; References</a></p>
@@ -269,7 +269,7 @@ flowchart LR
 <h3 id="large-amazon-clone-full-stack-multi-gate-sliced">🔴 Large — <code>amazon-clone</code> (full-stack, multi-gate, sliced)</h3>
 <pre class="code" data-lang="mermaid"><code>
 flowchart LR
-  s([Start]) --&gt; sr[&quot;Spec review&lt;br/&gt;codex&quot;] --&gt; arch[&quot;Architecture&lt;br/&gt;claude&quot;] --&gt; build
+  s([Start]) --&gt; sr[&quot;Spec review&lt;br/&gt;codex&quot;] --&gt; arch[&quot;Architecture&lt;br/&gt;minimax (Claude transport)&quot;] --&gt; build
   subgraph build[&quot;Build · specialized codergen nodes (mixed backends)&quot;]
     direction TB
     dm[Data model] --&gt; be[Backend API] --&gt; fe[Frontend] --&gt; fr[Firestore rules] --&gt; sd[Seed + reset] --&gt; vh[Validation harness]
@@ -278,7 +278,7 @@ flowchart LR
   ho -- pass --&gt; e([Exit])
   ho -- fail --&gt; fx[Fix] --&gt; sm
 </code></pre>
-<p>A built-in <code>spec_review</code> node opens the run; specialized build nodes split backend (<code>codex</code>) from frontend (<code>claude</code>); evidence gates (<code>/es</code>, <code>/er</code>), an independent adversarial reviewer, and a sealed holdout all guard the exit. The same project also ships <strong>vertical-slice</strong> graphs (<code>slices_foundation → catalog → cart → checkout</code>) when you'd rather ship one feature column end-to-end at a time. Reach for this shape for production full-stack work.</p>
+<p>A built-in <code>spec_review</code> node opens the run; specialized build nodes split backend (<code>codex</code>) from the MiniMax-M3 lane when selected (Claude transport in <code>--bare</code> mode); evidence gates (<code>/es</code>, <code>/er</code>), an independent adversarial reviewer, and a sealed holdout all guard the exit. A direct Claude backend is an explicit opt-in and requires a validated <code>DARK_FACTORY_CLAUDE_CONFIG_DIR</code>. The same project also ships <strong>vertical-slice</strong> graphs (<code>slices_foundation → catalog → cart → checkout</code>) when you'd rather ship one feature column end-to-end at a time. Reach for this shape for production full-stack work.</p>
 <hr />
 <h2 id="the-operator-agent-isolation-rule">🔒 The Operator-Agent Isolation Rule</h2>
 <p>To guarantee rigorous evaluation integrity, Dark Factory strictly enforces <strong>sandboxed agent execution</strong>:</p>
@@ -302,13 +302,15 @@ flowchart LR
 <ul><li>Invokes the powerful Antigravity execution engine headlessly and non-interactively using:</li></ul>
 <p>        ``<code>bash         agy --add-dir &lt;cwd&gt; --dangerously-skip-permissions --print --print-timeout &lt;s_s&gt;         </code>``</p>
 <ul><li>Wraps prompts automatically in a headless instruction wrapper, directing Antigravity to decompose the task, spawn parallel internal subagents if useful, apply direct workspace changes, and exit cleanly without waiting for interactive input.</li></ul>
-<p>2.  <strong><code>claude</code> (Claude Code CLI)</strong></p>
-<ul><li>Directly invokes <code>claude</code> with standard prompt text to run autonomous editing and execution tasks.</li><li>Also the automatic fallback reviewer when an <code>agy</code> review gate hits an infra failure (missing binary, sandbox unavailable, timeout, or unparseable output).</li></ul>
-<p>3.  <strong><code>codex</code> (Codex CLI)</strong></p>
+<p>2.  <strong><code>minimax</code> (MiniMax-M3 via Claude transport)</strong></p>
+<ul><li>The <code>minimax</code> backend uses the Claude transport in <code>--bare</code> mode, pinned to MiniMax-M3 and its explicit provider credentials.</li></ul>
+<p>3.  <strong><code>claude</code> (Claude Code CLI, explicit opt-in)</strong></p>
+<ul><li>Directly invokes Claude only when an operator selects this lane and provides a validated <code>DARK_FACTORY_CLAUDE_CONFIG_DIR</code>; it never inherits the personal host Claude profile by default.</li></ul>
+<p>4.  <strong><code>codex</code> (Codex CLI)</strong></p>
 <ul><li>Uses <code>codex exec</code> to drive immediate terminal or workspace updates.</li></ul>
-<p>4.  <strong><code>ao</code> (WorldArchitect Agent)</strong></p>
+<p>5.  <strong><code>ao</code> (WorldArchitect Agent)</strong></p>
 <ul><li>Spawns an autonomous workspace worker mapped to an active WorldArchitect project (<code>--ao-project</code>).</li></ul>
-<p>5.  <strong><code>mock_llm</code> / <code>echo</code></strong></p>
+<p>6.  <strong><code>mock_llm</code> / <code>echo</code></strong></p>
 <ul><li>Deterministic test backends used for validation, smoke testing, and continuous integration pipelines.</li></ul>
 <hr />
 <h2 id="pipeline-catalog">📊 Pipeline Catalog</h2>
@@ -325,7 +327,7 @@ flowchart LR
 <h2 id="fail-closed-observability-cxdb-healer">🩺 Fail-Closed Observability: CXDB + Healer</h2>
 <p>To build a true "Dark Factory," errors must be logged, clustered, and resolved programmatically:</p>
 <figure class="diagram-figure"><img class="diagram" src="diagrams/png/03-cxdb-healer-loop.png" alt="CXDB + Healer feedback loop" loading="lazy" /></figure>
-<ul><li><strong>CXDB SQLite Event Log (<code>runner/cxdb.py</code>):</strong></li><li>Every step, node transition, stdout snippet, stderr traceback, metadata chunk, and execution cost metric is recorded in a centralized SQLite database.</li><li>Runs in high-concurrency <strong>Write-Ahead Logging (WAL) mode</strong> with a robust <code>5000ms</code> busy timeout to guarantee concurrent multi-pipeline instances write safely without database locking errors.</li><li><strong>The Healer Engine (<code>runner/healer.py</code>):</strong></li><li>Reads the CXDB log and dynamically clusters terminal failures (e.g., <code>failure</code>, <code>exhausted</code>, <code>stuck</code>, <code>error</code>) by <code>(node, outcome, output_hash)</code>.</li><li>Invokes an LLM review backend (<code>claude</code> or <code>echo</code>) to analyze the precise error context and output.</li><li>Generates a structured, highly actionable Markdown report containing a tailored <strong>prescription</strong> (e.g., which prompt to refine, which code logic failed, or which harness configuration is broken) for every cluster.</li></ul>
+<ul><li><strong>CXDB SQLite Event Log (<code>runner/cxdb.py</code>):</strong></li><li>Every step, node transition, stdout snippet, stderr traceback, metadata chunk, and execution cost metric is recorded in a centralized SQLite database.</li><li>Runs in high-concurrency <strong>Write-Ahead Logging (WAL) mode</strong> with a robust <code>5000ms</code> busy timeout to guarantee concurrent multi-pipeline instances write safely without database locking errors.</li><li><strong>The Healer Engine (<code>runner/healer.py</code>):</strong></li><li>Reads the CXDB log and dynamically clusters terminal failures (e.g., <code>failure</code>, <code>exhausted</code>, <code>stuck</code>, <code>error</code>) by <code>(node, outcome, output_hash)</code>.</li><li>When the <code>minimax</code> route is selected, invokes the scoped MiniMax-M3 Claude transport in <code>--bare</code> mode; a direct Claude review requires explicit opt-in and validated <code>DARK_FACTORY_CLAUDE_CONFIG_DIR</code>.</li><li>Generates a structured, highly actionable Markdown report containing a tailored <strong>prescription</strong> (e.g., which prompt to refine, which code logic failed, or which harness configuration is broken) for every cluster.</li></ul>
 <hr />
 <h2 id="directory-layout">📁 Directory Layout</h2>
 <pre class="code" data-lang=""><code>
@@ -344,7 +346,7 @@ dark-factory/
 │   ├── __main__.py                 # Command line interface &amp; parser arguments
 │   ├── parser.py                   # PyDot loader &amp; validator (verifies start/exit)
 │   ├── engine.py                   # Graph traversal, state tracking, &amp; loop limits
-│   ├── handlers.py                 # Core handlers &amp; backends (agy, claude, codex, ao)
+│   ├── handlers.py                 # Core handlers &amp; backends (agy, minimax, claude, codex, ao)
 │   ├── cxdb.py                     # SQLite WAL step recording and logging schemas
 │   └── healer.py                   # Failure clustering &amp; automatic prescription engine
 ├── tests/                          # Rigorous unit and integration test suite
@@ -354,14 +356,14 @@ dark-factory/
 </code></pre>
 <hr />
 <h2 id="recommended-default-agent-orchestrator-ao-with-antigravity">⭐ Recommended default: Agent Orchestrator (AO) with Antigravity</h2>
-<p>For day-to-day work, the factory runs with the <code>--backend ao</code> default (configured to use the <code>--ao-agent antigravity</code> plugin to route headlessly through the Antigravity CLI, but swappable to other agents like <code>--ao-agent claude-code</code>). <strong>Pick the <code>.dot</code> for the task</strong> — do not default every run to a single pipeline. The full decision table is <a href="docs/pipeline-selection.md">docs/pipeline-selection.md</a>; the common picks:</p>
+<p>For day-to-day work, the factory runs with the <code>--backend ao</code> default (configured to use the <code>--ao-agent antigravity</code> plugin to route headlessly through the Antigravity CLI; any Claude Code agent is an explicit opt-in lane with validated account scope). <strong>Pick the <code>.dot</code> for the task</strong> — do not default every run to a single pipeline. The full decision table is <a href="docs/pipeline-selection.md">docs/pipeline-selection.md</a>; the common picks:</p>
 <p>| Task | Pipeline | |------|----------| | Smoke / wiring (no LLM cost) | <code>pipelines/factory/hello.dot</code> | | New feature (full loop) | <code>pipelines/slim/minimal_feature.dot</code> | | In-flight PR iteration | <code>pipelines/slim/minimal_pr.dot</code> | | Diff + sealed holdout validation | <code>pipelines/factory/gates.dot</code> |</p>
 <p><strong>Operating discipline:</strong></p>
 <ul><li><strong>Always record outcomes.</strong> Pass <code>--cxdb ~/.dark-factory/cxdb.sqlite</code> and</li></ul>
 <p>    <code>--feature &lt;name&gt;</code> on every real run, then run <code>df-healer --cxdb ~/.dark-factory/cxdb.sqlite</code>     afterward to cluster failures into a diagnosis. Merge confidence comes from     outcome artifacts (holdouts, gates, CXDB history), not from reading the diff.</p>
 <ul><li><strong>Keep adversarial cross-review independent.</strong> Every non-trivial pipeline should</li></ul>
 <p>    contain at least one reviewer node that is <em>separate</em> from the coder agent —     e.g. an independent reviewer <code>tool</code> node invoking <code>codex exec --yolo</code>. Because that     reviewer never saw the implementation prompt, its verdict is genuinely adversarial.     The slim pipelines (<code>minimal_feature.dot</code>, <code>minimal_pr.dot</code>) now ship this <strong>by     default</strong>: their <code>review</code> node pins <code>backend="codex"</code>, so the reviewer runs on a     different backend than the coder out of the box (precedence: explicit node attr &gt;     <code>model_stylesheet</code> &gt; <code>--backend</code>, so this is independent and non-overridable by the     coder's <code>--backend</code>). Requires <code>codex</code> installed; override path is in     <a href="docs/pipeline-selection.md#independent-reviewer-adversarial-by-default">docs/pipeline-selection.md</a>.</p>
-<ul><li><strong>Adversarial-review priority queue:</strong> <code>codex &gt; minimax &gt; agy &gt; claude-sonnet</code> (set</li></ul>
+<ul><li><strong>Adversarial-review priority queue:</strong> <code>codex &gt; minimax &gt; agy</code> (set</li></ul>
 <p>    <code>DARK_FACTORY_ADVERSARIAL_PRIORITY</code> env var to override). The queue is the <strong>first</strong>     adversarial pass — chosen at run-config time, <em>not</em> a retry cascade. A real     <code>fail|partial</code> from the chosen reviewer is authoritative and is never retried on a     different model (no-reviewer-shopping rule). Use <code>backend_priority=...</code> and     <code>prefer_adversarial: true</code> on <code>gate_er</code> / <code>gate_es</code> nodes; the resolver audit lands     in the gate's <code>Result.metadata</code> (priority list, resolved name, skipped entries).</p>
 <ul><li><strong>Route models by role, not by hand.</strong> Use a heavier model for plan/review and a</li></ul>
 <p>    faster one for implement. Set this per-node (<code>backend="…"</code> / <code>model="…"</code>) or, better,     once per graph via <code>model_stylesheet="….model.css"</code> — never by editing every node.</p>

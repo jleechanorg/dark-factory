@@ -229,9 +229,12 @@ gh pr checks <pr> --repo "$TARGET_REPO" --json name,state,conclusion
 ```
 
 Each gate is a model-delegated review (NOT keyword routing); the verifier
-dispatches them as subagents / `claude --print /<slash>` / `codex exec --yolo`
-against the PR diff. The overlay only records verdicts — the pass/warn/fail
-decision is the model's, not ours.
+dispatches them through the selected scoped lane against the PR diff. When the
+MiniMax route is selected, it uses the Claude transport in `--bare` mode pinned
+to MiniMax-M3; direct Claude is an explicit opt-in only and requires a validated
+`DARK_FACTORY_CLAUDE_CONFIG_DIR`. Codex reviewers use `codex exec --yolo` with
+their own intended credential scope. The overlay only records verdicts — the
+pass/warn/fail decision is the model's, not ours.
 
 Assess each gate:
 - ci_green: every check `conclusion=success` (or state=SUCCESS)

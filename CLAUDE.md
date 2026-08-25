@@ -175,14 +175,14 @@ Lookup order in `resolve(node)`:
 4. Default → `_codergen`
 
 Handler types:
-- `codergen` — render `prompt="@path"` (with `${goal}` and `${state.*}` substitution) and dispatch to the node's `backend`/`model` attribute or `ctx.backend`. The runner CLI accepts `echo` | `ao` | `claude` | `codex` | `agy`; per-node/model-stylesheet routing also supports `mock_llm` for test/conformance lanes. The default is `ao` (running `antigravity` agent under the hood via Agent Orchestrator).
+- `codergen` — render `prompt="@path"` (with `${goal}` and `${state.*}` substitution) and dispatch to the node's `backend`/`model` attribute or `ctx.backend`. The runner CLI accepts `echo` | `ao` | `claude` | `codex` | `minimax` | `agy`; per-node/model-stylesheet routing also supports `mock_llm` for test/conformance lanes. The default is `ao` (running `antigravity` agent under the hood via Agent Orchestrator).
 - `agy` backend — run Antigravity CLI directly and headlessly with `agy --print --dangerously-skip-permissions`; node `timeout="..."` maps to `agy --print-timeout`.
 - Reviewer/evaluator lanes are separate nodes: `tool` nodes can invoke `codex exec --yolo`, AO workers, or another reviewer CLI; `holdout_eval` runs the sealed Python evaluator from `$DARK_FACTORY_HOLDOUTS`.
 - `tool` — shell out to a `command="..."` attribute with optional `timeout`.
 - `human_gate` — block on stdin, or accept pre-seeded `ctx.state["<node>.outcome"]` for tests.
 - `conditional` — hexagon decision node; outcome comes from `ctx.state[decision_key]`.
 - `holdout_eval` — run the sealed evaluator at `$DARK_FACTORY_HOLDOUTS/evaluator/run.py`. Parses the last JSON line of stdout for `{verdict: pass|...}`.
-- `gate_es` / `gate_er` / `gate_code_standards` — shell out to `claude --print /<slash>`. Verdicts are normalized by `_parse_verdict`: the anchored marker regex (`verdict:`/`overall:`/`normalized:` + token) takes priority; the standalone-line fallback only fires when no marker is present; `pass|warn → success`, `fail|partial|inconclusive → failure`. Unknown verdict combined with `rc!=0` becomes `error` (distinct from real failures so the Healer can group infra crashes separately).
+- `gate_es` / `gate_er` / `gate_code_standards` — dispatch the selected, scoped reviewer transport. When the MiniMax route is selected, it uses the Claude transport in `--bare` mode pinned to MiniMax-M3; a direct Claude lane is explicit opt-in only and requires a validated `DARK_FACTORY_CLAUDE_CONFIG_DIR`. Verdicts are normalized by `_parse_verdict`: the anchored marker regex (`verdict:`/`overall:`/`normalized:` + token) takes priority; the standalone-line fallback only fires when no marker is present; `pass|warn → success`, `fail|partial|inconclusive → failure`. Unknown verdict combined with `rc!=0` becomes `error` (distinct from real failures so the Healer can group infra crashes separately).
 
 ### Spec validation benchmark
 
@@ -267,7 +267,7 @@ against the real `daemon/scripts/`).
 3. Edge conditions are simple: `condition="key=value"` or `key!=value`. The runtime does *not* evaluate arbitrary expressions; encode richer logic in a handler.
 4. Prompt references use `prompt="@relative/path.md"` (the `@` is stripped by the parser). Templates support `${goal}` and `${state.<key>}` substitution only — no Jinja, no conditionals.
 5. Coder backends are swappable per run via `--backend` or per codergen node via
-   `backend="codex"` / `backend="claude"` / `backend="ao"` / `backend="agy"`. The recommended default is `backend="ao"` with `--ao-agent antigravity` (running Antigravity CLI through Agent Orchestrator). Use reviewer
+   `backend="codex"` / `backend="claude"` / `backend="ao"` / `backend="minimax"` / `backend="agy"`. The recommended default is `backend="ao"` with `--ao-agent antigravity` (running Antigravity CLI through Agent Orchestrator). The `minimax` route uses MiniMax-M3 over the Claude transport in `--bare` mode; `backend="claude"` is an explicit opt-in lane and must provide a validated `DARK_FACTORY_CLAUDE_CONFIG_DIR`. Use reviewer
    `tool` nodes when separating coder and reviewer/evaluator CLIs.
 6. Use `model_stylesheet="path.model.css"` when a graph needs CSS-like
    backend/model routing without cluttering every node.
