@@ -172,6 +172,21 @@ def test_claude_coder_missing_returns_clean_failure(monkeypatch, tmp_path):
     assert result.metadata.get("backend_missing") != "true"
 
 
+def test_minimax_coder_requires_api_key_before_cli_resolution(monkeypatch, tmp_path):
+    """MiniMax coder must fail closed without selecting or spawning Claude."""
+    _disable_sandbox(monkeypatch)
+    monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "runner.handlers._get_claude_executable",
+        lambda: pytest.fail("MiniMax must validate its key before executable lookup"),
+    )
+
+    result = _codergen(_node("minimax"), Context(goal="t", workdir=tmp_path, backend="minimax"))
+
+    assert result.outcome == "failure"
+    assert "MINIMAX_API_KEY" in result.output
+
+
 def test_codex_coder_missing_returns_clean_error(monkeypatch, tmp_path):
     """codex missing → ``Result(outcome="error", ...)`` via the
     ``except Exception as exc:`` at line 583.
@@ -386,6 +401,27 @@ def test_gate_per_backend_missing_sets_backend_missing_metadata(monkeypatch, tmp
         assert result.metadata.get("reviewer_backend") == backend
         # No SHA echo because the subprocess never ran.
         assert result.metadata.get("head_sha_status") == "missing"
+
+
+def test_minimax_gate_requires_api_key_before_subprocess(monkeypatch, tmp_path):
+    """MiniMax reviewer gate must fail closed without launching Claude."""
+    monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "runner.handlers._get_claude_executable",
+        lambda: pytest.fail("MiniMax must validate its key before executable lookup"),
+    )
+    monkeypatch.setattr(
+        "runner.handlers.subprocess.run",
+        lambda *args, **kwargs: pytest.fail("MiniMax must not spawn without its key"),
+    )
+    result = _run_gate_once(
+        "minimax", "PROMPT", "0" * 40, 30,
+        Context(goal="t", workdir=tmp_path, backend="claude"), "gate_x",
+    )
+
+    assert result.outcome == "error"
+    assert "MINIMAX_API_KEY" in result.output
+    assert result.metadata.get("invalid_backend") == "true"
 
 
 def test_reviewer_gate_priority_queue_with_codex_missing_picks_codex(monkeypatch, tmp_path):

@@ -615,7 +615,7 @@ def _run_web_advice_subprocess(transport: str, prompt: str, *,
     import runner.handlers as _handlers_shim
 
     try:
-        claude_config = _handlers_shim._claude_config_dir()
+        env = _handlers_shim._scoped_claude_env()
     except (AttributeError, ValueError, OSError) as exc:
         return {
             "ok": False,
@@ -626,12 +626,6 @@ def _run_web_advice_subprocess(transport: str, prompt: str, *,
             "stderr": f"Claude scope unavailable: {exc}"[:500],
             "transport": transport,
         }
-    env = _handlers_shim._sanitized_env()
-    # The shared sanitizer strips holdout and inherited CLAUDE_CONFIG_DIR;
-    # direct Claude callers must also avoid AO's Anthropic auth token route.
-    env.pop("ANTHROPIC_AUTH_TOKEN", None)
-    env["CLAUDE_CONFIG_DIR"] = str(claude_config)
-
     cmd = ["claude", "--print", f"/web-advice {prompt}"]
     try:
         res = subprocess.run(

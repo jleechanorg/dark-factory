@@ -134,6 +134,50 @@ def _sanitized_env() -> dict[str, str]:
     return env
 
 
+_CLAUDE_PROVIDER_ENV = frozenset(
+    {
+        "CLAUDE_CONFIG_DIR",
+        "CLAUDEM_MODE",
+        "MINIMAX_API_KEY",
+        "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL",
+    }
+)
+
+
+def _scoped_claude_env(
+    config_dir: pathlib.Path | None = None,
+    base_env: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Build a direct-Claude environment from an explicit project scope."""
+    config_dir = config_dir or _claude_config_dir()
+    env = dict(base_env) if base_env is not None else _sanitized_env()
+    for key in tuple(env):
+        if key.startswith("ANTHROPIC_") or key in _CLAUDE_PROVIDER_ENV:
+            env.pop(key, None)
+    env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+    return env
+
+
+def _minimax_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
+    """Build a MiniMax Claude-transport environment with explicit credentials."""
+    key = os.environ.get("MINIMAX_API_KEY", "").strip()
+    if not key:
+        raise ValueError("MINIMAX_API_KEY must be non-empty for the minimax backend")
+    model = os.environ.get("DARK_FACTORY_MINIMAX_MODEL", "MiniMax-M3").strip() or "MiniMax-M3"
+    env = dict(base_env) if base_env is not None else _sanitized_env()
+    for key_name in tuple(env):
+        if key_name.startswith("ANTHROPIC_") or key_name in _CLAUDE_PROVIDER_ENV:
+            env.pop(key_name, None)
+    env.update(
+        {
+            "ANTHROPIC_BASE_URL": "https://api.minimax.io/anthropic",
+            "ANTHROPIC_API_KEY": key,
+            "ANTHROPIC_MODEL": model,
+        }
+    )
+    return env
+
+
 def _get_claude_executable() -> str:
     # PATH wins so tests can intercept with a fake claude binary on PATH
     # (see tests/test_gates.py::test_gate_nonzero_returncode_cannot_spoof_pass).

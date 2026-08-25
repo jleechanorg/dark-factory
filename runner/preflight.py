@@ -148,6 +148,8 @@ def preflight_check(
     # asked for.
     known = backend in PROBED_BACKENDS or backend in _CLAUDE_ALIASES
     config_error: str | None = None
+    if backend == "minimax" and not os.environ.get("MINIMAX_API_KEY", "").strip():
+        config_error = "MINIMAX_API_KEY must be non-empty for the minimax backend"
     if backend in _CLAUDE_ALIASES:
         try:
             from .handler_sandbox import _claude_config_dir
@@ -158,7 +160,7 @@ def preflight_check(
     configured_present = (
         backend == "echo"
         or (backend in _CLAUDE_ALIASES and config_error is None and _probe("claude") is not None)
-        or (backend == "minimax" and _probe_backend("minimax") is not None)
+        or (backend == "minimax" and config_error is None and _probe_backend("minimax") is not None)
         or (backend not in _CLAUDE_ALIASES and backend != "minimax" and _probe_backend(backend) is not None)
     )
 
@@ -168,10 +170,14 @@ def preflight_check(
             backends[name] = {"ok": True, "path": None, "hint": None}
             continue
         path = _probe_backend(name)
+        if name == "minimax" and not os.environ.get("MINIMAX_API_KEY", "").strip():
+            path = None
         backends[name] = {
             "ok": path is not None,
             "path": path,
-            "hint": None if path else HINTS.get(name),
+            "hint": None if path else (
+                config_error if name == "minimax" and config_error else HINTS.get(name)
+            ),
         }
 
     if backend in _CLAUDE_ALIASES:

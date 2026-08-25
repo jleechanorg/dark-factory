@@ -3157,8 +3157,30 @@ pub(crate) fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, Da
         // to this child only so a sibling `agy` thread cannot inherit
         // MiniMax's ANTHROPIC_BASE_URL.
         "claudem" | "minimax" => {
-            let key = std::env::var("MINIMAX_API_KEY").unwrap_or_default();
-            crate::tools::run_tool_with_env(
+            let key = std::env::var("MINIMAX_API_KEY")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    DaemonError::Config(
+                        "MiniMax reviewer requires a non-empty MINIMAX_API_KEY".to_string(),
+                    )
+                })?;
+            let model = std::env::var("DARK_FACTORY_MINIMAX_MODEL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "MiniMax-M3".to_string());
+            const MINIMAX_PROVIDER_ENV: &[&str] = &[
+                "CLAUDE_CONFIG_DIR",
+                "MINIMAX_API_KEY",
+                "ANTHROPIC_BASE_URL",
+                "ANTHROPIC_AUTH_TOKEN",
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_MODEL",
+                "ANTHROPIC_SMALL_FAST_MODEL",
+                "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL",
+                "CLAUDEM_MODE",
+            ];
+            crate::tools::run_tool_with_env_and_remove(
                 "claude",
                 &[
                     "--print",
@@ -3168,18 +3190,15 @@ pub(crate) fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, Da
                     "--effort",
                     "high",
                     "--model",
-                    "MiniMax-M3",
+                    model.as_str(),
                     prompt,
                 ],
                 &[
-                    ("CLAUDEM_MODE", "1"),
                     ("ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic"),
-                    ("ANTHROPIC_AUTH_TOKEN", key.as_str()),
                     ("ANTHROPIC_API_KEY", key.as_str()),
-                    ("ANTHROPIC_MODEL", "MiniMax-M3"),
-                    ("ANTHROPIC_SMALL_FAST_MODEL", "MiniMax-M3"),
-                    ("CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL", "0"),
+                    ("ANTHROPIC_MODEL", model.as_str()),
                 ],
+                MINIMAX_PROVIDER_ENV,
                 REVIEWER_TIMEOUT_SECS,
             )
         }
@@ -3395,6 +3414,87 @@ mod direct_claude_scope_tests {
             );
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn minimax_reviewer_requires_api_key_before_spawning() {
+        let _guard = env_lock().lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "afd_minimax_reviewer_missing_key_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let claude = bin.join("claude");
+        std::fs::write(&claude, "#!/bin/sh\nprintf unexpected-spawn\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _env = EnvRestore::capture(&["PATH", "MINIMAX_API_KEY"]);
+        EnvRestore::set("PATH", &bin);
+        EnvRestore::remove("MINIMAX_API_KEY");
+        let result = dispatch_reviewer("claudem", "scope-test");
+        let _ = std::fs::remove_dir_all(&root);
+
+        let rendered = result.expect_err("missing MiniMax key must fail closed").to_string();
+        assert!(rendered.contains("MINIMAX_API_KEY"), "{rendered}");
+        assert!(!rendered.contains("unexpected-spawn"), "{rendered}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn minimax_reviewer_pins_model_and_scrubs_inherited_claude_environment() {
+        let _guard = env_lock().lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "afd_minimax_reviewer_env_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let claude = bin.join("claude");
+        std::fs::write(
+            &claude,
+            "#!/bin/sh\nprintf 'config=%s\\nbase=%s\\napi=%s\\nauth=%s\\nmodel=%s\\nsmall=%s\\nmode=%s\\nargs=' \"$CLAUDE_CONFIG_DIR\" \"$ANTHROPIC_BASE_URL\" \"$ANTHROPIC_API_KEY\" \"$ANTHROPIC_AUTH_TOKEN\" \"$ANTHROPIC_MODEL\" \"$ANTHROPIC_SMALL_FAST_MODEL\" \"$CLAUDEM_MODE\"; for arg in \"$@\"; do printf '<%s>' \"$arg\"; done; printf '\\n'\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _env = EnvRestore::capture(&[
+            "PATH",
+            "CLAUDE_CONFIG_DIR",
+            "MINIMAX_API_KEY",
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_MODEL",
+            "ANTHROPIC_SMALL_FAST_MODEL",
+            "CLAUDEM_MODE",
+        ]);
+        EnvRestore::set("PATH", &bin);
+        EnvRestore::set("CLAUDE_CONFIG_DIR", "/home/operator/.claude");
+        EnvRestore::set("MINIMAX_API_KEY", "minimax-key");
+        EnvRestore::set("ANTHROPIC_BASE_URL", "https://personal.invalid");
+        EnvRestore::set("ANTHROPIC_API_KEY", "personal-key");
+        EnvRestore::set("ANTHROPIC_AUTH_TOKEN", "personal-token");
+        EnvRestore::set("ANTHROPIC_MODEL", "personal-model");
+        EnvRestore::set("ANTHROPIC_SMALL_FAST_MODEL", "personal-fast");
+        EnvRestore::set("CLAUDEM_MODE", "stale");
+
+        let result = dispatch_reviewer("minimax", "scope-test").expect("MiniMax shim succeeds");
+        let _ = std::fs::remove_dir_all(&root);
+
+        for line in ["config=", "auth=", "mode="] {
+            assert!(result.lines().any(|candidate| candidate == line), "{line:?}: {result}");
+        }
+        assert!(result.contains("base=https://api.minimax.io/anthropic"), "{result}");
+        assert!(result.contains("api=minimax-key"), "{result}");
+        assert!(result.contains("model=MiniMax-M3"), "{result}");
+        assert!(result.contains("small="), "{result}");
+        assert!(result.contains("<--model><MiniMax-M3>"), "{result}");
     }
 }
 

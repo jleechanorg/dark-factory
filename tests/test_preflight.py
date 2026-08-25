@@ -82,6 +82,22 @@ def test_configured_backend_present_returns_pass(monkeypatch, which_all_present)
     assert result["fallback_recommendation"] == "codex"
 
 
+def test_minimax_without_api_key_is_not_reported_as_usable(monkeypatch):
+    """Preflight must not advertise a MiniMax route that cannot authenticate."""
+    monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
+    monkeypatch.setattr(
+        preflight,
+        "_probe",
+        lambda name: "/usr/local/bin/claude" if name == "claude" else None,
+    )
+
+    result = preflight.preflight_check("minimax")
+
+    assert result["configured_ok"] is False
+    assert result["backends"]["minimax"]["ok"] is False
+    assert "MINIMAX_API_KEY" in (result["backends"]["minimax"]["hint"] or "")
+
+
 def test_configured_backend_missing_others_available_returns_warn(
     monkeypatch, which_claude_only
 ):

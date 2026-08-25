@@ -41,6 +41,9 @@ from .handler_core import (
 
 # Sandbox + env helpers.
 from .handler_sandbox import (
+    _CLAUDE_PROVIDER_ENV,
+    _minimax_env as _minimax_env_impl,
+    _scoped_claude_env as _scoped_claude_env_impl,
     _sanitized_env,
     _claude_config_dir,
     _get_claude_executable,
@@ -59,6 +62,16 @@ from .handler_sandbox import (
     _verify_darwin_sandbox_exec,
     _reset_darwin_sandbox_verification_cache_for_tests,
 )
+
+
+def _scoped_claude_env() -> dict[str, str]:
+    """Compatibility shim honoring monkeypatched config resolution."""
+    return _scoped_claude_env_impl(_claude_config_dir(), _sanitized_env())
+
+
+def _minimax_env() -> dict[str, str]:
+    """Compatibility shim honoring monkeypatched environment sanitization."""
+    return _minimax_env_impl(_sanitized_env())
 
 
 # AO backend helpers.

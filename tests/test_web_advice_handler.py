@@ -288,7 +288,14 @@ class TestStructuredPanelContract:
         monkeypatch.setattr("runner.handlers._sanitized_env", lambda: {
             "PATH": "/bin",
             "CLAUDE_CONFIG_DIR": "/personal/default",
+            "ANTHROPIC_BASE_URL": "https://api.minimax.io/anthropic",
+            "ANTHROPIC_API_KEY": "stale-key",
             "ANTHROPIC_AUTH_TOKEN": "must-be-scrubbed",
+            "ANTHROPIC_MODEL": "MiniMax-M3",
+            "ANTHROPIC_SMALL_FAST_MODEL": "MiniMax-M3",
+            "MINIMAX_API_KEY": "minimax-key",
+            "CLAUDEM_MODE": "1",
+            "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL": "1",
         })
         config = pathlib.Path("/tmp/project-claude-config")
         monkeypatch.setattr("runner.handlers._claude_config_dir", lambda: config)
@@ -312,7 +319,17 @@ class TestStructuredPanelContract:
         assert result["ok"] is True
         assert captured["env"]["CLAUDE_CONFIG_DIR"] == str(config)
         assert captured["env"]["PATH"] == "/bin"
-        assert "ANTHROPIC_AUTH_TOKEN" not in captured["env"]
+        for key in (
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_MODEL",
+            "ANTHROPIC_SMALL_FAST_MODEL",
+            "MINIMAX_API_KEY",
+            "CLAUDEM_MODE",
+            "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL",
+        ):
+            assert key not in captured["env"]
 
     def test_rejects_multiple_qualifying_panel_json_objects(self, monkeypatch):
         payload = {

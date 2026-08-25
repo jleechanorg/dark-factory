@@ -41,7 +41,7 @@ def test_healer_diagnose_cluster_echo(tmp_path):
     assert '"returncode": "1"' in rx
 
 
-def test_healer_diagnose_cluster_claude(tmp_path):
+def test_healer_diagnose_cluster_claude(tmp_path, monkeypatch):
     """Verify diagnose_cluster with 'claude' backend calls subprocess.run correctly with the prompt."""
     db_path = tmp_path / "cxdb.sqlite"
     db = CXDB(db_path)
@@ -64,11 +64,24 @@ def test_healer_diagnose_cluster_claude(tmp_path):
     assert len(clusters) == 1
     c = clusters[0]
 
+    claude_config = tmp_path / "project-claude-config"
+    claude_config.mkdir()
+    monkeypatch.setenv("DARK_FACTORY_CLAUDE_CONFIG_DIR", str(claude_config))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/home/operator/.claude")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://personal.example.invalid")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "personal-key")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "personal-token")
+    monkeypatch.setenv("ANTHROPIC_MODEL", "personal-model")
+    monkeypatch.setenv("ANTHROPIC_SMALL_FAST_MODEL", "personal-fast")
+    monkeypatch.setenv("MINIMAX_API_KEY", "minimax-key")
+    monkeypatch.setenv("CLAUDEM_MODE", "1")
+
     # Mock subprocess.run to simulate a successful LLM call
     mock_proc = MagicMock()
     mock_proc.returncode = 0
     mock_proc.stdout = "Evidence-backed prescription: Improve implement.md prompts by adding type annotations."
     mock_proc.stderr = ""
+    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda args: list(args))
 
     with patch("subprocess.run", return_value=mock_proc) as mock_run:
         rx = diagnose_cluster(c, backend="claude", cxdb_path=db_path)
@@ -87,6 +100,37 @@ def test_healer_diagnose_cluster_claude(tmp_path):
         assert "implement" in prompt
         assert "test_pipeline" in prompt
         assert "verify healer works" in prompt
+        env = kwargs["env"]
+        assert env["CLAUDE_CONFIG_DIR"] == str(claude_config.resolve())
+        for key in (
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_MODEL",
+            "ANTHROPIC_SMALL_FAST_MODEL",
+            "MINIMAX_API_KEY",
+            "CLAUDEM_MODE",
+        ):
+            assert key not in env
+
+
+def test_healer_claude_fails_closed_without_project_config(tmp_path, monkeypatch):
+    """An unscoped Healer Claude request must not launch a subprocess."""
+    monkeypatch.delenv("DARK_FACTORY_CLAUDE_CONFIG_DIR", raising=False)
+    cluster = Cluster(
+        node="implement",
+        outcome="failure",
+        output_hash="hash",
+        hits=1,
+        sample="failure output",
+        run_ids=[],
+    )
+
+    with patch("subprocess.run") as mock_run:
+        result = diagnose_cluster(cluster, backend="claude")
+
+    assert "DARK_FACTORY_CLAUDE_CONFIG_DIR" in result
+    mock_run.assert_not_called()
 
 
 def test_healer_report_integrates_prescription(tmp_path):

@@ -7886,11 +7886,14 @@ const FALLBACK_CWD: &str = ".";
 /// does (bead `jleechan-g1k`) — MiniMax is still driving the `claude` CLI, so
 /// it still reads AGENTS.md / `.claude/` from the invocation cwd.
 fn run_minimax_judge(claude_bin: &str, prompt: &str) -> Result<String, DaemonError> {
-    let minimax_key = std::env::var("MINIMAX_API_KEY").map_err(|e| DaemonError::Tool {
-        tool: "minimax".into(),
-        rc: -1,
-        stderr: format!("MINIMAX_API_KEY not set: {e}"),
-    })?;
+    let minimax_key = std::env::var("MINIMAX_API_KEY")
+        .ok()
+        .filter(|key| !key.trim().is_empty())
+        .ok_or_else(|| DaemonError::Tool {
+            tool: "minimax".into(),
+            rc: -1,
+            stderr: "MINIMAX_API_KEY must be non-empty".to_string(),
+        })?;
     let minimax_model = std::env::var("DARK_FACTORY_MINIMAX_MODEL")
         .ok()
         .filter(|model| !model.trim().is_empty())
@@ -8707,6 +8710,42 @@ mod chain_llm_fallback_argv_tests {
             output.contains("config=\n"),
             "direct Claude config leaked: {output}"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn minimax_judge_rejects_empty_or_whitespace_keys_before_spawn() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!("minimax_empty_key_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("spawned");
+        let claude = dir.join("claude");
+        std::fs::write(
+            &claude,
+            format!("#!/bin/sh\ntouch {}\nprintf spawned\n", marker.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let prior = std::env::var_os("MINIMAX_API_KEY");
+        for value in ["", "   "] {
+            unsafe { std::env::set_var("MINIMAX_API_KEY", value) };
+            let result = run_minimax_judge(claude.to_str().unwrap(), "empty-key");
+            assert!(result.is_err(), "key {value:?} must fail closed");
+            assert!(!marker.exists(), "key {value:?} launched the Claude CLI");
+        }
+        unsafe {
+            if let Some(value) = prior {
+                std::env::set_var("MINIMAX_API_KEY", value);
+            } else {
+                std::env::remove_var("MINIMAX_API_KEY");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

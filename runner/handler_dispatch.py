@@ -568,24 +568,11 @@ def _gate_subprocess_env(backend: str) -> dict[str, str]:
     must not reach any reviewer subprocess). All other backends use
     ``_sanitized_env`` unchanged.
     """
-    env = _handlers_shim._sanitized_env()
     if backend == "minimax":
-        model = os.environ.get("DARK_FACTORY_MINIMAX_MODEL", "MiniMax-M3")
-        env.pop("CLAUDE_CONFIG_DIR", None)
-        for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_AUTH_TOKEN"):
-            env.pop(key, None)
-        env.update({
-            "ANTHROPIC_BASE_URL": "https://api.minimax.io/anthropic",
-            "ANTHROPIC_MODEL": model,
-        })
-        if os.environ.get("MINIMAX_API_KEY"):
-            env["ANTHROPIC_API_KEY"] = os.environ["MINIMAX_API_KEY"]
-        return env
+        return _handlers_shim._minimax_env()
     if backend in {"claude", "claude-sonnet"}:
-        for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_AUTH_TOKEN"):
-            env.pop(key, None)
-        env["CLAUDE_CONFIG_DIR"] = str(_handlers_shim._claude_config_dir())
-    return env
+        return _handlers_shim._scoped_claude_env()
+    return _handlers_shim._sanitized_env()
 
 
 def _build_controller_codex_transport(args: list[str]) -> list[str]:
@@ -678,6 +665,22 @@ def _run_gate_once(
                 "invalid_backend": "true",
             },
         )
+    if backend == "minimax":
+        try:
+            _handlers_shim._minimax_env()
+        except ValueError as exc:
+            return Result(
+                outcome="error",
+                output=str(exc),
+                metadata={
+                    "slash_command": name,
+                    "verdict": "unknown",
+                    "reviewer_backend": backend,
+                    "invalid_backend": "true",
+                    "backend_missing": "true",
+                    "head_sha_status": "missing",
+                },
+            )
     # The recorded name must match the subprocess that actually ran. agy is
     # passed through as-is; minimax is recorded as ``minimax`` even though it
     # invokes the Claude CLI (the review is graded by the minimax-routed

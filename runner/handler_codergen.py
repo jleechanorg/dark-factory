@@ -862,13 +862,23 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         ))
 
     if backend in {"claude", "claude-sonnet", "minimax"}:
+        subprocess_env: dict[str, str]
         if backend in {"claude", "claude-sonnet"}:
             try:
-                claude_config = _handlers_shim._claude_config_dir()
+                subprocess_env = _handlers_shim._scoped_claude_env()
             except (AttributeError, ValueError) as exc:
                 return _finalize(Result(
                     outcome="failure",
                     output=f"{backend} backend requires DARK_FACTORY_CLAUDE_CONFIG_DIR: {exc}",
+                    metadata={"invalid_backend": "true"},
+                ))
+        if backend == "minimax":
+            try:
+                subprocess_env = _handlers_shim._minimax_env()
+            except ValueError as exc:
+                return _finalize(Result(
+                    outcome="failure",
+                    output=str(exc),
                     metadata={"invalid_backend": "true"},
                 ))
         # `--output-format json` makes coder token usage + dollar cost observable
@@ -889,21 +899,6 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         args = _handlers_shim._sandboxed_args_for_workdir(claude_cmd, ctx.workdir)
         if args is None:
             return _finalize(Result(outcome="failure", output="sandbox-exec unavailable"))
-        subprocess_env = _handlers_shim._sanitized_env()
-        if backend in {"claude", "claude-sonnet"}:
-            for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_AUTH_TOKEN"):
-                subprocess_env.pop(key, None)
-            subprocess_env["CLAUDE_CONFIG_DIR"] = str(claude_config)
-        else:
-            subprocess_env.pop("CLAUDE_CONFIG_DIR", None)
-            for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_AUTH_TOKEN"):
-                subprocess_env.pop(key, None)
-            subprocess_env.update({
-                "ANTHROPIC_BASE_URL": "https://api.minimax.io/anthropic",
-                "ANTHROPIC_MODEL": os.environ.get("DARK_FACTORY_MINIMAX_MODEL", "MiniMax-M3"),
-            })
-            if os.environ.get("MINIMAX_API_KEY"):
-                subprocess_env["ANTHROPIC_API_KEY"] = os.environ["MINIMAX_API_KEY"]
         try:
             timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1800"), 1800)
             proc = subprocess.run(

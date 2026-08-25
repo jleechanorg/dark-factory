@@ -40,9 +40,11 @@ from runner.handlers import (  # noqa: E402
     _codergen,
     _holdout_eval,
     _holdouts_repo_path,
+    _minimax_env,
     _parse_verdict,
     _render_prompt,
     _sanitized_env,
+    _scoped_claude_env,
 )
 from runner.parser import Edge, parse  # noqa: E402
 from runner.parser import Node, parse  # noqa: E402
@@ -52,6 +54,69 @@ from runner.parser import Node, parse  # noqa: E402
 # discipline violation (path unreachable on dev machines without the
 # sealed repo; non-portable).
 SEALED_HOLDOUTS_REPO = pathlib.Path.home() / "projects" / "dark-factory-holdouts"
+
+
+def test_scoped_claude_env_scrubs_all_provider_overrides(monkeypatch, tmp_path):
+    config = tmp_path / "project-claude"
+    config.mkdir()
+    monkeypatch.setenv("DARK_FACTORY_CLAUDE_CONFIG_DIR", str(config))
+    for key in (
+        "CLAUDE_CONFIG_DIR",
+        "MINIMAX_API_KEY",
+        "CLAUDEM_MODE",
+        "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_SMALL_FAST_MODEL",
+    ):
+        monkeypatch.setenv(key, "stale")
+
+    env = _scoped_claude_env()
+
+    assert env["CLAUDE_CONFIG_DIR"] == str(config.resolve())
+    assert not any(key.startswith("ANTHROPIC_") for key in env)
+    for key in ("MINIMAX_API_KEY", "CLAUDEM_MODE", "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL"):
+        assert key not in env
+
+
+def test_scoped_claude_env_rejects_symlink_to_personal_config(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    personal = home / ".claude"
+    personal.mkdir(parents=True)
+    link = tmp_path / "project-config"
+    link.symlink_to(personal, target_is_directory=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("DARK_FACTORY_CLAUDE_CONFIG_DIR", str(link))
+
+    with pytest.raises(ValueError, match="personal ~/.claude"):
+        _scoped_claude_env()
+
+
+@pytest.mark.parametrize("value", [None, "", "   "])
+def test_minimax_env_requires_nonempty_key(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("MINIMAX_API_KEY", value)
+    with pytest.raises(ValueError, match="MINIMAX_API_KEY"):
+        _minimax_env()
+
+
+def test_minimax_env_scrubs_provider_state_and_uses_model_fallback(monkeypatch):
+    monkeypatch.setenv("MINIMAX_API_KEY", "key")
+    monkeypatch.setenv("DARK_FACTORY_MINIMAX_MODEL", "   ")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/home/operator/.claude")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "stale")
+
+    env = _minimax_env()
+
+    assert env["ANTHROPIC_API_KEY"] == "key"
+    assert env["ANTHROPIC_BASE_URL"] == "https://api.minimax.io/anthropic"
+    assert env["ANTHROPIC_MODEL"] == "MiniMax-M3"
+    assert "CLAUDE_CONFIG_DIR" not in env
+    assert "ANTHROPIC_AUTH_TOKEN" not in env
 
 
 # ---------------------------------------------------------------------------

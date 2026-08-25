@@ -32,6 +32,9 @@ digraph redgreen_claudeaf {
         type="codergen",
         label="Fix & Iterate",
         class="fix",
+        backend="claude",
+        explicit_claude_lane="true",
+        requires_claude_config="true",
         prompt="@prompts/slim/fix.md",
         max_visits="3",
         timeout=600

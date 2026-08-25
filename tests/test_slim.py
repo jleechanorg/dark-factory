@@ -96,6 +96,15 @@ def test_minimal_pr_has_research_node_on_coder_tier():
     assert research.attrs.get("prompt") == "@prompts/slim/research.md"
 
 
+def test_redgreen_claudeaf_fix_stays_on_explicit_claude_lane():
+    """A failed Claude gate must not silently reroute fix work to AO."""
+    graph = parse(ROOT / "pipelines" / "slim" / "redgreen_claudeaf.dot")
+    fix = graph.nodes["fix"].attrs
+    assert fix.get("backend") == "claude"
+    assert fix.get("explicit_claude_lane") == "true"
+    assert fix.get("requires_claude_config") == "true"
+
+
 def test_minimal_pr_factory_runs_with_deterministic_gates(monkeypatch, tmp_path):
     monkeypatch.setattr(handlers_mod, "_sandboxed_args", lambda args: args)
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", lambda node, ctx: Result(outcome="success", output="ok"))
@@ -161,4 +170,3 @@ def test_minimal_research_factory_runs_with_deterministic_gates(monkeypatch, tmp
         "gate_er",
         "exit",
     ]
-

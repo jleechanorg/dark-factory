@@ -251,8 +251,13 @@ Terminal stdout/stderr sample:
 Please analyze the root cause of this failure and generate a highly specific, evidence-backed prescription advising where to look (e.g. prompt template, holdout scenario, node config) and how to resolve it. Do not use generic placeholders.
 Your output must consist entirely of the prescription (no preamble, no conversational filler)."""
 
-        from .handlers import _sandboxed_args, _get_claude_executable, _sanitized_env
+        from .handlers import _get_claude_executable, _sandboxed_args, _scoped_claude_env
         import subprocess
+
+        try:
+            env = _scoped_claude_env()
+        except (AttributeError, ValueError) as exc:
+            return f"Error: Claude scope unavailable: {exc}"
 
         args = _sandboxed_args([_get_claude_executable(), "--print", "--dangerously-skip-permissions", "--setting-sources", "", prompt])
         if args is None:
@@ -267,7 +272,7 @@ Your output must consist entirely of the prescription (no preamble, no conversat
                 check=False,
                 stdin=subprocess.DEVNULL,
                 start_new_session=True,
-                env=_sanitized_env(),
+                env=env,
             )
             if proc.returncode == 0:
                 return proc.stdout.strip()
