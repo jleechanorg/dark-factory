@@ -4328,6 +4328,54 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         let is_test_repo = crate::config::is_fixture_repo(&repo);
 
         if overlay.state == OverlayState::Dispatched {
+            // PR #755 Slice 1: orphaned DISPATCHED overlays (BOTH
+            // `session_id == None` AND `pr_number == None`) must not strand
+            // forever. After `MAX_TRANSIENT_SPAWN_RETRY` cycles they park
+            // HUMAN_HELD with `TransientSpawnRetryCapExceeded` and emit a
+            // dedicated `DISPATCHED_NO_SESSION_OR_PR` telemetry event so
+            // the wedge is auditable from the daemon log alone. Live quota
+            // watchdog arms MUST be left untouched so the slow-tier wake
+            // sweep resumes the same session once its quota window resets.
+            if overlay.session_id.is_none() && overlay.pr_number.is_none() {
+                if crate::health::quota_watchdog::recorded_reset_at(bead_id).is_some() {
+                    // Already-armed quota session: leave the overlay
+                    // untouched. The quota_watchdog ledger still points
+                    // at the live pane; the wake sweep will resume it.
+                } else {
+                    // Each tick that observes the orphan counts as one
+                    // transient spawn failure (the dispatch→live-session
+                    // link is broken — same durable retry/cap state used
+                    // by the dispatch path). When the count reaches the
+                    // cap, park HUMAN_HELD so an operator can intervene
+                    // instead of letting the bead strand forever.
+                    overlay.spawn_failure_count += 1;
+                    if overlay.spawn_failure_count >= MAX_TRANSIENT_SPAWN_RETRY {
+                        overlay.state = OverlayState::HumanHeld;
+                        set_human_hold_reason(
+                            &mut overlay,
+                            HumanHoldReason::TransientSpawnRetryCapExceeded,
+                        );
+                        deps.store.save(&overlay)?;
+                        summary.beads_parked_human_held += 1;
+                        emit(
+                            deps.telemetry_log,
+                            bead_id,
+                            overlay.attempt,
+                            OverlayState::HumanHeld.as_str(),
+                            "DISPATCHED_NO_SESSION_OR_PR",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "spawn_failure_count": overlay.spawn_failure_count,
+                                "max_transient_spawn_retry": MAX_TRANSIENT_SPAWN_RETRY,
+                                "branch": overlay.branch,
+                            }),
+                        )?;
+                        continue;
+                    }
+                    deps.store.save(&overlay)?;
+                }
+            }
+
             if let Some(ref session_id_str) = overlay.session_id {
                 let sid = SessionId(session_id_str.clone());
                 if let Ok(Some(health_failure)) = deps.sessions.check_session_health(&sid) {
