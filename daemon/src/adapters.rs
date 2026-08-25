@@ -906,29 +906,33 @@ struct GhReviewCommit {
 ///
 /// An `APPROVED` review is green only when GitHub reports the exact current
 /// head commit as its reviewed commit. Older reviews (or payloads that omit
-/// the commit oid) are unknown rather than green. This keeps stale approvals
-/// from silently satisfying the gate after a push while preserving the
-/// existing red treatment for an explicit changes-requested review.
+/// the commit oid) are non-actionable and skipped while looking for the last
+/// substantive review. This keeps stale approvals from silently satisfying
+/// the gate after a push while preserving the existing red treatment for an
+/// explicit changes-requested review.
 fn coderabbit_status_for_head(reviews: &[GhReview], head_ref_oid: &str) -> &'static str {
-    let last_coderabbit_review = reviews
-        .iter()
-        .rfind(|r| r.author.login.contains("coderabbit") && r.state != "COMMENTED");
-
-    match last_coderabbit_review {
-        Some(r) if r.state == "APPROVED" => {
-            match r
-                .commit
-                .as_ref()
-                .and_then(|commit| commit.oid.as_ref())
-                .and_then(serde_json::Value::as_str)
-            {
-                Some(reviewed_oid) if reviewed_oid == head_ref_oid => "green",
-                _ => "unknown",
-            }
+    for review in reviews.iter().rev() {
+        if !review.author.login.contains("coderabbit") || review.state == "COMMENTED" {
+            continue;
         }
-        Some(r) if r.state == "CHANGES_REQUESTED" => "red",
-        Some(_) | None => "unknown",
+        match review.state.as_str() {
+            "APPROVED" => {
+                let reviewed_oid = review
+                    .commit
+                    .as_ref()
+                    .and_then(|commit| commit.oid.as_ref())
+                    .and_then(serde_json::Value::as_str);
+                if reviewed_oid == Some(head_ref_oid) {
+                    return "green";
+                }
+                // Stale/malformed approvals do not supersede an earlier
+                // substantive rejection (or exact-head approval).
+            }
+            "CHANGES_REQUESTED" => return "red",
+            _ => continue,
+        }
     }
+    "unknown"
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Clone)]
@@ -10140,6 +10144,24 @@ mod coderabbit_exact_head_tests {
     }
 
     #[test]
+    fn malformed_later_approval_does_not_erase_older_changes_requested() {
+        let malformed: GhReview = serde_json::from_str(
+            r#"{"author":{"login":"coderabbitai[bot]"},"state":"APPROVED","commit":{"oid":123}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            coderabbit_status_for_head(
+                &[
+                    review("CHANGES_REQUESTED", Some("head-2")),
+                    malformed,
+                ],
+                "head-2"
+            ),
+            "red"
+        );
+    }
+
+    #[test]
     fn latest_changes_requested_review_remains_red() {
         assert_eq!(
             coderabbit_status_for_head(
@@ -10971,6 +10993,21 @@ exit 1
           {"user":{"login":"coderabbitai[bot]"},"state":"CHANGES_REQUESTED","commit_id":"deadbeefcafefeed0123456789abcdef01234567"}
         ]"#;
         let snapshot = run_pr_snapshot_with_rest_reviews(reviews, 749)
+            .expect("REST fallback review payload should remain parseable");
+        assert_eq!(snapshot.coderabbit_status, "red");
+        assert!(!snapshot.coderabbit_approved);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn rest_reviews_ignore_malformed_later_approvals_after_changes_requested() {
+        let reviews = r#"[
+          {"user":{"login":"coderabbitai[bot]"},"state":"CHANGES_REQUESTED","commit_id":"deadbeefcafefeed0123456789abcdef01234567"},
+          {"user":{"login":"coderabbitai[bot]"},"state":"APPROVED","commit_id":null},
+          {"user":{"login":"coderabbitai[bot]"},"state":"APPROVED","commit_id":123},
+          {"user":{"login":"coderabbitai[bot]"},"state":"APPROVED","commit_id":{"oid":"not-a-string"}}
+        ]"#;
+        let snapshot = run_pr_snapshot_with_rest_reviews(reviews, 750)
             .expect("REST fallback review payload should remain parseable");
         assert_eq!(snapshot.coderabbit_status, "red");
         assert!(!snapshot.coderabbit_approved);
