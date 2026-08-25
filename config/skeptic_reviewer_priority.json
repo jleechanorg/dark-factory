@@ -1,6 +1,7 @@
 {
   "reviewer_priority": ["claudem", "agy", "cursor-agent"],
+  "gha_reviewer_priority": ["codex", "gemini"],
   "default_coder": "agy",
   "coder_fallback_chain": ["claudem"],
-  "_comment": "Single source of truth for daemon skeptic/er and GHA skeptic_gate_cli. Operator 2026-08-18: claudem (MiniMax via claude --print) -> agy -> cursor-agent. Gemini CLI and Codex are not default reviewers."
+  "_comment": "Daemon reviewer_priority is claudem (MiniMax) -> agy -> cursor-agent. Python/GHA uses the separately declared gha_reviewer_priority because only Codex and Gemini have tested isolated transports in skeptic_gate_cli."
 }

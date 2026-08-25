@@ -158,9 +158,19 @@ class VerifierDispatcher:
         The provenance / bind checks still run on the fallback result
         (see ``dispatch`` below) — the fallback path is NOT a bypass.
         """
-        from runner.reviewer_priority import skeptic_reviewer_priority
+        from runner.reviewer_priority import gha_reviewer_priority, skeptic_reviewer_priority
 
-        priority = list(skeptic_reviewer_priority())
+        # The Python/GHA transport capability set is intentionally separate
+        # from the daemon's vendor queue.  Keep explicit legacy rule pins
+        # chain-walkable for compatibility, while all configured defaults use
+        # only transports implemented by skeptic_gate_cli.invoke_reviewer.
+        gha_priority = list(gha_reviewer_priority())
+        daemon_priority = list(skeptic_reviewer_priority())
+        priority = (
+            gha_priority
+            if original_reviewer in gha_priority
+            else daemon_priority
+        )
         # The walker starts at the resolved reviewer's position in the
         # priority list. If the resolved reviewer is not in the list
         # (legacy rule pinning), we still try the resolved reviewer first
