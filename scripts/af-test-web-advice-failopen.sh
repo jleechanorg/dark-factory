@@ -87,8 +87,9 @@ rm -f "${CXDB_PATH}" "${CXDB_PATH}.tmp"
 # `--backend echo` is the documented smoke-test mode — codergen echoes
 # its prompt and returns success without burning tokens. The strict gates
 # (gate_skeptic / parallel_reviewer / gate_es / gate_er / gate_cs) use
-# their own backend_priority chain (codex,minimax,agy,claude-sonnet),
-# independent of --backend, so they will still attempt to call out.
+# their own backend_priority chain (codex,minimax,agy), independent of
+# --backend, so they will still attempt to call out. Claude remains an
+# explicit opt-in only and is not part of the default chain.
 # Failures in strict gates route to the fix loop; only after gate_cs
 # succeeds does web_advice run.
 INVOCATION=(

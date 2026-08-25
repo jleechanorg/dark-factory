@@ -63,6 +63,9 @@ def test_scoped_claude_env_scrubs_all_provider_overrides(monkeypatch, tmp_path):
     for key in (
         "CLAUDE_CONFIG_DIR",
         "MINIMAX_API_KEY",
+        "MINIMAX_BASE_URL",
+        "MINIMAX_MODEL",
+        "DARK_FACTORY_MINIMAX_MODEL",
         "CLAUDEM_MODE",
         "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL",
         "ANTHROPIC_BASE_URL",
@@ -77,7 +80,14 @@ def test_scoped_claude_env_scrubs_all_provider_overrides(monkeypatch, tmp_path):
 
     assert env["CLAUDE_CONFIG_DIR"] == str(config.resolve())
     assert not any(key.startswith("ANTHROPIC_") for key in env)
-    for key in ("MINIMAX_API_KEY", "CLAUDEM_MODE", "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL"):
+    for key in (
+        "MINIMAX_API_KEY",
+        "MINIMAX_BASE_URL",
+        "MINIMAX_MODEL",
+        "DARK_FACTORY_MINIMAX_MODEL",
+        "CLAUDEM_MODE",
+        "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL",
+    ):
         assert key not in env
 
 
@@ -92,6 +102,37 @@ def test_scoped_claude_env_rejects_symlink_to_personal_config(monkeypatch, tmp_p
 
     with pytest.raises(ValueError, match="personal ~/.claude"):
         _scoped_claude_env()
+
+
+@pytest.mark.parametrize("critical_name", [".credentials.json", "settings.json"])
+def test_scoped_claude_env_rejects_critical_symlink_into_personal_tree(
+    monkeypatch, tmp_path, critical_name
+):
+    home = tmp_path / "home"
+    personal = home / ".claude"
+    personal.mkdir(parents=True)
+    config = tmp_path / "project-config"
+    config.mkdir()
+    (personal / critical_name).write_text("personal\n")
+    (config / critical_name).symlink_to(personal / critical_name)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("DARK_FACTORY_CLAUDE_CONFIG_DIR", str(config))
+
+    with pytest.raises(ValueError, match="critical file"):
+        _scoped_claude_env()
+
+
+def test_scoped_claude_env_accepts_regular_independent_critical_files(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    config = tmp_path / "project-config"
+    config.mkdir()
+    for name in (".credentials.json", ".claude.json", "settings.json", "mcp-strict.json"):
+        (config / name).write_text("independent\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("DARK_FACTORY_CLAUDE_CONFIG_DIR", str(config))
+
+    assert _scoped_claude_env()["CLAUDE_CONFIG_DIR"] == str(config.resolve())
 
 
 @pytest.mark.parametrize("value", [None, "", "   "])
@@ -109,6 +150,8 @@ def test_minimax_env_scrubs_provider_state_and_uses_model_fallback(monkeypatch):
     monkeypatch.setenv("DARK_FACTORY_MINIMAX_MODEL", "   ")
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/home/operator/.claude")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "stale")
+    monkeypatch.setenv("MINIMAX_BASE_URL", "https://stale.minimax.example")
+    monkeypatch.setenv("MINIMAX_MODEL", "stale-minimax-model")
 
     env = _minimax_env()
 
@@ -117,6 +160,9 @@ def test_minimax_env_scrubs_provider_state_and_uses_model_fallback(monkeypatch):
     assert env["ANTHROPIC_MODEL"] == "MiniMax-M3"
     assert "CLAUDE_CONFIG_DIR" not in env
     assert "ANTHROPIC_AUTH_TOKEN" not in env
+    assert "MINIMAX_BASE_URL" not in env
+    assert "MINIMAX_MODEL" not in env
+    assert "DARK_FACTORY_MINIMAX_MODEL" not in env
 
 
 # ---------------------------------------------------------------------------

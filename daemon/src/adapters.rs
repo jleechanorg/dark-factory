@@ -7919,6 +7919,9 @@ fn run_minimax_judge(claude_bin: &str, prompt: &str) -> Result<String, DaemonErr
     .env_remove("ANTHROPIC_SMALL_FAST_MODEL")
     .env_remove("CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL")
     .env_remove("CLAUDEM_MODE")
+    .env_remove("MINIMAX_BASE_URL")
+    .env_remove("MINIMAX_MODEL")
+    .env_remove("DARK_FACTORY_MINIMAX_MODEL")
     .env_remove("MINIMAX_API_KEY");
 
     let output = cmd.output().map_err(|e| DaemonError::Tool {
@@ -8649,7 +8652,7 @@ mod chain_llm_fallback_argv_tests {
         let claude = dir.join("claude");
         std::fs::write(
             &claude,
-            "#!/bin/sh\nprintf 'args='; for arg in \"$@\"; do printf '<%s>' \"$arg\"; done; printf '\\nmodel=%s\\nbase=%s\\nkey=%s\\nauth=%s\\nconfig=%s\\n' \"$ANTHROPIC_MODEL\" \"$ANTHROPIC_BASE_URL\" \"$ANTHROPIC_API_KEY\" \"$ANTHROPIC_AUTH_TOKEN\" \"$CLAUDE_CONFIG_DIR\"\n",
+            "#!/bin/sh\nprintf 'args='; for arg in \"$@\"; do printf '<%s>' \"$arg\"; done; printf '\\nmodel=%s\\nbase=%s\\nkey=%s\\nauth=%s\\nconfig=%s\\nminimax_base=%s\\nminimax_model=%s\\ndark_minimax_model=%s\\n' \"$ANTHROPIC_MODEL\" \"$ANTHROPIC_BASE_URL\" \"$ANTHROPIC_API_KEY\" \"$ANTHROPIC_AUTH_TOKEN\" \"$CLAUDE_CONFIG_DIR\" \"$MINIMAX_BASE_URL\" \"$MINIMAX_MODEL\" \"$DARK_FACTORY_MINIMAX_MODEL\"\n",
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -8658,6 +8661,8 @@ mod chain_llm_fallback_argv_tests {
         let keys = [
             "MINIMAX_API_KEY",
             "DARK_FACTORY_MINIMAX_MODEL",
+            "MINIMAX_BASE_URL",
+            "MINIMAX_MODEL",
             "ANTHROPIC_MODEL",
             "ANTHROPIC_BASE_URL",
             "ANTHROPIC_API_KEY",
@@ -8676,6 +8681,8 @@ mod chain_llm_fallback_argv_tests {
             std::env::set_var("ANTHROPIC_API_KEY", "stale-direct-key");
             std::env::set_var("ANTHROPIC_AUTH_TOKEN", "stale-direct-token");
             std::env::set_var("CLAUDE_CONFIG_DIR", "/home/operator/.claude");
+            std::env::set_var("MINIMAX_BASE_URL", "https://stale.minimax.example");
+            std::env::set_var("MINIMAX_MODEL", "stale-minimax-model");
         }
 
         let result = run_minimax_judge(claude.to_str().unwrap(), "minimax-prompt");
@@ -8710,6 +8717,9 @@ mod chain_llm_fallback_argv_tests {
             output.contains("config=\n"),
             "direct Claude config leaked: {output}"
         );
+        for line in ["minimax_base=\n", "minimax_model=\n", "dark_minimax_model=\n"] {
+            assert!(output.contains(line), "MiniMax routing state leaked: {output}");
+        }
     }
 
     #[test]

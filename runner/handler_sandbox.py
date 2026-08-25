@@ -91,6 +91,12 @@ from typing import Optional, Union
 # ``visible_acceptance.md`` and ``spec.md`` are intentionally absent —
 # those are the *visible* contract the agent IS allowed to see.
 _SEALED_BENCHMARK_DOC_NAMES = ("README.md", "DESIGN.md", "SCORING.md", "SCENARIOS.md")
+_CLAUDE_CONFIG_CRITICAL_CHILDREN = (
+    ".credentials.json",
+    ".claude.json",
+    "settings.json",
+    "mcp-strict.json",
+)
 
 
 def _claude_config_dir() -> pathlib.Path:
@@ -116,6 +122,24 @@ def _claude_config_dir() -> pathlib.Path:
         raise ValueError(
             "DARK_FACTORY_CLAUDE_CONFIG_DIR must not resolve to the personal ~/.claude directory"
         )
+    personal_root = (pathlib.Path.home() / ".claude").resolve()
+    for name in _CLAUDE_CONFIG_CRITICAL_CHILDREN:
+        child = resolved / name
+        if not child.is_symlink():
+            continue
+        try:
+            target = child.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(
+                f"DARK_FACTORY_CLAUDE_CONFIG_DIR has an unresolved critical symlink: {child}"
+            ) from exc
+        try:
+            target.relative_to(personal_root)
+        except ValueError:
+            continue
+        raise ValueError(
+            f"DARK_FACTORY_CLAUDE_CONFIG_DIR critical file {child.name} resolves inside personal ~/.claude"
+        )
     return resolved
 
 
@@ -139,6 +163,9 @@ _CLAUDE_PROVIDER_ENV = frozenset(
         "CLAUDE_CONFIG_DIR",
         "CLAUDEM_MODE",
         "MINIMAX_API_KEY",
+        "MINIMAX_BASE_URL",
+        "MINIMAX_MODEL",
+        "DARK_FACTORY_MINIMAX_MODEL",
         "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL",
     }
 )

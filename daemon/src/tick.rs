@@ -3055,6 +3055,9 @@ pub(crate) const SKEPTIC_REVIEWER_PRIORITY: &[&str] = &["claudem", "agy", "curso
 const DIRECT_CLAUDE_PROVIDER_ENV: &[&str] = &[
     "CLAUDEM_MODE",
     "MINIMAX_API_KEY",
+    "MINIMAX_BASE_URL",
+    "MINIMAX_MODEL",
+    "DARK_FACTORY_MINIMAX_MODEL",
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_API_KEY",
@@ -3098,8 +3101,9 @@ fn direct_claude_config_dir() -> Result<std::path::PathBuf, DaemonError> {
         )
     })?;
     let home_claude = std::path::PathBuf::from(home).join(".claude");
-    if let Ok(default_dir) = std::fs::canonicalize(&home_claude) {
-        if resolved == default_dir {
+    let personal_root = std::fs::canonicalize(&home_claude).ok();
+    if let Some(default_dir) = personal_root.as_ref() {
+        if resolved == *default_dir {
             return Err(DaemonError::Config(
                 "DARK_FACTORY_CLAUDE_CONFIG_DIR must not resolve to the operator's ~/.claude directory"
                     .to_string(),
@@ -3113,6 +3117,41 @@ fn direct_claude_config_dir() -> Result<std::path::PathBuf, DaemonError> {
             "DARK_FACTORY_CLAUDE_CONFIG_DIR must not point to the operator's ~/.claude directory"
                 .to_string(),
         ));
+    }
+    for name in [
+        ".credentials.json",
+        ".claude.json",
+        "settings.json",
+        "mcp-strict.json",
+    ] {
+        let child = resolved.join(name);
+        let metadata = match std::fs::symlink_metadata(&child) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(DaemonError::Config(format!(
+                    "could not inspect Claude config child {}: {error}",
+                    child.display()
+                )))
+            }
+        };
+        if !metadata.file_type().is_symlink() {
+            continue;
+        }
+        let target = std::fs::canonicalize(&child).map_err(|error| {
+            DaemonError::Config(format!(
+                "DARK_FACTORY_CLAUDE_CONFIG_DIR has an unresolved critical symlink {}: {error}",
+                child.display()
+            ))
+        })?;
+        if personal_root
+            .as_ref()
+            .is_some_and(|personal| target.starts_with(personal))
+        {
+            return Err(DaemonError::Config(format!(
+                "DARK_FACTORY_CLAUDE_CONFIG_DIR critical file {name} resolves inside personal ~/.claude"
+            )));
+        }
     }
     Ok(resolved)
 }
@@ -3172,6 +3211,9 @@ pub(crate) fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, Da
             const MINIMAX_PROVIDER_ENV: &[&str] = &[
                 "CLAUDE_CONFIG_DIR",
                 "MINIMAX_API_KEY",
+                "MINIMAX_BASE_URL",
+                "MINIMAX_MODEL",
+                "DARK_FACTORY_MINIMAX_MODEL",
                 "ANTHROPIC_BASE_URL",
                 "ANTHROPIC_AUTH_TOKEN",
                 "ANTHROPIC_API_KEY",
@@ -3239,7 +3281,7 @@ pub(crate) fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, Da
 
 #[cfg(test)]
 mod direct_claude_scope_tests {
-    use super::dispatch_reviewer;
+    use super::{direct_claude_config_dir, dispatch_reviewer};
     use std::sync::Mutex;
 
     fn env_lock() -> &'static Mutex<()> {
@@ -3359,6 +3401,61 @@ mod direct_claude_scope_tests {
 
     #[test]
     #[cfg(unix)]
+    fn direct_claude_config_rejects_critical_symlinks_into_personal_tree() {
+        let _guard = env_lock().lock().unwrap();
+        for name in [".credentials.json", "settings.json"] {
+            let root = std::env::temp_dir().join(format!(
+                "afd_direct_claude_critical_link_{}_{}",
+                std::process::id(),
+                name.replace('.', "_")
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let personal = root.join("home").join(".claude");
+            let scoped = root.join("project-claude");
+            std::fs::create_dir_all(&personal).unwrap();
+            std::fs::create_dir_all(&scoped).unwrap();
+            std::fs::write(personal.join(name), "personal\n").unwrap();
+            std::os::unix::fs::symlink(personal.join(name), scoped.join(name)).unwrap();
+
+            let _env = EnvRestore::capture(&["HOME", "DARK_FACTORY_CLAUDE_CONFIG_DIR"]);
+            EnvRestore::set("HOME", root.join("home"));
+            EnvRestore::set("DARK_FACTORY_CLAUDE_CONFIG_DIR", &scoped);
+            assert!(
+                direct_claude_config_dir().is_err(),
+                "critical symlink {name} into personal config must fail closed"
+            );
+            drop(_env);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn direct_claude_config_accepts_independent_regular_files() {
+        let _guard = env_lock().lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "afd_direct_claude_regular_config_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let personal = root.join("home").join(".claude");
+        let scoped = root.join("project-claude");
+        std::fs::create_dir_all(&personal).unwrap();
+        std::fs::create_dir_all(&scoped).unwrap();
+        for name in [".credentials.json", ".claude.json", "settings.json", "mcp-strict.json"] {
+            std::fs::write(scoped.join(name), "independent\n").unwrap();
+        }
+
+        let _env = EnvRestore::capture(&["HOME", "DARK_FACTORY_CLAUDE_CONFIG_DIR"]);
+        EnvRestore::set("HOME", root.join("home"));
+        EnvRestore::set("DARK_FACTORY_CLAUDE_CONFIG_DIR", &scoped);
+        let resolved = direct_claude_config_dir().expect("regular independent config is valid");
+        assert_eq!(resolved, std::fs::canonicalize(&scoped).unwrap());
+        drop(_env);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn direct_claude_reviewer_scrubs_minimax_provider_environment() {
         let _guard = env_lock().lock().unwrap();
         let root =
@@ -3373,7 +3470,7 @@ mod direct_claude_scope_tests {
         let claude = bin.join("claude");
         std::fs::write(
             &claude,
-            "#!/bin/sh\nprintf 'config=%s\\nbase=%s\\napi=%s\\nauth=%s\\nmodel=%s\\nmode=%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$ANTHROPIC_BASE_URL\" \"$ANTHROPIC_API_KEY\" \"$ANTHROPIC_AUTH_TOKEN\" \"$ANTHROPIC_MODEL\" \"$CLAUDEM_MODE\"\n",
+            "#!/bin/sh\nprintf 'config=%s\\nbase=%s\\napi=%s\\nauth=%s\\nmodel=%s\\nmode=%s\\nminimax_base=%s\\nminimax_model=%s\\ndark_minimax_model=%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$ANTHROPIC_BASE_URL\" \"$ANTHROPIC_API_KEY\" \"$ANTHROPIC_AUTH_TOKEN\" \"$ANTHROPIC_MODEL\" \"$CLAUDEM_MODE\" \"$MINIMAX_BASE_URL\" \"$MINIMAX_MODEL\" \"$DARK_FACTORY_MINIMAX_MODEL\"\n",
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -3388,6 +3485,9 @@ mod direct_claude_scope_tests {
             "ANTHROPIC_AUTH_TOKEN",
             "ANTHROPIC_MODEL",
             "CLAUDEM_MODE",
+            "MINIMAX_BASE_URL",
+            "MINIMAX_MODEL",
+            "DARK_FACTORY_MINIMAX_MODEL",
         ]);
         EnvRestore::set("PATH", &bin);
         EnvRestore::set("HOME", &home);
@@ -3397,6 +3497,9 @@ mod direct_claude_scope_tests {
         EnvRestore::set("ANTHROPIC_AUTH_TOKEN", "stale-minimax-token");
         EnvRestore::set("ANTHROPIC_MODEL", "MiniMax-M3");
         EnvRestore::set("CLAUDEM_MODE", "1");
+        EnvRestore::set("MINIMAX_BASE_URL", "https://stale.minimax.example");
+        EnvRestore::set("MINIMAX_MODEL", "stale-minimax-model");
+        EnvRestore::set("DARK_FACTORY_MINIMAX_MODEL", "stale-minimax-model");
 
         let result =
             dispatch_reviewer("claude", "scope-test").expect("scoped Claude shim succeeds");
@@ -3407,7 +3510,16 @@ mod direct_claude_scope_tests {
             result.contains(&format!("config={expected_config}")),
             "{result}"
         );
-        for line in ["base=", "api=", "auth=", "model=", "mode="] {
+        for line in [
+            "base=",
+            "api=",
+            "auth=",
+            "model=",
+            "mode=",
+            "minimax_base=",
+            "minimax_model=",
+            "dark_minimax_model=",
+        ] {
             assert!(
                 result.lines().any(|candidate| candidate == line),
                 "{line:?} leaked in {result:?}"
@@ -3457,7 +3569,7 @@ mod direct_claude_scope_tests {
         let claude = bin.join("claude");
         std::fs::write(
             &claude,
-            "#!/bin/sh\nprintf 'config=%s\\nbase=%s\\napi=%s\\nauth=%s\\nmodel=%s\\nsmall=%s\\nmode=%s\\nargs=' \"$CLAUDE_CONFIG_DIR\" \"$ANTHROPIC_BASE_URL\" \"$ANTHROPIC_API_KEY\" \"$ANTHROPIC_AUTH_TOKEN\" \"$ANTHROPIC_MODEL\" \"$ANTHROPIC_SMALL_FAST_MODEL\" \"$CLAUDEM_MODE\"; for arg in \"$@\"; do printf '<%s>' \"$arg\"; done; printf '\\n'\n",
+            "#!/bin/sh\nprintf 'config=%s\\nbase=%s\\napi=%s\\nauth=%s\\nmodel=%s\\nsmall=%s\\nmode=%s\\nminimax_base=%s\\nminimax_model=%s\\ndark_minimax_model=%s\\nargs=' \"$CLAUDE_CONFIG_DIR\" \"$ANTHROPIC_BASE_URL\" \"$ANTHROPIC_API_KEY\" \"$ANTHROPIC_AUTH_TOKEN\" \"$ANTHROPIC_MODEL\" \"$ANTHROPIC_SMALL_FAST_MODEL\" \"$CLAUDEM_MODE\" \"$MINIMAX_BASE_URL\" \"$MINIMAX_MODEL\" \"$DARK_FACTORY_MINIMAX_MODEL\"; for arg in \"$@\"; do printf '<%s>' \"$arg\"; done; printf '\\n'\n",
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -3473,6 +3585,9 @@ mod direct_claude_scope_tests {
             "ANTHROPIC_MODEL",
             "ANTHROPIC_SMALL_FAST_MODEL",
             "CLAUDEM_MODE",
+            "MINIMAX_BASE_URL",
+            "MINIMAX_MODEL",
+            "DARK_FACTORY_MINIMAX_MODEL",
         ]);
         EnvRestore::set("PATH", &bin);
         EnvRestore::set("CLAUDE_CONFIG_DIR", "/home/operator/.claude");
@@ -3483,18 +3598,28 @@ mod direct_claude_scope_tests {
         EnvRestore::set("ANTHROPIC_MODEL", "personal-model");
         EnvRestore::set("ANTHROPIC_SMALL_FAST_MODEL", "personal-fast");
         EnvRestore::set("CLAUDEM_MODE", "stale");
+        EnvRestore::set("MINIMAX_BASE_URL", "https://stale.minimax.example");
+        EnvRestore::set("MINIMAX_MODEL", "stale-minimax-model");
+        EnvRestore::set("DARK_FACTORY_MINIMAX_MODEL", "MiniMax-Test-Model");
 
         let result = dispatch_reviewer("minimax", "scope-test").expect("MiniMax shim succeeds");
         let _ = std::fs::remove_dir_all(&root);
 
-        for line in ["config=", "auth=", "mode="] {
+        for line in [
+            "config=",
+            "auth=",
+            "mode=",
+            "minimax_base=",
+            "minimax_model=",
+            "dark_minimax_model=",
+        ] {
             assert!(result.lines().any(|candidate| candidate == line), "{line:?}: {result}");
         }
         assert!(result.contains("base=https://api.minimax.io/anthropic"), "{result}");
         assert!(result.contains("api=minimax-key"), "{result}");
-        assert!(result.contains("model=MiniMax-M3"), "{result}");
+        assert!(result.contains("model=MiniMax-Test-Model"), "{result}");
         assert!(result.contains("small="), "{result}");
-        assert!(result.contains("<--model><MiniMax-M3>"), "{result}");
+        assert!(result.contains("<--model><MiniMax-Test-Model>"), "{result}");
     }
 }
 

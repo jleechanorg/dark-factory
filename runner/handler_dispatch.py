@@ -10,7 +10,7 @@ Owns:
   * `_is_gate_infra_failure` — detect sandbox/timeout/missing-binary vs real
     verdict.
   * `_DEFAULT_ADVERSARIAL_PRIORITY` — default queue
-    ``["codex", "minimax", "agy", "claude-sonnet"]``.
+    ``["codex", "minimax", "agy"]``.
   * `_parse_priority_env` — parse ``DARK_FACTORY_ADVERSARIAL_PRIORITY``.
   * `_probe_backend_installed` — ``which <name>`` + ``<name> --version`` with
     5s ceiling.
