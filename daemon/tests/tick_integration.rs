@@ -10730,6 +10730,129 @@ fn tick_resets_reroll_deferral_when_fresh_attempt_pr_opens() {
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+/// PR #755 Slice 2: a bead left `RE_ROLL` after a daemon crash (no session was
+/// ever spawned — `execute` set the state but `execute_adopted` never reached
+/// the `DISPATCHING` save) must NOT strand forever in RE_ROLL. The fast tier's
+/// `if overlay.state != OverlayState::Attested` filter (tick.rs line ~4819)
+/// skips non-ATTESTED overlays, so an orphan RE_ROLL overlay is invisible to
+/// gate assessment AND to the reroll lane. After restart, the durable state
+/// MUST resume the existing reroll path with existing bounds: demote the
+/// stranded RE_ROLL back to ATTESTED so the reroll lane re-fires
+/// `reroll::execute` (which still accepts ATTESTED|RE_ROLL via its freshness
+/// guard), and emit `REROLL_RESUMED_AFTER_RESTART` telemetry so the operator
+/// can audit the recovery from the daemon log alone.
+#[test]
+fn tick_resumes_stranded_reroll_overlay_after_restart() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let vcs = test_vcs();
+    let cfg = reroll_stage2_cfg();
+
+    // Simulate a daemon that crashed AFTER `reroll::execute`'s `state = ReRoll`
+    // save (reroll.rs line ~338) but BEFORE `execute_adopted`'s
+    // `state = Dispatching` save (reroll.rs line ~1414). No coder session was
+    // ever spawned; the bead is stranded in RE_ROLL with no live worker.
+    let branch = format!("factory/reroll-resume-r2");
+    store
+        .save(&BeadOverlay {
+            bead_id: "reroll-resume".into(),
+            state: OverlayState::ReRoll,
+            attempt: 2,
+            reroll_count: 1,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(6001),
+            branch: Some(branch.clone()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        })
+        .unwrap();
+    store.register_branch("reroll-resume", &branch).unwrap();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    scm.pr_snapshots.insert(
+        6001,
+        PrSnapshot {
+            pr_number: 6001,
+            ci_success: false, // -> CI gate RED -> reroll lane
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "deadbeef".into(),
+            body: "".into(),
+            comments: vec![PrComment {
+                author: "reviewer".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: now,
+            }],
+            files: vec![],
+            updated_at_epoch: now,
+            ci_status: "red".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: now.saturating_sub(60),
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_reroll_resume_after_restart.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        1,
+        0,
+    )
+    .expect("tick should resume the stranded RE_ROLL overlay");
+
+    let overlay = store.load("reroll-resume").unwrap().unwrap();
+    assert_ne!(
+        overlay.state,
+        OverlayState::ReRoll,
+        "stranded RE_ROLL overlay must NOT remain RE_ROLL after the tick \
+         (would be invisible to the reroll lane and strand forever); got {:?}",
+        overlay.state
+    );
+
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("REROLL_RESUMED_AFTER_RESTART"),
+        "REROLL_RESUMED_AFTER_RESTART telemetry must be emitted so the recovery \
+         is auditable from the daemon log alone; full log: {log}"
+    );
+    assert!(
+        summary.gates_assessed >= 1,
+        "resumed bead must be gate-assessed (reroll lane must reach the bead); \
+         got gates_assessed={}",
+        summary.gates_assessed
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
 // jleechan-park-leaves-zombie-session-mh9o: regression for the U4-class
 // zero-touch blocker where every PARKED_* transition leaked its AO session.
 //

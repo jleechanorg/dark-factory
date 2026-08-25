@@ -4816,6 +4816,41 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         if entered_as_ready {
             overlay.state = OverlayState::Attested; // in-memory only (NOT saved)
         }
+        // PR #755 Slice 2: restart-safe continuation of a stranded `RE_ROLL`
+        // overlay. `reroll::execute` persists `state = RE_ROLL` before its
+        // pre-spawn work; if the daemon crashes between that save and
+        // `execute_adopted`'s `state = Dispatching` save, the bead sits in
+        // RE_ROLL with `session_id == None` after restart. The fast-tier
+        // ATTESTED-only filter below would skip it forever — invisible to
+        // gate assessment AND to the reroll lane. Re-promote the stranded
+        // RE_ROLL back to ATTESTED so `reroll::execute`'s freshness guard
+        // (which accepts both ATTESTED and RE_ROLL) re-fires on the next
+        // iteration with the existing `MAX_REROLL_DEFERRALS` /
+        // `MAX_HUMAN_HELD_RECOVERY_ATTEMPT` bounds intact. Persist the
+        // demotion so a SECOND restart does not re-trip the recovery, and
+        // emit `REROLL_RESUMED_AFTER_RESTART` so the operator can audit
+        // the recovery from the daemon log alone. A RE_ROLL overlay with
+        // `session_id != None` is NOT stranded (the spawn succeeded but
+        // the post-spawn save failed) — leave it for the DISPATCHED wedge
+        // path, which uses the live session handle.
+        if overlay.state == OverlayState::ReRoll && overlay.session_id.is_none() {
+            overlay.state = OverlayState::Attested;
+            deps.store.save(&overlay)?;
+            emit(
+                deps.telemetry_log,
+                bead_id,
+                overlay.attempt,
+                OverlayState::Attested.as_str(),
+                "REROLL_RESUMED_AFTER_RESTART",
+                serde_json::json!({}),
+                serde_json::json!({
+                    "prior_state": OverlayState::ReRoll.as_str(),
+                    "branch": overlay.branch,
+                    "pr_number": overlay.pr_number,
+                    "reroll_count": overlay.reroll_count,
+                }),
+            )?;
+        }
         if overlay.state != OverlayState::Attested {
             continue;
         }
