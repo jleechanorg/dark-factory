@@ -382,9 +382,11 @@ fn extractor_outage_precedes_factory_reroll_supersession() {
         pre_session_head_sha: None, park_reason: None, target_repo: None, attempt_started_at: None,
     };
     store.save(&bead).unwrap();
+    sessions.attach_not_found_for("factory/bead-extractor-outage-r1");
     let deps = RerollDeps { scm: &scm, sessions: &sessions, vcs: &vcs, store: &store,
         llm: &llm, cfg: &cfg, telemetry_log: &telemetry_log, reviewer: "reviewer".into(), review_text: "untrusted feedback".into() };
-    assert!(reroll::execute(&deps, &mut bead).is_err());
+    let outcome = reroll::execute(&deps, &mut bead);
+    assert!(outcome.is_err(), "expected extractor outage, got {outcome:?}; LLM calls: {:?}", llm.calls.borrow());
     assert!(vcs.calls.borrow().is_empty(), "extractor failure must precede VCS branch/base effects");
     assert!(scm.calls.borrow().is_empty(), "extractor failure must precede PR closure");
     assert!(store.branches.borrow().is_empty(), "extractor failure must not register a replacement branch");
