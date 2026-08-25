@@ -557,6 +557,23 @@ while read -r num branch; do
   checks_reason="$(checks_all_green "$num" "$live_head_sha")"
   checks_rc=$?
   if [ "$checks_rc" -ne 0 ]; then
+    _runner_probe_output="$(scripts/check_runner_health.sh "$REPO" 2>&1)"
+    _runner_probe_rc=$?
+    if [ "$_runner_probe_rc" -eq 3 ]; then
+      _runner_warning="RUNNER FLEET DOWN — wait for org runner recovery; merge policy remains enforced"
+      echo "PR $num: $_runner_warning"
+      _runner_comments="$(gh pr view "$num" --repo "$REPO" --comments --json comments --jq '.comments[].body' 2>/dev/null)"
+      _runner_comments_rc=$?
+      if [ "$_runner_comments_rc" -ne 0 ]; then
+        echo "PR $num: RUNNER WARNING DEDUP INCONCLUSIVE — comment lookup failed; not posting"
+      elif [[ "$_runner_comments" != *"$_runner_warning"* ]]; then
+        gh pr comment "$num" --repo "$REPO" --body "$_runner_warning" 2>/dev/null || true
+      fi
+    elif [ "$_runner_probe_rc" -eq 1 ]; then
+      echo "PR $num: RUNNER SELECTOR DRIFT — configured labels match no online org runner"
+    elif [ "$_runner_probe_rc" -ne 0 ]; then
+      echo "PR $num: RUNNER STATUS INCONCLUSIVE — not classifying as an outage"
+    fi
     echo "PR $num: CI not green ($checks_reason) — skip"; continue
   fi
   verdict="$(latest_assessment_no_red "$num" "$live_head_sha")" || { echo "PR $num: verifier assessment ${verdict:-missing} — refusing merge (green CI is insufficient)"; continue; }
