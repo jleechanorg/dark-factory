@@ -473,7 +473,7 @@ For day-to-day work, the factory runs with the `--backend ao` default (configure
     `model_stylesheet` > `--backend`, so this is independent and non-overridable by the
     coder's `--backend`). Requires `codex` installed; override path is in
     [docs/pipeline-selection.md](docs/pipeline-selection.md#independent-reviewer-adversarial-by-default).
-*   **Adversarial-review priority queue:** `codex > minimax > agy > claude-sonnet` (set
+*   **Adversarial-review priority queue:** `codex > minimax > agy` (set
     `DARK_FACTORY_ADVERSARIAL_PRIORITY` env var to override). The queue is the **first**
     adversarial pass — chosen at run-config time, *not* a retry cascade. A real
     `fail|partial` from the chosen reviewer is authoritative and is never retried on a
