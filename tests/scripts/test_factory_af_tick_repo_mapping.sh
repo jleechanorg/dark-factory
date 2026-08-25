@@ -45,8 +45,9 @@
 # daemon binary, so a real invocation needs this stubbed to stay portable).
 #
 # This test inserts a bead with branch=NULL and a real, config-mapped
-# target_repo and asserts dispatch is attempted against the REAL script
-# (no false "no repo mapping" skip).
+# target_repo. Issue #743 now correctly blocks it before AO spawn because an
+# exact branch is required for worktree ownership preflight; it must still
+# reach that preflight (not be falsely skipped as an unmapped repository).
 #
 # Run with: bash tests/scripts/test_factory_af_tick_repo_mapping.sh
 set -euo pipefail
@@ -179,8 +180,8 @@ case "$out" in
 esac
 
 fake_calls="$(grep -c 'fake-R.*called' "$FAKE_R_LOG" || true)"
-assert "rev-wzrh: dispatch attempted (fake-R called) for NULL-branch bead" "1" "$fake_calls"
-assert_grep "rev-wzrh: fake-R received the correct (unshifted) target_repo" 'repo=jleechanorg/worldarchitect\.ai proj=worldarchitect' "$FAKE_R_LOG"
+assert "issue #743: NULL branch does not invoke AO remediation" "0" "$fake_calls"
+assert_grep "issue #743: NULL branch gets structured missing_branch telemetry" '"eventType": "TASK_DISPATCH_BLOCKED".*"reason": "missing_branch"' "$AFD_LOG"
 
 echo
 echo "=== RESULTS: $PASS passed, $FAIL failed ==="

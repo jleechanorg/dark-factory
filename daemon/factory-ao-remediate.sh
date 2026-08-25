@@ -41,6 +41,8 @@
 #                             optimistically (default 5). Most auth/project
 #                             errors fail within 1-2s; cold-start slow spawns
 #                             exceed this bound and proceed optimistically.
+#   AFD_REQUIRE_SESSION=1     sync callers require a visible, active
+#                             project-scoped AO session before accepting spawn
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export AO_MAX_CONCURRENT_SESSIONS="${AO_MAX_CONCURRENT_SESSIONS:-30}"
@@ -166,6 +168,21 @@ classify_spawn_outcome() {
   return 1
 }
 
+verify_active_session() {
+  # A zero exit from `ao spawn` only means the CLI accepted the request. The
+  # factory's DISPATCHED state is stronger: an AO session for this exact PR
+  # must be visible and active. Scope every query to the selected project.
+  local sessions
+  for _ in 1 2 3 4 5; do
+    sessions="$("$AO" session ls -p "$AO_PROJECT" 2>/dev/null || true)"
+    if printf '%s\n' "$sessions" | grep -E "pulls/${PR}\\b" | grep -Eq '\[(spawning|running|active|working|pr_open)\]'; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 # ---------- SYNC PATH (original blocking behavior) ----------
 if [ "$MODE" = "sync" ]; then
   MINIMAX_SYNC="$ROOT/daemon/factory-ao-minimax-sync.sh"
@@ -185,10 +202,14 @@ if [ "$MODE" = "sync" ]; then
   result="$(run_spawn_foreground)"
   rc="${result%%$'\t'*}"
   out="${result#*$'\t'}"
-  if classify_spawn_outcome "$rc" "$out" >/dev/null; then
+  if classify_spawn_outcome "$rc" "$out" >/dev/null \
+     && { [ "${AFD_REQUIRE_SESSION:-0}" != "1" ] || verify_active_session; }; then
     [ "$rc" -eq 0 ] || echo "[remediate] spawn accepted for PR #$PR (timeout=${SPAWN_TIMEOUT}s, rc=$rc)" >&2
     echo "$out"
     exit 0
+  fi
+  if [ "${AFD_REQUIRE_SESSION:-0}" = "1" ]; then
+    echo "[remediate] spawn for PR #$PR has no verified active AO session; refusing dispatch acknowledgement" >&2
   fi
   echo "$out" >&2
   exit 1

@@ -15,6 +15,7 @@
 #   route-record <id> <PATH> [n]  — record LLM route verdict (SMALL|STANDARD)
 #   capacity                      — print dispatchable slot count this tick
 #   dispatch-record <id> <branch> — QUEUED → DISPATCHED; register branch owner
+#   dispatch-blocked <id> <reason> <context-json> — retain QUEUED with telemetry
 #   pr-opened <id> <n> <url>      — DISPATCHED → ATTESTED
 #   autonomy-tick <secs>          — bump autonomy_secs; warn/park at threshold
 #   gate-assessment <id> <pr> <j> — record 7-gate verdict; emit READY hint
@@ -231,6 +232,21 @@ dispatch-record)
   cur_attempt="$(get_field "$2" attempt)"
   emit "$2" "$cur_attempt" DISPATCHED TASK_DISPATCHED "{\"activeModel\":\"minimax\",\"branch\":$(js "$3")}"
   echo "ok"
+  ;;
+
+dispatch-blocked)
+  # A dispatch preflight can establish that AO cannot safely claim the PR
+  # (for example, its branch is checked out by another worktree). Keep the
+  # bead retryable rather than creating a false DISPATCHED acknowledgement.
+  [ $# -eq 4 ] || die "usage: dispatch-blocked <bead_id> <reason> <context-json>"
+  valid_bead_id "$2"
+  [[ "$3" =~ ^[a-z0-9_]+$ ]] || die_code $EX_VALID_INPUT "invalid dispatch block reason: $3"
+  require_state "$2" QUEUED
+  printf '%s' "$4" | python3 -c 'import json,sys; json.load(sys.stdin)' >/dev/null 2>&1 \
+    || die_code $EX_VALID_INPUT "dispatch-blocked context must be JSON"
+  cur_attempt="$(get_field "$2" attempt)"
+  emit "$2" "$cur_attempt" QUEUED TASK_DISPATCH_BLOCKED "$4"
+  echo "blocked"
   ;;
 
 pr-opened)

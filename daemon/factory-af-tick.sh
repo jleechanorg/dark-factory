@@ -347,6 +347,51 @@ PY
         continue
     fi
 
+    # A claim-pr spawn must receive an exact target checkout so we can prove
+    # no other worktree owns the requested branch before DISPATCHED is ever
+    # recorded. AO itself creates its managed isolated worktree when the
+    # branch is free; the legacy CLI provides no safe "reuse this arbitrary
+    # worktree" argument, so a pre-existing checkout is a fail-closed block.
+    checkout="$(python3 - "$CONFIG" "$repo" <<'PY'
+import sys, toml
+try:
+    cfg = toml.load(sys.argv[1])
+except Exception:
+    cfg = {}
+repo = sys.argv[2]
+entry = (cfg.get("repos") or {}).get(repo) or {}
+print(entry.get("local_checkout", ""))
+PY
+)"
+    block_reason=""
+    block_detail=""
+    if [ -z "$branch" ]; then
+        block_reason="missing_branch"
+        block_detail="no exact branch was recorded for this PR"
+    elif [ -z "$checkout" ] || ! git -C "$checkout" rev-parse --git-dir >/dev/null 2>&1; then
+        block_reason="target_checkout_unavailable"
+        block_detail="configured local_checkout is required for worktree ownership preflight"
+    else
+        owner_path="$(git -C "$checkout" worktree list --porcelain 2>/dev/null | awk -v want="refs/heads/$branch" '
+          /^worktree / { path=substr($0, 10) }
+          /^branch / && substr($0, 8) == want { print path; exit }
+        ')"
+        if [ -n "$owner_path" ]; then
+            block_reason="branch_checked_out"
+            block_detail="branch is checked out at $owner_path"
+        fi
+    fi
+    if [ -n "$block_reason" ]; then
+        block_ctx="$(python3 - "$pr" "$branch" "$repo" "$block_reason" "$block_detail" <<'PY'
+import json, sys
+print(json.dumps({"pr_number": int(sys.argv[1]), "branch": sys.argv[2], "repo": sys.argv[3], "reason": sys.argv[4], "detail": sys.argv[5]}))
+PY
+)"
+        "$O" dispatch-blocked "$bead_id" "$block_reason" "$block_ctx" >/dev/null || true
+        echo "[af] dispatch blocked $bead_id: $block_reason ($block_detail)" >&2
+        continue
+    fi
+
     if [ -n "$AO" ] && "$AO" session ls -p "$proj" 2>/dev/null | rg "pulls/${pr}\\b" | rg -q '\[(spawning|running|active|working|pr_open)\]'; then
         echo "[af] skip $bead_id PR #$pr (active session exists in project $proj)" >&2
         continue
@@ -354,7 +399,9 @@ PY
     echo "[af] remediate $bead_id PR #$pr on $repo in project $proj"
     # CX-2: thread proj and repo through to factory-ao-remediate.sh so the spawned
     # session lives in the same AO project.
-    if bash "$R" "$bead_id" "$pr" "$repo" "$proj" 2>&1; then
+    # Do not accept async/pending acknowledgement here. The remediation
+    # wrapper must return only after its project-scoped session verification.
+    if SYNC=1 AFD_REQUIRE_SESSION=1 bash "$R" "$bead_id" "$pr" "$repo" "$proj" 2>&1; then
         cur_state="$(sqlite3 "$DB" "SELECT state FROM bead_overlay WHERE bead_id='$(printf "%s" "$bead_id" | sed "s/'/''/g")';" 2>/dev/null || true)"
         if [ "$cur_state" = "QUEUED" ]; then
             if [ -n "$branch" ]; then
