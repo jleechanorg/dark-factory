@@ -885,6 +885,42 @@ struct GhPrView {
 struct GhReview {
     author: GhAuthor,
     state: String,
+    /// Commit reviewed by this review. `gh pr view --json reviews` exposes
+    /// this as `commit.oid`; the REST fallback maps its `commit_id` field to
+    /// the same representation. A missing oid is intentionally preserved as
+    /// `None` so an approval cannot be treated as current by accident.
+    #[serde(default)]
+    commit: Option<GhReviewCommit>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
+struct GhReviewCommit {
+    #[serde(default)]
+    oid: Option<String>,
+}
+
+/// Classify the latest non-comment CodeRabbit review for a PR head.
+///
+/// An `APPROVED` review is green only when GitHub reports the exact current
+/// head commit as its reviewed commit. Older reviews (or payloads that omit
+/// the commit oid) are unknown rather than green. This keeps stale approvals
+/// from silently satisfying the gate after a push while preserving the
+/// existing red treatment for an explicit changes-requested review.
+fn coderabbit_status_for_head(reviews: &[GhReview], head_ref_oid: &str) -> &'static str {
+    let last_coderabbit_review = reviews
+        .iter()
+        .rfind(|r| r.author.login.contains("coderabbit") && r.state != "COMMENTED");
+
+    match last_coderabbit_review {
+        Some(r) if r.state == "APPROVED" => {
+            match r.commit.as_ref().and_then(|commit| commit.oid.as_deref()) {
+                Some(reviewed_oid) if reviewed_oid == head_ref_oid => "green",
+                _ => "unknown",
+            }
+        }
+        Some(r) if r.state == "CHANGES_REQUESTED" => "red",
+        Some(_) | None => "unknown",
+    }
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Clone)]
@@ -977,6 +1013,8 @@ impl CliScm {
         struct RestReview {
             user: Option<RestUser>,
             state: String,
+            #[serde(default)]
+            commit_id: Option<String>,
         }
         #[derive(serde::Deserialize)]
         struct RestUser {
@@ -1018,6 +1056,7 @@ impl CliScm {
                         login: r.user.map(|u| u.login).unwrap_or_default(),
                     },
                     state: r.state,
+                    commit: r.commit_id.map(|oid| GhReviewCommit { oid: Some(oid) }),
                 })
                 .collect(),
             head_ref_oid: rest_pr.head.sha,
@@ -2108,21 +2147,7 @@ impl Scm for CliScm {
         // `GateResult::Unknown` (transient) rather than `Red` (conflict).
         let merge_state_unknown = view.mergeable == "UNKNOWN";
 
-        let last_coderabbit_review = view.reviews.iter()
-            .rfind(|r| r.author.login.contains("coderabbit") && r.state != "COMMENTED");
-
-        let coderabbit_status = match last_coderabbit_review {
-            Some(r) => {
-                if r.state == "APPROVED" {
-                    "green".to_string()
-                } else if r.state == "CHANGES_REQUESTED" {
-                    "red".to_string()
-                } else {
-                    "unknown".to_string()
-                }
-            }
-            None => "unknown".to_string(),
-        };
+        let coderabbit_status = coderabbit_status_for_head(&view.reviews, &view.head_ref_oid).to_string();
         let coderabbit_approved = coderabbit_status == "green";
 
         let checks_out = if gql_limited || is_graphql_rate_limited() {
@@ -10028,6 +10053,70 @@ pub fn ci_success_from_check_buckets(buckets: &[&str], iteration_stub: bool) -> 
             .all(|b| matches!(*b, "pass" | "skipping" | "pending"))
     } else {
         buckets.iter().all(|b| matches!(*b, "pass" | "skipping"))
+    }
+}
+
+#[cfg(test)]
+mod coderabbit_exact_head_tests {
+    use super::{coderabbit_status_for_head, GhAuthor, GhReview, GhReviewCommit};
+
+    fn review(state: &str, oid: Option<&str>) -> GhReview {
+        GhReview {
+            author: GhAuthor {
+                login: "coderabbitai[bot]".to_string(),
+            },
+            state: state.to_string(),
+            commit: oid.map(|oid| GhReviewCommit {
+                oid: Some(oid.to_string()),
+            }),
+        }
+    }
+
+    #[test]
+    fn exact_head_approval_is_green() {
+        assert_eq!(
+            coderabbit_status_for_head(&[review("APPROVED", Some("head-2"))], "head-2"),
+            "green"
+        );
+    }
+
+    #[test]
+    fn stale_approval_is_unknown() {
+        assert_eq!(
+            coderabbit_status_for_head(&[review("APPROVED", Some("head-1"))], "head-2"),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn approval_without_commit_oid_is_unknown() {
+        assert_eq!(
+            coderabbit_status_for_head(&[review("APPROVED", None)], "head-2"),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn malformed_commit_object_is_fail_soft_unknown() {
+        let malformed: GhReview = serde_json::from_str(
+            r#"{"author":{"login":"coderabbitai[bot]"},"state":"APPROVED","commit":{}}"#,
+        )
+        .expect("missing commit oid should remain deserializable");
+        assert_eq!(coderabbit_status_for_head(&[malformed], "head-2"), "unknown");
+    }
+
+    #[test]
+    fn latest_changes_requested_review_remains_red() {
+        assert_eq!(
+            coderabbit_status_for_head(
+                &[
+                    review("APPROVED", Some("head-2")),
+                    review("CHANGES_REQUESTED", Some("head-2")),
+                ],
+                "head-2"
+            ),
+            "red"
+        );
     }
 }
 
