@@ -84,12 +84,30 @@ else
 fi
 
 # 3. Backend env vars — binding per user directive (minimax ONLY).
-export ANTHROPIC_BASE_URL="https://api.minimax.io/anthropic"
-export ANTHROPIC_AUTH_TOKEN="${MINIMAX_API_KEY:-}"
-export ANTHROPIC_API_KEY="${MINIMAX_API_KEY:-}"
-export ANTHROPIC_MODEL="MiniMax-M3"
-export ANTHROPIC_SMALL_FAST_MODEL="MiniMax-M3"
-export CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL=0
+#
+# launchd inherits the operator's environment, and the sourced profiles may
+# add more provider state. Scrub every Claude/Anthropic routing variable and
+# every MiniMax routing variable except the credential, then set only the
+# pinned MiniMax endpoint/model/key values used by the wrapper.
+configure_minimax_env() {
+  local minimax_key="${MINIMAX_API_KEY:-}"
+  local var
+  for var in $(compgen -A variable); do
+    case "$var" in
+      CLAUDE_*|CLAUDEM_MODE|DARK_FACTORY_CLAUDE_CONFIG_DIR|ANTHROPIC_*) unset "$var" ;;
+      MINIMAX_*|DARK_FACTORY_MINIMAX_MODEL) [[ "$var" == "MINIMAX_API_KEY" ]] || unset "$var" ;;
+    esac
+  done
+  export MINIMAX_API_KEY="$minimax_key"
+  export ANTHROPIC_BASE_URL="https://api.minimax.io/anthropic"
+  export ANTHROPIC_AUTH_TOKEN="$MINIMAX_API_KEY"
+  export ANTHROPIC_API_KEY="$MINIMAX_API_KEY"
+  export ANTHROPIC_MODEL="MiniMax-M3"
+  export ANTHROPIC_SMALL_FAST_MODEL="MiniMax-M3"
+  export CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL=0
+}
+
+configure_minimax_env
 log "minimax env vars set; ANTHROPIC_MODEL=${ANTHROPIC_MODEL}"
 
 cd "$WT"

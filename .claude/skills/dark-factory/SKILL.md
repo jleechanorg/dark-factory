@@ -121,7 +121,7 @@ task, not a deterministic rule table (no `if is_draft then X`, no
    `/code_standards` minimum, `holdout_eval` for behavior-grade) the
    pipeline needs to deliver without over-running.
 4. Pick the pipeline from **Available pipelines** above using that
-   reasoning, pick the backend (`echo` for wiring smoke; `claude` unless
+   reasoning, pick the backend (`echo` for wiring smoke; `ao`/Antigravity unless
    the PR's reviewer queue or `gate_er` priority queue says otherwise),
    then construct, show, and run the command — same shape as Step 0c
    below but `cd` into the PR's target repo, not `dark-factory`.
@@ -129,9 +129,9 @@ task, not a deterministic rule table (no `if is_draft then X`, no
 
 `/f-pr` honesty rules (in addition to the shared ones under **Honesty
 rules**): the `gate_er` priority queue (`codex > minimax > agy >
-claude-sonnet`) still resolves the reviewer even when `--backend claude`
-was passed for the run itself — passing `--backend claude` does not mean
-`gate_er` uses claude by default.
+claude-sonnet`) independently resolves the reviewer even when
+`--backend claude` was passed for the run itself — an explicit Claude run
+does not alter the reviewer queue.
 
 ### Step 0b — Auto-detect CLI backend
 
@@ -143,7 +143,7 @@ one the user picked from their shell. `%%` in the var name breaks
 
 ```bash
 detect_cli_backend() {
-  local key parent_comm ppid
+  local key
   for key in 'BASH_FUNC_claudem%%' 'BASH_FUNC_clauded%%' 'BASH_FUNC_agy%%' 'BASH_FUNC_codex%%' 'BASH_FUNC_claude%%'; do
     if [ -n "$(printenv "$key" 2>/dev/null)" ]; then
       case "$key" in
@@ -155,28 +155,18 @@ detect_cli_backend() {
       esac
     fi
   done
-  case "${ANTHROPIC_BASE_URL:-}" in
-    *api.minimax.io*) echo "minimax"; return ;;
-    *anthropic.com*)  echo "claude";  return ;;
-    *openai.com*)     echo "codex";   return ;;
-  esac
-  ppid="${PPID:-}"
-  if [ -n "$ppid" ]; then
-    parent_comm="$(ps -o comm= -p "$ppid" 2>/dev/null | tr -d ' ')"
-    case "$parent_comm" in
-      *claude*|*claudem*) echo "claude"; return ;;
-      *codex*)            echo "codex";  return ;;
-      *agy*|*antigrav*)   echo "agy";    return ;;
-    esac
-  fi
-  echo "claude"
+  # Ambient provider variables and the parent process are not intent signals:
+  # inheriting them would silently route a normal invocation to a personal
+  # Claude/Gmail account. Use an explicit --backend or exported wrapper signal
+  # for non-AO lanes.
+  echo "ao"
 }
 DETECTED_BACKEND="$(detect_cli_backend)"
 ```
 
 Override precedence (highest to lowest): explicit `--backend <x>` flag >
-`BASH_FUNC_*` wrapper signal > `ANTHROPIC_BASE_URL` > parent process name >
-hardcoded default (`claude`). Always echo the detected backend + source in
+`BASH_FUNC_*` wrapper signal > hardcoded default (`ao`). Always echo the
+detected backend + source in
 the proof block (see **Output contract**). If `--backend` was passed
 explicitly, note the override rather than the raw detection.
 
@@ -241,7 +231,7 @@ Honor these flags inside `$ARGUMENTS`:
   when the goal has no more specific holdout, but confirm the directory
   exists before passing it rather than defaulting unconditionally — see
   Honesty rules below on not inventing `--feature` values)
-- `--backend echo|claude|codex|ao|agy` — default `claude`. Use `echo` for cost-free
+- `--backend echo|claude|codex|ao|agy` — default `ao` (Antigravity via AO). Use `echo` for cost-free
   dry-runs that verify wiring without LLM calls.
 - `--max-steps <N>` — default 100
 - `--cxdb <path>` — default `~/.dark-factory/cxdb.sqlite` (shared across runs
@@ -383,9 +373,9 @@ later-confirmed blocker the delegated reviewer missed. If calibration is
 disabled, the final response must say `Reviewer calibration: disabled` and
 give the explicit reason.
 
-The `gate_er` priority queue is `codex > minimax > agy > claude-sonnet` by
-default; passing `--backend claude` for the run itself does not change how
-`gate_er` resolves its reviewer.
+The `gate_er` priority queue is `codex > minimax > agy > claude-sonnet`;
+passing `--backend claude` for the run itself does not change how `gate_er`
+resolves its reviewer.
 
 ## Output contract
 

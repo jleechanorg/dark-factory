@@ -27,8 +27,10 @@ command -v dark-factory >/dev/null || {
 # `df-healer --cxdb $CXDB` can cluster failures across phase boundaries.
 export CXDB="${CXDB:-$HOME/.dark-factory/cxdb.sqlite}"
 
-# Backend: 'claude' for production, 'echo' for smoke. All phases must agree.
-export BACKEND="${BACKEND:-claude}"
+# Backend: AO/Antigravity for production, 'echo' for smoke. All phases must
+# agree. Pass an explicit --backend when an intentionally scoped alternative
+# (such as Claude with its own account configuration) is required.
+export BACKEND="${BACKEND:-ao}"
 
 # Working directory of the TARGET repo (the one being built/modified).
 # Pipelines and prompts resolve from $DARK_FACTORY_HOME; code lands here.
