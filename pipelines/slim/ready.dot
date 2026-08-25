@@ -27,7 +27,7 @@ digraph ReadyPRFactory {
   gate_es [
     type="gate_es",
     label="/es Evidence Standards",
-    backend_priority="codex,minimax,agy,claude-sonnet",
+    backend_priority="codex,minimax,agy",
     prefer_adversarial="true",
     gate_strict="true",
     timeout=600,
@@ -39,7 +39,7 @@ digraph ReadyPRFactory {
   gate_er [
     type="gate_er",
     label="/er Evidence Review",
-    backend_priority="codex,minimax,agy,claude-sonnet",
+    backend_priority="codex,minimax,agy",
     prefer_adversarial="true",
     gate_strict="true",
     timeout=600,

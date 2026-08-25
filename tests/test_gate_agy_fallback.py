@@ -1,9 +1,8 @@
-"""agy reviewer backend + claude infra fallback + no-reviewer-shopping.
+"""agy reviewer backend + fail-closed infra handling + no-reviewer-shopping.
 
-Three properties that make "agy reviews, falls back to claude if it doesn't
-work" honest rather than a label: (a) actually invoke agy, (b) fall back to
-claude only on agy *infrastructure* failure, (c) NEVER reviewer-shop a real
-agy fail/partial verdict onto claude.
+Three properties keep reviewer routing honest: (a) actually invoke agy, (b)
+fail closed on agy *infrastructure* failure, and (c) NEVER reviewer-shop a
+real agy fail/partial verdict onto Claude.
 
 NOTE: The source `tests/test_gates.py` had two copies of `_agy_gate_node`
 and two copies of `test_gate_er_runs_agy_when_backend_agy`. The split
@@ -58,9 +57,8 @@ def test_gate_er_runs_agy_when_backend_agy(tmp_path, monkeypatch):
     assert not any("claude" in c[0] for c in seen)
 
 
-def test_gate_agy_falls_back_to_claude_on_infra_failure(tmp_path, monkeypatch):
-    """agy missing (FileNotFoundError) → fall back to claude; result is the claude verdict."""
-    import subprocess as _sp
+def test_gate_agy_fails_closed_on_infra_failure(tmp_path, monkeypatch):
+    """agy missing is terminal infrastructure error; never fall back to Claude."""
     from runner.handlers import _gate_er, Context as HCtx
 
     node = _agy_gate_node()
@@ -72,7 +70,7 @@ def test_gate_agy_falls_back_to_claude_on_infra_failure(tmp_path, monkeypatch):
         seen.append(cmd)
         if cmd[0] == "agy":
             raise FileNotFoundError("agy: command not found")
-        return _sp.CompletedProcess(cmd, 0, stdout=f"head_sha: {fake_sha}\nverdict: pass\n", stderr="")
+        raise AssertionError("no second reviewer invocation expected")
 
     monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda p: fake_sha)
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
@@ -80,13 +78,11 @@ def test_gate_agy_falls_back_to_claude_on_infra_failure(tmp_path, monkeypatch):
 
     result = _gate_er(node, ctx)
 
-    assert result.outcome == "success"
-    assert result.metadata["fallback_used"] == "true"
-    assert result.metadata["fallback_from"] == "agy"
-    assert result.metadata["reviewer_backend"] == "claude"
-    # agy was tried first, then claude.
+    assert result.outcome == "error"
+    assert result.metadata["fallback_used"] == "false"
+    assert result.metadata["reviewer_backend"] == "agy"
     assert seen[0][0] == "agy"
-    assert any("claude" in c[0] for c in seen), "claude fallback must have been invoked"
+    assert len(seen) == 1
 
 
 def test_gate_agy_real_fail_verdict_not_retried(tmp_path, monkeypatch):
@@ -118,11 +114,8 @@ def test_gate_agy_real_fail_verdict_not_retried(tmp_path, monkeypatch):
     assert all(c[0] == "agy" for c in seen), f"claude must not be retried; saw {[c[0] for c in seen]!r}"
 
 
-def test_gate_er_falls_back_to_claude_on_agy_infra_failure(tmp_path, monkeypatch):
-    """agy binary missing / sandbox block → verdict: unknown + head_sha: missing,
-    which is an infra failure. It must fall back to claude; the final result
-    records the fallback in metadata."""
-    import subprocess as _sp
+def test_gate_er_fails_closed_on_agy_infra_failure(tmp_path, monkeypatch):
+    """agy binary missing is terminal; the gate never reviewer-shops to Claude."""
     from runner.handlers import _gate_er, Context as HCtx
 
     node = _agy_gate_node()
@@ -136,22 +129,25 @@ def test_gate_er_falls_back_to_claude_on_agy_infra_failure(tmp_path, monkeypatch
         if os.path.basename(cmd[0]) == "agy":
             # agy failed to resolve/run → raise FileNotFoundError
             raise FileNotFoundError("agy not found")
-        # claude fallback succeeds
-        return _sp.CompletedProcess(
-            cmd, 0, stdout=f"head_sha: {fake_sha}\nverdict: pass\n", stderr=""
-        )
+        raise AssertionError("no Claude fallback invocation expected")
 
     monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda p: fake_sha)
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
     monkeypatch.setattr("subprocess.run", _fake_run)
 
     result = _gate_er(node, ctx)
-    assert result.outcome == "success"
-    assert len(seen) == 2, "must attempt agy, then fall back to claude"
+    assert result.outcome == "error"
+    assert len(seen) == 1
     assert os.path.basename(seen[0][0]) == "agy"
-    assert os.path.basename(seen[1][0]) == "claude"
-    assert result.metadata["fallback_used"] == "true"
-    assert result.metadata["fallback_from"] == "agy"
+    assert result.metadata["fallback_used"] == "false"
+    assert result.metadata["reviewer_backend"] == "agy"
+
+
+# Compatibility aliases: tests/test_gates.py historically re-exported these
+# names when the policy still permitted an agy→Claude fallback. Keep the
+# import surface stable while exercising the new fail-closed assertions.
+test_gate_agy_falls_back_to_claude_on_infra_failure = test_gate_agy_fails_closed_on_infra_failure
+test_gate_er_falls_back_to_claude_on_agy_infra_failure = test_gate_er_fails_closed_on_agy_infra_failure
 
 
 def test_gate_er_does_not_fall_back_on_real_agy_verdict(tmp_path, monkeypatch):

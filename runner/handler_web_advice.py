@@ -607,6 +607,31 @@ def _run_web_advice_subprocess(transport: str, prompt: str, *,
 
     Mockable: tests patch this symbol to return a canned result.
     """
+    # Keep direct Claude dispatch on the same explicit project account policy
+    # as codergen/gate lanes. Resolve through the handlers shim at call time so
+    # tests and policy updates can replace the shared helper without import
+    # cycles. A missing scope is an infrastructure failure; never inherit the
+    # operator's personal Claude environment or invoke a bare subprocess.
+    import runner.handlers as _handlers_shim
+
+    try:
+        claude_config = _handlers_shim._claude_config_dir()
+    except (AttributeError, ValueError, OSError) as exc:
+        return {
+            "ok": False,
+            "verdict": "infra_unavailable",
+            "summary": "",
+            "share_urls": [],
+            "returncode": -1,
+            "stderr": f"Claude scope unavailable: {exc}"[:500],
+            "transport": transport,
+        }
+    env = _handlers_shim._sanitized_env()
+    # The shared sanitizer strips holdout and inherited CLAUDE_CONFIG_DIR;
+    # direct Claude callers must also avoid AO's Anthropic auth token route.
+    env.pop("ANTHROPIC_AUTH_TOKEN", None)
+    env["CLAUDE_CONFIG_DIR"] = str(claude_config)
+
     cmd = ["claude", "--print", f"/web-advice {prompt}"]
     try:
         res = subprocess.run(
@@ -615,6 +640,7 @@ def _run_web_advice_subprocess(transport: str, prompt: str, *,
             text=True,
             timeout=timeout,
             check=False,
+            env=env,
         )
         stdout = res.stdout or ""
         payload = _parse_structured_panel_result(stdout)

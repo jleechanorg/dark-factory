@@ -74,6 +74,15 @@ from runner.parser import Node  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
+def _scoped_claude_config_for_subprocess_tests(monkeypatch, tmp_path):
+    """Keep legacy subprocess fixtures on an explicit project Claude scope."""
+    monkeypatch.setattr(
+        "runner.handlers._claude_config_dir",
+        lambda: tmp_path / "claude-config",
+    )
+
+
+@pytest.fixture(autouse=True)
 def _block_external_side_effects(monkeypatch):
     """Tests may opt in by monkeypatching; defaults cannot hit gh/br or repo docs."""
     original_run = subprocess.run
@@ -254,6 +263,57 @@ class TestCoerceMeta:
 
 
 class TestStructuredPanelContract:
+    def test_subprocess_fails_closed_without_scoped_claude_config(self, monkeypatch):
+        def _missing_scope():
+            raise ValueError("DARK_FACTORY_CLAUDE_CONFIG_DIR is required")
+
+        called = False
+
+        def _unexpected_run(*args, **kwargs):
+            nonlocal called
+            called = True
+
+        monkeypatch.setattr("runner.handlers._claude_config_dir", _missing_scope)
+        monkeypatch.setattr("runner.handler_web_advice.subprocess.run", _unexpected_run)
+
+        result = _run_web_advice_subprocess("aside_mcp", "prompt")
+
+        assert result["ok"] is False
+        assert result["returncode"] == -1
+        assert "DARK_FACTORY_CLAUDE_CONFIG_DIR" in result["stderr"]
+        assert called is False
+
+    def test_subprocess_passes_scoped_sanitized_env(self, monkeypatch):
+        captured = {}
+        monkeypatch.setattr("runner.handlers._sanitized_env", lambda: {
+            "PATH": "/bin",
+            "CLAUDE_CONFIG_DIR": "/personal/default",
+            "ANTHROPIC_AUTH_TOKEN": "must-be-scrubbed",
+        })
+        config = pathlib.Path("/tmp/project-claude-config")
+        monkeypatch.setattr("runner.handlers._claude_config_dir", lambda: config)
+        payload = {
+            "decision": "continue",
+            "panel_seats_attempted": list(PANEL_SEATS),
+            "panel_seats_live": [],
+            "panel_seats_unavailable": list(PANEL_SEATS),
+            "panel_seats_unavailable_reasons": {seat: "down" for seat in PANEL_SEATS},
+            "panel_verdict_summary": {},
+            "panel_convergence": {},
+        }
+
+        def _fake_run(cmd, **kwargs):
+            captured.update(kwargs)
+            return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
+
+        monkeypatch.setattr("runner.handler_web_advice.subprocess.run", _fake_run)
+        result = _run_web_advice_subprocess("aside_mcp", "prompt")
+
+        assert result["ok"] is True
+        assert captured["env"]["CLAUDE_CONFIG_DIR"] == str(config)
+        assert captured["env"]["PATH"] == "/bin"
+        assert "ANTHROPIC_AUTH_TOKEN" not in captured["env"]
+
     def test_rejects_multiple_qualifying_panel_json_objects(self, monkeypatch):
         payload = {
             "decision": "continue",

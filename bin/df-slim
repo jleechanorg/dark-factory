@@ -95,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
     run_cmd = sub.add_parser("run")
     run_cmd.add_argument("--pipeline", type=pathlib.Path, default=ROOT / "pipelines" / "slim" / "minimal_feature.dot")
     run_cmd.add_argument("--goal", required=True)
-    run_cmd.add_argument("--backend", choices=["echo", "claude", "codex", "ao", "agy"], default="echo")
+    run_cmd.add_argument("--backend", choices=["echo", "claude", "codex", "minimax", "ao", "agy"], default="echo")
     run_cmd.add_argument("--feature", default="slim")
     run_cmd.add_argument("--workdir", type=pathlib.Path, default=ROOT)
     run_cmd.add_argument("--run-dir", type=pathlib.Path)

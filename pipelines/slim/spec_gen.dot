@@ -22,7 +22,7 @@ digraph SpecGenFactory {
 
   // Cold adversarial reviewer plus parallel Codex comparison. The primary
   // lane uses the adversarial-review priority queue (codex > minimax > agy >
-  // claude-sonnet) via backend_priority=, while the handler also starts the
+  // supported reviewer queue via backend_priority=, while the handler also starts the
   // always-on shadow Codex reviewer and hands both rich outputs downstream.
   // goal_gate=true means a "failure" verdict routes to fix_main; "success"
   // routes to plan_attractor.
@@ -30,7 +30,7 @@ digraph SpecGenFactory {
     type="parallel_reviewer",
     label="Cold Review: Main Spec",
     class="review",
-    backend_priority="codex,minimax,agy,claude-sonnet",
+    backend_priority="codex,minimax,agy",
     prefer_adversarial="true",
     prompt="@prompts/slim/spec_review.md",
     goal_gate=true,
@@ -65,7 +65,7 @@ digraph SpecGenFactory {
     type="parallel_reviewer",
     label="Cold Review: Attractor Spec",
     class="review",
-    backend_priority="codex,minimax,agy,claude-sonnet",
+    backend_priority="codex,minimax,agy",
     prefer_adversarial="true",
     prompt="@prompts/slim/spec_review_attractor.md",
     goal_gate=true,

@@ -572,7 +572,7 @@ def _gate_subprocess_env(backend: str) -> dict[str, str]:
     if backend == "minimax":
         model = os.environ.get("DARK_FACTORY_MINIMAX_MODEL", "MiniMax-M3")
         env.pop("CLAUDE_CONFIG_DIR", None)
-        for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL"):
+        for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_AUTH_TOKEN"):
             env.pop(key, None)
         env.update({
             "ANTHROPIC_BASE_URL": "https://api.minimax.io/anthropic",
@@ -582,7 +582,7 @@ def _gate_subprocess_env(backend: str) -> dict[str, str]:
             env["ANTHROPIC_API_KEY"] = os.environ["MINIMAX_API_KEY"]
         return env
     if backend in {"claude", "claude-sonnet"}:
-        for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL"):
+        for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_AUTH_TOKEN"):
             env.pop(key, None)
         env["CLAUDE_CONFIG_DIR"] = str(_handlers_shim._claude_config_dir())
     return env

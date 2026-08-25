@@ -888,12 +888,12 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             return _finalize(Result(outcome="failure", output="sandbox-exec unavailable"))
         subprocess_env = _handlers_shim._sanitized_env()
         if backend in {"claude", "claude-sonnet"}:
-            for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL"):
+            for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_AUTH_TOKEN"):
                 subprocess_env.pop(key, None)
             subprocess_env["CLAUDE_CONFIG_DIR"] = str(claude_config)
         else:
             subprocess_env.pop("CLAUDE_CONFIG_DIR", None)
-            for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL"):
+            for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_AUTH_TOKEN"):
                 subprocess_env.pop(key, None)
             subprocess_env.update({
                 "ANTHROPIC_BASE_URL": "https://api.minimax.io/anthropic",

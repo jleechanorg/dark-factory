@@ -19,7 +19,7 @@ digraph pr_gates {
     gate_skeptic [
         type="gate_skeptic",
         label="Skeptic (inverted-incentive review)",
-        backend_priority="codex,minimax,agy,claude-sonnet",
+        backend_priority="codex,minimax,agy",
         prefer_adversarial="true",
         timeout=600
     ]
@@ -27,7 +27,7 @@ digraph pr_gates {
         type="parallel_reviewer",
         label="Adversarial reviewer (primary + shadow Codex)",
         review_contract="cold-review-v1",
-        backend_priority="codex,minimax,agy,claude-sonnet",
+        backend_priority="codex,minimax,agy",
         prefer_adversarial="true",
         receipt_required="true",
         timeout=600
@@ -35,7 +35,7 @@ digraph pr_gates {
     gate_es [
         type="gate_es",
         label="/es Evidence Standards",
-        backend_priority="codex,minimax,agy,claude-sonnet",
+        backend_priority="codex,minimax,agy",
         prefer_adversarial="true",
         gate_strict="true",
         timeout=600
@@ -43,7 +43,7 @@ digraph pr_gates {
     gate_er [
         type="gate_er",
         label="/er Evidence Review",
-        backend_priority="codex,minimax,agy,claude-sonnet",
+        backend_priority="codex,minimax,agy",
         prefer_adversarial="true",
         gate_strict="true",
         timeout=600
@@ -51,7 +51,7 @@ digraph pr_gates {
     gate_cs [
         type="gate_code_standards",
         label="/code_standards (ZFC + leveling + RCF)",
-        backend_priority="codex,minimax,agy,claude-sonnet",
+        backend_priority="codex,minimax,agy",
         prefer_adversarial="true",
         gate_strict="true",
         timeout=600
@@ -63,6 +63,8 @@ digraph pr_gates {
         label="/web-advice (fail-open)",
         prompt="@prompts/web_advice.txt",
         backend="claude",
+        explicit_claude_lane="true",
+        requires_claude_config="true",
         timeout=900,
         min_diff_lines="5",
         transport="auto",

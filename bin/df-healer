@@ -92,6 +92,14 @@ elif [[ "${PREFLIGHT_RC}" -eq 0 && -n "${PREFLIGHT_JSON}" ]]; then
       echo "ERROR: Claude is not an implicit fallback; provide an explicitly scoped backend" >&2
       exit 2
     fi
+    # Healer diagnosis currently supports echo and explicitly scoped Claude;
+    # MiniMax is a coder/gate transport, not a healer backend. Keep the
+    # wrapper capability-aware instead of forwarding an argparse-invalid
+    # backend and failing after preflight succeeded.
+    if [[ "${FALLBACK}" != "echo" && "${FALLBACK}" != "claude" ]]; then
+      echo "warning: healer does not support ${FALLBACK}; using echo diagnosis" >&2
+      FALLBACK="echo"
+    fi
     printf '\033[33mwarning\033[0m: %s missing; falling back to %s\n' \
       "${PREFLIGHT_BACKEND}" "${FALLBACK}" >&2
     if [[ -n "${FALLBACK}" ]]; then

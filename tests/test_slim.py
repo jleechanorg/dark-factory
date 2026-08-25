@@ -34,8 +34,8 @@ def test_slim_stylesheet_routes_roles_by_class():
     assert "model_name" not in explore
 
     assert plan.get("class") == "plan"
-    assert plan["backend"] == "claude"
-    assert plan["model_name"] == "claude-opus-4-6"
+    assert plan["backend"] == "minimax"
+    assert plan["model_name"] == "MiniMax-M3"
 
     assert implement.get("class") == "implement"
     assert "backend" not in implement
@@ -53,7 +53,7 @@ def test_minimal_feature_factory_runs_with_deterministic_gates(monkeypatch, tmp_
     monkeypatch.setattr(handlers_mod, "_sandboxed_args", lambda args: args)
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", lambda node, ctx: Result(outcome="success", output="ok"))
     graph = parse(ROOT / "pipelines" / "slim" / "minimal_feature.dot")
-    # production routes plan→claude opus and review→agy; pin echo for offline determinism
+    # production routes plan→MiniMax and review→agy; pin echo for offline determinism
     graph.nodes["plan"].attrs["backend"] = "echo"
     graph.nodes["review"].attrs["backend"] = "echo"
     ctx = Context(goal="ship a tiny feature", workdir=SCRATCH, backend="echo")
@@ -100,7 +100,7 @@ def test_minimal_pr_factory_runs_with_deterministic_gates(monkeypatch, tmp_path)
     monkeypatch.setattr(handlers_mod, "_sandboxed_args", lambda args: args)
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", lambda node, ctx: Result(outcome="success", output="ok"))
     graph = parse(ROOT / "pipelines" / "slim" / "minimal_pr.dot")
-    # production routes plan→claude opus and review→agy; pin echo for offline determinism
+    # production routes plan→MiniMax and review→agy; pin echo for offline determinism
     graph.nodes["plan"].attrs["backend"] = "echo"
     graph.nodes["review"].attrs["backend"] = "echo"
     ctx = Context(goal="refactor a tiny thing in-flight", workdir=SCRATCH, backend="echo")
@@ -161,5 +161,4 @@ def test_minimal_research_factory_runs_with_deterministic_gates(monkeypatch, tmp
         "gate_er",
         "exit",
     ]
-
 

@@ -1,6 +1,8 @@
 digraph redgreen_claudeaf {
     graph [
-        goal="Prove RED->GREEN for the /api/plan superadmin ownership bypass using claudeaf-only nodes (no codex). Run the regression test (RED on the vulnerable base, GREEN with the fix), then certify the GREEN diff with /es + /er. No sealed holdout exists for this feature so the holdout node is omitted; no coder/implement/fix nodes because the code is already on the branch and must be VALIDATED, not regenerated. gate_er has no hardcoded backend_priority, so DARK_FACTORY_ADVERSARIAL_PRIORITY=claude-sonnet binds the adversarial reviewer to claudeaf (claude), never codex."
+        explicit_claude_lane="true"
+        requires_claude_config="true"
+        goal="Prove RED->GREEN for the /api/plan superadmin ownership bypass using claudeaf-only nodes (no codex). Run the regression test (RED on the vulnerable base, GREEN with the fix), then certify the GREEN diff with /es + /er. No sealed holdout exists for this feature so the holdout node is omitted; no coder/implement/fix nodes because the code is already on the branch and must be VALIDATED, not regenerated. This is an explicit Claude lane and requires DARK_FACTORY_CLAUDE_CONFIG_DIR."
         label="RedGreen (claudeaf-only)"
     ]
     rankdir=LR
@@ -20,8 +22,8 @@ digraph redgreen_claudeaf {
     // claudeaf-only guarantee does not depend on the operator passing --backend claude
     // (without it, _resolve_gate_backend falls through to the run-level ctx.backend,
     // which could be codex). Keeps this pipeline claude-only regardless of invocation.
-    gate_es [type="gate_es", label="/es Evidence Standards", backend_priority="claude-sonnet", timeout=600]
-    gate_er [type="gate_er", label="/er Evidence Review",     backend_priority="claude-sonnet", timeout=600]
+    gate_es [type="gate_es", label="/es Evidence Standards", backend_priority="claude", explicit_claude_lane="true", requires_claude_config="true", timeout=600]
+    gate_er [type="gate_er", label="/er Evidence Review",     backend_priority="claude", explicit_claude_lane="true", requires_claude_config="true", timeout=600]
 
     // Bounded fix loop: any reviewer verdict other than success routes here
     // so a failing gate iterates on the artifact rather than terminating

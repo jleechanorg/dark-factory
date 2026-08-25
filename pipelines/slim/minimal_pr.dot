@@ -72,14 +72,14 @@ digraph MinimalPRFactory {
   ]
 
   // Resolves via the adversarial-review priority queue (codex > minimax >
-  // agy > claude-sonnet) so the reviewer is a *different vendor* from the
+  // agy is the final supported reviewer fallback so the reviewer is a *different vendor* from the
   // implementing coder. prefer_adversarial=true excludes the run-level
   // coder backend from the queue. Overridable per-run via
   // DARK_FACTORY_ADVERSARIAL_PRIORITY. See pipelines/slim/review_pr.dot.
   gate_er [
     type="gate_er",
     label="/er Evidence Review",
-    backend_priority="codex,minimax,agy,claude-sonnet",
+    backend_priority="codex,minimax,agy",
     prefer_adversarial="true",
     timeout=600
   ]
@@ -90,6 +90,8 @@ digraph MinimalPRFactory {
     label="/web-advice (fail-open)",
     prompt="@prompts/web_advice.txt",
     backend="claude",
+    explicit_claude_lane="true",
+    requires_claude_config="true",
     timeout=900,
     min_diff_lines="20",
     transport="auto",

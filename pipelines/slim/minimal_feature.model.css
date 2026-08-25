@@ -6,17 +6,17 @@
  * honor the run-level --backend (or a per-node backend attr). Explore uses the
  * same CLI/model as implement/fix.
  *
- * Plan tier: heavier Claude model for architecture/spec work (design phase).
+ * Plan tier: dedicated MiniMax model for architecture/spec work (design phase).
  * Explicit node attrs win over stylesheet rules; tests pin plan to echo.
- * The `model_name` honors `DARK_FACTORY_PLAN_MODEL` via `${VAR:-default}`
+ * The `model_name` honors `DARK_FACTORY_MINIMAX_MODEL` via `${VAR:-default}`
  * env-var substitution (see runner/parser.py:_substitute_env_in_value).
  *
  * Review tier: independent adversarial backend (Antigravity), separate from
  * the coder --backend.
  */
 .plan {
-  backend: claude;
-  model_name: ${DARK_FACTORY_PLAN_MODEL:-claude-opus-4-6};
+  backend: minimax;
+  model_name: ${DARK_FACTORY_MINIMAX_MODEL:-MiniMax-M3};
 }
 
 .review {

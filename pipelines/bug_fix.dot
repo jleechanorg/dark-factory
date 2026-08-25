@@ -92,7 +92,7 @@ digraph BugFix {
         type="gate_er",
         label="Evidence Review (gate_er)",
         class="review",
-        backend_priority="codex,minimax,agy,claude-sonnet",
+        backend_priority="codex,minimax,agy",
         prefer_adversarial="true",
         timeout=600
     ]
