@@ -395,7 +395,7 @@ fn rename_between_directories(
         if rc < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(target_os = "linux"))]
     {
