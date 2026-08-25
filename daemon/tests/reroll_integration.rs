@@ -267,7 +267,7 @@ fn test_reroll_success() {
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         reviewer: "skeptic".into(),
-        review_text: "Don't print to stdout, log errors.".into(),
+        review_text: "Don't \"\"\" print to stdout, log errors.".into(),
     };
 
     let outcome = reroll::execute(&deps, &mut bead).unwrap();
@@ -283,6 +283,9 @@ fn test_reroll_success() {
     assert_eq!(updated.state, OverlayState::Recovery);
     assert_eq!(updated.attempt, 2);
     assert_eq!(updated.reroll_count, 1);
+    let spec = std::fs::read_to_string(spec_dir.join("bead-success.toml")).unwrap();
+    let parsed: toml::Value = toml::from_str(&spec).expect("reroll spec remains valid TOML");
+    assert_eq!(parsed["reroll"][0]["raw_feedback"].as_str(), Some("Don't \"\"\" print to stdout, log errors."));
     assert_eq!(updated.branch, Some("factory/bead-success-r2".into()));
     assert_eq!(updated.pr_number, None); // Old PR number cleared
 

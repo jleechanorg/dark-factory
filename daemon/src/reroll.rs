@@ -773,13 +773,14 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
         positive_lines.push_str(&format!("    \"{}\",\n", spec.replace('"', "\\\"")));
     }
 
+    let raw_feedback = toml::Value::String(deps.review_text.clone()).to_string();
     let block = format!(
-        "\n[[reroll]]\n         reviewer = \"{}\"\n         attempt = {}\n         inhibition_specs = [\n         {}         ]\n         positive_assertions = [\n         {}         ]\n         raw_feedback = \"\"\"\n         {}\n         \"\"\"\n",
+        "\n[[reroll]]\n         reviewer = \"{}\"\n         attempt = {}\n         inhibition_specs = [\n         {}         ]\n         positive_assertions = [\n         {}         ]\n         raw_feedback = {}\n",
         deps.reviewer,
         superseded_attempt,
         inhibition_lines,
         positive_lines,
-        deps.review_text
+        raw_feedback
     );
 
     let spec_path = Path::new(&deps.cfg.spec_dir).join(format!("{}.toml", bead.bead_id));
