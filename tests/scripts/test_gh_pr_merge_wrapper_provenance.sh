@@ -40,7 +40,10 @@ assert() {
 }
 assert_contains() {
   local name="$1" needle="$2" haystack="$3"
-  if printf '%s' "$haystack" | grep -qF -- "$needle"; then
+  # Avoid `printf | grep -q` under `pipefail`: once grep finds a match it
+  # closes the pipe, and a large haystack can make printf exit on SIGPIPE,
+  # turning a true match into a flaky failure.
+  if [[ "$haystack" == *"$needle"* ]]; then
     echo "PASS: $name"; PASS=$((PASS + 1))
   else
     echo "FAIL: $name (expected to find '$needle' in: $haystack)"; FAIL=$((FAIL + 1))

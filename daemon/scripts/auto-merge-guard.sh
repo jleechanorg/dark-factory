@@ -557,12 +557,18 @@ while read -r num branch; do
   checks_reason="$(checks_all_green "$num" "$live_head_sha")"
   checks_rc=$?
   if [ "$checks_rc" -ne 0 ]; then
-    _online_runners="$(gh api "repos/$REPO/actions/runners" --jq '[.runners[]? | select(.status=="online")] | length' 2>/dev/null || echo "")"
-    if [ "$_online_runners" = "0" ]; then
-      echo "PR $num: RUNNER OUTAGE — consider --admin or wait (0 online runners in pool)"
-      if ! gh pr view "$num" --repo "$REPO" --comments --json comments --jq '.comments[].body' 2>/dev/null | grep -qF "RUNNER OUTAGE — consider --admin or wait"; then
-        gh pr comment "$num" --repo "$REPO" --body "RUNNER OUTAGE — consider --admin or wait" 2>/dev/null || true
+    _runner_probe_output="$(scripts/check_runner_health.sh "$REPO" 2>&1)"
+    _runner_probe_rc=$?
+    if [ "$_runner_probe_rc" -eq 3 ]; then
+      _runner_warning="RUNNER FLEET DOWN — wait for org runner recovery; merge policy remains enforced"
+      echo "PR $num: $_runner_warning"
+      if ! gh pr view "$num" --repo "$REPO" --comments --json comments --jq '.comments[].body' 2>/dev/null | grep -qF "$_runner_warning"; then
+        gh pr comment "$num" --repo "$REPO" --body "$_runner_warning" 2>/dev/null || true
       fi
+    elif [ "$_runner_probe_rc" -eq 1 ]; then
+      echo "PR $num: RUNNER SELECTOR DRIFT — configured labels match no online org runner"
+    elif [ "$_runner_probe_rc" -ne 0 ]; then
+      echo "PR $num: RUNNER STATUS INCONCLUSIVE — not classifying as an outage"
     fi
     echo "PR $num: CI not green ($checks_reason) — skip"; continue
   fi

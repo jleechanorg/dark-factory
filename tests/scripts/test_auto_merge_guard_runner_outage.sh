@@ -3,13 +3,12 @@
 # Avoid future --admin merges by surfacing runner outage earlier.
 #
 # Proves:
-#   1. check_runner_health.sh detects 0 online runners and outputs
-#      "RUNNER OUTAGE — consider --admin or wait" with exit code 1.
-#   2. check_runner_health.sh detects >0 online runners and outputs
-#      the online runner count with exit code 0.
-#   3. auto-merge-guard.sh detects 0 online runners when CI is not green,
+#   1. check_runner_health.sh checks org-scoped runners using the configured
+#      repo selector and distinguishes fleet-down from drift/probe failure.
+#   2. A healthy org pool passes even though the repo-scoped endpoint is empty.
+#   3. auto-merge-guard.sh detects a fleet-down condition when CI is not green,
 #      emits the runner outage warning, and posts the PR comment
-#      "RUNNER OUTAGE — consider --admin or wait".
+#      without recommending a merge-policy bypass.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -93,8 +92,22 @@ fi
 if [ "${1:-}" = "api" ]; then
   endpoint="${2:-}"
   case "$endpoint" in
-    *"actions/runners"*)
-      echo "${GH_SHIM_ONLINE_RUNNERS:-0}"
+    "repos/jleechanorg/dark-factory/actions/variables/SELF_HOSTED_RUNNER_LABELS")
+      echo '{"value":"[\"self-hosted\",\"self-hosted-mikey\",\"ezgha\"]"}'
+      exit 0
+      ;;
+    "orgs/jleechanorg/actions/runners?per_page=100")
+      case "${GH_SHIM_RUNNER_MODE:-down}" in
+        healthy)
+          echo '{"runners":[{"name":"runner-1","status":"online","busy":false,"labels":[{"name":"self-hosted"},{"name":"self-hosted-mikey"},{"name":"ezgha"}]},{"name":"runner-2","status":"online","busy":true,"labels":[{"name":"self-hosted"},{"name":"self-hosted-mikey"},{"name":"ezgha"}]}]}'
+          ;;
+        down) echo '{"runners":[]}' ;;
+        error) echo 'forbidden' >&2; exit 1 ;;
+      esac
+      exit 0
+      ;;
+    "repos/jleechanorg/dark-factory/actions/runners"*)
+      echo '{"runners":[]}'
       exit 0
       ;;
   esac
@@ -104,31 +117,51 @@ echo "{}"
 EOGH
 chmod +x "$FAKE_BIN_DIR/gh"
 
-echo "=== TEST CASE 1: check_runner_health.sh with 0 online runners ==="
+echo "=== TEST CASE 1: org runner fleet down ==="
 set +e
-out1="$(GH_SHIM_LOG="$LOG_FILE" GH_SHIM_ONLINE_RUNNERS="0" PATH="$FAKE_BIN_DIR:$PATH" bash "$CHECK_SCRIPT" 2>&1)"
+out1="$(GH_SHIM_LOG="$LOG_FILE" GH_SHIM_RUNNER_MODE="down" PATH="$FAKE_BIN_DIR:$PATH" bash "$CHECK_SCRIPT" 2>&1)"
 rc1=$?
 set -e
 
-assert "check_runner_health returns exit 1 when 0 online runners" "1" "$rc1"
-assert_contains "check_runner_health emits RUNNER OUTAGE message" "RUNNER OUTAGE — consider --admin or wait" "$out1"
+assert "check_runner_health returns fleet-down exit 3" "3" "$rc1"
+assert_contains "check_runner_health emits fleet-down message" "RUNNER FLEET DOWN" "$out1"
 
-echo "=== TEST CASE 2: check_runner_health.sh with 2 online runners ==="
+echo "=== TEST CASE 2: org-scoped runners healthy while repo endpoint is empty ==="
 set +e
-out2="$(GH_SHIM_LOG="$LOG_FILE" GH_SHIM_ONLINE_RUNNERS="2" PATH="$FAKE_BIN_DIR:$PATH" bash "$CHECK_SCRIPT" 2>&1)"
+out2="$(GH_SHIM_LOG="$LOG_FILE" GH_SHIM_RUNNER_MODE="healthy" PATH="$FAKE_BIN_DIR:$PATH" bash "$CHECK_SCRIPT" 2>&1)"
 rc2=$?
 set -e
 
 assert "check_runner_health returns exit 0 when runners online" "0" "$rc2"
-assert_contains "check_runner_health reports online runner count" "Online runners in jleechanorg/dark-factory pool: 2" "$out2"
+assert_contains "check_runner_health reports two matching org runners" '"match_count": 2' "$out2"
+assert_contains "check_runner_health reports PASS" "Runner selector health: PASS" "$out2"
+assert_contains "probe uses org-scoped runners endpoint" "api orgs/jleechanorg/actions/runners?per_page=100" "$(cat "$LOG_FILE")"
 
 echo "=== TEST CASE 3: auto-merge-guard surfaces runner outage on non-green CI ==="
 set +e
-out3="$(GH_SHIM_LOG="$LOG_FILE" GH_SHIM_ONLINE_RUNNERS="0" AMG_REPO_POLICY_FILE="$POLICY_FILE" HOME="$FAKE_HOME" PATH="$FAKE_BIN_DIR:$PATH" bash "$GUARD" 2>&1)"
+out3="$(GH_SHIM_LOG="$LOG_FILE" GH_SHIM_RUNNER_MODE="down" AMG_REPO_POLICY_FILE="$POLICY_FILE" HOME="$FAKE_HOME" PATH="$FAKE_BIN_DIR:$PATH" bash "$GUARD" 2>&1)"
 set -e
 
-assert_contains "auto-merge-guard surfaces RUNNER OUTAGE in output" "RUNNER OUTAGE — consider --admin or wait" "$out3"
-assert_contains "auto-merge-guard posts PR comment for runner outage" "pr comment 701 --repo jleechanorg/dark-factory --body RUNNER OUTAGE — consider --admin or wait" "$(cat "$LOG_FILE")"
+assert_contains "auto-merge-guard surfaces fleet-down output" "RUNNER FLEET DOWN" "$out3"
+assert_contains "auto-merge-guard posts fleet-down PR comment" "pr comment 701 --repo jleechanorg/dark-factory --body RUNNER FLEET DOWN — wait for org runner recovery; merge policy remains enforced" "$(cat "$LOG_FILE")"
+if printf '%s\n%s' "$out3" "$(cat "$LOG_FILE")" | grep -q -- '--admin'; then
+  echo "FAIL: runner guidance must not recommend --admin"; FAIL=$((FAIL + 1))
+else
+  echo "PASS: runner guidance does not recommend --admin"; PASS=$((PASS + 1))
+fi
+
+echo "=== TEST CASE 4: API/auth failure is inconclusive, not an outage ==="
+set +e
+out4="$(GH_SHIM_LOG="$LOG_FILE" GH_SHIM_RUNNER_MODE="error" PATH="$FAKE_BIN_DIR:$PATH" bash "$CHECK_SCRIPT" 2>&1)"
+rc4=$?
+set -e
+assert "check_runner_health returns invocation exit 2" "2" "$rc4"
+assert_contains "probe failure is explicitly inconclusive" "RUNNER STATUS INCONCLUSIVE" "$out4"
+if printf '%s' "$out4" | grep -q "RUNNER FLEET DOWN"; then
+  echo "FAIL: API failure must not be classified as fleet down"; FAIL=$((FAIL + 1))
+else
+  echo "PASS: API failure is not classified as fleet down"; PASS=$((PASS + 1))
+fi
 
 echo "=== RESULTS: $PASS passed, $FAIL failed ==="
 if [ "$FAIL" -gt 0 ]; then

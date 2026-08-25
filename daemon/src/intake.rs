@@ -733,10 +733,10 @@ pub fn normalize_labeled_prs_outcome(
                 metrics.rate_limited_skips += 1;
                 any_rate_limited = true;
                 eprintln!(
-                    "auto-factory daemon: WARNING intake rate-limited for repository {repo}; skipping and continuing with remaining repositories"
+                    "auto-factory daemon: WARNING intake rate-limited for repository {repo}; stopping sweep to prevent 403 fan-out"
                 );
                 emit_intake_repo_sweep_failed(telemetry_log, repo, "rate_limited", &e.to_string());
-                continue;
+                break;
             }
             Err(e) => {
                 eprintln!(
