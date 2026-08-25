@@ -4709,6 +4709,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 // on the remediation coder session having quiesced so the
                 // verifier checks real landed work, not the stale pre-fix
                 // commit.
+                let mut session_already_stopped = false;
                 let ready_to_promote = if overlay.is_adopted {
                     match &overlay.session_id {
                         Some(session_id_str) => {
@@ -4745,7 +4746,10 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                 // successful stop) is the only path to
                                 // promotion.
                                 match deps.sessions.stop(&sid) {
-                                    Ok(()) => true,
+                                    Ok(()) => {
+                                        session_already_stopped = true;
+                                        true
+                                    }
                                     Err(stop_err) => {
                                         let _ = emit(
                                             deps.telemetry_log,
@@ -4788,7 +4792,10 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                         // observation (or a successful stop)
                                         // is the only path to promotion.
                                         match deps.sessions.stop(&sid) {
-                                            Ok(()) => true,
+                                            Ok(()) => {
+                                                session_already_stopped = true;
+                                                true
+                                            }
                                             Err(stop_err) => {
                                                 let _ = emit(
                                                     deps.telemetry_log,
@@ -4837,7 +4844,12 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     let mut reap_stop_failed = false;
                     if let Some(session_id_str) = overlay.session_id.take() {
                         let sid = SessionId(session_id_str.clone());
-                        match deps.sessions.stop(&sid) {
+                        let stop_result = if session_already_stopped {
+                            Ok(())
+                        } else {
+                            deps.sessions.stop(&sid)
+                        };
+                        match stop_result {
                             Ok(()) => {}
                             Err(stop_err) => {
                                 reap_stop_failed = true;
