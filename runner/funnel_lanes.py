@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import re
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -68,6 +69,7 @@ CODERABBIT_BUCKETS = (
     "unobserved",
 )
 _CODERABBIT_WAIVER_TOKEN = "coderabbit:waived_vendor_unavailable"
+_REPOSITORY_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
 def _contains_waiver_token(value) -> bool:
@@ -118,15 +120,40 @@ def classify_coderabbit(context: object) -> str:
     return "unknown"
 
 
+def _resolved_repository(event: dict) -> Optional[str]:
+    """Return the canonical repository identity carried by gate telemetry.
+
+    New daemon assessments emit ``context.repo`` from the resolved routing
+    entry.  The aliases below keep the reader compatible with fixtures and
+    older producers that used ``target_repo`` or ``repository``.  Values are
+    validated as an owner/name pair and normalized because GitHub repository
+    names are case-insensitive.
+    """
+    context = event.get("context")
+    if not isinstance(context, dict):
+        return None
+    for field in ("repo", "target_repo", "repository", "repository_full_name"):
+        value = context.get(field)
+        if isinstance(value, dict):
+            value = value.get("full_name") or value.get("name")
+        if not isinstance(value, str):
+            continue
+        value = value.strip().rstrip("/")
+        if _REPOSITORY_ID_RE.fullmatch(value):
+            return value.lower()
+    return None
+
+
 def coderabbit_observation_key(event: dict, sequence: object = None) -> tuple:
     """Return the deduplication key for a CodeRabbit gate observation.
 
-    Recent daemon telemetry carries ``(pr_number, head_sha)``.  Repeated
+    Recent daemon telemetry carries ``(repo, pr_number, head_sha)``.  Repeated
     assessments for that immutable PR head are one observation for funnel
     metrics; the latest event wins because a vendor can move from unknown to
-    approved (or vice versa) without a new head.  Legacy rows without that
-    pair fall back to the event identity so old logs remain fail-soft rather
-    than collapsing unrelated assessments together.
+    approved (or vice versa) without a new head.  Legacy rows without the
+    repository field retain the historical ``(pr_number, head_sha)`` key so
+    existing logs remain comparable; the daemon now emits ``repo`` for new
+    rows, preventing cross-repository collisions going forward.
     """
     context = event.get("context")
     if isinstance(context, dict):
@@ -139,7 +166,10 @@ def coderabbit_observation_key(event: dict, sequence: object = None) -> tuple:
             and isinstance(head_sha, str)
             and head_sha
         ):
-            return ("pr_head", str(pr_number), head_sha)
+            repo = _resolved_repository(event)
+            if repo is not None:
+                return ("pr_head", repo, str(pr_number), head_sha)
+            return ("pr_head_legacy", str(pr_number), head_sha)
     # ``sequence`` is supplied by the streaming loader/compute loop.  It is
     # required for legacy rows where multiple assessments share bead, attempt,
     # and timestamp; using those fields alone silently collapses observations.

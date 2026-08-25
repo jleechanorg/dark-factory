@@ -512,6 +512,64 @@ def test_coderabbit_deduplicates_pr_head_and_keeps_latest(tmp_path):
     assert stat.coderabbit_total == 2
 
 
+def test_coderabbit_same_head_in_different_repositories_stays_distinct(tmp_path):
+    """Exact-head deduplication must be scoped to the resolved repository.
+
+    A daemon can assess PR 42 at the same commit in two configured
+    repositories.  Those are two observations, even though the PR number and
+    commit SHA match; only repeated assessments for the same repository/head
+    replace one another.
+    """
+    rows = [
+        _row("rev-cr-repo-a", 1, "INTAKE_BEAD_CREATED", 0, context={}),
+        _row(
+            "rev-cr-repo-a", 1, "GATE_ASSESSMENT", 1,
+            context={
+                "repo": "owner-a/repo",
+                "pr_number": 42,
+                "head_sha": "shared-head",
+                "gates": {"coderabbit": "unknown"},
+            },
+        ),
+        _row(
+            "rev-cr-repo-a", 1, "GATE_ASSESSMENT", 2,
+            context={
+                "repo": "owner-a/repo",
+                "pr_number": 42,
+                "head_sha": "shared-head",
+                "gates": {"coderabbit": "pass"},
+            },
+        ),
+        _row("rev-cr-repo-b", 1, "INTAKE_BEAD_CREATED", 3, context={}),
+        _row(
+            "rev-cr-repo-b", 1, "GATE_ASSESSMENT", 4,
+            context={
+                "repo": "owner-b/repo",
+                "pr_number": 42,
+                "head_sha": "shared-head",
+                "gates": {"coderabbit": "fail"},
+            },
+        ),
+    ]
+    events = load_events_full(
+        _write_fixture(tmp_path, rows=rows),
+        since=None,
+        now=T0 + timedelta(days=1),
+    )
+    report = compute_lane_report(events)
+
+    # owner-a/repo contributes its latest pass once; owner-b/repo contributes
+    # its independent fail once.  The earlier owner-a unknown is replaced.
+    assert report.coderabbit == {
+        "direct_approved": 1,
+        "waived_unavailable": 0,
+        "unknown": 0,
+        "fail": 1,
+        "unobserved": 0,
+    }
+    assert report.coderabbit_total == 2
+
+
 @pytest.mark.parametrize(
     ("verdict", "evidence", "expected"),
     [

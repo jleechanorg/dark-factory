@@ -5696,6 +5696,11 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             // `context.pr_number` before parsing `context.gates` — without
             // this key the guard's match path is permanently dormant no
             // matter how correct the `gates` shape is.
+            // Funnel metrics also use this immutable PR/head pair as an
+            // observation key.  Include the resolved target repository so
+            // identically numbered PRs pointing at the same commit in two
+            // configured repositories cannot overwrite one another.
+            obj.insert("repo".to_string(), serde_json::json!(repo));
             obj.insert("pr_number".to_string(), serde_json::json!(pr));
             // jleechan-328 P1 #1 (exact-head binding): record the PR's
             // current head SHA in the assessment context so the shell
