@@ -1157,9 +1157,11 @@ fn truncate_at_char_boundary(s: &mut String, cap: usize) {
 ///
 /// * The dimension that actually picks the graph is *is there already a PR to
 ///   iterate on?*, not the router's complexity judgment. `branch_mode ==
-///   "pr_head"` is exactly `DriveBranchDecision::PrHead` — the coder is bound
-///   to an open PR's own head ref — which is the doc's "In-flight PR
-///   iteration" row: `pipelines/slim/minimal_pr.dot`.
+///   "pr_head"` means the coder is bound to an existing branch — either via
+///   `DriveBranchDecision::PrHead` (an open PR's head ref) or a previously
+///   adopted `Generated` bead whose branch was already set (`tick.rs:480`) —
+///   which is the doc's "In-flight PR iteration" row:
+///   `pipelines/slim/minimal_pr.dot`.
 /// * Otherwise this is create-new-work (`Generated` / `ForkFallback`), the
 ///   doc's "New feature, full production loop" row:
 ///   `pipelines/slim/minimal_feature.dot`.
@@ -1193,7 +1195,7 @@ fn factory_pipeline_for(verdict: RoutingVerdict, branch_mode: &str) -> &'static 
 
 /// Stable `SMALL_PATH` / `STANDARD_PATH` / ... token for a verdict, used both
 /// in the dispatch prompt and (via `tick.rs`) in telemetry.
-fn routing_verdict_label(verdict: RoutingVerdict) -> &'static str {
+pub(crate) fn routing_verdict_label(verdict: RoutingVerdict) -> &'static str {
     match verdict {
         RoutingVerdict::SmallPath => "SMALL_PATH",
         RoutingVerdict::StandardPath => "STANDARD_PATH",
@@ -4807,6 +4809,18 @@ mod tests {
             overlay.park_reason.is_none(),
             "matching cwd must not park the bead"
         );
+    }
+
+    /// The `routing_verdict_label` helper is shared with `tick.rs` for
+    /// telemetry; this test pins the public surface so any drift is a compile
+    /// or test error rather than a silent desync between dispatch.rs labels
+    /// and tick.rs labels.
+    #[test]
+    fn routing_verdict_label_matches_every_variant() {
+        assert_eq!(routing_verdict_label(RoutingVerdict::SmallPath), "SMALL_PATH");
+        assert_eq!(routing_verdict_label(RoutingVerdict::StandardPath), "STANDARD_PATH");
+        assert_eq!(routing_verdict_label(RoutingVerdict::ResearchPath), "RESEARCH_PATH");
+        assert_eq!(routing_verdict_label(RoutingVerdict::GenericPath), "GENERIC_PATH");
     }
 }
 
