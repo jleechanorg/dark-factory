@@ -894,7 +894,11 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         if model_name and backend != "minimax":
             claude_cmd += ["--model", str(model_name)]
         if backend == "minimax":
-            claude_cmd += ["--model", os.environ.get("DARK_FACTORY_MINIMAX_MODEL", "MiniMax-M3")]
+            # ``_minimax_env`` is the canonical policy boundary for API-key
+            # validation, whitespace normalization, and the default model.
+            # Reuse its resolved value so argv and ANTHROPIC_MODEL cannot
+            # diverge when DARK_FACTORY_MINIMAX_MODEL contains whitespace.
+            claude_cmd += ["--model", subprocess_env["ANTHROPIC_MODEL"]]
         claude_cmd.append(prompt_text)
         args = _handlers_shim._sandboxed_args_for_workdir(claude_cmd, ctx.workdir)
         if args is None:

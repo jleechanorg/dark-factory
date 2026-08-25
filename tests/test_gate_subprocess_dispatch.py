@@ -64,6 +64,89 @@ def test_gate_subprocess_env_routes_minimax_through_minimax_gateway(monkeypatch)
     assert env.get("ANTHROPIC_BASE_URL") == "https://api.minimax.io/anthropic"
 
 
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [("   ", "MiniMax-M3"), ("  MiniMax-M2  ", "MiniMax-M2"), ("MiniMax-M1", "MiniMax-M1")],
+)
+def test_minimax_gate_argv_model_matches_normalized_env(monkeypatch, configured, expected):
+    """The Claude argv and MiniMax environment must use one normalized model."""
+    from runner.handlers import _gate_subprocess_args, _gate_subprocess_env, Context as HCtx
+
+    monkeypatch.setenv("MINIMAX_API_KEY", "test-minimax-key")
+    monkeypatch.setenv("DARK_FACTORY_MINIMAX_MODEL", configured)
+    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda args: args)
+    ctx = HCtx(goal="test", workdir=pathlib.Path("/tmp"), backend="minimax")
+
+    argv = _gate_subprocess_args("minimax", "PROMPT", ctx, 300)
+    env = _gate_subprocess_env("minimax")
+
+    assert argv[argv.index("--model") + 1] == expected
+    assert env["ANTHROPIC_MODEL"] == expected
+    assert argv[argv.index("--model") + 1] == env["ANTHROPIC_MODEL"]
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [("   ", "MiniMax-M3"), ("  MiniMax-M2  ", "MiniMax-M2"), ("MiniMax-M1", "MiniMax-M1")],
+)
+def test_minimax_codergen_argv_model_matches_normalized_env(
+    monkeypatch, tmp_path, configured, expected
+):
+    """Coder argv must consume the same normalized model as its environment."""
+    import subprocess as _sp
+    from runner.handlers import _codergen, Context as HCtx, Node
+
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("PROMPT")
+    observed: dict[str, object] = {}
+
+    def _fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "git":
+            return _sp.CompletedProcess(cmd, 0, stdout="", stderr="")
+        observed["cmd"] = cmd
+        observed["env"] = kwargs["env"]
+        return _sp.CompletedProcess(cmd, 0, stdout="done", stderr="")
+
+    monkeypatch.setenv("MINIMAX_API_KEY", "test-minimax-key")
+    monkeypatch.setenv("DARK_FACTORY_MINIMAX_MODEL", configured)
+    monkeypatch.setattr("runner.handlers._get_claude_executable", lambda: "claude")
+    monkeypatch.setattr("runner.handlers._sandboxed_args_for_workdir", lambda args, workdir: args)
+    monkeypatch.setattr("runner.handlers.subprocess.run", _fake_run)
+    ctx = HCtx(goal="test", workdir=tmp_path, backend="minimax")
+
+    result = _codergen(Node(name="implement", attrs={"prompt": "@prompt.md"}), ctx)
+
+    assert result.outcome == "success"
+    argv = observed["cmd"]
+    env = observed["env"]
+    assert isinstance(argv, list)
+    assert isinstance(env, dict)
+    assert argv[argv.index("--model") + 1] == expected
+    assert env["ANTHROPIC_MODEL"] == expected
+    assert argv[argv.index("--model") + 1] == env["ANTHROPIC_MODEL"]
+
+
+def test_run_gate_once_reports_claude_scope_error_distinct_from_sandbox(monkeypatch, tmp_path):
+    """Invalid direct-Claude scope must not be mislabeled sandbox unavailability."""
+    from runner.handlers import _run_gate_once, Context as HCtx
+
+    scope_error = "DARK_FACTORY_CLAUDE_CONFIG_DIR must be an absolute existing project config directory"
+    monkeypatch.setattr("runner.handlers._claude_config_dir", lambda: (_ for _ in ()).throw(ValueError(scope_error)))
+    monkeypatch.setattr(
+        "runner.handlers._sandboxed_args",
+        lambda args: pytest.fail("sandbox builder must not run when Claude scope is invalid"),
+    )
+    ctx = HCtx(goal="test", workdir=tmp_path, backend="claude")
+
+    result = _run_gate_once("claude", "PROMPT", "0" * 40, 30, ctx, "gate_x")
+
+    assert result.outcome == "error"
+    assert scope_error in result.output
+    assert result.metadata.get("invalid_scope") == "true"
+    assert result.metadata.get("scope_error") == scope_error
+    assert result.metadata.get("sandbox") != "unavailable"
+
+
 def test_gate_subprocess_env_minimax_is_sanitized(monkeypatch):
     """The minimax override must layer on _sanitized_env, not raw os.environ —
     holdout vars must never reach a reviewer subprocess (jleechan-4pa)."""

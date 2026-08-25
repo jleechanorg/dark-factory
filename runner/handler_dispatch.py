@@ -83,6 +83,19 @@ class _ShadowGateReview:
     json_transport: bool = False
 
 
+def _resolved_minimax_model() -> str:
+    """Return the MiniMax model after the canonical env policy is applied.
+
+    ``_minimax_env`` owns validation, whitespace normalization, and the
+    default model.  Reviewer argv must consume that same resolved value rather
+    than re-reading ``DARK_FACTORY_MINIMAX_MODEL`` directly.
+    """
+    import runner.handlers as _handlers_shim  # late-bound shim
+
+    env = _handlers_shim._minimax_env()
+    return str(env["ANTHROPIC_MODEL"])
+
+
 def _resolve_shadow_backend_env() -> str:
     """Resolve the override shadow backend from DARK_FACTORY_SHADOW_BACKEND env var.
 
@@ -532,7 +545,7 @@ def _gate_subprocess_args(
         claude_bin = _handlers_shim._get_claude_executable()
         claude_args = [claude_bin, "--print", "--dangerously-skip-permissions"]
         if backend == "minimax":
-            claude_args += ["--model", os.environ.get("DARK_FACTORY_MINIMAX_MODEL", "MiniMax-M3")]
+            claude_args += ["--model", _resolved_minimax_model()]
         claude_args.append(prompt)
         return sealed_args_builder(claude_args, workdir)
     if backend == "agy":
@@ -553,7 +566,7 @@ def _gate_subprocess_args(
     claude_bin = _handlers_shim._get_claude_executable()
     claude_args = [claude_bin, "--print", "--dangerously-skip-permissions"]
     if backend == "minimax":
-        claude_args += ["--model", os.environ.get("DARK_FACTORY_MINIMAX_MODEL", "MiniMax-M3")]
+        claude_args += ["--model", _resolved_minimax_model()]
     claude_args.append(prompt)
     return _handlers_shim._sandboxed_args(claude_args)
 
@@ -665,6 +678,46 @@ def _run_gate_once(
                 "invalid_backend": "true",
             },
         )
+    prompt_meta: dict[str, str] = {}
+    reviewer_backend = backend
+    controller_requested = str(ctx.state.get("_df_controller_review_json") or "").lower() in {"true", "1", "yes", "on"}
+    if controller_requested and backend != "codex":
+        return Result(
+            outcome="error",
+            output="controller review transport requires codex backend",
+            metadata={
+                "slash_command": name,
+                "verdict": "unknown",
+                "reviewer_backend": reviewer_backend,
+                "head_sha_status": "missing",
+                "backend_missing": "true",
+                **prompt_meta,
+            },
+        )
+    if backend in {"claude", "claude-sonnet"}:
+        # Distinguish a missing/invalid project-scoped Claude account from a
+        # platform sandbox failure.  ``_gate_subprocess_args`` also fails
+        # closed, but returning its ``None`` alone loses the actionable cause
+        # and causes Healer clusters to be mislabeled as sandbox outages.
+        try:
+            _handlers_shim._claude_config_dir()
+        except (AttributeError, ValueError) as exc:
+            message = str(exc)
+            return Result(
+                outcome="error",
+                output=f"{backend} backend Claude scope configuration error: {message}",
+                metadata={
+                    "slash_command": name,
+                    "verdict": "unknown",
+                    "reviewer_backend": backend,
+                    "invalid_backend": "true",
+                    "config_error": "true",
+                    "invalid_scope": "true",
+                    "scope_error": message,
+                    "head_sha_status": "missing",
+                    **prompt_meta,
+                },
+            )
     if backend == "minimax":
         try:
             _handlers_shim._minimax_env()
@@ -686,8 +739,6 @@ def _run_gate_once(
     # invokes the Claude CLI (the review is graded by the minimax-routed
     # model, which is the cross-vendor intent). Everything else is whatever
     # the priority queue / run-level config chose.
-    reviewer_backend = backend
-    prompt_meta: dict[str, str] = {}
     try:
         from . import engine_observability as _obs
 
@@ -719,20 +770,6 @@ def _run_gate_once(
             )
     except Exception:
         prompt_meta = {}
-    controller_requested = str(ctx.state.get("_df_controller_review_json") or "").lower() in {"true", "1", "yes", "on"}
-    if controller_requested and backend != "codex":
-        return Result(
-            outcome="error",
-            output="controller review transport requires codex backend",
-            metadata={
-                "slash_command": name,
-                "verdict": "unknown",
-                "reviewer_backend": reviewer_backend,
-                "head_sha_status": "missing",
-                "backend_missing": "true",
-                **prompt_meta,
-            },
-        )
     sub_args = _gate_subprocess_args(backend, prompt, ctx, timeout)
     if sub_args is None:
         return Result(
@@ -1195,7 +1232,10 @@ def _execute_gate(
     result = _run_gate_once(backend, prompt, expected_sha, timeout, ctx, name, gate_strict=gate_strict)
 
     controller_requested = str(ctx.state.get("_df_controller_review_json") or "").lower() in {"true", "1", "yes", "on"}
-    if result.metadata.get("invalid_backend") == "true":
+    if (
+        result.metadata.get("invalid_backend") == "true"
+        and result.metadata.get("config_error") != "true"
+    ):
         result.metadata["verdict"] = "infra_failure"
         result.metadata.setdefault("fallback_used", "false")
         return result
