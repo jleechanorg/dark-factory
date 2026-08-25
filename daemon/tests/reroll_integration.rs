@@ -590,6 +590,7 @@ fn test_tick_stage2_integration() {
             coderabbit_approved: true,
             bugbot_error_count: 0,
             unresolved_thread_count: Some(0),
+            unresolved_threads: Some(Vec::new()),
             head_sha: "head-sha-abc".into(),
             body: "".into(),
             comments: vec![],
