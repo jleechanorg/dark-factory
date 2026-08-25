@@ -1184,6 +1184,8 @@ pub trait Vcs {
 /// ZFC: ALL judgment goes through here — no keyword/heuristic routing in callers.
 pub trait Llm {
     fn judge(&self, prompt: &str) -> Result<String, DaemonError>;
+    /// Execute external review data without repository-write capabilities.
+    fn judge_read_only(&self, prompt: &str) -> Result<String, DaemonError> { self.judge(prompt) }
     fn is_real(&self) -> bool {
         false
     }

@@ -6725,10 +6725,10 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         }
                     }
                 }
-                let review_text = crate::reroll::append_unresolved_review_feedback(
+                let review_text = crate::constraints::bound_review_feedback(&crate::reroll::append_unresolved_review_feedback(
                     &red_reasons.join("\n"),
                     snapshot.unresolved_threads.as_deref(),
-                );
+                ))?;
 
                 let reroll_deps = crate::reroll::RerollDeps {
                     scm: deps.scm,

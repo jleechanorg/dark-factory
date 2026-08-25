@@ -10092,6 +10092,12 @@ impl Llm for ChainLlm {
             stderr: "All LLM backends in fallback chain failed".into(),
         })
     }
+
+    fn judge_read_only(&self, prompt: &str) -> Result<String, DaemonError> {
+        // Constraint extraction is pure classification of public review text;
+        // do not inherit the write-capable fallback chain used by orchestration.
+        run_tool_in_dir("codex", &["exec", "--sandbox", "read-only", "--skip-git-repo-check", prompt], FALLBACK_CWD, 120)
+    }
 }
 
 /// Check-run names whose verdict is owned by a dedicated gate rather than
