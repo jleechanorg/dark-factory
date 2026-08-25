@@ -248,6 +248,8 @@ def test_pinned_sha_matches_caller_self_pin() -> None:
 # ---------------------------------------------------------------------------
 
 GATE_PATH = REPO_ROOT / ".github" / "workflows" / "skeptic-gate.yml"
+PINNED_CALLEE_FIXTURES = REPO_ROOT / "tests" / "fixtures"
+
 
 def _assert_caller_permission_lattice(caller_text: str, callee_text: str) -> None:
     """Require caller permissions to retain every write scope the callee needs.
@@ -278,6 +280,28 @@ def _assert_caller_permission_lattice(caller_text: str, callee_text: str) -> Non
     assert caller_permissions.get("contents") == "read", (
         "caller must keep contents read-only; the gate does not need write access"
     )
+
+
+def _pinned_callee_contract(caller_text: str) -> str:
+    """Load the permission contract for the literal SHA in the caller.
+
+    The caller's ``uses:`` ref is immutable, but a normal checkout may not
+    contain that historical commit (and fetching it would make this test
+    network-dependent).  A SHA-named fixture records the audited contract at
+    that exact ref.  Changing the pin therefore fails until its contract is
+    deliberately re-audited and a matching fixture is added.
+    """
+    uses_pins = re.findall(
+        r"(?m)^\s*uses:\s*[^\n]+@([0-9a-f]{40})\s*$", caller_text
+    )
+    assert uses_pins, "caller has no literal SHA pin for its callee"
+    sha = uses_pins[0]
+    fixture = PINNED_CALLEE_FIXTURES / f"skeptic-gate-callee-{sha}.yml"
+    assert fixture.exists(), (
+        f"no audited callee contract fixture for pinned SHA {sha}; refusing "
+        "to fall back to the mutable working-tree skeptic-gate.yml"
+    )
+    return fixture.read_text(encoding="utf-8")
 
 SIX_PIN_VARS = (
     "SKEPTIC_CODEX_BIN",
@@ -548,16 +572,18 @@ def test_caller_retains_callee_write_permission_lattice() -> None:
     ``skeptic-gate.yml`` posts a pull-request comment and a commit status.
     GitHub rejects the workflow before jobs start when this caller grants
     either scope only ``read`` (the callee's ``write`` request cannot elevate
-    the caller token).  Parse both workflow files so this catches the actual
-    startup failure rather than merely checking a text fragment.
+    the caller token).  Parse the caller plus a SHA-named snapshot of the
+    exact immutable callee contract so working-tree callee drift cannot hide
+    the startup failure.
     """
-    _assert_caller_permission_lattice(_caller_text(), _gate_text())
+    caller = _caller_text()
+    _assert_caller_permission_lattice(caller, _pinned_callee_contract(caller))
 
 
 def test_red_first_permission_lattice_catches_read_downgrade() -> None:
     """The permission assertion must fail when either write scope regresses."""
     caller = _caller_text()
-    callee = _gate_text()
+    callee = _pinned_callee_contract(caller)
     _assert_caller_permission_lattice(caller, callee)
 
     for scope in ("pull-requests", "statuses"):

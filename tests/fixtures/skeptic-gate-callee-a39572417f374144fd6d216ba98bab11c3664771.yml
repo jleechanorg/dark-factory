@@ -1,0 +1,8 @@
+# Audited contract snapshot for the immutable callee ref used by
+# .github/workflows/skeptic-gate-caller.yml.
+# Source: jleechanorg/dark-factory/.github/workflows/skeptic-gate.yml
+# Commit: a39572417f374144fd6d216ba98bab11c3664771
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
