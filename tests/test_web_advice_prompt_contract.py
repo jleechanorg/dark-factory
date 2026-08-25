@@ -8,7 +8,12 @@ import re
 
 import pytest
 
-from runner.handler_web_advice import PANEL_SEATS, _PANEL_VERDICTS, _normalise_panel_result
+from runner.handler_web_advice import (
+    PANEL_SEATS,
+    _PANEL_CONTRACT_KEYS,
+    _PANEL_VERDICTS,
+    _normalise_panel_result,
+)
 
 
 PROMPT = pathlib.Path(__file__).parents[1] / "prompts" / "web_advice.txt"
@@ -116,6 +121,26 @@ def test_prompt_verdict_enum_and_live_summary_match_runtime() -> None:
     assert normalised["panel_contract_valid"] is True
     assert set(normalised["panel_verdict_summary"]) == set(normalised["panel_seats_live"])
     assert set(normalised["panel_seats_unavailable"]) == set(PANEL_SEATS) - set(normalised["panel_seats_live"])
+
+
+def test_prompt_top_level_envelope_matches_runtime_without_top_level_verdict() -> None:
+    """Keep the model's envelope instructions aligned with the strict parser.
+
+    ``_parse_structured_panel_result`` intentionally accepts exactly the seven
+    panel fields in ``_PANEL_CONTRACT_KEYS``.  A top-level ``verdict`` is not
+    part of that envelope; verdict tokens belong to each live seat summary.
+    """
+    text = _prompt()
+    lowered = re.sub(r"\s+", " ", text.lower())
+
+    assert "top-level json envelope has exactly the seven canonical keys and no others" in lowered
+    assert "do not add a top-level `verdict`" in lowered
+    assert "top-level `verdict` must" not in lowered
+
+    contract = _fenced_json_contract(text)
+    assert set(contract) == _PANEL_CONTRACT_KEYS
+    assert "verdict" not in contract
+    assert _PANEL_CONTRACT_KEYS == REQUIRED_RESULT_FIELDS
 
 
 def test_prompt_leaves_commands_and_persistence_to_runner() -> None:

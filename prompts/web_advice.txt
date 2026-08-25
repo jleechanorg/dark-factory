@@ -62,8 +62,13 @@ follow brief human-readable progress text). Do not emit a second result
 envelope, and do not encode the decision in prose for the runner to infer. The
 object MUST contain:
 
-Use the runtime's exact canonical values: `verdict` must be lowercase
-`approve`, `not_merge`, or `insufficient` (no other verdict token is accepted).
+The top-level JSON envelope has exactly the seven canonical keys and no others:
+`decision`, `panel_seats_attempted`, `panel_seats_live`,
+`panel_seats_unavailable`, `panel_seats_unavailable_reasons`,
+`panel_verdict_summary`, and `panel_convergence`. Do not add a top-level
+`verdict`; verdict tokens belong only to each live-seat summary. In each live
+seat summary, `verdict` must be lowercase `approve`, `not_merge`, or
+`insufficient` (no other verdict token is accepted).
 `decision` must be exactly one of `continue`, `continue_with_pr_warning`, or
 `continue_with_bead`.
 `panel_verdict_summary` must contain entries **exactly for seats listed in
