@@ -594,7 +594,7 @@ case "$args" in
             echo '{{"data": "truncated'
             exit 0
         else
-            echo '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[]}}}}}}}}}}'
+            echo '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[],"pageInfo":{{"hasNextPage":false}}}}}}}}}}}}'
             exit 0
         fi
         ;;
