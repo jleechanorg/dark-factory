@@ -17,7 +17,7 @@ WRAPPER="$ROOT/daemon/scripts/gh-pr-merge-wrapper.sh"
 PASS=0; FAIL=0
 assert_contains() {
   local name="$1" needle="$2" haystack="$3"
-  if printf '%s' "$haystack" | grep -qF -- "$needle"; then
+  if grep -qF -- "$needle" <<<"$haystack"; then
     echo "PASS: $name"; PASS=$((PASS + 1))
   else
     echo "FAIL: $name (expected to find '$needle')"; FAIL=$((FAIL + 1))
@@ -25,7 +25,7 @@ assert_contains() {
 }
 assert_not_contains() {
   local name="$1" needle="$2" haystack="$3"
-  if printf '%s' "$haystack" | grep -qF -- "$needle"; then
+  if grep -qF -- "$needle" <<<"$haystack"; then
     echo "FAIL: $name (unexpected: found '$needle')"; FAIL=$((FAIL + 1))
   else
     echo "PASS: $name"; PASS=$((PASS + 1))
