@@ -1981,6 +1981,7 @@ fn run_pytest_baseline_check(
             name: target.name.clone(),
         })
         .collect();
+    let mut materialized_test_modules = BTreeSet::new();
     for (target, baseline_target) in pytest_targets.iter().zip(&baseline_targets) {
         // Newly added test files do not exist in the detached base. Copy only
         // that HEAD test source into the baseline so the phase can execute it
@@ -2007,8 +2008,11 @@ fn run_pytest_baseline_check(
             // the detached base file even though the file itself exists.  If
             // we leave it untouched, pytest reports "not found" and the
             // baseline phase becomes BaselineFailed -> Green, bypassing gate
-            // 8.  Materialize only the newly-added function(s), preserving
-            // the base module's production-facing imports and existing tests.
+            // 8.  Its fixtures, helpers, decorators, and imports may also be
+            // newly added, so appending just the function is insufficient.
+            // Materialize the complete HEAD test module once; pytest still
+            // invokes only the explicitly targeted new/changed node IDs
+            // against baseline production/configuration.
             let rel = relative_repo_path(repo_root, &target.path);
             let base_src = rel.and_then(|path| read_base_blob(repo_root, base_ref, &path));
             let head_src = std::fs::read_to_string(&target.path).map_err(|e| {
@@ -2024,34 +2028,22 @@ fn run_pytest_baseline_check(
                 .into_iter()
                 .collect();
             if !base_names.contains(&target.name) {
-                let snippet = extract_python_test_fn(&head_src, &target.name).ok_or_else(|| {
+                extract_python_test_fn(&head_src, &target.name).ok_or_else(|| {
                     RedGreenError::BaselineFailed(format!(
                         "cannot materialize added pytest function {} from {}",
                         target.name,
                         target.path.display()
                     ))
                 })?;
-                let mut baseline_src = std::fs::read_to_string(&baseline_target.path).map_err(|e| {
-                    RedGreenError::BaselineFailed(format!(
-                        "read baseline pytest module {}: {e}",
-                        baseline_target.path.display()
-                    ))
-                })?;
-                if !baseline_src.ends_with('\n') {
-                    baseline_src.push('\n');
+                if materialized_test_modules.insert(baseline_target.path.clone()) {
+                    std::fs::write(&baseline_target.path, head_src).map_err(|e| {
+                        RedGreenError::BaselineFailed(format!(
+                            "materialize head pytest module {} into baseline {}: {e}",
+                            target.path.display(),
+                            baseline_target.path.display()
+                        ))
+                    })?;
                 }
-                baseline_src.push('\n');
-                baseline_src.push_str(&snippet);
-                if !baseline_src.ends_with('\n') {
-                    baseline_src.push('\n');
-                }
-                std::fs::write(&baseline_target.path, baseline_src).map_err(|e| {
-                    RedGreenError::BaselineFailed(format!(
-                        "materialize added pytest function {} into {}: {e}",
-                        target.name,
-                        baseline_target.path.display()
-                    ))
-                })?;
             }
         }
     }
@@ -2634,7 +2626,7 @@ fn b() {
         std::fs::write(dir.join("pkg/value.py"), "def value():\n    return 'head'\n").unwrap();
         std::fs::write(
             dir.join("tests/test_value.py"),
-            "import pytest\nfrom pkg.value import value\n\ndef test_existing():\n    assert value() == 'base'\n\n@pytest.mark.skipif(False, reason='regression')\n@pytest.mark.regression\ndef test_added_vacuous():\n    assert 2 + 2 == 4\n",
+            "import pytest\nfrom pkg.value import value\n\ndef test_existing():\n    assert value() == 'base'\n\n@pytest.fixture\ndef added_fixture():\n    return 4\n\n@pytest.mark.skipif(False, reason='regression')\n@pytest.mark.regression\ndef test_added_vacuous(added_fixture):\n    assert added_fixture == 4\n",
         )
         .unwrap();
         run(&["git", "add", "."]);
