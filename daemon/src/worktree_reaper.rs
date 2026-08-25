@@ -27,11 +27,19 @@
 use crate::config::Config;
 use crate::errors::DaemonError;
 use crate::telemetry::{emit, local_hostname, TelemetryEvent};
-use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::ffi::{CStr, CString};
+#[cfg(unix)]
+use std::io::Read;
+#[cfg(unix)]
+use std::os::fd::{FromRawFd, RawFd};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 /// One row of the reaper's report. The struct intentionally has the same
 /// shape as the telemetry event payload so tests can assert on it
@@ -119,66 +127,201 @@ fn is_dirty_worktree(path: &Path) -> Result<bool, DaemonError> {
     Ok(!output.stdout.is_empty())
 }
 
-fn sync_directory(path: &Path) -> std::io::Result<()> {
-    std::fs::File::open(path)?.sync_all()
+#[cfg(unix)]
+struct DirectoryFd(RawFd);
+
+#[cfg(unix)]
+impl Drop for DirectoryFd {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.0);
+        }
+    }
 }
 
+#[cfg(unix)]
+fn c_path(path: &Path) -> std::io::Result<CString> {
+    CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL")
+    })
+}
+
+#[cfg(unix)]
+fn c_name(name: &str) -> std::io::Result<CString> {
+    CString::new(name).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "name contains NUL")
+    })
+}
+
+#[cfg(unix)]
+fn open_directory(path: &Path) -> std::io::Result<DirectoryFd> {
+    let path = c_path(path)?;
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(DirectoryFd(fd))
+}
+
+#[cfg(unix)]
+fn open_child_directory(parent: &DirectoryFd, name: &str) -> std::io::Result<DirectoryFd> {
+    let name = c_name(name)?;
+    let fd = unsafe {
+        libc::openat(
+            parent.0,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(DirectoryFd(fd))
+}
+
+#[cfg(unix)]
+fn create_child_directory(parent: &DirectoryFd, name: &str) -> std::io::Result<DirectoryFd> {
+    let name = c_name(name)?;
+    let rc = unsafe { libc::mkdirat(parent.0, name.as_ptr(), 0o700) };
+    if rc < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists {
+        return Err(std::io::Error::last_os_error());
+    }
+    open_child_directory(parent, name.to_str().unwrap_or_default())
+}
+
+#[cfg(unix)]
+fn open_manifest(
+    parent: &DirectoryFd,
+    name: &str,
+    create_new: bool,
+) -> std::io::Result<std::fs::File> {
+    let name = c_name(name)?;
+    let mut flags = libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    if create_new {
+        flags |= libc::O_CREAT | libc::O_EXCL;
+    } else {
+        flags |= libc::O_APPEND;
+    }
+    let fd = unsafe { libc::openat(parent.0, name.as_ptr(), flags, 0o600) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn open_manifest_read(parent: &DirectoryFd, name: &str) -> std::io::Result<std::fs::File> {
+    let name = c_name(name)?;
+    let fd = unsafe {
+        libc::openat(
+            parent.0,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn sync_directory(parent: &DirectoryFd) -> std::io::Result<()> {
+    let rc = unsafe { libc::fsync(parent.0) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn write_manifest_line(
-    manifest_path: &Path,
+    parent: &DirectoryFd,
+    manifest_name: &str,
     record: &serde_json::Value,
     create_new: bool,
 ) -> std::io::Result<()> {
-    let mut options = OpenOptions::new();
-    options.write(true);
-    if create_new {
-        options.create_new(true);
-    } else {
-        options.append(true);
-    }
-    let mut manifest = options.open(manifest_path)?;
+    let mut manifest = open_manifest(parent, manifest_name, create_new)?;
     serde_json::to_writer(&mut manifest, record)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     manifest.write_all(b"\n")?;
     manifest.sync_all()
 }
 
-fn move_worktree(path: &Path, destination: &Path) -> Result<(), DaemonError> {
-    if linked_worktree_metadata(path)? {
-        let output = Command::new("git")
-            .args([
-                "-C",
-                path.to_string_lossy().as_ref(),
-                "worktree",
-                "move",
-                path.to_string_lossy().as_ref(),
-                destination.to_string_lossy().as_ref(),
-            ])
-            .output()
-            .map_err(|e| {
-                DaemonError::Config(format!(
-                    "worktree reaper: git worktree move {} -> {}: {e}",
-                    path.display(),
-                    destination.display()
-                ))
-            })?;
-        if !output.status.success() {
-            return Err(DaemonError::Config(format!(
-                "worktree reaper: git worktree move {} -> {} failed with {}",
-                path.display(),
-                destination.display(),
-                output.status
-            )));
-        }
-        Ok(())
-    } else {
-        std::fs::rename(path, destination).map_err(|e| {
-            DaemonError::Config(format!(
-                "worktree reaper: quarantine {} -> {}: {e}",
-                path.display(),
-                destination.display()
-            ))
-        })
+#[cfg(unix)]
+fn rename_into_directory(
+    path: &Path,
+    parent: &DirectoryFd,
+    destination_name: &str,
+) -> std::io::Result<()> {
+    let path = c_path(path)?;
+    let destination_name = c_name(destination_name)?;
+    let rc = unsafe {
+        libc::renameat(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            parent.0,
+            destination_name.as_ptr(),
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn repair_linked_worktree(parent: &DirectoryFd, destination_name: &str) -> Result<(), DaemonError> {
+    let destination_fd = open_child_directory(parent, destination_name).map_err(|e| {
+        DaemonError::Config(format!("worktree reaper: open moved worktree for repair: {e}"))
+    })?;
+    let repair_fd = destination_fd.0;
+    let output = unsafe {
+        Command::new("git")
+            .args(["worktree", "repair"])
+            .pre_exec(move || {
+                if libc::fchdir(repair_fd) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            })
+            .output()
+    }
+        .map_err(|e| DaemonError::Config(format!("worktree reaper: git worktree repair: {e}")))?;
+    if !output.status.success() {
+        return Err(DaemonError::Config(format!(
+            "worktree reaper: git worktree repair failed with {}",
+            output.status
+        )));
+    }
+    let status_fd = open_child_directory(parent, destination_name).map_err(|e| {
+        DaemonError::Config(format!("worktree reaper: reopen repaired worktree: {e}"))
+    })?;
+    let status_cwd = status_fd.0;
+    let status = unsafe {
+        Command::new("git")
+            .args(["status", "--porcelain=v1"])
+            .pre_exec(move || {
+                if libc::fchdir(status_cwd) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            })
+            .output()
+    }
+        .map_err(|e| DaemonError::Config(format!("worktree reaper: verify repaired worktree: {e}")))?;
+    if !status.status.success() {
+        return Err(DaemonError::Config(format!(
+            "worktree reaper: repaired worktree status failed with {}",
+            status.status
+        )));
+    }
+    Ok(())
 }
 
 fn remove_worktree(path: &Path) -> Result<(), DaemonError> {
@@ -216,55 +359,62 @@ fn remove_worktree(path: &Path) -> Result<(), DaemonError> {
     }
 }
 
-fn quarantine_worktree(root: &Path, path: &Path, agent_id: &str) -> Result<(), DaemonError> {
+#[cfg(unix)]
+fn quarantine_worktree_inner(
+    root: &Path,
+    path: &Path,
+    agent_id: &str,
+    #[cfg(test)] swap_after_open: Option<&Path>,
+) -> Result<(), DaemonError> {
     if agent_id.is_empty() || agent_id.contains('/') || agent_id.contains("..") {
         return Err(DaemonError::Config(format!(
             "worktree reaper: unsafe agent id {agent_id:?}"
         )));
     }
     let quarantine_root = root.join(QUARANTINE_DIR_NAME);
-    match std::fs::symlink_metadata(&quarantine_root) {
-        Ok(metadata) if metadata.file_type().is_dir() => {}
-        Ok(_) => {
-            return Err(DaemonError::Config(format!(
-                "worktree reaper: quarantine root {} is not a real directory",
-                quarantine_root.display()
-            )));
-        }
+    let root_fd = open_directory(root).map_err(|e| {
+        DaemonError::Config(format!(
+            "worktree reaper: open worktree root {}: {e}",
+            root.display()
+        ))
+    })?;
+    let quarantine_fd = match open_child_directory(&root_fd, QUARANTINE_DIR_NAME) {
+        Ok(fd) => fd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir(&quarantine_root).map_err(|e| {
+            create_child_directory(&root_fd, QUARANTINE_DIR_NAME).map_err(|e| {
                 DaemonError::Config(format!(
                     "worktree reaper: create quarantine {}: {e}",
                     quarantine_root.display()
                 ))
-            })?;
+            })?
         }
         Err(e) => {
             return Err(DaemonError::Config(format!(
-                "worktree reaper: inspect quarantine {}: {e}",
+                "worktree reaper: open quarantine {} without following links: {e}",
                 quarantine_root.display()
             )));
         }
-    }
-    if !std::fs::symlink_metadata(&quarantine_root)
-        .map(|metadata| metadata.file_type().is_dir())
-        .unwrap_or(false)
-    {
-        return Err(DaemonError::Config(format!(
-            "worktree reaper: quarantine root {} is not a real directory",
-            quarantine_root.display()
-        )));
+    };
+    #[cfg(test)]
+    if let Some(outside) = swap_after_open {
+        let backup = root.join(".quarantine-original");
+        std::fs::rename(&quarantine_root, &backup).unwrap();
+        std::os::unix::fs::symlink(outside, &quarantine_root).unwrap();
     }
     let stamp = now_epoch_secs();
+    let linked = linked_worktree_metadata(path)?;
     for sequence in 0..1000u32 {
         let stem = format!("{agent_id}-{stamp}-{}-{sequence}", std::process::id());
-        let destination = quarantine_root.join(&stem);
-        let manifest_path = quarantine_root.join(format!("{stem}.json"));
-        if std::fs::symlink_metadata(&destination).is_ok()
-            || std::fs::symlink_metadata(&manifest_path).is_ok()
-        {
+        let manifest_name = format!("{stem}.json");
+        if entry_exists(&quarantine_fd, &stem).map_err(|e| {
+            DaemonError::Config(format!("worktree reaper: inspect quarantine entry: {e}"))
+        })? || entry_exists(&quarantine_fd, &manifest_name).map_err(|e| {
+            DaemonError::Config(format!("worktree reaper: inspect quarantine manifest: {e}"))
+        })? {
             continue;
         }
+        let destination = quarantine_root.join(&stem);
+        let manifest_path = quarantine_root.join(&manifest_name);
         let prepared = serde_json::json!({
             "state": "prepared",
             "agent_id": agent_id,
@@ -272,31 +422,35 @@ fn quarantine_worktree(root: &Path, path: &Path, agent_id: &str) -> Result<(), D
             "quarantined_path": destination.display().to_string(),
             "recorded_at_epoch_secs": stamp,
         });
-        write_manifest_line(&manifest_path, &prepared, true).map_err(|e| {
+        write_manifest_line(&quarantine_fd, &manifest_name, &prepared, true).map_err(|e| {
             DaemonError::Config(format!(
                 "worktree reaper: record quarantine {}: {e}",
                 manifest_path.display()
             ))
         })?;
-        sync_directory(&quarantine_root).map_err(|e| {
+        sync_directory(&quarantine_fd).map_err(|e| {
             DaemonError::Config(format!(
                 "worktree reaper: sync quarantine {}: {e}",
                 quarantine_root.display()
             ))
         })?;
-        match move_worktree(path, &destination) {
-            Ok(()) => {}
-            Err(e) => {
-                let _ = std::fs::remove_file(&manifest_path);
-                return Err(e);
-            }
-        }
-        sync_directory(&quarantine_root).map_err(|e| {
+        rename_into_directory(path, &quarantine_fd, &stem).map_err(|e| {
+            let _ = unlink_at(&quarantine_fd, &manifest_name);
+            DaemonError::Config(format!(
+                "worktree reaper: quarantine {} -> {}: {e}",
+                path.display(),
+                destination.display()
+            ))
+        })?;
+        sync_directory(&quarantine_fd).map_err(|e| {
             DaemonError::Config(format!(
                 "worktree reaper: sync quarantine {} after move: {e}",
                 quarantine_root.display()
             ))
         })?;
+        if linked {
+            repair_linked_worktree(&quarantine_fd, &stem)?;
+        }
         let moved = serde_json::json!({
             "state": "moved",
             "agent_id": agent_id,
@@ -304,13 +458,13 @@ fn quarantine_worktree(root: &Path, path: &Path, agent_id: &str) -> Result<(), D
             "quarantined_path": destination.display().to_string(),
             "recorded_at_epoch_secs": stamp,
         });
-        write_manifest_line(&manifest_path, &moved, false).map_err(|e| {
+        write_manifest_line(&quarantine_fd, &manifest_name, &moved, false).map_err(|e| {
             DaemonError::Config(format!(
                 "worktree reaper: record moved quarantine {}: {e}",
                 manifest_path.display()
             ))
         })?;
-        sync_directory(&quarantine_root).map_err(|e| {
+        sync_directory(&quarantine_fd).map_err(|e| {
             DaemonError::Config(format!(
                 "worktree reaper: sync quarantine {} after record: {e}",
                 quarantine_root.display()
@@ -322,6 +476,187 @@ fn quarantine_worktree(root: &Path, path: &Path, agent_id: &str) -> Result<(), D
         "worktree reaper: no available quarantine name for {}",
         path.display()
     )))
+}
+
+#[cfg(unix)]
+fn quarantine_worktree(root: &Path, path: &Path, agent_id: &str) -> Result<(), DaemonError> {
+    #[cfg(test)]
+    {
+        quarantine_worktree_inner(root, path, agent_id, None)
+    }
+    #[cfg(not(test))]
+    {
+        quarantine_worktree_inner(root, path, agent_id)
+    }
+}
+
+#[cfg(unix)]
+fn entry_exists(parent: &DirectoryFd, name: &str) -> std::io::Result<bool> {
+    let name = c_name(name)?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let rc = unsafe {
+        libc::fstatat(
+            parent.0,
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(unix)]
+fn unlink_at(parent: &DirectoryFd, name: &str) -> std::io::Result<()> {
+    let name = c_name(name)?;
+    let rc = unsafe { libc::unlinkat(parent.0, name.as_ptr(), 0) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn directory_names(parent: &DirectoryFd) -> std::io::Result<Vec<String>> {
+    let duplicate = unsafe { libc::dup(parent.0) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let directory = unsafe { libc::fdopendir(duplicate) };
+    if directory.is_null() {
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(duplicate);
+        }
+        return Err(error);
+    }
+    let mut names = Vec::new();
+    loop {
+        let entry = unsafe { libc::readdir(directory) };
+        if entry.is_null() {
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        if name != "." && name != ".." {
+            names.push(name);
+        }
+    }
+    unsafe {
+        libc::closedir(directory);
+    }
+    Ok(names)
+}
+
+#[cfg(unix)]
+fn linked_worktree_metadata_at(parent: &DirectoryFd, destination_name: &str) -> std::io::Result<bool> {
+    let destination = open_child_directory(parent, destination_name)?;
+    let name = c_name(".git")?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let rc = unsafe {
+        libc::fstatat(
+            destination.0,
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mode = unsafe { (*stat.as_ptr()).st_mode } & libc::S_IFMT;
+    if mode == libc::S_IFREG {
+        Ok(true)
+    } else if mode == libc::S_IFDIR {
+        Ok(false)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unsupported .git metadata type",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn reconcile_quarantine(root: &Path) -> Result<(), DaemonError> {
+    let root_fd = open_directory(root).map_err(|e| {
+        DaemonError::Config(format!(
+            "worktree reaper: open worktree root {}: {e}",
+            root.display()
+        ))
+    })?;
+    let quarantine_fd = match open_child_directory(&root_fd, QUARANTINE_DIR_NAME) {
+        Ok(fd) => fd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(DaemonError::Config(format!(
+                "worktree reaper: open quarantine for reconciliation: {e}"
+            )))
+        }
+    };
+    for manifest_name in directory_names(&quarantine_fd).map_err(|e| {
+        DaemonError::Config(format!("worktree reaper: enumerate quarantine: {e}"))
+    })? {
+        let Some(stem) = manifest_name.strip_suffix(".json") else {
+            continue;
+        };
+        let mut manifest = match open_manifest_read(&quarantine_fd, &manifest_name) {
+            Ok(file) => file,
+            Err(_) => continue,
+        };
+        let mut body = String::new();
+        manifest.read_to_string(&mut body).map_err(|e| {
+            DaemonError::Config(format!("worktree reaper: read quarantine manifest: {e}"))
+        })?;
+        let Some(last) = body.lines().filter(|line| !line.trim().is_empty()).last() else {
+            continue;
+        };
+        let record: serde_json::Value = match serde_json::from_str(last) {
+            Ok(record) => record,
+            Err(_) => continue,
+        };
+        if record.get("state").and_then(|state| state.as_str()) != Some("prepared")
+            || !entry_exists(&quarantine_fd, stem).map_err(|e| {
+                DaemonError::Config(format!("worktree reaper: inspect prepared quarantine: {e}"))
+            })?
+        {
+            continue;
+        }
+        if linked_worktree_metadata_at(&quarantine_fd, stem).map_err(|e| {
+            DaemonError::Config(format!("worktree reaper: inspect moved worktree: {e}"))
+        })? {
+            repair_linked_worktree(&quarantine_fd, stem)?;
+        }
+        let moved = serde_json::json!({
+            "state": "moved",
+            "agent_id": record.get("agent_id").cloned().unwrap_or(serde_json::Value::Null),
+            "original_path": record.get("original_path").cloned().unwrap_or(serde_json::Value::Null),
+            "quarantined_path": record.get("quarantined_path").cloned().unwrap_or(serde_json::Value::Null),
+            "reconciled": true,
+        });
+        write_manifest_line(&quarantine_fd, &manifest_name, &moved, false).map_err(|e| {
+            DaemonError::Config(format!("worktree reaper: reconcile quarantine manifest: {e}"))
+        })?;
+        sync_directory(&quarantine_fd).map_err(|e| {
+            DaemonError::Config(format!("worktree reaper: sync reconciled quarantine: {e}"))
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn quarantine_worktree(_root: &Path, _path: &Path, _agent_id: &str) -> Result<(), DaemonError> {
+    Err(DaemonError::Config(
+        "worktree reaper quarantine requires a Unix filesystem".into(),
+    ))
 }
 
 /// Active-session probe used by the keep-alive check. The reaper avoids
@@ -395,6 +730,8 @@ pub fn enumerate_candidates(root: &Path) -> Result<Vec<Candidate>, DaemonError> 
     if !root.exists() {
         return Ok(Vec::new());
     }
+    #[cfg(unix)]
+    reconcile_quarantine(root)?;
     let entries = std::fs::read_dir(root).map_err(|e| {
         DaemonError::Config(format!("worktree reaper: read_dir {}: {e}", root.display()))
     })?;
@@ -1033,6 +1370,8 @@ mod tests {
             .unwrap()
             .path();
         assert_eq!(fs::read_to_string(recovered.join("tracked.txt")).unwrap(), "linked dirty\n");
+        let report = sweep(&cfg, "owner/repo", now_epoch_secs(), &InactiveProbe).unwrap();
+        assert_eq!(report.total_worktrees, 0, "prune must leave quarantined worktree intact");
         let status = std::process::Command::new("git")
             .args(["-C", recovered.to_str().unwrap(), "status", "--porcelain=v1"])
             .status()
@@ -1093,6 +1432,79 @@ mod tests {
         assert!(!outside.join("wa-link").exists());
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_directory_handle_survives_path_swap_without_escape() {
+        let root = std::env::temp_dir().join(format!("afd_reaper_handle_swap_{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("afd_reaper_handle_outside_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+        let repo_root = root.join("owner/repo");
+        let target = repo_root.join("df-handle-race");
+        fs::create_dir_all(&repo_root).unwrap();
+        fs::create_dir_all(&repo_root.join(".quarantine")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        init_git_worktree(&target);
+        fs::write(target.join("tracked.txt"), "must survive handle swap\n").unwrap();
+
+        quarantine_worktree_inner(&repo_root, &target, "df-handle-race", Some(&outside)).unwrap();
+        assert!(!target.exists());
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+        let backup = repo_root.join(".quarantine-original");
+        let recovered = fs::read_dir(&backup)
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| entry.path().is_dir())
+            .unwrap()
+            .path();
+        assert_eq!(
+            fs::read_to_string(recovered.join("tracked.txt")).unwrap(),
+            "must survive handle swap\n"
+        );
+        let _ = fs::remove_file(repo_root.join(".quarantine"));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_reconciles_linked_worktree_moved_before_repair() {
+        let root = std::env::temp_dir().join(format!("afd_reaper_reconcile_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let cfg = make_cfg(&root);
+        let repo = root.join("source-repo");
+        let target = root.join("owner/repo/df-crash");
+        let quarantine = root.join("owner/repo/.quarantine");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::create_dir_all(&quarantine).unwrap();
+        init_linked_worktree(&repo, &target);
+        let destination = quarantine.join("df-crash-raw");
+        fs::rename(&target, &destination).unwrap();
+        fs::write(
+            quarantine.join("df-crash-raw.json"),
+            serde_json::json!({
+                "state": "prepared",
+                "agent_id": "df-crash",
+                "original_path": target.display().to_string(),
+                "quarantined_path": destination.display().to_string(),
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+
+        let report = sweep(&cfg, "owner/repo", now_epoch_secs(), &InactiveProbe).unwrap();
+        assert_eq!(report.total_worktrees, 0);
+        let status = std::process::Command::new("git")
+            .args(["-C", destination.to_str().unwrap(), "status", "--porcelain=v1"])
+            .status()
+            .unwrap();
+        assert!(status.success(), "reconciled linked worktree must be usable");
+        let manifest = fs::read_to_string(quarantine.join("df-crash-raw.json")).unwrap();
+        assert!(manifest.contains("\"state\":\"moved\""));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
