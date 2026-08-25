@@ -81,15 +81,16 @@ edge as a safety net for any future engine revision that routes on
 | Class | Nodes | Default routing |
 |-------|-------|-----------------|
 | *(none)* | `explore`, `implement`, `fix` | Honor run-level `--backend` (coder tier) |
-| `.plan` | `plan` | `claude` + `claude-opus-4-6` (design/spec tier) |
+| `.plan` | `plan` | `minimax` + `MiniMax-M3` (design/spec tier) |
 | `.review` | `review` | `agy` (independent adversarial reviewer) |
 
 Explore uses the **same CLI/model as the coder** (`--backend`). Plan uses a
 heavier model for architecture work. Review stays on a separate backend.
 
-To override, set `backend=` / `model_name=` on the node in the `.dot` (explicit
-attrs win over the stylesheet). Tests pin `plan` and `review` to `echo` for
-offline determinism.
+To override routing, set `backend=` / `model_name=` on the node in the `.dot`
+(explicit attrs win over the stylesheet). The checked-in plan stylesheet is
+pinned to MiniMax-M3; tests pin `plan` and `review` to `echo` for offline
+determinism.
 
 ## Adversarial-review priority queue (`gate_er` and `gate_es`)
 
