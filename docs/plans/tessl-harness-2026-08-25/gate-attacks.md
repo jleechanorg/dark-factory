@@ -309,3 +309,9 @@
 **Top 5 critical attacks (≥2/3, severity HIGH/CRITICAL):** 4.1, 4.2, 6.1, 7.1, 8.1, C1.
 
 These flow into Phase 3 as invariant-redesign inputs.
+
+## Codex cross-model review (rule 12, 2026-08-25)
+
+`codex-pair-verifier` agentId `ac2f46420d36a8511` ran 10 spot-checks against HEAD `422e86bc5e`. Verdict per attack: PLAUSIBLE — all 6 redesigns address real bypasses confirmed via grep reproductions. Codex surfaced a common defect class: the initial redesign proposals favored new infrastructure over extending the existing substrate.
+
+Revisions are documented in `invariant-redesigns.md` § Codex cross-model review and reflected in the 3 factory beads at `beads/factory/tessl-harness-*.md` (commit `f2ebb19b24`).

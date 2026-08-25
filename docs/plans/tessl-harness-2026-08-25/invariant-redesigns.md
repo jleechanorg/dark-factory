@@ -223,12 +223,31 @@ Specifically:
 | ID | Tessl Pillar | Attacks Addressed | Risk Tier | PRs | Critical-Path |
 |----|--------------|-------------------|-----------|-----|---------------|
 | R1 | P1+P2 | A-4.1, A-4.2 | HIGH | 3 | BugBot structured verdict |
-| R2 | P1 | A-8.1 | **CRITICAL** | 3 | DetectorSkipped → Red |
+| R2 | P1 | A-8.1 | **CRITICAL** | 1 (revised) | BaselineFailed → Red (flip existing variant, no new infra) |
 | R3 | P2 | A-7.1 | HIGH | 1 | Skeptic::Warn telemetry |
 | R4 | P3 | A-6.1 | HIGH | 3 | Tiered evidence floor |
-| R5 | P1+P3 | A-2.1, A-3.2, A-5.1, A-5.2, C-1 | HIGH | 3+ | Reviewer alias + health ledger |
+| R5 | P1+P3 | A-2.1, A-3.2, A-5.1, A-5.2, C-1 | HIGH | 3 | Extend vendor_aliases.json + vendor_health.rs |
 | R6 | P2 | (meta) | LOW | 1 | Invariant adherence dashboard |
 
-**Total: ~14 PRs across 6 redesigns.** Top 3 priorities by Tessl P1+P3 weight: **R2** (CRITICAL, blocks the entire vacuous-detector purpose), **R1** (HIGH, fixes the most-flaky gate), **R5** (HIGH, foundational for the vendor-waiver contract).
+**Total: ~12 PRs across 6 redesigns.** Top 3 priorities by Tessl P1+P3 weight: **R2** (CRITICAL, blocks the entire vacuous-detector purpose), **R1** (HIGH, fixes the most-flaky gate), **R5** (HIGH, foundational for the vendor-waiver contract).
 
 Phase 4 will convert the top 3 (R2, R1, R5) into /af factory-labeled beads.
+
+## Codex cross-model review (rule 12, 2026-08-25)
+
+`codex-pair-verifier` agentId `ac2f46420d36a8511` reviewed the 3 factory beads.
+
+**Verdict per bead:** PLAUSIBLE — real attack vector confirmed at HEAD `422e86bc5e` via grep reproductions.
+
+**Common defect class across all 3 beads:** `propose-new-infrastructure-over-extend-existing-infrastructure`.
+
+| Codex killer | Confirmed? | Revision applied |
+|--------------|------------|-------------------|
+| Bead 1 misfiled the enum at `vacuous_red_green.rs:64-90`; actual location is `verifier.rs:504-547`. `DetectorSkipped` variant is redundant with existing `CargoNotFound` / `PytestNotFound` / `ManifestMissing` which already map to `Unknown`. Only `BaselineFailed` is the unique bypass. | ✓ | Bead 1 collapsed from 3 PRs to 1: flip the single line `BaselineFailed(_reason) => GateResult::Green` to `Red` at `verifier.rs:965`. No new enum variant. |
+| Bead 2 proposed new `bugbot_status: BugbotStatus` field; `bugbot_pending: bool` already exists at `tools.rs:222` (jleechan-8s2p). AST-grep tooling doesn't exist in repo (`grep -rn ast-grep daemon/` returns 0 hits). | ✓ | Bead 2 extends existing `bugbot_status: String` (line 207) into a typed enum; AST-grep replaced with `cargo clippy --workspace -- -D clippy::match_wildcard_for_single_variants` (deterministic coverage test). |
+| Bead 3 proposed new `daemon/src/reviewer_health.rs` + `config/reviewers.toml`; existing `daemon/src/vendor_health.rs` (428 LOC, 11 unit tests, `VendorHealthLedger`) and `config/vendor_aliases.json` exist. | ✓ | Bead 3 extends `config/vendor_aliases.json` with parallel `reviewer_aliases` section (mirrors `vendor_aliases` structure); extends `VendorHealthLedger` with `ReviewerHealth` variants. **No new files.** AST-grep replaced with cargo clippy. |
+
+**Post-revision verification:**
+- 3 revised beads committed at `f2ebb19b24`.
+- Bead body sizes: 2,809 / 3,542 / 3,845 chars (all < 4096).
+- Attack vectors remain PLAUSIBLE; fixes are now 1 PR / 3 PRs / 3 PRs (down from 3 / 3 / 3+).
