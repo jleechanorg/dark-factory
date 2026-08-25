@@ -756,7 +756,28 @@ pub trait Sessions {
     fn spawn(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError>;
     fn attach(&self, branch: &str, bead_id: &str) -> Result<SessionId, DaemonError>;
     fn stop(&self, id: &SessionId) -> Result<(), DaemonError>;
+    /// Stop a session while the caller has resolved its owning AO project.
+    /// The default preserves compatibility with fakes and adapters whose
+    /// session ids are globally addressable.
+    fn stop_in_project(
+        &self,
+        project: &str,
+        id: &SessionId,
+    ) -> Result<(), DaemonError> {
+        let _ = project;
+        self.stop(id)
+    }
     fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError>;
+    /// Project-scoped liveness probe. The default delegates so existing
+    /// adapters and test doubles remain source-compatible.
+    fn is_quiescent_in_project(
+        &self,
+        project: &str,
+        id: &SessionId,
+    ) -> Result<bool, DaemonError> {
+        let _ = project;
+        self.is_quiescent(id)
+    }
     /// Budget-bounded `attach` (bead jleechan-zeij / issue #322 r4 P2). The
     /// re-roll proceed poll caps each probe at the time remaining until its
     /// window deadline so a single poll cannot block for multiples of the
@@ -798,6 +819,16 @@ pub trait Sessions {
         } else {
             Ok(SessionActivity::Running)
         }
+    }
+    /// Project-scoped activity probe. The default delegates so existing
+    /// adapters and test doubles remain source-compatible.
+    fn session_activity_in_project(
+        &self,
+        project: &str,
+        id: &SessionId,
+    ) -> Result<SessionActivity, DaemonError> {
+        let _ = project;
+        self.session_activity(id)
     }
     /// Post-spawn session health monitor: checks if an active session died,
     /// failed authentication, hit quota limits, or suffered terminal errors in its terminal.

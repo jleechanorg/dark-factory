@@ -4326,6 +4326,26 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         // Unknown blocks readiness. The Stage-1 lane has no PR diff to revert,
         // so NotProvided is the right answer (matches r5 contract).
         let is_test_repo = crate::config::is_fixture_repo(&repo);
+        let ao_project = match deps.cfg.resolve_repo(&repo) {
+            Some(routing) => routing.ao_project,
+            None => {
+                if overlay.state == OverlayState::Dispatched {
+                    emit(
+                        deps.telemetry_log,
+                        bead_id,
+                        overlay.attempt,
+                        OverlayState::Dispatched.as_str(),
+                        "DISPATCHED_UNMAPPED_REPO",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "repo": repo,
+                            "action": "kept_dispatched_no_session_lifecycle_operation",
+                        }),
+                    )?;
+                }
+                continue;
+            }
+        };
 
         if overlay.state == OverlayState::Dispatched {
             // PR #755 Slice 1: orphaned DISPATCHED overlays (BOTH
@@ -4453,7 +4473,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     // wedge is auditable. A subsequent fresh
                     // `check_session_health()` observation (Terminal /
                     // NotFound) is the only path to promotion/retry.
-                    match deps.sessions.stop(&sid) {
+                    match deps.sessions.stop_in_project(&ao_project, &sid) {
                         Ok(()) => {
                             overlay.session_id = None;
                             // Bead rev-3lm8k: the coder session has
@@ -4745,7 +4765,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                 // `Terminal`/`NotFound` observation (or a
                                 // successful stop) is the only path to
                                 // promotion.
-                                match deps.sessions.stop(&sid) {
+                                match deps.sessions.stop_in_project(&ao_project, &sid) {
                                     Ok(()) => {
                                         session_already_stopped = true;
                                         true
@@ -4768,10 +4788,17 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                         false
                                     }
                                 }
-                            } else if deps.sessions.is_quiescent(&sid).unwrap_or(false) {
+                            } else if deps
+                                .sessions
+                                .is_quiescent_in_project(&ao_project, &sid)
+                                .unwrap_or(false)
+                            {
                                 true
                             } else {
-                                match deps.sessions.session_activity(&sid) {
+                                match deps
+                                    .sessions
+                                    .session_activity_in_project(&ao_project, &sid)
+                                {
                                     Ok(crate::tools::SessionActivity::Idle) => {
                                         // PR #755 Slice 4: a successful stop() is the
                                         // ONLY signal that authorizes the Idle
@@ -4791,7 +4818,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                         // fresh `Terminal`/`NotFound`
                                         // observation (or a successful stop)
                                         // is the only path to promotion.
-                                        match deps.sessions.stop(&sid) {
+                                        match deps.sessions.stop_in_project(&ao_project, &sid) {
                                             Ok(()) => {
                                                 session_already_stopped = true;
                                                 true
@@ -4835,7 +4862,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     if let Some(session_id_str) = overlay.session_id.as_ref() {
                         let sid = SessionId(session_id_str.clone());
                         if matches!(
-                            deps.sessions.session_activity(&sid),
+                            deps.sessions.session_activity_in_project(&ao_project, &sid),
                             Ok(crate::tools::SessionActivity::NotFound)
                         ) {
                             // A positive NotFound result is already a
@@ -4865,7 +4892,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         let stop_result = if session_already_stopped {
                             Ok(())
                         } else {
-                            deps.sessions.stop(&sid)
+                            deps.sessions.stop_in_project(&ao_project, &sid)
                         };
                         match stop_result {
                             Ok(()) => {}

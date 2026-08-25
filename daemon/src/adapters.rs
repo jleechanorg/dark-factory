@@ -3287,6 +3287,16 @@ impl CliSessions {
         }
     }
 
+    fn status_for_project(
+        project: &str,
+        timeout_secs: u64,
+    ) -> Result<serde_json::Value, DaemonError> {
+        let out = run_tool("ao", &["status", "-p", project, "--json"], timeout_secs)?;
+        let json_start = out.find('[').unwrap_or(0);
+        serde_json::from_str(&out[json_start..])
+            .map_err(|e| DaemonError::Parse(format!("failed to parse ao status: {e}")))
+    }
+
     fn run_spawn_process(&self, agent: &str, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
         // jleechan-bqdv Stage C: spawn into `spec.ao_project` (resolved per
         // bead by `Config::resolve_repo`, Stage B), not `self.project` (the
@@ -3350,7 +3360,7 @@ impl CliSessions {
         if let Some(spawn_error) = spawn_error {
             return match run_tool(
                 "ao",
-                &["session", "kill", &session.0, "-p", &spec.ao_project],
+                &["session", "kill", &session.0],
                 30,
             ) {
                 Ok(_) => Err(spawn_error),
@@ -3902,8 +3912,7 @@ import os
 import sys
 
 args = sys.argv[1:]
-if args[:2] == ["session", "kill"] and len(args) == 5:
-    assert args[3:] == ["-p", "dark-factory"], args
+if args[:2] == ["session", "kill"] and len(args) == 3:
     with open(os.environ["AO_FAKE_LOG"], "a", encoding="utf-8") as handle:
         handle.write(json.dumps({"kind": "kill", "args": args, "session": args[2]}) + "\n")
     if os.environ.get("AO_FAKE_KILL_FAIL") == "1":
@@ -4915,9 +4924,7 @@ export const isTerminalSession = () => false;
             serde_json::json!([
                 "session",
                 "kill",
-                kills[0]["session"],
-                "-p",
-                "dark-factory"
+                kills[0]["session"]
             ])
         );
     }
@@ -5030,7 +5037,7 @@ with open(os.environ["AO_FAKE_CLEANUP_LOG"], "a", encoding="utf-8") as handle:
 if sys.argv[1] == "spawn":
     print("SESSION=missing-worktree-session")
     raise SystemExit(0)
-if sys.argv[1:] == ["session", "kill", "missing-worktree-session", "-p", "dark-factory"]:
+if sys.argv[1:] == ["session", "kill", "missing-worktree-session"]:
     raise SystemExit(0)
 raise SystemExit(9)
 "#,
@@ -5074,15 +5081,13 @@ raise SystemExit(9)
                 "session",
                 "kill",
                 "missing-worktree-session",
-                "-p",
-                "dark-factory"
             ])
         );
         assert!(!calls.iter().any(|call| call == &serde_json::json!(["stop", "missing-worktree-session"])));
     }
 
     #[test]
-    fn session_stop_scopes_kill_to_configured_project() {
+    fn session_stop_uses_ts_compatible_global_kill() {
         let _guard = gh_env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -5102,7 +5107,7 @@ import os
 import sys
 with open(os.environ["AO_FAKE_STOP_LOG"], "a", encoding="utf-8") as handle:
     handle.write(json.dumps(sys.argv[1:]) + "\n")
-if sys.argv[1:] == ["session", "kill", "scoped-session", "-p", "dark-factory"]:
+if sys.argv[1:] == ["session", "kill", "scoped-session"]:
     raise SystemExit(0)
 raise SystemExit(9)
 "#,
@@ -5117,7 +5122,10 @@ raise SystemExit(9)
         std::env::set_var("AO_FAKE_STOP_LOG", &log);
 
         let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
-        let result = sessions.stop(&SessionId("scoped-session".to_string()));
+        let result = sessions.stop_in_project(
+            "secondary-project",
+            &SessionId("scoped-session".to_string()),
+        );
 
         std::env::set_var("PATH", old_path);
         match old_log {
@@ -5138,8 +5146,6 @@ raise SystemExit(9)
                 "session",
                 "kill",
                 "scoped-session",
-                "-p",
-                "dark-factory"
             ])]
         );
     }
@@ -5166,7 +5172,7 @@ with open(os.environ["AO_FAKE_CLEANUP_LOG"], "a", encoding="utf-8") as handle:
 if sys.argv[1] == "spawn":
     print("SESSION=untracked-session")
     raise SystemExit(0)
-if sys.argv[1:] == ["session", "kill", "untracked-session", "-p", "dark-factory"]:
+if sys.argv[1:] == ["session", "kill", "untracked-session"]:
     print("scripted kill failure", file=sys.stderr)
     raise SystemExit(8)
 raise SystemExit(9)
@@ -5215,8 +5221,6 @@ raise SystemExit(9)
                 "session",
                 "kill",
                 "untracked-session",
-                "-p",
-                "dark-factory"
             ])
         );
     }
@@ -6487,16 +6491,27 @@ impl Sessions for CliSessions {
     }
 
     fn stop(&self, id: &SessionId) -> Result<(), DaemonError> {
-        run_tool("ao", &["session", "kill", &id.0, "-p", &self.project], 30)?;
+        self.stop_in_project(&self.project, id)
+    }
+
+    fn stop_in_project(&self, project: &str, id: &SessionId) -> Result<(), DaemonError> {
+        // AO's deployed CLI (and the TypeScript session manager) accepts
+        // `ao session kill <id>` only; project scoping belongs on status.
+        let _ = project;
+        run_tool("ao", &["session", "kill", &id.0], 30)?;
         Ok(())
     }
 
     fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError> {
-        let out = run_tool("ao", &["status", "-p", &self.project, "--json"], 30)?;
-        let json_start = out.find('[').unwrap_or(0);
-        let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse ao status: {e}"))
-        })?;
+        self.is_quiescent_in_project(&self.project, id)
+    }
+
+    fn is_quiescent_in_project(
+        &self,
+        project: &str,
+        id: &SessionId,
+    ) -> Result<bool, DaemonError> {
+        let data = Self::status_for_project(project, 30)?;
         session_is_quiescent(&data, id)
     }
 
@@ -6510,7 +6525,16 @@ impl Sessions for CliSessions {
         &self,
         id: &SessionId,
     ) -> Result<crate::tools::SessionActivity, DaemonError> {
-        self.session_activity_within(id, 30)
+        self.session_activity_in_project(&self.project, id)
+    }
+
+    fn session_activity_in_project(
+        &self,
+        project: &str,
+        id: &SessionId,
+    ) -> Result<crate::tools::SessionActivity, DaemonError> {
+        let data = Self::status_for_project(project, 30)?;
+        session_activity(&data, id)
     }
 
     /// Bead jleechan-zeij / issue #322 r4 P2: budget-bounded

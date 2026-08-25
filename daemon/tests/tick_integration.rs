@@ -34,7 +34,7 @@ use daemon::tools::{
     SessionId, Sessions, SpawnSpec,
 };
 use daemon::verifier::SkepticVerdict;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 /// Models AO's non-idempotent `session kill`: the first stop succeeds, while
 /// any accidental second stop fails so promotion cannot hide a duplicate kill
@@ -88,6 +88,89 @@ impl Sessions for StopFailsOnSecond {
         id: &SessionId,
     ) -> Result<daemon::tools::SessionActivity, DaemonError> {
         self.inner.session_activity(id)
+    }
+}
+
+/// Models two AO projects sharing a session id namespace. The unscoped
+/// probes deliberately report the primary project's quiescent result, while
+/// project-aware probes report the secondary project's live session.
+struct ProjectAwareSessions {
+    inner: FakeSessions,
+    project_calls: RefCell<Vec<String>>,
+}
+
+impl ProjectAwareSessions {
+    fn new() -> Self {
+        Self {
+            inner: FakeSessions::new(),
+            project_calls: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl Sessions for ProjectAwareSessions {
+    fn active_count(&self) -> Result<usize, DaemonError> {
+        self.inner.active_count()
+    }
+
+    fn spawn(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
+        self.inner.spawn(spec)
+    }
+
+    fn attach(&self, branch: &str, bead_id: &str) -> Result<SessionId, DaemonError> {
+        self.inner.attach(branch, bead_id)
+    }
+
+    fn stop(&self, id: &SessionId) -> Result<(), DaemonError> {
+        self.inner.stop(id)
+    }
+
+    fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError> {
+        self.inner.is_quiescent(id)
+    }
+
+    fn session_activity(
+        &self,
+        id: &SessionId,
+    ) -> Result<daemon::tools::SessionActivity, DaemonError> {
+        self.inner.session_activity(id)
+    }
+
+    fn stop_in_project(
+        &self,
+        project: &str,
+        id: &SessionId,
+    ) -> Result<(), DaemonError> {
+        self.project_calls
+            .borrow_mut()
+            .push(format!("stop_in_project({project},{})", id.0));
+        self.inner.stop(id)
+    }
+
+    fn is_quiescent_in_project(
+        &self,
+        project: &str,
+        id: &SessionId,
+    ) -> Result<bool, DaemonError> {
+        self.project_calls
+            .borrow_mut()
+            .push(format!("is_quiescent_in_project({project},{})", id.0));
+        Ok(project != "secondary-project")
+    }
+
+    fn session_activity_in_project(
+        &self,
+        project: &str,
+        id: &SessionId,
+    ) -> Result<daemon::tools::SessionActivity, DaemonError> {
+        self.project_calls
+            .borrow_mut()
+            .push(format!("session_activity_in_project({project},{})", id.0));
+        if project == "secondary-project" {
+            Ok(daemon::tools::SessionActivity::Running)
+        } else {
+            Ok(daemon::tools::SessionActivity::NotFound)
+        }
     }
 }
 
@@ -15364,6 +15447,135 @@ fn tick_idle_promotion_with_succeeding_stop_promotes_and_cleans() {
     assert!(
         !log.contains("IDLE_STOP_FAILED_NO_PROMOTION"),
         "happy path must NOT emit IDLE_STOP_FAILED_NO_PROMOTION; full log: {log}"
+    );
+
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// A session missing from the daemon's primary AO project can still be live
+/// in the project resolved for a secondary repository. The fast tier must
+/// query that owning project and preserve the live worker and its worktree.
+#[test]
+fn tick_secondary_project_live_session_is_not_notfound_or_cleaned() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = ProjectAwareSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let worktree_root = std::env::temp_dir().join(format!(
+        "afd_secondary_project_liveness_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let mut cfg = test_cfg();
+    cfg.agent_worktree_root = Some(worktree_root.display().to_string());
+    cfg.repos.insert(
+        "jleechanorg/secondary-repo".into(),
+        RepoConfig {
+            ao_project: "secondary-project".into(),
+            push_remote: "origin".into(),
+            local_checkout: None,
+        },
+    );
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_secondary_project_liveness.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let worktree = worktree_root.join("jleechanorg/secondary-repo/secondary-session");
+    std::fs::create_dir_all(&worktree).unwrap();
+    init_cleanup_test_repo(&worktree);
+    std::fs::write(worktree.join("marker"), b"live secondary worker").unwrap();
+
+    store.overlays.borrow_mut().insert(
+        "secondary-bead".into(),
+        BeadOverlay {
+            bead_id: "secondary-bead".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(1105),
+            branch: Some("fix/secondary-live".into()),
+            session_id: Some("secondary-session".into()),
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: Some("jleechanorg/secondary-repo".into()),
+            attempt_started_at: None,
+        },
+    );
+    store
+        .register_branch("secondary-bead", "fix/secondary-live")
+        .unwrap();
+    scm.pr_numbers_for_branch.insert(
+        (
+            "jleechanorg/secondary-repo".into(),
+            "fix/secondary-live".into(),
+        ),
+        Some(1105),
+    );
+    scm.open_pr_head_refs.insert(
+        ("jleechanorg/secondary-repo".into(), 1105),
+        PrHeadBranch::SameRepo("fix/secondary-live".into()),
+    );
+    scm.pr_snapshots.insert(
+        1105,
+        PrSnapshot {
+            pr_number: 1105,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "head-1105".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".into(),
+            coderabbit_status: "green".into(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        0,
+        10,
+    )
+    .expect("secondary-project liveness probe must succeed");
+
+    let overlay = store.load("secondary-bead").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::Dispatched);
+    assert_eq!(overlay.session_id.as_deref(), Some("secondary-session"));
+    assert!(worktree.is_dir(), "live secondary worktree must be preserved");
+    let project_calls = sessions.project_calls.borrow();
+    assert!(
+        !project_calls.is_empty()
+            && project_calls
+                .iter()
+                .all(|call| call.contains("secondary-project")),
+        "every lifecycle lookup must use the owning AO project: {project_calls:?}"
+    );
+    assert!(
+        !project_calls.iter().any(|call| call.starts_with("stop_in_project")),
+        "a live secondary session must not be stopped: {project_calls:?}"
     );
 
     let _ = std::fs::remove_dir_all(&worktree_root);
