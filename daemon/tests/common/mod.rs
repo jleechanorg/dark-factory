@@ -1417,6 +1417,10 @@ impl Llm for FakeLlm {
             None => Ok(String::new()),
         }
     }
+
+    fn judge_read_only(&self, prompt: &str) -> Result<String, DaemonError> {
+        self.judge(prompt)
+    }
 }
 
 type RejectionRecord = (String, String, String);

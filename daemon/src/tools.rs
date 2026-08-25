@@ -1185,7 +1185,11 @@ pub trait Vcs {
 pub trait Llm {
     fn judge(&self, prompt: &str) -> Result<String, DaemonError>;
     /// Execute external review data without repository-write capabilities.
-    fn judge_read_only(&self, prompt: &str) -> Result<String, DaemonError> { self.judge(prompt) }
+    /// Implementations must opt in; silently falling back to `judge` would
+    /// turn public review text into a write-capable agent prompt.
+    fn judge_read_only(&self, _prompt: &str) -> Result<String, DaemonError> {
+        Err(DaemonError::Config("read-only LLM judgment is not implemented".into()))
+    }
     fn is_real(&self) -> bool {
         false
     }
