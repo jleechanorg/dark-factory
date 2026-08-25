@@ -667,7 +667,13 @@ fn python_fn_body_index(source: &str) -> std::collections::HashMap<String, Strin
             }
             body_end += 1;
         }
-        let body = lines[body_start..body_end].join("\n");
+        // Ignore separator whitespace before the next function.  Otherwise
+        // merely appending a new test function changes the preceding
+        // function's captured body and falsely marks it as modified.
+        let body = lines[body_start..body_end]
+            .join("\n")
+            .trim_end()
+            .to_string();
         out.insert(name.to_string(), body);
         i = body_end;
     }
@@ -1770,7 +1776,13 @@ fn run_pytest_tests(
         .unwrap_or(repo_root);
     let mut selector_args: Vec<String> = Vec::new();
     for target in pytest_targets {
-        let rel = relative_repo_path(repo_root, &target.path).unwrap_or_else(|| {
+        // Selectors and pytest's verbose node IDs share the manifest-root
+        // coordinate system.  Passing a nested-project path such as
+        // `mvp_site/tests/test_value.py` while running from the repository
+        // root makes pytest report `tests/test_value.py::...`, so the
+        // parser would classify a passing target as NEVER_RAN.  Construct
+        // the selector relative to the same root used for output parsing.
+        let rel = relative_repo_path(pytest_root, &target.path).unwrap_or_else(|| {
             target.path.to_string_lossy().into_owned()
         });
         selector_args.push(format!("{rel}::{}", target.name));
@@ -1815,7 +1827,10 @@ fn run_pytest_tests(
     args.extend(selector_args);
 
     let out = Command::new(&pytest_bin)
-        .current_dir(repo_root)
+        // A nested pyproject is a standalone pytest project.  Running from
+        // its manifest parent makes the repo-relative selectors above valid
+        // across pytest versions while preserving root-level behavior.
+        .current_dir(pytest_root)
         .args(&args)
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .env("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
@@ -1949,6 +1964,57 @@ fn run_pytest_baseline_check(
                     baseline_target.path.display()
                 ))
             })?;
+        } else if baseline_target.path.is_file() && target.path.is_file() {
+            // A newly added test function in an existing module is absent from
+            // the detached base file even though the file itself exists.  If
+            // we leave it untouched, pytest reports "not found" and the
+            // baseline phase becomes BaselineFailed -> Green, bypassing gate
+            // 8.  Materialize only the newly-added function(s), preserving
+            // the base module's production-facing imports and existing tests.
+            let rel = relative_repo_path(repo_root, &target.path);
+            let base_src = rel.and_then(|path| read_base_blob(repo_root, base_ref, &path));
+            let head_src = std::fs::read_to_string(&target.path).map_err(|e| {
+                RedGreenError::BaselineFailed(format!(
+                    "read head pytest module {}: {e}",
+                    target.path.display()
+                ))
+            })?;
+            let base_names: BTreeSet<String> = base_src
+                .as_deref()
+                .map(discover_python_test_fns)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            if !base_names.contains(&target.name) {
+                let snippet = extract_python_test_fn(&head_src, &target.name).ok_or_else(|| {
+                    RedGreenError::BaselineFailed(format!(
+                        "cannot materialize added pytest function {} from {}",
+                        target.name,
+                        target.path.display()
+                    ))
+                })?;
+                let mut baseline_src = std::fs::read_to_string(&baseline_target.path).map_err(|e| {
+                    RedGreenError::BaselineFailed(format!(
+                        "read baseline pytest module {}: {e}",
+                        baseline_target.path.display()
+                    ))
+                })?;
+                if !baseline_src.ends_with('\n') {
+                    baseline_src.push('\n');
+                }
+                baseline_src.push('\n');
+                baseline_src.push_str(&snippet);
+                if !baseline_src.ends_with('\n') {
+                    baseline_src.push('\n');
+                }
+                std::fs::write(&baseline_target.path, baseline_src).map_err(|e| {
+                    RedGreenError::BaselineFailed(format!(
+                        "materialize added pytest function {} into {}: {e}",
+                        target.name,
+                        baseline_target.path.display()
+                    ))
+                })?;
+            }
         }
     }
     let baseline_manifest = manifest
@@ -1978,6 +2044,51 @@ fn run_pytest_baseline_check(
     let _ = std::fs::remove_dir_all(&tmp);
 
     result
+}
+
+/// Extract one top-level pytest function, including immediately preceding
+/// decorators, from a module. This deliberately stays line-oriented like the
+/// discovery scanner above; pytest itself remains the parser of record.
+fn extract_python_test_fn(source: &str, name: &str) -> Option<String> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut fn_index = None;
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let Some(declaration) = trimmed
+            .strip_prefix("async def ")
+            .or_else(|| trimmed.strip_prefix("def "))
+        else {
+            continue;
+        };
+        let candidate = declaration
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .next()
+            .unwrap_or_default();
+        if candidate == name && line.len() == trimmed.len() {
+            fn_index = Some(index);
+            break;
+        }
+    }
+    let fn_index = fn_index?;
+    let mut start = fn_index;
+    while start > 0 {
+        let previous = lines[start - 1].trim_start();
+        if previous.starts_with('@') {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    let mut end = fn_index + 1;
+    while end < lines.len() {
+        let line = lines[end];
+        let trimmed = line.trim_start();
+        if !trimmed.is_empty() && line.len() == trimmed.len() {
+            break;
+        }
+        end += 1;
+    }
+    Some(lines[start..end].join("\n"))
 }
 
 /// Rebase a path resolved in `repo_root` into a detached worktree. Relative
@@ -2429,6 +2540,85 @@ fn b() {
             result.all_passed(),
             "detached base test must pass after path rebasing: {result:?}"
         );
+    }
+
+    #[test]
+    fn pytest_baseline_materializes_added_fn_in_existing_module() {
+        // The base already contains this test module, while the PR adds a
+        // second function to it.  The added function must be copied into the
+        // detached baseline; otherwise pytest reports "not found" and the
+        // verifier would map BaselineFailed to Green.
+        let dir = tempdir_unique("pytest-baseline-added-fn");
+        std::fs::create_dir_all(dir.join("pkg")).unwrap();
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            "[project]\nname='added-fn'\n\n[tool.pytest.ini_options]\npythonpath=['.']\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("pkg/__init__.py"), "").unwrap();
+        std::fs::write(dir.join("pkg/value.py"), "def value():\n    return 'base'\n").unwrap();
+        std::fs::write(
+            dir.join("tests/test_value.py"),
+            "from pkg.value import value\n\ndef test_existing():\n    assert value() == 'base'\n",
+        )
+        .unwrap();
+        let run = |args: &[&str]| {
+            let out = Command::new(args[0])
+                .current_dir(&dir)
+                .args(&args[1..])
+                .output()
+                .expect("spawn fixture command");
+            assert!(
+                out.status.success(),
+                "fixture command {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["git", "init", "-q", "-b", "main"]);
+        run(&["git", "config", "user.email", "pytest@example.com"]);
+        run(&["git", "config", "user.name", "pytest"]);
+        run(&["git", "add", "."]);
+        run(&["git", "commit", "-q", "-m", "base"]);
+        let base = String::from_utf8(
+            Command::new("git")
+                .current_dir(&dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+
+        std::fs::write(dir.join("pkg/value.py"), "def value():\n    return 'head'\n").unwrap();
+        std::fs::write(
+            dir.join("tests/test_value.py"),
+            "from pkg.value import value\n\ndef test_existing():\n    assert value() == 'base'\n\ndef test_added_vacuous():\n    assert 2 + 2 == 4\n",
+        )
+        .unwrap();
+        run(&["git", "add", "."]);
+        run(&["git", "commit", "-q", "-m", "head"]);
+
+        let changed = vec![
+            (dir.join("pkg/value.py"), FileClass::Production),
+            (dir.join("tests/test_value.py"), FileClass::Test),
+        ];
+        let report = check_red_green_with_manifest(
+            &dir,
+            &base,
+            &changed,
+            Some(&dir.join("pyproject.toml")),
+        )
+        .expect("pytest detector should execute");
+        assert_eq!(
+            report.verdict,
+            Verdict::Vacuous,
+            "added function must run on baseline, not become BaselineFailed: {report:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
