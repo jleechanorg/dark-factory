@@ -48,8 +48,9 @@ cat > "$FAKE_R" <<'EOF'
 #!/usr/bin/env bash
 printf 'bead=%s pr=%s async=%s sync=%s verify=%s\n' "$1" "$2" "${ASYNC:-}" "${SYNC:-}" "${AFD_REQUIRE_SESSION:-}" >> "$AFD_TEST_REMEDIATE_LOG"
 if [ "${SYNC:-0}" = "1" ]; then sleep 3; fi
+[ "${AFD_TEST_REMEDIATE_SLEEP:-0}" = "0" ] || sleep "$AFD_TEST_REMEDIATE_SLEEP"
 mkdir -p "$AFD_SPAWN_STATE_DIR"
-printf 'pending\n' > "$AFD_SPAWN_STATE_DIR/$1-$2.state"
+printf 'pending\n' > "$AFD_SPAWN_STATE_DIR/$1-$2-${5:-legacy}.state"
 exit 0
 EOF
 chmod +x "$FAKE_R"
@@ -63,6 +64,7 @@ chmod +x "$FAKE_DAEMON"
 FAKE_AO="$SCRATCH/ao-ts"
 cat > "$FAKE_AO" <<'EOF'
 #!/usr/bin/env bash
+if [ "${AFD_TEST_AO_HANG:-0}" = "1" ]; then sleep 30; fi
 case "${1:-}" in
   session)
     if [ -n "${AFD_TEST_ACTIVE_PR:-}" ]; then
@@ -142,22 +144,63 @@ start="$(date +%s)"
 run_tick pending >/dev/null
 elapsed=$(( $(date +%s) - start ))
 pending_state="$(sqlite3 "$AFD_DB" "SELECT state FROM bead_overlay WHERE bead_id='pending';")"
-assert "pending async spawn remains QUEUED" "QUEUED" "$pending_state"
-assert "tick requests async verified remediation" "bead=pending pr=745 async=1 sync= verify=1" "$(cat "$FAKE_R_LOG")"
+pending_nonce="$(sqlite3 "$AFD_DB" "SELECT session_id FROM bead_overlay WHERE bead_id='pending';")"
+assert "pending async spawn remains atomically reserved" "DISPATCHING" "$pending_state"
+assert "tick requests async verified remediation" "bead=pending pr=745 async=1 sync= verify=1" "$(cut -d' ' -f1-5 "$FAKE_R_LOG")"
+assert "pending state file is scoped to reservation nonce" "yes" "$( [ -f "$AFD_SPAWN_STATE_DIR/pending-745-$pending_nonce.state" ] && echo yes || echo no )"
 assert "async dispatch tick avoids overlap latency" "yes" "$( [ "$elapsed" -lt 2 ] && echo yes || echo no )"
+printf 'ok\n' > "$AFD_SPAWN_STATE_DIR/pending-745-$pending_nonce.state"
+export AFD_TEST_ACTIVE_PR=745
+run_tick pending >/dev/null
+unset AFD_TEST_ACTIVE_PR
+assert "matching nonce plus exact active session reconciles DISPATCHED" "DISPATCHED" "$(sqlite3 "$AFD_DB" "SELECT state FROM bead_overlay WHERE bead_id='pending';")"
 
 # An `ok` state without a visible session is allowed a bounded visibility
 # window, then becomes a structured retry instead of wedging QUEUED forever.
 git -C "$TARGET" branch fix/orphaned
 "$OVERLAY" intake-upsert orphaned 'orphaned verified state' >/dev/null
 sqlite3 "$AFD_DB" "UPDATE bead_overlay SET pr_number=748, branch='fix/orphaned', target_repo='owner/target' WHERE bead_id='orphaned';"
-printf 'ok\n' > "$AFD_SPAWN_STATE_DIR/orphaned-748.state"
-touch -d '10 minutes ago' "$AFD_SPAWN_STATE_DIR/orphaned-748.state"
+"$OVERLAY" dispatch-reserve orphaned nonce-orphaned >/dev/null
+printf 'ok\n' > "$AFD_SPAWN_STATE_DIR/orphaned-748-nonce-orphaned.state"
+touch -d '10 minutes ago' "$AFD_SPAWN_STATE_DIR/orphaned-748-nonce-orphaned.state"
 : > "$FAKE_R_LOG"
 AFD_PENDING_MAX_AGE_SEC=1 run_tick orphaned >/dev/null
 assert "stale verified state remains QUEUED while retrying" "QUEUED" "$(sqlite3 "$AFD_DB" "SELECT state FROM bead_overlay WHERE bead_id='orphaned';")"
-assert "stale verified state starts a new async attempt" "bead=orphaned pr=748 async=1 sync= verify=1" "$(cat "$FAKE_R_LOG")"
+assert "stale verified state does not spawn until a new tick reserves" "0" "$(wc -l < "$FAKE_R_LOG" | tr -d ' ')"
 assert_grep "stale verified state emits JSON blocked reason" '"eventType": "TASK_DISPATCH_BLOCKED".*"reason": "verified_session_missing"' "$AFD_LOG"
+
+# Two real overlapping tick processes race on one QUEUED bead. The database
+# reservation must admit one wrapper call, and the attempt nonce must be the
+# one persisted in both the row and state filename.
+git -C "$TARGET" branch fix/concurrent-tick
+"$OVERLAY" intake-upsert concurrent-tick 'overlapping tick reservation' >/dev/null
+sqlite3 "$AFD_DB" "UPDATE bead_overlay SET pr_number=751, branch='fix/concurrent-tick', target_repo='owner/target' WHERE bead_id='concurrent-tick';"
+: > "$FAKE_R_LOG"
+export AFD_TEST_REMEDIATE_SLEEP=1
+run_tick concurrent-tick >/dev/null & tick_a=$!
+run_tick concurrent-tick >/dev/null & tick_b=$!
+wait "$tick_a"
+wait "$tick_b"
+unset AFD_TEST_REMEDIATE_SLEEP
+assert "overlapping ticks invoke AO claim once" "1" "$(wc -l < "$FAKE_R_LOG" | tr -d ' ')"
+concurrent_row="$(sqlite3 "$AFD_DB" "SELECT state || '|' || coalesce(session_id,'') FROM bead_overlay WHERE bead_id='concurrent-tick';")"
+case "$concurrent_row" in DISPATCHING'|'?*) actual=yes;; *) actual=no;; esac
+assert "overlapping tick winner persists reservation nonce" "yes" "$actual"
+
+# The real tick also bounds its AO inventory/session probes; otherwise a
+# hanging CLI prevents it from ever reaching the bounded remediation wrapper.
+git -C "$TARGET" branch fix/hanging-ao
+"$OVERLAY" intake-upsert hanging-ao 'hanging AO probe' >/dev/null
+sqlite3 "$AFD_DB" "UPDATE bead_overlay SET pr_number=752, branch='fix/hanging-ao', target_repo='owner/target' WHERE bead_id='hanging-ao';"
+start="$(date +%s)"
+set +e
+AFD_TEST_AO_HANG=1 AFD_AO_READY_TIMEOUT_SEC=1 AFD_REMEDIATE_BIN="$FAKE_R" \
+  AFD_INTAKE_BIN="$FAKE_I" AFD_SKIP_DRIFT_CHECK=1 AFD_BEAD_FILTER=hanging-ao \
+  timeout 6 bash "$TICK" >/dev/null 2>&1
+hang_rc=$?
+set -e
+elapsed=$(( $(date +%s) - start ))
+assert "hanging AO tick completes within readiness budget" "yes" "$( [ "$hang_rc" -eq 0 ] && [ "$elapsed" -le 5 ] && echo yes || echo no )"
 
 # Missing and unmapped repo routing are retryable dispatch blocks, never AO
 # calls or HUMAN_HELD transitions, and carry machine-readable reasons.
@@ -176,6 +219,35 @@ run_tick unmapped-repo >/dev/null
 assert "unmapped repo remains QUEUED" "QUEUED" "$(sqlite3 "$AFD_DB" "SELECT state FROM bead_overlay WHERE bead_id='unmapped-repo';")"
 assert "unmapped repo does not call AO" "0" "$(wc -l < "$FAKE_R_LOG" | tr -d ' ')"
 assert_grep "unmapped repo emits JSON blocked reason" '"eventType": "TASK_DISPATCH_BLOCKED".*"reason": "unmapped_target_repo"' "$AFD_LOG"
+
+# URL suffix tricks must not pass origin validation. Only github.com with the
+# exact /owner/repo path is accepted.
+for case_name in evil-host attacker-host path-lookalike; do
+  case "$case_name" in
+    evil-host) bad_url='https://evilgithub.com/owner/target.git' ;;
+    attacker-host) bad_url='https://github.com.attacker.example/owner/target.git' ;;
+    path-lookalike) bad_url='https://github.com/owner/target-extra.git' ;;
+  esac
+  git -C "$TARGET" remote set-url origin "$bad_url"
+  bead="url-$case_name"
+  "$OVERLAY" intake-upsert "$bead" 'bad origin URL' >/dev/null
+  sqlite3 "$AFD_DB" "UPDATE bead_overlay SET pr_number=749, branch='fix/url-$case_name', target_repo='owner/target' WHERE bead_id='$bead';"
+  : > "$FAKE_R_LOG"
+  run_tick "$bead" >/dev/null
+  assert "$case_name origin remains QUEUED" "QUEUED" "$(sqlite3 "$AFD_DB" "SELECT state FROM bead_overlay WHERE bead_id='$bead';")"
+  assert "$case_name origin never calls AO" "0" "$(wc -l < "$FAKE_R_LOG" | tr -d ' ')"
+done
+git -C "$TARGET" remote set-url origin https://github.com/owner/target.git
+
+# A blocked ATTESTED row must be atomically requeued, not left in a state that
+# dispatch-blocked merely reports without changing.
+"$OVERLAY" intake-upsert attested-block 'attested blocked row' >/dev/null
+sqlite3 "$AFD_DB" "UPDATE bead_overlay SET state='ATTESTED', pr_number=750, branch='fix/attested-block', target_repo=NULL WHERE bead_id='attested-block';"
+: > "$FAKE_R_LOG"
+run_tick attested-block >/dev/null
+assert "blocked ATTESTED row transitions to QUEUED" "QUEUED" "$(sqlite3 "$AFD_DB" "SELECT state FROM bead_overlay WHERE bead_id='attested-block';")"
+assert "blocked ATTESTED row never calls AO" "0" "$(wc -l < "$FAKE_R_LOG" | tr -d ' ')"
+assert_grep "blocked ATTESTED telemetry records QUEUED" '"beadId": "attested-block".*"state": "QUEUED".*"eventType": "TASK_DISPATCH_BLOCKED"' "$AFD_LOG"
 
 echo "=== RESULTS: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ]

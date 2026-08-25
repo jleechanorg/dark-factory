@@ -15,6 +15,9 @@
 #   route-record <id> <PATH> [n]  — record LLM route verdict (SMALL|STANDARD)
 #   capacity                      — print dispatchable slot count this tick
 #   dispatch-record <id> <branch> — QUEUED → DISPATCHED; register branch owner
+#   dispatch-reserve <id> <nonce> — atomically reserve one dispatch attempt
+#   dispatch-complete <id> <branch> <nonce> — verified reservation → DISPATCHED
+#   dispatch-release <id> <nonce> <reason> <context-json> — retry as QUEUED
 #   dispatch-blocked <id> <reason> <context-json> — retain QUEUED with telemetry
 #   pr-opened <id> <n> <url>      — DISPATCHED → ATTESTED
 #   autonomy-tick <secs>          — bump autonomy_secs; warn/park at threshold
@@ -234,6 +237,69 @@ dispatch-record)
   echo "ok"
   ;;
 
+dispatch-reserve)
+  [ $# -eq 3 ] || die "usage: dispatch-reserve <bead_id> <nonce>"
+  valid_bead_id "$2"
+  [[ "$3" =~ ^[A-Za-z0-9._-]+$ ]] || die_code $EX_VALID_INPUT "invalid dispatch nonce: $3"
+  changed="$(sql "UPDATE bead_overlay
+       SET state='DISPATCHING', session_id='$(q "$3")', updated_at='$(now)'
+       WHERE bead_id='$(q "$2")' AND state IN ('QUEUED','ATTESTED');
+       SELECT changes();")"
+  [ "$changed" = "1" ] || die_code $EX_NOOP "dispatch reservation lost for $2"
+  cur_attempt="$(get_field "$2" attempt)"
+  emit "$2" "$cur_attempt" DISPATCHING TASK_DISPATCH_RESERVED \
+    "{\"nonce\":$(js "$3")}"
+  echo "reserved"
+  ;;
+
+dispatch-complete)
+  [ $# -eq 4 ] || die "usage: dispatch-complete <bead_id> <branch> <nonce>"
+  valid_bead_id "$2"
+  valid_branch "$3"
+  [[ "$4" =~ ^[A-Za-z0-9._-]+$ ]] || die_code $EX_VALID_INPUT "invalid dispatch nonce: $4"
+  changed="$(sql "BEGIN IMMEDIATE;
+       INSERT INTO branch_registry (branch,bead_id,created_at)
+       SELECT '$(q "$3")','$(q "$2")','$(now)'
+       WHERE EXISTS (SELECT 1 FROM bead_overlay WHERE bead_id='$(q "$2")'
+                     AND state='DISPATCHING' AND session_id='$(q "$4")')
+       ON CONFLICT(branch) DO NOTHING;
+       UPDATE bead_overlay SET state='DISPATCHED', branch='$(q "$3")',
+              session_id=NULL, updated_at='$(now)'
+       WHERE bead_id='$(q "$2")' AND state='DISPATCHING'
+         AND session_id='$(q "$4")'
+         AND EXISTS (SELECT 1 FROM branch_registry
+                     WHERE branch='$(q "$3")' AND bead_id='$(q "$2")');
+       SELECT changes();
+       COMMIT;")"
+  if [ "$changed" != "1" ]; then
+    owner="$(sql "SELECT bead_id FROM branch_registry WHERE branch='$(q "$3")';")"
+    if [ -n "$owner" ] && [ "$owner" != "$2" ]; then
+      die_code $EX_BRANCH_CONFLICT "branch $3 already registered to $owner"
+    fi
+    die_code $EX_NOOP "dispatch completion nonce/state mismatch for $2"
+  fi
+  cur_attempt="$(get_field "$2" attempt)"
+  emit "$2" "$cur_attempt" DISPATCHED TASK_DISPATCHED \
+    "{\"activeModel\":\"minimax\",\"branch\":$(js "$3"),\"nonce\":$(js "$4")}"
+  echo "ok"
+  ;;
+
+dispatch-release)
+  [ $# -eq 5 ] || die "usage: dispatch-release <bead_id> <nonce> <reason> <context-json>"
+  valid_bead_id "$2"
+  [[ "$3" =~ ^[A-Za-z0-9._-]+$ ]] || die_code $EX_VALID_INPUT "invalid dispatch nonce: $3"
+  [[ "$4" =~ ^[a-z0-9_]+$ ]] || die_code $EX_VALID_INPUT "invalid dispatch release reason: $4"
+  printf '%s' "$5" | python3 -c 'import json,sys; json.load(sys.stdin)' >/dev/null 2>&1 \
+    || die_code $EX_VALID_INPUT "dispatch-release context must be JSON"
+  changed="$(sql "UPDATE bead_overlay SET state='QUEUED', session_id=NULL, updated_at='$(now)'
+       WHERE bead_id='$(q "$2")' AND state='DISPATCHING' AND session_id='$(q "$3")';
+       SELECT changes();")"
+  [ "$changed" = "1" ] || die_code $EX_NOOP "dispatch release nonce/state mismatch for $2"
+  cur_attempt="$(get_field "$2" attempt)"
+  emit "$2" "$cur_attempt" QUEUED TASK_DISPATCH_BLOCKED "$5"
+  echo "released"
+  ;;
+
 dispatch-blocked)
   # A dispatch preflight can establish that AO cannot safely claim the PR
   # (for example, its branch is checked out by another worktree). Keep the
@@ -241,12 +307,14 @@ dispatch-blocked)
   [ $# -eq 4 ] || die "usage: dispatch-blocked <bead_id> <reason> <context-json>"
   valid_bead_id "$2"
   [[ "$3" =~ ^[a-z0-9_]+$ ]] || die_code $EX_VALID_INPUT "invalid dispatch block reason: $3"
-  require_state "$2" QUEUED ATTESTED
   printf '%s' "$4" | python3 -c 'import json,sys; json.load(sys.stdin)' >/dev/null 2>&1 \
     || die_code $EX_VALID_INPUT "dispatch-blocked context must be JSON"
+  changed="$(sql "UPDATE bead_overlay SET state='QUEUED', session_id=NULL, updated_at='$(now)'
+       WHERE bead_id='$(q "$2")' AND state IN ('QUEUED','ATTESTED');
+       SELECT changes();")"
+  [ "$changed" = "1" ] || die_code $EX_NOOP "dispatch-blocked state changed before transition for $2"
   cur_attempt="$(get_field "$2" attempt)"
-  cur_state="$(get_field "$2" state)"
-  emit "$2" "$cur_attempt" "$cur_state" TASK_DISPATCH_BLOCKED "$4"
+  emit "$2" "$cur_attempt" QUEUED TASK_DISPATCH_BLOCKED "$4"
   echo "blocked"
   ;;
 
@@ -501,7 +569,12 @@ recover-held)
   ;;
 
 unstick-dispatching)
-  n="$(sql "UPDATE bead_overlay SET state='QUEUED', updated_at='$(now)' WHERE state='DISPATCHING'; SELECT changes();")"
+  ttl="${AFD_PENDING_MAX_AGE_SEC:-180}"
+  case "$ttl" in ''|*[!0-9]*|0) ttl=180 ;; esac
+  n="$(sql "UPDATE bead_overlay SET state='QUEUED', session_id=NULL, updated_at='$(now)'
+            WHERE state='DISPATCHING'
+              AND updated_at <= strftime('%Y-%m-%dT%H:%M:%SZ','now','-${ttl} seconds');
+            SELECT changes();")"
   echo "unstuck=$n"
   ;;
 
@@ -563,6 +636,6 @@ list)
   ;;
 
 *)
-  die "unknown: ${1:-}. Valid: init intake-upsert route-record capacity dispatch-record dispatch-blocked pr-opened autonomy-tick gate-assessment prev-gate-assessment ready reroll-verdict park park-duplicate bead-closed-check tick-summary recover-held unstick-dispatching rollback-dispatched redrive-pr list"
+  die "unknown: ${1:-}. Valid: init intake-upsert route-record capacity dispatch-record dispatch-reserve dispatch-complete dispatch-release dispatch-blocked pr-opened autonomy-tick gate-assessment prev-gate-assessment ready reroll-verdict park park-duplicate bead-closed-check tick-summary recover-held unstick-dispatching rollback-dispatched redrive-pr list"
   ;;
 esac

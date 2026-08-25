@@ -54,8 +54,8 @@ export AFD_SPAWN_STATE_DIR="$SCRATCH/states"
 
 # Spawn output alone is insufficient: with no project-scoped session row the
 # detached completion must become fail:* and remain ineligible for DISPATCHED.
-AFD_REQUIRE_SESSION=1 AFD_ASYNC_WAIT_SEC=0 bash "$REMEDIATE" no-session 9001 owner/repo expected-project >/dev/null
-state="$(wait_for_final "$AFD_SPAWN_STATE_DIR/no-session-9001.state")"
+AFD_REQUIRE_SESSION=1 AFD_ASYNC_WAIT_SEC=0 bash "$REMEDIATE" no-session 9001 owner/repo expected-project nonce-9001 >/dev/null
+state="$(wait_for_final "$AFD_SPAWN_STATE_DIR/no-session-9001-nonce-9001.state")"
 case "$state" in fail:*session_unverified) actual=fail;; *) actual="$state";; esac
 assert "unverified async spawn writes failure state" "fail" "$actual"
 
@@ -63,11 +63,29 @@ assert "unverified async spawn writes failure state" "fail" "$actual"
 # project and returns the exact PR.
 export FAKE_VISIBLE_PR=9002
 : > "$AO_LOG"
-AFD_REQUIRE_SESSION=1 AFD_ASYNC_WAIT_SEC=0 bash "$REMEDIATE" visible-session 9002 owner/repo expected-project >/dev/null
-state="$(wait_for_final "$AFD_SPAWN_STATE_DIR/visible-session-9002.state")"
+AFD_REQUIRE_SESSION=1 AFD_ASYNC_WAIT_SEC=0 bash "$REMEDIATE" visible-session 9002 owner/repo expected-project nonce-9002 >/dev/null
+state="$(wait_for_final "$AFD_SPAWN_STATE_DIR/visible-session-9002-nonce-9002.state")"
 assert "project-scoped visible session writes ok" "ok" "$state"
 queries="$(grep -c '^session ls -p expected-project$' "$AO_LOG" || true)"
 assert "verification query is project scoped" "yes" "$( [ "$queries" -ge 1 ] && echo yes || echo no )"
+
+# Every readiness probe shares one wall-clock deadline. A CLI that hangs on
+# both --version and status must not consume an unbounded multiple of it.
+HANG_AO="$SCRATCH/hang-ao-ts"
+cat > "$HANG_AO" <<'EOF'
+#!/usr/bin/env bash
+sleep 30
+EOF
+chmod +x "$HANG_AO"
+start="$(date +%s)"
+set +e
+AFD_AO_READY_TIMEOUT_SEC=2 AO_BIN="$HANG_AO" AFD_REQUIRE_SESSION=1 AFD_ASYNC_WAIT_SEC=0 \
+  timeout 6 bash "$REMEDIATE" hanging-probe 9003 owner/repo expected-project >/dev/null 2>&1
+rc=$?
+set -e
+elapsed=$(( $(date +%s) - start ))
+assert "hanging AO readiness fails instead of acknowledging spawn" "no" "$( [ "$rc" -eq 0 ] && echo yes || echo no )"
+assert "all readiness probes stay within one deadline budget" "yes" "$( [ "$elapsed" -le 4 ] && echo yes || echo no )"
 
 echo "=== RESULTS: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ]
