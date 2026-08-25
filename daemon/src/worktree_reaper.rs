@@ -398,24 +398,26 @@ fn rename_between_directories(
         return Ok(());
     }
     #[cfg(not(target_os = "linux"))]
-    if entry_exists(destination_parent, destination_name.to_str().unwrap_or_default())? {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "rollback destination was recreated",
-        ));
+    {
+        if entry_exists(destination_parent, destination_name.to_str().unwrap_or_default())? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "rollback destination was recreated",
+            ));
+        }
+        let rc = unsafe {
+            libc::renameat(
+                source_parent.0,
+                source_name.as_ptr(),
+                destination_parent.0,
+                destination_name.as_ptr(),
+            )
+        };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
-    let rc = unsafe {
-        libc::renameat(
-            source_parent.0,
-            source_name.as_ptr(),
-            destination_parent.0,
-            destination_name.as_ptr(),
-        )
-    };
-    if rc < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 #[cfg(unix)]
@@ -826,7 +828,7 @@ fn reconcile_quarantine(root: &Path) -> Result<(), DaemonError> {
         manifest.read_to_string(&mut body).map_err(|e| {
             DaemonError::Config(format!("worktree reaper: read quarantine manifest: {e}"))
         })?;
-        let Some(last) = body.lines().filter(|line| !line.trim().is_empty()).last() else {
+        let Some(last) = body.lines().rfind(|line| !line.trim().is_empty()) else {
             continue;
         };
         let record: serde_json::Value = match serde_json::from_str(last) {
