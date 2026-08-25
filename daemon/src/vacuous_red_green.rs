@@ -661,7 +661,8 @@ fn python_fn_body_index(source: &str) -> std::collections::HashMap<String, Strin
             }
             if indent <= decl_indent
                 && (trimmed_local.starts_with("def ")
-                    || trimmed_local.starts_with("async def "))
+                    || trimmed_local.starts_with("async def ")
+                    || trimmed_local.starts_with('@'))
             {
                 break;
             }
@@ -2560,7 +2561,7 @@ fn b() {
         std::fs::write(dir.join("pkg/value.py"), "def value():\n    return 'base'\n").unwrap();
         std::fs::write(
             dir.join("tests/test_value.py"),
-            "from pkg.value import value\n\ndef test_existing():\n    assert value() == 'base'\n",
+            "import pytest\nfrom pkg.value import value\n\ndef test_existing():\n    assert value() == 'base'\n",
         )
         .unwrap();
         let run = |args: &[&str]| {
@@ -2596,7 +2597,7 @@ fn b() {
         std::fs::write(dir.join("pkg/value.py"), "def value():\n    return 'head'\n").unwrap();
         std::fs::write(
             dir.join("tests/test_value.py"),
-            "from pkg.value import value\n\ndef test_existing():\n    assert value() == 'base'\n\ndef test_added_vacuous():\n    assert 2 + 2 == 4\n",
+            "import pytest\nfrom pkg.value import value\n\ndef test_existing():\n    assert value() == 'base'\n\n@pytest.mark.skipif(False, reason='regression')\n@pytest.mark.regression\ndef test_added_vacuous():\n    assert 2 + 2 == 4\n",
         )
         .unwrap();
         run(&["git", "add", "."]);
@@ -3059,6 +3060,18 @@ def test_b():
         assert!(
             targeted.is_empty(),
             "no fn changed, expected empty targeted list; got {targeted:?}"
+        );
+    }
+
+    #[test]
+    fn compute_targeted_python_test_fns_does_not_attach_new_decorators_to_predecessor() {
+        let base = "def test_existing():\n    assert True\n";
+        let head = "def test_existing():\n    assert True\n\n@pytest.mark.parametrize('value', [1])\n@pytest.mark.skipif(False, reason='regression')\nasync def test_added(value):\n    assert value == 1\n";
+        let (targeted, _) = compute_targeted_python_test_fns(Some(base), head);
+        assert_eq!(
+            targeted,
+            vec!["test_added".to_string()],
+            "decorators on a new async test must not retarget its unchanged predecessor"
         );
     }
 
