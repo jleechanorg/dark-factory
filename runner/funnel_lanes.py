@@ -64,8 +64,22 @@ def _normalize_full(raw: dict) -> Optional[dict]:
     which the base module intentionally drops (it doesn't need them)."""
     event_type = raw.get("eventType")
     bead_id = raw.get("beadId")
-    ts = _parse_ts(raw.get("timestamp") or raw.get("ts"))
-    if not event_type or not bead_id or ts is None:
+    if not isinstance(event_type, str) or not event_type:
+        return None
+    if not isinstance(bead_id, str) or not bead_id:
+        return None
+
+    # Keep the current ``timestamp`` / legacy ``ts`` fallback, but reject a
+    # malformed non-string primary field before calling ``_parse_ts``.  The
+    # helper intentionally accepts strings only; passing a list/dict through
+    # would raise AttributeError before it can fail-soft.
+    timestamp = raw.get("timestamp")
+    if timestamp is None or timestamp == "":
+        timestamp = raw.get("ts")
+    if not isinstance(timestamp, str) or not timestamp:
+        return None
+    ts = _parse_ts(timestamp)
+    if ts is None:
         return None
     attempt = raw.get("attemptId")
     if attempt is None:

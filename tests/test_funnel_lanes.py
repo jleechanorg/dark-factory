@@ -117,6 +117,33 @@ def test_load_events_full_skips_valid_non_object_json(tmp_path, non_object):
     assert [event["bead_id"] for event in events] == ["rev-after-non-object"]
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("eventType", []),
+        ("eventType", {}),
+        ("eventType", 42),
+        ("eventType", ""),
+        ("beadId", []),
+        ("beadId", {}),
+        ("beadId", 42),
+        ("beadId", ""),
+        ("timestamp", []),
+        ("timestamp", {}),
+        ("timestamp", 42),
+        ("timestamp", "not-a-timestamp"),
+    ],
+)
+def test_normalize_full_rejects_malformed_required_fields(field, value):
+    """Malformed required fields are dropped before downstream set/dict use."""
+    import runner.funnel_lanes as fl
+
+    row = _row("rev-valid", 1, "INTAKE_BEAD_CREATED", 0)
+    row[field] = value
+
+    assert fl._normalize_full(row) is None
+
+
 # ---------------------------------------------------------------------------
 # classify_origin
 # ---------------------------------------------------------------------------
