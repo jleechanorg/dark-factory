@@ -1,5 +1,5 @@
 use crate::errors::{DaemonError, SpawnBatchCleanupFailure};
-use crate::tools::{run_tool, run_tool_in_dir, Bead, Issue, LabeledPr, Llm, Permission, PrHeadBranch, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs, WorktreeHeadAncestry};
+use crate::tools::{run_tool, run_tool_in_dir, Bead, Issue, LabeledPr, Llm, Permission, PrHeadBranch, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, UnresolvedReviewThread, Vcs, WorktreeHeadAncestry};
 use std::process::{Command, Stdio};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -712,7 +712,10 @@ fn canonicalize_external_ref_for_comment(external_ref: &str) -> Option<(String, 
     None
 }
 
-fn unresolved_thread_count_from_gql(gql_out: &str) -> Result<u32, DaemonError> {
+const MAX_UNRESOLVED_REVIEW_THREADS: usize = 100;
+const MAX_REVIEW_THREAD_BODY_CHARS: usize = 4_000;
+
+fn unresolved_threads_from_gql(gql_out: &str) -> Result<Vec<UnresolvedReviewThread>, DaemonError> {
     #[derive(serde::Deserialize)]
     struct GhGqlResponse {
         data: GhGqlData,
@@ -737,8 +740,27 @@ fn unresolved_thread_count_from_gql(gql_out: &str) -> Result<u32, DaemonError> {
     }
     #[derive(serde::Deserialize)]
     struct GhGqlNode {
+        #[serde(default)]
+        id: String,
         #[serde(rename = "isResolved")]
         is_resolved: bool,
+        #[serde(rename = "isOutdated", default)]
+        is_outdated: bool,
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        line: Option<u32>,
+        #[serde(default)]
+        comments: GhGqlComments,
+    }
+    #[derive(serde::Deserialize, Default)]
+    struct GhGqlComments {
+        nodes: Vec<GhGqlComment>,
+    }
+    #[derive(serde::Deserialize)]
+    struct GhGqlComment {
+        body: String,
+        author: Option<GhAuthor>,
     }
 
     let json_start = gql_out.find('{').unwrap_or(0);
@@ -751,9 +773,34 @@ fn unresolved_thread_count_from_gql(gql_out: &str) -> Result<u32, DaemonError> {
     Ok(pr_data
         .review_threads
         .nodes
-        .iter()
+        .into_iter()
         .filter(|n| !n.is_resolved)
-        .count() as u32)
+        .take(MAX_UNRESOLVED_REVIEW_THREADS)
+        .map(|node| {
+            let first_comment = node.comments.nodes.into_iter().next();
+            let (author, body) = first_comment
+                .map(|comment| {
+                    let body: String = comment.body.chars().take(MAX_REVIEW_THREAD_BODY_CHARS).collect();
+                    (
+                        comment.author.map(|author| author.login).unwrap_or_default(),
+                        body,
+                    )
+                })
+                .unwrap_or_default();
+            UnresolvedReviewThread {
+                id: node.id,
+                author,
+                path: node.path,
+                line: node.line,
+                is_outdated: node.is_outdated,
+                body,
+            }
+        })
+        .collect())
+}
+
+fn unresolved_thread_count_from_gql(gql_out: &str) -> Result<u32, DaemonError> {
+    Ok(unresolved_threads_from_gql(gql_out)?.len() as u32)
 }
 
 pub fn is_graphql_rate_limited() -> bool {
@@ -2136,16 +2183,28 @@ impl Scm for CliScm {
               pullRequest(number:$pr){
                 reviewThreads(first:100){
                   nodes{
+                    id
                     isResolved
+                    isOutdated
+                    path
+                    line
+                    comments(first:1){
+                      nodes{
+                        body
+                        author { login }
+                      }
+                    }
                   }
                 }
               }
             }
         }";
-        // Unresolved thread count: if GraphQL is rate-limited, attempt to
-        // reuse the cached thread count for the same head SHA if available,
-        // or check review states. Otherwise query GraphQL.
-        let unresolved_thread_count: Option<u32> = if gql_limited || is_graphql_rate_limited() {
+        // Unresolved thread count/details: if GraphQL is rate-limited, attempt
+        // to reuse the cached payload for the same head SHA if available, or
+        // check review states for the legacy count-only fallback. Otherwise
+        // query GraphQL and transport the bounded details alongside the
+        // fail-closed count.
+        let (unresolved_thread_count, unresolved_threads): (Option<u32>, Option<Vec<UnresolvedReviewThread>>) = if gql_limited || is_graphql_rate_limited() {
             let cached_count = {
                 let cache = self.pr_snapshot_cache.lock().unwrap();
                 cache.get(&(self.repo.clone(), pr)).and_then(|(s, _)| {
@@ -2157,13 +2216,23 @@ impl Scm for CliScm {
                 })
             };
             if let Some(count) = cached_count {
-                Some(count)
+                let cached_threads = {
+                    let cache = self.pr_snapshot_cache.lock().unwrap();
+                    cache.get(&(self.repo.clone(), pr)).and_then(|(s, _)| {
+                        if s.head_sha == view.head_ref_oid {
+                            s.unresolved_threads.clone()
+                        } else {
+                            None
+                        }
+                    })
+                };
+                (Some(count), cached_threads)
             } else {
                 let has_changes_requested = view.reviews.iter().any(|r| r.state == "CHANGES_REQUESTED");
                 if has_changes_requested {
-                    Some(1)
+                    (Some(1), None)
                 } else {
-                    None
+                    (None, None)
                 }
             }
         } else {
@@ -2184,14 +2253,14 @@ impl Scm for CliScm {
                 30,
             );
             match gql_out {
-                Ok(gql_out_str) => match unresolved_thread_count_from_gql(&gql_out_str) {
-                    Ok(count) => Some(count),
+                Ok(gql_out_str) => match unresolved_threads_from_gql(&gql_out_str) {
+                    Ok(threads) => (Some(threads.len() as u32), Some(threads)),
                     Err(e) => {
                         eprintln!(
                             "[warn] failed to parse unresolved-thread GraphQL response; \
                              comments-resolved gate will report Unknown, not Green: {e:?}"
                         );
-                        None
+                        (None, None)
                     }
                 },
                 Err(e) => {
@@ -2200,7 +2269,7 @@ impl Scm for CliScm {
                         "[warn] GraphQL query failed; comments-resolved gate will report Unknown, \
                          not Green: {e:?}"
                     );
-                    None
+                    (None, None)
                 }
             }
         };
@@ -2274,6 +2343,7 @@ impl Scm for CliScm {
             coderabbit_approved,
             bugbot_error_count,
             unresolved_thread_count,
+            unresolved_threads,
             head_sha: view.head_ref_oid,
             body: view.body,
             comments: pr_comments,
@@ -2644,6 +2714,11 @@ fn try_offline_pr_snapshot(pr: u64) -> Option<PrSnapshot> {
     }
     let ci_status = if snap.ci_success { "green".to_string() } else { "red".to_string() };
     let coderabbit_status = if snap.coderabbit_approved { "green".to_string() } else { "red".to_string() };
+    let unresolved_threads = if snap.unresolved_thread_count == 0 {
+        Some(Vec::new())
+    } else {
+        None
+    };
     Some(PrSnapshot {
         pr_number: pr,
         ci_success: snap.ci_success,
@@ -2651,6 +2726,7 @@ fn try_offline_pr_snapshot(pr: u64) -> Option<PrSnapshot> {
         coderabbit_approved: snap.coderabbit_approved,
         bugbot_error_count: snap.bugbot_error_count,
         unresolved_thread_count: Some(snap.unresolved_thread_count),
+        unresolved_threads,
         head_sha: snap.head_sha,
         body: snap.body,
         comments: snap.comments,
@@ -8055,6 +8131,7 @@ mod with_repo_tests {
             coderabbit_approved: true,
             bugbot_error_count: 0,
             unresolved_thread_count: Some(0),
+            unresolved_threads: Some(Vec::new()),
             head_sha: "abcdef123456".to_string(),
             body: "test body".to_string(),
             comments: vec![],
@@ -8093,6 +8170,7 @@ mod external_ref_tests {
     use super::{
         canonicalize_external_ref_for_comment, parse_external_ref,
         parse_external_refs_from_br_list, unresolved_thread_count_from_gql,
+        unresolved_threads_from_gql,
     };
 
     /// jleechan-mdgr: reproduces the exact 2026-07-11T00:05:15Z corruption —
@@ -8249,6 +8327,48 @@ mod external_ref_tests {
         let count = unresolved_thread_count_from_gql(json).unwrap();
 
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn graphql_threads_transport_bounded_structured_details() {
+        let json = r#"{
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "nodes": [
+                                {
+                                    "id": "thread-1",
+                                    "isResolved": true,
+                                    "isOutdated": false,
+                                    "path": "src/lib.rs",
+                                    "line": 17,
+                                    "comments": {"nodes": [{"body": "resolved", "author": {"login": "alice"}}]}
+                                },
+                                {
+                                    "id": "thread-2",
+                                    "isResolved": false,
+                                    "isOutdated": true,
+                                    "path": "src/main.rs",
+                                    "line": null,
+                                    "comments": {"nodes": [{"body": "please fix this", "author": {"login": "reviewer"}}]}
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }"#;
+
+        let parsed = unresolved_threads_from_gql(json).unwrap();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, "thread-2");
+        assert_eq!(parsed[0].author, "reviewer");
+        assert_eq!(parsed[0].path.as_deref(), Some("src/main.rs"));
+        assert_eq!(parsed[0].line, None);
+        assert!(parsed[0].is_outdated);
+        assert_eq!(parsed[0].body, "please fix this");
     }
 
     #[test]
