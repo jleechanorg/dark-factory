@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::hash::Hasher;
 use std::time::{Duration, Instant};
 mod common;
@@ -9,7 +10,9 @@ use daemon::errors::DaemonError;
 use daemon::reroll::{self, RerollDeps, RerollOutcome};
 use daemon::state::{BeadOverlay, OverlayState, StateStore};
 use daemon::tick::{run_tick, TickDeps};
-use daemon::tools::{Issue, Llm, Permission, PrSnapshot};
+use daemon::tools::{
+    Issue, Llm, Permission, PrSnapshot, SessionActivity, SessionId, Sessions, SpawnSpec,
+};
 
 fn test_cfg() -> Config {
     Config {
@@ -52,6 +55,100 @@ fn test_cfg() -> Config {
         agent_worktree_root: None,
         worktree_ttl_secs: 14 * 24 * 60 * 60,
         worktree_max_count: 200,
+    }
+}
+
+fn add_repo_route(cfg: &mut Config, repo: &str, ao_project: &str) {
+    cfg.repos.insert(
+        repo.to_string(),
+        RepoConfig {
+            ao_project: ao_project.to_string(),
+            push_remote: "origin".to_string(),
+            local_checkout: None,
+        },
+    );
+}
+
+struct ProjectBoundRerollSessions {
+    inner: FakeSessions,
+    project_calls: RefCell<Vec<String>>,
+}
+
+impl ProjectBoundRerollSessions {
+    fn new() -> Self {
+        Self {
+            inner: FakeSessions::new(),
+            project_calls: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl Sessions for ProjectBoundRerollSessions {
+    fn active_count(&self) -> Result<usize, DaemonError> {
+        self.inner.active_count()
+    }
+
+    fn spawn(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
+        self.inner.spawn(spec)
+    }
+
+    fn attach(&self, branch: &str, bead_id: &str) -> Result<SessionId, DaemonError> {
+        Err(DaemonError::SessionNotFound {
+            branch: branch.to_string(),
+            bead_id: bead_id.to_string(),
+        })
+    }
+
+    fn attach_in_project(
+        &self,
+        project: &str,
+        _branch: &str,
+        _bead_id: &str,
+    ) -> Result<SessionId, DaemonError> {
+        self.project_calls
+            .borrow_mut()
+            .push(format!("attach:{project}"));
+        Ok(SessionId("secondary-session".into()))
+    }
+
+    fn attach_within_in_project(
+        &self,
+        project: &str,
+        _branch: &str,
+        _bead_id: &str,
+        _timeout_secs: u64,
+    ) -> Result<SessionId, DaemonError> {
+        self.project_calls
+            .borrow_mut()
+            .push(format!("attach_within:{project}"));
+        Ok(SessionId("secondary-session".into()))
+    }
+
+    fn stop(&self, id: &SessionId) -> Result<(), DaemonError> {
+        self.inner.stop(id)
+    }
+
+    fn stop_in_project(&self, project: &str, _id: &SessionId) -> Result<(), DaemonError> {
+        self.project_calls
+            .borrow_mut()
+            .push(format!("stop:{project}"));
+        Ok(())
+    }
+
+    fn is_quiescent(&self, _id: &SessionId) -> Result<bool, DaemonError> {
+        Ok(false)
+    }
+
+    fn session_activity_within_in_project(
+        &self,
+        project: &str,
+        _id: &SessionId,
+        _timeout_secs: u64,
+    ) -> Result<SessionActivity, DaemonError> {
+        self.project_calls
+            .borrow_mut()
+            .push(format!("activity:{project}"));
+        Ok(SessionActivity::Running)
     }
 }
 
@@ -388,6 +485,7 @@ fn test_reroll_routes_vcs_ops_through_bead_repo_for_cross_repo_bead() {
     ));
 
     let mut cfg = test_cfg();
+    add_repo_route(&mut cfg, "jleechanorg/other-repo", "other-repo");
     cfg.spec_dir = std::env::temp_dir()
         .join("afd_spec_dir_cross_repo_test")
         .to_string_lossy()
@@ -492,6 +590,102 @@ fn test_reroll_routes_vcs_ops_through_bead_repo_for_cross_repo_bead() {
     );
 
     std::fs::remove_dir_all(spec_dir).ok();
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn secondary_project_live_worker_blocks_reroll_supersede() {
+    let scm = FakeScm::new();
+    let sessions = ProjectBoundRerollSessions::new();
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert(
+        "factory/secondary-r1".into(),
+        "secondary-live-head".into(),
+    );
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"inhibitionSpecs":[],"positiveAssertions":["keep live worker"],"securityRedactionEncountered":false}"#.into(),
+    ));
+    let mut cfg = test_cfg();
+    add_repo_route(
+        &mut cfg,
+        "jleechanorg/secondary-repo",
+        "secondary-project",
+    );
+    cfg.spec_dir = std::env::temp_dir()
+        .join("afd_secondary_project_reroll")
+        .to_string_lossy()
+        .into_owned();
+    let _ = std::fs::remove_dir_all(&cfg.spec_dir);
+    std::fs::create_dir_all(&cfg.spec_dir).unwrap();
+    let telemetry_log = std::env::temp_dir().join("afd_secondary_project_reroll.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    let mut bead = BeadOverlay {
+        bead_id: "secondary-reroll-bead".into(),
+        state: OverlayState::Attested,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 20,
+        spend_usd: 0.0,
+        pr_number: Some(4243),
+        branch: Some("factory/secondary-r1".into()),
+        session_id: Some("secondary-session".into()),
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: Some("jleechanorg/secondary-repo".into()),
+        attempt_started_at: None,
+    };
+    store.save(&bead).unwrap();
+
+    let outcome = reroll::execute(
+        &RerollDeps {
+            scm: &scm,
+            sessions: &sessions,
+            vcs: &vcs,
+            store: &store,
+            llm: &llm,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            reviewer: "skeptic".into(),
+            review_text: "reroll probe".into(),
+        },
+        &mut bead,
+    )
+    .expect("live secondary worker must defer safely");
+
+    assert!(matches!(outcome, RerollOutcome::Deferred(_)));
+    assert_eq!(bead.session_id.as_deref(), Some("secondary-session"));
+    assert_eq!(bead.branch.as_deref(), Some("factory/secondary-r1"));
+    assert_eq!(bead.pr_number, Some(4243));
+    assert!(
+        vcs.calls
+            .borrow()
+            .iter()
+            .all(|call| !call.starts_with("create_branch_at")),
+        "live worker must block replacement branch creation: {:?}",
+        vcs.calls.borrow()
+    );
+    assert!(
+        scm.calls
+            .borrow()
+            .iter()
+            .all(|call| !call.starts_with("close_pr")),
+        "live worker must block PR close: {:?}",
+        scm.calls.borrow()
+    );
+    let project_calls = sessions.project_calls.borrow();
+    assert!(
+        !project_calls.is_empty()
+            && project_calls
+                .iter()
+                .all(|call| call.ends_with("secondary-project")),
+        "all reroll liveness calls must use the owning AO project: {project_calls:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&cfg.spec_dir);
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
@@ -924,6 +1118,11 @@ fn test_reroll_adopted_unconfigured_repo_uses_daemon_owned_target_worktree() {
     let llm = FakeLlm::new();
     let mut cfg = test_cfg();
     cfg.repos.clear();
+    add_repo_route(
+        &mut cfg,
+        "jleechanorg/worldarchitect.ai",
+        "worldarchitect",
+    );
     let mut bead = adopted_overlay("bead-adopted-unconfigured-repo");
     bead.target_repo = Some("jleechanorg/worldarchitect.ai".into());
     store.save(&bead).unwrap();
@@ -2682,6 +2881,7 @@ fn test_reroll_close_pr_uses_bead_resolved_repo_not_cfg_target_repo() {
     // failure had. This is the repo reroll.rs MUST NOT use for the close
     // call when the bead has a different resolved `target_repo`.
     let mut cfg = test_cfg();
+    add_repo_route(&mut cfg, "jleechanorg/dark-factory", "dark-factory");
     cfg.target_repo = "jleechanorg/worldarchitect.ai".into();
     cfg.spec_dir = std::env::temp_dir()
         .join("afd_spec_dir_v6ud_test")
@@ -3072,6 +3272,7 @@ fn test_reroll_quiescence_head_probe_routes_through_bead_repo_and_defers_on_fail
     ));
 
     let mut cfg = test_cfg();
+    add_repo_route(&mut cfg, target_repo, "custom-routed-repo");
     cfg.spec_dir = std::env::temp_dir()
         .join("afd_spec_dir_mw85_test")
         .to_string_lossy()
@@ -3153,6 +3354,7 @@ fn test_reroll_quiescence_head_probe_error_warns_and_defers_without_crashing() {
     let llm = FakeLlm::new();
 
     let mut cfg = test_cfg();
+    add_repo_route(&mut cfg, target_repo, "custom-routed-repo-fail");
     cfg.spec_dir = std::env::temp_dir()
         .join("afd_spec_dir_mw85_fail_test")
         .to_string_lossy()
@@ -3257,6 +3459,7 @@ fn test_reroll_quiescence_head_probe_permanent_failure_escalates_after_threshold
     let llm = FakeLlm::new();
 
     let mut cfg = test_cfg();
+    add_repo_route(&mut cfg, target_repo, "custom-routed-repo-permfail");
     cfg.spec_dir = std::env::temp_dir()
         .join("afd_spec_dir_mw85_permfail_test")
         .to_string_lossy()
@@ -3378,6 +3581,7 @@ fn test_reroll_quiescence_head_probe_transient_failure_never_escalates() {
     let llm = FakeLlm::new();
 
     let mut cfg = test_cfg();
+    add_repo_route(&mut cfg, target_repo, "custom-routed-repo-transient");
     cfg.spec_dir = std::env::temp_dir()
         .join("afd_spec_dir_mw85_transient_test")
         .to_string_lossy()

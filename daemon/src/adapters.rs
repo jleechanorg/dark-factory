@@ -6472,6 +6472,15 @@ impl Sessions for CliSessions {
         self.attach_within(branch, bead_id, 30)
     }
 
+    fn attach_in_project(
+        &self,
+        project: &str,
+        branch: &str,
+        bead_id: &str,
+    ) -> Result<SessionId, DaemonError> {
+        self.attach_within_in_project(project, branch, bead_id, 30)
+    }
+
     /// Bead jleechan-zeij / issue #322 r4 P2: budget-bounded `attach` — the
     /// re-roll poll passes the time remaining until its window deadline so a
     /// single poll cannot block for multiples of the window on stacked ~30s
@@ -6482,11 +6491,17 @@ impl Sessions for CliSessions {
         bead_id: &str,
         timeout_secs: u64,
     ) -> Result<SessionId, DaemonError> {
-        let out = run_tool("ao", &["status", "-p", &self.project, "--json"], timeout_secs)?;
-        let json_start = out.find('[').unwrap_or(0);
-        let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse ao status: {e}"))
-        })?;
+        self.attach_within_in_project(&self.project, branch, bead_id, timeout_secs)
+    }
+
+    fn attach_within_in_project(
+        &self,
+        project: &str,
+        branch: &str,
+        bead_id: &str,
+        timeout_secs: u64,
+    ) -> Result<SessionId, DaemonError> {
+        let data = Self::status_for_project(project, timeout_secs)?;
         session_for_branch(&data, branch, bead_id)
     }
 
@@ -6544,11 +6559,16 @@ impl Sessions for CliSessions {
         id: &SessionId,
         timeout_secs: u64,
     ) -> Result<crate::tools::SessionActivity, DaemonError> {
-        let out = run_tool("ao", &["status", "-p", &self.project, "--json"], timeout_secs)?;
-        let json_start = out.find('[').unwrap_or(0);
-        let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse ao status: {e}"))
-        })?;
+        self.session_activity_within_in_project(&self.project, id, timeout_secs)
+    }
+
+    fn session_activity_within_in_project(
+        &self,
+        project: &str,
+        id: &SessionId,
+        timeout_secs: u64,
+    ) -> Result<crate::tools::SessionActivity, DaemonError> {
+        let data = Self::status_for_project(project, timeout_secs)?;
         session_activity(&data, id)
     }
 
