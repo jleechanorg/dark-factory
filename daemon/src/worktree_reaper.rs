@@ -1463,6 +1463,19 @@ mod tests {
             fs::read_to_string(recovered.join("tracked.txt")).unwrap(),
             "must survive handle swap\n"
         );
+        let manifest = fs::read_dir(&backup)
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| entry.path().is_file())
+            .map(|entry| fs::read_to_string(entry.path()).unwrap())
+            .unwrap();
+        for line in manifest.lines().filter(|line| !line.trim().is_empty()) {
+            let record: serde_json::Value = serde_json::from_str(line).unwrap();
+            if let Some(path) = record.get("quarantined_path").and_then(|path| path.as_str()) {
+                assert_eq!(Path::new(path), recovered);
+                assert!(!Path::new(path).starts_with(&outside));
+            }
+        }
         let _ = fs::remove_file(repo_root.join(".quarantine"));
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&outside);
