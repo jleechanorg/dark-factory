@@ -3097,7 +3097,7 @@ fn login_home_dir() -> Result<std::path::PathBuf, DaemonError> {
     {
         let uid = unsafe { geteuid() };
         let mut record = std::mem::MaybeUninit::<LinuxPasswd>::zeroed();
-        let mut buffer = vec![0i8; 64 * 1024];
+        let mut buffer = vec![0 as std::os::raw::c_char; 64 * 1024];
         let mut result = std::ptr::null_mut();
         let rc = unsafe {
             getpwuid_r(
