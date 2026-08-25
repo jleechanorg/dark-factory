@@ -60,14 +60,13 @@ EXPECTED_GATE_BACKEND_MISSING_OUTCOME = {
     "claude": ("error", "true"),
     "codex": ("error", "true"),
     "agy": ("error", "true"),
-    # ``minimax`` and ``claudeaf`` are *claude-routed* — they invoke
+    # ``minimax`` is *Claude-CLI-routed* — it invokes
     # the claude CLI binary with different env. The argv[0] is still
     # "claude", so a missing-CLI FileNotFoundError happens at the
     # subprocess level, but the recorded ``reviewer_backend`` reflects
     # the *logical* backend (minimax/claudeaf), not the physical
-    # binary. They share the gate's ``FileNotFoundError`` handler.
+    # binary while retaining an explicit endpoint/model scope.
     "minimax": ("error", "true"),
-    "claudeaf": ("error", "true"),
 }
 
 
@@ -156,6 +155,7 @@ def test_claude_coder_missing_returns_clean_failure(monkeypatch, tmp_path):
         "runner.handlers._get_claude_executable",
         lambda: "/nonexistent/claude-binary-for-test",
     )
+    monkeypatch.setattr("runner.handlers._claude_config_dir", lambda: pathlib.Path("/tmp/project-claude-config"))
     _patched_run_raises(
         monkeypatch,
         target="claude",
@@ -351,6 +351,8 @@ def test_gate_per_backend_missing_sets_backend_missing_metadata(monkeypatch, tmp
                 lambda b=backend: f"/nonexistent/claude-for-{b}",
             )
             physical_target = f"claude-for-{backend}"
+            if backend == "claude":
+                monkeypatch.setattr("runner.handlers._claude_config_dir", lambda: pathlib.Path("/tmp/project-claude-config"))
         else:
             physical_target = backend
 
@@ -446,14 +448,14 @@ def test_reviewer_gate_priority_queue_with_codex_missing_picks_codex(monkeypatch
     # fires (recorded in metadata) and succeeds with a real verdict.
     result = _execute_gate("PROMPT", fake_sha, 300, ctx, "ev", resolved)
 
-    assert result.outcome == "success"
+    assert result.outcome == "error"
     assert result.metadata["fallback_used"] == "true"
     assert result.metadata["fallback_from"] == "codex"
-    assert result.metadata["reviewer_backend"] == "claude"
+    assert result.metadata["reviewer_backend"] == "agy"
     # Confirm the dispatch order: codex (FileNotFoundError) -> agy (also
     # missing) -> claude (succeeds). The agy→claude fallback walks every
     # entry until one is not an infra failure (handler_dispatch.py:_execute_gate).
-    assert seen == ["codex", "agy", "claude"]
+    assert seen == ["codex", "agy"]
 
 
 def test_reviewer_gate_priority_queue_all_uninstalled_falls_through(monkeypatch, tmp_path):
@@ -510,11 +512,10 @@ def test_reviewer_gate_priority_queue_all_uninstalled_falls_through(monkeypatch,
 
     # agy is missing -> claude fallback fires.
     result = _execute_gate("PROMPT", fake_sha, 300, ctx, "ev", resolved)
-    assert result.outcome == "success"
-    assert result.metadata["fallback_used"] == "true"
-    assert result.metadata["fallback_from"] == "agy"
-    assert result.metadata["reviewer_backend"] == "claude"
-    assert seen == ["agy", "claude"]
+    assert result.outcome == "error"
+    assert result.metadata["fallback_used"] == "false"
+    assert result.metadata["reviewer_backend"] == "agy"
+    assert seen == ["agy"]
 
 
 def test_reviewer_gate_agy_missing_falls_back_to_claude_cleanly(monkeypatch, tmp_path):
@@ -543,11 +544,10 @@ def test_reviewer_gate_agy_missing_falls_back_to_claude_cleanly(monkeypatch, tmp
     ctx = Context(goal="t", workdir=tmp_path, backend="claude")
     result = _execute_gate("PROMPT", fake_sha, 300, ctx, "ev", "agy")
 
-    assert result.outcome == "success"
-    assert result.metadata["fallback_used"] == "true"
-    assert result.metadata["fallback_from"] == "agy"
-    assert result.metadata["reviewer_backend"] == "claude"
-    assert seen == ["agy", "claude"]
+    assert result.outcome == "error"
+    assert result.metadata["fallback_used"] == "false"
+    assert result.metadata["reviewer_backend"] == "agy"
+    assert seen == ["agy"]
 
 
 def test_reviewer_gate_all_backends_missing_tags_infra_failure(monkeypatch, tmp_path):
@@ -583,14 +583,14 @@ def test_reviewer_gate_all_backends_missing_tags_infra_failure(monkeypatch, tmp_
     )
     assert result.metadata["fallback_used"] == "true"
     assert result.metadata["fallback_from"] == "codex"
-    assert result.metadata["reviewer_backend"] == "claude"
+    assert result.metadata["reviewer_backend"] == "agy"
     assert result.metadata["backend_missing"] == "true", (
         "the FINAL result should still surface backend_missing='true' from "
         "the claude fallback attempt (it's an infra failure, after all)"
     )
     # Both backends were attempted.
     assert "codex" in seen
-    assert "claude" in seen
+    assert "claude" not in seen
 
 
 def test_target_worktree_ao_worktree_review_binding(tmp_path):

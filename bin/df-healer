@@ -88,6 +88,10 @@ elif [[ "${PREFLIGHT_RC}" -eq 0 && -n "${PREFLIGHT_JSON}" ]]; then
   STATUS="$(printf '%s' "${PREFLIGHT_JSON}" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
   FALLBACK="$(printf '%s' "${PREFLIGHT_JSON}" | sed -n 's/.*"fallback_recommendation"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
   if [[ "${STATUS}" == "warn" ]]; then
+    if [[ "${FALLBACK}" == "claude" || "${FALLBACK}" == "claude-sonnet" ]]; then
+      echo "ERROR: Claude is not an implicit fallback; provide an explicitly scoped backend" >&2
+      exit 2
+    fi
     printf '\033[33mwarning\033[0m: %s missing; falling back to %s\n' \
       "${PREFLIGHT_BACKEND}" "${FALLBACK}" >&2
     if [[ -n "${FALLBACK}" ]]; then

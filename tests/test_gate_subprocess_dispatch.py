@@ -35,6 +35,7 @@ def test_gate_subprocess_args_routes_claude_sonnet_to_claude_cli(monkeypatch):
     """backend='claude-sonnet' → argv starts with `claude --print` (not agy)."""
     from runner.handlers import _gate_subprocess_args, Context as HCtx
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr("runner.handlers._claude_config_dir", lambda: pathlib.Path("/tmp/project-claude-config"))
     ctx = HCtx(goal="test", workdir=pathlib.Path("/tmp"), backend="claude")
     argv = _gate_subprocess_args("claude-sonnet", "PROMPT", ctx, 300)
     assert os.path.basename(argv[0]) == "claude", f"expected claude argv, got {argv[:3]!r}"
@@ -47,6 +48,7 @@ def test_gate_subprocess_args_routes_bare_claude_to_claude_cli(monkeypatch):
     """backend='claude' (run-level default) → argv starts with `claude --print`."""
     from runner.handlers import _gate_subprocess_args, Context as HCtx
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr("runner.handlers._claude_config_dir", lambda: pathlib.Path("/tmp/project-claude-config"))
     ctx = HCtx(goal="test", workdir=pathlib.Path("/tmp"), backend="claude")
     argv = _gate_subprocess_args("claude", "PROMPT", ctx, 300)
     assert os.path.basename(argv[0]) == "claude"
@@ -82,11 +84,82 @@ def test_gate_subprocess_env_does_not_set_minimax_for_other_backends(monkeypatch
         "runner.handlers._sanitized_env",
         lambda: {"PATH": "/usr/bin", "HOME": "/root"},
     )
+    monkeypatch.setattr("runner.handlers._claude_config_dir", lambda: pathlib.Path("/tmp/project-claude-config"))
     for backend in ("agy", "codex", "claude-sonnet", "claude"):
         env = _gate_subprocess_env(backend)
         assert env.get("ANTHROPIC_BASE_URL") != "https://api.minimax.io/anthropic", (
             f"{backend!r} must not carry the minimax base URL override"
         )
+
+
+def test_claude_requires_absolute_project_config_and_injects_it(tmp_path, monkeypatch):
+    from runner.handlers import _gate_subprocess_env
+
+    config = tmp_path / "claude-config"
+    config.mkdir()
+    monkeypatch.setenv("DARK_FACTORY_CLAUDE_CONFIG_DIR", str(config))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/inherited/personal-config")
+
+    env = _gate_subprocess_env("claude")
+
+    assert env["CLAUDE_CONFIG_DIR"] == str(config.resolve())
+
+
+def test_direct_claude_scrubs_stale_minimax_provider_env(tmp_path, monkeypatch):
+    from runner.handlers import _gate_subprocess_env
+
+    config = tmp_path / "claude-config"
+    config.mkdir()
+    monkeypatch.setenv("DARK_FACTORY_CLAUDE_CONFIG_DIR", str(config))
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic")
+    monkeypatch.setenv("ANTHROPIC_MODEL", "MiniMax-M3")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "stale")
+
+    env = _gate_subprocess_env("claude")
+
+    assert "ANTHROPIC_BASE_URL" not in env
+    assert "ANTHROPIC_MODEL" not in env
+    assert "ANTHROPIC_API_KEY" not in env
+
+
+@pytest.mark.parametrize("value", [None, "relative/config", "~/.claude"])
+def test_claude_config_rejects_unscoped_or_non_absolute_values(tmp_path, monkeypatch, value):
+    from runner.handlers import _gate_subprocess_env
+
+    monkeypatch.delenv("DARK_FACTORY_CLAUDE_CONFIG_DIR", raising=False)
+    if value is not None:
+        monkeypatch.setenv("DARK_FACTORY_CLAUDE_CONFIG_DIR", value)
+    with pytest.raises(ValueError):
+        _gate_subprocess_env("claude")
+
+
+def test_unknown_gate_backend_fails_closed_without_claude_fallback(tmp_path, monkeypatch):
+    from runner.handlers import _execute_gate, Context as HCtx
+
+    seen = []
+    monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: seen.append(args[0]))
+    ctx = HCtx(goal="test", workdir=tmp_path, backend="codex")
+    result = _execute_gate("PROMPT", "d" * 40, 300, ctx, "evidence", "not-a-backend")
+
+    assert result.outcome == "error"
+    assert result.metadata.get("invalid_backend") == "true"
+    assert seen == []
+
+
+def test_minimax_is_endpoint_and_model_scoped_without_claude_config(tmp_path, monkeypatch):
+    from runner.handlers import _gate_subprocess_args, _gate_subprocess_env, Context as HCtx
+
+    monkeypatch.delenv("DARK_FACTORY_CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda args: args)
+    ctx = HCtx(goal="test", workdir=tmp_path, backend="minimax")
+    argv = _gate_subprocess_args("minimax", "PROMPT", ctx, 300)
+    env = _gate_subprocess_env("minimax")
+
+    assert os.path.basename(argv[0]) == "claude"
+    assert "--model" in argv
+    assert env["ANTHROPIC_BASE_URL"] == "https://api.minimax.io/anthropic"
+    assert env["ANTHROPIC_MODEL"] == "MiniMax-M3"
+    assert "CLAUDE_CONFIG_DIR" not in env
 
 
 def test_execute_gate_runs_codex_subprocess_when_priority_resolves_codex(
@@ -174,6 +247,7 @@ def test_complete_controller_prompt_is_not_rewrapped_for_shadow(tmp_path, monkey
             seen.append(cmd)
 
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr("runner.handlers._claude_config_dir", lambda: pathlib.Path("/tmp/project-claude-config"))
     monkeypatch.setattr("runner.handler_dispatch.shutil.which", lambda name: "/usr/bin/codex")
     monkeypatch.setattr("runner.handler_dispatch.subprocess.Popen", _FakePopen)
     ctx = HCtx(goal="untrusted goal", workdir=tmp_path, backend="codex")
@@ -224,6 +298,7 @@ def test_launch_shadow_gate_review_uses_controller_cwd_and_sanitized_env(tmp_pat
     monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", "/secret/holdouts")
     monkeypatch.setenv("MY_HOLDOUT_SECRET", "sealed")
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr("runner.handlers._claude_config_dir", lambda: pathlib.Path("/tmp/project-claude-config"))
     monkeypatch.setattr("runner.handler_dispatch.shutil.which", lambda name: "/usr/bin/codex")
     monkeypatch.setattr("runner.handler_dispatch.subprocess.Popen", _FakePopen)
     monkeypatch.setattr(
@@ -581,7 +656,7 @@ def test_resolve_adversarial_backend_falls_back_to_default_when_post_filter_empt
         },
     )
     resolved, meta = _resolve_gate_backend(node, ctx)
-    assert resolved == "claude-sonnet"
+    assert resolved == "agy"
     # If the resolver had used the empty-list short-circuit, the skip
     # list would be empty (nothing was probed). With the default-priority
     # fallback, the skip list records codex, minimax, agy, and any

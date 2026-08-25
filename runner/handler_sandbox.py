@@ -93,12 +93,42 @@ from typing import Optional, Union
 _SEALED_BENCHMARK_DOC_NAMES = ("README.md", "DESIGN.md", "SCORING.md", "SCENARIOS.md")
 
 
+def _claude_config_dir() -> pathlib.Path:
+    """Return the explicitly scoped Claude config directory.
+
+    The host's personal ``~/.claude`` config is never an implicit fallback.
+    Callers that launch a Claude-backed subprocess must require this helper to
+    succeed and pass the returned path as ``CLAUDE_CONFIG_DIR``.
+    """
+    raw = os.environ.get("DARK_FACTORY_CLAUDE_CONFIG_DIR", "")
+    if not raw or not pathlib.Path(raw).is_absolute():
+        raise ValueError(
+            "DARK_FACTORY_CLAUDE_CONFIG_DIR must be an absolute existing project config directory"
+        )
+    path = pathlib.Path(raw)
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(
+            "DARK_FACTORY_CLAUDE_CONFIG_DIR must be an absolute existing project config directory"
+        ) from exc
+    if not resolved.is_dir() or resolved == (pathlib.Path.home() / ".claude").resolve():
+        raise ValueError(
+            "DARK_FACTORY_CLAUDE_CONFIG_DIR must not resolve to the personal ~/.claude directory"
+        )
+    return resolved
+
+
 def _sanitized_env() -> dict[str, str]:
     env = {}
     for k, v in os.environ.items():
         if k == "DARK_FACTORY_HOLDOUTS":
             continue
         if "HOLDOUT" in k.upper():
+            continue
+        # A caller must explicitly scope Claude through
+        # DARK_FACTORY_CLAUDE_CONFIG_DIR. Never inherit a personal config.
+        if k == "CLAUDE_CONFIG_DIR":
             continue
         env[k] = v
     return env

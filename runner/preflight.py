@@ -33,7 +33,7 @@ from typing import Any, Optional
 
 # Backends we probe. ``echo`` is always considered available — it is
 # the no-LLM fallback built into the runner.
-PROBED_BACKENDS = ("claude", "codex", "agy", "ao", "echo")
+PROBED_BACKENDS = ("codex", "minimax", "agy", "ao", "echo")
 
 # Transitive deps: if a backend is configured, also check these.
 # Currently only ``ao`` requires ``sandbox-exec`` (macOS seatbelt).
@@ -44,7 +44,7 @@ TRANSITIVE_DEPS = {
 # Priority order for fallback_recommendation when the configured backend
 # is missing. The first CLI in this tuple that resolves to a real path
 # wins. ``echo`` is the final always-present fallback.
-FALLBACK_PRIORITY = ("codex", "claude", "agy", "ao", "echo")
+FALLBACK_PRIORITY = ("codex", "minimax", "agy", "ao", "echo")
 
 # Install hint shown for each backend when missing.
 HINTS = {
@@ -54,6 +54,15 @@ HINTS = {
     "ao": "Install: see Agent Orchestrator setup docs",
     "sandbox-exec": "macOS-only; built-in",
 }
+
+_CLAUDE_ALIASES = {"claude", "claude-sonnet"}
+
+
+def _probe_backend(name: str) -> Optional[str]:
+    """Probe a logical backend without treating Claude as an implicit default."""
+    if name == "minimax":
+        return _probe("claude")
+    return _probe(name)
 
 
 def _probe(name: str) -> Optional[str]:
@@ -137,25 +146,46 @@ def preflight_check(
     # Normalize: a backend we don't know about is treated as missing
     # but still appears in the report so the caller can see what was
     # asked for.
-    known = backend in PROBED_BACKENDS
-    configured_present = (backend == "echo") or _probe(backend) is not None
+    known = backend in PROBED_BACKENDS or backend in _CLAUDE_ALIASES
+    config_error: str | None = None
+    if backend in _CLAUDE_ALIASES:
+        try:
+            from .handler_sandbox import _claude_config_dir
+
+            _claude_config_dir()
+        except (ImportError, ValueError) as exc:
+            config_error = str(exc)
+    configured_present = (
+        backend == "echo"
+        or (backend in _CLAUDE_ALIASES and config_error is None and _probe("claude") is not None)
+        or (backend == "minimax" and _probe_backend("minimax") is not None)
+        or (backend not in _CLAUDE_ALIASES and backend != "minimax" and _probe_backend(backend) is not None)
+    )
 
     backends: dict[str, dict] = {}
     for name in PROBED_BACKENDS:
         if name == "echo":
             backends[name] = {"ok": True, "path": None, "hint": None}
             continue
-        path = _probe(name)
+        path = _probe_backend(name)
         backends[name] = {
             "ok": path is not None,
             "path": path,
             "hint": None if path else HINTS.get(name),
         }
 
+    if backend in _CLAUDE_ALIASES:
+        path = _probe("claude") if config_error is None else None
+        backends[backend] = {
+            "ok": configured_present,
+            "path": path,
+            "hint": config_error or (None if path else HINTS.get("claude")),
+        }
+
     # Include the configured backend in the report even if it's an
     # unknown name (e.g. user typo) so the caller sees what was asked.
     if not known and backend != "echo":
-        path = _probe(backend)
+        path = _probe_backend(backend)
         backends[backend] = {
             "ok": path is not None,
             "path": path,
@@ -172,7 +202,11 @@ def preflight_check(
         }
 
     # Determine status.
-    if backend == "echo" or configured_present:
+    if config_error is not None:
+        status = "fail"
+    elif not known and backend != "echo":
+        status = "fail"
+    elif backend == "echo" or configured_present:
         status = "pass"
     else:
         # At least one non-echo backend present AND all transitive deps OK?
@@ -222,7 +256,7 @@ def preflight_check(
             f"{backend} missing; fallback to {fallback}"
         )
     else:
-        message = "no backends reachable"
+        message = config_error or (f"unknown backend {backend!r}" if not known else "no backends reachable")
 
     holdouts_info: dict[str, Any] = {
         "required": bool(require_holdouts),

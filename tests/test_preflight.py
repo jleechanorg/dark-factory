@@ -71,15 +71,15 @@ def which_ao_no_sandbox(monkeypatch):
 
 def test_configured_backend_present_returns_pass(monkeypatch, which_all_present):
     """Configured backend present => status=pass, configured_ok=True."""
-    result = preflight.preflight_check("claude")
+    result = preflight.preflight_check("codex")
 
     assert result["status"] == "pass"
-    assert result["configured"] == "claude"
+    assert result["configured"] == "codex"
     assert result["configured_ok"] is True
-    assert result["backends"]["claude"]["ok"] is True
-    assert result["backends"]["claude"]["path"] == "/usr/local/bin/claude"
+    assert result["backends"]["codex"]["ok"] is True
+    assert result["backends"]["codex"]["path"] == "/usr/local/bin/codex"
     # Fallback should be the configured backend when it's present.
-    assert result["fallback_recommendation"] == "claude"
+    assert result["fallback_recommendation"] == "codex"
 
 
 def test_configured_backend_missing_others_available_returns_warn(
@@ -91,29 +91,29 @@ def test_configured_backend_missing_others_available_returns_warn(
     assert result["status"] == "warn"
     assert result["configured"] == "codex"
     assert result["configured_ok"] is False
-    assert result["backends"]["claude"]["ok"] is True
+    assert result["backends"]["minimax"]["ok"] is True
     assert result["backends"]["codex"]["ok"] is False
     assert result["backends"]["codex"]["hint"] is not None
-    # FALLBACK_PRIORITY = ("codex", "claude", "agy", "ao", "echo").
-    # codex is missing and excluded; first present is claude.
-    assert result["fallback_recommendation"] == "claude"
+    # Claude is not an implicit fallback; MiniMax may use the Claude binary
+    # while remaining explicitly endpoint/model scoped.
+    assert result["fallback_recommendation"] == "minimax"
     # Exit code 0 for warn
     assert preflight.main(["--backend", "codex", "--json"]) == 0
 
 
 def test_zero_backends_available_returns_fail(monkeypatch, which_none):
     """All probed CLIs missing => status=fail, exit code 2."""
-    result = preflight.preflight_check("claude")
+    result = preflight.preflight_check("codex")
 
     assert result["status"] == "fail"
-    assert result["configured"] == "claude"
+    assert result["configured"] == "codex"
     assert result["configured_ok"] is False
     # echo is always ok
     assert result["backends"]["echo"]["ok"] is True
     # fallback falls through to echo
     assert result["fallback_recommendation"] == "echo"
     # Exit code mapping
-    assert preflight.main(["--backend", "claude", "--json"]) == 2
+    assert preflight.main(["--backend", "codex", "--json"]) == 2
 
 
 def test_ao_configured_checks_sandbox_exec_transitive(
@@ -154,10 +154,9 @@ def test_fallback_priority_order(monkeypatch):
         "_probe",
         lambda name: "/usr/local/bin/agy" if name == "agy" else None,
     )
-    result = preflight.preflight_check("claude")
+    result = preflight.preflight_check("codex")
     assert result["status"] == "warn"
-    # FALLBACK_PRIORITY = ("codex", "claude", "agy", "ao", "echo")
-    # configured=claude missing; first present alt in priority order is agy.
+    # Claude is not an implicit fallback; configured codex may use agy.
     assert result["fallback_recommendation"] == "agy"
 
 

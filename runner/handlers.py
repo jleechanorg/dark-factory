@@ -42,6 +42,7 @@ from .handler_core import (
 # Sandbox + env helpers.
 from .handler_sandbox import (
     _sanitized_env,
+    _claude_config_dir,
     _get_claude_executable,
     _holdouts_repo_path,
     _holdout_denied_paths,

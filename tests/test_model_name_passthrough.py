@@ -40,6 +40,7 @@ def _patch_claude(monkeypatch, commands):
         return Proc()
 
     monkeypatch.setattr(handlers_mod, "_get_claude_executable", lambda: "claude")
+    monkeypatch.setattr(handlers_mod, "_claude_config_dir", lambda: pathlib.Path("/tmp/project-claude-config"))
     monkeypatch.setattr(handlers_mod, "_sandboxed_args", fake_sandbox)
     # Lane H (jleechan-113) routes claude/codex/agy coder subprocesses through
     # `_sandboxed_args_for_workdir` so the deny list also covers the
@@ -105,3 +106,30 @@ def test_model_name_without_backend_still_dispatches_to_claude(monkeypatch, tmp_
     assert "--print" in argv
     assert argv[1] == "claude"
     assert argv[argv.index("--model") + 1] == "claude-sonnet-4-6"
+
+
+def test_claude_coder_injects_scoped_config_and_scrubs_inherited_value(monkeypatch, tmp_path):
+    commands = []
+    (tmp_path / "prompt.md").write_text("build it")
+    _patch_claude(monkeypatch, commands)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/personal/default")
+    config = tmp_path / "scoped-config"
+    config.mkdir()
+    monkeypatch.setattr(handlers_mod, "_claude_config_dir", lambda: config)
+
+    def fake_run(args, **kwargs):
+        commands.append((args, kwargs.get("env", {})))
+        class Proc:
+            returncode = 0
+            stdout = "done"
+            stderr = ""
+        return Proc()
+
+    monkeypatch.setattr(handlers_mod.subprocess, "run", fake_run)
+    result = _codergen(
+        Node(name="implement", attrs={"prompt": "@prompt.md"}),
+        Context(goal="t", workdir=tmp_path, backend="claude", state={}),
+    )
+    assert result.outcome == "success"
+    env = next(item[1] for item in commands if isinstance(item, tuple) and item[0][0] == "sandboxed")
+    assert env["CLAUDE_CONFIG_DIR"] == str(config)

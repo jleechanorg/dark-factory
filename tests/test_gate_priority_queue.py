@@ -122,7 +122,7 @@ def test_adversarial_priority_env_override_honored(monkeypatch):
     assert meta["adversarial_skipped"] == "minimax"
 
 
-def test_adversarial_priority_falls_through_to_claude_sonnet_when_nothing_else(monkeypatch):
+def test_adversarial_priority_falls_through_to_non_claude_when_nothing_else(monkeypatch):
     """When no priority entry is installed, the resolver returns the last
     entry (claude-sonnet) so the gate still runs and surfaces the missing
     binary honestly. The gate's backend_missing=true path is the real
@@ -138,17 +138,22 @@ def test_adversarial_priority_falls_through_to_claude_sonnet_when_nothing_else(m
     )
 
     resolved, meta = _resolve_adversarial_backend(None, ctx)
-    # claude-sonnet is the tail of the default queue; the resolver falls
-    # through to it so the gate can run and the missing-binary path fires.
-    assert resolved == "claude-sonnet", (
-        f"with nothing installed, resolver must fall through to claude-sonnet; got {resolved!r}"
+    # Claude is not the implicit tail of the default queue.
+    assert resolved == "agy", (
+        f"with nothing installed, resolver must fail closed on a non-Claude backend; got {resolved!r}"
     )
     # The full default queue is recorded as skipped — operator can see
     # why the gate is running on a tail-end entry. The order is
     # probe-then-fallthrough, so the tail entry is also marked skipped
     # (the gate's missing-binary path is the real signal).
-    assert meta["adversarial_skipped"] == "codex,minimax,agy,claude-sonnet"
-    assert meta["adversarial_priority"] == "codex,minimax,agy,claude-sonnet"
+    assert meta["adversarial_skipped"] == "codex,minimax,agy"
+    assert meta["adversarial_priority"] == "codex,minimax,agy"
+
+
+# Backward-compatible collection name imported by tests/test_gates.py.
+test_adversarial_priority_falls_through_to_claude_sonnet_when_nothing_else = (
+    test_adversarial_priority_falls_through_to_non_claude_when_nothing_else
+)
 
 
 def test_adversarial_priority_pinned_across_visits(monkeypatch):
@@ -194,9 +199,10 @@ def test_adversarial_priority_pinned_across_visits(monkeypatch):
     assert second_meta["reviewer_backend_resolution"] == "priority_queue"
 
 
-def test_probe_backend_installed_maps_claude_sonnet_to_claude() -> None:
+def test_probe_backend_installed_maps_claude_sonnet_to_claude(monkeypatch) -> None:
     """_probe_backend_installed("claude-sonnet") must probe the standard `claude` binary."""
     from runner.handlers import _probe_backend_installed
+    monkeypatch.setattr("runner.handlers._claude_config_dir", lambda: pathlib.Path("/tmp"))
     # When `claude` is installed on PATH (as in this environment), probing
     # "claude-sonnet" must return True.
     import shutil

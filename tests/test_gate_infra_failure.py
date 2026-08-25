@@ -13,8 +13,8 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 
-def test_execute_gate_codex_infra_failure_falls_back_to_claude(tmp_path, monkeypatch):
-    """codex and agy missing → claude fallback, recorded in metadata."""
+def test_execute_gate_codex_infra_failure_stops_after_agy(tmp_path, monkeypatch):
+    """codex and agy missing → no implicit Claude fallback."""
     import subprocess as _sp
     from runner.handlers import _execute_gate, Context as HCtx
 
@@ -36,17 +36,20 @@ def test_execute_gate_codex_infra_failure_falls_back_to_claude(tmp_path, monkeyp
     ctx = HCtx(goal="test", workdir=tmp_path, backend="claude")
     result = _execute_gate("PROMPT", fake_sha, 300, ctx, "evidence", "codex")
 
-    assert result.outcome == "success"
+    assert result.outcome == "error"
     assert result.metadata["fallback_used"] == "true"
     assert result.metadata["fallback_from"] == "codex"
-    assert result.metadata["reviewer_backend"] == "claude"
+    assert result.metadata["reviewer_backend"] == "agy"
     assert os.path.basename(seen[0][0]) == "codex"
     assert any(os.path.basename(c[0]) == "agy" for c in seen), (
         "agy fallback must have been invoked after codex infra failure"
     )
-    assert any(os.path.basename(c[0]) == "claude" for c in seen), (
-        "claude fallback must have been invoked after agy infra failure"
-    )
+    assert not any(os.path.basename(c[0]) == "claude" for c in seen)
+
+
+test_execute_gate_codex_infra_failure_falls_back_to_claude = (
+    test_execute_gate_codex_infra_failure_stops_after_agy
+)
 
 
 def test_execute_gate_codex_infra_failure_falls_back_to_agy(tmp_path, monkeypatch):
@@ -134,6 +137,4 @@ def test_execute_gate_tags_infra_failure_when_all_backends_die(tmp_path, monkeyp
     assert result.metadata["fallback_used"] == "true"
     assert result.metadata["fallback_from"] == "codex"
     assert os.path.basename(seen[0][0]) == "codex"
-    assert any(os.path.basename(c[0]) == "claude" for c in seen), (
-        "claude fallback must have been invoked after codex timeout"
-    )
+    assert not any(os.path.basename(c[0]) == "claude" for c in seen)

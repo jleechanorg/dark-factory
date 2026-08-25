@@ -858,7 +858,16 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             metadata=meta,
         ))
 
-    if backend == "claude":
+    if backend in {"claude", "claude-sonnet", "minimax"}:
+        if backend in {"claude", "claude-sonnet"}:
+            try:
+                claude_config = _handlers_shim._claude_config_dir()
+            except (AttributeError, ValueError) as exc:
+                return _finalize(Result(
+                    outcome="failure",
+                    output=f"{backend} backend requires DARK_FACTORY_CLAUDE_CONFIG_DIR: {exc}",
+                    metadata={"invalid_backend": "true"},
+                ))
         # `--output-format json` makes coder token usage + dollar cost observable
         # (the cost axis is blind under plain `--print`). The envelope is parsed
         # by `_claude_json_result`; `output` is still the readable result text.
@@ -869,12 +878,29 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         # attr as a backend alias, so reusing it would misroute a node that sets
         # only `model` to a nonexistent backend named after the model string.
         model_name = node.attrs.get("model_name")
-        if model_name:
+        if model_name and backend != "minimax":
             claude_cmd += ["--model", str(model_name)]
+        if backend == "minimax":
+            claude_cmd += ["--model", os.environ.get("DARK_FACTORY_MINIMAX_MODEL", "MiniMax-M3")]
         claude_cmd.append(prompt_text)
         args = _handlers_shim._sandboxed_args_for_workdir(claude_cmd, ctx.workdir)
         if args is None:
             return _finalize(Result(outcome="failure", output="sandbox-exec unavailable"))
+        subprocess_env = _handlers_shim._sanitized_env()
+        if backend in {"claude", "claude-sonnet"}:
+            for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL"):
+                subprocess_env.pop(key, None)
+            subprocess_env["CLAUDE_CONFIG_DIR"] = str(claude_config)
+        else:
+            subprocess_env.pop("CLAUDE_CONFIG_DIR", None)
+            for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL"):
+                subprocess_env.pop(key, None)
+            subprocess_env.update({
+                "ANTHROPIC_BASE_URL": "https://api.minimax.io/anthropic",
+                "ANTHROPIC_MODEL": os.environ.get("DARK_FACTORY_MINIMAX_MODEL", "MiniMax-M3"),
+            })
+            if os.environ.get("MINIMAX_API_KEY"):
+                subprocess_env["ANTHROPIC_API_KEY"] = os.environ["MINIMAX_API_KEY"]
         try:
             timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1800"), 1800)
             proc = subprocess.run(
@@ -886,7 +912,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                 check=False,
                 stdin=subprocess.DEVNULL,
                 start_new_session=True,
-                env=_handlers_shim._sanitized_env(),
+                env=subprocess_env,
             )
         except subprocess.TimeoutExpired:
             return _finalize(Result(

@@ -19,7 +19,7 @@ Owns:
   * `_resolve_gate_backend` — resolve node-level priority OR explicit backend
     OR run-level; cross-visit pin.
   * `_coerce_bool_attr` — truthy/falsy parser for DOT attributes.
-  * `_execute_gate` — run gate; agy→claude infra fallback (no
+  * `_execute_gate` — run gate; codex/minimax→agy infra fallback (no
     reviewer-shopping).
 
 All monkeypatched helper symbols are looked up via ``runner.handlers``
@@ -501,6 +501,18 @@ def _gate_subprocess_args(
 
     Returns ``None`` when sandbox-exec is unavailable.
     """
+    supported = {"agy", "codex", "minimax", "claude", "claude-sonnet"}
+    if backend not in supported:
+        return None
+    # Claude-backed lanes are never allowed to inherit the operator's default
+    # account. MiniMax is a separate endpoint/model route and intentionally
+    # does not require a Claude config directory.
+    if backend in {"claude", "claude-sonnet"}:
+        try:
+            _handlers_shim._claude_config_dir()
+        except (AttributeError, ValueError):
+            return None
+
     sealed_args_builder = getattr(_handlers_shim, "_sandboxed_args_for_workdir", None)
     if workdir is not None and callable(sealed_args_builder):
         # Caller explicitly opts in to the sealed-doc deny rule (jleechan-113).
@@ -518,7 +530,11 @@ def _gate_subprocess_args(
                 "codex", "exec", "--yolo", "--skip-git-repo-check", prompt,
             ], workdir)
         claude_bin = _handlers_shim._get_claude_executable()
-        return sealed_args_builder([claude_bin, "--print", "--dangerously-skip-permissions", prompt], workdir)
+        claude_args = [claude_bin, "--print", "--dangerously-skip-permissions"]
+        if backend == "minimax":
+            claude_args += ["--model", os.environ.get("DARK_FACTORY_MINIMAX_MODEL", "MiniMax-M3")]
+        claude_args.append(prompt)
+        return sealed_args_builder(claude_args, workdir)
     if backend == "agy":
         return _handlers_shim._sandboxed_args([
             "agy",
@@ -532,12 +548,14 @@ def _gate_subprocess_args(
         return _handlers_shim._sandboxed_args([
             "codex", "exec", "--yolo", "--skip-git-repo-check", prompt,
         ])
-    # ``claude-sonnet`` (priority-queue name), bare ``claude`` (run-level
-    # default), and any other claude-routed backend → Anthropic Claude CLI.
-    # ``minimax`` is a special case of this path with a different base URL
-    # (see ``_gate_subprocess_env``).
+    # Explicit Claude routes are scoped above. MiniMax uses the Claude CLI
+    # transport but an explicit model and endpoint (see env builder).
     claude_bin = _handlers_shim._get_claude_executable()
-    return _handlers_shim._sandboxed_args([claude_bin, "--print", "--dangerously-skip-permissions", prompt])
+    claude_args = [claude_bin, "--print", "--dangerously-skip-permissions"]
+    if backend == "minimax":
+        claude_args += ["--model", os.environ.get("DARK_FACTORY_MINIMAX_MODEL", "MiniMax-M3")]
+    claude_args.append(prompt)
+    return _handlers_shim._sandboxed_args(claude_args)
 
 
 def _gate_subprocess_env(backend: str) -> dict[str, str]:
@@ -550,9 +568,24 @@ def _gate_subprocess_env(backend: str) -> dict[str, str]:
     must not reach any reviewer subprocess). All other backends use
     ``_sanitized_env`` unchanged.
     """
+    env = _handlers_shim._sanitized_env()
     if backend == "minimax":
-        return {**_handlers_shim._sanitized_env(), "ANTHROPIC_BASE_URL": "https://api.minimax.io/anthropic"}
-    return _handlers_shim._sanitized_env()
+        model = os.environ.get("DARK_FACTORY_MINIMAX_MODEL", "MiniMax-M3")
+        env.pop("CLAUDE_CONFIG_DIR", None)
+        for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL"):
+            env.pop(key, None)
+        env.update({
+            "ANTHROPIC_BASE_URL": "https://api.minimax.io/anthropic",
+            "ANTHROPIC_MODEL": model,
+        })
+        if os.environ.get("MINIMAX_API_KEY"):
+            env["ANTHROPIC_API_KEY"] = os.environ["MINIMAX_API_KEY"]
+        return env
+    if backend in {"claude", "claude-sonnet"}:
+        for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL"):
+            env.pop(key, None)
+        env["CLAUDE_CONFIG_DIR"] = str(_handlers_shim._claude_config_dir())
+    return env
 
 
 def _build_controller_codex_transport(args: list[str]) -> list[str]:
@@ -634,6 +667,17 @@ def _run_gate_once(
     recorded name matches the resolved priority-queue name end-to-end
     (e.g. ``codex`` means a codex subprocess really ran, not just a label).
     """
+    if backend not in {"agy", "codex", "minimax", "claude", "claude-sonnet"}:
+        return Result(
+            outcome="error",
+            output=f"unsupported reviewer backend: {backend!r}",
+            metadata={
+                "slash_command": name,
+                "verdict": "unknown",
+                "reviewer_backend": str(backend),
+                "invalid_backend": "true",
+            },
+        )
     # The recorded name must match the subprocess that actually ran. agy is
     # passed through as-is; minimax is recorded as ``minimax`` even though it
     # invokes the Claude CLI (the review is graded by the minimax-routed
@@ -672,18 +716,6 @@ def _run_gate_once(
             )
     except Exception:
         prompt_meta = {}
-    sub_args = _gate_subprocess_args(backend, prompt, ctx, timeout)
-    sub_env = _gate_subprocess_env(backend)
-    if sub_args is None:
-        return Result(
-            outcome="error",
-            output="sandbox-exec unavailable",
-            metadata={"slash_command": name, "verdict": "unknown",
-                      "reviewer_backend": reviewer_backend, "sandbox": "unavailable",
-                      "backend_missing": "true",
-                      **prompt_meta},
-        )
-
     controller_requested = str(ctx.state.get("_df_controller_review_json") or "").lower() in {"true", "1", "yes", "on"}
     if controller_requested and backend != "codex":
         return Result(
@@ -698,6 +730,17 @@ def _run_gate_once(
                 **prompt_meta,
             },
         )
+    sub_args = _gate_subprocess_args(backend, prompt, ctx, timeout)
+    if sub_args is None:
+        return Result(
+            outcome="error",
+            output="sandbox-exec unavailable",
+            metadata={"slash_command": name, "verdict": "unknown",
+                      "reviewer_backend": reviewer_backend, "sandbox": "unavailable",
+                      "backend_missing": "true",
+                      **prompt_meta},
+        )
+    sub_env = _gate_subprocess_env(backend)
     controller_json = backend == "codex" and controller_requested
     if controller_json:
         try:
@@ -870,7 +913,7 @@ def _run_gate_once(
 def _is_gate_infra_failure(result: "Result") -> bool:
     """True when a gate result is an *infrastructure* failure (not a real verdict).
 
-    Only infra failures justify the agy→claude fallback. A genuine
+    Only infra failures justify the reviewer→agy fallback. A genuine
     ``verdict: fail|partial`` is a real review result and must never trigger a
     retry on a different backend (that would be reviewer-shopping).
     """
@@ -918,7 +961,7 @@ def _build_reviewer_receipt(
 # authoritative and must never be retried on a different model — see
 # feedback_2026-05-31_runner_resilience_reviewer_gates.md for the
 # no-reviewer-shopping rule.
-_DEFAULT_ADVERSARIAL_PRIORITY = ["codex", "minimax", "agy", "claude-sonnet"]
+_DEFAULT_ADVERSARIAL_PRIORITY = ["codex", "minimax", "agy"]
 
 
 def _parse_priority_env(raw: str) -> list[str]:
@@ -942,7 +985,14 @@ def _probe_backend_installed(name: str) -> bool:
     existing ``subprocess.run(timeout=...)`` envelope in ``_run_gate_once`` to
     catch the hang, but the probe itself uses a 5s ceiling.
     """
-    bin_name = "claude" if name == "claude-sonnet" else name
+    import runner.handlers as _handlers_shim
+
+    bin_name = "claude" if name in {"claude", "claude-sonnet", "minimax"} else name
+    if name in {"claude", "claude-sonnet"}:
+        try:
+            _handlers_shim._claude_config_dir()
+        except (AttributeError, ValueError):
+            return False
     bin_path = shutil.which(bin_name)
     if not bin_path:
         return False
@@ -980,7 +1030,7 @@ def _resolve_adversarial_backend(
     list, the resolved backend, and the entries that were skipped because
     they are not installed. The metadata is meant to be merged into the gate
     ``Result.metadata`` so the operator/CXDB can see why a particular backend
-    was picked (or why the resolver fell all the way through to claude-sonnet).
+    was picked (or why the resolver exhausted the non-Claude queue).
 
     This is the FIRST adversarial pass selector — *not* a retry cascade. A
     real fail|partial from the chosen backend is kept (the no-reviewer-shopping
@@ -1120,16 +1170,14 @@ def _execute_gate(
     prompt: str, expected_sha: str, timeout: int, ctx: "Context", name: str, backend: str,
     *, gate_strict: bool = False,
 ) -> "Result":
-    """Run a reviewer gate on ``backend``; infra failures fall back to agy, then claude.
+    """Run a reviewer gate on ``backend``; infra failures fall back to agy only.
 
     Routing rules:
       - Run the resolved backend. If the result is an *infrastructure*
         failure (missing binary, sandbox unavailable, timeout, unparseable
         output, SHA mismatch with no real verdict) and the backend is not
-        already agy/claude-routed:
-        1. If backend is not agy and not claude/claude-sonnet, fall back to ``agy``.
-        2. If backend is agy, or if the agy fallback also suffers an infra failure,
-           fall back to ``claude``.
+        already agy-routed: if backend is not agy, fall back to ``agy`` once.
+        If agy also suffers an infra failure, stop with ``infra_failure``.
       - A real ``fail``/``partial`` verdict from any backend is kept as-is
         (no-reviewer-shopping): only non-verdicts trigger the fallback.
       - Any result that is still an infra failure after routing carries
@@ -1144,16 +1192,18 @@ def _execute_gate(
     result = _run_gate_once(backend, prompt, expected_sha, timeout, ctx, name, gate_strict=gate_strict)
 
     controller_requested = str(ctx.state.get("_df_controller_review_json") or "").lower() in {"true", "1", "yes", "on"}
+    if result.metadata.get("invalid_backend") == "true":
+        result.metadata["verdict"] = "infra_failure"
+        result.metadata.setdefault("fallback_used", "false")
+        return result
     if _is_gate_infra_failure(result):
         if controller_requested:
             result.metadata["verdict"] = "infra_failure"
             result.metadata.setdefault("fallback_used", "false")
             return result
         fallback_backends = []
-        if backend not in ("agy", "claude", "claude-sonnet"):
+        if backend != "agy":
             fallback_backends.append("agy")
-        if backend not in ("claude", "claude-sonnet"):
-            fallback_backends.append("claude")
 
         current_result = result
         for fb_backend in fallback_backends:
@@ -1164,6 +1214,7 @@ def _execute_gate(
             if not _is_gate_infra_failure(current_result):
                 return current_result
 
+        current_result.metadata.setdefault("fallback_used", "false")
         current_result.metadata["verdict"] = "infra_failure"
         return current_result
 
