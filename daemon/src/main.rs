@@ -529,6 +529,30 @@ fn verify_startup_cargo_toolchain(args: Args) {
     }
 }
 
+/// Emit a non-fatal startup capability signal for Python gate-8 targets.
+/// Cargo remains the primary daemon toolchain, so a host without pytest must
+/// not prevent startup or Rust-only assessments; it should nevertheless be
+/// visible in the service journal before a Python PR reaches verification.
+fn verify_startup_pytest_capability(args: Args) {
+    if args.dry_run {
+        return;
+    }
+    match daemon::vacuous_red_green::resolve_pytest(None) {
+        daemon::vacuous_red_green::PytestLocation::OnPath
+        | daemon::vacuous_red_green::PytestLocation::Found(_) => {
+            eprintln!("auto-factory daemon: gate-8 pytest capability available");
+        }
+        daemon::vacuous_red_green::PytestLocation::NotFound => {
+            eprintln!(
+                "auto-factory daemon: WARNING: pytest binary not found. Python target PRs will \
+                 report a structured pytest-not-found gate-8 result; Rust-only assessments and \
+                 daemon startup remain unaffected. Install pytest in the daemon service PATH \
+                 (for example, `python3 -m pip install pytest`)."
+            );
+        }
+    }
+}
+
 fn run(args: Args) -> Result<(), DaemonError> {
     let cfg_path = default_config_path();
     let cfg = load_config(&cfg_path)?;
@@ -551,6 +575,9 @@ fn run(args: Args) -> Result<(), DaemonError> {
     // operator sees it in the journalctl output before the first
     // assessment.
     verify_startup_cargo_toolchain(args);
+    // Python parity: expose whether the optional pytest backend is available
+    // without making non-Python daemon startup fail closed.
+    verify_startup_pytest_capability(args);
     // Verify the telemetry log path is writable BEFORE we start polling
     // ticks — every assessment writes here, and a churning 7-green false
     // alarm usually traces back to a silent telemetry write failure.
@@ -1402,5 +1429,15 @@ mod tests {
             Some(p) => std::env::set_var("CARGO_HOME", p),
             None => std::env::remove_var("CARGO_HOME"),
         }
+    }
+
+    #[test]
+    fn startup_pytest_check_is_silent_under_dry_run() {
+        // Dry-run diagnostics must not probe or mutate the host's optional
+        // Python toolchain; production startup remains non-fatal either way.
+        verify_startup_pytest_capability(Args {
+            dry_run: true,
+            once: false,
+        });
     }
 }
