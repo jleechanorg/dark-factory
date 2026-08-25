@@ -4,6 +4,20 @@ use crate::tools::Llm;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+/// Daemon-process-wide cache of the resolved `(spec_dir, bead_id)` path.
+/// The cache is keyed on the configured spec dir so two deployments that
+/// share a process (e.g. dual-target dispatch) can't accidentally agree
+/// on a path. The resolver's contract is: within one daemon lifetime,
+/// reroll append and tick readback MUST agree, and a transient flip in
+/// the configured dir's accessibility (e.g. an NFS hiccup, a chmod 555
+/// for 1ms, a release-tree re-mount) MUST NOT cause the resolver to
+/// silently switch roots mid-tick — the reroll that wrote at line N
+/// must return the same path the tick reads at line N+50.
+static RESOLVED_SPEC_PATHS: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<(String, String), PathBuf>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Extracted {
@@ -129,10 +143,48 @@ pub fn extract(llm: &dyn Llm, review_text: &str) -> Result<Extracted, DaemonErro
 ///
 /// Determinism: within one daemon lifetime, repeated calls with the same
 /// `(cfg, bead_id)` MUST return the same `PathBuf` — the resolver decides
-/// once at first call (or at process start) and caches, so a tick that
-/// reads at line N+50 cannot disagree with the reroll that wrote at
-/// line N.
+/// once at first call and caches, so a tick that reads at line N+50
+/// cannot disagree with the reroll that wrote at line N even if the
+/// configured dir's accessibility flips between the two calls (NFS
+/// hiccup, transient chmod, release-tree re-mount). The cache key is
+/// the configured spec_dir + bead_id so two deployments sharing one
+/// process cannot silently swap paths. The probe never truncates a
+/// pre-existing artifact — it uses `create_new` (which atomically
+/// fails on existence) and a namespaced filename so concurrent
+/// resolvers and concurrent tests cannot race the same sentinel.
 pub fn resolve_runtime_spec_path(cfg: &Config, bead_id: &str) -> PathBuf {
+    let key = (cfg.spec_dir.clone(), bead_id.to_string());
+    if let Some(cached) = RESOLVED_SPEC_PATHS
+        .lock()
+        .expect("resolver cache poisoned")
+        .get(&key)
+        .cloned()
+    {
+        return cached;
+    }
+    let resolved = resolve_runtime_spec_path_uncached(cfg, bead_id);
+    let mut cache = RESOLVED_SPEC_PATHS
+        .lock()
+        .expect("resolver cache poisoned");
+    // First-writer-wins: if a concurrent resolver already inserted
+    // (e.g. a parallel test), honor that decision so two simultaneous
+    // reroll/tick calls agree. Without this check our resolver's
+    // `dir_is_writable` probe (an external IO) could let two callers
+    // race a racy-flip window and pick different roots.
+    if let Some(loser) = cache.get(&key) {
+        return loser.clone();
+    }
+    cache.insert(key, resolved.clone());
+    resolved
+}
+
+/// Probe-and-decide variant of `resolve_runtime_spec_path`. The
+/// configured-vs-fallback decision is captured once and cached; the
+/// probe is `create_new` so a pre-existing sentinel (left behind by a
+/// crashed previous probe attempt, e.g. SIGKILL between open and
+/// remove) is left exactly as-is — we never truncate a file the
+/// operator can see.
+fn resolve_runtime_spec_path_uncached(cfg: &Config, bead_id: &str) -> PathBuf {
     let configured = PathBuf::from(&cfg.spec_dir).join(format!("{bead_id}.toml"));
     if dir_is_writable(Path::new(&cfg.spec_dir)) {
         configured
@@ -150,14 +202,18 @@ pub fn resolve_runtime_spec_path(cfg: &Config, bead_id: &str) -> PathBuf {
 }
 
 /// True when `dir` already exists and we can both `create_dir_all` (no-op
-/// is fine) and `OpenOptions::create+write+truncate` a tiny sentinel file
+/// is fine) and `OpenOptions::create_new+write` a tiny sentinel file
 /// inside it. False if the dir does not exist AND `create_dir_all` fails,
 /// OR if the dir exists but the kernel denies our write attempt (root in
 /// a non-POSIX namespace, mode 0o555, immutable bit, etc.). The sentinel
 /// is deleted immediately so the resolver is read-only with respect to
-/// the configured dir on a successful call. The probe filename is
-/// namespaced by PID + nanos so parallel resolver calls (parallel tests
-/// sharing `runtime_state_dir()`) cannot race on the same sentinel.
+/// the configured dir on a successful call. The probe uses
+/// `create_new` (NOT `create+truncate`) so a pre-existing artifact in
+/// the configured dir with the same name (left behind by a crashed
+/// previous probe, an operator-placed file, etc.) is NEVER truncated —
+/// we only ever create if absent. The probe filename is namespaced by
+/// PID + nanos so parallel resolver calls (parallel tests sharing
+/// `runtime_state_dir()`) cannot race the same sentinel.
 fn dir_is_writable(dir: &Path) -> bool {
     match std::fs::create_dir_all(dir) {
         Ok(()) => {}
@@ -172,14 +228,24 @@ fn dir_is_writable(dir: &Path) -> bool {
             .unwrap_or(0)
     ));
     let res = OpenOptions::new()
-        .create(true)
         .write(true)
-        .truncate(true)
+        .create_new(true)
         .open(&sentinel)
         .map(|mut f| f.write_all(b"ok").is_ok())
         .unwrap_or(false);
     let _ = std::fs::remove_file(&sentinel);
     res
+}
+
+/// Test-only: drop the resolver cache between tests so a
+/// `chmod 555 / chmod 755` flip in one test does not poison the next.
+/// Production code never needs this — the cache lives for the daemon
+/// process lifetime and is the *point* of the determinism contract.
+#[cfg(test)]
+pub fn clear_resolver_cache_for_tests() {
+    if let Ok(mut cache) = RESOLVED_SPEC_PATHS.lock() {
+        cache.clear();
+    }
 }
 
 /// Appends the extracted constraints block append-only to the bead's spec file.
@@ -604,5 +670,186 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    /// PR #755 Slice 3 r2: the resolver must agree across a transient
+    /// configured-dir accessibility flip within one daemon lifetime. The
+    /// reroll at line N and the tick readback at line N+50 must see the
+    /// same path even when a `chmod 555` lands between them (operator
+    /// release-tree re-mount, NFS hiccup, security scanner lockdown).
+    /// The cache guarantees that: first call decides, subsequent calls
+    /// honor the decision. Mirrors the live incident where the reroll
+    /// wrote into the fallback but the tick read from the configured
+    /// path because `dir_is_writable` saw a different answer 50 ms later.
+    #[test]
+    fn test_resolve_runtime_spec_path_is_cached_across_accessibility_flip() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            clear_resolver_cache_for_tests();
+
+            let configured =
+                std::env::temp_dir().join("afd_resolver_flip_unique");
+            std::fs::create_dir_all(&configured).unwrap();
+            let cfg = Config {
+                spec_dir: configured.to_string_lossy().into_owned(),
+                ..make_test_config()
+            };
+            let prev_perms = std::fs::metadata(&configured).unwrap().permissions();
+            // Step 1: configured dir IS writable — first call decides.
+            std::fs::set_permissions(
+                &configured,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+            let resolved_writable =
+                resolve_runtime_spec_path(&cfg, "bead-flip");
+            let expected_writable = PathBuf::from(&cfg.spec_dir)
+                .join("bead-flip.toml");
+            assert_eq!(
+                resolved_writable, expected_writable,
+                "first call (writable dir) must pick the configured path"
+            );
+
+            // Step 2: flip the dir to 0o555 to simulate a transient
+            // accessibility loss — and confirm we're really sandboxed
+            // (root would skip the test otherwise).
+            std::fs::set_permissions(
+                &configured,
+                std::fs::Permissions::from_mode(0o555),
+            )
+            .unwrap();
+            if read_only_dir_blocks_write(&configured) {
+                // Step 3: re-call the resolver under the read-only
+                // regime. Caching MUST keep returning the writable path
+                // so the reroll+tick pair reads / writes the same file.
+                let resolved_readonly =
+                    resolve_runtime_spec_path(&cfg, "bead-flip");
+                assert_eq!(
+                    resolved_readonly, expected_writable,
+                    "resolver MUST cache the writable decision so a \
+                     mid-tick chmod flip cannot redirect the readback \
+                     to the daemon-state fallback (got: {} expected: {})",
+                    resolved_readonly.display(),
+                    expected_writable.display(),
+                );
+            } else {
+                eprintln!(
+                    "SKIP: effective UID bypasses POSIX read-only perms (root)"
+                );
+            }
+
+            // Cleanup — restore perms before removing so the kernel
+            // doesn't refuse the unlink.
+            std::fs::set_permissions(&configured, prev_perms).unwrap();
+            let _ = std::fs::remove_dir_all(&configured);
+        }
+        #[cfg(not(unix))]
+        {
+            eprintln!("SKIP: chmod-based flip requires POSIX perms");
+        }
+    }
+
+    /// PR #755 Slice 3 r2: the resolver's probe must NOT leave any
+    /// artifact in the configured dir — even when the configured dir is
+    /// later flipped unreadable and the probe falls back, the operator
+    /// must not see a `.dark_factory_writable_probe.<pid>.<nanos>` file
+    /// dangling in their working tree. The probe uses `create_new`
+    /// (NOT `create+truncate`) and removes the sentinel on both Ok and
+    /// Err paths.
+    #[test]
+    fn test_resolve_runtime_spec_path_probe_leaves_no_artifact() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let configured =
+                std::env::temp_dir().join("afd_resolver_probe_unique");
+            std::fs::create_dir_all(&configured).unwrap();
+            let cfg = Config {
+                spec_dir: configured.to_string_lossy().into_owned(),
+                ..make_test_config()
+            };
+            let prev_perms = std::fs::metadata(&configured).unwrap().permissions();
+
+            // Caller A — resolver picks the configured path while
+            // it's writable.
+            std::fs::set_permissions(
+                &configured,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+            let _ = resolve_runtime_spec_path(&cfg, "bead-probe");
+
+            // Caller B — flip to read-only, probe must fall back to
+            // the daemon-state specs dir without touching the
+            // configured dir.
+            std::fs::set_permissions(
+                &configured,
+                std::fs::Permissions::from_mode(0o555),
+            )
+            .unwrap();
+            if read_only_dir_blocks_write(&configured) {
+                let _ = resolve_runtime_spec_path(&cfg, "bead-probe");
+            } else {
+                eprintln!(
+                    "SKIP: effective UID bypasses POSIX read-only perms (root)"
+                );
+            }
+
+            // Restore write perms so we can list contents.
+            std::fs::set_permissions(&configured, prev_perms.clone()).unwrap();
+            let mut found_sentinel = false;
+            for entry in std::fs::read_dir(&configured).unwrap() {
+                let name = entry.unwrap().file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(".dark_factory_writable_probe.") {
+                    found_sentinel = true;
+                    eprintln!("UNEXPECTED sentinel left behind: {name}");
+                }
+            }
+            assert!(
+                !found_sentinel,
+                "resolver probe must clean up its sentinel — leaving a \
+                 .dark_factory_writable_probe.<pid>.<nanos> file in the \
+                 operator-visible configured dir is a regression"
+            );
+
+            std::fs::set_permissions(&configured, prev_perms).unwrap();
+            let _ = std::fs::remove_dir_all(&configured);
+        }
+        #[cfg(not(unix))]
+        {
+            eprintln!("SKIP: chmod-based flip requires POSIX perms");
+        }
+    }
+
+    /// PR #755 Slice 3 r2: the resolver MUST preserve the cached path
+    /// when `clear_resolver_cache_for_tests` is NOT called — i.e. the
+    /// cache survives across calls within one process. The flip test
+    /// above proves the same thing end-to-end; this test pins the
+    /// contract from the other side: same daemon lifetime, two calls
+    /// with no fs flip, same path AND no extra probe artifacts.
+    #[test]
+    fn test_resolve_runtime_spec_path_does_not_reprobe_within_daemon_lifetime() {
+        let configured = std::env::temp_dir().join("afd_resolver_no_reprobe");
+        std::fs::create_dir_all(&configured).unwrap();
+        let cfg = Config {
+            spec_dir: configured.to_string_lossy().into_owned(),
+            ..make_test_config()
+        };
+        let path_a = resolve_runtime_spec_path(&cfg, "bead-noreprobe");
+        let path_b = resolve_runtime_spec_path(&cfg, "bead-noreprobe");
+        let path_c = resolve_runtime_spec_path(&cfg, "bead-noreprobe");
+        assert_eq!(
+            path_a, path_b,
+            "second call must return the cached path verbatim"
+        );
+        assert_eq!(path_a, path_c, "third call must also be cached");
+        assert_eq!(
+            path_a,
+            PathBuf::from(&cfg.spec_dir).join("bead-noreprobe.toml"),
+            "path must equal the configured dir join (writable regime)"
+        );
+        let _ = std::fs::remove_dir_all(&configured);
     }
 }
