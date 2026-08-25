@@ -315,6 +315,7 @@ impl Llm for ScriptedCbLlm {
             Ok(r#"{"inhibitionSpecs":["placeholder"],"positiveAssertions":["placeholder"],"securityRedactionEncountered":false}"#.into())
         }
     }
+    fn judge_read_only(&self, prompt: &str) -> Result<String, DaemonError> { self.judge(prompt) }
 }
 
 /// Runs one circuit-breaker corpus case through the REAL `reroll::execute`.
