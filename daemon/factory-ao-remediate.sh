@@ -210,17 +210,19 @@ if [ "$MODE" = "sync" ]; then
   if [ -x "$MINIMAX_SYNC" ]; then
     bash "$MINIMAX_SYNC" --all || echo "[remediate] WARN: MiniMax sync failed — sessions may use Anthropic OAuth" >&2
   fi
+  start_ready_deadline
   # Best-effort daemon readiness for sync path. Spawn capability detection
   # and required session verification still share one bounded probe deadline.
   if [[ "$(basename "$AO")" == "ao-go" ]]; then
-    state="$("$AO" status --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("state",""))' 2>/dev/null || true)"
+    state="$(ao_ready_probe status --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("state",""))' 2>/dev/null || true)"
     if [ "$state" != "ready" ] && [ "$state" != "running" ]; then
       echo "[remediate] starting Go AO daemon" >&2
       nohup "$AO" daemon >> /tmp/ao-go-daemon.log 2>&1 &
-      sleep 2
+      ready_wait=$(( READY_DEADLINE - $(date +%s) ))
+      [ "$ready_wait" -gt 2 ] && ready_wait=2
+      [ "$ready_wait" -gt 0 ] && sleep "$ready_wait"
     fi
   fi
-  start_ready_deadline
   result="$(run_spawn_foreground)"
   rc="${result%%$'\t'*}"
   out="${result#*$'\t'}"

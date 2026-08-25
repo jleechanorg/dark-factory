@@ -111,6 +111,33 @@ elapsed=$(( $(date +%s) - start ))
 assert "hanging sync verification rejects dispatch" "1" "$rc"
 assert "hanging sync verification stays within readiness deadline" "yes" "$( [ "$elapsed" -le 4 ] && echo yes || echo no )"
 
+# The Go AO sync preflight status query is part of the same probe budget as
+# spawn capability detection and required session verification.
+HANG_STATUS_DIR="$SCRATCH/hang-status"
+mkdir -p "$HANG_STATUS_DIR"
+HANG_STATUS_AO="$HANG_STATUS_DIR/ao-go"
+cat > "$HANG_STATUS_AO" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  'status --json') sleep 30 ;;
+  daemon) exit 0 ;;
+  'spawn --help') printf '%s\n' '--name' ;;
+  spawn*) exit 1 ;;
+  'session ls -p expected-project') sleep 30 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$HANG_STATUS_AO"
+start="$(date +%s)"
+set +e
+SYNC=1 AFD_AO_READY_TIMEOUT_SEC=2 AO_BIN="$HANG_STATUS_AO" AFD_REQUIRE_SESSION=1 \
+  timeout 6 bash "$REMEDIATE" hanging-sync-status 9006 owner/repo expected-project >/dev/null 2>&1
+rc=$?
+set -e
+elapsed=$(( $(date +%s) - start ))
+assert "hanging sync status rejects dispatch" "1" "$rc"
+assert "sync status shares readiness deadline" "yes" "$( [ "$elapsed" -le 4 ] && echo yes || echo no )"
+
 # `ao spawn --help` is a capability probe, not the spawn itself, and must
 # consume the same bounded probe budget as session verification.
 HANG_HELP_AO="$SCRATCH/hang-help-ao-ts"
