@@ -1146,12 +1146,95 @@ pub fn run_tool_with_env_and_remove(
     run_tool_with_cwd(cmd, args, None, extra_env, remove_env, timeout_secs)
 }
 
+/// Run a child after removing every inherited provider/account variable.
+///
+/// Provider CLIs add new knobs over time, so maintaining an exhaustive list of
+/// exact names at each call site is unsafe: an unlisted `AWS_*` or
+/// `CLAUDE_CODE_*` variable can silently redirect an unattended child.  This
+/// helper discovers the inherited environment at the process boundary and
+/// removes all known provider prefixes before applying the caller's explicit
+/// scope.  The caller can therefore pin MiniMax or a project Claude config
+/// without allowing ambient account state to win.
+pub fn run_tool_with_env_and_remove_provider(
+    cmd: &str,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+    timeout_secs: u64,
+) -> Result<String, DaemonError> {
+    run_tool_with_cwd_provider(cmd, args, None, extra_env, timeout_secs)
+}
+
+/// Explicit-cwd variant of [`run_tool_with_env_and_remove_provider`].
+pub fn run_tool_in_dir_with_provider_env(
+    cmd: &str,
+    args: &[&str],
+    cwd: &str,
+    extra_env: &[(&str, &str)],
+    timeout_secs: u64,
+) -> Result<String, DaemonError> {
+    run_tool_with_cwd_provider(cmd, args, Some(cwd), extra_env, timeout_secs)
+}
+
+/// Keep provider scrubbing in one place so every direct Claude/MiniMax child
+/// gets identical account isolation. Exact names cover legacy non-prefixed
+/// selectors retained for compatibility with existing launch wrappers.
+fn provider_env_name(name: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "CLAUDE_CODE_",
+        "ANTHROPIC_",
+        "AWS_",
+        "GOOGLE_",
+        "GCLOUD_",
+        "VERTEXAI_",
+        "BEDROCK_",
+        "CLOUD_ML_",
+        "MINIMAX_",
+        "AZURE_",
+        "FOUNDRY_",
+        "OPENAI_",
+    ];
+    const EXACT: &[&str] = &["CLAUDE_CONFIG_DIR", "CLAUDEM_MODE", "DARK_FACTORY_MINIMAX_MODEL"];
+    EXACT.contains(&name) || PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+}
+
+fn run_tool_with_cwd_provider(
+    cmd: &str,
+    args: &[&str],
+    cwd: Option<&str>,
+    extra_env: &[(&str, &str)],
+    timeout_secs: u64,
+) -> Result<String, DaemonError> {
+    let remove_env: Vec<std::ffi::OsString> = std::env::vars_os()
+        .filter_map(|(key, _)| {
+            key.to_str()
+                .filter(|name| provider_env_name(name))
+                .map(std::ffi::OsString::from)
+        })
+        .collect();
+    run_tool_with_cwd_and_os_remove(cmd, args, cwd, extra_env, &remove_env, timeout_secs)
+}
+
 fn run_tool_with_cwd(
     cmd: &str,
     args: &[&str],
     cwd: Option<&str>,
     extra_env: &[(&str, &str)],
     remove_env: &[&str],
+    timeout_secs: u64,
+) -> Result<String, DaemonError> {
+    let remove_env: Vec<std::ffi::OsString> = remove_env
+        .iter()
+        .map(std::ffi::OsString::from)
+        .collect();
+    run_tool_with_cwd_and_os_remove(cmd, args, cwd, extra_env, &remove_env, timeout_secs)
+}
+
+fn run_tool_with_cwd_and_os_remove(
+    cmd: &str,
+    args: &[&str],
+    cwd: Option<&str>,
+    extra_env: &[(&str, &str)],
+    remove_env: &[std::ffi::OsString],
     timeout_secs: u64,
 ) -> Result<String, DaemonError> {
     // Centralized GitHub rate-limit circuit-breaker admission check.

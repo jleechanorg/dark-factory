@@ -7880,71 +7880,6 @@ pub struct ChainLlm;
 /// expects.
 const FALLBACK_CWD: &str = ".";
 
-/// Environment selectors that can redirect a Claude-compatible child to a
-/// host provider/account.  Keep this list explicit at the process boundary:
-/// `ChainLlm` is used from unattended daemon ticks and must not inherit an
-/// operator's Bedrock/Vertex/OpenAI/Azure credentials or endpoint overrides.
-const CLAUDE_PROVIDER_ENV: &[&str] = &[
-    "CLAUDE_CONFIG_DIR",
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
-    "CLAUDE_CODE_USE_VERTEX",
-    "CLAUDE_CODE_SKIP_VERTEX_AUTH",
-    "CLAUDE_CODE_USE_FOUNDRY",
-    "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
-    "CLAUDE_CODE_USE_AZURE",
-    "CLAUDE_CODE_USE_OPENAI",
-    "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL",
-    "CLAUDEM_MODE",
-    "MINIMAX_API_KEY",
-    "MINIMAX_BASE_URL",
-    "MINIMAX_MODEL",
-    "DARK_FACTORY_MINIMAX_MODEL",
-    "ANTHROPIC_BASE_URL",
-    "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_MODEL",
-    "ANTHROPIC_SMALL_FAST_MODEL",
-    "ANTHROPIC_BEDROCK_BASE_URL",
-    "ANTHROPIC_BEDROCK_REGION",
-    "ANTHROPIC_BEDROCK_MODEL",
-    "ANTHROPIC_VERTEX_BASE_URL",
-    "ANTHROPIC_VERTEX_PROJECT_ID",
-    "ANTHROPIC_VERTEX_REGION",
-    "CLOUD_ML_REGION",
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-    "AWS_SECURITY_TOKEN",
-    "AWS_WEB_IDENTITY_TOKEN_FILE",
-    "AWS_ROLE_ARN",
-    "AWS_ROLE_SESSION_NAME",
-    "AWS_PROFILE",
-    "AWS_REGION",
-    "AWS_DEFAULT_REGION",
-    "AWS_ENDPOINT_URL",
-    "AWS_ENDPOINT_URL_BEDROCK",
-    "AWS_BEARER_TOKEN_BEDROCK",
-    "AWS_BEDROCK_MODEL_ID",
-    "GOOGLE_APPLICATION_CREDENTIALS",
-    "GOOGLE_API_KEY",
-    "GOOGLE_CLOUD_PROJECT",
-    "GOOGLE_CLOUD_LOCATION",
-    "GOOGLE_GENAI_USE_VERTEXAI",
-    "GCLOUD_PROJECT",
-    "VERTEXAI_PROJECT",
-    "VERTEXAI_LOCATION",
-    "BEDROCK_MODEL_ID",
-    "BEDROCK_REGION",
-    "AZURE_OPENAI_API_KEY",
-    "AZURE_OPENAI_ENDPOINT",
-    "AZURE_OPENAI_API_VERSION",
-    "FOUNDRY_API_KEY",
-    "FOUNDRY_ENDPOINT",
-    "OPENAI_API_KEY",
-    "OPENAI_BASE_URL",
-];
-
 /// Anthropic weekly-limit bypass: re-invoke the `claude` binary against the
 /// MiniMax-hosted Anthropic-compatible endpoint instead of api.anthropic.com.
 /// Runs from `FALLBACK_CWD` for the same reason every other fallback step
@@ -7963,8 +7898,7 @@ fn run_minimax_judge(claude_bin: &str, prompt: &str) -> Result<String, DaemonErr
     // overrides are intentionally ignored so argv and transport cannot drift.
     let minimax_model = "MiniMax-M3";
 
-    let mut cmd = std::process::Command::new(claude_bin);
-    cmd.args([
+    let args = [
         "--print",
         "--dangerously-skip-permissions",
         "--setting-sources",
@@ -7972,35 +7906,19 @@ fn run_minimax_judge(claude_bin: &str, prompt: &str) -> Result<String, DaemonErr
         "--model",
         minimax_model,
         prompt,
-    ])
-    .current_dir(FALLBACK_CWD)
-    .stdin(std::process::Stdio::null());
-    for key in CLAUDE_PROVIDER_ENV {
-        cmd.env_remove(key);
-    }
-    cmd.env("ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic")
-        .env("ANTHROPIC_API_KEY", &minimax_key)
-        .env("ANTHROPIC_MODEL", minimax_model)
-        .env("ANTHROPIC_SMALL_FAST_MODEL", minimax_model);
-
-    let output = cmd.output().map_err(|e| DaemonError::Tool {
-        tool: "minimax".into(),
-        rc: -1,
-        stderr: format!("failed to run minimax: {e}"),
-    })?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-
-    if output.status.success() {
-        Ok(stdout)
-    } else {
-        Err(DaemonError::Tool {
-            tool: "minimax".into(),
-            rc: output.status.code().unwrap_or(-1),
-            stderr,
-        })
-    }
+    ];
+    crate::tools::run_tool_in_dir_with_provider_env(
+        claude_bin,
+        &args,
+        FALLBACK_CWD,
+        &[
+            ("ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic"),
+            ("ANTHROPIC_API_KEY", minimax_key.as_str()),
+            ("ANTHROPIC_MODEL", minimax_model),
+            ("ANTHROPIC_SMALL_FAST_MODEL", minimax_model),
+        ],
+        120,
+    )
 }
 
 impl Llm for ChainLlm {
@@ -8711,7 +8629,7 @@ mod chain_llm_fallback_argv_tests {
         let claude = dir.join("claude");
         std::fs::write(
             &claude,
-            "#!/bin/sh\nprintf 'args='; for arg in \"$@\"; do printf '<%s>' \"$arg\"; done; printf '\\nmodel=%s\\nbase=%s\\nkey=%s\\nauth=%s\\nconfig=%s\\nminimax_base=%s\\nminimax_model=%s\\ndark_minimax_model=%s\\n' \"$ANTHROPIC_MODEL\" \"$ANTHROPIC_BASE_URL\" \"$ANTHROPIC_API_KEY\" \"$ANTHROPIC_AUTH_TOKEN\" \"$CLAUDE_CONFIG_DIR\" \"$MINIMAX_BASE_URL\" \"$MINIMAX_MODEL\" \"$DARK_FACTORY_MINIMAX_MODEL\"\n",
+            "#!/bin/sh\nprintf 'args='; for arg in \"$@\"; do printf '<%s>' \"$arg\"; done; printf '\\nmodel=%s\\nbase=%s\\nkey=%s\\nauth=%s\\nconfig=%s\\nminimax_base=%s\\nminimax_model=%s\\ndark_minimax_model=%s\\naws=%s\\naws_shared=%s\\ngoogle=%s\\nvertex=%s\\nfoundry=%s\\nanthropic_foundry=%s\\ncloudml=%s\\nazure=%s\\nbedrock=%s\\noauth=%s\\nopenai=%s\\n' \"$ANTHROPIC_MODEL\" \"$ANTHROPIC_BASE_URL\" \"$ANTHROPIC_API_KEY\" \"$ANTHROPIC_AUTH_TOKEN\" \"$CLAUDE_CONFIG_DIR\" \"$MINIMAX_BASE_URL\" \"$MINIMAX_MODEL\" \"$DARK_FACTORY_MINIMAX_MODEL\" \"$AWS_PROFILE\" \"$AWS_SHARED_CREDENTIALS_FILE\" \"$GOOGLE_API_KEY\" \"$VERTEXAI_PROJECT\" \"$FOUNDRY_ENDPOINT\" \"$ANTHROPIC_FOUNDRY_API_KEY\" \"$CLOUD_ML_REGION\" \"$AZURE_OPENAI_API_KEY\" \"$BEDROCK_MODEL_ID\" \"$CLAUDE_CODE_OAUTH_TOKEN\" \"$OPENAI_API_KEY\"\n",
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -8727,6 +8645,17 @@ mod chain_llm_fallback_argv_tests {
             "ANTHROPIC_API_KEY",
             "ANTHROPIC_AUTH_TOKEN",
             "CLAUDE_CONFIG_DIR",
+            "AWS_PROFILE",
+            "GOOGLE_API_KEY",
+            "OPENAI_API_KEY",
+            "AWS_SHARED_CREDENTIALS_FILE",
+            "VERTEXAI_PROJECT",
+            "FOUNDRY_ENDPOINT",
+            "ANTHROPIC_FOUNDRY_API_KEY",
+            "CLOUD_ML_REGION",
+            "AZURE_OPENAI_API_KEY",
+            "BEDROCK_MODEL_ID",
+            "CLAUDE_CODE_OAUTH_TOKEN",
         ];
         let prior: Vec<_> = keys
             .iter()
@@ -8742,6 +8671,17 @@ mod chain_llm_fallback_argv_tests {
             std::env::set_var("CLAUDE_CONFIG_DIR", "/home/operator/.claude");
             std::env::set_var("MINIMAX_BASE_URL", "https://stale.minimax.example");
             std::env::set_var("MINIMAX_MODEL", "stale-minimax-model");
+            std::env::set_var("AWS_PROFILE", "personal-aws");
+            std::env::set_var("GOOGLE_API_KEY", "personal-google");
+            std::env::set_var("OPENAI_API_KEY", "personal-openai");
+            std::env::set_var("AWS_SHARED_CREDENTIALS_FILE", "/tmp/personal-aws");
+            std::env::set_var("VERTEXAI_PROJECT", "personal-vertex");
+            std::env::set_var("FOUNDRY_ENDPOINT", "https://personal-foundry.invalid");
+            std::env::set_var("ANTHROPIC_FOUNDRY_API_KEY", "personal-foundry-key");
+            std::env::set_var("CLOUD_ML_REGION", "personal-region");
+            std::env::set_var("AZURE_OPENAI_API_KEY", "personal-azure");
+            std::env::set_var("BEDROCK_MODEL_ID", "personal-bedrock");
+            std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", "personal-oauth");
         }
 
         let result = run_minimax_judge(claude.to_str().unwrap(), "minimax-prompt");
@@ -8776,7 +8716,22 @@ mod chain_llm_fallback_argv_tests {
             output.contains("config=\n"),
             "direct Claude config leaked: {output}"
         );
-        for line in ["minimax_base=\n", "minimax_model=\n", "dark_minimax_model=\n"] {
+        for line in [
+            "minimax_base=\n",
+            "minimax_model=\n",
+            "dark_minimax_model=\n",
+            "aws=\n",
+            "google=\n",
+            "openai=\n",
+            "aws_shared=\n",
+            "vertex=\n",
+            "foundry=\n",
+            "anthropic_foundry=\n",
+            "cloudml=\n",
+            "azure=\n",
+            "bedrock=\n",
+            "oauth=\n",
+        ] {
             assert!(output.contains(line), "MiniMax routing state leaked: {output}");
         }
     }

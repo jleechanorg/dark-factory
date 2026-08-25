@@ -3048,71 +3048,6 @@ const REVIEWER_TIMEOUT_SECS: u64 = 300;
 /// guarantee; `cursor-agent` is the fallback second family.
 pub(crate) const SKEPTIC_REVIEWER_PRIORITY: &[&str] = &["claudem", "agy", "cursor-agent"];
 
-/// Provider variables that are meaningful to the MiniMax-compatible
-/// `claudem` lane but must not leak into a direct Anthropic Claude process.
-/// The daemon can dispatch reviewer lanes in parallel, so these are removed
-/// from the child environment rather than mutated in the parent process.
-const DIRECT_CLAUDE_PROVIDER_ENV: &[&str] = &[
-    "CLAUDE_CONFIG_DIR",
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
-    "CLAUDE_CODE_USE_VERTEX",
-    "CLAUDE_CODE_SKIP_VERTEX_AUTH",
-    "CLAUDE_CODE_USE_FOUNDRY",
-    "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
-    "CLAUDE_CODE_USE_AZURE",
-    "CLAUDE_CODE_USE_OPENAI",
-    "CLAUDEM_MODE",
-    "MINIMAX_API_KEY",
-    "MINIMAX_BASE_URL",
-    "MINIMAX_MODEL",
-    "DARK_FACTORY_MINIMAX_MODEL",
-    "ANTHROPIC_BASE_URL",
-    "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_MODEL",
-    "ANTHROPIC_SMALL_FAST_MODEL",
-    "ANTHROPIC_BEDROCK_BASE_URL",
-    "ANTHROPIC_BEDROCK_REGION",
-    "ANTHROPIC_BEDROCK_MODEL",
-    "ANTHROPIC_VERTEX_BASE_URL",
-    "ANTHROPIC_VERTEX_PROJECT_ID",
-    "ANTHROPIC_VERTEX_REGION",
-    "CLOUD_ML_REGION",
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-    "AWS_SECURITY_TOKEN",
-    "AWS_WEB_IDENTITY_TOKEN_FILE",
-    "AWS_ROLE_ARN",
-    "AWS_ROLE_SESSION_NAME",
-    "AWS_PROFILE",
-    "AWS_REGION",
-    "AWS_DEFAULT_REGION",
-    "AWS_ENDPOINT_URL",
-    "AWS_ENDPOINT_URL_BEDROCK",
-    "AWS_BEARER_TOKEN_BEDROCK",
-    "AWS_BEDROCK_MODEL_ID",
-    "GOOGLE_APPLICATION_CREDENTIALS",
-    "GOOGLE_API_KEY",
-    "GOOGLE_CLOUD_PROJECT",
-    "GOOGLE_CLOUD_LOCATION",
-    "GOOGLE_GENAI_USE_VERTEXAI",
-    "GCLOUD_PROJECT",
-    "VERTEXAI_PROJECT",
-    "VERTEXAI_LOCATION",
-    "BEDROCK_MODEL_ID",
-    "BEDROCK_REGION",
-    "AZURE_OPENAI_API_KEY",
-    "AZURE_OPENAI_ENDPOINT",
-    "AZURE_OPENAI_API_VERSION",
-    "FOUNDRY_API_KEY",
-    "FOUNDRY_ENDPOINT",
-    "OPENAI_API_KEY",
-    "OPENAI_BASE_URL",
-    "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL",
-];
-
 #[cfg(target_os = "linux")]
 #[repr(C)]
 struct LinuxPasswd {
@@ -3364,7 +3299,7 @@ fn direct_claude_config_dir() -> Result<std::path::PathBuf, DaemonError> {
 /// construction. `pub(crate)` so `/er` reuses the same argv table instead
 /// of hardcoding Claude.
 pub(crate) fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, DaemonError> {
-    use crate::tools::{run_tool, run_tool_with_env_and_remove};
+    use crate::tools::run_tool;
     match vendor {
         "codex" => run_tool(
             "codex",
@@ -3378,7 +3313,7 @@ pub(crate) fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, Da
                     "DARK_FACTORY_CLAUDE_CONFIG_DIR must be valid UTF-8".to_string(),
                 )
             })?;
-            run_tool_with_env_and_remove(
+            crate::tools::run_tool_with_env_and_remove_provider(
                 "claude",
                 &[
                     "--print",
@@ -3388,7 +3323,6 @@ pub(crate) fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, Da
                     prompt,
                 ],
                 &[("CLAUDE_CONFIG_DIR", config_dir)],
-                DIRECT_CLAUDE_PROVIDER_ENV,
                 REVIEWER_TIMEOUT_SECS,
             )
         }
@@ -3409,7 +3343,7 @@ pub(crate) fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, Da
             // Unattended MiniMax reviewer traffic is pinned to M3.  Do not
             // let a host override change the child env or `--model`.
             let model = "MiniMax-M3";
-            crate::tools::run_tool_with_env_and_remove(
+            crate::tools::run_tool_with_env_and_remove_provider(
                 "claude",
                 &[
                     "--print",
@@ -3428,7 +3362,6 @@ pub(crate) fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, Da
                     ("ANTHROPIC_MODEL", model),
                     ("ANTHROPIC_SMALL_FAST_MODEL", model),
                 ],
-                DIRECT_CLAUDE_PROVIDER_ENV,
                 REVIEWER_TIMEOUT_SECS,
             )
         }
@@ -3771,7 +3704,7 @@ mod direct_claude_scope_tests {
         let claude = bin.join("claude");
         std::fs::write(
             &claude,
-            "#!/bin/sh\nprintf 'config=%s\\nbase=%s\\napi=%s\\nauth=%s\\nmodel=%s\\nmode=%s\\nminimax_base=%s\\nminimax_model=%s\\ndark_minimax_model=%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$ANTHROPIC_BASE_URL\" \"$ANTHROPIC_API_KEY\" \"$ANTHROPIC_AUTH_TOKEN\" \"$ANTHROPIC_MODEL\" \"$CLAUDEM_MODE\" \"$MINIMAX_BASE_URL\" \"$MINIMAX_MODEL\" \"$DARK_FACTORY_MINIMAX_MODEL\"\n",
+            "#!/bin/sh\nprintf 'config=%s\\nbase=%s\\napi=%s\\nauth=%s\\nmodel=%s\\nmode=%s\\nminimax_base=%s\\nminimax_model=%s\\ndark_minimax_model=%s\\naws=%s\\nvertex=%s\\nopenai=%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$ANTHROPIC_BASE_URL\" \"$ANTHROPIC_API_KEY\" \"$ANTHROPIC_AUTH_TOKEN\" \"$ANTHROPIC_MODEL\" \"$CLAUDEM_MODE\" \"$MINIMAX_BASE_URL\" \"$MINIMAX_MODEL\" \"$DARK_FACTORY_MINIMAX_MODEL\" \"$AWS_PROFILE\" \"$VERTEXAI_PROJECT\" \"$OPENAI_API_KEY\"\n",
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -3789,6 +3722,9 @@ mod direct_claude_scope_tests {
             "MINIMAX_BASE_URL",
             "MINIMAX_MODEL",
             "DARK_FACTORY_MINIMAX_MODEL",
+            "AWS_PROFILE",
+            "VERTEXAI_PROJECT",
+            "OPENAI_API_KEY",
         ]);
         EnvRestore::set("PATH", prepend_path(&bin));
         EnvRestore::set("HOME", &home);
@@ -3801,6 +3737,9 @@ mod direct_claude_scope_tests {
         EnvRestore::set("MINIMAX_BASE_URL", "https://stale.minimax.example");
         EnvRestore::set("MINIMAX_MODEL", "stale-minimax-model");
         EnvRestore::set("DARK_FACTORY_MINIMAX_MODEL", "stale-minimax-model");
+        EnvRestore::set("AWS_PROFILE", "personal-aws");
+        EnvRestore::set("VERTEXAI_PROJECT", "personal-vertex");
+        EnvRestore::set("OPENAI_API_KEY", "personal-openai");
 
         let result =
             dispatch_reviewer("claude", "scope-test").expect("scoped Claude shim succeeds");
@@ -3820,6 +3759,9 @@ mod direct_claude_scope_tests {
             "minimax_base=",
             "minimax_model=",
             "dark_minimax_model=",
+            "aws=",
+            "vertex=",
+            "openai=",
         ] {
             assert!(
                 result.lines().any(|candidate| candidate == line),

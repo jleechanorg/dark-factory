@@ -1,12 +1,12 @@
 #!/bin/bash
-# Full run — AO backend with Claude Sonnet override, real holdout evaluation.
+# Full run — AO backend with the canonical Antigravity agent, real holdout evaluation.
 # Usage: ./scripts/run_full.sh [--sprint 1|2|3|all] [--ao-agent <agent>] [--workdir <dir>]
 #
 # Prerequisites:
 #   DARK_FACTORY_HOLDOUTS  path to sealed holdouts repo (required)
 #   AO_CONFIG_PATH         optional: path to custom AO config (for model override)
 #
-# Model override (Sonnet without editing agent-orchestrator.yaml):
+# Optional model override without editing agent-orchestrator.yaml:
 #   cp ~/.hermes/agent-orchestrator.yaml /tmp/ao-airbnb.yaml
 #   # Edit /tmp/ao-airbnb.yaml: under agentConfig, set model: claude-sonnet-4-6
 #   AO_CONFIG_PATH=/tmp/ao-airbnb.yaml ./scripts/run_full.sh
@@ -47,7 +47,7 @@ fi
 
 # Parse args
 SPRINT="all"
-AO_AGENT="${AO_AGENT:-claude-code}"
+AO_AGENT="${AO_AGENT:-antigravity}"
 WORKDIR="${WORKDIR_BASE:-$HOME/benchmark-runs/airbnb-clone}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 RUN_ID="run_${TIMESTAMP}"

@@ -44,6 +44,12 @@ def test_workflow_defaults_to_runner_ao_backend() -> None:
     assert 'export BACKEND="${BACKEND:-claude}"' not in workflow
 
 
+def test_airbnb_benchmark_defaults_to_canonical_non_claude_agent() -> None:
+    script = (ROOT / "benchmarks/airbnb-clone/scripts/run_full.sh").read_text()
+    assert 'AO_AGENT="${AO_AGENT:-antigravity}"' in script
+    assert 'AO_AGENT="${AO_AGENT:-claude-code}"' not in script
+
+
 def test_skill_detector_falls_back_to_ao_without_explicit_signal() -> None:
     skill = (ROOT / ".claude/skills/dark-factory/SKILL.md").read_text()
 
@@ -107,6 +113,14 @@ def test_pilot_minimax_scrubber_removes_inherited_routing_state() -> None:
             "CLAUDEM_MODE": "personal",
             "ANTHROPIC_SMALL_FAST_MODEL": "stale-fast-model",
             "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL": "1",
+            "AWS_PROFILE": "personal",
+            "GOOGLE_APPLICATION_CREDENTIALS": "/tmp/personal.json",
+            "VERTEXAI_PROJECT": "personal-project",
+            "BEDROCK_MODEL_ID": "personal-bedrock",
+            "CLOUD_ML_REGION": "us-east1",
+            "AZURE_OPENAI_API_KEY": "personal-azure-key",
+            "FOUNDRY_ENDPOINT": "https://personal.foundry.invalid",
+            "OPENAI_API_KEY": "personal-openai-key",
         }
     )
     probe = (
@@ -131,6 +145,17 @@ def test_pilot_minimax_scrubber_removes_inherited_routing_state() -> None:
     assert "MINIMAX_BASE_URL=https://stale.minimax.example" not in env_lines
     assert "DARK_FACTORY_MINIMAX_MODEL=stale-factory-model" not in env_lines
     assert "ANTHROPIC_BASE_URL=https://api.anthropic.com" not in env_lines
+    for leaked in [
+        "AWS_PROFILE=personal",
+        "GOOGLE_APPLICATION_CREDENTIALS=/tmp/personal.json",
+        "VERTEXAI_PROJECT=personal-project",
+        "BEDROCK_MODEL_ID=personal-bedrock",
+        "CLOUD_ML_REGION=us-east1",
+        "AZURE_OPENAI_API_KEY=personal-azure-key",
+        "FOUNDRY_ENDPOINT=https://personal.foundry.invalid",
+        "OPENAI_API_KEY=personal-openai-key",
+    ]:
+        assert leaked not in env_lines
     assert "MINIMAX_API_KEY=pilot-key" in env_lines
     assert "ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic" in env_lines
     assert "ANTHROPIC_MODEL=MiniMax-M3" in env_lines

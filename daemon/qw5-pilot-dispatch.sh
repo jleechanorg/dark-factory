@@ -86,7 +86,7 @@ fi
 # 3. Backend env vars — binding per user directive (minimax ONLY).
 #
 # launchd inherits the operator's environment, and the sourced profiles may
-# add more provider state. Scrub every Claude/Anthropic routing variable and
+# add more provider state. Scrub every provider routing/auth variable and
 # every MiniMax routing variable except the credential, then set only the
 # pinned MiniMax endpoint/model/key values used by the wrapper.
 configure_minimax_env() {
@@ -94,7 +94,7 @@ configure_minimax_env() {
   local var
   for var in $(compgen -A variable); do
     case "$var" in
-      CLAUDE_*|CLAUDEM_MODE|DARK_FACTORY_CLAUDE_CONFIG_DIR|ANTHROPIC_*) unset "$var" ;;
+      CLAUDE_*|CLAUDEM_MODE|DARK_FACTORY_CLAUDE_CONFIG_DIR|ANTHROPIC_*|AWS_*|GOOGLE_*|GCLOUD_*|VERTEXAI_*|BEDROCK_*|CLOUD_ML_*|AZURE_*|FOUNDRY_*|OPENAI_*) unset "$var" ;;
       MINIMAX_*|DARK_FACTORY_MINIMAX_MODEL) [[ "$var" == "MINIMAX_API_KEY" ]] || unset "$var" ;;
     esac
   done
