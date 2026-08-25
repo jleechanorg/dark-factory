@@ -296,7 +296,7 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument(
             "--ao-agent",
             default="antigravity",
-            help="AO agent plugin to use when --backend ao (default: claude-code).",
+            help="AO agent plugin to use when --backend ao (default: antigravity).",
         )
         p.add_argument(
             "--agy-agent",

@@ -360,6 +360,12 @@ def test_real_pipeline_node_runs_while_holdout_reads_stay_denied(tmp_path, monke
 
     workdir = tmp_path / "worktree"
     workdir.mkdir()
+    # Direct Claude is an explicit, scoped backend. Give this end-to-end
+    # isolation test a project config directory so it exercises the real
+    # subprocess + LD_PRELOAD path rather than the fail-closed config check.
+    claude_config_dir = tmp_path / "project-claude-config"
+    claude_config_dir.mkdir()
+    monkeypatch.setenv("DARK_FACTORY_CLAUDE_CONFIG_DIR", str(claude_config_dir))
 
     # (a) Attempt to leak the holdout file.
     monkeypatch.setenv("TEST_LEAK_TARGET", str(secret))

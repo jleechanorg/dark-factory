@@ -41,6 +41,9 @@
 #                             optimistically (default 5). Most auth/project
 #                             errors fail within 1-2s; cold-start slow spawns
 #                             exceed this bound and proceed optimistically.
+#   AO_AGENT                  AO plugin for the remediation worker (default
+#                             antigravity; set explicitly for another
+#                             project-scoped plugin).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export AO_MAX_CONCURRENT_SESSIONS="${AO_MAX_CONCURRENT_SESSIONS:-30}"
@@ -49,6 +52,7 @@ BEAD_ID="${1:?bead_id required}"
 PR="${2:?pr_number required}"
 TARGET_REPO="${3:-jleechanorg/worldarchitect.ai}"
 AO_PROJECT="${4:-worldarchitect}"
+AO_AGENT="${AO_AGENT:-antigravity}"
 SPAWN_TIMEOUT="${AO_SPAWN_TIMEOUT_SEC:-120}"
 DISPLAY_NAME="$(python3 -c 'import sys; print(sys.argv[1][:20])' "$BEAD_ID")"
 LOG_DIR="${AFD_LOG_DIR:-$HOME/Library/Logs/dark-factory}"
@@ -144,9 +148,9 @@ run_spawn_foreground() {
   local out rc
   set +e
   if "$AO" spawn --help 2>&1 | grep -Eq '\-\-name'; then
-    out="$(timeout "$SPAWN_TIMEOUT" "$AO" spawn --project "$AO_PROJECT" --name "$DISPLAY_NAME" --agent claude-code --claim-pr "$PR" --prompt "$PROMPT" 2>&1)"
+    out="$(timeout "$SPAWN_TIMEOUT" "$AO" spawn --project "$AO_PROJECT" --name "$DISPLAY_NAME" --agent "$AO_AGENT" --claim-pr "$PR" --prompt "$PROMPT" 2>&1)"
   else
-    out="$(timeout "$SPAWN_TIMEOUT" "$AO" spawn --project "$AO_PROJECT" --claim-pr "$PR" --agent claude-code "$PROMPT" 2>&1)"
+    out="$(timeout "$SPAWN_TIMEOUT" "$AO" spawn --project "$AO_PROJECT" --claim-pr "$PR" --agent "$AO_AGENT" "$PROMPT" 2>&1)"
   fi
   rc=$?
   set -e

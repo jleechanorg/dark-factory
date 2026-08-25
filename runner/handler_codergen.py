@@ -682,7 +682,10 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         project = ctx.state.get("ao.project")
         if not project:
             return _finalize(Result(outcome="failure", output="ao backend requires --ao-project"))
-        agent = ctx.state.get("ao.agent", "claude-code")
+        # Keep the direct handler aligned with the canonical AO default.  The
+        # CLI records this value explicitly, while direct Context callers may
+        # omit it; never fall back to the host's personal Claude plugin.
+        agent = ctx.state.get("ao.agent", "antigravity")
         session = ctx.state.get("ao.session")
         if not session:
             spawn_args = ["ao", "spawn", prompt_text, "--project", project, "--agent", agent]

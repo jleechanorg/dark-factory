@@ -438,7 +438,12 @@ def test_ao_spawn_is_launched_through_holdout_sandbox(monkeypatch, tmp_path):
     monkeypatch.setattr(handlers_mod.subprocess, "run", fake_run)
     monkeypatch.setattr(handlers_mod, "_ao_wait_idle", lambda *args, **kwargs: "ready")
 
-    ctx = Context(goal="t", workdir=tmp_path, backend="ao", state={"ao.project": "dark-factory"})
+    ctx = Context(
+        goal="t",
+        workdir=tmp_path,
+        backend="ao",
+        state={"ao.project": "dark-factory", "ao.agent": "antigravity"},
+    )
     result = _codergen(Node(name="implement", attrs={"prompt": "@prompt.md"}), ctx)
 
     assert result.outcome == "success"
@@ -448,7 +453,7 @@ def test_ao_spawn_is_launched_through_holdout_sandbox(monkeypatch, tmp_path):
     assert "--project" in commands[0]
     assert commands[0][commands[0].index("--project") + 1] == "dark-factory"
     assert "--agent" in commands[0]
-    assert commands[0][commands[0].index("--agent") + 1] == "claude-code"
+    assert commands[0][commands[0].index("--agent") + 1] == "antigravity"
     assert "--prompt" not in commands[0]
     assert "--harness" not in commands[0]
 
