@@ -3140,24 +3140,46 @@ fn files_byte_identical(
     first: &std::path::Path,
     second: &std::path::Path,
 ) -> Result<bool, std::io::Error> {
-    use std::io::Read;
     let mut first = std::fs::File::open(first)?;
     let mut second = std::fs::File::open(second)?;
+    let first_len = first.metadata()?.len();
+    let second_len = second.metadata()?.len();
+    if first_len != second_len {
+        return Ok(false);
+    }
+
+    let identical = readers_byte_identical(&mut first, &mut second, first_len)?;
+    if !identical {
+        return Ok(false);
+    }
+
+    // Do not accept a file that changed while it was being compared.  The
+    // initial size check bounds the read loop; this second check prevents a
+    // concurrent append from turning an equal prefix into a false match.
+    Ok(first.metadata()?.len() == first_len && second.metadata()?.len() == second_len)
+}
+
+/// Compare exactly `len` bytes from two readers using bounded memory.
+/// `read_exact` handles legal short reads and retries `Interrupted`, while
+/// the caller's size check keeps the loop bounded even if a file grows later.
+fn readers_byte_identical<R1: std::io::Read, R2: std::io::Read>(
+    first: &mut R1,
+    second: &mut R2,
+    len: u64,
+) -> Result<bool, std::io::Error> {
     let mut first_buf = [0u8; 8192];
     let mut second_buf = [0u8; 8192];
-    loop {
-        let first_len = first.read(&mut first_buf)?;
-        let second_len = second.read(&mut second_buf)?;
-        if first_len != second_len {
+    let mut remaining = len;
+    while remaining != 0 {
+        let chunk_len = remaining.min(first_buf.len() as u64) as usize;
+        first.read_exact(&mut first_buf[..chunk_len])?;
+        second.read_exact(&mut second_buf[..chunk_len])?;
+        if first_buf[..chunk_len] != second_buf[..chunk_len] {
             return Ok(false);
         }
-        if first_len == 0 {
-            return Ok(true);
-        }
-        if first_buf[..first_len] != second_buf[..second_len] {
-            return Ok(false);
-        }
+        remaining -= chunk_len as u64;
     }
+    Ok(true)
 }
 
 /// Resolve the explicitly configured Claude account directory against a
@@ -3402,12 +3424,58 @@ pub(crate) fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, Da
 
 #[cfg(test)]
 mod direct_claude_scope_tests {
-    use super::{direct_claude_config_dir_with_login_home, dispatch_reviewer};
+    use super::{
+        direct_claude_config_dir_with_login_home, dispatch_reviewer, readers_byte_identical,
+    };
+    use std::io::{self, Read};
     use std::path::Path;
     use std::sync::Mutex;
 
     fn env_lock() -> &'static Mutex<()> {
         crate::adapters::gh_env_test_lock()
+    }
+
+    struct ShortReader {
+        bytes: Vec<u8>,
+        offset: usize,
+        max_per_read: usize,
+        interrupt_next: bool,
+    }
+
+    impl Read for ShortReader {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if self.interrupt_next {
+                self.interrupt_next = false;
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "retry"));
+            }
+            if self.offset == self.bytes.len() {
+                return Ok(0);
+            }
+            let count = (self.bytes.len() - self.offset)
+                .min(output.len())
+                .min(self.max_per_read);
+            output[..count].copy_from_slice(&self.bytes[self.offset..self.offset + count]);
+            self.offset += count;
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn readers_byte_identical_handles_short_reads_and_interrupted_reads() {
+        let payload = b"credential payload spanning multiple reads";
+        let mut first = ShortReader {
+            bytes: payload.to_vec(),
+            offset: 0,
+            max_per_read: 3,
+            interrupt_next: true,
+        };
+        let mut second = ShortReader {
+            bytes: payload.to_vec(),
+            offset: 0,
+            max_per_read: 2,
+            interrupt_next: true,
+        };
+        assert!(readers_byte_identical(&mut first, &mut second, payload.len() as u64).unwrap());
     }
 
     struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
