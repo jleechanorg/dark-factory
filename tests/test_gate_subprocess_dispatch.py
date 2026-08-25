@@ -66,7 +66,7 @@ def test_gate_subprocess_env_routes_minimax_through_minimax_gateway(monkeypatch)
 
 @pytest.mark.parametrize(
     ("configured", "expected"),
-    [("   ", "MiniMax-M3"), ("  MiniMax-M2  ", "MiniMax-M2"), ("MiniMax-M1", "MiniMax-M1")],
+    [("   ", "MiniMax-M3"), ("  MiniMax-M2  ", "MiniMax-M3"), ("MiniMax-M1", "MiniMax-M3")],
 )
 def test_minimax_gate_argv_model_matches_normalized_env(monkeypatch, configured, expected):
     """The Claude argv and MiniMax environment must use one normalized model."""
@@ -87,7 +87,7 @@ def test_minimax_gate_argv_model_matches_normalized_env(monkeypatch, configured,
 
 @pytest.mark.parametrize(
     ("configured", "expected"),
-    [("   ", "MiniMax-M3"), ("  MiniMax-M2  ", "MiniMax-M2"), ("MiniMax-M1", "MiniMax-M1")],
+    [("   ", "MiniMax-M3"), ("  MiniMax-M2  ", "MiniMax-M3"), ("MiniMax-M1", "MiniMax-M3")],
 )
 def test_minimax_codergen_argv_model_matches_normalized_env(
     monkeypatch, tmp_path, configured, expected

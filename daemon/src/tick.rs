@@ -3053,6 +3053,15 @@ pub(crate) const SKEPTIC_REVIEWER_PRIORITY: &[&str] = &["claudem", "agy", "curso
 /// The daemon can dispatch reviewer lanes in parallel, so these are removed
 /// from the child environment rather than mutated in the parent process.
 const DIRECT_CLAUDE_PROVIDER_ENV: &[&str] = &[
+    "CLAUDE_CONFIG_DIR",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+    "CLAUDE_CODE_USE_AZURE",
+    "CLAUDE_CODE_USE_OPENAI",
     "CLAUDEM_MODE",
     "MINIMAX_API_KEY",
     "MINIMAX_BASE_URL",
@@ -3063,6 +3072,44 @@ const DIRECT_CLAUDE_PROVIDER_ENV: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_MODEL",
     "ANTHROPIC_SMALL_FAST_MODEL",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_BEDROCK_REGION",
+    "ANTHROPIC_BEDROCK_MODEL",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "ANTHROPIC_VERTEX_REGION",
+    "CLOUD_ML_REGION",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_SECURITY_TOKEN",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_ROLE_ARN",
+    "AWS_ROLE_SESSION_NAME",
+    "AWS_PROFILE",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_ENDPOINT_URL",
+    "AWS_ENDPOINT_URL_BEDROCK",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AWS_BEDROCK_MODEL_ID",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_API_KEY",
+    "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_CLOUD_LOCATION",
+    "GOOGLE_GENAI_USE_VERTEXAI",
+    "GCLOUD_PROJECT",
+    "VERTEXAI_PROJECT",
+    "VERTEXAI_LOCATION",
+    "BEDROCK_MODEL_ID",
+    "BEDROCK_REGION",
+    "AZURE_OPENAI_API_KEY",
+    "AZURE_OPENAI_ENDPOINT",
+    "AZURE_OPENAI_API_VERSION",
+    "FOUNDRY_API_KEY",
+    "FOUNDRY_ENDPOINT",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
     "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL",
 ];
 
@@ -3359,24 +3406,9 @@ pub(crate) fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, Da
                         "MiniMax reviewer requires a non-empty MINIMAX_API_KEY".to_string(),
                     )
                 })?;
-            let model = std::env::var("DARK_FACTORY_MINIMAX_MODEL")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| "MiniMax-M3".to_string());
-            const MINIMAX_PROVIDER_ENV: &[&str] = &[
-                "CLAUDE_CONFIG_DIR",
-                "MINIMAX_API_KEY",
-                "MINIMAX_BASE_URL",
-                "MINIMAX_MODEL",
-                "DARK_FACTORY_MINIMAX_MODEL",
-                "ANTHROPIC_BASE_URL",
-                "ANTHROPIC_AUTH_TOKEN",
-                "ANTHROPIC_API_KEY",
-                "ANTHROPIC_MODEL",
-                "ANTHROPIC_SMALL_FAST_MODEL",
-                "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL",
-                "CLAUDEM_MODE",
-            ];
+            // Unattended MiniMax reviewer traffic is pinned to M3.  Do not
+            // let a host override change the child env or `--model`.
+            let model = "MiniMax-M3";
             crate::tools::run_tool_with_env_and_remove(
                 "claude",
                 &[
@@ -3387,15 +3419,16 @@ pub(crate) fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, Da
                     "--effort",
                     "high",
                     "--model",
-                    model.as_str(),
+                    model,
                     prompt,
                 ],
                 &[
                     ("ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic"),
                     ("ANTHROPIC_API_KEY", key.as_str()),
-                    ("ANTHROPIC_MODEL", model.as_str()),
+                    ("ANTHROPIC_MODEL", model),
+                    ("ANTHROPIC_SMALL_FAST_MODEL", model),
                 ],
-                MINIMAX_PROVIDER_ENV,
+                DIRECT_CLAUDE_PROVIDER_ENV,
                 REVIEWER_TIMEOUT_SECS,
             )
         }
@@ -3885,9 +3918,9 @@ mod direct_claude_scope_tests {
         }
         assert!(result.contains("base=https://api.minimax.io/anthropic"), "{result}");
         assert!(result.contains("api=minimax-key"), "{result}");
-        assert!(result.contains("model=MiniMax-Test-Model"), "{result}");
+        assert!(result.contains("model=MiniMax-M3"), "{result}");
         assert!(result.contains("small="), "{result}");
-        assert!(result.contains("<--model><MiniMax-Test-Model>"), "{result}");
+        assert!(result.contains("<--model><MiniMax-M3>"), "{result}");
     }
 }
 

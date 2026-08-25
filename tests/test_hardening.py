@@ -71,6 +71,18 @@ def test_scoped_claude_env_scrubs_all_provider_overrides(monkeypatch, tmp_path):
         "DARK_FACTORY_MINIMAX_MODEL",
         "CLAUDEM_MODE",
         "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_BEDROCK_MODEL_ID",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_GENAI_USE_VERTEXAI",
+        "CLOUD_ML_REGION",
+        "AZURE_OPENAI_ENDPOINT",
+        "OPENAI_API_KEY",
         "ANTHROPIC_BASE_URL",
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
@@ -90,6 +102,18 @@ def test_scoped_claude_env_scrubs_all_provider_overrides(monkeypatch, tmp_path):
         "DARK_FACTORY_MINIMAX_MODEL",
         "CLAUDEM_MODE",
         "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_BEDROCK_MODEL_ID",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_GENAI_USE_VERTEXAI",
+        "CLOUD_ML_REGION",
+        "AZURE_OPENAI_ENDPOINT",
+        "OPENAI_API_KEY",
     ):
         assert key not in env
 
@@ -259,14 +283,45 @@ def test_minimax_env_scrubs_provider_state_and_uses_model_fallback(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "stale")
     monkeypatch.setenv("MINIMAX_BASE_URL", "https://stale.minimax.example")
     monkeypatch.setenv("MINIMAX_MODEL", "stale-minimax-model")
+    for key in (
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_BEDROCK_MODEL_ID",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_GENAI_USE_VERTEXAI",
+        "CLOUD_ML_REGION",
+        "AZURE_OPENAI_ENDPOINT",
+        "OPENAI_API_KEY",
+    ):
+        monkeypatch.setenv(key, "stale")
 
     env = _minimax_env()
 
     assert env["ANTHROPIC_API_KEY"] == "key"
     assert env["ANTHROPIC_BASE_URL"] == "https://api.minimax.io/anthropic"
     assert env["ANTHROPIC_MODEL"] == "MiniMax-M3"
+    assert env["ANTHROPIC_SMALL_FAST_MODEL"] == "MiniMax-M3"
     assert "CLAUDE_CONFIG_DIR" not in env
     assert "ANTHROPIC_AUTH_TOKEN" not in env
+    for key in (
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_BEDROCK_MODEL_ID",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_GENAI_USE_VERTEXAI",
+        "CLOUD_ML_REGION",
+        "AZURE_OPENAI_ENDPOINT",
+        "OPENAI_API_KEY",
+    ):
+        assert key not in env
     assert "MINIMAX_BASE_URL" not in env
     assert "MINIMAX_MODEL" not in env
     assert "DARK_FACTORY_MINIMAX_MODEL" not in env

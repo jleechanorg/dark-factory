@@ -7880,6 +7880,71 @@ pub struct ChainLlm;
 /// expects.
 const FALLBACK_CWD: &str = ".";
 
+/// Environment selectors that can redirect a Claude-compatible child to a
+/// host provider/account.  Keep this list explicit at the process boundary:
+/// `ChainLlm` is used from unattended daemon ticks and must not inherit an
+/// operator's Bedrock/Vertex/OpenAI/Azure credentials or endpoint overrides.
+const CLAUDE_PROVIDER_ENV: &[&str] = &[
+    "CLAUDE_CONFIG_DIR",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+    "CLAUDE_CODE_USE_AZURE",
+    "CLAUDE_CODE_USE_OPENAI",
+    "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL",
+    "CLAUDEM_MODE",
+    "MINIMAX_API_KEY",
+    "MINIMAX_BASE_URL",
+    "MINIMAX_MODEL",
+    "DARK_FACTORY_MINIMAX_MODEL",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_BEDROCK_REGION",
+    "ANTHROPIC_BEDROCK_MODEL",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "ANTHROPIC_VERTEX_REGION",
+    "CLOUD_ML_REGION",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_SECURITY_TOKEN",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_ROLE_ARN",
+    "AWS_ROLE_SESSION_NAME",
+    "AWS_PROFILE",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_ENDPOINT_URL",
+    "AWS_ENDPOINT_URL_BEDROCK",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AWS_BEDROCK_MODEL_ID",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_API_KEY",
+    "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_CLOUD_LOCATION",
+    "GOOGLE_GENAI_USE_VERTEXAI",
+    "GCLOUD_PROJECT",
+    "VERTEXAI_PROJECT",
+    "VERTEXAI_LOCATION",
+    "BEDROCK_MODEL_ID",
+    "BEDROCK_REGION",
+    "AZURE_OPENAI_API_KEY",
+    "AZURE_OPENAI_ENDPOINT",
+    "AZURE_OPENAI_API_VERSION",
+    "FOUNDRY_API_KEY",
+    "FOUNDRY_ENDPOINT",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+];
+
 /// Anthropic weekly-limit bypass: re-invoke the `claude` binary against the
 /// MiniMax-hosted Anthropic-compatible endpoint instead of api.anthropic.com.
 /// Runs from `FALLBACK_CWD` for the same reason every other fallback step
@@ -7894,10 +7959,9 @@ fn run_minimax_judge(claude_bin: &str, prompt: &str) -> Result<String, DaemonErr
             rc: -1,
             stderr: "MINIMAX_API_KEY must be non-empty".to_string(),
         })?;
-    let minimax_model = std::env::var("DARK_FACTORY_MINIMAX_MODEL")
-        .ok()
-        .filter(|model| !model.trim().is_empty())
-        .unwrap_or_else(|| "MiniMax-M3".to_string());
+    // The unattended factory lane is pinned to MiniMax-M3.  Ambient model
+    // overrides are intentionally ignored so argv and transport cannot drift.
+    let minimax_model = "MiniMax-M3";
 
     let mut cmd = std::process::Command::new(claude_bin);
     cmd.args([
@@ -7906,23 +7970,18 @@ fn run_minimax_judge(claude_bin: &str, prompt: &str) -> Result<String, DaemonErr
         "--setting-sources",
         "",
         "--model",
-        minimax_model.as_str(),
+        minimax_model,
         prompt,
     ])
     .current_dir(FALLBACK_CWD)
-    .stdin(std::process::Stdio::null())
-    .env("ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic")
-    .env("ANTHROPIC_API_KEY", &minimax_key)
-    .env("ANTHROPIC_MODEL", &minimax_model)
-    .env_remove("CLAUDE_CONFIG_DIR")
-    .env_remove("ANTHROPIC_AUTH_TOKEN")
-    .env_remove("ANTHROPIC_SMALL_FAST_MODEL")
-    .env_remove("CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL")
-    .env_remove("CLAUDEM_MODE")
-    .env_remove("MINIMAX_BASE_URL")
-    .env_remove("MINIMAX_MODEL")
-    .env_remove("DARK_FACTORY_MINIMAX_MODEL")
-    .env_remove("MINIMAX_API_KEY");
+    .stdin(std::process::Stdio::null());
+    for key in CLAUDE_PROVIDER_ENV {
+        cmd.env_remove(key);
+    }
+    cmd.env("ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic")
+        .env("ANTHROPIC_API_KEY", &minimax_key)
+        .env("ANTHROPIC_MODEL", minimax_model)
+        .env("ANTHROPIC_SMALL_FAST_MODEL", minimax_model);
 
     let output = cmd.output().map_err(|e| DaemonError::Tool {
         tool: "minimax".into(),
@@ -8700,10 +8759,10 @@ mod chain_llm_fallback_argv_tests {
 
         let output = result.expect("MiniMax shim should succeed");
         assert!(
-            output.contains("args=<--print><--dangerously-skip-permissions><--setting-sources><><--model><MiniMax-Test-Model><minimax-prompt>"),
-            "MiniMax argv must pin the configured model: {output}"
+            output.contains("args=<--print><--dangerously-skip-permissions><--setting-sources><><--model><MiniMax-M3><minimax-prompt>"),
+            "MiniMax argv must pin MiniMax-M3: {output}"
         );
-        assert!(output.contains("model=MiniMax-Test-Model"), "{output}");
+        assert!(output.contains("model=MiniMax-M3"), "{output}");
         assert!(
             output.contains("base=https://api.minimax.io/anthropic"),
             "{output}"

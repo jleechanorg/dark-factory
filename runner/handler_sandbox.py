@@ -214,8 +214,60 @@ _CLAUDE_PROVIDER_ENV = frozenset(
         "MINIMAX_MODEL",
         "DARK_FACTORY_MINIMAX_MODEL",
         "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL",
+        # Claude Code can silently select Bedrock/Vertex when these are
+        # inherited from an operator shell.  They are never valid inputs to a
+        # factory-scoped direct-Claude or MiniMax launch.
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_SECURITY_TOKEN",
+        "AWS_PROFILE",
+        "AWS_REGION",
+        "AWS_DEFAULT_REGION",
+        "AWS_ENDPOINT_URL",
+        "AWS_ENDPOINT_URL_BEDROCK",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_API_KEY",
+        "GOOGLE_CLOUD_PROJECT",
+        "GCLOUD_PROJECT",
+        "GOOGLE_VERTEXAI_USE_VERTEXAI",
+        "VERTEXAI_PROJECT",
+        "VERTEXAI_LOCATION",
+        "BEDROCK_MODEL_ID",
+        "BEDROCK_REGION",
+        "ANTHROPIC_VERTEX_PROJECT_ID",
+        "ANTHROPIC_VERTEX_REGION",
+        "ANTHROPIC_BEDROCK_REGION",
+        "ANTHROPIC_BEDROCK_MODEL",
+        "CLOUD_ML_REGION",
     }
 )
+
+_CLAUDE_PROVIDER_ENV_PREFIXES = (
+    "ANTHROPIC_",
+    "CLAUDE_CODE_",
+    "AWS_",
+    "GOOGLE_",
+    "GCLOUD_",
+    "VERTEXAI_",
+    "BEDROCK_",
+    "CLOUD_ML_",
+    "MINIMAX_",
+    # These providers are not valid for either factory Claude lane.  Remove
+    # their endpoint/credential selectors as well, so a host shell cannot
+    # silently redirect a child process.
+    "AZURE_",
+    "FOUNDRY_",
+    "OPENAI_",
+)
+
+
+def _is_provider_scope_key(key: str) -> bool:
+    """Return whether *key* can redirect a child to another provider/account."""
+    return key in _CLAUDE_PROVIDER_ENV or key.startswith(_CLAUDE_PROVIDER_ENV_PREFIXES)
 
 
 def _scoped_claude_env(
@@ -226,7 +278,7 @@ def _scoped_claude_env(
     config_dir = config_dir or _claude_config_dir()
     env = dict(base_env) if base_env is not None else _sanitized_env()
     for key in tuple(env):
-        if key.startswith("ANTHROPIC_") or key in _CLAUDE_PROVIDER_ENV:
+        if _is_provider_scope_key(key):
             env.pop(key, None)
     env["CLAUDE_CONFIG_DIR"] = str(config_dir)
     return env
@@ -237,16 +289,19 @@ def _minimax_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
     key = os.environ.get("MINIMAX_API_KEY", "").strip()
     if not key:
         raise ValueError("MINIMAX_API_KEY must be non-empty for the minimax backend")
-    model = os.environ.get("DARK_FACTORY_MINIMAX_MODEL", "MiniMax-M3").strip() or "MiniMax-M3"
+    # The factory's MiniMax lane is intentionally pinned.  An ambient model
+    # override must not change either the transport model or the CLI argv.
+    model = "MiniMax-M3"
     env = dict(base_env) if base_env is not None else _sanitized_env()
     for key_name in tuple(env):
-        if key_name.startswith("ANTHROPIC_") or key_name in _CLAUDE_PROVIDER_ENV:
+        if _is_provider_scope_key(key_name):
             env.pop(key_name, None)
     env.update(
         {
             "ANTHROPIC_BASE_URL": "https://api.minimax.io/anthropic",
             "ANTHROPIC_API_KEY": key,
             "ANTHROPIC_MODEL": model,
+            "ANTHROPIC_SMALL_FAST_MODEL": model,
         }
     )
     return env
