@@ -116,40 +116,184 @@ pub fn parse_retry_after(text: &str) -> Option<Duration> {
     None
 }
 
-pub fn parse_rate_limit_error(stderr: &str, rc: i32) -> Option<RateLimitSignal> {
+/// Classification of a failed `gh` invocation.
+///
+/// Bead rev-x92c8: the circuit breaker used to funnel *every* `gh` failure
+/// whose stderr merely CONTAINED a rate-limit-ish token (`rate limit`,
+/// `rate_limit`, `ratelimit`, `retry-after`) into `primary_rate_limit`.
+/// That substring net catches things that are not rate limits at all:
+/// the `https://api.github.com/rate_limit` probe URL echoed back inside a
+/// timeout/DNS error, an `x-ratelimit-remaining: 4209` header echoed inside a
+/// permission 403, and — worst — this breaker's OWN suppression stderr
+/// ("gh call suppressed by rate limit circuit breaker ..."), which made the
+/// breaker self-feeding. Live symptom: `GH_CIRCUIT_BREAKER_OPENED`
+/// `reason=primary_rate_limit`, `retry_after_secs=null` every few seconds
+/// while `gh api rate_limit` reported core 2692/5000 and graphql 4209/5000
+/// remaining.
+///
+/// Every failure now gets its own reason string, and only genuine GitHub
+/// rate-limit evidence maps to a rate-limit reason. Note the inverse of the
+/// 2026-08-17 incident: there, real quota exhaustion arrived as a 403 and was
+/// misread as *auth* failure. Both directions are handled here — a 403 whose
+/// body carries a rate-limit phrase IS a rate limit; a 403 without one is
+/// `gh_forbidden`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GhFailureKind {
+    /// GitHub's primary (hourly quota) rate limit is exhausted.
+    PrimaryRateLimit,
+    /// GitHub's secondary / abuse-detection rate limit fired.
+    SecondaryRateLimit,
+    /// This daemon's own breaker suppressed the call (not a GitHub signal).
+    CircuitBreakerSuppressed,
+    /// 401/403 that carries no rate-limit evidence: permissions, SAML, token.
+    Forbidden,
+    /// 404 / missing resource.
+    NotFound,
+    /// The call timed out.
+    Timeout,
+    /// DNS/TLS/connection/empty-response failure.
+    Network,
+    /// Anything else.
+    Other,
+}
+
+impl GhFailureKind {
+    /// Stable reason string used in circuit-breaker telemetry.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::PrimaryRateLimit => "primary_rate_limit",
+            Self::SecondaryRateLimit => "secondary_rate_limit",
+            Self::CircuitBreakerSuppressed => "circuit_breaker_suppressed",
+            Self::Forbidden => "gh_forbidden",
+            Self::NotFound => "gh_not_found",
+            Self::Timeout => "gh_timeout",
+            Self::Network => "gh_network_error",
+            Self::Other => "gh_error",
+        }
+    }
+
+    pub fn is_rate_limit(self) -> bool {
+        matches!(self, Self::PrimaryRateLimit | Self::SecondaryRateLimit)
+    }
+}
+
+/// Phrases GitHub actually uses when the primary quota is exhausted.
+const PRIMARY_EXHAUSTION_PHRASES: &[&str] = &[
+    "api rate limit exceeded",
+    "rate limit exceeded",
+    "rate limit already exceeded",
+    "exceeded your rate limit",
+    "exceeded the rate limit",
+    "exceeded a rate limit",
+    "rate limit reached",
+];
+
+/// True iff stderr echoes an `x-ratelimit-remaining` header whose value is 0.
+/// A non-zero value (e.g. `x-ratelimit-remaining: 4209`) is *proof the quota
+/// is healthy* and must never be read as exhaustion.
+fn ratelimit_remaining_is_zero(lower: &str) -> bool {
+    let Some(idx) = lower.find("x-ratelimit-remaining") else {
+        return false;
+    };
+    let tail = &lower[idx + "x-ratelimit-remaining".len()..];
+    let tail = tail.trim_start_matches(|c: char| c == ':' || c == '=' || c.is_whitespace());
+    let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse::<u64>().map(|n| n == 0).unwrap_or(false)
+}
+
+/// The words "rate limit" / "rate-limit" as a PHRASE. Deliberately excludes
+/// the `rate_limit` (REST probe URL path) and `ratelimit` (HTTP header) token
+/// spellings: both appear constantly in failures that are not rate limits.
+fn mentions_rate_limit_phrase(lower: &str) -> bool {
+    lower.contains("rate limit") || lower.contains("rate-limit")
+}
+
+/// Classify a failed `gh` invocation from its stderr and process exit code.
+///
+/// `rc` is the *process* exit code (gh exits 1 for most API errors), except
+/// for the synthetic suppression error this module raises with `rc = 403`.
+/// HTTP status therefore has to be read out of the stderr text.
+pub fn classify_gh_failure(stderr: &str, rc: i32) -> GhFailureKind {
     let lower = stderr.to_ascii_lowercase();
 
-    // 1. Check for secondary rate limit
-    let is_secondary = lower.contains("secondary rate limit")
-        || lower.contains("you have exceeded a secondary rate limit")
+    // 0. Our own suppression error. Must be first: its text mentions "rate
+    //    limit", so any later check would re-classify it as a GitHub signal
+    //    and let the breaker re-trip on its own output.
+    if lower.contains("circuit breaker") {
+        return GhFailureKind::CircuitBreakerSuppressed;
+    }
+
+    // 1. Secondary / abuse-detection limit — explicit GitHub wording.
+    if lower.contains("secondary rate limit")
+        || lower.contains("abuse detection")
         || lower.contains("please wait a few minutes before you try again")
-        || lower.contains("abuse detection mechanism");
+    {
+        return GhFailureKind::SecondaryRateLimit;
+    }
 
-    // 2. Check for primary or general rate limit
-    let is_primary = lower.contains("rate limit")
-        || lower.contains("rate-limit")
-        || lower.contains("rate_limit")
-        || lower.contains("ratelimit")
-        || lower.contains("retry-after")
-        || (rc == 403
-            && (lower.contains("secondary")
-                || lower.contains("abuse")
-                || lower.contains("retry-after")));
+    // 2. Primary limit — requires explicit exhaustion evidence, never a bare
+    //    token match.
+    let has_403 = rc == 403 || lower.contains("403");
+    // Bare "429" is not usable: hex SHAs echoed in gh stderr contain digit
+    // runs. Require the HTTP status in context.
+    let has_429 = rc == 429 || lower.contains("http 429") || lower.contains("too many requests");
+    let is_primary = PRIMARY_EXHAUSTION_PHRASES.iter().any(|p| lower.contains(p))
+        || ratelimit_remaining_is_zero(&lower)
+        // GraphQL error type RATE_LIMITED (distinct from the `rate_limit`
+        // REST path, which has no trailing "ed").
+        || lower.contains("rate_limited")
+        || has_429
+        // A 403 whose body talks about rate limiting IS a rate limit — the
+        // 2026-08-17 direction. A 403 without that phrase is not.
+        || (has_403 && mentions_rate_limit_phrase(&lower))
+        // An explicit Retry-After header alongside a throttling status.
+        || (lower.contains("retry-after") && has_403 && parse_retry_after(stderr).is_some());
+    if is_primary {
+        return GhFailureKind::PrimaryRateLimit;
+    }
 
-    if !is_secondary && !is_primary {
+    // 3. Everything else gets its own reason instead of being laundered into
+    //    a rate-limit trip.
+    if lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("deadline exceeded")
+    {
+        return GhFailureKind::Timeout;
+    }
+    if lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("could not resolve host")
+        || lower.contains("no such host")
+        || lower.contains("dial tcp")
+        || lower.contains("tls handshake")
+        || lower.contains("network error")
+        || lower.contains("empty response")
+    {
+        return GhFailureKind::Network;
+    }
+    if has_403
+        || lower.contains("401")
+        || lower.contains("bad credentials")
+        || lower.contains("resource not accessible")
+    {
+        return GhFailureKind::Forbidden;
+    }
+    if lower.contains("404") || lower.contains("not found") {
+        return GhFailureKind::NotFound;
+    }
+    GhFailureKind::Other
+}
+
+pub fn parse_rate_limit_error(stderr: &str, rc: i32) -> Option<RateLimitSignal> {
+    let kind = classify_gh_failure(stderr, rc);
+    if !kind.is_rate_limit() {
         return None;
     }
 
-    let retry_after = parse_retry_after(stderr);
-    let reason = if is_secondary {
-        "secondary_rate_limit".to_string()
-    } else {
-        "primary_rate_limit".to_string()
-    };
-
+    let reason = kind.reason().to_string();
     Some(RateLimitSignal {
-        is_secondary,
-        retry_after,
+        is_secondary: kind == GhFailureKind::SecondaryRateLimit,
+        retry_after: parse_retry_after(stderr),
         reason: reason.clone(),
         matched_phrase: reason,
     })
@@ -560,6 +704,39 @@ mod tests {
     fn test_generic_forbidden_is_not_rate_limit() {
         let stderr = "HTTP 403 Forbidden: repository access denied";
         assert!(parse_rate_limit_error(stderr, 403).is_none());
+    }
+
+    /// Bead rev-x92c8: the three shapes that used to be laundered into
+    /// `primary_rate_limit` by the old bare-substring net. Pinned here, at
+    /// the classifier's home, so a future widening of the match cannot
+    /// silently reintroduce the false-trip loop.
+    #[test]
+    fn test_non_rate_limit_failures_get_their_own_reason() {
+        // Healthy quota proven by the echoed header (4209 of 5000 left).
+        let headers = "HTTP 403: Resource not accessible by integration\nx-ratelimit-remaining: 4209";
+        assert_eq!(classify_gh_failure(headers, 1), GhFailureKind::Forbidden);
+        assert!(parse_rate_limit_error(headers, 1).is_none());
+
+        // The `gh api rate_limit` probe URL echoed inside a timeout.
+        let probe = "gh: Get \"https://api.github.com/rate_limit\": net/http: request canceled (Client.Timeout exceeded while awaiting headers)";
+        assert_eq!(classify_gh_failure(probe, 1), GhFailureKind::Timeout);
+        assert!(parse_rate_limit_error(probe, 1).is_none());
+
+        // This breaker's OWN suppression stderr must never re-trip it.
+        let suppressed = "gh call suppressed by rate limit circuit breaker (cooldown active for 47s until epoch 1756000000, suppressed_calls=3)";
+        assert_eq!(
+            classify_gh_failure(suppressed, 403),
+            GhFailureKind::CircuitBreakerSuppressed
+        );
+        assert!(parse_rate_limit_error(suppressed, 403).is_none());
+    }
+
+    /// Zero remaining IS exhaustion, even without an "exceeded" phrase.
+    #[test]
+    fn test_zero_ratelimit_remaining_is_primary() {
+        let stderr = "HTTP 403: Forbidden\nx-ratelimit-limit: 5000\nx-ratelimit-remaining: 0";
+        let signal = parse_rate_limit_error(stderr, 1).expect("zero remaining is exhaustion");
+        assert_eq!(signal.reason, "primary_rate_limit");
     }
 
     #[test]
