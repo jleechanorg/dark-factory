@@ -369,6 +369,27 @@ def _find_start_node(graph: Graph) -> Optional[str]:
     return None
 
 
+def _is_failure_terminal_node(node: Node) -> bool:
+    """Return whether ``node`` terminates a non-success branch.
+
+    ``Msquare``/``exit`` is the canonical terminal in a runnable graph.  A
+    graph may also mark an explicit failure sink with ``failure_terminal`` or
+    ``terminal="failure"``; those sinks are terminal for G1's happy-path
+    witness search as well.  Keeping this predicate separate makes the edge
+    lookup safe and ensures continuation targets (for example ``implement``
+    or ``review``) are never mistaken for terminal failure handling.
+    """
+    if is_exit_node(node):
+        return True
+    if str(node.attrs.get("failure_terminal") or "").strip().lower() == "true":
+        return True
+    return str(node.attrs.get("terminal") or "").strip().lower() in {
+        "failure",
+        "failed",
+        "error",
+    }
+
+
 def _dfs_witness(
     graph: Graph,
     current: str,
@@ -390,20 +411,29 @@ def _dfs_witness(
         return
     for edge in outgoing:
         dst = edge.dst
+        dst_node = graph.nodes.get(dst)
+        if dst_node is None:
+            # Be defensive for hand-built Graph values; parsed DOT graphs
+            # reject unknown destinations before reaching the audit.
+            continue
         # Cycle / re-visit guard: do not descend into a node already on
         # the current path. (max_visits-style bounds are runtime
         # concerns; here we only need to avoid infinite recursion.)
         if dst in new_path:
-            if is_exit_node(graph.nodes[dst]) and saw_code and not current_saw_reviewer:
+            if is_exit_node(dst_node) and saw_code and not current_saw_reviewer:
                 out.append(new_path + (dst,))
             continue
         # Failure-terminal edges are intentionally excluded from the G1
-        # happy-path search.  A planner/backend failure may route to the
-        # Msquare exit so the engine preserves a non-success result; that is
-        # not an unreviewed *successful* merge path.  G2 separately audits
-        # reviewer failure -> exit edges, so skipping these here does not
-        # weaken the review-failure contract.
-        if _is_outcome_failure_condition(edge.condition):
+        # happy-path search. A planner/backend failure may route to an
+        # explicit terminal sink so the engine preserves a non-success
+        # result; that is not an unreviewed *successful* merge path. G2
+        # separately audits reviewer failure -> exit edges, so skipping these
+        # here does not weaken the review-failure contract. Non-success edges
+        # into continuation stages remain part of the audited path search.
+        if (
+            _is_outcome_failure_condition(edge.condition)
+            and _is_failure_terminal_node(dst_node)
+        ):
             continue
         _dfs_witness(graph, dst, new_path, current_saw_reviewer, out)
 

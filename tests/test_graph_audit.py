@@ -341,6 +341,28 @@ def test_failure_terminal_exit_is_not_an_unreviewed_success_path(tmp_path):
     assert not [v for v in violations if v.kind == "G1"], violations
 
 
+def test_failure_edge_to_continuation_still_requires_review(tmp_path):
+    """A non-success edge into another stage remains an audited path.
+
+    Only an explicit failure terminal may be skipped by G1's happy-path
+    traversal.  A planner failure that continues into implementation must not
+    hide an unreviewed ``start -> plan -> implement -> exit`` witness.
+    """
+    p = _write_dot(tmp_path, "planner_failure_continuation.dot", """
+        digraph planner_failure_continuation {
+            start [shape=Mdiamond]
+            exit [shape=Msquare]
+            plan [type="codergen", backend="minimax"]
+            implement [type="codergen", backend="minimax"]
+            start -> plan
+            plan -> implement [condition="outcome!=success"]
+            implement -> exit [condition="outcome=success"]
+        }
+    """)
+    violations = graph_audit.audit_graph(p)
+    assert any(v.kind == "G1" for v in violations), violations
+
+
 def test_g1_violator_has_g1_violation_only():
     violations = graph_audit.audit_graph(FIXTURES / "g1_violator.dot")
     kinds = [v.kind for v in violations]
