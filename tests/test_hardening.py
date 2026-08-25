@@ -10,11 +10,13 @@ Covers:
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import sqlite3
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -31,6 +33,7 @@ from conftest import _pipeline, register_scratch_dir  # noqa: E402
 register_scratch_dir(SCRATCH)
 
 import runner.handlers as handlers_mod  # noqa: E402
+import runner.handler_sandbox as sandbox_mod  # noqa: E402
 from runner.cxdb import CXDB  # noqa: E402
 from runner.engine import _attr_int, _edge_matches, run  # noqa: E402
 from runner.handlers import (  # noqa: E402
@@ -92,15 +95,57 @@ def test_scoped_claude_env_scrubs_all_provider_overrides(monkeypatch, tmp_path):
 
 
 def test_scoped_claude_env_rejects_symlink_to_personal_config(monkeypatch, tmp_path):
-    home = tmp_path / "home"
-    personal = home / ".claude"
+    login_home = tmp_path / "login-home"
+    personal = login_home / ".claude"
     personal.mkdir(parents=True)
     link = tmp_path / "project-config"
     link.symlink_to(personal, target_is_directory=True)
-    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(
+        sandbox_mod.pwd,
+        "getpwuid",
+        lambda _uid: SimpleNamespace(pw_dir=str(login_home)),
+    )
+    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
     monkeypatch.setenv("DARK_FACTORY_CLAUDE_CONFIG_DIR", str(link))
 
     with pytest.raises(ValueError, match="personal ~/.claude"):
+        _scoped_claude_env()
+
+
+def test_scoped_claude_env_rejects_login_users_personal_config_when_home_is_mutated(
+    monkeypatch, tmp_path
+):
+    """A child-controlled HOME must not redefine the login user's ~/.claude."""
+    login_home = tmp_path / "login-home"
+    personal = login_home / ".claude"
+    personal.mkdir(parents=True)
+    fake_home = tmp_path / "fake-home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setattr(
+        sandbox_mod.pwd,
+        "getpwuid",
+        lambda _uid: SimpleNamespace(pw_dir=str(login_home)),
+    )
+    monkeypatch.setenv("DARK_FACTORY_CLAUDE_CONFIG_DIR", str(personal))
+
+    with pytest.raises(ValueError, match="personal ~/.claude"):
+        _scoped_claude_env()
+
+
+def test_scoped_claude_env_fails_closed_when_login_identity_cannot_resolve(
+    monkeypatch, tmp_path
+):
+    config = tmp_path / "project-config"
+    config.mkdir()
+    monkeypatch.setenv("DARK_FACTORY_CLAUDE_CONFIG_DIR", str(config))
+
+    def missing_uid(_uid):
+        raise KeyError("missing uid")
+
+    monkeypatch.setattr(sandbox_mod.pwd, "getpwuid", missing_uid)
+
+    with pytest.raises(ValueError, match="login user's home"):
         _scoped_claude_env()
 
 
@@ -108,28 +153,90 @@ def test_scoped_claude_env_rejects_symlink_to_personal_config(monkeypatch, tmp_p
 def test_scoped_claude_env_rejects_critical_symlink_into_personal_tree(
     monkeypatch, tmp_path, critical_name
 ):
-    home = tmp_path / "home"
-    personal = home / ".claude"
+    login_home = tmp_path / "login-home"
+    personal = login_home / ".claude"
     personal.mkdir(parents=True)
     config = tmp_path / "project-config"
     config.mkdir()
     (personal / critical_name).write_text("personal\n")
     (config / critical_name).symlink_to(personal / critical_name)
-    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(
+        sandbox_mod.pwd,
+        "getpwuid",
+        lambda _uid: SimpleNamespace(pw_dir=str(login_home)),
+    )
+    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
     monkeypatch.setenv("DARK_FACTORY_CLAUDE_CONFIG_DIR", str(config))
 
     with pytest.raises(ValueError, match="critical file"):
         _scoped_claude_env()
 
 
+@pytest.mark.parametrize("critical_name", [".credentials.json", ".claude.json"])
+@pytest.mark.parametrize("copy_kind", ["copy", "hardlink"])
+def test_scoped_claude_env_rejects_copied_or_hardlinked_personal_credentials(
+    monkeypatch, tmp_path, critical_name, copy_kind
+):
+    login_home = tmp_path / "login-home"
+    personal = login_home / ".claude"
+    personal.mkdir(parents=True)
+    config = tmp_path / "project-config"
+    config.mkdir()
+    source = personal / critical_name
+    source.write_text('{"account":"personal"}\n')
+    target = config / critical_name
+    if copy_kind == "hardlink":
+        os.link(source, target)
+    else:
+        target.write_bytes(source.read_bytes())
+    monkeypatch.setattr(
+        sandbox_mod.pwd,
+        "getpwuid",
+        lambda _uid: SimpleNamespace(pw_dir=str(login_home)),
+    )
+    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
+    monkeypatch.setenv("DARK_FACTORY_CLAUDE_CONFIG_DIR", str(config))
+
+    with pytest.raises(ValueError, match="personal credential"):
+        _scoped_claude_env()
+
+
+@pytest.mark.parametrize("critical_name", ["settings.json", "mcp-strict.json"])
+def test_scoped_claude_env_does_not_compare_benign_profile_files(
+    monkeypatch, tmp_path, critical_name
+):
+    login_home = tmp_path / "login-home"
+    personal = login_home / ".claude"
+    personal.mkdir(parents=True)
+    config = tmp_path / "project-config"
+    config.mkdir()
+    source = personal / critical_name
+    source.write_text("shared-benign-profile\n")
+    (config / critical_name).write_bytes(source.read_bytes())
+    monkeypatch.setattr(
+        sandbox_mod.pwd,
+        "getpwuid",
+        lambda _uid: SimpleNamespace(pw_dir=str(login_home)),
+    )
+    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
+    monkeypatch.setenv("DARK_FACTORY_CLAUDE_CONFIG_DIR", str(config))
+
+    assert _scoped_claude_env()["CLAUDE_CONFIG_DIR"] == str(config.resolve())
+
+
 def test_scoped_claude_env_accepts_regular_independent_critical_files(monkeypatch, tmp_path):
-    home = tmp_path / "home"
-    (home / ".claude").mkdir(parents=True)
+    login_home = tmp_path / "login-home"
+    (login_home / ".claude").mkdir(parents=True)
     config = tmp_path / "project-config"
     config.mkdir()
     for name in (".credentials.json", ".claude.json", "settings.json", "mcp-strict.json"):
         (config / name).write_text("independent\n")
-    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(
+        sandbox_mod.pwd,
+        "getpwuid",
+        lambda _uid: SimpleNamespace(pw_dir=str(login_home)),
+    )
+    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
     monkeypatch.setenv("DARK_FACTORY_CLAUDE_CONFIG_DIR", str(config))
 
     assert _scoped_claude_env()["CLAUDE_CONFIG_DIR"] == str(config.resolve())

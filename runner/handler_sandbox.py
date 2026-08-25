@@ -78,6 +78,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import pwd
 import pathlib
 import shutil
 import subprocess
@@ -99,6 +100,36 @@ _CLAUDE_CONFIG_CRITICAL_CHILDREN = (
 )
 
 
+def _same_file_contents(first: pathlib.Path, second: pathlib.Path) -> bool:
+    """Compare files exactly without retaining or logging credential bytes."""
+    first_hash = hashlib.sha256()
+    second_hash = hashlib.sha256()
+    with first.open("rb") as first_stream, second.open("rb") as second_stream:
+        while True:
+            first_chunk = first_stream.read(1024 * 1024)
+            second_chunk = second_stream.read(1024 * 1024)
+            if not first_chunk and not second_chunk:
+                break
+            first_hash.update(first_chunk)
+            second_hash.update(second_chunk)
+    return first_hash.digest() == second_hash.digest()
+
+
+def _login_home_dir() -> pathlib.Path:
+    """Resolve the OS login user's home independently of mutable ``HOME``."""
+    try:
+        record = pwd.getpwuid(os.getuid())
+    except (KeyError, OSError, TypeError) as exc:
+        raise ValueError("cannot resolve the OS login user's home directory") from exc
+    home = record.pw_dir
+    if not home or not os.path.isabs(home):
+        raise ValueError("cannot resolve the OS login user's home directory")
+    try:
+        return pathlib.Path(home).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("cannot resolve the OS login user's home directory") from exc
+
+
 def _claude_config_dir() -> pathlib.Path:
     """Return the explicitly scoped Claude config directory.
 
@@ -118,11 +149,11 @@ def _claude_config_dir() -> pathlib.Path:
         raise ValueError(
             "DARK_FACTORY_CLAUDE_CONFIG_DIR must be an absolute existing project config directory"
         ) from exc
-    if not resolved.is_dir() or resolved == (pathlib.Path.home() / ".claude").resolve():
+    personal_root = (_login_home_dir() / ".claude").resolve()
+    if not resolved.is_dir() or resolved == personal_root:
         raise ValueError(
             "DARK_FACTORY_CLAUDE_CONFIG_DIR must not resolve to the personal ~/.claude directory"
         )
-    personal_root = (pathlib.Path.home() / ".claude").resolve()
     for name in _CLAUDE_CONFIG_CRITICAL_CHILDREN:
         child = resolved / name
         if not child.is_symlink():
@@ -140,6 +171,22 @@ def _claude_config_dir() -> pathlib.Path:
         raise ValueError(
             f"DARK_FACTORY_CLAUDE_CONFIG_DIR critical file {child.name} resolves inside personal ~/.claude"
         )
+    for name in (".credentials.json", ".claude.json"):
+        child = resolved / name
+        personal = personal_root / name
+        if not child.is_file() or not personal.is_file():
+            continue
+        try:
+            same_file = os.path.samefile(child, personal)
+            same_contents = _same_file_contents(child, personal)
+        except OSError as exc:
+            raise ValueError(
+                f"DARK_FACTORY_CLAUDE_CONFIG_DIR could not compare personal credential file {name}"
+            ) from exc
+        if same_file or same_contents:
+            raise ValueError(
+                f"DARK_FACTORY_CLAUDE_CONFIG_DIR must not reuse personal credential file {name}"
+            )
     return resolved
 
 

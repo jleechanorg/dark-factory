@@ -3066,11 +3066,124 @@ const DIRECT_CLAUDE_PROVIDER_ENV: &[&str] = &[
     "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL",
 ];
 
-/// Resolve the explicitly configured Claude account directory, refusing the
-/// operator's default `~/.claude` account. Direct Claude is an opt-in reviewer
-/// lane; an unset, relative, missing, non-directory, or default-home path is
-/// a configuration error rather than an invitation to inherit host state.
-fn direct_claude_config_dir() -> Result<std::path::PathBuf, DaemonError> {
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct LinuxPasswd {
+    pw_name: *mut std::os::raw::c_char,
+    pw_passwd: *mut std::os::raw::c_char,
+    pw_uid: u32,
+    pw_gid: u32,
+    pw_gecos: *mut std::os::raw::c_char,
+    pw_dir: *mut std::os::raw::c_char,
+    pw_shell: *mut std::os::raw::c_char,
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn geteuid() -> u32;
+    fn getpwuid_r(
+        uid: u32,
+        pwd: *mut LinuxPasswd,
+        buffer: *mut std::os::raw::c_char,
+        buffer_len: usize,
+        result: *mut *mut LinuxPasswd,
+    ) -> std::os::raw::c_int;
+}
+
+/// Resolve the account home from the kernel's effective uid, never from the
+/// mutable HOME environment inherited by a child process.
+fn login_home_dir() -> Result<std::path::PathBuf, DaemonError> {
+    #[cfg(target_os = "linux")]
+    {
+        let uid = unsafe { geteuid() };
+        let mut record = std::mem::MaybeUninit::<LinuxPasswd>::zeroed();
+        let mut buffer = vec![0i8; 64 * 1024];
+        let mut result = std::ptr::null_mut();
+        let rc = unsafe {
+            getpwuid_r(
+                uid,
+                record.as_mut_ptr(),
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if rc != 0 || result.is_null() {
+            return Err(DaemonError::Config(
+                "direct Claude reviewer cannot resolve the login user's home directory"
+                    .to_string(),
+            ));
+        }
+        let record = unsafe { result.as_ref() }.ok_or_else(|| {
+            DaemonError::Config(
+                "direct Claude reviewer cannot resolve the login user's home directory"
+                    .to_string(),
+            )
+        })?;
+        if record.pw_dir.is_null() {
+            return Err(DaemonError::Config(
+                "direct Claude reviewer cannot resolve the login user's home directory"
+                    .to_string(),
+            ));
+        }
+        let home = unsafe { std::ffi::CStr::from_ptr(record.pw_dir) }
+            .to_str()
+            .map_err(|_| {
+                DaemonError::Config(
+                    "direct Claude reviewer login home is not valid UTF-8".to_string(),
+                )
+            })?;
+        let home = std::path::PathBuf::from(home);
+        if !home.is_absolute() {
+            return Err(DaemonError::Config(
+                "direct Claude reviewer login home must be absolute".to_string(),
+            ));
+        }
+        std::fs::canonicalize(home).map_err(|error| {
+            DaemonError::Config(format!(
+                "direct Claude reviewer cannot resolve the login user's home directory: {error}"
+            ))
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(DaemonError::Config(
+            "direct Claude reviewer cannot resolve the login user's home directory on this platform"
+                .to_string(),
+        ))
+    }
+}
+
+fn files_byte_identical(
+    first: &std::path::Path,
+    second: &std::path::Path,
+) -> Result<bool, std::io::Error> {
+    use std::io::Read;
+    let mut first = std::fs::File::open(first)?;
+    let mut second = std::fs::File::open(second)?;
+    let mut first_buf = [0u8; 8192];
+    let mut second_buf = [0u8; 8192];
+    loop {
+        let first_len = first.read(&mut first_buf)?;
+        let second_len = second.read(&mut second_buf)?;
+        if first_len != second_len {
+            return Ok(false);
+        }
+        if first_len == 0 {
+            return Ok(true);
+        }
+        if first_buf[..first_len] != second_buf[..second_len] {
+            return Ok(false);
+        }
+    }
+}
+
+/// Resolve the explicitly configured Claude account directory against a
+/// caller-supplied login home. The caller must obtain that home from the OS
+/// account database, never from the mutable HOME environment.
+fn direct_claude_config_dir_with_login_home(
+    login_home: &std::path::Path,
+) -> Result<std::path::PathBuf, DaemonError> {
     let raw = std::env::var_os("DARK_FACTORY_CLAUDE_CONFIG_DIR").ok_or_else(|| {
         DaemonError::Config(
             "direct Claude reviewer requires DARK_FACTORY_CLAUDE_CONFIG_DIR pointing to a project-scoped config directory"
@@ -3094,13 +3207,7 @@ fn direct_claude_config_dir() -> Result<std::path::PathBuf, DaemonError> {
             "DARK_FACTORY_CLAUDE_CONFIG_DIR could not be resolved: {error}"
         ))
     })?;
-    let home = std::env::var_os("HOME").ok_or_else(|| {
-        DaemonError::Config(
-            "direct Claude reviewer cannot validate the operator home because HOME is unset"
-                .to_string(),
-        )
-    })?;
-    let home_claude = std::path::PathBuf::from(home).join(".claude");
+    let home_claude = login_home.join(".claude");
     let personal_root = std::fs::canonicalize(&home_claude).ok();
     if let Some(default_dir) = personal_root.as_ref() {
         if resolved == *default_dir {
@@ -3153,7 +3260,55 @@ fn direct_claude_config_dir() -> Result<std::path::PathBuf, DaemonError> {
             )));
         }
     }
+    for name in [".credentials.json", ".claude.json"] {
+        let child = resolved.join(name);
+        let personal = home_claude.join(name);
+        if !child.is_file() || !personal.is_file() {
+            continue;
+        }
+        let same_inode = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let child_metadata = std::fs::metadata(&child).map_err(|error| {
+                    DaemonError::Config(format!(
+                        "could not inspect Claude config child {}: {error}",
+                        child.display()
+                    ))
+                })?;
+                let personal_metadata = std::fs::metadata(&personal).map_err(|error| {
+                    DaemonError::Config(format!(
+                        "could not inspect personal Claude credential file {}: {error}",
+                        personal.display()
+                    ))
+                })?;
+                child_metadata.dev() == personal_metadata.dev()
+                    && child_metadata.ino() == personal_metadata.ino()
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        };
+        let same_contents = files_byte_identical(&child, &personal).map_err(|error| {
+            DaemonError::Config(format!(
+                "could not compare personal Claude credential file {name}: {error}"
+            ))
+        })?;
+        if same_inode || same_contents {
+            return Err(DaemonError::Config(format!(
+                "DARK_FACTORY_CLAUDE_CONFIG_DIR must not reuse personal credential file {name}"
+            )));
+        }
+    }
     Ok(resolved)
+}
+
+/// Resolve the explicitly configured Claude account directory, refusing the
+/// operator's default `~/.claude` account.
+fn direct_claude_config_dir() -> Result<std::path::PathBuf, DaemonError> {
+    let login_home = login_home_dir()?;
+    direct_claude_config_dir_with_login_home(&login_home)
 }
 
 /// Dispatch one independent reviewer subprocess by vendor name. Extracted
@@ -3281,7 +3436,7 @@ pub(crate) fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, Da
 
 #[cfg(test)]
 mod direct_claude_scope_tests {
-    use super::{direct_claude_config_dir, dispatch_reviewer};
+    use super::{direct_claude_config_dir_with_login_home, dispatch_reviewer};
     use std::path::Path;
     use std::sync::Mutex;
 
@@ -3410,13 +3565,39 @@ mod direct_claude_scope_tests {
         let home_claude = root.join("home").join(".claude");
         std::fs::create_dir_all(&home_claude).unwrap();
         let _env = EnvRestore::capture(&["HOME", "DARK_FACTORY_CLAUDE_CONFIG_DIR"]);
-        EnvRestore::set("HOME", root.join("home"));
+        EnvRestore::set("HOME", root.join("fake-home"));
         EnvRestore::set("DARK_FACTORY_CLAUDE_CONFIG_DIR", &home_claude);
 
-        let result = dispatch_reviewer("claude", "scope-test");
+        let result = direct_claude_config_dir_with_login_home(&root.join("home"));
 
         let _ = std::fs::remove_dir_all(&root);
         assert!(result.is_err(), "operator ~/.claude must not be accepted");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn direct_claude_reviewer_rejects_login_users_personal_config_when_home_is_mutated() {
+        let _guard = env_lock().lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "afd_direct_claude_mutated_home_{}",
+            std::process::id()
+        ));
+        let login_home = root.join("login-home");
+        let personal = login_home.join(".claude");
+        std::fs::create_dir_all(&personal).unwrap();
+        let fake_home = root.join("fake-home");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        let _env = EnvRestore::capture(&["HOME", "DARK_FACTORY_CLAUDE_CONFIG_DIR"]);
+        EnvRestore::set("HOME", &fake_home);
+        EnvRestore::set("DARK_FACTORY_CLAUDE_CONFIG_DIR", &personal);
+
+        let result = direct_claude_config_dir_with_login_home(&login_home);
+
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            result.is_err(),
+            "changing HOME must not allow the login user's ~/.claude"
+        );
     }
 
     #[test]
@@ -3441,8 +3622,74 @@ mod direct_claude_scope_tests {
             EnvRestore::set("HOME", root.join("home"));
             EnvRestore::set("DARK_FACTORY_CLAUDE_CONFIG_DIR", &scoped);
             assert!(
-                direct_claude_config_dir().is_err(),
+                direct_claude_config_dir_with_login_home(&root.join("home")).is_err(),
                 "critical symlink {name} into personal config must fail closed"
+            );
+            drop(_env);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn direct_claude_config_rejects_copied_or_hardlinked_personal_credentials() {
+        let _guard = env_lock().lock().unwrap();
+        for name in [".credentials.json", ".claude.json"] {
+            for kind in ["copy", "hardlink"] {
+                let root = std::env::temp_dir().join(format!(
+                    "afd_direct_claude_credential_copy_{}_{}_{}",
+                    std::process::id(),
+                    name.replace('.', "_"),
+                    kind
+                ));
+                let _ = std::fs::remove_dir_all(&root);
+                let personal = root.join("login-home").join(".claude");
+                let scoped = root.join("project-claude");
+                std::fs::create_dir_all(&personal).unwrap();
+                std::fs::create_dir_all(&scoped).unwrap();
+                let source = personal.join(name);
+                std::fs::write(&source, b"{\"account\":\"personal\"}\n").unwrap();
+                let target = scoped.join(name);
+                if kind == "hardlink" {
+                    std::fs::hard_link(&source, &target).unwrap();
+                } else {
+                    std::fs::copy(&source, &target).unwrap();
+                }
+                let _env = EnvRestore::capture(&["HOME", "DARK_FACTORY_CLAUDE_CONFIG_DIR"]);
+                EnvRestore::set("HOME", root.join("fake-home"));
+                EnvRestore::set("DARK_FACTORY_CLAUDE_CONFIG_DIR", &scoped);
+                assert!(
+                    direct_claude_config_dir_with_login_home(&root.join("login-home")).is_err(),
+                    "{kind} personal credential {name} must fail closed"
+                );
+                drop(_env);
+                let _ = std::fs::remove_dir_all(&root);
+            }
+        }
+    }
+
+    #[test]
+    fn direct_claude_config_does_not_compare_benign_profile_files() {
+        let _guard = env_lock().lock().unwrap();
+        for name in ["settings.json", "mcp-strict.json"] {
+            let root = std::env::temp_dir().join(format!(
+                "afd_direct_claude_benign_copy_{}_{}",
+                std::process::id(),
+                name.replace('.', "_")
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let personal = root.join("login-home").join(".claude");
+            let scoped = root.join("project-claude");
+            std::fs::create_dir_all(&personal).unwrap();
+            std::fs::create_dir_all(&scoped).unwrap();
+            std::fs::write(personal.join(name), b"shared-benign-profile\n").unwrap();
+            std::fs::copy(personal.join(name), scoped.join(name)).unwrap();
+            let _env = EnvRestore::capture(&["HOME", "DARK_FACTORY_CLAUDE_CONFIG_DIR"]);
+            EnvRestore::set("HOME", root.join("fake-home"));
+            EnvRestore::set("DARK_FACTORY_CLAUDE_CONFIG_DIR", &scoped);
+            assert!(
+                direct_claude_config_dir_with_login_home(&root.join("login-home")).is_ok(),
+                "benign profile file {name} may be copied into a WA config"
             );
             drop(_env);
             let _ = std::fs::remove_dir_all(&root);
@@ -3468,7 +3715,8 @@ mod direct_claude_scope_tests {
         let _env = EnvRestore::capture(&["HOME", "DARK_FACTORY_CLAUDE_CONFIG_DIR"]);
         EnvRestore::set("HOME", root.join("home"));
         EnvRestore::set("DARK_FACTORY_CLAUDE_CONFIG_DIR", &scoped);
-        let resolved = direct_claude_config_dir().expect("regular independent config is valid");
+        let resolved = direct_claude_config_dir_with_login_home(&root.join("home"))
+            .expect("regular independent config is valid");
         assert_eq!(resolved, std::fs::canonicalize(&scoped).unwrap());
         drop(_env);
         let _ = std::fs::remove_dir_all(&root);
