@@ -24,7 +24,6 @@ from .handler_dispatch import (
     _gate_subprocess_env,
 )
 from .review_controller import (
-    DIFF_ARGV,
     EvidenceArtifact,
     ReviewContractError,
     ReviewInputs,
@@ -141,12 +140,6 @@ def _snapshot(workdir: pathlib.Path, base_sha: str, head_sha: str) -> dict[str, 
             f"workspace HEAD mismatch: expected {head_sha}, observed {actual_head}"
         )
     tree_sha = _git(workdir, "rev-parse", f"{head_sha}^{{tree}}").lower()
-    diff_text = _git(
-        workdir,
-        *DIFF_ARGV[1:],
-        f"{base_sha}..{head_sha}",
-        allow_empty=True,
-    )
     changed_files_text = _git(
         workdir,
         "diff",
@@ -157,8 +150,6 @@ def _snapshot(workdir: pathlib.Path, base_sha: str, head_sha: str) -> dict[str, 
     return {
         "head_sha": actual_head,
         "tree_sha": tree_sha,
-        "diff_text": diff_text,
-        "diff_sha256": _sha256(diff_text.encode("utf-8")),
         "changed_files": tuple(
             line for line in changed_files_text.splitlines() if line.strip()
         ),
@@ -232,7 +223,6 @@ def main(argv: list[str] | None = None) -> int:
             head_sha=head_sha,
             tree_sha=str(before["tree_sha"]),
             task_text=task_text,
-            diff_text=str(before["diff_text"]),
             changed_files=tuple(before["changed_files"]),
             evidence=evidence,
             run_id=f"review-{int(time.time())}",
@@ -325,10 +315,11 @@ def main(argv: list[str] | None = None) -> int:
 
         after = _snapshot(workdir, base_sha, head_sha)
         _verify_evidence(workdir, evidence)
+        # head + tree pin the whole reviewed state; with a fixed base_sha the
+        # reviewed change cannot differ while both still match.
         if (
             before["head_sha"] != after["head_sha"]
             or before["tree_sha"] != after["tree_sha"]
-            or before["diff_sha256"] != after["diff_sha256"]
         ):
             contract_error = "reviewed repository changed during cold review"
             verdict = "invalid"
@@ -343,7 +334,6 @@ def main(argv: list[str] | None = None) -> int:
             "base_sha": base_sha,
             "head_sha": head_sha,
             "tree_sha": before["tree_sha"],
-            "diff_sha256": before["diff_sha256"],
             "prompt_id": request.prompt_id,
             "prompt_sha256": _sha256(prompt_bytes),
             "prompt_payload_sha256": request.prompt_sha256,
