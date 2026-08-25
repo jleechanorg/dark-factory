@@ -4815,10 +4815,16 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                             }
                                         }
                                     }
-                                    Ok(
-                                        crate::tools::SessionActivity::Terminal
-                                        | crate::tools::SessionActivity::NotFound,
-                                    ) => true,
+                                    Ok(crate::tools::SessionActivity::Terminal) => true,
+                                    Ok(crate::tools::SessionActivity::NotFound) => {
+                                        // NotFound is positive evidence that AO has
+                                        // already reaped the session.  Treat it as
+                                        // already stopped so the second, non-idempotent
+                                        // reap stop is skipped and promotion/cleanup can
+                                        // complete in this tick.
+                                        session_already_stopped = true;
+                                        true
+                                    }
                                     _ => false,
                                 }
                             }
@@ -4826,6 +4832,18 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         None => true,
                     }
                 } else {
+                    if let Some(session_id_str) = overlay.session_id.as_ref() {
+                        let sid = SessionId(session_id_str.clone());
+                        if matches!(
+                            deps.sessions.session_activity(&sid),
+                            Ok(crate::tools::SessionActivity::NotFound)
+                        ) {
+                            // A positive NotFound result is already a
+                            // confirmed stop for ordinary DISPATCHED beads
+                            // too; avoid a second non-idempotent kill below.
+                            session_already_stopped = true;
+                        }
+                    }
                     true
                 };
 

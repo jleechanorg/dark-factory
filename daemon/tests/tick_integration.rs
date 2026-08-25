@@ -15370,6 +15370,257 @@ fn tick_idle_promotion_with_succeeding_stop_promotes_and_cleans() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+/// A positive NotFound activity result means AO has already reaped the
+/// session. Promotion must skip the non-idempotent stop and still clean up
+/// the orphaned worktree in the same tick.
+#[test]
+fn tick_not_found_promotion_skips_stop_and_cleans() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = false;
+    sessions.set_activity(daemon::tools::SessionActivity::NotFound);
+
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let worktree_root = std::env::temp_dir().join(format!(
+        "afd_not_found_promotion_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let cfg = Config {
+        agent_worktree_root: Some(worktree_root.display().to_string()),
+        ..test_cfg()
+    };
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_not_found_promotion.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let worktree = worktree_root.join("owner/repo/not-found-session");
+    std::fs::create_dir_all(&worktree).unwrap();
+    init_cleanup_test_repo(&worktree);
+    std::fs::write(worktree.join("marker"), b"reaped worker worktree").unwrap();
+
+    store.overlays.borrow_mut().insert(
+        "not-found-bead".into(),
+        BeadOverlay {
+            bead_id: "not-found-bead".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(1103),
+            branch: Some("fix/not-found".into()),
+            session_id: Some("not-found-session".into()),
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+    store
+        .register_branch("not-found-bead", "fix/not-found")
+        .unwrap();
+
+    scm.pr_numbers_for_branch.insert(
+        ("owner/repo".into(), "fix/not-found".into()),
+        Some(1103),
+    );
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 1103),
+        daemon::tools::PrHeadBranch::SameRepo("fix/not-found".into()),
+    );
+    scm.pr_snapshots.insert(
+        1103,
+        PrSnapshot {
+            pr_number: 1103,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "head-1103".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        0,
+        10,
+    )
+    .expect("NotFound promotion must complete");
+
+    let overlay = store.load("not-found-bead").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::Attested);
+    assert_eq!(overlay.session_id, None);
+    assert!(
+        !sessions
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call.starts_with("stop(")),
+        "positive NotFound must skip the non-idempotent stop; calls: {:?}",
+        sessions.calls.borrow()
+    );
+    assert!(!worktree.is_dir(), "NotFound promotion must clean the worktree");
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("WORKTREE_CLEANED_ON_SESSION_EXIT"),
+        "NotFound promotion must emit cleanup telemetry: {telemetry}"
+    );
+
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn tick_not_found_normal_dispatch_promotion_skips_stop_and_cleans() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = false;
+    sessions.set_activity(daemon::tools::SessionActivity::NotFound);
+
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let worktree_root = std::env::temp_dir().join(format!(
+        "afd_not_found_normal_promotion_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let cfg = Config {
+        agent_worktree_root: Some(worktree_root.display().to_string()),
+        ..test_cfg()
+    };
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_not_found_normal_promotion.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let worktree = worktree_root.join("owner/repo/not-found-normal-session");
+    std::fs::create_dir_all(&worktree).unwrap();
+    init_cleanup_test_repo(&worktree);
+    std::fs::write(worktree.join("marker"), b"reaped worker worktree").unwrap();
+
+    store.overlays.borrow_mut().insert(
+        "not-found-normal-bead".into(),
+        BeadOverlay {
+            bead_id: "not-found-normal-bead".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(1104),
+            branch: Some("fix/not-found-normal".into()),
+            session_id: Some("not-found-normal-session".into()),
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+    store
+        .register_branch("not-found-normal-bead", "fix/not-found-normal")
+        .unwrap();
+
+    scm.pr_numbers_for_branch.insert(
+        ("owner/repo".into(), "fix/not-found-normal".into()),
+        Some(1104),
+    );
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 1104),
+        daemon::tools::PrHeadBranch::SameRepo("fix/not-found-normal".into()),
+    );
+    scm.pr_snapshots.insert(
+        1104,
+        PrSnapshot {
+            pr_number: 1104,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "head-1104".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        0,
+        10,
+    )
+    .expect("normal NotFound promotion must complete");
+
+    let overlay = store.load("not-found-normal-bead").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::Attested);
+    assert_eq!(overlay.session_id, None);
+    assert!(
+        !sessions
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call.starts_with("stop(")),
+        "normal NotFound must skip the non-idempotent stop; calls: {:?}",
+        sessions.calls.borrow()
+    );
+    assert!(!worktree.is_dir(), "normal NotFound must clean the worktree");
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("WORKTREE_CLEANED_ON_SESSION_EXIT"),
+        "normal NotFound must emit cleanup telemetry: {telemetry}"
+    );
+
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 #[test]
 fn session_health_failure_reaps_session_and_requeues_bead() {
     let scm = FakeScm::new();
