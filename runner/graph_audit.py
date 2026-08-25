@@ -26,8 +26,11 @@ The audit is invoked three ways:
 
 1. ``audit_graph(path)`` — returns ``list[Violation]`` for a single .dot.
 2. ``audit_graphs(dir)`` — walks ``dir.rglob("*.dot")`` and aggregates.
-3. ``python -m runner.graph_audit [pipeline_dir]`` — CLI; exit 0 if
-   no violations, exit 1 + human-readable report otherwise.
+3. ``audit_repository(repo_root)`` — audits production graphs fully and
+   applies universal route/parse checks to every authored benchmark graph.
+4. ``python -m runner.graph_audit [pipeline_dir]`` — CLI; exit 0 if
+   no violations, exit 1 + human-readable report otherwise. Pass
+   ``--repository`` to select the repository-wide structural scope.
 """
 
 from __future__ import annotations
@@ -220,11 +223,15 @@ def _is_direct_claude_route(node: Node) -> bool:
     resolved = _resolved_type_label(node)
     if resolved == "web_advice":
         return True
+    # ``backend``/``model`` are explicit route selectors even when the node
+    # resolves to a non-codergen handler (for example a gate or tool node).
+    # Inspect them before handler-specific routing so every direct Claude
+    # capability is held to the same scope-marker contract.
+    for key in ("backend", "model"):
+        token = str(node.attrs.get(key) or "").strip().lower()
+        if token in _CLAUDE_ROUTE_TOKENS:
+            return True
     if resolved == "codergen":
-        for key in ("backend", "model"):
-            token = str(node.attrs.get(key) or "").strip().lower()
-            if token in _CLAUDE_ROUTE_TOKENS:
-                return True
         return False
     priority = str(node.attrs.get("backend_priority") or "")
     tokens = {part.strip().lower() for part in priority.split(",") if part.strip()}
@@ -596,6 +603,59 @@ def audit_graphs(pipeline_dir: pathlib.Path) -> list[Violation]:
     return violations
 
 
+def _is_authored_graph(repo_root: pathlib.Path, path: pathlib.Path) -> bool:
+    """Return whether ``path`` is an authored repository pipeline graph.
+
+    Production graphs live below a top-level ``pipelines/`` directory and
+    benchmark graphs either use that conventional directory or are a direct
+    ``.dot`` file below ``benchmarks/<name>/``. Generated evidence and test
+    fixtures intentionally sit outside those structural roots and are not
+    shipped pipeline inputs.
+    """
+    try:
+        relative = path.resolve().relative_to(repo_root.resolve())
+    except ValueError:
+        return False
+    parts = relative.parts
+    return bool(parts) and (parts[0] == "pipelines" or parts[0] == "benchmarks")
+
+
+def audit_repository(repo_root: pathlib.Path) -> list[Violation]:
+    """Audit every authored graph discoverable in a repository tree.
+
+    Unlike ``audit_graphs(pipelines/)``, this boundary includes nested
+    benchmark pipeline families as well as the production graph root. The
+    production root receives the complete G1-G5 audit. Benchmark graphs are
+    checked for the cross-cutting direct-Claude scope invariant (G5) and
+    parse failures, while their intentionally varied reviewer topologies are
+    not reclassified as production G1/G4 failures. Discovery is structural
+    (repository source roots and ``*.dot`` files), so adding a new benchmark
+    does not require updating an allowlist.
+    """
+    if not repo_root.exists():
+        raise FileNotFoundError(f"repository root does not exist: {repo_root}")
+    if not repo_root.is_dir():
+        raise NotADirectoryError(f"repository root is not a directory: {repo_root}")
+    violations: list[Violation] = []
+    for dot in sorted(repo_root.rglob("*.dot")):
+        if _is_authored_graph(repo_root, dot):
+            graph_violations = audit_graph(dot)
+            try:
+                relative = dot.resolve().relative_to(repo_root.resolve())
+            except ValueError:
+                continue
+            if relative.parts[0] == "benchmarks":
+                # G5 is a universal route-scope invariant. Parse errors are
+                # also universally actionable, regardless of graph family.
+                violations.extend(
+                    v for v in graph_violations
+                    if v.kind == "G5" or v.location == "<parse>"
+                )
+            else:
+                violations.extend(graph_violations)
+    return violations
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -634,11 +694,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         default="pipelines",
         help="Root directory to walk for *.dot files (default: ./pipelines).",
     )
+    parser.add_argument(
+        "--repository",
+        action="store_true",
+        help="Discover and audit authored graphs under both pipelines/ and benchmarks/.",
+    )
     args = parser.parse_args(argv)
 
     root = pathlib.Path(args.pipeline_dir)
     try:
-        violations = audit_graphs(root)
+        violations = audit_repository(root) if args.repository else audit_graphs(root)
     except FileNotFoundError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

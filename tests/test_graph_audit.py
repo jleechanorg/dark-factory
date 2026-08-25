@@ -165,12 +165,84 @@ def test_direct_claude_route_with_both_scope_markers_passes(tmp_path):
     assert not [v for v in graph_audit.audit_graph(p) if v.kind == "G5"]
 
 
+def test_non_codergen_backend_claude_requires_scope_markers(tmp_path):
+    """A non-codergen node can still select a direct Claude lane.
+
+    The route audit must inspect the explicit backend attribute regardless of
+    the resolved handler type; otherwise a reviewer/tool node can bypass the
+    same project-scoped Claude account requirement enforced for codergen nodes.
+    """
+    p = _write_dot(tmp_path, "non_codergen_claude.dot", """
+        digraph non_codergen_claude {
+            start [shape=Mdiamond]
+            exit [shape=Msquare]
+            coder [type="codergen", backend="codex"]
+            reviewer [type="gate_er", backend="claude"]
+            start -> coder -> reviewer -> exit
+        }
+    """)
+    violations = graph_audit.audit_graph(p)
+    g5 = [v for v in violations if v.kind == "G5"]
+    assert len(g5) == 1, f"expected unscoped non-codergen Claude route, got {violations}"
+    assert g5[0].location == "reviewer"
+
+
 def test_audit_amazon_clone_pipelines_is_clean():
     violations = graph_audit.audit_graphs(ROOT / "benchmarks" / "amazon-clone" / "pipelines")
     # The benchmark bundle intentionally contains legacy graphs with unrelated
     # G1/G4 findings; this contract only asserts every direct Claude route is
     # explicitly scoped.
     assert not [v for v in violations if v.kind == "G5"], violations
+
+
+def test_audit_repository_discovers_benchmark_claude_routes(tmp_path):
+    """Repository-level audits include benchmark routes for G5 coverage.
+
+    The production ``pipelines/`` audit root alone misses this nested graph.
+    Existing benchmark G1/G4 design findings remain out of this route-scoped
+    repository check, but an unscoped direct Claude route must be surfaced.
+    """
+    import shutil
+
+    (tmp_path / "pipelines").mkdir()
+    shutil.copy2(FIXTURES / "clean.dot", tmp_path / "pipelines" / "clean.dot")
+    benchmark_pipelines = tmp_path / "benchmarks" / "example" / "pipelines"
+    benchmark_pipelines.mkdir(parents=True)
+    (benchmark_pipelines / "benchmark.dot").write_text(textwrap.dedent("""
+        digraph benchmark {
+            start [shape=Mdiamond]
+            exit [shape=Msquare]
+            coder [type="codergen", backend="codex"]
+            reviewer [type="gate_er", backend="claude"]
+            start -> coder -> reviewer -> exit
+        }
+    """), encoding="utf-8")
+
+    violations = graph_audit.audit_repository(tmp_path)
+    benchmark_violations = [
+        v for v in violations
+        if pathlib.PurePosixPath(v.pipeline).parts[-4:-1]
+        == ("benchmarks", "example", "pipelines")
+    ]
+    assert benchmark_violations, (
+        "repository audit must discover benchmark pipeline graphs; "
+        f"got {violations}"
+    )
+    assert [v.kind for v in benchmark_violations] == ["G5"]
+
+
+def test_audit_repository_does_not_block_on_benchmark_g1_g4(tmp_path):
+    """Legacy benchmark topology is not silently treated as production G1/G4."""
+    import shutil
+
+    (tmp_path / "pipelines").mkdir()
+    shutil.copy2(FIXTURES / "clean.dot", tmp_path / "pipelines" / "clean.dot")
+    benchmark_pipelines = tmp_path / "benchmarks" / "example" / "pipelines"
+    benchmark_pipelines.mkdir(parents=True)
+    shutil.copy2(FIXTURES / "g1_violator.dot", benchmark_pipelines / "legacy.dot")
+
+    violations = graph_audit.audit_repository(tmp_path)
+    assert not [v for v in violations if v.pipeline.endswith("legacy.dot")], violations
 
 
 # ---------------------------------------------------------------------------

@@ -221,8 +221,8 @@ jobs:
           done
           exit $fail
 
-      - name: Graph structural audit (G1/G2 dogfooding)
-        run: python -m runner.graph_audit pipelines
+      - name: Graph structural audit (authored pipelines + benchmarks)
+        run: python -m runner.graph_audit --repository .
 
   daemon-tests:
     # Fork-PR isolation: same guard as the `test` job above.
