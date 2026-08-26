@@ -1,4 +1,4 @@
-"""Controller-owned, digest-bound cold-review prompt contract.
+"""Controller-owned, digest-bound cold-review prompt and response contract.
 
 The static authority is always loaded from this source checkout. Target
 workspaces can contribute review *data* through :class:`ReviewInputs`, but
@@ -13,16 +13,18 @@ import base64
 import hashlib
 import json
 import os
+import pathlib
 import re
 import subprocess
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
-
 PROMPT_ID = "controller-cold-review-v1"
-CORRECTNESS_CHECK_IDS = tuple(f"C{i}" for i in range(8))
-EVIDENCE_CHECK_IDS = tuple(f"E{i}" for i in range(15))
+# The native fallback deliberately has no model-reported checklist.  Keep the
+# exported tuple for callers that still serialize ``checks`` in findings.json.
+CORRECTNESS_CHECK_IDS: tuple[str, ...] = ()
+EVIDENCE_CHECK_IDS: tuple[str, ...] = ()
 CHECK_IDS = CORRECTNESS_CHECK_IDS + EVIDENCE_CHECK_IDS
 
 
@@ -52,22 +54,10 @@ _TEMPLATE_PATH = (
     _SOURCE_ROOT / "prompts" / "catalog" / "controller_cold_review_v1.md"
 )
 _EXPECTED_TEMPLATE_SHA256 = (
-    "d013aa36dc26439edba7d5b33bf3f716f1fc97ecd11ddf3e73580e4f52b0b328"
+    "76205442f6a060486cbeb081d4fcecc38eb386c3a47120d8e9c712df802f3f89"
 )
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
-_FIELD_RE = re.compile(
-    r"^(PROMPT_ID|PROMPT_SHA256|ENVELOPE_SHA256|HEAD_SHA|TASK_SHA256|"
-    r"CHANGED_FILES_SHA256|EVIDENCE_MANIFEST_SHA256|VERDICT|[CE]\d+):"
-    r"[ \t]*(\S+)[ \t]*$",
-    re.MULTILINE,
-)
-_REQUIRED_RESPONSE_SECTIONS = (
-    "## Findings",
-    "## Commands Executed",
-    "## Evidence Checked",
-    "## Caveats",
-)
 _MAX_INPUT_BYTES = 1024 * 1024
 
 #: Envelope schema. v2 carries no diff snapshot at all -- neither the text nor
@@ -167,6 +157,11 @@ class ExecutionReceipt:
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _reject_json_constant(value: str) -> None:
+    """Reject JavaScript constants accepted by Python's permissive decoder."""
+    raise ValueError(f"invalid JSON constant: {value}")
 
 
 def _path_is_symlink(path: Path) -> bool:
@@ -329,12 +324,6 @@ def _load_static_template() -> tuple[str, str]:
             "cold-review template digest does not match the controller pin"
         )
 
-    for check_id in CHECK_IDS:
-        count = len(re.findall(rf"(?m)^- {re.escape(check_id)}\b", text))
-        if count != 1:
-            raise ReviewContractError(
-                f"static template must define {check_id} exactly once; found {count}"
-            )
     if "${" in text:
         raise ReviewContractError("static template must not contain substitutions")
     return text, observed_digest
@@ -597,39 +586,9 @@ def _render_prompt_payload(template: str, envelope_json: str) -> str:
     )
 
 
-def _render_prompt(
-    prompt_payload: str,
-    *,
-    prompt_sha256: str,
-    envelope_sha256: str,
-    head_sha: str,
-    digests: dict[str, str],
-) -> str:
-    """Return the complete prompt: payload plus the exact response contract.
-
-    Kept a pure function of the envelope so ``verify_request_integrity`` can
-    rebuild it from ``envelope_json`` alone, with no access to the reviewed
-    change. That is what lets the envelope omit the change entirely without
-    weakening the tamper check.
-    """
-    checklist_lines = "\n".join(f"{check_id}: <pass|fail>" for check_id in CHECK_IDS)
-    return (
-        prompt_payload
-        + "\n## Exact response contract\n\n"
-        + "Emit each machine line below exactly once, with the bound values "
-        + "unchanged. Use lowercase `pass` or `fail` only. After these lines, "
-        + "provide concise findings and exact evidence checked.\n\n"
-        + f"PROMPT_ID: {PROMPT_ID}\n"
-        + f"PROMPT_SHA256: {prompt_sha256}\n"
-        + f"ENVELOPE_SHA256: {envelope_sha256}\n"
-        + f"HEAD_SHA: {head_sha}\n"
-        + f"TASK_SHA256: {digests['task_sha256']}\n"
-        + f"CHANGED_FILES_SHA256: {digests['changed_files_sha256']}\n"
-        + f"EVIDENCE_MANIFEST_SHA256: {digests['evidence_manifest_sha256']}\n"
-        + "VERDICT: <pass|fail>\n"
-        + checklist_lines
-        + "\n"
-    )
+def _render_prompt(prompt_payload: str) -> str:
+    """Return the model prompt without echoing controller-owned hashes."""
+    return prompt_payload.rstrip() + "\n"
 
 
 def create_review_request(inputs: ReviewInputs) -> ReviewRequest:
@@ -642,13 +601,7 @@ def create_review_request(inputs: ReviewInputs) -> ReviewRequest:
     envelope_sha256 = _sha256(envelope_json.encode("utf-8"))
     prompt_payload = _render_prompt_payload(template, envelope_json)
     prompt_sha256 = _sha256(prompt_payload.encode("utf-8"))
-    prompt = _render_prompt(
-        prompt_payload,
-        prompt_sha256=prompt_sha256,
-        envelope_sha256=envelope_sha256,
-        head_sha=normalized.head_sha,
-        digests=envelope_digests,
-    )
+    prompt = _render_prompt(prompt_payload)
     return ReviewRequest(
         prompt_id=PROMPT_ID,
         prompt_sha256=prompt_sha256,
@@ -732,13 +685,7 @@ def verify_request_integrity(request: ReviewRequest) -> None:
         )
     try:
         expected_payload = _render_prompt_payload(template, request.envelope_json)
-        expected_prompt = _render_prompt(
-            expected_payload,
-            prompt_sha256=_sha256(expected_payload.encode("utf-8")),
-            envelope_sha256=request.envelope_sha256,
-            head_sha=target["head_sha"],
-            digests=request_digests,
-        )
+        expected_prompt = _render_prompt(expected_payload)
     except (KeyError, TypeError, ValueError) as exc:
         raise ReviewContractError("request envelope schema is invalid") from exc
     if request.prompt != expected_prompt:
@@ -749,80 +696,58 @@ def validate_review_response(
     response: str,
     request: ReviewRequest,
 ) -> ValidatedReview:
-    """Validate exact bindings and the complete strict pass/fail checklist."""
+    """Validate the compact, strict JSON response from the native reviewer."""
     verify_request_integrity(request)
     if not isinstance(response, str) or not response.strip():
         raise ReviewContractError("review response must be non-empty text")
 
-    fields: dict[str, list[str]] = {}
-    for key, value in _FIELD_RE.findall(response):
-        fields.setdefault(key, []).append(value)
+    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ReviewContractError(
+                    f"review response contains duplicate key: {key}"
+                )
+            result[key] = value
+        return result
 
-    required = (
-        "PROMPT_ID",
-        "PROMPT_SHA256",
-        "ENVELOPE_SHA256",
-        "HEAD_SHA",
-        "TASK_SHA256",
-        "CHANGED_FILES_SHA256",
-        "EVIDENCE_MANIFEST_SHA256",
-        "VERDICT",
-        *CHECK_IDS,
-    )
-    for key in required:
-        count = len(fields.get(key, ()))
-        if count != 1:
-            raise ReviewContractError(
-                f"response must contain {key} exactly once; found {count}"
-            )
-    unknown_checks = sorted(
-        key
-        for key in fields
-        if re.fullmatch(r"[CE]\d+", key) and key not in CHECK_IDS
-    )
-    if unknown_checks:
-        raise ReviewContractError(
-            f"response contains unknown checklist IDs: {', '.join(unknown_checks)}"
+    try:
+        payload = json.loads(
+            response,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=_reject_json_constant,
         )
-    for section in _REQUIRED_RESPONSE_SECTIONS:
-        count = len(re.findall(rf"(?m)^{re.escape(section)}[ \t]*$", response))
-        if count != 1:
-            raise ReviewContractError(
-                f"response must contain {section} exactly once; found {count}"
-            )
-
-    expected_bindings = {
-        "PROMPT_ID": request.prompt_id,
-        "PROMPT_SHA256": request.prompt_sha256,
-        "ENVELOPE_SHA256": request.envelope_sha256,
-        "HEAD_SHA": request.head_sha,
-        "TASK_SHA256": request.task_sha256,
-        "CHANGED_FILES_SHA256": request.changed_files_sha256,
-        "EVIDENCE_MANIFEST_SHA256": request.evidence_manifest_sha256,
+    except ReviewContractError:
+        raise
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ReviewContractError("review response must be one JSON object") from exc
+    if not isinstance(payload, dict):
+        raise ReviewContractError("review response must be one JSON object")
+    expected_keys = {
+        "verdict",
+        "findings",
+        "evidence_checked",
+        "commands_executed",
+        "caveats",
     }
-    for key, expected in expected_bindings.items():
-        if fields[key][0] != expected:
-            raise ReviewContractError(f"response {key} binding mismatch")
-
-    verdict = fields["VERDICT"][0]
+    if set(payload) != expected_keys:
+        missing = sorted(expected_keys - set(payload))
+        extra = sorted(set(payload) - expected_keys)
+        detail = []
+        if missing:
+            detail.append(f"missing keys: {', '.join(missing)}")
+        if extra:
+            detail.append(f"unknown keys: {', '.join(extra)}")
+        raise ReviewContractError("review response schema mismatch (" + "; ".join(detail) + ")")
+    verdict = payload["verdict"]
+    for key in expected_keys - {"verdict"}:
+        if not isinstance(payload[key], list):
+            raise ReviewContractError(f"review response field {key} must be an array")
     if verdict not in ("pass", "fail"):
-        raise ReviewContractError("VERDICT must be lowercase pass or fail")
-    checks: list[tuple[str, Literal["pass", "fail"]]] = []
-    for check_id in CHECK_IDS:
-        status = fields[check_id][0]
-        if status not in ("pass", "fail"):
-            raise ReviewContractError(
-                f"{check_id} must be lowercase pass or fail"
-            )
-        checks.append((check_id, status))
-    expected_verdict = "pass" if all(status == "pass" for _, status in checks) else "fail"
-    if verdict != expected_verdict:
-        raise ReviewContractError(
-            f"VERDICT must be {expected_verdict} for the reported checklist"
-        )
+        raise ReviewContractError("verdict must be lowercase pass or fail")
     return ValidatedReview(
         verdict=verdict,
-        checks=tuple(checks),
+        checks=(),
         response_sha256=_sha256(response.encode("utf-8")),
     )
 
@@ -920,8 +845,8 @@ class ControllerReviewResult:
 def run_controller_review(
     request: ReviewRequest,
     *,
-    neutral_cwd: "pathlib.Path",
-    output_dir: "pathlib.Path",
+    neutral_cwd: pathlib.Path,
+    output_dir: pathlib.Path,
     transport_argv: tuple[str, ...],
     timeout: float = 1200.0,
 ) -> ControllerReviewResult:
@@ -936,9 +861,7 @@ def run_controller_review(
     ``runner.handler_parallel_reviewer`` route through this function so they
     cannot diverge on shape or digest handling.
     """
-    import pathlib
     import subprocess
-    import tempfile
 
     if not isinstance(request, ReviewRequest):
         raise TypeError("request must be ReviewRequest")
@@ -975,6 +898,15 @@ def run_controller_review(
     transport_text = proc.stdout
     response_path.write_text(response_text, encoding="utf-8")
     transport_path.write_text(transport_text, encoding="utf-8")
+
+    # A failed transport is not parseable review evidence. Check the process
+    # result before interpreting any stdout so a crash cannot be accepted as a
+    # malformed-but-otherwise-valid reviewer response.
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or "no output"
+        raise ReviewContractError(
+            f"review backend exited with {proc.returncode}: {detail}"
+        )
 
     response_body, receipts = parse_codex_jsonl(transport_text)
     response_path.write_text(response_body, encoding="utf-8")
@@ -1064,8 +996,8 @@ __all__ = [
     "CHECK_IDS",
     "CORRECTNESS_CHECK_IDS",
     "EVIDENCE_CHECK_IDS",
-    "ControllerReviewResult",
     "PROMPT_ID",
+    "ControllerReviewResult",
     "EvidenceArtifact",
     "EvidenceDelta",
     "EvidenceOrigin",
@@ -1078,8 +1010,8 @@ __all__ = [
     "create_review_request",
     "parse_codex_jsonl",
     "run_controller_review",
-    "validate_execution_receipts",
     "validate_evidence_origin",
+    "validate_execution_receipts",
     "validate_review_response",
     "verify_request_integrity",
 ]

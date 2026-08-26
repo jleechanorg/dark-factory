@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
-import re
+import json
 import subprocess
 
 import pytest
 
 from runner.review_cli import main
-from runner.review_controller import CHECK_IDS
 
 
 def _repo(tmp_path):
@@ -34,38 +32,15 @@ def _repo(tmp_path):
 
 
 def _valid_response(prompt: str, *, verdict: str = "pass") -> str:
-    keys = (
-        "PROMPT_ID",
-        "PROMPT_SHA256",
-        "ENVELOPE_SHA256",
-        "HEAD_SHA",
-        "TASK_SHA256",
-        "CHANGED_FILES_SHA256",
-        "EVIDENCE_MANIFEST_SHA256",
-    )
-    values = {}
-    for key in keys:
-        match = re.search(rf"^{key}: (\S+)$", prompt, re.MULTILINE)
-        assert match, f"prompt is missing required binding line: {key}"
-        values[key] = match.group(1)
-    return "\n".join(
-        [
-            *(f"{key}: {values[key]}" for key in keys),
-            f"VERDICT: {verdict}",
-            *(
-                f"{check_id}: {'pass' if verdict == 'pass' else 'fail'}"
-                for check_id in CHECK_IDS
-            ),
-            "",
-            "## Findings",
-            "None; inspected the changed implementation and callers.",
-            "## Commands Executed",
-            "`python -m pytest` — exit code 0.",
-            "## Evidence Checked",
-            "Changed files and test output.",
-            "## Caveats",
-            "None.",
-        ]
+    return json.dumps(
+        {
+            "verdict": verdict,
+            "findings": [] if verdict == "pass" else ["blocking finding"],
+            "evidence_checked": ["changed files and test output"],
+            "commands_executed": ["python -m pytest -q"],
+            "caveats": [],
+        },
+        separators=(",", ":"),
     )
 
 

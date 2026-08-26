@@ -11,7 +11,6 @@ from pathlib import Path
 import pytest
 
 from runner.review_controller import (
-    CHECK_IDS,
     ENVELOPE_SCHEMA,
     PROMPT_ID,
     EvidenceArtifact,
@@ -52,33 +51,18 @@ def _inputs() -> ReviewInputs:
 
 
 def _response(request, *, verdict: str = "pass", failed: str | None = None) -> str:
-    statuses = {
-        check_id: ("fail" if check_id == failed else "pass")
-        for check_id in CHECK_IDS
-    }
     if failed is not None:
         verdict = "fail"
-    lines = [
-        f"PROMPT_ID: {request.prompt_id}",
-        f"PROMPT_SHA256: {request.prompt_sha256}",
-        f"ENVELOPE_SHA256: {request.envelope_sha256}",
-        f"HEAD_SHA: {request.head_sha}",
-        f"TASK_SHA256: {request.task_sha256}",
-        f"CHANGED_FILES_SHA256: {request.changed_files_sha256}",
-        f"EVIDENCE_MANIFEST_SHA256: {request.evidence_manifest_sha256}",
-        f"VERDICT: {verdict}",
-        *(f"{check_id}: {statuses[check_id]}" for check_id in CHECK_IDS),
-        "",
-        "## Findings",
-        "None; inspected the changed implementation and its callers.",
-        "## Commands Executed",
-        "`python -m pytest` — exit code 0.",
-        "## Evidence Checked",
-        "Changed files and test output.",
-        "## Caveats",
-        "None.",
-    ]
-    return "\n".join(lines)
+    return json.dumps(
+        {
+            "verdict": verdict,
+            "findings": [] if failed is None else [f"failed check: {failed}"],
+            "evidence_checked": ["changed files and test output"],
+            "commands_executed": ["python -m pytest -q"],
+            "caveats": [],
+        },
+        separators=(",", ":"),
+    )
 
 
 def test_template_is_source_root_pinned_not_cwd(tmp_path, monkeypatch):
@@ -126,47 +110,20 @@ def test_static_prompt_reviews_any_target_and_executed_evidence():
     normalized = " ".join(static_text.split())
 
     required = (
-        "pr, commit, code",
-        "design document",
-        "research report",
-        "other artifact",
-        "parallel subagents",
-        "user-scope and repository-scope skills, commands, and policy instructions",
-        "active cli",
-        "user configuration and instruction directories",
-        "target repository's local configuration and instruction directories",
-        "equivalently named locations",
-        "irrelevant or superseded instructions",
-        "original design documents",
-        "goals",
-        "tenets",
-        "descriptions and claims",
-        "target content or code",
+        "exact target",
         "callers and consumers",
-        "provenance",
-        "integrity",
-        "freshness",
-        "exact target/version binding",
-        "real-versus-mock status",
-        "reproducibility",
-        "claim coverage",
-        "applicable ci and review state",
-        "applicable missing inputs or evidence",
-        "not applicable",
-        "machine `pass` only when primary evidence establishes non-applicability",
-        "n/a: <check id> — <reason>",
-        "missing applicable evidence remains `fail`",
-        "exact path, line, command, log, or artifact references",
+        "correctness",
+        "security",
+        "state-transition",
+        "boundary",
+        "regression",
+        "evidence",
+        "read-only checks",
+        "material uncertainty",
         "continue after the first finding",
+        "exactly one json object",
     )
     assert not [clause for clause in required if clause not in normalized]
-
-    forbidden_pr_only = (
-        "cross-examine pr goals",
-        "against pr description",
-        "reject prs",
-    )
-    assert not [phrase for phrase in forbidden_pr_only if phrase in normalized]
 
 
 def test_static_prompt_limits_source_head_receipts_for_derived_evidence() -> None:
@@ -174,10 +131,11 @@ def test_static_prompt_limits_source_head_receipts_for_derived_evidence() -> Non
         "## Controller-bound review envelope", 1
     )[0]
     normalized = " ".join(static_text.split())
-    assert "evidence_origin" in normalized
-    assert "source-head evidence" in normalized
-    assert "not evidence generated at the derived snapshot head" in normalized
-    assert "product changes in `snapshot_delta` beyond the declared evidence" in normalized
+    # Evidence-origin lineage remains controller-owned envelope data, not model
+    # response boilerplate. The compact static prompt still requires freshness
+    # and target binding judgments.
+    assert "fresh" in normalized
+    assert "bound to this target" in normalized
 
 
 def test_envelope_and_prompt_are_canonical_across_input_order():
@@ -301,87 +259,16 @@ def test_valid_response_requires_every_check_and_returns_digest():
     result = validate_review_response(response, request)
 
     assert result.verdict == "pass"
-    assert len(result.checks) == 23
-    assert result.status("C0") == "pass"
+    assert result.checks == ()
     assert len(result.response_sha256) == 64
 
 
-def test_strict_fail_response_is_valid_when_a_check_fails():
+def test_strict_fail_response_is_valid_with_findings():
     request = create_review_request(_inputs())
 
-    result = validate_review_response(_response(request, failed="E10"), request)
+    result = validate_review_response(_response(request, failed="evidence"), request)
 
     assert result.verdict == "fail"
-    assert result.status("E10") == "fail"
-
-
-@pytest.mark.parametrize(
-    ("field", "replacement"),
-    (
-        ("PROMPT_ID", "different-prompt"),
-        ("PROMPT_SHA256", "0" * 64),
-        ("ENVELOPE_SHA256", "1" * 64),
-        ("HEAD_SHA", "2" * 40),
-        ("TASK_SHA256", "0" * 64),
-        ("CHANGED_FILES_SHA256", "2" * 64),
-        ("EVIDENCE_MANIFEST_SHA256", "3" * 64),
-    ),
-)
-def test_response_rejects_binding_mismatch(field, replacement):
-    request = create_review_request(_inputs())
-    response = _response(request).replace(
-        f"{field}: {getattr(request, field.lower())}",
-        f"{field}: {replacement}",
-        1,
-    )
-
-    with pytest.raises(ReviewContractError, match=f"{field} binding mismatch"):
-        validate_review_response(response, request)
-
-
-def test_response_rejects_missing_and_duplicate_checklist_ids():
-    request = create_review_request(_inputs())
-    response = _response(request)
-    missing = response.replace("E13: pass\n", "", 1)
-    duplicate = response.replace("C0: pass\n", "C0: pass\nC0: pass\n", 1)
-
-    with pytest.raises(ReviewContractError, match="E13 exactly once"):
-        validate_review_response(missing, request)
-    with pytest.raises(ReviewContractError, match="C0 exactly once"):
-        validate_review_response(duplicate, request)
-
-
-@pytest.mark.parametrize("status", ("warn", "partial", "PASS", "unknown"))
-def test_response_rejects_non_strict_check_status(status):
-    request = create_review_request(_inputs())
-    response = _response(request).replace("C3: pass", f"C3: {status}", 1)
-
-    with pytest.raises(ReviewContractError, match="C3 must be lowercase pass or fail"):
-        validate_review_response(response, request)
-
-
-def test_response_rejects_verdict_checklist_contradiction():
-    request = create_review_request(_inputs())
-    response = _response(request).replace("C4: pass", "C4: fail", 1)
-
-    with pytest.raises(ReviewContractError, match="VERDICT must be fail"):
-        validate_review_response(response, request)
-
-
-def test_response_rejects_unknown_checklist_id():
-    request = create_review_request(_inputs())
-    response = _response(request) + "\nE15: pass\n"
-
-    with pytest.raises(ReviewContractError, match="unknown checklist IDs: E15"):
-        validate_review_response(response, request)
-
-
-def test_response_rejects_marker_only_pass_without_required_sections():
-    request = create_review_request(_inputs())
-    response = "\n".join(_response(request).splitlines()[: 5 + len(CHECK_IDS)])
-
-    with pytest.raises(ReviewContractError, match="response must contain"):
-        validate_review_response(response, request)
 
 
 def test_request_integrity_rejects_tampered_envelope_prompt_and_head():
