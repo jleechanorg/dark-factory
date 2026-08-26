@@ -72,8 +72,6 @@ echo "==> git-lfs $(git-lfs version | head -1)"
 # repo-local development layout for backwards compatibility with launchd.
 if [[ "$(uname -s)" == "Linux" && ( "${DARK_FACTORY_DISABLE_IMMUTABLE_ARTIFACT:-0}" != "1" || -n "${DARK_FACTORY_EXPECTED_RELEASE_SHA:-}" ) ]]; then
   ARTIFACT_ROOT="${DARK_FACTORY_INSTALL_ROOT:-${HOME}/.local/share/dark-factory}"
-  mkdir -p "${ARTIFACT_ROOT}"
-  ARTIFACT_ROOT="$(cd "${ARTIFACT_ROOT}" && pwd -P)"
   if [[ -n "${DARK_FACTORY_EXPECTED_RELEASE_SHA:-}" ]]; then
     if [[ ! "${DARK_FACTORY_EXPECTED_RELEASE_SHA}" =~ ^[0-9a-fA-F]{40}$ ]]; then
       echo "ERROR: DARK_FACTORY_EXPECTED_RELEASE_SHA must be exactly 40 hexadecimal characters: '${DARK_FACTORY_EXPECTED_RELEASE_SHA}'" >&2
@@ -101,6 +99,8 @@ if [[ "$(uname -s)" == "Linux" && ( "${DARK_FACTORY_DISABLE_IMMUTABLE_ARTIFACT:-
   else
     ARTIFACT_VERSION="$(sha256sum "${REPO_ROOT}/install.sh" | cut -c1-40)"
   fi
+  mkdir -p "${ARTIFACT_ROOT}"
+  ARTIFACT_ROOT="$(cd "${ARTIFACT_ROOT}" && pwd -P)"
   ARTIFACT_DIR="${ARTIFACT_ROOT}/releases/${ARTIFACT_VERSION}"
   if [[ "${CLEAR}" -eq 1 && -d "${ARTIFACT_DIR}" ]]; then
     echo "==> removing immutable release (${ARTIFACT_DIR})"
