@@ -70,9 +70,27 @@ echo "==> git-lfs $(git-lfs version | head -1)"
 # it is running). Snapshot the source into a versioned UV-managed release and
 # point the installed launcher at that immutable copy. macOS keeps the
 # repo-local development layout for backwards compatibility with launchd.
-if [[ "$(uname -s)" == "Linux" && "${DARK_FACTORY_DISABLE_IMMUTABLE_ARTIFACT:-0}" != "1" ]]; then
+if [[ "$(uname -s)" == "Linux" && ( "${DARK_FACTORY_DISABLE_IMMUTABLE_ARTIFACT:-0}" != "1" || -n "${DARK_FACTORY_EXPECTED_RELEASE_SHA:-}" ) ]]; then
   ARTIFACT_ROOT="${DARK_FACTORY_INSTALL_ROOT:-${HOME}/.local/share/dark-factory}"
-  if ARTIFACT_VERSION="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null)"; then
+  if [[ -n "${DARK_FACTORY_EXPECTED_RELEASE_SHA:-}" ]]; then
+    if [[ ! "${DARK_FACTORY_EXPECTED_RELEASE_SHA}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+      echo "ERROR: DARK_FACTORY_EXPECTED_RELEASE_SHA must be exactly 40 hexadecimal characters: '${DARK_FACTORY_EXPECTED_RELEASE_SHA}'" >&2
+      exit 1
+    fi
+    if ! ARTIFACT_VERSION="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null)"; then
+      echo "ERROR: expected release SHA requested (${DARK_FACTORY_EXPECTED_RELEASE_SHA}), but git HEAD is unavailable." >&2
+      exit 1
+    fi
+    if [[ "${ARTIFACT_VERSION}" != "${DARK_FACTORY_EXPECTED_RELEASE_SHA}" ]]; then
+      echo "ERROR: requested release SHA (${DARK_FACTORY_EXPECTED_RELEASE_SHA}) does not match git HEAD (${ARTIFACT_VERSION})." >&2
+      exit 1
+    fi
+    if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=normal 2>/dev/null)" ]]; then
+      echo "ERROR: refusing to publish an immutable release from a dirty Git checkout." >&2
+      echo "Commit or remove tracked/untracked changes, then rerun install.sh." >&2
+      exit 1
+    fi
+  elif ARTIFACT_VERSION="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null)"; then
     if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=normal 2>/dev/null)" ]]; then
       echo "ERROR: refusing to publish an immutable release from a dirty Git checkout." >&2
       echo "Commit or remove tracked/untracked changes, then rerun install.sh." >&2
