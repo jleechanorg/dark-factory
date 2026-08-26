@@ -6752,8 +6752,16 @@ impl Sessions for CliSessions {
         #[cfg(unix)]
         let (captured_vec, pgids_vec) = {
             let mut captured = std::collections::BTreeSet::<i32>::new();
+            let mut original_pgids = std::collections::BTreeSet::<i32>::new();
             let mut worklist: std::collections::VecDeque<i32> = std::collections::VecDeque::new();
             for pid in &pids {
+                let pgid = unsafe { libc::getpgid(*pid) };
+                if pgid <= 0 {
+                    return Err(DaemonError::Config(format!(
+                        "cannot capture process group for pane PID {pid}; refusing safe-stop"
+                    )));
+                }
+                original_pgids.insert(pgid);
                 if captured.insert(*pid) {
                     worklist.push_back(*pid);
                 }
@@ -6775,7 +6783,7 @@ impl Sessions for CliSessions {
                     "empty runtime PID closure for tmux session {tmux_name}; refusing safe-stop"
                 )));
             }
-            let mut pgids = std::collections::BTreeSet::<i32>::new();
+            let mut pgids = original_pgids;
             for pid in &captured {
                 let pgid = unsafe { libc::getpgid(*pid) };
                 if pgid > 0 {
@@ -6791,9 +6799,6 @@ impl Sessions for CliSessions {
         };
         #[cfg(not(unix))]
         let (captured_vec, pgids_vec): (Vec<i32>, Vec<i32>) = {
-            // Non-Linux: pane-leader PID set + their PGIDs only. fail-closed
-            // gates in confirm_runtime_absent_in_project reject any retained
-            // empty set so safe-stop cannot accidentally proceed on macOS.
             (pids.clone(), vec![])
         };
         self.captured_pane_pids.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id.0.clone(), captured_vec);
@@ -6853,8 +6858,6 @@ impl Sessions for CliSessions {
         }
         #[cfg(not(unix))]
         {
-            // Non-unix fallback retains the pane-leader set; if any PIDs
-            // remain in the captured set, fail closed.
             if !pids.is_empty() {
                 return Err(DaemonError::Config(format!(
                     "non-unix host cannot probe {} retained PIDs for {}; refusing safe-stop",
@@ -6963,14 +6966,8 @@ impl Sessions for CliSessions {
         file.sync_all().map_err(|e| DaemonError::Config(format!("sync temp archive: {e}")))?;
         drop(file);
 
-        // Linux. EEXIST is the legitimate "another publisher already archived
-        // this session" signal — recover by validating the existing archive.
         match atomic_noreplace_rename(&temp_archive, &archive_target) {
             Ok(()) => {
-                // Fsync the renamed archive file (data durability) and the
-                // archive directory (entry durability) before verifying
-                // content. ENOENT means the entry vanished mid-flight; the
-                // dir fsync still durably persists whatever rename succeeded.
                 if let Ok(f) = std::fs::File::open(&archive_target) {
                     let _ = f.sync_all();
                 }
@@ -6986,9 +6983,6 @@ impl Sessions for CliSessions {
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // EEXIST: drop our staged temp and validate the existing
-                // killed archive (status=killed + expected worktree match)
-                // before unlinking the active session_file.
                 let _ = std::fs::remove_file(&temp_archive);
                 let existing = std::fs::read_to_string(&archive_target).map_err(|e| DaemonError::Config(format!("read existing archive {}: {e}", archive_target.display())))?;
                 let status_ok = existing.lines().any(|l| l.trim() == "status=killed");
