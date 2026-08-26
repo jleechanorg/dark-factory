@@ -178,6 +178,27 @@ def _path_is_symlink(path: Path) -> bool:
         return True
 
 
+def _reject_symlinked_workspace_components(path: Path) -> None:
+    """Reject symlink components below the filesystem's absolute root.
+
+    Some platforms expose ordinary temporary paths through a root-level
+    redirect (for example, macOS ``/var`` -> ``/private/var``). Those absolute
+    ancestors are legitimate; a user-controlled alias below one is not.
+    """
+    absolute = Path(os.path.abspath(path))
+    anchor = Path(absolute.anchor)
+    components = absolute.relative_to(anchor).parts
+    current = anchor
+    for index, component in enumerate(components):
+        current /= component
+        if index == 0:
+            continue
+        if _path_is_symlink(current):
+            raise ReviewContractError(
+                f"workspace_path contains a symlink component: {path}"
+            )
+
+
 def _resolve_strict(path: Path) -> Path:
     """Resolve ``path`` strictly, rejecting non-existent targets."""
     try:
@@ -214,6 +235,7 @@ def validate_immutable_target(
         raise ReviewContractError(
             f"workspace_path must not be a symlink: {raw_workspace}"
         )
+    _reject_symlinked_workspace_components(raw_workspace)
     workspace = _resolve_strict(raw_workspace)
     if _path_is_symlink(workspace) and workspace != raw_workspace:
         # Defensive: a parent component was a symlink. Treat the final target

@@ -113,6 +113,14 @@ class WorkspacePathValidationTests(unittest.TestCase):
         with self.assertRaises(ReviewContractError):
             validate_immutable_target(inputs, holdout_roots=self.holdouts)
 
+    def test_workspace_with_symlinked_parent_rejected(self) -> None:
+        alias = self.tmp / "workspace_alias"
+        os.symlink(self.tmp, alias, target_is_directory=True)
+        aliased_repo = alias / self.repo.name
+        inputs = _base_inputs(aliased_repo, self.holdouts)
+        with self.assertRaises(ReviewContractError):
+            validate_immutable_target(inputs, holdout_roots=self.holdouts)
+
     def test_workspace_inside_holdout_rejected(self) -> None:
         inside = self.tmp / "holdout" / "scenarios"
         inside.mkdir()
