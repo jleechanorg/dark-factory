@@ -14963,11 +14963,8 @@ fn test_non_default_repository_branch_collision_telemetry_attribution() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
-/// Bead jleechan-w0r4: verify that when an adopted remediation session transitions
-/// to idle (finished prompt execution), the daemon reaps the worker session via
-/// stop() and promotes the bead to ATTESTED, clearing the session handle.
 #[test]
-fn test_dispatched_adopted_idle_session_reaped_and_promoted() {
+fn test_dispatched_adopted_idle_without_worktree_preserves_session() {
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
     let mut sessions = StopFailsOnSecond::new(FakeSessions::new());
@@ -15046,19 +15043,17 @@ fn test_dispatched_adopted_idle_session_reaped_and_promoted() {
     assert_eq!(summary.beads_parked_human_held, 0);
 
     let o = store.load("bead-w0r4").unwrap().unwrap();
+    assert_eq!(o.state, OverlayState::Dispatched);
     assert_eq!(
-        o.state,
-        OverlayState::Attested,
-        "idle adopted session must promote to ATTESTED"
+        o.session_id.as_deref(),
+        Some("wa-9999"),
+        "missing worktree must preserve the session handle"
     );
-    assert_eq!(
-        o.session_id, None,
-        "session handle must be cleared after reaping"
-    );
-    assert!(
-        sessions.stop_succeeded.get(),
-        "sessions.stop() must be called to reap idle worker"
-    );
+    assert!(!sessions.stop_succeeded.get());
+    assert!(!telemetry_log.exists() || {
+        let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+        !log.contains("BEAD_SESSION_KILLED") && !log.contains("WORKTREE_")
+    });
 
     let _ = std::fs::remove_file(&telemetry_log);
 }

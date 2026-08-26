@@ -7007,9 +7007,6 @@ impl Sessions for CliSessions {
             }
         }
 
-        // Only after the archive has been published (or validated as already
-        // present) do we touch the active session_file. Parent directory
-        // fsyncs are preserved for crash safety.
         std::fs::remove_file(&session_file).map_err(|e| DaemonError::Config(format!("failed to remove active session file {}: {e}", session_file.display())))?;
         if let Some(parent) = session_file.parent() {
             if let Ok(dir) = std::fs::File::open(parent) { let _ = dir.sync_all(); }

@@ -750,7 +750,6 @@ pub struct WorktreeHeadAncestry {
     pub contains_ancestor: bool,
 }
 
-/// Authoritative runtime identity resolved for an AO worker session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRuntimeIdentity {
     pub session_id: SessionId,
@@ -788,12 +787,9 @@ pub trait Sessions {
         let _ = project;
         self.stop(id)
     }
-    /// Perform a runtime-only stop terminating the worker process while
-    /// preserving its worktree and branch.
     fn stop_runtime_in_project(&self, project: &str, id: &SessionId) -> Result<(), DaemonError> {
         self.stop_in_project(project, id)
     }
-    /// Positively confirm the exact runtime/process is absent.
     fn confirm_runtime_absent_in_project(
         &self,
         project: &str,
@@ -802,9 +798,6 @@ pub trait Sessions {
         let _ = (project, id);
         Ok(true)
     }
-    /// Atomically archive AO metadata after worktree quarantine, updating
-    /// status to killed and worktree to quarantine path without invoking
-    /// destructive AO session kill.
     fn archive_session_metadata_in_project(
         &self,
         project: &str,
@@ -815,7 +808,6 @@ pub trait Sessions {
         let _ = (project, id, quarantined_worktree, dirty_hash);
         Ok(())
     }
-    /// Resolve authoritative AO runtime identity for `id` within `project`.
     fn resolve_runtime_in_project(
         &self,
         project: &str,

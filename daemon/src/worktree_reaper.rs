@@ -113,22 +113,11 @@ fn git_command() -> Command {
     }
 }
 
-fn provenance_hash(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
-}
+fn provenance_hash(bytes: &[u8]) -> String { let mut hasher = Sha256::new(); hasher.update(bytes); format!("{:x}", hasher.finalize()) }
 
 fn manifest_value(record: &serde_json::Value, state: &str, reconciled: bool) -> serde_json::Value {
-    let mut value = record.clone();
-    let fields = value
-        .as_object_mut()
-        .expect("quarantine record is an object");
-    fields.insert("state".into(), serde_json::json!(state));
-    if reconciled {
-        fields.insert("reconciled".into(), serde_json::json!(true));
-    }
-    value
+    let mut value = record.clone(); let fields = value.as_object_mut().expect("quarantine record is an object");
+    fields.insert("state".into(), serde_json::json!(state)); if reconciled { fields.insert("reconciled".into(), serde_json::json!(true)); } value
 }
 
 #[cfg(unix)]
@@ -205,7 +194,6 @@ fn git_status_bytes(path: &Path) -> Result<Vec<u8>, DaemonError> {
 fn dirty_content_hash(path: &Path) -> Result<String, DaemonError> {
     let mut hasher = Sha256::new();
 
-    // 1. Unstaged diff
     let unstaged = git_command()
         .args([
             "-C",
@@ -231,7 +219,6 @@ fn dirty_content_hash(path: &Path) -> Result<String, DaemonError> {
     hasher.update(b"domain:unstaged_diff\0");
     hasher.update(&unstaged.stdout);
 
-    // 2. Cached / staged diff
     let staged = git_command()
         .args([
             "-C",
@@ -258,7 +245,6 @@ fn dirty_content_hash(path: &Path) -> Result<String, DaemonError> {
     hasher.update(b"domain:staged_diff\0");
     hasher.update(&staged.stdout);
 
-    // 3. Untracked entries
     let untracked = git_command()
         .args([
             "-C",
@@ -283,7 +269,6 @@ fn dirty_content_hash(path: &Path) -> Result<String, DaemonError> {
         )));
     }
 
-    // 4. Ignored entries
     let ignored = git_command()
         .args([
             "-C",
@@ -723,7 +708,6 @@ fn rename_into_directory(
         }
         return Err(err);
     }
-    // Dual fsync: renamed file (data durability) + parent directory (entry durability).
     sync_renamed_file(parent, destination_name.to_str().unwrap_or_default())?;
     sync_directory(parent)?;
     Ok(())
@@ -741,8 +725,6 @@ fn sync_renamed_file(parent: &DirectoryFd, name: &str) -> std::io::Result<()> {
     };
     if fd < 0 {
         let err = std::io::Error::last_os_error();
-        // ENOENT after a successful renameat2 means the entry vanished mid-flight;
-        // the directory fsync still durably persists the rename, so this is non-fatal.
         if err.raw_os_error() == Some(libc::ENOENT) {
             return Ok(());
         }
@@ -1050,11 +1032,6 @@ fn quarantine_worktree_inner(
                 ))
             })?;
         }
-        // A cross-directory rename mutates both parent directories. Persist
-        // the source-name removal before recording the move as durable; a
-        // destination-only fsync can otherwise resurrect the old worktree
-        // name after a crash while leaving the quarantine copy visible.
-        // On failure the prepared manifest remains for startup reconciliation.
         sync_directory(&root_fd).map_err(|e| {
             DaemonError::Config(format!(
                 "worktree reaper: sync worktree root {} after move: {e}",
@@ -1698,9 +1675,14 @@ pub fn execute_safe_stop_and_quarantine(
         context.branch = identity.branch;
     }
 
-    let cfg_wt = cfg.agent_worktree_path(repo, &session_id.0);
-    if let Some(cfg_wt) = cfg_wt.as_ref() {
-        if !is_plain_directory(cfg_wt).unwrap_or(false) {
+    let cfg_wt = cfg.agent_worktree_path(repo, &session_id.0).ok_or_else(|| {
+        DaemonError::Config(format!(
+            "configured worktree path missing for session {} in repo {repo}; refusing safe-stop",
+            session_id.0
+        ))
+    })?;
+    {
+        if !is_plain_directory(&cfg_wt).unwrap_or(false) {
             let ao_wt = identity.worktree_path.as_deref().ok_or_else(|| DaemonError::Config(format!(
                 "AO metadata worktree_path missing for session {} in project {ao_project}; refusing recovery",
                 session_id.0
@@ -1735,7 +1717,7 @@ pub fn execute_safe_stop_and_quarantine(
                 session_id.0
             ))
         })?;
-        let cfg_canon = std::fs::canonicalize(cfg_wt).map_err(|e| {
+        let cfg_canon = std::fs::canonicalize(&cfg_wt).map_err(|e| {
             DaemonError::Config(format!(
                 "canonicalize configured worktree {} failed for session {} in project {ao_project}: {e}; refusing safe-stop",
                 cfg_wt.display(),
@@ -1770,11 +1752,6 @@ pub fn execute_safe_stop_and_quarantine(
             "AO status probe failed for session {}: {e:?}", session_id.0
         ))),
     }
-    let Some(cfg_wt) = cfg_wt else {
-        sessions.archive_session_metadata_in_project(ao_project, session_id, None, None)?;
-        return Ok(SafeStopOutcome::NoWorktree);
-    };
-
     let path = cfg_wt;
     let root = cfg
         .agent_worktree_root_for_repo(repo)
@@ -2045,6 +2022,44 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_preserves_prepared_provenance() {
+        let root = std::env::temp_dir().join(format!("afd_reconcile_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("owner/repo")).unwrap();
+        let q = test_recovery_root(&root);
+        fs::create_dir_all(&q).unwrap();
+        init_git_worktree(&q.join("prepared"));
+        fs::write(q.join("prepared.json"), serde_json::json!({
+            "state": "prepared", "agent_id": "wa", "reason": "park_transition",
+            "bead_id": "bead", "session_id": "session", "branch": "fix/x",
+            "branch_hash": "branch-hash", "overlay_hash": "overlay-hash",
+            "dirty_hash": "dirty-hash", "original_path": "/worktrees/wa"
+        }).to_string() + "\n").unwrap();
+        reconcile_quarantine(&root.join("owner/repo")).unwrap();
+        let body = fs::read_to_string(q.join("prepared.json")).unwrap();
+        let record: serde_json::Value = body.lines().last().map(|l| serde_json::from_str(l).unwrap()).unwrap();
+        assert_eq!(record["state"], "moved");
+        assert_eq!(record["reason"], "park_transition");
+        assert_eq!(record["dirty_hash"], "dirty-hash");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dirty_hash_nonregular_entries_return_promptly() {
+        let root = std::env::temp_dir().join(format!("afd_hash_nonregular_{}", std::process::id())); let _ = fs::remove_dir_all(&root); init_git_worktree(&root);
+        let fifo = root.join("test.fifo");
+        let c_path = CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0);
+        let socket = std::os::unix::net::UnixListener::bind(root.join("test.sock")).unwrap();
+        let start = std::time::Instant::now();
+        assert!(!dirty_content_hash(&root).unwrap().is_empty());
+        assert!(start.elapsed().as_millis() < 500);
+        drop(socket); let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn reap_uses_git_worktree_move_for_dirty_linked_worktree() {
         let root = std::env::temp_dir().join(format!("afd_reaper_linked_{}", std::process::id()));
@@ -2275,18 +2290,13 @@ mod tests {
         init_linked_worktree(&repo, &target);
         let destination = quarantine.join("df-crash-raw");
         fs::rename(&target, &destination).unwrap();
-        fs::write(
-            quarantine.join("df-crash-raw.json"),
-            serde_json::json!({
-                "state": "prepared",
-                "agent_id": "df-crash",
-                "original_path": target.display().to_string(),
-                "quarantined_path": destination.display().to_string(),
-            })
-            .to_string()
-                + "\n",
-        )
-        .unwrap();
+        fs::write(quarantine.join("df-crash-raw.json"), serde_json::json!({
+            "state": "prepared", "reason": "park_transition", "bead_id": "bead",
+            "session_id": "session", "project": "owner/repo", "branch": "fix/x",
+            "branch_hash": "branch-hash", "overlay_hash": "overlay-hash", "dirty_hash": "dirty-hash",
+            "agent_id": "df-crash", "original_path": target.display().to_string(),
+            "quarantined_path": destination.display().to_string(),
+        }).to_string() + "\n").unwrap();
 
         let report = sweep(&cfg, "owner/repo", now_epoch_secs(), &InactiveProbe).unwrap();
         assert_eq!(report.total_worktrees, 0);
@@ -2304,7 +2314,7 @@ mod tests {
             "reconciled linked worktree must be usable"
         );
         let manifest = fs::read_to_string(quarantine.join("df-crash-raw.json")).unwrap();
-        assert!(manifest.contains("\"state\":\"moved\""));
+        for (key, value) in [("state", "moved"), ("reason", "park_transition"), ("bead_id", "bead"), ("session_id", "session"), ("project", "owner/repo"), ("branch", "fix/x"), ("branch_hash", "branch-hash"), ("overlay_hash", "overlay-hash"), ("dirty_hash", "dirty-hash")] { assert!(manifest.contains(&format!("\"{key}\":\"{value}\""))); }
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -2436,7 +2446,6 @@ mod tests {
 
         let hash1 = dirty_content_hash(&wt).unwrap();
 
-        // Mutate the outside file content
         fs::write(&outside_file, "secret-modified-different-bytes").unwrap();
         let hash2 = dirty_content_hash(&wt).unwrap();
 
