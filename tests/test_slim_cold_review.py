@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from test_review_controller import _inputs
 
 from runner.review_controller import (
     CHECK_IDS,
+    ExecutionReceipt,
     ReviewContractError,
     create_review_request,
     run_controller_review,
+    validate_execution_receipts,
     validate_review_response,
 )
 
@@ -60,6 +63,72 @@ def test_compact_response_is_strict_json_with_empty_checks_compatibility() -> No
     assert result.verdict == "pass"
     assert result.checks == ()
     assert len(result.response_sha256) == 64
+
+
+def test_pass_requires_meaningful_evidence_and_commands() -> None:
+    request = create_review_request(_inputs())
+    response = _compact_response(evidence_checked=[], commands_executed=[])
+    with pytest.raises(ReviewContractError, match="pass requires"):
+        validate_review_response(response, request)
+
+
+def test_pass_requires_a_captured_successful_command_receipt() -> None:
+    request = create_review_request(_inputs())
+    validated = validate_review_response(_compact_response(), request)
+    with pytest.raises(ReviewContractError, match="successful command receipt"):
+        validate_execution_receipts((), validated)
+
+
+def test_pass_rejects_commands_not_matching_captured_receipts() -> None:
+    request = create_review_request(_inputs())
+    validated = validate_review_response(_compact_response(), request)
+    receipt = ExecutionReceipt(
+        command="different command",
+        exit_code=0,
+        output_sha256="0" * 64,
+    )
+    with pytest.raises(ReviewContractError, match="commands_executed"):
+        validate_execution_receipts((receipt,), validated)
+
+
+def test_controller_acceptance_rejects_pass_without_captured_receipt(monkeypatch) -> None:
+    from runner.handler_core import Result
+    from runner.handler_parallel_reviewer import _contract_adjusted_result
+
+    request = create_review_request(_inputs())
+    monkeypatch.setattr(
+        "runner.handler_parallel_reviewer._verify_controller_workspace",
+        lambda ctx, request: None,
+    )
+    result = _contract_adjusted_result(
+        Result(outcome="success", output=_compact_response()),
+        request,
+        object(),
+        lane="primary",
+    )
+    assert result.outcome == "failure"
+    assert "successful command receipt" in result.metadata["review_contract_gap"]
+
+
+def test_fail_response_remains_valid_without_evidence_or_receipts() -> None:
+    request = create_review_request(_inputs())
+    validated = validate_review_response(
+        _compact_response(
+            verdict="fail",
+            findings=["material uncertainty"],
+            evidence_checked=[],
+            commands_executed=[],
+        ),
+        request,
+    )
+    validate_execution_receipts((), validated)
+
+
+def test_two_node_controller_requires_receipt() -> None:
+    from runner.parser import parse
+
+    graph = parse(Path(__file__).parents[1] / "pipelines/slim/two_node.dot")
+    assert graph.nodes["cold_reviewer"].attrs.get("receipt_required") == "true"
 
 
 @pytest.mark.parametrize(

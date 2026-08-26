@@ -440,11 +440,12 @@ def test_codex_jsonl_extracts_final_response_and_command_receipts():
     assert len(receipts[0].output_sha256) == 64
 
 
-def test_pass_does_not_require_a_command_receipt():
+def test_pass_requires_a_command_receipt():
     request = create_review_request(_inputs())
     validated = validate_review_response(_response(request), request)
 
-    validate_execution_receipts((), validated)
+    with pytest.raises(ReviewContractError, match="successful command receipt"):
+        validate_execution_receipts((), validated)
 
 
 def test_execution_receipts_reject_bad_output_digest():
@@ -471,7 +472,7 @@ def test_command_shape_boundaries_do_not_depend_on_regex_classification():
     validated = validate_review_response(_response(request), request)
     receipts = (
         ExecutionReceipt(
-            command="pytest --version",
+            command="python -m pytest -q",
             exit_code=0,
             output_sha256="0" * 64,
         ),
@@ -528,7 +529,20 @@ def test_run_controller_review_refuses_pass_under_iteration_stub(monkeypatch, tm
 
     request = create_review_request(_inputs())
     response = _response(request)  # default verdict="pass"
-    raw_jsonl = json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": response}})
+    raw_jsonl = "\n".join(
+        (
+            json.dumps({
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": "python -m pytest -q",
+                    "exit_code": 0,
+                    "aggregated_output": "1 passed",
+                },
+            }),
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": response}}),
+        )
+    )
 
     class _FakeProc:
         returncode = 0
@@ -557,7 +571,20 @@ def test_run_controller_review_refuses_pass_under_fake_llm(monkeypatch, tmp_path
 
     request = create_review_request(_inputs())
     response = _response(request)
-    raw_jsonl = json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": response}})
+    raw_jsonl = "\n".join(
+        (
+            json.dumps({
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": "python -m pytest -q",
+                    "exit_code": 0,
+                    "aggregated_output": "1 passed",
+                },
+            }),
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": response}}),
+        )
+    )
 
     class _FakeProc:
         returncode = 0
@@ -586,7 +613,20 @@ def test_run_controller_review_allows_pass_without_stub_env(monkeypatch, tmp_pat
 
     request = create_review_request(_inputs())
     response = _response(request)
-    raw_jsonl = json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": response}})
+    raw_jsonl = "\n".join(
+        (
+            json.dumps({
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": "python -m pytest -q",
+                    "exit_code": 0,
+                    "aggregated_output": "1 passed",
+                },
+            }),
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": response}}),
+        )
+    )
 
     class _FakeProc:
         returncode = 0

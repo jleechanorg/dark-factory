@@ -1,6 +1,6 @@
 # Slim Cold-Review Fallback Design
 
-**Date:** 2026-08-26  
+**Date:** 2026-08-26
 **Status:** Implemented on `feat/slim-cold-review-prompt-luna`
 
 ## Intent
@@ -28,6 +28,13 @@ Base64 envelope, repository/base/head/tree, changed-file and evidence digests,
 workspace cleanliness, and captured command-output hashes. `ValidatedReview`
 continues exposing `checks`, but it is always the empty tuple for compatibility
 with external receipt consumers.
+
+For a `pass`, `evidence_checked` and `commands_executed` must contain
+non-empty strings. The controller acceptance path also requires at least one
+captured command receipt with exit code `0` and compares the sorted reported
+command strings with the sorted captured command strings. A `fail` remains
+valid without evidence or receipts so missing proof can itself be reported as
+the blocking result.
 
 ## Failure behavior
 

@@ -27,3 +27,12 @@
   `tests/test_review_cli.py`: 45 passed.
 - Immutable-target, graph-controller, prompt-pinning consumers: 33 passed.
 - Parallel reviewer and verdict consumers: 44 passed.
+
+## Follow-up hardening
+
+The exact-head review identified that a pass could still carry empty evidence
+arrays and no captured command. A second RED cycle added regressions for empty
+passes, missing successful receipts, command/receipt mismatches, and the
+controller acceptance path, then made pass validation require non-empty typed
+evidence plus exact captured-command correspondence. The slim default graph
+now explicitly sets `receipt_required="true"` on `cold_reviewer`.

@@ -140,6 +140,7 @@ class ValidatedReview:
     verdict: Literal["pass", "fail"]
     checks: tuple[tuple[str, Literal["pass", "fail"]], ...]
     response_sha256: str
+    commands_executed: tuple[str, ...] = ()
 
     def status(self, check_id: str) -> Literal["pass", "fail"]:
         """Return one validated checklist status by ID."""
@@ -745,10 +746,21 @@ def validate_review_response(
             raise ReviewContractError(f"review response field {key} must be an array")
     if verdict not in ("pass", "fail"):
         raise ReviewContractError("verdict must be lowercase pass or fail")
+    commands_executed = tuple(payload["commands_executed"])
+    if verdict == "pass":
+        for key in ("evidence_checked", "commands_executed"):
+            values = payload[key]
+            if not values or any(
+                not isinstance(value, str) or not value.strip() for value in values
+            ):
+                raise ReviewContractError(
+                    f"pass requires meaningful {key} entries"
+                )
     return ValidatedReview(
         verdict=verdict,
         checks=(),
         response_sha256=_sha256(response.encode("utf-8")),
+        commands_executed=commands_executed,
     )
 
 
@@ -821,8 +833,18 @@ def validate_execution_receipts(
             raise ReviewContractError(
                 f"command receipt has invalid output digest: {receipt.command}"
             )
-    if not receipts:
+    if review.verdict != "pass":
         return
+    if not receipts or not any(receipt.exit_code == 0 for receipt in receipts):
+        raise ReviewContractError(
+            "pass requires at least one successful command receipt"
+        )
+    reported = tuple(sorted(review.commands_executed))
+    captured = tuple(sorted(receipt.command for receipt in receipts))
+    if reported != captured:
+        raise ReviewContractError(
+            "commands_executed does not match captured command receipts"
+        )
 
 
 @dataclass(frozen=True, slots=True)
