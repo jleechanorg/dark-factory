@@ -480,6 +480,9 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
     workdir, expected_sha, evidence_origin = _controller_snapshot(
         source_workdir, expected_sha, declared_evidence
     )
+    # The engine owns final cleanup. Record the exact generated snapshot path
+    # immediately so setup failures after snapshot creation cannot leak it.
+    ctx.state["_controller_review_snapshot_path"] = str(workdir)
     base_sha = _git_output(workdir, "merge-base", "origin/main", expected_sha)
     tree_sha = _git_output(workdir, "rev-parse", f"{expected_sha}^{{tree}}")
     changed_text = _git_output(

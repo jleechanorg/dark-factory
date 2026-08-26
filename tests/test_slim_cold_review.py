@@ -370,6 +370,83 @@ def test_two_node_controller_requires_receipt() -> None:
 
 
 @pytest.mark.parametrize(
+    "terminal_case", ("success", "review_failure", "exit_repin_failure", "exhausted")
+)
+def test_engine_finalization_removes_controller_snapshot(
+    tmp_path, monkeypatch, terminal_case
+) -> None:
+    from test_review_cli import _repo
+
+    import runner.engine_run as engine_run
+
+    run = engine_run.run
+    from runner.handler_core import Context, Result
+    from runner.handler_parallel_reviewer import _controller_snapshot
+    from runner.parser import Edge, Graph, Node
+
+    repo, base, head = _repo(tmp_path)
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    snapshot, _, _ = _controller_snapshot(repo, head, ())
+    tree = subprocess.check_output(
+        ["git", "-C", str(snapshot), "rev-parse", "HEAD^{tree}"],
+        text=True,
+    ).strip()
+    binding = json.dumps(
+        {"workspace_path": str(snapshot), "head_sha": head, "tree_sha": tree},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    state = {
+        "_controller_review_snapshot_path": str(snapshot),
+        "_verified_review_target_required": "true",
+        "_verified_review_target": binding,
+    }
+    nodes = {
+        "start": Node(name="start", attrs={"type": "start"}),
+        "exit": Node(name="exit", attrs={"type": "exit"}),
+    }
+    edges = [Edge(src="start", dst="exit", attrs={})]
+    if terminal_case == "review_failure":
+        nodes["review"] = Node(name="review", attrs={"type": "codergen"})
+        edges = [
+            Edge(src="start", dst="review", attrs={}),
+            Edge(src="review", dst="exit", attrs={"condition": "outcome=failure"}),
+        ]
+        real_resolve = engine_run.resolve
+
+        def resolve(node):
+            if node.name == "review":
+                return lambda _node, _ctx: Result(
+                    outcome="failure", output="review failure"
+                )
+            return real_resolve(node)
+
+        monkeypatch.setattr("runner.engine_run.resolve", resolve)
+    elif terminal_case == "exit_repin_failure":
+        subprocess.run(
+            ["git", "-C", str(snapshot), "checkout", "--quiet", "--detach", base],
+            check=True,
+        )
+    elif terminal_case == "exhausted":
+        edges = [Edge(src="start", dst="start", attrs={})]
+
+    graph = Graph(name="snapshot-cleanup", goal="", nodes=nodes, edges=edges)
+    history = run(
+        graph,
+        Context(goal="", workdir=repo, state=state),
+        max_steps=1 if terminal_case == "exhausted" else 10,
+    )
+
+    assert history
+    assert not snapshot.exists()
+    worktrees = subprocess.check_output(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        text=True,
+    )
+    assert str(snapshot) not in worktrees
+
+
+@pytest.mark.parametrize(
     "payload",
     (
         {"verdict": "pass", "findings": [], "evidence_checked": [], "commands_executed": []},

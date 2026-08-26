@@ -175,6 +175,67 @@ def _auto_wip_commit_on_exhaustion(ctx: "Context", reason: str) -> None:
         return
 
 
+def _cleanup_controller_snapshot(ctx: "Context") -> None:
+    """Remove the exact controller snapshot after the engine owns its run end.
+
+    Controller snapshots are detached worktrees created beneath the dedicated
+    snapshot root. Keep them alive through review and exit re-pin, then remove
+    only the exact validated path recorded by the controller handler.
+    """
+    raw_path = ctx.state.pop("_controller_review_snapshot_path", None)
+    if not isinstance(raw_path, str) or not raw_path:
+        return
+    try:
+        snapshot = pathlib.Path(raw_path)
+        root = pathlib.Path.home() / ".dark-factory" / "controller-snapshots"
+        if (
+            not snapshot.is_absolute()
+            or snapshot.parent != root
+            or not snapshot.name.startswith("snapshot-")
+            or snapshot.is_symlink()
+            or not snapshot.is_dir()
+        ):
+            return
+        if snapshot.resolve(strict=False).parent != root.resolve(strict=False):
+            return
+        source = pathlib.Path(getattr(ctx, "workdir", "") or "")
+        if not source.is_dir():
+            return
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(source),
+                "worktree",
+                "remove",
+                "--force",
+                str(snapshot),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(source),
+                "worktree",
+                "prune",
+                "--expire",
+                "now",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # Cleanup is best-effort and must never mask the run's terminal result.
+        return
+
+
 def _extract_coder_handoff(text: str) -> str:
     """Extract ## Coder Handoff section from reviewer output."""
     if not text:
@@ -1160,5 +1221,6 @@ def run(
                 log.close()
             except OSError:
                 pass
+        _cleanup_controller_snapshot(ctx)
 
     return history
