@@ -3271,6 +3271,134 @@ pub struct CliSessions {
     spawned_session_worktrees: std::sync::Mutex<
         std::collections::HashMap<String, (String, std::path::PathBuf)>,
     >,
+    captured_pane_pids: std::sync::Mutex<std::collections::HashMap<String, Vec<i32>>>,
+    captured_pane_pgids: std::sync::Mutex<std::collections::HashMap<String, Vec<i32>>>,
+    resolved_tmux_names: std::sync::Mutex<std::collections::HashMap<String, String>>,
+}
+
+#[cfg(unix)]
+fn atomic_noreplace_rename(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        const RENAME_NOREPLACE: libc::c_uint = 1;
+        let src_c = CString::new(src.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "src path contains NUL"))?;
+        let dst_c = CString::new(dst.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "dst path contains NUL"))?;
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                src_c.as_ptr(),
+                libc::AT_FDCWD,
+                dst_c.as_ptr(),
+                RENAME_NOREPLACE,
+            )
+        };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if std::path::Path::new(dst).exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "rename destination already exists",
+            ));
+        }
+        std::fs::rename(src, dst)
+    }
+}
+
+#[cfg(unix)]
+fn pgid_members(pid: i32) -> Vec<i32> {
+    #[cfg(target_os = "linux")]
+    {
+        let pgid = unsafe { libc::getpgid(pid) };
+        if pgid < 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let entries = match std::fs::read_dir("/proc") {
+            Ok(e) => e,
+            Err(_) => return Vec::new(),
+        };
+        for entry in entries.flatten() {
+            let name = match entry.file_name().into_string() {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let candidate: i32 = match name.parse() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            let stat = match std::fs::read_to_string(format!("/proc/{candidate}/stat")) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let Some(close) = stat.rfind(')') else { continue; };
+            let tail = &stat[close + 1..];
+            let mut iter = tail.split_whitespace();
+            iter.next();
+            iter.next();
+            if let Some(pgrp_tok) = iter.next() {
+                if let Ok(pgrp) = pgrp_tok.parse::<i32>() {
+                    if pgrp == pgid {
+                        out.push(candidate);
+                    }
+                }
+            }
+        }
+        out
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        Vec::new()
+    }
+}
+
+#[cfg(unix)]
+fn collect_descendants(root: i32) -> Vec<i32> {
+    let mut out = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut stack = vec![root];
+    while let Some(pid) = stack.pop() {
+        if !visited.insert(pid) {
+            continue;
+        }
+        for child in read_proc_children(pid) {
+            if !visited.contains(&child) {
+                stack.push(child);
+                out.push(child);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn read_proc_children(pid: i32) -> Vec<i32> {
+    let path = format!("/proc/{pid}/task/{pid}/children");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    content
+        .split_whitespace()
+        .filter_map(|tok| tok.parse::<i32>().ok())
+        .collect()
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn read_proc_children(_pid: i32) -> Vec<i32> {
+    Vec::new()
 }
 
 impl CliSessions {
@@ -3284,7 +3412,77 @@ impl CliSessions {
             agent: agent.to_string(),
             spawned_worktrees: std::sync::Mutex::new(std::collections::HashMap::new()),
             spawned_session_worktrees: std::sync::Mutex::new(std::collections::HashMap::new()),
+            captured_pane_pids: std::sync::Mutex::new(std::collections::HashMap::new()),
+            captured_pane_pgids: std::sync::Mutex::new(std::collections::HashMap::new()),
+            resolved_tmux_names: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    fn locate_ao_session_file(project: &str, sid: &str) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let base = std::env::var_os("AO_HOME").map(std::path::PathBuf::from).or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".agent-orchestrator"))
+        })?;
+        if !base.is_dir() { return None; }
+        for entry in std::fs::read_dir(&base).ok()?.flatten() {
+            let path = entry.path();
+            if !path.is_dir() { continue; }
+            let dir_name = path.file_name()?.to_str()?;
+            if dir_name.ends_with(&format!("-{project}")) || dir_name == project {
+                let session_file = path.join("sessions").join(sid);
+                if session_file.is_file() { return Some((path, session_file)); }
+            }
+        }
+        None
+    }
+
+    fn locate_ao_archive_file(project: &str, sid: &str) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let base = std::env::var_os("AO_HOME").map(std::path::PathBuf::from).or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".agent-orchestrator"))
+        })?;
+        for entry in std::fs::read_dir(base).ok()?.flatten() {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?;
+            if path.is_dir() && (name.ends_with(&format!("-{project}")) || name == project) {
+                let archive = path.join("sessions").join("archive").join(sid);
+                if archive.is_file() { return Some((path, archive)); }
+            }
+        }
+        None
+    }
+
+    fn parse_and_validate_session_metadata(project: &str, session_file: &std::path::Path) -> Result<crate::tools::SessionRuntimeIdentity, DaemonError> {
+        let content = std::fs::read_to_string(session_file).map_err(|e| DaemonError::Config(format!("read AO metadata {}: {e}", session_file.display())))?;
+        let (mut meta_proj, mut meta_branch, mut meta_wt, mut meta_tmux, mut meta_handle) = (None, None, None, None, None);
+        for line in content.lines() {
+            if let Some((k, v)) = line.trim().split_once('=') {
+                match k.trim() {
+                    "project" => meta_proj = Some(v.trim().to_string()),
+                    "branch" => meta_branch = Some(v.trim().to_string()),
+                    "worktree" => meta_wt = Some(std::path::PathBuf::from(v.trim())),
+                    "tmuxName" => meta_tmux = Some(v.trim().to_string()),
+                    "runtimeHandle" => meta_handle = serde_json::from_str::<serde_json::Value>(v.trim()).ok(),
+                    _ => {}
+                }
+            }
+        }
+        let meta_proj = meta_proj.ok_or_else(|| DaemonError::Config("missing project".into()))?;
+        if meta_proj != project { return Err(DaemonError::Config(format!("project mismatch: expected {project}, got {meta_proj}"))); }
+        let tmux_name = meta_tmux.ok_or_else(|| DaemonError::Config("missing tmuxName".into()))?;
+        let runtime_handle = meta_handle.ok_or_else(|| DaemonError::Config("missing runtimeHandle".into()))?;
+        if runtime_handle.get("runtimeName").and_then(|v| v.as_str()) != Some("tmux") {
+            return Err(DaemonError::Config("runtimeName is not tmux".into()));
+        }
+        if runtime_handle.get("id").and_then(|v| v.as_str()) != Some(&tmux_name) {
+            return Err(DaemonError::Config("tmuxName does not match runtimeHandle.id".into()));
+        }
+        let sid = session_file.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        Ok(crate::tools::SessionRuntimeIdentity {
+            session_id: crate::tools::SessionId(sid.to_string()),
+            project: project.to_string(),
+            runtime_id: Some(tmux_name),
+            worktree_path: meta_wt,
+            branch: meta_branch,
+        })
     }
 
     fn status_for_project(
@@ -6514,6 +6712,323 @@ impl Sessions for CliSessions {
         // `ao session kill <id>` only; project scoping belongs on status.
         let _ = project;
         run_tool("ao", &["session", "kill", &id.0], 30)?;
+        Ok(())
+    }
+
+    fn resolve_runtime_in_project(
+        &self,
+        project: &str,
+        id: &SessionId,
+    ) -> Result<Option<crate::tools::SessionRuntimeIdentity>, DaemonError> {
+        if let Some((_, session_file)) = Self::locate_ao_session_file(project, &id.0) {
+            let identity = Self::parse_and_validate_session_metadata(project, &session_file)?;
+            if let Some(ref tmux_name) = identity.runtime_id {
+                self.resolved_tmux_names
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(id.0.clone(), tmux_name.clone());
+            }
+            return Ok(Some(identity));
+        }
+        Ok(None)
+    }
+
+    fn stop_runtime_in_project(&self, project: &str, id: &SessionId) -> Result<(), DaemonError> {
+        let identity = self.resolve_runtime_in_project(project, id)?.ok_or_else(|| {
+            DaemonError::Config(format!("AO session metadata not found for {} in project {project}", id.0))
+        })?;
+        let tmux_name = identity.runtime_id.ok_or_else(|| {
+            DaemonError::Config(format!("missing tmux runtime id for session {}", id.0))
+        })?;
+        let target = format!("={tmux_name}");
+        let out = run_tool("tmux", &["list-panes", "-t", &target, "-F", "#{pane_pid}"], 5)?;
+        let mut pids = Vec::new();
+        for line in out.lines() {
+            if let Ok(pid) = line.trim().parse::<i32>() { pids.push(pid); }
+        }
+        if pids.is_empty() {
+            return Err(DaemonError::Config(format!("zero captured pane PIDs for tmux session {tmux_name}")));
+        }
+        #[cfg(unix)]
+        let (captured_vec, pgids_vec) = {
+            let mut captured = std::collections::BTreeSet::<i32>::new();
+            let mut worklist: std::collections::VecDeque<i32> = std::collections::VecDeque::new();
+            for pid in &pids {
+                if captured.insert(*pid) {
+                    worklist.push_back(*pid);
+                }
+                for extra in pgid_members(*pid) {
+                    if captured.insert(extra) {
+                        worklist.push_back(extra);
+                    }
+                }
+            }
+            while let Some(pid) = worklist.pop_front() {
+                for extra in collect_descendants(pid) {
+                    if captured.insert(extra) {
+                        worklist.push_back(extra);
+                    }
+                }
+            }
+            if captured.is_empty() {
+                return Err(DaemonError::Config(format!(
+                    "empty runtime PID closure for tmux session {tmux_name}; refusing safe-stop"
+                )));
+            }
+            let mut pgids = std::collections::BTreeSet::<i32>::new();
+            for pid in &captured {
+                let pgid = unsafe { libc::getpgid(*pid) };
+                if pgid > 0 {
+                    pgids.insert(pgid);
+                }
+            }
+            if pgids.is_empty() {
+                return Err(DaemonError::Config(format!(
+                    "zero retained PGIDs for tmux session {tmux_name}; refusing safe-stop"
+                )));
+            }
+            (captured.into_iter().collect::<Vec<i32>>(), pgids.into_iter().collect::<Vec<i32>>())
+        };
+        #[cfg(not(unix))]
+        let (captured_vec, pgids_vec): (Vec<i32>, Vec<i32>) = {
+            // Non-Linux: pane-leader PID set + their PGIDs only. fail-closed
+            // gates in confirm_runtime_absent_in_project reject any retained
+            // empty set so safe-stop cannot accidentally proceed on macOS.
+            (pids.clone(), vec![])
+        };
+        self.captured_pane_pids.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id.0.clone(), captured_vec);
+        self.captured_pane_pgids.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id.0.clone(), pgids_vec);
+        run_tool("tmux", &["kill-session", "-t", &target], 5)?;
+        Ok(())
+    }
+
+    fn confirm_runtime_absent_in_project(
+        &self,
+        project: &str,
+        id: &SessionId,
+    ) -> Result<bool, DaemonError> {
+        let tmux_name = self.resolved_tmux_names.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&id.0).cloned().ok_or_else(|| {
+            DaemonError::Config(format!("unresolved tmux runtime for {}", id.0))
+        })?;
+        let target = format!("={tmux_name}");
+        match run_tool("tmux", &["has-session", "-t", &target], 5) {
+            Ok(_) => return Ok(false),
+            Err(DaemonError::Tool { rc, stderr, .. }) => {
+                let is_not_found = rc == 1
+                    && (stderr.contains("can't find session")
+                        || stderr.contains("no server running")
+                        || stderr.contains("failed to connect")
+                        || stderr.contains("error connecting to"));
+                if !is_not_found {
+                    return Err(DaemonError::Tool {
+                        tool: "tmux".into(),
+                        rc,
+                        stderr: format!("unexpected tmux has-session error: {stderr}"),
+                    });
+                }
+            }
+            Err(e) => return Err(e),
+        }
+
+        let pids = self.captured_pane_pids.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&id.0).cloned().unwrap_or_default();
+        if pids.is_empty() {
+            return Err(DaemonError::Config(format!("zero captured pane PIDs to verify absence for {}", id.0)));
+        }
+        #[cfg(unix)]
+        {
+            for pid in pids {
+                let rc = unsafe { libc::kill(pid, 0) };
+                if rc == 0 { return Ok(false); }
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if errno != libc::ESRCH {
+                    return Err(DaemonError::Tool {
+                        tool: "kill".into(),
+                        rc: -1,
+                        stderr: format!(
+                            "fail-closed probe: kill -0 pid {pid} returned errno {errno} (only ESRCH counts as absent)"
+                        ),
+                    });
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            // Non-unix fallback retains the pane-leader set; if any PIDs
+            // remain in the captured set, fail closed.
+            if !pids.is_empty() {
+                return Err(DaemonError::Config(format!(
+                    "non-unix host cannot probe {} retained PIDs for {}; refusing safe-stop",
+                    pids.len(),
+                    id.0
+                )));
+            }
+        }
+        let pgids = self.captured_pane_pgids.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&id.0).cloned().unwrap_or_default();
+        if pgids.is_empty() {
+            return Err(DaemonError::Config(format!("zero captured pane PGIDs to verify absence for {}", id.0)));
+        }
+        #[cfg(unix)]
+        {
+            for pgid in pgids {
+                let rc = unsafe { libc::kill(-pgid, 0) };
+                if rc == 0 { return Ok(false); }
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if errno != libc::ESRCH {
+                    return Err(DaemonError::Tool {
+                        tool: "kill".into(),
+                        rc: -1,
+                        stderr: format!(
+                            "fail-closed probe: kill -0 pgid {pgid} returned errno {errno} (only ESRCH counts as absent)"
+                        ),
+                    });
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if !pgids.is_empty() {
+                return Err(DaemonError::Config(format!(
+                    "non-unix host cannot probe {} retained PGIDs for {}; refusing safe-stop",
+                    pgids.len(),
+                    id.0
+                )));
+            }
+        }
+        if let Ok(data) = Self::status_for_project(project, 30) {
+            if let Ok(act) = session_activity(&data, id) {
+                if matches!(act, crate::tools::SessionActivity::Running) { return Ok(false); }
+            }
+        }
+        Ok(true)
+    }
+
+    fn archive_session_metadata_in_project(
+        &self,
+        project: &str,
+        id: &SessionId,
+        quarantined_worktree: Option<&std::path::Path>,
+        dirty_hash: Option<&str>,
+    ) -> Result<(), DaemonError> {
+        let (project_dir, session_file) = match Self::locate_ao_session_file(project, &id.0) {
+            Some(found) => found,
+            None => {
+                let (_, archive) = Self::locate_ao_archive_file(project, &id.0).ok_or_else(|| {
+                    DaemonError::Config(format!("session metadata file not found for {}", id.0))
+                })?;
+                let existing = std::fs::read_to_string(&archive).map_err(|e| {
+                    DaemonError::Config(format!("read existing archive {}: {e}", archive.display()))
+                })?;
+                let status_ok = existing.lines().any(|l| l.trim() == "status=killed");
+                let worktree_ok = quarantined_worktree.is_none_or(|qw| {
+                    existing.lines().any(|l| l.trim() == format!("worktree={}", qw.display()))
+                });
+                if status_ok && worktree_ok { return Ok(()); }
+                return Err(DaemonError::Config(format!(
+                    "mismatched archive target already exists for {}", id.0
+                )));
+            }
+        };
+        let archive_dir = project_dir.join("sessions").join("archive");
+        std::fs::create_dir_all(&archive_dir).map_err(|e| DaemonError::Config(format!("create AO archive dir {}: {e}", archive_dir.display())))?;
+        let archive_target = archive_dir.join(&id.0);
+
+        let content = std::fs::read_to_string(&session_file).map_err(|e| DaemonError::Config(format!("read session file {}: {e}", session_file.display())))?;
+        let mut rewritten_lines = Vec::new();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("status=") {
+                rewritten_lines.push("status=killed".to_string());
+            } else if trimmed.starts_with("worktree=") {
+                if let Some(qw) = quarantined_worktree {
+                    rewritten_lines.push(format!("worktree={}", qw.display()));
+                } else {
+                    rewritten_lines.push(trimmed.to_string());
+                }
+            } else {
+                rewritten_lines.push(trimmed.to_string());
+            }
+        }
+        if let Some(dh) = dirty_hash { rewritten_lines.push(format!("dirtyHash={dh}")); }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        rewritten_lines.push(format!("archivedAtEpochSecs={now}"));
+
+        let temp_archive = archive_dir.join(format!(".{}.tmp.{}.{}", id.0, std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let mut file = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&temp_archive).map_err(|e| {
+            DaemonError::Config(format!("open temp archive {}: {e}", temp_archive.display()))
+        })?;
+        use std::io::Write;
+        for l in &rewritten_lines {
+            writeln!(file, "{l}").map_err(|e| DaemonError::Config(format!("write temp archive: {e}")))?;
+        }
+        file.sync_all().map_err(|e| DaemonError::Config(format!("sync temp archive: {e}")))?;
+        drop(file);
+
+        // Linux. EEXIST is the legitimate "another publisher already archived
+        // this session" signal — recover by validating the existing archive.
+        match atomic_noreplace_rename(&temp_archive, &archive_target) {
+            Ok(()) => {
+                // Fsync the renamed archive file (data durability) and the
+                // archive directory (entry durability) before verifying
+                // content. ENOENT means the entry vanished mid-flight; the
+                // dir fsync still durably persists whatever rename succeeded.
+                if let Ok(f) = std::fs::File::open(&archive_target) {
+                    let _ = f.sync_all();
+                }
+                if let Ok(dir) = std::fs::File::open(&archive_dir) { let _ = dir.sync_all(); }
+                let read_back = std::fs::read_to_string(&archive_target).map_err(|e| DaemonError::Config(format!("verify archive {}: {e}", archive_target.display())))?;
+                if !read_back.lines().any(|l| l.trim() == "status=killed") {
+                    return Err(DaemonError::Config(format!("archive verification failed for session {}", id.0)));
+                }
+                if let Some(qw) = quarantined_worktree {
+                    if !read_back.lines().any(|l| l.trim() == format!("worktree={}", qw.display())) {
+                        return Err(DaemonError::Config(format!("archive verification failed: mismatched worktree for {}", id.0)));
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // EEXIST: drop our staged temp and validate the existing
+                // killed archive (status=killed + expected worktree match)
+                // before unlinking the active session_file.
+                let _ = std::fs::remove_file(&temp_archive);
+                let existing = std::fs::read_to_string(&archive_target).map_err(|e| DaemonError::Config(format!("read existing archive {}: {e}", archive_target.display())))?;
+                let status_ok = existing.lines().any(|l| l.trim() == "status=killed");
+                let worktree_ok = match quarantined_worktree {
+                    Some(qw) => existing.lines().any(|l| l.trim() == format!("worktree={}", qw.display())),
+                    None => true,
+                };
+                if !status_ok || !worktree_ok {
+                    return Err(DaemonError::Config(format!(
+                        "mismatched archive target already exists for {} (status_ok={status_ok}, worktree_ok={worktree_ok})",
+                        id.0
+                    )));
+                }
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&temp_archive);
+                return Err(DaemonError::Config(format!(
+                    "atomic rename archive {} -> {}: {e}; refusing to overwrite existing archive",
+                    temp_archive.display(),
+                    archive_target.display()
+                )));
+            }
+        }
+
+        // Only after the archive has been published (or validated as already
+        // present) do we touch the active session_file. Parent directory
+        // fsyncs are preserved for crash safety.
+        std::fs::remove_file(&session_file).map_err(|e| DaemonError::Config(format!("failed to remove active session file {}: {e}", session_file.display())))?;
+        if let Some(parent) = session_file.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) { let _ = dir.sync_all(); }
+        }
+        if session_file.exists() {
+            return Err(DaemonError::Config(format!("active session file {} still exists after unlink", session_file.display())));
+        }
+
+        self.captured_pane_pids.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&id.0);
+        self.captured_pane_pgids.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&id.0);
+        self.resolved_tmux_names.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&id.0);
+        self.spawned_session_worktrees.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&id.0);
+
         Ok(())
     }
 
@@ -10319,6 +10834,57 @@ mod offline_cache_tests {
         assert_eq!(snap.coderabbit_status, "green");
         assert!(!snap.ci_pending);
         assert!(!snap.bugbot_pending);
+    }
+
+    #[test]
+    fn test_ao_metadata_validation_exact_match() {
+        use super::CliSessions;
+        let tmp = std::env::temp_dir().join(format!("afd_ao_meta_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let session_file = tmp.join("wa-valid-123");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(&session_file, "project=dark-factory\nbranch=feat/test\nworktree=/tmp/wt\ntmuxName=ao-wa-123\nruntimeHandle={\"id\":\"ao-wa-123\",\"runtimeName\":\"tmux\"}\n").unwrap();
+
+        let identity = CliSessions::parse_and_validate_session_metadata("dark-factory", &session_file).unwrap();
+        assert_eq!(identity.project, "dark-factory");
+        assert_eq!(identity.runtime_id, Some("ao-wa-123".into()));
+
+        assert!(CliSessions::parse_and_validate_session_metadata("other-proj", &session_file).is_err());
+        std::fs::write(&session_file, "project=dark-factory\nbranch=feat/test\nworktree=/tmp/wt\ntmuxName=ao-wa-123\nruntimeHandle={\"id\":\"ao-wa-123\",\"runtimeName\":\"docker\"}\n").unwrap();
+        assert!(CliSessions::parse_and_validate_session_metadata("dark-factory", &session_file).is_err());
+        std::fs::write(&session_file, "project=dark-factory\nbranch=feat/test\nworktree=/tmp/wt\ntmuxName=ao-wa-123\nruntimeHandle={\"id\":\"mismatched\",\"runtimeName\":\"tmux\"}\n").unwrap();
+        assert!(CliSessions::parse_and_validate_session_metadata("dark-factory", &session_file).is_err());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_archive_no_clobber_and_reconciliation() {
+        use super::CliSessions;
+        use crate::tools::{SessionId, Sessions};
+        let tmp = std::env::temp_dir().join(format!("afd_archive_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let sessions_dir = tmp.join("hash-proj").join("sessions");
+        let archive_dir = sessions_dir.join("archive");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let sid = "wa-archive-test";
+        let session_file = sessions_dir.join(sid);
+        std::fs::write(&session_file, "project=proj\nbranch=feat/test\nworktree=/tmp/wt\ntmuxName=ao-123\nruntimeHandle={\"id\":\"ao-123\",\"runtimeName\":\"tmux\"}\nstatus=working\n").unwrap();
+
+        let prev = std::env::var_os("AO_HOME");
+        std::env::set_var("AO_HOME", &tmp);
+        let sessions = CliSessions::new("proj", "agent");
+        let session_id = SessionId(sid.into());
+        let q_wt = std::path::Path::new("/tmp/quarantine/wa-archive-test");
+
+        assert!(sessions.archive_session_metadata_in_project("proj", &session_id, Some(q_wt), Some("hash123")).is_ok());
+        assert!(!session_file.exists());
+        assert!(archive_dir.join(sid).exists());
+        assert!(sessions.archive_session_metadata_in_project("proj", &session_id, Some(q_wt), Some("hash123")).is_ok());
+        assert!(sessions.archive_session_metadata_in_project("proj", &session_id, Some(std::path::Path::new("/tmp/other")), Some("hash123")).is_err());
+
+        if let Some(h) = prev { std::env::set_var("AO_HOME", h); } else { std::env::remove_var("AO_HOME"); }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
 

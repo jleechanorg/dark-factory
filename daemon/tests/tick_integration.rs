@@ -15683,11 +15683,11 @@ fn tick_not_found_promotion_skips_stop_and_cleans() {
         0,
         10,
     )
-    .expect("NotFound promotion must complete");
+    .expect("NotFound must fail closed without promotion");
 
     let overlay = store.load("not-found-bead").unwrap().unwrap();
-    assert_eq!(overlay.state, OverlayState::Attested);
-    assert_eq!(overlay.session_id, None);
+    assert_eq!(overlay.state, OverlayState::Dispatched);
+    assert_eq!(overlay.session_id.as_deref(), Some("not-found-session"));
     assert!(
         !sessions
             .calls
@@ -15697,12 +15697,12 @@ fn tick_not_found_promotion_skips_stop_and_cleans() {
         "positive NotFound must skip the non-idempotent stop; calls: {:?}",
         sessions.calls.borrow()
     );
-    assert!(!worktree.is_dir(), "NotFound promotion must clean the worktree");
+    assert!(worktree.is_dir(), "NotFound must preserve the worktree");
 
     let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
     assert!(
-        telemetry.contains("WORKTREE_CLEANED_ON_SESSION_EXIT"),
-        "NotFound promotion must emit cleanup telemetry: {telemetry}"
+        !telemetry.contains("WORKTREE_CLEANED_ON_SESSION_EXIT"),
+        "NotFound must not emit cleanup telemetry: {telemetry}"
     );
 
     let _ = std::fs::remove_dir_all(&worktree_root);
@@ -15807,11 +15807,11 @@ fn tick_not_found_normal_dispatch_promotion_skips_stop_and_cleans() {
         0,
         10,
     )
-    .expect("normal NotFound promotion must complete");
+    .expect("normal NotFound must fail closed without promotion");
 
     let overlay = store.load("not-found-normal-bead").unwrap().unwrap();
-    assert_eq!(overlay.state, OverlayState::Attested);
-    assert_eq!(overlay.session_id, None);
+    assert_eq!(overlay.state, OverlayState::Dispatched);
+    assert_eq!(overlay.session_id.as_deref(), Some("not-found-normal-session"));
     assert!(
         !sessions
             .calls
@@ -15821,12 +15821,12 @@ fn tick_not_found_normal_dispatch_promotion_skips_stop_and_cleans() {
         "normal NotFound must skip the non-idempotent stop; calls: {:?}",
         sessions.calls.borrow()
     );
-    assert!(!worktree.is_dir(), "normal NotFound must clean the worktree");
+    assert!(worktree.is_dir(), "normal NotFound must preserve the worktree");
 
     let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
     assert!(
-        telemetry.contains("WORKTREE_CLEANED_ON_SESSION_EXIT"),
-        "normal NotFound must emit cleanup telemetry: {telemetry}"
+        !telemetry.contains("WORKTREE_CLEANED_ON_SESSION_EXIT"),
+        "normal NotFound must not emit cleanup telemetry: {telemetry}"
     );
 
     let _ = std::fs::remove_dir_all(&worktree_root);
