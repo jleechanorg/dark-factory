@@ -30,6 +30,7 @@ from .review_controller import (
     ReviewInputs,
     create_review_request,
     parse_codex_jsonl,
+    run_controller_review,
     validate_execution_receipts,
     validate_immutable_target,
     validate_review_response,
@@ -386,4 +387,4 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
 
-__all__ = ["main"]
+__all__ = ["main", "run_controller_review"]
