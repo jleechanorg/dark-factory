@@ -55,6 +55,11 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+if [ "$RENDER_ONLY" -eq 1 ] && [ "$UNINSTALL" -eq 1 ]; then
+    echo "ERROR: --render-only and --uninstall are mutually exclusive." >&2
+    exit 2
+fi
+
 if [ -n "${DARK_FACTORY_EXPECTED_RELEASE_SHA:-}" ]; then
     if [[ ! "$DARK_FACTORY_EXPECTED_RELEASE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
         echo "ERROR: DARK_FACTORY_EXPECTED_RELEASE_SHA must be exactly 40 hexadecimal characters: '$DARK_FACTORY_EXPECTED_RELEASE_SHA'" >&2

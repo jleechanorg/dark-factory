@@ -215,7 +215,7 @@ touch "$db"
 
 
 def test_linux_install_exact_reviewed_immutable_release_drift_rejected(tmp_path):
-    checkout, fake_bin, home, install_root = tmp_path / "checkout", tmp_path / "fake-bin", tmp_path / "home", tmp_path / "installed"
+    checkout, fake_bin, home, real_root, install_root = tmp_path / "checkout", tmp_path / "fake-bin", tmp_path / "home", tmp_path / "real-installed", tmp_path / "installed"; real_root.mkdir(); install_root.symlink_to(real_root)
     checkout.mkdir()
     shutil.copy2(ROOT / "install.sh", checkout / "install.sh")
     (checkout / "requirements.lock").write_text("")
@@ -254,9 +254,9 @@ def test_linux_install_exact_reviewed_immutable_release_drift_rejected(tmp_path)
     }
 
     # 1 & 2: Install exact reviewed release, assert payload hash and rendered unit paths under reviewed release
-    r1 = subprocess.run([str(checkout / "install.sh"), "--no-smoke", "--no-cmds"], cwd=checkout, env=env, capture_output=True, text=True)
+    assert subprocess.run([str(checkout / "daemon" / "systemd" / "install-systemd-user.sh"), "--render-only", "--uninstall"], cwd=checkout, env=env, capture_output=True, text=True).returncode == 2; r1 = subprocess.run([str(checkout / "install.sh"), "--no-smoke", "--no-cmds"], cwd=checkout, env=env, capture_output=True, text=True)
     assert r1.returncode == 0, r1.stdout + r1.stderr
-    rel = install_root / "releases" / rev_sha
+    rel = real_root.resolve() / "releases" / rev_sha
     assert (rel / "payload.txt").is_file()
     assert hashlib.sha256((rel / "payload.txt").read_bytes()).hexdigest() == payload_sha
     daemon_bin = rel / "daemon" / "target" / "release" / "daemon"
