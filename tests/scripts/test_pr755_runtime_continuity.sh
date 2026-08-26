@@ -3,7 +3,7 @@
 set -euo pipefail
 fail(){ echo "FAIL: $*" >&2; exit 1; }
 [ "$(uname -s)" = Linux ] || fail "Linux required"
-[ "$(hostname -s)" = jeff-ubuntu ] || fail "must run on jeff-ubuntu"
+HOSTNAME_SHORT="$(hostname -s)"; [ "${HOSTNAME_SHORT,,}" = jeff-ubuntu ] || fail "must run on jeff-ubuntu"
 for c in systemctl systemd-run ao br tmux sqlite3 git sha256sum; do command -v "$c" >/dev/null || fail "missing prerequisite: $c"; done; systemd-run --help 2>&1 | grep -q -- '--setenv' || fail "systemd-run lacks --setenv"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; INSTALLER="$ROOT/daemon/systemd/install-systemd-user.sh"
 PERSIST=ai.dark-factory.daemon.service; BEFORE="$(systemctl --user is-active "$PERSIST" 2>/dev/null || true)"; persist_state(){ systemctl --user show "$PERSIST" -p ActiveState -p SubState -p MainPID -p ExecStart -p FragmentPath -p UnitFileState 2>/dev/null || true; }; PSTATE_BEFORE="$(persist_state)"
