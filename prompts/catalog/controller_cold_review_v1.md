@@ -22,6 +22,8 @@ Return exactly one JSON object and no prose or markdown. Its keys must be
 exactly `verdict`, `findings`, `evidence_checked`, `commands_executed`, and
 `caveats`. `verdict` is only `pass` or `fail`; the other four values are JSON
 arrays. Put actionable findings with paths or other precise references in
-`findings`; list concrete files, artifacts, and checks in `evidence_checked`
-and `commands_executed`; put remaining uncertainty or `N/A` notes in
-`caveats`. Use `fail` whenever an applicable requirement cannot be proven.
+`findings`; summarize concrete files, artifacts, checks, and commands in
+`evidence_checked` and `commands_executed`; put remaining uncertainty or `N/A`
+notes in `caveats`. Controller-captured command receipts are authoritative, so
+the command summary need not reproduce receipt strings. Use `fail` whenever an
+applicable requirement cannot be proven.

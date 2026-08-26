@@ -79,16 +79,27 @@ def test_pass_requires_a_captured_successful_command_receipt() -> None:
         validate_execution_receipts((), validated)
 
 
-def test_pass_rejects_commands_not_matching_captured_receipts() -> None:
+def test_pass_uses_authoritative_receipts_with_human_command_summary() -> None:
     request = create_review_request(_inputs())
-    validated = validate_review_response(_compact_response(), request)
-    receipt = ExecutionReceipt(
-        command="different command",
-        exit_code=0,
-        output_sha256="0" * 64,
+    validated = validate_review_response(
+        _compact_response(
+            commands_executed=["ran a probe, then the focused verification suite"],
+        ),
+        request,
     )
-    with pytest.raises(ReviewContractError, match="commands_executed"):
-        validate_execution_receipts((receipt,), validated)
+    receipts = (
+        ExecutionReceipt(
+            command="probe command",
+            exit_code=1,
+            output_sha256="1" * 64,
+        ),
+        ExecutionReceipt(
+            command="focused verification command",
+            exit_code=0,
+            output_sha256="2" * 64,
+        ),
+    )
+    validate_execution_receipts(receipts, validated)
 
 
 def test_controller_acceptance_rejects_pass_without_captured_receipt(monkeypatch) -> None:
