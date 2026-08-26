@@ -117,6 +117,15 @@ if [[ "$(uname -s)" == "Linux" && ( "${DARK_FACTORY_DISABLE_IMMUTABLE_ARTIFACT:-
     echo "==> snapshotted immutable release: ${ARTIFACT_DIR}"
   else
     echo "==> reusing immutable release: ${ARTIFACT_DIR}"
+    DAEMON_BIN="${ARTIFACT_DIR}/daemon/target/release/daemon"
+    STORED_DAEMON_DIGEST="$(cat "${ARTIFACT_DIR}/.dark-factory-daemon-sha256" 2>/dev/null || true)"
+    if [[ ! -f "${ARTIFACT_DIR}/.dark-factory-release-sha" || "$(cat "${ARTIFACT_DIR}/.dark-factory-release-sha")" != "${ARTIFACT_VERSION}" || \
+          ! -x "${DAEMON_BIN}" || ! "${STORED_DAEMON_DIGEST}" =~ ^[0-9a-fA-F]{64}$ || \
+          "$(sha256sum "${DAEMON_BIN}" 2>/dev/null | cut -c1-64)" != "${STORED_DAEMON_DIGEST}" ]]; then
+      echo "ERROR: immutable release ${ARTIFACT_DIR} failed provenance/integrity validation." >&2
+      echo "Rerun install.sh --clear to rebuild the release." >&2
+      exit 1
+    fi
   fi
   RUNTIME_ROOT="${ARTIFACT_DIR}"
 fi
@@ -228,6 +237,13 @@ fi
 chmod +x "${BIN_DIR}/dark-factory" "${BIN_DIR}/df-healer" "${BIN_DIR}/df-validate" "${BIN_DIR}/df-funnel" "${BIN_DIR}/df-funnel-lanes"
 
 if [[ "${ARTIFACT_CREATED}" -eq 1 ]]; then
+  DAEMON_BINARY="${RUNTIME_ROOT}/daemon/target/release/daemon"
+  if [[ ! -x "${DAEMON_BINARY}" ]]; then
+    echo "ERROR: immutable release daemon binary is not executable: ${DAEMON_BINARY}" >&2
+    exit 1
+  fi
+  printf '%s\n' "${ARTIFACT_VERSION}" > "${RUNTIME_ROOT}/.dark-factory-release-sha"
+  sha256sum "${DAEMON_BINARY}" | cut -c1-64 > "${RUNTIME_ROOT}/.dark-factory-daemon-sha256"
   # Runtime code and the venv are complete before this point. Removing write
   # permission makes accidental in-place edits fail instead of silently
   # changing the release used by systemd.

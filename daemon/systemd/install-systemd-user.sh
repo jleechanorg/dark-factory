@@ -139,6 +139,13 @@ if [ -n "${DARK_FACTORY_EXPECTED_RELEASE_SHA:-}" ]; then
         echo "ERROR: expected release is missing executable daemon: $REPO/daemon/target/release/daemon" >&2
         exit 1
     fi
+    [ -f "$REPO/.dark-factory-release-sha" ] && [ "$(cat "$REPO/.dark-factory-release-sha")" = "$DARK_FACTORY_EXPECTED_RELEASE_SHA" ] || {
+        echo "ERROR: expected release source marker missing or mismatch in $REPO" >&2; exit 1;
+    }
+    STORED_DAEMON_SHA="$(cat "$REPO/.dark-factory-daemon-sha256" 2>/dev/null || true)"
+    if [[ ! "$STORED_DAEMON_SHA" =~ ^[0-9a-fA-F]{64}$ ]] || [ "$(sha256sum "$REPO/daemon/target/release/daemon" 2>/dev/null | cut -c1-64)" != "$STORED_DAEMON_SHA" ]; then
+        echo "ERROR: expected release daemon digest missing or mismatch in $REPO" >&2; exit 1;
+    fi
 fi
 
 if [ "$RENDER_ONLY" -eq 1 ]; then
