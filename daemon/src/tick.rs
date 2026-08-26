@@ -4423,18 +4423,6 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             if let Some(ref session_id_str) = session_id_owned {
                 let sid = SessionId(session_id_str.clone());
                 if let Ok(Some(health_failure)) = deps.sessions.check_session_health(&sid) {
-                    // rev-4ou1z: a Gemini individual-quota exhaustion is
-                    // RECOVERABLE — the paused pane just needs an Enter
-                    // keypress once its quota window resets, not a
-                    // kill+respawn cycle. A fresh spawn would hit the same
-                    // quota wall immediately, burning
-                    // `MAX_TRANSIENT_SPAWN_RETRY` in minutes against a
-                    // window that can take hours to reset (live incident:
-                    // coder wa-3538 parked HUMAN_HELD well before its quota
-                    // actually cleared). Already-armed sessions skip
-                    // straight past the SESSION_HEALTH_FAILED emit + kill
-                    // path below so the pane is left untouched for the
-                    // slow-tier wake sweep (`run_quota_watchdog_wake`).
                     if crate::health::quota_watchdog::parse_quota_reset_duration(&health_failure)
                         .is_some()
                         && crate::health::quota_watchdog::recorded_reset_at(bead_id).is_some()
@@ -4741,23 +4729,6 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                         "branch": overlay.branch,
                                     }),
                                 )?;
-                                // PR #755 Slice 4 r2 (rev-...): a successful
-                                // stop() is the ONLY signal that authorizes
-                                // promotion to ATTESTED + worktree reap. If
-                                // stop() returns Err, the worker is still
-                                // live (transient RPC failure, AO still has
-                                // the session, etc.); promoting + cleaning
-                                // the worktree would leave a U4-class
-                                // undefined-state wedge (live worker,
-                                // missing worktree). Treat the health-failed
-                                // signal as unconfirmed — preserve the
-                                // session handle, DO NOT promote, DO NOT
-                                // clean the worktree, and emit
-                                // SESSION_HEALTH_STOP_FAILED_NO_PROMOTION so
-                                // the wedge is auditable. A subsequent fresh
-                                // `Terminal`/`NotFound` observation (or a
-                                // successful stop) is the only path to
-                                // promotion.
                                 match safe_stop_session(
                                     deps,
                                     &overlay,
@@ -4804,24 +4775,6 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                     .session_activity_in_project(&ao_project, &sid)
                                 {
                                     Ok(crate::tools::SessionActivity::Idle) => {
-                                        // PR #755 Slice 4: a successful stop() is the
-                                        // ONLY signal that authorizes the Idle
-                                        // promotion to ATTESTED + the worktree
-                                        // reap below. If stop() returns Err, the
-                                        // worker is still live (transient RPC
-                                        // failure, AO still has the session,
-                                        // etc.); promoting + cleaning the
-                                        // worktree would leave a U4-class
-                                        // undefined-state wedge (live worker,
-                                        // missing worktree). Treat the Idle
-                                        // signal as unconfirmed — preserve the
-                                        // session handle, DO NOT promote, DO
-                                        // NOT clean the worktree, and emit
-                                        // IDLE_STOP_FAILED_NO_PROMOTION so the
-                                        // wedge is auditable. A subsequent
-                                        // fresh `Terminal`/`NotFound`
-                                        // observation (or a successful stop)
-                                        // is the only path to promotion.
                                         match safe_stop_session(
                                             deps,
                                             &overlay,

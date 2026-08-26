@@ -60,6 +60,10 @@ impl StopFailsOnSecond {
         self.runtime_worktree = Some(path);
     }
 
+    fn set_post_stop_activity(&mut self, activity: daemon::tools::SessionActivity) {
+        self.post_stop_activity = activity;
+    }
+
 }
 
 impl Sessions for StopFailsOnSecond {
@@ -117,67 +121,12 @@ impl Sessions for StopFailsOnSecond {
     }
 }
 
-struct FixtureSessions {
-    inner: FakeSessions,
-    runtime_worktree: Option<std::path::PathBuf>,
-    post_stop_activity: daemon::tools::SessionActivity,
-}
-
-impl FixtureSessions {
-    fn new(inner: FakeSessions) -> Self {
-        Self {
-            inner,
-            runtime_worktree: None,
-            post_stop_activity: daemon::tools::SessionActivity::Terminal,
-        }
-    }
-
-    fn set_runtime_worktree(&mut self, path: std::path::PathBuf) {
-        self.runtime_worktree = Some(path);
-    }
-
-    fn set_post_stop_activity(&mut self, activity: daemon::tools::SessionActivity) {
-        self.post_stop_activity = activity;
-    }
-}
-
-impl Sessions for FixtureSessions {
-    fn active_count(&self) -> Result<usize, DaemonError> { self.inner.active_count() }
-    fn spawn(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> { self.inner.spawn(spec) }
-    fn attach(&self, branch: &str, bead_id: &str) -> Result<SessionId, DaemonError> {
-        self.inner.attach(branch, bead_id)
-    }
-    fn stop(&self, id: &SessionId) -> Result<(), DaemonError> { self.inner.stop(id) }
-    fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError> {
-        self.inner.is_quiescent(id)
-    }
-    fn session_activity(&self, id: &SessionId) -> Result<daemon::tools::SessionActivity, DaemonError> {
-        if self.inner.stop_succeeded.get() {
-            return Ok(self.post_stop_activity);
-        }
-        self.inner.session_activity(id)
-    }
-    fn resolve_runtime_in_project(
-        &self,
-        project: &str,
-        id: &SessionId,
-    ) -> Result<Option<daemon::tools::SessionRuntimeIdentity>, DaemonError> {
-        Ok(Some(daemon::tools::SessionRuntimeIdentity {
-            session_id: id.clone(),
-            project: project.to_string(),
-            runtime_id: Some(id.0.clone()),
-            worktree_path: self.runtime_worktree.clone(),
-            branch: self.inner.branch_for.borrow().get(&id.0).cloned(),
-        }))
-    }
-}
-
-impl std::ops::Deref for FixtureSessions {
+impl std::ops::Deref for StopFailsOnSecond {
     type Target = FakeSessions;
     fn deref(&self) -> &Self::Target { &self.inner }
 }
 
-impl std::ops::DerefMut for FixtureSessions {
+impl std::ops::DerefMut for StopFailsOnSecond {
     fn deref_mut(&mut self) -> &mut Self::Target { &mut self.inner }
 }
 
@@ -15021,7 +14970,7 @@ fn test_non_default_repository_branch_collision_telemetry_attribution() {
 fn test_dispatched_adopted_idle_session_reaped_and_promoted() {
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
-    let mut sessions = FixtureSessions::new(FakeSessions::new());
+    let mut sessions = StopFailsOnSecond::new(FakeSessions::new());
     // Non-terminal quiescence but idle activity
     sessions.quiescent = false;
     sessions.set_activity(daemon::tools::SessionActivity::Idle);
@@ -15126,7 +15075,7 @@ fn test_dispatched_adopted_idle_session_reaped_and_promoted() {
 fn test_worktree_cleaned_up_on_coder_session_exit_promotion() {
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
-    let mut sessions = FixtureSessions::new(FakeSessions::new());
+    let mut sessions = StopFailsOnSecond::new(FakeSessions::new());
     sessions.quiescent = false;
     sessions.set_activity(daemon::tools::SessionActivity::Idle);
 
@@ -15682,7 +15631,7 @@ fn tick_secondary_project_live_session_is_not_notfound_or_cleaned() {
 fn tick_not_found_promotion_skips_stop_and_cleans() {
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
-    let mut sessions = FixtureSessions::new(FakeSessions::new());
+    let mut sessions = StopFailsOnSecond::new(FakeSessions::new());
     sessions.quiescent = false;
     sessions.set_activity(daemon::tools::SessionActivity::NotFound);
 
@@ -15808,7 +15757,7 @@ fn tick_not_found_promotion_skips_stop_and_cleans() {
 fn tick_not_found_normal_dispatch_promotion_skips_stop_and_cleans() {
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
-    let mut sessions = FixtureSessions::new(FakeSessions::new());
+    let mut sessions = StopFailsOnSecond::new(FakeSessions::new());
     sessions.quiescent = false;
     sessions.set_activity(daemon::tools::SessionActivity::NotFound);
 
@@ -16163,7 +16112,7 @@ fn adopted_session_health_failure_with_failing_stop_preserves_session_and_worktr
 fn adopted_session_health_failure_with_succeeding_stop_clears_and_reaps() {
     let scm = FakeScm::new();
     let tracker = FakeTracker::new();
-    let mut sessions = FixtureSessions::new(FakeSessions::new());
+    let mut sessions = StopFailsOnSecond::new(FakeSessions::new());
     sessions.set_session_health_failure(
         "adopted-stop-ok",
         "terminal session error in tmux pane: login expired",
