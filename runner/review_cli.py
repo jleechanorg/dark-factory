@@ -16,6 +16,7 @@ import pathlib
 import subprocess
 import tempfile
 import time
+from typing import cast
 
 from .handler_core import Context
 from .handler_dispatch import (
@@ -29,7 +30,6 @@ from .review_controller import (
     ReviewInputs,
     create_review_request,
     parse_codex_jsonl,
-    run_controller_review,
     validate_execution_receipts,
     validate_immutable_target,
     validate_review_response,
@@ -223,7 +223,7 @@ def main(argv: list[str] | None = None) -> int:
             head_sha=head_sha,
             tree_sha=str(before["tree_sha"]),
             task_text=task_text,
-            changed_files=tuple(before["changed_files"]),
+            changed_files=cast(tuple[str, ...], before["changed_files"]),
             evidence=evidence,
             run_id=f"review-{int(time.time())}",
         )
@@ -233,7 +233,7 @@ def main(argv: list[str] | None = None) -> int:
             holdout_roots = tuple(
                 str(path) for path in _holdout_denied_paths()
             )
-        except Exception:
+        except (OSError, RuntimeError):
             holdout_roots = ()
         validate_immutable_target(inputs, holdout_roots=holdout_roots)
         request = create_review_request(inputs)

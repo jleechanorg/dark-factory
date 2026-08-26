@@ -535,13 +535,14 @@ class ControllerSnapshotTests(unittest.TestCase):
 
         ctx = Context(goal="must not review holdout", workdir=self.repo)
         ctx.state["ao.worktree"] = str(source)
-        with patch.dict(os.environ, {"DARK_FACTORY_HOLDOUTS": str(holdout)}):
-            with self.assertRaisesRegex(ValueError, "sealed holdout"):
-                _controller_review_request(
-                    Node(name="cold_reviewer", attrs={}),
-                    ctx,
-                    _git(source, "rev-parse", "HEAD").strip(),
-                )
+        with patch.dict(
+            os.environ, {"DARK_FACTORY_HOLDOUTS": str(holdout)}
+        ), self.assertRaisesRegex(ValueError, "sealed holdout"):
+            _controller_review_request(
+                Node(name="cold_reviewer", attrs={}),
+                ctx,
+                _git(source, "rev-parse", "HEAD").strip(),
+            )
 
     def test_controller_contract_does_not_inherit_worker_echo_backend(self) -> None:
         """A two-node controller gate resolves Codex when run-level backend is non-echo."""

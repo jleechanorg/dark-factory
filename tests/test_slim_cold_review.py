@@ -103,7 +103,7 @@ def test_pass_uses_authoritative_receipts_with_human_command_summary() -> None:
 
 
 def test_controller_acceptance_rejects_pass_without_captured_receipt(monkeypatch) -> None:
-    from runner.handler_core import Result
+    from runner.handler_core import Context, Result
     from runner.handler_parallel_reviewer import _contract_adjusted_result
 
     request = create_review_request(_inputs())
@@ -114,7 +114,7 @@ def test_controller_acceptance_rejects_pass_without_captured_receipt(monkeypatch
     result = _contract_adjusted_result(
         Result(outcome="success", output=_compact_response()),
         request,
-        object(),
+        Context(goal="", workdir=Path(".")),
         lane="primary",
     )
     assert result.outcome == "failure"
