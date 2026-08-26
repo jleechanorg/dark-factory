@@ -1606,33 +1606,6 @@ pub fn reap(report: &ReaperReport, candidates: &[Candidate]) -> Result<usize, Da
     Ok(removed)
 }
 
-/// Bead rev-3lm8k: immediately clean up ONE agent's worktree directory the
-/// moment its coder session is known to have exited (`SessionActivity`
-/// reaches `Idle`/terminal and the daemon calls `sessions.stop()`, or a
-/// park-to-`HUMAN_HELD` kill). Unlike `sweep()`/`is_prunable()`, this does
-/// NOT consult the active-session probe or `worktree_ttl_secs` — the
-/// caller already knows the session is dead, so waiting out the TTL would
-/// leave the stale AO-managed worktree blocking subsequent dispatches that
-/// hash to the same orchestrator branch (the observed incident: `wa-3538`
-/// under `/home/jleechan/.worktrees/worldarchitect/` blocked every
-/// `slim/two_node.dot` dispatch hashing to its branch until a human
-/// manually removed the directory).
-///
-/// Returns `Ok(true)` iff a directory was actually removed. `Ok(false)`
-/// when `cfg.agent_worktree_root` is unset (knob off), `agent_id` fails
-/// the path-traversal guard in `Config::agent_worktree_path`, or nothing
-/// exists at the resolved path — all treated as a no-op rather than an
-/// error, since "nothing to clean" is the expected steady state once a
-/// worktree has already been reaped once. Refuses to touch a path that
-/// exists but is not a plain directory (defensive: never delete a file,
-/// symlink, or unexpected mount the reaper does not own).
-pub fn clean_stale_worktree(cfg: &Config, repo: &str, agent_id: &str) -> Result<bool, DaemonError> {
-    Ok(
-        clean_stale_worktree_with_context(cfg, repo, agent_id, QuarantineContext::default())?
-            .is_some(),
-    )
-}
-
 pub fn clean_stale_worktree_with_context(
     cfg: &Config,
     repo: &str,
@@ -1690,6 +1663,7 @@ fn verified_quarantine_for_session(
     repo: &str,
     session_id: &str,
     project: &str,
+    runtime_worktree: &Path,
 ) -> Result<Option<(PathBuf, Option<String>)>, DaemonError> {
     let Some(original) = cfg.agent_worktree_path(repo, session_id) else {
         return Ok(None);
@@ -1699,6 +1673,9 @@ fn verified_quarantine_for_session(
         .ok_or_else(|| DaemonError::Config("missing worktree root for quarantine recovery".into()))?;
     let namespace = recovery_namespace_path(&root)?;
     let original = original.to_string_lossy();
+    if runtime_worktree.to_string_lossy() != original {
+        return Ok(None);
+    }
     for entry in fs::read_dir(&namespace)
         .map_err(|e| DaemonError::Config(format!("read quarantine recovery namespace: {e}")))?
         .flatten()
@@ -1747,6 +1724,7 @@ fn verified_quarantine_for_session(
     _repo: &str,
     _session_id: &str,
     _project: &str,
+    _runtime_worktree: &Path,
 ) -> Result<Option<(PathBuf, Option<String>)>, DaemonError> {
     Ok(None)
 }
@@ -1777,21 +1755,36 @@ pub fn execute_safe_stop_and_quarantine(
         context.branch = identity.branch;
     }
 
-    let ao_wt = identity.worktree_path.as_ref().ok_or_else(|| {
-        DaemonError::Config(format!(
-            "AO metadata worktree_path missing for session {} in project {ao_project}; refusing safe-stop",
+    sessions.stop_runtime_in_project(ao_project, session_id)?;
+    if !sessions.confirm_runtime_absent_in_project(ao_project, session_id)? {
+        return Err(DaemonError::Config(format!(
+            "positive absence proof failed for session {} in project {ao_project}",
             session_id.0
-        ))
-    })?;
-    let cfg_wt = cfg.agent_worktree_path(repo, &session_id.0).ok_or_else(|| {
-        DaemonError::Config(format!(
-            "configured worktree path missing for repo {repo} agent {}; refusing safe-stop",
-            session_id.0
-        ))
-    })?;
+        )));
+    }
+    match sessions.session_activity_in_project(ao_project, session_id) {
+        Ok(crate::tools::SessionActivity::Terminal)
+        | Ok(crate::tools::SessionActivity::NotFound) => {}
+        Ok(other) => return Err(DaemonError::Config(format!(
+            "AO status for session {} is {:?}, not Terminal/NotFound",
+            session_id.0, other
+        ))),
+        Err(e) => return Err(DaemonError::Config(format!(
+            "AO status probe failed for session {}: {e:?}", session_id.0
+        ))),
+    }
+
+    let Some(cfg_wt) = cfg.agent_worktree_path(repo, &session_id.0) else {
+        sessions.archive_session_metadata_in_project(ao_project, session_id, None, None)?;
+        return Ok(SafeStopOutcome::NoWorktree);
+    };
     if !is_plain_directory(&cfg_wt).unwrap_or(false) {
+        let ao_wt = identity.worktree_path.as_deref().ok_or_else(|| DaemonError::Config(format!(
+            "AO metadata worktree_path missing for session {} in project {ao_project}; refusing recovery",
+            session_id.0
+        )))?;
         if let Some((quarantined, dirty_hash)) =
-            verified_quarantine_for_session(cfg, repo, &session_id.0, ao_project)?
+            verified_quarantine_for_session(cfg, repo, &session_id.0, ao_project, ao_wt)?
         {
             sessions.archive_session_metadata_in_project(
                 ao_project,
@@ -1809,6 +1802,10 @@ pub fn execute_safe_stop_and_quarantine(
             cfg_wt.display()
         )));
     }
+    let ao_wt = identity.worktree_path.as_ref().ok_or_else(|| DaemonError::Config(format!(
+        "AO metadata worktree_path missing for session {} in project {ao_project}; refusing safe-stop",
+        session_id.0
+    )))?;
     let ao_canon = std::fs::canonicalize(ao_wt).map_err(|e| {
         DaemonError::Config(format!(
             "canonicalize AO metadata worktree_path {} failed for session {} in project {ao_project}: {e}; refusing safe-stop",
@@ -1832,41 +1829,7 @@ pub fn execute_safe_stop_and_quarantine(
         )));
     }
 
-    sessions.stop_runtime_in_project(ao_project, session_id)?;
-
-    let absent = sessions.confirm_runtime_absent_in_project(ao_project, session_id)?;
-    if !absent {
-        return Err(DaemonError::Config(format!(
-            "positive absence proof failed for session {} in project {ao_project}",
-            session_id.0
-        )));
-    }
-
-    match sessions.session_activity_in_project(ao_project, session_id) {
-        Ok(crate::tools::SessionActivity::Terminal)
-        | Ok(crate::tools::SessionActivity::NotFound) => {}
-        Ok(other) => {
-            return Err(DaemonError::Config(format!(
-                "AO status for session {} in project {ao_project} is {:?}, not Terminal/NotFound; refusing safe-stop",
-                session_id.0, other
-            )));
-        }
-        Err(e) => {
-            return Err(DaemonError::Config(format!(
-                "AO status probe failed for session {} in project {ao_project}: {e:?}",
-                session_id.0
-            )));
-        }
-    }
-
-    let Some(path) = cfg.agent_worktree_path(repo, &session_id.0) else {
-        sessions.archive_session_metadata_in_project(ao_project, session_id, None, None)?;
-        return Ok(SafeStopOutcome::NoWorktree);
-    };
-    if !is_plain_directory(&path).unwrap_or(false) {
-        sessions.archive_session_metadata_in_project(ao_project, session_id, None, None)?;
-        return Ok(SafeStopOutcome::NoWorktree);
-    }
+    let path = cfg_wt;
     let root = cfg
         .agent_worktree_root_for_repo(repo)
         .expect("agent_worktree_path and root must agree");
@@ -2218,7 +2181,14 @@ mod tests {
         init_git_worktree(&target);
         fs::write(target.join("new.txt"), "untracked\n").unwrap();
 
-        assert!(clean_stale_worktree(&cfg, "owner/repo", "wa-untracked").unwrap());
+        assert!(clean_stale_worktree_with_context(
+            &cfg,
+            "owner/repo",
+            "wa-untracked",
+            QuarantineContext::default(),
+        )
+        .unwrap()
+        .is_some());
         assert!(!target.exists());
         let quarantine = test_recovery_root(&root);
         let entries: Vec<_> = fs::read_dir(&quarantine)
@@ -2355,6 +2325,52 @@ mod tests {
         }
         assert_eq!(manifest["state"], "moved");
         let _ = fs::remove_dir_all(&quarantine);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_rejects_runtime_worktree_identity_mismatch() {
+        let root = std::env::temp_dir().join(format!(
+            "afd_recovery_identity_mismatch_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let original = root.join("owner/repo/session");
+        let runtime = root.join("other/runtime");
+        fs::create_dir_all(&original).unwrap();
+        fs::create_dir_all(&runtime).unwrap();
+        let cfg = make_cfg(&root);
+        let namespace = test_recovery_root(&root);
+        fs::create_dir_all(&namespace).unwrap();
+        let quarantined = namespace.join("session-recovered");
+        init_git_worktree(&quarantined);
+        fs::write(
+            namespace.join("session.json"),
+            serde_json::json!({
+                "state": "moved",
+                "session_id": "session",
+                "project": "owner/repo",
+                "original_path": original,
+                "quarantined_path": quarantined,
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+
+        let recovered = verified_quarantine_for_session(
+            &cfg,
+            "owner/repo",
+            "session",
+            "owner/repo",
+            &runtime,
+        )
+        .unwrap();
+        assert!(recovered.is_none());
+        assert!(original.is_dir());
+        assert!(runtime.is_dir());
+        assert!(quarantined.is_dir());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -2554,7 +2570,14 @@ mod tests {
         fs::create_dir_all(&outside).unwrap();
         symlink(&outside, root.join("owner/repo/.quarantine")).unwrap();
 
-        assert!(clean_stale_worktree(&cfg, "owner/repo", "wa-link").unwrap());
+        assert!(clean_stale_worktree_with_context(
+            &cfg,
+            "owner/repo",
+            "wa-link",
+            QuarantineContext::default(),
+        )
+        .unwrap()
+        .is_some());
         assert!(!target.exists());
         assert!(!outside.join("wa-link").exists());
         let _ = fs::remove_dir_all(&root);
@@ -2804,88 +2827,6 @@ mod tests {
         let inactive = InactiveProbe;
         let result = is_prunable(&candidate, 60, 200, &inactive);
         assert!(matches!(result, Ok(true)));
-    }
-
-    // Bead rev-3lm8k: `clean_stale_worktree` removes a single known-dead
-    // agent's worktree immediately, bypassing TTL — the fix for "AO coder
-    // sessions finish work and leave behind worktree dirs" blocking later
-    // dispatches until a human manually cleans up.
-
-    #[test]
-    fn clean_stale_worktree_removes_fresh_directory_immediately() {
-        let root = std::env::temp_dir().join(format!("afd_clean_fresh_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let cfg = make_cfg(&root);
-        // `touch_dir` with 0 seconds ago is well within `worktree_ttl_secs`
-        // (60s in `make_cfg`) — a TTL-based sweep would NOT prune this, but
-        // `clean_stale_worktree` must remove it anyway because the caller
-        // already knows the session exited.
-        let target = root.join("owner/repo/wa-500");
-        init_git_worktree(&target);
-        assert!(target.is_dir());
-        let removed = clean_stale_worktree(&cfg, "owner/repo", "wa-500").unwrap();
-        assert!(
-            removed,
-            "a fresh but session-dead worktree must still be removed"
-        );
-        assert!(!target.exists());
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn clean_stale_worktree_is_noop_when_knob_is_off() {
-        let cfg = Config {
-            agent_worktree_root: None,
-            ..make_cfg(Path::new("/tmp"))
-        };
-        let removed = clean_stale_worktree(&cfg, "owner/repo", "wa-500").unwrap();
-        assert!(
-            !removed,
-            "legacy layout (knob off) must be a no-op, not an error"
-        );
-    }
-
-    #[test]
-    fn clean_stale_worktree_is_noop_when_directory_absent() {
-        let root = std::env::temp_dir().join(format!("afd_clean_absent_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let cfg = make_cfg(&root);
-        let removed = clean_stale_worktree(&cfg, "owner/repo", "wa-nonexistent").unwrap();
-        assert!(
-            !removed,
-            "nothing to clean is the expected steady state, not an error"
-        );
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn clean_stale_worktree_rejects_path_traversal_agent_id() {
-        let root = std::env::temp_dir().join(format!("afd_clean_traversal_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let cfg = make_cfg(&root);
-        let removed = clean_stale_worktree(&cfg, "owner/repo", "../escape").unwrap();
-        assert!(
-            !removed,
-            "path-traversal agent_id must be refused, not resolved"
-        );
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn clean_stale_worktree_only_touches_directories() {
-        let root = std::env::temp_dir().join(format!("afd_clean_file_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let cfg = make_cfg(&root);
-        let path = cfg.agent_worktree_path("owner/repo", "wa-file").unwrap();
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, b"not a worktree dir").unwrap();
-        let removed = clean_stale_worktree(&cfg, "owner/repo", "wa-file").unwrap();
-        assert!(
-            !removed,
-            "a non-directory at the resolved path must be left alone"
-        );
-        assert!(path.is_file(), "the file must survive untouched");
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

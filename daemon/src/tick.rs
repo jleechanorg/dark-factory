@@ -570,13 +570,79 @@ fn emit_intake_outcome(telemetry_log: &Path, outcome: &IntakeOutcome) -> Result<
 /// operators the durable evidence they need to retry cleanup or kill the
 /// session manually. The `BEAD_SESSION_KILL_FAILED` telemetry event
 /// preserves visibility into the still-leaked session.
+fn safe_stop_session(
+    deps: &TickDeps,
+    overlay: &BeadOverlay,
+    ao_project: &str,
+    reason: &str,
+) -> Result<crate::worktree_reaper::SafeStopOutcome, DaemonError> {
+    let session_id = overlay
+        .session_id
+        .as_ref()
+        .map(|id| SessionId(id.clone()))
+        .ok_or_else(|| DaemonError::Config("safe-stop requires a session handle".into()))?;
+    let context = crate::worktree_reaper::QuarantineContext {
+        bead_id: Some(overlay.bead_id.clone()),
+        session_id: Some(session_id.0.clone()),
+        project: Some(ao_project.to_string()),
+        branch: overlay.branch.clone(),
+        overlay_state: Some(overlay.state.as_str().to_string()),
+        reason: reason.to_string(),
+        ..Default::default()
+    };
+    crate::worktree_reaper::execute_safe_stop_and_quarantine(
+        deps.sessions,
+        deps.cfg,
+        overlay.repo(deps.cfg),
+        ao_project,
+        &session_id,
+        context,
+    )
+}
+
+fn emit_safe_stop_cleanup(
+    deps: &TickDeps<'_>,
+    overlay: &BeadOverlay,
+    outcome: &crate::worktree_reaper::SafeStopOutcome,
+    phase: &str,
+) -> Result<(), DaemonError> {
+    let (event_type, extra) = match outcome {
+        crate::worktree_reaper::SafeStopOutcome::Removed => (
+            "WORKTREE_CLEANED_ON_SESSION_EXIT",
+            serde_json::json!({}),
+        ),
+        crate::worktree_reaper::SafeStopOutcome::Quarantined(record) => (
+            "WORKTREE_QUARANTINED_ON_SESSION_EXIT",
+            serde_json::json!({"quarantine": record}),
+        ),
+        crate::worktree_reaper::SafeStopOutcome::NoWorktree => return Ok(()),
+    };
+    emit(
+        deps.telemetry_log,
+        &overlay.bead_id,
+        overlay.attempt,
+        overlay.state.as_str(),
+        event_type,
+        serde_json::json!({}),
+        serde_json::json!({"session_id": overlay.session_id, "phase": phase, "outcome": extra}),
+    )?;
+    Ok(())
+}
+
 fn kill_session_and_clear_handle(deps: &TickDeps, overlay: &mut BeadOverlay) {
     let Some(session_id_str) = overlay.session_id.clone() else {
         return;
     };
-    let session_id = SessionId(session_id_str.clone());
-    match deps.sessions.stop(&session_id) {
-        Ok(()) => {
+    let Some(ao_project) = deps
+        .cfg
+        .resolve_repo(overlay.repo(deps.cfg))
+        .map(|routing| routing.ao_project)
+    else {
+        return;
+    };
+    match safe_stop_session(deps, overlay, &ao_project, "park_transition") {
+        Ok(outcome) => {
+            let _ = emit_safe_stop_cleanup(deps, overlay, &outcome, "park_transition");
             let _ = emit(
                 deps.telemetry_log,
                 &overlay.bead_id,
@@ -589,50 +655,7 @@ fn kill_session_and_clear_handle(deps: &TickDeps, overlay: &mut BeadOverlay) {
                     "phase": "park_transition",
                 }),
             );
-            // Proven dead — safe to clear the handle. Unblocks both
-            // recover_human_held and any operator-driven requeue without
-            // risking a duplicate worker or AO dedup collision.
             overlay.session_id = None;
-            // Bead rev-3lm8k: the session is now provably dead, so its
-            // AO-managed worktree dir (if any) is stale immediately — do
-            // not wait for the TTL sweep. `clean_stale_worktree` is a
-            // no-op when `agent_worktree_root` is unset (legacy layout).
-            match crate::worktree_reaper::clean_stale_worktree(
-                deps.cfg,
-                overlay.repo(deps.cfg),
-                &session_id_str,
-            ) {
-                Ok(true) => {
-                    let _ = emit(
-                        deps.telemetry_log,
-                        &overlay.bead_id,
-                        overlay.attempt,
-                        OverlayState::HumanHeld.as_str(),
-                        "WORKTREE_CLEANED_ON_SESSION_EXIT",
-                        serde_json::json!({}),
-                        serde_json::json!({
-                            "session_id": session_id_str,
-                            "phase": "park_transition",
-                        }),
-                    );
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    let _ = emit(
-                        deps.telemetry_log,
-                        &overlay.bead_id,
-                        overlay.attempt,
-                        OverlayState::HumanHeld.as_str(),
-                        "WORKTREE_CLEAN_FAILED",
-                        serde_json::json!({}),
-                        serde_json::json!({
-                            "session_id": session_id_str,
-                            "error": format!("{e:?}"),
-                            "phase": "park_transition",
-                        }),
-                    );
-                }
-            }
         }
         Err(stop_err) => {
             // Stop failed: the session may still be live. RETAIN the handle
@@ -4473,50 +4496,20 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     // wedge is auditable. A subsequent fresh
                     // `check_session_health()` observation (Terminal /
                     // NotFound) is the only path to promotion/retry.
-                    match deps.sessions.stop_in_project(&ao_project, &sid) {
-                        Ok(()) => {
+                    match safe_stop_session(
+                        deps,
+                        &overlay,
+                        &ao_project,
+                        "adopted_health_failure",
+                    ) {
+                        Ok(outcome) => {
+                            emit_safe_stop_cleanup(
+                                deps,
+                                &overlay,
+                                &outcome,
+                                "adopted_health_failure",
+                            )?;
                             overlay.session_id = None;
-                            // Bead rev-3lm8k: the coder session has
-                            // finished and is being reaped right here —
-                            // its AO-managed worktree dir (if any) is
-                            // stale immediately, so clean it now rather
-                            // than waiting on the next TTL sweep.
-                            match crate::worktree_reaper::clean_stale_worktree(
-                                deps.cfg,
-                                overlay.repo(deps.cfg),
-                                session_id_str,
-                            ) {
-                                Ok(true) => {
-                                    let _ = emit(
-                                        deps.telemetry_log,
-                                        bead_id,
-                                        overlay.attempt,
-                                        OverlayState::Dispatched.as_str(),
-                                        "WORKTREE_CLEANED_ON_SESSION_EXIT",
-                                        serde_json::json!({}),
-                                        serde_json::json!({
-                                            "session_id": session_id_str,
-                                            "phase": "adopted_health_failure",
-                                        }),
-                                    );
-                                }
-                                Ok(false) => {}
-                                Err(clean_err) => {
-                                    let _ = emit(
-                                        deps.telemetry_log,
-                                        bead_id,
-                                        overlay.attempt,
-                                        OverlayState::Dispatched.as_str(),
-                                        "WORKTREE_CLEAN_FAILED",
-                                        serde_json::json!({}),
-                                        serde_json::json!({
-                                            "session_id": session_id_str,
-                                            "error": format!("{clean_err:?}"),
-                                            "phase": "adopted_health_failure",
-                                        }),
-                                    );
-                                }
-                            }
                             if overlay.pr_number.is_none() {
                                 overlay.spawn_failure_count += 1;
                                 if overlay.spawn_failure_count
@@ -4765,8 +4758,19 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                 // `Terminal`/`NotFound` observation (or a
                                 // successful stop) is the only path to
                                 // promotion.
-                                match deps.sessions.stop_in_project(&ao_project, &sid) {
-                                    Ok(()) => {
+                                match safe_stop_session(
+                                    deps,
+                                    &overlay,
+                                    &ao_project,
+                                    "adopted_health_failure",
+                                ) {
+                                    Ok(outcome) => {
+                                        emit_safe_stop_cleanup(
+                                            deps,
+                                            &overlay,
+                                            &outcome,
+                                            "adopted_health_failure",
+                                        )?;
                                         session_already_stopped = true;
                                         true
                                     }
@@ -4818,8 +4822,19 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                         // fresh `Terminal`/`NotFound`
                                         // observation (or a successful stop)
                                         // is the only path to promotion.
-                                        match deps.sessions.stop_in_project(&ao_project, &sid) {
-                                            Ok(()) => {
+                                        match safe_stop_session(
+                                            deps,
+                                            &overlay,
+                                            &ao_project,
+                                            "idle_session_exit",
+                                        ) {
+                                            Ok(outcome) => {
+                                                emit_safe_stop_cleanup(
+                                                    deps,
+                                                    &overlay,
+                                                    &outcome,
+                                                    "idle_session_exit",
+                                                )?;
                                                 session_already_stopped = true;
                                                 true
                                             }
@@ -4879,80 +4894,42 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     // PR_OPENED promotion, mirroring the IDLE/health-stop
                     // branches above.
                     let mut reap_stop_failed = false;
-                    if let Some(session_id_str) = overlay.session_id.take() {
-                        let sid = SessionId(session_id_str.clone());
-                        let stop_result = if session_already_stopped {
-                            Ok(())
-                        } else {
-                            deps.sessions.stop_in_project(&ao_project, &sid)
-                        };
-                        match stop_result {
-                            Ok(()) => {}
+                    if overlay.session_id.is_some() && !session_already_stopped {
+                        match safe_stop_session(
+                            deps,
+                            &overlay,
+                            &ao_project,
+                            "session_exit",
+                        ) {
+                            Ok(outcome) => {
+                                emit_safe_stop_cleanup(
+                                    deps,
+                                    &overlay,
+                                    &outcome,
+                                    "session_exit",
+                                )?;
+                            }
                             Err(stop_err) => {
                                 reap_stop_failed = true;
-                                // Put the session handle back so the next
-                                // tick can retry once liveness is confirmed
-                                // fresh.
-                                overlay.session_id = Some(session_id_str.clone());
                                 let _ = emit(
-                                    deps.telemetry_log,
-                                    bead_id,
-                                    overlay.attempt,
-                                    OverlayState::Dispatched.as_str(),
-                                    "REAP_STOP_FAILED_NO_PROMOTION",
-                                    serde_json::json!({}),
-                                    serde_json::json!({
-                                        "session_id": session_id_str,
-                                        "branch": overlay.branch,
-                                        "stop_error": format!("{stop_err:?}"),
-                                        "action": "kept_dispatched_session_handle_preserved_worktree_not_cleaned",
-                                    }),
+                                deps.telemetry_log,
+                                bead_id,
+                                overlay.attempt,
+                                OverlayState::Dispatched.as_str(),
+                                "REAP_STOP_FAILED_NO_PROMOTION",
+                                serde_json::json!({}),
+                                serde_json::json!({
+                                    "session_id": overlay.session_id,
+                                    "branch": overlay.branch,
+                                    "stop_error": format!("{stop_err:?}"),
+                                    "action": "kept_dispatched_session_handle_preserved_worktree_not_cleaned",
+                                }),
                                 );
                             }
                         }
-                        if !reap_stop_failed {
-                            // Bead rev-3lm8k: the coder session has finished and
-                            // is being reaped right here — its AO-managed
-                            // worktree dir (if any) is stale immediately, so
-                            // clean it now rather than waiting on the next TTL
-                            // sweep (a no-op when `agent_worktree_root` is
-                            // unset). This is the exact "coder session exit"
-                            // moment the bead's incident describes: a leftover
-                            // worktree dir blocking every subsequent dispatch
-                            // hashing to the same orchestrator branch.
-                            match crate::worktree_reaper::clean_stale_worktree(
-                                deps.cfg,
-                                overlay.repo(deps.cfg),
-                                &session_id_str,
-                            ) {
-                                Ok(true) => {
-                                    let _ = emit(
-                                        deps.telemetry_log,
-                                        bead_id,
-                                        overlay.attempt,
-                                        OverlayState::Attested.as_str(),
-                                        "WORKTREE_CLEANED_ON_SESSION_EXIT",
-                                        serde_json::json!({}),
-                                        serde_json::json!({"session_id": session_id_str}),
-                                    );
-                                }
-                                Ok(false) => {}
-                                Err(e) => {
-                                    let _ = emit(
-                                        deps.telemetry_log,
-                                        bead_id,
-                                        overlay.attempt,
-                                        OverlayState::Attested.as_str(),
-                                        "WORKTREE_CLEAN_FAILED",
-                                        serde_json::json!({}),
-                                        serde_json::json!({
-                                            "session_id": session_id_str,
-                                            "error": format!("{e:?}"),
-                                        }),
-                                    );
-                                }
-                            }
-                        }
+                    }
+                    if !reap_stop_failed && overlay.session_id.is_some() {
+                        overlay.session_id = None;
                     }
                     // PR #755 Slice 4: when stop() returned Err on
                     // the predicate (IDLE_STOP_FAILED_NO_PROMOTION /

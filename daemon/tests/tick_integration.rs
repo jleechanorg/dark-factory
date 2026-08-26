@@ -42,6 +42,8 @@ use std::cell::{Cell, RefCell};
 struct StopFailsOnSecond {
     inner: FakeSessions,
     stop_calls: Cell<usize>,
+    runtime_worktree: Option<std::path::PathBuf>,
+    post_stop_activity: daemon::tools::SessionActivity,
 }
 
 impl StopFailsOnSecond {
@@ -49,8 +51,15 @@ impl StopFailsOnSecond {
         Self {
             inner,
             stop_calls: Cell::new(0),
+            runtime_worktree: None,
+            post_stop_activity: daemon::tools::SessionActivity::Terminal,
         }
     }
+
+    fn set_runtime_worktree(&mut self, path: std::path::PathBuf) {
+        self.runtime_worktree = Some(path);
+    }
+
 }
 
 impl Sessions for StopFailsOnSecond {
@@ -87,8 +96,89 @@ impl Sessions for StopFailsOnSecond {
         &self,
         id: &SessionId,
     ) -> Result<daemon::tools::SessionActivity, DaemonError> {
+        if self.inner.stop_succeeded.get() {
+            return Ok(self.post_stop_activity);
+        }
         self.inner.session_activity(id)
     }
+
+    fn resolve_runtime_in_project(
+        &self,
+        project: &str,
+        id: &SessionId,
+    ) -> Result<Option<daemon::tools::SessionRuntimeIdentity>, DaemonError> {
+        Ok(Some(daemon::tools::SessionRuntimeIdentity {
+            session_id: id.clone(),
+            project: project.to_string(),
+            runtime_id: Some(id.0.clone()),
+            worktree_path: self.runtime_worktree.clone(),
+            branch: None,
+        }))
+    }
+}
+
+struct FixtureSessions {
+    inner: FakeSessions,
+    runtime_worktree: Option<std::path::PathBuf>,
+    post_stop_activity: daemon::tools::SessionActivity,
+}
+
+impl FixtureSessions {
+    fn new(inner: FakeSessions) -> Self {
+        Self {
+            inner,
+            runtime_worktree: None,
+            post_stop_activity: daemon::tools::SessionActivity::Terminal,
+        }
+    }
+
+    fn set_runtime_worktree(&mut self, path: std::path::PathBuf) {
+        self.runtime_worktree = Some(path);
+    }
+
+    fn set_post_stop_activity(&mut self, activity: daemon::tools::SessionActivity) {
+        self.post_stop_activity = activity;
+    }
+}
+
+impl Sessions for FixtureSessions {
+    fn active_count(&self) -> Result<usize, DaemonError> { self.inner.active_count() }
+    fn spawn(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> { self.inner.spawn(spec) }
+    fn attach(&self, branch: &str, bead_id: &str) -> Result<SessionId, DaemonError> {
+        self.inner.attach(branch, bead_id)
+    }
+    fn stop(&self, id: &SessionId) -> Result<(), DaemonError> { self.inner.stop(id) }
+    fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError> {
+        self.inner.is_quiescent(id)
+    }
+    fn session_activity(&self, id: &SessionId) -> Result<daemon::tools::SessionActivity, DaemonError> {
+        if self.inner.stop_succeeded.get() {
+            return Ok(self.post_stop_activity);
+        }
+        self.inner.session_activity(id)
+    }
+    fn resolve_runtime_in_project(
+        &self,
+        project: &str,
+        id: &SessionId,
+    ) -> Result<Option<daemon::tools::SessionRuntimeIdentity>, DaemonError> {
+        Ok(Some(daemon::tools::SessionRuntimeIdentity {
+            session_id: id.clone(),
+            project: project.to_string(),
+            runtime_id: Some(id.0.clone()),
+            worktree_path: self.runtime_worktree.clone(),
+            branch: self.inner.branch_for.borrow().get(&id.0).cloned(),
+        }))
+    }
+}
+
+impl std::ops::Deref for FixtureSessions {
+    type Target = FakeSessions;
+    fn deref(&self) -> &Self::Target { &self.inner }
+}
+
+impl std::ops::DerefMut for FixtureSessions {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.inner }
 }
 
 /// Models two AO projects sharing a session id namespace. The unscoped
@@ -14931,7 +15021,7 @@ fn test_non_default_repository_branch_collision_telemetry_attribution() {
 fn test_dispatched_adopted_idle_session_reaped_and_promoted() {
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
-    let mut sessions = FakeSessions::new();
+    let mut sessions = FixtureSessions::new(FakeSessions::new());
     // Non-terminal quiescence but idle activity
     sessions.quiescent = false;
     sessions.set_activity(daemon::tools::SessionActivity::Idle);
@@ -15036,7 +15126,7 @@ fn test_dispatched_adopted_idle_session_reaped_and_promoted() {
 fn test_worktree_cleaned_up_on_coder_session_exit_promotion() {
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
-    let mut sessions = FakeSessions::new();
+    let mut sessions = FixtureSessions::new(FakeSessions::new());
     sessions.quiescent = false;
     sessions.set_activity(daemon::tools::SessionActivity::Idle);
 
@@ -15064,6 +15154,7 @@ fn test_worktree_cleaned_up_on_coder_session_exit_promotion() {
     init_cleanup_test_repo(&stale_worktree);
     std::fs::write(stale_worktree.join("marker"), b"leftover coder worktree").unwrap();
     assert!(stale_worktree.is_dir(), "fixture must actually create the dir");
+    sessions.set_runtime_worktree(stale_worktree.clone());
 
     store.overlays.borrow_mut().insert(
         "bead-rev3lm8k".into(),
@@ -15143,8 +15234,8 @@ fn test_worktree_cleaned_up_on_coder_session_exit_promotion() {
 
     let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
     assert!(
-        telemetry.contains("WORKTREE_CLEANED_ON_SESSION_EXIT"),
-        "telemetry must record the worktree cleanup: {telemetry}"
+        telemetry.contains("WORKTREE_QUARANTINED_ON_SESSION_EXIT"),
+        "telemetry must record the worktree quarantine: {telemetry}"
     );
 
     let _ = std::fs::remove_dir_all(&worktree_root);
@@ -15347,6 +15438,8 @@ fn tick_idle_promotion_with_succeeding_stop_promotes_and_cleans() {
     std::fs::create_dir_all(&worktree).unwrap();
     init_cleanup_test_repo(&worktree);
     std::fs::write(worktree.join("marker"), b"idle worker worktree").unwrap();
+    let mut sessions = sessions;
+    sessions.set_runtime_worktree(worktree.clone());
 
     store.overlays.borrow_mut().insert(
         "idle-ok-bead".into(),
@@ -15441,8 +15534,8 @@ fn tick_idle_promotion_with_succeeding_stop_promotes_and_cleans() {
 
     let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
     assert!(
-        log.contains("WORKTREE_CLEANED_ON_SESSION_EXIT"),
-        "happy path must emit WORKTREE_CLEANED_ON_SESSION_EXIT; full log: {log}"
+        log.contains("WORKTREE_QUARANTINED_ON_SESSION_EXIT"),
+        "happy path must emit WORKTREE_QUARANTINED_ON_SESSION_EXIT; full log: {log}"
     );
     assert!(
         !log.contains("IDLE_STOP_FAILED_NO_PROMOTION"),
@@ -15589,7 +15682,7 @@ fn tick_secondary_project_live_session_is_not_notfound_or_cleaned() {
 fn tick_not_found_promotion_skips_stop_and_cleans() {
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
-    let mut sessions = FakeSessions::new();
+    let mut sessions = FixtureSessions::new(FakeSessions::new());
     sessions.quiescent = false;
     sessions.set_activity(daemon::tools::SessionActivity::NotFound);
 
@@ -15612,6 +15705,8 @@ fn tick_not_found_promotion_skips_stop_and_cleans() {
     std::fs::create_dir_all(&worktree).unwrap();
     init_cleanup_test_repo(&worktree);
     std::fs::write(worktree.join("marker"), b"reaped worker worktree").unwrap();
+    sessions.set_runtime_worktree(worktree.clone());
+    sessions.set_post_stop_activity(daemon::tools::SessionActivity::NotFound);
 
     store.overlays.borrow_mut().insert(
         "not-found-bead".into(),
@@ -15713,7 +15808,7 @@ fn tick_not_found_promotion_skips_stop_and_cleans() {
 fn tick_not_found_normal_dispatch_promotion_skips_stop_and_cleans() {
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
-    let mut sessions = FakeSessions::new();
+    let mut sessions = FixtureSessions::new(FakeSessions::new());
     sessions.quiescent = false;
     sessions.set_activity(daemon::tools::SessionActivity::NotFound);
 
@@ -15736,6 +15831,8 @@ fn tick_not_found_normal_dispatch_promotion_skips_stop_and_cleans() {
     std::fs::create_dir_all(&worktree).unwrap();
     init_cleanup_test_repo(&worktree);
     std::fs::write(worktree.join("marker"), b"reaped worker worktree").unwrap();
+    sessions.set_runtime_worktree(worktree.clone());
+    sessions.set_post_stop_activity(daemon::tools::SessionActivity::NotFound);
 
     store.overlays.borrow_mut().insert(
         "not-found-normal-bead".into(),
@@ -16066,7 +16163,7 @@ fn adopted_session_health_failure_with_failing_stop_preserves_session_and_worktr
 fn adopted_session_health_failure_with_succeeding_stop_clears_and_reaps() {
     let scm = FakeScm::new();
     let tracker = FakeTracker::new();
-    let mut sessions = FakeSessions::new();
+    let mut sessions = FixtureSessions::new(FakeSessions::new());
     sessions.set_session_health_failure(
         "adopted-stop-ok",
         "terminal session error in tmux pane: login expired",
@@ -16092,6 +16189,7 @@ fn adopted_session_health_failure_with_succeeding_stop_clears_and_reaps() {
     std::fs::create_dir_all(&worktree).unwrap();
     init_cleanup_test_repo(&worktree);
     std::fs::write(worktree.join("marker"), b"reaped worker worktree").unwrap();
+    sessions.set_runtime_worktree(worktree.clone());
 
     store.overlays.borrow_mut().insert(
         "adopted-stop-ok-bead".into(),
@@ -16151,8 +16249,8 @@ fn adopted_session_health_failure_with_succeeding_stop_clears_and_reaps() {
 
     let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
     assert!(
-        log.contains("WORKTREE_CLEANED_ON_SESSION_EXIT"),
-        "happy path must emit WORKTREE_CLEANED_ON_SESSION_EXIT; full log: {log}"
+        log.contains("WORKTREE_QUARANTINED_ON_SESSION_EXIT"),
+        "happy path must emit WORKTREE_QUARANTINED_ON_SESSION_EXIT; full log: {log}"
     );
     assert!(
         !log.contains("ADOPTED_HEALTH_STOP_FAILED_NO_PROMOTION"),
