@@ -273,8 +273,8 @@ impl Llm for NoopAdapters {
 }
 
 fn default_config_path() -> PathBuf {
-    if let Some(v) = std::env::var_os("DARK_FACTORY_CONFIG").and_then(|v| v.into_string().ok()) {
-        return PathBuf::from(v);
+    if let Some(v) = env_path("DARK_FACTORY_CONFIG") {
+        return v;
     }
     let live = PathBuf::from("config/daemon.toml");
     if live.exists() {
@@ -285,10 +285,15 @@ fn default_config_path() -> PathBuf {
 }
 
 fn default_telemetry_log() -> PathBuf {
-    if let Some(v) = std::env::var_os("DARK_FACTORY_TELEMETRY_LOG").and_then(|v| v.into_string().ok()) {
-        return PathBuf::from(v);
+    if let Some(v) = env_path("DARK_FACTORY_TELEMETRY_LOG") {
+        return v;
     }
     dirs_home_log_path().unwrap_or_else(|| PathBuf::from("daemon.jsonl"))
+}
+
+fn env_path(k: &str) -> Option<PathBuf> {
+    let s = std::env::var_os(k)?.into_string().ok()?;
+    (!s.is_empty()).then(|| PathBuf::from(s))
 }
 
 fn dirs_home_log_path() -> Option<PathBuf> {
@@ -892,56 +897,52 @@ mod tests {
     static NOTIFY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct EnvGuard(&'static str, Option<std::ffi::OsString>);
-    impl EnvGuard {
-        fn set(k: &'static str, v: Option<&std::ffi::OsStr>) -> Self {
-            let prev = std::env::var_os(k);
-            match v {
-                Some(s) => unsafe { std::env::set_var(k, s) },
-                None => unsafe { std::env::remove_var(k) },
-            }
-            Self(k, prev)
-        }
-    }
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            match &self.1 {
-                Some(s) => unsafe { std::env::set_var(self.0, s) },
-                None => unsafe { std::env::remove_var(self.0) },
+            unsafe {
+                match &self.1 {
+                    Some(s) => std::env::set_var(self.0, s),
+                    None => std::env::remove_var(self.0),
+                }
             }
+        }
+    }
+
+    fn check_override(k: &'static str, f: fn() -> PathBuf, ex: PathBuf) {
+        use std::ffi::OsStr;
+        #[cfg(unix)]
+        use std::os::unix::ffi::OsStrExt;
+        let _g = EnvGuard(k, std::env::var_os(k));
+        unsafe { std::env::set_var(k, "/ov") };
+        assert_eq!(f(), PathBuf::from("/ov"));
+        unsafe { std::env::remove_var(k) };
+        assert_eq!(f(), ex);
+        unsafe { std::env::set_var(k, "") };
+        assert_eq!(f(), ex);
+        #[cfg(unix)]
+        {
+            unsafe { std::env::set_var(k, OsStr::from_bytes(b"\xFF")) };
+            assert_eq!(f(), ex);
         }
     }
 
     #[test]
     fn default_config_path_env_override_and_fallback() {
-        let _lock = NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _c = EnvGuard::set("DARK_FACTORY_CONFIG", Some(std::ffi::OsStr::new("/custom/config.toml")));
-        assert_eq!(default_config_path(), PathBuf::from("/custom/config.toml"));
-        let _c = EnvGuard::set("DARK_FACTORY_CONFIG", None);
-        assert_eq!(default_config_path(), PathBuf::from("daemon/contracts/daemon.toml.example"));
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStrExt;
-            let _c = EnvGuard::set("DARK_FACTORY_CONFIG", Some(std::ffi::OsStr::from_bytes(b"\xFF\xFE")));
-            assert_eq!(default_config_path(), PathBuf::from("daemon/contracts/daemon.toml.example"));
-        }
+        let _l = NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ex = PathBuf::from("daemon/contracts/daemon.toml.example");
+        check_override("DARK_FACTORY_CONFIG", default_config_path, ex);
     }
 
     #[test]
     fn default_telemetry_log_env_override_and_fallback() {
-        let _lock = NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _t = EnvGuard::set("DARK_FACTORY_TELEMETRY_LOG", Some(std::ffi::OsStr::new("/custom/daemon.jsonl")));
-        assert_eq!(default_telemetry_log(), PathBuf::from("/custom/daemon.jsonl"));
-        let _h = EnvGuard::set("HOME", Some(std::ffi::OsStr::new("/tmp/df_home")));
-        let _t = EnvGuard::set("DARK_FACTORY_TELEMETRY_LOG", None);
-        assert_eq!(default_telemetry_log(), PathBuf::from("/tmp/df_home/Library/Logs/dark-factory/daemon.jsonl"));
-        let _h = EnvGuard::set("HOME", None);
-        assert_eq!(default_telemetry_log(), PathBuf::from("daemon.jsonl"));
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStrExt;
-            let _t = EnvGuard::set("DARK_FACTORY_TELEMETRY_LOG", Some(std::ffi::OsStr::from_bytes(b"\xFF\xFE")));
-            assert_eq!(default_telemetry_log(), PathBuf::from("daemon.jsonl"));
-        }
+        let _l = NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _h = EnvGuard("HOME", std::env::var_os("HOME"));
+        unsafe { std::env::set_var("HOME", "/h") };
+        let ex = PathBuf::from("/h/Library/Logs/dark-factory/daemon.jsonl");
+        check_override("DARK_FACTORY_TELEMETRY_LOG", default_telemetry_log, ex);
+        unsafe { std::env::remove_var("HOME") };
+        let ex = PathBuf::from("daemon.jsonl");
+        check_override("DARK_FACTORY_TELEMETRY_LOG", default_telemetry_log, ex);
     }
 
     #[test]
