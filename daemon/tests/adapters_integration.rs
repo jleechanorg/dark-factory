@@ -29,8 +29,13 @@ impl Drop for EnvVarGuard {
     }
 }
 
+/// Guards every test in this file that needs to mutate process-wide env vars
+/// (`PATH`) or current directory so concurrent tests cannot race.
+static FAKE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn test_cli_vcs_real_git() {
+    let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if std::env::var("GITHUB_ACTIONS").is_ok() {
         return;
     }
@@ -355,9 +360,7 @@ fn live_ao_sessions_with_branch() -> Option<Vec<(String, String)>> {
 // Tests for jleechan-kk64: GraphQL failure must report Unknown, not Green
 // ============================================================================
 
-/// Guards every test in this file that needs to mutate process-wide env vars
-/// (`PATH`) so concurrent tests cannot race.
-static FAKE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 
 // ============================================================================
 // jleechan-nfdl (PR #655 finding 3) — production must reject planted fixtures

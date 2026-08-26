@@ -715,7 +715,13 @@ fn test_tick_stage2_integration() {
     ));
 
     let store = FakeStateStore::new();
+    let worktree_root = std::env::temp_dir().join(format!(
+        "afd_test_stage2_worktree_root_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&worktree_root);
     let mut cfg = test_cfg();
+    cfg.agent_worktree_root = Some(worktree_root.display().to_string());
     cfg.spec_dir = std::env::temp_dir()
         .join("afd_spec_dir_tick_test")
         .to_string_lossy()
@@ -723,6 +729,11 @@ fn test_tick_stage2_integration() {
     let spec_dir = std::path::Path::new(&cfg.spec_dir);
     let _ = std::fs::remove_dir_all(spec_dir);
     std::fs::create_dir_all(spec_dir).unwrap();
+
+    let worktree = worktree_root.join("owner/repo/fake-session-1");
+    std::fs::create_dir_all(&worktree).unwrap();
+    common::init_cleanup_test_repo(&worktree);
+    sessions.set_runtime_worktree(worktree.clone());
 
     let telemetry_log = std::env::temp_dir().join("afd_tick_stage2_telemetry.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
@@ -841,6 +852,7 @@ fn test_tick_stage2_integration() {
     assert!(spec_content.contains("reviewer = \"skeptic\""));
 
     std::fs::remove_dir_all(spec_dir).ok();
+    let _ = std::fs::remove_dir_all(&worktree_root);
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
@@ -2160,7 +2172,7 @@ mod quiescence_timeout_races {
         sessions.set_orphan_after_stop();
         sessions.set_activity(SessionActivity::Idle);
         // Transcript updated just now — a live mid-tool-call worker.
-        sessions.set_transcript_activity("repo", branch, now_epoch());
+        sessions.set_transcript_activity("repo", branch, now_epoch() + 10);
 
         let deps = RerollDeps {
             scm: &scm,

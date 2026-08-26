@@ -300,7 +300,20 @@ fn one_full_tick_cycle_keeps_unknown_only_gate_attested() {
         r#"{"routingVerdict":"SMALL_PATH","justification":"single small change"}"#.into(),
     ));
     let store = FakeStateStore::new();
-    let cfg = test_cfg();
+    let worktree_root = std::env::temp_dir().join(format!(
+        "afd_tick_one_full_cycle_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let cfg = Config {
+        agent_worktree_root: Some(worktree_root.display().to_string()),
+        ..test_cfg()
+    };
+    let worktree = worktree_root.join("owner/repo/fake-session-1");
+    std::fs::create_dir_all(&worktree).unwrap();
+    init_cleanup_test_repo(&worktree);
+    sessions.set_runtime_worktree(worktree.clone());
+
     let vcs = test_vcs();
     let telemetry_dir = std::env::temp_dir().join("afd_tick_integration_test");
     std::fs::create_dir_all(&telemetry_dir).unwrap();
@@ -532,6 +545,7 @@ fn one_full_tick_cycle_keeps_unknown_only_gate_attested() {
         }
     }
 
+    let _ = std::fs::remove_dir_all(&worktree_root);
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
@@ -11078,8 +11092,21 @@ fn autonomy_timebox_park_kills_associated_ao_session_and_clears_handle() {
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
-    let mut cfg = test_cfg();
+    let worktree_root = std::env::temp_dir().join(format!(
+        "afd_test_mh9o_timebox_wt_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let mut cfg = Config {
+        agent_worktree_root: Some(worktree_root.display().to_string()),
+        ..test_cfg()
+    };
     cfg.autonomy_timebox_secs = 3600;
+
+    let worktree = worktree_root.join("owner/repo/df-mh9o-timebox");
+    std::fs::create_dir_all(&worktree).unwrap();
+    init_cleanup_test_repo(&worktree);
+    sessions.set_runtime_worktree(worktree.clone());
 
     let now_epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -11165,6 +11192,7 @@ fn autonomy_timebox_park_kills_associated_ao_session_and_clears_handle() {
         sessions.calls.borrow()
     );
 
+    let _ = std::fs::remove_dir_all(&worktree_root);
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
@@ -11175,7 +11203,20 @@ fn coder_silent_park_kills_associated_ao_session_and_clears_handle() {
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
-    let cfg = test_cfg();
+    let worktree_root = std::env::temp_dir().join(format!(
+        "afd_test_mh9o_silent_wt_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let cfg = Config {
+        agent_worktree_root: Some(worktree_root.display().to_string()),
+        ..test_cfg()
+    };
+
+    let worktree = worktree_root.join("owner/repo/df-mh9o-silent");
+    std::fs::create_dir_all(&worktree).unwrap();
+    init_cleanup_test_repo(&worktree);
+    sessions.set_runtime_worktree(worktree.clone());
 
     // DISPATCHED bead whose remote branch has had no commit for >30 minutes,
     // no recent transcript activity → the wedge-detection sweep must park
@@ -11251,6 +11292,7 @@ fn coder_silent_park_kills_associated_ao_session_and_clears_handle() {
         sessions.calls.borrow()
     );
 
+    let _ = std::fs::remove_dir_all(&worktree_root);
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
@@ -11439,7 +11481,20 @@ fn adopted_branch_history_rewrite_park_kills_associated_ao_session() {
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
-    let cfg = test_cfg();
+    let worktree_root = std::env::temp_dir().join(format!(
+        "afd_test_mh9o_adopted_wt_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let cfg = Config {
+        agent_worktree_root: Some(worktree_root.display().to_string()),
+        ..test_cfg()
+    };
+
+    let worktree = worktree_root.join("owner/repo/df-mh9o-adopted");
+    std::fs::create_dir_all(&worktree).unwrap();
+    init_cleanup_test_repo(&worktree);
+    sessions.set_runtime_worktree(worktree.clone());
 
     // Pre-seed an adopted DISPATCHED bead whose pre_session_head_sha is
     // NOT an ancestor of the live remote head (positive history rewrite).
@@ -11518,6 +11573,7 @@ fn adopted_branch_history_rewrite_park_kills_associated_ao_session() {
         sessions.calls.borrow()
     );
 
+    let _ = std::fs::remove_dir_all(&worktree_root);
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
@@ -15881,10 +15937,23 @@ fn session_health_failure_reaps_session_and_requeues_bead() {
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
-    let cfg = test_cfg();
+    let worktree_root = std::env::temp_dir().join(format!(
+        "afd_test_session_health_wt_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let cfg = Config {
+        agent_worktree_root: Some(worktree_root.display().to_string()),
+        ..test_cfg()
+    };
     let vcs = FakeVcs::new();
     let telemetry_log = std::env::temp_dir().join("afd_test_session_health.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
+
+    let worktree = worktree_root.join("owner/repo/wa-dead-auth");
+    std::fs::create_dir_all(&worktree).unwrap();
+    init_cleanup_test_repo(&worktree);
+    sessions.set_runtime_worktree(worktree.clone());
 
     store.overlays.borrow_mut().insert(
         "bead-health-fail".into(),
@@ -15947,6 +16016,7 @@ fn session_health_failure_reaps_session_and_requeues_bead() {
         "SESSION_HEALTH_FAILED event must be emitted; telemetry:\n{telemetry}"
     );
 
+    let _ = std::fs::remove_dir_all(&worktree_root);
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
@@ -15966,7 +16036,7 @@ fn session_health_failure_reaps_session_and_requeues_bead() {
 fn adopted_session_health_failure_with_failing_stop_preserves_session_and_worktree() {
     let scm = FakeScm::new();
     let tracker = FakeTracker::new();
-    let mut sessions = FakeSessions::new();
+    let sessions = FakeSessions::new();
     sessions.set_session_health_failure(
         "adopted-stop-fail",
         "terminal session error in tmux pane: login expired",

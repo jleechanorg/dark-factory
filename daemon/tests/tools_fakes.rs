@@ -124,6 +124,7 @@ fn fake_sessions_spawn_attach_stop_quiescent_roundtrip() {
         worktree_ancestor_for: Default::default(),
         worktree_ancestor_error_for: Default::default(),
         session_health_failure_for: Default::default(),
+        ..FakeSessions::default()
     };
 
     assert_eq!(fake.active_count().unwrap(), 3);
