@@ -1,11 +1,3 @@
-from __future__ import annotations
-
-import hashlib
-import json
-import pathlib
-import re
-import shutil
-
 """Parallel reviewer handler.
 
 Runs a primary reviewer lane and a shadow Codex reviewer lane in parallel,
@@ -16,21 +8,13 @@ behavior is aligned with existing lanes (`_resolve_gate_backend`,
 `_start_shadow_gate_review`, `_finish_shadow_gate_review`).
 """
 
-_LANE_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
-_CONTROLLER_TASK_ARTIFACT_RE = re.compile(r"^\.dark-factory/agy-task-[^/]+\.md$")
+from __future__ import annotations
 
-
-def lane_output_dir(neutral_cwd: pathlib.Path, lane: str) -> pathlib.Path:
-    """Return the per-lane output directory inside ``neutral_cwd``.
-
-    Sanitizes the lane label so it is safe as a single directory name. The
-    caller must NOT reuse the returned path across lanes — every parallel
-    lane (primary + every shadow) must have its own output directory.
-    """
-    sanitized = _LANE_NAME_RE.sub("-", str(lane)).strip("-") or "lane"
-    return pathlib.Path(neutral_cwd) / sanitized
-
-
+import hashlib
+import json
+import pathlib
+import re
+import shutil
 import subprocess
 import tempfile
 from typing import TYPE_CHECKING
@@ -45,26 +29,39 @@ from typing import TYPE_CHECKING
 #
 # Symbols that tests monkeypatch via ``runner.handlers._X`` are looked up
 # lazily inside ``_parallel_reviewer`` via the shim — see the function body.
-from .handler_core import Result
-from .handler_core import _gate_strict_flag
+from .handler_core import Result, _gate_strict_flag
+from .handler_dispatch import (
+    _execute_gate,
+    _finish_shadow_gate_review,
+    _launch_shadow_gate_review,
+    _parse_priority_env,
+    _resolve_gate_backend,
+    _start_shadow_gate_review,
+)
+
 # Canonical implementation lives in handler_verdict (pr228 B1 relocation).
 # Re-exported here for backward compatibility: handler_verdict is a leaf
 # module (imports nothing from handlers), so this creates no import cycle.
 from .handler_verdict import _enforce_outcome_verdict_consistency  # noqa: F401
-from .handler_dispatch import (
-    _finish_shadow_gate_review,
-    _is_gate_infra_failure,
-    _resolve_gate_backend,
-    _execute_gate,
-    _launch_shadow_gate_review,
-    _parse_priority_env,
-    _start_shadow_gate_review,
-)
 from .review_controller import EvidenceDelta, EvidenceOrigin
 
 if TYPE_CHECKING:
     from .handler_core import Context
     from .parser import Node
+
+_LANE_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+_CONTROLLER_TASK_ARTIFACT_RE = re.compile(r"^\.dark-factory/agy-task-[^/]+\.md$")
+
+
+def lane_output_dir(neutral_cwd: pathlib.Path, lane: str) -> pathlib.Path:
+    """Return the per-lane output directory inside ``neutral_cwd``.
+
+    Sanitizes the lane label so it is safe as a single directory name. The
+    caller must NOT reuse the returned path across lanes — every parallel
+    lane (primary + every shadow) must have its own output directory.
+    """
+    sanitized = _LANE_NAME_RE.sub("-", str(lane)).strip("-") or "lane"
+    return pathlib.Path(neutral_cwd) / sanitized
 
 
 def _shadow_codex_review_enabled(ctx: "Context") -> bool:
@@ -227,7 +224,7 @@ def _controller_evidence_paths(node: "Node", ctx: "Context") -> tuple[str, ...]:
     elif isinstance(raw, (list, tuple)):
         values = raw
     else:
-        raise ValueError("evidence_paths must be a list or comma-separated string")
+        raise TypeError("evidence_paths must be a list or comma-separated string")
 
     paths: list[str] = []
     for value in values:
@@ -286,16 +283,6 @@ def _controller_snapshot(
     observed_head = _git_output(source, "rev-parse", "HEAD^{commit}").lower()
     if observed_head != expected_sha.lower():
         raise ValueError("controller review target head changed before snapshot")
-    source_status = _git_output(
-        source,
-        "status",
-        "--porcelain=v1",
-        "--untracked-files=all",
-        allow_empty=True,
-    )
-    if not source_status and not declared_evidence:
-        return source, observed_head, None
-
     snapshot_root = pathlib.Path.home() / ".dark-factory" / "controller-snapshots"
     snapshot_root.mkdir(parents=True, exist_ok=True)
     snapshot = pathlib.Path(tempfile.mkdtemp(prefix="snapshot-", dir=snapshot_root))
@@ -457,14 +444,14 @@ def _controller_snapshot(
 
 def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
     """Build the source-owned request; graph/goal content remains envelope data."""
+    import runner.handlers as _handlers_shim
+
     from .review_controller import (
         ReviewContractError,
         ReviewInputs,
         create_review_request,
         validate_immutable_target,
     )
-
-    import runner.handlers as _handlers_shim
 
     source_workdir = _handlers_shim._target_worktree(ctx)
     declared_evidence = _controller_evidence_paths(node, ctx)
@@ -545,11 +532,38 @@ def _holdout_root_strings() -> list[str]:
 
 def _verify_controller_workspace(ctx: "Context", request) -> None:
     """Recompute frozen repository bindings after a reviewer lane returns."""
-    from .review_controller import ReviewContractError
+    from .review_controller import (
+        EvidenceArtifact,
+        ReviewContractError,
+        ReviewInputs,
+        validate_immutable_target,
+    )
 
     envelope = json.loads(request.envelope_json)
     target = envelope["target"]
-    workdir = pathlib.Path(str(target["workspace_path"])).resolve()
+    raw_workdir = pathlib.Path(str(target["workspace_path"]))
+    evidence = tuple(
+        EvidenceArtifact(
+            path=str(item["path"]),
+            size_bytes=int(item["size_bytes"]),
+            sha256=str(item["sha256"]),
+        )
+        for item in envelope.get("evidence", [])
+    )
+    # Validate the raw envelope path before resolving it. This preserves the
+    # symlink-parent guard during post-review re-pin as well as request build.
+    workdir = validate_immutable_target(
+        ReviewInputs(
+            repository=str(target.get("repository", "controller-review")),
+            workspace_path=str(raw_workdir),
+            base_sha=str(target["head_sha"]),
+            head_sha=str(target["head_sha"]),
+            tree_sha=str(target["tree_sha"]),
+            task_text="",
+            evidence=evidence,
+        ),
+        holdout_roots=tuple(_holdout_root_strings()),
+    )
     status = subprocess.run(
 
         [
@@ -609,6 +623,7 @@ def _contract_adjusted_result(
     ctx: "Context",
     *,
     lane: str,
+    backend: str = "",
 ) -> "Result":
     """Fail closed when a lane omits or contradicts the controller contract."""
     from .review_controller import (
@@ -640,6 +655,9 @@ def _contract_adjusted_result(
             if isinstance(item, dict)
         )
         validate_execution_receipts(receipts, validated)
+        from .review_controller import ensure_review_pass_allowed
+
+        ensure_review_pass_allowed(validated, backend=backend, execution_path="graph_controller")
     except ReviewContractError as exc:
         metadata["review_contract_status"] = "invalid"
         metadata["review_contract_gap"] = str(exc)
@@ -655,13 +673,30 @@ def _contract_adjusted_result(
     metadata["review_contract_status"] = "valid"
     metadata["review_response_sha256"] = validated.response_sha256
     metadata["verdict"] = validated.verdict
+    context_updates = dict(result.context_updates)
+    if validated.verdict == "pass":
+        envelope = json.loads(request.envelope_json)
+        target = envelope["target"]
+        context_updates["_last_validated_head_sha"] = str(target["head_sha"])
+        # Mark this state as contract-owned so exit can distinguish a missing
+        # binding (fail closed) from legacy gates that only pin HEAD.
+        context_updates["_verified_review_target_required"] = "true"
+        context_updates["_verified_review_target"] = json.dumps(
+            {
+                "workspace_path": str(target["workspace_path"]),
+                "head_sha": str(target["head_sha"]),
+                "tree_sha": str(target["tree_sha"]),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     return Result(
         outcome="success" if validated.verdict == "pass" else "failure",
         output=result.output,
         metadata=metadata,
         preferred_label=result.preferred_label,
         suggested_next_ids=result.suggested_next_ids,
-        context_updates=result.context_updates,
+        context_updates=context_updates,
     )
 
 
@@ -891,9 +926,11 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
         # Per-lane output directories so primary + every shadow write to
         # distinct cwd/output_dir paths (the controller review contract
         # requires this).
-        ctx.state["_df_controller_review_lane_dirs"] = {
-            "primary": str(lane_output_dir(neutral_cwd, "primary")),
-        }
+        ctx.state["_df_controller_review_lane_dirs"] = json.dumps(
+            {"primary": str(lane_output_dir(neutral_cwd, "primary"))},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         prompt = request.prompt
     else:
         prompt = _handlers_shim._render_prompt(node, ctx)
@@ -961,6 +998,7 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
             request,
             ctx,
             lane="primary",
+            backend=backend,
         )
 
     if not shadows:
@@ -1044,6 +1082,7 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
                 request,
                 ctx,
                 lane=f"shadow_{shadow.backend}",
+                backend=str(shadow.backend),
             )
             md = dict(result.metadata)
             md[f"shadow_{shadow.backend}_gate_outcome"] = shadow_contract_result.outcome

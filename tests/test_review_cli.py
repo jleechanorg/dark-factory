@@ -188,6 +188,124 @@ def test_review_command_returns_two_for_valid_fail_verdict(
     assert json.loads(capsys.readouterr().out)["verdict"] == "fail"
 
 
+
+@pytest.mark.parametrize(
+    "stub_env",
+    ("DARK_FACTORY_ITERATION_STUB", "DARK_FACTORY_FAKE_LLM"),
+)
+def test_review_command_rejects_pass_under_stub_env(
+    tmp_path, monkeypatch, capsys, stub_env
+):
+    repo, base, head = _repo(tmp_path)
+    task = tmp_path / "task.md"
+    task.write_text("Review the behavior change.", encoding="utf-8")
+    output = tmp_path / "review-output"
+    real_run = subprocess.run
+    monkeypatch.setenv(stub_env, "1")
+    monkeypatch.setattr(
+        "runner.review_cli._gate_subprocess_args",
+        lambda backend, prompt, ctx, timeout: ["codex", "exec", prompt],
+    )
+
+    def fake_run(command, **kwargs):
+        if command[0] == "git":
+            return real_run(command, **kwargs)
+        return subprocess.CompletedProcess(
+            command, 0, stdout=_valid_transport(kwargs["input"]), stderr=""
+        )
+
+    monkeypatch.setattr("runner.review_cli.subprocess.run", fake_run)
+    rc = main(
+        [
+            "--workdir", str(repo),
+            "--base-sha", base,
+            "--head-sha", head,
+            "--task-file", str(task),
+            "--output-dir", str(output),
+            "--backend", "codex",
+        ]
+    )
+
+    assert rc == 1
+    receipt = json.loads((output / "controller-receipt.json").read_text())
+    assert receipt["status"] == "invalid"
+    assert "stub-mode" in receipt["contract_error"]
+    assert json.loads(capsys.readouterr().out)["status"] == "invalid"
+
+
+def test_review_command_rejects_symlinked_parent_before_target_query(
+    tmp_path, monkeypatch
+):
+    repo, base, head = _repo(tmp_path)
+    task = tmp_path / "task.md"
+    task.write_text("Review the behavior change.", encoding="utf-8")
+    alias_parent = tmp_path / "alias-parent"
+    alias_parent.symlink_to(tmp_path, target_is_directory=True)
+    target_operation_attempted = False
+
+    def unexpected_target_operation(*args, **kwargs):
+        nonlocal target_operation_attempted
+        target_operation_attempted = True
+        raise AssertionError("target must not be queried through a symlink")
+
+    monkeypatch.setattr("runner.review_cli.subprocess.run", unexpected_target_operation)
+    rc = main(
+        [
+            "--workdir", str(alias_parent / repo.name),
+            "--base-sha", base,
+            "--head-sha", head,
+            "--task-file", str(task),
+            "--output-dir", str(tmp_path / "review-output"),
+        ]
+    )
+
+    assert rc == 1
+    assert target_operation_attempted is False
+
+
+def test_review_command_rejects_post_request_symlink_swap(tmp_path, monkeypatch):
+    repo, base, head = _repo(tmp_path)
+    task = tmp_path / "task.md"
+    task.write_text("Review the behavior change.", encoding="utf-8")
+    output = tmp_path / "review-output"
+    real_run = subprocess.run
+    swapped = False
+    monkeypatch.setattr(
+        "runner.review_cli._gate_subprocess_args",
+        lambda backend, prompt, ctx, timeout: ["codex", "exec", prompt],
+    )
+
+    def fake_run(command, **kwargs):
+        nonlocal swapped
+        if command[0] == "git":
+            return real_run(command, **kwargs)
+        moved = tmp_path / "reviewed-repo-moved"
+        repo.rename(moved)
+        repo.symlink_to(moved, target_is_directory=True)
+        swapped = True
+        return subprocess.CompletedProcess(
+            command, 0, stdout=_valid_transport(kwargs["input"]), stderr=""
+        )
+
+    monkeypatch.setattr("runner.review_cli.subprocess.run", fake_run)
+    rc = main(
+        [
+            "--workdir", str(repo),
+            "--base-sha", base,
+            "--head-sha", head,
+            "--task-file", str(task),
+            "--output-dir", str(output),
+            "--backend", "codex",
+        ]
+    )
+
+    assert swapped is True
+    assert rc == 1
+    receipt = json.loads((output / "controller-receipt.json").read_text())
+    assert receipt["status"] == "invalid"
+    assert "symlink" in receipt["contract_error"]
+
+
 def test_review_command_fails_closed_on_unstructured_response(
     tmp_path, monkeypatch
 ):

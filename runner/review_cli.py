@@ -16,7 +16,7 @@ import pathlib
 import subprocess
 import tempfile
 import time
-from typing import cast
+from dataclasses import replace
 
 from .handler_core import Context
 from .handler_dispatch import (
@@ -29,11 +29,13 @@ from .review_controller import (
     ReviewContractError,
     ReviewInputs,
     create_review_request,
+    ensure_review_pass_allowed,
     parse_codex_jsonl,
     run_controller_review,
     validate_execution_receipts,
     validate_immutable_target,
     validate_review_response,
+    validate_workspace_path,
 )
 
 
@@ -195,48 +197,70 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
-    workdir = args.workdir.expanduser().resolve()
+    # Keep the lexical path until immutable-target validation. Resolving here
+    # would erase a symlinked parent and bypass its containment check.
+    lexical_workdir = args.workdir.expanduser()
     output_dir = args.output_dir.expanduser().resolve()
-    try:
-        output_dir.relative_to(workdir)
-    except ValueError:
-        pass
-    else:
-        parser.error("--output-dir must be outside the reviewed workspace")
     claimed_output = False
     try:
+        try:
+            from .handler_sandbox import _holdout_denied_paths
+
+            holdout_roots = tuple(str(path) for path in _holdout_denied_paths())
+        except (OSError, RuntimeError):
+            holdout_roots = ()
+        # This must precede every git query and every read from the target.
+        workdir = validate_workspace_path(
+            str(lexical_workdir),
+            holdout_roots=holdout_roots,
+        )
         base_sha = _full_revision(workdir, args.base_sha)
         head_sha = _full_revision(workdir, args.head_sha)
         _require_review_range(workdir, base_sha, head_sha)
-        before = _snapshot(workdir, base_sha, head_sha)
+        tree_sha = _git(workdir, "rev-parse", f"{head_sha}^{{tree}}").lower()
+        changed_files_text = _git(
+            workdir,
+            "diff",
+            "--name-only",
+            f"{base_sha}..{head_sha}",
+            allow_empty=True,
+        )
         task_path = args.task_file.expanduser().resolve(strict=True)
         task_text = task_path.read_text(encoding="utf-8")
-        evidence = _evidence_artifacts(workdir, args.evidence)
         try:
             repository = _git(workdir, "config", "--get", "remote.origin.url")
         except ReviewContractError:
             repository = workdir.name
 
+        # Validate the lexical path before reading any target-owned evidence.
+        # Keep that raw spelling in the request so a later symlink-parent swap
+        # is observable when the target is revalidated after review.
         inputs = ReviewInputs(
             repository=repository,
-            workspace_path=str(workdir),
+            workspace_path=str(lexical_workdir),
             base_sha=base_sha,
             head_sha=head_sha,
-            tree_sha=str(before["tree_sha"]),
+            tree_sha=tree_sha,
             task_text=task_text,
-            changed_files=cast(tuple[str, ...], before["changed_files"]),
-            evidence=evidence,
+            changed_files=tuple(
+                line for line in changed_files_text.splitlines() if line.strip()
+            ),
+            evidence=(),
             run_id=f"review-{int(time.time())}",
         )
+        workdir = validate_immutable_target(inputs, holdout_roots=holdout_roots)
+        evidence = _evidence_artifacts(workdir, args.evidence)
+        inputs = replace(inputs, evidence=evidence)
+        # Re-check after collecting evidence so the raw path and every
+        # evidence path are bound before the request is emitted.
+        workdir = validate_immutable_target(inputs, holdout_roots=holdout_roots)
         try:
-            from .handler_sandbox import _holdout_denied_paths
-
-            holdout_roots = tuple(
-                str(path) for path in _holdout_denied_paths()
-            )
-        except (OSError, RuntimeError):
-            holdout_roots = ()
-        validate_immutable_target(inputs, holdout_roots=holdout_roots)
+            output_dir.relative_to(workdir)
+        except ValueError:
+            pass
+        else:
+            parser.error("--output-dir must be outside the reviewed workspace")
+        before = _snapshot(workdir, base_sha, head_sha)
         request = create_review_request(inputs)
         output_dir.mkdir(parents=True, mode=0o700, exist_ok=False)
         claimed_output = True
@@ -307,6 +331,11 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 validated = validate_review_response(response, request)
                 validate_execution_receipts(command_receipts, validated)
+                ensure_review_pass_allowed(
+                    validated,
+                    backend=args.backend,
+                    execution_path="cli",
+                )
                 verdict = validated.verdict
                 response_sha256 = validated.response_sha256
             except ReviewContractError as exc:
@@ -314,6 +343,10 @@ def main(argv: list[str] | None = None) -> int:
         elif proc.returncode != 0:
             contract_error = f"review backend exited with {proc.returncode}"
 
+        # Revalidate the original lexical path before the post-review snapshot;
+        # resolving only once would let a symlink-parent swap redirect the
+        # final check to an unreviewed target.
+        workdir = validate_immutable_target(inputs, holdout_roots=holdout_roots)
         after = _snapshot(workdir, base_sha, head_sha)
         _verify_evidence(workdir, evidence)
         # head + tree pin the whole reviewed state; with a fixed base_sha the

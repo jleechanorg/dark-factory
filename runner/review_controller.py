@@ -49,6 +49,12 @@ def _stub_mode_requested() -> bool:
         or os.environ.get("DARK_FACTORY_FAKE_LLM") == "1"
     )
 
+
+# Echo and mock_llm are deterministic fixtures used by tests and conformance
+# lanes. Every other backend is treated as real review traffic and fails closed
+# if a stub-mode environment attempts to turn PASS into an acceptance result.
+_FIXTURE_BACKENDS: frozenset[str] = frozenset({"echo", "mock_llm"})
+
 _SOURCE_ROOT = Path(__file__).resolve().parents[1]
 _TEMPLATE_PATH = (
     _SOURCE_ROOT / "prompts" / "catalog" / "controller_cold_review_v1.md"
@@ -209,6 +215,39 @@ def _resolve_strict(path: Path) -> Path:
         ) from exc
 
 
+def validate_workspace_path(
+    workspace_path: str | os.PathLike[str],
+    *,
+    holdout_roots: tuple[str, ...] = (),
+) -> Path:
+    """Validate a lexical workspace path before any target-owned operation."""
+    raw_workspace = Path(workspace_path)
+    if _path_is_symlink(raw_workspace):
+        raise ReviewContractError(
+            f"workspace_path must not be a symlink: {raw_workspace}"
+        )
+    _reject_symlinked_workspace_components(raw_workspace)
+    workspace = _resolve_strict(raw_workspace)
+    if not workspace.is_dir():
+        raise ReviewContractError(
+            f"workspace_path must be a regular directory: {workspace}"
+        )
+
+    for entry in holdout_roots:
+        try:
+            holdout = Path(entry).resolve(strict=False)
+        except OSError:
+            continue
+        try:
+            workspace.relative_to(holdout)
+        except ValueError:
+            continue
+        raise ReviewContractError(
+            f"workspace_path is inside a sealed holdout root: {workspace}"
+        )
+    return workspace
+
+
 def validate_immutable_target(
     inputs: ReviewInputs,
     *,
@@ -230,39 +269,10 @@ def validate_immutable_target(
         raise TypeError("inputs must be ReviewInputs")
 
     normalized = _normalized_inputs(inputs)
-    raw_workspace = Path(normalized.workspace_path)
-    if _path_is_symlink(raw_workspace):
-        raise ReviewContractError(
-            f"workspace_path must not be a symlink: {raw_workspace}"
-        )
-    _reject_symlinked_workspace_components(raw_workspace)
-    workspace = _resolve_strict(raw_workspace)
-    if _path_is_symlink(workspace) and workspace != raw_workspace:
-        # Defensive: a parent component was a symlink. Treat the final target
-        # as the resolved location, then re-check the original path.
-        raise ReviewContractError(
-            f"workspace_path resolves through a symlink: {raw_workspace}"
-        )
-    if not workspace.is_dir():
-        raise ReviewContractError(
-            f"workspace_path must be a regular directory: {workspace}"
-        )
-
-    normalized_holdouts: list[Path] = []
-    for entry in holdout_roots:
-        try:
-            resolved = Path(entry).resolve(strict=False)
-        except OSError:
-            continue
-        normalized_holdouts.append(resolved)
-    for holdout in normalized_holdouts:
-        try:
-            workspace.relative_to(holdout)
-        except ValueError:
-            continue
-        raise ReviewContractError(
-            f"workspace_path is inside a sealed holdout root: {workspace}"
-        )
+    workspace = validate_workspace_path(
+        normalized.workspace_path,
+        holdout_roots=holdout_roots,
+    )
 
     for artifact in normalized.evidence:
         if not isinstance(artifact, EvidenceArtifact):
@@ -863,6 +873,41 @@ def validate_execution_receipts(
         )
 
 
+def ensure_review_pass_allowed(
+    review: ValidatedReview,
+    *,
+    execution_path: str = "controller",
+    backend: str = "",
+) -> None:
+    """Reject synthetic PASS results at every real controller acceptance seam.
+
+    The stub-mode rejection only fires for *real* backend traffic. Echo and
+    ``mock_llm`` are deterministic fixtures used by unit tests and conformance
+    lanes; refusing PASS for those would block fixture-only test suites from
+    exercising the controller contract. The ``execution_path`` argument lets
+    callers record which acceptance seam is invoking the check (CLI binary,
+    graph lane, or fixture) and the ``backend`` argument identifies which
+    reviewer lane produced the verdict. Both are recorded in the diagnostic
+    so a regression report shows exactly which seam rejected the verdict.
+    """
+    if not isinstance(review, ValidatedReview):
+        raise TypeError("review must be a ValidatedReview")
+    if review.verdict != "pass":
+        return
+    if not _stub_mode_requested():
+        return
+    if backend in _FIXTURE_BACKENDS:
+        return
+    if execution_path == "fixture":
+        return
+    raise ReviewContractError(
+        f"controller refuses PASS verdict under stub-mode env vars "
+        f"(DARK_FACTORY_ITERATION_STUB=1 or DARK_FACTORY_FAKE_LLM=1); "
+        f"backend={backend!r} execution_path={execution_path!r}; "
+        f"stub mode drives iteration ceilings and cannot transition to READY"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ControllerReviewResult:
     """Typed result of one controller review lane invocation.
@@ -887,6 +932,8 @@ def run_controller_review(
     output_dir: pathlib.Path,
     transport_argv: tuple[str, ...],
     timeout: float = 1200.0,
+    execution_path: str = "controller",
+    backend: str = "",
 ) -> ControllerReviewResult:
     """Run one controller-owned review lane and write its artifacts.
 
@@ -898,6 +945,11 @@ def run_controller_review(
     canonical artifact emission. Both ``runner.review_cli`` and
     ``runner.handler_parallel_reviewer`` route through this function so they
     cannot diverge on shape or digest handling.
+
+    ``execution_path`` and ``backend`` flow into :func:`ensure_review_pass_allowed`
+    so a fixture-backed call (deterministic echo / mock_llm) can declare that
+    fact and skip the stub-mode PASS rejection that exists only to prevent
+    real CLI / graph lanes from accepting synthetic PASS verdicts.
     """
     import subprocess
 
@@ -951,15 +1003,7 @@ def run_controller_review(
     review = validate_review_response(response_body, request)
     validate_execution_receipts(receipts, review)
 
-    # Second line of defence against stub-mode leakage: refuse a PASS verdict
-    # if a stub-mode env var is set, regardless of CI status. A real PASS
-    # requires real LLM + real CI; under stub mode the verdict is synthetic.
-    if review.verdict == "pass" and _stub_mode_requested():
-        raise ReviewContractError(
-            "controller refuses PASS verdict under stub-mode env vars "
-            "(DARK_FACTORY_ITERATION_STUB=1 or DARK_FACTORY_FAKE_LLM=1); "
-            "stub mode drives iteration ceilings and cannot transition to READY"
-        )
+    ensure_review_pass_allowed(review, execution_path=execution_path, backend=backend)
 
     receipt = {
         "schema": 1,
@@ -1046,10 +1090,12 @@ __all__ = [
     "ValidatedReview",
     "build_envelope",
     "create_review_request",
+    "ensure_review_pass_allowed",
     "parse_codex_jsonl",
     "run_controller_review",
     "validate_evidence_origin",
     "validate_execution_receipts",
     "validate_review_response",
+    "validate_workspace_path",
     "verify_request_integrity",
 ]
