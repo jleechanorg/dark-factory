@@ -275,6 +275,10 @@ def test_linux_install_exact_reviewed_immutable_release_drift_rejected(tmp_path)
     assert r2.returncode == 0, r2.stdout + r2.stderr
     unit2 = subprocess.run([str(checkout / "daemon" / "systemd" / "install-systemd-user.sh"), "--render-only"], cwd=checkout, env=env, capture_output=True, text=True)
     assert unit2.returncode == 0 and unit2.stdout == unit1.stdout
+    daemon_bin.chmod(daemon_bin.stat().st_mode | stat.S_IWUSR)
+    daemon_bin.write_text("#!/bin/sh\n# poisoned\nexit 1\n")
+    poison_run = subprocess.run([str(checkout / "daemon" / "systemd" / "install-systemd-user.sh"), "--dry-run", "--skip-build"], cwd=checkout, env=env, capture_output=True, text=True)
+    assert poison_run.returncode != 0, f"dark-factory-824t.1: expected failure on same-SHA poisoned daemon in {rel}"
 
     # 4 & 5: Drift rejection: source payload changes and git reports drift SHA while requested SHA remains fixed
     payload.write_text("drifted-runtime-payload\n")
