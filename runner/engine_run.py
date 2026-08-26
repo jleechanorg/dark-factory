@@ -176,64 +176,91 @@ def _auto_wip_commit_on_exhaustion(ctx: "Context", reason: str) -> None:
 
 
 def _cleanup_controller_snapshot(ctx: "Context") -> None:
-    """Remove the exact controller snapshot after the engine owns its run end.
+    """Remove every exact controller snapshot after the engine owns run end.
 
     Controller snapshots are detached worktrees created beneath the dedicated
     snapshot root. Keep them alive through review and exit re-pin, then remove
-    only the exact validated path recorded by the controller handler.
+    only the exact validated paths recorded by the controller handler.
     """
-    raw_path = ctx.state.pop("_controller_review_snapshot_path", None)
-    if not isinstance(raw_path, str) or not raw_path:
+    raw_snapshots = ctx.state.pop("_controller_review_snapshots", None)
+    if not isinstance(raw_snapshots, str) or not raw_snapshots:
         return
     try:
-        snapshot = pathlib.Path(raw_path)
-        root = pathlib.Path.home() / ".dark-factory" / "controller-snapshots"
+        entries = json.loads(raw_snapshots)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(entries, list):
+        return
+
+    root = pathlib.Path.home() / ".dark-factory" / "controller-snapshots"
+    seen: set[tuple[str, str]] = set()
+    for entry in entries:
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"snapshot_path", "source_worktree"}
+            or not isinstance(entry["snapshot_path"], str)
+            or not isinstance(entry["source_worktree"], str)
+        ):
+            continue
+        snapshot = pathlib.Path(entry["snapshot_path"])
+        source = pathlib.Path(entry["source_worktree"])
+        key = (str(snapshot), str(source))
+        if key in seen:
+            continue
+        seen.add(key)
         if (
             not snapshot.is_absolute()
             or snapshot.parent != root
             or not snapshot.name.startswith("snapshot-")
             or snapshot.is_symlink()
-            or not snapshot.is_dir()
+            or not source.is_absolute()
+            or source.is_symlink()
+            or not source.is_dir()
         ):
-            return
-        if snapshot.resolve(strict=False).parent != root.resolve(strict=False):
-            return
-        source = pathlib.Path(getattr(ctx, "workdir", "") or "")
-        if not source.is_dir():
-            return
-        subprocess.run(
-            [
-                "git",
-                "-C",
-                str(source),
-                "worktree",
-                "remove",
-                "--force",
-                str(snapshot),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-        subprocess.run(
-            [
-                "git",
-                "-C",
-                str(source),
-                "worktree",
-                "prune",
-                "--expire",
-                "now",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        # Cleanup is best-effort and must never mask the run's terminal result.
-        return
+            continue
+        try:
+            if snapshot.resolve(strict=False).parent != root.resolve(strict=False):
+                continue
+        except OSError:
+            continue
+        try:
+            remove_result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(source),
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(snapshot),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if remove_result.returncode != 0 and snapshot.exists():
+                continue
+            if snapshot.exists():
+                continue
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(source),
+                    "worktree",
+                    "prune",
+                    "--expire",
+                    "now",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            # Cleanup is best-effort and must never mask the terminal result.
+            continue
 
 
 def _extract_coder_handoff(text: str) -> str:

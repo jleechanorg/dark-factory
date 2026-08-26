@@ -477,12 +477,37 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
         validate_immutable_target(source_inputs, holdout_roots=holdout_roots)
     except ReviewContractError as exc:
         raise ValueError(f"controller review source is not immutable: {exc}") from exc
+    # Validate the append-only cleanup state before creating another snapshot;
+    # malformed state must fail closed without creating an untracked worktree.
+    raw_snapshots = ctx.state.get("_controller_review_snapshots", "[]")
+    try:
+        snapshots = json.loads(raw_snapshots)
+    except json.JSONDecodeError as exc:
+        raise ValueError("controller snapshot state is malformed") from exc
+    if not isinstance(snapshots, list) or any(
+        not isinstance(entry, dict)
+        or set(entry) != {"snapshot_path", "source_worktree"}
+        or not isinstance(entry["snapshot_path"], str)
+        or not isinstance(entry["source_worktree"], str)
+        for entry in snapshots
+    ):
+        raise ValueError("controller snapshot state is malformed")
     workdir, expected_sha, evidence_origin = _controller_snapshot(
         source_workdir, expected_sha, declared_evidence
     )
-    # The engine owns final cleanup. Record the exact generated snapshot path
-    # immediately so setup failures after snapshot creation cannot leak it.
-    ctx.state["_controller_review_snapshot_path"] = str(workdir)
+    # The engine owns final cleanup. Keep every retry's exact snapshot and its
+    # owning source worktree so no earlier snapshot is orphaned by overwrite.
+    snapshots.append(
+        {
+            "snapshot_path": str(workdir),
+            "source_worktree": str(source_workdir),
+        }
+    )
+    ctx.state["_controller_review_snapshots"] = json.dumps(
+        snapshots,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     base_sha = _git_output(workdir, "merge-base", "origin/main", expected_sha)
     tree_sha = _git_output(workdir, "rev-parse", f"{expected_sha}^{{tree}}")
     changed_text = _git_output(

@@ -377,7 +377,7 @@ def test_engine_finalization_removes_controller_snapshot(
 ) -> None:
     from test_review_cli import _repo
 
-    import runner.engine_run as engine_run
+    from runner import engine_run
 
     run = engine_run.run
     from runner.handler_core import Context, Result
@@ -386,7 +386,11 @@ def test_engine_finalization_removes_controller_snapshot(
 
     repo, base, head = _repo(tmp_path)
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
-    snapshot, _, _ = _controller_snapshot(repo, head, ())
+    snapshots = [
+        _controller_snapshot(repo, head, ())[0],
+        _controller_snapshot(repo, head, ())[0],
+    ]
+    snapshot = snapshots[-1]
     tree = subprocess.check_output(
         ["git", "-C", str(snapshot), "rev-parse", "HEAD^{tree}"],
         text=True,
@@ -397,7 +401,14 @@ def test_engine_finalization_removes_controller_snapshot(
         separators=(",", ":"),
     )
     state = {
-        "_controller_review_snapshot_path": str(snapshot),
+        "_controller_review_snapshots": json.dumps(
+            [
+                {"snapshot_path": str(path), "source_worktree": str(repo)}
+                for path in snapshots
+            ],
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
         "_verified_review_target_required": "true",
         "_verified_review_target": binding,
     }
@@ -438,6 +449,40 @@ def test_engine_finalization_removes_controller_snapshot(
     )
 
     assert history
+    assert all(not path.exists() for path in snapshots)
+    worktrees = subprocess.check_output(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        text=True,
+    )
+    assert all(str(path) not in worktrees for path in snapshots)
+
+
+def test_engine_snapshot_cleanup_skips_malformed_entries_and_deduplicates(
+    tmp_path, monkeypatch
+) -> None:
+    from test_review_cli import _repo
+
+    from runner.engine_run import _cleanup_controller_snapshot
+    from runner.handler_core import Context
+    from runner.handler_parallel_reviewer import _controller_snapshot
+
+    repo, _, head = _repo(tmp_path)
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    snapshot = _controller_snapshot(repo, head, ())[0]
+    state = {
+        "_controller_review_snapshots": json.dumps(
+            [
+                {"snapshot_path": str(snapshot), "source_worktree": str(repo)},
+                {"snapshot_path": str(snapshot), "source_worktree": str(repo)},
+                {"snapshot_path": str(tmp_path / "outside"), "source_worktree": str(repo)},
+                {"snapshot_path": str(snapshot)},
+            ],
+            separators=(",", ":"),
+        )
+    }
+
+    _cleanup_controller_snapshot(Context(goal="", workdir=repo, state=state))
+
     assert not snapshot.exists()
     worktrees = subprocess.check_output(
         ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
