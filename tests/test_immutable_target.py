@@ -38,8 +38,8 @@ def _git(cwd: Path, *args: str, allow_empty: bool = False) -> str:
 
 
 def _trusted_controller_context(**kwargs):
-    from runner.handler_core import Context
     from runner.engine_run import _set_controller_base_sha
+    from runner.handler_core import Context
 
     base_sha = kwargs.pop("_controller_base_sha")
     ctx = Context(**kwargs)

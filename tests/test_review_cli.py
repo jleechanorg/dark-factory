@@ -7,12 +7,13 @@ import json
 import os
 import pathlib
 import subprocess
+from typing import ClassVar
 
 import pytest
 
 from runner.review_cli import _parser, _read_validated_task, main
-from runner.review_controller import ReviewContractError
 from runner.handler_sandbox import _PinnedLauncherCommand
+from runner.review_controller import ReviewContractError
 
 
 def _repo(tmp_path):
@@ -158,7 +159,7 @@ def test_review_cli_passes_and_closes_pinned_linux_launcher(tmp_path, monkeypatc
     class Runtime:
         run_dir = tmp_path / "runtime"
         codex_home = tmp_path / "codex-home"
-        env = {}
+        env: ClassVar[dict[str, str]] = {}
 
     monkeypatch.setattr(
         "runner.review_cli._gate_subprocess_args",

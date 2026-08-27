@@ -8,9 +8,9 @@ worktree and its private Codex runtime.
 
 from __future__ import annotations
 
-import pathlib
 import hashlib
 import os
+import pathlib
 import shutil
 import subprocess
 import sys
@@ -22,13 +22,12 @@ import pytest
 from runner.handler_dispatch import _build_controller_codex_transport
 from runner.handler_sandbox import (
     _extend_pinned_launcher_command,
-    _linux_controller_sandbox_prefix,
     _linux_codex_runtime_paths,
+    _linux_controller_sandbox_prefix,
     _linux_landlock_launcher_path,
     _open_verified_launcher,
     _reset_linux_landlock_launcher_cache_for_tests,
 )
-
 
 linux_only = pytest.mark.skipif(
     not sys.platform.startswith("linux"), reason="Landlock is Linux-only"
