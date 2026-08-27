@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import pathlib
 import subprocess
 
 import pytest
 
-from runner.review_cli import _validated_task_path, main
+from runner.review_cli import _read_validated_task, main
 from runner.review_controller import ReviewContractError
 
 
@@ -356,7 +358,7 @@ def test_task_file_rejects_external_holdout_and_symlink_before_backend(tmp_path,
 
     for candidate in (outside, held, linked):
         with pytest.raises(ReviewContractError):
-            _validated_task_path(candidate, repo, (str(holdout),))
+            _read_validated_task(candidate, repo, (str(holdout),))
 
     launched = False
 
@@ -378,6 +380,31 @@ def test_task_file_rejects_external_holdout_and_symlink_before_backend(tmp_path,
     )
     assert rc == 1
     assert launched is False
+
+
+@pytest.mark.parametrize("replacement", ("symlink", "hardlink"))
+def test_task_file_read_binds_descriptor_before_replacement(tmp_path, replacement, monkeypatch):
+    repo, _base, _head = _repo(tmp_path)
+    task = repo / "task.md"
+    task.write_text("review task\n", encoding="utf-8")
+    holdout = tmp_path / "holdout"
+    holdout.mkdir()
+    sealed = holdout / "sealed.md"
+    sealed.write_text("sealed\n", encoding="utf-8")
+    real_open = os.open
+
+    def race_open(path, flags, *args):
+        if pathlib.Path(path) == task:
+            task.unlink()
+            if replacement == "symlink":
+                task.symlink_to(sealed)
+            else:
+                os.link(sealed, task)
+        return real_open(path, flags, *args)
+
+    monkeypatch.setattr("runner.review_cli.os.open", race_open)
+    with pytest.raises(ReviewContractError, match="safe|regular"):
+        _read_validated_task(task, repo, (str(holdout),))
 
 
 def test_review_command_rejects_post_request_symlink_swap(tmp_path, monkeypatch):

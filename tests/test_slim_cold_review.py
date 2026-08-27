@@ -119,7 +119,7 @@ def test_pass_uses_authoritative_receipts_with_human_command_summary() -> None:
     request = create_review_request(_inputs())
     validated = validate_review_response(
         _compact_response(
-            commands_executed=["ran a probe, then the focused verification suite"],
+            commands_executed=["probe command", "focused verification command"],
         ),
         request,
     )
@@ -143,7 +143,7 @@ def test_pass_rejects_successful_receipt_with_empty_output_digest() -> None:
     validated = validate_review_response(_compact_response(), request)
     receipts = (
         ExecutionReceipt(
-            command="true",
+            command="python -m pytest -q",
             exit_code=0,
             output_sha256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         ),
@@ -195,7 +195,7 @@ def test_graph_controller_stub_pass_is_rejected_for_every_backend(
             metadata={
                 "_controller_command_receipts": [
                     {
-                        "command": "pytest",
+                        "command": "python -m pytest -q",
                         "exit_code": 0,
                         "output_sha256": "0" * 64,
                     }
@@ -245,7 +245,7 @@ def test_parallel_reviewer_stub_backends_do_not_bypass_cold_review_contract(
             metadata={
                 "_controller_command_receipts": [
                     {
-                        "command": "pytest",
+                        "command": "python -m pytest -q",
                         "exit_code": 0,
                         "output_sha256": "1" * 64,
                     }
@@ -381,7 +381,7 @@ def test_controller_acceptance_binds_detached_target_and_exit_repins(
             metadata={
                 "_controller_command_receipts": [
                     {
-                        "command": "pytest",
+                        "command": "python -m pytest -q",
                         "exit_code": 0,
                         "output_sha256": "0" * 64,
                     }

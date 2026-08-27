@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import pathlib
+import stat
 import subprocess
 import tempfile
 import time
@@ -48,19 +49,15 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _validated_task_path(
+def _read_validated_task(
     task_path: pathlib.Path,
     workdir: pathlib.Path,
     holdout_roots: tuple[str, ...],
-) -> pathlib.Path:
-    """Validate the task file before reading caller-controlled task text."""
+) -> tuple[pathlib.Path, str]:
+    """Open and read a contained task file without following a replacement."""
     lexical = task_path.expanduser()
-    if lexical.is_symlink():
-        raise ReviewContractError(f"task file must not be a symlink: {lexical}")
     validate_workspace_path(str(lexical.parent), holdout_roots=holdout_roots)
-    resolved = lexical.resolve(strict=True)
-    if not resolved.is_file() or resolved.is_symlink():
-        raise ReviewContractError(f"task file must be a regular file: {lexical}")
+    resolved = lexical.resolve(strict=False)
     try:
         resolved.relative_to(workdir)
     except ValueError as exc:
@@ -72,7 +69,58 @@ def _validated_task_path(
         except ValueError:
             continue
         raise ReviewContractError("task file is inside a sealed holdout root")
-    return resolved
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(lexical, flags)
+    except OSError as exc:
+        raise ReviewContractError(f"task file could not be opened safely: {lexical}") from exc
+    try:
+        before = os.fstat(fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size > 1024 * 1024
+        ):
+            raise ReviewContractError("task file must be a private regular file")
+        try:
+            current = os.stat(lexical, follow_symlinks=False)
+        except OSError as exc:
+            raise ReviewContractError("task file changed during safe open") from exc
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_dev != before.st_dev
+            or current.st_ino != before.st_ino
+            or current.st_nlink != 1
+        ):
+            raise ReviewContractError("task file changed during safe open")
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining >= 0:
+            chunk = os.read(fd, min(1024 * 1024, remaining + 1))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+            if remaining < 0:
+                raise ReviewContractError("task file changed during safe read")
+        after = os.fstat(fd)
+        if (
+            after.st_dev != before.st_dev
+            or after.st_ino != before.st_ino
+            or after.st_nlink != 1
+            or after.st_size != before.st_size
+            or sum(map(len, chunks)) != before.st_size
+        ):
+            raise ReviewContractError("task file changed during safe read")
+        try:
+            text = b"".join(chunks).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ReviewContractError("task file is not valid UTF-8") from exc
+        return resolved, text
+    finally:
+        os.close(fd)
 
 
 def _write_atomic(path: pathlib.Path, data: bytes) -> None:
@@ -259,8 +307,9 @@ def main(argv: list[str] | None = None) -> int:
             f"{base_sha}..{head_sha}",
             allow_empty=True,
         )
-        task_path = _validated_task_path(args.task_file, workdir, holdout_roots)
-        task_text = task_path.read_text(encoding="utf-8")
+        task_path, task_text = _read_validated_task(
+            args.task_file, workdir, holdout_roots
+        )
         try:
             repository = _git(workdir, "config", "--get", "remote.origin.url")
         except ReviewContractError:

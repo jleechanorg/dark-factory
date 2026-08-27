@@ -1053,18 +1053,18 @@ def validate_execution_receipts(
             )
     if review.verdict != "pass":
         return
-    claimed_commands = review.commands_executed
-    captured_commands = tuple(receipt.command for receipt in receipts)
-    if claimed_commands != captured_commands:
-        raise ReviewContractError(
-            "pass requires commands_executed to exactly match captured command receipts"
-        )
     if not receipts or not any(
         receipt.exit_code == 0 and receipt.output_sha256 != _EMPTY_OUTPUT_SHA256
         for receipt in receipts
     ):
         raise ReviewContractError(
             "pass requires at least one successful command receipt with non-empty output"
+        )
+    claimed_commands = review.commands_executed
+    captured_commands = tuple(receipt.command for receipt in receipts)
+    if claimed_commands != captured_commands:
+        raise ReviewContractError(
+            "pass requires commands_executed to exactly match captured command receipts"
         )
 
 
