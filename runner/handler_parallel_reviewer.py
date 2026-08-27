@@ -479,6 +479,7 @@ def _controller_base_sha(
     workdir: pathlib.Path,
     source_sha: str,
     head_sha: str,
+    require_distinct: bool = True,
 ) -> str:
     """Return the authenticated immutable base for a controller review.
 
@@ -500,7 +501,7 @@ def _controller_base_sha(
         raise ValueError("controller review base SHA must be a full 40-hex revision")
     if not _SHA_RE.fullmatch(str(head_sha).strip().lower()):
         raise ValueError("controller review head SHA is unavailable")
-    if base_sha == str(head_sha).strip().lower():
+    if require_distinct and base_sha == str(head_sha).strip().lower():
         raise ValueError("controller review base SHA must differ from head SHA")
     ancestor = subprocess.run(
         [
@@ -597,6 +598,16 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
     ):
         raise ValueError("controller snapshot state is malformed")
     source_head_sha = expected_sha
+    # Authenticate the non-mutable base before creating a snapshot. Invalid
+    # or equal bases must not leave an untracked controller worktree behind.
+    base_sha = _controller_base_sha(
+        node,
+        ctx,
+        source_workdir,
+        source_sha=source_head_sha,
+        head_sha=source_head_sha,
+        require_distinct=False,
+    )
     workdir, expected_sha, evidence_origin = _controller_snapshot(
         source_workdir, source_head_sha, declared_evidence
     )
