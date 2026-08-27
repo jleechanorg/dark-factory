@@ -836,7 +836,7 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
             from .review_controller import validate_workspace_path
 
             trusted_source = validate_workspace_path(
-                str(source_workdir),
+                str(raw_source_workdir),
                 holdout_roots=tuple(_holdout_root_strings()),
             )
             if (
@@ -871,7 +871,7 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
         raise ValueError("controller source binding state is malformed")
     source_bindings.append(
         {
-            "source_worktree": str(source_workdir),
+            "source_worktree": str(raw_source_workdir),
             "fingerprint": source_fingerprint_before,
             "untracked_files": source_state_before["untracked_files"],
             "excluded_untracked_files": list(excluded_untracked),
@@ -886,7 +886,7 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
     snapshots.append(
         {
             "snapshot_path": str(workdir),
-            "source_worktree": str(source_workdir),
+            "source_worktree": str(raw_source_workdir),
         }
     )
     ctx.state["_controller_review_snapshots"] = json.dumps(

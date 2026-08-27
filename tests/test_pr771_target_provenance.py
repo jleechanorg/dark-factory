@@ -321,6 +321,7 @@ def test_snapshot_failure_skips_cleanup_after_source_parent_swap(
     source_parent = tmp_path / "source-parent"
     source_parent.mkdir(mode=0o700)
     repo, _base, head = _repo(source_parent)
+    raw_repo = source_parent / repo.name / ".." / repo.name
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
@@ -357,10 +358,101 @@ def test_snapshot_failure_skips_cleanup_after_source_parent_swap(
 
     monkeypatch.setattr(reviewer, "_git_output", fail_after_add)
     with pytest.raises(ValueError, match="forced snapshot failure"):
-        reviewer._controller_snapshot(repo, head, ())
+        reviewer._controller_snapshot(repo, head, (), cleanup_source=raw_repo)
 
     assert calls_to_output >= 2
     assert cleanup_calls == []
+
+
+def test_review_persists_raw_source_for_mutation_and_engine_cleanup(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Accepted lexical aliases remain bound for both later cleanup paths."""
+    import runner.handler_parallel_reviewer as reviewer
+    from runner.engine_run import _cleanup_controller_snapshot
+
+    source_parent = tmp_path / "source-parent"
+    source_parent.mkdir(mode=0o700)
+    repo, base, head = _repo(source_parent)
+    raw_repo = source_parent / repo.name / ".." / repo.name
+    assert str(raw_repo) != str(repo)
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.setattr("runner.handler_sandbox._holdout_denied_paths", lambda: [])
+
+    # The source-mutation cleanup must validate the raw spelling, not the
+    # already-resolved source path used for reads and fingerprinting.
+    ctx = Context(
+        goal="review worker change",
+        workdir=raw_repo,
+        state={"base_sha": base},
+        run_id="raw-source-cleanup",
+    )
+    original_snapshot = reviewer._controller_snapshot
+    captured: dict[str, Path] = {}
+
+    def snapshot_then_swap(source, expected_sha, evidence, **kwargs):
+        result = original_snapshot(source, expected_sha, evidence, **kwargs)
+        captured["snapshot"] = result[0]
+        (repo / "value.txt").write_text("changed after snapshot\n")
+        real_parent = tmp_path / "real-source-parent"
+        source_parent.rename(real_parent)
+        source_parent.symlink_to(real_parent, target_is_directory=True)
+        return result
+
+    cleanup_calls: list[list[str]] = []
+    real_run = reviewer.subprocess.run
+
+    def observe_cleanup(command, *args, **kwargs):
+        if "worktree" in command and "remove" in command:
+            cleanup_calls.append(command)
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(reviewer, "_controller_snapshot", snapshot_then_swap)
+    monkeypatch.setattr(reviewer.subprocess, "run", observe_cleanup)
+    with pytest.raises(ValueError, match="changed during snapshot creation"):
+        reviewer._controller_review_request(Node(name="cold_reviewer", attrs={}), ctx, head)
+    assert cleanup_calls == []
+    assert captured["snapshot"].exists()
+
+    # Restore the parent before deterministic test cleanup.
+    source_parent.unlink()
+    (tmp_path / "real-source-parent").rename(source_parent)
+    _git(repo, "worktree", "remove", "--force", str(captured["snapshot"]))
+    (repo / "value.txt").write_text("worker change\n")
+    monkeypatch.setattr(reviewer, "_controller_snapshot", original_snapshot)
+
+    # A successful request records the same raw spelling for engine-owned
+    # cleanup. After a parent swap, the engine must reject remove and prune.
+    clean_ctx = Context(
+        goal="review worker change",
+        workdir=raw_repo,
+        state={"base_sha": base},
+        run_id="raw-source-engine-cleanup",
+    )
+    reviewer._controller_review_request(
+        Node(name="cold_reviewer", attrs={}), clean_ctx, head
+    )
+    state_entries = json.loads(clean_ctx.state["_controller_review_snapshots"])
+    binding_entries = json.loads(clean_ctx.state["_controller_review_source_bindings"])
+    assert state_entries[-1]["source_worktree"] == str(raw_repo)
+    assert binding_entries[-1]["source_worktree"] == str(raw_repo)
+    clean_snapshot = Path(state_entries[-1]["snapshot_path"])
+    real_parent = tmp_path / "real-source-parent"
+    source_parent.rename(real_parent)
+    source_parent.symlink_to(real_parent, target_is_directory=True)
+
+    engine_calls: list[list[str]] = []
+
+    def unexpected_engine_git(command, **kwargs):
+        engine_calls.append(command)
+        raise AssertionError("engine cleanup followed a swapped raw source parent")
+
+    monkeypatch.setattr("runner.engine_run.subprocess.run", unexpected_engine_git)
+    _cleanup_controller_snapshot(Context(goal="", workdir=repo, state=clean_ctx.state))
+    assert engine_calls == []
+    assert clean_snapshot.exists()
 
 
 def test_default_two_node_seeds_base_before_worker_mutation(tmp_path: Path, monkeypatch) -> None:
