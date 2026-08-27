@@ -548,7 +548,7 @@ _LINUX_LANDLOCK_SOURCE = (
     / "agent-isolation"
     / "landlock_launcher.c"
 )
-_linux_landlock_launcher: "Optional[pathlib.Path]" = None
+_linux_landlock_launcher: pathlib.Path | None = None
 _linux_landlock_launcher_checked = False
 
 
@@ -566,10 +566,10 @@ class _PinnedLauncherCommand(list[str]):
             self.launcher_fd = -1
             self.pass_fds = ()
 
-    def __add__(self, other: list[str]) -> "_PinnedLauncherCommand":
+    def __add__(self, other: list[str]) -> _PinnedLauncherCommand:
         return _PinnedLauncherCommand(list(self) + list(other), self.launcher_fd)
 
-    def __radd__(self, other: list[str]) -> "_PinnedLauncherCommand":
+    def __radd__(self, other: list[str]) -> _PinnedLauncherCommand:
         return _PinnedLauncherCommand(list(other) + list(self), self.launcher_fd)
 
 
@@ -718,7 +718,7 @@ def _close_pinned_launcher_command(command: object) -> None:
         close()
 
 
-def _linux_landlock_launcher_path() -> "Optional[pathlib.Path]":
+def _linux_landlock_launcher_path() -> pathlib.Path | None:
     """Build and content-hash cache the kernel-enforced launcher."""
     global _linux_landlock_launcher, _linux_landlock_launcher_checked
     if _linux_landlock_launcher_checked:
@@ -861,11 +861,11 @@ def _linux_codex_runtime_paths(executable: pathlib.Path) -> list[pathlib.Path] |
 
 def _linux_controller_sandbox_prefix(
     *,
-    denied_paths: "list[pathlib.Path]",
-    read_paths: "list[pathlib.Path]",
-    writable_paths: "list[pathlib.Path]",
-    executable_paths: "list[pathlib.Path] | None" = None,
-) -> "Optional[list[str]]":
+    denied_paths: list[pathlib.Path],
+    read_paths: list[pathlib.Path],
+    writable_paths: list[pathlib.Path],
+    executable_paths: list[pathlib.Path] | None = None,
+) -> list[str] | None:
     """Return a Landlock allow-list prefix for a controller Codex process.
 
     Landlock is an allow-list API: an omitted path is denied.  Keep the list
@@ -877,7 +877,7 @@ def _linux_controller_sandbox_prefix(
     if launcher is None:
         return None
 
-    def normalized(paths: "list[pathlib.Path]") -> list[pathlib.Path] | None:
+    def normalized(paths: list[pathlib.Path]) -> list[pathlib.Path] | None:
         result: list[pathlib.Path] = []
         for raw in paths:
             try:
