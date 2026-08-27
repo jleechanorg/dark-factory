@@ -1105,7 +1105,6 @@ def _verify_controller_workspace(ctx: "Context", request) -> None:
                     binding["source_worktree"],
                     holdout_roots=tuple(_holdout_root_strings()),
                 )
-                expected_files: list[str] = []
                 for item in binding["untracked_files"]:
                     if (
                         not isinstance(item, dict)
@@ -1115,7 +1114,6 @@ def _verify_controller_workspace(ctx: "Context", request) -> None:
                         or not isinstance(item["sha256"], str)
                     ):
                         raise ReviewContractError("controller source binding state is malformed")
-                    expected_files.append(item["path"])
                 excluded = tuple(binding["excluded_untracked_files"])
                 if any(not isinstance(item, str) for item in excluded):
                     raise ReviewContractError("controller source binding state is malformed")
@@ -1132,9 +1130,8 @@ def _verify_controller_workspace(ctx: "Context", request) -> None:
                     declared_evidence.append(item["path"])
                 observed_state = _controller_source_state(
                     source,
-                    tuple(expected_files),
-                    excluded,
-                    tuple(declared_evidence),
+                    excluded_untracked=excluded,
+                    declared_evidence_paths=tuple(declared_evidence),
                 )
                 observed = hashlib.sha256(
                     json.dumps(

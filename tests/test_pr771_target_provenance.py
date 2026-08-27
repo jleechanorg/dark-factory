@@ -177,6 +177,72 @@ def test_controller_post_review_revalidates_copied_untracked_file(
         _cleanup_snapshots(repo, ctx)
 
 
+def test_controller_post_review_rejects_new_untracked_product_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A product file added after request binding cannot receive a pass."""
+    from runner.handler_core import Result
+    from runner.handler_parallel_reviewer import _contract_adjusted_result
+
+    repo, base, head = _repo(tmp_path)
+    evidence = repo / "review-evidence.json"
+    evidence.write_text('{"status":"pass"}\n')
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    monkeypatch.setenv("HOME", str(home))
+    ctx = Context(
+        goal="review worker change",
+        workdir=repo,
+        state={
+            "base_sha": base,
+            "evidence_paths": ["review-evidence.json"],
+        },
+        run_id="new-untracked-revalidation",
+    )
+    try:
+        request = _controller_review_request(
+            Node(name="cold_reviewer", attrs={}), ctx, head
+        )
+        (repo / "new-product-source.py").write_text("print('new product')\n")
+        result = _contract_adjusted_result(
+            Result(
+                outcome="success",
+                output=json.dumps(
+                    {
+                        "verdict": "pass",
+                        "findings": [],
+                        "evidence_checked": ["review-evidence.json"],
+                        "commands_executed": ["python -m pytest -q"],
+                        "caveats": [],
+                    },
+                    separators=(",", ":"),
+                ),
+                metadata={
+                    "_controller_command_receipts": [
+                        {
+                            "command": "python -m pytest -q",
+                            "exit_code": 0,
+                            "output_sha256": "0" * 64,
+                        }
+                    ]
+                },
+            ),
+            request,
+            ctx,
+            lane="primary",
+            backend="codex",
+        )
+        assert result.outcome == "failure"
+        assert result.metadata["review_contract_status"] == "invalid"
+        assert (
+            "source checkout changed during review"
+            in result.metadata["review_contract_gap"]
+        )
+        assert "_verified_review_target" not in result.context_updates
+    finally:
+        _cleanup_snapshots(repo, ctx)
+
+
 def test_controller_post_review_revalidates_ignored_declared_evidence(
     tmp_path: Path, monkeypatch
 ) -> None:
