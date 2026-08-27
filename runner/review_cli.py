@@ -28,6 +28,7 @@ from .review_controller import (
     EvidenceArtifact,
     ReviewContractError,
     ReviewInputs,
+    build_controller_receipt,
     create_review_request,
     ensure_review_pass_allowed,
     parse_codex_jsonl,
@@ -202,6 +203,7 @@ def main(argv: list[str] | None = None) -> int:
     lexical_workdir = args.workdir.expanduser()
     output_dir = args.output_dir.expanduser().resolve()
     claimed_output = False
+    request = None
     try:
         try:
             from .handler_sandbox import _holdout_denied_paths
@@ -358,39 +360,29 @@ def main(argv: list[str] | None = None) -> int:
             contract_error = "reviewed repository changed during cold review"
             verdict = "invalid"
 
-        receipt = {
-            "schema": 1,
-            "status": "valid" if not contract_error else "invalid",
-            "verdict": verdict,
-            "contract_error": contract_error,
-            "backend": args.backend,
-            "backend_returncode": proc.returncode,
-            "base_sha": base_sha,
-            "head_sha": head_sha,
-            "tree_sha": before["tree_sha"],
-            "prompt_id": request.prompt_id,
-            "prompt_sha256": _sha256(prompt_bytes),
-            "prompt_payload_sha256": request.prompt_sha256,
-            "envelope_sha256": request.envelope_sha256,
-            "response_sha256": response_sha256,
-            "transport_sha256": (
-                _sha256(raw_transport.encode("utf-8"))
-                if transport_is_jsonl
-                else ""
-            ),
-            "command_receipts": [
-                {
-                    "command": item.command,
-                    "exit_code": item.exit_code,
-                    "output_sha256": item.output_sha256,
-                }
-                for item in command_receipts
-            ],
-            "prompt_path": prompt_path.name,
-            "envelope_path": envelope_path.name,
-            "response_path": response_path.name,
-            "transport_path": transport_path.name if transport_is_jsonl else "",
-        }
+        receipt = build_controller_receipt(
+            request,
+            lane="controller",
+            backend=args.backend,
+            neutral_cwd=output_dir,
+            output_dir=output_dir,
+            transport_argv=tuple(str(arg) for arg in command),
+            transport_text=raw_transport if transport_is_jsonl else "",
+            response_text=response,
+            backend_returncode=proc.returncode,
+            status="valid" if not contract_error else "invalid",
+            verdict=verdict,
+            contract_error=contract_error,
+            receipts=command_receipts,
+        )
+        receipt.update(
+            {
+                "prompt_path": prompt_path.name,
+                "envelope_path": envelope_path.name,
+                "response_path": response_path.name,
+                "transport_path": transport_path.name if transport_is_jsonl else "",
+            }
+        )
         _write_atomic(
             receipt_path,
             (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode("utf-8"),
@@ -400,12 +392,36 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 0 if verdict == "pass" else 2
     except (OSError, UnicodeError, subprocess.TimeoutExpired, ReviewContractError) as exc:
-        payload = {
-            "schema": 1,
-            "status": "invalid",
-            "verdict": "invalid",
-            "contract_error": f"{type(exc).__name__}: {exc}",
-        }
+        contract_error = f"{type(exc).__name__}: {exc}"
+        if request is not None:
+            process = locals().get("proc")
+            returncode = getattr(process, "returncode", -1)
+            payload = build_controller_receipt(
+                request,
+                lane="controller",
+                backend=args.backend,
+                neutral_cwd=output_dir,
+                output_dir=output_dir,
+                transport_argv=tuple(
+                    str(arg) for arg in locals().get("command", ())
+                ),
+                transport_text=str(locals().get("raw_transport", "")),
+                response_text=str(locals().get("response", "")),
+                backend_returncode=returncode
+                if isinstance(returncode, int)
+                else -1,
+                status="invalid",
+                verdict="invalid",
+                contract_error=contract_error,
+                receipts=locals().get("command_receipts", ()),
+            )
+        else:
+            payload = {
+                "schema": 1,
+                "status": "invalid",
+                "verdict": "invalid",
+                "contract_error": contract_error,
+            }
         if claimed_output:
             try:
                 _write_atomic(

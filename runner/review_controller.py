@@ -183,6 +183,75 @@ def _write_controller_artifact(path: Path, data: bytes) -> None:
         raise
 
 
+def build_controller_receipt(
+    request: ReviewRequest,
+    *,
+    lane: str,
+    backend: str,
+    neutral_cwd: Path,
+    output_dir: Path,
+    transport_argv: tuple[str, ...],
+    transport_text: str,
+    response_text: str,
+    backend_returncode: int,
+    status: str,
+    verdict: str,
+    contract_error: str = "",
+    receipts: tuple[ExecutionReceipt, ...] = (),
+) -> dict[str, object]:
+    """Build the common receipt schema shared by CLI and graph lanes."""
+    if not isinstance(request, ReviewRequest):
+        raise TypeError("request must be ReviewRequest")
+    try:
+        envelope = json.loads(request.envelope_json)
+        target = envelope["target"]
+        base_sha = str(target["base_sha"])
+        head_sha = str(target["head_sha"])
+        tree_sha = str(target["tree_sha"])
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise ReviewContractError("request envelope target is invalid") from exc
+    prompt_bytes = request.prompt.encode("utf-8")
+    envelope_bytes = request.envelope_json.encode("utf-8")
+    transport_bytes = str(transport_text).encode("utf-8")
+    response_bytes = str(response_text).encode("utf-8")
+    command_receipts = [
+        {
+            "command": item.command,
+            "exit_code": item.exit_code,
+            "output_sha256": item.output_sha256,
+        }
+        for item in receipts
+    ]
+    return {
+        "schema": 1,
+        "lane": str(lane),
+        "status": str(status),
+        "verdict": str(verdict),
+        "contract_error": str(contract_error),
+        "backend": str(backend),
+        "backend_returncode": backend_returncode,
+        "returncode": backend_returncode,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "tree_sha": tree_sha,
+        "prompt_id": request.prompt_id,
+        "prompt_sha256": _sha256(prompt_bytes),
+        "prompt_payload_sha256": request.prompt_sha256,
+        "envelope_sha256": _sha256(envelope_bytes),
+        "task_sha256": request.task_sha256,
+        "changed_files_sha256": request.changed_files_sha256,
+        "evidence_manifest_sha256": request.evidence_manifest_sha256,
+        "transport_sha256": _sha256(transport_bytes),
+        "response_sha256": _sha256(response_bytes),
+        "transport_argv": [str(arg) for arg in transport_argv],
+        "neutral_cwd": str(Path(neutral_cwd)),
+        "output_dir": str(Path(output_dir)),
+        "cleanup_policy": "retain_until_run_cleanup",
+        "command_receipts": command_receipts,
+        "receipts": command_receipts,
+    }
+
+
 def persist_controller_lane_artifacts(
     request: ReviewRequest,
     *,
@@ -196,6 +265,7 @@ def persist_controller_lane_artifacts(
     backend_returncode: int,
     status: str,
     verdict: str,
+    contract_error: str = "",
     receipts: tuple[ExecutionReceipt, ...] = (),
     create_output_dir: bool = True,
 ) -> dict[str, str]:
@@ -232,38 +302,21 @@ def persist_controller_lane_artifacts(
     _write_controller_artifact(envelope_path, envelope_bytes)
     _write_controller_artifact(transport_path, transport_bytes)
     _write_controller_artifact(response_path, response_bytes)
-    receipt = {
-        "schema": 1,
-        "lane": str(lane),
-        "status": str(status),
-        "verdict": str(verdict),
-        "backend": str(backend),
-        "backend_returncode": backend_returncode,
-        "exit_code": backend_returncode,
-        "prompt_id": request.prompt_id,
-        "prompt_sha256": _sha256(prompt_bytes),
-        "prompt_payload_sha256": request.prompt_sha256,
-        "envelope_sha256": _sha256(envelope_bytes),
-        "head_sha": request.head_sha,
-        "task_sha256": request.task_sha256,
-        "changed_files_sha256": request.changed_files_sha256,
-        "evidence_manifest_sha256": request.evidence_manifest_sha256,
-        "transport_sha256": _sha256(transport_bytes),
-        "response_sha256": _sha256(response_bytes),
-        "transport_argv": [str(arg) for arg in transport_argv],
-        "neutral_cwd": str(Path(neutral_cwd)),
-        "output_dir": str(output_dir),
-        "cleanup_policy": "retain_until_run_cleanup",
-        "command_receipts": [
-            {
-                "command": item.command,
-                "exit_code": item.exit_code,
-                "output_sha256": item.output_sha256,
-            }
-            for item in receipts
-        ],
-    }
-    receipt["receipts"] = receipt["command_receipts"]
+    receipt = build_controller_receipt(
+        request,
+        lane=lane,
+        backend=backend,
+        neutral_cwd=neutral_cwd,
+        output_dir=output_dir,
+        transport_argv=transport_argv,
+        transport_text=transport_text,
+        response_text=response_text,
+        backend_returncode=backend_returncode,
+        status=status,
+        verdict=verdict,
+        contract_error=contract_error,
+        receipts=receipts,
+    )
     _write_controller_artifact(
         receipt_path,
         (json.dumps(receipt, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode(
@@ -1194,6 +1247,7 @@ __all__ = [
     "ReviewRequest",
     "ValidatedReview",
     "build_envelope",
+    "build_controller_receipt",
     "create_review_request",
     "ensure_review_pass_allowed",
     "parse_codex_jsonl",

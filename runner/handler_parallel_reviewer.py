@@ -490,7 +490,9 @@ def _controller_base_sha(
     """
     raw_base = ctx.state.get("_controller_base_sha") or ctx.state.get("base_sha")
     if raw_base is None:
-        raw_base = node.attrs.get("base_sha") or source_sha
+        raw_base = node.attrs.get("base_sha")
+    if raw_base is None:
+        raise ValueError("controller review base SHA is unavailable")
     if not isinstance(raw_base, str):
         raise TypeError("controller review base SHA is unavailable")
     base_sha = raw_base.strip().lower()
@@ -498,6 +500,8 @@ def _controller_base_sha(
         raise ValueError("controller review base SHA must be a full 40-hex revision")
     if not _SHA_RE.fullmatch(str(head_sha).strip().lower()):
         raise ValueError("controller review head SHA is unavailable")
+    if base_sha == str(head_sha).strip().lower():
+        raise ValueError("controller review base SHA must differ from head SHA")
     ancestor = subprocess.run(
         [
             "git",
@@ -551,6 +555,12 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
         )
     except ReviewContractError as exc:
         raise ValueError(f"controller review source is not immutable: {exc}") from exc
+    if (
+        ctx.state.get("_controller_base_sha") is None
+        and ctx.state.get("base_sha") is None
+        and node.attrs.get("base_sha") is None
+    ):
+        raise ValueError("controller review base SHA is unavailable")
     source_inputs = ReviewInputs(
         repository=source_workdir.name,
         workspace_path=str(raw_source_workdir),
@@ -1111,8 +1121,11 @@ def _persist_controller_lane(
         for item in raw_receipts
         if isinstance(item, dict)
     )
+    raw_returncode = metadata.get("returncode", -1)
     try:
-        returncode = int(metadata.get("returncode", -1) or -1)
+        # Preserve an actual zero: ``0 or -1`` would incorrectly record a
+        # successful controller transport as an infrastructure failure.
+        returncode = -1 if raw_returncode in (None, "") else int(raw_returncode)
     except (TypeError, ValueError):
         returncode = -1
     status = str(metadata.get("review_contract_status", "invalid"))
@@ -1129,6 +1142,7 @@ def _persist_controller_lane(
         backend_returncode=returncode,
         status=status,
         verdict=verdict,
+        contract_error=str(metadata.get("review_contract_gap", "")),
         receipts=receipts,
     )
     metadata.update({f"controller_{lane}_{key}_path": value for key, value in paths.items()})
@@ -1232,11 +1246,11 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     configured_shadow_backends = list(shadow_backends)
     if not configured_shadow_backends and _shadow_codex_review_enabled(ctx):
         configured_shadow_backends = ["codex"]
-    lane_dirs = {"primary": str(lane_output_dir(neutral_cwd, "primary"))} if request is not None else {}
-    for index, shadow_backend in enumerate(configured_shadow_backends):
-        suffix = f"shadow_{shadow_backend}" if configured_shadow_backends.count(shadow_backend) == 1 else f"shadow_{shadow_backend}_{index}"
-        lane_dirs[suffix] = str(lane_output_dir(neutral_cwd, suffix))
     if request is not None:
+        lane_dirs = {"primary": str(lane_output_dir(neutral_cwd, "primary"))}
+        for index, shadow_backend in enumerate(configured_shadow_backends):
+            suffix = f"shadow_{shadow_backend}" if configured_shadow_backends.count(shadow_backend) == 1 else f"shadow_{shadow_backend}_{index}"
+            lane_dirs[suffix] = str(lane_output_dir(neutral_cwd, suffix))
         ctx.state["_df_controller_review_lane_dirs"] = json.dumps(
             lane_dirs, sort_keys=True, separators=(",", ":")
         )
@@ -1361,7 +1375,7 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
         else:
             primary_lane_outcome = primary.outcome
         shadow_lane_outcomes.append(primary_lane_outcome)
-    for shadow in shadows:
+    for shadow_index, shadow in enumerate(shadows):
         result = _finish_shadow_gate_review(result, shadow, node.name, expected_sha, timeout, ctx)
         if request is not None:
             shadow_output = str(
@@ -1395,6 +1409,7 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
                             f"shadow_{shadow.backend}_gate_returncode",
                             "",
                         ),
+                        "reviewer_backend": shadow.backend,
                     },
                 ),
                 request,
@@ -1422,9 +1437,7 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
                 suggested_next_ids=result.suggested_next_ids,
                 context_updates=result.context_updates,
             )
-            shadow_lane = f"shadow_{shadow.backend}"
-            if configured_shadow_backends.count(shadow.backend) > 1:
-                shadow_lane = f"shadow_{shadow.backend}_{shadows.index(shadow)}"
+            shadow_lane = shadow.lane_name or f"shadow_{shadow.backend}"
             shadow_contract_result = _persist_controller_lane(
                 shadow_contract_result,
                 request,

@@ -73,7 +73,7 @@ def test_controller_review_fails_closed_without_authenticated_base(tmp_path: Pat
     ctx = Context(goal="review worker change", workdir=repo, run_id="missing-base")
 
     with pytest.raises(ValueError, match="base SHA|target head"):
-        _controller_review_request(Node(name="cold_reviewer", attrs={}), ctx, "")
+        _controller_review_request(Node(name="cold_reviewer", attrs={}), ctx, head)
 
 
 def test_controller_preserves_lexical_symlink_parent_until_validation(tmp_path: Path) -> None:

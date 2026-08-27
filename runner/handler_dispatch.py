@@ -86,6 +86,7 @@ class _ShadowGateReview:
     transport_text: str = ""
     response_text: str = ""
     output_dir: pathlib.Path | None = None
+    lane_name: str = ""
 
 
 def _resolve_shadow_backend_env() -> str:
@@ -189,6 +190,7 @@ def _launch_shadow_gate_review(
     backend without patching the dot file. Caller-specified non-default
     backends always win.
     """
+    configured_lane = lane_name or f"shadow_{backend}"
     if backend == "codex":
         backend = _resolve_shadow_backend_env()
     shadow_prompt = prompt if prompt_is_complete else _shadow_gate_prompt(
@@ -199,6 +201,7 @@ def _launch_shadow_gate_review(
         started_at=time.monotonic(),
         backend=backend,
         prompt_is_complete=prompt_is_complete,
+        lane_name=configured_lane,
     )
     if prompt_is_complete:
         raw_lane_dirs = ctx.state.get("_df_controller_review_lane_dirs", "{}")
@@ -206,7 +209,6 @@ def _launch_shadow_gate_review(
             lane_dirs = json.loads(str(raw_lane_dirs))
         except (TypeError, json.JSONDecodeError):
             lane_dirs = {}
-        configured_lane = lane_name or f"shadow_{backend}"
         configured_path = lane_dirs.get(configured_lane)
         if isinstance(configured_path, str) and configured_path:
             shadow.output_dir = pathlib.Path(configured_path)

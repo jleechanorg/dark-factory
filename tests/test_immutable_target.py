@@ -375,7 +375,11 @@ class ControllerSnapshotTests(unittest.TestCase):
 
         request = _controller_review_request(
             Node(name="cold_reviewer", attrs={}),
-            Context(goal="review worker output", workdir=self.repo),
+            Context(
+                goal="review worker output",
+                workdir=self.repo,
+                state={"base_sha": _git(self.repo, "rev-parse", "HEAD").strip()},
+            ),
             _git(self.repo, "rev-parse", "HEAD").strip(),
         )
         envelope = json.loads(request.envelope_json)
@@ -399,37 +403,25 @@ class ControllerSnapshotTests(unittest.TestCase):
         verify_request_integrity(request)
 
     def test_worker_task_artifact_only_uses_clean_noop_review_snapshot(self) -> None:
-        """A transport-only worker result still receives an immutable no-op review."""
+        """A controller review rejects a missing, distinct authenticated base."""
         from runner.handler_core import Context
         from runner.handler_parallel_reviewer import _controller_review_request
         from runner.parser import Node
-        from runner.review_controller import verify_request_integrity
 
         task_dir = self.repo / ".dark-factory"
         task_dir.mkdir()
         (task_dir / "agy-task-worker.md").write_text("runner task artifact\n")
 
-        request = _controller_review_request(
-            Node(name="cold_reviewer", attrs={}),
-            Context(goal="review no-op worker output", workdir=self.repo),
-            _git(self.repo, "rev-parse", "HEAD").strip(),
-        )
-        envelope = json.loads(request.envelope_json)
-        snapshot = Path(envelope["target"]["workspace_path"])
-
-        verify_request_integrity(request)
-        self.assertNotEqual(snapshot, self.repo)
-        self.assertEqual(_git(snapshot, "status", "--porcelain=v1"), "")
-        self.assertFalse((snapshot / ".dark-factory" / "agy-task-worker.md").exists())
-        self.assertEqual(_git(snapshot, "rev-parse", "HEAD").strip(), request.head_sha)
-        # A no-op worker changes nothing, and the envelope carries no diff
-        # snapshot at all -- the pinned head/tree are the whole commitment.
-        self.assertNotIn("diff", envelope["snapshots"])
-        self.assertEqual(envelope["snapshots"]["changed_files"], [])
-        self.assertEqual(
-            envelope["target"]["tree_sha"],
-            _git(snapshot, "rev-parse", "HEAD^{tree}").strip(),
-        )
+        with self.assertRaisesRegex(ValueError, "base SHA must differ"):
+            _controller_review_request(
+                Node(name="cold_reviewer", attrs={}),
+                Context(
+                    goal="review no-op worker output",
+                    workdir=self.repo,
+                    state={"base_sha": _git(self.repo, "rev-parse", "HEAD").strip()},
+                ),
+                _git(self.repo, "rev-parse", "HEAD").strip(),
+            )
 
     def test_declared_evidence_is_bound_without_copying_unrelated_ignored_files(self) -> None:
         """Snapshot includes declared evidence, but not unrelated ignored runtime data."""
@@ -460,7 +452,11 @@ class ControllerSnapshotTests(unittest.TestCase):
                 name="cold_reviewer",
                 attrs={"evidence_paths": "evidence/controller.json,normal-evidence.json"},
             ),
-            Context(goal="review worker evidence", workdir=self.repo),
+            Context(
+                goal="review worker evidence",
+                workdir=self.repo,
+                state={"base_sha": _git(self.repo, "rev-parse", "HEAD").strip()},
+            ),
             _git(self.repo, "rev-parse", "HEAD").strip(),
         )
         envelope = json.loads(request.envelope_json)
@@ -504,7 +500,11 @@ class ControllerSnapshotTests(unittest.TestCase):
 
         request = _controller_review_request(
             Node(name="cold_reviewer", attrs={"evidence_paths": "evidence/controller.json"}),
-            Context(goal="review ignored-only evidence", workdir=self.repo),
+            Context(
+                goal="review ignored-only evidence",
+                workdir=self.repo,
+                state={"base_sha": _git(self.repo, "rev-parse", "HEAD").strip()},
+            ),
             _git(self.repo, "rev-parse", "HEAD").strip(),
         )
         snapshot = Path(json.loads(request.envelope_json)["target"]["workspace_path"])
@@ -566,7 +566,12 @@ class ControllerSnapshotTests(unittest.TestCase):
                 "backend_priority": "codex",
             },
         )
-        ctx = Context(goal="review worker output", workdir=self.repo, backend="ao")
+        ctx = Context(
+            goal="review worker output",
+            workdir=self.repo,
+            backend="ao",
+            state={"base_sha": _git(self.repo, "rev-parse", "HEAD").strip()},
+        )
         with patch("runner.handler_parallel_reviewer._run_primary_review", _fake_primary), patch(
             "runner.handler_parallel_reviewer._contract_adjusted_result",
             lambda result, request, ctx, **kwargs: result,
@@ -622,7 +627,12 @@ class ControllerSnapshotTests(unittest.TestCase):
             name="cold_reviewer",
             attrs={"review_contract": "cold-review-v1", "backend_priority": "codex"},
         )
-        ctx = Context(goal="review worker output", workdir=self.repo, backend="ao")
+        ctx = Context(
+            goal="review worker output",
+            workdir=self.repo,
+            backend="ao",
+            state={"base_sha": _git(self.repo, "rev-parse", "HEAD").strip()},
+        )
         ctx.state["cold_reviewer.outcome"] = "success"
         with patch("runner.handler_parallel_reviewer._run_primary_review", _fake_primary), patch(
             "runner.handler_parallel_reviewer._contract_adjusted_result",
