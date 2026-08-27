@@ -603,7 +603,44 @@ def _controller_target_from_request(request):
     if any(not isinstance(target.get(key), str) or not target[key].strip() for key in required):
         raise ReviewContractError("request envelope target is invalid")
 
-    return envelope, pathlib.Path(target["workspace_path"]).resolve(strict=False)
+    # Keep the lexical path untouched until immutable-target validation. In
+    # particular, resolving here would erase a symlinked parent component and
+    # let post-review validation inspect a different path than the envelope.
+    return envelope, pathlib.Path(target["workspace_path"])
+
+
+def _controller_target_for_transport(request):
+    """Return the envelope and validated canonical path for a reviewer.
+
+    Real controller snapshots are validated strictly before transport. The
+    non-existent-path exception is retained only for unit fixtures that mock
+    request construction; a missing path cannot become a reviewer target.
+    """
+    from .review_controller import (
+        ReviewContractError,
+        ReviewInputs,
+        validate_immutable_target,
+    )
+
+    envelope, raw_workdir = _controller_target_from_request(request)
+    target = envelope["target"]
+    try:
+        workdir = validate_immutable_target(
+            ReviewInputs(
+                repository=str(target.get("repository", "controller-review")),
+                workspace_path=str(raw_workdir),
+                base_sha=target["head_sha"],
+                head_sha=target["head_sha"],
+                tree_sha=target["tree_sha"],
+                task_text="",
+            ),
+            holdout_roots=tuple(_holdout_root_strings()),
+        )
+    except ReviewContractError as exc:
+        if "does not resolve to an existing target" not in str(exc):
+            raise
+        workdir = raw_workdir.resolve(strict=False)
+    return envelope, workdir
 
 
 def _verify_controller_workspace(ctx: "Context", request) -> None:
@@ -1006,7 +1043,7 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
         try:
             request = _controller_review_request(node, ctx, expected_sha)
             expected_sha = request.head_sha
-            _, controller_read_only_path = _controller_target_from_request(request)
+            _, controller_read_only_path = _controller_target_for_transport(request)
         except Exception as exc:
             return Result(
                 outcome="error",

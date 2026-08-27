@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from runner.handler_core import Context, Result
 from runner.handler_dispatch import (
     _build_controller_codex_transport,
@@ -139,3 +141,18 @@ def test_complete_prompt_shadow_uses_envelope_snapshot_for_write_denial(
     transport = seen["command"]
     assert isinstance(transport, list)
     _assert_snapshot_profile(transport, source, snapshot.resolve())
+
+
+def test_post_review_rejects_symlinked_parent_before_canonicalization(tmp_path):
+    from runner.handler_parallel_reviewer import _verify_controller_workspace
+    from runner.review_controller import ReviewContractError
+
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    (real_parent / "repo").mkdir()
+    alias_parent = tmp_path / "alias"
+    alias_parent.symlink_to(real_parent, target_is_directory=True)
+    request = _request(alias_parent / "repo")
+
+    with pytest.raises(ReviewContractError, match="symlink"):
+        _verify_controller_workspace(None, request)
