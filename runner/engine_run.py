@@ -41,6 +41,15 @@ _CONTROLLER_SNAPSHOT_JOURNAL = "controller-snapshot-journal.json"
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
+def _set_controller_base_sha(ctx: Context, base_sha: str) -> None:
+    """Set controller provenance through the runner-owned initialization path."""
+    normalized = str(base_sha).strip().lower()
+    if not _CONTROLLER_SHA_RE.fullmatch(normalized):
+        raise ValueError("controller base SHA must be a full 40-hex revision")
+    ctx._controller_base_sha = normalized
+    ctx.state["_controller_base_sha"] = normalized
+
+
 def _seed_controller_base_sha(ctx: Context, graph: Graph) -> None:
     """Bind a cold-review base to the selected target before any worker runs.
 
@@ -90,8 +99,7 @@ def _seed_controller_base_sha(ctx: Context, graph: Graph) -> None:
         return
     base_sha = proc.stdout.strip().lower() if proc.returncode == 0 else ""
     if _CONTROLLER_SHA_RE.fullmatch(base_sha):
-        ctx._controller_base_sha = base_sha
-        ctx.state["_controller_base_sha"] = base_sha
+        _set_controller_base_sha(ctx, base_sha)
 
 
 def _controller_snapshot_journal_path(ctx: Context) -> pathlib.Path | None:

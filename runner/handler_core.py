@@ -56,7 +56,7 @@ class Context:
     git_ctx: Optional["GitContext"] = None
     perf_run: Optional["PerfRun"] = None
     last_completed_seq: int = 0
-    _controller_base_sha: Optional[str] = field(default=None, repr=False)
+    _controller_base_sha: Optional[str] = field(default=None, init=False, repr=False)
 
 
 _TIMEOUT_MIN_SECONDS = 5

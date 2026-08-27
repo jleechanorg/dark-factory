@@ -37,6 +37,16 @@ def _git(cwd: Path, *args: str, allow_empty: bool = False) -> str:
     return proc.stdout
 
 
+def _trusted_controller_context(**kwargs):
+    from runner.handler_core import Context
+    from runner.engine_run import _set_controller_base_sha
+
+    base_sha = kwargs.pop("_controller_base_sha")
+    ctx = Context(**kwargs)
+    _set_controller_base_sha(ctx, base_sha)
+    return ctx
+
+
 def _init_clean_repo(tmp: Path) -> Path:
     """Initialize a git repo with one commit so HEAD/tree SHAs exist."""
     repo = tmp / "repo"
@@ -375,7 +385,7 @@ class ControllerSnapshotTests(unittest.TestCase):
 
         request = _controller_review_request(
             Node(name="cold_reviewer", attrs={}),
-            Context(
+            _trusted_controller_context(
                 goal="review worker output",
                 workdir=self.repo,
                 _controller_base_sha=_git(self.repo, "rev-parse", "HEAD").strip(),
@@ -415,7 +425,7 @@ class ControllerSnapshotTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "base SHA must differ"):
             _controller_review_request(
                 Node(name="cold_reviewer", attrs={}),
-                Context(
+                _trusted_controller_context(
                     goal="review no-op worker output",
                     workdir=self.repo,
                     _controller_base_sha=_git(self.repo, "rev-parse", "HEAD").strip(),
@@ -452,7 +462,7 @@ class ControllerSnapshotTests(unittest.TestCase):
                 name="cold_reviewer",
                 attrs={"evidence_paths": "evidence/controller.json,normal-evidence.json"},
             ),
-            Context(
+            _trusted_controller_context(
                 goal="review worker evidence",
                 workdir=self.repo,
                 _controller_base_sha=_git(self.repo, "rev-parse", "HEAD").strip(),
@@ -500,7 +510,7 @@ class ControllerSnapshotTests(unittest.TestCase):
 
         request = _controller_review_request(
             Node(name="cold_reviewer", attrs={"evidence_paths": "evidence/controller.json"}),
-            Context(
+            _trusted_controller_context(
                 goal="review ignored-only evidence",
                 workdir=self.repo,
                 _controller_base_sha=_git(self.repo, "rev-parse", "HEAD").strip(),
@@ -566,7 +576,7 @@ class ControllerSnapshotTests(unittest.TestCase):
                 "backend_priority": "codex",
             },
         )
-        ctx = Context(
+        ctx = _trusted_controller_context(
             goal="review worker output",
             workdir=self.repo,
             backend="ao",
@@ -627,7 +637,7 @@ class ControllerSnapshotTests(unittest.TestCase):
             name="cold_reviewer",
             attrs={"review_contract": "cold-review-v1", "backend_priority": "codex"},
         )
-        ctx = Context(
+        ctx = _trusted_controller_context(
             goal="review worker output",
             workdir=self.repo,
             backend="ao",
