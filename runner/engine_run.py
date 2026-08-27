@@ -54,7 +54,9 @@ def _seed_controller_base_sha(ctx: Context, graph: Graph) -> None:
     pipelines retain their existing behavior; a controller request then fails
     closed at its own validation boundary.
     """
-    if "_controller_base_sha" in ctx.state:
+    private_base = getattr(ctx, "_controller_base_sha", None)
+    if isinstance(private_base, str) and _CONTROLLER_SHA_RE.fullmatch(private_base.strip().lower()):
+        ctx.state["_controller_base_sha"] = private_base.strip().lower()
         return
     try:
         from .handler_core import _target_worktree
@@ -88,6 +90,7 @@ def _seed_controller_base_sha(ctx: Context, graph: Graph) -> None:
         return
     base_sha = proc.stdout.strip().lower() if proc.returncode == 0 else ""
     if _CONTROLLER_SHA_RE.fullmatch(base_sha):
+        ctx._controller_base_sha = base_sha
         ctx.state["_controller_base_sha"] = base_sha
 
 
