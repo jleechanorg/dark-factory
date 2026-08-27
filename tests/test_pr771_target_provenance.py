@@ -58,7 +58,7 @@ def test_controller_base_does_not_follow_mutable_origin_main(tmp_path: Path) -> 
     ctx = Context(
         goal="review worker change",
         workdir=repo,
-        state={"base_sha": base},
+        state={"_controller_base_sha": base},
         run_id="base-provenance",
     )
 
@@ -68,6 +68,16 @@ def test_controller_base_does_not_follow_mutable_origin_main(tmp_path: Path) -> 
         assert envelope["target"]["base_sha"] == base
         assert envelope["target"]["base_sha"] != envelope["target"]["head_sha"]
         assert envelope["snapshots"]["changed_files"] == ["value.txt"]
+        journal = (
+            Path.home()
+            / ".dark-factory"
+            / "runs"
+            / "base-provenance"
+            / "controller-snapshot-journal.json"
+        )
+        assert json.loads(journal.read_text()) == json.loads(
+            ctx.state["_controller_review_snapshots"]
+        )
     finally:
         _cleanup_snapshots(repo, ctx)
 
@@ -82,6 +92,104 @@ def test_controller_review_fails_closed_without_authenticated_base(tmp_path: Pat
         _controller_review_request(Node(name="cold_reviewer", attrs={}), ctx, head)
 
 
+def test_controller_base_ignores_public_state_and_graph_attribute(tmp_path: Path) -> None:
+    """The graph reviewer must use only the runner-captured controller base."""
+    from runner.engine_run import _seed_controller_base_sha
+    from runner.parser import Graph
+
+    repo, base, head = _repo(tmp_path)
+    graph = Graph(
+        name="controller-base",
+        goal="",
+        nodes={
+            "start": Node(name="start", attrs={}),
+            "cold_reviewer": Node(
+                name="cold_reviewer", attrs={"base_sha": base, "review_contract": "cold-review-v1"}
+            ),
+        },
+        edges=[],
+    )
+    ctx = Context(goal="review", workdir=repo, state={"base_sha": base})
+
+    _seed_controller_base_sha(ctx, graph)
+
+    assert ctx.state["_controller_base_sha"] == head
+    assert ctx.state["base_sha"] == base
+
+
+def test_controller_cleanup_retains_failed_journal_entry(tmp_path: Path, monkeypatch) -> None:
+    """A failed remove remains durable for a later retry."""
+    from runner.engine_run import _cleanup_controller_snapshot
+
+    repo, _base, head = _repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    snapshot = _controller_snapshot(repo, head, ())[0]
+    entry = {"snapshot_path": str(snapshot), "source_worktree": str(repo)}
+    ctx = Context(
+        goal="cleanup",
+        workdir=repo,
+        run_id="cleanup-retry",
+        state={"_controller_review_snapshots": json.dumps([entry])},
+    )
+    journal = home / ".dark-factory" / "runs" / "cleanup-retry" / "controller-snapshot-journal.json"
+    journal.parent.mkdir(parents=True)
+    journal.write_text(json.dumps([entry]))
+    real_run = subprocess.run
+
+    def fail_remove(command, *args, **kwargs):
+        if "worktree" in command and "remove" in command:
+            return subprocess.CompletedProcess(command, 1, "", "remove failed")
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr("runner.engine_run.subprocess.run", fail_remove)
+    _cleanup_controller_snapshot(ctx)
+
+    assert json.loads(ctx.state["_controller_review_snapshots"]) == [entry]
+    assert json.loads(journal.read_text()) == [entry]
+    assert snapshot.exists()
+
+
+def test_resume_terminal_checkpoint_retries_durable_snapshot_cleanup(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A resume early return still retries snapshots left by a prior run."""
+    from runner.engine_run import run
+    from runner.parser import Edge, Graph
+
+    repo, _base, head = _repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    snapshot = _controller_snapshot(repo, head, ())[0]
+    run_dir = home / ".dark-factory" / "runs" / "resume-cleanup"
+    run_dir.mkdir(parents=True)
+    entry = {"snapshot_path": str(snapshot), "source_worktree": str(repo)}
+    (run_dir / "controller-snapshot-journal.json").write_text(json.dumps([entry]))
+    checkpoint = run_dir / "checkpoint.json"
+    checkpoint.write_text(
+        json.dumps([{"node": "exit", "outcome": "success", "ts": 0, "output_preview": ""}])
+    )
+    graph = Graph(
+        name="resume-cleanup",
+        goal="",
+        nodes={"start": Node(name="start", attrs={}), "exit": Node(name="exit", attrs={})},
+        edges=[Edge(src="start", dst="exit", attrs={})],
+    )
+
+    history = run(
+        graph,
+        Context(goal="resume", workdir=repo),
+        resume=checkpoint,
+        max_steps=10,
+    )
+
+    assert history
+    assert not snapshot.exists()
+    assert json.loads((run_dir / "controller-snapshot-journal.json").read_text()) == []
+
+
 @pytest.mark.parametrize(
     "discovery_error", (OSError("unavailable"), RuntimeError("missing"))
 )
@@ -92,7 +200,7 @@ def test_controller_review_fails_closed_when_holdout_discovery_fails(
     ctx = Context(
         goal="review worker change",
         workdir=repo,
-        state={"base_sha": base},
+        state={"_controller_base_sha": base},
         run_id="missing-holdouts",
     )
 
@@ -171,7 +279,7 @@ def test_controller_post_review_revalidates_mutable_source_checkout(tmp_path: Pa
     ctx = Context(
         goal="review worker change",
         workdir=repo,
-        state={"base_sha": base},
+        state={"_controller_base_sha": base},
         run_id="source-revalidation",
     )
     try:
@@ -196,7 +304,7 @@ def test_controller_post_review_revalidates_copied_untracked_file(
     ctx = Context(
         goal="review worker change",
         workdir=repo,
-        state={"base_sha": base},
+        state={"_controller_base_sha": base},
         run_id="untracked-revalidation",
     )
     try:
@@ -225,7 +333,7 @@ def test_controller_post_review_rejects_new_untracked_product_file(
         goal="review worker change",
         workdir=repo,
         state={
-            "base_sha": base,
+            "_controller_base_sha": base,
             "evidence_paths": ["review-evidence.json"],
         },
         run_id="new-untracked-revalidation",
@@ -289,7 +397,7 @@ def test_controller_post_review_revalidates_ignored_declared_evidence(
     ctx = Context(
         goal="review worker change",
         workdir=repo,
-        state={"base_sha": base, "evidence_paths": ["evidence/worker-verification.json"]},
+        state={"_controller_base_sha": base, "evidence_paths": ["evidence/worker-verification.json"]},
         run_id="ignored-evidence-revalidation",
     )
     try:
@@ -319,7 +427,7 @@ def test_controller_rejects_source_mutation_between_snapshot_and_binding(
     ctx = Context(
         goal="review worker change",
         workdir=repo,
-        state={"base_sha": base},
+        state={"_controller_base_sha": base},
         run_id="snapshot-binding-race",
     )
     original_snapshot = reviewer._controller_snapshot
@@ -483,7 +591,7 @@ def test_review_persists_raw_source_for_mutation_and_engine_cleanup(
     ctx = Context(
         goal="review worker change",
         workdir=raw_repo,
-        state={"base_sha": base},
+        state={"_controller_base_sha": base},
         run_id="raw-source-cleanup",
     )
     original_snapshot = reviewer._controller_snapshot
@@ -525,7 +633,7 @@ def test_review_persists_raw_source_for_mutation_and_engine_cleanup(
     clean_ctx = Context(
         goal="review worker change",
         workdir=raw_repo,
-        state={"base_sha": base},
+        state={"_controller_base_sha": base},
         run_id="raw-source-engine-cleanup",
     )
     reviewer._controller_review_request(
