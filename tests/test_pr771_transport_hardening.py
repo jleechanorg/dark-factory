@@ -141,8 +141,10 @@ def test_controller_transport_macos_profile_enforces_read_only_and_holdout_denia
         sandboxed = [
             str(pathlib.Path(shutil.which("sandbox-exec") or "sandbox-exec")),
             "-p",
-            '(version 1)\n(allow default)\n'
-            f'(deny file-read* (subpath "{holdout}"))\n',
+            (
+                '(version 1)\n(allow default)\n'
+                f'(deny file-read* (subpath "{holdout}"))\n'
+            ),
             str(codex),
             "exec",
             "--yolo",

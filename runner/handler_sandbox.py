@@ -201,7 +201,7 @@ def _build_sandbox_profile(extra_denied_paths: list[pathlib.Path]) -> str:
 
 
 def _macos_read_only_profile(
-    profile: str, read_only_path: "Union[pathlib.Path, str, None]" = None
+    profile: str, read_only_path: pathlib.Path | str | None = None
 ) -> str:
     """Add the controller's read-only write boundary to an existing profile.
 

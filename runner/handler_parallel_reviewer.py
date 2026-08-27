@@ -109,6 +109,7 @@ def _run_primary_review(
     backend: str,
     *,
     gate_strict: bool,
+    read_only_path: pathlib.Path | str | None = None,
 ) -> Result:
     """Run the primary reviewer lane with infra fallback policy.
 
@@ -126,6 +127,7 @@ def _run_primary_review(
             node_name,
             backend,
             gate_strict=gate_strict,
+            read_only_path=read_only_path,
         )
     finally:
         if prior_shadow_flag is None:
@@ -572,6 +574,38 @@ def _holdout_root_strings() -> list[str]:
     return [str(path) for path in _holdout_denied_paths()]
 
 
+def _controller_target_from_request(request):
+    """Return the authenticated envelope and its canonical target workspace.
+
+    The graph's source checkout is only used to create the request. Once the
+    request exists, controller transport boundaries must come from its
+    integrity-checked target envelope, which may be a detached snapshot.
+    ``_controller_review_request`` and post-review verification perform the
+    strict filesystem validation; this extraction only needs a canonical path
+    so a mocked request can exercise the dispatch path without a real target.
+    """
+    from .review_controller import (
+        ReviewContractError,
+        verify_request_integrity,
+    )
+
+    verify_request_integrity(request)
+    try:
+        envelope = json.loads(request.envelope_json)
+    except json.JSONDecodeError as exc:
+        raise ReviewContractError("request envelope is not valid JSON") from exc
+    if not isinstance(envelope, dict):
+        raise ReviewContractError("request envelope must be a JSON object")
+    target = envelope.get("target")
+    if not isinstance(target, dict):
+        raise ReviewContractError("request envelope target is invalid")
+    required = ("workspace_path", "head_sha", "tree_sha")
+    if any(not isinstance(target.get(key), str) or not target[key].strip() for key in required):
+        raise ReviewContractError("request envelope target is invalid")
+
+    return envelope, pathlib.Path(target["workspace_path"]).resolve(strict=False)
+
+
 def _verify_controller_workspace(ctx: "Context", request) -> None:
     """Recompute frozen repository bindings after a reviewer lane returns."""
     from .review_controller import (
@@ -581,9 +615,8 @@ def _verify_controller_workspace(ctx: "Context", request) -> None:
         validate_immutable_target,
     )
 
-    envelope = json.loads(request.envelope_json)
+    envelope, raw_workdir = _controller_target_from_request(request)
     target = envelope["target"]
-    raw_workdir = pathlib.Path(str(target["workspace_path"]))
     evidence = tuple(
         EvidenceArtifact(
             path=str(item["path"]),
@@ -962,6 +995,7 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     expected_sha = _handlers_shim._worktree_head_sha(target_dir)
 
     request = None
+    controller_read_only_path = None
     if review_contract:
         if review_contract != "cold-review-v1":
             return Result(
@@ -972,6 +1006,7 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
         try:
             request = _controller_review_request(node, ctx, expected_sha)
             expected_sha = request.head_sha
+            _, controller_read_only_path = _controller_target_from_request(request)
         except Exception as exc:
             return Result(
                 outcome="error",
@@ -1024,6 +1059,7 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
                 ctx,
                 backend=b,
                 prompt_is_complete=request is not None,
+                read_only_path=controller_read_only_path,
             ))
     elif _shadow_codex_review_enabled(ctx):
         s = _start_shadow_gate_review(
@@ -1033,6 +1069,7 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
             timeout,
             ctx,
             prompt_is_complete=request is not None,
+            read_only_path=controller_read_only_path,
         )
         if s:
             shadows.append(s)
@@ -1049,6 +1086,7 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
             node.name,
             backend,
             gate_strict=gate_strict,
+            read_only_path=controller_read_only_path,
         )
     finally:
         if prior_controller_json is None:

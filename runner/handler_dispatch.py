@@ -165,6 +165,7 @@ def _launch_shadow_gate_review(
     backend: str = "codex",
     *,
     prompt_is_complete: bool = False,
+    read_only_path: pathlib.Path | str | None = None,
 ) -> _ShadowGateReview | None:
     import runner.handlers as _handlers_shim  # late-bound shim (see module docstring)
     """Spawn a shadow reviewer on ``backend`` (no enable-gate).
@@ -238,7 +239,9 @@ def _launch_shadow_gate_review(
         return shadow
     if prompt_is_complete and backend == "codex":
         try:
-            args = _controller_codex_args(args, read_only_path=ctx.workdir)
+            args = _controller_codex_args(
+                args, read_only_path=read_only_path or ctx.workdir
+            )
         except ValueError as exc:
             shadow.launch_error = str(exc)
             return shadow
@@ -273,6 +276,7 @@ def _start_shadow_gate_review(
     backend: str = "codex",
     *,
     prompt_is_complete: bool = False,
+    read_only_path: pathlib.Path | str | None = None,
 ) -> _ShadowGateReview | None:
     """Back-compat wrapper: gate-on-enable then spawn the shadow reviewer.
 
@@ -290,6 +294,7 @@ def _start_shadow_gate_review(
         ctx,
         backend,
         prompt_is_complete=prompt_is_complete,
+        read_only_path=read_only_path,
     )
 
 
@@ -559,7 +564,7 @@ def _gate_subprocess_env(backend: str) -> dict[str, str]:
 def _build_controller_codex_transport(
     args: list[str],
     *,
-    read_only_path: "Optional[pathlib.Path | str]" = None,
+    read_only_path: pathlib.Path | str | None = None,
 ) -> list[str]:
     """Build the concrete controller transport command for Codex review.
 
@@ -668,7 +673,7 @@ def _build_controller_codex_transport(
 def _controller_codex_args(
     args: list[str],
     *,
-    read_only_path: "Optional[pathlib.Path | str]" = None,
+    read_only_path: pathlib.Path | str | None = None,
 ) -> list[str]:
     """Backward-compatible shim for the controller transport builder."""
     return _build_controller_codex_transport(args, read_only_path=read_only_path)
@@ -676,7 +681,7 @@ def _controller_codex_args(
 
 def _run_gate_once(
     backend: str, prompt: str, expected_sha: str, timeout: int, ctx: "Context", name: str,
-    *, gate_strict: bool = False,
+    *, gate_strict: bool = False, read_only_path: pathlib.Path | str | None = None,
 ) -> "Result":
     import runner.handlers as _handlers_shim  # late-bound shim
     """Run one reviewer-gate attempt on ``backend`` and classify the result.
@@ -756,7 +761,9 @@ def _run_gate_once(
     controller_json = backend == "codex" and controller_requested
     if controller_json:
         try:
-            sub_args = _controller_codex_args(sub_args, read_only_path=ctx.workdir)
+            sub_args = _controller_codex_args(
+                sub_args, read_only_path=read_only_path or ctx.workdir
+            )
         except ValueError:
             return Result(
                 outcome="error",
@@ -1185,7 +1192,7 @@ def _coerce_bool_attr(value: object) -> bool:
 
 def _execute_gate(
     prompt: str, expected_sha: str, timeout: int, ctx: "Context", name: str, backend: str,
-    *, gate_strict: bool = False,
+    *, gate_strict: bool = False, read_only_path: pathlib.Path | str | None = None,
 ) -> "Result":
     """Run a reviewer gate on ``backend``; infra failures fall back to agy, then claude.
 
@@ -1208,7 +1215,16 @@ def _execute_gate(
     ``codex`` actually invokes the codex subprocess, with
     ``reviewer_backend: codex`` recorded in the result metadata.
     """
-    result = _run_gate_once(backend, prompt, expected_sha, timeout, ctx, name, gate_strict=gate_strict)
+    result = _run_gate_once(
+        backend,
+        prompt,
+        expected_sha,
+        timeout,
+        ctx,
+        name,
+        gate_strict=gate_strict,
+        read_only_path=read_only_path,
+    )
 
     controller_requested = str(ctx.state.get("_df_controller_review_json") or "").lower() in {"true", "1", "yes", "on"}
     if _is_gate_infra_failure(result):
@@ -1224,7 +1240,16 @@ def _execute_gate(
 
         current_result = result
         for fb_backend in fallback_backends:
-            fallback = _run_gate_once(fb_backend, prompt, expected_sha, timeout, ctx, name, gate_strict=gate_strict)
+            fallback = _run_gate_once(
+                fb_backend,
+                prompt,
+                expected_sha,
+                timeout,
+                ctx,
+                name,
+                gate_strict=gate_strict,
+                read_only_path=read_only_path,
+            )
             fallback.metadata["fallback_used"] = "true"
             fallback.metadata["fallback_from"] = backend
             current_result = fallback
