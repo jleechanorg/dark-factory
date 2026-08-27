@@ -213,21 +213,12 @@ def _macos_read_only_profile(
     """
     if "(deny file-read* (subpath \"" not in profile:
         raise ValueError("controller sandbox profile lacks holdout read denial")
-    if read_only_path is None:
-        write_rule = "(deny file-write*)"
-    else:
-        try:
-            resolved = pathlib.Path(str(read_only_path)).expanduser().resolve()
-        except (OSError, RuntimeError) as exc:
-            raise ValueError("controller read-only path cannot be resolved") from exc
-        if (
-            not resolved.is_absolute()
-            or "\n" in str(resolved)
-            or "\r" in str(resolved)
-        ):
-            raise ValueError("controller read-only path must be an absolute safe path")
-        escaped = str(resolved).replace("\\", "\\\\").replace('"', '\\"')
-        write_rule = f'(deny file-write* (subpath "{escaped}"))'
+    # The controller is a read-only reviewer. A path-specific denial is not
+    # enough: it leaves the source checkout, Git admin area, and unrelated
+    # filesystem writable. Keep the parameter for API compatibility, but do
+    # not turn it into a writable exception or a weaker boundary.
+    del read_only_path
+    write_rule = "(deny file-write*)"
     if write_rule in profile:
         return profile
     return profile.rstrip() + "\n" + write_rule + "\n"

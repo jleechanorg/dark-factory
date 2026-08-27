@@ -90,7 +90,7 @@ def test_controller_transport_uses_one_macos_sandbox_for_read_only_review(
         "-",
     ]
     assert '(deny file-read* (subpath "/sealed/holdouts"))' in transport[2]
-    assert f'(deny file-write* (subpath "{tmp_path}"))' in transport[2]
+    assert "(deny file-write*)" in transport[2]
     assert "--sandbox" not in transport
 
 
@@ -108,7 +108,11 @@ def test_controller_transport_macos_profile_enforces_read_only_and_holdout_denia
         / "hello"
         / "scenarios.yaml"
     )
-    if not holdout.is_file():
+    try:
+        holdout_exists = holdout.is_file()
+    except OSError as exc:
+        pytest.skip(f"cannot probe real holdout target: {exc}")
+    if not holdout_exists:
         pytest.skip(f"real holdout target missing: {holdout}")
 
     cache_root = pathlib.Path.home() / "Library" / "Caches"
@@ -122,25 +126,26 @@ def test_controller_transport_macos_profile_enforces_read_only_and_holdout_denia
         codex = tmp_path / "codex"
         codex.write_text(
             "#!/usr/bin/env python3\n"
+            "import errno\n"
             "import json\n"
             "from pathlib import Path\n"
             f"allowed = Path({str(allowed)!r}).read_text(encoding='utf-8')\n"
             f"holdout = Path({str(holdout)!r})\n"
             "try:\n"
             "    holdout.read_bytes()\n"
-            "except PermissionError:\n"
-            "    holdout_denied = True\n"
             "except OSError as exc:\n"
-            "    raise SystemExit(f'holdout probe failed: {exc}')\n"
+            "    if exc.errno not in (errno.EPERM, errno.EACCES):\n"
+            "        raise SystemExit(f'holdout probe failed: {exc}')\n"
+            "    holdout_denied = True\n"
             "else:\n"
             "    raise SystemExit('holdout-readable')\n"
             f"target = Path({str(target)!r})\n"
             "try:\n"
             "    target.write_text('changed', encoding='utf-8')\n"
-            "except PermissionError:\n"
-            "    write_denied = True\n"
             "except OSError as exc:\n"
-            "    raise SystemExit(f'write probe failed: {exc}')\n"
+            "    if exc.errno not in (errno.EPERM, errno.EACCES):\n"
+            "        raise SystemExit(f'write probe failed: {exc}')\n"
+            "    write_denied = True\n"
             "else:\n"
             "    raise SystemExit('target-write-allowed')\n"
             "print(json.dumps({'allowed': allowed.strip(), "

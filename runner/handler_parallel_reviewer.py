@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import pathlib
 import re
 import shutil
+import stat
 import subprocess
-import tempfile
+import uuid
 from typing import TYPE_CHECKING
 
 # Import collaborators from their source modules directly. Importing
@@ -53,6 +55,76 @@ _LANE_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 _CONTROLLER_TASK_ARTIFACT_RE = re.compile(r"^\.dark-factory/agy-task-[^/]+\.md$")
 _CONTROLLER_FIXTURE_STATE = "_df_controller_fixture"
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _controller_snapshot_root() -> pathlib.Path:
+    """Return a private, non-symlinked root for controller worktrees.
+
+    Snapshot creation is a security boundary: resolving a path before checking
+    it would allow a symlinked ``~/.dark-factory`` component to redirect Git's
+    worktree registration.  Validate each user-owned component with ``lstat``
+    and create missing components with mode 0700; callers re-run this check
+    immediately before mutation to narrow the replacement race.
+    """
+    home = pathlib.Path.home()
+    if not home.is_absolute() or home.is_symlink():
+        raise ValueError("controller snapshot home must be a non-symlink directory")
+    try:
+        home_stat = home.stat()
+    except OSError as exc:
+        raise ValueError("controller snapshot home is unavailable") from exc
+    if not stat.S_ISDIR(home_stat.st_mode) or home_stat.st_uid != os.getuid():
+        raise ValueError("controller snapshot home is not owned by the current user")
+    if home_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise ValueError("controller snapshot home is group/world writable")
+
+    dark_factory = home / ".dark-factory"
+    root = dark_factory / "controller-snapshots"
+    current = home
+    for component in (dark_factory.name, root.name):
+        current = current / component
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            try:
+                current.mkdir(mode=0o700)
+            except FileExistsError:
+                # Another process won the creation race; validate its result.
+                pass
+            except OSError as exc:
+                raise ValueError(f"controller snapshot root cannot be created: {current}") from exc
+            try:
+                info = current.lstat()
+            except OSError as exc:
+                raise ValueError(f"controller snapshot root cannot be validated: {current}") from exc
+        except OSError as exc:
+            raise ValueError(f"controller snapshot root cannot be inspected: {current}") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise ValueError(f"controller snapshot root contains a symlink or non-directory: {current}")
+        if info.st_uid != os.getuid():
+            raise ValueError(f"controller snapshot root is not owned by the current user: {current}")
+        if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise ValueError(f"controller snapshot root is group/world writable: {current}")
+    return root
+
+
+def _controller_source_fingerprint(source: pathlib.Path) -> str:
+    """Hash mutable source checkout state so review cannot race worker output."""
+    digest = hashlib.sha256()
+    # Ignore newly-created untracked files here: the runner itself appends
+    # event/evidence artifacts to the worker checkout during a review. The
+    # tracked/index diff is the mutable source surface that can invalidate the
+    # snapshot and is stable across those controller-owned artifacts.
+    for args in (
+        ("rev-parse", "HEAD^{commit}"),
+        ("diff", "--no-ext-diff", "--binary", "HEAD"),
+    ):
+        output = _git_output(source, *args, allow_empty=True)
+        digest.update(" ".join(args).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(output.encode("utf-8", "surrogateescape"))
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def _controller_fixture_enabled(node: Node, ctx: Context) -> bool:
@@ -314,10 +386,15 @@ def _controller_snapshot(
     observed_head = _git_output(source, "rev-parse", "HEAD^{commit}").lower()
     if observed_head != expected_sha.lower():
         raise ValueError("controller review target head changed before snapshot")
-    snapshot_root = pathlib.Path.home() / ".dark-factory" / "controller-snapshots"
-    snapshot_root.mkdir(parents=True, exist_ok=True)
-    snapshot = pathlib.Path(tempfile.mkdtemp(prefix="snapshot-", dir=snapshot_root))
-    snapshot.rmdir()
+    snapshot_root = _controller_snapshot_root()
+    # Git creates the worktree directory itself.  Do not create then remove a
+    # temporary directory: that gap permits a replaced directory or symlink to
+    # redirect the subsequent ``git worktree add``.
+    snapshot = snapshot_root / f"snapshot-{uuid.uuid4().hex}"
+    _controller_snapshot_root()
+    if snapshot.exists() or snapshot.is_symlink():
+        raise ValueError("controller snapshot path already exists")
+    _controller_snapshot_root()
     add = subprocess.run(
         ["git", "-C", str(source), "worktree", "add", "--detach", str(snapshot), observed_head],
         capture_output=True,
@@ -611,6 +688,22 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
     workdir, expected_sha, evidence_origin = _controller_snapshot(
         source_workdir, source_head_sha, declared_evidence
     )
+    source_bindings_raw = ctx.state.get("_controller_review_source_bindings", "[]")
+    try:
+        source_bindings = json.loads(source_bindings_raw)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("controller source binding state is malformed") from exc
+    if not isinstance(source_bindings, list):
+        raise ValueError("controller source binding state is malformed")
+    source_bindings.append(
+        {
+            "source_worktree": str(source_workdir),
+            "fingerprint": _controller_source_fingerprint(source_workdir),
+        }
+    )
+    ctx.state["_controller_review_source_bindings"] = json.dumps(
+        source_bindings, sort_keys=True, separators=(",", ":")
+    )
     # The engine owns final cleanup. Keep every retry's exact snapshot and its
     # owning source worktree so no earlier snapshot is orphaned by overwrite.
     snapshots.append(
@@ -798,6 +891,40 @@ def _verify_controller_workspace(ctx: "Context", request) -> None:
         ),
         holdout_roots=tuple(_holdout_root_strings()),
     )
+    # The detached snapshot is immutable, but the worker checkout and its Git
+    # index remain mutable while a reviewer runs. Re-pin those source surfaces
+    # as well; otherwise a worker can alter the source after snapshot creation
+    # and still receive a pass for an older target.
+    if ctx is not None and isinstance(getattr(ctx, "state", None), dict):
+        raw_bindings = ctx.state.get("_controller_review_source_bindings", "[]")
+        try:
+            source_bindings = json.loads(raw_bindings)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ReviewContractError("controller source binding state is malformed") from exc
+        if not isinstance(source_bindings, list):
+            raise ReviewContractError("controller source binding state is malformed")
+        for binding in source_bindings:
+            if (
+                not isinstance(binding, dict)
+                or set(binding) != {"source_worktree", "fingerprint"}
+                or not isinstance(binding["source_worktree"], str)
+                or not isinstance(binding["fingerprint"], str)
+            ):
+                raise ReviewContractError("controller source binding state is malformed")
+            try:
+                from .review_controller import validate_workspace_path
+
+                source = validate_workspace_path(
+                    binding["source_worktree"],
+                    holdout_roots=tuple(_holdout_root_strings()),
+                )
+                observed = _controller_source_fingerprint(source)
+            except (ValueError, OSError, ReviewContractError) as exc:
+                raise ReviewContractError(
+                    f"controller source checkout revalidation failed: {exc}"
+                ) from exc
+            if observed != binding["fingerprint"]:
+                raise ReviewContractError("controller source checkout changed during review")
     status = subprocess.run(
 
         [

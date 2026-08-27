@@ -49,7 +49,7 @@ def _sandboxed_codex_args() -> list[str]:
 
 def _assert_snapshot_profile(transport: list[str], source: Path, snapshot: Path) -> None:
     profile = transport[2]
-    assert f'(deny file-write* (subpath "{snapshot}"))' in profile
+    assert "(deny file-write*)" in profile
     assert str(source) not in profile
     assert "--dangerously-bypass-approvals-and-sandbox" in transport
     assert "--sandbox" not in transport

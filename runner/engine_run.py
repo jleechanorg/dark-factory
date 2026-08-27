@@ -251,7 +251,15 @@ def _cleanup_controller_snapshot(ctx: Context) -> None:
     if not isinstance(entries, list):
         return
 
-    root = pathlib.Path.home() / ".dark-factory" / "controller-snapshots"
+    # Use the same no-follow, owner/mode-checked root validator as snapshot
+    # creation. If an operator or another process replaced any parent with a
+    # symlink, skip cleanup rather than handing that path to Git.
+    try:
+        from .handler_parallel_reviewer import _controller_snapshot_root
+
+        root = _controller_snapshot_root()
+    except (OSError, RuntimeError, ValueError):
+        return
     seen: set[tuple[str, str]] = set()
     for entry in entries:
         if (

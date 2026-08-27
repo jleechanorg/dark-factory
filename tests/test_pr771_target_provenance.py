@@ -9,7 +9,11 @@ from pathlib import Path
 import pytest
 
 from runner.handler_core import Context, _target_worktree
-from runner.handler_parallel_reviewer import _controller_review_request
+from runner.handler_parallel_reviewer import (
+    _controller_review_request,
+    _controller_snapshot_root,
+    _verify_controller_workspace,
+)
 from runner.parser import Node
 
 
@@ -104,6 +108,46 @@ def test_controller_preserves_lexical_ao_worktree_until_validation(tmp_path: Pat
     assert _target_worktree(ctx) == lexical_repo
     with pytest.raises(ValueError, match="symlink"):
         _controller_review_request(Node(name="cold_reviewer", attrs={}), ctx, head)
+
+
+def test_controller_snapshot_root_rejects_symlink_before_git_mutation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A symlinked controller-snapshots root cannot redirect Git worktrees."""
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    (home / ".dark-factory").mkdir(mode=0o700)
+    (home / ".dark-factory" / "controller-snapshots").symlink_to(
+        outside, target_is_directory=True
+    )
+    monkeypatch.setenv("HOME", str(home))
+
+    with pytest.raises(ValueError, match="symlink"):
+        _controller_snapshot_root()
+    assert not list(outside.iterdir())
+
+
+def test_controller_post_review_revalidates_mutable_source_checkout(tmp_path: Path, monkeypatch):
+    """A source/index change after snapshot creation invalidates a pass."""
+    repo, base, head = _repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    monkeypatch.setenv("HOME", str(home))
+    ctx = Context(
+        goal="review worker change",
+        workdir=repo,
+        state={"base_sha": base},
+        run_id="source-revalidation",
+    )
+    try:
+        request = _controller_review_request(Node(name="cold_reviewer", attrs={}), ctx, head)
+        (repo / "value.txt").write_text("mutated after snapshot\n")
+        with pytest.raises(ValueError, match="source checkout changed"):
+            _verify_controller_workspace(ctx, request)
+    finally:
+        _cleanup_snapshots(repo, ctx)
 
 
 def test_default_two_node_seeds_base_before_worker_mutation(tmp_path: Path, monkeypatch) -> None:
