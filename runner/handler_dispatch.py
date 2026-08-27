@@ -82,6 +82,10 @@ class _ShadowGateReview:
     backend: str = "codex"
     prompt_is_complete: bool = False
     json_transport: bool = False
+    transport_argv: tuple[str, ...] = ()
+    transport_text: str = ""
+    response_text: str = ""
+    output_dir: pathlib.Path | None = None
 
 
 def _resolve_shadow_backend_env() -> str:
@@ -166,6 +170,7 @@ def _launch_shadow_gate_review(
     *,
     prompt_is_complete: bool = False,
     read_only_path: pathlib.Path | str | None = None,
+    lane_name: str = "",
 ) -> _ShadowGateReview | None:
     import runner.handlers as _handlers_shim  # late-bound shim (see module docstring)
     """Spawn a shadow reviewer on ``backend`` (no enable-gate).
@@ -195,6 +200,16 @@ def _launch_shadow_gate_review(
         backend=backend,
         prompt_is_complete=prompt_is_complete,
     )
+    if prompt_is_complete:
+        raw_lane_dirs = ctx.state.get("_df_controller_review_lane_dirs", "{}")
+        try:
+            lane_dirs = json.loads(str(raw_lane_dirs))
+        except (TypeError, json.JSONDecodeError):
+            lane_dirs = {}
+        configured_lane = lane_name or f"shadow_{backend}"
+        configured_path = lane_dirs.get(configured_lane)
+        if isinstance(configured_path, str) and configured_path:
+            shadow.output_dir = pathlib.Path(configured_path)
     if prompt_is_complete and backend != "codex":
         shadow.launch_error = "controller review requests require codex backend"
         return shadow
@@ -246,6 +261,7 @@ def _launch_shadow_gate_review(
             shadow.launch_error = str(exc)
             return shadow
         shadow.json_transport = True
+    shadow.transport_argv = tuple(str(arg) for arg in args)
     review_cwd = ctx.workdir
     if prompt_is_complete:
         configured_cwd = ctx.state.get("_df_controller_review_cwd")
@@ -277,6 +293,7 @@ def _start_shadow_gate_review(
     *,
     prompt_is_complete: bool = False,
     read_only_path: pathlib.Path | str | None = None,
+    lane_name: str = "",
 ) -> _ShadowGateReview | None:
     """Back-compat wrapper: gate-on-enable then spawn the shadow reviewer.
 
@@ -295,6 +312,7 @@ def _start_shadow_gate_review(
         backend,
         prompt_is_complete=prompt_is_complete,
         read_only_path=read_only_path,
+        lane_name=lane_name,
     )
 
 
@@ -384,6 +402,8 @@ def _finish_shadow_gate_review(
                 shadow_outcome = "error"
             else:
                 shadow_outcome = normalized
+            shadow.transport_text = stdout
+            shadow.response_text = output
 
     output_path = ""
     output_sha = ""
@@ -896,6 +916,12 @@ def _run_gate_once(
         ]
         if transport_error:
             metadata["review_transport_error"] = transport_error
+        # The parallel controller lane persists this exact raw JSONL through
+        # the shared controller artifact writer after contract adjustment.
+        # Keep it transiently in metadata so the graph path cannot fall back
+        # to a generic sidecar or reconstruct transport from parsed prose.
+        metadata["_controller_transport_text"] = proc.stdout
+        metadata["_controller_transport_argv"] = list(sub_args)
     # Codergen-sourced receipts (Task 2): the codergen producer stashes
     # parsed ``commands_run.md`` records into ``ctx.state`` under per-node
     # keys ``"<node>.structured_receipt"``. The reviewer gate runs in a

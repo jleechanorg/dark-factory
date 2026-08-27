@@ -76,7 +76,16 @@ def lane_output_dir(neutral_cwd: pathlib.Path, lane: str) -> pathlib.Path:
     lane (primary + every shadow) must have its own output directory.
     """
     sanitized = _LANE_NAME_RE.sub("-", str(lane)).strip("-") or "lane"
-    return pathlib.Path(neutral_cwd) / sanitized
+    base = pathlib.Path(neutral_cwd) / sanitized
+    # A run id may be reused by a caller after an interrupted process. Keep
+    # the original attempt immutable and allocate an explicit retry sibling
+    # rather than overwriting or mixing transcripts from the prior attempt.
+    candidate = base
+    retry = 1
+    while candidate.exists():
+        candidate = base.with_name(f"{sanitized}-retry-{retry}")
+        retry += 1
+    return candidate
 
 
 def _shadow_codex_review_enabled(ctx: "Context") -> bool:
@@ -1074,6 +1083,70 @@ class _MDToCtxShim:
         }
 
 
+def _persist_controller_lane(
+    result: "Result",
+    request,
+    *,
+    lane: str,
+    output_dir: pathlib.Path,
+    neutral_cwd: pathlib.Path,
+    transport_text: str = "",
+    transport_argv: tuple[str, ...] = (),
+    response_text: str | None = None,
+) -> "Result":
+    """Persist one graph lane through the canonical controller artifact seam."""
+    from .review_controller import (
+        ExecutionReceipt,
+        persist_controller_lane_artifacts,
+    )
+
+    metadata = dict(result.metadata or {})
+    raw_receipts = metadata.get("_controller_command_receipts") or []
+    receipts = tuple(
+        ExecutionReceipt(
+            command=str(item.get("command", "")),
+            exit_code=int(item.get("exit_code", -1)),
+            output_sha256=str(item.get("output_sha256", "")),
+        )
+        for item in raw_receipts
+        if isinstance(item, dict)
+    )
+    try:
+        returncode = int(metadata.get("returncode", -1) or -1)
+    except (TypeError, ValueError):
+        returncode = -1
+    status = str(metadata.get("review_contract_status", "invalid"))
+    verdict = str(metadata.get("verdict", "unknown"))
+    paths = persist_controller_lane_artifacts(
+        request,
+        output_dir=output_dir,
+        lane=lane,
+        backend=str(metadata.get("reviewer_backend", "codex")),
+        neutral_cwd=neutral_cwd,
+        transport_argv=transport_argv,
+        transport_text=transport_text,
+        response_text=result.output if response_text is None else response_text,
+        backend_returncode=returncode,
+        status=status,
+        verdict=verdict,
+        receipts=receipts,
+    )
+    metadata.update({f"controller_{lane}_{key}_path": value for key, value in paths.items()})
+    metadata[f"controller_{lane}_artifact_status"] = "persisted"
+    # Raw transport is retained only long enough to reach the writer. Do not
+    # copy the complete JSONL transcript into engine state or CXDB metadata.
+    metadata.pop("_controller_transport_text", None)
+    metadata.pop("_controller_transport_argv", None)
+    return Result(
+        outcome=result.outcome,
+        output=result.output,
+        metadata=metadata,
+        preferred_label=result.preferred_label,
+        suggested_next_ids=result.suggested_next_ids,
+        context_updates=result.context_updates,
+    )
+
+
 def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     """Run parallel reviewer lanes and pass combined evidence downstream."""
     import runner.handlers as _handlers_shim  # late-bound shim for monkeypatched helpers
@@ -1142,11 +1215,6 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
         # Per-lane output directories so primary + every shadow write to
         # distinct cwd/output_dir paths (the controller review contract
         # requires this).
-        ctx.state["_df_controller_review_lane_dirs"] = json.dumps(
-            {"primary": str(lane_output_dir(neutral_cwd, "primary"))},
-            sort_keys=True,
-            separators=(",", ":"),
-        )
         prompt = request.prompt
     else:
         prompt = _handlers_shim._render_prompt(node, ctx)
@@ -1161,9 +1229,21 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     # Determine shadow lanes BEFORE running primary so Popen launches happen
     # before primary (and before any communicate()). True concurrency.
     shadow_backends = _parse_shadow_backends(ctx)
+    configured_shadow_backends = list(shadow_backends)
+    if not configured_shadow_backends and _shadow_codex_review_enabled(ctx):
+        configured_shadow_backends = ["codex"]
+    lane_dirs = {"primary": str(lane_output_dir(neutral_cwd, "primary"))} if request is not None else {}
+    for index, shadow_backend in enumerate(configured_shadow_backends):
+        suffix = f"shadow_{shadow_backend}" if configured_shadow_backends.count(shadow_backend) == 1 else f"shadow_{shadow_backend}_{index}"
+        lane_dirs[suffix] = str(lane_output_dir(neutral_cwd, suffix))
+    if request is not None:
+        ctx.state["_df_controller_review_lane_dirs"] = json.dumps(
+            lane_dirs, sort_keys=True, separators=(",", ":")
+        )
     shadows = []
     if shadow_backends:
-        for b in shadow_backends:
+        for index, b in enumerate(shadow_backends):
+            suffix = f"shadow_{b}" if configured_shadow_backends.count(b) == 1 else f"shadow_{b}_{index}"
             shadows.append(_launch_shadow_gate_review(
                 node.name,
                 prompt,
@@ -1173,6 +1253,7 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
                 backend=b,
                 prompt_is_complete=request is not None,
                 read_only_path=controller_read_only_path,
+                lane_name=suffix,
             ))
     elif _shadow_codex_review_enabled(ctx):
         s = _start_shadow_gate_review(
@@ -1183,6 +1264,7 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
             ctx,
             prompt_is_complete=request is not None,
             read_only_path=controller_read_only_path,
+            lane_name="shadow_codex",
         )
         if s:
             shadows.append(s)
@@ -1191,6 +1273,8 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     if request is not None:
         ctx.state["_df_controller_review_json"] = "true"
     try:
+        if request is not None:
+            ctx.state["_df_controller_review_request"] = request
         primary = _run_primary_review(
             prompt,
             expected_sha,
@@ -1202,6 +1286,8 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
             read_only_path=controller_read_only_path,
         )
     finally:
+        if request is not None:
+            ctx.state.pop("_df_controller_review_request", None)
         if prior_controller_json is None:
             ctx.state.pop("_df_controller_review_json", None)
         else:
@@ -1218,6 +1304,15 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
             ctx,
             lane="primary",
             backend=backend,
+        )
+        primary = _persist_controller_lane(
+            primary,
+            request,
+            lane="primary",
+            output_dir=pathlib.Path(lane_dirs["primary"]),
+            neutral_cwd=neutral_cwd,
+            transport_text=str(primary.metadata.pop("_controller_transport_text", "")),
+            transport_argv=tuple(primary.metadata.pop("_controller_transport_argv", []) or []),
         )
 
     if not shadows:
@@ -1319,6 +1414,31 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
                 md[f"shadow_{shadow.backend}_review_contract_gap"] = str(
                     shadow_contract_result.metadata["review_contract_gap"]
                 )
+            result = Result(
+                outcome=result.outcome,
+                output=result.output,
+                metadata=md,
+                preferred_label=result.preferred_label,
+                suggested_next_ids=result.suggested_next_ids,
+                context_updates=result.context_updates,
+            )
+            shadow_lane = f"shadow_{shadow.backend}"
+            if configured_shadow_backends.count(shadow.backend) > 1:
+                shadow_lane = f"shadow_{shadow.backend}_{shadows.index(shadow)}"
+            shadow_contract_result = _persist_controller_lane(
+                shadow_contract_result,
+                request,
+                lane=shadow_lane,
+                output_dir=pathlib.Path(lane_dirs[shadow_lane]),
+                neutral_cwd=neutral_cwd,
+                transport_text=shadow.transport_text,
+                transport_argv=shadow.transport_argv,
+                response_text=shadow.response_text or shadow_output,
+            )
+            md = dict(result.metadata)
+            for key, value in shadow_contract_result.metadata.items():
+                if key.startswith("controller_"):
+                    md[key] = value
             result = Result(
                 outcome=result.outcome,
                 output=result.output,

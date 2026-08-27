@@ -16,6 +16,7 @@ import os
 import pathlib
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
@@ -162,6 +163,120 @@ def _sha256(data: bytes) -> str:
 
 
 _EMPTY_OUTPUT_SHA256 = _sha256(b"")
+
+
+def _write_controller_artifact(path: Path, data: bytes) -> None:
+    """Atomically write one controller-owned lane artifact."""
+    fd, temporary = tempfile.mkstemp(prefix=".controller-artifact-", dir=path.parent)
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    except Exception:
+        try:
+            temporary_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def persist_controller_lane_artifacts(
+    request: ReviewRequest,
+    *,
+    output_dir: Path,
+    lane: str,
+    backend: str,
+    neutral_cwd: Path,
+    transport_argv: tuple[str, ...],
+    transport_text: str,
+    response_text: str,
+    backend_returncode: int,
+    status: str,
+    verdict: str,
+    receipts: tuple[ExecutionReceipt, ...] = (),
+    create_output_dir: bool = True,
+) -> dict[str, str]:
+    """Persist the canonical evidence seam for one graph or CLI lane.
+
+    The lane directory is created once and never reused. This makes retries
+    append-only (the caller supplies a new attempt directory), keeps primary
+    and shadow transcripts separate, and lets both graph execution and the
+    standalone controller use the same artifact/hash format. Validation stays
+    at the caller's existing acceptance seam; this function records its
+    authoritative result, including nonzero transport return codes.
+    """
+    if not isinstance(request, ReviewRequest):
+        raise TypeError("request must be ReviewRequest")
+    if not lane or not str(lane).strip():
+        raise ValueError("controller lane is required")
+    if isinstance(backend_returncode, bool) or not isinstance(backend_returncode, int):
+        raise TypeError("backend_returncode must be an int")
+    output_dir = Path(output_dir)
+    if create_output_dir:
+        output_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
+    elif not output_dir.is_dir():
+        raise FileNotFoundError(f"controller lane directory is missing: {output_dir}")
+    prompt_bytes = request.prompt.encode("utf-8")
+    envelope_bytes = request.envelope_json.encode("utf-8")
+    transport_bytes = str(transport_text).encode("utf-8")
+    response_bytes = str(response_text).encode("utf-8")
+    prompt_path = output_dir / "prompt.txt"
+    envelope_path = output_dir / "envelope.json"
+    transport_path = output_dir / "transport.jsonl"
+    response_path = output_dir / "reviewer.output.md"
+    receipt_path = output_dir / "controller-receipt.json"
+    _write_controller_artifact(prompt_path, prompt_bytes)
+    _write_controller_artifact(envelope_path, envelope_bytes)
+    _write_controller_artifact(transport_path, transport_bytes)
+    _write_controller_artifact(response_path, response_bytes)
+    receipt = {
+        "schema": 1,
+        "lane": str(lane),
+        "status": str(status),
+        "verdict": str(verdict),
+        "backend": str(backend),
+        "backend_returncode": backend_returncode,
+        "exit_code": backend_returncode,
+        "prompt_id": request.prompt_id,
+        "prompt_sha256": _sha256(prompt_bytes),
+        "prompt_payload_sha256": request.prompt_sha256,
+        "envelope_sha256": _sha256(envelope_bytes),
+        "head_sha": request.head_sha,
+        "task_sha256": request.task_sha256,
+        "changed_files_sha256": request.changed_files_sha256,
+        "evidence_manifest_sha256": request.evidence_manifest_sha256,
+        "transport_sha256": _sha256(transport_bytes),
+        "response_sha256": _sha256(response_bytes),
+        "transport_argv": [str(arg) for arg in transport_argv],
+        "neutral_cwd": str(Path(neutral_cwd)),
+        "output_dir": str(output_dir),
+        "cleanup_policy": "retain_until_run_cleanup",
+        "command_receipts": [
+            {
+                "command": item.command,
+                "exit_code": item.exit_code,
+                "output_sha256": item.output_sha256,
+            }
+            for item in receipts
+        ],
+    }
+    receipt["receipts"] = receipt["command_receipts"]
+    _write_controller_artifact(
+        receipt_path,
+        (json.dumps(receipt, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode(
+            "utf-8"
+        ),
+    )
+    return {
+        "prompt": str(prompt_path),
+        "envelope": str(envelope_path),
+        "transport": str(transport_path),
+        "response": str(response_path),
+        "receipt": str(receipt_path),
+    }
 
 
 def _reject_json_constant(value: str) -> None:
@@ -928,9 +1043,8 @@ class ControllerReviewResult:
     """Typed result of one controller review lane invocation.
 
     Captures the validated review, the parsed execution receipts, and the
-    per-lane artifact paths that the lane wrote. Both the standalone CLI and
-    the graph lane use this shape so downstream callers do not need to know
-    which path produced the review.
+    per-lane artifact paths that the lane wrote. Standalone and graph callers
+    share the request, validation, and canonical artifact writer seams.
     """
 
     review: ValidatedReview
@@ -957,9 +1071,10 @@ def run_controller_review(
     helper deliberately knows nothing about how the transport is constructed
     — that decision is owned by the dispatch module — but it owns the
     subprocess invocation, JSONL parsing, response + receipt validation, and
-    canonical artifact emission. Both ``runner.review_cli`` and
-    ``runner.handler_parallel_reviewer`` route through this function so they
-    cannot diverge on shape or digest handling.
+    canonical artifact emission. The graph handler uses
+    :func:`persist_controller_lane_artifacts` after its concurrent transport
+    completes; the standalone CLI retains its lifecycle checks around this
+    same artifact format.
 
     ``execution_path`` and ``backend`` flow into :func:`ensure_review_pass_allowed`;
     only an explicit fixture execution path can skip stub-mode PASS rejection.
@@ -982,7 +1097,6 @@ def run_controller_review(
     envelope_path = output_dir / "envelope.json"
     response_path = output_dir / "reviewer.output.md"
     transport_path = output_dir / "transport.jsonl"
-    receipt_path = output_dir / "controller-receipt.json"
     findings_path = output_dir / "findings.json"
 
     prompt_path.write_text(prompt_text, encoding="utf-8")
@@ -1018,35 +1132,20 @@ def run_controller_review(
 
     ensure_review_pass_allowed(review, execution_path=execution_path, backend=backend)
 
-    receipt = {
-        "schema": 1,
-        "prompt_id": request.prompt_id,
-        "prompt_sha256": request.prompt_sha256,
-        "envelope_sha256": request.envelope_sha256,
-        "head_sha": request.head_sha,
-        "task_sha256": request.task_sha256,
-        "changed_files_sha256": request.changed_files_sha256,
-        "evidence_manifest_sha256": request.evidence_manifest_sha256,
-        "response_sha256": review.response_sha256,
-        "verdict": review.verdict,
-        "exit_code": proc.returncode,
-        "duration_seconds": max(0.0, float(timeout)),
-        "transport_argv": list(transport_argv),
-        "neutral_cwd": str(neutral_cwd),
-        "output_dir": str(output_dir),
-        "receipts": [
-            {
-                "command": receipt.command,
-                "exit_code": receipt.exit_code,
-                "output_sha256": receipt.output_sha256,
-            }
-            for receipt in receipts
-        ],
-        "timestamp": _utc_now_iso(),
-    }
-    receipt_path.write_text(
-        json.dumps(receipt, indent=2, sort_keys=True, ensure_ascii=False),
-        encoding="utf-8",
+    output_paths = persist_controller_lane_artifacts(
+        request,
+        output_dir=output_dir,
+        lane="controller",
+        backend=backend,
+        neutral_cwd=neutral_cwd,
+        transport_argv=transport_argv,
+        transport_text=transport_text,
+        response_text=response_body,
+        backend_returncode=proc.returncode,
+        status="valid",
+        verdict=review.verdict,
+        receipts=receipts,
+        create_output_dir=False,
     )
     findings_path.write_text(
         json.dumps(
@@ -1069,14 +1168,7 @@ def run_controller_review(
         receipts=receipts,
         response_text=response_body,
         transport_text=transport_text,
-        output_paths={
-            "prompt": str(prompt_path),
-            "envelope": str(envelope_path),
-            "response": str(response_path),
-            "transport": str(transport_path),
-            "receipt": str(receipt_path),
-            "findings": str(findings_path),
-        },
+        output_paths={**output_paths, "findings": str(findings_path)},
     )
 
 
@@ -1105,6 +1197,7 @@ __all__ = [
     "create_review_request",
     "ensure_review_pass_allowed",
     "parse_codex_jsonl",
+    "persist_controller_lane_artifacts",
     "run_controller_review",
     "validate_evidence_origin",
     "validate_execution_receipts",
