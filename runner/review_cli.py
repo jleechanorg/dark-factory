@@ -394,7 +394,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
             except ValueError as exc:
                 raise ReviewContractError(
-                    "codex review command did not contain the codex executable"
+                    f"codex review command setup failed: {exc}"
                 ) from exc
             stdin_text = request.prompt
         try:

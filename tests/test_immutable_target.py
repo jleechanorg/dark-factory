@@ -14,6 +14,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from runner.review_controller import (
@@ -50,7 +51,7 @@ def _trusted_controller_context(**kwargs):
 def _init_clean_repo(tmp: Path) -> Path:
     """Initialize a git repo with one commit so HEAD/tree SHAs exist."""
     repo = tmp / "repo"
-    repo.mkdir()
+    repo.mkdir(mode=0o700)
     _git(repo, "init", "-q", "--initial-branch=main")
     _git(repo, "config", "user.email", "jleechan2015@users.noreply.github.com")
     _git(repo, "config", "user.name", "ci")
@@ -62,7 +63,7 @@ def _init_clean_repo(tmp: Path) -> Path:
 
 def _make_holdout_roots(tmp: Path) -> tuple[str, ...]:
     holdout = tmp / "holdout"
-    holdout.mkdir()
+    holdout.mkdir(mode=0o700)
     return (str(holdout),)
 
 
@@ -365,10 +366,16 @@ class ControllerSnapshotTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp = Path(self._tmp.name)
+        self.home = self.tmp / "home"
+        self.home.mkdir(mode=0o700)
+        self.home.chmod(0o700)
+        self._home_patch = patch.dict(os.environ, {"HOME": str(self.home)})
+        self._home_patch.start()
         self.repo = _init_clean_repo(self.tmp)
         _git(self.repo, "update-ref", "refs/remotes/origin/main", "HEAD")
 
     def tearDown(self) -> None:
+        self._home_patch.stop()
         self._tmp.cleanup()
 
     def test_worker_task_artifact_uses_clean_frozen_review_snapshot(self) -> None:

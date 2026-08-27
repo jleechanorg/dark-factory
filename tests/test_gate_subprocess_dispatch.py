@@ -175,6 +175,18 @@ def test_complete_controller_prompt_is_not_rewrapped_for_shadow(tmp_path, monkey
             seen.append(cmd)
 
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    class _Runtime:
+        run_dir = tmp_path / "runtime"
+        codex_home = tmp_path / "codex-home"
+        env = {}
+
+    _Runtime.run_dir.mkdir(mode=0o700)
+    monkeypatch.setattr("runner.handlers._create_controller_runtime", lambda: _Runtime())
+    monkeypatch.setattr(
+        "runner.handlers._controller_output_schema",
+        lambda run_dir: run_dir / "output-schema.json",
+    )
+    monkeypatch.setattr("runner.handler_dispatch.sys.platform", "darwin")
     monkeypatch.setattr("runner.handler_dispatch.shutil.which", lambda name: "/usr/bin/codex")
     monkeypatch.setattr("runner.handler_dispatch.subprocess.Popen", _FakePopen)
     ctx = HCtx(goal="untrusted goal", workdir=tmp_path, backend="codex")
@@ -192,7 +204,7 @@ def test_complete_controller_prompt_is_not_rewrapped_for_shadow(tmp_path, monkey
     assert shadow is not None
     assert shadow.prompt_is_complete is True
     assert shadow.prompt == prompt
-    assert shadow.json_transport is True
+    assert shadow.json_transport is True, shadow.launch_error
     assert seen
     assert seen[0][-1] == "-"
     assert "--json" in seen[0]
@@ -226,6 +238,18 @@ def test_launch_shadow_gate_review_uses_target_cwd_and_sanitized_env(tmp_path, m
     monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", "/secret/holdouts")
     monkeypatch.setenv("MY_HOLDOUT_SECRET", "sealed")
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    class _Runtime:
+        run_dir = tmp_path / "runtime"
+        codex_home = tmp_path / "codex-home"
+        env = {}
+
+    _Runtime.run_dir.mkdir(mode=0o700)
+    monkeypatch.setattr("runner.handlers._create_controller_runtime", lambda: _Runtime())
+    monkeypatch.setattr(
+        "runner.handlers._controller_output_schema",
+        lambda run_dir: run_dir / "output-schema.json",
+    )
+    monkeypatch.setattr("runner.handler_dispatch.sys.platform", "darwin")
     monkeypatch.setattr("runner.handler_dispatch.shutil.which", lambda name: "/usr/bin/codex")
     monkeypatch.setattr("runner.handler_dispatch.subprocess.Popen", _FakePopen)
     monkeypatch.setattr(
@@ -249,7 +273,7 @@ def test_launch_shadow_gate_review_uses_target_cwd_and_sanitized_env(tmp_path, m
 
     assert review is not None
     assert review.prompt_is_complete is True
-    assert review.json_transport is True
+    assert review.json_transport is True, review.launch_error
     assert observed.get("cwd") == ctx.workdir
     env = observed.get("env", {})
     assert isinstance(env, dict)
@@ -257,7 +281,7 @@ def test_launch_shadow_gate_review_uses_target_cwd_and_sanitized_env(tmp_path, m
     assert "MY_HOLDOUT_SECRET" not in env
 
 
-def test_controller_codex_args_builds_stdin_transport():
+def test_controller_codex_args_builds_stdin_transport(monkeypatch):
     """Controller transport must use JSON transport on stdin and a neutral cwd."""
     from runner.handler_dispatch import _controller_codex_args
     argv = [
@@ -269,6 +293,7 @@ def test_controller_codex_args_builds_stdin_transport():
         "--skip-git-repo-check",
         "PROMPT",
     ]
+    monkeypatch.setattr("runner.handler_dispatch.sys.platform", "darwin")
     transformed = _controller_codex_args(argv)
     assert transformed[-1] == "-"
     assert transformed == [
@@ -286,6 +311,12 @@ def test_controller_codex_args_builds_stdin_transport():
         "browser_use",
         "--disable",
         "computer_use",
+        "--disable",
+        "plugins",
+        "--disable",
+        "shell_snapshot",
+        "--disable",
+        "shell_snapshot_v2",
         "--config",
         'web_search="disabled"',
         "--ignore-rules",
@@ -300,10 +331,11 @@ def test_controller_codex_args_rejects_non_codex_command():
         _controller_codex_args(["claude", "--print", "PROMPT"])
 
 
-def test_controller_codex_args_rejects_unsafe_transport_options():
+def test_controller_codex_args_rejects_unsafe_transport_options(monkeypatch):
     """Unsafe Codex transport options must fail closed before launch."""
     from runner.handler_dispatch import _controller_codex_args
 
+    monkeypatch.setattr("runner.handler_dispatch.sys.platform", "darwin")
     legacy = _controller_codex_args([
         "codex",
         "exec",

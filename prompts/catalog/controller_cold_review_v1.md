@@ -13,6 +13,8 @@ judge correctness, security, boundaries,
 state transitions, regressions, and evidence sufficiency. Do not use shell,
 unified-exec, browser, computer, web, or any other tool. Do not invent or
 claim commands, checks, files, or evidence that are not supplied.
+Compare the goal and supplied description/claims against the code/evidence
+and their callers/consumers.
 
 Return exactly one JSON object and no prose or markdown. Its keys must be
 exactly `verdict`, `findings`, `evidence_checked`, `commands_executed`, and

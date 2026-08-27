@@ -41,7 +41,7 @@ def _trusted_controller_context(**kwargs) -> Context:
 
 def _repo(tmp_path: Path) -> tuple[Path, str, str]:
     repo = tmp_path / "repo"
-    repo.mkdir()
+    repo.mkdir(mode=0o700)
     _git(repo, "init", "-q", "--initial-branch=main")
     _git(repo, "config", "user.name", "test")
     _git(repo, "config", "user.email", "test@example.invalid")
@@ -55,6 +55,19 @@ def _repo(tmp_path: Path) -> tuple[Path, str, str]:
     return repo, base, head
 
 
+def _private_run_dir(home: Path, run_id: str) -> Path:
+    dark_factory = home / ".dark-factory"
+    dark_factory.mkdir(mode=0o700, exist_ok=True)
+    dark_factory.chmod(0o700)
+    runs = dark_factory / "runs"
+    runs.mkdir(mode=0o700, exist_ok=True)
+    runs.chmod(0o700)
+    run_dir = runs / run_id
+    run_dir.mkdir(mode=0o700, exist_ok=True)
+    run_dir.chmod(0o700)
+    return run_dir
+
+
 def _cleanup_snapshots(repo: Path, ctx: Context) -> None:
     for entry in json.loads(ctx.state.get("_controller_review_snapshots", "[]")):
         _git(repo, "worktree", "remove", "--force", entry["snapshot_path"])
@@ -65,6 +78,7 @@ def test_controller_base_does_not_follow_mutable_origin_main(tmp_path: Path, mon
     repo, base, head = _repo(tmp_path)
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
+    home.chmod(0o700)
     monkeypatch.setenv("HOME", str(home))
     _git(repo, "update-ref", "refs/remotes/origin/main", head)
     ctx = _trusted_controller_context(
@@ -152,6 +166,7 @@ def test_controller_cleanup_retains_failed_journal_entry(tmp_path: Path, monkeyp
     repo, _base, head = _repo(tmp_path)
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
+    home.chmod(0o700)
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     snapshot = _controller_snapshot(repo, head, ())[0]
     entry = {"snapshot_path": str(snapshot), "source_worktree": str(repo)}
@@ -162,8 +177,9 @@ def test_controller_cleanup_retains_failed_journal_entry(tmp_path: Path, monkeyp
         state={"_controller_review_snapshots": json.dumps([entry])},
     )
     journal = home / ".dark-factory" / "runs" / "cleanup-retry" / "controller-snapshot-journal.json"
-    journal.parent.mkdir(parents=True)
+    journal.parent.mkdir(parents=True, mode=0o700)
     journal.write_text(json.dumps([entry]))
+    journal.chmod(0o600)
     real_run = subprocess.run
 
     def fail_remove(command, *args, **kwargs):
@@ -189,16 +205,19 @@ def test_resume_terminal_checkpoint_retries_durable_snapshot_cleanup(
     repo, _base, head = _repo(tmp_path)
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
+    home.chmod(0o700)
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     snapshot = _controller_snapshot(repo, head, ())[0]
-    run_dir = home / ".dark-factory" / "runs" / "resume-cleanup"
-    run_dir.mkdir(parents=True)
+    run_dir = _private_run_dir(home, "resume-cleanup")
     entry = {"snapshot_path": str(snapshot), "source_worktree": str(repo)}
-    (run_dir / "controller-snapshot-journal.json").write_text(json.dumps([entry]))
+    journal = run_dir / "controller-snapshot-journal.json"
+    journal.write_text(json.dumps([entry]))
+    journal.chmod(0o600)
     checkpoint = run_dir / "checkpoint.json"
     checkpoint.write_text(
         json.dumps([{"node": "start", "outcome": "success", "ts": 0, "output_preview": ""}])
     )
+    checkpoint.chmod(0o600)
     graph = Graph(
         name="resume-cleanup",
         goal="",
@@ -226,16 +245,19 @@ def test_resume_cxdb_keeps_original_journal_identity(tmp_path: Path, monkeypatch
     repo, _base, head = _repo(tmp_path)
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
+    home.chmod(0o700)
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     snapshot = _controller_snapshot(repo, head, ())[0]
-    run_dir = home / ".dark-factory" / "runs" / "resume-cxdb"
-    run_dir.mkdir(parents=True)
+    run_dir = _private_run_dir(home, "resume-cxdb")
     entry = {"snapshot_path": str(snapshot), "source_worktree": str(repo)}
-    (run_dir / "controller-snapshot-journal.json").write_text(json.dumps([entry]))
+    journal = run_dir / "controller-snapshot-journal.json"
+    journal.write_text(json.dumps([entry]))
+    journal.chmod(0o600)
     checkpoint = run_dir / "checkpoint.json"
     checkpoint.write_text(
         json.dumps([{"node": "start", "outcome": "success", "ts": 0, "output_preview": ""}])
     )
+    checkpoint.chmod(0o600)
     graph = Graph(
         name="resume-cxdb",
         goal="",
@@ -265,6 +287,7 @@ def test_snapshot_journal_fsyncs_file_and_parent(tmp_path: Path, monkeypatch) ->
 
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
+    home.chmod(0o700)
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     ctx = Context(
         goal="persist",
@@ -287,13 +310,14 @@ def test_snapshot_journal_persist_merges_concurrent_entries(tmp_path: Path, monk
 
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
+    home.chmod(0o700)
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
-    run_dir = home / ".dark-factory" / "runs" / "merge-journal"
-    run_dir.mkdir(parents=True)
+    run_dir = _private_run_dir(home, "merge-journal")
     first = {"snapshot_path": "/private/snapshot-a", "source_worktree": "/private/source"}
     second = {"snapshot_path": "/private/snapshot-b", "source_worktree": "/private/source"}
     journal = run_dir / "controller-snapshot-journal.json"
     journal.write_text(json.dumps([first]))
+    journal.chmod(0o600)
     ctx = Context(
         goal="persist",
         workdir=tmp_path,
@@ -848,7 +872,8 @@ def test_default_two_node_seeds_base_before_worker_mutation(tmp_path: Path, monk
     _git(repo, "reset", "--hard", base)
     (repo / "evidence").mkdir()
     home = tmp_path / "home"
-    home.mkdir()
+    home.mkdir(mode=0o700)
+    home.chmod(0o700)
     monkeypatch.setenv("HOME", str(home))
 
     def worker(node, ctx):
@@ -948,7 +973,8 @@ def test_cli_ao_worktree_symlink_parent_rejected_before_snapshot(
     alias_parent.symlink_to(tmp_path, target_is_directory=True)
     lexical_worktree = alias_parent / repo.name
     home = tmp_path / "home"
-    home.mkdir()
+    home.mkdir(mode=0o700)
+    home.chmod(0o700)
     monkeypatch.setenv("HOME", str(home))
     head_lookup_attempted = False
 

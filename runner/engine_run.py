@@ -860,7 +860,7 @@ def run(
 
     if ctx.run_id is not None:
         run_dir = pathlib.Path.home() / ".dark-factory" / "runs" / ctx.run_id
-        run_dir.mkdir(parents=True, exist_ok=True)
+        run_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
         manifest_path = run_dir / "manifest.json"
         pipeline_val = str(graph.pipeline_path) if getattr(graph, "pipeline_path", None) else graph.name
         manifest_data = {

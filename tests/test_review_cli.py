@@ -7,6 +7,7 @@ import json
 import os
 import pathlib
 import subprocess
+import sys
 from typing import ClassVar
 
 import pytest
@@ -16,9 +17,36 @@ from runner.handler_sandbox import _PinnedLauncherCommand
 from runner.review_controller import ReviewContractError
 
 
+def _safe_controller_args(_backend, prompt, _ctx, _timeout):
+    """Return the minimal canonical command before controller hardening."""
+    if sys.platform.startswith("linux"):
+        return [
+            "/usr/bin/env",
+            "DENY_PATHS=/sealed/holdouts",
+            "/usr/local/bin/codex",
+            "exec",
+            "--skip-git-repo-check",
+            prompt,
+        ]
+    return ["codex", "exec", "--skip-git-repo-check", prompt]
+
+
+def _raise_controller_setup_error(*_args, **_kwargs):
+    raise ValueError("controller executable trust proof failed")
+
+
+@pytest.fixture(autouse=True)
+def _stub_controller_transport_for_cli_tests(monkeypatch):
+    """Keep CLI contract tests independent of host Landlock availability."""
+    monkeypatch.setattr(
+        "runner.review_cli._controller_codex_args",
+        lambda command, **_kwargs: command,
+    )
+
+
 def _repo(tmp_path):
     repo = tmp_path / "repo"
-    repo.mkdir()
+    repo.mkdir(mode=0o700)
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.email", "review@example.invalid"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.name", "Review Test"], cwd=repo, check=True)
@@ -78,7 +106,7 @@ def test_review_command_writes_valid_digest_bound_receipt(tmp_path, monkeypatch,
 
     monkeypatch.setattr(
         "runner.review_cli._gate_subprocess_args",
-        lambda backend, prompt, ctx, timeout: ["codex", "exec", prompt],
+        _safe_controller_args,
     )
 
     def fake_run(command, **kwargs):
@@ -152,11 +180,15 @@ def test_review_cli_passes_and_closes_pinned_linux_launcher(tmp_path, monkeypatc
         codex_home = tmp_path / "codex-home"
         env: ClassVar[dict[str, str]] = {}
 
-    Runtime.run_dir.mkdir()
+    Runtime.run_dir.mkdir(mode=0o700)
 
     monkeypatch.setattr(
         "runner.review_cli._gate_subprocess_args",
-        lambda backend, prompt, ctx, timeout: ["codex", "exec", prompt],
+        _safe_controller_args,
+    )
+    monkeypatch.setattr(
+        "runner.review_cli._controller_output_schema",
+        lambda run_dir: run_dir / "output-schema.json",
     )
     monkeypatch.setattr("runner.review_cli._create_controller_runtime", lambda: Runtime())
     monkeypatch.setattr("runner.review_cli._controller_codex_args", lambda *args, **kwargs: command)
@@ -189,6 +221,49 @@ def test_review_cli_passes_and_closes_pinned_linux_launcher(tmp_path, monkeypatc
     assert json.loads(capsys.readouterr().out)["status"] == "valid"
 
 
+def test_review_cli_preserves_controller_setup_error(tmp_path, monkeypatch, capsys):
+    repo, base, head = _repo(tmp_path)
+    task = _task(repo)
+    output = tmp_path / "review-output"
+
+    class Runtime:
+        run_dir = tmp_path / "runtime"
+        codex_home = tmp_path / "codex-home"
+        env: ClassVar[dict[str, str]] = {}
+
+    Runtime.run_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(
+        "runner.review_cli._gate_subprocess_args", _safe_controller_args
+    )
+    monkeypatch.setattr(
+        "runner.review_cli._controller_output_schema",
+        lambda run_dir: run_dir / "output-schema.json",
+    )
+    monkeypatch.setattr("runner.review_cli._create_controller_runtime", lambda: Runtime())
+    monkeypatch.setattr(
+        "runner.review_cli._controller_codex_args",
+        _raise_controller_setup_error,
+    )
+    monkeypatch.setattr("runner.review_cli._cleanup_controller_runtime", lambda path: None)
+
+    rc = main(
+        [
+            "--workdir", str(repo),
+            "--base-sha", base,
+            "--head-sha", head,
+            "--task-file", str(task),
+            "--evidence", "value.txt",
+            "--output-dir", str(output),
+            "--backend", "codex",
+        ]
+    )
+
+    assert rc == 1
+    receipt = json.loads((output / "controller-receipt.json").read_text())
+    assert "controller executable trust proof failed" in receipt["contract_error"]
+    assert json.loads(capsys.readouterr().out)["status"] == "invalid"
+
+
 def test_review_command_rejects_pass_without_evidence_manifest(
     tmp_path, monkeypatch, capsys
 ):
@@ -198,7 +273,7 @@ def test_review_command_rejects_pass_without_evidence_manifest(
     real_run = subprocess.run
     monkeypatch.setattr(
         "runner.review_cli._gate_subprocess_args",
-        lambda backend, prompt, ctx, timeout: ["codex", "exec", prompt],
+        _safe_controller_args,
     )
 
     def fake_run(command, **kwargs):
@@ -236,7 +311,7 @@ def test_review_command_rejects_empty_success_receipt(
     real_run = subprocess.run
     monkeypatch.setattr(
         "runner.review_cli._gate_subprocess_args",
-        lambda backend, prompt, ctx, timeout: ["codex", "exec", prompt],
+        _safe_controller_args,
     )
     empty_transport = _valid_transport("").rsplit("\n", 1)[0]
 
@@ -276,7 +351,7 @@ def test_review_command_returns_two_for_valid_fail_verdict(
 
     monkeypatch.setattr(
         "runner.review_cli._gate_subprocess_args",
-        lambda backend, prompt, ctx, timeout: ["codex", "exec", prompt],
+        _safe_controller_args,
     )
 
     def fake_run(command, **kwargs):
@@ -331,7 +406,7 @@ def test_review_command_rejects_pass_under_stub_env(
     monkeypatch.setenv(stub_env, "1")
     monkeypatch.setattr(
         "runner.review_cli._gate_subprocess_args",
-        lambda backend, prompt, ctx, timeout: ["codex", "exec", prompt],
+        _safe_controller_args,
     )
 
     def fake_run(command, **kwargs):
@@ -504,7 +579,7 @@ def test_review_command_rejects_post_request_symlink_swap(tmp_path, monkeypatch)
     swapped = False
     monkeypatch.setattr(
         "runner.review_cli._gate_subprocess_args",
-        lambda backend, prompt, ctx, timeout: ["codex", "exec", prompt],
+        _safe_controller_args,
     )
 
     def fake_run(command, **kwargs):
@@ -548,7 +623,7 @@ def test_review_command_fails_closed_on_unstructured_response(
 
     monkeypatch.setattr(
         "runner.review_cli._gate_subprocess_args",
-        lambda backend, prompt, ctx, timeout: ["codex", "exec", prompt],
+        _safe_controller_args,
     )
 
     def fake_run(command, **kwargs):
