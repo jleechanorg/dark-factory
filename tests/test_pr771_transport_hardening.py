@@ -194,8 +194,20 @@ def test_controller_transport_macos_profile_enforces_read_only_and_holdout_denia
 def test_controller_transport_keeps_linux_deny_paths_and_native_read_only(
     monkeypatch, tmp_path
 ):
-    """Linux keeps the preload deny prefix and Codex native read-only mode."""
+    """Linux adds kernel Landlock while retaining preload defense-in-depth."""
     monkeypatch.setattr("runner.handler_dispatch.sys.platform", "linux")
+    monkeypatch.setattr(
+        "runner.handlers._linux_controller_sandbox_prefix",
+        lambda **kwargs: [
+            "/usr/bin/env",
+            "LD_PRELOAD=/tmp/deny_paths.so",
+            "DENY_PATHS=/sealed/holdouts",
+            "/opt/dark-factory/landlock-launcher",
+            "--read",
+            str(tmp_path),
+            "--",
+        ],
+    )
     sandboxed = [
         "/usr/bin/env",
         "LD_PRELOAD=/tmp/deny_paths.so",
@@ -211,8 +223,16 @@ def test_controller_transport_keeps_linux_deny_paths_and_native_read_only(
         sandboxed, read_only_path=tmp_path
     )
 
-    assert transport[:3] == sandboxed[:3]
-    assert transport[3:] == [
+    assert transport[:7] == [
+        "/usr/bin/env",
+        "LD_PRELOAD=/tmp/deny_paths.so",
+        "DENY_PATHS=/sealed/holdouts",
+        "/opt/dark-factory/landlock-launcher",
+        "--read",
+        str(tmp_path),
+        "--",
+    ]
+    assert transport[7:] == [
         "/usr/local/bin/codex",
         "exec",
         "--json",

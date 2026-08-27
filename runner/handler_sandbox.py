@@ -66,6 +66,13 @@ alone. If verification fails (or the compiler/library are unavailable),
 callers fail the node closed (see ``runner/handler_codergen.py``), exactly
 as they already did for a missing ``sandbox-exec`` on macOS.
 
+The Linux **controller reviewer** uses ``landlock_launcher.c`` in addition to
+this shim. It installs a kernel-enforced read/write allow-list before native
+Codex starts, so static binaries and direct syscalls cannot bypass the sealed
+holdout boundary. The preload shim is retained only as defense-in-depth; if
+the launcher cannot be built or Landlock is unavailable, controller launch
+fails closed.
+
 Note: tests heavily monkeypatch ``runner.handlers._sanitized_env`` and
 ``runner.handlers._sandboxed_args`` via
 ``monkeypatch.setattr("runner.handlers._X", ...)``. The ``runner/handlers.py``
@@ -529,6 +536,162 @@ def _linux_sandbox_prefix(denied_paths: "list[pathlib.Path]") -> "Optional[list[
     joined = ":".join(str(p) for p in denied_paths)
     env_bin = shutil.which("env") or "/usr/bin/env"
     return [env_bin, f"LD_PRELOAD={lib}", f"DENY_PATHS={joined}"]
+
+
+# Linux controller reviews need kernel enforcement because a reviewer may use
+# a static executable or issue raw openat(2) syscalls.  The preload shim above
+# remains in the prefix as defense-in-depth, but it is not the boundary.
+_LINUX_LANDLOCK_SOURCE = (
+    pathlib.Path(__file__).resolve().parent.parent
+    / "scripts"
+    / "agent-isolation"
+    / "landlock_launcher.c"
+)
+_linux_landlock_launcher: "Optional[pathlib.Path]" = None
+_linux_landlock_launcher_checked = False
+
+
+def _linux_landlock_launcher_path() -> "Optional[pathlib.Path]":
+    """Build and content-hash cache the kernel-enforced launcher."""
+    global _linux_landlock_launcher, _linux_landlock_launcher_checked
+    if _linux_landlock_launcher_checked:
+        return _linux_landlock_launcher
+    _linux_landlock_launcher_checked = True
+    compiler = shutil.which("cc") or shutil.which("gcc")
+    if compiler is None or not _LINUX_LANDLOCK_SOURCE.is_file():
+        return None
+    try:
+        digest = hashlib.sha256(_LINUX_LANDLOCK_SOURCE.read_bytes()).hexdigest()[:16]
+        cache_dir = pathlib.Path.home() / ".cache" / "dark-factory" / "agent-isolation"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        target = cache_dir / f"landlock-launcher-{digest}"
+        if not target.is_file():
+            proc = subprocess.run(
+                [compiler, "-O2", "-Wall", "-Wextra", "-o", str(target), str(_LINUX_LANDLOCK_SOURCE)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if proc.returncode != 0 or not target.is_file():
+                return None
+            target.chmod(0o700)
+        _linux_landlock_launcher = target
+        return target
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _linux_controller_sandbox_prefix(
+    *,
+    denied_paths: "list[pathlib.Path]",
+    read_paths: "list[pathlib.Path]",
+    writable_paths: "list[pathlib.Path]",
+    executable_paths: "list[pathlib.Path] | None" = None,
+) -> "Optional[list[str]]":
+    """Return a Landlock allow-list prefix for a controller Codex process.
+
+    Landlock is an allow-list API: an omitted path is denied.  Keep the list
+    deliberately small while allowing ordinary command execution, the target
+    checkout, and the private Codex runtime.  Any path that overlaps a sealed
+    path causes a closed failure rather than weakening the rule.
+    """
+    launcher = _linux_landlock_launcher_path()
+    if launcher is None:
+        return None
+
+    def normalized(paths: "list[pathlib.Path]") -> list[pathlib.Path] | None:
+        result: list[pathlib.Path] = []
+        for raw in paths:
+            try:
+                path = pathlib.Path(raw).resolve(strict=True)
+            except (OSError, RuntimeError):
+                return None
+            if not path.is_absolute():
+                return None
+            result.append(path)
+        return result
+
+    denied = normalized(denied_paths)
+    reads = normalized(read_paths)
+    writes = normalized(writable_paths)
+    executables = normalized(executable_paths or [])
+    if denied is None or reads is None or writes is None or executables is None:
+        return None
+
+    def contains(parent: pathlib.Path, child: pathlib.Path) -> bool:
+        try:
+            child.relative_to(parent)
+            return True
+        except ValueError:
+            return False
+
+    # A Landlock rule cannot subtract a nested deny from an allowed parent.
+    # Refuse such a configuration instead of claiming the sealed path is safe.
+    if any(contains(allowed, secret) for allowed in reads + writes for secret in denied):
+        return None
+
+    system_roots = ["/bin", "/dev", "/etc", "/lib", "/lib64", "/sbin", "/sys", "/usr", "/proc"]
+    for raw in system_roots:
+        path = pathlib.Path(raw)
+        if path.is_dir():
+            try:
+                reads.append(path.resolve(strict=True))
+            except (OSError, RuntimeError):
+                return None
+    if any(contains(allowed, secret) for allowed in reads for secret in denied):
+        return None
+    for executable in executables:
+        reads.append(executable.parent)
+        # A symlink-resolved executable may live outside its command's parent.
+    preload_lib = _linux_preload_lib_path()
+    if preload_lib is None:
+        return None
+    reads.append(preload_lib.parent)
+    writes.append(pathlib.Path("/dev/null"))
+
+    # Worktrees may use a .git file that points at an admin directory outside
+    # the checkout. Allow that exact metadata tree so normal git inspection
+    # remains available without granting the checkout's parent directory.
+    for root in list(reads):
+        marker = root / ".git"
+        try:
+            if marker.is_file():
+                text = marker.read_text(encoding="utf-8").strip()
+                if text.startswith("gitdir:"):
+                    gitdir = pathlib.Path(text.split(":", 1)[1].strip())
+                    if not gitdir.is_absolute():
+                        gitdir = marker.parent / gitdir
+                    gitdir = gitdir.resolve(strict=True)
+                    reads.append(gitdir)
+                    common = gitdir / "commondir"
+                    if common.is_file():
+                        common_path = pathlib.Path(common.read_text(encoding="utf-8").strip())
+                        if not common_path.is_absolute():
+                            common_path = gitdir / common_path
+                        reads.append(common_path.resolve(strict=True))
+        except (OSError, RuntimeError, ValueError):
+            return None
+    if any(contains(allowed, secret) for allowed in reads + writes for secret in denied):
+        return None
+
+    # Keep the runtime and target out of any accidental duplicate path list;
+    # deterministic argv helps audit logs and tests.
+    read_unique = sorted(set(reads), key=str)
+    write_unique = sorted(set(writes), key=str)
+    launcher_args: list[str] = [str(launcher)]
+    for path in read_unique:
+        launcher_args.extend(("--read", str(path)))
+    for path in write_unique:
+        launcher_args.extend(("--write", str(path)))
+    launcher_args.append("--")
+
+    # Retain preload containment as defense-in-depth.  Landlock remains the
+    # kernel boundary and is what protects static binaries/raw syscalls.
+    preload = _linux_sandbox_prefix(denied)
+    if preload is None:
+        return None
+    return preload + launcher_args
 
 
 _darwin_sandbox_exec_verified: "Optional[bool]" = None
