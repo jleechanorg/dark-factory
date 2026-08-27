@@ -13,13 +13,15 @@ import json
 import os
 import pathlib
 import re
+import stat
 import subprocess
 import threading
 import time
 import traceback
 import uuid
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional
+from typing import Iterator, Optional
 
 from . import engine_branches as _branches
 from . import engine_edges as _edges
@@ -41,9 +43,9 @@ _RUN_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 def _seed_controller_base_sha(ctx: Context, graph: Graph) -> None:
     """Bind a cold-review base to the selected target before any worker runs.
 
-    The runner owns this initial provenance.  It must never ask the target
-    checkout to resolve a mutable branch, and it must not replace explicit
-    controller state or a graph-provided base.  AO worktrees supplied before
+    The runner owns this initial provenance. It never asks the target checkout
+    to resolve a mutable branch, and public state or graph attributes cannot
+    narrow the controller's review range. AO worktrees supplied before
     execution are selected by ``_target_worktree`` and therefore receive the
     same immutable HEAD capture as the ordinary CLI worktree.
 
@@ -90,17 +92,164 @@ def _seed_controller_base_sha(ctx: Context, graph: Graph) -> None:
 
 def _controller_snapshot_journal_path(ctx: Context) -> pathlib.Path | None:
     """Return the durable snapshot journal path for this run, if addressable."""
-    run_id = str(getattr(ctx, "run_id", "") or "")
+    run_id = str(
+        ctx.state.get("_controller_snapshot_journal_run_id")
+        or getattr(ctx, "run_id", "")
+        or ""
+    )
     if not _RUN_ID_RE.fullmatch(run_id):
         return None
-    return pathlib.Path.home() / ".dark-factory" / "runs" / run_id / _CONTROLLER_SNAPSHOT_JOURNAL
+    home = pathlib.Path.home()
+    try:
+        home_info = home.lstat()
+    except OSError as exc:
+        raise ValueError("controller snapshot journal home is unavailable") from exc
+    if (
+        not home.is_absolute()
+        or stat.S_ISLNK(home_info.st_mode)
+        or not stat.S_ISDIR(home_info.st_mode)
+        or home_info.st_uid != os.getuid()
+        or home_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise ValueError("controller snapshot journal home is not private")
+    run_dir = home
+    for component in (".dark-factory", "runs", run_id):
+        run_dir /= component
+        try:
+            info = run_dir.lstat()
+        except FileNotFoundError:
+            try:
+                run_dir.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+            info = run_dir.lstat()
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise ValueError(f"controller snapshot journal directory is not private: {run_dir}")
+    return run_dir / _CONTROLLER_SNAPSHOT_JOURNAL
 
 
-def _persist_controller_snapshot_journal(ctx: Context) -> None:
-    """Persist the controller snapshot journal without dropping failed entries."""
+def _read_controller_snapshot_journal(path: pathlib.Path) -> list:
+    """Read a journal through a no-follow descriptor after validating its file."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return []
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid not in {0, os.getuid()}
+            or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise ValueError("controller snapshot journal is not private")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    try:
+        entries = json.loads(b"".join(chunks).decode("utf-8"))
+    except (UnicodeError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("controller snapshot journal is malformed") from exc
+    if not isinstance(entries, list):
+        raise TypeError("controller snapshot journal is malformed")
+    return entries
+
+
+@contextmanager
+def _controller_snapshot_journal_lock(
+    ctx: Context,
+) -> Iterator[pathlib.Path | None]:
+    """Serialize journal updates with an owner-validated per-run lock."""
     path = _controller_snapshot_journal_path(ctx)
     if path is None:
+        yield None
         return
+    import fcntl
+
+    lock_path = path.with_name(f".{path.name}.lock")
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(lock_path, flags, 0o600)
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid not in {0, os.getuid()}
+            or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise ValueError("controller snapshot journal lock is not private")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield path
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _write_controller_snapshot_journal(path: pathlib.Path, entries: list) -> None:
+    """Atomically replace a journal and flush both file and directory metadata."""
+    if path.is_symlink():
+        raise ValueError("controller snapshot journal is a symlink")
+    payload = (json.dumps(entries, sort_keys=True, separators=(",", ":")) + "\n").encode(
+        "utf-8"
+    )
+    directory_flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        directory_flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+    directory_fd = os.open(path.parent, directory_flags)
+    temporary_name = f".{path.name}.{uuid.uuid4().hex}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd: int | None = None
+    try:
+        try:
+            fd = os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
+            view = memoryview(payload)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            if fd is not None:
+                os.close(fd)
+        os.replace(
+            temporary_name,
+            path.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+    except Exception:
+        try:
+            os.unlink(temporary_name, dir_fd=directory_fd)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(directory_fd)
+
+
+def _persist_controller_snapshot_journal(
+    ctx: Context, *, remove_entry: dict | None = None
+) -> None:
+    """Merge and persist the controller snapshot journal under its run lock."""
     raw = ctx.state.get("_controller_review_snapshots", "[]")
     try:
         entries = json.loads(raw)
@@ -108,20 +257,19 @@ def _persist_controller_snapshot_journal(ctx: Context) -> None:
         raise ValueError("controller snapshot state is malformed") from exc
     if not isinstance(entries, list):
         raise TypeError("controller snapshot state is malformed")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        temporary.write_text(
-            json.dumps(entries, sort_keys=True, separators=(",", ":")) + "\n",
-            encoding="utf-8",
+    with _controller_snapshot_journal_lock(ctx) as path:
+        if path is None:
+            return
+        merged = _read_controller_snapshot_journal(path)
+        for entry in entries:
+            if entry not in merged:
+                merged.append(entry)
+        if remove_entry is not None:
+            merged = [entry for entry in merged if entry != remove_entry]
+        ctx.state["_controller_review_snapshots"] = json.dumps(
+            merged, sort_keys=True, separators=(",", ":")
         )
-        os.replace(temporary, path)
-    except Exception:
-        try:
-            temporary.unlink()
-        except OSError:
-            pass
-        raise
+        _write_controller_snapshot_journal(path, merged)
 
 
 def _load_controller_snapshot_journal(ctx: Context) -> None:
@@ -129,14 +277,25 @@ def _load_controller_snapshot_journal(ctx: Context) -> None:
     path = _controller_snapshot_journal_path(ctx)
     if path is None:
         return
-    raw = ctx.state.get("_controller_review_snapshots")
-    if raw not in (None, "", "[]"):
-        return
     try:
-        entries = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, TypeError, json.JSONDecodeError):
+        with _controller_snapshot_journal_lock(ctx) as locked_path:
+            if locked_path is None:
+                return
+            disk_entries = _read_controller_snapshot_journal(locked_path)
+    except (OSError, TypeError, ValueError):
         return
-    if isinstance(entries, list):
+    raw = ctx.state.get("_controller_review_snapshots", "[]")
+    try:
+        local_entries = json.loads(raw) if raw not in (None, "") else []
+    except (TypeError, json.JSONDecodeError):
+        local_entries = []
+    if not isinstance(local_entries, list):
+        local_entries = []
+    entries = list(disk_entries)
+    for entry in local_entries:
+        if entry not in entries:
+            entries.append(entry)
+    if entries:
         ctx.state["_controller_review_snapshots"] = json.dumps(
             entries, sort_keys=True, separators=(",", ":")
         )
@@ -394,13 +553,7 @@ def _cleanup_controller_snapshot(ctx: Context) -> None:
             )
             if prune_result.returncode != 0:
                 continue
-            entries = [candidate for candidate in entries if candidate != entry]
-            ctx.state["_controller_review_snapshots"] = json.dumps(
-                entries,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            _persist_controller_snapshot_journal(ctx)
+            _persist_controller_snapshot_journal(ctx, remove_entry=entry)
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
             # Cleanup is best-effort and must never mask the terminal result.
             continue
@@ -497,10 +650,12 @@ def run(
     """
     # Resume uses the checkpoint's run directory as the durable journal owner.
     # Establish that identity before any terminal resume fast path can return.
-    if ctx.run_id is None and resume is not None:
+    if resume is not None:
         candidate_run_id = pathlib.Path(resume).expanduser().parent.name
         if _RUN_ID_RE.fullmatch(candidate_run_id):
-            ctx.run_id = candidate_run_id
+            ctx.state["_controller_snapshot_journal_run_id"] = candidate_run_id
+            if ctx.run_id is None:
+                ctx.run_id = candidate_run_id
     if not ctx.run_id:
         ctx.run_id = uuid.uuid4().hex[:12]
     _load_controller_snapshot_journal(ctx)

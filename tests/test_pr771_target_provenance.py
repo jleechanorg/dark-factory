@@ -51,9 +51,12 @@ def _cleanup_snapshots(repo: Path, ctx: Context) -> None:
         _git(repo, "worktree", "remove", "--force", entry["snapshot_path"])
 
 
-def test_controller_base_does_not_follow_mutable_origin_main(tmp_path: Path) -> None:
+def test_controller_base_does_not_follow_mutable_origin_main(tmp_path: Path, monkeypatch) -> None:
     """A worker-controlled origin/main ref cannot collapse the reviewed range."""
     repo, base, head = _repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    monkeypatch.setenv("HOME", str(home))
     _git(repo, "update-ref", "refs/remotes/origin/main", head)
     ctx = Context(
         goal="review worker change",
@@ -169,7 +172,7 @@ def test_resume_terminal_checkpoint_retries_durable_snapshot_cleanup(
     (run_dir / "controller-snapshot-journal.json").write_text(json.dumps([entry]))
     checkpoint = run_dir / "checkpoint.json"
     checkpoint.write_text(
-        json.dumps([{"node": "exit", "outcome": "success", "ts": 0, "output_preview": ""}])
+        json.dumps([{"node": "start", "outcome": "success", "ts": 0, "output_preview": ""}])
     )
     graph = Graph(
         name="resume-cleanup",
@@ -188,6 +191,116 @@ def test_resume_terminal_checkpoint_retries_durable_snapshot_cleanup(
     assert history
     assert not snapshot.exists()
     assert json.loads((run_dir / "controller-snapshot-journal.json").read_text()) == []
+
+
+def test_resume_cxdb_keeps_original_journal_identity(tmp_path: Path, monkeypatch) -> None:
+    """CXDB's new run id must not strand the resumed run's journal."""
+    from runner.engine_run import run
+    from runner.parser import Edge, Graph
+
+    repo, _base, head = _repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    snapshot = _controller_snapshot(repo, head, ())[0]
+    run_dir = home / ".dark-factory" / "runs" / "resume-cxdb"
+    run_dir.mkdir(parents=True)
+    entry = {"snapshot_path": str(snapshot), "source_worktree": str(repo)}
+    (run_dir / "controller-snapshot-journal.json").write_text(json.dumps([entry]))
+    checkpoint = run_dir / "checkpoint.json"
+    checkpoint.write_text(
+        json.dumps([{"node": "start", "outcome": "success", "ts": 0, "output_preview": ""}])
+    )
+    graph = Graph(
+        name="resume-cxdb",
+        goal="",
+        nodes={"start": Node(name="start", attrs={}), "exit": Node(name="exit", attrs={})},
+        edges=[Edge(src="start", dst="exit", attrs={})],
+    )
+
+    run(
+        graph,
+        Context(
+            goal="resume",
+            workdir=repo,
+            run_id="caller-run-id",
+            cxdb_path=tmp_path / "run.sqlite",
+        ),
+        resume=checkpoint,
+        max_steps=10,
+    )
+
+    assert json.loads((run_dir / "controller-snapshot-journal.json").read_text()) == []
+    assert not snapshot.exists()
+
+
+def test_snapshot_journal_fsyncs_file_and_parent(tmp_path: Path, monkeypatch) -> None:
+    """Journal replacement must flush both file contents and directory entry."""
+    from runner.engine_run import _persist_controller_snapshot_journal
+
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    ctx = Context(
+        goal="persist",
+        workdir=tmp_path,
+        run_id="fsync-journal",
+        state={"_controller_review_snapshots": "[]"},
+    )
+    fsync_calls: list[int] = []
+    real_fsync = __import__("os").fsync
+    monkeypatch.setattr("runner.engine_run.os.fsync", lambda fd: fsync_calls.append(fd) or real_fsync(fd))
+
+    _persist_controller_snapshot_journal(ctx)
+
+    assert len(fsync_calls) >= 2
+
+
+def test_snapshot_journal_persist_merges_concurrent_entries(tmp_path: Path, monkeypatch) -> None:
+    """A stale local cleanup/write must preserve entries committed by another run."""
+    from runner.engine_run import _persist_controller_snapshot_journal
+
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    run_dir = home / ".dark-factory" / "runs" / "merge-journal"
+    run_dir.mkdir(parents=True)
+    first = {"snapshot_path": "/private/snapshot-a", "source_worktree": "/private/source"}
+    second = {"snapshot_path": "/private/snapshot-b", "source_worktree": "/private/source"}
+    journal = run_dir / "controller-snapshot-journal.json"
+    journal.write_text(json.dumps([first]))
+    ctx = Context(
+        goal="persist",
+        workdir=tmp_path,
+        run_id="merge-journal",
+        state={"_controller_review_snapshots": json.dumps([second])},
+    )
+
+    _persist_controller_snapshot_journal(ctx)
+
+    entries = json.loads(journal.read_text())
+    assert entries == [first, second]
+
+
+def test_snapshot_journal_rejects_symlinked_private_root(tmp_path: Path, monkeypatch) -> None:
+    """Journal writes must reject a replaced private root instead of following it."""
+    from runner.engine_run import _persist_controller_snapshot_journal
+
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    target = tmp_path / "redirect"
+    target.mkdir(mode=0o700)
+    (home / ".dark-factory").symlink_to(target, target_is_directory=True)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    ctx = Context(
+        goal="persist",
+        workdir=tmp_path,
+        run_id="unsafe-journal",
+        state={"_controller_review_snapshots": "[]"},
+    )
+
+    with pytest.raises(ValueError, match="private|symlink"):
+        _persist_controller_snapshot_journal(ctx)
 
 
 @pytest.mark.parametrize(
