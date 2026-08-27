@@ -822,6 +822,10 @@ def parse_codex_jsonl(raw: str) -> tuple[str, tuple[ExecutionReceipt, ...]]:
             raise ReviewContractError(
                 f"review transport emitted invalid JSONL at line {line_number}"
             ) from exc
+        if not isinstance(event, dict):
+            raise ReviewContractError(
+                f"review transport emitted non-object JSONL event at line {line_number}"
+            )
         item = event.get("item")
         if not isinstance(item, dict):
             continue
