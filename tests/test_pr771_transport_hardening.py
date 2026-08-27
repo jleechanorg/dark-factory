@@ -208,6 +208,7 @@ def test_controller_transport_keeps_linux_deny_paths_and_native_read_only(
             "--",
         ],
     )
+    monkeypatch.setattr("runner.handlers._linux_codex_runtime_paths", lambda path: [])
     sandboxed = [
         "/usr/bin/env",
         "LD_PRELOAD=/tmp/deny_paths.so",

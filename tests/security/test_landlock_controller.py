@@ -18,7 +18,9 @@ import pytest
 from runner.handler_dispatch import _build_controller_codex_transport
 from runner.handler_sandbox import (
     _linux_controller_sandbox_prefix,
+    _linux_codex_runtime_paths,
     _linux_landlock_launcher_path,
+    _reset_linux_landlock_launcher_cache_for_tests,
 )
 
 
@@ -76,6 +78,33 @@ def test_landlock_launcher_builds_and_reports_kernel_support():
 
 
 @linux_only
+def test_landlock_requires_abi_three_for_truncate_enforcement(monkeypatch):
+    import runner.handler_sandbox as sandbox
+
+    monkeypatch.setattr(sandbox, "_linux_landlock_abi", lambda: 2)
+    _reset_linux_landlock_launcher_cache_for_tests()
+    try:
+        assert _linux_landlock_launcher_path() is None
+    finally:
+        _reset_linux_landlock_launcher_cache_for_tests()
+
+
+@linux_only
+def test_codex_js_launcher_allows_bundled_native_runtime_root(tmp_path):
+    package = tmp_path / "node_modules" / "@openai" / "codex"
+    launcher = package / "bin" / "codex.js"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+    native = package / "node_modules" / "@openai" / "codex-linux-x64" / "vendor" / "bin" / "codex"
+    native.parent.mkdir(parents=True)
+    native.write_bytes(b"native")
+    paths = _linux_codex_runtime_paths(launcher)
+    assert paths is not None
+    assert package.resolve() in paths
+    assert native.parent.resolve().is_relative_to(package.resolve())
+
+
+@linux_only
 def test_landlock_denies_raw_openat_from_static_binary(tmp_path):
     launcher = _linux_landlock_launcher_path()
     assert launcher is not None
@@ -91,6 +120,7 @@ def test_landlock_denies_raw_openat_from_static_binary(tmp_path):
         denied_paths=[denied],
         read_paths=[allowed],
         writable_paths=[],
+        executable_paths=[raw_open],
     )
     assert prefix is not None
     proc = subprocess.run(
@@ -99,7 +129,10 @@ def test_landlock_denies_raw_openat_from_static_binary(tmp_path):
         text=True,
         check=False,
     )
-    assert proc.returncode != 0
+    # The probe must execute and report the raw openat denial itself.  A 127
+    # from the launcher would only prove that the executable was not allowed.
+    assert proc.returncode == 3, proc.stderr
+    assert "Permission denied" not in proc.stdout
     assert "STATIC-RAW-SYSCALL-SECRET" not in proc.stdout
 
 
