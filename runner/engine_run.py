@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import subprocess
 import threading
 import time
@@ -31,6 +32,47 @@ from ._classify import _classify_outcome
 from .cxdb import CXDB
 from .handlers import Context, Result, resolve
 from .parser import Graph, Node, is_exit_node
+
+_CONTROLLER_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _seed_controller_base_sha(ctx: Context, graph: Graph) -> None:
+    """Bind a cold-review base to the selected target before any worker runs.
+
+    The runner owns this initial provenance.  It must never ask the target
+    checkout to resolve a mutable branch, and it must not replace explicit
+    controller state or a graph-provided base.  AO worktrees supplied before
+    execution are selected by ``_target_worktree`` and therefore receive the
+    same immutable HEAD capture as the ordinary CLI worktree.
+
+    Non-Git workdirs and unavailable HEADs are left unset so non-controller
+    pipelines retain their existing behavior; a controller request then fails
+    closed at its own validation boundary.
+    """
+    if "_controller_base_sha" in ctx.state or "base_sha" in ctx.state:
+        return
+    if any(
+        str(node.attrs.get("review_contract") or "").strip() == "cold-review-v1"
+        and "base_sha" in node.attrs
+        for node in graph.nodes.values()
+    ):
+        return
+    try:
+        from .handler_core import _target_worktree
+
+        target = _target_worktree(ctx)
+        proc = subprocess.run(
+            ["git", "-C", str(target), "rev-parse", "HEAD^{commit}"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError, AttributeError, TypeError):
+        return
+    base_sha = proc.stdout.strip().lower() if proc.returncode == 0 else ""
+    if _CONTROLLER_SHA_RE.fullmatch(base_sha):
+        ctx.state["_controller_base_sha"] = base_sha
 
 
 # Cross-run exhaustion circuit breaker (v4 hardening).
@@ -352,6 +394,10 @@ def run(
     If `resume` is provided, execution restarts from the successor of the
     checkpointed last step.
     """
+    # Capture the controller-owned base before the first worker visit.  This
+    # runs after CLI/AO state has been assembled, so an explicitly selected AO
+    # worktree is the target whose immutable HEAD is bound.
+    _seed_controller_base_sha(ctx, graph)
     history: list = []
     visits: dict[str, int] = {}
     # Per-node ring of recent output hashes for the no_progress detector

@@ -104,3 +104,87 @@ def test_controller_preserves_lexical_ao_worktree_until_validation(tmp_path: Pat
     assert _target_worktree(ctx) == lexical_repo
     with pytest.raises(ValueError, match="symlink"):
         _controller_review_request(Node(name="cold_reviewer", attrs={}), ctx, head)
+
+
+def test_default_two_node_seeds_base_before_worker_mutation(tmp_path: Path, monkeypatch) -> None:
+    """The production default graph binds its base before creating a review snapshot."""
+    import runner.handler_parallel_reviewer as reviewer
+    from runner import handlers
+    from runner.__main__ import main
+    from runner.handler_core import Result
+
+    repo, base, _head = _repo(tmp_path)
+    _git(repo, "reset", "--hard", base)
+    (repo / "evidence").mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    def worker(node, ctx):
+        (repo / "worker.txt").write_text("worker mutation\n")
+        (repo / "evidence" / "worker-verification.json").write_text(
+            '{"status":"pass"}\n'
+        )
+        return Result(outcome="success", output="worker complete")
+
+    monkeypatch.setitem(handlers.TYPE_REGISTRY, "codergen", worker)
+    captured: dict[str, object] = {}
+    original_request = reviewer._controller_review_request
+
+    def capture_request(node, ctx, expected_sha):
+        request = original_request(node, ctx, expected_sha)
+        captured["request"] = request
+        captured["base_state"] = ctx.state.get("_controller_base_sha")
+        return request
+
+    monkeypatch.setattr(reviewer, "_controller_review_request", capture_request)
+    monkeypatch.setattr(
+        reviewer,
+        "_run_primary_review",
+        lambda *args, **kwargs: Result(
+            outcome="success",
+            output=json.dumps(
+                {
+                    "verdict": "pass",
+                    "findings": [],
+                    "evidence_checked": ["worker-verification.json"],
+                    "commands_executed": ["verification command"],
+                    "caveats": [],
+                }
+            ),
+            metadata={
+                "returncode": "0",
+                "_controller_command_receipts": [
+                    {
+                        "command": "verification command",
+                        "exit_code": 0,
+                        "output_sha256": "1" * 64,
+                    }
+                ],
+            },
+        ),
+    )
+
+    result = main(
+        [
+            "--goal",
+            "review worker mutation",
+            "--workdir",
+            str(repo),
+            "--ao-worktree",
+            str(repo),
+            "--backend",
+            "echo",
+            "--no-perf-log",
+            "--max-steps",
+            "10",
+        ]
+    )
+
+    request = captured["request"]
+    envelope = json.loads(request.envelope_json)
+    assert result == 0
+    assert captured["base_state"] == base
+    assert envelope["target"]["base_sha"] == base
+    assert envelope["target"]["base_sha"] != envelope["target"]["head_sha"]
+    assert "worker.txt" in envelope["snapshots"]["changed_files"]
