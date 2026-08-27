@@ -959,19 +959,24 @@ def _linux_controller_sandbox_prefix(
     launcher_fd = _open_verified_launcher(launcher)
     if launcher_fd is None:
         return None
-    launcher_args: list[str] = [f"/proc/self/fd/{launcher_fd}"]
-    for path in read_unique:
-        launcher_args.extend(("--read", str(path)))
-    for path in write_unique:
-        launcher_args.extend(("--write", str(path)))
-    launcher_args.append("--")
+    try:
+        launcher_args: list[str] = [f"/proc/self/fd/{launcher_fd}"]
+        for path in read_unique:
+            launcher_args.extend(("--read", str(path)))
+        for path in write_unique:
+            launcher_args.extend(("--write", str(path)))
+        launcher_args.append("--")
 
-    # Retain preload containment as defense-in-depth.  Landlock remains the
-    # kernel boundary and is what protects static binaries/raw syscalls.
-    preload = _linux_sandbox_prefix(denied)
-    if preload is None:
-        return None
-    return _PinnedLauncherCommand(preload + launcher_args, launcher_fd)
+        # Retain preload containment as defense-in-depth.  Landlock remains the
+        # kernel boundary and is what protects static binaries/raw syscalls.
+        preload = _linux_sandbox_prefix(denied)
+        if preload is None:
+            os.close(launcher_fd)
+            return None
+        return _PinnedLauncherCommand(preload + launcher_args, launcher_fd)
+    except Exception:
+        os.close(launcher_fd)
+        raise
 
 
 _darwin_sandbox_exec_verified: "Optional[bool]" = None

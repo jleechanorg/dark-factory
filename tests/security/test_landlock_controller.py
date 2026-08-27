@@ -198,6 +198,32 @@ def test_launcher_rejects_replacement_before_pinning(tmp_path, monkeypatch):
 
 
 @linux_only
+def test_landlock_prefix_closes_pinned_fd_when_preload_fails(tmp_path, monkeypatch):
+    import runner.handler_sandbox as sandbox
+
+    fd = os.open(sandbox._LINUX_LANDLOCK_SOURCE, os.O_RDONLY)
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    sealed = tmp_path / "sealed"
+    sealed.mkdir()
+    monkeypatch.setattr(sandbox, "_linux_landlock_launcher_path", lambda: sandbox._LINUX_LANDLOCK_SOURCE)
+    monkeypatch.setattr(sandbox, "_open_verified_launcher", lambda path: fd)
+    monkeypatch.setattr(sandbox, "_linux_sandbox_prefix", lambda denied: None)
+    try:
+        assert sandbox._linux_controller_sandbox_prefix(
+            denied_paths=[sealed],
+            read_paths=[allowed],
+            writable_paths=[],
+        ) is None
+        with pytest.raises(OSError):
+            os.fstat(fd)
+        fd = None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+@linux_only
 def test_landlock_requires_abi_three_for_truncate_enforcement(monkeypatch):
     import runner.handler_sandbox as sandbox
 

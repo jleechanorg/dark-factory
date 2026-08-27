@@ -27,6 +27,7 @@ from .handler_dispatch import (
 )
 from .handler_sandbox import (
     _cleanup_controller_runtime,
+    _close_pinned_launcher_command,
     _create_controller_runtime,
 )
 from .review_controller import (
@@ -389,16 +390,20 @@ def main(argv: list[str] | None = None) -> int:
                     "codex review command did not contain the codex executable"
                 ) from exc
             stdin_text = request.prompt
-        proc = subprocess.run(
-            command,
-            cwd=output_dir,
-            capture_output=True,
-            text=True,
-            input=stdin_text,
-            timeout=args.timeout,
-            check=False,
-            env=runtime.env if runtime is not None else _gate_subprocess_env(args.backend),
-        )
+        try:
+            proc = subprocess.run(
+                command,
+                cwd=output_dir,
+                capture_output=True,
+                text=True,
+                input=stdin_text,
+                timeout=args.timeout,
+                check=False,
+                env=runtime.env if runtime is not None else _gate_subprocess_env(args.backend),
+                pass_fds=getattr(command, "pass_fds", ()),
+            )
+        finally:
+            _close_pinned_launcher_command(command)
         raw_transport = proc.stdout
         command_receipts = ()
         response = proc.stdout.strip()
@@ -483,6 +488,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 0 if verdict == "pass" else 2
     except (OSError, UnicodeError, subprocess.TimeoutExpired, ReviewContractError) as exc:
+        _close_pinned_launcher_command(locals().get("command"))
         if runtime is not None:
             try:
                 _cleanup_controller_runtime(runtime.run_dir)

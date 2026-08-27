@@ -12,6 +12,7 @@ import pytest
 
 from runner.review_cli import _parser, _read_validated_task, main
 from runner.review_controller import ReviewContractError
+from runner.handler_sandbox import _PinnedLauncherCommand
 
 
 def _repo(tmp_path):
@@ -141,6 +142,56 @@ def test_review_command_writes_valid_digest_bound_receipt(tmp_path, monkeypatch,
     assert (output / "prompt.txt").is_file()
     assert (output / "envelope.json").is_file()
     assert (output / "reviewer.output.md").is_file()
+    assert json.loads(capsys.readouterr().out)["status"] == "valid"
+
+
+def test_review_cli_passes_and_closes_pinned_linux_launcher(tmp_path, monkeypatch, capsys):
+    """The standalone CLI must inherit and then close a pinned launcher FD."""
+    repo, base, head = _repo(tmp_path)
+    task = _task(repo)
+    output = tmp_path / "review-output"
+    real_run = subprocess.run
+    seen: dict[str, object] = {}
+    launcher_fd = os.open(os.devnull, os.O_RDONLY)
+    command = _PinnedLauncherCommand(["codex", "exec", "-"], launcher_fd)
+
+    class Runtime:
+        run_dir = tmp_path / "runtime"
+        codex_home = tmp_path / "codex-home"
+        env = {}
+
+    monkeypatch.setattr(
+        "runner.review_cli._gate_subprocess_args",
+        lambda backend, prompt, ctx, timeout: ["codex", "exec", prompt],
+    )
+    monkeypatch.setattr("runner.review_cli._create_controller_runtime", lambda: Runtime())
+    monkeypatch.setattr("runner.review_cli._controller_codex_args", lambda *args, **kwargs: command)
+    monkeypatch.setattr("runner.review_cli._cleanup_controller_runtime", lambda path: None)
+
+    def fake_run(process_args, **kwargs):
+        if process_args[0] == "git":
+            return real_run(process_args, **kwargs)
+        seen["pass_fds"] = kwargs.get("pass_fds")
+        return subprocess.CompletedProcess(
+            process_args, 0, stdout=_valid_transport(kwargs["input"]), stderr=""
+        )
+
+    monkeypatch.setattr("runner.review_cli.subprocess.run", fake_run)
+    rc = main(
+        [
+            "--workdir", str(repo),
+            "--base-sha", base,
+            "--head-sha", head,
+            "--task-file", str(task),
+            "--evidence", "value.txt",
+            "--output-dir", str(output),
+            "--backend", "codex",
+        ]
+    )
+
+    assert rc == 0
+    assert seen["pass_fds"] == (launcher_fd,)
+    assert command.launcher_fd == -1
     assert json.loads(capsys.readouterr().out)["status"] == "valid"
 
 
