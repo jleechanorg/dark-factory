@@ -30,6 +30,15 @@ def _git(cwd: Path, *args: str) -> str:
     return proc.stdout.strip()
 
 
+def _trusted_controller_context(**kwargs) -> Context:
+    from runner.engine_run import _set_controller_base_sha
+
+    base_sha = kwargs.pop("_controller_base_sha")
+    ctx = Context(**kwargs)
+    _set_controller_base_sha(ctx, base_sha)
+    return ctx
+
+
 def _repo(tmp_path: Path) -> tuple[Path, str, str]:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -58,7 +67,7 @@ def test_controller_base_does_not_follow_mutable_origin_main(tmp_path: Path, mon
     home.mkdir(mode=0o700)
     monkeypatch.setenv("HOME", str(home))
     _git(repo, "update-ref", "refs/remotes/origin/main", head)
-    ctx = Context(
+    ctx = _trusted_controller_context(
         goal="review worker change",
         workdir=repo,
         _controller_base_sha=base,
@@ -365,7 +374,7 @@ def test_controller_review_fails_closed_when_holdout_discovery_fails(
     tmp_path: Path, monkeypatch, discovery_error
 ) -> None:
     repo, base, head = _repo(tmp_path)
-    ctx = Context(
+    ctx = _trusted_controller_context(
         goal="review worker change",
         workdir=repo,
         _controller_base_sha=base,
@@ -444,7 +453,7 @@ def test_controller_post_review_revalidates_mutable_source_checkout(tmp_path: Pa
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     monkeypatch.setenv("HOME", str(home))
-    ctx = Context(
+    ctx = _trusted_controller_context(
         goal="review worker change",
         workdir=repo,
         _controller_base_sha=base,
@@ -469,7 +478,7 @@ def test_controller_post_review_revalidates_copied_untracked_file(
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     monkeypatch.setenv("HOME", str(home))
-    ctx = Context(
+    ctx = _trusted_controller_context(
         goal="review worker change",
         workdir=repo,
         _controller_base_sha=base,
@@ -497,7 +506,7 @@ def test_controller_post_review_rejects_new_untracked_product_file(
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     monkeypatch.setenv("HOME", str(home))
-    ctx = Context(
+    ctx = _trusted_controller_context(
         goal="review worker change",
         workdir=repo,
         state={"evidence_paths": ["review-evidence.json"]},
@@ -560,7 +569,7 @@ def test_controller_post_review_revalidates_ignored_declared_evidence(
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     monkeypatch.setenv("HOME", str(home))
-    ctx = Context(
+    ctx = _trusted_controller_context(
         goal="review worker change",
         workdir=repo,
         state={"evidence_paths": ["evidence/worker-verification.json"]},
@@ -591,7 +600,7 @@ def test_controller_rejects_source_mutation_between_snapshot_and_binding(
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     monkeypatch.setenv("HOME", str(home))
-    ctx = Context(
+    ctx = _trusted_controller_context(
         goal="review worker change",
         workdir=repo,
         _controller_base_sha=base,
@@ -755,7 +764,7 @@ def test_review_persists_raw_source_for_mutation_and_engine_cleanup(
 
     # The source-mutation cleanup must validate the raw spelling, not the
     # already-resolved source path used for reads and fingerprinting.
-    ctx = Context(
+    ctx = _trusted_controller_context(
         goal="review worker change",
         workdir=raw_repo,
         _controller_base_sha=base,
@@ -797,7 +806,7 @@ def test_review_persists_raw_source_for_mutation_and_engine_cleanup(
 
     # A successful request records the same raw spelling for engine-owned
     # cleanup. After a parent swap, the engine must reject remove and prune.
-    clean_ctx = Context(
+    clean_ctx = _trusted_controller_context(
         goal="review worker change",
         workdir=raw_repo,
         _controller_base_sha=base,
