@@ -143,7 +143,12 @@ def _copy_controller_auth(source: pathlib.Path, destination: pathlib.Path) -> No
     """Copy one validated auth file into a fresh private Codex home."""
     _validate_private_dir(source.parent)
     source_info = source.lstat()
-    if source_info.st_uid != os.getuid() or stat.S_IMODE(source_info.st_mode) != 0o600:
+    if (
+        not stat.S_ISREG(source_info.st_mode)
+        or source_info.st_nlink != 1
+        or source_info.st_uid != os.getuid()
+        or stat.S_IMODE(source_info.st_mode) != 0o600
+    ):
         raise ValueError("controller Codex auth source is not a private regular file")
     if destination.exists() or destination.is_symlink():
         raise ValueError("controller Codex auth destination already exists")
@@ -198,7 +203,19 @@ def _create_controller_runtime() -> _ControllerRuntime:
         _validate_private_dir(run_dir)
         codex_home = _ensure_private_dir(run_dir / "codex-home")
         _ensure_private_dir(codex_home / "tmp")
-        _copy_controller_auth(home / ".codex" / "auth.json", codex_home / "auth.json")
+        configured_codex_home = os.environ.get("CODEX_HOME")
+        if configured_codex_home is None:
+            auth_source_root = home / ".codex"
+        else:
+            if not configured_codex_home:
+                raise ValueError("configured CODEX_HOME must be an absolute directory")
+            auth_source_root = pathlib.Path(configured_codex_home)
+            if not auth_source_root.is_absolute():
+                raise ValueError("configured CODEX_HOME must be an absolute directory")
+        _validate_private_dir(auth_source_root)
+        _copy_controller_auth(
+            auth_source_root / "auth.json", codex_home / "auth.json"
+        )
     except Exception:
         try:
             _validate_private_dir(run_dir)

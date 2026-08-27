@@ -75,6 +75,7 @@ def test_controller_runtime_is_private_and_cleans_only_its_run_dir(
     outside = tmp_path / "outside-sentinel"
     outside.write_text("preserve\n")
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
 
     runtime = _create_controller_runtime()
     auth = runtime.codex_home / "auth.json"
@@ -97,6 +98,7 @@ def test_controller_runtime_rejects_symlinked_root_and_auth(tmp_path, monkeypatc
     outside = tmp_path / "outside"
     outside.mkdir()
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
 
     runtime_parent = home / ".dark-factory" / "controller-runtimes"
     runtime_parent.parent.mkdir(parents=True, mode=0o700)
@@ -123,6 +125,46 @@ def test_workspace_rejects_untrusted_top_level_symlink(tmp_path):
         validate_workspace_path(str(alias))
 
 
+def test_controller_runtime_uses_configured_codex_home(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    configured = tmp_path / "configured-codex-home"
+    configured.mkdir(mode=0o700)
+    auth = configured / "auth.json"
+    auth.write_text('{"token":"configured-source"}\n')
+    os.chmod(auth, 0o600)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.setenv("CODEX_HOME", str(configured))
+
+    runtime = _create_controller_runtime()
+    try:
+        assert (runtime.codex_home / "auth.json").read_text() == (
+            '{"token":"configured-source"}\n'
+        )
+        assert runtime.env["CODEX_HOME"] == str(runtime.codex_home)
+    finally:
+        _cleanup_controller_runtime(runtime.run_dir)
+
+
+def test_controller_runtime_rejects_invalid_configured_codex_home(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "missing-codex-home"))
+    with pytest.raises((ValueError, FileNotFoundError)):
+        _create_controller_runtime()
+
+    configured = tmp_path / "configured-codex-home"
+    configured.mkdir(mode=0o700)
+    (configured / "auth.json").symlink_to(outside / "auth.json")
+    monkeypatch.setenv("CODEX_HOME", str(configured))
+    with pytest.raises(ValueError, match="regular file"):
+        _create_controller_runtime()
+    assert not list((home / ".dark-factory" / "controller-runtimes").iterdir())
+
+
 def test_controller_runtime_cleanup_rejects_symlink_and_profile_allows_only_home(
     tmp_path, monkeypatch
 ):
@@ -130,6 +172,7 @@ def test_controller_runtime_cleanup_rejects_symlink_and_profile_allows_only_home
     outside = tmp_path / "outside"
     outside.mkdir()
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     runtime = _create_controller_runtime()
     linked = tmp_path / "linked-review"
     linked.symlink_to(runtime.run_dir, target_is_directory=True)
