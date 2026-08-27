@@ -552,6 +552,27 @@ _linux_landlock_launcher: "Optional[pathlib.Path]" = None
 _linux_landlock_launcher_checked = False
 
 
+class _PinnedLauncherCommand(list[str]):
+    """Command argv carrying the already-verified launcher descriptor."""
+
+    def __init__(self, args: list[str], launcher_fd: int):
+        super().__init__(args)
+        self.launcher_fd = launcher_fd
+        self.pass_fds = (launcher_fd,)
+
+    def close_launcher(self) -> None:
+        if self.launcher_fd >= 0:
+            os.close(self.launcher_fd)
+            self.launcher_fd = -1
+            self.pass_fds = ()
+
+    def __add__(self, other: list[str]) -> "_PinnedLauncherCommand":
+        return _PinnedLauncherCommand(list(self) + list(other), self.launcher_fd)
+
+    def __radd__(self, other: list[str]) -> "_PinnedLauncherCommand":
+        return _PinnedLauncherCommand(list(other) + list(self), self.launcher_fd)
+
+
 def _linux_landlock_abi() -> int | None:
     """Return the host Landlock ABI, or None when the syscall is unavailable."""
     if not sys.platform.startswith("linux"):
@@ -615,6 +636,86 @@ def _private_regular_executable(path: pathlib.Path) -> bool:
         and not info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
         and stat.S_IMODE(info.st_mode) & stat.S_IXUSR
     )
+
+
+def _open_verified_launcher(path: pathlib.Path) -> int | None:
+    """Open the validated launcher without following a replacement symlink."""
+    flags = getattr(os, "O_PATH", os.O_RDONLY)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != os.getuid()
+            or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or not stat.S_IMODE(info.st_mode) & stat.S_IXUSR
+        ):
+            os.close(fd)
+            return None
+        content_fd = os.open(f"/proc/self/fd/{fd}", os.O_RDONLY)
+        actual_digest = hashlib.sha256()
+        offset = 0
+        try:
+            while True:
+                chunk = os.pread(content_fd, 1024 * 1024, offset)
+                if not chunk:
+                    break
+                actual_digest.update(chunk)
+                offset += len(chunk)
+        finally:
+            os.close(content_fd)
+        manifest = path.with_name(path.name + ".manifest")
+        manifest_flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            manifest_flags |= os.O_NOFOLLOW
+        manifest_fd = os.open(manifest, manifest_flags)
+        try:
+            manifest_info = os.fstat(manifest_fd)
+            if (
+                not stat.S_ISREG(manifest_info.st_mode)
+                or manifest_info.st_nlink != 1
+                or manifest_info.st_uid != os.getuid()
+                or manifest_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            ):
+                os.close(fd)
+                return None
+            manifest_bytes = os.read(manifest_fd, 4096)
+        finally:
+            os.close(manifest_fd)
+        source_digest = hashlib.sha256(_LINUX_LANDLOCK_SOURCE.read_bytes()).hexdigest()
+        expected = (
+            f"source_sha256={source_digest}\n"
+            f"binary_sha256={actual_digest.hexdigest()}\n"
+        ).encode("ascii")
+        if manifest_bytes != expected:
+            os.close(fd)
+            return None
+        return fd
+    except (OSError, UnicodeError):
+        try:
+            os.close(fd)
+        except (UnboundLocalError, OSError):
+            pass
+        return None
+
+
+def _extend_pinned_launcher_command(
+    prefix: list[str], suffix: list[str]
+) -> list[str]:
+    """Append argv while retaining the launcher's inherited descriptor."""
+    launcher_fd = getattr(prefix, "launcher_fd", None)
+    if launcher_fd is None:
+        return prefix + suffix
+    return _PinnedLauncherCommand(list(prefix) + suffix, launcher_fd)
+
+
+def _close_pinned_launcher_command(command: object) -> None:
+    close = getattr(command, "close_launcher", None)
+    if close is not None:
+        close()
 
 
 def _linux_landlock_launcher_path() -> "Optional[pathlib.Path]":
@@ -855,7 +956,10 @@ def _linux_controller_sandbox_prefix(
     # deterministic argv helps audit logs and tests.
     read_unique = sorted(set(reads), key=str)
     write_unique = sorted(set(writes), key=str)
-    launcher_args: list[str] = [str(launcher)]
+    launcher_fd = _open_verified_launcher(launcher)
+    if launcher_fd is None:
+        return None
+    launcher_args: list[str] = [f"/proc/self/fd/{launcher_fd}"]
     for path in read_unique:
         launcher_args.extend(("--read", str(path)))
     for path in write_unique:
@@ -867,7 +971,7 @@ def _linux_controller_sandbox_prefix(
     preload = _linux_sandbox_prefix(denied)
     if preload is None:
         return None
-    return preload + launcher_args
+    return _PinnedLauncherCommand(preload + launcher_args, launcher_fd)
 
 
 _darwin_sandbox_exec_verified: "Optional[bool]" = None
