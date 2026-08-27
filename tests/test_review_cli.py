@@ -10,7 +10,7 @@ import subprocess
 
 import pytest
 
-from runner.review_cli import _read_validated_task, main
+from runner.review_cli import _parser, _read_validated_task, main
 from runner.review_controller import ReviewContractError
 
 
@@ -541,3 +541,50 @@ def test_main_entrypoint_dispatches_review_subcommand(capsys):
     assert "--task-file" in captured.out
     assert "--output-dir" in captured.out
     assert "--backend" in captured.out
+
+
+@pytest.mark.parametrize("backend", ("claude", "agy", "minimax", "claude-sonnet"))
+def test_review_cli_rejects_backends_without_captured_command_receipts(backend):
+    """Standalone controller review accepts only its JSONL Codex transport."""
+    backend_action = next(
+        action for action in _parser()._actions if action.dest == "backend"
+    )
+
+    assert backend not in backend_action.choices
+
+
+def test_review_wrapper_does_not_rewrite_codex_to_non_codex_fallback(tmp_path):
+    """A review request must reach the Codex-only parser unchanged."""
+    root = tmp_path / "dark-factory"
+    wrapper = root / "bin" / "dark-factory"
+    python = root / ".venv" / "bin" / "python"
+    wrapper.parent.mkdir(parents=True)
+    python.parent.mkdir(parents=True)
+    wrapper.write_text(
+        pathlib.Path(__file__).parents[1].joinpath("bin/dark-factory").read_text(),
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    python.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$2\" = runner.preflight ]; then\n"
+        "  printf '%s\\n' '{\"status\":\"warn\",\"fallback_recommendation\":\"claude\"}'\n"
+        "  exit 0\n"
+        "fi\n"
+        "printf '%s\\n' \"$*\"\n",
+        encoding="utf-8",
+    )
+    python.chmod(0o755)
+
+    completed = subprocess.run(
+        [str(wrapper), "review", "--backend", "codex"],
+        cwd=tmp_path,
+        env={"PATH": os.environ["PATH"]},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert "review --backend codex" in completed.stdout
+    assert "review --backend claude" not in completed.stdout

@@ -332,7 +332,7 @@ resolve_dark_factory_home() {
 run. Treat the flag as present unless the user explicitly passes
 `--reviewer-calibration=false`.
 
-Calibration routes every backend through the binary-owned controller
+Calibration routes the Codex backend through the binary-owned controller
 command:
 
 ```bash
@@ -342,14 +342,15 @@ dark-factory review \
   --head-sha <full-40-hex-sha> \
   --task-file <path> \
   --output-dir <dir> \
-  --backend <backend>
+  --backend codex
 ```
 
 `dark-factory review` owns the static prompt, canonical envelope, backend
-dispatch, response validation, and `controller-receipt.json`. The
-selected backend supplies transport only; do not author reviewer
-instructions, do not inline prompts, do not pass vendor CLI flags. The
-controller binds `prompt SHA-256`, `envelope SHA-256`, `task SHA-256`,
+dispatch, response validation, and `controller-receipt.json`. Controller v1
+accepts only Codex because its JSONL transport supplies the command receipts
+required for a valid PASS. Do not author reviewer instructions, do not inline
+prompts, do not pass vendor CLI flags. The controller binds `prompt SHA-256`,
+`envelope SHA-256`, `task SHA-256`,
 `diff SHA-256`, `changed-files SHA-256`, and `evidence-manifest SHA-256`
 in the controller receipt so calibration lanes can hash the receipt
 itself for provenance.

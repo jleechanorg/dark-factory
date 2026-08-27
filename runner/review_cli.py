@@ -267,7 +267,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=pathlib.Path, required=True)
     parser.add_argument(
         "--backend",
-        choices=["codex", "claude", "agy", "minimax", "claude-sonnet"],
+        choices=["codex"],
         default="codex",
     )
     parser.add_argument("--timeout", type=int, default=1200)
