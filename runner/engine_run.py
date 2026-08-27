@@ -34,6 +34,8 @@ from .handlers import Context, Result, resolve
 from .parser import Graph, Node, is_exit_node
 
 _CONTROLLER_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_CONTROLLER_SNAPSHOT_JOURNAL = "controller-snapshot-journal.json"
+_RUN_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 def _seed_controller_base_sha(ctx: Context, graph: Graph) -> None:
@@ -49,13 +51,7 @@ def _seed_controller_base_sha(ctx: Context, graph: Graph) -> None:
     pipelines retain their existing behavior; a controller request then fails
     closed at its own validation boundary.
     """
-    if "_controller_base_sha" in ctx.state or "base_sha" in ctx.state:
-        return
-    if any(
-        str(node.attrs.get("review_contract") or "").strip() == "cold-review-v1"
-        and "base_sha" in node.attrs
-        for node in graph.nodes.values()
-    ):
+    if "_controller_base_sha" in ctx.state:
         return
     try:
         from .handler_core import _target_worktree
@@ -90,6 +86,60 @@ def _seed_controller_base_sha(ctx: Context, graph: Graph) -> None:
     base_sha = proc.stdout.strip().lower() if proc.returncode == 0 else ""
     if _CONTROLLER_SHA_RE.fullmatch(base_sha):
         ctx.state["_controller_base_sha"] = base_sha
+
+
+def _controller_snapshot_journal_path(ctx: Context) -> pathlib.Path | None:
+    """Return the durable snapshot journal path for this run, if addressable."""
+    run_id = str(getattr(ctx, "run_id", "") or "")
+    if not _RUN_ID_RE.fullmatch(run_id):
+        return None
+    return pathlib.Path.home() / ".dark-factory" / "runs" / run_id / _CONTROLLER_SNAPSHOT_JOURNAL
+
+
+def _persist_controller_snapshot_journal(ctx: Context) -> None:
+    """Persist the controller snapshot journal without dropping failed entries."""
+    path = _controller_snapshot_journal_path(ctx)
+    if path is None:
+        return
+    raw = ctx.state.get("_controller_review_snapshots", "[]")
+    try:
+        entries = json.loads(raw)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("controller snapshot state is malformed") from exc
+    if not isinstance(entries, list):
+        raise TypeError("controller snapshot state is malformed")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(entries, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _load_controller_snapshot_journal(ctx: Context) -> None:
+    """Restore pending snapshots from disk before resume or early return."""
+    path = _controller_snapshot_journal_path(ctx)
+    if path is None:
+        return
+    raw = ctx.state.get("_controller_review_snapshots")
+    if raw not in (None, "", "[]"):
+        return
+    try:
+        entries = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, json.JSONDecodeError):
+        return
+    if isinstance(entries, list):
+        ctx.state["_controller_review_snapshots"] = json.dumps(
+            entries, sort_keys=True, separators=(",", ":")
+        )
 
 
 # Cross-run exhaustion circuit breaker (v4 hardening).
@@ -241,7 +291,7 @@ def _cleanup_controller_snapshot(ctx: Context) -> None:
     snapshot root. Keep them alive through review and exit re-pin, then remove
     only the exact validated paths recorded by the controller handler.
     """
-    raw_snapshots = ctx.state.pop("_controller_review_snapshots", None)
+    raw_snapshots = ctx.state.get("_controller_review_snapshots")
     if not isinstance(raw_snapshots, str) or not raw_snapshots:
         return
     try:
@@ -327,7 +377,7 @@ def _cleanup_controller_snapshot(ctx: Context) -> None:
                 str(source_lexical),
                 holdout_roots=tuple(str(path) for path in _holdout_denied_paths()),
             )
-            subprocess.run(
+            prune_result = subprocess.run(
                 [
                     "git",
                     "-C",
@@ -342,6 +392,15 @@ def _cleanup_controller_snapshot(ctx: Context) -> None:
                 timeout=30,
                 check=False,
             )
+            if prune_result.returncode != 0:
+                continue
+            entries = [candidate for candidate in entries if candidate != entry]
+            ctx.state["_controller_review_snapshots"] = json.dumps(
+                entries,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            _persist_controller_snapshot_journal(ctx)
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
             # Cleanup is best-effort and must never mask the terminal result.
             continue
@@ -436,6 +495,16 @@ def run(
     If `resume` is provided, execution restarts from the successor of the
     checkpointed last step.
     """
+    # Resume uses the checkpoint's run directory as the durable journal owner.
+    # Establish that identity before any terminal resume fast path can return.
+    if ctx.run_id is None and resume is not None:
+        candidate_run_id = pathlib.Path(resume).expanduser().parent.name
+        if _RUN_ID_RE.fullmatch(candidate_run_id):
+            ctx.run_id = candidate_run_id
+    if not ctx.run_id:
+        ctx.run_id = uuid.uuid4().hex[:12]
+    _load_controller_snapshot_journal(ctx)
+
     # Capture the controller-owned base before the first worker visit.  This
     # runs after CLI/AO state has been assembled, so an explicitly selected AO
     # worktree is the target whose immutable HEAD is bound.
@@ -468,8 +537,10 @@ def run(
             if last_node is None:
                 raise ValueError(f"checkpoint node missing from graph: {last.node!r}")
             if is_exit_node(last_node):
+                _cleanup_controller_snapshot(ctx)
                 return history
             if len(history) - _resumed_overhead >= max_steps:
+                _cleanup_controller_snapshot(ctx)
                 return history
             synthetic = _obs._normalized_result(Result(outcome=last.outcome))
             # Detect incomplete parallel fan-out: the fan-out step was checkpointed
@@ -485,13 +556,12 @@ def run(
                 goal_gate_node = _persist._goal_gate_target(graph, last_node, synthetic, ctx)
                 next_node = goal_gate_node or _edges._pick_next(graph, last_node, synthetic, ctx)
                 if next_node is None:
+                    _cleanup_controller_snapshot(ctx)
                     return history
                 current = next_node
 
     # Always have an addressable run_id so diagnostics are locatable even when
     # no CXDB is attached (ad-hoc smoke runs, echo backend, etc.).
-    if not ctx.run_id:
-        ctx.run_id = uuid.uuid4().hex[:12]
     event_path_is_default = getattr(ctx, "event_log_path", None) is None
 
     cxdb: Optional[CXDB] = None
