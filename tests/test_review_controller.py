@@ -50,7 +50,13 @@ def _inputs() -> ReviewInputs:
     )
 
 
-def _response(request, *, verdict: str = "pass", failed: str | None = None) -> str:
+def _response(
+    request,
+    *,
+    verdict: str = "pass",
+    failed: str | None = None,
+    commands: list[str] | None = None,
+) -> str:
     if failed is not None:
         verdict = "fail"
     return json.dumps(
@@ -58,7 +64,7 @@ def _response(request, *, verdict: str = "pass", failed: str | None = None) -> s
             "verdict": verdict,
             "findings": [] if failed is None else [f"failed check: {failed}"],
             "evidence_checked": ["changed files and test output"],
-            "commands_executed": ["python -m pytest -q"],
+            "commands_executed": commands or ["python -m pytest -q"],
             "caveats": [],
         },
         separators=(",", ":"),
@@ -444,8 +450,45 @@ def test_pass_requires_a_command_receipt():
     request = create_review_request(_inputs())
     validated = validate_review_response(_response(request), request)
 
-    with pytest.raises(ReviewContractError, match="successful command receipt"):
+    with pytest.raises(ReviewContractError, match="pass requires"):
         validate_execution_receipts((), validated)
+
+
+@pytest.mark.parametrize(
+    "claimed, captured",
+    (
+        (["python -m pytest -q"], ["python -m pytest -q"]),
+        (["python -m ruff", "python -m pytest -q"], ["python -m pytest -q", "python -m ruff"]),
+        (["python -m pytest -q"], ["python -m pytest -q", "python -m ruff"]),
+        (["Ran python -m pytest -q"], ["python -m pytest -q"]),
+    ),
+)
+def test_pass_commands_must_match_captured_receipts_in_order(claimed, captured):
+    request = create_review_request(_inputs())
+    validated = validate_review_response(
+        _response(request, commands=claimed), request
+    )
+    receipts = tuple(
+        ExecutionReceipt(command=command, exit_code=0, output_sha256="a" * 64)
+        for command in captured
+    )
+    if claimed == captured:
+        validate_execution_receipts(receipts, validated)
+    else:
+        with pytest.raises(ReviewContractError, match="exactly match"):
+            validate_execution_receipts(receipts, validated)
+
+
+def test_fail_commands_may_summarize_without_receipt_equality():
+    request = create_review_request(_inputs())
+    validated = validate_review_response(
+        _response(request, verdict="fail", failed="scope", commands=["summary"]),
+        request,
+    )
+    validate_execution_receipts(
+        (ExecutionReceipt(command="actual command", exit_code=1, output_sha256="a" * 64),),
+        validated,
+    )
 
 
 def test_execution_receipts_reject_bad_output_digest():

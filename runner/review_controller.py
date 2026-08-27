@@ -56,7 +56,7 @@ _TEMPLATE_PATH = (
     _SOURCE_ROOT / "prompts" / "catalog" / "controller_cold_review_v1.md"
 )
 _EXPECTED_TEMPLATE_SHA256 = (
-    "5deb360741eefd016088768ec616d160f84843eb6d841715f017a6e0f04b2238"
+    "6a6216d51001589458d0bc8d48e6bfebc211d71a5a356a73265a32e82553f298"
 )
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -1053,6 +1053,12 @@ def validate_execution_receipts(
             )
     if review.verdict != "pass":
         return
+    claimed_commands = review.commands_executed
+    captured_commands = tuple(receipt.command for receipt in receipts)
+    if claimed_commands != captured_commands:
+        raise ReviewContractError(
+            "pass requires commands_executed to exactly match captured command receipts"
+        )
     if not receipts or not any(
         receipt.exit_code == 0 and receipt.output_sha256 != _EMPTY_OUTPUT_SHA256
         for receipt in receipts

@@ -48,6 +48,33 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _validated_task_path(
+    task_path: pathlib.Path,
+    workdir: pathlib.Path,
+    holdout_roots: tuple[str, ...],
+) -> pathlib.Path:
+    """Validate the task file before reading caller-controlled task text."""
+    lexical = task_path.expanduser()
+    if lexical.is_symlink():
+        raise ReviewContractError(f"task file must not be a symlink: {lexical}")
+    validate_workspace_path(str(lexical.parent), holdout_roots=holdout_roots)
+    resolved = lexical.resolve(strict=True)
+    if not resolved.is_file() or resolved.is_symlink():
+        raise ReviewContractError(f"task file must be a regular file: {lexical}")
+    try:
+        resolved.relative_to(workdir)
+    except ValueError as exc:
+        raise ReviewContractError("task file must be inside the reviewed workspace") from exc
+    for entry in holdout_roots:
+        holdout = pathlib.Path(entry).resolve(strict=False)
+        try:
+            resolved.relative_to(holdout)
+        except ValueError:
+            continue
+        raise ReviewContractError("task file is inside a sealed holdout root")
+    return resolved
+
+
 def _write_atomic(path: pathlib.Path, data: bytes) -> None:
     """Write one controller artifact without following a target symlink."""
     fd, temp_name = tempfile.mkstemp(prefix=".review-", dir=path.parent)
@@ -232,7 +259,7 @@ def main(argv: list[str] | None = None) -> int:
             f"{base_sha}..{head_sha}",
             allow_empty=True,
         )
-        task_path = args.task_file.expanduser().resolve(strict=True)
+        task_path = _validated_task_path(args.task_file, workdir, holdout_roots)
         task_text = task_path.read_text(encoding="utf-8")
         try:
             repository = _git(workdir, "config", "--get", "remote.origin.url")

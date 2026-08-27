@@ -8,7 +8,8 @@ import subprocess
 
 import pytest
 
-from runner.review_cli import main
+from runner.review_cli import _validated_task_path, main
+from runner.review_controller import ReviewContractError
 
 
 def _repo(tmp_path):
@@ -29,6 +30,10 @@ def _repo(tmp_path):
         ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
     ).stdout.strip()
     return repo, base, head
+
+
+def _task(repo):
+    return repo / "value.txt"
 
 
 def _valid_response(prompt: str, *, verdict: str = "pass") -> str:
@@ -73,8 +78,7 @@ def _valid_transport(prompt: str, *, verdict: str = "pass") -> str:
 
 def test_review_command_writes_valid_digest_bound_receipt(tmp_path, monkeypatch, capsys):
     repo, base, head = _repo(tmp_path)
-    task = tmp_path / "task.md"
-    task.write_text("Review the behavior change.", encoding="utf-8")
+    task = _task(repo)
     output = tmp_path / "review-output"
     real_run = subprocess.run
 
@@ -142,8 +146,7 @@ def test_review_command_rejects_pass_without_evidence_manifest(
     tmp_path, monkeypatch, capsys
 ):
     repo, base, head = _repo(tmp_path)
-    task = tmp_path / "task.md"
-    task.write_text("Review the behavior change.", encoding="utf-8")
+    task = _task(repo)
     output = tmp_path / "review-output"
     real_run = subprocess.run
     monkeypatch.setattr(
@@ -181,8 +184,7 @@ def test_review_command_rejects_empty_success_receipt(
     tmp_path, monkeypatch, capsys
 ):
     repo, base, head = _repo(tmp_path)
-    task = tmp_path / "task.md"
-    task.write_text("Review the behavior change.", encoding="utf-8")
+    task = _task(repo)
     output = tmp_path / "review-output"
     real_run = subprocess.run
     monkeypatch.setattr(
@@ -221,8 +223,7 @@ def test_review_command_returns_two_for_valid_fail_verdict(
 ):
     """Transport validity must never be mistaken for review acceptance."""
     repo, base, head = _repo(tmp_path)
-    task = tmp_path / "task.md"
-    task.write_text("Review the behavior change.", encoding="utf-8")
+    task = _task(repo)
     output = tmp_path / "review-output"
     real_run = subprocess.run
 
@@ -277,8 +278,7 @@ def test_review_command_rejects_pass_under_stub_env(
     tmp_path, monkeypatch, capsys, stub_env
 ):
     repo, base, head = _repo(tmp_path)
-    task = tmp_path / "task.md"
-    task.write_text("Review the behavior change.", encoding="utf-8")
+    task = _task(repo)
     output = tmp_path / "review-output"
     real_run = subprocess.run
     monkeypatch.setenv(stub_env, "1")
@@ -318,8 +318,7 @@ def test_review_command_rejects_symlinked_parent_before_target_query(
     tmp_path, monkeypatch
 ):
     repo, base, head = _repo(tmp_path)
-    task = tmp_path / "task.md"
-    task.write_text("Review the behavior change.", encoding="utf-8")
+    task = _task(repo)
     alias_parent = tmp_path / "alias-parent"
     alias_parent.symlink_to(tmp_path, target_is_directory=True)
     target_operation_attempted = False
@@ -344,10 +343,46 @@ def test_review_command_rejects_symlinked_parent_before_target_query(
     assert target_operation_attempted is False
 
 
+def test_task_file_rejects_external_holdout_and_symlink_before_backend(tmp_path, monkeypatch):
+    repo, _base, _head = _repo(tmp_path)
+    outside = tmp_path / "outside.md"
+    outside.write_text("outside", encoding="utf-8")
+    holdout = tmp_path / "holdout"
+    holdout.mkdir()
+    held = holdout / "task.md"
+    held.write_text("sealed", encoding="utf-8")
+    linked = repo / "task-link.md"
+    linked.symlink_to(outside)
+
+    for candidate in (outside, held, linked):
+        with pytest.raises(ReviewContractError):
+            _validated_task_path(candidate, repo, (str(holdout),))
+
+    launched = False
+
+    def unexpected_launch(*args, **kwargs):
+        nonlocal launched
+        launched = True
+        raise AssertionError("invalid task file must fail before backend")
+
+    monkeypatch.setattr("runner.review_cli._gate_subprocess_args", unexpected_launch)
+    rc = main(
+        [
+            "--workdir", str(repo),
+            "--base-sha", _base,
+            "--head-sha", _head,
+            "--task-file", str(outside),
+            "--evidence", "value.txt",
+            "--output-dir", str(tmp_path / "review-output"),
+        ]
+    )
+    assert rc == 1
+    assert launched is False
+
+
 def test_review_command_rejects_post_request_symlink_swap(tmp_path, monkeypatch):
     repo, base, head = _repo(tmp_path)
-    task = tmp_path / "task.md"
-    task.write_text("Review the behavior change.", encoding="utf-8")
+    task = _task(repo)
     output = tmp_path / "review-output"
     real_run = subprocess.run
     swapped = False
@@ -391,8 +426,7 @@ def test_review_command_fails_closed_on_unstructured_response(
     tmp_path, monkeypatch
 ):
     repo, base, head = _repo(tmp_path)
-    task = tmp_path / "task.md"
-    task.write_text("Review the behavior change.", encoding="utf-8")
+    task = _task(repo)
     output = tmp_path / "review-output"
     real_run = subprocess.run
 
@@ -433,8 +467,7 @@ def test_review_command_rejects_dirty_workspace_before_backend(
     tmp_path, monkeypatch
 ):
     repo, base, head = _repo(tmp_path)
-    task = tmp_path / "task.md"
-    task.write_text("Review the behavior change.", encoding="utf-8")
+    task = _task(repo)
     (repo / "untracked.txt").write_text("not frozen\n", encoding="utf-8")
     launched = False
 

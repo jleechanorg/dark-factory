@@ -27,6 +27,6 @@ exactly `verdict`, `findings`, `evidence_checked`, `commands_executed`, and
 arrays. Put actionable findings with paths or other precise references in
 `findings`; summarize concrete files, artifacts, checks, and commands in
 `evidence_checked` and `commands_executed`; put remaining uncertainty or `N/A`
-notes in `caveats`. Controller-captured command receipts are authoritative, so
-the command summary need not reproduce receipt strings. Use `fail` whenever an
-applicable requirement cannot be proven.
+notes in `caveats`. For a PASS, `commands_executed` must exactly reproduce the
+controller-captured command receipts in order. Use `fail` whenever an applicable
+requirement cannot be proven.
