@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from runner.handler_core import Result
 from runner import handler_dispatch
+from runner.handler_core import Result
 from runner.handler_parallel_reviewer import _persist_controller_lane
 from runner.review_controller import (
     ExecutionReceipt,
