@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 
@@ -19,15 +20,58 @@ from runner.review_controller import (
     ExecutionReceipt,
     ReviewContractError,
     ReviewInputs,
+    ReviewTransportReceipt,
     _stub_mode_requested,
+    build_frozen_review_bundle,
     build_envelope,
     create_review_request,
+    parse_tool_free_codex_jsonl,
     parse_codex_jsonl,
     run_controller_review,
     validate_execution_receipts,
     validate_review_response,
     verify_request_integrity,
 )
+
+
+def _frozen_repo(tmp_path: Path):
+    repo = tmp_path / "frozen-repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "review@example.invalid"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Review Test"], cwd=repo, check=True)
+    (repo / "value.txt").write_text("before\n", encoding="utf-8")
+    subprocess.run(["git", "add", "value.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    (repo / "value.txt").write_text("after\n", encoding="utf-8")
+    (repo / "evidence.log").write_bytes(b"receipt\n")
+    subprocess.run(["git", "add", "value.txt", "evidence.log"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "head"], cwd=repo, check=True)
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    evidence = repo / "evidence.log"
+    inputs = ReviewInputs(
+        repository="example",
+        workspace_path=str(repo),
+        base_sha=base,
+        head_sha=head,
+        tree_sha=subprocess.run(
+            ["git", "rev-parse", "HEAD^{tree}"], cwd=repo, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip(),
+        task_text="Review the exact frozen change.",
+        changed_files=("evidence.log", "value.txt"),
+        evidence=(EvidenceArtifact(
+            path="evidence.log",
+            size_bytes=evidence.stat().st_size,
+            sha256=hashlib.sha256(evidence.read_bytes()).hexdigest(),
+        ),),
+    )
+    return repo, inputs
 
 
 def _inputs() -> ReviewInputs:
@@ -116,18 +160,16 @@ def test_static_prompt_reviews_any_target_and_executed_evidence():
     normalized = " ".join(static_text.split())
 
     required = (
-        "exact target",
-        "callers and consumers",
+        "exact frozen change",
         "correctness",
         "security",
-        "state-transition",
-        "boundary",
-        "regression",
+        "boundaries",
+        "state transitions",
+        "regressions",
         "evidence",
-        "read-only checks",
-        "material uncertainty",
-        "continue after the first finding",
+        "do not use shell",
         "exactly one json object",
+        "commands_executed",
     )
     assert not [clause for clause in required if clause not in normalized]
 
@@ -138,9 +180,9 @@ def test_static_prompt_limits_source_head_receipts_for_derived_evidence() -> Non
     )[0]
     normalized = " ".join(static_text.split())
     # Evidence-origin lineage remains controller-owned envelope data, not model
-    # response boilerplate. The compact static prompt still requires freshness
-    # and target binding judgments.
-    assert "fresh" in normalized
+    # response boilerplate. The compact static prompt still requires digest
+    # binding and sufficiency judgments.
+    assert "digests" in normalized
     assert "bound to this target" in normalized
 
 
@@ -521,6 +563,124 @@ def test_command_shape_boundaries_do_not_depend_on_regex_classification():
         ),
     )
     validate_execution_receipts(receipts, validated)
+
+
+def test_frozen_bundle_contains_exact_binary_diff_and_evidence_bytes(tmp_path):
+    repo, inputs = _frozen_repo(tmp_path)
+
+    bundle = json.loads(build_frozen_review_bundle(inputs))
+    expected = subprocess.run(
+        ["git", "diff", "--no-ext-diff", "--binary", f"{inputs.base_sha}..{inputs.head_sha}"],
+        cwd=repo, check=True, capture_output=True,
+    ).stdout.decode("utf-8")
+
+    assert bundle["target"]["base_sha"] == inputs.base_sha
+    assert bundle["target"]["head_sha"] == inputs.head_sha
+    assert bundle["diff"] == expected
+    assert bundle["changed_files"] == ["evidence.log", "value.txt"]
+    assert base64.b64decode(bundle["evidence"][0]["content_b64"]) == b"receipt\n"
+
+
+def test_frozen_bundle_rejects_changed_file_list_and_mutated_evidence(tmp_path):
+    repo, inputs = _frozen_repo(tmp_path)
+    with pytest.raises(ReviewContractError, match="changed_files"):
+        build_frozen_review_bundle(replace(inputs, changed_files=("value.txt",)))
+
+    (repo / "evidence.log").write_bytes(b"tampered\n")
+    with pytest.raises(ReviewContractError, match="evidence"):
+        build_frozen_review_bundle(inputs)
+
+
+def test_frozen_bundle_supports_binary_diff_and_rejects_oversize_bundle(tmp_path):
+    repo, inputs = _frozen_repo(tmp_path)
+    binary = repo / "image.bin"
+    binary.write_bytes(b"\x00\xff\x00")
+    subprocess.run(["git", "add", "image.bin"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "binary"], cwd=repo, check=True)
+    binary_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    binary_inputs = replace(inputs, head_sha=binary_head, changed_files=("evidence.log", "image.bin", "value.txt"))
+    binary_bundle = json.loads(build_frozen_review_bundle(binary_inputs))
+    assert "GIT binary patch" in binary_bundle["diff"]
+
+    huge = repo / "huge.txt"
+    huge.write_text("x" * (1024 * 1024), encoding="utf-8")
+    subprocess.run(["git", "add", "huge.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "huge"], cwd=repo, check=True)
+    huge_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    huge_inputs = replace(inputs, head_sha=huge_head, changed_files=("evidence.log", "huge.txt", "image.bin", "value.txt"))
+    with pytest.raises(ReviewContractError, match="1 MiB"):
+        build_frozen_review_bundle(huge_inputs)
+
+
+def test_tool_free_transport_requires_one_terminal_and_rejects_tools():
+    request = create_review_request(_inputs())
+    response = _response(request, commands=[]).replace(
+        '"evidence_checked":["changed files and test output"]',
+        '"evidence_checked":["changed files and evidence manifest"]',
+    )
+    raw = "\n".join((
+        json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": response}}),
+        json.dumps({"type": "turn.completed", "usage": {}}),
+    ))
+    extracted, receipt = parse_tool_free_codex_jsonl(raw, request=request)
+    assert extracted == response
+    assert receipt.transport == "tool-free"
+    assert receipt.head_sha == request.head_sha
+
+    for malformed in (
+        raw.replace('"type": "turn.completed"', '"type": "turn.completed", "duplicate": true') + "\n" + json.dumps({"type": "turn.completed"}),
+        raw.replace('"type": "turn.completed"', '"type": "item.completed", "item": {"type": "command_execution"}'),
+    ):
+        with pytest.raises(ReviewContractError):
+            parse_tool_free_codex_jsonl(malformed, request=request)
+
+
+def test_tool_free_transport_accepts_safe_codex_lifecycle_items_and_rejects_unknowns():
+    request = create_review_request(_inputs())
+    response = _response(request, commands=[]).replace(
+        '"evidence_checked":["changed files and test output"]',
+        '"evidence_checked":["changed files and evidence manifest"]',
+    )
+    safe = "\n".join(
+        (
+            json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+            json.dumps({"type": "turn.started", "turn_id": "turn-1"}),
+            json.dumps({"type": "item.started", "item": {"type": "reasoning"}}),
+            json.dumps({"type": "item.updated", "item": {"type": "reasoning", "text": "reviewing"}}),
+            json.dumps({"type": "item.completed", "item": {"type": "reasoning", "text": "reviewed"}}),
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": response}}),
+            json.dumps({"type": "turn.completed", "usage": {}}),
+        )
+    )
+    extracted, _ = parse_tool_free_codex_jsonl(safe, request=request)
+    assert extracted == response
+
+    for event_type in ("item.started", "item.updated"):
+        unknown = "\n".join(
+            (
+                json.dumps({"type": event_type, "item": {"type": "future_tool_call"}}),
+                json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": response}}),
+                json.dumps({"type": "turn.completed", "usage": {}}),
+            )
+        )
+        with pytest.raises(ReviewContractError, match="unknown item type"):
+            parse_tool_free_codex_jsonl(unknown, request=request)
+
+
+def test_review_transport_receipt_binds_all_controller_digests():
+    request = create_review_request(_inputs())
+    receipt = ReviewTransportReceipt.from_request(
+        request, response='{"verdict":"pass"}', transport="tool-free"
+    )
+    assert receipt.prompt_sha256 == request.prompt_sha256
+    assert receipt.envelope_sha256 == request.envelope_sha256
+    assert receipt.head_sha == request.head_sha
+    assert receipt.tree_sha == "c" * 40
+    assert receipt.evidence_manifest_sha256 == request.evidence_manifest_sha256
 
 
 # -----------------------------------------------------------------------------

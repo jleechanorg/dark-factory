@@ -60,6 +60,12 @@ def _valid_fail_response() -> str:
     )
 
 
+darwin_only = pytest.mark.skipif(
+    sys.platform != "darwin", reason="Seatbelt is macOS-only"
+)
+
+
+@darwin_only
 def test_controller_transport_uses_one_macos_sandbox_for_read_only_review(
     tmp_path,
 ):
@@ -87,7 +93,17 @@ def test_controller_transport_uses_one_macos_sandbox_for_read_only_review(
         "--ephemeral",
         "--ignore-user-config",
         "--skip-git-repo-check",
-        "--dangerously-bypass-approvals-and-sandbox",
+        "--disable",
+        "shell_tool",
+        "--disable",
+        "unified_exec",
+        "--disable",
+        "browser_use",
+        "--disable",
+        "computer_use",
+        "--config",
+        'web_search="disabled"',
+        "--ignore-rules",
         "-",
     ]
     assert '(deny file-read* (subpath "/sealed/holdouts"))' in transport[2]
@@ -240,10 +256,42 @@ def test_controller_transport_keeps_linux_deny_paths_and_native_read_only(
         "--ephemeral",
         "--ignore-user-config",
         "--skip-git-repo-check",
-        "--sandbox",
-        "read-only",
+        "--disable",
+        "shell_tool",
+        "--disable",
+        "unified_exec",
+        "--disable",
+        "browser_use",
+        "--disable",
+        "computer_use",
+        "--config",
+        'web_search="disabled"',
+        "--ignore-rules",
         "-",
     ]
+    assert "features.use_legacy_landlock=true" not in transport
+
+
+def test_controller_transport_binds_controller_owned_schema(monkeypatch, tmp_path):
+    monkeypatch.setattr("runner.handler_dispatch.sys.platform", "linux")
+    monkeypatch.setattr(
+        "runner.handlers._linux_controller_sandbox_prefix",
+        lambda **kwargs: ["/opt/landlock", "DENY_PATHS=/sealed", "--"],
+    )
+    monkeypatch.setattr("runner.handlers._linux_codex_runtime_paths", lambda path: [])
+    schema = tmp_path / "schema.json"
+    schema.write_text("{}", encoding="utf-8")
+    transport = _build_controller_codex_transport(
+        [
+            "/usr/bin/env", "DENY_PATHS=/sealed", "/usr/local/bin/codex", "exec",
+            "--skip-git-repo-check", "ignored",
+        ],
+        read_only_path=tmp_path,
+        schema_path=schema,
+    )
+    assert transport[-3:] == ["--output-schema", str(schema), "-"]
+    assert "--sandbox" not in transport
+    assert "features.use_legacy_landlock=true" not in transport
 
 
 @pytest.mark.parametrize("platform", ["darwin", "linux"])

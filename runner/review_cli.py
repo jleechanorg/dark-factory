@@ -28,6 +28,7 @@ from .handler_dispatch import (
 from .handler_sandbox import (
     _cleanup_controller_runtime,
     _close_pinned_launcher_command,
+    _controller_output_schema,
     _create_controller_runtime,
 )
 from .review_controller import (
@@ -35,9 +36,10 @@ from .review_controller import (
     ReviewContractError,
     ReviewInputs,
     build_controller_receipt,
+    build_frozen_review_bundle,
     create_review_request,
     ensure_review_pass_allowed,
-    parse_codex_jsonl,
+    parse_tool_free_codex_jsonl,
     run_controller_review,
     validate_execution_receipts,
     validate_immutable_target,
@@ -347,7 +349,10 @@ def main(argv: list[str] | None = None) -> int:
         else:
             parser.error("--output-dir must be outside the reviewed workspace")
         before = _snapshot(workdir, base_sha, head_sha)
-        request = create_review_request(inputs)
+        frozen_bundle = build_frozen_review_bundle(
+            inputs, holdout_roots=holdout_roots
+        )
+        request = create_review_request(inputs, frozen_bundle=frozen_bundle)
         output_dir.mkdir(parents=True, mode=0o700, exist_ok=False)
         claimed_output = True
         prompt_path = output_dir / "prompt.txt"
@@ -380,10 +385,12 @@ def main(argv: list[str] | None = None) -> int:
         if transport_is_jsonl:
             try:
                 runtime = _create_controller_runtime()
+                schema_path = _controller_output_schema(runtime.run_dir)
                 command = _controller_codex_args(
                     command,
                     read_only_path=workdir,
                     writable_path=runtime.codex_home,
+                    schema_path=schema_path,
                 )
             except ValueError as exc:
                 raise ReviewContractError(
@@ -393,7 +400,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             proc = subprocess.run(
                 command,
-                cwd=output_dir,
+                cwd=workdir if transport_is_jsonl else output_dir,
                 capture_output=True,
                 text=True,
                 input=stdin_text,
@@ -406,11 +413,15 @@ def main(argv: list[str] | None = None) -> int:
             _close_pinned_launcher_command(command)
         raw_transport = proc.stdout
         command_receipts = ()
+        transport_receipt = None
         response = proc.stdout.strip()
         parse_error = ""
         if transport_is_jsonl and proc.returncode == 0:
             try:
-                response, command_receipts = parse_codex_jsonl(raw_transport)
+                response, transport_receipt = parse_tool_free_codex_jsonl(
+                    raw_transport, request=request
+                )
+                command_receipts = ()
             except ReviewContractError as exc:
                 response = ""
                 parse_error = str(exc)
@@ -425,7 +436,13 @@ def main(argv: list[str] | None = None) -> int:
         if proc.returncode == 0 and not contract_error:
             try:
                 validated = validate_review_response(response, request)
-                validate_execution_receipts(command_receipts, validated)
+                if request.bundle_sha256:
+                    if validated.commands_executed:
+                        raise ReviewContractError(
+                            "tool-free controller PASS requires empty commands_executed"
+                        )
+                else:
+                    validate_execution_receipts(command_receipts, validated)
                 ensure_review_pass_allowed(
                     validated,
                     backend=args.backend,
@@ -467,6 +484,7 @@ def main(argv: list[str] | None = None) -> int:
             verdict=verdict,
             contract_error=contract_error,
             receipts=command_receipts,
+            transport_receipt=transport_receipt,
         )
         receipt.update(
             {
@@ -516,6 +534,7 @@ def main(argv: list[str] | None = None) -> int:
                 verdict="invalid",
                 contract_error=contract_error,
                 receipts=locals().get("command_receipts", ()),
+                transport_receipt=locals().get("transport_receipt"),
             )
         else:
             payload = {

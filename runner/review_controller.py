@@ -56,19 +56,17 @@ _TEMPLATE_PATH = (
     _SOURCE_ROOT / "prompts" / "catalog" / "controller_cold_review_v1.md"
 )
 _EXPECTED_TEMPLATE_SHA256 = (
-    "6a6216d51001589458d0bc8d48e6bfebc211d71a5a356a73265a32e82553f298"
+    "74fe790c701ea584ad912707cabe3f8dbfe1869d94934afcbd95b692edfec6ac"
 )
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_INPUT_BYTES = 1024 * 1024
 
-#: Envelope schema. v2 carries no diff snapshot at all -- neither the text nor
-#: a digest pointer. ``target.tree_sha`` is a cryptographic commitment to the
-#: entire tree at ``target.head_sha``, and both are reverified before the review
-#: is accepted; with a pinned ``base_sha`` the reviewed diff is a pure function
-#: of those two values, so a separate diff digest proves nothing they do not.
-#: An envelope that still carries ``snapshots.diff`` fails closed rather than
-#: being verified against a shape this module no longer emits.
+#: Envelope schema. v2 carries the frozen review bundle under ``snapshots`` as
+#: authenticated Base64 data. ``target.tree_sha`` remains a cryptographic
+#: commitment to the entire tree at ``target.head_sha``, and both are
+#: reverified before the review is accepted. Legacy raw ``snapshots.diff``
+#: entries fail closed rather than being accepted as controller evidence.
 ENVELOPE_SCHEMA = 2
 
 
@@ -133,6 +131,7 @@ class ReviewRequest:
     task_sha256: str
     changed_files_sha256: str
     evidence_manifest_sha256: str
+    bundle_sha256: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +155,43 @@ class ExecutionReceipt:
     command: str
     exit_code: int
     output_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewTransportReceipt:
+    """Controller-owned terminal receipt for a tool-free review transport."""
+
+    transport: str
+    prompt_sha256: str
+    envelope_sha256: str
+    response_sha256: str
+    head_sha: str
+    tree_sha: str
+    evidence_manifest_sha256: str
+
+    @classmethod
+    def from_request(
+        cls, request: ReviewRequest, *, response: str, transport: str
+    ) -> ReviewTransportReceipt:
+        if not isinstance(request, ReviewRequest):
+            raise TypeError("request must be ReviewRequest")
+        try:
+            target = json.loads(request.envelope_json)["target"]
+            tree_sha = str(target["tree_sha"])
+        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise ReviewContractError("request envelope target is invalid") from exc
+        return cls(
+            transport=str(transport),
+            prompt_sha256=request.prompt_sha256,
+            envelope_sha256=request.envelope_sha256,
+            response_sha256=_sha256(str(response).encode("utf-8")),
+            head_sha=request.head_sha,
+            tree_sha=tree_sha,
+            evidence_manifest_sha256=request.evidence_manifest_sha256,
+        )
+
+
+_MAX_FROZEN_BUNDLE_BYTES = 1024 * 1024
 
 
 def _sha256(data: bytes) -> str:
@@ -198,6 +234,7 @@ def build_controller_receipt(
     verdict: str,
     contract_error: str = "",
     receipts: tuple[ExecutionReceipt, ...] = (),
+    transport_receipt: ReviewTransportReceipt | None = None,
 ) -> dict[str, object]:
     """Build the common receipt schema shared by CLI and graph lanes."""
     if not isinstance(request, ReviewRequest):
@@ -249,6 +286,19 @@ def build_controller_receipt(
         "cleanup_policy": "retain_until_run_cleanup",
         "command_receipts": command_receipts,
         "receipts": command_receipts,
+        "transport_receipt": (
+            {
+                "transport": transport_receipt.transport,
+                "prompt_sha256": transport_receipt.prompt_sha256,
+                "envelope_sha256": transport_receipt.envelope_sha256,
+                "response_sha256": transport_receipt.response_sha256,
+                "head_sha": transport_receipt.head_sha,
+                "tree_sha": transport_receipt.tree_sha,
+                "evidence_manifest_sha256": transport_receipt.evidence_manifest_sha256,
+            }
+            if transport_receipt is not None
+            else None
+        ),
     }
 
 
@@ -267,6 +317,7 @@ def persist_controller_lane_artifacts(
     verdict: str,
     contract_error: str = "",
     receipts: tuple[ExecutionReceipt, ...] = (),
+    transport_receipt: ReviewTransportReceipt | None = None,
     create_output_dir: bool = True,
 ) -> dict[str, str]:
     """Persist the canonical evidence seam for one graph or CLI lane.
@@ -316,6 +367,7 @@ def persist_controller_lane_artifacts(
         verdict=verdict,
         contract_error=contract_error,
         receipts=receipts,
+        transport_receipt=transport_receipt,
     )
     _write_controller_artifact(
         receipt_path,
@@ -706,7 +758,88 @@ def validate_evidence_origin(
         raise ReviewContractError("evidence_origin snapshot delta does not match target")
 
 
-def _build_envelope(inputs: ReviewInputs, *, template_sha256: str) -> str:
+def build_frozen_review_bundle(
+    inputs: ReviewInputs, *, holdout_roots: tuple[str, ...] = ()
+) -> str:
+    """Freeze the exact target diff and declared evidence for a controller turn."""
+    normalized = _normalized_inputs(inputs)
+    workspace = validate_immutable_target(normalized, holdout_roots=holdout_roots)
+
+    def git_bytes(*args: str) -> bytes:
+        proc = subprocess.run(
+            ["git", "-C", str(workspace), *args],
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or b"").decode("utf-8", "replace")
+            raise ReviewContractError(f"frozen bundle git query failed: {detail.strip()}")
+        return proc.stdout
+
+    diff_bytes = git_bytes(
+        "diff", "--no-ext-diff", "--binary", f"{normalized.base_sha}..{normalized.head_sha}"
+    )
+    try:
+        diff = diff_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ReviewContractError("frozen bundle diff is binary") from exc
+    if b"\x00" in diff_bytes:
+        raise ReviewContractError("frozen bundle diff is binary")
+    changed_raw = git_bytes(
+        "diff", "--no-ext-diff", "--name-only", "-z",
+        f"{normalized.base_sha}..{normalized.head_sha}",
+    )
+    try:
+        observed_changed = tuple(
+            sorted(path for path in changed_raw.decode("utf-8").split("\0") if path)
+        )
+    except UnicodeDecodeError as exc:
+        raise ReviewContractError("frozen bundle changed-file list is not UTF-8") from exc
+    if observed_changed != tuple(sorted(normalized.changed_files)):
+        raise ReviewContractError("frozen bundle changed_files do not match target diff")
+
+    evidence_payload: list[dict[str, object]] = []
+    for artifact in normalized.evidence:
+        path = workspace / artifact.path
+        try:
+            content = path.read_bytes()
+        except OSError as exc:
+            raise ReviewContractError(f"frozen bundle evidence could not be read: {artifact.path}") from exc
+        digest = _sha256(content)
+        if len(content) != artifact.size_bytes or digest != artifact.sha256:
+            raise ReviewContractError(f"frozen bundle evidence changed: {artifact.path}")
+        evidence_payload.append({
+            "path": artifact.path,
+            "size_bytes": len(content),
+            "sha256": digest,
+            "content_b64": base64.b64encode(content).decode("ascii"),
+        })
+
+    payload = {
+        "schema": 1,
+        "target": {
+            "repository": normalized.repository,
+            "workspace_path": normalized.workspace_path,
+            "base_sha": normalized.base_sha,
+            "head_sha": normalized.head_sha,
+            "tree_sha": normalized.tree_sha,
+        },
+        "task": normalized.task_text,
+        "changed_files": list(observed_changed),
+        "diff": diff,
+        "evidence": evidence_payload,
+        "run_id": normalized.run_id,
+    }
+    encoded = _canonical_json(payload).encode("utf-8")
+    if len(encoded) > _MAX_FROZEN_BUNDLE_BYTES:
+        raise ReviewContractError("frozen bundle exceeds 1 MiB")
+    return encoded.decode("utf-8")
+
+
+def _build_envelope(
+    inputs: ReviewInputs, *, template_sha256: str, frozen_bundle: str = ""
+) -> str:
     normalized = _normalized_inputs(inputs)
     template_digest = _require_digest("template_sha256", template_sha256)
     changed_files = list(normalized.changed_files)
@@ -754,6 +887,15 @@ def _build_envelope(inputs: ReviewInputs, *, template_sha256: str) -> str:
         },
         "run_id": normalized.run_id,
     }
+    if frozen_bundle:
+        bundle_bytes = frozen_bundle.encode("utf-8")
+        if len(bundle_bytes) > _MAX_FROZEN_BUNDLE_BYTES:
+            raise ReviewContractError("frozen bundle exceeds 1 MiB")
+        payload["snapshots"]["bundle"] = {
+            "sha256": _sha256(bundle_bytes),
+            "size_bytes": len(bundle_bytes),
+            "content_b64": base64.b64encode(bundle_bytes).decode("ascii"),
+        }
     if normalized.evidence_origin is not None:
         payload["evidence_origin"] = {
             "source_head_sha": normalized.evidence_origin.source_head_sha,
@@ -763,13 +905,18 @@ def _build_envelope(inputs: ReviewInputs, *, template_sha256: str) -> str:
                 for entry in normalized.evidence_origin.snapshot_delta
             ],
         }
-    return _canonical_json(payload)
+    encoded = _canonical_json(payload).encode("utf-8")
+    if frozen_bundle and len(encoded) > _MAX_FROZEN_BUNDLE_BYTES:
+        raise ReviewContractError("frozen review envelope exceeds 1 MiB")
+    return encoded.decode("utf-8")
 
 
-def build_envelope(inputs: ReviewInputs) -> str:
+def build_envelope(inputs: ReviewInputs, *, frozen_bundle: str = "") -> str:
     """Return canonical JSON bound to the source-owned static template."""
     _, template_sha256 = _load_static_template()
-    return _build_envelope(inputs, template_sha256=template_sha256)
+    return _build_envelope(
+        inputs, template_sha256=template_sha256, frozen_bundle=frozen_bundle
+    )
 
 
 def _render_prompt_payload(template: str, envelope_json: str) -> str:
@@ -791,15 +938,21 @@ def _render_prompt(prompt_payload: str) -> str:
     return prompt_payload.rstrip() + "\n"
 
 
-def create_review_request(inputs: ReviewInputs) -> ReviewRequest:
+def create_review_request(
+    inputs: ReviewInputs, *, frozen_bundle: str = ""
+) -> ReviewRequest:
     """Build the immutable envelope, static authority, and response contract."""
     normalized = _normalized_inputs(inputs)
     template, template_sha256 = _load_static_template()
-    envelope_json = _build_envelope(normalized, template_sha256=template_sha256)
+    envelope_json = _build_envelope(
+        normalized, template_sha256=template_sha256, frozen_bundle=frozen_bundle
+    )
     envelope_payload = json.loads(envelope_json)
     envelope_digests = envelope_payload["digests"]
     envelope_sha256 = _sha256(envelope_json.encode("utf-8"))
     prompt_payload = _render_prompt_payload(template, envelope_json)
+    if frozen_bundle and len(prompt_payload.encode("utf-8")) > _MAX_FROZEN_BUNDLE_BYTES:
+        raise ReviewContractError("frozen review prompt exceeds 1 MiB")
     prompt_sha256 = _sha256(prompt_payload.encode("utf-8"))
     prompt = _render_prompt(prompt_payload)
     return ReviewRequest(
@@ -814,6 +967,9 @@ def create_review_request(inputs: ReviewInputs) -> ReviewRequest:
         task_sha256=envelope_digests["task_sha256"],
         changed_files_sha256=envelope_digests["changed_files_sha256"],
         evidence_manifest_sha256=envelope_digests["evidence_manifest_sha256"],
+        bundle_sha256=(
+            _sha256(frozen_bundle.encode("utf-8")) if frozen_bundle else ""
+        ),
     )
 
 
@@ -872,9 +1028,9 @@ def verify_request_integrity(request: ReviewRequest) -> None:
         raise ReviewContractError("request prompt digest mismatch")
     # Checked outside the try below: ReviewContractError subclasses ValueError,
     # so raising it inside would be swallowed and re-reported as the generic
-    # "schema is invalid". The reviewed change is never carried in any form --
-    # neither text nor digest pointer -- so any `snapshots.diff` is a stale or
-    # forged producer and fails closed.
+    # "schema is invalid". The reviewed change is carried only in the
+    # authenticated Base64 bundle; any raw `snapshots.diff` is stale or forged
+    # producer data and fails closed.
     snapshots = envelope.get("snapshots")
     if not isinstance(snapshots, dict):
         raise ReviewContractError("request envelope schema is invalid")
@@ -883,6 +1039,22 @@ def verify_request_integrity(request: ReviewRequest) -> None:
             "request envelope carries a diff snapshot; schema "
             f"{ENVELOPE_SCHEMA} derives the change from the pinned revisions"
         )
+    bundle = snapshots.get("bundle")
+    if request.bundle_sha256:
+        if not isinstance(bundle, dict) or set(bundle) != {"content_b64", "sha256", "size_bytes"}:
+            raise ReviewContractError("request frozen bundle is missing")
+        try:
+            bundle_bytes = base64.b64decode(bundle["content_b64"], validate=True)
+        except (TypeError, ValueError) as exc:
+            raise ReviewContractError("request frozen bundle encoding is invalid") from exc
+        if (
+            bundle["sha256"] != request.bundle_sha256
+            or bundle["size_bytes"] != len(bundle_bytes)
+            or _sha256(bundle_bytes) != request.bundle_sha256
+        ):
+            raise ReviewContractError("request frozen bundle digest mismatch")
+    elif bundle is not None:
+        raise ReviewContractError("request carries an unexpected frozen bundle")
     try:
         expected_payload = _render_prompt_payload(template, request.envelope_json)
         expected_prompt = _render_prompt(expected_payload)
@@ -964,7 +1136,14 @@ def validate_review_response(
             raise ReviewContractError("pass requires a non-empty evidence manifest") from exc
         if not isinstance(evidence_manifest, list) or not evidence_manifest:
             raise ReviewContractError("pass requires a non-empty evidence manifest")
-        for key in ("evidence_checked", "commands_executed"):
+        if request.bundle_sha256 and payload["commands_executed"] != []:
+            raise ReviewContractError(
+                "tool-free controller PASS requires commands_executed to be empty"
+            )
+        required_nonempty = ("evidence_checked",) if request.bundle_sha256 else (
+            "evidence_checked", "commands_executed"
+        )
+        for key in required_nonempty:
             values = payload[key]
             if not values:
                 raise ReviewContractError(
@@ -1025,6 +1204,85 @@ def parse_codex_jsonl(raw: str) -> tuple[str, tuple[ExecutionReceipt, ...]]:
     if not response.strip():
         raise ReviewContractError("review transport emitted no final agent response")
     return response, tuple(receipts)
+
+
+def parse_tool_free_codex_jsonl(
+    raw: str, *, request: ReviewRequest
+) -> tuple[str, ReviewTransportReceipt]:
+    """Parse a controller transport that must not expose model tools."""
+    safe_item_types = {
+        "agent_message",
+        "context_compaction",
+        "plan",
+        "reasoning",
+        "todo_list",
+    }
+    item_events = {"item.started", "item.updated", "item.completed"}
+    lifecycle_events = {"thread.started", "turn.started", "turn.completed"}
+    verify_request_integrity(request)
+    response = ""
+    terminal_count = 0
+    response_count = 0
+    for line_number, line in enumerate(raw.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ReviewContractError(
+                f"review transport emitted invalid JSONL at line {line_number}"
+            ) from exc
+        if not isinstance(event, dict):
+            raise ReviewContractError("tool-free transport emitted non-object event")
+        event_type = event.get("type")
+        if event_type not in item_events | lifecycle_events:
+            if event_type in {"error", "turn.failed", "shutdown.complete"}:
+                raise ReviewContractError(
+                    f"tool-free transport emitted terminal error: {event_type}"
+                )
+            raise ReviewContractError(
+                f"tool-free transport emitted unknown event: {event_type!r}"
+            )
+        if event_type in lifecycle_events:
+            if "item" in event:
+                raise ReviewContractError(
+                    f"tool-free transport emitted an item on {event_type}"
+                )
+            if event_type == "turn.completed":
+                terminal_count += 1
+                if terminal_count > 1:
+                    raise ReviewContractError(
+                        "tool-free transport emitted duplicate turn.completed"
+                    )
+            continue
+        item = event.get("item")
+        if not isinstance(item, dict):
+            raise ReviewContractError(
+                f"tool-free transport emitted malformed {event_type} item"
+            )
+        item_type = item.get("type")
+        if item_type not in safe_item_types:
+            raise ReviewContractError(
+                f"tool-free transport emitted unknown item type: {item_type!r}"
+            )
+        if event_type == "item.completed":
+            if item_type != "agent_message":
+                continue
+            text = item.get("text")
+            if not isinstance(text, str) or not text.strip():
+                raise ReviewContractError("tool-free transport emitted an empty response")
+            response_count += 1
+            if response_count > 1:
+                raise ReviewContractError("tool-free transport emitted duplicate responses")
+            response = text
+            continue
+    if terminal_count != 1:
+        raise ReviewContractError("tool-free transport requires exactly one turn.completed")
+    if response_count != 1:
+        raise ReviewContractError("tool-free transport requires exactly one final response")
+    return response, ReviewTransportReceipt.from_request(
+        request, response=response, transport="tool-free"
+    )
 
 
 def validate_execution_receipts(
@@ -1164,7 +1422,13 @@ def run_controller_review(
 
     proc = subprocess.run(
         list(transport_argv),
-        cwd=str(neutral_cwd),
+        cwd=str(
+            json.loads(request.envelope_json)["target"].get(
+                "workspace_path", neutral_cwd
+            )
+            if request.bundle_sha256
+            else neutral_cwd
+        ),
         input=prompt_text,
         capture_output=True,
         text=True,
@@ -1185,10 +1449,21 @@ def run_controller_review(
             f"review backend exited with {proc.returncode}: {detail}"
         )
 
-    response_body, receipts = parse_codex_jsonl(transport_text)
+    transport_receipt = None
+    if request.bundle_sha256:
+        response_body, transport_receipt = parse_tool_free_codex_jsonl(
+            transport_text, request=request
+        )
+        receipts = ()
+    else:
+        response_body, receipts = parse_codex_jsonl(transport_text)
     response_path.write_text(response_body, encoding="utf-8")
     review = validate_review_response(response_body, request)
-    validate_execution_receipts(receipts, review)
+    if request.bundle_sha256:
+        if review.commands_executed:
+            raise ReviewContractError("tool-free controller PASS requires empty commands_executed")
+    else:
+        validate_execution_receipts(receipts, review)
 
     ensure_review_pass_allowed(review, execution_path=execution_path, backend=backend)
 
@@ -1205,6 +1480,7 @@ def run_controller_review(
         status="valid",
         verdict=review.verdict,
         receipts=receipts,
+        transport_receipt=transport_receipt,
         create_output_dir=False,
     )
     findings_path.write_text(
@@ -1252,12 +1528,15 @@ __all__ = [
     "ReviewContractError",
     "ReviewInputs",
     "ReviewRequest",
+    "ReviewTransportReceipt",
     "ValidatedReview",
-    "build_envelope",
     "build_controller_receipt",
+    "build_envelope",
+    "build_frozen_review_bundle",
     "create_review_request",
     "ensure_review_pass_allowed",
     "parse_codex_jsonl",
+    "parse_tool_free_codex_jsonl",
     "persist_controller_lane_artifacts",
     "run_controller_review",
     "validate_evidence_origin",

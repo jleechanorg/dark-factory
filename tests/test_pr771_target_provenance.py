@@ -842,6 +842,7 @@ def test_default_two_node_seeds_base_before_worker_mutation(tmp_path: Path, monk
     from runner import handlers
     from runner.__main__ import main
     from runner.handler_core import Result
+    from runner.review_controller import ReviewTransportReceipt
 
     repo, base, _head = _repo(tmp_path)
     _git(repo, "reset", "--hard", base)
@@ -873,32 +874,38 @@ def test_default_two_node_seeds_base_before_worker_mutation(tmp_path: Path, monk
         return request
 
     monkeypatch.setattr(reviewer, "_controller_review_request", capture_request)
-    monkeypatch.setattr(
-        reviewer,
-        "_run_primary_review",
-        lambda *args, **kwargs: Result(
+    def fake_primary(*args, **kwargs):
+        response = json.dumps(
+            {
+                "verdict": "pass",
+                "findings": [],
+                "evidence_checked": ["worker-verification.json"],
+                "commands_executed": [],
+                "caveats": [],
+            }
+        )
+        request = captured["request"]
+        transport_receipt = ReviewTransportReceipt.from_request(
+            request, response=response, transport="tool-free"
+        )
+        return Result(
             outcome="success",
-            output=json.dumps(
-                {
-                    "verdict": "pass",
-                    "findings": [],
-                    "evidence_checked": ["worker-verification.json"],
-                    "commands_executed": ["verification command"],
-                    "caveats": [],
-                }
-            ),
+            output=response,
             metadata={
                 "returncode": "0",
-                "_controller_command_receipts": [
-                    {
-                        "command": "verification command",
-                        "exit_code": 0,
-                        "output_sha256": "1" * 64,
-                    }
-                ],
+                "_controller_transport_receipt": {
+                    "transport": transport_receipt.transport,
+                    "prompt_sha256": transport_receipt.prompt_sha256,
+                    "envelope_sha256": transport_receipt.envelope_sha256,
+                    "response_sha256": transport_receipt.response_sha256,
+                    "head_sha": transport_receipt.head_sha,
+                    "tree_sha": transport_receipt.tree_sha,
+                    "evidence_manifest_sha256": transport_receipt.evidence_manifest_sha256,
+                },
             },
-        ),
-    )
+        )
+
+    monkeypatch.setattr(reviewer, "_run_primary_review", fake_primary)
 
     result = main(
         [

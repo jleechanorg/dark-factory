@@ -250,6 +250,104 @@ def test_codex_js_launcher_allows_bundled_native_runtime_root(tmp_path):
 
 
 @linux_only
+def test_codex_js_launcher_resolves_hoisted_native_runtime_root(tmp_path):
+    """npm hoisting puts the platform package beside the JS package."""
+    package = tmp_path / "node_modules" / "@openai" / "codex"
+    launcher = package / "bin" / "codex.js"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+    native = (
+        tmp_path
+        / "node_modules"
+        / "@openai"
+        / "codex-linux-x64"
+        / "vendor"
+        / "x86_64-unknown-linux-musl"
+        / "bin"
+        / "codex"
+    )
+    native.parent.mkdir(parents=True)
+    native.write_bytes(b"native")
+    paths = _linux_codex_runtime_paths(launcher)
+    assert paths is not None
+    assert native.parents[3].resolve() in paths
+
+
+@linux_only
+def test_codex_js_launcher_rejects_mutable_native_runtime_root(tmp_path):
+    """A world-writable native package must never enter the allow-list."""
+    package = tmp_path / "node_modules" / "@openai" / "codex"
+    launcher = package / "bin" / "codex.js"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+    native_root = tmp_path / "node_modules" / "@openai" / "codex-linux-x64"
+    native_root.mkdir(parents=True)
+    native_root.chmod(0o777)
+    try:
+        assert _linux_codex_runtime_paths(launcher) is None
+    finally:
+        native_root.chmod(0o755)
+
+
+@linux_only
+def test_codex_runtime_allows_private_primary_group_directory(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import runner.handler_sandbox as sandbox
+
+    package = tmp_path / "node_modules" / "@openai" / "codex"
+    launcher = package / "bin" / "codex.js"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+    package.chmod(0o770)
+    username = "controller-user"
+    gid = os.getgid()
+    monkeypatch.setattr(sandbox.pwd, "getpwuid", lambda uid: SimpleNamespace(pw_name=username))
+    monkeypatch.setattr(
+        sandbox.pwd,
+        "getpwall",
+        lambda: [SimpleNamespace(pw_uid=os.getuid(), pw_gid=gid, pw_name=username)],
+    )
+    monkeypatch.setattr(
+        sandbox.grp,
+        "getgrall",
+        lambda: [SimpleNamespace(gr_gid=gid, gr_mem=[username])],
+    )
+    paths = _linux_codex_runtime_paths(launcher)
+    assert paths is not None
+
+
+@linux_only
+def test_codex_runtime_rejects_extra_primary_group_member_or_gid(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import runner.handler_sandbox as sandbox
+
+    package = tmp_path / "node_modules" / "@openai" / "codex"
+    launcher = package / "bin" / "codex.js"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+    package.chmod(0o770)
+    username = "controller-user"
+    gid = os.getgid()
+    monkeypatch.setattr(sandbox.pwd, "getpwuid", lambda uid: SimpleNamespace(pw_name=username))
+    monkeypatch.setattr(
+        sandbox.pwd,
+        "getpwall",
+        lambda: [SimpleNamespace(pw_uid=os.getuid(), pw_gid=gid, pw_name=username)],
+    )
+    monkeypatch.setattr(
+        sandbox.grp,
+        "getgrall",
+        lambda: [SimpleNamespace(gr_gid=gid, gr_mem=[username, "other-user"])],
+    )
+    assert _linux_codex_runtime_paths(launcher) is None
+
+    monkeypatch.setattr(sandbox.os, "getgid", lambda: gid + 1)
+    assert _linux_codex_runtime_paths(launcher) is None
+
+
+@linux_only
 def test_landlock_denies_raw_openat_from_static_binary(tmp_path):
     launcher = _linux_landlock_launcher_path()
     assert launcher is not None
@@ -307,63 +405,6 @@ def test_landlock_allows_resolver_symlink_target_but_not_run_sibling(tmp_path):
     assert prefix is not None
     allowed = subprocess.run(
         _extend_pinned_launcher_command(prefix, [str(raw_open), str(resolver)]),
-        pass_fds=prefix.pass_fds,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert allowed.returncode == 0, allowed.stderr
-    prefix.close_launcher()
-
-    prefix = _linux_controller_sandbox_prefix(
-        denied_paths=[sealed],
-        read_paths=[work],
-        writable_paths=[],
-        executable_paths=[raw_open],
-    )
-    assert prefix is not None
-    denied = subprocess.run(
-        _extend_pinned_launcher_command(prefix, [str(raw_open), str(sibling)]),
-        pass_fds=prefix.pass_fds,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    prefix.close_launcher()
-    assert denied.returncode == 3, denied.stderr
-
-
-@linux_only
-def test_landlock_allows_only_codex_config_not_home_codex_parent(tmp_path):
-    """Codex's compatibility config allowance must not expose sibling files."""
-    config = pathlib.Path.home() / ".codex" / "config.toml"
-    if not config.is_file():
-        pytest.skip(f"Codex config unavailable: {config}")
-    sibling = next(
-        (
-            path
-            for path in config.parent.iterdir()
-            if path.is_file() and path != config and not path.is_symlink()
-        ),
-        None,
-    )
-    if sibling is None:
-        pytest.skip(f"No regular sibling in {config.parent}")
-    work = tmp_path / "work"
-    work.mkdir()
-    raw_open = _compile_static_raw_open(work / "tool")
-    sealed = tmp_path / "sealed"
-    sealed.mkdir()
-
-    prefix = _linux_controller_sandbox_prefix(
-        denied_paths=[sealed],
-        read_paths=[work],
-        writable_paths=[],
-        executable_paths=[raw_open],
-    )
-    assert prefix is not None
-    allowed = subprocess.run(
-        _extend_pinned_launcher_command(prefix, [str(raw_open), str(config)]),
         pass_fds=prefix.pass_fds,
         capture_output=True,
         text=True,

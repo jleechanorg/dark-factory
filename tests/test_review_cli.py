@@ -45,8 +45,8 @@ def _valid_response(prompt: str, *, verdict: str = "pass") -> str:
         {
             "verdict": verdict,
             "findings": [] if verdict == "pass" else ["blocking finding"],
-            "evidence_checked": ["changed files and test output"],
-            "commands_executed": ["python -m pytest -q"],
+            "evidence_checked": ["changed files and frozen bundle"],
+            "commands_executed": [],
             "caveats": [],
         },
         separators=(",", ":"),
@@ -60,22 +60,12 @@ def _valid_transport(prompt: str, *, verdict: str = "pass") -> str:
                 {
                     "type": "item.completed",
                     "item": {
-                        "type": "command_execution",
-                        "command": "python -m pytest -q",
-                        "exit_code": 0,
-                        "aggregated_output": "3 passed",
-                    },
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "item.completed",
-                    "item": {
                         "type": "agent_message",
                         "text": _valid_response(prompt, verdict=verdict),
                     },
                 }
             ),
+            json.dumps({"type": "turn.completed", "usage": {}}),
         )
     )
 
@@ -133,7 +123,8 @@ def test_review_command_writes_valid_digest_bound_receipt(tmp_path, monkeypatch,
     assert receipt["envelope_path"] == "envelope.json"
     assert receipt["response_path"] == "reviewer.output.md"
     assert receipt["transport_path"] == "transport.jsonl"
-    assert receipt["command_receipts"][0]["exit_code"] == 0
+    assert receipt["command_receipts"] == []
+    assert receipt["transport_receipt"]["transport"] == "tool-free"
     assert receipt["envelope_sha256"] == hashlib.sha256(
         (output / "envelope.json").read_bytes()
     ).hexdigest()
@@ -160,6 +151,8 @@ def test_review_cli_passes_and_closes_pinned_linux_launcher(tmp_path, monkeypatc
         run_dir = tmp_path / "runtime"
         codex_home = tmp_path / "codex-home"
         env: ClassVar[dict[str, str]] = {}
+
+    Runtime.run_dir.mkdir()
 
     monkeypatch.setattr(
         "runner.review_cli._gate_subprocess_args",
@@ -245,7 +238,7 @@ def test_review_command_rejects_empty_success_receipt(
         "runner.review_cli._gate_subprocess_args",
         lambda backend, prompt, ctx, timeout: ["codex", "exec", prompt],
     )
-    empty_transport = _valid_transport("").replace('"3 passed"', '""')
+    empty_transport = _valid_transport("").rsplit("\n", 1)[0]
 
     def fake_run(command, **kwargs):
         if command[0] == "git":
@@ -268,7 +261,7 @@ def test_review_command_rejects_empty_success_receipt(
     assert rc == 1
     receipt = json.loads((output / "controller-receipt.json").read_text())
     assert receipt["status"] == "invalid"
-    assert "non-empty output" in receipt["contract_error"]
+    assert "exactly one turn.completed" in receipt["contract_error"]
     assert json.loads(capsys.readouterr().out)["status"] == "invalid"
 
 

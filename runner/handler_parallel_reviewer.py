@@ -722,6 +722,7 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
     import runner.handlers as _handlers_shim
 
     from .review_controller import (
+        build_frozen_review_bundle,
         ReviewContractError,
         ReviewInputs,
         create_review_request,
@@ -936,7 +937,8 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
         validate_immutable_target(inputs, holdout_roots=holdout_roots)
     except ReviewContractError as exc:
         raise ValueError(f"controller review target is not immutable: {exc}") from exc
-    return create_review_request(inputs)
+    frozen_bundle = build_frozen_review_bundle(inputs, holdout_roots=holdout_roots)
+    return create_review_request(inputs, frozen_bundle=frozen_bundle)
 
 
 def _validated_controller_source(ctx: Context) -> pathlib.Path:
@@ -1205,6 +1207,7 @@ def _contract_adjusted_result(
     from .review_controller import (
         ExecutionReceipt,
         ReviewContractError,
+        ReviewTransportReceipt,
         validate_execution_receipts,
         validate_review_response,
     )
@@ -1232,17 +1235,33 @@ def _contract_adjusted_result(
                 )
         _verify_controller_workspace(ctx, request)
         validated = validate_review_response(result.output or "", request)
-        raw_receipts = metadata.get("_controller_command_receipts") or []
-        receipts = tuple(
-            ExecutionReceipt(
-                command=str(item["command"]),
-                exit_code=int(item["exit_code"]),
-                output_sha256=str(item["output_sha256"]),
+        if request.bundle_sha256:
+            raw_receipt = metadata.get("_controller_transport_receipt")
+            if not isinstance(raw_receipt, dict):
+                raise ReviewContractError("tool-free controller receipt is missing")
+            try:
+                receipt = ReviewTransportReceipt(**raw_receipt)
+            except (TypeError, ValueError) as exc:
+                raise ReviewContractError(
+                    "tool-free controller receipt is malformed"
+                ) from exc
+            expected = ReviewTransportReceipt.from_request(
+                request, response=result.output or "", transport="tool-free"
             )
-            for item in raw_receipts
-            if isinstance(item, dict)
-        )
-        validate_execution_receipts(receipts, validated)
+            if receipt != expected or validated.commands_executed:
+                raise ReviewContractError("tool-free controller receipt is not bound to the response")
+        else:
+            raw_receipts = metadata.get("_controller_command_receipts") or []
+            receipts = tuple(
+                ExecutionReceipt(
+                    command=str(item["command"]),
+                    exit_code=int(item["exit_code"]),
+                    output_sha256=str(item["output_sha256"]),
+                )
+                for item in raw_receipts
+                if isinstance(item, dict)
+            )
+            validate_execution_receipts(receipts, validated)
         from .review_controller import ensure_review_pass_allowed
 
         ensure_review_pass_allowed(validated, backend=backend, execution_path="graph_controller")
@@ -1476,6 +1495,8 @@ def _persist_controller_lane(
     """Persist one graph lane through the canonical controller artifact seam."""
     from .review_controller import (
         ExecutionReceipt,
+        ReviewContractError,
+        ReviewTransportReceipt,
         persist_controller_lane_artifacts,
     )
 
@@ -1500,6 +1521,16 @@ def _persist_controller_lane(
         returncode = -1
     status = str(metadata.get("review_contract_status", "invalid"))
     verdict = str(metadata.get("verdict", "unknown"))
+    raw_transport_receipt = metadata.get("_controller_transport_receipt")
+    if raw_transport_receipt is None:
+        transport_receipt = None
+    elif isinstance(raw_transport_receipt, dict):
+        try:
+            transport_receipt = ReviewTransportReceipt(**raw_transport_receipt)
+        except (TypeError, ValueError) as exc:
+            raise ReviewContractError("tool-free controller receipt is malformed") from exc
+    else:
+        raise ReviewContractError("tool-free controller receipt is malformed")
     cleanup_error = ""
     try:
         paths = persist_controller_lane_artifacts(
@@ -1516,6 +1547,7 @@ def _persist_controller_lane(
             verdict=verdict,
             contract_error=str(metadata.get("review_contract_gap", "")),
             receipts=receipts,
+            transport_receipt=transport_receipt,
         )
     finally:
         if runtime_root:
@@ -1543,7 +1575,7 @@ def _persist_controller_lane(
     )
 
 
-def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
+def _parallel_reviewer_impl(node: "Node", ctx: "Context") -> "Result":
     """Run parallel reviewer lanes and pass combined evidence downstream."""
     import runner.handlers as _handlers_shim  # late-bound shim for monkeypatched helpers
     review_contract = str(node.attrs.get("review_contract") or "").strip()
@@ -1643,6 +1675,8 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
             lane_dirs, sort_keys=True, separators=(",", ":")
         )
     shadows = []
+    if request is not None:
+        ctx.state["_df_controller_review_request"] = request
     if shadow_backends:
         for index, b in enumerate(shadow_backends):
             suffix = f"shadow_{b}" if configured_shadow_backends.count(b) == 1 else f"shadow_{b}_{index}"
@@ -1688,8 +1722,6 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
             read_only_path=controller_read_only_path,
         )
     finally:
-        if request is not None:
-            ctx.state.pop("_df_controller_review_request", None)
         if prior_controller_json is None:
             ctx.state.pop("_df_controller_review_json", None)
         else:
@@ -1792,6 +1824,9 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
                         "_controller_command_receipts": result.metadata.get(
                             f"shadow_{shadow.backend}_gate_command_receipts",
                             [],
+                        ),
+                        "_controller_transport_receipt": result.metadata.get(
+                            f"shadow_{shadow.backend}_gate_transport_receipt"
                         ),
                         "returncode": result.metadata.get(
                             f"shadow_{shadow.backend}_gate_returncode",
@@ -1926,5 +1961,20 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     ):
         final_result = _enforce_reproduction_receipt(
             final_result, expected_sha=expected_sha,
-        )
+    )
     return final_result
+
+
+def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
+    """Run controller lanes and clear the authenticated request afterward.
+
+    The request must remain in context while every shadow lane is drained and
+    its tool-free terminal receipt is validated.  Keeping cleanup in this
+    outer wrapper also clears the request when a primary or shadow lane
+    returns a failure result or raises during execution.
+    """
+    try:
+        return _parallel_reviewer_impl(node, ctx)
+    finally:
+        if isinstance(getattr(ctx, "state", None), dict):
+            ctx.state.pop("_df_controller_review_request", None)

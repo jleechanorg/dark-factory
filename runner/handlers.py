@@ -48,6 +48,7 @@ from .handler_sandbox import (
     _sealed_benchmark_doc_paths,
     _macos_read_only_profile,  # noqa: F401 - public handler shim export
     _create_controller_runtime,  # noqa: F401 - public handler shim export
+    _controller_output_schema,  # noqa: F401 - public handler shim export
     _cleanup_controller_runtime,  # noqa: F401 - public handler shim export
     _sandboxed_args,
     _sandboxed_args_for_workdir,

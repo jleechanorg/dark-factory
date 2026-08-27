@@ -8,6 +8,7 @@ Extracted from tests/test_gates.py per docs/refactor/file-ownership-map.test_gat
 from __future__ import annotations
 
 import os
+import hashlib
 import pathlib
 import sys
 import pytest
@@ -196,8 +197,9 @@ def test_complete_controller_prompt_is_not_rewrapped_for_shadow(tmp_path, monkey
     assert seen[0][-1] == "-"
     assert "--json" in seen[0]
     assert "--ephemeral" in seen[0]
-    assert "--sandbox" in seen[0]
-    assert "read-only" in seen[0]
+    assert "--disable" in seen[0]
+    assert "shell_tool" in seen[0]
+    assert "unified_exec" in seen[0]
     assert "--yolo" not in seen[0]
     assert "--dangerously-bypass-approvals-and-sandbox" not in seen[0]
     assert "--ignore-user-config" in seen[0]
@@ -205,8 +207,8 @@ def test_complete_controller_prompt_is_not_rewrapped_for_shadow(tmp_path, monkey
     assert "Normal gate prompt for comparison" not in " ".join(seen[0])
 
 
-def test_launch_shadow_gate_review_uses_controller_cwd_and_sanitized_env(tmp_path, monkeypatch):
-    """Controller-complete shadow launch must run from neutral cwd and
+def test_launch_shadow_gate_review_uses_target_cwd_and_sanitized_env(tmp_path, monkeypatch):
+    """Controller-complete shadow launch must run from target cwd and
     sanitized environment."""
     from runner.handlers import Context as HCtx
     from runner.handler_dispatch import _launch_shadow_gate_review
@@ -248,7 +250,7 @@ def test_launch_shadow_gate_review_uses_controller_cwd_and_sanitized_env(tmp_pat
     assert review is not None
     assert review.prompt_is_complete is True
     assert review.json_transport is True
-    assert observed.get("cwd") == neutral
+    assert observed.get("cwd") == ctx.workdir
     env = observed.get("env", {})
     assert isinstance(env, dict)
     assert "DARK_FACTORY_HOLDOUTS" not in env
@@ -276,8 +278,17 @@ def test_controller_codex_args_builds_stdin_transport():
         "--ephemeral",
         "--ignore-user-config",
         "--skip-git-repo-check",
-        "--sandbox",
-        "read-only",
+        "--disable",
+        "shell_tool",
+        "--disable",
+        "unified_exec",
+        "--disable",
+        "browser_use",
+        "--disable",
+        "computer_use",
+        "--config",
+        'web_search="disabled"',
+        "--ignore-rules",
         "-",
     ]
 
@@ -399,22 +410,142 @@ def test_execute_gate_uses_controller_codex_transport(tmp_path, monkeypatch):
 
     result = _execute_gate("PROMPT", fake_sha, 300, ctx, "gate_er", "codex")
 
+    assert result.outcome == "error"
+    assert not observed
+
+
+def test_run_gate_once_controller_uses_authenticated_json_verdict_without_sha_echo(
+    tmp_path, monkeypatch
+):
+    """Graph controller PASS must not depend on legacy prose markers."""
+    import json
+    from types import SimpleNamespace
+
+    from runner.handler_dispatch import _run_gate_once
+    from runner.review_controller import EvidenceArtifact, ReviewInputs, create_review_request
+
+    evidence = tmp_path / "evidence.txt"
+    evidence.write_text("proof\n", encoding="utf-8")
+    request = create_review_request(
+        ReviewInputs(
+            repository="example",
+            workspace_path=str(tmp_path),
+            base_sha="a" * 40,
+            head_sha="b" * 40,
+            tree_sha="c" * 40,
+            task_text="Review the change.",
+            changed_files=("evidence.txt",),
+            evidence=(
+                EvidenceArtifact(
+                    path="evidence.txt",
+                    size_bytes=evidence.stat().st_size,
+                    sha256=hashlib.sha256(evidence.read_bytes()).hexdigest(),
+                ),
+            ),
+        )
+    )
+    response = json.dumps(
+        {
+            "verdict": "pass",
+            "findings": [],
+            "evidence_checked": ["evidence.txt"],
+            "commands_executed": ["verification"],
+            "caveats": [],
+        }
+    )
+    runtime = SimpleNamespace(run_dir=tmp_path, codex_home=tmp_path, env={})
+    ctx = SimpleNamespace(
+        state={
+            "_df_controller_review_json": "true",
+            "_df_controller_review_request": request,
+        },
+        workdir=tmp_path,
+        run_id="run",
+    )
+
+    monkeypatch.setattr("runner.handler_dispatch._gate_subprocess_args", lambda *args: ["codex"])
+    monkeypatch.setattr("runner.handler_dispatch._gate_subprocess_env", lambda *args: {})
+    monkeypatch.setattr("runner.handlers._create_controller_runtime", lambda: runtime)
+    monkeypatch.setattr("runner.handler_dispatch._controller_codex_args", lambda args, **kwargs: args)
+    monkeypatch.setattr("runner.handler_dispatch._start_shadow_gate_review", lambda *args: None)
+    monkeypatch.setattr("runner.handlers._close_pinned_launcher_command", lambda args: None)
+    monkeypatch.setattr("runner.handlers._controller_output_schema", lambda run_dir: tmp_path / "schema.json")
+    monkeypatch.setattr("runner.handler_dispatch.subprocess.run", lambda *args, **kwargs: SimpleNamespace(
+        returncode=0, stdout=json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": response}})
+        + "\n"
+        + json.dumps({"type": "turn.completed"}),
+        stderr="",
+    ))
+    monkeypatch.setattr("runner.handlers._parse_verdict", lambda *args, **kwargs: pytest.fail("legacy parser used"))
+    monkeypatch.setattr("runner.handlers._verify_head_sha_echo", lambda *args, **kwargs: pytest.fail("legacy SHA echo used"))
+
+    result = _run_gate_once("codex", "controller prompt", request.head_sha, 30, ctx, "cold_reviewer")
+
     assert result.outcome == "success"
-    assert observed["input"] == "PROMPT"
-    assert observed["cwd"] == neutral
-    cmd = observed["cmd"]
-    assert isinstance(cmd, list)
-    assert cmd[-1] == "-"
-    assert "--json" in cmd
-    assert "--ephemeral" in cmd
-    assert "--sandbox" in cmd
-    assert "read-only" in cmd
-    assert "--skip-git-repo-check" in cmd
-    assert "--yolo" not in cmd
-    env = observed.get("env", {})
-    assert isinstance(env, dict)
-    assert "DARK_FACTORY_HOLDOUTS" not in env
-    assert "MY_HOLDOUT_SECRET" not in env
+    assert result.metadata["verdict"] == "pass"
+    assert result.metadata["head_sha_status"] == "matched"
+
+
+def test_run_gate_once_controller_rejects_tampered_receipt_and_keeps_failures(
+    tmp_path, monkeypatch
+):
+    """Controller receipt head tampering is an error; a real JSON fail is failure."""
+    import json
+    from types import SimpleNamespace
+
+    from runner.handler_dispatch import _run_gate_once
+    from dataclasses import replace
+
+    from runner.review_controller import ReviewTransportReceipt
+    from tests.test_pr771_transport_hardening import _request
+
+    request = _request(tmp_path)
+    runtime = SimpleNamespace(run_dir=tmp_path, codex_home=tmp_path, env={})
+    ctx = SimpleNamespace(
+        state={
+            "_df_controller_review_json": "true",
+            "_df_controller_review_request": request,
+        },
+        workdir=tmp_path,
+        run_id="run",
+    )
+    fail_response = json.dumps(
+        {
+            "verdict": "fail",
+            "findings": ["blocking finding"],
+            "evidence_checked": ["evidence.txt"],
+            "commands_executed": ["verification"],
+            "caveats": [],
+        }
+    )
+    transport = "\n".join(
+        (
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": fail_response}}),
+            json.dumps({"type": "turn.completed"}),
+        )
+    )
+
+    monkeypatch.setattr("runner.handler_dispatch._gate_subprocess_args", lambda *args: ["codex"])
+    monkeypatch.setattr("runner.handler_dispatch._gate_subprocess_env", lambda *args: {})
+    monkeypatch.setattr("runner.handlers._create_controller_runtime", lambda: runtime)
+    monkeypatch.setattr("runner.handler_dispatch._controller_codex_args", lambda args, **kwargs: args)
+    monkeypatch.setattr("runner.handler_dispatch._start_shadow_gate_review", lambda *args: None)
+    monkeypatch.setattr("runner.handlers._close_pinned_launcher_command", lambda args: None)
+    monkeypatch.setattr("runner.handlers._controller_output_schema", lambda run_dir: tmp_path / "schema.json")
+    monkeypatch.setattr("runner.handler_dispatch.subprocess.run", lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=transport, stderr=""))
+
+    failure = _run_gate_once("codex", "controller prompt", request.head_sha, 30, ctx, "cold_reviewer")
+    assert failure.outcome == "failure"
+    assert failure.metadata["verdict"] == "fail"
+
+    receipt = ReviewTransportReceipt.from_request(request, response=fail_response, transport="tool-free")
+    tampered = replace(receipt, head_sha="0" * 40)
+    monkeypatch.setattr(
+        "runner.review_controller.parse_tool_free_codex_jsonl",
+        lambda raw, *, request: (fail_response, tampered),
+    )
+    error = _run_gate_once("codex", "controller prompt", request.head_sha, 30, ctx, "cold_reviewer")
+    assert error.outcome == "error"
 
 
 def test_execute_gate_rejects_controller_request_for_non_codex_backend(

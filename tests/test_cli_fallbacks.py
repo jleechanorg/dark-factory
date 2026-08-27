@@ -674,5 +674,6 @@ def test_controller_codex_transport_strips_outer_sandbox_exec():
 
     assert transport[0] == "codex"
     assert transport[1] == "exec"
-    assert "--sandbox" in transport
-    assert "read-only" in transport
+    assert "--sandbox" not in transport
+    assert "--disable" in transport
+    assert "shell_tool" in transport

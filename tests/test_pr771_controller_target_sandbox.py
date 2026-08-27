@@ -237,7 +237,9 @@ def _assert_snapshot_profile(transport: list[str], source: Path, snapshot: Path)
     profile = transport[2]
     assert "(deny file-write*)" in profile
     assert str(source) not in profile
-    assert "--dangerously-bypass-approvals-and-sandbox" in transport
+    assert "--dangerously-bypass-approvals-and-sandbox" not in transport
+    assert "--disable" in transport
+    assert "shell_tool" in transport
     assert "--sandbox" not in transport
 
 
@@ -345,3 +347,42 @@ def test_post_review_rejects_symlinked_parent_before_canonicalization(tmp_path):
 
     with pytest.raises(ReviewContractError, match="symlink"):
         _verify_controller_workspace(None, request)
+
+
+def test_controller_request_survives_shadow_finish_then_clears_on_failure(monkeypatch):
+    """The authenticated request must outlive shadow validation and cleanup."""
+    import runner.handler_parallel_reviewer as reviewer
+
+    request = object()
+    observed: list[object] = []
+
+    def fake_impl(node, ctx):
+        ctx.state["_df_controller_review_request"] = request
+        observed.append(ctx.state["_df_controller_review_request"])
+        return Result(outcome="failure", output="shadow contract rejected")
+
+    monkeypatch.setattr(reviewer, "_parallel_reviewer_impl", fake_impl)
+    ctx = Context(goal="review", workdir=Path.cwd(), backend="codex")
+    result = reviewer._parallel_reviewer(Node(name="cold_reviewer"), ctx)
+
+    assert result.outcome == "failure"
+    assert observed == [request]
+    assert "_df_controller_review_request" not in ctx.state
+
+
+def test_controller_request_clears_after_shadow_finish_exception(monkeypatch):
+    """Exceptional lane completion must not leak the authenticated request."""
+    import runner.handler_parallel_reviewer as reviewer
+
+    request = object()
+
+    def fake_impl(node, ctx):
+        ctx.state["_df_controller_review_request"] = request
+        raise RuntimeError("shadow finish failed")
+
+    monkeypatch.setattr(reviewer, "_parallel_reviewer_impl", fake_impl)
+    ctx = Context(goal="review", workdir=Path.cwd(), backend="codex")
+
+    with pytest.raises(RuntimeError, match="shadow finish failed"):
+        reviewer._parallel_reviewer(Node(name="cold_reviewer"), ctx)
+    assert "_df_controller_review_request" not in ctx.state

@@ -85,8 +85,10 @@ from __future__ import annotations
 
 import hashlib
 import ctypes
+import grp
 import os
 import pathlib
+import pwd
 import shutil
 import stat
 import subprocess
@@ -110,6 +112,36 @@ class _ControllerRuntime:
     run_dir: pathlib.Path
     codex_home: pathlib.Path
     env: dict[str, str]
+
+
+_CONTROLLER_OUTPUT_SCHEMA = (
+    '{"type":"object","additionalProperties":false,"required":'
+    '["verdict","findings","evidence_checked","commands_executed","caveats"],'
+    '"properties":{"verdict":{"enum":["pass","fail"]},'
+    '"findings":{"type":"array","items":{"type":"string"}},'
+    '"evidence_checked":{"type":"array","items":{"type":"string"}},'
+    '"commands_executed":{"type":"array","items":{"type":"string"}},'
+    '"caveats":{"type":"array","items":{"type":"string"}}}}\n'
+)
+
+
+def _controller_output_schema(run_dir: pathlib.Path) -> pathlib.Path:
+    """Create the immutable, controller-owned response schema for one run."""
+    run_dir = _validate_private_dir(pathlib.Path(run_dir))
+    path = run_dir / "output-schema.json"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o444)
+    try:
+        os.write(fd, _CONTROLLER_OUTPUT_SCHEMA.encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    info = path.lstat()
+    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o444:
+        raise ValueError("controller output schema is not immutable")
+    return path
 
 
 def _validate_private_dir(path: pathlib.Path) -> pathlib.Path:
@@ -830,14 +862,64 @@ def _linux_codex_runtime_paths(executable: pathlib.Path) -> list[pathlib.Path] |
         resolved = executable.resolve(strict=True)
     except (OSError, RuntimeError):
         return None
-    paths = [resolved.parent]
+    # Refuse executable trees whose package directories are mutable by another
+    # user.  A public sticky parent such as /tmp is fine.  Group-writable
+    # user-owned npm prefixes are common (for example, nvm installs); those
+    # remain bound to the current owner, while world-writable package roots do
+    # not enter the allow-list.
+    def private_group(info: os.stat_result) -> bool:
+        if not info.st_mode & stat.S_IWGRP:
+            return True
+        try:
+            uid = os.getuid()
+            gid = os.getgid()
+            username = pwd.getpwuid(uid).pw_name
+            if info.st_gid != gid:
+                return False
+            for entry in pwd.getpwall():
+                if entry.pw_gid == gid and (entry.pw_uid != uid or entry.pw_name != username):
+                    return False
+            for entry in grp.getgrall():
+                if entry.gr_gid == gid and any(member != username for member in entry.gr_mem):
+                    return False
+        except (KeyError, OSError, RuntimeError):
+            return False
+        return True
+
+    def trusted_directory(path: pathlib.Path) -> pathlib.Path | None:
+        try:
+            current = path.resolve(strict=True)
+            if not current.is_dir():
+                return None
+            while True:
+                info = current.lstat()
+                if info.st_uid not in {0, os.getuid()}:
+                    return None
+                if info.st_mode & stat.S_IWOTH:
+                    if info.st_uid == 0 and info.st_mode & stat.S_ISVTX:
+                        break
+                    return None
+                if not private_group(info):
+                    return None
+                if current == pathlib.Path(current.anchor):
+                    break
+                current = current.parent
+            return path.resolve(strict=True)
+        except (OSError, RuntimeError):
+            return None
+
+    executable_parent = trusted_directory(resolved.parent)
+    if executable_parent is None:
+        return None
+    paths = [executable_parent]
 
     def add_package_roots(path: pathlib.Path) -> None:
         parts = path.parts
         for index in range(len(parts) - 1):
             if parts[index:index + 2] in (("@openai", "codex"), ("@openai", "codex-linux-x64")):
                 package_root = pathlib.Path(*parts[: index + 2])
-                if package_root.is_dir():
+                package_root = trusted_directory(package_root)
+                if package_root is not None:
                     paths.append(package_root)
 
     add_package_roots(resolved)
@@ -856,7 +938,12 @@ def _linux_codex_runtime_paths(executable: pathlib.Path) -> list[pathlib.Path] |
             interpreter_path = interpreter[0] if interpreter else None
         if interpreter_path:
             try:
-                paths.append(pathlib.Path(interpreter_path).resolve(strict=True).parent)
+                interpreter_root = trusted_directory(
+                    pathlib.Path(interpreter_path).resolve(strict=True).parent
+                )
+                if interpreter_root is None:
+                    return None
+                paths.append(interpreter_root)
             except (OSError, RuntimeError):
                 return None
     try:
@@ -867,10 +954,45 @@ def _linux_codex_runtime_paths(executable: pathlib.Path) -> list[pathlib.Path] |
             candidate_path = pathlib.Path(candidate)
             if candidate_path.is_file():
                 candidate_path = candidate_path.resolve(strict=True)
-                paths.append(candidate_path.parent)
+                candidate_root = trusted_directory(candidate_path.parent)
+                if candidate_root is None:
+                    return None
+                paths.append(candidate_root)
                 add_package_roots(candidate_path)
     except (OSError, UnicodeDecodeError, RuntimeError):
         return None
+    # Codex's JS launcher resolves the platform package with Node's normal
+    # module lookup.  npm may hoist that optional package beside the primary
+    # package, while pnpm may keep it nested under the primary package.  Add
+    # only those exact package locations and retain their mode/owner checks.
+    package_roots = [path for path in paths if path.name == "codex"]
+    machine = os.uname().machine if hasattr(os, "uname") else ""
+    native_name = {
+        "x86_64": "codex-linux-x64",
+        "amd64": "codex-linux-x64",
+        "aarch64": "codex-linux-arm64",
+        "arm64": "codex-linux-arm64",
+    }.get(machine)
+    if native_name:
+        for package_root in package_roots:
+            candidates = (
+                package_root.parent / native_name,
+                package_root / "node_modules" / "@openai" / native_name,
+            )
+            for candidate in candidates:
+                try:
+                    candidate.lstat()
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    return None
+                native_root = trusted_directory(candidate)
+                if native_root is None:
+                    # An installed native package that cannot be trusted must
+                    # fail closed; silently omitting it would let the caller
+                    # run with a different, unvalidated runtime.
+                    return None
+                paths.append(native_root)
     return sorted(set(paths), key=str)
 
 
@@ -933,10 +1055,8 @@ def _linux_controller_sandbox_prefix(
                 return None
     # Linux resolves /etc/resolv.conf through a symlink into /run.  The
     # controller must allow only that exact target, rather than opening the
-    # whole /run tree.  Codex 0.144.x also consults the user's config path even
-    # with a private CODEX_HOME and --ignore-user-config; grant that one file
-    # when present, never its parent directory.  Resolve both paths before
-    # adding rules so a changed or malformed symlink fails closed.
+    # whole /run tree.  The private CODEX_HOME and --ignore-user-config path
+    # must not grant access to the host user's config.
     try:
         resolver_target = pathlib.Path("/etc/resolv.conf").resolve(strict=True)
     except (OSError, RuntimeError):
@@ -944,17 +1064,6 @@ def _linux_controller_sandbox_prefix(
     if not resolver_target.is_file():
         return None
     reads.append(resolver_target)
-    codex_config = pathlib.Path.home() / ".codex" / "config.toml"
-    try:
-        codex_config_target = codex_config.resolve(strict=True)
-    except FileNotFoundError:
-        codex_config_target = None
-    except (OSError, RuntimeError):
-        return None
-    if codex_config_target is not None:
-        if not codex_config_target.is_file():
-            return None
-        reads.append(codex_config_target)
     if any(contains(allowed, secret) for allowed in reads for secret in denied):
         return None
     for executable in executables:
