@@ -289,8 +289,10 @@ def main(argv: list[str] | None = None) -> int:
             from .handler_sandbox import _holdout_denied_paths
 
             holdout_roots = tuple(str(path) for path in _holdout_denied_paths())
-        except (OSError, RuntimeError):
-            holdout_roots = ()
+        except (OSError, RuntimeError) as exc:
+            raise ReviewContractError(
+                f"sealed holdout roots unavailable: {exc}"
+            ) from exc
         # This must precede every git query and every read from the target.
         workdir = validate_workspace_path(
             str(lexical_workdir),

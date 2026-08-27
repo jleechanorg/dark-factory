@@ -741,8 +741,8 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
             str(pathlib.Path(root).resolve(strict=False))
             for root in _holdout_root_strings()
         )
-    except Exception:
-        holdout_roots = ()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"controller review holdout roots unavailable: {exc}") from exc
     try:
         # Validate the raw lexical spelling before canonicalizing it or doing
         # any target-owned Git/evidence reads. This catches symlinked parents

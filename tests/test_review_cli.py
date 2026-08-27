@@ -345,6 +345,50 @@ def test_review_command_rejects_symlinked_parent_before_target_query(
     assert target_operation_attempted is False
 
 
+@pytest.mark.parametrize(
+    "discovery_error", (OSError("unavailable"), RuntimeError("missing"))
+)
+def test_review_command_fails_closed_when_holdout_discovery_fails(
+    tmp_path, monkeypatch, discovery_error
+):
+    repo, base, head = _repo(tmp_path)
+    task = _task(repo)
+    launched = False
+
+    def unavailable():
+        raise type(discovery_error)(str(discovery_error))
+
+    def unexpected_launch(*args, **kwargs):
+        nonlocal launched
+        launched = True
+        raise AssertionError("holdout discovery must fail before reviewer launch")
+
+    monkeypatch.setattr(
+        "runner.handler_sandbox._holdout_denied_paths", unavailable
+    )
+    monkeypatch.setattr("runner.review_cli._gate_subprocess_args", unexpected_launch)
+    monkeypatch.setattr(
+        "runner.review_cli._snapshot",
+        lambda *args, **kwargs: pytest.fail(
+            "holdout discovery must fail before snapshot"
+        ),
+    )
+
+    rc = main(
+        [
+            "--workdir", str(repo),
+            "--base-sha", base,
+            "--head-sha", head,
+            "--task-file", str(task),
+            "--evidence", "value.txt",
+            "--output-dir", str(tmp_path / "review-output"),
+        ]
+    )
+
+    assert rc == 1
+    assert launched is False
+
+
 def test_task_file_rejects_external_holdout_and_symlink_before_backend(tmp_path, monkeypatch):
     repo, _base, _head = _repo(tmp_path)
     outside = tmp_path / "outside.md"

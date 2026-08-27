@@ -82,6 +82,37 @@ def test_controller_review_fails_closed_without_authenticated_base(tmp_path: Pat
         _controller_review_request(Node(name="cold_reviewer", attrs={}), ctx, head)
 
 
+@pytest.mark.parametrize(
+    "discovery_error", (OSError("unavailable"), RuntimeError("missing"))
+)
+def test_controller_review_fails_closed_when_holdout_discovery_fails(
+    tmp_path: Path, monkeypatch, discovery_error
+) -> None:
+    repo, base, head = _repo(tmp_path)
+    ctx = Context(
+        goal="review worker change",
+        workdir=repo,
+        state={"base_sha": base},
+        run_id="missing-holdouts",
+    )
+
+    def unavailable():
+        raise type(discovery_error)(str(discovery_error))
+
+    monkeypatch.setattr(
+        "runner.handler_parallel_reviewer._holdout_root_strings", unavailable
+    )
+    monkeypatch.setattr(
+        "runner.handler_parallel_reviewer._controller_snapshot",
+        lambda *args, **kwargs: pytest.fail(
+            "holdout discovery must fail before snapshot"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="holdout|sealed"):
+        _controller_review_request(Node(name="cold_reviewer", attrs={}), ctx, head)
+
+
 def test_controller_preserves_lexical_symlink_parent_until_validation(tmp_path: Path) -> None:
     """The earliest target resolver must not erase a symlinked parent."""
     repo, _base, head = _repo(tmp_path)
