@@ -175,7 +175,7 @@ def _auto_wip_commit_on_exhaustion(ctx: "Context", reason: str) -> None:
         return
 
 
-def _cleanup_controller_snapshot(ctx: "Context") -> None:
+def _cleanup_controller_snapshot(ctx: Context) -> None:
     """Remove every exact controller snapshot after the engine owns run end.
 
     Controller snapshots are detached worktrees created beneath the dedicated
