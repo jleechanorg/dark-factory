@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -227,8 +228,8 @@ def test_controller_rejects_source_mutation_between_snapshot_and_binding(
     original_snapshot = reviewer._controller_snapshot
     captured: dict[str, Path] = {}
 
-    def snapshot_then_mutate(source, expected_sha, evidence):
-        result = original_snapshot(source, expected_sha, evidence)
+    def snapshot_then_mutate(source, expected_sha, evidence, **kwargs):
+        result = original_snapshot(source, expected_sha, evidence, **kwargs)
         captured["snapshot"] = result[0]
         if untracked:
             (repo / "worker-output.txt").write_text("after\n")
@@ -273,6 +274,93 @@ def test_cleanup_skips_git_when_source_ancestor_becomes_symlink(tmp_path: Path, 
 
     assert calls == []
     assert snapshot.exists()
+
+
+def test_cleanup_revalidates_source_before_prune(tmp_path: Path, monkeypatch):
+    """A parent swap after remove must prevent a later prune invocation."""
+    from runner.engine_run import _cleanup_controller_snapshot
+
+    source_parent = tmp_path / "source-parent"
+    source_parent.mkdir(mode=0o700)
+    repo, _base, head = _repo(source_parent)
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    snapshot = _controller_snapshot(repo, head, ())[0]
+    monkeypatch.setattr("runner.handler_sandbox._holdout_denied_paths", lambda: [])
+    calls: list[list[str]] = []
+
+    def fake_git(command, **kwargs):
+        calls.append(command)
+        if command[-4:-2] == ["worktree", "remove"]:
+            shutil.rmtree(snapshot)
+            real_parent = tmp_path / "real-source-parent"
+            source_parent.rename(real_parent)
+            source_parent.symlink_to(real_parent, target_is_directory=True)
+            return subprocess.CompletedProcess(command, 0, "", "")
+        raise AssertionError("worktree prune ran after source parent was swapped")
+
+    monkeypatch.setattr("runner.engine_run.subprocess.run", fake_git)
+    state = {
+        "_controller_review_snapshots": json.dumps(
+            [{"snapshot_path": str(snapshot), "source_worktree": str(repo)}]
+        )
+    }
+    _cleanup_controller_snapshot(Context(goal="", workdir=repo, state=state))
+
+    assert len(calls) == 1
+    assert calls[0][-4:-2] == ["worktree", "remove"]
+
+
+def test_snapshot_failure_skips_cleanup_after_source_parent_swap(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Snapshot failure must not remove through an ancestor swapped to a symlink."""
+    import runner.handler_parallel_reviewer as reviewer
+
+    source_parent = tmp_path / "source-parent"
+    source_parent.mkdir(mode=0o700)
+    repo, _base, head = _repo(source_parent)
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.setattr("runner.handler_sandbox._holdout_denied_paths", lambda: [])
+    real_run = reviewer.subprocess.run
+    cleanup_calls: list[list[str]] = []
+    swapped = False
+
+    def git_with_swap(command, *args, **kwargs):
+        nonlocal swapped
+        is_add = command[0:2] == ["git", "-C"] and "worktree" in command and "add" in command
+        if is_add:
+            result = real_run(command, *args, **kwargs)
+            real_parent = tmp_path / "real-source-parent"
+            source_parent.rename(real_parent)
+            source_parent.symlink_to(real_parent, target_is_directory=True)
+            swapped = True
+            return result
+        if "worktree" in command and "remove" in command:
+            cleanup_calls.append(command)
+            raise AssertionError("snapshot cleanup followed a swapped source parent")
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(reviewer.subprocess, "run", git_with_swap)
+    real_git_output = reviewer._git_output
+    calls_to_output = 0
+
+    def fail_after_add(workdir, *args, **kwargs):
+        nonlocal calls_to_output
+        calls_to_output += 1
+        if swapped and args[:1] == ("diff",):
+            raise ValueError("forced snapshot failure")
+        return real_git_output(workdir, *args, **kwargs)
+
+    monkeypatch.setattr(reviewer, "_git_output", fail_after_add)
+    with pytest.raises(ValueError, match="forced snapshot failure"):
+        reviewer._controller_snapshot(repo, head, ())
+
+    assert calls_to_output >= 2
+    assert cleanup_calls == []
 
 
 def test_default_two_node_seeds_base_before_worker_mutation(tmp_path: Path, monkeypatch) -> None:

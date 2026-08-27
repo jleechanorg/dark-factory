@@ -272,7 +272,11 @@ def _cleanup_controller_snapshot(ctx: Context) -> None:
         ):
             continue
         snapshot = pathlib.Path(entry["snapshot_path"])
-        source = pathlib.Path(entry["source_worktree"])
+        # Preserve the submitted spelling separately from any validated,
+        # canonical path. The lexical path must be revalidated before each
+        # independent Git mutation so an ancestor swap cannot redirect prune.
+        source_lexical = pathlib.Path(entry["source_worktree"])
+        source = source_lexical
         key = (str(snapshot), str(source))
         if key in seen:
             continue
@@ -319,11 +323,15 @@ def _cleanup_controller_snapshot(ctx: Context) -> None:
                 continue
             if snapshot.exists():
                 continue
+            source_for_prune = validate_workspace_path(
+                str(source_lexical),
+                holdout_roots=tuple(str(path) for path in _holdout_denied_paths()),
+            )
             subprocess.run(
                 [
                     "git",
                     "-C",
-                    str(source),
+                    str(source_for_prune),
                     "worktree",
                     "prune",
                     "--expire",

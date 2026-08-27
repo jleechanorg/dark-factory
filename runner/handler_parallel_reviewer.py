@@ -468,6 +468,8 @@ def _controller_snapshot(
     source: pathlib.Path,
     expected_sha: str,
     declared_evidence: tuple[str, ...],
+    *,
+    cleanup_source: pathlib.Path | None = None,
 ) -> tuple[pathlib.Path, str, EvidenceOrigin | None]:
     """Freeze dirty worker output into a clean detached Git worktree for review.
 
@@ -476,6 +478,10 @@ def _controller_snapshot(
     detached commit supplies that target without changing the worker checkout.
     Runner-created AGY task files are transport artifacts, not product output.
     """
+    # Keep the original lexical spelling for exception cleanup. source is
+    # normally already validated/canonicalized by the request builder, while
+    # cleanup must validate the path spelling again immediately before Git.
+    cleanup_source = pathlib.Path(cleanup_source or source)
     observed_head = _git_output(source, "rev-parse", "HEAD^{commit}").lower()
     if observed_head != expected_sha.lower():
         raise ValueError("controller review target head changed before snapshot")
@@ -633,13 +639,34 @@ def _controller_snapshot(
             snapshot_delta=delta,
         )
     except Exception:
-        subprocess.run(
-            ["git", "-C", str(source), "worktree", "remove", "--force", str(snapshot)],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
+        try:
+            from .handler_sandbox import _holdout_denied_paths
+            from .review_controller import validate_workspace_path
+
+            trusted_source = validate_workspace_path(
+                str(cleanup_source),
+                holdout_roots=tuple(
+                    str(path) for path in _holdout_denied_paths()
+                ),
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(trusted_source),
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(snapshot),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+            # Cleanup is best-effort and must not follow an invalidated path.
+            pass
         raise
 
 
@@ -789,7 +816,10 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
     )
     source_fingerprint_before = _controller_source_state_fingerprint(source_state_before)
     workdir, expected_sha, evidence_origin = _controller_snapshot(
-        source_workdir, source_head_sha, declared_evidence
+        source_workdir,
+        source_head_sha,
+        declared_evidence,
+        cleanup_source=raw_source_workdir,
     )
     source_state_after = _controller_source_state(
         source_workdir,
