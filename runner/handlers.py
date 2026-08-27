@@ -46,6 +46,7 @@ from .handler_sandbox import (
     _holdouts_repo_path,
     _holdout_denied_paths,
     _sealed_benchmark_doc_paths,
+    _macos_read_only_profile,
     _sandboxed_args,
     _sandboxed_args_for_workdir,
     # Linux isolation backend (jleechan-haux) — re-exported so

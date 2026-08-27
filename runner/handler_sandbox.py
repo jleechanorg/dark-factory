@@ -200,6 +200,39 @@ def _build_sandbox_profile(extra_denied_paths: list[pathlib.Path]) -> str:
 """
 
 
+def _macos_read_only_profile(
+    profile: str, read_only_path: "Union[pathlib.Path, str, None]" = None
+) -> str:
+    """Add the controller's read-only write boundary to an existing profile.
+
+    Controller Codex runs under this outer Seatbelt profile on macOS. Codex's
+    own sandbox must therefore be bypassed (the outer profile remains the
+    security boundary), while the reviewed workspace is denied writes. The
+    profile must already contain a path-specific holdout read denial; an
+    incomplete profile is rejected rather than upgraded into a weaker one.
+    """
+    if "(deny file-read* (subpath \"" not in profile:
+        raise ValueError("controller sandbox profile lacks holdout read denial")
+    if read_only_path is None:
+        write_rule = "(deny file-write*)"
+    else:
+        try:
+            resolved = pathlib.Path(str(read_only_path)).expanduser().resolve()
+        except (OSError, RuntimeError) as exc:
+            raise ValueError("controller read-only path cannot be resolved") from exc
+        if (
+            not resolved.is_absolute()
+            or "\n" in str(resolved)
+            or "\r" in str(resolved)
+        ):
+            raise ValueError("controller read-only path must be an absolute safe path")
+        escaped = str(resolved).replace("\\", "\\\\").replace('"', '\\"')
+        write_rule = f'(deny file-write* (subpath "{escaped}"))'
+    if write_rule in profile:
+        return profile
+    return profile.rstrip() + "\n" + write_rule + "\n"
+
+
 # ---------------------------------------------------------------------------
 # Linux backend — LD_PRELOAD deny-path shim (jleechan-haux).
 #

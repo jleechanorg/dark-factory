@@ -293,7 +293,7 @@ def main(argv: list[str] | None = None) -> int:
         transport_is_jsonl = args.backend == "codex"
         if transport_is_jsonl:
             try:
-                command = _controller_codex_args(command)
+                command = _controller_codex_args(command, read_only_path=workdir)
             except ValueError as exc:
                 raise ReviewContractError(
                     "codex review command did not contain the codex executable"

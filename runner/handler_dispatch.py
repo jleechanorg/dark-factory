@@ -45,6 +45,7 @@ import pathlib
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
@@ -237,7 +238,7 @@ def _launch_shadow_gate_review(
         return shadow
     if prompt_is_complete and backend == "codex":
         try:
-            args = _controller_codex_args(args)
+            args = _controller_codex_args(args, read_only_path=ctx.workdir)
         except ValueError as exc:
             shadow.launch_error = str(exc)
             return shadow
@@ -555,16 +556,23 @@ def _gate_subprocess_env(backend: str) -> dict[str, str]:
     return _handlers_shim._sanitized_env()
 
 
-def _build_controller_codex_transport(args: list[str]) -> list[str]:
+def _build_controller_codex_transport(
+    args: list[str],
+    *,
+    read_only_path: "Optional[pathlib.Path | str]" = None,
+) -> list[str]:
     """Build the concrete controller transport command for Codex review.
 
     The controller transport is always JSON-over-stdin:
       - complete payload on stdin (`-`), never argv positionals
       - `codex exec --json --ephemeral --skip-git-repo-check`
-      - `--sandbox read-only`
+      - native `--sandbox read-only` on Linux and other non-macOS platforms
+      - one outer Seatbelt profile with a workspace write denial on macOS
     Any unsupported transport mode (prompt-in-argv, bypass, write-capable
     sandbox mode, or weaker backend) fails closed before launch.
     """
+    import runner.handlers as _handlers_shim  # late-bound shim
+
     prepared = list(args)
     if not prepared:
         raise ValueError("codex controller argv is empty")
@@ -598,16 +606,51 @@ def _build_controller_codex_transport(args: list[str]) -> list[str]:
             if mode != "read-only":
                 raise ValueError("controller transport requires read-only codex sandboxing")
 
-    # Preserve an outer wrapper when it carries a path-specific denial. Native
-    # Codex read-only mode is complementary: it limits Codex's own operations
-    # while the outer wrapper continues to deny the sealed holdout paths. A
-    # permissive test/development wrapper has no isolation value and is
-    # intentionally removed to avoid nested sandbox setup failures.
+    # Preserve an outer wrapper when it carries a path-specific denial. On
+    # macOS, the outer Seatbelt profile is the single sandbox: augment it with
+    # the workspace write boundary and use Codex's externally-sandboxed mode
+    # so Codex does not try to apply a nested Seatbelt profile. On Linux, the
+    # LD_PRELOAD prefix is not a sandbox and native Codex read-only remains
+    # necessary. A permissive test/development wrapper has no isolation value
+    # and is intentionally removed.
     outer = prepared[:codex_index]
     path_denial = any(
         "(deny file-read*" in value or value.startswith("DENY_PATHS=")
         for value in outer
     )
+    if sys.platform == "darwin" and path_denial:
+        sandbox_index = next(
+            (
+                index
+                for index, value in enumerate(outer)
+                if (
+                    value == "sandbox-exec"
+                    or pathlib.Path(value).name == "sandbox-exec"
+                )
+            ),
+            None,
+        )
+        if (
+            sandbox_index is None
+            or sandbox_index + 2 >= len(outer)
+            or outer[sandbox_index + 1] != "-p"
+        ):
+            raise ValueError("controller macOS transport lacks a sandbox profile")
+        profile_index = sandbox_index + 2
+        outer = list(outer)
+        outer[profile_index] = _handlers_shim._macos_read_only_profile(
+            outer[profile_index], read_only_path
+        )
+        executable = prepared[codex_index]
+        return outer + [
+            executable,
+            "exec",
+            "--json",
+            "--ephemeral",
+            "--skip-git-repo-check",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "-",
+        ]
     executable = prepared[codex_index] if path_denial else "codex"
     return (outer if path_denial else []) + [
         executable,
@@ -622,9 +665,13 @@ def _build_controller_codex_transport(args: list[str]) -> list[str]:
 
 
 
-def _controller_codex_args(args: list[str]) -> list[str]:
+def _controller_codex_args(
+    args: list[str],
+    *,
+    read_only_path: "Optional[pathlib.Path | str]" = None,
+) -> list[str]:
     """Backward-compatible shim for the controller transport builder."""
-    return _build_controller_codex_transport(args)
+    return _build_controller_codex_transport(args, read_only_path=read_only_path)
 
 
 def _run_gate_once(
@@ -709,7 +756,7 @@ def _run_gate_once(
     controller_json = backend == "codex" and controller_requested
     if controller_json:
         try:
-            sub_args = _controller_codex_args(sub_args)
+            sub_args = _controller_codex_args(sub_args, read_only_path=ctx.workdir)
         except ValueError:
             return Result(
                 outcome="error",
