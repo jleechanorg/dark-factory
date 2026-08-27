@@ -111,6 +111,20 @@ def test_controller_runtime_repairs_current_owned_writable_factory_dir(
         _cleanup_controller_runtime(runtime.run_dir)
 
 
+def test_controller_runtime_rejects_writable_home_without_repair(
+    tmp_path, monkeypatch
+):
+    home = _auth_home(tmp_path)
+    os.chmod(home, 0o775)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+
+    with pytest.raises(ValueError, match="private"):
+        _create_controller_runtime()
+    assert stat.S_IMODE(home.stat().st_mode) == 0o775
+    assert not (home / ".dark-factory").exists()
+
+
 def test_controller_runtime_rejects_symlinked_root_and_auth(tmp_path, monkeypatch):
     home = _auth_home(tmp_path)
     outside = tmp_path / "outside"
