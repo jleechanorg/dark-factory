@@ -269,7 +269,7 @@ def _launch_shadow_gate_review(
             if runtime is not None:
                 try:
                     _handlers_shim._cleanup_controller_runtime(runtime.run_dir)
-                except Exception:
+                except Exception:  # noqa: BLE001, S110 - best-effort runtime cleanup
                     pass
             shadow.launch_error = str(exc)
             return shadow
@@ -297,7 +297,7 @@ def _launch_shadow_gate_review(
         if runtime is not None:
             try:
                 _handlers_shim._cleanup_controller_runtime(runtime.run_dir)
-            except Exception:
+            except Exception:  # noqa: BLE001, S110 - best-effort runtime cleanup
                 pass
         shadow.launch_error = f"{type(exc).__name__}: {exc}"
     return shadow
@@ -827,7 +827,7 @@ def _run_gate_once(
             if runtime is not None:
                 try:
                     _handlers_shim._cleanup_controller_runtime(runtime.run_dir)
-                except Exception:
+                except Exception:  # noqa: BLE001, S110 - best-effort runtime cleanup
                     pass
             return Result(
                 outcome="error",
@@ -871,7 +871,7 @@ def _run_gate_once(
         if runtime is not None:
             try:
                 _handlers_shim._cleanup_controller_runtime(runtime.run_dir)
-            except Exception:
+            except Exception:  # noqa: BLE001, S110 - best-effort runtime cleanup
                 pass
         return _finalize(Result(
             outcome="failure",
@@ -884,7 +884,7 @@ def _run_gate_once(
         if runtime is not None:
             try:
                 _handlers_shim._cleanup_controller_runtime(runtime.run_dir)
-            except Exception:
+            except Exception:  # noqa: BLE001, S110 - best-effort runtime cleanup
                 pass
         return _finalize(Result(
             outcome="error",
@@ -897,7 +897,7 @@ def _run_gate_once(
         if runtime is not None:
             try:
                 _handlers_shim._cleanup_controller_runtime(runtime.run_dir)
-            except Exception:
+            except Exception:  # noqa: BLE001, S110 - best-effort runtime cleanup
                 pass
         return _finalize(Result(
             outcome="error",
