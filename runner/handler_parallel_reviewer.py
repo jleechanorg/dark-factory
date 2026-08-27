@@ -685,7 +685,12 @@ def _controller_base_sha(
     must never narrow the controller's review range. Never ask the target
     checkout to resolve a mutable branch or ref.
     """
-    raw_base = ctx.state.get("_controller_base_sha")
+    raw_base = getattr(ctx, "_controller_base_sha", None)
+    if raw_base is None:
+        # Direct controller callers predating the runner-owned field may still
+        # provide authenticated state; a running graph always has the private
+        # field populated by _seed_controller_base_sha first.
+        raw_base = ctx.state.get("_controller_base_sha")
     if raw_base is None:
         raise ValueError("controller review base SHA is unavailable")
     if not isinstance(raw_base, str):

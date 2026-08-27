@@ -831,7 +831,11 @@ def test_default_two_node_seeds_base_before_worker_mutation(tmp_path: Path, monk
         (repo / "evidence" / "worker-verification.json").write_text(
             '{"status":"pass"}\n'
         )
-        return Result(outcome="success", output="worker complete")
+        return Result(
+            outcome="success",
+            output="worker complete",
+            context_updates={"_controller_base_sha": _head},
+        )
 
     monkeypatch.setitem(handlers.TYPE_REGISTRY, "codergen", worker)
     captured: dict[str, object] = {}
@@ -840,7 +844,8 @@ def test_default_two_node_seeds_base_before_worker_mutation(tmp_path: Path, monk
     def capture_request(node, ctx, expected_sha):
         request = original_request(node, ctx, expected_sha)
         captured["request"] = request
-        captured["base_state"] = ctx.state.get("_controller_base_sha")
+        captured["base_state"] = getattr(ctx, "_controller_base_sha", None)
+        captured["public_base_state"] = ctx.state.get("_controller_base_sha")
         return request
 
     monkeypatch.setattr(reviewer, "_controller_review_request", capture_request)
@@ -881,6 +886,8 @@ def test_default_two_node_seeds_base_before_worker_mutation(tmp_path: Path, monk
             str(repo),
             "--backend",
             "echo",
+            "--state",
+            f"_controller_base_sha={_head}",
             "--no-perf-log",
             "--max-steps",
             "10",
@@ -891,6 +898,7 @@ def test_default_two_node_seeds_base_before_worker_mutation(tmp_path: Path, monk
     envelope = json.loads(request.envelope_json)
     assert result == 0
     assert captured["base_state"] == base
+    assert captured["public_base_state"] == _head
     assert envelope["target"]["base_sha"] == base
     assert envelope["target"]["base_sha"] != envelope["target"]["head_sha"]
     assert "worker.txt" in envelope["snapshots"]["changed_files"]
