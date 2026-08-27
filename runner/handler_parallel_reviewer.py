@@ -687,11 +687,6 @@ def _controller_base_sha(
     """
     raw_base = getattr(ctx, "_controller_base_sha", None)
     if raw_base is None:
-        # Direct controller callers predating the runner-owned field may still
-        # provide authenticated state; a running graph always has the private
-        # field populated by _seed_controller_base_sha first.
-        raw_base = ctx.state.get("_controller_base_sha")
-    if raw_base is None:
         raise ValueError("controller review base SHA is unavailable")
     if not isinstance(raw_base, str):
         raise TypeError("controller review base SHA is unavailable")
@@ -755,7 +750,7 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
         )
     except ReviewContractError as exc:
         raise ValueError(f"controller review source is not immutable: {exc}") from exc
-    if ctx.state.get("_controller_base_sha") is None:
+    if getattr(ctx, "_controller_base_sha", None) is None:
         raise ValueError("controller review base SHA is unavailable")
     source_inputs = ReviewInputs(
         repository=source_workdir.name,
