@@ -684,6 +684,18 @@ def _contract_adjusted_result(
         }
     )
     try:
+        raw_returncode = metadata.get("returncode")
+        if raw_returncode not in (None, ""):
+            try:
+                returncode = int(raw_returncode)
+            except (TypeError, ValueError) as exc:
+                raise ReviewContractError(
+                    f"review backend returned malformed exit code: {raw_returncode!r}"
+                ) from exc
+            if returncode != 0:
+                raise ReviewContractError(
+                    f"review backend exited with {returncode}"
+                )
         _verify_controller_workspace(ctx, request)
         validated = validate_review_response(result.output or "", request)
         raw_receipts = metadata.get("_controller_command_receipts") or []
@@ -1132,6 +1144,10 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
                         "_controller_command_receipts": result.metadata.get(
                             f"shadow_{shadow.backend}_gate_command_receipts",
                             [],
+                        ),
+                        "returncode": result.metadata.get(
+                            f"shadow_{shadow.backend}_gate_returncode",
+                            "",
                         ),
                     },
                 ),

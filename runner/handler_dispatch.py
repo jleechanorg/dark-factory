@@ -598,11 +598,19 @@ def _build_controller_codex_transport(args: list[str]) -> list[str]:
             if mode != "read-only":
                 raise ValueError("controller transport requires read-only codex sandboxing")
 
-    # Construct transport starting with `codex` binary, stripping any outer
-    # `sandbox-exec` wrapper so `codex exec --sandbox read-only` runs natively
-    # without triggering nested seatbelt sandbox_apply failures on macOS.
-    return [
-        "codex",
+    # Preserve an outer wrapper when it carries a path-specific denial. Native
+    # Codex read-only mode is complementary: it limits Codex's own operations
+    # while the outer wrapper continues to deny the sealed holdout paths. A
+    # permissive test/development wrapper has no isolation value and is
+    # intentionally removed to avoid nested sandbox setup failures.
+    outer = prepared[:codex_index]
+    path_denial = any(
+        "(deny file-read*" in value or value.startswith("DENY_PATHS=")
+        for value in outer
+    )
+    executable = prepared[codex_index] if path_denial else "codex"
+    return (outer if path_denial else []) + [
+        executable,
         "exec",
         "--json",
         "--ephemeral",
