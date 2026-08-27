@@ -194,8 +194,9 @@ def test_cli_ao_worktree_symlink_parent_rejected_before_snapshot(
     tmp_path: Path, monkeypatch
 ) -> None:
     """CLI AO worktree ingestion must retain aliases for the lexical guard."""
-    import runner.handler_parallel_reviewer as reviewer
+    from runner import handlers
     from runner.__main__ import main
+    from runner.handler_core import Result
 
     repo, _base, _head = _repo(tmp_path)
     alias_parent = tmp_path / "ao-alias"
@@ -204,14 +205,18 @@ def test_cli_ao_worktree_symlink_parent_rejected_before_snapshot(
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
-    snapshot_attempted = False
+    head_lookup_attempted = False
 
-    def unexpected_snapshot(*args, **kwargs):
-        nonlocal snapshot_attempted
-        snapshot_attempted = True
-        raise AssertionError("symlinked AO worktree reached snapshot creation")
+    def worker(node, ctx):
+        return Result(outcome="success", output="worker complete")
 
-    monkeypatch.setattr(reviewer, "_controller_snapshot", unexpected_snapshot)
+    def unexpected_head(*args, **kwargs):
+        nonlocal head_lookup_attempted
+        head_lookup_attempted = True
+        raise AssertionError("symlinked AO worktree reached a Git HEAD lookup")
+
+    monkeypatch.setitem(handlers.TYPE_REGISTRY, "codergen", worker)
+    monkeypatch.setattr(handlers, "_worktree_head_sha", unexpected_head)
     result = main(
         [
             "--goal",
@@ -229,4 +234,4 @@ def test_cli_ao_worktree_symlink_parent_rejected_before_snapshot(
     )
 
     assert result != 0
-    assert snapshot_attempted is False
+    assert head_lookup_attempted is False

@@ -673,6 +673,22 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
     return create_review_request(inputs)
 
 
+def _validated_controller_source(ctx: "Context") -> pathlib.Path:
+    """Validate the raw controller source before reading its Git HEAD."""
+    import runner.handlers as _handlers_shim
+
+    from .review_controller import ReviewContractError, validate_workspace_path
+
+    raw_source = _handlers_shim._target_worktree(ctx)
+    try:
+        return validate_workspace_path(
+            str(raw_source),
+            holdout_roots=tuple(_holdout_root_strings()),
+        )
+    except ReviewContractError as exc:
+        raise ValueError(f"controller review source is not immutable: {exc}") from exc
+
+
 def _holdout_root_strings() -> list[str]:
     """Return the sealed holdout roots that the controller must reject."""
     from .handler_sandbox import _holdout_denied_paths
@@ -1202,8 +1218,8 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
                 "review_contract_status": "fixture",
             },
         )
-    target_dir = _handlers_shim._target_worktree(ctx)
-    expected_sha = _handlers_shim._worktree_head_sha(target_dir)
+    target_dir = None
+    expected_sha = ""
 
     request = None
     controller_read_only_path = None
@@ -1215,6 +1231,10 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
                 metadata={"review_contract_status": "unknown"},
             )
         try:
+            # The lexical source guard must run before any target-owned Git
+            # lookup. Canonicalize only after that validation succeeds.
+            target_dir = _validated_controller_source(ctx)
+            expected_sha = _handlers_shim._worktree_head_sha(target_dir)
             request = _controller_review_request(node, ctx, expected_sha)
             expected_sha = request.head_sha
             _, controller_read_only_path = _controller_target_for_transport(request)
@@ -1242,6 +1262,8 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
         # requires this).
         prompt = request.prompt
     else:
+        target_dir = _handlers_shim._target_worktree(ctx)
+        expected_sha = _handlers_shim._worktree_head_sha(target_dir)
         prompt = _handlers_shim._render_prompt(node, ctx)
     backend, backend_meta = _resolve_gate_backend(node, ctx)
 
