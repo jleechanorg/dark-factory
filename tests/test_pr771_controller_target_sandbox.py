@@ -22,6 +22,7 @@ from runner.handler_sandbox import (
 from runner.handler_parallel_reviewer import _parallel_reviewer
 from runner.parser import Node
 from runner.review_controller import ReviewInputs, create_review_request
+from runner.review_controller import ReviewContractError, validate_workspace_path
 
 
 def _request(snapshot: Path):
@@ -107,6 +108,15 @@ def test_controller_runtime_rejects_symlinked_root_and_auth(tmp_path, monkeypatc
     with pytest.raises(ValueError, match="regular file"):
         _create_controller_runtime()
     assert not list(runtime_parent.iterdir())
+
+
+def test_workspace_rejects_untrusted_top_level_symlink(tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(target, target_is_directory=True)
+    with pytest.raises(ReviewContractError, match="symlink"):
+        validate_workspace_path(str(alias))
 
 
 def test_controller_runtime_cleanup_rejects_symlink_and_profile_allows_only_home(

@@ -361,9 +361,10 @@ def _reject_symlinked_workspace_components(path: Path) -> None:
     anchor = Path(absolute.anchor)
     components = absolute.relative_to(anchor).parts
     current = anchor
+    trusted_aliases = {Path("/tmp"), Path("/var"), Path("/etc")}
     for index, component in enumerate(components):
         current /= component
-        if index == 0:
+        if index == 0 and current in trusted_aliases and _path_is_symlink(current):
             continue
         if _path_is_symlink(current):
             raise ReviewContractError(
