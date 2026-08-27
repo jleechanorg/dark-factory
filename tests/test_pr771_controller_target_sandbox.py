@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import stat
+import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -63,16 +65,24 @@ def _auth_home(tmp_path: Path) -> Path:
     home = tmp_path / "home"
     auth = home / ".codex"
     auth.mkdir(parents=True, mode=0o700)
+    os.chmod(home, 0o700)
     (auth / "auth.json").write_text('{"token":"test"}\n')
     os.chmod(auth / "auth.json", 0o600)
     return home
 
 
+@pytest.fixture
+def private_tmp_path():
+    """Provide a temporary root whose full ancestry passes private-dir checks."""
+    with tempfile.TemporaryDirectory(prefix="df-controller-test-", dir=Path.home()) as root:
+        yield Path(root)
+
+
 def test_controller_runtime_is_private_and_cleans_only_its_run_dir(
-    tmp_path, monkeypatch
+    private_tmp_path, monkeypatch
 ):
-    home = _auth_home(tmp_path)
-    outside = tmp_path / "outside-sentinel"
+    home = _auth_home(private_tmp_path)
+    outside = private_tmp_path / "outside-sentinel"
     outside.write_text("preserve\n")
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     monkeypatch.delenv("CODEX_HOME", raising=False)
@@ -94,9 +104,9 @@ def test_controller_runtime_is_private_and_cleans_only_its_run_dir(
 
 
 def test_controller_runtime_repairs_current_owned_writable_factory_dir(
-    tmp_path, monkeypatch
+    private_tmp_path, monkeypatch
 ):
-    home = _auth_home(tmp_path)
+    home = _auth_home(private_tmp_path)
     factory_dir = home / ".dark-factory"
     factory_dir.mkdir(mode=0o775)
     os.chmod(factory_dir, 0o775)
@@ -112,9 +122,9 @@ def test_controller_runtime_repairs_current_owned_writable_factory_dir(
 
 
 def test_controller_runtime_rejects_writable_home_without_repair(
-    tmp_path, monkeypatch
+    private_tmp_path, monkeypatch
 ):
-    home = _auth_home(tmp_path)
+    home = _auth_home(private_tmp_path)
     os.chmod(home, 0o775)
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     monkeypatch.delenv("CODEX_HOME", raising=False)
@@ -125,9 +135,9 @@ def test_controller_runtime_rejects_writable_home_without_repair(
     assert not (home / ".dark-factory").exists()
 
 
-def test_controller_runtime_rejects_symlinked_root_and_auth(tmp_path, monkeypatch):
-    home = _auth_home(tmp_path)
-    outside = tmp_path / "outside"
+def test_controller_runtime_rejects_symlinked_root_and_auth(private_tmp_path, monkeypatch):
+    home = _auth_home(private_tmp_path)
+    outside = private_tmp_path / "outside"
     outside.mkdir()
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     monkeypatch.delenv("CODEX_HOME", raising=False)
@@ -157,10 +167,10 @@ def test_workspace_rejects_untrusted_top_level_symlink(tmp_path):
         validate_workspace_path(str(alias))
 
 
-def test_controller_runtime_uses_configured_codex_home(tmp_path, monkeypatch):
-    home = tmp_path / "home"
+def test_controller_runtime_uses_configured_codex_home(private_tmp_path, monkeypatch):
+    home = private_tmp_path / "home"
     home.mkdir(mode=0o700)
-    configured = tmp_path / "configured-codex-home"
+    configured = private_tmp_path / "configured-codex-home"
     configured.mkdir(mode=0o700)
     auth = configured / "auth.json"
     auth.write_text('{"token":"configured-source"}\n')
@@ -178,17 +188,17 @@ def test_controller_runtime_uses_configured_codex_home(tmp_path, monkeypatch):
         _cleanup_controller_runtime(runtime.run_dir)
 
 
-def test_controller_runtime_rejects_invalid_configured_codex_home(tmp_path, monkeypatch):
-    home = tmp_path / "home"
+def test_controller_runtime_rejects_invalid_configured_codex_home(private_tmp_path, monkeypatch):
+    home = private_tmp_path / "home"
     home.mkdir(mode=0o700)
-    outside = tmp_path / "outside"
+    outside = private_tmp_path / "outside"
     outside.mkdir(mode=0o700)
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "missing-codex-home"))
+    monkeypatch.setenv("CODEX_HOME", str(private_tmp_path / "missing-codex-home"))
     with pytest.raises((ValueError, FileNotFoundError)):
         _create_controller_runtime()
 
-    configured = tmp_path / "configured-codex-home"
+    configured = private_tmp_path / "configured-codex-home"
     configured.mkdir(mode=0o700)
     (configured / "auth.json").symlink_to(outside / "auth.json")
     monkeypatch.setenv("CODEX_HOME", str(configured))
@@ -198,15 +208,15 @@ def test_controller_runtime_rejects_invalid_configured_codex_home(tmp_path, monk
 
 
 def test_controller_runtime_cleanup_rejects_symlink_and_profile_allows_only_home(
-    tmp_path, monkeypatch
+    private_tmp_path, monkeypatch
 ):
-    home = _auth_home(tmp_path)
-    outside = tmp_path / "outside"
+    home = _auth_home(private_tmp_path)
+    outside = private_tmp_path / "outside"
     outside.mkdir()
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     monkeypatch.delenv("CODEX_HOME", raising=False)
     runtime = _create_controller_runtime()
-    linked = tmp_path / "linked-review"
+    linked = private_tmp_path / "linked-review"
     linked.symlink_to(runtime.run_dir, target_is_directory=True)
 
     with pytest.raises(ValueError, match="private"):
@@ -231,6 +241,9 @@ def _assert_snapshot_profile(transport: list[str], source: Path, snapshot: Path)
     assert "--sandbox" not in transport
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin", reason="graph primary write-denial profile is macOS-specific"
+)
 def test_graph_primary_uses_validated_envelope_snapshot_for_write_denial(
     tmp_path, monkeypatch
 ):
