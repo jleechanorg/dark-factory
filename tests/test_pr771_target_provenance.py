@@ -303,6 +303,45 @@ def test_snapshot_journal_rejects_symlinked_private_root(tmp_path: Path, monkeyp
         _persist_controller_snapshot_journal(ctx)
 
 
+def test_snapshot_journal_dirfd_survives_ancestor_replacement(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A parent swapped after HOME open cannot redirect the journal write."""
+    from runner.engine_run import _persist_controller_snapshot_journal
+
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    dark_factory = home / ".dark-factory"
+    (dark_factory / "runs" / "dirfd-race").mkdir(parents=True)
+    redirect = tmp_path / "redirect"
+    redirect.mkdir(mode=0o700)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    ctx = Context(
+        goal="persist",
+        workdir=tmp_path,
+        run_id="dirfd-race",
+        state={"_controller_review_snapshots": "[]"},
+    )
+    real_open = __import__("os").open
+    replaced = False
+
+    def replace_ancestor_after_home_open(path, flags, *args, **kwargs):
+        nonlocal replaced
+        fd = real_open(path, flags, *args, **kwargs)
+        if path == home and kwargs.get("dir_fd") is None and not replaced:
+            replaced = True
+            dark_factory.rename(home / ".dark-factory-original")
+            dark_factory.symlink_to(redirect, target_is_directory=True)
+        return fd
+
+    monkeypatch.setattr("runner.engine_run.os.open", replace_ancestor_after_home_open)
+
+    with pytest.raises(ValueError, match="unsafe|private"):
+        _persist_controller_snapshot_journal(ctx)
+
+    assert not (redirect / "controller-snapshot-journal.json").exists()
+
+
 @pytest.mark.parametrize(
     "discovery_error", (OSError("unavailable"), RuntimeError("missing"))
 )
