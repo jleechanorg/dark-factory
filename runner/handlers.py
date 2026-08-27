@@ -57,6 +57,8 @@ from .handler_sandbox import (
     _linux_preload_lib_path,
     _verify_linux_preload_denies,
     _linux_sandbox_prefix,
+    _linux_landlock_launcher_path,
+    _linux_controller_sandbox_prefix,
     _reset_linux_preload_verification_cache_for_tests,
     _verify_darwin_sandbox_exec,
     _reset_darwin_sandbox_verification_cache_for_tests,

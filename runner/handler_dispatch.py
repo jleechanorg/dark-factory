@@ -705,6 +705,44 @@ def _build_controller_codex_transport(
             "--dangerously-bypass-approvals-and-sandbox",
             "-",
         ]
+    if sys.platform.startswith("linux") and path_denial:
+        if read_only_path is None:
+            raise ValueError("controller Linux transport requires a read-only target path")
+        denied_paths: list[pathlib.Path] = []
+        for value in outer:
+            if value.startswith("DENY_PATHS="):
+                denied_paths.extend(
+                    pathlib.Path(item)
+                    for item in value.split("=", 1)[1].split(":")
+                    if item
+                )
+        if not denied_paths:
+            raise ValueError("controller Linux transport lacks holdout denial paths")
+        executable = prepared[codex_index]
+        resolved_executable = (
+            shutil.which(executable) if pathlib.Path(executable).name == "codex" else executable
+        ) or executable
+        landlock_prefix = _handlers_shim._linux_controller_sandbox_prefix(
+            denied_paths=denied_paths,
+            read_paths=[pathlib.Path(read_only_path)],
+            writable_paths=[pathlib.Path(writable_path)] if writable_path is not None else [],
+            executable_paths=[pathlib.Path(resolved_executable)],
+        )
+        if landlock_prefix is None:
+            raise ValueError("controller Linux Landlock isolation unavailable")
+        return landlock_prefix + [
+            executable,
+            "exec",
+            "--json",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "read-only",
+            "-",
+        ]
+    if sys.platform.startswith("linux") and not path_denial:
+        raise ValueError("controller Linux transport lacks holdout denial")
     executable = prepared[codex_index] if path_denial else "codex"
     return (outer if path_denial else []) + [
         executable,
