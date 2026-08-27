@@ -188,3 +188,45 @@ def test_default_two_node_seeds_base_before_worker_mutation(tmp_path: Path, monk
     assert envelope["target"]["base_sha"] == base
     assert envelope["target"]["base_sha"] != envelope["target"]["head_sha"]
     assert "worker.txt" in envelope["snapshots"]["changed_files"]
+
+
+def test_cli_ao_worktree_symlink_parent_rejected_before_snapshot(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """CLI AO worktree ingestion must retain aliases for the lexical guard."""
+    import runner.handler_parallel_reviewer as reviewer
+    from runner.__main__ import main
+
+    repo, _base, _head = _repo(tmp_path)
+    alias_parent = tmp_path / "ao-alias"
+    alias_parent.symlink_to(tmp_path, target_is_directory=True)
+    lexical_worktree = alias_parent / repo.name
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    snapshot_attempted = False
+
+    def unexpected_snapshot(*args, **kwargs):
+        nonlocal snapshot_attempted
+        snapshot_attempted = True
+        raise AssertionError("symlinked AO worktree reached snapshot creation")
+
+    monkeypatch.setattr(reviewer, "_controller_snapshot", unexpected_snapshot)
+    result = main(
+        [
+            "--goal",
+            "reject symlinked AO worktree",
+            "--workdir",
+            str(repo),
+            "--ao-worktree",
+            str(lexical_worktree),
+            "--backend",
+            "echo",
+            "--no-perf-log",
+            "--max-steps",
+            "10",
+        ]
+    )
+
+    assert result != 0
+    assert snapshot_attempted is False

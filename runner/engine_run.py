@@ -59,8 +59,19 @@ def _seed_controller_base_sha(ctx: Context, graph: Graph) -> None:
         return
     try:
         from .handler_core import _target_worktree
+        from .handler_sandbox import _holdout_denied_paths
+        from .review_controller import ReviewContractError, validate_workspace_path
 
-        target = _target_worktree(ctx)
+        raw_target = _target_worktree(ctx)
+        holdout_roots = tuple(
+            str(pathlib.Path(root).resolve(strict=False))
+            for root in _holdout_denied_paths()
+        )
+        # Validate the lexical path before any target-owned Git operation.
+        target = validate_workspace_path(
+            str(raw_target),
+            holdout_roots=holdout_roots,
+        )
         proc = subprocess.run(
             ["git", "-C", str(target), "rev-parse", "HEAD^{commit}"],
             capture_output=True,
@@ -68,7 +79,13 @@ def _seed_controller_base_sha(ctx: Context, graph: Graph) -> None:
             timeout=15,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError, AttributeError, TypeError):
+    except (
+        OSError,
+        subprocess.SubprocessError,
+        AttributeError,
+        TypeError,
+        ReviewContractError,
+    ):
         return
     base_sha = proc.stdout.strip().lower() if proc.returncode == 0 else ""
     if _CONTROLLER_SHA_RE.fullmatch(base_sha):

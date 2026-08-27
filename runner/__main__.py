@@ -483,7 +483,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.ao_session:
             ctx.state["ao.session"] = args.ao_session
         if args.ao_worktree:
-            ctx.state["ao.worktree"] = str(pathlib.Path(args.ao_worktree).expanduser().resolve())
+            ao_worktree = pathlib.Path(args.ao_worktree).expanduser()
+            if not ao_worktree.is_absolute():
+                ao_worktree = pathlib.Path.cwd() / ao_worktree
+            # Preserve lexical spelling so the engine's immutable workspace
+            # validation can reject symlinked parents and traversal aliases.
+            ctx.state["ao.worktree"] = str(ao_worktree)
 
         history = run(
             graph,
