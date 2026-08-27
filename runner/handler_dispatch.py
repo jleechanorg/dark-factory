@@ -722,11 +722,15 @@ def _build_controller_codex_transport(
         resolved_executable = (
             shutil.which(executable) if pathlib.Path(executable).name == "codex" else executable
         ) or executable
+        executable_path = pathlib.Path(resolved_executable)
+        runtime_paths = _handlers_shim._linux_codex_runtime_paths(executable_path)
+        if runtime_paths is None:
+            raise ValueError("controller Linux transport cannot resolve Codex runtime")
         landlock_prefix = _handlers_shim._linux_controller_sandbox_prefix(
             denied_paths=denied_paths,
-            read_paths=[pathlib.Path(read_only_path)],
+            read_paths=[pathlib.Path(read_only_path), *runtime_paths],
             writable_paths=[pathlib.Path(writable_path)] if writable_path is not None else [],
-            executable_paths=[pathlib.Path(resolved_executable)],
+            executable_paths=[executable_path],
         )
         if landlock_prefix is None:
             raise ValueError("controller Linux Landlock isolation unavailable")
