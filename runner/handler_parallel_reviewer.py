@@ -680,15 +680,12 @@ def _controller_base_sha(
 ) -> str:
     """Return the authenticated immutable base for a controller review.
 
-    A graph review may receive an explicit controller base through state (or a
-    controller-owned node attribute). If it does not, the already authenticated
-    source head is the safe base for the dirty-worker snapshot: the snapshot's
-    parent is that exact commit. Never ask the target checkout to resolve a
-    mutable branch or ref.
+    The runner captures the base before worker execution in private controller
+    state. Public graph state and DOT attributes are target-authored data and
+    must never narrow the controller's review range. Never ask the target
+    checkout to resolve a mutable branch or ref.
     """
-    raw_base = ctx.state.get("_controller_base_sha") or ctx.state.get("base_sha")
-    if raw_base is None:
-        raw_base = node.attrs.get("base_sha")
+    raw_base = ctx.state.get("_controller_base_sha")
     if raw_base is None:
         raise ValueError("controller review base SHA is unavailable")
     if not isinstance(raw_base, str):
@@ -753,11 +750,7 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
         )
     except ReviewContractError as exc:
         raise ValueError(f"controller review source is not immutable: {exc}") from exc
-    if (
-        ctx.state.get("_controller_base_sha") is None
-        and ctx.state.get("base_sha") is None
-        and node.attrs.get("base_sha") is None
-    ):
+    if ctx.state.get("_controller_base_sha") is None:
         raise ValueError("controller review base SHA is unavailable")
     source_inputs = ReviewInputs(
         repository=source_workdir.name,
@@ -821,6 +814,22 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
         declared_evidence,
         cleanup_source=raw_source_workdir,
     )
+    # Journal the snapshot before any later source re-pin can fail. The engine
+    # retries this exact entry on resume or terminal early-return paths.
+    snapshots.append(
+        {
+            "snapshot_path": str(workdir),
+            "source_worktree": str(raw_source_workdir),
+        }
+    )
+    ctx.state["_controller_review_snapshots"] = json.dumps(
+        snapshots,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    from .engine_run import _persist_controller_snapshot_journal
+
+    _persist_controller_snapshot_journal(ctx)
     source_state_after = _controller_source_state(
         source_workdir,
         excluded_untracked=excluded_untracked,
@@ -880,19 +889,6 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
     )
     ctx.state["_controller_review_source_bindings"] = json.dumps(
         source_bindings, sort_keys=True, separators=(",", ":")
-    )
-    # The engine owns final cleanup. Keep every retry's exact snapshot and its
-    # owning source worktree so no earlier snapshot is orphaned by overwrite.
-    snapshots.append(
-        {
-            "snapshot_path": str(workdir),
-            "source_worktree": str(raw_source_workdir),
-        }
-    )
-    ctx.state["_controller_review_snapshots"] = json.dumps(
-        snapshots,
-        sort_keys=True,
-        separators=(",", ":"),
     )
     base_sha = _controller_base_sha(
         node,
