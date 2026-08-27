@@ -378,7 +378,7 @@ class ControllerSnapshotTests(unittest.TestCase):
             Context(
                 goal="review worker output",
                 workdir=self.repo,
-                state={"_controller_base_sha": _git(self.repo, "rev-parse", "HEAD").strip()},
+                _controller_base_sha=_git(self.repo, "rev-parse", "HEAD").strip(),
             ),
             _git(self.repo, "rev-parse", "HEAD").strip(),
         )
@@ -418,7 +418,7 @@ class ControllerSnapshotTests(unittest.TestCase):
                 Context(
                     goal="review no-op worker output",
                     workdir=self.repo,
-                    state={"_controller_base_sha": _git(self.repo, "rev-parse", "HEAD").strip()},
+                    _controller_base_sha=_git(self.repo, "rev-parse", "HEAD").strip(),
                 ),
                 _git(self.repo, "rev-parse", "HEAD").strip(),
             )
@@ -455,7 +455,7 @@ class ControllerSnapshotTests(unittest.TestCase):
             Context(
                 goal="review worker evidence",
                 workdir=self.repo,
-                state={"_controller_base_sha": _git(self.repo, "rev-parse", "HEAD").strip()},
+                _controller_base_sha=_git(self.repo, "rev-parse", "HEAD").strip(),
             ),
             _git(self.repo, "rev-parse", "HEAD").strip(),
         )
@@ -503,7 +503,7 @@ class ControllerSnapshotTests(unittest.TestCase):
             Context(
                 goal="review ignored-only evidence",
                 workdir=self.repo,
-                state={"_controller_base_sha": _git(self.repo, "rev-parse", "HEAD").strip()},
+                _controller_base_sha=_git(self.repo, "rev-parse", "HEAD").strip(),
             ),
             _git(self.repo, "rev-parse", "HEAD").strip(),
         )
@@ -570,7 +570,7 @@ class ControllerSnapshotTests(unittest.TestCase):
             goal="review worker output",
             workdir=self.repo,
             backend="ao",
-            state={"_controller_base_sha": _git(self.repo, "rev-parse", "HEAD").strip()},
+            _controller_base_sha=_git(self.repo, "rev-parse", "HEAD").strip(),
         )
         with patch("runner.handler_parallel_reviewer._run_primary_review", _fake_primary), patch(
             "runner.handler_parallel_reviewer._contract_adjusted_result",
@@ -631,7 +631,7 @@ class ControllerSnapshotTests(unittest.TestCase):
             goal="review worker output",
             workdir=self.repo,
             backend="ao",
-            state={"_controller_base_sha": _git(self.repo, "rev-parse", "HEAD").strip()},
+            _controller_base_sha=_git(self.repo, "rev-parse", "HEAD").strip(),
         )
         ctx.state["cold_reviewer.outcome"] = "success"
         with patch("runner.handler_parallel_reviewer._run_primary_review", _fake_primary), patch(

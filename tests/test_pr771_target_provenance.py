@@ -61,7 +61,7 @@ def test_controller_base_does_not_follow_mutable_origin_main(tmp_path: Path, mon
     ctx = Context(
         goal="review worker change",
         workdir=repo,
-        state={"_controller_base_sha": base},
+        _controller_base_sha=base,
         run_id="base-provenance",
     )
 
@@ -92,6 +92,22 @@ def test_controller_review_fails_closed_without_authenticated_base(tmp_path: Pat
     ctx = Context(goal="review worker change", workdir=repo, run_id="missing-base")
 
     with pytest.raises(ValueError, match="base SHA|target head"):
+        _controller_review_request(Node(name="cold_reviewer", attrs={}), ctx, head)
+
+
+def test_controller_review_rejects_public_reserved_base_without_private_field(
+    tmp_path: Path,
+) -> None:
+    """A direct library caller cannot authenticate a base through public state."""
+    repo, base, head = _repo(tmp_path)
+    ctx = Context(
+        goal="review worker change",
+        workdir=repo,
+        state={"_controller_base_sha": base},
+        run_id="public-base-only",
+    )
+
+    with pytest.raises(ValueError, match="base SHA is unavailable"):
         _controller_review_request(Node(name="cold_reviewer", attrs={}), ctx, head)
 
 
@@ -352,7 +368,7 @@ def test_controller_review_fails_closed_when_holdout_discovery_fails(
     ctx = Context(
         goal="review worker change",
         workdir=repo,
-        state={"_controller_base_sha": base},
+        _controller_base_sha=base,
         run_id="missing-holdouts",
     )
 
@@ -431,7 +447,7 @@ def test_controller_post_review_revalidates_mutable_source_checkout(tmp_path: Pa
     ctx = Context(
         goal="review worker change",
         workdir=repo,
-        state={"_controller_base_sha": base},
+        _controller_base_sha=base,
         run_id="source-revalidation",
     )
     try:
@@ -456,7 +472,7 @@ def test_controller_post_review_revalidates_copied_untracked_file(
     ctx = Context(
         goal="review worker change",
         workdir=repo,
-        state={"_controller_base_sha": base},
+        _controller_base_sha=base,
         run_id="untracked-revalidation",
     )
     try:
@@ -484,10 +500,8 @@ def test_controller_post_review_rejects_new_untracked_product_file(
     ctx = Context(
         goal="review worker change",
         workdir=repo,
-        state={
-            "_controller_base_sha": base,
-            "evidence_paths": ["review-evidence.json"],
-        },
+        state={"evidence_paths": ["review-evidence.json"]},
+        _controller_base_sha=base,
         run_id="new-untracked-revalidation",
     )
     try:
@@ -549,7 +563,8 @@ def test_controller_post_review_revalidates_ignored_declared_evidence(
     ctx = Context(
         goal="review worker change",
         workdir=repo,
-        state={"_controller_base_sha": base, "evidence_paths": ["evidence/worker-verification.json"]},
+        state={"evidence_paths": ["evidence/worker-verification.json"]},
+        _controller_base_sha=base,
         run_id="ignored-evidence-revalidation",
     )
     try:
@@ -579,7 +594,7 @@ def test_controller_rejects_source_mutation_between_snapshot_and_binding(
     ctx = Context(
         goal="review worker change",
         workdir=repo,
-        state={"_controller_base_sha": base},
+        _controller_base_sha=base,
         run_id="snapshot-binding-race",
     )
     original_snapshot = reviewer._controller_snapshot
@@ -743,7 +758,7 @@ def test_review_persists_raw_source_for_mutation_and_engine_cleanup(
     ctx = Context(
         goal="review worker change",
         workdir=raw_repo,
-        state={"_controller_base_sha": base},
+        _controller_base_sha=base,
         run_id="raw-source-cleanup",
     )
     original_snapshot = reviewer._controller_snapshot
@@ -785,7 +800,7 @@ def test_review_persists_raw_source_for_mutation_and_engine_cleanup(
     clean_ctx = Context(
         goal="review worker change",
         workdir=raw_repo,
-        state={"_controller_base_sha": base},
+        _controller_base_sha=base,
         run_id="raw-source-engine-cleanup",
     )
     reviewer._controller_review_request(
