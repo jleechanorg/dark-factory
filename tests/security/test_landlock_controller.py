@@ -9,9 +9,11 @@ worktree and its private Codex runtime.
 from __future__ import annotations
 
 import pathlib
+import hashlib
 import shutil
 import subprocess
 import sys
+import tempfile
 
 import pytest
 
@@ -75,6 +77,38 @@ def test_landlock_launcher_builds_and_reports_kernel_support():
     assert launcher is not None
     assert launcher.is_file()
     assert launcher.stat().st_mode & 0o111
+
+
+@linux_only
+@pytest.mark.parametrize("preseed_kind", ["regular", "symlink"])
+def test_landlock_launcher_replaces_untrusted_cached_entry(tmp_path, monkeypatch, preseed_kind):
+    import runner.handler_sandbox as sandbox
+
+    cache_dir = pathlib.Path(tempfile.mkdtemp(prefix="df-landlock-cache-", dir=pathlib.Path.home()))
+    source_digest = hashlib.sha256(sandbox._LINUX_LANDLOCK_SOURCE.read_bytes()).hexdigest()
+    target = cache_dir / f"landlock-launcher-{source_digest[:16]}"
+    fake = tmp_path / "fake-launcher"
+    fake.write_text("#!/bin/sh\necho PRESEEDED\n", encoding="utf-8")
+    fake.chmod(0o700)
+    if preseed_kind == "symlink":
+        target.symlink_to(fake)
+    else:
+        target.write_bytes(fake.read_bytes())
+        target.chmod(0o700)
+
+    monkeypatch.setattr(sandbox, "_linux_landlock_cache_dir", lambda: cache_dir)
+    sandbox._reset_linux_landlock_launcher_cache_for_tests()
+    try:
+        launcher = sandbox._linux_landlock_launcher_path()
+        assert launcher == target
+        assert target.is_file() and not target.is_symlink()
+        assert target.read_bytes() != fake.read_bytes()
+        manifest = target.with_name(target.name + ".manifest")
+        assert manifest.is_file()
+        assert f"source_sha256={source_digest}" in manifest.read_text(encoding="ascii")
+    finally:
+        sandbox._reset_linux_landlock_launcher_cache_for_tests()
+        shutil.rmtree(cache_dir, ignore_errors=True)
 
 
 @linux_only

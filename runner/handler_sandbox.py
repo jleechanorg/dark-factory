@@ -575,6 +575,48 @@ def _linux_landlock_abi() -> int | None:
     return int(abi) if abi > 0 else None
 
 
+def _linux_landlock_cache_dir() -> pathlib.Path:
+    return pathlib.Path.home() / ".cache" / "dark-factory" / "agent-isolation"
+
+
+def _prepare_private_cache_dir(path: pathlib.Path) -> pathlib.Path:
+    """Create the launcher cache and tighten user-owned parents before use."""
+    path = pathlib.Path(path)
+    if not path.is_absolute():
+        raise ValueError("launcher cache path must be absolute")
+    current = pathlib.Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            current.mkdir(mode=0o700)
+            info = current.lstat()
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISDIR(info.st_mode)
+            or info.st_uid not in {0, os.getuid()}
+        ):
+            raise ValueError(f"launcher cache parent is not trusted: {current}")
+        if info.st_uid == os.getuid() and info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            current.chmod(0o700)
+    return _validate_private_dir(path)
+
+
+def _private_regular_executable(path: pathlib.Path) -> bool:
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(info.st_mode)
+        and info.st_nlink == 1
+        and info.st_uid == os.getuid()
+        and not info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        and stat.S_IMODE(info.st_mode) & stat.S_IXUSR
+    )
+
+
 def _linux_landlock_launcher_path() -> "Optional[pathlib.Path]":
     """Build and content-hash cache the kernel-enforced launcher."""
     global _linux_landlock_launcher, _linux_landlock_launcher_checked
@@ -587,24 +629,76 @@ def _linux_landlock_launcher_path() -> "Optional[pathlib.Path]":
     if compiler is None or not _LINUX_LANDLOCK_SOURCE.is_file():
         return None
     try:
-        digest = hashlib.sha256(_LINUX_LANDLOCK_SOURCE.read_bytes()).hexdigest()[:16]
-        cache_dir = pathlib.Path.home() / ".cache" / "dark-factory" / "agent-isolation"
-        cache_dir.mkdir(parents=True, exist_ok=True)
+        source_digest = hashlib.sha256(_LINUX_LANDLOCK_SOURCE.read_bytes()).hexdigest()
+        digest = source_digest[:16]
+        cache_dir = _linux_landlock_cache_dir()
+        _prepare_private_cache_dir(cache_dir)
         target = cache_dir / f"landlock-launcher-{digest}"
-        if not target.is_file():
+        manifest = target.with_name(target.name + ".manifest")
+        reusable = False
+        if _private_regular_executable(target):
+            try:
+                manifest_info = manifest.lstat()
+                manifest_text = manifest.read_text(encoding="ascii").strip().splitlines()
+                binary_digest = hashlib.sha256(target.read_bytes()).hexdigest()
+                reusable = (
+                    stat.S_ISREG(manifest_info.st_mode)
+                    and manifest_info.st_nlink == 1
+                    and manifest_info.st_uid == os.getuid()
+                    and not manifest_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                    and manifest_text == [
+                        f"source_sha256={source_digest}",
+                        f"binary_sha256={binary_digest}",
+                    ]
+                )
+            except (OSError, UnicodeError):
+                reusable = False
+        if reusable:
+            _linux_landlock_launcher = target
+            return target
+
+        temp_fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=str(cache_dir))
+        temp_path = pathlib.Path(temp_name)
+        manifest_temp = cache_dir / f".{manifest.name}.{os.getpid()}"
+        try:
+            os.close(temp_fd)
+            temp_path.chmod(0o700)
             proc = subprocess.run(
-                [compiler, "-O2", "-Wall", "-Wextra", "-o", str(target), str(_LINUX_LANDLOCK_SOURCE)],
+                [compiler, "-O2", "-Wall", "-Wextra", "-o", str(temp_path), str(_LINUX_LANDLOCK_SOURCE)],
                 capture_output=True,
                 text=True,
                 timeout=30,
                 check=False,
             )
-            if proc.returncode != 0 or not target.is_file():
+            if proc.returncode != 0 or not _private_regular_executable(temp_path):
                 return None
-            target.chmod(0o700)
-        _linux_landlock_launcher = target
-        return target
-    except (OSError, subprocess.SubprocessError):
+            binary_digest = hashlib.sha256(temp_path.read_bytes()).hexdigest()
+            manifest_temp_fd = os.open(
+                manifest_temp,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            try:
+                os.write(
+                    manifest_temp_fd,
+                    f"source_sha256={source_digest}\nbinary_sha256={binary_digest}\n".encode("ascii"),
+                )
+                os.fsync(manifest_temp_fd)
+            finally:
+                os.close(manifest_temp_fd)
+            os.replace(temp_path, target)
+            os.replace(manifest_temp, manifest)
+            if not _private_regular_executable(target):
+                return None
+            _linux_landlock_launcher = target
+            return target
+        finally:
+            for stale in (temp_path, manifest_temp):
+                try:
+                    stale.unlink()
+                except FileNotFoundError:
+                    pass
+    except (OSError, ValueError, subprocess.SubprocessError):
         return None
 
 
