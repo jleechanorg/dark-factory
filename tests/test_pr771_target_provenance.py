@@ -11,6 +11,7 @@ import pytest
 from runner.handler_core import Context, _target_worktree
 from runner.handler_parallel_reviewer import (
     _controller_review_request,
+    _controller_snapshot,
     _controller_snapshot_root,
     _verify_controller_workspace,
 )
@@ -175,6 +176,35 @@ def test_controller_post_review_revalidates_copied_untracked_file(
         _cleanup_snapshots(repo, ctx)
 
 
+def test_controller_post_review_revalidates_ignored_declared_evidence(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Ignored declared evidence remains bound and cannot change after review."""
+    repo, base, head = _repo(tmp_path)
+    (repo / ".gitignore").write_text("evidence/\n")
+    evidence = repo / "evidence" / "worker-verification.json"
+    evidence.parent.mkdir()
+    evidence.write_text('{"status":"pass"}\n')
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    monkeypatch.setenv("HOME", str(home))
+    ctx = Context(
+        goal="review worker change",
+        workdir=repo,
+        state={"base_sha": base, "evidence_paths": ["evidence/worker-verification.json"]},
+        run_id="ignored-evidence-revalidation",
+    )
+    try:
+        request = _controller_review_request(
+            Node(name="cold_reviewer", attrs={}), ctx, head
+        )
+        evidence.write_text('{"status":"changed"}\n')
+        with pytest.raises(ValueError, match="source checkout changed"):
+            _verify_controller_workspace(ctx, request)
+    finally:
+        _cleanup_snapshots(repo, ctx)
+
+
 @pytest.mark.parametrize("untracked", [False, True])
 def test_controller_rejects_source_mutation_between_snapshot_and_binding(
     tmp_path: Path, monkeypatch, untracked: bool
@@ -210,6 +240,39 @@ def test_controller_rejects_source_mutation_between_snapshot_and_binding(
     with pytest.raises(ValueError, match="changed during snapshot creation"):
         _controller_review_request(Node(name="cold_reviewer", attrs={}), ctx, head)
     assert not captured["snapshot"].exists()
+
+
+def test_cleanup_skips_git_when_source_ancestor_becomes_symlink(tmp_path: Path, monkeypatch):
+    """Cleanup must not hand Git a source path whose parent was swapped."""
+    from runner.engine_run import _cleanup_controller_snapshot
+
+    repo, _base, head = _repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    snapshot = _controller_snapshot(repo, head, ())[0]
+    alias_parent = tmp_path / "alias"
+    alias_parent.symlink_to(tmp_path, target_is_directory=True)
+    source_alias = alias_parent / repo.name
+    monkeypatch.setattr(
+        "runner.handler_sandbox._holdout_denied_paths", lambda: []
+    )
+    calls: list[list[str]] = []
+
+    def unexpected_git(command, **kwargs):
+        calls.append(command)
+        raise AssertionError("cleanup invoked Git with a symlinked source ancestor")
+
+    monkeypatch.setattr("runner.engine_run.subprocess.run", unexpected_git)
+    state = {
+        "_controller_review_snapshots": json.dumps(
+            [{"snapshot_path": str(snapshot), "source_worktree": str(source_alias)}]
+        )
+    }
+    _cleanup_controller_snapshot(Context(goal="", workdir=repo, state=state))
+
+    assert calls == []
+    assert snapshot.exists()
 
 
 def test_default_two_node_seeds_base_before_worker_mutation(tmp_path: Path, monkeypatch) -> None:

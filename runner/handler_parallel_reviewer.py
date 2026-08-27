@@ -112,6 +112,7 @@ def _controller_source_state(
     source: pathlib.Path,
     untracked_paths: tuple[str, ...] | None = None,
     excluded_untracked: tuple[str, ...] = (),
+    declared_evidence_paths: tuple[str, ...] = (),
 ) -> dict[str, object]:
     """Capture tracked/index and copied-untracked source state.
 
@@ -123,6 +124,7 @@ def _controller_source_state(
     """
     head = _git_output(source, "rev-parse", "HEAD^{commit}").lower()
     diff = _git_output(source, "diff", "--no-ext-diff", "--binary", "HEAD", allow_empty=True)
+    declared = set(declared_evidence_paths)
     if untracked_paths is None:
         raw_untracked = _git_output(
             source, "ls-files", "--others", "--exclude-standard", "-z", allow_empty=True
@@ -138,7 +140,11 @@ def _controller_source_state(
         if relative.is_absolute() or ".." in relative.parts:
             raise ValueError(f"unsafe worker path: {raw_path}")
         normalized = relative.as_posix()
-        if normalized in excluded or _CONTROLLER_TASK_ARTIFACT_RE.fullmatch(normalized):
+        if (
+            normalized in declared
+            or normalized in excluded
+            or _CONTROLLER_TASK_ARTIFACT_RE.fullmatch(normalized)
+        ):
             continue
         path = source.joinpath(*relative.parts)
         resolved = path.resolve()
@@ -157,10 +163,34 @@ def _controller_source_state(
             }
         )
     untracked.sort(key=lambda item: str(item["path"]))
+    evidence: list[dict[str, object]] = []
+    for raw_path in declared_evidence_paths:
+        relative = pathlib.PurePosixPath(raw_path)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"declared evidence escapes the workspace: {raw_path}")
+        normalized = relative.as_posix()
+        path = source.joinpath(*relative.parts)
+        resolved = path.resolve()
+        try:
+            resolved.relative_to(source_root)
+        except ValueError as exc:
+            raise ValueError(f"declared evidence escapes the workspace: {normalized}") from exc
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"declared evidence is not a regular file: {normalized}")
+        data = path.read_bytes()
+        evidence.append(
+            {
+                "path": normalized,
+                "size_bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+        )
+    evidence.sort(key=lambda item: str(item["path"]))
     return {
         "head_sha": head,
         "diff_sha256": hashlib.sha256(diff.encode("utf-8", "surrogateescape")).hexdigest(),
         "untracked_files": untracked,
+        "declared_evidence": evidence,
     }
 
 
@@ -753,14 +783,18 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
     # the later binding, leaving the reviewer with a stale target.
     excluded_untracked = _controller_owned_source_paths(ctx, source_workdir)
     source_state_before = _controller_source_state(
-        source_workdir, excluded_untracked=excluded_untracked
+        source_workdir,
+        excluded_untracked=excluded_untracked,
+        declared_evidence_paths=declared_evidence,
     )
     source_fingerprint_before = _controller_source_state_fingerprint(source_state_before)
     workdir, expected_sha, evidence_origin = _controller_snapshot(
         source_workdir, source_head_sha, declared_evidence
     )
     source_state_after = _controller_source_state(
-        source_workdir, excluded_untracked=excluded_untracked
+        source_workdir,
+        excluded_untracked=excluded_untracked,
+        declared_evidence_paths=declared_evidence,
     )
     source_fingerprint_after = _controller_source_state_fingerprint(source_state_after)
     if source_fingerprint_before != source_fingerprint_after:
@@ -769,17 +803,22 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
         # safer than handing Git a path that now resolves elsewhere.
         try:
             trusted_root = _controller_snapshot_root()
+            from .review_controller import validate_workspace_path
+
+            trusted_source = validate_workspace_path(
+                str(source_workdir),
+                holdout_roots=tuple(_holdout_root_strings()),
+            )
             if (
                 workdir.parent != trusted_root
                 or workdir.is_symlink()
-                or source_workdir.is_symlink()
             ):
                 raise ValueError("controller snapshot cleanup target is unsafe")
             subprocess.run(
                 [
                     "git",
                     "-C",
-                    str(source_workdir),
+                    str(trusted_source),
                     "worktree",
                     "remove",
                     "--force",
@@ -806,6 +845,7 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
             "fingerprint": source_fingerprint_before,
             "untracked_files": source_state_before["untracked_files"],
             "excluded_untracked_files": list(excluded_untracked),
+            "declared_evidence": source_state_before["declared_evidence"],
         }
     )
     ctx.state["_controller_review_source_bindings"] = json.dumps(
@@ -1019,11 +1059,13 @@ def _verify_controller_workspace(ctx: "Context", request) -> None:
                     "fingerprint",
                     "untracked_files",
                     "excluded_untracked_files",
+                    "declared_evidence",
                 }
                 or not isinstance(binding["source_worktree"], str)
                 or not isinstance(binding["fingerprint"], str)
                 or not isinstance(binding["untracked_files"], list)
                 or not isinstance(binding["excluded_untracked_files"], list)
+                or not isinstance(binding["declared_evidence"], list)
             ):
                 raise ReviewContractError("controller source binding state is malformed")
             try:
@@ -1047,8 +1089,22 @@ def _verify_controller_workspace(ctx: "Context", request) -> None:
                 excluded = tuple(binding["excluded_untracked_files"])
                 if any(not isinstance(item, str) for item in excluded):
                     raise ReviewContractError("controller source binding state is malformed")
+                declared_evidence: list[str] = []
+                for item in binding["declared_evidence"]:
+                    if (
+                        not isinstance(item, dict)
+                        or set(item) != {"path", "size_bytes", "sha256"}
+                        or not isinstance(item["path"], str)
+                        or not isinstance(item["size_bytes"], int)
+                        or not isinstance(item["sha256"], str)
+                    ):
+                        raise ReviewContractError("controller source binding state is malformed")
+                    declared_evidence.append(item["path"])
                 observed_state = _controller_source_state(
-                    source, tuple(expected_files), excluded
+                    source,
+                    tuple(expected_files),
+                    excluded,
+                    tuple(declared_evidence),
                 )
                 observed = hashlib.sha256(
                     json.dumps(

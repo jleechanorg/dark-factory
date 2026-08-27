@@ -256,6 +256,8 @@ def _cleanup_controller_snapshot(ctx: Context) -> None:
     # symlink, skip cleanup rather than handing that path to Git.
     try:
         from .handler_parallel_reviewer import _controller_snapshot_root
+        from .handler_sandbox import _holdout_denied_paths
+        from .review_controller import validate_workspace_path
 
         root = _controller_snapshot_root()
     except (OSError, RuntimeError, ValueError):
@@ -291,6 +293,13 @@ def _cleanup_controller_snapshot(ctx: Context) -> None:
         except OSError:
             continue
         try:
+            # Validate the complete lexical source path immediately before
+            # every Git operation. Checking only ``source.is_symlink()`` would
+            # miss an ancestor being swapped to a symlink.
+            source = validate_workspace_path(
+                str(source),
+                holdout_roots=tuple(str(path) for path in _holdout_denied_paths()),
+            )
             remove_result = subprocess.run(
                 [
                     "git",
@@ -325,7 +334,7 @@ def _cleanup_controller_snapshot(ctx: Context) -> None:
                 timeout=30,
                 check=False,
             )
-        except (OSError, RuntimeError, subprocess.SubprocessError):
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
             # Cleanup is best-effort and must never mask the terminal result.
             continue
 
