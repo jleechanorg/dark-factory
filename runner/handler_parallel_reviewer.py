@@ -51,6 +51,20 @@ if TYPE_CHECKING:
 
 _LANE_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 _CONTROLLER_TASK_ARTIFACT_RE = re.compile(r"^\.dark-factory/agy-task-[^/]+\.md$")
+_CONTROLLER_FIXTURE_STATE = "_df_controller_fixture"
+
+
+def _controller_fixture_enabled(node: "Node", ctx: "Context") -> bool:
+    """Allow synthetic cold-review results only for an explicit test fixture.
+
+    Both the graph marker and the exact state token are required. Production
+    graphs do not carry the marker, and ordinary run state cannot accidentally
+    turn an echo/mock backend into a controller acceptance path.
+    """
+    return (
+        str(node.attrs.get("test_fixture", "")).strip().lower() == "true"
+        and ctx.state.get(_CONTROLLER_FIXTURE_STATE) == "cold-review-v1"
+    )
 
 
 def lane_output_dir(neutral_cwd: pathlib.Path, lane: str) -> pathlib.Path:
@@ -906,7 +920,7 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     """Run parallel reviewer lanes and pass combined evidence downstream."""
     import runner.handlers as _handlers_shim  # late-bound shim for monkeypatched helpers
     review_contract = str(node.attrs.get("review_contract") or "").strip()
-    if ctx.backend in ("echo", "mock_llm"):
+    if not review_contract and ctx.backend in ("echo", "mock_llm"):
         hint = ctx.state.get(f"{node.name}.outcome", "success")
         return Result(
             outcome=hint,
@@ -916,6 +930,20 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
                 "verdict": "echo:" + str(hint),
                 "reviewer_backend": str(ctx.backend),
                 "parallel_reviewer": "echo",
+            },
+        )
+    if review_contract == "cold-review-v1" and _controller_fixture_enabled(node, ctx):
+        hint = ctx.state.get(f"{node.name}.outcome", "success")
+        return Result(
+            outcome=hint,
+            output=f"fixture parallel reviewer {node.name}: pre-seeded {hint}",
+            metadata={
+                "slash_command": node.name,
+                "verdict": "fixture:" + str(hint),
+                "reviewer_backend": str(ctx.backend),
+                "parallel_reviewer": "fixture",
+                "review_contract": review_contract,
+                "review_contract_status": "fixture",
             },
         )
     target_dir = _handlers_shim._target_worktree(ctx)

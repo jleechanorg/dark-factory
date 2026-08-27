@@ -50,17 +50,12 @@ def _stub_mode_requested() -> bool:
     )
 
 
-# Echo and mock_llm are deterministic fixtures used by tests and conformance
-# lanes. Every other backend is treated as real review traffic and fails closed
-# if a stub-mode environment attempts to turn PASS into an acceptance result.
-_FIXTURE_BACKENDS: frozenset[str] = frozenset({"echo", "mock_llm"})
-
 _SOURCE_ROOT = Path(__file__).resolve().parents[1]
 _TEMPLATE_PATH = (
     _SOURCE_ROOT / "prompts" / "catalog" / "controller_cold_review_v1.md"
 )
 _EXPECTED_TEMPLATE_SHA256 = (
-    "d80ae48a43ae877ed8a2991af8e102e674eb491468028d69bef5e767aa324353"
+    "552b4c2cbd4b4211a9595f1b3ff7d9bdb766dce1511f12858cd7c8efd39174c8"
 )
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -164,6 +159,9 @@ class ExecutionReceipt:
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+_EMPTY_OUTPUT_SHA256 = _sha256(b"")
 
 
 def _reject_json_constant(value: str) -> None:
@@ -776,15 +774,30 @@ def validate_review_response(
     for key in expected_keys - {"verdict"}:
         if not isinstance(payload[key], list):
             raise ReviewContractError(f"review response field {key} must be an array")
+        if any(
+            not isinstance(value, str) or not value.strip()
+            for value in payload[key]
+        ):
+            raise ReviewContractError(
+                f"review response field {key} array entries must be non-empty strings"
+            )
     if verdict not in ("pass", "fail"):
         raise ReviewContractError("verdict must be lowercase pass or fail")
     commands_executed = tuple(payload["commands_executed"])
     if verdict == "pass":
+        if payload["findings"]:
+            raise ReviewContractError("pass requires empty findings")
+        if payload["caveats"]:
+            raise ReviewContractError("pass requires empty caveats")
+        try:
+            evidence_manifest = json.loads(request.envelope_json).get("evidence")
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ReviewContractError("pass requires a non-empty evidence manifest") from exc
+        if not isinstance(evidence_manifest, list) or not evidence_manifest:
+            raise ReviewContractError("pass requires a non-empty evidence manifest")
         for key in ("evidence_checked", "commands_executed"):
             values = payload[key]
-            if not values or any(
-                not isinstance(value, str) or not value.strip() for value in values
-            ):
+            if not values:
                 raise ReviewContractError(
                     f"pass requires meaningful {key} entries"
                 )
@@ -867,9 +880,12 @@ def validate_execution_receipts(
             )
     if review.verdict != "pass":
         return
-    if not receipts or not any(receipt.exit_code == 0 for receipt in receipts):
+    if not receipts or not any(
+        receipt.exit_code == 0 and receipt.output_sha256 != _EMPTY_OUTPUT_SHA256
+        for receipt in receipts
+    ):
         raise ReviewContractError(
-            "pass requires at least one successful command receipt"
+            "pass requires at least one successful command receipt with non-empty output"
         )
 
 
@@ -881,22 +897,17 @@ def ensure_review_pass_allowed(
 ) -> None:
     """Reject synthetic PASS results at every real controller acceptance seam.
 
-    The stub-mode rejection only fires for *real* backend traffic. Echo and
-    ``mock_llm`` are deterministic fixtures used by unit tests and conformance
-    lanes; refusing PASS for those would block fixture-only test suites from
-    exercising the controller contract. The ``execution_path`` argument lets
-    callers record which acceptance seam is invoking the check (CLI binary,
-    graph lane, or fixture) and the ``backend`` argument identifies which
-    reviewer lane produced the verdict. Both are recorded in the diagnostic
-    so a regression report shows exactly which seam rejected the verdict.
+    The stub-mode rejection applies to every backend. A fixture must opt into
+    the explicit ``execution_path="fixture"`` seam; backend names alone never
+    turn synthetic output into an accepted controller verdict. The
+    ``execution_path`` and ``backend`` arguments identify the acceptance seam
+    in diagnostics.
     """
     if not isinstance(review, ValidatedReview):
         raise TypeError("review must be a ValidatedReview")
     if review.verdict != "pass":
         return
     if not _stub_mode_requested():
-        return
-    if backend in _FIXTURE_BACKENDS:
         return
     if execution_path == "fixture":
         return
@@ -946,10 +957,8 @@ def run_controller_review(
     ``runner.handler_parallel_reviewer`` route through this function so they
     cannot diverge on shape or digest handling.
 
-    ``execution_path`` and ``backend`` flow into :func:`ensure_review_pass_allowed`
-    so a fixture-backed call (deterministic echo / mock_llm) can declare that
-    fact and skip the stub-mode PASS rejection that exists only to prevent
-    real CLI / graph lanes from accepting synthetic PASS verdicts.
+    ``execution_path`` and ``backend`` flow into :func:`ensure_review_pass_allowed`;
+    only an explicit fixture execution path can skip stub-mode PASS rejection.
     """
     import subprocess
 

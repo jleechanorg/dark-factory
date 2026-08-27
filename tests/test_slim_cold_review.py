@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 from dataclasses import replace
@@ -12,6 +13,7 @@ from test_review_controller import _inputs
 
 from runner.review_controller import (
     CHECK_IDS,
+    EvidenceArtifact,
     ExecutionReceipt,
     ReviewContractError,
     create_review_request,
@@ -57,6 +59,8 @@ def test_compact_contract_has_no_checklist_or_controller_hash_echoes() -> None:
         "continue",
     ):
         assert phrase in request.prompt_payload.lower()
+    assert "base64-decode" in request.prompt_payload.lower()
+    assert "utf-8" in request.prompt_payload.lower()
 
 
 def test_compact_response_is_strict_json_with_empty_checks_compatibility() -> None:
@@ -72,6 +76,36 @@ def test_pass_requires_meaningful_evidence_and_commands() -> None:
     response = _compact_response(evidence_checked=[], commands_executed=[])
     with pytest.raises(ReviewContractError, match="pass requires"):
         validate_review_response(response, request)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("findings", "caveats"),
+)
+def test_pass_rejects_semantic_content_in_findings_or_caveats(field: str) -> None:
+    request = create_review_request(_inputs())
+    with pytest.raises(ReviewContractError, match=f"pass requires empty {field}"):
+        validate_review_response(
+            _compact_response(**{field: ["BLOCKER: unresolved defect"]}), request
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("findings", "evidence_checked", "commands_executed", "caveats"),
+)
+def test_response_arrays_require_nonempty_strings(field: str) -> None:
+    request = create_review_request(_inputs())
+    with pytest.raises(ReviewContractError, match="array entries"):
+        validate_review_response(_compact_response(**{field: [""]}), request)
+    with pytest.raises(ReviewContractError, match="array entries"):
+        validate_review_response(_compact_response(**{field: [None]}), request)
+
+
+def test_pass_requires_nonempty_controller_evidence_manifest() -> None:
+    request = create_review_request(replace(_inputs(), evidence=()))
+    with pytest.raises(ReviewContractError, match="evidence manifest"):
+        validate_review_response(_compact_response(), request)
 
 
 def test_pass_requires_a_captured_successful_command_receipt() -> None:
@@ -104,6 +138,20 @@ def test_pass_uses_authoritative_receipts_with_human_command_summary() -> None:
     validate_execution_receipts(receipts, validated)
 
 
+def test_pass_rejects_successful_receipt_with_empty_output_digest() -> None:
+    request = create_review_request(_inputs())
+    validated = validate_review_response(_compact_response(), request)
+    receipts = (
+        ExecutionReceipt(
+            command="true",
+            exit_code=0,
+            output_sha256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ),
+    )
+    with pytest.raises(ReviewContractError, match="non-empty output"):
+        validate_execution_receipts(receipts, validated)
+
+
 def test_controller_acceptance_rejects_pass_without_captured_receipt(monkeypatch) -> None:
     from runner.handler_core import Context, Result
     from runner.handler_parallel_reviewer import _contract_adjusted_result
@@ -126,9 +174,9 @@ def test_controller_acceptance_rejects_pass_without_captured_receipt(monkeypatch
 
 @pytest.mark.parametrize(
     ("backend", "expected_outcome"),
-    (("codex", "failure"), ("echo", "success"), ("mock_llm", "success")),
+    (("codex", "failure"), ("echo", "failure"), ("mock_llm", "failure")),
 )
-def test_graph_controller_stub_pass_depends_on_backend(
+def test_graph_controller_stub_pass_is_rejected_for_every_backend(
     monkeypatch, backend, expected_outcome
 ) -> None:
     from runner.handler_core import Context, Result
@@ -161,8 +209,99 @@ def test_graph_controller_stub_pass_depends_on_backend(
     )
 
     assert result.outcome == expected_outcome
-    if backend == "codex":
-        assert "stub-mode" in result.metadata["review_contract_gap"]
+    assert "stub-mode" in result.metadata["review_contract_gap"]
+
+
+@pytest.mark.parametrize("backend", ("echo", "mock_llm"))
+def test_parallel_reviewer_stub_backends_do_not_bypass_cold_review_contract(
+    tmp_path, monkeypatch, backend
+) -> None:
+    from runner.handler_core import Context, Result
+    from runner.handler_parallel_reviewer import _parallel_reviewer
+    from runner.parser import Node
+
+    request = create_review_request(_inputs())
+    node = Node(
+        name="cold_reviewer",
+        attrs={"type": "parallel_reviewer", "review_contract": "cold-review-v1"},
+    )
+    ctx = Context(
+        goal="review",
+        workdir=tmp_path,
+        backend=backend,
+        state={"cold_reviewer.outcome": "success"},
+    )
+    monkeypatch.setattr("runner.handlers._target_worktree", lambda _: tmp_path)
+    monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda _: request.head_sha)
+    monkeypatch.setattr(
+        "runner.handler_parallel_reviewer._controller_review_request",
+        lambda node, ctx, expected_sha: request,
+    )
+    monkeypatch.setattr(
+        "runner.handler_parallel_reviewer._run_primary_review",
+        lambda *args, **kwargs: Result(
+            outcome="success",
+            output=_compact_response(),
+            metadata={
+                "_controller_command_receipts": [
+                    {
+                        "command": "pytest",
+                        "exit_code": 0,
+                        "output_sha256": "1" * 64,
+                    }
+                ]
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        "runner.handler_parallel_reviewer._record_primary_output",
+        lambda node, attempt, result, seq, ctx: result,
+    )
+    monkeypatch.setattr(
+        "runner.handler_parallel_reviewer._verify_controller_workspace",
+        lambda ctx, request: None,
+    )
+
+    result = _parallel_reviewer(node, ctx)
+
+    assert result.outcome == "success"
+    assert result.metadata["review_contract_status"] == "valid"
+    assert result.metadata.get("parallel_reviewer") != "echo"
+
+
+def test_parallel_reviewer_fixture_requires_explicit_marker_and_state(tmp_path) -> None:
+    from runner.handler_core import Context
+    from runner.handler_parallel_reviewer import (
+        _controller_fixture_enabled,
+        _parallel_reviewer,
+    )
+    from runner.parser import Node
+
+    node = Node(
+        name="cold_reviewer",
+        attrs={
+            "type": "parallel_reviewer",
+            "review_contract": "cold-review-v1",
+            "test_fixture": "true",
+        },
+    )
+    assert not _controller_fixture_enabled(
+        node,
+        Context(goal="", workdir=tmp_path, backend="echo"),
+    )
+    fixture_ctx = Context(
+        goal="",
+        workdir=tmp_path,
+        backend="echo",
+        state={
+            "_df_controller_fixture": "cold-review-v1",
+            "cold_reviewer.outcome": "success",
+        },
+    )
+    assert _controller_fixture_enabled(node, fixture_ctx)
+    result = _parallel_reviewer(node, fixture_ctx)
+    assert result.outcome == "success"
+    assert result.metadata["review_contract_status"] == "fixture"
 
 
 def test_clean_worker_uses_a_detached_controller_snapshot(tmp_path, monkeypatch):
@@ -226,7 +365,13 @@ def test_controller_acceptance_binds_detached_target_and_exit_repins(
             base_sha=base,
             head_sha=head,
             tree_sha=tree,
-            evidence=(),
+            evidence=(
+                EvidenceArtifact(
+                    path="value.txt",
+                    size_bytes=6,
+                    sha256=hashlib.sha256(b"after\n").hexdigest(),
+                ),
+            ),
         )
     )
     result = _contract_adjusted_result(

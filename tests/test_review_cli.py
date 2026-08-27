@@ -105,6 +105,8 @@ def test_review_command_writes_valid_digest_bound_receipt(tmp_path, monkeypatch,
             head,
             "--task-file",
             str(task),
+            "--evidence",
+            "value.txt",
             "--output-dir",
             str(output),
             "--backend",
@@ -134,6 +136,84 @@ def test_review_command_writes_valid_digest_bound_receipt(tmp_path, monkeypatch,
     assert (output / "envelope.json").is_file()
     assert (output / "reviewer.output.md").is_file()
     assert json.loads(capsys.readouterr().out)["status"] == "valid"
+
+
+def test_review_command_rejects_pass_without_evidence_manifest(
+    tmp_path, monkeypatch, capsys
+):
+    repo, base, head = _repo(tmp_path)
+    task = tmp_path / "task.md"
+    task.write_text("Review the behavior change.", encoding="utf-8")
+    output = tmp_path / "review-output"
+    real_run = subprocess.run
+    monkeypatch.setattr(
+        "runner.review_cli._gate_subprocess_args",
+        lambda backend, prompt, ctx, timeout: ["codex", "exec", prompt],
+    )
+
+    def fake_run(command, **kwargs):
+        if command[0] == "git":
+            return real_run(command, **kwargs)
+        return subprocess.CompletedProcess(
+            command, 0, stdout=_valid_transport(kwargs["input"]), stderr=""
+        )
+
+    monkeypatch.setattr("runner.review_cli.subprocess.run", fake_run)
+    rc = main(
+        [
+            "--workdir", str(repo),
+            "--base-sha", base,
+            "--head-sha", head,
+            "--task-file", str(task),
+            "--output-dir", str(output),
+            "--backend", "codex",
+        ]
+    )
+
+    assert rc == 1
+    receipt = json.loads((output / "controller-receipt.json").read_text())
+    assert receipt["status"] == "invalid"
+    assert "evidence manifest" in receipt["contract_error"]
+    assert json.loads(capsys.readouterr().out)["status"] == "invalid"
+
+
+def test_review_command_rejects_empty_success_receipt(
+    tmp_path, monkeypatch, capsys
+):
+    repo, base, head = _repo(tmp_path)
+    task = tmp_path / "task.md"
+    task.write_text("Review the behavior change.", encoding="utf-8")
+    output = tmp_path / "review-output"
+    real_run = subprocess.run
+    monkeypatch.setattr(
+        "runner.review_cli._gate_subprocess_args",
+        lambda backend, prompt, ctx, timeout: ["codex", "exec", prompt],
+    )
+    empty_transport = _valid_transport("").replace('"3 passed"', '""')
+
+    def fake_run(command, **kwargs):
+        if command[0] == "git":
+            return real_run(command, **kwargs)
+        return subprocess.CompletedProcess(command, 0, stdout=empty_transport, stderr="")
+
+    monkeypatch.setattr("runner.review_cli.subprocess.run", fake_run)
+    rc = main(
+        [
+            "--workdir", str(repo),
+            "--base-sha", base,
+            "--head-sha", head,
+            "--task-file", str(task),
+            "--evidence", "value.txt",
+            "--output-dir", str(output),
+            "--backend", "codex",
+        ]
+    )
+
+    assert rc == 1
+    receipt = json.loads((output / "controller-receipt.json").read_text())
+    assert receipt["status"] == "invalid"
+    assert "non-empty output" in receipt["contract_error"]
+    assert json.loads(capsys.readouterr().out)["status"] == "invalid"
 
 
 def test_review_command_returns_two_for_valid_fail_verdict(
@@ -221,6 +301,7 @@ def test_review_command_rejects_pass_under_stub_env(
             "--base-sha", base,
             "--head-sha", head,
             "--task-file", str(task),
+            "--evidence", "value.txt",
             "--output-dir", str(output),
             "--backend", "codex",
         ]
