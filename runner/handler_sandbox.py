@@ -931,6 +931,30 @@ def _linux_controller_sandbox_prefix(
                 reads.append(path.resolve(strict=True))
             except (OSError, RuntimeError):
                 return None
+    # Linux resolves /etc/resolv.conf through a symlink into /run.  The
+    # controller must allow only that exact target, rather than opening the
+    # whole /run tree.  Codex 0.144.x also consults the user's config path even
+    # with a private CODEX_HOME and --ignore-user-config; grant that one file
+    # when present, never its parent directory.  Resolve both paths before
+    # adding rules so a changed or malformed symlink fails closed.
+    try:
+        resolver_target = pathlib.Path("/etc/resolv.conf").resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if not resolver_target.is_file():
+        return None
+    reads.append(resolver_target)
+    codex_config = pathlib.Path.home() / ".codex" / "config.toml"
+    try:
+        codex_config_target = codex_config.resolve(strict=True)
+    except FileNotFoundError:
+        codex_config_target = None
+    except (OSError, RuntimeError):
+        return None
+    if codex_config_target is not None:
+        if not codex_config_target.is_file():
+            return None
+        reads.append(codex_config_target)
     if any(contains(allowed, secret) for allowed in reads for secret in denied):
         return None
     for executable in executables:
