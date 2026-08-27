@@ -283,6 +283,114 @@ def test_landlock_denies_raw_openat_from_static_binary(tmp_path):
 
 
 @linux_only
+def test_landlock_allows_resolver_symlink_target_but_not_run_sibling(tmp_path):
+    """The resolver symlink target is an exact read rule, not a /run grant."""
+    launcher = _linux_landlock_launcher_path()
+    assert launcher is not None
+    resolver = pathlib.Path("/etc/resolv.conf")
+    target = resolver.resolve(strict=True)
+    sibling = target.parent / ("resolv.conf" if target.name != "resolv.conf" else "stub-resolv.conf")
+    if not sibling.is_file():
+        pytest.skip(f"resolver sibling unavailable: {sibling}")
+    work = tmp_path / "work"
+    work.mkdir()
+    sealed = tmp_path / "sealed"
+    sealed.mkdir()
+    raw_open = _compile_static_raw_open(work / "tool")
+
+    prefix = _linux_controller_sandbox_prefix(
+        denied_paths=[sealed],
+        read_paths=[work],
+        writable_paths=[],
+        executable_paths=[raw_open],
+    )
+    assert prefix is not None
+    allowed = subprocess.run(
+        _extend_pinned_launcher_command(prefix, [str(raw_open), str(resolver)]),
+        pass_fds=prefix.pass_fds,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert allowed.returncode == 0, allowed.stderr
+    prefix.close_launcher()
+
+    prefix = _linux_controller_sandbox_prefix(
+        denied_paths=[sealed],
+        read_paths=[work],
+        writable_paths=[],
+        executable_paths=[raw_open],
+    )
+    assert prefix is not None
+    denied = subprocess.run(
+        _extend_pinned_launcher_command(prefix, [str(raw_open), str(sibling)]),
+        pass_fds=prefix.pass_fds,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    prefix.close_launcher()
+    assert denied.returncode == 3, denied.stderr
+
+
+@linux_only
+def test_landlock_allows_only_codex_config_not_home_codex_parent(tmp_path):
+    """Codex's compatibility config allowance must not expose sibling files."""
+    config = pathlib.Path.home() / ".codex" / "config.toml"
+    if not config.is_file():
+        pytest.skip(f"Codex config unavailable: {config}")
+    sibling = next(
+        (
+            path
+            for path in config.parent.iterdir()
+            if path.is_file() and path != config and not path.is_symlink()
+        ),
+        None,
+    )
+    if sibling is None:
+        pytest.skip(f"No regular sibling in {config.parent}")
+    work = tmp_path / "work"
+    work.mkdir()
+    raw_open = _compile_static_raw_open(work / "tool")
+    sealed = tmp_path / "sealed"
+    sealed.mkdir()
+
+    prefix = _linux_controller_sandbox_prefix(
+        denied_paths=[sealed],
+        read_paths=[work],
+        writable_paths=[],
+        executable_paths=[raw_open],
+    )
+    assert prefix is not None
+    allowed = subprocess.run(
+        _extend_pinned_launcher_command(prefix, [str(raw_open), str(config)]),
+        pass_fds=prefix.pass_fds,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert allowed.returncode == 0, allowed.stderr
+    prefix.close_launcher()
+
+    prefix = _linux_controller_sandbox_prefix(
+        denied_paths=[sealed],
+        read_paths=[work],
+        writable_paths=[],
+        executable_paths=[raw_open],
+    )
+    assert prefix is not None
+    denied = subprocess.run(
+        _extend_pinned_launcher_command(prefix, [str(raw_open), str(sibling)]),
+        pass_fds=prefix.pass_fds,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    prefix.close_launcher()
+    assert denied.returncode == 3, denied.stderr
+
+
+@linux_only
 def test_controller_transport_denies_secret_but_allows_repo_and_runtime(tmp_path):
     workdir = tmp_path / "repo"
     workdir.mkdir()
