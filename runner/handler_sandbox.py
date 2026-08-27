@@ -359,6 +359,10 @@ def _macos_read_only_profile(
     del read_only_path
     write_rule = "(deny file-write*)"
     profile = profile.rstrip() + "\n" + write_rule + "\n"
+    # Shells and Git use /dev/null for ordinary command plumbing. It is a
+    # device sink, not a writable filesystem location; allowing it keeps the
+    # reviewer transport functional without opening any user-controlled path.
+    profile += '(allow file-write* (literal "/dev/null"))\n'
     if writable_path is not None:
         writable = _validate_private_dir(pathlib.Path(writable_path))
         escaped = str(writable).replace("\\", "\\\\").replace('"', '\\"')

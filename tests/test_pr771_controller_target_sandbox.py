@@ -128,6 +128,7 @@ def test_controller_runtime_cleanup_rejects_symlink_and_profile_allows_only_home
         writable_path=runtime.codex_home,
     )
     assert "(deny file-write*)" in profile
+    assert '(allow file-write* (literal "/dev/null"))' in profile
     assert f'(allow file-write* (subpath "{runtime.codex_home}"))' in profile
     assert str(outside) not in profile
     _cleanup_controller_runtime(runtime.run_dir)
