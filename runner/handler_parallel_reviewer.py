@@ -70,7 +70,7 @@ def _controller_snapshot_root() -> pathlib.Path:
     if not home.is_absolute() or home.is_symlink():
         raise ValueError("controller snapshot home must be a non-symlink directory")
     try:
-        home_stat = home.stat()
+        home_stat = home.lstat()
     except OSError as exc:
         raise ValueError("controller snapshot home is unavailable") from exc
     if not stat.S_ISDIR(home_stat.st_mode) or home_stat.st_uid != os.getuid():
@@ -108,23 +108,86 @@ def _controller_snapshot_root() -> pathlib.Path:
     return root
 
 
+def _controller_source_state(
+    source: pathlib.Path,
+    untracked_paths: tuple[str, ...] | None = None,
+    excluded_untracked: tuple[str, ...] = (),
+) -> dict[str, object]:
+    """Capture tracked/index and copied-untracked source state.
+
+    The runner may add new ignored/controller evidence files after review
+    starts, so only the untracked files present at snapshot binding time are
+    pinned. Each of those files is copied into the snapshot and rehashed on
+    the post-review check; a newly-created file is not silently treated as
+    product input.
+    """
+    head = _git_output(source, "rev-parse", "HEAD^{commit}").lower()
+    diff = _git_output(source, "diff", "--no-ext-diff", "--binary", "HEAD", allow_empty=True)
+    if untracked_paths is None:
+        raw_untracked = _git_output(
+            source, "ls-files", "--others", "--exclude-standard", "-z", allow_empty=True
+        )
+        paths_to_pin = tuple(filter(None, raw_untracked.split("\0")))
+    else:
+        paths_to_pin = untracked_paths
+    excluded = set(excluded_untracked)
+    untracked: list[dict[str, object]] = []
+    source_root = source.resolve()
+    for raw_path in paths_to_pin:
+        relative = pathlib.PurePosixPath(raw_path)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"unsafe worker path: {raw_path}")
+        normalized = relative.as_posix()
+        if normalized in excluded or _CONTROLLER_TASK_ARTIFACT_RE.fullmatch(normalized):
+            continue
+        path = source.joinpath(*relative.parts)
+        resolved = path.resolve()
+        try:
+            resolved.relative_to(source_root)
+        except ValueError as exc:
+            raise ValueError(f"worker path escapes the workspace: {normalized}") from exc
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"worker path is not a regular file: {normalized}")
+        data = path.read_bytes()
+        untracked.append(
+            {
+                "path": normalized,
+                "size_bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+        )
+    untracked.sort(key=lambda item: str(item["path"]))
+    return {
+        "head_sha": head,
+        "diff_sha256": hashlib.sha256(diff.encode("utf-8", "surrogateescape")).hexdigest(),
+        "untracked_files": untracked,
+    }
+
+
 def _controller_source_fingerprint(source: pathlib.Path) -> str:
-    """Hash mutable source checkout state so review cannot race worker output."""
-    digest = hashlib.sha256()
-    # Ignore newly-created untracked files here: the runner itself appends
-    # event/evidence artifacts to the worker checkout during a review. The
-    # tracked/index diff is the mutable source surface that can invalidate the
-    # snapshot and is stable across those controller-owned artifacts.
-    for args in (
-        ("rev-parse", "HEAD^{commit}"),
-        ("diff", "--no-ext-diff", "--binary", "HEAD"),
-    ):
-        output = _git_output(source, *args, allow_empty=True)
-        digest.update(" ".join(args).encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(output.encode("utf-8", "surrogateescape"))
-        digest.update(b"\0")
-    return digest.hexdigest()
+    """Hash the complete source state used by the controller snapshot."""
+    state = _controller_source_state(source)
+    return _controller_source_state_fingerprint(state)
+
+
+def _controller_source_state_fingerprint(state: dict[str, object]) -> str:
+    """Return the stable digest for a captured source state."""
+    return hashlib.sha256(
+        json.dumps(state, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _controller_owned_source_paths(ctx: "Context", source: pathlib.Path) -> tuple[str, ...]:
+    """Return exact runner-owned files that may grow during a review."""
+    source_root = source.resolve()
+    owned: set[str] = set()
+    event_path = getattr(ctx, "event_log_path", None)
+    if event_path:
+        try:
+            owned.add(pathlib.Path(event_path).resolve().relative_to(source_root).as_posix())
+        except (OSError, ValueError):
+            pass
+    return tuple(sorted(owned))
 
 
 def _controller_fixture_enabled(node: Node, ctx: Context) -> bool:
@@ -685,9 +748,51 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
         head_sha=source_head_sha,
         require_distinct=False,
     )
+    # Bind the mutable worker checkout on both sides of snapshot creation. A
+    # worker can otherwise change between the snapshot's initial Git reads and
+    # the later binding, leaving the reviewer with a stale target.
+    excluded_untracked = _controller_owned_source_paths(ctx, source_workdir)
+    source_state_before = _controller_source_state(
+        source_workdir, excluded_untracked=excluded_untracked
+    )
+    source_fingerprint_before = _controller_source_state_fingerprint(source_state_before)
     workdir, expected_sha, evidence_origin = _controller_snapshot(
         source_workdir, source_head_sha, declared_evidence
     )
+    source_state_after = _controller_source_state(
+        source_workdir, excluded_untracked=excluded_untracked
+    )
+    source_fingerprint_after = _controller_source_state_fingerprint(source_state_after)
+    if source_fingerprint_before != source_fingerprint_after:
+        # Only clean the completed snapshot while the trusted root still
+        # validates. If an attacker replaced a parent, refusing cleanup is
+        # safer than handing Git a path that now resolves elsewhere.
+        try:
+            trusted_root = _controller_snapshot_root()
+            if (
+                workdir.parent != trusted_root
+                or workdir.is_symlink()
+                or source_workdir.is_symlink()
+            ):
+                raise ValueError("controller snapshot cleanup target is unsafe")
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(source_workdir),
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(workdir),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+            pass
+        raise ValueError("controller source checkout changed during snapshot creation")
     source_bindings_raw = ctx.state.get("_controller_review_source_bindings", "[]")
     try:
         source_bindings = json.loads(source_bindings_raw)
@@ -698,7 +803,9 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
     source_bindings.append(
         {
             "source_worktree": str(source_workdir),
-            "fingerprint": _controller_source_fingerprint(source_workdir),
+            "fingerprint": source_fingerprint_before,
+            "untracked_files": source_state_before["untracked_files"],
+            "excluded_untracked_files": list(excluded_untracked),
         }
     )
     ctx.state["_controller_review_source_bindings"] = json.dumps(
@@ -906,9 +1013,17 @@ def _verify_controller_workspace(ctx: "Context", request) -> None:
         for binding in source_bindings:
             if (
                 not isinstance(binding, dict)
-                or set(binding) != {"source_worktree", "fingerprint"}
+                or set(binding)
+                != {
+                    "source_worktree",
+                    "fingerprint",
+                    "untracked_files",
+                    "excluded_untracked_files",
+                }
                 or not isinstance(binding["source_worktree"], str)
                 or not isinstance(binding["fingerprint"], str)
+                or not isinstance(binding["untracked_files"], list)
+                or not isinstance(binding["excluded_untracked_files"], list)
             ):
                 raise ReviewContractError("controller source binding state is malformed")
             try:
@@ -918,7 +1033,28 @@ def _verify_controller_workspace(ctx: "Context", request) -> None:
                     binding["source_worktree"],
                     holdout_roots=tuple(_holdout_root_strings()),
                 )
-                observed = _controller_source_fingerprint(source)
+                expected_files: list[str] = []
+                for item in binding["untracked_files"]:
+                    if (
+                        not isinstance(item, dict)
+                        or set(item) != {"path", "size_bytes", "sha256"}
+                        or not isinstance(item["path"], str)
+                        or not isinstance(item["size_bytes"], int)
+                        or not isinstance(item["sha256"], str)
+                    ):
+                        raise ReviewContractError("controller source binding state is malformed")
+                    expected_files.append(item["path"])
+                excluded = tuple(binding["excluded_untracked_files"])
+                if any(not isinstance(item, str) for item in excluded):
+                    raise ReviewContractError("controller source binding state is malformed")
+                observed_state = _controller_source_state(
+                    source, tuple(expected_files), excluded
+                )
+                observed = hashlib.sha256(
+                    json.dumps(
+                        observed_state, sort_keys=True, separators=(",", ":")
+                    ).encode("utf-8")
+                ).hexdigest()
             except (ValueError, OSError, ReviewContractError) as exc:
                 raise ReviewContractError(
                     f"controller source checkout revalidation failed: {exc}"

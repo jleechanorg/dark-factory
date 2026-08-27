@@ -150,6 +150,68 @@ def test_controller_post_review_revalidates_mutable_source_checkout(tmp_path: Pa
         _cleanup_snapshots(repo, ctx)
 
 
+def test_controller_post_review_revalidates_copied_untracked_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A copied untracked worker artifact cannot change after review starts."""
+    repo, base, head = _repo(tmp_path)
+    worker_output = repo / "worker-output.txt"
+    worker_output.write_text("before\n")
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    monkeypatch.setenv("HOME", str(home))
+    ctx = Context(
+        goal="review worker change",
+        workdir=repo,
+        state={"base_sha": base},
+        run_id="untracked-revalidation",
+    )
+    try:
+        request = _controller_review_request(Node(name="cold_reviewer", attrs={}), ctx, head)
+        worker_output.write_text("after\n")
+        with pytest.raises(ValueError, match="source checkout changed"):
+            _verify_controller_workspace(ctx, request)
+    finally:
+        _cleanup_snapshots(repo, ctx)
+
+
+@pytest.mark.parametrize("untracked", [False, True])
+def test_controller_rejects_source_mutation_between_snapshot_and_binding(
+    tmp_path: Path, monkeypatch, untracked: bool
+) -> None:
+    """Snapshot-to-binding races cannot leave a stale review target accepted."""
+    import runner.handler_parallel_reviewer as reviewer
+
+    repo, base, head = _repo(tmp_path)
+    if untracked:
+        (repo / "worker-output.txt").write_text("before\n")
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    monkeypatch.setenv("HOME", str(home))
+    ctx = Context(
+        goal="review worker change",
+        workdir=repo,
+        state={"base_sha": base},
+        run_id="snapshot-binding-race",
+    )
+    original_snapshot = reviewer._controller_snapshot
+    captured: dict[str, Path] = {}
+
+    def snapshot_then_mutate(source, expected_sha, evidence):
+        result = original_snapshot(source, expected_sha, evidence)
+        captured["snapshot"] = result[0]
+        if untracked:
+            (repo / "worker-output.txt").write_text("after\n")
+        else:
+            (repo / "value.txt").write_text("tracked race\n")
+        return result
+
+    monkeypatch.setattr(reviewer, "_controller_snapshot", snapshot_then_mutate)
+    with pytest.raises(ValueError, match="changed during snapshot creation"):
+        _controller_review_request(Node(name="cold_reviewer", attrs={}), ctx, head)
+    assert not captured["snapshot"].exists()
+
+
 def test_default_two_node_seeds_base_before_worker_mutation(tmp_path: Path, monkeypatch) -> None:
     """The production default graph binds its base before creating a review snapshot."""
     import runner.handler_parallel_reviewer as reviewer
