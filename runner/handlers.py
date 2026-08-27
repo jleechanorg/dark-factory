@@ -47,10 +47,6 @@ from .handler_sandbox import (
     _holdout_denied_paths,
     _sealed_benchmark_doc_paths,
     _macos_read_only_profile,  # noqa: F401 - public handler shim export
-    _create_controller_runtime,
-    _cleanup_controller_runtime,
-    _sandboxed_args,
-    _sandboxed_args_for_workdir,
     # Linux isolation backend (jleechan-haux) — re-exported so
     # tests/security/test_agent_isolation.py can exercise + monkeypatch
     # them the same way the macOS sandbox-exec helpers are exercised.

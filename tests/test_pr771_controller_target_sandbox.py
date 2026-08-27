@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import os
 import stat
+from pathlib import Path
 
 import pytest
 
@@ -14,15 +14,19 @@ from runner.handler_dispatch import (
     _launch_shadow_gate_review,
     _ShadowGateReview,
 )
+from runner.handler_parallel_reviewer import _parallel_reviewer
 from runner.handler_sandbox import (
     _cleanup_controller_runtime,
     _create_controller_runtime,
     _macos_read_only_profile,
 )
-from runner.handler_parallel_reviewer import _parallel_reviewer
 from runner.parser import Node
-from runner.review_controller import ReviewInputs, create_review_request
-from runner.review_controller import ReviewContractError, validate_workspace_path
+from runner.review_controller import (
+    ReviewContractError,
+    ReviewInputs,
+    create_review_request,
+    validate_workspace_path,
+)
 
 
 def _request(snapshot: Path):

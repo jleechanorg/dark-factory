@@ -256,7 +256,7 @@ def test_cleanup_skips_git_when_source_ancestor_becomes_symlink(tmp_path: Path, 
     alias_parent.symlink_to(tmp_path, target_is_directory=True)
     source_alias = alias_parent / repo.name
     monkeypatch.setattr(
-        "runner.handler_sandbox._holdout_denied_paths", lambda: []
+        "runner.handler_sandbox._holdout_denied_paths", list
     )
     calls: list[list[str]] = []
 
@@ -287,7 +287,7 @@ def test_cleanup_revalidates_source_before_prune(tmp_path: Path, monkeypatch):
     home.mkdir(mode=0o700)
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     snapshot = _controller_snapshot(repo, head, ())[0]
-    monkeypatch.setattr("runner.handler_sandbox._holdout_denied_paths", lambda: [])
+    monkeypatch.setattr("runner.handler_sandbox._holdout_denied_paths", list)
     calls: list[list[str]] = []
 
     def fake_git(command, **kwargs):
@@ -325,7 +325,7 @@ def test_snapshot_failure_skips_cleanup_after_source_parent_swap(
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
-    monkeypatch.setattr("runner.handler_sandbox._holdout_denied_paths", lambda: [])
+    monkeypatch.setattr("runner.handler_sandbox._holdout_denied_paths", list)
     real_run = reviewer.subprocess.run
     cleanup_calls: list[list[str]] = []
     swapped = False
@@ -379,7 +379,7 @@ def test_review_persists_raw_source_for_mutation_and_engine_cleanup(
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
-    monkeypatch.setattr("runner.handler_sandbox._holdout_denied_paths", lambda: [])
+    monkeypatch.setattr("runner.handler_sandbox._holdout_denied_paths", list)
 
     # The source-mutation cleanup must validate the raw spelling, not the
     # already-resolved source path used for reads and fingerprinting.

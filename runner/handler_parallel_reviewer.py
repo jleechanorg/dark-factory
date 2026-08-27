@@ -207,7 +207,7 @@ def _controller_source_state_fingerprint(state: dict[str, object]) -> str:
     ).hexdigest()
 
 
-def _controller_owned_source_paths(ctx: "Context", source: pathlib.Path) -> tuple[str, ...]:
+def _controller_owned_source_paths(ctx: Context, source: pathlib.Path) -> tuple[str, ...]:
     """Return exact runner-owned files that may grow during a review."""
     source_root = source.resolve()
     owned: set[str] = set()
@@ -671,8 +671,8 @@ def _controller_snapshot(
 
 
 def _controller_base_sha(
-    node: "Node",
-    ctx: "Context",
+    node: Node,
+    ctx: Context,
     workdir: pathlib.Path,
     source_sha: str,
     head_sha: str,
@@ -868,7 +868,7 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
     except (TypeError, json.JSONDecodeError) as exc:
         raise ValueError("controller source binding state is malformed") from exc
     if not isinstance(source_bindings, list):
-        raise ValueError("controller source binding state is malformed")
+        raise TypeError("controller source binding state is malformed")
     source_bindings.append(
         {
             "source_worktree": str(raw_source_workdir),
@@ -943,7 +943,7 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
     return create_review_request(inputs)
 
 
-def _validated_controller_source(ctx: "Context") -> pathlib.Path:
+def _validated_controller_source(ctx: Context) -> pathlib.Path:
     """Validate the raw controller source before reading its Git HEAD."""
     import runner.handlers as _handlers_shim
 
@@ -1201,13 +1201,13 @@ def _verify_controller_workspace(ctx: "Context", request) -> None:
 
 
 def _contract_adjusted_result(
-    result: "Result",
+    result: Result,
     request,
     ctx: "Context",
     *,
     lane: str,
     backend: str = "",
-) -> "Result":
+) -> Result:
     """Fail closed when a lane omits or contradicts the controller contract."""
     from .review_controller import (
         ExecutionReceipt,
@@ -1470,7 +1470,7 @@ class _MDToCtxShim:
 
 
 def _persist_controller_lane(
-    result: "Result",
+    result: Result,
     request,
     *,
     lane: str,
@@ -1479,7 +1479,7 @@ def _persist_controller_lane(
     transport_text: str = "",
     transport_argv: tuple[str, ...] = (),
     response_text: str | None = None,
-) -> "Result":
+) -> Result:
     """Persist one graph lane through the canonical controller artifact seam."""
     from .review_controller import (
         ExecutionReceipt,
@@ -1530,7 +1530,7 @@ def _persist_controller_lane(
                 from .handler_sandbox import _cleanup_controller_runtime
 
                 _cleanup_controller_runtime(pathlib.Path(runtime_root))
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - cleanup reports boundary failures
                 cleanup_error = f"{type(exc).__name__}: {exc}"
     if cleanup_error:
         metadata["controller_runtime_cleanup_error"] = cleanup_error

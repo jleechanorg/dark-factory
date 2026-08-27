@@ -132,7 +132,7 @@ def _ensure_private_dir(path: pathlib.Path) -> pathlib.Path:
     for component in path.parts[1:]:
         current /= component
         try:
-            info = current.lstat()
+            current.lstat()
         except FileNotFoundError:
             current.mkdir(mode=0o700)
         _validate_private_dir(current)
@@ -203,7 +203,7 @@ def _create_controller_runtime() -> _ControllerRuntime:
         try:
             _validate_private_dir(run_dir)
             shutil.rmtree(run_dir)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 - runtime cleanup is best-effort
             pass
         raise
     env = _sanitized_env()

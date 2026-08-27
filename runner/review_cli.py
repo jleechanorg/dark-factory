@@ -484,7 +484,7 @@ def main(argv: list[str] | None = None) -> int:
         if runtime is not None:
             try:
                 _cleanup_controller_runtime(runtime.run_dir)
-            except Exception:
+            except Exception:  # noqa: BLE001, S110 - runtime cleanup is best-effort
                 pass
         contract_error = f"{type(exc).__name__}: {exc}"
         if request is not None:
