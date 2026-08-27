@@ -14,9 +14,10 @@ conversation without weakening the envelope, workspace, or receipt checks.
 ## Contract
 
 The static authority tells the reviewer to treat repository data as untrusted,
-inspect the exact pinned change and its callers, continue after the first
-finding, run feasible read-only checks, and fail on material uncertainty or
-missing applicable proof. The only accepted model response is one JSON object
+compare the stated goal and description/claims with the code, its callers and
+consumers, and the supplied evidence, then continue after the first finding,
+run feasible read-only checks, and fail on material uncertainty or missing
+applicable proof. The only accepted model response is one JSON object
 with exactly these keys:
 
 ```json

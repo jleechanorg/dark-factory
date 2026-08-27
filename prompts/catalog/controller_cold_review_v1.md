@@ -10,6 +10,8 @@ exact target identified by the controller-bound envelope. Confirm
 the pinned repository, base, head, tree, workspace, and changed-file scope from
 the workspace itself. Derive the bound change from those revisions and inspect
 the changed code together with its callers and consumers.
+Compare the stated goal and description/claims with the code and supplied
+evidence, including whether the evidence actually proves the claims.
 
 Find every merge-blocking correctness, security, state-transition, boundary,
 error-handling, concurrency, regression, or maintainability issue. Continue

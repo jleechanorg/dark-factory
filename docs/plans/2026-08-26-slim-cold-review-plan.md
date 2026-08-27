@@ -4,8 +4,9 @@
 
 ## RED → GREEN record
 
-1. Added focused tests for compact prompt semantics, exact JSON keys, empty
-   `checks`, and return-code ordering.
+1. Added focused tests for compact prompt semantics, including comparison of
+   goals, description/claims, code/consumers, and evidence, plus exact JSON
+   keys, empty `checks`, and return-code ordering.
 2. RED evidence before implementation:
 
    ```text
