@@ -292,8 +292,11 @@ def _launch_shadow_gate_review(
             text=True,
             start_new_session=True,
             env=runtime.env if runtime is not None else _gate_subprocess_env(backend),
+            pass_fds=getattr(args, "pass_fds", ()),
         )
+        _handlers_shim._close_pinned_launcher_command(args)
     except Exception as exc:
+        _handlers_shim._close_pinned_launcher_command(args)
         if runtime is not None:
             try:
                 _handlers_shim._cleanup_controller_runtime(runtime.run_dir)
@@ -734,7 +737,7 @@ def _build_controller_codex_transport(
         )
         if landlock_prefix is None:
             raise ValueError("controller Linux Landlock isolation unavailable")
-        return landlock_prefix + [
+        return _handlers_shim._extend_pinned_launcher_command(landlock_prefix, [
             executable,
             "exec",
             "--json",
@@ -744,7 +747,7 @@ def _build_controller_codex_transport(
             "--sandbox",
             "read-only",
             "-",
-        ]
+        ])
     if sys.platform.startswith("linux") and not path_denial:
         raise ValueError("controller Linux transport lacks holdout denial")
     executable = prepared[codex_index] if path_denial else "codex"
@@ -898,6 +901,7 @@ def _run_gate_once(
             sub_args, cwd=review_cwd, capture_output=True, text=True,
             input=prompt if controller_json else None,
             timeout=run_timeout, check=False, env=sub_env,
+            pass_fds=getattr(sub_args, "pass_fds", ()),
         )
     except subprocess.TimeoutExpired as exc:
         # TimeoutExpired carries bytes for stdout/stderr even when the run
@@ -948,6 +952,8 @@ def _run_gate_once(
                       "head_sha_status": "missing", "reviewer_backend": reviewer_backend,
                       **prompt_meta},
         ))
+    finally:
+        _handlers_shim._close_pinned_launcher_command(sub_args)
     command_receipts = ()
     review_output = proc.stdout
     transport_error = ""

@@ -61,6 +61,8 @@ from .handler_sandbox import (
     _linux_landlock_abi,
     _linux_codex_runtime_paths,
     _linux_controller_sandbox_prefix,
+    _extend_pinned_launcher_command,
+    _close_pinned_launcher_command,
     _reset_linux_landlock_launcher_cache_for_tests,
     _reset_linux_preload_verification_cache_for_tests,
     _verify_darwin_sandbox_exec,

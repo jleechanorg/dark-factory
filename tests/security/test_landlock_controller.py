@@ -10,18 +10,22 @@ from __future__ import annotations
 
 import pathlib
 import hashlib
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 
 import pytest
 
 from runner.handler_dispatch import _build_controller_codex_transport
 from runner.handler_sandbox import (
+    _extend_pinned_launcher_command,
     _linux_controller_sandbox_prefix,
     _linux_codex_runtime_paths,
     _linux_landlock_launcher_path,
+    _open_verified_launcher,
     _reset_linux_landlock_launcher_cache_for_tests,
 )
 
@@ -112,6 +116,88 @@ def test_landlock_launcher_replaces_untrusted_cached_entry(tmp_path, monkeypatch
 
 
 @linux_only
+def test_pinned_launcher_survives_cached_target_replacement(tmp_path, monkeypatch):
+    import runner.handler_sandbox as sandbox
+
+    cache_dir = pathlib.Path(tempfile.mkdtemp(prefix="df-landlock-pinned-", dir=pathlib.Path.home()))
+    monkeypatch.setattr(sandbox, "_linux_landlock_cache_dir", lambda: cache_dir)
+    sandbox._reset_linux_landlock_launcher_cache_for_tests()
+    fd = None
+    try:
+        launcher = sandbox._linux_landlock_launcher_path()
+        assert launcher is not None
+        fd = _open_verified_launcher(launcher)
+        assert fd is not None
+        fake = tmp_path / "replacement"
+        fake.write_text("#!/bin/sh\necho REPLACEMENT-RAN\n", encoding="utf-8")
+        fake.chmod(0o700)
+        replaced = threading.Event()
+
+        def replace_target():
+            os.replace(fake, launcher)
+            replaced.set()
+
+        replacer = threading.Thread(target=replace_target)
+        replacer.start()
+        replacer.join()
+        assert replaced.is_set()
+
+        proc = subprocess.run(
+            [
+                f"/proc/self/fd/{fd}",
+                "--read",
+                str(tmp_path),
+                "--read",
+                "/usr",
+                "--write",
+                "/dev/null",
+                "--",
+                "/bin/true",
+            ],
+            pass_fds=(fd,),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert "REPLACEMENT-RAN" not in proc.stdout
+    finally:
+        if fd is not None:
+            os.close(fd)
+        sandbox._reset_linux_landlock_launcher_cache_for_tests()
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
+
+@linux_only
+def test_launcher_rejects_replacement_before_pinning(tmp_path, monkeypatch):
+    import runner.handler_sandbox as sandbox
+
+    cache_dir = pathlib.Path(tempfile.mkdtemp(prefix="df-landlock-publish-", dir=pathlib.Path.home()))
+    monkeypatch.setattr(sandbox, "_linux_landlock_cache_dir", lambda: cache_dir)
+    sandbox._reset_linux_landlock_launcher_cache_for_tests()
+    try:
+        launcher = sandbox._linux_landlock_launcher_path()
+        assert launcher is not None
+        fake = tmp_path / "replacement"
+        fake.write_text("#!/bin/sh\necho REPLACEMENT-RAN\n", encoding="utf-8")
+        fake.chmod(0o700)
+        ready = threading.Barrier(2)
+
+        def replace_target():
+            ready.wait()
+            os.replace(fake, launcher)
+
+        replacer = threading.Thread(target=replace_target)
+        replacer.start()
+        ready.wait()
+        replacer.join()
+        assert _open_verified_launcher(launcher) is None
+    finally:
+        sandbox._reset_linux_landlock_launcher_cache_for_tests()
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
+
+@linux_only
 def test_landlock_requires_abi_three_for_truncate_enforcement(monkeypatch):
     import runner.handler_sandbox as sandbox
 
@@ -158,7 +244,8 @@ def test_landlock_denies_raw_openat_from_static_binary(tmp_path):
     )
     assert prefix is not None
     proc = subprocess.run(
-        prefix + [str(raw_open), str(secret)],
+        _extend_pinned_launcher_command(prefix, [str(raw_open), str(secret)]),
+        pass_fds=prefix.pass_fds,
         capture_output=True,
         text=True,
         check=False,
@@ -208,6 +295,7 @@ def test_controller_transport_denies_secret_but_allows_repo_and_runtime(tmp_path
         cwd=workdir,
         env={"HOME": str(runtime), "TEST_SECRET": str(secret), "PATH": "/usr/bin:/bin"},
         input="{}\n",
+        pass_fds=transport.pass_fds,
         capture_output=True,
         text=True,
         check=False,
