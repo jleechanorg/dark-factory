@@ -87,6 +87,8 @@ class _ShadowGateReview:
     response_text: str = ""
     output_dir: pathlib.Path | None = None
     lane_name: str = ""
+    controller_runtime_root: pathlib.Path | None = None
+    controller_runtime_writable: pathlib.Path | None = None
 
 
 def _resolve_shadow_backend_env() -> str:
@@ -254,14 +256,25 @@ def _launch_shadow_gate_review(
     if args is None:
         shadow.launch_error = "sandbox-exec unavailable"
         return shadow
+    runtime = None
     if prompt_is_complete and backend == "codex":
         try:
+            runtime = _handlers_shim._create_controller_runtime()
             args = _controller_codex_args(
-                args, read_only_path=read_only_path or ctx.workdir
+                args,
+                read_only_path=read_only_path or ctx.workdir,
+                writable_path=runtime.codex_home,
             )
-        except ValueError as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
+            if runtime is not None:
+                try:
+                    _handlers_shim._cleanup_controller_runtime(runtime.run_dir)
+                except Exception:
+                    pass
             shadow.launch_error = str(exc)
             return shadow
+        shadow.controller_runtime_root = runtime.run_dir
+        shadow.controller_runtime_writable = runtime.codex_home
         shadow.json_transport = True
     shadow.transport_argv = tuple(str(arg) for arg in args)
     review_cwd = ctx.workdir
@@ -278,9 +291,14 @@ def _launch_shadow_gate_review(
             stderr=subprocess.PIPE,
             text=True,
             start_new_session=True,
-            env=_gate_subprocess_env(backend),
+            env=runtime.env if runtime is not None else _gate_subprocess_env(backend),
         )
     except Exception as exc:
+        if runtime is not None:
+            try:
+                _handlers_shim._cleanup_controller_runtime(runtime.run_dir)
+            except Exception:
+                pass
         shadow.launch_error = f"{type(exc).__name__}: {exc}"
     return shadow
 
@@ -465,6 +483,8 @@ def _finish_shadow_gate_review(
             ] if "command_receipts" in locals() else [],
         }
     )
+    if shadow.controller_runtime_root is not None:
+        metadata["_controller_runtime_root"] = str(shadow.controller_runtime_root)
     comparison = (
         "\n\n---\n\n"
         f"## Parallel {label} Gate Review\n"
@@ -587,6 +607,7 @@ def _build_controller_codex_transport(
     args: list[str],
     *,
     read_only_path: pathlib.Path | str | None = None,
+    writable_path: pathlib.Path | str | None = None,
 ) -> list[str]:
     """Build the concrete controller transport command for Codex review.
 
@@ -671,7 +692,7 @@ def _build_controller_codex_transport(
         profile_index = sandbox_index + 2
         outer = list(outer)
         outer[profile_index] = _handlers_shim._macos_read_only_profile(
-            outer[profile_index], read_only_path
+            outer[profile_index], read_only_path, writable_path
         )
         executable = prepared[codex_index]
         return outer + [
@@ -679,6 +700,7 @@ def _build_controller_codex_transport(
             "exec",
             "--json",
             "--ephemeral",
+            "--ignore-user-config",
             "--skip-git-repo-check",
             "--dangerously-bypass-approvals-and-sandbox",
             "-",
@@ -689,6 +711,7 @@ def _build_controller_codex_transport(
         "exec",
         "--json",
         "--ephemeral",
+        "--ignore-user-config",
         "--skip-git-repo-check",
         "--sandbox",
         "read-only",
@@ -701,9 +724,14 @@ def _controller_codex_args(
     args: list[str],
     *,
     read_only_path: pathlib.Path | str | None = None,
+    writable_path: pathlib.Path | str | None = None,
 ) -> list[str]:
     """Backward-compatible shim for the controller transport builder."""
-    return _build_controller_codex_transport(args, read_only_path=read_only_path)
+    return _build_controller_codex_transport(
+        args,
+        read_only_path=read_only_path,
+        writable_path=writable_path,
+    )
 
 
 def _run_gate_once(
@@ -786,15 +814,24 @@ def _run_gate_once(
             },
         )
     controller_json = backend == "codex" and controller_requested
+    runtime = None
     if controller_json:
         try:
+            runtime = _handlers_shim._create_controller_runtime()
             sub_args = _controller_codex_args(
-                sub_args, read_only_path=read_only_path or ctx.workdir
+                sub_args,
+                read_only_path=read_only_path or ctx.workdir,
+                writable_path=runtime.codex_home,
             )
-        except ValueError:
+        except (OSError, RuntimeError, ValueError) as exc:
+            if runtime is not None:
+                try:
+                    _handlers_shim._cleanup_controller_runtime(runtime.run_dir)
+                except Exception:
+                    pass
             return Result(
                 outcome="error",
-                output="controller review argv does not contain codex",
+                output=f"controller review runtime/argv setup failed: {exc}",
                 metadata={
                     "slash_command": name,
                     "verdict": "unknown",
@@ -802,6 +839,7 @@ def _run_gate_once(
                     **prompt_meta,
                 },
             )
+        sub_env = runtime.env
     shadow_review = _start_shadow_gate_review(name, prompt, expected_sha, timeout, ctx)
 
     def _finalize(result: "Result") -> "Result":
@@ -830,6 +868,11 @@ def _run_gate_once(
             return v
 
         combined = _as_text(exc.stdout) + "\n" + _as_text(exc.stderr)
+        if runtime is not None:
+            try:
+                _handlers_shim._cleanup_controller_runtime(runtime.run_dir)
+            except Exception:
+                pass
         return _finalize(Result(
             outcome="failure",
             output=combined.strip() or f"gate {name} timed out after {run_timeout}s",
@@ -838,6 +881,11 @@ def _run_gate_once(
                       "reviewer_backend": reviewer_backend, **prompt_meta},
         ))
     except FileNotFoundError as exc:
+        if runtime is not None:
+            try:
+                _handlers_shim._cleanup_controller_runtime(runtime.run_dir)
+            except Exception:
+                pass
         return _finalize(Result(
             outcome="error",
             output=f"gate {name} backend {reviewer_backend!r} not found: {exc}",
@@ -846,6 +894,11 @@ def _run_gate_once(
                       "backend_missing": "true", **prompt_meta},
         ))
     except Exception as exc:
+        if runtime is not None:
+            try:
+                _handlers_shim._cleanup_controller_runtime(runtime.run_dir)
+            except Exception:
+                pass
         return _finalize(Result(
             outcome="error",
             output=f"gate {name} subprocess failed: {exc}",
@@ -908,6 +961,7 @@ def _run_gate_once(
         # structured gate (_check_structured_receipt) via _MDToCtxShim.
         metadata["_reviewer_receipts"] = [receipt]
     if controller_json:
+        metadata["_controller_runtime_root"] = str(runtime.run_dir) if runtime is not None else ""
         metadata["_controller_command_receipts"] = [
             {
                 "command": item.command,

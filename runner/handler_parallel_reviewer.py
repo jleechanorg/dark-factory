@@ -1487,6 +1487,7 @@ def _persist_controller_lane(
     )
 
     metadata = dict(result.metadata or {})
+    runtime_root = metadata.pop("_controller_runtime_root", "")
     raw_receipts = metadata.get("_controller_command_receipts") or []
     receipts = tuple(
         ExecutionReceipt(
@@ -1506,21 +1507,33 @@ def _persist_controller_lane(
         returncode = -1
     status = str(metadata.get("review_contract_status", "invalid"))
     verdict = str(metadata.get("verdict", "unknown"))
-    paths = persist_controller_lane_artifacts(
-        request,
-        output_dir=output_dir,
-        lane=lane,
-        backend=str(metadata.get("reviewer_backend", "codex")),
-        neutral_cwd=neutral_cwd,
-        transport_argv=transport_argv,
-        transport_text=transport_text,
-        response_text=result.output if response_text is None else response_text,
-        backend_returncode=returncode,
-        status=status,
-        verdict=verdict,
-        contract_error=str(metadata.get("review_contract_gap", "")),
-        receipts=receipts,
-    )
+    cleanup_error = ""
+    try:
+        paths = persist_controller_lane_artifacts(
+            request,
+            output_dir=output_dir,
+            lane=lane,
+            backend=str(metadata.get("reviewer_backend", "codex")),
+            neutral_cwd=neutral_cwd,
+            transport_argv=transport_argv,
+            transport_text=transport_text,
+            response_text=result.output if response_text is None else response_text,
+            backend_returncode=returncode,
+            status=status,
+            verdict=verdict,
+            contract_error=str(metadata.get("review_contract_gap", "")),
+            receipts=receipts,
+        )
+    finally:
+        if runtime_root:
+            try:
+                from .handler_sandbox import _cleanup_controller_runtime
+
+                _cleanup_controller_runtime(pathlib.Path(runtime_root))
+            except Exception as exc:
+                cleanup_error = f"{type(exc).__name__}: {exc}"
+    if cleanup_error:
+        metadata["controller_runtime_cleanup_error"] = cleanup_error
     metadata.update({f"controller_{lane}_{key}_path": value for key, value in paths.items()})
     metadata[f"controller_{lane}_artifact_status"] = "persisted"
     # Raw transport is retained only long enough to reach the writer. Do not
@@ -1528,7 +1541,7 @@ def _persist_controller_lane(
     metadata.pop("_controller_transport_text", None)
     metadata.pop("_controller_transport_argv", None)
     return Result(
-        outcome=result.outcome,
+        outcome="error" if cleanup_error else result.outcome,
         output=result.output,
         metadata=metadata,
         preferred_label=result.preferred_label,

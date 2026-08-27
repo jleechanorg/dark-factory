@@ -200,7 +200,7 @@ def test_complete_controller_prompt_is_not_rewrapped_for_shadow(tmp_path, monkey
     assert "read-only" in seen[0]
     assert "--yolo" not in seen[0]
     assert "--dangerously-bypass-approvals-and-sandbox" not in seen[0]
-    assert "--ignore-user-config" not in seen[0]
+    assert "--ignore-user-config" in seen[0]
     assert "--ephemeral" in seen[0]
     assert "Normal gate prompt for comparison" not in " ".join(seen[0])
 
@@ -274,6 +274,7 @@ def test_controller_codex_args_builds_stdin_transport():
         "exec",
         "--json",
         "--ephemeral",
+        "--ignore-user-config",
         "--skip-git-repo-check",
         "--sandbox",
         "read-only",

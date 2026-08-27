@@ -80,9 +80,11 @@ import hashlib
 import os
 import pathlib
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from typing import Optional, Union
 
 
@@ -91,6 +93,141 @@ from typing import Optional, Union
 # ``visible_acceptance.md`` and ``spec.md`` are intentionally absent —
 # those are the *visible* contract the agent IS allowed to see.
 _SEALED_BENCHMARK_DOC_NAMES = ("README.md", "DESIGN.md", "SCORING.md", "SCENARIOS.md")
+
+
+@dataclass(frozen=True)
+class _ControllerRuntime:
+    """Private per-review Codex home and its exact cleanup root."""
+
+    run_dir: pathlib.Path
+    codex_home: pathlib.Path
+    env: dict[str, str]
+
+
+def _validate_private_dir(path: pathlib.Path) -> pathlib.Path:
+    """Validate an existing absolute directory without following symlinks."""
+    path = pathlib.Path(path)
+    if not path.is_absolute():
+        raise ValueError("controller runtime path must be absolute")
+    current = pathlib.Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        info = current.lstat()
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISDIR(info.st_mode)
+            or info.st_uid not in {0, os.getuid()}
+            or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise ValueError(f"controller runtime path is not private: {current}")
+    return path
+
+
+def _ensure_private_dir(path: pathlib.Path) -> pathlib.Path:
+    """Create each missing component privately, validating every result."""
+    path = pathlib.Path(path)
+    if not path.is_absolute():
+        raise ValueError("controller runtime path must be absolute")
+    current = pathlib.Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            current.mkdir(mode=0o700)
+        _validate_private_dir(current)
+    return path
+
+
+def _copy_controller_auth(source: pathlib.Path, destination: pathlib.Path) -> None:
+    """Copy one validated auth file into a fresh private Codex home."""
+    _validate_private_dir(source.parent)
+    source_info = source.lstat()
+    if source_info.st_uid != os.getuid() or stat.S_IMODE(source_info.st_mode) != 0o600:
+        raise ValueError("controller Codex auth source is not a private regular file")
+    if destination.exists() or destination.is_symlink():
+        raise ValueError("controller Codex auth destination already exists")
+    source_flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        source_flags |= os.O_NOFOLLOW
+    source_fd = os.open(source, source_flags)
+    try:
+        source_info = os.fstat(source_fd)
+        if (
+            not stat.S_ISREG(source_info.st_mode)
+            or source_info.st_uid != os.getuid()
+            or source_info.st_nlink != 1
+            or stat.S_IMODE(source_info.st_mode) != 0o600
+        ):
+            raise ValueError("controller Codex auth source is not a private regular file")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(destination, flags, 0o600)
+        try:
+            while True:
+                chunk = os.read(source_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(fd, view)
+                    view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(source_fd)
+    destination_info = destination.lstat()
+    if (
+        stat.S_ISLNK(destination_info.st_mode)
+        or not stat.S_ISREG(destination_info.st_mode)
+        or destination_info.st_uid != os.getuid()
+        or destination_info.st_nlink != 1
+        or stat.S_IMODE(destination_info.st_mode) != 0o600
+    ):
+        raise ValueError("controller Codex auth destination is not private")
+
+
+def _create_controller_runtime() -> _ControllerRuntime:
+    """Create an isolated, writable-only Codex runtime for one review."""
+    home = pathlib.Path.home()
+    parent = _ensure_private_dir(home / ".dark-factory" / "controller-runtimes")
+    run_dir = pathlib.Path(tempfile.mkdtemp(prefix="review-", dir=str(parent)))
+    try:
+        _validate_private_dir(run_dir)
+        codex_home = _ensure_private_dir(run_dir / "codex-home")
+        _ensure_private_dir(codex_home / "tmp")
+        _copy_controller_auth(home / ".codex" / "auth.json", codex_home / "auth.json")
+    except Exception:
+        try:
+            _validate_private_dir(run_dir)
+            shutil.rmtree(run_dir)
+        except Exception:
+            pass
+        raise
+    env = _sanitized_env()
+    env.update(
+        {
+            "CODEX_HOME": str(codex_home),
+            "HOME": str(codex_home),
+            "TMPDIR": str(codex_home / "tmp"),
+        }
+    )
+    return _ControllerRuntime(run_dir=run_dir, codex_home=codex_home, env=env)
+
+
+def _cleanup_controller_runtime(run_dir: pathlib.Path) -> None:
+    """Remove only an owned, validated per-review runtime directory."""
+    run_dir = _validate_private_dir(pathlib.Path(run_dir))
+    if not run_dir.name.startswith("review-"):
+        raise ValueError("controller runtime cleanup target is not a review run")
+    parent = _validate_private_dir(run_dir.parent)
+    if parent.name != "controller-runtimes":
+        raise ValueError("controller runtime cleanup parent is invalid")
+    shutil.rmtree(run_dir)
+    if run_dir.exists() or run_dir.is_symlink():
+        raise OSError("controller runtime cleanup did not remove the run directory")
 
 
 def _sanitized_env() -> dict[str, str]:
@@ -201,7 +338,9 @@ def _build_sandbox_profile(extra_denied_paths: list[pathlib.Path]) -> str:
 
 
 def _macos_read_only_profile(
-    profile: str, read_only_path: pathlib.Path | str | None = None
+    profile: str,
+    read_only_path: pathlib.Path | str | None = None,
+    writable_path: pathlib.Path | str | None = None,
 ) -> str:
     """Add the controller's read-only write boundary to an existing profile.
 
@@ -219,9 +358,12 @@ def _macos_read_only_profile(
     # not turn it into a writable exception or a weaker boundary.
     del read_only_path
     write_rule = "(deny file-write*)"
-    if write_rule in profile:
-        return profile
-    return profile.rstrip() + "\n" + write_rule + "\n"
+    profile = profile.rstrip() + "\n" + write_rule + "\n"
+    if writable_path is not None:
+        writable = _validate_private_dir(pathlib.Path(writable_path))
+        escaped = str(writable).replace("\\", "\\\\").replace('"', '\\"')
+        profile += f'(allow file-write* (subpath "{escaped}"))\n'
+    return profile
 
 
 # ---------------------------------------------------------------------------

@@ -24,6 +24,10 @@ from .handler_dispatch import (
     _gate_subprocess_args,
     _gate_subprocess_env,
 )
+from .handler_sandbox import (
+    _cleanup_controller_runtime,
+    _create_controller_runtime,
+)
 from .review_controller import (
     EvidenceArtifact,
     ReviewContractError,
@@ -204,6 +208,7 @@ def main(argv: list[str] | None = None) -> int:
     output_dir = args.output_dir.expanduser().resolve()
     claimed_output = False
     request = None
+    runtime = None
     try:
         try:
             from .handler_sandbox import _holdout_denied_paths
@@ -295,7 +300,12 @@ def main(argv: list[str] | None = None) -> int:
         transport_is_jsonl = args.backend == "codex"
         if transport_is_jsonl:
             try:
-                command = _controller_codex_args(command, read_only_path=workdir)
+                runtime = _create_controller_runtime()
+                command = _controller_codex_args(
+                    command,
+                    read_only_path=workdir,
+                    writable_path=runtime.codex_home,
+                )
             except ValueError as exc:
                 raise ReviewContractError(
                     "codex review command did not contain the codex executable"
@@ -309,7 +319,7 @@ def main(argv: list[str] | None = None) -> int:
             input=stdin_text,
             timeout=args.timeout,
             check=False,
-            env=_gate_subprocess_env(args.backend),
+            env=runtime.env if runtime is not None else _gate_subprocess_env(args.backend),
         )
         raw_transport = proc.stdout
         command_receipts = ()
@@ -387,11 +397,19 @@ def main(argv: list[str] | None = None) -> int:
             receipt_path,
             (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode("utf-8"),
         )
+        if runtime is not None:
+            _cleanup_controller_runtime(runtime.run_dir)
+            runtime = None
         print(json.dumps(receipt, indent=2, sort_keys=True))
         if contract_error:
             return 1
         return 0 if verdict == "pass" else 2
     except (OSError, UnicodeError, subprocess.TimeoutExpired, ReviewContractError) as exc:
+        if runtime is not None:
+            try:
+                _cleanup_controller_runtime(runtime.run_dir)
+            except Exception:
+                pass
         contract_error = f"{type(exc).__name__}: {exc}"
         if request is not None:
             process = locals().get("proc")

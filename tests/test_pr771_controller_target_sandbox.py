@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
+import stat
 
 import pytest
 
@@ -11,6 +13,11 @@ from runner.handler_dispatch import (
     _build_controller_codex_transport,
     _launch_shadow_gate_review,
     _ShadowGateReview,
+)
+from runner.handler_sandbox import (
+    _cleanup_controller_runtime,
+    _create_controller_runtime,
+    _macos_read_only_profile,
 )
 from runner.handler_parallel_reviewer import _parallel_reviewer
 from runner.parser import Node
@@ -45,6 +52,85 @@ def _sandboxed_codex_args() -> list[str]:
         "--skip-git-repo-check",
         "ignored prompt",
     ]
+
+
+def _auth_home(tmp_path: Path) -> Path:
+    home = tmp_path / "home"
+    auth = home / ".codex"
+    auth.mkdir(parents=True, mode=0o700)
+    (auth / "auth.json").write_text('{"token":"test"}\n')
+    os.chmod(auth / "auth.json", 0o600)
+    return home
+
+
+def test_controller_runtime_is_private_and_cleans_only_its_run_dir(
+    tmp_path, monkeypatch
+):
+    home = _auth_home(tmp_path)
+    outside = tmp_path / "outside-sentinel"
+    outside.write_text("preserve\n")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    runtime = _create_controller_runtime()
+    auth = runtime.codex_home / "auth.json"
+    assert runtime.run_dir.parent == home / ".dark-factory" / "controller-runtimes"
+    assert runtime.env["CODEX_HOME"] == str(runtime.codex_home)
+    assert runtime.env["HOME"] == str(runtime.codex_home)
+    assert runtime.env["TMPDIR"] == str(runtime.codex_home / "tmp")
+    assert not runtime.codex_home.is_symlink()
+    assert stat.S_IMODE(auth.stat().st_mode) == 0o600
+    assert auth.stat().st_nlink == 1
+    assert auth.read_text() == '{"token":"test"}\n'
+
+    _cleanup_controller_runtime(runtime.run_dir)
+    assert not runtime.run_dir.exists()
+    assert outside.read_text() == "preserve\n"
+
+
+def test_controller_runtime_rejects_symlinked_root_and_auth(tmp_path, monkeypatch):
+    home = _auth_home(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    runtime_parent = home / ".dark-factory" / "controller-runtimes"
+    runtime_parent.parent.mkdir(parents=True, mode=0o700)
+    runtime_parent.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="private"):
+        _create_controller_runtime()
+
+    runtime_parent.unlink()
+    runtime_parent.mkdir(mode=0o700)
+    auth = home / ".codex" / "auth.json"
+    auth.unlink()
+    auth.symlink_to(outside / "auth.json")
+    with pytest.raises(ValueError, match="regular file"):
+        _create_controller_runtime()
+    assert not list(runtime_parent.iterdir())
+
+
+def test_controller_runtime_cleanup_rejects_symlink_and_profile_allows_only_home(
+    tmp_path, monkeypatch
+):
+    home = _auth_home(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    runtime = _create_controller_runtime()
+    linked = tmp_path / "linked-review"
+    linked.symlink_to(runtime.run_dir, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="private"):
+        _cleanup_controller_runtime(linked)
+    assert runtime.run_dir.exists()
+    profile = _macos_read_only_profile(
+        '(version 1)\n(allow default)\n(deny file-read* (subpath "/sealed"))',
+        writable_path=runtime.codex_home,
+    )
+    assert "(deny file-write*)" in profile
+    assert f'(allow file-write* (subpath "{runtime.codex_home}"))' in profile
+    assert str(outside) not in profile
+    _cleanup_controller_runtime(runtime.run_dir)
 
 
 def _assert_snapshot_profile(transport: list[str], source: Path, snapshot: Path) -> None:
