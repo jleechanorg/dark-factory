@@ -32,8 +32,8 @@ with external receipt consumers.
 
 For a `pass`, `evidence_checked` and `commands_executed` must contain
 non-empty strings. The controller acceptance path also requires at least one
-captured command receipt with exit code `0`; the model's command summary is
-informational and does not need to reproduce receipt strings. A `fail` remains
+captured command receipt with exit code `0`; for `pass`, `commands_executed` must
+exactly reproduce the captured receipt commands in order. A `fail` remains
 valid without evidence or receipts so missing proof can itself be reported as
 the blocking result.
 
