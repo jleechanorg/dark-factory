@@ -84,6 +84,7 @@ monkeypatches stay in effect.
 from __future__ import annotations
 
 import hashlib
+import ctypes
 import os
 import pathlib
 import shutil
@@ -551,12 +552,37 @@ _linux_landlock_launcher: "Optional[pathlib.Path]" = None
 _linux_landlock_launcher_checked = False
 
 
+def _linux_landlock_abi() -> int | None:
+    """Return the host Landlock ABI, or None when the syscall is unavailable."""
+    if not sys.platform.startswith("linux"):
+        return None
+    syscall_nr = {"x86_64": 444, "aarch64": 444, "riscv64": 444}.get(
+        os.uname().machine
+    )
+    if syscall_nr is None:
+        return None
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.syscall.restype = ctypes.c_long
+        abi = libc.syscall(
+            ctypes.c_long(syscall_nr),
+            ctypes.c_void_p(),
+            ctypes.c_size_t(0),
+            ctypes.c_uint(1),
+        )
+    except (AttributeError, OSError):
+        return None
+    return int(abi) if abi > 0 else None
+
+
 def _linux_landlock_launcher_path() -> "Optional[pathlib.Path]":
     """Build and content-hash cache the kernel-enforced launcher."""
     global _linux_landlock_launcher, _linux_landlock_launcher_checked
     if _linux_landlock_launcher_checked:
         return _linux_landlock_launcher
     _linux_landlock_launcher_checked = True
+    if (_linux_landlock_abi() or 0) < 3:
+        return None
     compiler = shutil.which("cc") or shutil.which("gcc")
     if compiler is None or not _LINUX_LANDLOCK_SOURCE.is_file():
         return None
@@ -580,6 +606,62 @@ def _linux_landlock_launcher_path() -> "Optional[pathlib.Path]":
         return target
     except (OSError, subprocess.SubprocessError):
         return None
+
+
+def _reset_linux_landlock_launcher_cache_for_tests() -> None:
+    global _linux_landlock_launcher, _linux_landlock_launcher_checked
+    _linux_landlock_launcher = None
+    _linux_landlock_launcher_checked = False
+
+
+def _linux_codex_runtime_paths(executable: pathlib.Path) -> list[pathlib.Path] | None:
+    """Return exact installed Codex roots needed by a JS/native launcher."""
+    try:
+        resolved = executable.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    paths = [resolved.parent]
+
+    def add_package_roots(path: pathlib.Path) -> None:
+        parts = path.parts
+        for index in range(len(parts) - 1):
+            if parts[index:index + 2] in (("@openai", "codex"), ("@openai", "codex-linux-x64")):
+                package_root = pathlib.Path(*parts[: index + 2])
+                if package_root.is_dir():
+                    paths.append(package_root)
+
+    add_package_roots(resolved)
+    # JS and shell launchers may point at a bundled native executable or a
+    # non-system interpreter. Follow only explicit launcher references; do
+    # not allow every PATH directory, which could contain a sealed child.
+    try:
+        first_line = resolved.read_text(encoding="utf-8").splitlines()[0]
+    except (OSError, UnicodeDecodeError, IndexError):
+        first_line = ""
+    if first_line.startswith("#!"):
+        interpreter = first_line[2:].strip().split()
+        if interpreter and pathlib.Path(interpreter[0]).name == "env" and len(interpreter) > 1:
+            interpreter_path = shutil.which(interpreter[1])
+        else:
+            interpreter_path = interpreter[0] if interpreter else None
+        if interpreter_path:
+            try:
+                paths.append(pathlib.Path(interpreter_path).resolve(strict=True).parent)
+            except (OSError, RuntimeError):
+                return None
+    try:
+        for line in resolved.read_text(encoding="utf-8").splitlines():
+            if "real-bin:" not in line and not line.startswith("REAL_BIN="):
+                continue
+            candidate = line.split(":", 1)[1].strip() if "real-bin:" in line else line.split("=", 1)[1].strip()
+            candidate_path = pathlib.Path(candidate)
+            if candidate_path.is_file():
+                candidate_path = candidate_path.resolve(strict=True)
+                paths.append(candidate_path.parent)
+                add_package_roots(candidate_path)
+    except (OSError, UnicodeDecodeError, RuntimeError):
+        return None
+    return sorted(set(paths), key=str)
 
 
 def _linux_controller_sandbox_prefix(

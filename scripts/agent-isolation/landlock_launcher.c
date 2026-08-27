@@ -142,6 +142,11 @@ int main(int argc, char **argv) {
         free(rules);
         return 125;
     }
+    if (abi < 3) {
+        fprintf(stderr, "Landlock ABI %d lacks mandatory truncate enforcement\n", abi);
+        free(rules);
+        return 125;
+    }
     uint64_t read_access = LANDLOCK_ACCESS_FS_EXECUTE |
                            LANDLOCK_ACCESS_FS_READ_FILE |
                            LANDLOCK_ACCESS_FS_READ_DIR;
@@ -155,12 +160,7 @@ int main(int argc, char **argv) {
                             LANDLOCK_ACCESS_FS_MAKE_FIFO |
                             LANDLOCK_ACCESS_FS_MAKE_BLOCK |
                             LANDLOCK_ACCESS_FS_MAKE_SYM;
-    if (abi >= 2) {
-        write_access |= LANDLOCK_ACCESS_FS_REFER;
-    }
-    if (abi >= 3) {
-        write_access |= LANDLOCK_ACCESS_FS_TRUNCATE;
-    }
+    write_access |= LANDLOCK_ACCESS_FS_REFER | LANDLOCK_ACCESS_FS_TRUNCATE;
     struct landlock_ruleset_attr ruleset_attr = {
         .handled_access_fs = read_access | write_access,
     };
