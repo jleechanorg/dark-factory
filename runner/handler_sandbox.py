@@ -137,19 +137,23 @@ def _ensure_private_dir(path: pathlib.Path) -> pathlib.Path:
     if not path.is_absolute():
         raise ValueError("controller runtime path must be absolute")
     current = pathlib.Path(path.anchor)
+    repair_allowed = False
     for component in path.parts[1:]:
         current /= component
+        repair_allowed = repair_allowed or current.name == ".dark-factory"
         try:
             info = current.lstat()
         except FileNotFoundError:
             current.mkdir(mode=0o700)
         else:
             # Existing user-owned runtime roots may predate this contract and
-            # be group/other-writable. Tighten only those directories before
-            # validation; symlinks, files, and foreign-owned paths remain
+            # be group/other-writable. Tighten only the .dark-factory subtree
+            # before validation; HOME and its ancestors must already be
+            # private. Symlinks, files, and foreign-owned paths remain
             # fail-closed through _validate_private_dir.
             if (
-                stat.S_ISDIR(info.st_mode)
+                repair_allowed
+                and stat.S_ISDIR(info.st_mode)
                 and info.st_uid == os.getuid()
                 and info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
             ):
