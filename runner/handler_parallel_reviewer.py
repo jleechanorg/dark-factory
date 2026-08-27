@@ -54,7 +54,7 @@ _CONTROLLER_TASK_ARTIFACT_RE = re.compile(r"^\.dark-factory/agy-task-[^/]+\.md$"
 _CONTROLLER_FIXTURE_STATE = "_df_controller_fixture"
 
 
-def _controller_fixture_enabled(node: "Node", ctx: "Context") -> bool:
+def _controller_fixture_enabled(node: Node, ctx: Context) -> bool:
     """Allow synthetic cold-review results only for an explicit test fixture.
 
     Both the graph marker and the exact state token are required. Production

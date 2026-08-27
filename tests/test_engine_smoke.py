@@ -53,12 +53,18 @@ def test_gate_echo_seeded_outcome(monkeypatch):
         return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
     g = parse(_pipeline("gates.dot"))
+    g.nodes["adversarial_reviewer"].attrs["test_fixture"] = "true"
     ctx = Context(goal="t", workdir=ROOT, backend="echo")
-    ctx.state["gate_skeptic.outcome"] = "success"
-    ctx.state["adversarial_reviewer.outcome"] = "success"
-    ctx.state["gate_es.outcome"] = "success"
-    ctx.state["gate_er.outcome"] = "success"
-    ctx.state["gate_cs.outcome"] = "success"
+    ctx.state.update(
+        {
+            "_df_controller_fixture": "cold-review-v1",
+            "gate_skeptic.outcome": "success",
+            "adversarial_reviewer.outcome": "success",
+            "gate_es.outcome": "success",
+            "gate_er.outcome": "success",
+            "gate_cs.outcome": "success",
+        }
+    )
 
     history = run(g, ctx, max_steps=20)
     nodes = [r.node for r in history]

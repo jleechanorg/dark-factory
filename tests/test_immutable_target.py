@@ -582,9 +582,17 @@ class ControllerSnapshotTests(unittest.TestCase):
         from runner.handler_parallel_reviewer import _parallel_reviewer
         from runner.parser import Node
 
-        node = Node(name="cold_reviewer", attrs={"review_contract": "cold-review-v1"})
+        node = Node(
+            name="cold_reviewer",
+            attrs={"review_contract": "cold-review-v1", "test_fixture": "true"},
+        )
         ctx = Context(goal="fixture", workdir=self.repo, backend="echo")
-        ctx.state["cold_reviewer.outcome"] = "success"
+        ctx.state.update(
+            {
+                "_df_controller_fixture": "cold-review-v1",
+                "cold_reviewer.outcome": "success",
+            }
+        )
 
         result = _parallel_reviewer(node, ctx)
 
@@ -637,6 +645,16 @@ class ControllerSnapshotTests(unittest.TestCase):
         (self.repo / "README.md").write_text("worker output\n")
         checkpoint = self.tmp / "checkpoint.json"
         bundle = self.tmp / "evidence"
+        production_pipeline = Path(__file__).parent.parent / "pipelines/slim/two_node.dot"
+        fixture_pipeline = self.tmp / "two_node_fixture.dot"
+        fixture_pipeline.write_text(
+            production_pipeline.read_text(encoding="utf-8").replace(
+                '        review_contract="cold-review-v1",\n',
+                '        review_contract="cold-review-v1",\n'
+                '        test_fixture="true",\n',
+            ),
+            encoding="utf-8",
+        )
 
         def _worker_with_inherited_reviewer_outcome(node, ctx):
             receipt = ctx.workdir / "evidence" / "worker-verification.json"
@@ -659,14 +677,17 @@ class ControllerSnapshotTests(unittest.TestCase):
             return Result(
                 outcome="success",
                 output="worker completed",
-                context_updates={"cold_reviewer.outcome": "success"},
+                context_updates={
+                    "_df_controller_fixture": "cold-review-v1",
+                    "cold_reviewer.outcome": "success",
+                },
             )
 
         with patch.dict(TYPE_REGISTRY, {"codergen": _worker_with_inherited_reviewer_outcome}):
             rc = cli.main(
                 [
                     "--pipeline",
-                    str(Path(__file__).parent.parent / "pipelines/slim/two_node.dot"),
+                    str(fixture_pipeline),
                     "--workdir",
                     str(self.repo),
                     "--goal",
