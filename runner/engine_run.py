@@ -19,9 +19,10 @@ import threading
 import time
 import traceback
 import uuid
-from contextlib import contextmanager
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Iterator, Optional
+from contextlib import contextmanager
+from typing import Optional
 
 from . import engine_branches as _branches
 from . import engine_edges as _edges
@@ -133,13 +134,113 @@ def _controller_snapshot_journal_path(ctx: Context) -> pathlib.Path | None:
     return run_dir / _CONTROLLER_SNAPSHOT_JOURNAL
 
 
-def _read_controller_snapshot_journal(path: pathlib.Path) -> list:
+def _controller_snapshot_dir_flags() -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return flags
+
+
+def _validate_controller_snapshot_dir_fd(fd: int, description: str) -> None:
+    info = os.fstat(fd)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid not in {0, os.getuid()}
+        or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise ValueError(f"{description} is not private")
+
+
+@contextmanager
+def _controller_snapshot_journal_directory(
+    ctx: Context,
+) -> Iterator[tuple[pathlib.Path, int] | None]:
+    """Descend to the journal directory using validated, no-follow dirfds."""
+    run_id = str(
+        ctx.state.get("_controller_snapshot_journal_run_id")
+        or getattr(ctx, "run_id", "")
+        or ""
+    )
+    if not _RUN_ID_RE.fullmatch(run_id):
+        yield None
+        return
+    home = pathlib.Path.home()
+    try:
+        home_info = home.lstat()
+    except OSError as exc:
+        raise ValueError("controller snapshot journal home is unavailable") from exc
+    if (
+        not home.is_absolute()
+        or stat.S_ISLNK(home_info.st_mode)
+        or not stat.S_ISDIR(home_info.st_mode)
+        or home_info.st_uid not in {0, os.getuid()}
+        or home_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise ValueError("controller snapshot journal home is not private")
+
+    directory_fd: int | None = None
+    directory_path = home
+    try:
+        directory_fd = os.open(home, _controller_snapshot_dir_flags())
+        _validate_controller_snapshot_dir_fd(directory_fd, "controller snapshot journal home")
+        for component in (".dark-factory", "runs", run_id):
+            try:
+                next_fd = os.open(
+                    component,
+                    _controller_snapshot_dir_flags(),
+                    dir_fd=directory_fd,
+                )
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, 0o700, dir_fd=directory_fd)
+                except FileExistsError:
+                    pass
+                try:
+                    next_fd = os.open(
+                        component,
+                        _controller_snapshot_dir_flags(),
+                        dir_fd=directory_fd,
+                    )
+                except OSError as exc:
+                    raise ValueError(
+                        f"controller snapshot journal directory {component} is unsafe "
+                        "(symlink or non-private)"
+                    ) from exc
+            except OSError as exc:
+                raise ValueError(
+                    f"controller snapshot journal directory {component} is unsafe "
+                    "(symlink or non-private)"
+                ) from exc
+            try:
+                _validate_controller_snapshot_dir_fd(
+                    next_fd, f"controller snapshot journal directory {component}"
+                )
+            except Exception:
+                os.close(next_fd)
+                raise
+            os.close(directory_fd)
+            directory_fd = next_fd
+            directory_path /= component
+        yield directory_path / _CONTROLLER_SNAPSHOT_JOURNAL, directory_fd
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+def _read_controller_snapshot_journal(
+    path: pathlib.Path, *, dir_fd: int | None = None
+) -> list:
     """Read a journal through a no-follow descriptor after validating its file."""
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
-        fd = os.open(path, flags)
+        if dir_fd is None:
+            fd = os.open(path, flags)
+        else:
+            fd = os.open(path.name, flags, dir_fd=dir_fd)
     except FileNotFoundError:
         return []
     try:
@@ -170,49 +271,57 @@ def _read_controller_snapshot_journal(path: pathlib.Path) -> list:
 @contextmanager
 def _controller_snapshot_journal_lock(
     ctx: Context,
-) -> Iterator[pathlib.Path | None]:
+) -> Iterator[tuple[pathlib.Path, int] | None]:
     """Serialize journal updates with an owner-validated per-run lock."""
-    path = _controller_snapshot_journal_path(ctx)
-    if path is None:
-        yield None
-        return
     import fcntl
 
-    lock_path = path.with_name(f".{path.name}.lock")
-    flags = os.O_RDWR | os.O_CREAT
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(lock_path, flags, 0o600)
-    try:
-        info = os.fstat(fd)
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or info.st_uid not in {0, os.getuid()}
-            or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-        ):
-            raise ValueError("controller snapshot journal lock is not private")
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield path
-    finally:
+    with _controller_snapshot_journal_directory(ctx) as location:
+        if location is None:
+            yield None
+            return
+        path, directory_fd = location
+        lock_name = f".{path.name}.lock"
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(lock_name, flags, 0o600, dir_fd=directory_fd)
         try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            info = os.fstat(fd)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid not in {0, os.getuid()}
+                or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            ):
+                raise ValueError("controller snapshot journal lock is not private")
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield location
         finally:
-            os.close(fd)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
 
-def _write_controller_snapshot_journal(path: pathlib.Path, entries: list) -> None:
+def _write_controller_snapshot_journal(
+    path: pathlib.Path, entries: list, *, dir_fd: int | None = None
+) -> None:
     """Atomically replace a journal and flush both file and directory metadata."""
-    if path.is_symlink():
-        raise ValueError("controller snapshot journal is a symlink")
+    if dir_fd is None:
+        if path.is_symlink():
+            raise ValueError("controller snapshot journal is a symlink")
+    else:
+        try:
+            if stat.S_ISLNK(os.stat(path.name, dir_fd=dir_fd, follow_symlinks=False).st_mode):
+                raise ValueError("controller snapshot journal is a symlink")
+        except FileNotFoundError:
+            pass
     payload = (json.dumps(entries, sort_keys=True, separators=(",", ":")) + "\n").encode(
         "utf-8"
     )
-    directory_flags = os.O_RDONLY
-    if hasattr(os, "O_DIRECTORY"):
-        directory_flags |= os.O_DIRECTORY
-    if hasattr(os, "O_NOFOLLOW"):
-        directory_flags |= os.O_NOFOLLOW
-    directory_fd = os.open(path.parent, directory_flags)
+    owns_directory_fd = dir_fd is None
+    directory_fd = (
+        os.open(path.parent, _controller_snapshot_dir_flags()) if owns_directory_fd else dir_fd
+    )
     temporary_name = f".{path.name}.{uuid.uuid4().hex}.tmp"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
@@ -243,7 +352,8 @@ def _write_controller_snapshot_journal(path: pathlib.Path, entries: list) -> Non
             pass
         raise
     finally:
-        os.close(directory_fd)
+        if owns_directory_fd:
+            os.close(directory_fd)
 
 
 def _persist_controller_snapshot_journal(
@@ -257,10 +367,11 @@ def _persist_controller_snapshot_journal(
         raise ValueError("controller snapshot state is malformed") from exc
     if not isinstance(entries, list):
         raise TypeError("controller snapshot state is malformed")
-    with _controller_snapshot_journal_lock(ctx) as path:
-        if path is None:
+    with _controller_snapshot_journal_lock(ctx) as location:
+        if location is None:
             return
-        merged = _read_controller_snapshot_journal(path)
+        path, dir_fd = location
+        merged = _read_controller_snapshot_journal(path, dir_fd=dir_fd)
         for entry in entries:
             if entry not in merged:
                 merged.append(entry)
@@ -269,19 +380,17 @@ def _persist_controller_snapshot_journal(
         ctx.state["_controller_review_snapshots"] = json.dumps(
             merged, sort_keys=True, separators=(",", ":")
         )
-        _write_controller_snapshot_journal(path, merged)
+        _write_controller_snapshot_journal(path, merged, dir_fd=dir_fd)
 
 
 def _load_controller_snapshot_journal(ctx: Context) -> None:
     """Restore pending snapshots from disk before resume or early return."""
-    path = _controller_snapshot_journal_path(ctx)
-    if path is None:
-        return
     try:
-        with _controller_snapshot_journal_lock(ctx) as locked_path:
-            if locked_path is None:
+        with _controller_snapshot_journal_lock(ctx) as location:
+            if location is None:
                 return
-            disk_entries = _read_controller_snapshot_journal(locked_path)
+            path, dir_fd = location
+            disk_entries = _read_controller_snapshot_journal(path, dir_fd=dir_fd)
     except (OSError, TypeError, ValueError):
         return
     raw = ctx.state.get("_controller_review_snapshots", "[]")
