@@ -91,9 +91,11 @@ def test_cxdb_records_steps(tmp_path, monkeypatch):
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
     db_path = tmp_path / "cxdb.sqlite"
     g = parse(_pipeline("gates.dot"))
+    g.nodes["adversarial_reviewer"].attrs["test_fixture"] = "true"
     ctx = Context(goal="t", workdir=ROOT, backend="echo", cxdb_path=db_path)
     ctx.state.update(
         {
+            "_df_controller_fixture": "cold-review-v1",
             "gate_skeptic.outcome": "success",
             "adversarial_reviewer.outcome": "success",
             "gate_es.outcome": "success",
