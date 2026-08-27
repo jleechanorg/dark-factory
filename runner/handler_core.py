@@ -156,7 +156,7 @@ def _gate_strict_flag(node: "Node") -> bool:
 
 
 def _target_worktree(ctx: "Context") -> pathlib.Path:
-    """Return the validated target worktree for worker diff and controller review.
+    """Return the caller-selected worktree without changing its lexical spelling.
 
     Prefers `ctx.state["ao.worktree"]` when it is an absolute, non-traversing
     path to an existing directory; otherwise falls back to `ctx.workdir`.
@@ -170,11 +170,18 @@ def _target_worktree(ctx: "Context") -> pathlib.Path:
                 and ".." not in ao_path.parts
                 and ao_path.is_dir()
             ):
-                return ao_path.resolve()
+                # Preserve the caller's lexical spelling until the controller
+                # validates it. Resolving here would erase a symlinked parent
+                # and make the later immutable-target check inspect another
+                # path than the one supplied by the run.
+                return ao_path
     try:
-        return pathlib.Path(ctx.workdir).resolve()
+        # The controller owns canonicalization after lexical validation. Other
+        # callers can still resolve this path at the boundary where they need
+        # a canonical identity.
+        return pathlib.Path(ctx.workdir)
     except (AttributeError, TypeError):
-        return pathlib.Path(".").resolve()
+        return pathlib.Path(".")
 
 
 

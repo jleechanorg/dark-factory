@@ -52,6 +52,7 @@ if TYPE_CHECKING:
 _LANE_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 _CONTROLLER_TASK_ARTIFACT_RE = re.compile(r"^\.dark-factory/agy-task-[^/]+\.md$")
 _CONTROLLER_FIXTURE_STATE = "_df_controller_fixture"
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 def _controller_fixture_enabled(node: Node, ctx: Context) -> bool:
@@ -265,6 +266,11 @@ def _controller_evidence(
         import runner.handlers as _handlers_shim
 
         root = _handlers_shim._target_worktree(ctx)
+    # This function is called only after the controller has validated the raw
+    # target path. Canonicalize at that boundary so platform aliases such as
+    # macOS /var -> /private/var do not make a valid evidence file appear to
+    # escape its already-validated workspace.
+    root = root.resolve()
     for rel in _controller_evidence_paths(node, ctx):
         path = (root / rel).resolve()
         try:
@@ -458,6 +464,51 @@ def _controller_snapshot(
         raise
 
 
+def _controller_base_sha(
+    node: "Node",
+    ctx: "Context",
+    workdir: pathlib.Path,
+    source_sha: str,
+    head_sha: str,
+) -> str:
+    """Return the authenticated immutable base for a controller review.
+
+    A graph review may receive an explicit controller base through state (or a
+    controller-owned node attribute). If it does not, the already authenticated
+    source head is the safe base for the dirty-worker snapshot: the snapshot's
+    parent is that exact commit. Never ask the target checkout to resolve a
+    mutable branch or ref.
+    """
+    raw_base = ctx.state.get("_controller_base_sha") or ctx.state.get("base_sha")
+    if raw_base is None:
+        raw_base = node.attrs.get("base_sha") or source_sha
+    if not isinstance(raw_base, str):
+        raise TypeError("controller review base SHA is unavailable")
+    base_sha = raw_base.strip().lower()
+    if not _SHA_RE.fullmatch(base_sha):
+        raise ValueError("controller review base SHA must be a full 40-hex revision")
+    if not _SHA_RE.fullmatch(str(head_sha).strip().lower()):
+        raise ValueError("controller review head SHA is unavailable")
+    ancestor = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(workdir),
+            "merge-base",
+            "--is-ancestor",
+            base_sha,
+            str(head_sha).strip().lower(),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if ancestor.returncode != 0:
+        raise ValueError("controller review base SHA is not an ancestor of the target head")
+    return base_sha
+
+
 def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
     """Build the source-owned request; graph/goal content remains envelope data."""
     import runner.handlers as _handlers_shim
@@ -467,9 +518,12 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
         ReviewInputs,
         create_review_request,
         validate_immutable_target,
+        validate_workspace_path,
     )
 
-    source_workdir = _handlers_shim._target_worktree(ctx)
+    if not isinstance(expected_sha, str) or not _SHA_RE.fullmatch(expected_sha.strip().lower()):
+        raise ValueError("controller review target head SHA is unavailable")
+    raw_source_workdir = _handlers_shim._target_worktree(ctx)
     declared_evidence = _controller_evidence_paths(node, ctx)
     try:
         holdout_roots = tuple(
@@ -478,9 +532,19 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
         )
     except Exception:
         holdout_roots = ()
+    try:
+        # Validate the raw lexical spelling before canonicalizing it or doing
+        # any target-owned Git/evidence reads. This catches symlinked parents
+        # that ``Path.resolve`` would otherwise erase.
+        source_workdir = validate_workspace_path(
+            str(raw_source_workdir),
+            holdout_roots=holdout_roots,
+        )
+    except ReviewContractError as exc:
+        raise ValueError(f"controller review source is not immutable: {exc}") from exc
     source_inputs = ReviewInputs(
         repository=source_workdir.name,
-        workspace_path=str(source_workdir),
+        workspace_path=str(raw_source_workdir),
         base_sha=expected_sha,
         head_sha=expected_sha,
         tree_sha=_git_output(source_workdir, "rev-parse", f"{expected_sha}^{{tree}}"),
@@ -490,7 +554,12 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
         run_id=str(ctx.run_id or ""),
     )
     try:
-        validate_immutable_target(source_inputs, holdout_roots=holdout_roots)
+        # Keep the raw lexical path in ``source_inputs`` through validation;
+        # only the validated return value may be used for Git/evidence access.
+        source_workdir = validate_immutable_target(
+            source_inputs,
+            holdout_roots=holdout_roots,
+        )
     except ReviewContractError as exc:
         raise ValueError(f"controller review source is not immutable: {exc}") from exc
     # Validate the append-only cleanup state before creating another snapshot;
@@ -508,8 +577,9 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
         for entry in snapshots
     ):
         raise ValueError("controller snapshot state is malformed")
+    source_head_sha = expected_sha
     workdir, expected_sha, evidence_origin = _controller_snapshot(
-        source_workdir, expected_sha, declared_evidence
+        source_workdir, source_head_sha, declared_evidence
     )
     # The engine owns final cleanup. Keep every retry's exact snapshot and its
     # owning source worktree so no earlier snapshot is orphaned by overwrite.
@@ -524,7 +594,13 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
         sort_keys=True,
         separators=(",", ":"),
     )
-    base_sha = _git_output(workdir, "merge-base", "origin/main", expected_sha)
+    base_sha = _controller_base_sha(
+        node,
+        ctx,
+        workdir,
+        source_sha=source_head_sha,
+        head_sha=expected_sha,
+    )
     tree_sha = _git_output(workdir, "rev-parse", f"{expected_sha}^{{tree}}")
     changed_text = _git_output(
         workdir,
