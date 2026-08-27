@@ -578,6 +578,11 @@ def _build_controller_codex_transport(
     """
     import runner.handlers as _handlers_shim  # late-bound shim
 
+    if os.environ.get("DISABLE_SANDBOX"):
+        raise ValueError(
+            "controller transport refuses DISABLE_SANDBOX; holdout isolation is required"
+        )
+
     prepared = list(args)
     if not prepared:
         raise ValueError("codex controller argv is empty")

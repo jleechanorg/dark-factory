@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import pathlib
-import shlex
 import shutil
 import stat
 import subprocess
@@ -122,19 +121,30 @@ def test_controller_transport_macos_profile_enforces_read_only_and_holdout_denia
         target.write_text("unchanged\n", encoding="utf-8")
         codex = tmp_path / "codex"
         codex.write_text(
-            "#!/bin/sh\n"
-            "set -eu\n"
-            f"allowed=$(cat {shlex.quote(str(allowed))})\n"
-            f"if cat {shlex.quote(str(holdout))} >/dev/null 2>&1; then\n"
-            "  echo holdout-readable >&2\n"
-            "  exit 11\n"
-            "fi\n"
-            f"if printf changed > {shlex.quote(str(target))}; then\n"
-            "  echo target-write-allowed >&2\n"
-            "  exit 12\n"
-            "fi\n"
-            "printf '{\"allowed\":\"%s\",\"holdout_denied\":true,"
-            "\"write_denied\":true}\n' \"$allowed\"\n",
+            "#!/usr/bin/env python3\n"
+            "import json\n"
+            "from pathlib import Path\n"
+            f"allowed = Path({str(allowed)!r}).read_text(encoding='utf-8')\n"
+            f"holdout = Path({str(holdout)!r})\n"
+            "try:\n"
+            "    holdout.read_bytes()\n"
+            "except PermissionError:\n"
+            "    holdout_denied = True\n"
+            "except OSError as exc:\n"
+            "    raise SystemExit(f'holdout probe failed: {exc}')\n"
+            "else:\n"
+            "    raise SystemExit('holdout-readable')\n"
+            f"target = Path({str(target)!r})\n"
+            "try:\n"
+            "    target.write_text('changed', encoding='utf-8')\n"
+            "except PermissionError:\n"
+            "    write_denied = True\n"
+            "except OSError as exc:\n"
+            "    raise SystemExit(f'write probe failed: {exc}')\n"
+            "else:\n"
+            "    raise SystemExit('target-write-allowed')\n"
+            "print(json.dumps({'allowed': allowed.strip(), "
+            "'holdout_denied': holdout_denied, 'write_denied': write_denied}))\n",
             encoding="utf-8",
         )
         codex.chmod(codex.stat().st_mode | stat.S_IXUSR)
@@ -165,9 +175,11 @@ def test_controller_transport_macos_profile_enforces_read_only_and_holdout_denia
         )
 
         assert proc.returncode == 0, proc.stderr
-        assert '"allowed":"allowed"' in proc.stdout
-        assert '"holdout_denied":true' in proc.stdout
-        assert '"write_denied":true' in proc.stdout
+        assert json.loads(proc.stdout) == {
+            "allowed": "allowed",
+            "holdout_denied": True,
+            "write_denied": True,
+        }
         assert target.read_text(encoding="utf-8") == "unchanged\n"
     finally:
         shutil.rmtree(target_root)
@@ -204,6 +216,27 @@ def test_controller_transport_keeps_linux_deny_paths_and_native_read_only(
         "read-only",
         "-",
     ]
+
+
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
+def test_controller_transport_rejects_disable_sandbox(
+    monkeypatch, tmp_path, platform
+):
+    """Controller reviews must not use the testing sandbox escape hatch."""
+    monkeypatch.setattr("runner.handler_dispatch.sys.platform", platform)
+    monkeypatch.setenv("DISABLE_SANDBOX", "1")
+
+    with pytest.raises(ValueError, match="DISABLE_SANDBOX"):
+        _build_controller_codex_transport(
+            [
+                "codex",
+                "exec",
+                "--yolo",
+                "--skip-git-repo-check",
+                "ignored prompt",
+            ],
+            read_only_path=tmp_path,
+        )
 
 
 def test_controller_graph_rejects_nonzero_transport_with_valid_fail_response(
