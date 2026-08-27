@@ -93,6 +93,24 @@ def test_controller_runtime_is_private_and_cleans_only_its_run_dir(
     assert outside.read_text() == "preserve\n"
 
 
+def test_controller_runtime_repairs_current_owned_writable_factory_dir(
+    tmp_path, monkeypatch
+):
+    home = _auth_home(tmp_path)
+    factory_dir = home / ".dark-factory"
+    factory_dir.mkdir(mode=0o775)
+    os.chmod(factory_dir, 0o775)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+
+    runtime = _create_controller_runtime()
+    try:
+        assert stat.S_IMODE(factory_dir.stat().st_mode) == 0o700
+        assert runtime.run_dir.parent == factory_dir / "controller-runtimes"
+    finally:
+        _cleanup_controller_runtime(runtime.run_dir)
+
+
 def test_controller_runtime_rejects_symlinked_root_and_auth(tmp_path, monkeypatch):
     home = _auth_home(tmp_path)
     outside = tmp_path / "outside"

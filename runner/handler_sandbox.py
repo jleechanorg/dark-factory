@@ -140,9 +140,20 @@ def _ensure_private_dir(path: pathlib.Path) -> pathlib.Path:
     for component in path.parts[1:]:
         current /= component
         try:
-            current.lstat()
+            info = current.lstat()
         except FileNotFoundError:
             current.mkdir(mode=0o700)
+        else:
+            # Existing user-owned runtime roots may predate this contract and
+            # be group/other-writable. Tighten only those directories before
+            # validation; symlinks, files, and foreign-owned paths remain
+            # fail-closed through _validate_private_dir.
+            if (
+                stat.S_ISDIR(info.st_mode)
+                and info.st_uid == os.getuid()
+                and info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            ):
+                os.chmod(current, 0o700, follow_symlinks=False)
         _validate_private_dir(current)
     return path
 
