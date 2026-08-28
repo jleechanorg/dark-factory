@@ -30,7 +30,6 @@ jobs:
     permissions:
       contents: read
     env:
-      DISABLE_SANDBOX: "1"
       DARK_FACTORY_HOLDOUTS: "${{ github.workspace }}/tests/fixtures/holdout-eval"
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2

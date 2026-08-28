@@ -8,6 +8,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import tempfile
 from typing import ClassVar
 
 import pytest
@@ -42,6 +43,39 @@ def _stub_controller_transport_for_cli_tests(monkeypatch):
         "runner.review_cli._controller_codex_args",
         lambda command, **_kwargs: command,
     )
+
+
+@pytest.fixture
+def _private_tmp_root():
+    """Create test state below the real home, whose ancestry is private.
+
+    The controller intentionally rejects writable or symlinked path ancestors.
+    Pytest's default ``tmp_path`` is commonly under ``/tmp`` (mode 1777), so it
+    is not a valid home for the controller runtime on Linux CI.  Capture the
+    real home before the test changes ``HOME`` and let TemporaryDirectory clean
+    up the isolated root afterward.
+    """
+    real_home = pathlib.Path.home()
+    with tempfile.TemporaryDirectory(prefix="df-review-cli-", dir=real_home) as root:
+        yield pathlib.Path(root)
+
+
+@pytest.fixture(autouse=True)
+def _private_codex_home(_private_tmp_root, monkeypatch):
+    """Give CLI tests a private, self-contained Codex auth source.
+
+    The controller runtime deliberately refuses symlinked HOME ancestors and
+    must copy auth from the caller's ``~/.codex``.  Build both under the
+    canonicalized pytest temp root so tests do not depend on the operator's
+    home directory or its Codex installation.
+    """
+    home = _private_tmp_root / "home"
+    codex_home = home / ".codex"
+    codex_home.mkdir(mode=0o700, parents=True)
+    auth = codex_home / "auth.json"
+    auth.write_text('{"test":true}\n', encoding="utf-8")
+    auth.chmod(0o600)
+    monkeypatch.setenv("HOME", str(home))
 
 
 def _repo(tmp_path):

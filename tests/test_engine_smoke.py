@@ -7,6 +7,8 @@ from __future__ import annotations
 import pathlib
 import sys
 
+import pytest
+
 ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
@@ -18,6 +20,19 @@ from runner.engine import run  # noqa: E402
 from runner.handlers import Context, Result, TYPE_REGISTRY  # noqa: E402
 from runner.healer import report  # noqa: E402
 from runner.parser import parse  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _stub_fail_open_web_advice(monkeypatch):
+    """Keep engine smoke tests independent of live advisory transports."""
+    def fake_web_advice(node, ctx):
+        return Result(
+            outcome="success",
+            output="web_advice fixture: fail-open advisory skipped",
+            metadata={"web_advice_outcome": "fixture_skipped"},
+        )
+
+    monkeypatch.setitem(TYPE_REGISTRY, "web_advice", fake_web_advice)
 
 
 def test_holdout_missing_feature_handoff_reaches_fix_prompt(tmp_path):
