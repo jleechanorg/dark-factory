@@ -210,6 +210,34 @@ def test_run_gate_once_reports_claude_scope_error_distinct_from_sandbox(monkeypa
     assert result.metadata.get("sandbox") != "unavailable"
 
 
+def test_shadow_claude_scope_error_is_not_mislabeled_sandbox(monkeypatch, tmp_path):
+    """Shadow launches must preserve direct-Claude scope failures."""
+    from runner.handlers import Context as HCtx
+    from runner.handler_dispatch import _launch_shadow_gate_review
+
+    scope_error = "DARK_FACTORY_CLAUDE_CONFIG_DIR must be an absolute existing project config directory"
+    monkeypatch.setattr(
+        "runner.handlers._claude_config_dir",
+        lambda: (_ for _ in ()).throw(ValueError(scope_error)),
+    )
+    monkeypatch.setattr("runner.handlers._get_claude_executable", lambda: "claude")
+    monkeypatch.setattr("runner.handler_dispatch.shutil.which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(
+        "runner.handler_dispatch.subprocess.Popen",
+        lambda *args, **kwargs: pytest.fail("invalid shadow scope must not spawn"),
+    )
+    ctx = HCtx(goal="test", workdir=tmp_path, backend="codex")
+
+    shadow = _launch_shadow_gate_review(
+        "gate", "PROMPT", "a" * 40, 30, ctx, backend="claude-sonnet"
+    )
+
+    assert shadow is not None
+    assert shadow.proc is None
+    assert scope_error in shadow.launch_error
+    assert shadow.launch_error_classification == "config_error"
+
+
 def test_gate_subprocess_env_minimax_is_sanitized(monkeypatch):
     """The minimax override must layer on _sanitized_env, not raw os.environ —
     holdout vars must never reach a reviewer subprocess (jleechan-4pa)."""
