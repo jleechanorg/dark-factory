@@ -6,9 +6,9 @@
 # ~2h from when the plist is bootstrapped.
 #
 # Behavior:
-#   1. Check sentinel; if already dispatched, self-unload and exit (idempotent).
-#   2. git fetch origin/main; create or reuse the worktree at /tmp/qw5-coder-wt.
-#   3. Set minimax env vars (binding — backend constraint).
+#   1. git fetch origin/main; create or reuse the worktree at /tmp/qw5-coder-wt.
+#   2. Set minimax env vars (binding — backend constraint).
+#   3. Check sentinel; if already dispatched, self-unload and exit (idempotent).
 #   4. Spawn the coder subagent via `claudem -p <prompt>` and stream its log.
 #   5. On completion, write a CXDB pointer + report tail.
 #   6. Self-unload the launchd job so it doesn't re-fire.
@@ -61,16 +61,7 @@ if [ ! -f "${REPO}/daemon/qw5-coder-prompt.md" ]; then
   exit 65
 fi
 
-# 1. Idempotency sentinel — self-unload and exit if already fired.
-if [ -f "$SENTINEL" ]; then
-  log "sentinel ${SENTINEL} already present; self-unloading and exiting (no-op)"
-  launchctl bootout "gui/$(id -u)" "$PLIST_DST" 2>/dev/null || true
-  exit 0
-fi
-touch "$SENTINEL"
-log "sentinel created at ${SENTINEL}"
-
-# 2. Fetch + ensure worktree.
+# 1. Fetch + ensure worktree.
 cd "$REPO"
 git fetch origin main
 
@@ -113,6 +104,15 @@ configure_minimax_env() {
 
 configure_minimax_env
 log "minimax env vars set; ANTHROPIC_MODEL=${ANTHROPIC_MODEL}"
+
+# 3. Idempotency sentinel — consume only after MiniMax validation succeeds.
+if [ -f "$SENTINEL" ]; then
+  log "sentinel ${SENTINEL} already present; self-unloading and exiting (no-op)"
+  launchctl bootout "gui/$(id -u)" "$PLIST_DST" 2>/dev/null || true
+  exit 0
+fi
+touch "$SENTINEL"
+log "sentinel created at ${SENTINEL}"
 
 cd "$WT"
 
