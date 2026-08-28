@@ -84,6 +84,7 @@ configure_minimax_env() {
   local minimax_key="${MINIMAX_API_KEY:-}"
   if [[ -z "${minimax_key//[[:space:]]/}" ]]; then
     printf 'FATAL: MINIMAX_API_KEY must be nonblank\n' >&2
+    printf 'RECOVERY: after configuring MINIMAX_API_KEY, run: launchctl kickstart -k gui/%s/%s\n' "$(id -u)" "$PLIST_LABEL" >&2
     return 66
   fi
   local var

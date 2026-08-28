@@ -43,6 +43,9 @@ chmod +x "$BIN_DIR/claudem"
 cat > "$BIN_DIR/launchctl" <<'SHIM'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$LAUNCHCTL_CALLS"
+if [[ "${1:-}" == kickstart && "${2:-}" == -k && "${3:-}" == "gui/$(id -u)/local.dark-factory.qw5-pilot-dispatch" ]]; then
+  bash "$DISPATCH"
+fi
 exit 0
 SHIM
 chmod +x "$BIN_DIR/launchctl"
@@ -86,8 +89,24 @@ if ! grep -q 'MINIMAX_API_KEY must be nonblank' "$LOG_DIR/jleechan-qw5-dispatch.
   echo "missing MiniMax key failure was not recorded" >&2
   exit 1
 fi
+RECOVERY_COMMAND="launchctl kickstart -k gui/$(id -u)/local.dark-factory.qw5-pilot-dispatch"
+if ! grep -Fq "$RECOVERY_COMMAND" "$LOG_DIR/jleechan-qw5-dispatch.stderr.log"; then
+  echo "missing MiniMax key failure did not provide the exact kickstart recovery" >&2
+  exit 1
+fi
 
-run_dispatch env MINIMAX_API_KEY='test-minimax-key'
+HOME="$HOME_DIR" \
+  PATH="$BIN_DIR:/usr/bin:/bin" \
+  CALLS="$CALLS" \
+  LAUNCHCTL_CALLS="$LAUNCHCTL_CALLS" \
+  DISPATCH="$DISPATCH" \
+  MINIMAX_API_KEY='test-minimax-key' \
+  launchctl kickstart -k "gui/$(id -u)/local.dark-factory.qw5-pilot-dispatch"
+
+if ! grep -Fqx "kickstart -k gui/$(id -u)/local.dark-factory.qw5-pilot-dispatch" "$LAUNCHCTL_CALLS"; then
+  echo "retry was not initiated through launchctl kickstart" >&2
+  exit 1
+fi
 
 if [[ ! -f "$SENTINEL" ]]; then
   echo "successful retry did not create the one-shot sentinel" >&2

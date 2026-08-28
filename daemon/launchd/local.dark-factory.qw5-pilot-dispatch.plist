@@ -9,6 +9,12 @@
     launchctl bootstrap gui/$UID "$HOME/Library/LaunchAgents/local.dark-factory.qw5-pilot-dispatch.plist"
     # (or `launchctl load -w` for legacy) but launchctl bootstrap is preferred on macOS 11+.
 
+  Recovery after a missing or blank MiniMax key:
+    export MINIMAX_API_KEY=<key>
+    launchctl kickstart -k gui/$(id -u)/local.dark-factory.qw5-pilot-dispatch
+    The failed run leaves this job loaded and does not create the dispatch
+    sentinel, so the kickstart immediately retries the one-shot job.
+
   Disarm:
     rm /tmp/jleechan-qw5-dispatch.done
     launchctl bootout gui/$UID "$HOME/Library/LaunchAgents/local.dark-factory.qw5-pilot-dispatch.plist"
