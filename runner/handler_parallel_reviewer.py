@@ -879,7 +879,7 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
         raise ValueError("controller source binding state is malformed") from exc
     if not isinstance(source_bindings, list):
         raise TypeError("controller source binding state is malformed")
-    source_bindings.append(
+    source_bindings = [
         {
             "source_worktree": str(raw_source_workdir),
             "fingerprint": source_fingerprint_before,
@@ -887,7 +887,7 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
             "excluded_untracked_files": list(excluded_untracked),
             "declared_evidence": source_state_before["declared_evidence"],
         }
-    )
+    ]
     ctx.state["_controller_review_source_bindings"] = json.dumps(
         source_bindings, sort_keys=True, separators=(",", ":")
     )
