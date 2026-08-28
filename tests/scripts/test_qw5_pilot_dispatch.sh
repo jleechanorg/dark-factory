@@ -44,7 +44,7 @@ cat > "$BIN_DIR/launchctl" <<'SHIM'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$LAUNCHCTL_CALLS"
 if [[ "${1:-}" == kickstart && "${2:-}" == -k && "${3:-}" == "gui/$(id -u)/local.dark-factory.qw5-pilot-dispatch" ]]; then
-  bash "$DISPATCH"
+  env -u MINIMAX_API_KEY bash "$DISPATCH"
 fi
 exit 0
 SHIM
@@ -94,13 +94,19 @@ if ! grep -Fq "$RECOVERY_COMMAND" "$LOG_DIR/jleechan-qw5-dispatch.stderr.log"; t
   echo "missing MiniMax key failure did not provide the exact kickstart recovery" >&2
   exit 1
 fi
+RECOVERY_SCOPE='configure MINIMAX_API_KEY in a profile sourced by the dispatch script (or the launchd environment)'
+if ! grep -Fq "$RECOVERY_SCOPE" "$LOG_DIR/jleechan-qw5-dispatch.stderr.log"; then
+  echo "missing MiniMax key recovery did not explain the launchd credential scope" >&2
+  exit 1
+fi
+
+printf "export MINIMAX_API_KEY='test-minimax-key'\n" > "$HOME_DIR/.bash_profile"
 
 HOME="$HOME_DIR" \
   PATH="$BIN_DIR:/usr/bin:/bin" \
   CALLS="$CALLS" \
   LAUNCHCTL_CALLS="$LAUNCHCTL_CALLS" \
   DISPATCH="$DISPATCH" \
-  MINIMAX_API_KEY='test-minimax-key' \
   launchctl kickstart -k "gui/$(id -u)/local.dark-factory.qw5-pilot-dispatch"
 
 if ! grep -Fqx "kickstart -k gui/$(id -u)/local.dark-factory.qw5-pilot-dispatch" "$LAUNCHCTL_CALLS"; then
