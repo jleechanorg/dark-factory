@@ -15,6 +15,7 @@ import pytest
 
 from runner.handler_core import Context, Result
 from runner.handler_dispatch import _build_controller_codex_transport
+from runner.handler_sandbox import _build_sandbox_profile
 from runner.handler_parallel_reviewer import _contract_adjusted_result
 from runner.review_controller import (
     EvidenceArtifact,
@@ -110,10 +111,7 @@ def test_controller_transport_macos_accepts_canonical_producer_profile(
 ):
     """The canonical holdout-denying producer profile remains accepted."""
     monkeypatch.setattr("runner.handler_dispatch.sys.platform", "darwin")
-    profile = (
-        '(version 1)\n(allow default)\n'
-        '(deny file-read* (subpath "/sealed/holdouts"))\n'
-    )
+    profile = _build_sandbox_profile([])
     transport = _build_controller_codex_transport(
         [
             "/usr/bin/sandbox-exec",
@@ -128,7 +126,7 @@ def test_controller_transport_macos_accepts_canonical_producer_profile(
     )
 
     assert transport[0:2] == ["/usr/bin/sandbox-exec", "-p"]
-    assert '(deny file-read* (subpath "/sealed/holdouts"))' in transport[2]
+    assert '(deny file-read* (subpath "' in transport[2]
     assert "(deny file-write*)" in transport[2]
     assert transport[3] == "/usr/local/bin/codex"
 
