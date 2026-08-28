@@ -655,9 +655,10 @@ def test_controller_review_codex_unavailable_fails_closed(monkeypatch, tmp_path)
     assert attempts == ["codex"]
 
 
-def test_controller_codex_transport_strips_outer_sandbox_exec(monkeypatch, tmp_path):
-    """_build_controller_codex_transport strips any outer sandbox-exec wrapper
-    so `codex exec --sandbox read-only` runs natively."""
+def test_controller_codex_transport_rejects_permissive_outer_sandbox_exec(
+    monkeypatch, tmp_path
+):
+    """A permissive outer sandbox must fail closed rather than launch Codex."""
     from runner.handler_dispatch import _build_controller_codex_transport
 
     monkeypatch.setattr("runner.handler_dispatch.sys.platform", "darwin")
@@ -671,12 +672,5 @@ def test_controller_codex_transport_strips_outer_sandbox_exec(monkeypatch, tmp_p
         "--skip-git-repo-check",
         "prompt text",
     ]
-    transport = _build_controller_codex_transport(
-        sandboxed_argv, read_only_path=tmp_path
-    )
-
-    assert transport[0] == "codex"
-    assert transport[1] == "exec"
-    assert "--sandbox" not in transport
-    assert "--disable" in transport
-    assert "shell_tool" in transport
+    with pytest.raises(ValueError, match="controller"):
+        _build_controller_codex_transport(sandboxed_argv, read_only_path=tmp_path)

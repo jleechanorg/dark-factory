@@ -65,6 +65,74 @@ darwin_only = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize(
+    "sandboxed",
+    [
+        [
+            "/usr/local/bin/codex",
+            "exec",
+            "--skip-git-repo-check",
+            "ignored prompt",
+        ],
+        [
+            "/usr/bin/sandbox-exec",
+            "-p",
+            "(version 1)\n(allow default)",
+            "/usr/local/bin/codex",
+            "exec",
+            "--skip-git-repo-check",
+            "ignored prompt",
+        ],
+        [
+            "/usr/bin/sandbox-exec",
+            "-p",
+            '(version 1)\n(allow default)\n(deny file-read-data (subpath "/sealed/holdouts"))',
+            "/usr/local/bin/codex",
+            "exec",
+            "--skip-git-repo-check",
+            "ignored prompt",
+        ],
+    ],
+    ids=["no-seatbelt-wrapper", "permissive-profile", "unrecognized-read-denial"],
+)
+def test_controller_transport_macos_requires_canonical_seatbelt_contract(
+    monkeypatch, tmp_path, sandboxed
+):
+    """Darwin controller transport must reject anything weaker than Seatbelt."""
+    monkeypatch.setattr("runner.handler_dispatch.sys.platform", "darwin")
+
+    with pytest.raises(ValueError, match="controller"):
+        _build_controller_codex_transport(sandboxed, read_only_path=tmp_path)
+
+
+def test_controller_transport_macos_accepts_canonical_producer_profile(
+    monkeypatch, tmp_path
+):
+    """The canonical holdout-denying producer profile remains accepted."""
+    monkeypatch.setattr("runner.handler_dispatch.sys.platform", "darwin")
+    profile = (
+        '(version 1)\n(allow default)\n'
+        '(deny file-read* (subpath "/sealed/holdouts"))\n'
+    )
+    transport = _build_controller_codex_transport(
+        [
+            "/usr/bin/sandbox-exec",
+            "-p",
+            profile,
+            "/usr/local/bin/codex",
+            "exec",
+            "--skip-git-repo-check",
+            "ignored prompt",
+        ],
+        read_only_path=tmp_path,
+    )
+
+    assert transport[0:2] == ["/usr/bin/sandbox-exec", "-p"]
+    assert '(deny file-read* (subpath "/sealed/holdouts"))' in transport[2]
+    assert "(deny file-write*)" in transport[2]
+    assert transport[3] == "/usr/local/bin/codex"
+
+
 @darwin_only
 def test_controller_transport_uses_one_macos_sandbox_for_read_only_review(
     tmp_path,

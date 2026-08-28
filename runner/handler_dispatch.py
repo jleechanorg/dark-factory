@@ -689,13 +689,11 @@ def _build_controller_codex_transport(
             if mode != "read-only":
                 raise ValueError("controller transport requires read-only codex sandboxing")
 
-    # Preserve an outer wrapper when it carries a path-specific denial. On
-    # macOS, the outer Seatbelt profile is the single sandbox: augment it with
-    # the workspace write boundary and use Codex's externally-sandboxed mode
-    # so Codex does not try to apply a nested Seatbelt profile. On Linux, the
-    # LD_PRELOAD prefix is not a sandbox and native Codex read-only remains
-    # necessary. A permissive test/development wrapper has no isolation value
-    # and is intentionally removed.
+    # On macOS, the outer Seatbelt profile is the single sandbox: require it,
+    # augment it with the workspace write boundary, and use Codex's
+    # externally-sandboxed mode so Codex does not try to apply a nested
+    # Seatbelt profile. On Linux, the LD_PRELOAD prefix is not a sandbox and
+    # native Codex read-only remains necessary.
     outer = prepared[:codex_index]
     path_denial = any(
         "(deny file-read*" in value or value.startswith("DENY_PATHS=")
@@ -728,7 +726,7 @@ def _build_controller_codex_transport(
     if schema_path is not None:
         controller_tail.extend(["--output-schema", str(schema_path)])
     controller_tail.append("-")
-    if sys.platform == "darwin" and path_denial:
+    if sys.platform == "darwin":
         sandbox_index = next(
             (
                 index
@@ -745,7 +743,7 @@ def _build_controller_codex_transport(
             or sandbox_index + 2 >= len(outer)
             or outer[sandbox_index + 1] != "-p"
         ):
-            raise ValueError("controller macOS transport lacks a sandbox profile")
+            raise ValueError("controller macOS transport requires sandbox-exec -p profile")
         profile_index = sandbox_index + 2
         outer = list(outer)
         outer[profile_index] = _handlers_shim._macos_read_only_profile(
