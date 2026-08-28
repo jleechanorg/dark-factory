@@ -5,7 +5,7 @@ set -euo pipefail
 # The script is copied only to redirect its macOS-specific absolute paths into
 # a disposable fixture; all dispatch and MiniMax lifecycle logic is real.
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/qw5-dispatch-test.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -48,12 +48,17 @@ SHIM
 chmod +x "$BIN_DIR/launchctl"
 
 cp "$ROOT/daemon/qw5-pilot-dispatch.sh" "$DISPATCH"
-sed -i "s|^REPO=.*|REPO=\"$FIXTURE_REPO\"|" "$DISPATCH"
-sed -i "s|^WT=.*|WT=\"$WORKTREE\"|" "$DISPATCH"
-sed -i "s|^SENTINEL=.*|SENTINEL=\"$SENTINEL\"|" "$DISPATCH"
-sed -i "s|^PLIST_SRC=.*|PLIST_SRC=\"$TMP_DIR/pilot.plist.template\"|" "$DISPATCH"
-sed -i "s|^PLIST_DST=.*|PLIST_DST=\"$TMP_DIR/pilot.plist\"|" "$DISPATCH"
-sed -i "s|^LOGDIR=.*|LOGDIR=\"$LOG_DIR\"|" "$DISPATCH"
+rewrite_assignment() {
+  local name="$1" value="$2"
+  sed -i.bak "s|^${name}=.*|${name}=\"${value}\"|" "$DISPATCH"
+  rm -f "$DISPATCH.bak"
+}
+rewrite_assignment REPO "$FIXTURE_REPO"
+rewrite_assignment WT "$WORKTREE"
+rewrite_assignment SENTINEL "$SENTINEL"
+rewrite_assignment PLIST_SRC "$TMP_DIR/pilot.plist.template"
+rewrite_assignment PLIST_DST "$TMP_DIR/pilot.plist"
+rewrite_assignment LOGDIR "$LOG_DIR"
 chmod +x "$DISPATCH"
 
 run_dispatch() {
