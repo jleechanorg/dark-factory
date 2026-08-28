@@ -44,7 +44,9 @@ def test_gate_slash_unknown_command_errors(tmp_path, monkeypatch):
     assert "refusing to run an undefined review lane" in result.output
 
 
-def test_gate_slash_materializes_user_scope_command(tmp_path, monkeypatch):
+def test_gate_slash_materializes_user_scope_command(
+    tmp_path, monkeypatch, project_scoped_claude_config
+):
     """Command in ~/.claude/commands/ but not the repo → copied into the
     workdir so every reviewer backend (incl. codex) resolves it repo-local."""
     import pathlib as _pl
@@ -79,7 +81,7 @@ def test_gate_slash_materializes_user_scope_command(tmp_path, monkeypatch):
     assert materialized.read_text() == "# /zfc user-scope review"
 
 
-def test_gate_slash_runs_named_command(tmp_path, monkeypatch):
+def test_gate_slash_runs_named_command(tmp_path, monkeypatch, project_scoped_claude_config):
     """With .claude/commands/<cmd>.md present, the gate shells out `/cmd` with
     SHA binding, identical to the named gates."""
     import subprocess as _sp

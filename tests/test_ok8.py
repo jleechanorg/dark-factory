@@ -79,7 +79,7 @@ def test_gate_net_loc_binary_and_empty(tmp_path, monkeypatch):
     assert "Net LOC: 0" in result.output
 
 
-def test_gate_dead_code_pass(tmp_path, monkeypatch):
+def test_gate_dead_code_pass(tmp_path, monkeypatch, project_scoped_claude_config):
     """gate_dead_code succeeds when the LLM reviews and returns a pass verdict."""
     node = make_node(name="gate_dead_code")
     ctx = Context(goal="test", workdir=tmp_path, backend="claude")
@@ -101,7 +101,7 @@ def test_gate_dead_code_pass(tmp_path, monkeypatch):
     assert "Dead Code & Cleanliness Review" in called_prompts[0]
 
 
-def test_gate_dead_code_fail(tmp_path, monkeypatch):
+def test_gate_dead_code_fail(tmp_path, monkeypatch, project_scoped_claude_config):
     """gate_dead_code fails when the LLM reviews and returns a fail verdict."""
     node = make_node(name="gate_dead_code")
     ctx = Context(goal="test", workdir=tmp_path, backend="claude")
