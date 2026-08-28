@@ -89,4 +89,3 @@ def test_second_review_uses_current_source_binding_after_worker_mutation(
         _cleanup_controller_snapshot(context)
 
     assert json.loads(context.state["_controller_review_snapshots"]) == []
-
