@@ -35,6 +35,19 @@ linux_only = pytest.mark.skipif(
 )
 
 
+def _native_codex_package_name() -> str:
+    machine = os.uname().machine
+    package = {
+        "x86_64": "codex-linux-x64",
+        "amd64": "codex-linux-x64",
+        "aarch64": "codex-linux-arm64",
+        "arm64": "codex-linux-arm64",
+    }.get(machine)
+    if package is None:
+        pytest.skip(f"unsupported Linux architecture: {machine}")
+    return package
+
+
 RAW_OPEN_SOURCE = r'''
 #define _GNU_SOURCE
 #include <fcntl.h>
@@ -283,6 +296,7 @@ def test_codex_js_launcher_allows_bundled_native_runtime_root(tmp_path):
 @linux_only
 def test_codex_js_launcher_resolves_hoisted_native_runtime_root(tmp_path):
     """npm hoisting puts the platform package beside the JS package."""
+    native_package = _native_codex_package_name()
     package = tmp_path / "node_modules" / "@openai" / "codex"
     launcher = package / "bin" / "codex.js"
     launcher.parent.mkdir(parents=True)
@@ -291,7 +305,7 @@ def test_codex_js_launcher_resolves_hoisted_native_runtime_root(tmp_path):
         tmp_path
         / "node_modules"
         / "@openai"
-        / "codex-linux-x64"
+        / native_package
         / "vendor"
         / "x86_64-unknown-linux-musl"
         / "bin"
@@ -307,11 +321,12 @@ def test_codex_js_launcher_resolves_hoisted_native_runtime_root(tmp_path):
 @linux_only
 def test_codex_js_launcher_rejects_mutable_native_runtime_root(tmp_path):
     """A world-writable native package must never enter the allow-list."""
+    native_package = _native_codex_package_name()
     package = tmp_path / "node_modules" / "@openai" / "codex"
     launcher = package / "bin" / "codex.js"
     launcher.parent.mkdir(parents=True)
     launcher.write_text("#!/usr/bin/env node\n", encoding="utf-8")
-    native_root = tmp_path / "node_modules" / "@openai" / "codex-linux-x64"
+    native_root = tmp_path / "node_modules" / "@openai" / native_package
     native_root.mkdir(parents=True)
     native_root.chmod(0o777)
     try:
