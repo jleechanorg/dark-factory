@@ -32,8 +32,11 @@
 ## Follow-up hardening
 
 The exact-head review identified that a pass could still carry empty evidence
-arrays and no captured command. A second RED cycle added regressions for empty
-passes, missing successful receipts, command/receipt mismatches, and the
-controller acceptance path, then made pass validation require non-empty typed
-evidence plus an authoritative successful captured receipt. The slim default
-graph now explicitly sets `receipt_required="true"` on `cold_reviewer`.
+arrays or a non-empty command list. A second RED cycle added regressions for
+empty passes and tool-free transport receipt binding, then made pass
+validation require non-empty typed evidence while requiring
+`commands_executed` to be exactly `[]`. The tool-free
+`ReviewTransportReceipt` and controller terminal receipt bind the prompt,
+envelope, response, reviewed revision/tree, and evidence manifest. The slim
+default graph now explicitly sets `receipt_required="true"` on
+`cold_reviewer`.

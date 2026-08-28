@@ -26,16 +26,16 @@ with exactly these keys:
 
 The controller still binds and verifies the source template, canonical
 Base64 envelope, repository/base/head/tree, changed-file and evidence digests,
-workspace cleanliness, and captured command-output hashes. `ValidatedReview`
-continues exposing `checks`, but it is always the empty tuple for compatibility
-with external receipt consumers.
+and workspace cleanliness. The tool-free `ReviewTransportReceipt` and
+controller terminal receipt bind the prompt, envelope, response, reviewed
+revision/tree, and evidence manifest. `ValidatedReview` continues exposing
+`checks`, but it is always the empty tuple for compatibility with external
+receipt consumers.
 
-For a `pass`, `evidence_checked` and `commands_executed` must contain
-non-empty strings. The controller acceptance path also requires at least one
-captured command receipt with exit code `0`; for `pass`, `commands_executed` must
-exactly reproduce the captured receipt commands in order. A `fail` remains
-valid without evidence or receipts so missing proof can itself be reported as
-the blocking result.
+For a `pass`, `evidence_checked` must contain non-empty strings and
+`commands_executed` must be exactly `[]`. A `fail` remains valid without
+evidence or receipts so missing proof can itself be reported as the blocking
+result.
 
 ## Failure behavior
 
