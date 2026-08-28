@@ -489,7 +489,7 @@ def audit_graph(
     if relpath in ADVISORY_ALLOWLIST:
         return []
     try:
-        graph = parse(path)
+        graph = parse(path, repo_root=repo_root)
     except ValueError as exc:
         # A "must contain both 'start' and 'exit' nodes" error on a
         # file that has an `include` graph-attribute is a *library*,

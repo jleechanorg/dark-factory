@@ -444,6 +444,7 @@ def _resolve_includes(
     graph_attrs: dict[str, AttrValue],
     require_start_exit: bool,
     visited: tuple[pathlib.Path, ...] = (),
+    repo_root: pathlib.Path | None = None,
 ) -> None:
     """Process graph-attr ``include="@path[@;path...]"`` on the parent.
 
@@ -459,7 +460,9 @@ def _resolve_includes(
 
       1. Absolute path.
       2. Relative to the parent .dot file's directory.
-      3. Relative to the current working directory.
+      3. Relative to the explicit repository root, when supplied.
+      4. Relative to the current working directory.
+      5. Relative to ``$DARK_FACTORY_HOME``, when supplied.
 
     The leading ``@`` is optional and stripped.
 
@@ -484,14 +487,16 @@ def _resolve_includes(
             continue
         include_path: pathlib.Path | None = None
         tried: list[pathlib.Path] = []
-        # Resolution order: parent_dir → cwd → $DARK_FACTORY_HOME.
-        # The third fallback lets the `dark-factory` binary be invoked from
+        # Resolution order: parent_dir → repo_root → cwd → $DARK_FACTORY_HOME.
+        # The final fallback lets the `dark-factory` binary be invoked from
         # any workdir without `cd`-ing into the install root, matching
         # `paths.resolve_factory_path`'s cwd→$DARK_FACTORY_HOME contract.
-        # Bug: pre-fix, the parser only tried parent_dir + cwd, so
-        # `--pipeline slim/spec_gen.dot` (a bare filename) from a worktree
-        # cwd raised "include not found" for `@pipelines/_base.dot`.
-        bases: list[pathlib.Path] = [parent_dir, cwd]
+        # An explicit repository root keeps repository audits independent of
+        # their caller's CWD without mutating process state or environment.
+        bases: list[pathlib.Path] = [parent_dir]
+        if repo_root is not None:
+            bases.append(repo_root.resolve())
+        bases.append(cwd)
         home = factory_home()
         if home is not None:
             bases.append(home)
@@ -512,7 +517,12 @@ def _resolve_includes(
             raise ValueError(
                 f"{path}: include cycle detected: {chain}"
             )
-        sub = _parse(include_path, require_start_exit=False, visited=(*visited, include_path))
+        sub = _parse(
+            include_path,
+            require_start_exit=False,
+            visited=(*visited, include_path),
+            repo_root=repo_root,
+        )
         # Reject any start/exit in the included graph — libraries must
         # be runnable-only-when-wired-into-a-lane, not standalone.
         for nm, node in sub.nodes.items():
@@ -543,20 +553,26 @@ def _resolve_includes(
                 pass
 
 
-def parse(path: pathlib.Path, require_start_exit: bool = True) -> Graph:
+def parse(
+    path: pathlib.Path,
+    require_start_exit: bool = True,
+    *,
+    repo_root: pathlib.Path | None = None,
+) -> Graph:
     """Load a .dot file and return a Graph.
 
     By default pipelines must contain both ``start`` and ``exit`` nodes.
     Pass ``require_start_exit=False`` to load a graph *library* (used by
     ``include="@path"`` and by tests that want to inspect a library directly).
     """
-    return _parse(path, require_start_exit=require_start_exit)
+    return _parse(path, require_start_exit=require_start_exit, repo_root=repo_root)
 
 
 def _parse(
     path: pathlib.Path,
     require_start_exit: bool,
     visited: tuple[pathlib.Path, ...] = (),
+    repo_root: pathlib.Path | None = None,
 ) -> Graph:
     """Internal: load a .dot file and return a Graph.
 
@@ -566,6 +582,8 @@ def _parse(
 
     ``visited`` is the chain of resolved include paths leading here, used
     by ``_resolve_includes`` to detect cycles (see its docstring).
+    ``repo_root`` is an optional explicit root for repository-relative
+    includes and is propagated through nested library parses.
     """
     raw = pydot.graph_from_dot_file(str(path))
     if not raw:
@@ -644,7 +662,13 @@ def _parse(
     # still applies; the included graph must not declare its own.
     if graph_attrs.get("include"):
         _resolve_includes(
-            path, nodes, edges, graph_attrs, require_start_exit, visited
+            path,
+            nodes,
+            edges,
+            graph_attrs,
+            require_start_exit,
+            visited,
+            repo_root,
         )
 
     _apply_model_stylesheet(path, nodes, graph_attrs.get("model_stylesheet"))
