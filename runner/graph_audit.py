@@ -467,7 +467,9 @@ def _find_g2_violations(graph: Graph, relpath: str) -> list[Violation]:
 # ---------------------------------------------------------------------------
 
 
-def audit_graph(path: pathlib.Path) -> list[Violation]:
+def audit_graph(
+    path: pathlib.Path, *, repo_root: Optional[pathlib.Path] = None
+) -> list[Violation]:
     """Audit a single ``.dot`` pipeline.
 
     Library files (those that ``include="@..."`` other graphs and
@@ -480,7 +482,10 @@ def audit_graph(path: pathlib.Path) -> list[Violation]:
     violation so a downstream driver can still report the file as
     broken.
     """
-    relpath = _relpath(path)
+    # Repository-wide callers pass their root explicitly so report paths do
+    # not depend on the process CWD.  Standalone callers retain the historical
+    # CWD-relative behavior when no root is supplied.
+    relpath = _relpath(path, repo_root)
     if relpath in ADVISORY_ALLOWLIST:
         return []
     try:
@@ -667,7 +672,10 @@ def audit_repository(repo_root: pathlib.Path) -> list[Violation]:
     violations: list[Violation] = []
     for dot in sorted(repo_root.rglob("*.dot")):
         if _is_authored_graph(repo_root, dot):
-            graph_violations = audit_graph(dot)
+            # ``audit_graph`` normally reports relative to CWD.  A repository
+            # audit may be invoked from any directory, so bind its report
+            # paths to the repository root explicitly.
+            graph_violations = audit_graph(dot, repo_root=repo_root)
             try:
                 relative = dot.resolve().relative_to(repo_root.resolve())
             except ValueError:
@@ -689,13 +697,18 @@ def audit_repository(repo_root: pathlib.Path) -> list[Violation]:
 # ---------------------------------------------------------------------------
 
 
-def _relpath(path: pathlib.Path) -> str:
-    """Return the path as a repo-root-relative POSIX string for
-    consistent reporting. Falls back to absolute when the path is
-    not under the current working directory.
+def _relpath(
+    path: pathlib.Path, root: Optional[pathlib.Path] = None
+) -> str:
+    """Return a stable POSIX report path relative to ``root`` or CWD.
+
+    Repository audits supply ``root`` explicitly because the caller may be
+    outside the repository.  Standalone graph audits retain CWD-relative
+    behavior and fall back to the path's spelling when it is external.
     """
+    base = root.resolve() if root is not None else pathlib.Path.cwd()
     try:
-        return path.resolve().relative_to(pathlib.Path.cwd()).as_posix()
+        return path.resolve().relative_to(base).as_posix()
     except ValueError:
         return path.as_posix()
 

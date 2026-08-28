@@ -245,6 +245,41 @@ def test_audit_repository_does_not_block_on_benchmark_g1_g4(tmp_path):
     assert not [v for v in violations if v.pipeline.endswith("legacy.dot")], violations
 
 
+def test_audit_repository_reports_repo_relative_paths_outside_cwd(
+    tmp_path, monkeypatch
+):
+    """Repository reports stay relative when the caller is elsewhere.
+
+    ``audit_graph`` historically derived its report path from the process CWD.
+    A repository-wide audit receives an explicit root, so its paths must remain
+    stable for CI, callers, and benchmark filtering regardless of invocation
+    directory.  The benchmark's intentionally ignored G1 finding must remain
+    filtered while the production finding keeps its other fields unchanged.
+    """
+    import shutil
+
+    repo_root = tmp_path / "repo"
+    production = repo_root / "pipelines"
+    production.mkdir(parents=True)
+    shutil.copy2(FIXTURES / "g1_violator.dot", production / "g1.dot")
+    benchmark = repo_root / "benchmarks" / "example" / "pipelines"
+    benchmark.mkdir(parents=True)
+    shutil.copy2(FIXTURES / "g1_violator.dot", benchmark / "legacy.dot")
+
+    outside_cwd = tmp_path / "caller"
+    outside_cwd.mkdir()
+    monkeypatch.chdir(outside_cwd)
+
+    violations = graph_audit.audit_repository(repo_root)
+
+    assert len(violations) == 1
+    violation = violations[0]
+    assert violation.kind == "G1"
+    assert violation.pipeline == "pipelines/g1.dot"
+    assert violation.location == "start -> coder -> exit"
+    assert violation.message
+
+
 def test_audit_repository_discovers_hidden_dark_factory_slices(tmp_path):
     """Authored slice graphs under ``.dark-factory/`` are route-audited.
 
