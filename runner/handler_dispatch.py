@@ -281,10 +281,16 @@ def _launch_shadow_gate_review(
     shadow.transport_argv = tuple(str(arg) for arg in args)
     review_cwd = ctx.workdir
     if prompt_is_complete:
-        request = ctx.state.get("_df_controller_review_request")
-        if request is not None:
-            target = json.loads(request.envelope_json)["target"]
-            review_cwd = pathlib.Path(str(target["workspace_path"]))
+        neutral = ctx.state.get("_df_controller_review_cwd")
+        if not isinstance(neutral, str) or not neutral:
+            shadow.launch_error = "controller neutral cwd is missing"
+            if runtime is not None:
+                try:
+                    _handlers_shim._cleanup_controller_runtime(runtime.run_dir)
+                except Exception:  # noqa: BLE001, S110 - best-effort runtime cleanup
+                    pass
+            return shadow
+        review_cwd = pathlib.Path(neutral).resolve()
     try:
         shadow.proc = subprocess.Popen(
             args,
@@ -771,9 +777,8 @@ def _build_controller_codex_transport(
         landlock_prefix = _handlers_shim._linux_controller_sandbox_prefix(
             denied_paths=denied_paths,
             read_paths=[
-                pathlib.Path(read_only_path),
                 *runtime_paths,
-                pathlib.Path(schema_path) if schema_path is not None else pathlib.Path(read_only_path),
+                *([pathlib.Path(schema_path)] if schema_path is not None else []),
             ],
             writable_paths=[pathlib.Path(writable_path)] if writable_path is not None else [],
             executable_paths=[executable_path],
@@ -927,9 +932,10 @@ def _run_gate_once(
             request = ctx.state.get("_df_controller_review_request")
             if request is None:
                 raise RuntimeError("controller review request is missing")
-            review_cwd = pathlib.Path(
-                str(json.loads(request.envelope_json)["target"]["workspace_path"])
-            )
+            neutral = ctx.state.get("_df_controller_review_cwd")
+            if not isinstance(neutral, str) or not neutral:
+                raise RuntimeError("controller neutral cwd is missing")
+            review_cwd = pathlib.Path(neutral).resolve()
         proc = subprocess.run(
             sub_args, cwd=review_cwd, capture_output=True, text=True,
             input=prompt if controller_json else None,
@@ -1005,7 +1011,9 @@ def _run_gate_once(
             review_output, transport_receipt = parse_tool_free_codex_jsonl(
                 proc.stdout, request=request
             )
-            controller_review = validate_review_response(review_output, request)
+            controller_review = validate_review_response(
+                review_output, request, tool_free=True
+            )
             if transport_receipt.head_sha != expected_sha:
                 raise ValueError("tool-free controller receipt head binding mismatch")
             command_receipts = ()

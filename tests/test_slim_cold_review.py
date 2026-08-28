@@ -59,8 +59,8 @@ def test_compact_contract_has_no_checklist_or_controller_hash_echoes() -> None:
         "continue",
     ):
         assert phrase in request.prompt_payload.lower()
-    assert "base64-decode" in request.prompt_payload.lower()
-    assert "utf-8" in request.prompt_payload.lower()
+    assert "canonical json bundle" in request.prompt_payload.lower()
+    assert "begin_untrusted_review_bundle" in request.prompt_payload.lower()
 
 
 def test_compact_response_is_strict_json_with_empty_checks_compatibility() -> None:

@@ -142,7 +142,9 @@ def test_controller_transport_macos_profile_enforces_read_only_and_holdout_denia
     cache_root.mkdir(parents=True, exist_ok=True)
     target_root = pathlib.Path(tempfile.mkdtemp(prefix="df-pr771-", dir=cache_root))
     try:
-        allowed = target_root / "allowed.txt"
+        neutral_root = tmp_path / "neutral"
+        neutral_root.mkdir()
+        allowed = neutral_root / "allowed.txt"
         target = target_root / "target.txt"
         allowed.write_text("allowed\n", encoding="utf-8")
         target.write_text("unchanged\n", encoding="utf-8")
@@ -164,6 +166,15 @@ def test_controller_transport_macos_profile_enforces_read_only_and_holdout_denia
             "    raise SystemExit('holdout-readable')\n"
             f"target = Path({str(target)!r})\n"
             "try:\n"
+            "    target.read_text(encoding='utf-8')\n"
+            "except OSError as exc:\n"
+            "    if exc.errno not in (errno.EPERM, errno.EACCES):\n"
+            "        raise SystemExit(f'target read probe failed: {exc}')\n"
+            "    target_read_denied = True\n"
+            "else:\n"
+            "    raise SystemExit('target-readable')\n"
+            f"target = Path({str(target)!r})\n"
+            "try:\n"
             "    target.write_text('changed', encoding='utf-8')\n"
             "except OSError as exc:\n"
             "    if exc.errno not in (errno.EPERM, errno.EACCES):\n"
@@ -172,7 +183,9 @@ def test_controller_transport_macos_profile_enforces_read_only_and_holdout_denia
             "else:\n"
             "    raise SystemExit('target-write-allowed')\n"
             "print(json.dumps({'allowed': allowed.strip(), "
-            "'holdout_denied': holdout_denied, 'write_denied': write_denied}))\n",
+            "'holdout_denied': holdout_denied, "
+            "'target_read_denied': target_read_denied, "
+            "'write_denied': write_denied}))\n",
             encoding="utf-8",
         )
         codex.chmod(codex.stat().st_mode | stat.S_IXUSR)
@@ -206,6 +219,7 @@ def test_controller_transport_macos_profile_enforces_read_only_and_holdout_denia
         assert json.loads(proc.stdout) == {
             "allowed": "allowed",
             "holdout_denied": True,
+            "target_read_denied": True,
             "write_denied": True,
         }
         assert target.read_text(encoding="utf-8") == "unchanged\n"
@@ -304,6 +318,34 @@ def test_controller_transport_binds_controller_owned_schema(monkeypatch, tmp_pat
     assert transport[-3:] == ["--output-schema", str(schema), "-"]
     assert "--sandbox" not in transport
     assert "features.use_legacy_landlock=true" not in transport
+
+
+def test_linux_controller_transport_excludes_target_from_landlock_reads(
+    monkeypatch, tmp_path
+):
+    captured: dict[str, object] = {}
+    monkeypatch.setattr("runner.handler_dispatch.sys.platform", "linux")
+
+    def fake_landlock(**kwargs):
+        captured.update(kwargs)
+        return ["/opt/landlock", "DENY_PATHS=/sealed", "--"]
+
+    monkeypatch.setattr("runner.handlers._linux_controller_sandbox_prefix", fake_landlock)
+    monkeypatch.setattr("runner.handlers._linux_codex_runtime_paths", lambda _path: [])
+    target = tmp_path / "target"
+    target.mkdir(mode=0o700)
+    transport = _build_controller_codex_transport(
+        [
+            "/usr/bin/env", "DENY_PATHS=/sealed", "/usr/local/bin/codex", "exec",
+            "--skip-git-repo-check", "ignored",
+        ],
+        read_only_path=target,
+    )
+
+    assert transport
+    assert target.resolve() not in captured["read_paths"]
+    assert pathlib.Path("/etc/codex") not in captured["read_paths"]
+    assert pathlib.Path("/etc") not in captured["read_paths"]
 
 
 @pytest.mark.parametrize("platform", ["darwin", "linux"])

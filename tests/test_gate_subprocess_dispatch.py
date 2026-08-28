@@ -189,7 +189,10 @@ def test_complete_controller_prompt_is_not_rewrapped_for_shadow(tmp_path, monkey
     monkeypatch.setattr("runner.handler_dispatch.sys.platform", "darwin")
     monkeypatch.setattr("runner.handler_dispatch.shutil.which", lambda name: "/usr/bin/codex")
     monkeypatch.setattr("runner.handler_dispatch.subprocess.Popen", _FakePopen)
+    neutral = tmp_path / "controller-cwd"
+    neutral.mkdir()
     ctx = HCtx(goal="untrusted goal", workdir=tmp_path, backend="codex")
+    ctx.state["_df_controller_review_cwd"] = str(neutral)
 
     prompt = "CONTROLLER-OWNED COMPLETE PROMPT"
     shadow = _launch_shadow_gate_review(
@@ -274,7 +277,8 @@ def test_launch_shadow_gate_review_uses_target_cwd_and_sanitized_env(tmp_path, m
     assert review is not None
     assert review.prompt_is_complete is True
     assert review.json_transport is True, review.launch_error
-    assert observed.get("cwd") == ctx.workdir
+    assert observed.get("cwd") == neutral
+    assert observed.get("cwd") != ctx.workdir
     env = observed.get("env", {})
     assert isinstance(env, dict)
     assert "DARK_FACTORY_HOLDOUTS" not in env
@@ -481,7 +485,7 @@ def test_run_gate_once_controller_uses_authenticated_json_verdict_without_sha_ec
             "verdict": "pass",
             "findings": [],
             "evidence_checked": ["evidence.txt"],
-            "commands_executed": ["verification"],
+            "commands_executed": [],
             "caveats": [],
         }
     )
@@ -490,6 +494,7 @@ def test_run_gate_once_controller_uses_authenticated_json_verdict_without_sha_ec
         state={
             "_df_controller_review_json": "true",
             "_df_controller_review_request": request,
+            "_df_controller_review_cwd": str(tmp_path),
         },
         workdir=tmp_path,
         run_id="run",
@@ -537,6 +542,7 @@ def test_run_gate_once_controller_rejects_tampered_receipt_and_keeps_failures(
         state={
             "_df_controller_review_json": "true",
             "_df_controller_review_request": request,
+            "_df_controller_review_cwd": str(tmp_path),
         },
         workdir=tmp_path,
         run_id="run",
@@ -546,7 +552,7 @@ def test_run_gate_once_controller_rejects_tampered_receipt_and_keeps_failures(
             "verdict": "fail",
             "findings": ["blocking finding"],
             "evidence_checked": ["evidence.txt"],
-            "commands_executed": ["verification"],
+            "commands_executed": [],
             "caveats": [],
         }
     )

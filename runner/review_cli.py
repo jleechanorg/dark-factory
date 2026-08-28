@@ -400,7 +400,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             proc = subprocess.run(
                 command,
-                cwd=workdir if transport_is_jsonl else output_dir,
+                cwd=output_dir,
                 capture_output=True,
                 text=True,
                 input=stdin_text,
@@ -435,7 +435,9 @@ def main(argv: list[str] | None = None) -> int:
         response_sha256 = _sha256(response_bytes)
         if proc.returncode == 0 and not contract_error:
             try:
-                validated = validate_review_response(response, request)
+                validated = validate_review_response(
+                    response, request, tool_free=transport_is_jsonl
+                )
                 if request.bundle_sha256:
                     if validated.commands_executed:
                         raise ReviewContractError(

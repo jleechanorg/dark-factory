@@ -381,6 +381,37 @@ def test_landlock_denies_raw_openat_from_static_binary(tmp_path):
 
 
 @linux_only
+def test_landlock_denies_unlisted_etc_sibling_from_static_binary(tmp_path):
+    """Exact runtime files must not expand into a readable /etc directory."""
+    launcher = _linux_landlock_launcher_path()
+    assert launcher is not None
+    raw_open = _compile_static_raw_open(tmp_path / "tool")
+    work = tmp_path / "work"
+    work.mkdir()
+
+    denied = pathlib.Path("/etc/hostname")
+    if not denied.is_file():
+        pytest.skip(f"unlisted /etc sibling unavailable: {denied}")
+    prefix = _linux_controller_sandbox_prefix(
+        denied_paths=[denied],
+        read_paths=[work],
+        writable_paths=[],
+        executable_paths=[raw_open],
+    )
+    assert prefix is not None
+    proc = subprocess.run(
+        _extend_pinned_launcher_command(prefix, [str(raw_open), str(denied)]),
+        pass_fds=prefix.pass_fds,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    prefix.close_launcher()
+    assert proc.returncode == 3, proc.stderr
+    assert "Permission denied" not in proc.stdout
+
+
+@linux_only
 def test_landlock_allows_resolver_symlink_target_but_not_run_sibling(tmp_path):
     """The resolver symlink target is an exact read rule, not a /run grant."""
     launcher = _linux_landlock_launcher_path()

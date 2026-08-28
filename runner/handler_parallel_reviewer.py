@@ -1234,7 +1234,9 @@ def _contract_adjusted_result(
                     f"review backend exited with {returncode}"
                 )
         _verify_controller_workspace(ctx, request)
-        validated = validate_review_response(result.output or "", request)
+        validated = validate_review_response(
+            result.output or "", request, tool_free=bool(request.bundle_sha256)
+        )
         if request.bundle_sha256:
             raw_receipt = metadata.get("_controller_transport_receipt")
             if not isinstance(raw_receipt, dict):
@@ -1642,7 +1644,7 @@ def _parallel_reviewer_impl(node: "Node", ctx: "Context") -> "Result":
             / node.name
             / str(int(getattr(ctx, "_df_current_attempt", 1)))
         )
-        neutral_cwd.mkdir(parents=True, exist_ok=True)
+        neutral_cwd.mkdir(parents=True, exist_ok=True, mode=0o700)
         ctx.state["_df_controller_review_cwd"] = str(neutral_cwd)
         # Per-lane output directories so primary + every shadow write to
         # distinct cwd/output_dir paths (the controller review contract

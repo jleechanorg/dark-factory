@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -224,11 +226,13 @@ def test_controller_runtime_cleanup_rejects_symlink_and_profile_allows_only_home
     assert runtime.run_dir.exists()
     profile = _macos_read_only_profile(
         '(version 1)\n(allow default)\n(deny file-read* (subpath "/sealed"))',
+        read_only_path=runtime.run_dir,
         writable_path=runtime.codex_home,
     )
     assert "(deny file-write*)" in profile
     assert '(allow file-write* (literal "/dev/null"))' in profile
     assert f'(allow file-write* (subpath "{runtime.codex_home}"))' in profile
+    assert f'(deny file-read* (subpath "{runtime.run_dir}"))' in profile
     assert str(outside) not in profile
     _cleanup_controller_runtime(runtime.run_dir)
 
@@ -236,11 +240,45 @@ def test_controller_runtime_cleanup_rejects_symlink_and_profile_allows_only_home
 def _assert_snapshot_profile(transport: list[str], source: Path, snapshot: Path) -> None:
     profile = transport[2]
     assert "(deny file-write*)" in profile
+    assert f'(deny file-read* (subpath "{snapshot}"))' in profile
     assert str(source) not in profile
     assert "--dangerously-bypass-approvals-and-sandbox" not in transport
     assert "--disable" in transport
     assert "shell_tool" in transport
     assert "--sandbox" not in transport
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin" or shutil.which("sandbox-exec") is None,
+    reason="macOS sandbox-exec is required",
+)
+def test_macos_controller_denies_target_read_but_allows_neutral_cwd(tmp_path):
+    target = tmp_path / "target"
+    neutral = tmp_path / "neutral"
+    target.mkdir(mode=0o700)
+    neutral.mkdir(mode=0o700)
+    (target / "secret.txt").write_text("TARGET-SECRET\n", encoding="utf-8")
+    (neutral / "marker.txt").write_text("NEUTRAL-OK\n", encoding="utf-8")
+    profile = _macos_read_only_profile(
+        '(version 1)\n(allow default)\n(deny file-read* (subpath "/sealed"))',
+        read_only_path=target,
+    )
+    denied = subprocess.run(
+        ["sandbox-exec", "-p", profile, "/bin/cat", str(target / "secret.txt")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    allowed = subprocess.run(
+        ["sandbox-exec", "-p", profile, "/bin/cat", str(neutral / "marker.txt")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert denied.returncode != 0
+    assert "TARGET-SECRET" not in denied.stdout
+    assert allowed.returncode == 0
+    assert allowed.stdout == "NEUTRAL-OK\n"
 
 
 @pytest.mark.skipif(
@@ -317,13 +355,21 @@ def test_complete_prompt_shadow_uses_envelope_snapshot_for_write_denial(
         lambda backend, prompt, ctx, timeout: _sandboxed_codex_args(),
     )
     monkeypatch.setattr("runner.handler_dispatch.subprocess.Popen", FakePopen)
+    neutral = tmp_path / "neutral"
+    neutral.mkdir(mode=0o700)
+    ctx = Context(
+        goal="review",
+        workdir=source,
+        backend="codex",
+        state={"_df_controller_review_cwd": str(neutral)},
+    )
 
     review = _launch_shadow_gate_review(
         "cold_reviewer",
         "COMPLETE CONTROLLER PROMPT",
         "a" * 40,
         300,
-        Context(goal="review", workdir=source, backend="codex"),
+        ctx,
         prompt_is_complete=True,
         read_only_path=snapshot,
     )

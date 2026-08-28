@@ -424,11 +424,14 @@ def _macos_read_only_profile(
     """
     if "(deny file-read* (subpath \"" not in profile:
         raise ValueError("controller sandbox profile lacks holdout read denial")
-    # The controller is a read-only reviewer. A path-specific denial is not
-    # enough: it leaves the source checkout, Git admin area, and unrelated
-    # filesystem writable. Keep the parameter for API compatibility, but do
-    # not turn it into a writable exception or a weaker boundary.
-    del read_only_path
+    if read_only_path is None:
+        raise ValueError("controller sandbox profile lacks target read denial")
+    try:
+        target = pathlib.Path(read_only_path).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("controller sandbox target is unavailable") from exc
+    escaped_target = str(target).replace("\\", "\\\\").replace('"', '\\"')
+    profile = profile.rstrip() + f'\n(deny file-read* (subpath "{escaped_target}"))\n'
     write_rule = "(deny file-write*)"
     profile = profile.rstrip() + "\n" + write_rule + "\n"
     # Shells and Git use /dev/null for ordinary command plumbing. It is a
@@ -1045,7 +1048,7 @@ def _linux_controller_sandbox_prefix(
     if any(contains(allowed, secret) for allowed in reads + writes for secret in denied):
         return None
 
-    system_roots = ["/bin", "/dev", "/etc", "/lib", "/lib64", "/sbin", "/sys", "/usr", "/proc"]
+    system_roots = ["/bin", "/dev", "/lib", "/lib64", "/sbin", "/sys", "/usr", "/proc"]
     for raw in system_roots:
         path = pathlib.Path(raw)
         if path.is_dir():
@@ -1053,6 +1056,28 @@ def _linux_controller_sandbox_prefix(
                 reads.append(path.resolve(strict=True))
             except (OSError, RuntimeError):
                 return None
+    # Keep configuration access to the exact files needed for identity,
+    # resolver, and TLS setup.  Never allow the whole /etc tree: that would
+    # expose controller-owned configuration such as /etc/codex.
+    for raw in (
+        "/etc/ld.so.cache",
+        "/etc/nsswitch.conf",
+        "/etc/passwd",
+        "/etc/group",
+        "/etc/hosts",
+        "/etc/resolv.conf",
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/ssl/openssl.cnf",
+        "/etc/localtime",
+    ):
+        path = pathlib.Path(raw)
+        try:
+            resolved = path.resolve(strict=True)
+        except (OSError, RuntimeError):
+            return None
+        if not resolved.is_file():
+            return None
+        reads.extend((path, resolved))
     # Linux resolves /etc/resolv.conf through a symlink into /run.  The
     # controller must allow only that exact target, rather than opening the
     # whole /run tree.  The private CODEX_HOME and --ignore-user-config path
