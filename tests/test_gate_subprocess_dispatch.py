@@ -210,6 +210,31 @@ def test_run_gate_once_reports_claude_scope_error_distinct_from_sandbox(monkeypa
     assert result.metadata.get("sandbox") != "unavailable"
 
 
+def test_execute_gate_does_not_fallback_on_direct_claude_scope_error(monkeypatch, tmp_path):
+    """An invalid direct-Claude scope is terminal; it must not invoke AGY."""
+    from runner.handlers import _execute_gate, Context as HCtx
+
+    scope_error = "DARK_FACTORY_CLAUDE_CONFIG_DIR must be an absolute existing project config directory"
+    monkeypatch.setattr(
+        "runner.handlers._claude_config_dir",
+        lambda: (_ for _ in ()).throw(ValueError(scope_error)),
+    )
+    monkeypatch.setattr(
+        "runner.handlers._sandboxed_args",
+        lambda args: pytest.fail("invalid direct-Claude scope must not reach subprocess construction"),
+    )
+    ctx = HCtx(goal="test", workdir=tmp_path, backend="claude")
+
+    result = _execute_gate("PROMPT", "0" * 40, 30, ctx, "gate_x", "claude-sonnet")
+
+    assert result.outcome == "error"
+    assert scope_error in result.output
+    assert result.metadata["config_error"] == "true"
+    assert result.metadata["invalid_scope"] == "true"
+    assert result.metadata["fallback_used"] == "false"
+    assert result.metadata["reviewer_backend"] == "claude-sonnet"
+
+
 def test_shadow_claude_scope_error_is_not_mislabeled_sandbox(monkeypatch, tmp_path):
     """Shadow launches must preserve direct-Claude scope failures."""
     from runner.handlers import Context as HCtx
@@ -733,6 +758,7 @@ def test_execute_gate_runs_parallel_codex_shadow_review(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr("runner.handlers._claude_config_dir", lambda: tmp_path / "project-claude-config")
     monkeypatch.setattr("runner.handler_dispatch.shutil.which", lambda name: "/usr/bin/codex")
     monkeypatch.setattr("subprocess.run", _fake_run)
     monkeypatch.setattr("runner.handler_dispatch.subprocess.Popen", _FakePopen)

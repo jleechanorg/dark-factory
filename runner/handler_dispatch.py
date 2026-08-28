@@ -1263,6 +1263,17 @@ def _execute_gate(
     result = _run_gate_once(backend, prompt, expected_sha, timeout, ctx, name, gate_strict=gate_strict)
 
     controller_requested = str(ctx.state.get("_df_controller_review_json") or "").lower() in {"true", "1", "yes", "on"}
+    # A direct-Claude scope/configuration error is a deterministic dispatch
+    # policy violation, not a transient reviewer outage.  Falling through to
+    # AGY here would hide an unscoped Claude launch behind a successful result
+    # and would make the configured account boundary optional.  Keep the
+    # original error and stop before any fallback process is constructed.
+    if (
+        result.metadata.get("config_error") == "true"
+        or result.metadata.get("invalid_scope") == "true"
+    ):
+        result.metadata.setdefault("fallback_used", "false")
+        return result
     if (
         result.metadata.get("invalid_backend") == "true"
         and result.metadata.get("config_error") != "true"
