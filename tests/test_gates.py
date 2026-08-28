@@ -73,7 +73,7 @@ from tests.test_gate_custom_prompts import (  # noqa: F401
     test_gate_es_and_cs_with_prompt_attr_route_custom_prompt,
 )
 from tests.test_gate_infra_failure import (  # noqa: F401
-    test_execute_gate_codex_infra_failure_falls_back_to_claude,
+    test_execute_gate_codex_infra_failure_stops_after_agy,
     test_execute_gate_codex_real_fail_not_retried,
     test_execute_gate_tags_infra_failure_when_all_backends_die,
 )
