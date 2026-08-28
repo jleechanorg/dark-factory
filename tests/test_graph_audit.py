@@ -280,6 +280,54 @@ def test_audit_repository_reports_repo_relative_paths_outside_cwd(
     assert violation.message
 
 
+def test_audit_repository_resolves_repo_root_includes_outside_cwd(
+    tmp_path, monkeypatch
+):
+    """Repository audits propagate their explicit root to DOT includes.
+
+    Production lanes conventionally include ``@pipelines/_base.dot``.  When
+    the audit is invoked from a caller directory, that reference is relative
+    to the repository root rather than the caller's CWD.  Keep this test
+    hermetic by removing ``DARK_FACTORY_HOME``; the repository root itself is
+    the only valid fallback.
+    """
+    repo_root = tmp_path / "repo"
+    pipeline_dir = repo_root / "pipelines" / "factory"
+    pipeline_dir.mkdir(parents=True)
+    (repo_root / "pipelines" / "_base.dot").write_text(
+        textwrap.dedent(
+            """
+            // include="@pipelines/_base.dot" (library audit exemption marker)
+            digraph base {
+                reviewer [type="gate_er"]
+            }
+            """
+        ),
+        encoding="utf-8",
+    )
+    (pipeline_dir / "lane.dot").write_text(
+        textwrap.dedent(
+            """
+            digraph lane {
+                graph [include="@pipelines/_base.dot"]
+                start [shape=Mdiamond]
+                exit [shape=Msquare]
+                coder [type="codergen", backend="codex"]
+                start -> coder -> reviewer -> exit
+            }
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    outside_cwd = tmp_path / "caller"
+    outside_cwd.mkdir()
+    monkeypatch.chdir(outside_cwd)
+    monkeypatch.delenv("DARK_FACTORY_HOME", raising=False)
+
+    assert graph_audit.audit_repository(repo_root) == []
+
+
 def test_audit_repository_discovers_hidden_dark_factory_slices(tmp_path):
     """Authored slice graphs under ``.dark-factory/`` are route-audited.
 
