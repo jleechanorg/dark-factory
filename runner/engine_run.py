@@ -38,6 +38,7 @@ from .parser import Graph, Node, is_exit_node
 
 _CONTROLLER_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _CONTROLLER_SNAPSHOT_JOURNAL = "controller-snapshot-journal.json"
+_CONTROLLER_BASE_PROVENANCE = "controller-base-provenance.json"
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
@@ -240,10 +241,10 @@ def _controller_snapshot_journal_directory(
             os.close(directory_fd)
 
 
-def _read_controller_snapshot_journal(
+def _read_controller_private_json(
     path: pathlib.Path, *, dir_fd: int | None = None
-) -> list:
-    """Read a journal through a no-follow descriptor after validating its file."""
+) -> object | None:
+    """Read a private JSON file through a validated no-follow descriptor."""
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -253,7 +254,7 @@ def _read_controller_snapshot_journal(
         else:
             fd = os.open(path.name, flags, dir_fd=dir_fd)
     except FileNotFoundError:
-        return []
+        return None
     try:
         info = os.fstat(fd)
         if (
@@ -271,9 +272,18 @@ def _read_controller_snapshot_journal(
     finally:
         os.close(fd)
     try:
-        entries = json.loads(b"".join(chunks).decode("utf-8"))
+        return json.loads(b"".join(chunks).decode("utf-8"))
     except (UnicodeError, TypeError, json.JSONDecodeError) as exc:
-        raise ValueError("controller snapshot journal is malformed") from exc
+        raise ValueError("controller private JSON is malformed") from exc
+
+
+def _read_controller_snapshot_journal(
+    path: pathlib.Path, *, dir_fd: int | None = None
+) -> list:
+    """Read a journal through a no-follow descriptor after validating its file."""
+    entries = _read_controller_private_json(path, dir_fd=dir_fd)
+    if entries is None:
+        return []
     if not isinstance(entries, list):
         raise TypeError("controller snapshot journal is malformed")
     return entries
@@ -313,10 +323,10 @@ def _controller_snapshot_journal_lock(
                 os.close(fd)
 
 
-def _write_controller_snapshot_journal(
-    path: pathlib.Path, entries: list, *, dir_fd: int | None = None
+def _write_controller_private_json(
+    path: pathlib.Path, entries: object, *, dir_fd: int | None = None
 ) -> None:
-    """Atomically replace a journal and flush both file and directory metadata."""
+    """Atomically replace private JSON and flush file plus directory metadata."""
     if dir_fd is None:
         if path.is_symlink():
             raise ValueError("controller snapshot journal is a symlink")
@@ -365,6 +375,49 @@ def _write_controller_snapshot_journal(
     finally:
         if owns_directory_fd:
             os.close(directory_fd)
+
+
+def _write_controller_snapshot_journal(
+    path: pathlib.Path, entries: list, *, dir_fd: int | None = None
+) -> None:
+    """Atomically replace a journal and flush both file and directory metadata."""
+    _write_controller_private_json(path, entries, dir_fd=dir_fd)
+
+
+def _load_controller_base_provenance(ctx: Context) -> bool:
+    """Restore the runner-owned base from the protected per-run sidecar."""
+    try:
+        with _controller_snapshot_journal_lock(ctx) as location:
+            if location is None:
+                return False
+            _journal_path, dir_fd = location
+            sidecar = pathlib.Path(_CONTROLLER_BASE_PROVENANCE)
+            payload = _read_controller_private_json(sidecar, dir_fd=dir_fd)
+    except (OSError, TypeError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    base_sha = payload.get("controller_base_sha")
+    if not isinstance(base_sha, str) or not _CONTROLLER_SHA_RE.fullmatch(base_sha.lower()):
+        return False
+    _set_controller_base_sha(ctx, base_sha)
+    return True
+
+
+def _persist_controller_base_provenance(ctx: Context) -> None:
+    """Durably persist the runner-owned base under the per-run journal lock."""
+    base_sha = getattr(ctx, "_controller_base_sha", None)
+    if not isinstance(base_sha, str) or not _CONTROLLER_SHA_RE.fullmatch(base_sha.lower()):
+        return
+    with _controller_snapshot_journal_lock(ctx) as location:
+        if location is None:
+            return
+        _journal_path, dir_fd = location
+        _write_controller_private_json(
+            pathlib.Path(_CONTROLLER_BASE_PROVENANCE),
+            {"controller_base_sha": base_sha.lower()},
+            dir_fd=dir_fd,
+        )
 
 
 def _persist_controller_snapshot_journal(
@@ -780,10 +833,18 @@ def run(
         ctx.run_id = uuid.uuid4().hex[:12]
     _load_controller_snapshot_journal(ctx)
 
+    # A resumed controller must restore the original runner-owned base before
+    # looking at the target checkout again.  The worker may have advanced HEAD,
+    # and public state is not an authentication channel for this value.
+    restored_controller_base = (
+        _load_controller_base_provenance(ctx) if resume is not None else False
+    )
+
     # Capture the controller-owned base before the first worker visit.  This
     # runs after CLI/AO state has been assembled, so an explicitly selected AO
     # worktree is the target whose immutable HEAD is bound.
-    _seed_controller_base_sha(ctx, graph)
+    if not restored_controller_base:
+        _seed_controller_base_sha(ctx, graph)
     history: list = []
     visits: dict[str, int] = {}
     # Per-node ring of recent output hashes for the no_progress detector
@@ -874,6 +935,11 @@ def run(
             manifest_path.write_text(json.dumps(manifest_data, indent=2), encoding="utf-8")
         except Exception:
             pass
+
+    # Persist after CXDB has finalized the run identity.  This keeps the
+    # sidecar in the same per-run directory used by the checkpoint and makes a
+    # resumed run's restored base durable under any newly assigned run ID too.
+    _persist_controller_base_provenance(ctx)
 
     if checkpoint is None and ctx.run_id is not None:
         checkpoint = pathlib.Path.home() / ".dark-factory" / "runs" / ctx.run_id / "checkpoint.json"
