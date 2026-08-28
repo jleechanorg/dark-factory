@@ -77,6 +77,13 @@ review_parallel -> gate_es (success)
 review_parallel -> fix
 ```
 
+**Backend scope:** `backend_priority` in this graph example is the explicit
+reviewer queue used when the resulting pipeline runs. It does not change the
+MiniMax-only coder or pilot contract: this coder is dispatched through
+MiniMax-M3, and the documented pilot is invoked with `--backend minimax`.
+The queue intentionally contains only non-Claude reviewer backends; do not add
+`claude`, `claude-sonnet`, or another personal-account fallback to it.
+
 The `parallel_reviewer` handler internally fans out to 3 distinct reviewer prompts (one per role) while preserving each role's review identity. The merged output is a single verdict envelope.
 
 Do NOT delete `adversarial_reviewer`, `gate_skeptic`, or `gate_er` from the DOT — preserve them as defined shapes other pipelines may still reference. Only CHANGE the Phase 5 subgraph edges to use the new parallel node.
