@@ -22,6 +22,7 @@ import pytest
 from runner.handler_dispatch import _build_controller_codex_transport
 from runner.handler_sandbox import (
     _extend_pinned_launcher_command,
+    _holdout_denied_paths,
     _linux_codex_runtime_paths,
     _linux_controller_sandbox_prefix,
     _linux_landlock_launcher_path,
@@ -348,24 +349,74 @@ def test_codex_runtime_rejects_extra_primary_group_member_or_gid(tmp_path, monke
 
 
 @linux_only
-def test_landlock_denies_raw_openat_from_static_binary(tmp_path):
+def test_landlock_prefix_keeps_missing_canonical_default_denial(tmp_path, monkeypatch):
+    import runner.handler_sandbox as sandbox
+
+    fake_home = tmp_path / "fake-home"
+    explicit = tmp_path / "explicit-holdouts"
+    allowed = tmp_path / "allowed"
+    fake_home.mkdir()
+    explicit.mkdir()
+    allowed.mkdir()
+    monkeypatch.setattr(pathlib.Path, "home", lambda: fake_home)
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(explicit))
+    denied = _holdout_denied_paths()
+    default = fake_home / "projects" / "dark-factory-holdouts"
+    assert default in denied
+    assert not default.is_dir()
+
+    captured: list[pathlib.Path] = []
+    fd = os.open(__file__, os.O_RDONLY)
+    monkeypatch.setattr(sandbox, "_linux_landlock_launcher_path", lambda: __file__)
+    monkeypatch.setattr(sandbox, "_open_verified_launcher", lambda _path: fd)
+
+    def fake_preload(paths):
+        captured.extend(paths)
+        return ["/usr/bin/env", f"DENY_PATHS={':'.join(map(str, paths))}"]
+
+    monkeypatch.setattr(sandbox, "_linux_sandbox_prefix", fake_preload)
+    try:
+        prefix = _linux_controller_sandbox_prefix(
+            denied_paths=denied,
+            read_paths=[allowed],
+            writable_paths=[],
+        )
+        assert prefix is not None
+        assert set(denied).issubset(captured)
+        deny_arg = next(arg for arg in prefix if arg.startswith("DENY_PATHS="))
+        assert all(str(path) in deny_arg for path in denied)
+    finally:
+        os.close(fd)
+
+
+@linux_only
+def test_landlock_denies_raw_openat_from_static_binary(tmp_path, monkeypatch):
     launcher = _linux_landlock_launcher_path()
     assert launcher is not None
     raw_open = _compile_static_raw_open(tmp_path / "tool")
     allowed = tmp_path / "allowed"
     denied = tmp_path / "sealed"
+    fake_home = tmp_path / "fake-home"
     allowed.mkdir()
     denied.mkdir()
-    secret = denied / "scenario.txt"
-    secret.write_text("STATIC-RAW-SYSCALL-SECRET", encoding="utf-8")
+    fake_home.mkdir()
+    monkeypatch.setattr(pathlib.Path, "home", lambda: fake_home)
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(denied))
+    default = fake_home / "projects" / "dark-factory-holdouts"
+    assert default in _holdout_denied_paths()
+    assert not default.is_dir()
 
     prefix = _linux_controller_sandbox_prefix(
-        denied_paths=[denied],
+        denied_paths=_holdout_denied_paths(),
         read_paths=[allowed],
         writable_paths=[],
         executable_paths=[raw_open],
     )
     assert prefix is not None
+
+    default.mkdir(parents=True)
+    secret = default / "scenario.txt"
+    secret.write_text("STATIC-RAW-SYSCALL-SECRET", encoding="utf-8")
     proc = subprocess.run(
         _extend_pinned_launcher_command(prefix, [str(raw_open), str(secret)]),
         pass_fds=prefix.pass_fds,

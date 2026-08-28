@@ -1018,11 +1018,13 @@ def _linux_controller_sandbox_prefix(
     if launcher is None:
         return None
 
-    def normalized(paths: list[pathlib.Path]) -> list[pathlib.Path] | None:
+    def normalized(
+        paths: list[pathlib.Path], *, strict: bool = True
+    ) -> list[pathlib.Path] | None:
         result: list[pathlib.Path] = []
         for raw in paths:
             try:
-                path = pathlib.Path(raw).resolve(strict=True)
+                path = pathlib.Path(raw).resolve(strict=strict)
             except (OSError, RuntimeError):
                 return None
             if not path.is_absolute():
@@ -1030,7 +1032,7 @@ def _linux_controller_sandbox_prefix(
             result.append(path)
         return result
 
-    denied = normalized(denied_paths)
+    denied = normalized(denied_paths, strict=False)
     reads = normalized(read_paths)
     writes = normalized(writable_paths)
     executables = normalized(executable_paths or [])
