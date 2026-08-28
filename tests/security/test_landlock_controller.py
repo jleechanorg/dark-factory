@@ -224,6 +224,36 @@ def test_landlock_prefix_closes_pinned_fd_when_preload_fails(tmp_path, monkeypat
 
 
 @linux_only
+def test_landlock_prefix_does_not_allow_proc_root(tmp_path, monkeypatch):
+    """The controller allow-list must not grant the host process tree."""
+    import runner.handler_sandbox as sandbox
+
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    fd = os.open(__file__, os.O_RDONLY)
+    monkeypatch.setattr(sandbox, "_linux_landlock_launcher_path", lambda: __file__)
+    monkeypatch.setattr(sandbox, "_open_verified_launcher", lambda _path: fd)
+    monkeypatch.setattr(sandbox, "_linux_preload_lib_path", lambda: pathlib.Path(__file__))
+    monkeypatch.setattr(sandbox, "_linux_sandbox_prefix", lambda _denied: ["env"])
+    try:
+        prefix = _linux_controller_sandbox_prefix(
+            denied_paths=[tmp_path / "sealed"],
+            read_paths=[allowed],
+            writable_paths=[],
+        )
+        assert prefix is not None
+        read_paths = [
+            pathlib.Path(prefix[index + 1])
+            for index, value in enumerate(prefix)
+            if value == "--read"
+        ]
+        assert pathlib.Path("/proc") not in read_paths
+        assert not any(path.is_relative_to("/proc") for path in read_paths)
+    finally:
+        os.close(fd)
+
+
+@linux_only
 def test_landlock_requires_abi_three_for_truncate_enforcement(monkeypatch):
     import runner.handler_sandbox as sandbox
 
@@ -460,6 +490,39 @@ def test_landlock_denies_unlisted_etc_sibling_from_static_binary(tmp_path):
     prefix.close_launcher()
     assert proc.returncode == 3, proc.stderr
     assert "Permission denied" not in proc.stdout
+
+
+@linux_only
+def test_landlock_denies_unrelated_proc_cmdline_from_static_binary(tmp_path):
+    """The controller must not read another process through the host /proc."""
+    launcher = _linux_landlock_launcher_path()
+    assert launcher is not None
+    proc_cmdline = pathlib.Path("/proc/1/cmdline")
+    if not proc_cmdline.is_file():
+        pytest.skip(f"unrelated process proc entry unavailable: {proc_cmdline}")
+    raw_open = _compile_static_raw_open(tmp_path / "tool")
+    work = tmp_path / "work"
+    work.mkdir()
+
+    prefix = _linux_controller_sandbox_prefix(
+        denied_paths=[tmp_path / "sealed"],
+        read_paths=[work],
+        writable_paths=[],
+        executable_paths=[raw_open],
+    )
+    assert prefix is not None
+    try:
+        result = subprocess.run(
+            _extend_pinned_launcher_command(prefix, [str(raw_open), str(proc_cmdline)]),
+            pass_fds=prefix.pass_fds,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    finally:
+        prefix.close_launcher()
+    assert result.returncode == 3, result.stderr
+    assert "Permission denied" not in result.stdout
 
 
 @linux_only

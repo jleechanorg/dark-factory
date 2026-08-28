@@ -1051,7 +1051,7 @@ def _linux_controller_sandbox_prefix(
     if any(contains(allowed, secret) for allowed in reads + writes for secret in denied):
         return None
 
-    system_roots = ["/bin", "/dev", "/lib", "/lib64", "/sbin", "/sys", "/usr", "/proc"]
+    system_roots = ["/bin", "/dev", "/lib", "/lib64", "/sbin", "/sys", "/usr"]
     for raw in system_roots:
         path = pathlib.Path(raw)
         if path.is_dir():
