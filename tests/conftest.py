@@ -133,6 +133,24 @@ def make_node(name: str = "test", **attrs) -> _Node:
     return _Node(name=name, attrs=attrs)
 
 
+@pytest.fixture
+def project_scoped_claude_config(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> pathlib.Path:
+    """Provide an isolated Claude config for tests that intentionally launch Claude.
+
+    Direct-Claude dispatch is fail-closed unless the caller supplies an
+    explicit project-scoped config.  Tests exercising a successful Claude
+    reviewer path should opt into this fixture rather than inheriting a real
+    operator account (or globally masking tests that verify the missing-scope
+    failure).
+    """
+    config_dir = tmp_path / "factory-claude-config"
+    config_dir.mkdir()
+    monkeypatch.setenv("DARK_FACTORY_CLAUDE_CONFIG_DIR", str(config_dir))
+    return config_dir
+
+
 def hermetic_subprocess_env(**overrides) -> dict:
     """Build a minimal, explicit env for a `sys.executable` subprocess.
 

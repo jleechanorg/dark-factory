@@ -15,7 +15,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from conftest import make_node  # noqa: E402
 
 
-def test_gate_es_uses_universal_prompt_when_local_es_md_absent(tmp_path, monkeypatch):
+def test_gate_es_uses_universal_prompt_when_local_es_md_absent(
+    tmp_path, monkeypatch, project_scoped_claude_config
+):
     """_gate_es must fall back to the embedded universal prompt when
     .claude/commands/es.md is absent from the workdir.
 
@@ -59,7 +61,9 @@ def test_gate_es_uses_universal_prompt_when_local_es_md_absent(tmp_path, monkeyp
     )
 
 
-def test_gate_code_standards_uses_universal_prompt_when_local_file_absent(tmp_path, monkeypatch):
+def test_gate_code_standards_uses_universal_prompt_when_local_file_absent(
+    tmp_path, monkeypatch, project_scoped_claude_config
+):
     """_gate_code_standards must fall back to embedded prompt when
     .claude/commands/code-standards.md is absent from workdir.
 
@@ -117,7 +121,9 @@ def test_universal_gate_prompts_require_coder_handoff() -> None:
     assert "Blocking findings" in CODER_HANDOFF_FORMAT
 
 
-def test_custom_prompt_gate_appends_coder_handoff_contract(tmp_path, monkeypatch):
+def test_custom_prompt_gate_appends_coder_handoff_contract(
+    tmp_path, monkeypatch, project_scoped_claude_config
+):
     import subprocess as _sp
     from runner.handlers import _run_custom_prompt_gate, Context as HCtx
 
