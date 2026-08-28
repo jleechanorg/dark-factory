@@ -655,13 +655,16 @@ def test_controller_review_codex_unavailable_fails_closed(monkeypatch, tmp_path)
     assert attempts == ["codex"]
 
 
-def test_controller_codex_transport_rejects_permissive_outer_sandbox_exec(
+def test_controller_codex_transport_replaces_permissive_outer_sandbox_exec(
     monkeypatch, tmp_path
 ):
-    """A permissive outer sandbox must fail closed rather than launch Codex."""
+    """A permissive outer profile is replaced with the owned profile."""
     from runner.handler_dispatch import _build_controller_codex_transport
 
     monkeypatch.setattr("runner.handler_dispatch.sys.platform", "darwin")
+    holdouts = tmp_path / "sealed holdouts"
+    holdouts.mkdir()
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(holdouts))
     sandboxed_argv = [
         "/usr/bin/sandbox-exec",
         "-p",
@@ -672,5 +675,9 @@ def test_controller_codex_transport_rejects_permissive_outer_sandbox_exec(
         "--skip-git-repo-check",
         "prompt text",
     ]
-    with pytest.raises(ValueError, match="controller"):
-        _build_controller_codex_transport(sandboxed_argv, read_only_path=tmp_path)
+    transport = _build_controller_codex_transport(sandboxed_argv, read_only_path=tmp_path)
+
+    assert transport[:2] == ["/usr/bin/sandbox-exec", "-p"]
+    assert '(version 1)' in transport[2]
+    assert f'(deny file-read* (subpath "{holdouts.resolve()}"))' in transport[2]
+    assert "(deny file-write*)" in transport[2]

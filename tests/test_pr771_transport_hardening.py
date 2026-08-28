@@ -15,8 +15,8 @@ import pytest
 
 from runner.handler_core import Context, Result
 from runner.handler_dispatch import _build_controller_codex_transport
-from runner.handler_sandbox import _build_sandbox_profile
 from runner.handler_parallel_reviewer import _contract_adjusted_result
+from runner.handler_sandbox import _build_sandbox_profile, _holdout_denied_paths
 from runner.review_controller import (
     EvidenceArtifact,
     ReviewInputs,
@@ -77,24 +77,15 @@ darwin_only = pytest.mark.skipif(
         ],
         [
             "/usr/bin/sandbox-exec",
-            "-p",
+            "--profile",
             "(version 1)\n(allow default)",
             "/usr/local/bin/codex",
             "exec",
             "--skip-git-repo-check",
             "ignored prompt",
         ],
-        [
-            "/usr/bin/sandbox-exec",
-            "-p",
-            '(version 1)\n(allow default)\n(deny file-read-data (subpath "/sealed/holdouts"))',
-            "/usr/local/bin/codex",
-            "exec",
-            "--skip-git-repo-check",
-            "ignored prompt",
-        ],
     ],
-    ids=["no-seatbelt-wrapper", "permissive-profile", "unrecognized-read-denial"],
+    ids=["no-seatbelt-wrapper", "malformed-seatbelt-wrapper"],
 )
 def test_controller_transport_macos_requires_canonical_seatbelt_contract(
     monkeypatch, tmp_path, sandboxed
@@ -111,6 +102,9 @@ def test_controller_transport_macos_accepts_canonical_producer_profile(
 ):
     """The canonical holdout-denying producer profile remains accepted."""
     monkeypatch.setattr("runner.handler_dispatch.sys.platform", "darwin")
+    holdouts = tmp_path / "sealed holdouts"
+    holdouts.mkdir()
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(holdouts))
     profile = _build_sandbox_profile([])
     transport = _build_controller_codex_transport(
         [
@@ -131,11 +125,47 @@ def test_controller_transport_macos_accepts_canonical_producer_profile(
     assert transport[3] == "/usr/local/bin/codex"
 
 
+def test_controller_transport_macos_replaces_caller_profile_with_owned_roots(
+    monkeypatch, tmp_path
+):
+    """Caller denial rules cannot replace the controller's holdout roots."""
+    monkeypatch.setattr("runner.handler_dispatch.sys.platform", "darwin")
+    holdouts = tmp_path / "sealed holdouts"
+    holdouts.mkdir()
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(holdouts))
+    supplied_profile = (
+        '(version 1)\n(allow default)\n'
+        '(deny file-read* (subpath "/unrelated"))\n'
+    )
+    transport = _build_controller_codex_transport(
+        [
+            "/usr/bin/sandbox-exec",
+            "-p",
+            supplied_profile,
+            "/usr/local/bin/codex",
+            "exec",
+            "--skip-git-repo-check",
+            "ignored prompt",
+        ],
+        read_only_path=tmp_path,
+    )
+
+    profile = transport[2]
+    assert '(deny file-read* (subpath "/unrelated"))' not in profile
+    for root in _holdout_denied_paths():
+        assert f'(deny file-read* (subpath "{root}"))' in profile
+    assert f'(deny file-read* (subpath "{tmp_path.resolve()}"))' in profile
+    assert "(deny file-write*)" in profile
+
+
 @darwin_only
 def test_controller_transport_uses_one_macos_sandbox_for_read_only_review(
-    tmp_path,
+    tmp_path, monkeypatch
 ):
     """macOS must combine holdout denial + read-only in one outer sandbox."""
+    holdouts = tmp_path / "sealed holdouts"
+    holdouts.mkdir()
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(holdouts))
     sandboxed = [
         "/usr/bin/sandbox-exec",
         "-p",
@@ -178,7 +208,8 @@ def test_controller_transport_uses_one_macos_sandbox_for_read_only_review(
         "--ignore-rules",
         "-",
     ]
-    assert '(deny file-read* (subpath "/sealed/holdouts"))' in transport[2]
+    for root in _holdout_denied_paths():
+        assert f'(deny file-read* (subpath "{root}"))' in transport[2]
     assert "(deny file-write*)" in transport[2]
     assert "--sandbox" not in transport
 

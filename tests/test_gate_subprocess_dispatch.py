@@ -186,6 +186,9 @@ def test_complete_controller_prompt_is_not_rewrapped_for_shadow(tmp_path, monkey
         def __init__(self, cmd, **kwargs):
             seen.append(cmd)
 
+    holdouts = tmp_path / "sealed holdouts"
+    holdouts.mkdir()
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(holdouts))
     monkeypatch.setattr(
         "runner.handlers._sandboxed_args", _canonical_sandboxed_codex_args
     )
@@ -253,7 +256,9 @@ def test_launch_shadow_gate_review_uses_target_cwd_and_sanitized_env(tmp_path, m
             observed["cwd"] = kwargs.get("cwd")
             observed["env"] = kwargs.get("env", {})
 
-    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", "/secret/holdouts")
+    holdouts = tmp_path / "sealed holdouts"
+    holdouts.mkdir()
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(holdouts))
     monkeypatch.setenv("MY_HOLDOUT_SECRET", "sealed")
     monkeypatch.setattr(
         "runner.handlers._sandboxed_args", _canonical_sandboxed_codex_args
@@ -308,6 +313,9 @@ def test_launch_shadow_gate_review_uses_target_cwd_and_sanitized_env(tmp_path, m
 def test_controller_codex_args_builds_stdin_transport(monkeypatch, tmp_path):
     """Controller transport must use JSON transport on stdin and a neutral cwd."""
     from runner.handler_dispatch import _controller_codex_args
+    holdouts = tmp_path / "sealed holdouts"
+    holdouts.mkdir()
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(holdouts))
     argv = [
         "sandbox-exec",
         "-p",
@@ -324,7 +332,7 @@ def test_controller_codex_args_builds_stdin_transport(monkeypatch, tmp_path):
     transformed = _controller_codex_args(argv, read_only_path=tmp_path)
     assert transformed[-1] == "-"
     assert transformed[:2] == ["sandbox-exec", "-p"]
-    assert '(deny file-read* (subpath "/sealed/holdouts"))' in transformed[2]
+    assert f'(deny file-read* (subpath "{holdouts.resolve()}"))' in transformed[2]
     assert "(deny file-write*)" in transformed[2]
     assert transformed[3:] == [
         "codex",

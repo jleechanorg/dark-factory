@@ -727,6 +727,8 @@ def _build_controller_codex_transport(
         controller_tail.extend(["--output-schema", str(schema_path)])
     controller_tail.append("-")
     if sys.platform == "darwin":
+        from . import handler_sandbox as _sandbox
+
         sandbox_index = next(
             (
                 index
@@ -747,7 +749,7 @@ def _build_controller_codex_transport(
         profile_index = sandbox_index + 2
         outer = list(outer)
         outer[profile_index] = _handlers_shim._macos_read_only_profile(
-            outer[profile_index], read_only_path, writable_path
+            _sandbox._build_sandbox_profile([]), read_only_path, writable_path
         )
         executable = prepared[codex_index]
         return outer + [executable, *controller_tail]
