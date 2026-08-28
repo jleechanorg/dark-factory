@@ -18,6 +18,18 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 
+def _canonical_sandboxed_codex_args(argv: list[str]) -> list[str]:
+    return [
+        "sandbox-exec",
+        "-p",
+        (
+            '(version 1)\n(allow default)\n'
+            '(deny file-read* (subpath "/sealed/holdouts"))\n'
+        ),
+        *argv,
+    ]
+
+
 def test_gate_subprocess_args_routes_codex_to_codex_cli(monkeypatch):
     """backend='codex' → argv starts with `codex exec --yolo`."""
     from runner.handlers import _gate_subprocess_args, Context as HCtx
@@ -174,13 +186,16 @@ def test_complete_controller_prompt_is_not_rewrapped_for_shadow(tmp_path, monkey
         def __init__(self, cmd, **kwargs):
             seen.append(cmd)
 
-    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr(
+        "runner.handlers._sandboxed_args", _canonical_sandboxed_codex_args
+    )
     class _Runtime:
         run_dir = tmp_path / "runtime"
         codex_home = tmp_path / "codex-home"
         env = {}
 
     _Runtime.run_dir.mkdir(mode=0o700)
+    _Runtime.codex_home.mkdir(mode=0o700)
     monkeypatch.setattr("runner.handlers._create_controller_runtime", lambda: _Runtime())
     monkeypatch.setattr(
         "runner.handlers._controller_output_schema",
@@ -240,13 +255,16 @@ def test_launch_shadow_gate_review_uses_target_cwd_and_sanitized_env(tmp_path, m
 
     monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", "/secret/holdouts")
     monkeypatch.setenv("MY_HOLDOUT_SECRET", "sealed")
-    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr(
+        "runner.handlers._sandboxed_args", _canonical_sandboxed_codex_args
+    )
     class _Runtime:
         run_dir = tmp_path / "runtime"
         codex_home = tmp_path / "codex-home"
         env = {}
 
     _Runtime.run_dir.mkdir(mode=0o700)
+    _Runtime.codex_home.mkdir(mode=0o700)
     monkeypatch.setattr("runner.handlers._create_controller_runtime", lambda: _Runtime())
     monkeypatch.setattr(
         "runner.handlers._controller_output_schema",
@@ -260,6 +278,8 @@ def test_launch_shadow_gate_review_uses_target_cwd_and_sanitized_env(tmp_path, m
         lambda: "claude",
     )
 
+    target = tmp_path / "target"
+    target.mkdir()
     neutral = tmp_path / "controller-cwd"
     neutral.mkdir()
     ctx = HCtx(goal="review", workdir=tmp_path / "target", backend="codex")
@@ -285,22 +305,28 @@ def test_launch_shadow_gate_review_uses_target_cwd_and_sanitized_env(tmp_path, m
     assert "MY_HOLDOUT_SECRET" not in env
 
 
-def test_controller_codex_args_builds_stdin_transport(monkeypatch):
+def test_controller_codex_args_builds_stdin_transport(monkeypatch, tmp_path):
     """Controller transport must use JSON transport on stdin and a neutral cwd."""
     from runner.handler_dispatch import _controller_codex_args
     argv = [
         "sandbox-exec",
         "-p",
-        "(version 1)\n(allow default)",
+        (
+            '(version 1)\n(allow default)\n'
+            '(deny file-read* (subpath "/sealed/holdouts"))'
+        ),
         "codex",
         "exec",
         "--skip-git-repo-check",
         "PROMPT",
     ]
     monkeypatch.setattr("runner.handler_dispatch.sys.platform", "darwin")
-    transformed = _controller_codex_args(argv)
+    transformed = _controller_codex_args(argv, read_only_path=tmp_path)
     assert transformed[-1] == "-"
-    assert transformed == [
+    assert transformed[:2] == ["sandbox-exec", "-p"]
+    assert '(deny file-read* (subpath "/sealed/holdouts"))' in transformed[2]
+    assert "(deny file-write*)" in transformed[2]
+    assert transformed[3:] == [
         "codex",
         "exec",
         "--json",
@@ -335,42 +361,63 @@ def test_controller_codex_args_rejects_non_codex_command():
         _controller_codex_args(["claude", "--print", "PROMPT"])
 
 
-def test_controller_codex_args_rejects_unsafe_transport_options(monkeypatch):
+def test_controller_codex_args_rejects_unsafe_transport_options(monkeypatch, tmp_path):
     """Unsafe Codex transport options must fail closed before launch."""
     from runner.handler_dispatch import _controller_codex_args
 
     monkeypatch.setattr("runner.handler_dispatch.sys.platform", "darwin")
-    legacy = _controller_codex_args([
-        "codex",
-        "exec",
-        "--yolo",
-        "--skip-git-repo-check",
-        "PROMPT",
-    ])
+    with pytest.raises(ValueError, match="sandbox-exec"):
+        _controller_codex_args([
+            "codex",
+            "exec",
+            "--yolo",
+            "--skip-git-repo-check",
+            "PROMPT",
+        ])
+
+    legacy = _controller_codex_args(
+        _canonical_sandboxed_codex_args([
+            "codex",
+            "exec",
+            "--yolo",
+            "--skip-git-repo-check",
+            "PROMPT",
+        ]),
+        read_only_path=tmp_path,
+    )
     assert "--yolo" not in legacy
 
     with pytest.raises(ValueError, match="unsafe codex flags"):
-        _controller_codex_args([
-            "codex",
-            "exec",
-            "--dangerously-bypass-approvals-and-sandbox",
-            "PROMPT",
-        ])
+        _controller_codex_args(
+            _canonical_sandboxed_codex_args([
+                "codex",
+                "exec",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "PROMPT",
+            ]),
+            read_only_path=tmp_path,
+        )
     with pytest.raises(ValueError, match="read-only"):
-        _controller_codex_args([
-            "codex",
-            "exec",
-            "--sandbox",
-            "read-write",
-            "PROMPT",
-        ])
+        _controller_codex_args(
+            _canonical_sandboxed_codex_args([
+                "codex",
+                "exec",
+                "--sandbox",
+                "read-write",
+                "PROMPT",
+            ]),
+            read_only_path=tmp_path,
+        )
     with pytest.raises(ValueError, match="read-only"):
-        _controller_codex_args([
-            "codex",
-            "exec",
-            "--sandbox=read-write",
-            "PROMPT",
-        ])
+        _controller_codex_args(
+            _canonical_sandboxed_codex_args([
+                "codex",
+                "exec",
+                "--sandbox=read-write",
+                "PROMPT",
+            ]),
+            read_only_path=tmp_path,
+        )
 
 
 def test_launch_shadow_gate_review_rejects_complete_controller_prompt_non_codex_backend(
