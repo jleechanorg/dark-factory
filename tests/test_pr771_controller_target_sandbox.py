@@ -347,8 +347,15 @@ def test_graph_primary_uses_validated_envelope_snapshot_for_write_denial(
 
 
 def test_complete_prompt_shadow_uses_envelope_snapshot_for_write_denial(
-    tmp_path, monkeypatch
+    tmp_path, private_tmp_path, monkeypatch
 ):
+    # CI may expose HOME as a writable staging path (including /tmp).  The
+    # controller runtime validator must see a private ancestry, so construct
+    # the auth/runtime home under the existing private fixture before changing
+    # Path.home for this test.
+    home = _auth_home(private_tmp_path)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     source = tmp_path / "source"
     snapshot = tmp_path / "snapshot"
     source.mkdir()

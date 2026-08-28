@@ -11,6 +11,7 @@ import os
 import hashlib
 import pathlib
 import sys
+import tempfile
 import pytest
 
 ROOT = pathlib.Path(__file__).parent.parent
@@ -28,6 +29,13 @@ def _canonical_sandboxed_codex_args(argv: list[str]) -> list[str]:
         ),
         *argv,
     ]
+
+
+@pytest.fixture
+def private_tmp_path():
+    """Provide a private runtime root for controller transport fixtures."""
+    with tempfile.TemporaryDirectory(prefix="df-gate-dispatch-", dir=pathlib.Path.home()) as root:
+        yield pathlib.Path(root)
 
 
 def test_gate_subprocess_args_routes_codex_to_codex_cli(monkeypatch):
@@ -172,7 +180,9 @@ def test_execute_gate_writes_exact_prompt_sidecar(tmp_path, monkeypatch):
     assert any('"event": "node_prompt"' in line and '"node": "evidence"' in line for line in events)
 
 
-def test_complete_controller_prompt_is_not_rewrapped_for_shadow(tmp_path, monkeypatch):
+def test_complete_controller_prompt_is_not_rewrapped_for_shadow(
+    tmp_path, private_tmp_path, monkeypatch
+):
     """Controller-owned review bytes must be identical in every reviewer lane."""
     from runner.handlers import Context as HCtx
     from runner.handler_dispatch import _launch_shadow_gate_review
@@ -193,8 +203,8 @@ def test_complete_controller_prompt_is_not_rewrapped_for_shadow(tmp_path, monkey
         "runner.handlers._sandboxed_args", _canonical_sandboxed_codex_args
     )
     class _Runtime:
-        run_dir = tmp_path / "runtime"
-        codex_home = tmp_path / "codex-home"
+        run_dir = private_tmp_path / "runtime"
+        codex_home = private_tmp_path / "codex-home"
         env = {}
 
     _Runtime.run_dir.mkdir(mode=0o700)
@@ -240,7 +250,9 @@ def test_complete_controller_prompt_is_not_rewrapped_for_shadow(tmp_path, monkey
     assert "Normal gate prompt for comparison" not in " ".join(seen[0])
 
 
-def test_launch_shadow_gate_review_uses_target_cwd_and_sanitized_env(tmp_path, monkeypatch):
+def test_launch_shadow_gate_review_uses_target_cwd_and_sanitized_env(
+    tmp_path, private_tmp_path, monkeypatch
+):
     """Controller-complete shadow launch must run from target cwd and
     sanitized environment."""
     from runner.handlers import Context as HCtx
@@ -264,8 +276,8 @@ def test_launch_shadow_gate_review_uses_target_cwd_and_sanitized_env(tmp_path, m
         "runner.handlers._sandboxed_args", _canonical_sandboxed_codex_args
     )
     class _Runtime:
-        run_dir = tmp_path / "runtime"
-        codex_home = tmp_path / "codex-home"
+        run_dir = private_tmp_path / "runtime"
+        codex_home = private_tmp_path / "codex-home"
         env = {}
 
     _Runtime.run_dir.mkdir(mode=0o700)
