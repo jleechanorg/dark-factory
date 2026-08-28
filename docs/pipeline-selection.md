@@ -12,6 +12,10 @@ The "auto-select from the goal" rule that previously lived in the
 factory skill is retired. The slim two-node shape is the new default
 across the board.
 
+Cold-review-v1 graphs bind their review base during a fresh run and do not
+support `--resume`; start a new run when retrying a cold review. Other graphs
+retain the normal checkpoint-resume behavior.
+
 ## Decision table
 
 | Task | Pipeline | Notes |

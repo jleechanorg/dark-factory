@@ -31,7 +31,6 @@ from . import engine_observability as _obs
 from . import engine_parallel as _parallel
 from . import engine_persist as _persist
 from . import perf_log
-from ._git import _git_rev_parse
 from ._classify import _classify_outcome
 from .cxdb import CXDB
 from .handlers import Context, Result, resolve
@@ -39,8 +38,6 @@ from .parser import Graph, Node, is_exit_node
 
 _CONTROLLER_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _CONTROLLER_SNAPSHOT_JOURNAL = "controller-snapshot-journal.json"
-_CONTROLLER_BASE_PROVENANCE = "controller-base-provenance.json"
-_CONTROLLER_BASE_PROVENANCE_ERROR = "controller base provenance is unavailable"
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
@@ -113,66 +110,6 @@ def _is_controller_graph(graph: Graph) -> bool:
         str(node.attrs.get("review_contract", "")).strip() == "cold-review-v1"
         for node in graph.nodes.values()
     )
-
-
-def _verify_controller_base_provenance(ctx: Context) -> None:
-    """Verify a restored base still belongs to the current target history."""
-    base_sha = getattr(ctx, "_controller_base_sha", None)
-    if not isinstance(base_sha, str):
-        raise ValueError(_CONTROLLER_BASE_PROVENANCE_ERROR)
-    base_sha = base_sha.strip().lower()
-    if not _CONTROLLER_SHA_RE.fullmatch(base_sha):
-        raise ValueError(_CONTROLLER_BASE_PROVENANCE_ERROR)
-
-    try:
-        from .handler_core import _target_worktree
-        from .handler_sandbox import _holdout_denied_paths
-        from .review_controller import ReviewContractError, validate_workspace_path
-
-        raw_target = _target_worktree(ctx)
-        holdout_roots = tuple(
-            str(pathlib.Path(root).resolve(strict=False))
-            for root in _holdout_denied_paths()
-        )
-        # Validate the lexical path before any target-owned Git operation.
-        target = validate_workspace_path(
-            str(raw_target),
-            holdout_roots=holdout_roots,
-        )
-        resolved_base = _git_rev_parse(
-            target,
-            "--verify",
-            f"{base_sha}^{{commit}}",
-        )
-        current_head = _git_rev_parse(target, "HEAD^{commit}")
-        if (
-            resolved_base is None
-            or resolved_base.strip().lower() != base_sha
-            or current_head is None
-            or not _CONTROLLER_SHA_RE.fullmatch(current_head.strip().lower())
-        ):
-            raise ValueError(_CONTROLLER_BASE_PROVENANCE_ERROR)
-        ancestor = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(target),
-                "merge-base",
-                "--is-ancestor",
-                base_sha,
-                current_head.strip().lower(),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-        if ancestor.returncode != 0:
-            raise ValueError(_CONTROLLER_BASE_PROVENANCE_ERROR)
-    except (OSError, ReviewContractError, subprocess.SubprocessError, ValueError) as exc:
-        if str(exc) == _CONTROLLER_BASE_PROVENANCE_ERROR:
-            raise
-        raise ValueError(_CONTROLLER_BASE_PROVENANCE_ERROR) from exc
 
 
 def _controller_snapshot_journal_path(ctx: Context) -> pathlib.Path | None:
@@ -454,50 +391,6 @@ def _write_controller_snapshot_journal(
 ) -> None:
     """Atomically replace a journal and flush both file and directory metadata."""
     _write_controller_private_json(path, entries, dir_fd=dir_fd)
-
-
-def _load_controller_base_provenance(ctx: Context, *, required: bool = False) -> bool:
-    """Restore the runner-owned base from the protected per-run sidecar."""
-    try:
-        with _controller_snapshot_journal_lock(ctx) as location:
-            if location is None:
-                if required:
-                    raise ValueError(_CONTROLLER_BASE_PROVENANCE_ERROR)
-                return False
-            _journal_path, dir_fd = location
-            sidecar = pathlib.Path(_CONTROLLER_BASE_PROVENANCE)
-            payload = _read_controller_private_json(sidecar, dir_fd=dir_fd)
-    except (OSError, TypeError, ValueError) as exc:
-        if required:
-            raise ValueError(_CONTROLLER_BASE_PROVENANCE_ERROR) from exc
-        return False
-    if not isinstance(payload, dict):
-        if required:
-            raise ValueError(_CONTROLLER_BASE_PROVENANCE_ERROR)
-        return False
-    base_sha = payload.get("controller_base_sha")
-    if not isinstance(base_sha, str) or not _CONTROLLER_SHA_RE.fullmatch(base_sha.lower()):
-        if required:
-            raise ValueError(_CONTROLLER_BASE_PROVENANCE_ERROR)
-        return False
-    _set_controller_base_sha(ctx, base_sha)
-    return True
-
-
-def _persist_controller_base_provenance(ctx: Context) -> None:
-    """Durably persist the runner-owned base under the per-run journal lock."""
-    base_sha = getattr(ctx, "_controller_base_sha", None)
-    if not isinstance(base_sha, str) or not _CONTROLLER_SHA_RE.fullmatch(base_sha.lower()):
-        return
-    with _controller_snapshot_journal_lock(ctx) as location:
-        if location is None:
-            return
-        _journal_path, dir_fd = location
-        _write_controller_private_json(
-            pathlib.Path(_CONTROLLER_BASE_PROVENANCE),
-            {"controller_base_sha": base_sha.lower()},
-            dir_fd=dir_fd,
-        )
 
 
 def _persist_controller_snapshot_journal(
@@ -901,6 +794,9 @@ def run(
     If `resume` is provided, execution restarts from the successor of the
     checkpointed last step.
     """
+    if resume is not None and _is_controller_graph(graph):
+        raise ValueError("resume is not supported for cold-review-v1 graphs")
+
     # Resume uses the checkpoint's run directory as the durable journal owner.
     # Establish that identity before any terminal resume fast path can return.
     if resume is not None:
@@ -913,23 +809,10 @@ def run(
         ctx.run_id = uuid.uuid4().hex[:12]
     _load_controller_snapshot_journal(ctx)
 
-    # A resumed controller must restore the original runner-owned base before
-    # looking at the target checkout again.  The worker may have advanced HEAD,
-    # and public state is not an authentication channel for this value.
-    controller_graph = _is_controller_graph(graph)
-    restored_controller_base = (
-        _load_controller_base_provenance(ctx, required=controller_graph)
-        if resume is not None
-        else False
-    )
-    if restored_controller_base:
-        _verify_controller_base_provenance(ctx)
-
     # Capture the controller-owned base before the first worker visit.  This
     # runs after CLI/AO state has been assembled, so an explicitly selected AO
     # worktree is the target whose immutable HEAD is bound.
-    if not restored_controller_base:
-        _seed_controller_base_sha(ctx, graph)
+    _seed_controller_base_sha(ctx, graph)
     history: list = []
     visits: dict[str, int] = {}
     # Per-node ring of recent output hashes for the no_progress detector
@@ -1020,11 +903,6 @@ def run(
             manifest_path.write_text(json.dumps(manifest_data, indent=2), encoding="utf-8")
         except Exception:
             pass
-
-    # Persist after CXDB has finalized the run identity.  This keeps the
-    # sidecar in the same per-run directory used by the checkpoint and makes a
-    # resumed run's restored base durable under any newly assigned run ID too.
-    _persist_controller_base_provenance(ctx)
 
     if checkpoint is None and ctx.run_id is not None:
         checkpoint = pathlib.Path.home() / ".dark-factory" / "runs" / ctx.run_id / "checkpoint.json"
