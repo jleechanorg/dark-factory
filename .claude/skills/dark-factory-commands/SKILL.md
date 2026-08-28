@@ -24,18 +24,18 @@ dark-factory --pipeline pipelines/factory/hello.dot --goal "smoke test" --backen
 ```
 
 ### Full gated pipeline
-The checked-in `gates.dot` pipeline evaluates the sealed `hello` feature. Run it with CXDB recording from the target repo cwd:
+Run the full gated pipeline with CXDB recording from the target repo cwd:
 ```bash
 dark-factory \
   --pipeline pipelines/factory/gates.dot \
   --goal "<feature description>" \
   --backend ao \
   --ao-agent antigravity \
-  --feature hello \
+  --feature <feature_name> \
   --cxdb ~/.dark-factory/cxdb.sqlite
 ```
 
-For a different feature, use or author a pipeline whose `holdout_eval` node is configured for that feature; `--feature` alone does not override an explicit DOT `feature` attribute.
+`gates.dot` declares `hello` as its default holdout feature; an explicit `--feature` value overrides that DOT default at runtime.
 
 ## Diagnosis and visualization
 
