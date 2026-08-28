@@ -1,48 +1,35 @@
 # Skeptic Gate (issue #278, mandatory redesign)
 
-The Skeptic Gate is the dark-factory 7-green policy's **gate 7**. It
-guarantees that every merged PR has an independent, SHA-bound review
-verdict from non-Claude reviewer CLIs (Codex AND Gemini must both
-PASS), published by code that **never** executes PR-head Python on
-the credentialed runner.
+The Skeptic Gate implements the dark-factory 7-green policy's **gate 7**
+when invoked. The reusable gate provides an independent, SHA-bound
+review verdict from non-Claude reviewer CLIs (Codex AND Gemini must
+both PASS), published by code that **never** executes PR-head Python on
+the credentialed runner. It is not automatically enforced on pull
+requests: the former automatic caller workflow was removed. The
+remaining entry points are trusted `workflow_call` invocations and
+manual diagnostic `workflow_dispatch` runs.
 
-## Bootstrap dependency (READ THIS BEFORE MERGING)
+## Invocation posture (READ THIS BEFORE MERGING)
 
-**This PR cannot self-bootstrap gate-7.** A `pull_request` workflow
-is forgeable — PR head controls its own YAML and could hardcode a
-PASS marker — and `pull_request_target` cannot bootstrap until this
-workflow file already lives on the default branch, which is exactly
-what this PR is adding. The catch-22 is structural, not
-implementation-specific.
+The former `.github/workflows/skeptic-gate-caller.yml` bootstrap
+workflow invoked the gate automatically for pull-request events. It
+has been removed; no automatic PR caller is shipped by this repository.
+The gate workflow remains available as a reusable `workflow_call`
+target and as a manual `workflow_dispatch` diagnostic entry point.
 
-The only legitimate bootstrap is via a separate trusted external
-caller workflow that lives on the default branch and invokes this
-file via `uses: jleechanorg/dark-factory/.github/workflows/skeptic-gate.yml@<PINNED-SHA>`.
+If automatic enforcement is needed in a deployment, a separately
+managed trusted workflow on the default branch may invoke this file
+via `uses: jleechanorg/dark-factory/.github/workflows/skeptic-gate.yml@<PINNED-SHA>`.
+That caller must be in the same target repository so the token scope
+matches the comment/status target. Cross-repo callers (e.g.
+`jleechanorg/.github`) cannot post comments into a private repo with a
+caller-repo-scoped token and fail closed at the first API call.
 
-Concretely:
-
-1. Merge this PR so the workflow + Python files exist on `main`.
-2. Add a trusted caller workflow (e.g. `.github/workflows/skeptic-caller.yml`)
-   that lives on `main` and uses `pull_request_target` to call this
-   file via `workflow_call`. The caller pins the ref via
-   `uses: jleechanorg/dark-factory/.github/workflows/skeptic-gate.yml@<PINNED-SHA>`
-   and forwards `secrets.GITHUB_TOKEN`.
-3. The caller must be in the same target repo (`jleechanorg/dark-factory`)
-   so the GITHUB_TOKEN's repo scope matches the comment/status target.
-   Cross-repo callers (e.g. `jleechanorg/.github`) cannot post comments
-   into a private repo with a caller-repo-scoped token — they fail
-   closed at the first API call.
-
-Until the caller exists:
-
-- This workflow has NO `pull_request` trigger (forgeable).
-- This workflow has NO `pull_request_target` trigger (cannot bootstrap).
-- This workflow accepts `workflow_call` only from a trusted caller in
-  the same repo.
-- This workflow accepts `workflow_dispatch` for diagnostic re-runs only.
-  A `workflow_dispatch` run posts as `github-actions[bot]`, but the
-  read-back step requires a same-target-repo bot token; a human-
-  dispatched run therefore cannot produce a satisfiable PASS.
+The reusable workflow has no `pull_request` or `pull_request_target`
+trigger. A `workflow_dispatch` run is for diagnostic re-runs only. It
+posts as `github-actions[bot]`, but the read-back step requires a
+same-target-repo bot token; a human-dispatched run therefore cannot
+produce a satisfiable PASS.
 
 **Self-PASS is impossible by design.** A diagnostic `workflow_dispatch`
 run that tries to publish a PASS comment will fail the read-back step
@@ -79,8 +66,8 @@ This PR adds:
 
 This PR does NOT add:
 
-- A `pull_request` or `pull_request_target` trigger. See "Bootstrap
-  dependency" above.
+- An automatic `pull_request` or `pull_request_target` trigger. The
+  former automatic caller was removed; see "Invocation posture" above.
 - A `--force-pass` or `--skip-readback` flag. No escape hatch.
 - A mutable reviewer install (`npm install -g …`) on the credentialed
   runner. Reviewer binaries must be pre-installed via the trusted
@@ -111,16 +98,8 @@ This PR does NOT add:
 ## Architecture
 
 ```
-Trusted same-target-repo caller workflow
-   pull_request_target on jleechanorg/dark-factory main
-        │
-        ▼
-   Resolve caller's commit SHA on the default branch
-        │
-        ▼
-   uses: jleechanorg/dark-factory/.github/workflows/skeptic-gate.yml@<PINNED-SHA>
-        │  with inputs pr_number, pr_sha, trusted_code_sha;
-        │  secret github_token
+Manual operator dispatch or a separately managed trusted workflow
+   workflow_dispatch or workflow_call (pinned trusted ref)
         │
         ▼
    .github/workflows/skeptic-gate.yml
@@ -333,8 +312,8 @@ vars are set" step.
 | `vars.SKEPTIC_GEMINI_BIN` | **required** | Pinned absolute path to gemini binary |
 | `vars.SKEPTIC_GEMINI_VERSION` | **required** | Expected gemini version string (e.g. `gemini-cli 0.5.4`) |
 | `vars.SKEPTIC_GEMINI_SHA256` | **required** | Expected SHA256 of the gemini binary |
-| `inputs.trusted_code_sha` | **required** (workflow_call) | 40-hex SHA the caller pinned the workflow ref to. The "Validate trusted_code_sha" step refuses to proceed unless this is a 40-hex string; for dispatch runs it falls back to `github.sha` (the workflow's own commit SHA on the default branch). |
-| `inputs.trusted_ref` | **REMOVED** | (Previously allowed caller to override the code ref; removed per post-audit comment 4953064910.) The code ref is now implicitly pinned by the caller's `uses: ...@<SHA>` and the gate's own SHA equality check. |
+| `inputs.trusted_code_sha` | **required** (workflow_call) | 40-hex SHA supplied by a trusted caller that pins the workflow ref. The "Validate trusted_code_sha" step refuses to proceed unless this is a 40-hex string; for dispatch runs it falls back to `github.sha` (the workflow's own commit SHA on the default branch). |
+| `inputs.trusted_ref` | **REMOVED** | (Previously allowed a caller to override the code ref; removed per post-audit comment 4953064910.) For `workflow_call`, the trusted caller pins the ref via `uses: ...@<SHA>`; for dispatch, the gate uses its own workflow ref and enforces the SHA equality check. |
 
 ## Files
 
@@ -348,11 +327,7 @@ vars are set" step.
 - `.github/workflows/skeptic-gate.yml` — workflow (`workflow_call`
   target only; no `pull_request` / `pull_request_target`; pinned
   reviewer binaries; secrets stripped before reviewer invocation;
-  no `workflow_dispatch` `trusted_code_sha` input)
-- `.github/workflows/skeptic-gate-caller.yml` — bootstrap caller
-  (`pull_request_target` + `workflow_dispatch`); resolves the
-  caller's commit SHA on the default branch and invokes the gate
-  via `uses: ...@<PINNED-SHA>` at the job level (reusable-workflow
-  reference must be a static literal)
+  manual `workflow_dispatch`; no `workflow_dispatch` `trusted_code_sha`
+  input). The former automatic PR caller was removed.
 - `tests/test_skeptic_gate.py` — **79** contract + adversarial tests
 - `docs/skeptic-gate.md` — this file

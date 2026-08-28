@@ -34,6 +34,7 @@ sys.path.insert(0, str(ROOT))
 from runner.handlers import (  # noqa: E402
     Context,
     _codergen,
+    _holdout_denied_paths,
     _holdouts_repo_path,
     _sandboxed_args,
     _sanitized_env,
@@ -369,3 +370,19 @@ def test_holdouts_repo_path_succeeds_when_env_points_at_real_dir(monkeypatch, tm
     resolved = _holdouts_repo_path()
 
     assert resolved == real_dir.resolve()
+
+
+def test_holdout_denied_paths_keep_missing_canonical_default(monkeypatch, tmp_path):
+    """Explicit holdouts plus a missing canonical default stay deny-listed."""
+    fake_home = tmp_path / "fake-home"
+    explicit = tmp_path / "explicit-holdouts"
+    fake_home.mkdir()
+    explicit.mkdir()
+    monkeypatch.setattr(pathlib.Path, "home", lambda: fake_home)
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(explicit))
+
+    default = fake_home / "projects" / "dark-factory-holdouts"
+    denied = _holdout_denied_paths()
+
+    assert not default.is_dir()
+    assert denied == sorted((explicit.resolve(), default.resolve()), key=str)

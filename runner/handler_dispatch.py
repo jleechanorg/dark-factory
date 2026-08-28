@@ -45,6 +45,7 @@ import pathlib
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
@@ -81,6 +82,14 @@ class _ShadowGateReview:
     backend: str = "codex"
     prompt_is_complete: bool = False
     json_transport: bool = False
+    transport_argv: tuple[str, ...] = ()
+    transport_text: str = ""
+    response_text: str = ""
+    transport_receipt: dict[str, str] | None = None
+    output_dir: pathlib.Path | None = None
+    lane_name: str = ""
+    controller_runtime_root: pathlib.Path | None = None
+    controller_runtime_writable: pathlib.Path | None = None
 
 
 def _resolve_shadow_backend_env() -> str:
@@ -164,6 +173,8 @@ def _launch_shadow_gate_review(
     backend: str = "codex",
     *,
     prompt_is_complete: bool = False,
+    read_only_path: pathlib.Path | str | None = None,
+    lane_name: str = "",
 ) -> _ShadowGateReview | None:
     import runner.handlers as _handlers_shim  # late-bound shim (see module docstring)
     """Spawn a shadow reviewer on ``backend`` (no enable-gate).
@@ -182,6 +193,7 @@ def _launch_shadow_gate_review(
     backend without patching the dot file. Caller-specified non-default
     backends always win.
     """
+    configured_lane = lane_name or f"shadow_{backend}"
     if backend == "codex":
         backend = _resolve_shadow_backend_env()
     shadow_prompt = prompt if prompt_is_complete else _shadow_gate_prompt(
@@ -192,7 +204,17 @@ def _launch_shadow_gate_review(
         started_at=time.monotonic(),
         backend=backend,
         prompt_is_complete=prompt_is_complete,
+        lane_name=configured_lane,
     )
+    if prompt_is_complete:
+        raw_lane_dirs = ctx.state.get("_df_controller_review_lane_dirs", "{}")
+        try:
+            lane_dirs = json.loads(str(raw_lane_dirs))
+        except (TypeError, json.JSONDecodeError):
+            lane_dirs = {}
+        configured_path = lane_dirs.get(configured_lane)
+        if isinstance(configured_path, str) and configured_path:
+            shadow.output_dir = pathlib.Path(configured_path)
     if prompt_is_complete and backend != "codex":
         shadow.launch_error = "controller review requests require codex backend"
         return shadow
@@ -235,18 +257,40 @@ def _launch_shadow_gate_review(
     if args is None:
         shadow.launch_error = "sandbox-exec unavailable"
         return shadow
+    runtime = None
     if prompt_is_complete and backend == "codex":
         try:
-            args = _controller_codex_args(args)
-        except ValueError as exc:
+            runtime = _handlers_shim._create_controller_runtime()
+            args = _controller_codex_args(
+                args,
+                read_only_path=read_only_path or ctx.workdir,
+                writable_path=runtime.codex_home,
+                schema_path=_handlers_shim._controller_output_schema(runtime.run_dir),
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            if runtime is not None:
+                try:
+                    _handlers_shim._cleanup_controller_runtime(runtime.run_dir)
+                except Exception:  # noqa: BLE001, S110 - best-effort runtime cleanup
+                    pass
             shadow.launch_error = str(exc)
             return shadow
+        shadow.controller_runtime_root = runtime.run_dir
+        shadow.controller_runtime_writable = runtime.codex_home
         shadow.json_transport = True
+    shadow.transport_argv = tuple(str(arg) for arg in args)
     review_cwd = ctx.workdir
     if prompt_is_complete:
-        configured_cwd = ctx.state.get("_df_controller_review_cwd")
-        if configured_cwd:
-            review_cwd = pathlib.Path(str(configured_cwd))
+        neutral = ctx.state.get("_df_controller_review_cwd")
+        if not isinstance(neutral, str) or not neutral:
+            shadow.launch_error = "controller neutral cwd is missing"
+            if runtime is not None:
+                try:
+                    _handlers_shim._cleanup_controller_runtime(runtime.run_dir)
+                except Exception:  # noqa: BLE001, S110 - best-effort runtime cleanup
+                    pass
+            return shadow
+        review_cwd = pathlib.Path(neutral).resolve()
     try:
         shadow.proc = subprocess.Popen(
             args,
@@ -256,9 +300,17 @@ def _launch_shadow_gate_review(
             stderr=subprocess.PIPE,
             text=True,
             start_new_session=True,
-            env=_gate_subprocess_env(backend),
+            env=runtime.env if runtime is not None else _gate_subprocess_env(backend),
+            pass_fds=getattr(args, "pass_fds", ()),
         )
+        _handlers_shim._close_pinned_launcher_command(args)
     except Exception as exc:
+        _handlers_shim._close_pinned_launcher_command(args)
+        if runtime is not None:
+            try:
+                _handlers_shim._cleanup_controller_runtime(runtime.run_dir)
+            except Exception:  # noqa: BLE001, S110 - best-effort runtime cleanup
+                pass
         shadow.launch_error = f"{type(exc).__name__}: {exc}"
     return shadow
 
@@ -272,6 +324,8 @@ def _start_shadow_gate_review(
     backend: str = "codex",
     *,
     prompt_is_complete: bool = False,
+    read_only_path: pathlib.Path | str | None = None,
+    lane_name: str = "",
 ) -> _ShadowGateReview | None:
     """Back-compat wrapper: gate-on-enable then spawn the shadow reviewer.
 
@@ -289,6 +343,8 @@ def _start_shadow_gate_review(
         ctx,
         backend,
         prompt_is_complete=prompt_is_complete,
+        read_only_path=read_only_path,
+        lane_name=lane_name,
     )
 
 
@@ -310,6 +366,7 @@ def _finish_shadow_gate_review(
 
     returncode = ""
     timed_out = False
+    transport_receipt = None
     if shadow.launch_error:
         output = f"shadow codex gate review did not run: {shadow.launch_error}"
         verdict = "unknown"
@@ -355,12 +412,26 @@ def _finish_shadow_gate_review(
             returncode = str(proc.returncode if proc.returncode is not None else "")
             output = (stdout + ("\nSTDERR:\n" + stderr if stderr else "")).strip()
             command_receipts = ()
+            transport_receipt = None
             transport_error = ""
             if shadow.json_transport and not timed_out and proc.returncode == 0:
                 try:
-                    from .review_controller import parse_codex_jsonl
+                    from .review_controller import parse_tool_free_codex_jsonl
 
-                    output, command_receipts = parse_codex_jsonl(stdout)
+                    request = ctx.state.get("_df_controller_review_request")
+                    output, _transport_receipt = parse_tool_free_codex_jsonl(
+                        stdout, request=request
+                    )
+                    transport_receipt = {
+                        "transport": _transport_receipt.transport,
+                        "prompt_sha256": _transport_receipt.prompt_sha256,
+                        "envelope_sha256": _transport_receipt.envelope_sha256,
+                        "response_sha256": _transport_receipt.response_sha256,
+                        "head_sha": _transport_receipt.head_sha,
+                        "tree_sha": _transport_receipt.tree_sha,
+                        "evidence_manifest_sha256": _transport_receipt.evidence_manifest_sha256,
+                    }
+                    command_receipts = ()
                 except Exception as exc:
                     transport_error = str(exc)
                     output = stdout.strip()
@@ -378,6 +449,8 @@ def _finish_shadow_gate_review(
                 shadow_outcome = "error"
             else:
                 shadow_outcome = normalized
+            shadow.transport_text = stdout
+            shadow.response_text = output
 
     output_path = ""
     output_sha = ""
@@ -437,6 +510,10 @@ def _finish_shadow_gate_review(
             ] if "command_receipts" in locals() else [],
         }
     )
+    if transport_receipt is not None:
+        metadata[f"{prefix}transport_receipt"] = transport_receipt
+    if shadow.controller_runtime_root is not None:
+        metadata["_controller_runtime_root"] = str(shadow.controller_runtime_root)
     comparison = (
         "\n\n---\n\n"
         f"## Parallel {label} Gate Review\n"
@@ -555,16 +632,30 @@ def _gate_subprocess_env(backend: str) -> dict[str, str]:
     return _handlers_shim._sanitized_env()
 
 
-def _build_controller_codex_transport(args: list[str]) -> list[str]:
+def _build_controller_codex_transport(
+    args: list[str],
+    *,
+    read_only_path: pathlib.Path | str | None = None,
+    writable_path: pathlib.Path | str | None = None,
+    schema_path: pathlib.Path | str | None = None,
+) -> list[str]:
     """Build the concrete controller transport command for Codex review.
 
     The controller transport is always JSON-over-stdin:
       - complete payload on stdin (`-`), never argv positionals
-      - `codex exec --json --ephemeral --skip-git-repo-check`
-      - `--sandbox read-only`
+      - `codex exec --json --ephemeral --skip-git-repo-check -`
+      - shell/unified-exec/browser/computer features disabled and web search off
+      - one outer Landlock/Seatbelt profile with a workspace write denial
     Any unsupported transport mode (prompt-in-argv, bypass, write-capable
     sandbox mode, or weaker backend) fails closed before launch.
     """
+    import runner.handlers as _handlers_shim  # late-bound shim
+
+    if os.environ.get("DISABLE_SANDBOX"):
+        raise ValueError(
+            "controller transport refuses DISABLE_SANDBOX; holdout isolation is required"
+        )
+
     prepared = list(args)
     if not prepared:
         raise ValueError("codex controller argv is empty")
@@ -598,30 +689,131 @@ def _build_controller_codex_transport(args: list[str]) -> list[str]:
             if mode != "read-only":
                 raise ValueError("controller transport requires read-only codex sandboxing")
 
-    # Construct transport starting with `codex` binary, stripping any outer
-    # `sandbox-exec` wrapper so `codex exec --sandbox read-only` runs natively
-    # without triggering nested seatbelt sandbox_apply failures on macOS.
-    return [
-        "codex",
+    # On macOS, the outer Seatbelt profile is the single sandbox: require it,
+    # augment it with the workspace write boundary, and use Codex's
+    # externally-sandboxed mode so Codex does not try to apply a nested
+    # Seatbelt profile. On Linux, the LD_PRELOAD prefix is not a sandbox and
+    # native Codex read-only remains necessary.
+    outer = prepared[:codex_index]
+    path_denial = any(
+        "(deny file-read*" in value or value.startswith("DENY_PATHS=")
+        for value in outer
+    )
+    controller_tail = [
         "exec",
         "--json",
         "--ephemeral",
+        "--ignore-user-config",
         "--skip-git-repo-check",
-        "--sandbox",
-        "read-only",
-        "-",
+        "--disable",
+        "shell_tool",
+        "--disable",
+        "unified_exec",
+        "--disable",
+        "browser_use",
+        "--disable",
+        "computer_use",
+        "--disable",
+        "plugins",
+        "--disable",
+        "shell_snapshot",
+        "--disable",
+        "shell_snapshot_v2",
+        "--config",
+        'web_search="disabled"',
+        "--ignore-rules",
     ]
+    if schema_path is not None:
+        controller_tail.extend(["--output-schema", str(schema_path)])
+    controller_tail.append("-")
+    if sys.platform == "darwin":
+        from . import handler_sandbox as _sandbox
+
+        sandbox_index = next(
+            (
+                index
+                for index, value in enumerate(outer)
+                if (
+                    value == "sandbox-exec"
+                    or pathlib.Path(value).name == "sandbox-exec"
+                )
+            ),
+            None,
+        )
+        if (
+            sandbox_index is None
+            or sandbox_index + 2 >= len(outer)
+            or outer[sandbox_index + 1] != "-p"
+        ):
+            raise ValueError("controller macOS transport requires sandbox-exec -p profile")
+        profile_index = sandbox_index + 2
+        outer = list(outer)
+        outer[profile_index] = _handlers_shim._macos_read_only_profile(
+            _sandbox._build_sandbox_profile([]), read_only_path, writable_path
+        )
+        executable = prepared[codex_index]
+        return outer + [executable, *controller_tail]
+    if sys.platform.startswith("linux") and path_denial:
+        if read_only_path is None:
+            raise ValueError("controller Linux transport requires a read-only target path")
+        denied_paths: list[pathlib.Path] = []
+        for value in outer:
+            if value.startswith("DENY_PATHS="):
+                denied_paths.extend(
+                    pathlib.Path(item)
+                    for item in value.split("=", 1)[1].split(":")
+                    if item
+                )
+        if not denied_paths:
+            raise ValueError("controller Linux transport lacks holdout denial paths")
+        executable = prepared[codex_index]
+        resolved_executable = (
+            shutil.which(executable) if pathlib.Path(executable).name == "codex" else executable
+        ) or executable
+        executable_path = pathlib.Path(resolved_executable)
+        runtime_paths = _handlers_shim._linux_codex_runtime_paths(executable_path)
+        if runtime_paths is None:
+            raise ValueError("controller Linux transport cannot resolve Codex runtime")
+        landlock_prefix = _handlers_shim._linux_controller_sandbox_prefix(
+            denied_paths=denied_paths,
+            read_paths=[
+                *runtime_paths,
+                *([pathlib.Path(schema_path)] if schema_path is not None else []),
+            ],
+            writable_paths=[pathlib.Path(writable_path)] if writable_path is not None else [],
+            executable_paths=[executable_path],
+        )
+        if landlock_prefix is None:
+            raise ValueError("controller Linux Landlock isolation unavailable")
+        return _handlers_shim._extend_pinned_launcher_command(
+            landlock_prefix, [executable, *controller_tail]
+        )
+    if sys.platform.startswith("linux") and not path_denial:
+        raise ValueError("controller Linux transport lacks holdout denial")
+    executable = prepared[codex_index] if path_denial else "codex"
+    return (outer if path_denial else []) + [executable, *controller_tail]
 
 
 
-def _controller_codex_args(args: list[str]) -> list[str]:
+def _controller_codex_args(
+    args: list[str],
+    *,
+    read_only_path: pathlib.Path | str | None = None,
+    writable_path: pathlib.Path | str | None = None,
+    schema_path: pathlib.Path | str | None = None,
+) -> list[str]:
     """Backward-compatible shim for the controller transport builder."""
-    return _build_controller_codex_transport(args)
+    return _build_controller_codex_transport(
+        args,
+        read_only_path=read_only_path,
+        writable_path=writable_path,
+        schema_path=schema_path,
+    )
 
 
 def _run_gate_once(
     backend: str, prompt: str, expected_sha: str, timeout: int, ctx: "Context", name: str,
-    *, gate_strict: bool = False,
+    *, gate_strict: bool = False, read_only_path: pathlib.Path | str | None = None,
 ) -> "Result":
     import runner.handlers as _handlers_shim  # late-bound shim
     """Run one reviewer-gate attempt on ``backend`` and classify the result.
@@ -699,13 +891,25 @@ def _run_gate_once(
             },
         )
     controller_json = backend == "codex" and controller_requested
+    runtime = None
     if controller_json:
         try:
-            sub_args = _controller_codex_args(sub_args)
-        except ValueError:
+            runtime = _handlers_shim._create_controller_runtime()
+            sub_args = _controller_codex_args(
+                sub_args,
+                read_only_path=read_only_path or ctx.workdir,
+                writable_path=runtime.codex_home,
+                schema_path=_handlers_shim._controller_output_schema(runtime.run_dir),
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            if runtime is not None:
+                try:
+                    _handlers_shim._cleanup_controller_runtime(runtime.run_dir)
+                except Exception:  # noqa: BLE001, S110 - best-effort runtime cleanup
+                    pass
             return Result(
                 outcome="error",
-                output="controller review argv does not contain codex",
+                output=f"controller review runtime/argv setup failed: {exc}",
                 metadata={
                     "slash_command": name,
                     "verdict": "unknown",
@@ -713,6 +917,7 @@ def _run_gate_once(
                     **prompt_meta,
                 },
             )
+        sub_env = runtime.env
     shadow_review = _start_shadow_gate_review(name, prompt, expected_sha, timeout, ctx)
 
     def _finalize(result: "Result") -> "Result":
@@ -723,12 +928,19 @@ def _run_gate_once(
     run_timeout = timeout + 30 if backend == "agy" else timeout
     try:
         review_cwd = ctx.workdir
-        if controller_json and ctx.state.get("_df_controller_review_cwd"):
-            review_cwd = pathlib.Path(str(ctx.state["_df_controller_review_cwd"]))
+        if controller_json:
+            request = ctx.state.get("_df_controller_review_request")
+            if request is None:
+                raise RuntimeError("controller review request is missing")
+            neutral = ctx.state.get("_df_controller_review_cwd")
+            if not isinstance(neutral, str) or not neutral:
+                raise RuntimeError("controller neutral cwd is missing")
+            review_cwd = pathlib.Path(neutral).resolve()
         proc = subprocess.run(
             sub_args, cwd=review_cwd, capture_output=True, text=True,
             input=prompt if controller_json else None,
             timeout=run_timeout, check=False, env=sub_env,
+            pass_fds=getattr(sub_args, "pass_fds", ()),
         )
     except subprocess.TimeoutExpired as exc:
         # TimeoutExpired carries bytes for stdout/stderr even when the run
@@ -741,6 +953,11 @@ def _run_gate_once(
             return v
 
         combined = _as_text(exc.stdout) + "\n" + _as_text(exc.stderr)
+        if runtime is not None:
+            try:
+                _handlers_shim._cleanup_controller_runtime(runtime.run_dir)
+            except Exception:  # noqa: BLE001, S110 - best-effort runtime cleanup
+                pass
         return _finalize(Result(
             outcome="failure",
             output=combined.strip() or f"gate {name} timed out after {run_timeout}s",
@@ -749,6 +966,11 @@ def _run_gate_once(
                       "reviewer_backend": reviewer_backend, **prompt_meta},
         ))
     except FileNotFoundError as exc:
+        if runtime is not None:
+            try:
+                _handlers_shim._cleanup_controller_runtime(runtime.run_dir)
+            except Exception:  # noqa: BLE001, S110 - best-effort runtime cleanup
+                pass
         return _finalize(Result(
             outcome="error",
             output=f"gate {name} backend {reviewer_backend!r} not found: {exc}",
@@ -757,6 +979,11 @@ def _run_gate_once(
                       "backend_missing": "true", **prompt_meta},
         ))
     except Exception as exc:
+        if runtime is not None:
+            try:
+                _handlers_shim._cleanup_controller_runtime(runtime.run_dir)
+            except Exception:  # noqa: BLE001, S110 - best-effort runtime cleanup
+                pass
         return _finalize(Result(
             outcome="error",
             output=f"gate {name} subprocess failed: {exc}",
@@ -764,32 +991,64 @@ def _run_gate_once(
                       "head_sha_status": "missing", "reviewer_backend": reviewer_backend,
                       **prompt_meta},
         ))
+    finally:
+        _handlers_shim._close_pinned_launcher_command(sub_args)
     command_receipts = ()
+    transport_receipt = None
     review_output = proc.stdout
     transport_error = ""
+    controller_review = None
     if controller_json and proc.returncode == 0:
         try:
-            from .review_controller import parse_codex_jsonl
+            from .review_controller import (
+                parse_tool_free_codex_jsonl,
+                validate_review_response,
+            )
 
-            review_output, command_receipts = parse_codex_jsonl(proc.stdout)
+            request = ctx.state.get("_df_controller_review_request")
+            if request is None:
+                raise RuntimeError("controller review request is missing")
+            review_output, transport_receipt = parse_tool_free_codex_jsonl(
+                proc.stdout, request=request
+            )
+            controller_review = validate_review_response(
+                review_output, request, tool_free=True
+            )
+            if transport_receipt.head_sha != expected_sha:
+                raise ValueError("tool-free controller receipt head binding mismatch")
+            command_receipts = ()
         except Exception as exc:
             transport_error = str(exc)
             review_output = proc.stdout
-    combined = review_output + "\n" + proc.stderr
-    verdict, normalized = _handlers_shim._parse_verdict(combined, gate_strict=gate_strict)
-    # SHA binding check comes BEFORE collapsing to pass/fail so a spoofed-pass
-    # with the wrong SHA collapses to `error`, not `success`.
-    sha_ok, observed_sha = _handlers_shim._verify_head_sha_echo(combined, expected_sha)
-    if transport_error:
-        outcome = "error"
-    elif proc.returncode != 0 and (verdict == "unknown" or normalized == "success"):
-        outcome = "error"
-    elif not sha_ok:
-        # Spoofed PASS / unknown without a SHA echo → error. A real FAIL/PARTIAL
-        # without a SHA echo is kept (conservative — never hide a real verdict).
-        outcome = "error" if normalized in ("success", "unknown") else normalized
+    if controller_json:
+        if controller_review is not None and not transport_error and proc.returncode == 0:
+            verdict = controller_review.verdict
+            normalized = "success" if verdict == "pass" else "failure"
+            observed_sha = transport_receipt.head_sha if transport_receipt else ""
+            sha_ok = observed_sha == expected_sha
+            outcome = normalized if sha_ok else "error"
+        else:
+            verdict = "unknown"
+            normalized = "error"
+            observed_sha = ""
+            sha_ok = False
+            outcome = "error"
     else:
-        outcome = normalized
+        combined = review_output + "\n" + proc.stderr
+        verdict, normalized = _handlers_shim._parse_verdict(combined, gate_strict=gate_strict)
+        # SHA binding check comes BEFORE collapsing to pass/fail so a spoofed-pass
+        # with the wrong SHA collapses to `error`, not `success`.
+        sha_ok, observed_sha = _handlers_shim._verify_head_sha_echo(combined, expected_sha)
+        if transport_error:
+            outcome = "error"
+        elif proc.returncode != 0 and (verdict == "unknown" or normalized == "success"):
+            outcome = "error"
+        elif not sha_ok:
+            # Spoofed PASS / unknown without a SHA echo → error. A real FAIL/PARTIAL
+            # without a SHA echo is kept (conservative — never hide a real verdict).
+            outcome = "error" if normalized in ("success", "unknown") else normalized
+        else:
+            outcome = normalized
     head_sha_status = (
         "matched" if sha_ok and observed_sha
         else ("mismatched" if observed_sha else "missing")
@@ -819,6 +1078,7 @@ def _run_gate_once(
         # structured gate (_check_structured_receipt) via _MDToCtxShim.
         metadata["_reviewer_receipts"] = [receipt]
     if controller_json:
+        metadata["_controller_runtime_root"] = str(runtime.run_dir) if runtime is not None else ""
         metadata["_controller_command_receipts"] = [
             {
                 "command": item.command,
@@ -827,8 +1087,24 @@ def _run_gate_once(
             }
             for item in command_receipts
         ]
+        if transport_receipt is not None:
+            metadata["_controller_transport_receipt"] = {
+                "transport": transport_receipt.transport,
+                "prompt_sha256": transport_receipt.prompt_sha256,
+                "envelope_sha256": transport_receipt.envelope_sha256,
+                "response_sha256": transport_receipt.response_sha256,
+                "head_sha": transport_receipt.head_sha,
+                "tree_sha": transport_receipt.tree_sha,
+                "evidence_manifest_sha256": transport_receipt.evidence_manifest_sha256,
+            }
         if transport_error:
             metadata["review_transport_error"] = transport_error
+        # The parallel controller lane persists this exact raw JSONL through
+        # the shared controller artifact writer after contract adjustment.
+        # Keep it transiently in metadata so the graph path cannot fall back
+        # to a generic sidecar or reconstruct transport from parsed prose.
+        metadata["_controller_transport_text"] = proc.stdout
+        metadata["_controller_transport_argv"] = list(sub_args)
     # Codergen-sourced receipts (Task 2): the codergen producer stashes
     # parsed ``commands_run.md`` records into ``ctx.state`` under per-node
     # keys ``"<node>.structured_receipt"``. The reviewer gate runs in a
@@ -1130,7 +1406,7 @@ def _coerce_bool_attr(value: object) -> bool:
 
 def _execute_gate(
     prompt: str, expected_sha: str, timeout: int, ctx: "Context", name: str, backend: str,
-    *, gate_strict: bool = False,
+    *, gate_strict: bool = False, read_only_path: pathlib.Path | str | None = None,
 ) -> "Result":
     """Run a reviewer gate on ``backend``; infra failures fall back to agy, then claude.
 
@@ -1153,7 +1429,16 @@ def _execute_gate(
     ``codex`` actually invokes the codex subprocess, with
     ``reviewer_backend: codex`` recorded in the result metadata.
     """
-    result = _run_gate_once(backend, prompt, expected_sha, timeout, ctx, name, gate_strict=gate_strict)
+    result = _run_gate_once(
+        backend,
+        prompt,
+        expected_sha,
+        timeout,
+        ctx,
+        name,
+        gate_strict=gate_strict,
+        read_only_path=read_only_path,
+    )
 
     controller_requested = str(ctx.state.get("_df_controller_review_json") or "").lower() in {"true", "1", "yes", "on"}
     if _is_gate_infra_failure(result):
@@ -1169,7 +1454,16 @@ def _execute_gate(
 
         current_result = result
         for fb_backend in fallback_backends:
-            fallback = _run_gate_once(fb_backend, prompt, expected_sha, timeout, ctx, name, gate_strict=gate_strict)
+            fallback = _run_gate_once(
+                fb_backend,
+                prompt,
+                expected_sha,
+                timeout,
+                ctx,
+                name,
+                gate_strict=gate_strict,
+                read_only_path=read_only_path,
+            )
             fallback.metadata["fallback_used"] = "true"
             fallback.metadata["fallback_from"] = backend
             current_result = fallback
