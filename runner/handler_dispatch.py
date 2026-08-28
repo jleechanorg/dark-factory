@@ -543,7 +543,10 @@ def _gate_subprocess_args(
     if backend in {"claude", "claude-sonnet"}:
         try:
             _handlers_shim._claude_config_dir()
-        except (AttributeError, ValueError):
+        except AttributeError:
+            # Preserve the legacy unavailable-helper behavior, but let a
+            # ValueError escape so callers can report invalid Claude scope
+            # separately from an unavailable sandbox.
             return None
 
     sealed_args_builder = getattr(_handlers_shim, "_sandboxed_args_for_workdir", None)
