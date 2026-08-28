@@ -39,6 +39,7 @@ from .parser import Graph, Node, is_exit_node
 _CONTROLLER_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _CONTROLLER_SNAPSHOT_JOURNAL = "controller-snapshot-journal.json"
 _CONTROLLER_BASE_PROVENANCE = "controller-base-provenance.json"
+_CONTROLLER_BASE_PROVENANCE_ERROR = "controller base provenance is unavailable"
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
@@ -101,6 +102,16 @@ def _seed_controller_base_sha(ctx: Context, graph: Graph) -> None:
     base_sha = proc.stdout.strip().lower() if proc.returncode == 0 else ""
     if _CONTROLLER_SHA_RE.fullmatch(base_sha):
         _set_controller_base_sha(ctx, base_sha)
+
+
+def _is_controller_graph(graph: Graph) -> bool:
+    """Identify graphs whose cold-review contract requires durable provenance."""
+    if str(graph.attrs.get("review_contract", "")).strip() == "cold-review-v1":
+        return True
+    return any(
+        str(node.attrs.get("review_contract", "")).strip() == "cold-review-v1"
+        for node in graph.nodes.values()
+    )
 
 
 def _controller_snapshot_journal_path(ctx: Context) -> pathlib.Path | None:
@@ -384,21 +395,29 @@ def _write_controller_snapshot_journal(
     _write_controller_private_json(path, entries, dir_fd=dir_fd)
 
 
-def _load_controller_base_provenance(ctx: Context) -> bool:
+def _load_controller_base_provenance(ctx: Context, *, required: bool = False) -> bool:
     """Restore the runner-owned base from the protected per-run sidecar."""
     try:
         with _controller_snapshot_journal_lock(ctx) as location:
             if location is None:
+                if required:
+                    raise ValueError(_CONTROLLER_BASE_PROVENANCE_ERROR)
                 return False
             _journal_path, dir_fd = location
             sidecar = pathlib.Path(_CONTROLLER_BASE_PROVENANCE)
             payload = _read_controller_private_json(sidecar, dir_fd=dir_fd)
-    except (OSError, TypeError, ValueError):
+    except (OSError, TypeError, ValueError) as exc:
+        if required:
+            raise ValueError(_CONTROLLER_BASE_PROVENANCE_ERROR) from exc
         return False
     if not isinstance(payload, dict):
+        if required:
+            raise ValueError(_CONTROLLER_BASE_PROVENANCE_ERROR)
         return False
     base_sha = payload.get("controller_base_sha")
     if not isinstance(base_sha, str) or not _CONTROLLER_SHA_RE.fullmatch(base_sha.lower()):
+        if required:
+            raise ValueError(_CONTROLLER_BASE_PROVENANCE_ERROR)
         return False
     _set_controller_base_sha(ctx, base_sha)
     return True
@@ -836,8 +855,11 @@ def run(
     # A resumed controller must restore the original runner-owned base before
     # looking at the target checkout again.  The worker may have advanced HEAD,
     # and public state is not an authentication channel for this value.
+    controller_graph = _is_controller_graph(graph)
     restored_controller_base = (
-        _load_controller_base_provenance(ctx) if resume is not None else False
+        _load_controller_base_provenance(ctx, required=controller_graph)
+        if resume is not None
+        else False
     )
 
     # Capture the controller-owned base before the first worker visit.  This

@@ -8,12 +8,11 @@ import subprocess
 from dataclasses import asdict
 from pathlib import Path
 
+import pytest
+
 from runner import engine_run
 from runner.engine_run import (
     _CONTROLLER_BASE_PROVENANCE,
-    _load_controller_base_provenance,
-    _persist_controller_base_provenance,
-    _seed_controller_base_sha,
 )
 from runner.handlers import Context, Result
 from runner.parser import Edge, Graph, Node
@@ -49,11 +48,15 @@ def _advance_worker(repo: Path) -> str:
     return _git(repo, "rev-parse", "HEAD")
 
 
-def _graph() -> Graph:
+def _graph(*, controller: bool = True) -> Graph:
+    reviewer_attrs = {"review_contract": "cold-review-v1"} if controller else {}
     return Graph(
         name="resume-base",
         goal="",
-        nodes={name: Node(name=name) for name in ("start", "worker", "reviewer", "exit")},
+        nodes={
+            name: Node(name=name, attrs=reviewer_attrs if name == "reviewer" else {})
+            for name in ("start", "worker", "reviewer", "exit")
+        },
         edges=[
             Edge(src="start", dst="worker"),
             Edge(src="worker", dst="reviewer"),
@@ -123,7 +126,75 @@ def test_resume_restores_original_base_before_reseed_after_worker_advances_head(
     assert sidecar.stat().st_uid == os.getuid()
 
 
-def test_public_state_alone_cannot_restore_private_controller_base(
+@pytest.mark.parametrize(
+    "sidecar_kind",
+    ["missing", "malformed", "nonobject", "missing_field", "bad_sha", "symlink", "unsafe"],
+)
+def test_controller_resume_rejects_lost_or_invalid_sidecar_before_execution(
+    tmp_path: Path, monkeypatch, sidecar_kind: str
+) -> None:
+    repo, base = _repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    home.chmod(0o700)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    run_dir = home / ".dark-factory" / "runs" / "without-sidecar"
+    run_dir.mkdir(parents=True, mode=0o700)
+    sidecar = run_dir / _CONTROLLER_BASE_PROVENANCE
+    if sidecar_kind == "malformed":
+        sidecar.write_text("{", encoding="utf-8")
+    elif sidecar_kind == "nonobject":
+        sidecar.write_text("[]", encoding="utf-8")
+    elif sidecar_kind == "missing_field":
+        sidecar.write_text("{}", encoding="utf-8")
+    elif sidecar_kind == "bad_sha":
+        sidecar.write_text(
+            json.dumps({"controller_base_sha": "not-a-sha"}), encoding="utf-8"
+        )
+    elif sidecar_kind == "symlink":
+        target = tmp_path / "sidecar-target"
+        target.write_text(json.dumps({"controller_base_sha": base}), encoding="utf-8")
+        sidecar.symlink_to(target)
+    elif sidecar_kind == "unsafe":
+        sidecar.write_text(json.dumps({"controller_base_sha": base}), encoding="utf-8")
+        sidecar.chmod(0o666)
+
+    checkpoint = run_dir / "checkpoint.json"
+    checkpoint.write_text("[]", encoding="utf-8")
+    worker_head = _advance_worker(repo)
+    calls: list[str] = []
+
+    def handler(node: Node, _ctx: Context) -> Result:
+        calls.append(node.name)
+        return Result()
+
+    monkeypatch.setattr(engine_run, "resolve", lambda node: handler)
+    monkeypatch.setattr(
+        engine_run,
+        "_seed_controller_base_sha",
+        lambda *_args: pytest.fail("controller resume reseeded after sidecar loss"),
+    )
+    monkeypatch.setattr(
+        engine_run._persist,
+        "_load_checkpoint",
+        lambda *_args: pytest.fail("controller resume loaded checkpoint after sidecar loss"),
+    )
+    resumed = Context(
+        goal="review worker change",
+        workdir=repo,
+        run_id="without-sidecar",
+        state={"_controller_base_sha": base},
+    )
+
+    with pytest.raises(ValueError, match="controller base provenance is unavailable"):
+        engine_run.run(_graph(), resumed, checkpoint=checkpoint, resume=checkpoint, max_steps=10)
+
+    assert resumed._controller_base_sha is None
+    assert calls == []
+    assert worker_head != base
+
+
+def test_non_controller_resume_without_sidecar_still_reseeds(
     tmp_path: Path, monkeypatch
 ) -> None:
     repo, base = _repo(tmp_path)
@@ -131,19 +202,33 @@ def test_public_state_alone_cannot_restore_private_controller_base(
     home.mkdir(mode=0o700)
     home.chmod(0o700)
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
-    worker_head = _advance_worker(repo)
-    resumed = Context(
-        goal="review",
-        workdir=repo,
-        run_id="without-sidecar",
-        state={"_controller_base_sha": base},
+
+    calls: list[str] = []
+
+    def handler(node: Node, _ctx: Context) -> Result:
+        calls.append(node.name)
+        if node.name == "worker":
+            _advance_worker(repo)
+        return Result()
+
+    monkeypatch.setattr(engine_run, "resolve", lambda node: handler)
+    checkpoint = home / ".dark-factory" / "runs" / "non-controller" / "checkpoint.json"
+    first = Context(goal="review", workdir=repo, run_id="non-controller")
+    first_history = engine_run.run(
+        _graph(controller=False), first, checkpoint=checkpoint, max_steps=2
+    )
+    sidecar = checkpoint.parent / _CONTROLLER_BASE_PROVENANCE
+    sidecar.unlink()
+    checkpoint.write_text(
+        json.dumps([asdict(step) for step in first_history[:2]]), encoding="utf-8"
     )
 
-    assert _load_controller_base_provenance(resumed) is False
-    assert resumed._controller_base_sha is None
-    _seed_controller_base_sha(resumed, _graph())
+    resumed = Context(goal="review", workdir=repo, run_id="non-controller")
+    history = engine_run.run(
+        _graph(controller=False), resumed, checkpoint=checkpoint, resume=checkpoint, max_steps=10
+    )
 
-    # The mutable checkout's current HEAD is the only value the runner may
-    # capture when no durable provenance exists; public state did not help.
-    assert resumed._controller_base_sha == worker_head
-    assert resumed.state["_controller_base_sha"] == worker_head
+    assert resumed._controller_base_sha == _git(repo, "rev-parse", "HEAD")
+    assert resumed._controller_base_sha != base
+    assert [step.node for step in history] == ["start", "worker", "reviewer", "exit"]
+    assert calls == ["start", "worker", "reviewer", "exit"]
