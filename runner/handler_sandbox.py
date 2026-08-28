@@ -136,6 +136,7 @@ def _controller_output_schema(run_dir: pathlib.Path) -> pathlib.Path:
     try:
         os.write(fd, _CONTROLLER_OUTPUT_SCHEMA.encode("utf-8"))
         os.fsync(fd)
+        os.fchmod(fd, 0o444)
     finally:
         os.close(fd)
     info = path.lstat()

@@ -21,6 +21,7 @@ from runner.handler_dispatch import (
 from runner.handler_parallel_reviewer import _parallel_reviewer
 from runner.handler_sandbox import (
     _cleanup_controller_runtime,
+    _controller_output_schema,
     _create_controller_runtime,
     _macos_read_only_profile,
 )
@@ -121,6 +122,20 @@ def test_controller_runtime_repairs_current_owned_writable_factory_dir(
         assert runtime.run_dir.parent == factory_dir / "controller-runtimes"
     finally:
         _cleanup_controller_runtime(runtime.run_dir)
+
+
+def test_controller_output_schema_is_exactly_readable_under_restrictive_umask(
+    private_tmp_path,
+):
+    run_dir = private_tmp_path / "run"
+    run_dir.mkdir(mode=0o700)
+    previous_umask = os.umask(0o077)
+    try:
+        schema_path = _controller_output_schema(run_dir)
+    finally:
+        os.umask(previous_umask)
+
+    assert stat.S_IMODE(schema_path.lstat().st_mode) == 0o444
 
 
 def test_controller_runtime_rejects_writable_home_without_repair(
