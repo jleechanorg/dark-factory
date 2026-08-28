@@ -48,6 +48,19 @@ def _advance_worker(repo: Path) -> str:
     return _git(repo, "rev-parse", "HEAD")
 
 
+def _nonancestor_sha(repo: Path) -> str:
+    _git(repo, "checkout", "-q", "-b", "side")
+    (repo / "side.txt").write_text("side\n")
+    _git(repo, "add", "side.txt")
+    _git(repo, "commit", "-q", "-m", "side")
+    side_sha = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "-q", "main")
+    (repo / "main.txt").write_text("main\n")
+    _git(repo, "add", "main.txt")
+    _git(repo, "commit", "-q", "-m", "main")
+    return side_sha
+
+
 def _graph(*, controller: bool = True) -> Graph:
     reviewer_attrs = {"review_contract": "cold-review-v1"} if controller else {}
     return Graph(
@@ -192,6 +205,55 @@ def test_controller_resume_rejects_lost_or_invalid_sidecar_before_execution(
     assert resumed._controller_base_sha is None
     assert calls == []
     assert worker_head != base
+
+
+@pytest.mark.parametrize("sidecar_kind", ["unknown", "noncommit", "nonancestor"])
+def test_controller_resume_rejects_semantically_invalid_sidecar_before_checkpoint(
+    tmp_path: Path, monkeypatch, sidecar_kind: str
+) -> None:
+    repo, base = _repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    home.chmod(0o700)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    run_dir = home / ".dark-factory" / "runs" / "semantic-sidecar"
+    run_dir.mkdir(parents=True, mode=0o700)
+    if sidecar_kind == "unknown":
+        sidecar_sha = "0" * 40
+    elif sidecar_kind == "noncommit":
+        (repo / "blob.txt").write_text("blob\n")
+        sidecar_sha = _git(repo, "hash-object", "-w", "blob.txt")
+    else:
+        sidecar_sha = _nonancestor_sha(repo)
+    sidecar = run_dir / _CONTROLLER_BASE_PROVENANCE
+    sidecar.write_text(json.dumps({"controller_base_sha": sidecar_sha}), encoding="utf-8")
+    sidecar.chmod(0o600)
+    checkpoint = run_dir / "checkpoint.json"
+    checkpoint.write_text("[]", encoding="utf-8")
+    calls: list[str] = []
+
+    def handler(node: Node, _ctx: Context) -> Result:
+        calls.append(node.name)
+        return Result()
+
+    monkeypatch.setattr(engine_run, "resolve", lambda node: handler)
+    monkeypatch.setattr(
+        engine_run._persist,
+        "_load_checkpoint",
+        lambda *_args: pytest.fail("semantic sidecar loaded checkpoint before validation"),
+    )
+    resumed = Context(
+        goal="review",
+        workdir=repo,
+        run_id="semantic-sidecar",
+        state={"_controller_base_sha": base},
+    )
+
+    with pytest.raises(ValueError, match="controller base provenance is unavailable"):
+        engine_run.run(_graph(), resumed, checkpoint=checkpoint, resume=checkpoint, max_steps=10)
+
+    assert resumed._controller_base_sha == sidecar_sha
+    assert calls == []
 
 
 def test_non_controller_resume_without_sidecar_still_reseeds(

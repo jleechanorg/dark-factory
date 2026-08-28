@@ -31,6 +31,7 @@ from . import engine_observability as _obs
 from . import engine_parallel as _parallel
 from . import engine_persist as _persist
 from . import perf_log
+from ._git import _git_rev_parse
 from ._classify import _classify_outcome
 from .cxdb import CXDB
 from .handlers import Context, Result, resolve
@@ -112,6 +113,66 @@ def _is_controller_graph(graph: Graph) -> bool:
         str(node.attrs.get("review_contract", "")).strip() == "cold-review-v1"
         for node in graph.nodes.values()
     )
+
+
+def _verify_controller_base_provenance(ctx: Context) -> None:
+    """Verify a restored base still belongs to the current target history."""
+    base_sha = getattr(ctx, "_controller_base_sha", None)
+    if not isinstance(base_sha, str):
+        raise ValueError(_CONTROLLER_BASE_PROVENANCE_ERROR)
+    base_sha = base_sha.strip().lower()
+    if not _CONTROLLER_SHA_RE.fullmatch(base_sha):
+        raise ValueError(_CONTROLLER_BASE_PROVENANCE_ERROR)
+
+    try:
+        from .handler_core import _target_worktree
+        from .handler_sandbox import _holdout_denied_paths
+        from .review_controller import ReviewContractError, validate_workspace_path
+
+        raw_target = _target_worktree(ctx)
+        holdout_roots = tuple(
+            str(pathlib.Path(root).resolve(strict=False))
+            for root in _holdout_denied_paths()
+        )
+        # Validate the lexical path before any target-owned Git operation.
+        target = validate_workspace_path(
+            str(raw_target),
+            holdout_roots=holdout_roots,
+        )
+        resolved_base = _git_rev_parse(
+            target,
+            "--verify",
+            f"{base_sha}^{{commit}}",
+        )
+        current_head = _git_rev_parse(target, "HEAD^{commit}")
+        if (
+            resolved_base is None
+            or resolved_base.strip().lower() != base_sha
+            or current_head is None
+            or not _CONTROLLER_SHA_RE.fullmatch(current_head.strip().lower())
+        ):
+            raise ValueError(_CONTROLLER_BASE_PROVENANCE_ERROR)
+        ancestor = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(target),
+                "merge-base",
+                "--is-ancestor",
+                base_sha,
+                current_head.strip().lower(),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if ancestor.returncode != 0:
+            raise ValueError(_CONTROLLER_BASE_PROVENANCE_ERROR)
+    except (OSError, ReviewContractError, subprocess.SubprocessError, ValueError) as exc:
+        if str(exc) == _CONTROLLER_BASE_PROVENANCE_ERROR:
+            raise
+        raise ValueError(_CONTROLLER_BASE_PROVENANCE_ERROR) from exc
 
 
 def _controller_snapshot_journal_path(ctx: Context) -> pathlib.Path | None:
@@ -861,6 +922,8 @@ def run(
         if resume is not None
         else False
     )
+    if restored_controller_base:
+        _verify_controller_base_provenance(ctx)
 
     # Capture the controller-owned base before the first worker visit.  This
     # runs after CLI/AO state has been assembled, so an explicitly selected AO
