@@ -429,15 +429,13 @@ def test_reviewer_gate_priority_queue_with_codex_missing_picks_codex(monkeypatch
     responds to ``--version`` (probe stubbed here). When the resolved
     backend is then missing at run time, ``_execute_gate`` walks the
     infra-failure fallback chain in order: ``agy`` first (if not already
-    the resolved backend), then ``claude``. The chain
-    "codex (missing) -> agy (missing) -> claude (succeeds)" is the
-    canonical path now that agy→claude infra fallback was added (commit
-    981e26bd9).
+    the resolved backend), then fail closed. The chain
+    "codex (missing) -> agy (missing)" must not invoke an implicit personal
+    Claude transport.
 
     Note: this test deliberately fails BOTH codex and agy in the stub so
-    the fallback walks all the way to claude. The companion test
-    ``test_reviewer_gate_priority_queue_agy_succeeds_after_codex_missing``
-    covers the "agy succeeds" mid-chain case.
+    the explicit fallback chain terminates with an infrastructure error.
+    The companion agy-success coverage exercises the mid-chain success case.
     """
     fake_sha = "0" * 40
     seen: list[str] = []

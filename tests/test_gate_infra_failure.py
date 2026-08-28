@@ -1,4 +1,4 @@
-"""Universal infra fallback (codex/minimax/etc → claude) + infra_failure tag.
+"""Reviewer infrastructure-failure handling and ``infra_failure`` tagging.
 
 Extracted from tests/test_gates.py per docs/refactor/file-ownership-map.test_gates.md.
 """
@@ -13,8 +13,30 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 
+def test_codex_infra_fallback_docs_do_not_claim_personal_claude() -> None:
+    """The fail-closed codex→agy contract must not drift back to Claude prose."""
+    module = sys.modules[__name__]
+    stale_names = [
+        name
+        for name, value in vars(module).items()
+        if name.startswith("test_")
+        and callable(value)
+        and "falls_back_to_claude" in name
+    ]
+    assert not stale_names, f"stale Claude-fallback test aliases: {stale_names!r}"
+
+    stale_docs = []
+    for name, value in vars(module).items():
+        if not name.startswith("test_") or not callable(value):
+            continue
+        doc = (getattr(value, "__doc__", "") or "").lower()
+        if "claude fallback" in doc or "-> claude" in doc:
+            stale_docs.append(name)
+    assert not stale_docs, f"stale Claude-fallback test documentation: {stale_docs!r}"
+
+
 def test_execute_gate_codex_infra_failure_stops_after_agy(tmp_path, monkeypatch):
-    """codex and agy missing → no implicit Claude fallback."""
+    """codex and agy missing → no implicit personal-Claude transport."""
     import subprocess as _sp
     from runner.handlers import _execute_gate, Context as HCtx
 
@@ -45,11 +67,6 @@ def test_execute_gate_codex_infra_failure_stops_after_agy(tmp_path, monkeypatch)
         "agy fallback must have been invoked after codex infra failure"
     )
     assert not any(os.path.basename(c[0]) == "claude" for c in seen)
-
-
-test_execute_gate_codex_infra_failure_falls_back_to_claude = (
-    test_execute_gate_codex_infra_failure_stops_after_agy
-)
 
 
 def test_execute_gate_codex_infra_failure_falls_back_to_agy(tmp_path, monkeypatch):
@@ -83,7 +100,7 @@ def test_execute_gate_codex_infra_failure_falls_back_to_agy(tmp_path, monkeypatc
         "agy fallback must have been invoked after codex infra failure"
     )
     assert not any(os.path.basename(c[0]) == "claude" for c in seen), (
-        "claude fallback must not have been invoked since agy succeeded"
+        "personal Claude transport must not be invoked since agy succeeded"
     )
 
 
@@ -114,8 +131,11 @@ def test_execute_gate_codex_real_fail_not_retried(tmp_path, monkeypatch):
 
 
 def test_execute_gate_tags_infra_failure_when_all_backends_die(tmp_path, monkeypatch):
-    """codex times out AND the claude fallback times out → verdict: infra_failure,
-    so the operator can tell 'no reviewer ever graded the diff' from a real FAIL."""
+    """codex and its explicit agy fallback time out → ``infra_failure``.
+
+    This distinguishes "no reviewer ever graded the diff" from a real FAIL
+    without introducing an implicit personal-Claude transport.
+    """
     import subprocess as _sp
     from runner.handlers import _execute_gate, Context as HCtx
 
