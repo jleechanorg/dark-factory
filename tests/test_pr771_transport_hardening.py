@@ -201,8 +201,6 @@ def test_controller_transport_uses_one_macos_sandbox_for_read_only_review(
         "plugins",
         "--disable",
         "shell_snapshot",
-        "--disable",
-        "shell_snapshot_v2",
         "--config",
         'web_search="disabled"',
         "--ignore-rules",
@@ -385,14 +383,55 @@ def test_controller_transport_keeps_linux_deny_paths_and_native_read_only(
         "plugins",
         "--disable",
         "shell_snapshot",
-        "--disable",
-        "shell_snapshot_v2",
         "--config",
         'web_search="disabled"',
         "--ignore-rules",
         "-",
     ]
     assert "features.use_legacy_landlock=true" not in transport
+
+
+def test_controller_codex_transport_uses_only_supported_tool_disables(
+    monkeypatch, tmp_path
+):
+    """The controller must not send removed Codex feature names.
+
+    Codex 0.147.0 rejects the obsolete ``shell_snapshot_v2`` feature before
+    emitting JSONL.  Keep the shell/tool restrictions that are part of the
+    controller contract, but only use feature names accepted by the CLI.
+    """
+    monkeypatch.setattr("runner.handler_dispatch.sys.platform", "darwin")
+    holdouts = tmp_path / "sealed holdouts"
+    holdouts.mkdir()
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(holdouts))
+    transport = _build_controller_codex_transport(
+        [
+            "/usr/bin/sandbox-exec",
+            "-p",
+            "(version 1)",
+            "/usr/local/bin/codex",
+            "exec",
+            "--skip-git-repo-check",
+            "ignored prompt",
+        ],
+        read_only_path=tmp_path,
+    )
+
+    required_disabled = {
+        "shell_tool",
+        "unified_exec",
+        "browser_use",
+        "computer_use",
+        "plugins",
+        "shell_snapshot",
+    }
+    disabled = {
+        transport[index + 1]
+        for index, value in enumerate(transport[:-1])
+        if value == "--disable"
+    }
+    assert required_disabled <= disabled
+    assert "shell_snapshot_v2" not in transport
 
 
 def test_controller_transport_binds_controller_owned_schema(monkeypatch, tmp_path):

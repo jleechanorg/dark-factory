@@ -717,8 +717,6 @@ def _build_controller_codex_transport(
         "plugins",
         "--disable",
         "shell_snapshot",
-        "--disable",
-        "shell_snapshot_v2",
         "--config",
         'web_search="disabled"',
         "--ignore-rules",

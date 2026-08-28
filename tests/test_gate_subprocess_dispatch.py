@@ -365,8 +365,6 @@ def test_controller_codex_args_builds_stdin_transport(monkeypatch, tmp_path):
         "plugins",
         "--disable",
         "shell_snapshot",
-        "--disable",
-        "shell_snapshot_v2",
         "--config",
         'web_search="disabled"',
         "--ignore-rules",
