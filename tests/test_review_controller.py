@@ -240,6 +240,82 @@ def test_frozen_bundle_is_plain_canonical_json_and_integrity_bound(tmp_path):
     assert "content_b64" not in json.dumps(envelope)
 
 
+def test_frozen_bundle_includes_canonical_evidence_origin_and_binds_it(tmp_path):
+    _repo, inputs = _frozen_repo(tmp_path)
+    origin = EvidenceOrigin(
+        source_head_sha=inputs.base_sha,
+        snapshot_parent_sha=inputs.base_sha,
+        snapshot_delta=(
+            EvidenceDelta(status="A", path="evidence.log"),
+            EvidenceDelta(status="M", path="value.txt"),
+        ),
+    )
+    inputs = replace(inputs, evidence_origin=origin)
+
+    frozen = build_frozen_review_bundle(inputs)
+    bundle = json.loads(frozen)
+    expected_origin = {
+        "source_head_sha": inputs.base_sha,
+        "snapshot_parent_sha": inputs.base_sha,
+        "snapshot_delta": [
+            {"status": "A", "path": "evidence.log"},
+            {"status": "M", "path": "value.txt"},
+        ],
+    }
+    assert bundle["schema"] == 2
+    assert bundle["evidence_origin"] == expected_origin
+
+    request = create_review_request(inputs, frozen_bundle=frozen)
+    model_bundle = json.loads(
+        request.prompt.split("BEGIN_UNTRUSTED_REVIEW_BUNDLE\n", 1)[1].split(
+            "\nEND_UNTRUSTED_REVIEW_BUNDLE", 1
+        )[0]
+    )
+    assert model_bundle["evidence_origin"] == expected_origin
+    assert model_bundle["evidence_origin"] == json.loads(request.envelope_json)[
+        "evidence_origin"
+    ]
+    verify_request_integrity(request)
+
+
+def test_frozen_bundle_evidence_origin_must_match_authenticated_input(tmp_path):
+    _repo, inputs = _frozen_repo(tmp_path)
+    origin = EvidenceOrigin(
+        source_head_sha=inputs.base_sha,
+        snapshot_parent_sha=inputs.base_sha,
+        snapshot_delta=(
+            EvidenceDelta(status="A", path="evidence.log"),
+            EvidenceDelta(status="M", path="value.txt"),
+        ),
+    )
+    inputs = replace(inputs, evidence_origin=origin)
+    tampered = json.loads(build_frozen_review_bundle(inputs))
+    tampered["evidence_origin"]["source_head_sha"] = "c" * 40
+    tampered_bundle = json.dumps(tampered, sort_keys=True, separators=(",", ":"))
+
+    with pytest.raises(ReviewContractError, match="evidence_origin"):
+        create_review_request(inputs, frozen_bundle=tampered_bundle)
+
+
+def test_frozen_bundle_without_evidence_origin_is_explicitly_null(tmp_path):
+    _repo, inputs = _frozen_repo(tmp_path)
+
+    bundle = json.loads(build_frozen_review_bundle(inputs))
+
+    assert bundle["schema"] == 2
+    assert bundle["evidence_origin"] is None
+
+
+def test_frozen_bundle_rejects_omitted_evidence_origin(tmp_path):
+    _repo, inputs = _frozen_repo(tmp_path)
+    bundle = json.loads(build_frozen_review_bundle(inputs))
+    del bundle["evidence_origin"]
+    tampered_bundle = json.dumps(bundle, sort_keys=True, separators=(",", ":"))
+
+    with pytest.raises(ReviewContractError, match="evidence_origin"):
+        create_review_request(inputs, frozen_bundle=tampered_bundle)
+
+
 def test_frozen_bundle_round_trips_compact_binary_evidence_under_limit(tmp_path):
     repo, inputs = _frozen_repo(tmp_path)
     binary = repo / "evidence.bin"
@@ -277,7 +353,11 @@ def test_frozen_bundle_round_trips_compact_binary_evidence_under_limit(tmp_path)
 def test_run_controller_review_uses_neutral_cwd_for_frozen_bundle(monkeypatch, tmp_path):
     import subprocess as subprocess_module
 
-    frozen = json.dumps({"schema": 1}, separators=(",", ":"))
+    frozen = json.dumps(
+        {"schema": 2, "evidence_origin": None},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     request = create_review_request(_inputs(), frozen_bundle=frozen)
     response = _response(request, commands=[])
     neutral = tmp_path / "neutral"

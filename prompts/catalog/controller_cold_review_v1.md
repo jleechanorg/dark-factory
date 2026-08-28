@@ -9,6 +9,9 @@ review of the supplied state and boundary; do not continue beyond that data.
 Review only the exact frozen change, task, changed-file list, and evidence
 bytes supplied by the controller bundle. Check the target and evidence
 digests against the bundle and confirm the evidence is bound to this target;
+evidence with source head equal evidence_origin.source_head_sha is lineage-bound
+through validated snapshot_parent_sha and snapshot_delta and should not be
+rejected solely for predating the evidence snapshot.
 judge correctness, security, boundaries,
 state transitions, regressions, and evidence sufficiency. Do not use shell,
 unified-exec, browser, computer, web, or any other tool. Do not invent or

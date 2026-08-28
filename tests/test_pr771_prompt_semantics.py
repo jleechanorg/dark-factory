@@ -26,6 +26,13 @@ def test_slim_prompt_states_the_complete_semantic_comparison_duty() -> None:
         )
 
     assert "untrusted" in normalized
+    assert (
+        "evidence with source head equal evidence_origin.source_head_sha is "
+        "lineage-bound through validated snapshot_parent_sha and snapshot_delta "
+        "and should not be rejected solely for predating the evidence snapshot"
+    ) in normalized
+    assert "future trace" not in normalized
+    assert "future receipt" not in normalized
     assert len(prompt.splitlines()) <= 40
     assert "c0" not in normalized
     assert "e14" not in normalized

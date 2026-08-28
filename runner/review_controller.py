@@ -56,7 +56,7 @@ _TEMPLATE_PATH = (
     _SOURCE_ROOT / "prompts" / "catalog" / "controller_cold_review_v1.md"
 )
 _EXPECTED_TEMPLATE_SHA256 = (
-    "6c385a145cd9e7365b837bc89568097362a8380705522c8b0325adb61e565328"
+    "606f269d3a139a4b62c7a396ccf051f408cee35ba4e7d4bc9b81d936eeabb68f"
 )
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -544,6 +544,19 @@ def _canonical_json(value: object) -> str:
     )
 
 
+def _evidence_origin_payload(origin: EvidenceOrigin | None) -> dict[str, object] | None:
+    if origin is None:
+        return None
+    return {
+        "source_head_sha": origin.source_head_sha,
+        "snapshot_parent_sha": origin.snapshot_parent_sha,
+        "snapshot_delta": [
+            {"status": entry.status, "path": entry.path}
+            for entry in origin.snapshot_delta
+        ],
+    }
+
+
 def _require_sha(name: str, value: str) -> str:
     normalized = str(value).strip().lower()
     if not _SHA_RE.fullmatch(normalized):
@@ -822,7 +835,7 @@ def build_frozen_review_bundle(
         evidence_payload.append(evidence_entry)
 
     payload = {
-        "schema": 1,
+        "schema": 2,
         "target": {
             "repository": normalized.repository,
             "workspace_path": normalized.workspace_path,
@@ -834,6 +847,7 @@ def build_frozen_review_bundle(
         "changed_files": list(observed_changed),
         "diff": diff,
         "evidence": evidence_payload,
+        "evidence_origin": _evidence_origin_payload(normalized.evidence_origin),
         "run_id": normalized.run_id,
     }
     encoded = _canonical_json(payload).encode("utf-8")
@@ -847,6 +861,21 @@ def _build_envelope(
 ) -> str:
     normalized = _normalized_inputs(inputs)
     template_digest = _require_digest("template_sha256", template_sha256)
+    if frozen_bundle:
+        try:
+            frozen_payload = json.loads(frozen_bundle)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ReviewContractError("review bundle is not valid JSON") from exc
+        if not isinstance(frozen_payload, dict):
+            raise ReviewContractError("review bundle must be a JSON object")
+        if frozen_payload.get("schema") != 2:
+            raise ReviewContractError("frozen review bundle schema must be 2")
+        if "evidence_origin" not in frozen_payload:
+            raise ReviewContractError("frozen bundle evidence_origin is missing")
+        if frozen_payload.get("evidence_origin") != _evidence_origin_payload(
+            normalized.evidence_origin
+        ):
+            raise ReviewContractError("frozen bundle evidence_origin mismatch")
     changed_files = list(normalized.changed_files)
     evidence_payload = [
         {
@@ -901,14 +930,9 @@ def _build_envelope(
             "size_bytes": len(bundle_bytes),
         }
     if normalized.evidence_origin is not None:
-        payload["evidence_origin"] = {
-            "source_head_sha": normalized.evidence_origin.source_head_sha,
-            "snapshot_parent_sha": normalized.evidence_origin.snapshot_parent_sha,
-            "snapshot_delta": [
-                {"status": entry.status, "path": entry.path}
-                for entry in normalized.evidence_origin.snapshot_delta
-            ],
-        }
+        payload["evidence_origin"] = _evidence_origin_payload(
+            normalized.evidence_origin
+        )
     encoded = _canonical_json(payload).encode("utf-8")
     if frozen_bundle and len(encoded) > _MAX_FROZEN_BUNDLE_BYTES:
         raise ReviewContractError("frozen review envelope exceeds 1 MiB")
@@ -1076,6 +1100,20 @@ def verify_request_integrity(request: ReviewRequest) -> None:
                 or _sha256(bundle_bytes) != request.bundle_sha256
             ):
                 raise ReviewContractError("request frozen bundle digest mismatch")
+            try:
+                frozen_payload = json.loads(expected_bundle)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ReviewContractError("request frozen bundle is not valid JSON") from exc
+            if (
+                not isinstance(frozen_payload, dict)
+                or frozen_payload.get("schema") != 2
+                or "evidence_origin" not in frozen_payload
+                or frozen_payload.get("evidence_origin")
+                != envelope.get("evidence_origin")
+            ):
+                raise ReviewContractError(
+                    "request frozen bundle evidence_origin mismatch"
+                )
         expected_payload = _render_prompt_payload(
             template,
             request.envelope_json,
