@@ -655,11 +655,12 @@ def test_controller_review_codex_unavailable_fails_closed(monkeypatch, tmp_path)
     assert attempts == ["codex"]
 
 
-def test_controller_codex_transport_strips_outer_sandbox_exec():
+def test_controller_codex_transport_strips_outer_sandbox_exec(monkeypatch, tmp_path):
     """_build_controller_codex_transport strips any outer sandbox-exec wrapper
     so `codex exec --sandbox read-only` runs natively."""
     from runner.handler_dispatch import _build_controller_codex_transport
 
+    monkeypatch.setattr("runner.handler_dispatch.sys.platform", "darwin")
     sandboxed_argv = [
         "/usr/bin/sandbox-exec",
         "-p",
@@ -670,7 +671,9 @@ def test_controller_codex_transport_strips_outer_sandbox_exec():
         "--skip-git-repo-check",
         "prompt text",
     ]
-    transport = _build_controller_codex_transport(sandboxed_argv)
+    transport = _build_controller_codex_transport(
+        sandboxed_argv, read_only_path=tmp_path
+    )
 
     assert transport[0] == "codex"
     assert transport[1] == "exec"
