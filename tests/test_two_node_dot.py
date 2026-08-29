@@ -79,12 +79,12 @@ def test_two_node_dot_parses_and_has_expected_topology() -> None:
     assert g.nodes["worker"].attrs.get("type") == "codergen"
     assert g.nodes["worker"].attrs.get("class") == "worker"
     assert g.nodes["round_begin"].attrs.get("type") == "round_begin"
-    assert g.nodes["round_begin"].attrs.get("members") == "cold_reviewer"
+    assert g.nodes["round_begin"].attrs.get("members") == "worker,cold_reviewer"
     assert g.nodes["cold_reviewer"].attrs.get("type") == "parallel_reviewer"
     assert g.nodes["cold_reviewer"].attrs.get("class") == "review"
     assert g.nodes["cold_reviewer"].attrs.get("review_contract") == "cold-review-v1"
     assert g.nodes["round_end"].attrs.get("type") == "round_end"
-    assert g.nodes["round_end"].attrs.get("members") == "cold_reviewer"
+    assert g.nodes["round_end"].attrs.get("members") == "worker,cold_reviewer"
 
 
 def test_two_node_dot_declares_timeout_on_every_subprocess_node() -> None:

@@ -6,9 +6,9 @@
 //                    cold-review-v1 execution path (prompts/catalog/controller_cold_review_v1.md).
 //
 // Wiring:
-//   start -> worker -> round_begin -> cold_reviewer -> round_end
-//   round_end -> exit   [condition="outcome=success"]
-//   round_end -> worker [condition="outcome!=success"]
+//   start -> round_begin -> worker -> cold_reviewer -> round_end
+//   round_end -> exit        [condition="outcome=success"]
+//   round_end -> round_begin [condition="outcome!=success"]
 //
 // Backend routing:
 //   - worker          honors the run-level --backend (the coder tier the user
@@ -18,9 +18,8 @@
 //                     a receipt-capable transport only for Codex.
 //
 // Failure semantics:
-//   - Initial worker attempt runs once before reviewer rounds.
-//   - Reviewer round validates the worker output.
-//   - On reviewer failure below max_rounds, worker is invoked as the one fix between rounds.
+//   - Each round runs worker, then validates with cold_reviewer.
+//   - On reviewer or worker failure below max_rounds, the next round begins.
 //   - Reaching max_rounds (default 3) terminates exhausted without extra worker invocation.
 
 digraph SlimTwoNode {
@@ -34,6 +33,12 @@ digraph SlimTwoNode {
     start  [shape=Mdiamond, label="Start"]
     exit   [shape=Msquare,  label="Exit"]
 
+    round_begin [
+        type="round_begin",
+        label="Begin Validation Round",
+        members="worker,cold_reviewer"
+    ]
+
     worker [
         type="codergen",
         label="Generic Worker",
@@ -41,12 +46,6 @@ digraph SlimTwoNode {
         prompt="@prompts/slim/worker.md",
         max_retries=2,
         timeout=600
-    ]
-
-    round_begin [
-        type="round_begin",
-        label="Begin Reviewer Round",
-        members="cold_reviewer"
     ]
 
     cold_reviewer [
@@ -63,15 +62,15 @@ digraph SlimTwoNode {
 
     round_end [
         type="round_end",
-        label="End Reviewer Round",
-        members="cold_reviewer"
+        label="End Validation Round",
+        members="worker,cold_reviewer"
     ]
 
-    start -> worker
-    worker -> round_begin
-    round_begin -> cold_reviewer
+    start -> round_begin
+    round_begin -> worker
+    worker -> cold_reviewer
     cold_reviewer -> round_end
 
-    round_end -> exit   [condition="outcome=success"]
-    round_end -> worker [condition="outcome!=success"]
+    round_end -> exit        [condition="outcome=success"]
+    round_end -> round_begin [condition="outcome!=success"]
 }

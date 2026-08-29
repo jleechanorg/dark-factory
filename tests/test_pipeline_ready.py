@@ -111,4 +111,3 @@ def test_ready_pipeline_iteration_and_fix_loop(monkeypatch, tmp_path):
     assert history[-1].outcome == "exhausted"
     assert history[-1].node == "round_end"
     assert calls["gate_er"] == 3
-

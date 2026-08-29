@@ -83,7 +83,6 @@ digraph ReadyPRFactory {
     class="fix",
     prompt="@prompts/slim/ready_fix.md",
     max_retries=0,
-    no_progress_max="2",
     timeout=600
   ]
 
