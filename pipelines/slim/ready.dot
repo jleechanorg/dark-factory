@@ -2,6 +2,7 @@ digraph ReadyPRFactory {
   graph [
     goal="Enforce PR is /ready: verify CI tests, /es evidence, /er review, /advice approval, and holdouts with bounded N=3 fix iteration"
     label="PR Ready Enforcement"
+    validation_rounds="true"
     skip_explore="true"
     skip_plan="true"
     skip_implement="true"
@@ -12,6 +13,12 @@ digraph ReadyPRFactory {
   start [shape=Mdiamond, label="Start"]
   exit  [shape=Msquare, label="Exit - Ready to Merge"]
 
+  round_begin [
+    type="round_begin",
+    label="Begin Validation Round",
+    members="test,gate_es,gate_er,gate_advice,holdout"
+  ]
+
   // 1. Run deterministic CI tests / build check
   test [
     type="tool",
@@ -19,8 +26,7 @@ digraph ReadyPRFactory {
     command="${state.slim.test_command}",
     validation=true,
     goal_gate=true,
-    timeout=600,
-    retry_target="fix"
+    timeout=600
   ]
 
   // 2. Gate 1: /es Evidence Standards (published gist linked in PR body)
@@ -31,8 +37,7 @@ digraph ReadyPRFactory {
     prefer_adversarial="true",
     gate_strict="true",
     timeout=600,
-    goal_gate=true,
-    retry_target="fix"
+    goal_gate=true
   ]
 
   // 3. Gate 2: /er Adversarial Evidence Review (PASS verdict at current head)
@@ -43,8 +48,7 @@ digraph ReadyPRFactory {
     prefer_adversarial="true",
     gate_strict="true",
     timeout=600,
-    goal_gate=true,
-    retry_target="fix"
+    goal_gate=true
   ]
 
   // 4. Gate 3: /advice Independent Review Gate (APPROVE / comments handled)
@@ -53,8 +57,7 @@ digraph ReadyPRFactory {
     command="advice",
     label="/advice Independent Review",
     timeout=600,
-    goal_gate=true,
-    retry_target="fix"
+    goal_gate=true
   ]
 
   // 5. Gate 4: Sealed Holdout Evaluation
@@ -64,37 +67,36 @@ digraph ReadyPRFactory {
     feature="${state.feature}",
     validation=true,
     goal_gate=true,
-    timeout=600,
-    retry_target="fix"
+    timeout=600
   ]
 
-  // 6. Fix & Iterate Node (Bounded by max_visits=3)
+  round_end [
+    type="round_end",
+    label="End Validation Round",
+    members="test,gate_es,gate_er,gate_advice,holdout"
+  ]
+
+  // 6. Fix & Iterate Node (Bounded by validation rounds)
   fix [
     type="codergen",
     label="Fix & Iterate (max N=3)",
     class="fix",
     prompt="@prompts/slim/ready_fix.md",
-    max_retries=2,
-    max_visits="3",
+    max_retries=0,
     no_progress_max="2",
     timeout=600
   ]
 
-  start -> test
-  test -> gate_es [condition="outcome=success"]
-  test -> fix [condition="outcome!=success"]
+  start -> round_begin
+  round_begin -> test
+  test -> gate_es
+  gate_es -> gate_er
+  gate_er -> gate_advice
+  gate_advice -> holdout
+  holdout -> round_end
 
-  gate_es -> gate_er [condition="outcome=success"]
-  gate_es -> fix [condition="outcome!=success"]
+  round_end -> exit [condition="outcome=success"]
+  round_end -> fix  [condition="outcome!=success"]
 
-  gate_er -> gate_advice [condition="outcome=success"]
-  gate_er -> fix [condition="outcome!=success"]
-
-  gate_advice -> holdout [condition="outcome=success"]
-  gate_advice -> fix [condition="outcome!=success"]
-
-  holdout -> exit [condition="outcome=success"]
-  holdout -> fix [condition="outcome!=success"]
-
-  fix -> test
+  fix -> round_begin
 }

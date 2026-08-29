@@ -15,6 +15,8 @@ def test_ready_pipeline_parses_and_has_required_nodes():
 
     assert "start" in node_names
     assert "exit" in node_names
+    assert "round_begin" in node_names
+    assert "round_end" in node_names
     assert "test" in node_names
     assert "gate_es" in node_names
     assert "gate_er" in node_names
@@ -22,9 +24,10 @@ def test_ready_pipeline_parses_and_has_required_nodes():
     assert "holdout" in node_names
     assert "fix" in node_names
 
+    assert str(graph.attrs.get("validation_rounds")).lower() in ("true", "1", "yes")
+
     fix_node = graph.nodes["fix"]
     assert fix_node is not None
-    assert fix_node.attrs.get("max_visits") == 3, "fix node must enforce max_visits=3"
     assert fix_node.attrs.get("type") == "codergen"
 
     advice_node = graph.nodes["gate_advice"]
@@ -61,11 +64,13 @@ def test_ready_pipeline_green_execution(monkeypatch, tmp_path):
     executed_nodes = [step.node for step in history]
 
     assert "start" in executed_nodes
+    assert "round_begin" in executed_nodes
     assert "test" in executed_nodes
     assert "gate_es" in executed_nodes
     assert "gate_er" in executed_nodes
     assert "gate_advice" in executed_nodes
     assert "holdout" in executed_nodes
+    assert "round_end" in executed_nodes
     assert "exit" in executed_nodes
     assert "fix" not in executed_nodes
 
@@ -104,5 +109,6 @@ def test_ready_pipeline_iteration_and_fix_loop(monkeypatch, tmp_path):
 
     assert "fix" in executed_nodes
     assert history[-1].outcome == "exhausted"
-    assert history[-1].node == "fix"
-    assert calls["gate_er"] >= 2
+    assert history[-1].node == "round_end"
+    assert calls["gate_er"] == 3
+

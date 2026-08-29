@@ -63,24 +63,28 @@ def _normalise_timeout(value: object) -> int | None:
 
 def test_two_node_dot_parses_and_has_expected_topology() -> None:
     """The default `/f` graph parses cleanly and exposes exactly two productive
-    nodes (worker + cold_reviewer), plus start/exit anchors. No third fix node.
+    nodes (worker + cold_reviewer), plus start/exit anchors and round_begin/round_end.
 
     This test pins the contract: any future PR that adds or removes nodes
     from two_node.dot must update this assertion deliberately.
     """
     g = parse(ROOT / _PIPELINE)
     names = set(g.nodes.keys())
-    # Top-level anchor nodes + the two productive nodes.
-    assert names == {"start", "worker", "cold_reviewer", "exit"}, (
-        f"two_node.dot must have exactly start/worker/cold_reviewer/exit; "
+    # Top-level anchor nodes + the two productive nodes + round control.
+    assert names == {"start", "worker", "round_begin", "cold_reviewer", "round_end", "exit"}, (
+        f"two_node.dot must have exactly start/worker/round_begin/cold_reviewer/round_end/exit; "
         f"got {sorted(names)}"
     )
     # Worker and cold_reviewer are the only goal-producing nodes.
     assert g.nodes["worker"].attrs.get("type") == "codergen"
     assert g.nodes["worker"].attrs.get("class") == "worker"
+    assert g.nodes["round_begin"].attrs.get("type") == "round_begin"
+    assert g.nodes["round_begin"].attrs.get("members") == "cold_reviewer"
     assert g.nodes["cold_reviewer"].attrs.get("type") == "parallel_reviewer"
     assert g.nodes["cold_reviewer"].attrs.get("class") == "review"
     assert g.nodes["cold_reviewer"].attrs.get("review_contract") == "cold-review-v1"
+    assert g.nodes["round_end"].attrs.get("type") == "round_end"
+    assert g.nodes["round_end"].attrs.get("members") == "cold_reviewer"
 
 
 def test_two_node_dot_declares_timeout_on_every_subprocess_node() -> None:

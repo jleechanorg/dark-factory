@@ -788,6 +788,7 @@ def run(
     checkpoint: Optional[pathlib.Path] = None,
     resume: Optional[pathlib.Path] = None,
     max_steps: int = 100,
+    max_rounds: int = 3,
 ) -> list:
     """Execute the graph starting at 'start' until 'exit' or max_steps.
 
@@ -796,6 +797,11 @@ def run(
     """
     if resume is not None and _is_controller_graph(graph):
         raise ValueError("resume is not supported for cold-review-v1 graphs")
+
+    if ctx.state.get("rounds.requested") is None:
+        ctx.state["rounds.requested"] = max_rounds
+    if ctx.state.get("rounds.max") is None:
+        ctx.state["rounds.max"] = max_rounds
 
     # Resume uses the checkpoint's run directory as the durable journal owner.
     # Establish that identity before any terminal resume fast path can return.
@@ -897,6 +903,8 @@ def run(
             "goal": ctx.goal,
             "backend": ctx.backend,
             "workdir": str(ctx.workdir) if ctx.workdir else "",
+            "max_rounds": max_rounds,
+            "rounds_requested": ctx.state.get("rounds.requested", max_rounds),
             "state": ctx.state,
         }
         try:
@@ -1522,6 +1530,24 @@ def run(
                 _failure_node = _para_jump_to if _para_jump_to is not None else current
                 _persist._update_failure_state(_failure_node, ctx, result)
 
+            if "rounds.current" in ctx.state and current.attrs.get("type") not in ("round_begin", "round_end"):
+                raw_ledger = ctx.state.get("rounds.ledger", "{}")
+                if isinstance(raw_ledger, str):
+                    try:
+                        ledger = json.loads(raw_ledger)
+                    except Exception:
+                        ledger = {}
+                elif isinstance(raw_ledger, dict):
+                    ledger = raw_ledger
+                else:
+                    ledger = {}
+                ledger[current.name] = {
+                    "outcome": result.outcome,
+                    "output": (result.output or "")[:500],
+                    "metadata": result.metadata or {},
+                }
+                ctx.state["rounds.ledger"] = json.dumps(ledger)
+
             _obs._perf_node_exit(
                 ctx,
                 current.name,
@@ -1544,6 +1570,13 @@ def run(
 
             if is_exit_node(current):
                 ended_at_exit = True
+                break
+
+            if current.attrs.get("type") == "round_end" and result.outcome == "exhausted":
+                _auto_wip_commit_on_exhaustion(
+                    ctx,
+                    f"validation rounds exhausted ({ctx.state.get('rounds.current', 0)}/{ctx.state.get('rounds.requested', 3)})",
+                )
                 break
 
             try:

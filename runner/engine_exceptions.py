@@ -114,5 +114,13 @@ def _handle_node_exception(
         next_node = graph.nodes.get(selected.dst)
         _obs._log(log, f"routing crashed node {current.name!r} -> {selected.dst!r} (fix edge)")
         return next_node
+    if (
+        str(graph.attrs.get("validation_rounds", "")).strip().lower() in ("true", "1", "yes")
+        or "rounds.current" in ctx.state
+    ):
+        next_node = _edges._pick_next(graph, current, error_result, ctx)
+        if next_node is not None:
+            _obs._log(log, f"routing crashed member {current.name!r} -> {next_node.name!r} (validation round continuation)")
+            return next_node
     _obs._log(log, f"no recovery edge for crashed node {current.name!r}; ending run")
     return None

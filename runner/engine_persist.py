@@ -141,6 +141,11 @@ def _run_with_retries(handler, node: Node, ctx: Context, graph, input_logger=Non
 
 
 def _goal_gate_target(graph, node: Node, result, ctx: Optional[Context] = None):
+    if (
+        str(graph.attrs.get("validation_rounds", "")).strip().lower() in ("true", "1", "yes")
+        or (ctx is not None and "rounds.current" in ctx.state)
+    ):
+        return None
     goal_gate = node.attrs.get("goal_gate", False)
     if isinstance(goal_gate, bool):
         enabled = goal_gate

@@ -206,6 +206,12 @@ from .handler_web_advice import (
     _web_advice,
 )
 
+# Sequential validation rounds handlers.
+from .handler_rounds import (
+    _round_begin,
+    _round_end,
+)
+
 # Registries + dispatcher live at the bottom of the shim so they pick up
 # every re-exported handler above.
 from .parser import Node, is_start_node, is_exit_node
@@ -243,6 +249,8 @@ TYPE_REGISTRY: "dict[str, Handler]" = {
     "join": _join_handler,              # fan-in type (type=join)
     "parallel_reviewer": _parallel_reviewer,
     "web_advice": _web_advice,
+    "round_begin": _round_begin,
+    "round_end": _round_end,
 }
 
 

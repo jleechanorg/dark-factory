@@ -303,9 +303,24 @@ def main(argv: list[str] | None = None) -> int:
             default="gemini-3.6-flash-high",
             help="AGY agent to use when --backend agy (default: gemini-3.6-flash-high).",
         )
+        def _positive_int(val: str) -> int:
+            try:
+                ival = int(val)
+            except (ValueError, TypeError):
+                raise argparse.ArgumentTypeError(f"expected positive integer, got {val!r}")
+            if ival <= 0:
+                raise argparse.ArgumentTypeError(f"expected positive integer, got {ival}")
+            return ival
+
         p.add_argument("--checkpoint", type=pathlib.Path, default=None)
         p.add_argument("--resume", type=pathlib.Path, default=None, help="Resume from a prior checkpoint file.")
         p.add_argument("--max-steps", type=int, default=100)
+        p.add_argument(
+            "--max-rounds",
+            type=_positive_int,
+            default=3,
+            help="Maximum validation rounds budget (positive integer, default: 3).",
+        )
         p.add_argument("--feature", default=None, help="feature name for holdout eval")
         p.add_argument("--ao-session", default=None, help="Reuse existing AO session (skip spawn)")
         p.add_argument("--ao-worktree", default=None, help="AO worktree path to use for holdout eval")
@@ -428,6 +443,10 @@ def main(argv: list[str] | None = None) -> int:
                 p.error(f"--state requires KEY=VALUE format, got: {kv!r}")
             k, v = kv.split("=", 1)
             initial_state[k] = v
+        if "rounds.requested" not in initial_state:
+            initial_state["rounds.requested"] = args.max_rounds
+        if "rounds.max" not in initial_state:
+            initial_state["rounds.max"] = args.max_rounds
         if args.feature:
             initial_state["feature"] = args.feature
         if args.require_holdouts:
@@ -496,6 +515,7 @@ def main(argv: list[str] | None = None) -> int:
             checkpoint=args.checkpoint,
             resume=args.resume,
             max_steps=args.max_steps,
+            max_rounds=args.max_rounds,
         )
 
         _finalize_evidence_bundle_path(
@@ -517,6 +537,8 @@ def main(argv: list[str] | None = None) -> int:
             "goal": args.goal,
             "run_id": ctx.run_id,
             "command": command,
+            "rounds_requested": args.max_rounds,
+            "rounds_effective": ctx.state.get("rounds.effective", ctx.state.get("rounds.current", 0)),
             "run_dir": (
                 str(pathlib.Path.home() / ".dark-factory" / "runs" / ctx.run_id)
                 if ctx.run_id

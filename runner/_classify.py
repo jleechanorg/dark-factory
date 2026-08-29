@@ -16,6 +16,7 @@ def _classify_outcome(raw: str) -> str:
       - `pass` and `warn` are treated as success for routing.
       - `partial` is preserved as partial so caller can opt into
         `allow_partial` semantics.
+      - `exhausted` and `stuck` are preserved as distinct terminal outcomes.
       - Any non-empty unknown token collapses to failure.
     """
     value = str(raw).strip().lower()
@@ -25,6 +26,8 @@ def _classify_outcome(raw: str) -> str:
         return "partial"
     if value == "error":
         return "error"
-    if value in {"failure", "fail", "exhausted", "stuck", "inconclusive"}:
+    if value in {"exhausted", "stuck"}:
+        return value
+    if value in {"failure", "fail", "inconclusive"}:
         return "failure"
     return "failure"
