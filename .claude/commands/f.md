@@ -19,6 +19,8 @@ the proof-block output contract all live there.
 
 ```
 /f <goal description>                          # DEFAULT: binary-first factory run + reviewer calibration
+/f max 5 rounds <goal>                         # explicit validation rounds bound (default: 3)
+/f --max-rounds 5 <goal>                       # pass --max-rounds explicitly
 /f --pipeline gates <goal>                     # explicit binary pipeline
 /f --backend echo <goal>                       # wiring smoke (no LLM)
 /f --feature <name> <goal>                     # override holdout feature key

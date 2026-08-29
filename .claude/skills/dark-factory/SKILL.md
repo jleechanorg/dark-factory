@@ -222,6 +222,10 @@ The default is the user's standing rule (set 2026-08-02): **slim two-node
 is the default; custom graphs are explicit opt-in.** This applies to all
 `/f` invocations across this repo.
 
+### Slash command rounds syntax
+
+The slash contract recognizes only a leading case-insensitive `max <positive-int> round|rounds` prefix in the goal argument (for example `/f max 5 rounds <goal>`, `/factory max 1 round <goal>`, or `/f MAX 3 ROUNDS <goal>`). When present, strip this prefix from the goal and pass `--max-rounds <N>` to the runner. If omitted, default `--max-rounds` is 3. Any malformed controls (e.g. `max 0 rounds`, `max -1 rounds`, `max abc rounds`) or duplicate/conflicting round controls fail closed with an immediate error before invoking the runner.
+
 ### Arg parsing
 
 Honor these flags inside `$ARGUMENTS`:
@@ -234,6 +238,7 @@ Honor these flags inside `$ARGUMENTS`:
   heavyweight pipelines (gates / minimal_feature / etc.) pass an explicit
   `--pipeline <name>`. The previous "auto-select from the goal" behavior is
   retired; the slim two-node shape is the new default across the board.
+- `--max-rounds <N>` — positive integer validation round budget (default: 3). Independent of `--max-steps`.
 - `--feature <name>` — holdout feature. Required when the pipeline includes a
   `holdout_eval` node, but never default it blindly: pass it only after
   confirming `~/projects/dark-factory-holdouts/holdouts/<name>/` actually

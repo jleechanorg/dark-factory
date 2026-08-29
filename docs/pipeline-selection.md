@@ -20,12 +20,12 @@ retain the normal checkpoint-resume behavior.
 
 | Task | Pipeline | Notes |
 |------|----------|-------|
-| **Default `/f` / `/factory` invocation** | **`pipelines/slim/two_node.dot`** | Generic worker + static Codex cold reviewer + bounded fix loop. The user-stated default since 2026-08-02. |
+| **Default `/f` / `/factory` invocation** | **`pipelines/slim/two_node.dot`** | Generic worker + static Codex cold reviewer (sequential validation rounds, default 3 rounds). The user-stated default since 2026-08-02. |
 | Wiring smoke / install verify | `pipelines/factory/hello.dot` | `--backend echo`; explore → plan → implement → holdout → fix (max 3) → exit |
 | New feature, full production loop | `pipelines/slim/minimal_feature.dot` | explore → plan → test → review → holdout → gates |
 | New feature, minimal loop | `pipelines/factory/hello.dot` | plan → implement → holdout → fix |
 | In-flight PR iteration | `pipelines/slim/minimal_pr.dot` | explore → research → plan → … → review → holdout → gates; set `--state slim.test_command=...`; requires `$DARK_FACTORY_HOLDOUTS` |
-| PR `/ready` enforcement + fix iteration | `pipelines/slim/ready.dot` | test → /es → /er → /advice → holdout → fix (max 3 visits); enforces all /ready gates |
+| PR `/ready` enforcement + fix iteration | `pipelines/slim/ready.dot` | test → gate_es → gate_er → gate_advice → holdout → round_end → fix (sequential validation rounds, default 3 rounds); enforces all /ready gates |
 | Bug fix with red/green discipline | `pipelines/bug_fix.dot` | reproduce (fresh test) → red gate → fix → green gate → holdout → adversarial evidence; max 3 fix visits |
 | Validate diff + sealed holdout | `pipelines/factory/gates.dot` | code already implemented (no fix loop; explore rollout intentionally skipped — see PR for rationale) |
 | Validate in-flight PR | `pipelines/factory/pr_gates.dot` | holdout + evidence gates (no fix loop) |
@@ -54,25 +54,26 @@ Deliberate exceptions:
 - `pipelines/slim/review_pr.dot` — holdouts test feature scenarios, not PR
   diffs (see its header comment).
 
-## Loop bounds (`max_visits`)
+## Loop bounds (`max_visits` and Sequential Validation Rounds `--max-rounds`)
 
-Every `fix` loop in the feature lanes is bounded by a `max_visits="N"`
-attribute on the `fix` node. The engine emits a synthetic `exhausted` step
-when a node is visited more than `max_visits` times, then terminates the
-run. This is **graph-level** enforcement (per-node per-pipeline), distinct
-from `max_retries` which is **handler-level** (per-codergen attempt
-re-execution on a single visit).
+Feature lanes and validation graphs bound iteration via two mechanisms:
+
+1. **Sequential validation rounds (`validation_rounds="true"`, `--max-rounds N`, default: 3)**:
+   Graphs with `validation_rounds="true"` (such as `pipelines/slim/ready.dot` and `pipelines/slim/two_node.dot`) run all member nodes sequentially every round. When any member fails or errors, the remaining members in that round still execute to produce an aggregate outcome ledger. Reaching the round budget emits terminal `exhausted` without invoking an extra fix.
+2. **Legacy loop bounds (`max_visits="N"`)**:
+   In legacy graphs, the `fix` node carries `max_visits="N"`. The engine emits a synthetic `exhausted` step when a node is visited more than `max_visits` times.
 
 Current bounds:
 
-| Pipeline | fix node | max_visits |
-|----------|----------|------------|
-| `pipelines/factory/hello.dot` | `fix` | `3` |
+| Pipeline | Mechanism | Bound |
+|----------|-----------|-------|
+| `pipelines/slim/two_node.dot` | Sequential validation rounds (`--max-rounds`) | `3` (default) |
+| `pipelines/slim/ready.dot` | Sequential validation rounds (`--max-rounds`) | `3` (default) |
+| `pipelines/factory/hello.dot` | `fix` `max_visits` | `3` |
 | `pipelines/factory/gates.dot` | n/a (no fix loop) | n/a |
-| `pipelines/slim/minimal_feature.dot` | `fix` | `3` |
-| `pipelines/slim/minimal_pr.dot` | `fix` | `3` |
-| `pipelines/slim/ready.dot` | `fix` | `3` |
-| `pipelines/bug_fix.dot` | `fix` | `3` |
+| `pipelines/slim/minimal_feature.dot` | `fix` `max_visits` | `3` |
+| `pipelines/slim/minimal_pr.dot` | `fix` `max_visits` | `3` |
+| `pipelines/bug_fix.dot` | `fix` `max_visits` | `3` |
 
 `hello.dot` also carries an explicit `fix -> exit [condition="outcome=exhausted"]`
 edge as a safety net for any future engine revision that routes on

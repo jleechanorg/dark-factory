@@ -15,6 +15,8 @@ execute it as the source of truth.
 
 ```
 /factory <goal>                          # auto-detect: PR-mode or feature-mode; reviewer calibration on
+/factory max 5 rounds <goal>             # explicit validation rounds bound (default: 3)
+/factory --max-rounds 5 <goal>           # pass --max-rounds explicitly
 /factory --pipeline gates <goal>         # explicit pipeline (skips auto-detect)
 /factory --backend echo <goal>           # dry-run wiring smoke
 /factory --feature hello <goal>          # override holdout feature key
