@@ -75,7 +75,6 @@ def _reconstruct_round_state_on_resume(
     round_meta = getattr(rb_step, "metadata", {}) or {}
 
     round_num = int(round_meta.get("round", 1))
-    max_rounds = int(round_meta.get("max_rounds", ctx.state.get("rounds.requested", 3)))
     members_raw = round_meta.get("members", "")
     if members_raw:
         members = [m.strip() for m in members_raw.split(",") if m.strip()]
@@ -86,8 +85,10 @@ def _reconstruct_round_state_on_resume(
 
     ctx.state["rounds.current"] = round_num
     ctx.state["rounds.effective"] = round_num
-    ctx.state["rounds.requested"] = max_rounds
-    ctx.state["rounds.max"] = max_rounds
+    if "rounds.requested" not in ctx.state:
+        max_rounds = int(round_meta.get("max_rounds", 3))
+        ctx.state["rounds.requested"] = max_rounds
+        ctx.state["rounds.max"] = max_rounds
     ctx.state["rounds.members"] = json.dumps(members)
 
     has_round_end = any(

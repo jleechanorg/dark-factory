@@ -63,7 +63,12 @@ echoed in the run evidence.
 | `pipelines/factory/pr_gates.dot` | start → holdout → /es → /er → /code_standards → exit | Validate an already-implemented in-flight PR diff (Holdout-always policy; requires `--feature <name>` for the holdout) |
 | `pipelines/slim/minimal_feature.dot` | explore → plan → implement → test → review → holdout → gates → exit | Full production pipeline from scratch with a holdout |
 | `pipelines/slim/minimal_pr.dot` | explore → plan → implement → test → review → holdout → gates → exit | Slim in-flight PR iteration loop with parameterized tests (Holdout-always policy; requires `--feature <name>` for the holdout) |
-
+| `pipelines/slim/ready.dot` | test → gate_es → gate_er → gate_advice → holdout → round_end → fix | PR `/ready` enforcement + fix iteration (sequential validation rounds, default 3 rounds); enforces all /ready gates |
+| `pipelines/slim/minimal_research.dot` | explore fanout → research → exit | Research report only (no implementation); writes `.dark-factory/research-findings.md` |
+| `pipelines/slim/spec_gen.dot` | explore → plan → cold spec review → fix loop | Produce a reviewed spec only (no implementation) |
+| `pipelines/bug_fix.dot` | reproduce → red gate → fix → green gate → holdout → adversarial evidence | Bug fix with red/green discipline |
+| `benchmarks/attractor-spec-review/pipelines/review_slim.dot` | acceptance + codex reviewer | Spec review (line-aware, slim) |
+| `benchmarks/attractor-spec-review/pipelines/review_full.dot` | adds fullstack smoke | Spec review (+ stack smoke) |
 | `pipelines/factory/level5_feature.dot` | full reference pipeline | Full Level-5 reference pipeline with hard-tier gates wired in |
 | **dynamic DOT via binary** | binary-owned graph builder | A static graph can't express the needed phase/fanout; the binary saves/echoes the generated graph in run evidence |
 | **no pipeline** | — | Docs-only / test-only / config-only PRs have no behavioral surface for the holdout to grade — say so and stop |
@@ -192,11 +197,13 @@ When `--pipeline` is a short name (no `/` or `.dot`), expand under
 | Short name | Path |
 |------------|------|
 | `two_node` | `pipelines/slim/two_node.dot` |
+| `ready` | `pipelines/slim/ready.dot` |
 | `gates` | `pipelines/factory/gates.dot` |
 | `hello` | `pipelines/factory/hello.dot` |
 | `pr_gates` | `pipelines/factory/pr_gates.dot` |
 | `minimal_feature` | `pipelines/slim/minimal_feature.dot` |
 | `minimal_pr` | `pipelines/slim/minimal_pr.dot` |
+| `minimal_research` | `pipelines/slim/minimal_research.dot` |
 | `review_slim` | `benchmarks/attractor-spec-review/pipelines/review_slim.dot` |
 | `review_full` | `benchmarks/attractor-spec-review/pipelines/review_full.dot` |
 | `spec_gen` | `pipelines/slim/spec_gen.dot` |
@@ -224,14 +231,15 @@ is the default; custom graphs are explicit opt-in.** This applies to all
 
 ### Slash command rounds syntax
 
-The slash contract recognizes only a leading case-insensitive `max <positive-int> round|rounds` prefix in the goal argument (for example `/f max 5 rounds <goal>`, `/factory max 1 round <goal>`, or `/f MAX 3 ROUNDS <goal>`). When present, strip this prefix from the goal and pass `--max-rounds <N>` to the runner. If omitted, default `--max-rounds` is 3. Any malformed controls (e.g. `max 0 rounds`, `max -1 rounds`, `max abc rounds`) or duplicate/conflicting round controls fail closed with an immediate error before invoking the runner.
+The slash contract recognizes only a leading case-insensitive `max <positive-int> round|rounds` prefix in the goal argument (for example `/f max 5 rounds <goal>`, `/factory max 1 round <goal>`, or `/f MAX 3 ROUNDS <goal>`). When present, strip this prefix from the goal and pass `--max-rounds <N>` to the runner. If omitted, default `--max-rounds` is 3. Any valid-looking `max N rounds` text that does not appear as the leading prefix is treated as ordinary goal text. Any malformed controls (e.g. `max 0 rounds`, `max -1 rounds`, `max abc rounds`) or duplicate/conflicting round controls (such as a leading natural prefix combined with an explicit `--max-rounds` flag) fail closed with an immediate error before invoking the runner.
 
 ### Arg parsing
 
 Honor these flags inside `$ARGUMENTS`:
 
-- `--pipeline <name>` — short name (`two_node`, `gates`, `hello`, `pr_gates`,
-  `minimal_pr`, `minimal_feature`, `review_slim`, `review_full`) or path to a
+- `--pipeline <name>` — short name (`two_node`, `ready`, `gates`, `hello`, `pr_gates`,
+  `minimal_feature`, `minimal_pr`, `minimal_research`, `review_slim`, `review_full`,
+  `spec_gen`, `bug_fix`, `level5_feature`) or path to a
   `.dot`. If omitted, the runner dispatches the slim two-node default graph
   (`pipelines/slim/two_node.dot`) — a generic worker + static Codex cold
   reviewer — for every `/f` and `/factory` invocation. To opt into the

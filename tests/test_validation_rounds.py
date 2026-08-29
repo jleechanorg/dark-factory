@@ -505,6 +505,52 @@ def test_mid_round_resume_reconstructs_ledger_without_unknown_members(
     assert member_outcomes == {"check_a": "success", "check_b": "failure"}
 
 
+def test_resume_uses_run_max_rounds_not_checkpoint_round_bound(monkeypatch, tmp_path):
+    """A checkpoint's historical bound cannot reduce the current run bound."""
+    calls: list[str] = []
+
+    def fake_member(node, ctx):
+        calls.append(node.name)
+        if node.name == "check_b" and len(calls) == 1:
+            return Result(outcome="failure", output="check_b failed")
+        return Result(outcome="success", output=f"{node.name} passed")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "tool", fake_member)
+    checkpoint = tmp_path / "checkpoint.json"
+    checkpoint.write_text(
+        json.dumps(
+            [
+                {"node": "start", "outcome": "success", "ts": 1.0, "output_preview": ""},
+                {
+                    "node": "round_begin",
+                    "outcome": "success",
+                    "ts": 2.0,
+                    "output_preview": "",
+                    "metadata": {
+                        "round": "1",
+                        "max_rounds": "1",
+                        "members": "check_a,check_b",
+                    },
+                },
+                {
+                    "node": "check_a",
+                    "outcome": "failure",
+                    "ts": 3.0,
+                    "output_preview": "check_a failed",
+                    "metadata": {},
+                },
+            ]
+        )
+    )
+
+    ctx = Context(goal="resume authoritative bound", workdir=tmp_path, backend="echo")
+    history = run(_round_graph(tmp_path), ctx, resume=checkpoint, max_steps=100, max_rounds=3)
+
+    assert history[-1].outcome == "success"
+    assert calls == ["check_b", "fix", "check_a", "check_b"]
+    assert ctx.state["rounds.requested"] == 3
+
+
 def test_cli_resume_from_manifest_preserves_requested_max_rounds(
     monkeypatch, tmp_path, capsys
 ):
