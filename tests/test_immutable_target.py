@@ -14,6 +14,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from runner.review_controller import (
@@ -37,10 +38,20 @@ def _git(cwd: Path, *args: str, allow_empty: bool = False) -> str:
     return proc.stdout
 
 
+def _trusted_controller_context(**kwargs):
+    from runner.engine_run import _set_controller_base_sha
+    from runner.handler_core import Context
+
+    base_sha = kwargs.pop("_controller_base_sha")
+    ctx = Context(**kwargs)
+    _set_controller_base_sha(ctx, base_sha)
+    return ctx
+
+
 def _init_clean_repo(tmp: Path) -> Path:
     """Initialize a git repo with one commit so HEAD/tree SHAs exist."""
     repo = tmp / "repo"
-    repo.mkdir()
+    repo.mkdir(mode=0o700)
     _git(repo, "init", "-q", "--initial-branch=main")
     _git(repo, "config", "user.email", "jleechan2015@users.noreply.github.com")
     _git(repo, "config", "user.name", "ci")
@@ -52,7 +63,7 @@ def _init_clean_repo(tmp: Path) -> Path:
 
 def _make_holdout_roots(tmp: Path) -> tuple[str, ...]:
     holdout = tmp / "holdout"
-    holdout.mkdir()
+    holdout.mkdir(mode=0o700)
     return (str(holdout),)
 
 
@@ -71,7 +82,6 @@ def _base_inputs(repo: Path, holdouts: tuple[str, ...], task: str = "task") -> R
         head_sha=head,
         tree_sha=tree,
         task_text=task,
-        diff_text="",
         changed_files=("README.md",),
         evidence=(),
         run_id="test",
@@ -111,6 +121,14 @@ class WorkspacePathValidationTests(unittest.TestCase):
         link = self.tmp / "link_to_repo"
         os.symlink(self.repo, link)
         inputs = _base_inputs(link, self.holdouts)
+        with self.assertRaises(ReviewContractError):
+            validate_immutable_target(inputs, holdout_roots=self.holdouts)
+
+    def test_workspace_with_symlinked_parent_rejected(self) -> None:
+        alias = self.tmp / "workspace_alias"
+        os.symlink(self.tmp, alias, target_is_directory=True)
+        aliased_repo = alias / self.repo.name
+        inputs = _base_inputs(aliased_repo, self.holdouts)
         with self.assertRaises(ReviewContractError):
             validate_immutable_target(inputs, holdout_roots=self.holdouts)
 
@@ -280,6 +298,67 @@ class PostReviewReverifyTests(unittest.TestCase):
 
         _verify_controller_workspace(_FakeCtx(self.repo), request)  # type: ignore[arg-type]
 
+    def test_head_and_tree_alone_detect_a_changed_diff(self) -> None:
+        """head_sha + tree_sha are why no separate diff digest is needed.
+
+        The reviewed change is ``base..head`` with ``base_sha`` pinned in the
+        envelope, so it is a pure function of the head commit's tree. Any
+        rewrite that changes what the reviewer would see must move the head
+        commit or its tree, and the reverifier already compares both. That is
+        the whole argument for dropping DIFF_SHA256: a diff digest could only
+        restate what these two already prove, while binding the reviewer to one
+        byte-exact rendering that a git config or version bump can break.
+        """
+        from runner.handler_parallel_reviewer import _verify_controller_workspace
+
+        class _FakeCtx:
+            def __init__(self, workdir: Path) -> None:
+                self.workdir = workdir
+
+        base = _git(self.repo, "rev-parse", "HEAD").strip()
+        (self.repo / "README.md").write_text("worker change\n")
+        _git(self.repo, "add", "README.md")
+        _git(self.repo, "commit", "-q", "-m", "worker change")
+
+        request = create_review_request(
+            ReviewInputs(
+                repository="example/repo",
+                workspace_path=str(self.repo),
+                base_sha=base,
+                head_sha=_git(self.repo, "rev-parse", "HEAD").strip(),
+                tree_sha=_git(self.repo, "rev-parse", "HEAD^{tree}").strip(),
+                task_text="task",
+                changed_files=("README.md",),
+                evidence=(),
+                run_id="test",
+            )
+        )
+        envelope = json.loads(request.envelope_json)
+        # Nothing in the envelope describes the change itself.
+        self.assertNotIn("diff", envelope["snapshots"])
+        self.assertNotIn("diff_sha256", envelope["digests"])
+        _verify_controller_workspace(_FakeCtx(self.repo), request)  # type: ignore[arg-type]
+
+        before_diff = _git(self.repo, "diff", "--no-ext-diff", f"{base}..HEAD")
+
+        # Rewrite the head commit in place so the pinned range now yields a
+        # different change. `base` stays reachable, so the range still resolves
+        # and the workspace stays clean -- the status check cannot catch this.
+        (self.repo / "README.md").write_text("a different worker change\n")
+        _git(self.repo, "add", "README.md")
+        _git(self.repo, "commit", "-q", "--amend", "--no-edit")
+
+        self.assertEqual(_git(self.repo, "status", "--porcelain=v1"), "")
+        after_diff = _git(self.repo, "diff", "--no-ext-diff", f"{base}..HEAD")
+        self.assertNotEqual(before_diff, after_diff)
+        self.assertNotEqual(
+            _git(self.repo, "rev-parse", "HEAD^{tree}").strip(),
+            envelope["target"]["tree_sha"],
+        )
+
+        with self.assertRaises(ReviewContractError):
+            _verify_controller_workspace(_FakeCtx(self.repo), request)  # type: ignore[arg-type]
+
 
 class ControllerSnapshotTests(unittest.TestCase):
     """Worker output must be reviewed through a clean frozen Git target."""
@@ -287,10 +366,16 @@ class ControllerSnapshotTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp = Path(self._tmp.name)
+        self.home = self.tmp / "home"
+        self.home.mkdir(mode=0o700)
+        self.home.chmod(0o700)
+        self._home_patch = patch.dict(os.environ, {"HOME": str(self.home)})
+        self._home_patch.start()
         self.repo = _init_clean_repo(self.tmp)
         _git(self.repo, "update-ref", "refs/remotes/origin/main", "HEAD")
 
     def tearDown(self) -> None:
+        self._home_patch.stop()
         self._tmp.cleanup()
 
     def test_worker_task_artifact_uses_clean_frozen_review_snapshot(self) -> None:
@@ -307,7 +392,11 @@ class ControllerSnapshotTests(unittest.TestCase):
 
         request = _controller_review_request(
             Node(name="cold_reviewer", attrs={}),
-            Context(goal="review worker output", workdir=self.repo),
+            _trusted_controller_context(
+                goal="review worker output",
+                workdir=self.repo,
+                _controller_base_sha=_git(self.repo, "rev-parse", "HEAD").strip(),
+            ),
             _git(self.repo, "rev-parse", "HEAD").strip(),
         )
         envelope = json.loads(request.envelope_json)
@@ -331,31 +420,25 @@ class ControllerSnapshotTests(unittest.TestCase):
         verify_request_integrity(request)
 
     def test_worker_task_artifact_only_uses_clean_noop_review_snapshot(self) -> None:
-        """A transport-only worker result still receives an immutable no-op review."""
+        """A controller review rejects a missing, distinct authenticated base."""
         from runner.handler_core import Context
         from runner.handler_parallel_reviewer import _controller_review_request
         from runner.parser import Node
-        from runner.review_controller import verify_request_integrity
 
         task_dir = self.repo / ".dark-factory"
         task_dir.mkdir()
         (task_dir / "agy-task-worker.md").write_text("runner task artifact\n")
 
-        request = _controller_review_request(
-            Node(name="cold_reviewer", attrs={}),
-            Context(goal="review no-op worker output", workdir=self.repo),
-            _git(self.repo, "rev-parse", "HEAD").strip(),
-        )
-        envelope = json.loads(request.envelope_json)
-        snapshot = Path(envelope["target"]["workspace_path"])
-
-        verify_request_integrity(request)
-        self.assertNotEqual(snapshot, self.repo)
-        self.assertEqual(_git(snapshot, "status", "--porcelain=v1"), "")
-        self.assertFalse((snapshot / ".dark-factory" / "agy-task-worker.md").exists())
-        self.assertEqual(_git(snapshot, "rev-parse", "HEAD").strip(), request.head_sha)
-        self.assertEqual(envelope["snapshots"]["diff"]["text"], "")
-        self.assertEqual(envelope["snapshots"]["changed_files"], [])
+        with self.assertRaisesRegex(ValueError, "base SHA must differ"):
+            _controller_review_request(
+                Node(name="cold_reviewer", attrs={}),
+                _trusted_controller_context(
+                    goal="review no-op worker output",
+                    workdir=self.repo,
+                    _controller_base_sha=_git(self.repo, "rev-parse", "HEAD").strip(),
+                ),
+                _git(self.repo, "rev-parse", "HEAD").strip(),
+            )
 
     def test_declared_evidence_is_bound_without_copying_unrelated_ignored_files(self) -> None:
         """Snapshot includes declared evidence, but not unrelated ignored runtime data."""
@@ -386,7 +469,11 @@ class ControllerSnapshotTests(unittest.TestCase):
                 name="cold_reviewer",
                 attrs={"evidence_paths": "evidence/controller.json,normal-evidence.json"},
             ),
-            Context(goal="review worker evidence", workdir=self.repo),
+            _trusted_controller_context(
+                goal="review worker evidence",
+                workdir=self.repo,
+                _controller_base_sha=_git(self.repo, "rev-parse", "HEAD").strip(),
+            ),
             _git(self.repo, "rev-parse", "HEAD").strip(),
         )
         envelope = json.loads(request.envelope_json)
@@ -430,7 +517,11 @@ class ControllerSnapshotTests(unittest.TestCase):
 
         request = _controller_review_request(
             Node(name="cold_reviewer", attrs={"evidence_paths": "evidence/controller.json"}),
-            Context(goal="review ignored-only evidence", workdir=self.repo),
+            _trusted_controller_context(
+                goal="review ignored-only evidence",
+                workdir=self.repo,
+                _controller_base_sha=_git(self.repo, "rev-parse", "HEAD").strip(),
+            ),
             _git(self.repo, "rev-parse", "HEAD").strip(),
         )
         snapshot = Path(json.loads(request.envelope_json)["target"]["workspace_path"])
@@ -461,13 +552,14 @@ class ControllerSnapshotTests(unittest.TestCase):
 
         ctx = Context(goal="must not review holdout", workdir=self.repo)
         ctx.state["ao.worktree"] = str(source)
-        with patch.dict(os.environ, {"DARK_FACTORY_HOLDOUTS": str(holdout)}):
-            with self.assertRaisesRegex(ValueError, "sealed holdout"):
-                _controller_review_request(
-                    Node(name="cold_reviewer", attrs={}),
-                    ctx,
-                    _git(source, "rev-parse", "HEAD").strip(),
-                )
+        with patch.dict(
+            os.environ, {"DARK_FACTORY_HOLDOUTS": str(holdout)}
+        ), self.assertRaisesRegex(ValueError, "sealed holdout"):
+            _controller_review_request(
+                Node(name="cold_reviewer", attrs={}),
+                ctx,
+                _git(source, "rev-parse", "HEAD").strip(),
+            )
 
     def test_controller_contract_does_not_inherit_worker_echo_backend(self) -> None:
         """A two-node controller gate resolves Codex when run-level backend is non-echo."""
@@ -491,7 +583,12 @@ class ControllerSnapshotTests(unittest.TestCase):
                 "backend_priority": "codex",
             },
         )
-        ctx = Context(goal="review worker output", workdir=self.repo, backend="ao")
+        ctx = _trusted_controller_context(
+            goal="review worker output",
+            workdir=self.repo,
+            backend="ao",
+            _controller_base_sha=_git(self.repo, "rev-parse", "HEAD").strip(),
+        )
         with patch("runner.handler_parallel_reviewer._run_primary_review", _fake_primary), patch(
             "runner.handler_parallel_reviewer._contract_adjusted_result",
             lambda result, request, ctx, **kwargs: result,
@@ -507,9 +604,17 @@ class ControllerSnapshotTests(unittest.TestCase):
         from runner.handler_parallel_reviewer import _parallel_reviewer
         from runner.parser import Node
 
-        node = Node(name="cold_reviewer", attrs={"review_contract": "cold-review-v1"})
+        node = Node(
+            name="cold_reviewer",
+            attrs={"review_contract": "cold-review-v1", "test_fixture": "true"},
+        )
         ctx = Context(goal="fixture", workdir=self.repo, backend="echo")
-        ctx.state["cold_reviewer.outcome"] = "success"
+        ctx.state.update(
+            {
+                "_df_controller_fixture": "cold-review-v1",
+                "cold_reviewer.outcome": "success",
+            }
+        )
 
         result = _parallel_reviewer(node, ctx)
 
@@ -539,7 +644,12 @@ class ControllerSnapshotTests(unittest.TestCase):
             name="cold_reviewer",
             attrs={"review_contract": "cold-review-v1", "backend_priority": "codex"},
         )
-        ctx = Context(goal="review worker output", workdir=self.repo, backend="ao")
+        ctx = _trusted_controller_context(
+            goal="review worker output",
+            workdir=self.repo,
+            backend="ao",
+            _controller_base_sha=_git(self.repo, "rev-parse", "HEAD").strip(),
+        )
         ctx.state["cold_reviewer.outcome"] = "success"
         with patch("runner.handler_parallel_reviewer._run_primary_review", _fake_primary), patch(
             "runner.handler_parallel_reviewer._contract_adjusted_result",
@@ -562,6 +672,16 @@ class ControllerSnapshotTests(unittest.TestCase):
         (self.repo / "README.md").write_text("worker output\n")
         checkpoint = self.tmp / "checkpoint.json"
         bundle = self.tmp / "evidence"
+        production_pipeline = Path(__file__).parent.parent / "pipelines/slim/two_node.dot"
+        fixture_pipeline = self.tmp / "two_node_fixture.dot"
+        fixture_pipeline.write_text(
+            production_pipeline.read_text(encoding="utf-8").replace(
+                '        review_contract="cold-review-v1",\n',
+                '        review_contract="cold-review-v1",\n'
+                '        test_fixture="true",\n',
+            ),
+            encoding="utf-8",
+        )
 
         def _worker_with_inherited_reviewer_outcome(node, ctx):
             receipt = ctx.workdir / "evidence" / "worker-verification.json"
@@ -584,14 +704,17 @@ class ControllerSnapshotTests(unittest.TestCase):
             return Result(
                 outcome="success",
                 output="worker completed",
-                context_updates={"cold_reviewer.outcome": "success"},
+                context_updates={
+                    "_df_controller_fixture": "cold-review-v1",
+                    "cold_reviewer.outcome": "success",
+                },
             )
 
         with patch.dict(TYPE_REGISTRY, {"codergen": _worker_with_inherited_reviewer_outcome}):
             rc = cli.main(
                 [
                     "--pipeline",
-                    str(Path(__file__).parent.parent / "pipelines/slim/two_node.dot"),
+                    str(fixture_pipeline),
                     "--workdir",
                     str(self.repo),
                     "--goal",
@@ -627,7 +750,6 @@ def replace_evidence(
         head_sha=inputs.head_sha,
         tree_sha=inputs.tree_sha,
         task_text=inputs.task_text,
-        diff_text=inputs.diff_text,
         changed_files=inputs.changed_files,
         evidence=evidence,
         run_id=inputs.run_id,

@@ -66,6 +66,13 @@ alone. If verification fails (or the compiler/library are unavailable),
 callers fail the node closed (see ``runner/handler_codergen.py``), exactly
 as they already did for a missing ``sandbox-exec`` on macOS.
 
+The Linux **controller reviewer** uses ``landlock_launcher.c`` in addition to
+this shim. It installs a kernel-enforced read/write allow-list before native
+Codex starts, so static binaries and direct syscalls cannot bypass the sealed
+holdout boundary. The preload shim is retained only as defense-in-depth; if
+the launcher cannot be built or Landlock is unavailable, controller launch
+fails closed.
+
 Note: tests heavily monkeypatch ``runner.handlers._sanitized_env`` and
 ``runner.handlers._sandboxed_args`` via
 ``monkeypatch.setattr("runner.handlers._X", ...)``. The ``runner/handlers.py``
@@ -77,12 +84,17 @@ monkeypatches stay in effect.
 from __future__ import annotations
 
 import hashlib
+import ctypes
+import grp
 import os
 import pathlib
+import pwd
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from typing import Optional, Union
 
 
@@ -91,6 +103,204 @@ from typing import Optional, Union
 # ``visible_acceptance.md`` and ``spec.md`` are intentionally absent —
 # those are the *visible* contract the agent IS allowed to see.
 _SEALED_BENCHMARK_DOC_NAMES = ("README.md", "DESIGN.md", "SCORING.md", "SCENARIOS.md")
+
+
+@dataclass(frozen=True)
+class _ControllerRuntime:
+    """Private per-review Codex home and its exact cleanup root."""
+
+    run_dir: pathlib.Path
+    codex_home: pathlib.Path
+    env: dict[str, str]
+
+
+_CONTROLLER_OUTPUT_SCHEMA = (
+    '{"type":"object","additionalProperties":false,"required":'
+    '["verdict","findings","evidence_checked","commands_executed","caveats"],'
+    '"properties":{"verdict":{"enum":["pass","fail"]},'
+    '"findings":{"type":"array","items":{"type":"string"}},'
+    '"evidence_checked":{"type":"array","items":{"type":"string"}},'
+    '"commands_executed":{"type":"array","items":{"type":"string"}},'
+    '"caveats":{"type":"array","items":{"type":"string"}}}}\n'
+)
+
+
+def _controller_output_schema(run_dir: pathlib.Path) -> pathlib.Path:
+    """Create the immutable, controller-owned response schema for one run."""
+    run_dir = _validate_private_dir(pathlib.Path(run_dir))
+    path = run_dir / "output-schema.json"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o444)
+    try:
+        os.write(fd, _CONTROLLER_OUTPUT_SCHEMA.encode("utf-8"))
+        os.fsync(fd)
+        os.fchmod(fd, 0o444)
+    finally:
+        os.close(fd)
+    info = path.lstat()
+    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o444:
+        raise ValueError("controller output schema is not immutable")
+    return path
+
+
+def _validate_private_dir(path: pathlib.Path) -> pathlib.Path:
+    """Validate an existing absolute directory without following symlinks."""
+    path = pathlib.Path(path)
+    if not path.is_absolute():
+        raise ValueError("controller runtime path must be absolute")
+    current = pathlib.Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        info = current.lstat()
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISDIR(info.st_mode)
+            or info.st_uid not in {0, os.getuid()}
+            or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise ValueError(f"controller runtime path is not private: {current}")
+    return path
+
+
+def _ensure_private_dir(path: pathlib.Path) -> pathlib.Path:
+    """Create each missing component privately, validating every result."""
+    path = pathlib.Path(path)
+    if not path.is_absolute():
+        raise ValueError("controller runtime path must be absolute")
+    current = pathlib.Path(path.anchor)
+    repair_allowed = False
+    for component in path.parts[1:]:
+        current /= component
+        repair_allowed = repair_allowed or current.name == ".dark-factory"
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            current.mkdir(mode=0o700)
+        else:
+            # Existing user-owned runtime roots may predate this contract and
+            # be group/other-writable. Tighten only the .dark-factory subtree
+            # before validation; HOME and its ancestors must already be
+            # private. Symlinks, files, and foreign-owned paths remain
+            # fail-closed through _validate_private_dir.
+            if (
+                repair_allowed
+                and stat.S_ISDIR(info.st_mode)
+                and info.st_uid == os.getuid()
+                and info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            ):
+                os.chmod(current, 0o700, follow_symlinks=False)
+        _validate_private_dir(current)
+    return path
+
+
+def _copy_controller_auth(source: pathlib.Path, destination: pathlib.Path) -> None:
+    """Copy one validated auth file into a fresh private Codex home."""
+    _validate_private_dir(source.parent)
+    source_info = source.lstat()
+    if (
+        not stat.S_ISREG(source_info.st_mode)
+        or source_info.st_nlink != 1
+        or source_info.st_uid != os.getuid()
+        or stat.S_IMODE(source_info.st_mode) != 0o600
+    ):
+        raise ValueError("controller Codex auth source is not a private regular file")
+    if destination.exists() or destination.is_symlink():
+        raise ValueError("controller Codex auth destination already exists")
+    source_flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        source_flags |= os.O_NOFOLLOW
+    source_fd = os.open(source, source_flags)
+    try:
+        source_info = os.fstat(source_fd)
+        if (
+            not stat.S_ISREG(source_info.st_mode)
+            or source_info.st_uid != os.getuid()
+            or source_info.st_nlink != 1
+            or stat.S_IMODE(source_info.st_mode) != 0o600
+        ):
+            raise ValueError("controller Codex auth source is not a private regular file")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(destination, flags, 0o600)
+        try:
+            while True:
+                chunk = os.read(source_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(fd, view)
+                    view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(source_fd)
+    destination_info = destination.lstat()
+    if (
+        stat.S_ISLNK(destination_info.st_mode)
+        or not stat.S_ISREG(destination_info.st_mode)
+        or destination_info.st_uid != os.getuid()
+        or destination_info.st_nlink != 1
+        or stat.S_IMODE(destination_info.st_mode) != 0o600
+    ):
+        raise ValueError("controller Codex auth destination is not private")
+
+
+def _create_controller_runtime() -> _ControllerRuntime:
+    """Create an isolated, writable-only Codex runtime for one review."""
+    home = pathlib.Path.home()
+    parent = _ensure_private_dir(home / ".dark-factory" / "controller-runtimes")
+    run_dir = pathlib.Path(tempfile.mkdtemp(prefix="review-", dir=str(parent)))
+    try:
+        _validate_private_dir(run_dir)
+        codex_home = _ensure_private_dir(run_dir / "codex-home")
+        _ensure_private_dir(codex_home / "tmp")
+        configured_codex_home = os.environ.get("CODEX_HOME")
+        if configured_codex_home is None:
+            auth_source_root = home / ".codex"
+        else:
+            if not configured_codex_home:
+                raise ValueError("configured CODEX_HOME must be an absolute directory")
+            auth_source_root = pathlib.Path(configured_codex_home)
+            if not auth_source_root.is_absolute():
+                raise ValueError("configured CODEX_HOME must be an absolute directory")
+        _validate_private_dir(auth_source_root)
+        _copy_controller_auth(
+            auth_source_root / "auth.json", codex_home / "auth.json"
+        )
+    except Exception:
+        try:
+            _validate_private_dir(run_dir)
+            shutil.rmtree(run_dir)
+        except Exception:  # noqa: BLE001, S110 - runtime cleanup is best-effort
+            pass
+        raise
+    env = _sanitized_env()
+    env.update(
+        {
+            "CODEX_HOME": str(codex_home),
+            "HOME": str(codex_home),
+            "TMPDIR": str(codex_home / "tmp"),
+        }
+    )
+    return _ControllerRuntime(run_dir=run_dir, codex_home=codex_home, env=env)
+
+
+def _cleanup_controller_runtime(run_dir: pathlib.Path) -> None:
+    """Remove only an owned, validated per-review runtime directory."""
+    run_dir = _validate_private_dir(pathlib.Path(run_dir))
+    if not run_dir.name.startswith("review-"):
+        raise ValueError("controller runtime cleanup target is not a review run")
+    parent = _validate_private_dir(run_dir.parent)
+    if parent.name != "controller-runtimes":
+        raise ValueError("controller runtime cleanup parent is invalid")
+    shutil.rmtree(run_dir)
+    if run_dir.exists() or run_dir.is_symlink():
+        raise OSError("controller runtime cleanup did not remove the run directory")
 
 
 def _sanitized_env() -> dict[str, str]:
@@ -198,6 +408,42 @@ def _build_sandbox_profile(extra_denied_paths: list[pathlib.Path]) -> str:
 (allow default)
 {deny_rules}
 """
+
+
+def _macos_read_only_profile(
+    profile: str,
+    read_only_path: pathlib.Path | str | None = None,
+    writable_path: pathlib.Path | str | None = None,
+) -> str:
+    """Add the controller's read-only write boundary to an existing profile.
+
+    Controller Codex runs under this outer Seatbelt profile on macOS. Codex's
+    own sandbox must therefore be bypassed (the outer profile remains the
+    security boundary), while the reviewed workspace is denied writes. The
+    profile must already contain a path-specific holdout read denial; an
+    incomplete profile is rejected rather than upgraded into a weaker one.
+    """
+    if "(deny file-read* (subpath \"" not in profile:
+        raise ValueError("controller sandbox profile lacks holdout read denial")
+    if read_only_path is None:
+        raise ValueError("controller sandbox profile lacks target read denial")
+    try:
+        target = pathlib.Path(read_only_path).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("controller sandbox target is unavailable") from exc
+    escaped_target = str(target).replace("\\", "\\\\").replace('"', '\\"')
+    profile = profile.rstrip() + f'\n(deny file-read* (subpath "{escaped_target}"))\n'
+    write_rule = "(deny file-write*)"
+    profile = profile.rstrip() + "\n" + write_rule + "\n"
+    # Shells and Git use /dev/null for ordinary command plumbing. It is a
+    # device sink, not a writable filesystem location; allowing it keeps the
+    # reviewer transport functional without opening any user-controlled path.
+    profile += '(allow file-write* (literal "/dev/null"))\n'
+    if writable_path is not None:
+        writable = _validate_private_dir(pathlib.Path(writable_path))
+        escaped = str(writable).replace("\\", "\\\\").replace('"', '\\"')
+        profile += f'(allow file-write* (subpath "{escaped}"))\n'
+    return profile
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +588,571 @@ def _linux_sandbox_prefix(denied_paths: "list[pathlib.Path]") -> "Optional[list[
     joined = ":".join(str(p) for p in denied_paths)
     env_bin = shutil.which("env") or "/usr/bin/env"
     return [env_bin, f"LD_PRELOAD={lib}", f"DENY_PATHS={joined}"]
+
+
+# Linux controller reviews need kernel enforcement because a reviewer may use
+# a static executable or issue raw openat(2) syscalls.  The preload shim above
+# remains in the prefix as defense-in-depth, but it is not the boundary.
+_LINUX_LANDLOCK_SOURCE = (
+    pathlib.Path(__file__).resolve().parent.parent
+    / "scripts"
+    / "agent-isolation"
+    / "landlock_launcher.c"
+)
+_linux_landlock_launcher: pathlib.Path | None = None
+_linux_landlock_launcher_checked = False
+
+
+class _PinnedLauncherCommand(list[str]):
+    """Command argv carrying the already-verified launcher descriptor."""
+
+    def __init__(self, args: list[str], launcher_fd: int):
+        super().__init__(args)
+        self.launcher_fd = launcher_fd
+        self.pass_fds = (launcher_fd,)
+
+    def close_launcher(self) -> None:
+        if self.launcher_fd >= 0:
+            os.close(self.launcher_fd)
+            self.launcher_fd = -1
+            self.pass_fds = ()
+
+    def __add__(self, other: list[str]) -> _PinnedLauncherCommand:
+        return _PinnedLauncherCommand(list(self) + list(other), self.launcher_fd)
+
+    def __radd__(self, other: list[str]) -> _PinnedLauncherCommand:
+        return _PinnedLauncherCommand(list(other) + list(self), self.launcher_fd)
+
+
+def _linux_landlock_abi() -> int | None:
+    """Return the host Landlock ABI, or None when the syscall is unavailable."""
+    if not sys.platform.startswith("linux"):
+        return None
+    syscall_nr = {"x86_64": 444, "aarch64": 444, "riscv64": 444}.get(
+        os.uname().machine
+    )
+    if syscall_nr is None:
+        return None
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.syscall.restype = ctypes.c_long
+        abi = libc.syscall(
+            ctypes.c_long(syscall_nr),
+            ctypes.c_void_p(),
+            ctypes.c_size_t(0),
+            ctypes.c_uint(1),
+        )
+    except (AttributeError, OSError):
+        return None
+    return int(abi) if abi > 0 else None
+
+
+def _linux_landlock_cache_dir() -> pathlib.Path:
+    return pathlib.Path.home() / ".cache" / "dark-factory" / "agent-isolation"
+
+
+def _prepare_private_cache_dir(path: pathlib.Path) -> pathlib.Path:
+    """Create the launcher cache and tighten user-owned parents before use."""
+    path = pathlib.Path(path)
+    if not path.is_absolute():
+        raise ValueError("launcher cache path must be absolute")
+    current = pathlib.Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            current.mkdir(mode=0o700)
+            info = current.lstat()
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISDIR(info.st_mode)
+            or info.st_uid not in {0, os.getuid()}
+        ):
+            raise ValueError(f"launcher cache parent is not trusted: {current}")
+        if info.st_uid == os.getuid() and info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            current.chmod(0o700)
+    return _validate_private_dir(path)
+
+
+def _private_regular_executable(path: pathlib.Path) -> bool:
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(info.st_mode)
+        and info.st_nlink == 1
+        and info.st_uid == os.getuid()
+        and not info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        and stat.S_IMODE(info.st_mode) & stat.S_IXUSR
+    )
+
+
+def _open_verified_launcher(path: pathlib.Path) -> int | None:
+    """Open the validated launcher without following a replacement symlink."""
+    flags = getattr(os, "O_PATH", os.O_RDONLY)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != os.getuid()
+            or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or not stat.S_IMODE(info.st_mode) & stat.S_IXUSR
+        ):
+            os.close(fd)
+            return None
+        content_fd = os.open(f"/proc/self/fd/{fd}", os.O_RDONLY)
+        actual_digest = hashlib.sha256()
+        offset = 0
+        try:
+            while True:
+                chunk = os.pread(content_fd, 1024 * 1024, offset)
+                if not chunk:
+                    break
+                actual_digest.update(chunk)
+                offset += len(chunk)
+        finally:
+            os.close(content_fd)
+        manifest = path.with_name(path.name + ".manifest")
+        manifest_flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            manifest_flags |= os.O_NOFOLLOW
+        manifest_fd = os.open(manifest, manifest_flags)
+        try:
+            manifest_info = os.fstat(manifest_fd)
+            if (
+                not stat.S_ISREG(manifest_info.st_mode)
+                or manifest_info.st_nlink != 1
+                or manifest_info.st_uid != os.getuid()
+                or manifest_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            ):
+                os.close(fd)
+                return None
+            manifest_bytes = os.read(manifest_fd, 4096)
+        finally:
+            os.close(manifest_fd)
+        source_digest = hashlib.sha256(_LINUX_LANDLOCK_SOURCE.read_bytes()).hexdigest()
+        expected = (
+            f"source_sha256={source_digest}\n"
+            f"binary_sha256={actual_digest.hexdigest()}\n"
+        ).encode("ascii")
+        if manifest_bytes != expected:
+            os.close(fd)
+            return None
+        return fd
+    except (OSError, UnicodeError):
+        try:
+            os.close(fd)
+        except (UnboundLocalError, OSError):
+            pass
+        return None
+
+
+def _extend_pinned_launcher_command(
+    prefix: list[str], suffix: list[str]
+) -> list[str]:
+    """Append argv while retaining the launcher's inherited descriptor."""
+    launcher_fd = getattr(prefix, "launcher_fd", None)
+    if launcher_fd is None:
+        return prefix + suffix
+    return _PinnedLauncherCommand(list(prefix) + suffix, launcher_fd)
+
+
+def _close_pinned_launcher_command(command: object) -> None:
+    close = getattr(command, "close_launcher", None)
+    if close is not None:
+        close()
+
+
+def _linux_landlock_launcher_path() -> pathlib.Path | None:
+    """Build and content-hash cache the kernel-enforced launcher."""
+    global _linux_landlock_launcher, _linux_landlock_launcher_checked
+    if _linux_landlock_launcher_checked:
+        return _linux_landlock_launcher
+    _linux_landlock_launcher_checked = True
+    if (_linux_landlock_abi() or 0) < 3:
+        return None
+    compiler = shutil.which("cc") or shutil.which("gcc")
+    if compiler is None or not _LINUX_LANDLOCK_SOURCE.is_file():
+        return None
+    try:
+        source_digest = hashlib.sha256(_LINUX_LANDLOCK_SOURCE.read_bytes()).hexdigest()
+        digest = source_digest[:16]
+        cache_dir = _linux_landlock_cache_dir()
+        _prepare_private_cache_dir(cache_dir)
+        target = cache_dir / f"landlock-launcher-{digest}"
+        manifest = target.with_name(target.name + ".manifest")
+        reusable = False
+        if _private_regular_executable(target):
+            try:
+                manifest_info = manifest.lstat()
+                manifest_text = manifest.read_text(encoding="ascii").strip().splitlines()
+                binary_digest = hashlib.sha256(target.read_bytes()).hexdigest()
+                reusable = (
+                    stat.S_ISREG(manifest_info.st_mode)
+                    and manifest_info.st_nlink == 1
+                    and manifest_info.st_uid == os.getuid()
+                    and not manifest_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                    and manifest_text == [
+                        f"source_sha256={source_digest}",
+                        f"binary_sha256={binary_digest}",
+                    ]
+                )
+            except (OSError, UnicodeError):
+                reusable = False
+        if reusable:
+            _linux_landlock_launcher = target
+            return target
+
+        temp_fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=str(cache_dir))
+        temp_path = pathlib.Path(temp_name)
+        manifest_temp = cache_dir / f".{manifest.name}.{os.getpid()}"
+        try:
+            os.close(temp_fd)
+            temp_path.chmod(0o700)
+            proc = subprocess.run(
+                [compiler, "-O2", "-Wall", "-Wextra", "-o", str(temp_path), str(_LINUX_LANDLOCK_SOURCE)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if proc.returncode != 0 or not _private_regular_executable(temp_path):
+                return None
+            binary_digest = hashlib.sha256(temp_path.read_bytes()).hexdigest()
+            manifest_temp_fd = os.open(
+                manifest_temp,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            try:
+                os.write(
+                    manifest_temp_fd,
+                    f"source_sha256={source_digest}\nbinary_sha256={binary_digest}\n".encode("ascii"),
+                )
+                os.fsync(manifest_temp_fd)
+            finally:
+                os.close(manifest_temp_fd)
+            os.replace(temp_path, target)
+            os.replace(manifest_temp, manifest)
+            if not _private_regular_executable(target):
+                return None
+            _linux_landlock_launcher = target
+            return target
+        finally:
+            for stale in (temp_path, manifest_temp):
+                try:
+                    stale.unlink()
+                except FileNotFoundError:
+                    pass
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _reset_linux_landlock_launcher_cache_for_tests() -> None:
+    global _linux_landlock_launcher, _linux_landlock_launcher_checked
+    _linux_landlock_launcher = None
+    _linux_landlock_launcher_checked = False
+
+
+def _linux_codex_runtime_paths(executable: pathlib.Path) -> list[pathlib.Path] | None:
+    """Return exact installed Codex roots needed by a JS/native launcher."""
+    try:
+        resolved = executable.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    # Refuse executable trees whose package directories are mutable by another
+    # user.  A public sticky parent such as /tmp is fine.  Group-writable
+    # user-owned npm prefixes are common (for example, nvm installs); those
+    # remain bound to the current owner, while world-writable package roots do
+    # not enter the allow-list.
+    def private_group(info: os.stat_result) -> bool:
+        if not info.st_mode & stat.S_IWGRP:
+            return True
+        try:
+            uid = os.getuid()
+            gid = os.getgid()
+            username = pwd.getpwuid(uid).pw_name
+            if info.st_gid != gid:
+                return False
+            for entry in pwd.getpwall():
+                if entry.pw_gid == gid and (entry.pw_uid != uid or entry.pw_name != username):
+                    return False
+            for entry in grp.getgrall():
+                if entry.gr_gid == gid and any(member != username for member in entry.gr_mem):
+                    return False
+        except (KeyError, OSError, RuntimeError):
+            return False
+        return True
+
+    def trusted_directory(path: pathlib.Path) -> pathlib.Path | None:
+        try:
+            current = path.resolve(strict=True)
+            if not current.is_dir():
+                return None
+            while True:
+                info = current.lstat()
+                if info.st_uid not in {0, os.getuid()}:
+                    return None
+                if info.st_mode & stat.S_IWOTH:
+                    if info.st_uid == 0 and info.st_mode & stat.S_ISVTX:
+                        break
+                    return None
+                if not private_group(info):
+                    return None
+                if current == pathlib.Path(current.anchor):
+                    break
+                current = current.parent
+            return path.resolve(strict=True)
+        except (OSError, RuntimeError):
+            return None
+
+    executable_parent = trusted_directory(resolved.parent)
+    if executable_parent is None:
+        return None
+    paths = [executable_parent]
+
+    def add_package_roots(path: pathlib.Path) -> None:
+        parts = path.parts
+        for index in range(len(parts) - 1):
+            if parts[index:index + 2] in (("@openai", "codex"), ("@openai", "codex-linux-x64")):
+                package_root = pathlib.Path(*parts[: index + 2])
+                package_root = trusted_directory(package_root)
+                if package_root is not None:
+                    paths.append(package_root)
+
+    add_package_roots(resolved)
+    # JS and shell launchers may point at a bundled native executable or a
+    # non-system interpreter. Follow only explicit launcher references; do
+    # not allow every PATH directory, which could contain a sealed child.
+    try:
+        first_line = resolved.read_text(encoding="utf-8").splitlines()[0]
+    except (OSError, UnicodeDecodeError, IndexError):
+        first_line = ""
+    if first_line.startswith("#!"):
+        interpreter = first_line[2:].strip().split()
+        if interpreter and pathlib.Path(interpreter[0]).name == "env" and len(interpreter) > 1:
+            interpreter_path = shutil.which(interpreter[1])
+        else:
+            interpreter_path = interpreter[0] if interpreter else None
+        if interpreter_path:
+            try:
+                interpreter_root = trusted_directory(
+                    pathlib.Path(interpreter_path).resolve(strict=True).parent
+                )
+                if interpreter_root is None:
+                    return None
+                paths.append(interpreter_root)
+            except (OSError, RuntimeError):
+                return None
+    try:
+        for line in resolved.read_text(encoding="utf-8").splitlines():
+            if "real-bin:" not in line and not line.startswith("REAL_BIN="):
+                continue
+            candidate = line.split(":", 1)[1].strip() if "real-bin:" in line else line.split("=", 1)[1].strip()
+            candidate_path = pathlib.Path(candidate)
+            if candidate_path.is_file():
+                candidate_path = candidate_path.resolve(strict=True)
+                candidate_root = trusted_directory(candidate_path.parent)
+                if candidate_root is None:
+                    return None
+                paths.append(candidate_root)
+                add_package_roots(candidate_path)
+    except (OSError, UnicodeDecodeError, RuntimeError):
+        return None
+    # Codex's JS launcher resolves the platform package with Node's normal
+    # module lookup.  npm may hoist that optional package beside the primary
+    # package, while pnpm may keep it nested under the primary package.  Add
+    # only those exact package locations and retain their mode/owner checks.
+    package_roots = [path for path in paths if path.name == "codex"]
+    machine = os.uname().machine if hasattr(os, "uname") else ""
+    native_name = {
+        "x86_64": "codex-linux-x64",
+        "amd64": "codex-linux-x64",
+        "aarch64": "codex-linux-arm64",
+        "arm64": "codex-linux-arm64",
+    }.get(machine)
+    if native_name:
+        for package_root in package_roots:
+            candidates = (
+                package_root.parent / native_name,
+                package_root / "node_modules" / "@openai" / native_name,
+            )
+            for candidate in candidates:
+                try:
+                    candidate.lstat()
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    return None
+                native_root = trusted_directory(candidate)
+                if native_root is None:
+                    # An installed native package that cannot be trusted must
+                    # fail closed; silently omitting it would let the caller
+                    # run with a different, unvalidated runtime.
+                    return None
+                paths.append(native_root)
+    return sorted(set(paths), key=str)
+
+
+def _linux_controller_sandbox_prefix(
+    *,
+    denied_paths: list[pathlib.Path],
+    read_paths: list[pathlib.Path],
+    writable_paths: list[pathlib.Path],
+    executable_paths: list[pathlib.Path] | None = None,
+) -> list[str] | None:
+    """Return a Landlock allow-list prefix for a controller Codex process.
+
+    Landlock is an allow-list API: an omitted path is denied.  Keep the list
+    deliberately small while allowing ordinary command execution, the target
+    checkout, and the private Codex runtime.  Any path that overlaps a sealed
+    path causes a closed failure rather than weakening the rule.
+    """
+    launcher = _linux_landlock_launcher_path()
+    if launcher is None:
+        return None
+
+    def normalized(
+        paths: list[pathlib.Path], *, strict: bool = True
+    ) -> list[pathlib.Path] | None:
+        result: list[pathlib.Path] = []
+        for raw in paths:
+            try:
+                path = pathlib.Path(raw).resolve(strict=strict)
+            except (OSError, RuntimeError):
+                return None
+            if not path.is_absolute():
+                return None
+            result.append(path)
+        return result
+
+    denied = normalized(denied_paths, strict=False)
+    reads = normalized(read_paths)
+    writes = normalized(writable_paths)
+    executables = normalized(executable_paths or [])
+    if denied is None or reads is None or writes is None or executables is None:
+        return None
+
+    def contains(parent: pathlib.Path, child: pathlib.Path) -> bool:
+        try:
+            child.relative_to(parent)
+            return True
+        except ValueError:
+            return False
+
+    # A Landlock rule cannot subtract a nested deny from an allowed parent.
+    # Refuse such a configuration instead of claiming the sealed path is safe.
+    if any(contains(allowed, secret) for allowed in reads + writes for secret in denied):
+        return None
+
+    system_roots = ["/bin", "/dev", "/lib", "/lib64", "/sbin", "/sys", "/usr"]
+    for raw in system_roots:
+        path = pathlib.Path(raw)
+        if path.is_dir():
+            try:
+                reads.append(path.resolve(strict=True))
+            except (OSError, RuntimeError):
+                return None
+    # Keep configuration access to the exact files needed for identity,
+    # resolver, and TLS setup.  Never allow the whole /etc tree: that would
+    # expose controller-owned configuration such as /etc/codex.
+    for raw in (
+        "/etc/ld.so.cache",
+        "/etc/nsswitch.conf",
+        "/etc/passwd",
+        "/etc/group",
+        "/etc/hosts",
+        "/etc/resolv.conf",
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/ssl/openssl.cnf",
+        "/etc/localtime",
+    ):
+        path = pathlib.Path(raw)
+        try:
+            resolved = path.resolve(strict=True)
+        except (OSError, RuntimeError):
+            return None
+        if not resolved.is_file():
+            return None
+        reads.extend((path, resolved))
+    # Linux resolves /etc/resolv.conf through a symlink into /run.  The
+    # controller must allow only that exact target, rather than opening the
+    # whole /run tree.  The private CODEX_HOME and --ignore-user-config path
+    # must not grant access to the host user's config.
+    try:
+        resolver_target = pathlib.Path("/etc/resolv.conf").resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if not resolver_target.is_file():
+        return None
+    reads.append(resolver_target)
+    if any(contains(allowed, secret) for allowed in reads for secret in denied):
+        return None
+    for executable in executables:
+        reads.append(executable.parent)
+        # A symlink-resolved executable may live outside its command's parent.
+    preload_lib = _linux_preload_lib_path()
+    if preload_lib is None:
+        return None
+    reads.append(preload_lib.parent)
+    writes.append(pathlib.Path("/dev/null"))
+
+    # Worktrees may use a .git file that points at an admin directory outside
+    # the checkout. Allow that exact metadata tree so normal git inspection
+    # remains available without granting the checkout's parent directory.
+    for root in list(reads):
+        marker = root / ".git"
+        try:
+            if marker.is_file():
+                text = marker.read_text(encoding="utf-8").strip()
+                if text.startswith("gitdir:"):
+                    gitdir = pathlib.Path(text.split(":", 1)[1].strip())
+                    if not gitdir.is_absolute():
+                        gitdir = marker.parent / gitdir
+                    gitdir = gitdir.resolve(strict=True)
+                    reads.append(gitdir)
+                    common = gitdir / "commondir"
+                    if common.is_file():
+                        common_path = pathlib.Path(common.read_text(encoding="utf-8").strip())
+                        if not common_path.is_absolute():
+                            common_path = gitdir / common_path
+                        reads.append(common_path.resolve(strict=True))
+        except (OSError, RuntimeError, ValueError):
+            return None
+    if any(contains(allowed, secret) for allowed in reads + writes for secret in denied):
+        return None
+
+    # Keep the runtime and target out of any accidental duplicate path list;
+    # deterministic argv helps audit logs and tests.
+    read_unique = sorted(set(reads), key=str)
+    write_unique = sorted(set(writes), key=str)
+    launcher_fd = _open_verified_launcher(launcher)
+    if launcher_fd is None:
+        return None
+    try:
+        launcher_args: list[str] = [f"/proc/self/fd/{launcher_fd}"]
+        for path in read_unique:
+            launcher_args.extend(("--read", str(path)))
+        for path in write_unique:
+            launcher_args.extend(("--write", str(path)))
+        launcher_args.append("--")
+
+        # Retain preload containment as defense-in-depth.  Landlock remains the
+        # kernel boundary and is what protects static binaries/raw syscalls.
+        preload = _linux_sandbox_prefix(denied)
+        if preload is None:
+            os.close(launcher_fd)
+            return None
+        return _PinnedLauncherCommand(preload + launcher_args, launcher_fd)
+    except Exception:
+        os.close(launcher_fd)
+        raise
 
 
 _darwin_sandbox_exec_verified: "Optional[bool]" = None

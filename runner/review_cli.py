@@ -13,9 +13,11 @@ import hashlib
 import json
 import os
 import pathlib
+import stat
 import subprocess
 import tempfile
 import time
+from dataclasses import replace
 
 from .handler_core import Context
 from .handler_dispatch import (
@@ -23,21 +25,105 @@ from .handler_dispatch import (
     _gate_subprocess_args,
     _gate_subprocess_env,
 )
+from .handler_sandbox import (
+    _cleanup_controller_runtime,
+    _close_pinned_launcher_command,
+    _controller_output_schema,
+    _create_controller_runtime,
+)
 from .review_controller import (
     EvidenceArtifact,
     ReviewContractError,
     ReviewInputs,
+    build_controller_receipt,
+    build_frozen_review_bundle,
     create_review_request,
-    parse_codex_jsonl,
+    ensure_review_pass_allowed,
+    parse_tool_free_codex_jsonl,
     run_controller_review,
     validate_execution_receipts,
     validate_immutable_target,
     validate_review_response,
+    validate_workspace_path,
 )
 
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _read_validated_task(
+    task_path: pathlib.Path,
+    workdir: pathlib.Path,
+    holdout_roots: tuple[str, ...],
+) -> tuple[pathlib.Path, str]:
+    """Open and read a contained task file without following a replacement."""
+    lexical = task_path.expanduser()
+    validate_workspace_path(str(lexical.parent), holdout_roots=holdout_roots)
+    resolved = lexical.resolve(strict=False)
+    try:
+        resolved.relative_to(workdir)
+    except ValueError as exc:
+        raise ReviewContractError("task file must be inside the reviewed workspace") from exc
+    for entry in holdout_roots:
+        holdout = pathlib.Path(entry).resolve(strict=False)
+        try:
+            resolved.relative_to(holdout)
+        except ValueError:
+            continue
+        raise ReviewContractError("task file is inside a sealed holdout root")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(lexical, flags)
+    except OSError as exc:
+        raise ReviewContractError(f"task file could not be opened safely: {lexical}") from exc
+    try:
+        before = os.fstat(fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size > 1024 * 1024
+        ):
+            raise ReviewContractError("task file must be a private regular file")
+        try:
+            current = os.stat(lexical, follow_symlinks=False)
+        except OSError as exc:
+            raise ReviewContractError("task file changed during safe open") from exc
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_dev != before.st_dev
+            or current.st_ino != before.st_ino
+            or current.st_nlink != 1
+        ):
+            raise ReviewContractError("task file changed during safe open")
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining >= 0:
+            chunk = os.read(fd, min(1024 * 1024, remaining + 1))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+            if remaining < 0:
+                raise ReviewContractError("task file changed during safe read")
+        after = os.fstat(fd)
+        if (
+            after.st_dev != before.st_dev
+            or after.st_ino != before.st_ino
+            or after.st_nlink != 1
+            or after.st_size != before.st_size
+            or sum(map(len, chunks)) != before.st_size
+        ):
+            raise ReviewContractError("task file changed during safe read")
+        try:
+            text = b"".join(chunks).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ReviewContractError("task file is not valid UTF-8") from exc
+        return resolved, text
+    finally:
+        os.close(fd)
 
 
 def _write_atomic(path: pathlib.Path, data: bytes) -> None:
@@ -140,14 +226,6 @@ def _snapshot(workdir: pathlib.Path, base_sha: str, head_sha: str) -> dict[str, 
             f"workspace HEAD mismatch: expected {head_sha}, observed {actual_head}"
         )
     tree_sha = _git(workdir, "rev-parse", f"{head_sha}^{{tree}}").lower()
-    diff_text = _git(
-        workdir,
-        "diff",
-        "--no-ext-diff",
-        "--binary",
-        f"{base_sha}..{head_sha}",
-        allow_empty=True,
-    )
     changed_files_text = _git(
         workdir,
         "diff",
@@ -158,8 +236,6 @@ def _snapshot(workdir: pathlib.Path, base_sha: str, head_sha: str) -> dict[str, 
     return {
         "head_sha": actual_head,
         "tree_sha": tree_sha,
-        "diff_text": diff_text,
-        "diff_sha256": _sha256(diff_text.encode("utf-8")),
         "changed_files": tuple(
             line for line in changed_files_text.splitlines() if line.strip()
         ),
@@ -194,7 +270,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=pathlib.Path, required=True)
     parser.add_argument(
         "--backend",
-        choices=["codex", "claude", "agy", "minimax", "claude-sonnet"],
+        choices=["codex"],
         default="codex",
     )
     parser.add_argument("--timeout", type=int, default=1200)
@@ -204,50 +280,79 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
-    workdir = args.workdir.expanduser().resolve()
+    # Keep the lexical path until immutable-target validation. Resolving here
+    # would erase a symlinked parent and bypass its containment check.
+    lexical_workdir = args.workdir.expanduser()
     output_dir = args.output_dir.expanduser().resolve()
-    try:
-        output_dir.relative_to(workdir)
-    except ValueError:
-        pass
-    else:
-        parser.error("--output-dir must be outside the reviewed workspace")
     claimed_output = False
+    request = None
+    runtime = None
     try:
+        try:
+            from .handler_sandbox import _holdout_denied_paths
+
+            holdout_roots = tuple(str(path) for path in _holdout_denied_paths())
+        except (OSError, RuntimeError) as exc:
+            raise ReviewContractError(
+                f"sealed holdout roots unavailable: {exc}"
+            ) from exc
+        # This must precede every git query and every read from the target.
+        workdir = validate_workspace_path(
+            str(lexical_workdir),
+            holdout_roots=holdout_roots,
+        )
         base_sha = _full_revision(workdir, args.base_sha)
         head_sha = _full_revision(workdir, args.head_sha)
         _require_review_range(workdir, base_sha, head_sha)
-        before = _snapshot(workdir, base_sha, head_sha)
-        task_path = args.task_file.expanduser().resolve(strict=True)
-        task_text = task_path.read_text(encoding="utf-8")
-        evidence = _evidence_artifacts(workdir, args.evidence)
+        tree_sha = _git(workdir, "rev-parse", f"{head_sha}^{{tree}}").lower()
+        changed_files_text = _git(
+            workdir,
+            "diff",
+            "--name-only",
+            f"{base_sha}..{head_sha}",
+            allow_empty=True,
+        )
+        task_path, task_text = _read_validated_task(
+            args.task_file, workdir, holdout_roots
+        )
         try:
             repository = _git(workdir, "config", "--get", "remote.origin.url")
         except ReviewContractError:
             repository = workdir.name
 
+        # Validate the lexical path before reading any target-owned evidence.
+        # Keep that raw spelling in the request so a later symlink-parent swap
+        # is observable when the target is revalidated after review.
         inputs = ReviewInputs(
             repository=repository,
-            workspace_path=str(workdir),
+            workspace_path=str(lexical_workdir),
             base_sha=base_sha,
             head_sha=head_sha,
-            tree_sha=str(before["tree_sha"]),
+            tree_sha=tree_sha,
             task_text=task_text,
-            diff_text=str(before["diff_text"]),
-            changed_files=tuple(before["changed_files"]),
-            evidence=evidence,
+            changed_files=tuple(
+                line for line in changed_files_text.splitlines() if line.strip()
+            ),
+            evidence=(),
             run_id=f"review-{int(time.time())}",
         )
+        workdir = validate_immutable_target(inputs, holdout_roots=holdout_roots)
+        evidence = _evidence_artifacts(workdir, args.evidence)
+        inputs = replace(inputs, evidence=evidence)
+        # Re-check after collecting evidence so the raw path and every
+        # evidence path are bound before the request is emitted.
+        workdir = validate_immutable_target(inputs, holdout_roots=holdout_roots)
         try:
-            from .handler_sandbox import _holdout_denied_paths
-
-            holdout_roots = tuple(
-                str(path) for path in _holdout_denied_paths()
-            )
-        except Exception:
-            holdout_roots = ()
-        validate_immutable_target(inputs, holdout_roots=holdout_roots)
-        request = create_review_request(inputs)
+            output_dir.relative_to(workdir)
+        except ValueError:
+            pass
+        else:
+            parser.error("--output-dir must be outside the reviewed workspace")
+        before = _snapshot(workdir, base_sha, head_sha)
+        frozen_bundle = build_frozen_review_bundle(
+            inputs, holdout_roots=holdout_roots
+        )
+        request = create_review_request(inputs, frozen_bundle=frozen_bundle)
         output_dir.mkdir(parents=True, mode=0o700, exist_ok=False)
         claimed_output = True
         prompt_path = output_dir / "prompt.txt"
@@ -279,29 +384,44 @@ def main(argv: list[str] | None = None) -> int:
         transport_is_jsonl = args.backend == "codex"
         if transport_is_jsonl:
             try:
-                command = _controller_codex_args(command)
+                runtime = _create_controller_runtime()
+                schema_path = _controller_output_schema(runtime.run_dir)
+                command = _controller_codex_args(
+                    command,
+                    read_only_path=workdir,
+                    writable_path=runtime.codex_home,
+                    schema_path=schema_path,
+                )
             except ValueError as exc:
                 raise ReviewContractError(
-                    "codex review command did not contain the codex executable"
+                    f"codex review command setup failed: {exc}"
                 ) from exc
             stdin_text = request.prompt
-        proc = subprocess.run(
-            command,
-            cwd=output_dir,
-            capture_output=True,
-            text=True,
-            input=stdin_text,
-            timeout=args.timeout,
-            check=False,
-            env=_gate_subprocess_env(args.backend),
-        )
+        try:
+            proc = subprocess.run(
+                command,
+                cwd=output_dir,
+                capture_output=True,
+                text=True,
+                input=stdin_text,
+                timeout=args.timeout,
+                check=False,
+                env=runtime.env if runtime is not None else _gate_subprocess_env(args.backend),
+                pass_fds=getattr(command, "pass_fds", ()),
+            )
+        finally:
+            _close_pinned_launcher_command(command)
         raw_transport = proc.stdout
         command_receipts = ()
+        transport_receipt = None
         response = proc.stdout.strip()
         parse_error = ""
         if transport_is_jsonl and proc.returncode == 0:
             try:
-                response, command_receipts = parse_codex_jsonl(raw_transport)
+                response, transport_receipt = parse_tool_free_codex_jsonl(
+                    raw_transport, request=request
+                )
+                command_receipts = ()
             except ReviewContractError as exc:
                 response = ""
                 parse_error = str(exc)
@@ -315,8 +435,21 @@ def main(argv: list[str] | None = None) -> int:
         response_sha256 = _sha256(response_bytes)
         if proc.returncode == 0 and not contract_error:
             try:
-                validated = validate_review_response(response, request)
-                validate_execution_receipts(command_receipts, validated)
+                validated = validate_review_response(
+                    response, request, tool_free=transport_is_jsonl
+                )
+                if request.bundle_sha256:
+                    if validated.commands_executed:
+                        raise ReviewContractError(
+                            "tool-free controller PASS requires empty commands_executed"
+                        )
+                else:
+                    validate_execution_receipts(command_receipts, validated)
+                ensure_review_pass_allowed(
+                    validated,
+                    backend=args.backend,
+                    execution_path="cli",
+                )
                 verdict = validated.verdict
                 response_sha256 = validated.response_sha256
             except ReviewContractError as exc:
@@ -324,65 +457,94 @@ def main(argv: list[str] | None = None) -> int:
         elif proc.returncode != 0:
             contract_error = f"review backend exited with {proc.returncode}"
 
+        # Revalidate the original lexical path before the post-review snapshot;
+        # resolving only once would let a symlink-parent swap redirect the
+        # final check to an unreviewed target.
+        workdir = validate_immutable_target(inputs, holdout_roots=holdout_roots)
         after = _snapshot(workdir, base_sha, head_sha)
         _verify_evidence(workdir, evidence)
+        # head + tree pin the whole reviewed state; with a fixed base_sha the
+        # reviewed change cannot differ while both still match.
         if (
             before["head_sha"] != after["head_sha"]
             or before["tree_sha"] != after["tree_sha"]
-            or before["diff_sha256"] != after["diff_sha256"]
         ):
             contract_error = "reviewed repository changed during cold review"
             verdict = "invalid"
 
-        receipt = {
-            "schema": 1,
-            "status": "valid" if not contract_error else "invalid",
-            "verdict": verdict,
-            "contract_error": contract_error,
-            "backend": args.backend,
-            "backend_returncode": proc.returncode,
-            "base_sha": base_sha,
-            "head_sha": head_sha,
-            "tree_sha": before["tree_sha"],
-            "diff_sha256": before["diff_sha256"],
-            "prompt_id": request.prompt_id,
-            "prompt_sha256": _sha256(prompt_bytes),
-            "prompt_payload_sha256": request.prompt_sha256,
-            "envelope_sha256": request.envelope_sha256,
-            "response_sha256": response_sha256,
-            "transport_sha256": (
-                _sha256(raw_transport.encode("utf-8"))
-                if transport_is_jsonl
-                else ""
-            ),
-            "command_receipts": [
-                {
-                    "command": item.command,
-                    "exit_code": item.exit_code,
-                    "output_sha256": item.output_sha256,
-                }
-                for item in command_receipts
-            ],
-            "prompt_path": prompt_path.name,
-            "envelope_path": envelope_path.name,
-            "response_path": response_path.name,
-            "transport_path": transport_path.name if transport_is_jsonl else "",
-        }
+        receipt = build_controller_receipt(
+            request,
+            lane="controller",
+            backend=args.backend,
+            neutral_cwd=output_dir,
+            output_dir=output_dir,
+            transport_argv=tuple(str(arg) for arg in command),
+            transport_text=raw_transport if transport_is_jsonl else "",
+            response_text=response,
+            backend_returncode=proc.returncode,
+            status="valid" if not contract_error else "invalid",
+            verdict=verdict,
+            contract_error=contract_error,
+            receipts=command_receipts,
+            transport_receipt=transport_receipt,
+        )
+        receipt.update(
+            {
+                "prompt_path": prompt_path.name,
+                "envelope_path": envelope_path.name,
+                "response_path": response_path.name,
+                "transport_path": transport_path.name if transport_is_jsonl else "",
+            }
+        )
         _write_atomic(
             receipt_path,
             (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode("utf-8"),
         )
+        if runtime is not None:
+            _cleanup_controller_runtime(runtime.run_dir)
+            runtime = None
         print(json.dumps(receipt, indent=2, sort_keys=True))
         if contract_error:
             return 1
         return 0 if verdict == "pass" else 2
     except (OSError, UnicodeError, subprocess.TimeoutExpired, ReviewContractError) as exc:
-        payload = {
-            "schema": 1,
-            "status": "invalid",
-            "verdict": "invalid",
-            "contract_error": f"{type(exc).__name__}: {exc}",
-        }
+        _close_pinned_launcher_command(locals().get("command"))
+        if runtime is not None:
+            try:
+                _cleanup_controller_runtime(runtime.run_dir)
+            except Exception:  # noqa: BLE001, S110 - runtime cleanup is best-effort
+                pass
+        contract_error = f"{type(exc).__name__}: {exc}"
+        if request is not None:
+            process = locals().get("proc")
+            returncode = getattr(process, "returncode", -1)
+            payload = build_controller_receipt(
+                request,
+                lane="controller",
+                backend=args.backend,
+                neutral_cwd=output_dir,
+                output_dir=output_dir,
+                transport_argv=tuple(
+                    str(arg) for arg in locals().get("command", ())
+                ),
+                transport_text=str(locals().get("raw_transport", "")),
+                response_text=str(locals().get("response", "")),
+                backend_returncode=returncode
+                if isinstance(returncode, int)
+                else -1,
+                status="invalid",
+                verdict="invalid",
+                contract_error=contract_error,
+                receipts=locals().get("command_receipts", ()),
+                transport_receipt=locals().get("transport_receipt"),
+            )
+        else:
+            payload = {
+                "schema": 1,
+                "status": "invalid",
+                "verdict": "invalid",
+                "contract_error": contract_error,
+            }
         if claimed_output:
             try:
                 _write_atomic(
@@ -397,4 +559,4 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
 
-__all__ = ["main"]
+__all__ = ["main", "run_controller_review"]

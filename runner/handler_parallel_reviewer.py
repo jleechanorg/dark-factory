@@ -1,11 +1,3 @@
-from __future__ import annotations
-
-import hashlib
-import json
-import pathlib
-import re
-import shutil
-
 """Parallel reviewer handler.
 
 Runs a primary reviewer lane and a shadow Codex reviewer lane in parallel,
@@ -16,23 +8,17 @@ behavior is aligned with existing lanes (`_resolve_gate_backend`,
 `_start_shadow_gate_review`, `_finish_shadow_gate_review`).
 """
 
-_LANE_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
-_CONTROLLER_TASK_ARTIFACT_RE = re.compile(r"^\.dark-factory/agy-task-[^/]+\.md$")
+from __future__ import annotations
 
-
-def lane_output_dir(neutral_cwd: pathlib.Path, lane: str) -> pathlib.Path:
-    """Return the per-lane output directory inside ``neutral_cwd``.
-
-    Sanitizes the lane label so it is safe as a single directory name. The
-    caller must NOT reuse the returned path across lanes — every parallel
-    lane (primary + every shadow) must have its own output directory.
-    """
-    sanitized = _LANE_NAME_RE.sub("-", str(lane)).strip("-") or "lane"
-    return pathlib.Path(neutral_cwd) / sanitized
-
-
+import hashlib
+import json
+import os
+import pathlib
+import re
+import shutil
+import stat
 import subprocess
-import tempfile
+import uuid
 from typing import TYPE_CHECKING
 
 # Import collaborators from their source modules directly. Importing
@@ -45,26 +31,226 @@ from typing import TYPE_CHECKING
 #
 # Symbols that tests monkeypatch via ``runner.handlers._X`` are looked up
 # lazily inside ``_parallel_reviewer`` via the shim — see the function body.
-from .handler_core import Result
-from .handler_core import _gate_strict_flag
+from .handler_core import Result, _gate_strict_flag
+from .handler_dispatch import (
+    _execute_gate,
+    _finish_shadow_gate_review,
+    _launch_shadow_gate_review,
+    _parse_priority_env,
+    _resolve_gate_backend,
+    _start_shadow_gate_review,
+)
+
 # Canonical implementation lives in handler_verdict (pr228 B1 relocation).
 # Re-exported here for backward compatibility: handler_verdict is a leaf
 # module (imports nothing from handlers), so this creates no import cycle.
 from .handler_verdict import _enforce_outcome_verdict_consistency  # noqa: F401
-from .handler_dispatch import (
-    _finish_shadow_gate_review,
-    _is_gate_infra_failure,
-    _resolve_gate_backend,
-    _execute_gate,
-    _launch_shadow_gate_review,
-    _parse_priority_env,
-    _start_shadow_gate_review,
-)
 from .review_controller import EvidenceDelta, EvidenceOrigin
 
 if TYPE_CHECKING:
     from .handler_core import Context
     from .parser import Node
+
+_LANE_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+_CONTROLLER_TASK_ARTIFACT_RE = re.compile(r"^\.dark-factory/agy-task-[^/]+\.md$")
+_CONTROLLER_FIXTURE_STATE = "_df_controller_fixture"
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _controller_snapshot_root() -> pathlib.Path:
+    """Return a private, non-symlinked root for controller worktrees.
+
+    Snapshot creation is a security boundary: resolving a path before checking
+    it would allow a symlinked ``~/.dark-factory`` component to redirect Git's
+    worktree registration.  Validate each user-owned component with ``lstat``
+    and create missing components with mode 0700; callers re-run this check
+    immediately before mutation to narrow the replacement race.
+    """
+    home = pathlib.Path.home()
+    if not home.is_absolute() or home.is_symlink():
+        raise ValueError("controller snapshot home must be a non-symlink directory")
+    try:
+        home_stat = home.lstat()
+    except OSError as exc:
+        raise ValueError("controller snapshot home is unavailable") from exc
+    if not stat.S_ISDIR(home_stat.st_mode) or home_stat.st_uid != os.getuid():
+        raise ValueError("controller snapshot home is not owned by the current user")
+    if home_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise ValueError("controller snapshot home is group/world writable")
+
+    dark_factory = home / ".dark-factory"
+    root = dark_factory / "controller-snapshots"
+    current = home
+    for component in (dark_factory.name, root.name):
+        current = current / component
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            try:
+                current.mkdir(mode=0o700)
+            except FileExistsError:
+                # Another process won the creation race; validate its result.
+                pass
+            except OSError as exc:
+                raise ValueError(f"controller snapshot root cannot be created: {current}") from exc
+            try:
+                info = current.lstat()
+            except OSError as exc:
+                raise ValueError(f"controller snapshot root cannot be validated: {current}") from exc
+        except OSError as exc:
+            raise ValueError(f"controller snapshot root cannot be inspected: {current}") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise ValueError(f"controller snapshot root contains a symlink or non-directory: {current}")
+        if info.st_uid != os.getuid():
+            raise ValueError(f"controller snapshot root is not owned by the current user: {current}")
+        if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise ValueError(f"controller snapshot root is group/world writable: {current}")
+    return root
+
+
+def _controller_source_state(
+    source: pathlib.Path,
+    untracked_paths: tuple[str, ...] | None = None,
+    excluded_untracked: tuple[str, ...] = (),
+    declared_evidence_paths: tuple[str, ...] = (),
+) -> dict[str, object]:
+    """Capture tracked/index and copied-untracked source state.
+
+    The runner may add new ignored/controller evidence files after review
+    starts, so only the untracked files present at snapshot binding time are
+    pinned. Each of those files is copied into the snapshot and rehashed on
+    the post-review check; a newly-created file is not silently treated as
+    product input.
+    """
+    head = _git_output(source, "rev-parse", "HEAD^{commit}").lower()
+    diff = _git_output(source, "diff", "--no-ext-diff", "--binary", "HEAD", allow_empty=True)
+    declared = set(declared_evidence_paths)
+    if untracked_paths is None:
+        raw_untracked = _git_output(
+            source, "ls-files", "--others", "--exclude-standard", "-z", allow_empty=True
+        )
+        paths_to_pin = tuple(filter(None, raw_untracked.split("\0")))
+    else:
+        paths_to_pin = untracked_paths
+    excluded = set(excluded_untracked)
+    untracked: list[dict[str, object]] = []
+    source_root = source.resolve()
+    for raw_path in paths_to_pin:
+        relative = pathlib.PurePosixPath(raw_path)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"unsafe worker path: {raw_path}")
+        normalized = relative.as_posix()
+        if (
+            normalized in declared
+            or normalized in excluded
+            or _CONTROLLER_TASK_ARTIFACT_RE.fullmatch(normalized)
+        ):
+            continue
+        path = source.joinpath(*relative.parts)
+        resolved = path.resolve()
+        try:
+            resolved.relative_to(source_root)
+        except ValueError as exc:
+            raise ValueError(f"worker path escapes the workspace: {normalized}") from exc
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"worker path is not a regular file: {normalized}")
+        data = path.read_bytes()
+        untracked.append(
+            {
+                "path": normalized,
+                "size_bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+        )
+    untracked.sort(key=lambda item: str(item["path"]))
+    evidence: list[dict[str, object]] = []
+    for raw_path in declared_evidence_paths:
+        relative = pathlib.PurePosixPath(raw_path)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"declared evidence escapes the workspace: {raw_path}")
+        normalized = relative.as_posix()
+        path = source.joinpath(*relative.parts)
+        resolved = path.resolve()
+        try:
+            resolved.relative_to(source_root)
+        except ValueError as exc:
+            raise ValueError(f"declared evidence escapes the workspace: {normalized}") from exc
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"declared evidence is not a regular file: {normalized}")
+        data = path.read_bytes()
+        evidence.append(
+            {
+                "path": normalized,
+                "size_bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+        )
+    evidence.sort(key=lambda item: str(item["path"]))
+    return {
+        "head_sha": head,
+        "diff_sha256": hashlib.sha256(diff.encode("utf-8", "surrogateescape")).hexdigest(),
+        "untracked_files": untracked,
+        "declared_evidence": evidence,
+    }
+
+
+def _controller_source_fingerprint(source: pathlib.Path) -> str:
+    """Hash the complete source state used by the controller snapshot."""
+    state = _controller_source_state(source)
+    return _controller_source_state_fingerprint(state)
+
+
+def _controller_source_state_fingerprint(state: dict[str, object]) -> str:
+    """Return the stable digest for a captured source state."""
+    return hashlib.sha256(
+        json.dumps(state, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _controller_owned_source_paths(ctx: Context, source: pathlib.Path) -> tuple[str, ...]:
+    """Return exact runner-owned files that may grow during a review."""
+    source_root = source.resolve()
+    owned: set[str] = set()
+    event_path = getattr(ctx, "event_log_path", None)
+    if event_path:
+        try:
+            owned.add(pathlib.Path(event_path).resolve().relative_to(source_root).as_posix())
+        except (OSError, ValueError):
+            pass
+    return tuple(sorted(owned))
+
+
+def _controller_fixture_enabled(node: Node, ctx: Context) -> bool:
+    """Allow synthetic cold-review results only for an explicit test fixture.
+
+    Both the graph marker and the exact state token are required. Production
+    graphs do not carry the marker, and ordinary run state cannot accidentally
+    turn an echo/mock backend into a controller acceptance path.
+    """
+    return (
+        str(node.attrs.get("test_fixture", "")).strip().lower() == "true"
+        and ctx.state.get(_CONTROLLER_FIXTURE_STATE) == "cold-review-v1"
+    )
+
+
+def lane_output_dir(neutral_cwd: pathlib.Path, lane: str) -> pathlib.Path:
+    """Return the per-lane output directory inside ``neutral_cwd``.
+
+    Sanitizes the lane label so it is safe as a single directory name. The
+    caller must NOT reuse the returned path across lanes — every parallel
+    lane (primary + every shadow) must have its own output directory.
+    """
+    sanitized = _LANE_NAME_RE.sub("-", str(lane)).strip("-") or "lane"
+    base = pathlib.Path(neutral_cwd) / sanitized
+    # A run id may be reused by a caller after an interrupted process. Keep
+    # the original attempt immutable and allocate an explicit retry sibling
+    # rather than overwriting or mixing transcripts from the prior attempt.
+    candidate = base
+    retry = 1
+    while candidate.exists():
+        candidate = base.with_name(f"{sanitized}-retry-{retry}")
+        retry += 1
+    return candidate
 
 
 def _shadow_codex_review_enabled(ctx: "Context") -> bool:
@@ -98,6 +284,7 @@ def _run_primary_review(
     backend: str,
     *,
     gate_strict: bool,
+    read_only_path: pathlib.Path | str | None = None,
 ) -> Result:
     """Run the primary reviewer lane with infra fallback policy.
 
@@ -115,6 +302,7 @@ def _run_primary_review(
             node_name,
             backend,
             gate_strict=gate_strict,
+            read_only_path=read_only_path,
         )
     finally:
         if prior_shadow_flag is None:
@@ -227,7 +415,7 @@ def _controller_evidence_paths(node: "Node", ctx: "Context") -> tuple[str, ...]:
     elif isinstance(raw, (list, tuple)):
         values = raw
     else:
-        raise ValueError("evidence_paths must be a list or comma-separated string")
+        raise TypeError("evidence_paths must be a list or comma-separated string")
 
     paths: list[str] = []
     for value in values:
@@ -252,6 +440,11 @@ def _controller_evidence(
         import runner.handlers as _handlers_shim
 
         root = _handlers_shim._target_worktree(ctx)
+    # This function is called only after the controller has validated the raw
+    # target path. Canonicalize at that boundary so platform aliases such as
+    # macOS /var -> /private/var do not make a valid evidence file appear to
+    # escape its already-validated workspace.
+    root = root.resolve()
     for rel in _controller_evidence_paths(node, ctx):
         path = (root / rel).resolve()
         try:
@@ -275,6 +468,8 @@ def _controller_snapshot(
     source: pathlib.Path,
     expected_sha: str,
     declared_evidence: tuple[str, ...],
+    *,
+    cleanup_source: pathlib.Path | None = None,
 ) -> tuple[pathlib.Path, str, EvidenceOrigin | None]:
     """Freeze dirty worker output into a clean detached Git worktree for review.
 
@@ -283,23 +478,22 @@ def _controller_snapshot(
     detached commit supplies that target without changing the worker checkout.
     Runner-created AGY task files are transport artifacts, not product output.
     """
+    # Keep the original lexical spelling for exception cleanup. source is
+    # normally already validated/canonicalized by the request builder, while
+    # cleanup must validate the path spelling again immediately before Git.
+    cleanup_source = pathlib.Path(cleanup_source or source)
     observed_head = _git_output(source, "rev-parse", "HEAD^{commit}").lower()
     if observed_head != expected_sha.lower():
         raise ValueError("controller review target head changed before snapshot")
-    source_status = _git_output(
-        source,
-        "status",
-        "--porcelain=v1",
-        "--untracked-files=all",
-        allow_empty=True,
-    )
-    if not source_status and not declared_evidence:
-        return source, observed_head, None
-
-    snapshot_root = pathlib.Path.home() / ".dark-factory" / "controller-snapshots"
-    snapshot_root.mkdir(parents=True, exist_ok=True)
-    snapshot = pathlib.Path(tempfile.mkdtemp(prefix="snapshot-", dir=snapshot_root))
-    snapshot.rmdir()
+    snapshot_root = _controller_snapshot_root()
+    # Git creates the worktree directory itself.  Do not create then remove a
+    # temporary directory: that gap permits a replaced directory or symlink to
+    # redirect the subsequent ``git worktree add``.
+    snapshot = snapshot_root / f"snapshot-{uuid.uuid4().hex}"
+    _controller_snapshot_root()
+    if snapshot.exists() or snapshot.is_symlink():
+        raise ValueError("controller snapshot path already exists")
+    _controller_snapshot_root()
     add = subprocess.run(
         ["git", "-C", str(source), "worktree", "add", "--detach", str(snapshot), observed_head],
         capture_output=True,
@@ -445,65 +639,266 @@ def _controller_snapshot(
             snapshot_delta=delta,
         )
     except Exception:
-        subprocess.run(
-            ["git", "-C", str(source), "worktree", "remove", "--force", str(snapshot)],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
+        try:
+            from .handler_sandbox import _holdout_denied_paths
+            from .review_controller import validate_workspace_path
+
+            trusted_source = validate_workspace_path(
+                str(cleanup_source),
+                holdout_roots=tuple(
+                    str(path) for path in _holdout_denied_paths()
+                ),
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(trusted_source),
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(snapshot),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+            # Cleanup is best-effort and must not follow an invalidated path.
+            pass
         raise
+
+
+def _controller_base_sha(
+    node: Node,
+    ctx: Context,
+    workdir: pathlib.Path,
+    source_sha: str,
+    head_sha: str,
+    require_distinct: bool = True,
+) -> str:
+    """Return the authenticated immutable base for a controller review.
+
+    The runner captures the base before worker execution in private controller
+    state. Public graph state and DOT attributes are target-authored data and
+    must never narrow the controller's review range. Never ask the target
+    checkout to resolve a mutable branch or ref.
+    """
+    raw_base = getattr(ctx, "_controller_base_sha", None)
+    if raw_base is None:
+        raise ValueError("controller review base SHA is unavailable")
+    if not isinstance(raw_base, str):
+        raise TypeError("controller review base SHA is unavailable")
+    base_sha = raw_base.strip().lower()
+    if not _SHA_RE.fullmatch(base_sha):
+        raise ValueError("controller review base SHA must be a full 40-hex revision")
+    if not _SHA_RE.fullmatch(str(head_sha).strip().lower()):
+        raise ValueError("controller review head SHA is unavailable")
+    if require_distinct and base_sha == str(head_sha).strip().lower():
+        raise ValueError("controller review base SHA must differ from head SHA")
+    ancestor = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(workdir),
+            "merge-base",
+            "--is-ancestor",
+            base_sha,
+            str(head_sha).strip().lower(),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if ancestor.returncode != 0:
+        raise ValueError("controller review base SHA is not an ancestor of the target head")
+    return base_sha
 
 
 def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
     """Build the source-owned request; graph/goal content remains envelope data."""
+    import runner.handlers as _handlers_shim
+
     from .review_controller import (
+        build_frozen_review_bundle,
         ReviewContractError,
         ReviewInputs,
         create_review_request,
         validate_immutable_target,
+        validate_workspace_path,
     )
 
-    import runner.handlers as _handlers_shim
-
-    source_workdir = _handlers_shim._target_worktree(ctx)
+    if not isinstance(expected_sha, str) or not _SHA_RE.fullmatch(expected_sha.strip().lower()):
+        raise ValueError("controller review target head SHA is unavailable")
+    raw_source_workdir = _handlers_shim._target_worktree(ctx)
     declared_evidence = _controller_evidence_paths(node, ctx)
     try:
         holdout_roots = tuple(
             str(pathlib.Path(root).resolve(strict=False))
             for root in _holdout_root_strings()
         )
-    except Exception:
-        holdout_roots = ()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"controller review holdout roots unavailable: {exc}") from exc
+    try:
+        # Validate the raw lexical spelling before canonicalizing it or doing
+        # any target-owned Git/evidence reads. This catches symlinked parents
+        # that ``Path.resolve`` would otherwise erase.
+        source_workdir = validate_workspace_path(
+            str(raw_source_workdir),
+            holdout_roots=holdout_roots,
+        )
+    except ReviewContractError as exc:
+        raise ValueError(f"controller review source is not immutable: {exc}") from exc
+    if getattr(ctx, "_controller_base_sha", None) is None:
+        raise ValueError("controller review base SHA is unavailable")
     source_inputs = ReviewInputs(
         repository=source_workdir.name,
-        workspace_path=str(source_workdir),
+        workspace_path=str(raw_source_workdir),
         base_sha=expected_sha,
         head_sha=expected_sha,
         tree_sha=_git_output(source_workdir, "rev-parse", f"{expected_sha}^{{tree}}"),
         task_text="",
-        diff_text="",
         changed_files=(),
         evidence=_controller_evidence(node, ctx, source_workdir),
         run_id=str(ctx.run_id or ""),
     )
     try:
-        validate_immutable_target(source_inputs, holdout_roots=holdout_roots)
+        # Keep the raw lexical path in ``source_inputs`` through validation;
+        # only the validated return value may be used for Git/evidence access.
+        source_workdir = validate_immutable_target(
+            source_inputs,
+            holdout_roots=holdout_roots,
+        )
     except ReviewContractError as exc:
         raise ValueError(f"controller review source is not immutable: {exc}") from exc
+    # Validate the append-only cleanup state before creating another snapshot;
+    # malformed state must fail closed without creating an untracked worktree.
+    raw_snapshots = ctx.state.get("_controller_review_snapshots", "[]")
+    try:
+        snapshots = json.loads(raw_snapshots)
+    except json.JSONDecodeError as exc:
+        raise ValueError("controller snapshot state is malformed") from exc
+    if not isinstance(snapshots, list) or any(
+        not isinstance(entry, dict)
+        or set(entry) != {"snapshot_path", "source_worktree"}
+        or not isinstance(entry["snapshot_path"], str)
+        or not isinstance(entry["source_worktree"], str)
+        for entry in snapshots
+    ):
+        raise ValueError("controller snapshot state is malformed")
+    source_head_sha = expected_sha
+    # Authenticate the non-mutable base before creating a snapshot. Invalid
+    # or equal bases must not leave an untracked controller worktree behind.
+    base_sha = _controller_base_sha(
+        node,
+        ctx,
+        source_workdir,
+        source_sha=source_head_sha,
+        head_sha=source_head_sha,
+        require_distinct=False,
+    )
+    # Bind the mutable worker checkout on both sides of snapshot creation. A
+    # worker can otherwise change between the snapshot's initial Git reads and
+    # the later binding, leaving the reviewer with a stale target.
+    excluded_untracked = _controller_owned_source_paths(ctx, source_workdir)
+    source_state_before = _controller_source_state(
+        source_workdir,
+        excluded_untracked=excluded_untracked,
+        declared_evidence_paths=declared_evidence,
+    )
+    source_fingerprint_before = _controller_source_state_fingerprint(source_state_before)
     workdir, expected_sha, evidence_origin = _controller_snapshot(
-        source_workdir, expected_sha, declared_evidence
+        source_workdir,
+        source_head_sha,
+        declared_evidence,
+        cleanup_source=raw_source_workdir,
     )
-    base_sha = _git_output(workdir, "merge-base", "origin/main", expected_sha)
-    tree_sha = _git_output(workdir, "rev-parse", f"{expected_sha}^{{tree}}")
-    diff_text = _git_output(
+    # Journal the snapshot before any later source re-pin can fail. The engine
+    # retries this exact entry on resume or terminal early-return paths.
+    snapshots.append(
+        {
+            "snapshot_path": str(workdir),
+            "source_worktree": str(raw_source_workdir),
+        }
+    )
+    ctx.state["_controller_review_snapshots"] = json.dumps(
+        snapshots,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    from .engine_run import _persist_controller_snapshot_journal
+
+    _persist_controller_snapshot_journal(ctx)
+    source_state_after = _controller_source_state(
+        source_workdir,
+        excluded_untracked=excluded_untracked,
+        declared_evidence_paths=declared_evidence,
+    )
+    source_fingerprint_after = _controller_source_state_fingerprint(source_state_after)
+    if source_fingerprint_before != source_fingerprint_after:
+        # Only clean the completed snapshot while the trusted root still
+        # validates. If an attacker replaced a parent, refusing cleanup is
+        # safer than handing Git a path that now resolves elsewhere.
+        try:
+            trusted_root = _controller_snapshot_root()
+            from .review_controller import validate_workspace_path
+
+            trusted_source = validate_workspace_path(
+                str(raw_source_workdir),
+                holdout_roots=tuple(_holdout_root_strings()),
+            )
+            if (
+                workdir.parent != trusted_root
+                or workdir.is_symlink()
+            ):
+                raise ValueError("controller snapshot cleanup target is unsafe")
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(trusted_source),
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(workdir),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+            pass
+        raise ValueError("controller source checkout changed during snapshot creation")
+    source_bindings_raw = ctx.state.get("_controller_review_source_bindings", "[]")
+    try:
+        source_bindings = json.loads(source_bindings_raw)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("controller source binding state is malformed") from exc
+    if not isinstance(source_bindings, list):
+        raise TypeError("controller source binding state is malformed")
+    source_bindings = [
+        {
+            "source_worktree": str(raw_source_workdir),
+            "fingerprint": source_fingerprint_before,
+            "untracked_files": source_state_before["untracked_files"],
+            "excluded_untracked_files": list(excluded_untracked),
+            "declared_evidence": source_state_before["declared_evidence"],
+        }
+    ]
+    ctx.state["_controller_review_source_bindings"] = json.dumps(
+        source_bindings, sort_keys=True, separators=(",", ":")
+    )
+    base_sha = _controller_base_sha(
+        node,
+        ctx,
         workdir,
-        "diff",
-        "--no-ext-diff",
-        "--binary",
-        f"{base_sha}..{expected_sha}",
-        allow_empty=True,
+        source_sha=source_head_sha,
+        head_sha=expected_sha,
     )
+    tree_sha = _git_output(workdir, "rev-parse", f"{expected_sha}^{{tree}}")
     changed_text = _git_output(
         workdir,
         "diff",
@@ -533,7 +928,6 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
         head_sha=expected_sha,
         tree_sha=tree_sha,
         task_text=task_text,
-        diff_text=diff_text,
         changed_files=tuple(changed),
         evidence=_controller_evidence(node, ctx, workdir),
         evidence_origin=evidence_origin,
@@ -543,7 +937,24 @@ def _controller_review_request(node: "Node", ctx: "Context", expected_sha: str):
         validate_immutable_target(inputs, holdout_roots=holdout_roots)
     except ReviewContractError as exc:
         raise ValueError(f"controller review target is not immutable: {exc}") from exc
-    return create_review_request(inputs)
+    frozen_bundle = build_frozen_review_bundle(inputs, holdout_roots=holdout_roots)
+    return create_review_request(inputs, frozen_bundle=frozen_bundle)
+
+
+def _validated_controller_source(ctx: Context) -> pathlib.Path:
+    """Validate the raw controller source before reading its Git HEAD."""
+    import runner.handlers as _handlers_shim
+
+    from .review_controller import ReviewContractError, validate_workspace_path
+
+    raw_source = _handlers_shim._target_worktree(ctx)
+    try:
+        return validate_workspace_path(
+            str(raw_source),
+            holdout_roots=tuple(_holdout_root_strings()),
+        )
+    except ReviewContractError as exc:
+        raise ValueError(f"controller review source is not immutable: {exc}") from exc
 
 
 def _holdout_root_strings() -> list[str]:
@@ -553,14 +964,184 @@ def _holdout_root_strings() -> list[str]:
     return [str(path) for path in _holdout_denied_paths()]
 
 
+def _controller_target_from_request(request):
+    """Return the authenticated envelope and its canonical target workspace.
+
+    The graph's source checkout is only used to create the request. Once the
+    request exists, controller transport boundaries must come from its
+    integrity-checked target envelope, which may be a detached snapshot.
+    ``_controller_review_request`` and post-review verification perform the
+    strict filesystem validation; this extraction only needs a canonical path
+    so a mocked request can exercise the dispatch path without a real target.
+    """
+    from .review_controller import (
+        ReviewContractError,
+        verify_request_integrity,
+    )
+
+    verify_request_integrity(request)
+    try:
+        envelope = json.loads(request.envelope_json)
+    except json.JSONDecodeError as exc:
+        raise ReviewContractError("request envelope is not valid JSON") from exc
+    if not isinstance(envelope, dict):
+        raise ReviewContractError("request envelope must be a JSON object")
+    target = envelope.get("target")
+    if not isinstance(target, dict):
+        raise ReviewContractError("request envelope target is invalid")
+    required = ("workspace_path", "head_sha", "tree_sha")
+    if any(not isinstance(target.get(key), str) or not target[key].strip() for key in required):
+        raise ReviewContractError("request envelope target is invalid")
+
+    # Keep the lexical path untouched until immutable-target validation. In
+    # particular, resolving here would erase a symlinked parent component and
+    # let post-review validation inspect a different path than the envelope.
+    return envelope, pathlib.Path(target["workspace_path"])
+
+
+def _controller_target_for_transport(request):
+    """Return the envelope and validated canonical path for a reviewer.
+
+    Real controller snapshots are validated strictly before transport. The
+    non-existent-path exception is retained only for unit fixtures that mock
+    request construction; a missing path cannot become a reviewer target.
+    """
+    from .review_controller import (
+        ReviewContractError,
+        ReviewInputs,
+        validate_immutable_target,
+    )
+
+    envelope, raw_workdir = _controller_target_from_request(request)
+    target = envelope["target"]
+    try:
+        workdir = validate_immutable_target(
+            ReviewInputs(
+                repository=str(target.get("repository", "controller-review")),
+                workspace_path=str(raw_workdir),
+                base_sha=target["head_sha"],
+                head_sha=target["head_sha"],
+                tree_sha=target["tree_sha"],
+                task_text="",
+            ),
+            holdout_roots=tuple(_holdout_root_strings()),
+        )
+    except ReviewContractError as exc:
+        if "does not resolve to an existing target" not in str(exc):
+            raise
+        workdir = raw_workdir.resolve(strict=False)
+    return envelope, workdir
+
+
 def _verify_controller_workspace(ctx: "Context", request) -> None:
     """Recompute frozen repository bindings after a reviewer lane returns."""
-    from .review_controller import ReviewContractError
+    from .review_controller import (
+        EvidenceArtifact,
+        ReviewContractError,
+        ReviewInputs,
+        validate_immutable_target,
+    )
 
-    envelope = json.loads(request.envelope_json)
+    envelope, raw_workdir = _controller_target_from_request(request)
     target = envelope["target"]
-    snapshots = envelope["snapshots"]
-    workdir = pathlib.Path(str(target["workspace_path"])).resolve()
+    evidence = tuple(
+        EvidenceArtifact(
+            path=str(item["path"]),
+            size_bytes=int(item["size_bytes"]),
+            sha256=str(item["sha256"]),
+        )
+        for item in envelope.get("evidence", [])
+    )
+    # Validate the raw envelope path before resolving it. This preserves the
+    # symlink-parent guard during post-review re-pin as well as request build.
+    workdir = validate_immutable_target(
+        ReviewInputs(
+            repository=str(target.get("repository", "controller-review")),
+            workspace_path=str(raw_workdir),
+            base_sha=str(target["head_sha"]),
+            head_sha=str(target["head_sha"]),
+            tree_sha=str(target["tree_sha"]),
+            task_text="",
+            evidence=evidence,
+        ),
+        holdout_roots=tuple(_holdout_root_strings()),
+    )
+    # The detached snapshot is immutable, but the worker checkout and its Git
+    # index remain mutable while a reviewer runs. Re-pin those source surfaces
+    # as well; otherwise a worker can alter the source after snapshot creation
+    # and still receive a pass for an older target.
+    if ctx is not None and isinstance(getattr(ctx, "state", None), dict):
+        raw_bindings = ctx.state.get("_controller_review_source_bindings", "[]")
+        try:
+            source_bindings = json.loads(raw_bindings)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ReviewContractError("controller source binding state is malformed") from exc
+        if not isinstance(source_bindings, list):
+            raise ReviewContractError("controller source binding state is malformed")
+        for binding in source_bindings:
+            if (
+                not isinstance(binding, dict)
+                or set(binding)
+                != {
+                    "source_worktree",
+                    "fingerprint",
+                    "untracked_files",
+                    "excluded_untracked_files",
+                    "declared_evidence",
+                }
+                or not isinstance(binding["source_worktree"], str)
+                or not isinstance(binding["fingerprint"], str)
+                or not isinstance(binding["untracked_files"], list)
+                or not isinstance(binding["excluded_untracked_files"], list)
+                or not isinstance(binding["declared_evidence"], list)
+            ):
+                raise ReviewContractError("controller source binding state is malformed")
+            try:
+                from .review_controller import validate_workspace_path
+
+                source = validate_workspace_path(
+                    binding["source_worktree"],
+                    holdout_roots=tuple(_holdout_root_strings()),
+                )
+                for item in binding["untracked_files"]:
+                    if (
+                        not isinstance(item, dict)
+                        or set(item) != {"path", "size_bytes", "sha256"}
+                        or not isinstance(item["path"], str)
+                        or not isinstance(item["size_bytes"], int)
+                        or not isinstance(item["sha256"], str)
+                    ):
+                        raise ReviewContractError("controller source binding state is malformed")
+                excluded = tuple(binding["excluded_untracked_files"])
+                if any(not isinstance(item, str) for item in excluded):
+                    raise ReviewContractError("controller source binding state is malformed")
+                declared_evidence: list[str] = []
+                for item in binding["declared_evidence"]:
+                    if (
+                        not isinstance(item, dict)
+                        or set(item) != {"path", "size_bytes", "sha256"}
+                        or not isinstance(item["path"], str)
+                        or not isinstance(item["size_bytes"], int)
+                        or not isinstance(item["sha256"], str)
+                    ):
+                        raise ReviewContractError("controller source binding state is malformed")
+                    declared_evidence.append(item["path"])
+                observed_state = _controller_source_state(
+                    source,
+                    excluded_untracked=excluded,
+                    declared_evidence_paths=tuple(declared_evidence),
+                )
+                observed = hashlib.sha256(
+                    json.dumps(
+                        observed_state, sort_keys=True, separators=(",", ":")
+                    ).encode("utf-8")
+                ).hexdigest()
+            except (ValueError, OSError, ReviewContractError) as exc:
+                raise ReviewContractError(
+                    f"controller source checkout revalidation failed: {exc}"
+                ) from exc
+            if observed != binding["fingerprint"]:
+                raise ReviewContractError("controller source checkout changed during review")
     status = subprocess.run(
 
         [
@@ -580,22 +1161,18 @@ def _verify_controller_workspace(ctx: "Context", request) -> None:
         raise ReviewContractError("reviewed workspace status could not be read")
     if status.stdout.strip():
         raise ReviewContractError("reviewed workspace is not clean")
+    # These two comparisons are the whole change check. `base_sha` is pinned in
+    # the envelope and `tree_sha` commits to every byte of the tree at
+    # `head_sha`, so if both still match, the reviewed `base..head` change is
+    # provably the one the reviewer was bound to. Re-deriving the change here
+    # and comparing its digest could only restate that, at the cost of pinning
+    # one byte-exact rendering of it.
     observed_head = _git_output(workdir, "rev-parse", "HEAD^{commit}").lower()
     observed_tree = _git_output(workdir, "rev-parse", "HEAD^{tree}").lower()
     if observed_head != target["head_sha"]:
         raise ReviewContractError("reviewed workspace head changed")
     if observed_tree != target["tree_sha"]:
         raise ReviewContractError("reviewed workspace tree changed")
-    diff_text = _git_output(
-        workdir,
-        "diff",
-        "--no-ext-diff",
-        "--binary",
-        f"{target['base_sha']}..{target['head_sha']}",
-        allow_empty=True,
-    )
-    if hashlib.sha256(diff_text.encode("utf-8")).hexdigest() != snapshots["diff"]["sha256"]:
-        raise ReviewContractError("reviewed diff changed")
     root = workdir.resolve()
     for artifact in envelope.get("evidence", []):
         path = (root / str(artifact["path"])).resolve()
@@ -619,16 +1196,18 @@ def _verify_controller_workspace(ctx: "Context", request) -> None:
 
 
 def _contract_adjusted_result(
-    result: "Result",
+    result: Result,
     request,
     ctx: "Context",
     *,
     lane: str,
-) -> "Result":
+    backend: str = "",
+) -> Result:
     """Fail closed when a lane omits or contradicts the controller contract."""
     from .review_controller import (
         ExecutionReceipt,
         ReviewContractError,
+        ReviewTransportReceipt,
         validate_execution_receipts,
         validate_review_response,
     )
@@ -642,19 +1221,52 @@ def _contract_adjusted_result(
         }
     )
     try:
+        raw_returncode = metadata.get("returncode")
+        if raw_returncode not in (None, ""):
+            try:
+                returncode = int(raw_returncode)
+            except (TypeError, ValueError) as exc:
+                raise ReviewContractError(
+                    f"review backend returned malformed exit code: {raw_returncode!r}"
+                ) from exc
+            if returncode != 0:
+                raise ReviewContractError(
+                    f"review backend exited with {returncode}"
+                )
         _verify_controller_workspace(ctx, request)
-        validated = validate_review_response(result.output or "", request)
-        raw_receipts = metadata.get("_controller_command_receipts") or []
-        receipts = tuple(
-            ExecutionReceipt(
-                command=str(item["command"]),
-                exit_code=int(item["exit_code"]),
-                output_sha256=str(item["output_sha256"]),
-            )
-            for item in raw_receipts
-            if isinstance(item, dict)
+        validated = validate_review_response(
+            result.output or "", request, tool_free=bool(request.bundle_sha256)
         )
-        validate_execution_receipts(receipts, validated)
+        if request.bundle_sha256:
+            raw_receipt = metadata.get("_controller_transport_receipt")
+            if not isinstance(raw_receipt, dict):
+                raise ReviewContractError("tool-free controller receipt is missing")
+            try:
+                receipt = ReviewTransportReceipt(**raw_receipt)
+            except (TypeError, ValueError) as exc:
+                raise ReviewContractError(
+                    "tool-free controller receipt is malformed"
+                ) from exc
+            expected = ReviewTransportReceipt.from_request(
+                request, response=result.output or "", transport="tool-free"
+            )
+            if receipt != expected or validated.commands_executed:
+                raise ReviewContractError("tool-free controller receipt is not bound to the response")
+        else:
+            raw_receipts = metadata.get("_controller_command_receipts") or []
+            receipts = tuple(
+                ExecutionReceipt(
+                    command=str(item["command"]),
+                    exit_code=int(item["exit_code"]),
+                    output_sha256=str(item["output_sha256"]),
+                )
+                for item in raw_receipts
+                if isinstance(item, dict)
+            )
+            validate_execution_receipts(receipts, validated)
+        from .review_controller import ensure_review_pass_allowed
+
+        ensure_review_pass_allowed(validated, backend=backend, execution_path="graph_controller")
     except ReviewContractError as exc:
         metadata["review_contract_status"] = "invalid"
         metadata["review_contract_gap"] = str(exc)
@@ -670,13 +1282,30 @@ def _contract_adjusted_result(
     metadata["review_contract_status"] = "valid"
     metadata["review_response_sha256"] = validated.response_sha256
     metadata["verdict"] = validated.verdict
+    context_updates = dict(result.context_updates)
+    if validated.verdict == "pass":
+        envelope = json.loads(request.envelope_json)
+        target = envelope["target"]
+        context_updates["_last_validated_head_sha"] = str(target["head_sha"])
+        # Mark this state as contract-owned so exit can distinguish a missing
+        # binding (fail closed) from legacy gates that only pin HEAD.
+        context_updates["_verified_review_target_required"] = "true"
+        context_updates["_verified_review_target"] = json.dumps(
+            {
+                "workspace_path": str(target["workspace_path"]),
+                "head_sha": str(target["head_sha"]),
+                "tree_sha": str(target["tree_sha"]),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     return Result(
         outcome="success" if validated.verdict == "pass" else "failure",
         output=result.output,
         metadata=metadata,
         preferred_label=result.preferred_label,
         suggested_next_ids=result.suggested_next_ids,
-        context_updates=result.context_updates,
+        context_updates=context_updates,
     )
 
 
@@ -854,11 +1483,105 @@ class _MDToCtxShim:
         }
 
 
-def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
+def _persist_controller_lane(
+    result: Result,
+    request,
+    *,
+    lane: str,
+    output_dir: pathlib.Path,
+    neutral_cwd: pathlib.Path,
+    transport_text: str = "",
+    transport_argv: tuple[str, ...] = (),
+    response_text: str | None = None,
+) -> Result:
+    """Persist one graph lane through the canonical controller artifact seam."""
+    from .review_controller import (
+        ExecutionReceipt,
+        ReviewContractError,
+        ReviewTransportReceipt,
+        persist_controller_lane_artifacts,
+    )
+
+    metadata = dict(result.metadata or {})
+    runtime_root = metadata.pop("_controller_runtime_root", "")
+    raw_receipts = metadata.get("_controller_command_receipts") or []
+    receipts = tuple(
+        ExecutionReceipt(
+            command=str(item.get("command", "")),
+            exit_code=int(item.get("exit_code", -1)),
+            output_sha256=str(item.get("output_sha256", "")),
+        )
+        for item in raw_receipts
+        if isinstance(item, dict)
+    )
+    raw_returncode = metadata.get("returncode", -1)
+    try:
+        # Preserve an actual zero: ``0 or -1`` would incorrectly record a
+        # successful controller transport as an infrastructure failure.
+        returncode = -1 if raw_returncode in (None, "") else int(raw_returncode)
+    except (TypeError, ValueError):
+        returncode = -1
+    status = str(metadata.get("review_contract_status", "invalid"))
+    verdict = str(metadata.get("verdict", "unknown"))
+    raw_transport_receipt = metadata.get("_controller_transport_receipt")
+    if raw_transport_receipt is None:
+        transport_receipt = None
+    elif isinstance(raw_transport_receipt, dict):
+        try:
+            transport_receipt = ReviewTransportReceipt(**raw_transport_receipt)
+        except (TypeError, ValueError) as exc:
+            raise ReviewContractError("tool-free controller receipt is malformed") from exc
+    else:
+        raise ReviewContractError("tool-free controller receipt is malformed")
+    cleanup_error = ""
+    try:
+        paths = persist_controller_lane_artifacts(
+            request,
+            output_dir=output_dir,
+            lane=lane,
+            backend=str(metadata.get("reviewer_backend", "codex")),
+            neutral_cwd=neutral_cwd,
+            transport_argv=transport_argv,
+            transport_text=transport_text,
+            response_text=result.output if response_text is None else response_text,
+            backend_returncode=returncode,
+            status=status,
+            verdict=verdict,
+            contract_error=str(metadata.get("review_contract_gap", "")),
+            receipts=receipts,
+            transport_receipt=transport_receipt,
+        )
+    finally:
+        if runtime_root:
+            try:
+                from .handler_sandbox import _cleanup_controller_runtime
+
+                _cleanup_controller_runtime(pathlib.Path(runtime_root))
+            except Exception as exc:  # noqa: BLE001 - cleanup reports boundary failures
+                cleanup_error = f"{type(exc).__name__}: {exc}"
+    if cleanup_error:
+        metadata["controller_runtime_cleanup_error"] = cleanup_error
+    metadata.update({f"controller_{lane}_{key}_path": value for key, value in paths.items()})
+    metadata[f"controller_{lane}_artifact_status"] = "persisted"
+    # Raw transport is retained only long enough to reach the writer. Do not
+    # copy the complete JSONL transcript into engine state or CXDB metadata.
+    metadata.pop("_controller_transport_text", None)
+    metadata.pop("_controller_transport_argv", None)
+    return Result(
+        outcome="error" if cleanup_error else result.outcome,
+        output=result.output,
+        metadata=metadata,
+        preferred_label=result.preferred_label,
+        suggested_next_ids=result.suggested_next_ids,
+        context_updates=result.context_updates,
+    )
+
+
+def _parallel_reviewer_impl(node: "Node", ctx: "Context") -> "Result":
     """Run parallel reviewer lanes and pass combined evidence downstream."""
     import runner.handlers as _handlers_shim  # late-bound shim for monkeypatched helpers
     review_contract = str(node.attrs.get("review_contract") or "").strip()
-    if ctx.backend in ("echo", "mock_llm"):
+    if not review_contract and ctx.backend in ("echo", "mock_llm"):
         hint = ctx.state.get(f"{node.name}.outcome", "success")
         return Result(
             outcome=hint,
@@ -870,10 +1593,25 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
                 "parallel_reviewer": "echo",
             },
         )
-    target_dir = _handlers_shim._target_worktree(ctx)
-    expected_sha = _handlers_shim._worktree_head_sha(target_dir)
+    if review_contract == "cold-review-v1" and _controller_fixture_enabled(node, ctx):
+        hint = ctx.state.get(f"{node.name}.outcome", "success")
+        return Result(
+            outcome=hint,
+            output=f"fixture parallel reviewer {node.name}: pre-seeded {hint}",
+            metadata={
+                "slash_command": node.name,
+                "verdict": "fixture:" + str(hint),
+                "reviewer_backend": str(ctx.backend),
+                "parallel_reviewer": "fixture",
+                "review_contract": review_contract,
+                "review_contract_status": "fixture",
+            },
+        )
+    target_dir = None
+    expected_sha = ""
 
     request = None
+    controller_read_only_path = None
     if review_contract:
         if review_contract != "cold-review-v1":
             return Result(
@@ -882,8 +1620,13 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
                 metadata={"review_contract_status": "unknown"},
             )
         try:
+            # The lexical source guard must run before any target-owned Git
+            # lookup. Canonicalize only after that validation succeeds.
+            target_dir = _validated_controller_source(ctx)
+            expected_sha = _handlers_shim._worktree_head_sha(target_dir)
             request = _controller_review_request(node, ctx, expected_sha)
             expected_sha = request.head_sha
+            _, controller_read_only_path = _controller_target_for_transport(request)
         except Exception as exc:
             return Result(
                 outcome="error",
@@ -901,16 +1644,15 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
             / node.name
             / str(int(getattr(ctx, "_df_current_attempt", 1)))
         )
-        neutral_cwd.mkdir(parents=True, exist_ok=True)
+        neutral_cwd.mkdir(parents=True, exist_ok=True, mode=0o700)
         ctx.state["_df_controller_review_cwd"] = str(neutral_cwd)
         # Per-lane output directories so primary + every shadow write to
         # distinct cwd/output_dir paths (the controller review contract
         # requires this).
-        ctx.state["_df_controller_review_lane_dirs"] = {
-            "primary": str(lane_output_dir(neutral_cwd, "primary")),
-        }
         prompt = request.prompt
     else:
+        target_dir = _handlers_shim._target_worktree(ctx)
+        expected_sha = _handlers_shim._worktree_head_sha(target_dir)
         prompt = _handlers_shim._render_prompt(node, ctx)
     backend, backend_meta = _resolve_gate_backend(node, ctx)
 
@@ -923,9 +1665,23 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     # Determine shadow lanes BEFORE running primary so Popen launches happen
     # before primary (and before any communicate()). True concurrency.
     shadow_backends = _parse_shadow_backends(ctx)
+    configured_shadow_backends = list(shadow_backends)
+    if not configured_shadow_backends and _shadow_codex_review_enabled(ctx):
+        configured_shadow_backends = ["codex"]
+    if request is not None:
+        lane_dirs = {"primary": str(lane_output_dir(neutral_cwd, "primary"))}
+        for index, shadow_backend in enumerate(configured_shadow_backends):
+            suffix = f"shadow_{shadow_backend}" if configured_shadow_backends.count(shadow_backend) == 1 else f"shadow_{shadow_backend}_{index}"
+            lane_dirs[suffix] = str(lane_output_dir(neutral_cwd, suffix))
+        ctx.state["_df_controller_review_lane_dirs"] = json.dumps(
+            lane_dirs, sort_keys=True, separators=(",", ":")
+        )
     shadows = []
+    if request is not None:
+        ctx.state["_df_controller_review_request"] = request
     if shadow_backends:
-        for b in shadow_backends:
+        for index, b in enumerate(shadow_backends):
+            suffix = f"shadow_{b}" if configured_shadow_backends.count(b) == 1 else f"shadow_{b}_{index}"
             shadows.append(_launch_shadow_gate_review(
                 node.name,
                 prompt,
@@ -934,6 +1690,8 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
                 ctx,
                 backend=b,
                 prompt_is_complete=request is not None,
+                read_only_path=controller_read_only_path,
+                lane_name=suffix,
             ))
     elif _shadow_codex_review_enabled(ctx):
         s = _start_shadow_gate_review(
@@ -943,6 +1701,8 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
             timeout,
             ctx,
             prompt_is_complete=request is not None,
+            read_only_path=controller_read_only_path,
+            lane_name="shadow_codex",
         )
         if s:
             shadows.append(s)
@@ -951,6 +1711,8 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     if request is not None:
         ctx.state["_df_controller_review_json"] = "true"
     try:
+        if request is not None:
+            ctx.state["_df_controller_review_request"] = request
         primary = _run_primary_review(
             prompt,
             expected_sha,
@@ -959,6 +1721,7 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
             node.name,
             backend,
             gate_strict=gate_strict,
+            read_only_path=controller_read_only_path,
         )
     finally:
         if prior_controller_json is None:
@@ -976,6 +1739,16 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
             request,
             ctx,
             lane="primary",
+            backend=backend,
+        )
+        primary = _persist_controller_lane(
+            primary,
+            request,
+            lane="primary",
+            output_dir=pathlib.Path(lane_dirs["primary"]),
+            neutral_cwd=neutral_cwd,
+            transport_text=str(primary.metadata.pop("_controller_transport_text", "")),
+            transport_argv=tuple(primary.metadata.pop("_controller_transport_argv", []) or []),
         )
 
     if not shadows:
@@ -1024,7 +1797,7 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
         else:
             primary_lane_outcome = primary.outcome
         shadow_lane_outcomes.append(primary_lane_outcome)
-    for shadow in shadows:
+    for shadow_index, shadow in enumerate(shadows):
         result = _finish_shadow_gate_review(result, shadow, node.name, expected_sha, timeout, ctx)
         if request is not None:
             shadow_output = str(
@@ -1054,11 +1827,20 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
                             f"shadow_{shadow.backend}_gate_command_receipts",
                             [],
                         ),
+                        "_controller_transport_receipt": result.metadata.get(
+                            f"shadow_{shadow.backend}_gate_transport_receipt"
+                        ),
+                        "returncode": result.metadata.get(
+                            f"shadow_{shadow.backend}_gate_returncode",
+                            "",
+                        ),
+                        "reviewer_backend": shadow.backend,
                     },
                 ),
                 request,
                 ctx,
                 lane=f"shadow_{shadow.backend}",
+                backend=str(shadow.backend),
             )
             md = dict(result.metadata)
             md[f"shadow_{shadow.backend}_gate_outcome"] = shadow_contract_result.outcome
@@ -1072,6 +1854,29 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
                 md[f"shadow_{shadow.backend}_review_contract_gap"] = str(
                     shadow_contract_result.metadata["review_contract_gap"]
                 )
+            result = Result(
+                outcome=result.outcome,
+                output=result.output,
+                metadata=md,
+                preferred_label=result.preferred_label,
+                suggested_next_ids=result.suggested_next_ids,
+                context_updates=result.context_updates,
+            )
+            shadow_lane = shadow.lane_name or f"shadow_{shadow.backend}"
+            shadow_contract_result = _persist_controller_lane(
+                shadow_contract_result,
+                request,
+                lane=shadow_lane,
+                output_dir=pathlib.Path(lane_dirs[shadow_lane]),
+                neutral_cwd=neutral_cwd,
+                transport_text=shadow.transport_text,
+                transport_argv=shadow.transport_argv,
+                response_text=shadow.response_text or shadow_output,
+            )
+            md = dict(result.metadata)
+            for key, value in shadow_contract_result.metadata.items():
+                if key.startswith("controller_"):
+                    md[key] = value
             result = Result(
                 outcome=result.outcome,
                 output=result.output,
@@ -1158,5 +1963,20 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     ):
         final_result = _enforce_reproduction_receipt(
             final_result, expected_sha=expected_sha,
-        )
+    )
     return final_result
+
+
+def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
+    """Run controller lanes and clear the authenticated request afterward.
+
+    The request must remain in context while every shadow lane is drained and
+    its tool-free terminal receipt is validated.  Keeping cleanup in this
+    outer wrapper also clears the request when a primary or shadow lane
+    returns a failure result or raises during execution.
+    """
+    try:
+        return _parallel_reviewer_impl(node, ctx)
+    finally:
+        if isinstance(getattr(ctx, "state", None), dict):
+            ctx.state.pop("_df_controller_review_request", None)
