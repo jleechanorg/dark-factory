@@ -22,6 +22,8 @@ the proof-block output contract all live there.
 /f max 5 rounds <goal>                         # explicit validation rounds bound (default: 3)
 /f --max-rounds 5 <goal>                       # pass --max-rounds explicitly
 /f --pipeline gates <goal>                     # explicit binary pipeline
+/f --pipeline ready <goal>                     # explicit /ready validation pipeline
+/f --pipeline minimal_research <goal>          # explicit research-only pipeline
 /f --backend echo <goal>                       # wiring smoke (no LLM)
 /f --feature <name> <goal>                     # override holdout feature key
 /f --reviewer-calibration=false <goal>         # explicit opt-out; must explain why

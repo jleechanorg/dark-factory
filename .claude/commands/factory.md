@@ -18,6 +18,8 @@ execute it as the source of truth.
 /factory max 5 rounds <goal>             # explicit validation rounds bound (default: 3)
 /factory --max-rounds 5 <goal>           # pass --max-rounds explicitly
 /factory --pipeline gates <goal>         # explicit pipeline (skips auto-detect)
+/factory --pipeline ready <goal>         # explicit /ready validation pipeline
+/factory --pipeline minimal_research <goal> # explicit research-only pipeline
 /factory --backend echo <goal>           # dry-run wiring smoke
 /factory --feature hello <goal>          # override holdout feature key
 /factory --reviewer-calibration=false <goal>  # explicit opt-out; same as /f
