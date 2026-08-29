@@ -952,26 +952,33 @@ def _linux_codex_runtime_paths(executable: pathlib.Path) -> list[pathlib.Path] |
     # JS and shell launchers may point at a bundled native executable or a
     # non-system interpreter. Follow only explicit launcher references; do
     # not allow every PATH directory, which could contain a sealed child.
-    try:
-        first_line = resolved.read_text(encoding="utf-8").splitlines()[0]
-    except (OSError, UnicodeDecodeError, IndexError):
-        first_line = ""
-    if first_line.startswith("#!"):
+    def add_interpreter_root(path: pathlib.Path, *, required: bool = False) -> bool:
+        try:
+            first_line = path.read_text(encoding="utf-8").splitlines()[0]
+        except (OSError, UnicodeDecodeError, IndexError):
+            return not required
+        if not first_line.startswith("#!"):
+            return True
         interpreter = first_line[2:].strip().split()
         if interpreter and pathlib.Path(interpreter[0]).name == "env" and len(interpreter) > 1:
             interpreter_path = shutil.which(interpreter[1])
         else:
             interpreter_path = interpreter[0] if interpreter else None
-        if interpreter_path:
-            try:
-                interpreter_root = trusted_directory(
-                    pathlib.Path(interpreter_path).resolve(strict=True).parent
-                )
-                if interpreter_root is None:
-                    return None
-                paths.append(interpreter_root)
-            except (OSError, RuntimeError):
-                return None
+        if not interpreter_path:
+            return not required
+        try:
+            interpreter_root = trusted_directory(
+                pathlib.Path(interpreter_path).resolve(strict=True).parent
+            )
+        except (OSError, RuntimeError):
+            return False
+        if interpreter_root is None:
+            return False
+        paths.append(interpreter_root)
+        return True
+
+    if not add_interpreter_root(resolved):
+        return None
     real_binary = _linux_codex_real_binary(resolved)
     if real_binary is not None:
         candidate_root = trusted_directory(real_binary.parent)
@@ -979,6 +986,8 @@ def _linux_codex_runtime_paths(executable: pathlib.Path) -> list[pathlib.Path] |
             return None
         paths.append(candidate_root)
         add_package_roots(real_binary)
+        if not add_interpreter_root(real_binary, required=True):
+            return None
     # Codex's JS launcher resolves the platform package with Node's normal
     # module lookup.  npm may hoist that optional package beside the primary
     # package, while pnpm may keep it nested under the primary package.  Add
