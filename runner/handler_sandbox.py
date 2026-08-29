@@ -954,11 +954,17 @@ def _linux_codex_runtime_paths(executable: pathlib.Path) -> list[pathlib.Path] |
     # not allow every PATH directory, which could contain a sealed child.
     def add_interpreter_root(path: pathlib.Path, *, required: bool = False) -> bool:
         try:
-            first_line = path.read_text(encoding="utf-8").splitlines()[0]
-        except (OSError, UnicodeDecodeError, IndexError):
+            with path.open("rb") as stream:
+                prefix = stream.read(2)
+                if prefix != b"#!":
+                    return True
+                first_line = prefix + stream.readline()
+        except OSError:
             return not required
-        if not first_line.startswith("#!"):
-            return True
+        try:
+            first_line = first_line.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
         interpreter = first_line[2:].strip().split()
         if interpreter and pathlib.Path(interpreter[0]).name == "env" and len(interpreter) > 1:
             interpreter_path = shutil.which(interpreter[1])

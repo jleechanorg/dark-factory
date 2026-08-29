@@ -468,6 +468,57 @@ def test_controller_transport_allows_real_codex_js_interpreter_from_service_path
 
 
 @linux_only
+def test_controller_transport_accepts_native_real_codex_without_interpreter(
+    tmp_path, monkeypatch
+):
+    """A native REAL_BIN must not require text-readable interpreter metadata."""
+    wrapper_dir = tmp_path / "local-bin"
+    wrapper_dir.mkdir()
+    wrapper = wrapper_dir / "codex"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        "REAL_BIN=/usr/bin/true\n"
+        "exec \"$HOME/.local/libexec/codex\" \"$@\"\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    private_home = tmp_path / "private-home"
+    private_home.mkdir()
+    sealed = tmp_path / "sealed"
+    sealed.mkdir()
+    service_path = f"{wrapper_dir}:/usr/bin:/bin"
+    monkeypatch.setenv("PATH", service_path)
+    observed: dict[str, object] = {}
+
+    def fake_landlock(**kwargs):
+        observed.update(kwargs)
+        return ["/usr/bin/env", f"DENY_PATHS={sealed}"]
+
+    monkeypatch.setattr(
+        "runner.handlers._linux_controller_sandbox_prefix", fake_landlock
+    )
+    transport = _build_controller_codex_transport(
+        ["/usr/bin/env", f"DENY_PATHS={sealed}", "codex", "exec", "--yolo", "PROMPT"],
+        read_only_path=tmp_path,
+    )
+    proc = subprocess.run(
+        transport,
+        cwd=tmp_path,
+        env={"HOME": str(private_home), "PATH": service_path},
+        input="{}\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert str(pathlib.Path("/usr/bin/true")) in transport
+    read_paths = observed["read_paths"]
+    assert isinstance(read_paths, list)
+    assert pathlib.Path("/usr/bin") in read_paths
+
+
+@linux_only
 def test_codex_runtime_allows_private_primary_group_directory(tmp_path, monkeypatch):
     from types import SimpleNamespace
 
