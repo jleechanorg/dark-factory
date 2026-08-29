@@ -336,6 +336,189 @@ def test_codex_js_launcher_rejects_mutable_native_runtime_root(tmp_path):
 
 
 @linux_only
+def test_controller_transport_uses_declared_real_codex_with_private_home(
+    tmp_path, monkeypatch
+):
+    """A PATH wrapper must not resolve its real Codex through private HOME."""
+    wrapper_dir = tmp_path / "bin"
+    wrapper_dir.mkdir()
+    wrapper = wrapper_dir / "codex"
+    real_codex = tmp_path / "libexec" / "codex"
+    real_codex.parent.mkdir()
+    real_codex.write_text(
+        "#!/bin/sh\n"
+        "printf REAL-CODEX-RAN\\n\n",
+        encoding="utf-8",
+    )
+    real_codex.chmod(0o755)
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        f"REAL_BIN={real_codex}\n"
+        "exec \"$HOME/.local/libexec/codex\" \"$@\"\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    private_home = tmp_path / "private-home"
+    private_home.mkdir()
+    sealed = tmp_path / "sealed"
+    sealed.mkdir()
+    monkeypatch.setenv("PATH", f"{wrapper_dir}:/usr/bin:/bin")
+    monkeypatch.setattr(
+        "runner.handlers._linux_controller_sandbox_prefix",
+        lambda **kwargs: ["/usr/bin/env", f"DENY_PATHS={sealed}"],
+    )
+
+    transport = _build_controller_codex_transport(
+        ["/usr/bin/env", f"DENY_PATHS={sealed}", "codex", "exec", "--yolo", "PROMPT"],
+        read_only_path=tmp_path,
+    )
+    proc = subprocess.run(
+        transport,
+        cwd=tmp_path,
+        env={"HOME": str(private_home), "PATH": f"{wrapper_dir}:/usr/bin:/bin"},
+        input="{}\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    # The current transport executes bare ``codex`` and therefore runs the
+    # wrapper under private HOME, which exits 127 on Linux (126 on macOS's
+    # shell).  It must instead invoke this trusted target.
+    assert proc.returncode == 0, proc.stderr
+    assert "REAL-CODEX-RAN" in proc.stdout
+    assert str(real_codex) in transport
+
+
+@linux_only
+def test_controller_transport_allows_real_codex_js_interpreter_from_service_path(
+    tmp_path, monkeypatch
+):
+    """Landlock must allow the env-resolved Node interpreter of REAL_BIN."""
+    wrapper_dir = tmp_path / "local-bin"
+    wrapper_dir.mkdir()
+    node_dir = tmp_path / "nvm" / "versions" / "node" / "v22.22.0" / "bin"
+    node_dir.mkdir(parents=True)
+    node = node_dir / "node"
+    node.write_text(
+        "#!/bin/sh\n"
+        "printf NODE-RUNTIME-RAN\\n\n",
+        encoding="utf-8",
+    )
+    node.chmod(0o755)
+    real_codex = (
+        tmp_path
+        / "npm-global"
+        / "lib"
+        / "node_modules"
+        / "@openai"
+        / "codex"
+        / "bin"
+        / "codex.js"
+    )
+    real_codex.parent.mkdir(parents=True)
+    real_codex.write_text(
+        "#!/usr/bin/env node\n"
+        "// controller entrypoint\n",
+        encoding="utf-8",
+    )
+    real_codex.chmod(0o755)
+    wrapper = wrapper_dir / "codex"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        f"REAL_BIN={real_codex}\n"
+        "exec \"$HOME/.local/libexec/codex\" \"$@\"\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    private_home = tmp_path / "private-home"
+    private_home.mkdir()
+    sealed = tmp_path / "sealed"
+    sealed.mkdir()
+    service_path = f"{wrapper_dir}:{node_dir}:/usr/bin:/bin"
+    monkeypatch.setenv("PATH", service_path)
+    observed: dict[str, object] = {}
+
+    def fake_landlock(**kwargs):
+        observed.update(kwargs)
+        return ["/usr/bin/env", f"DENY_PATHS={sealed}"]
+
+    monkeypatch.setattr(
+        "runner.handlers._linux_controller_sandbox_prefix", fake_landlock
+    )
+    transport = _build_controller_codex_transport(
+        ["/usr/bin/env", f"DENY_PATHS={sealed}", "codex", "exec", "--yolo", "PROMPT"],
+        read_only_path=tmp_path,
+    )
+    proc = subprocess.run(
+        transport,
+        cwd=tmp_path,
+        env={"HOME": str(private_home), "PATH": service_path},
+        input="{}\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "NODE-RUNTIME-RAN" in proc.stdout
+    read_paths = observed["read_paths"]
+    assert isinstance(read_paths, list)
+    assert node_dir.resolve() in read_paths
+
+
+@linux_only
+def test_controller_transport_accepts_native_real_codex_without_interpreter(
+    tmp_path, monkeypatch
+):
+    """A native REAL_BIN must not require text-readable interpreter metadata."""
+    wrapper_dir = tmp_path / "local-bin"
+    wrapper_dir.mkdir()
+    wrapper = wrapper_dir / "codex"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        "REAL_BIN=/usr/bin/true\n"
+        "exec \"$HOME/.local/libexec/codex\" \"$@\"\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    private_home = tmp_path / "private-home"
+    private_home.mkdir()
+    sealed = tmp_path / "sealed"
+    sealed.mkdir()
+    service_path = f"{wrapper_dir}:/usr/bin:/bin"
+    monkeypatch.setenv("PATH", service_path)
+    observed: dict[str, object] = {}
+
+    def fake_landlock(**kwargs):
+        observed.update(kwargs)
+        return ["/usr/bin/env", f"DENY_PATHS={sealed}"]
+
+    monkeypatch.setattr(
+        "runner.handlers._linux_controller_sandbox_prefix", fake_landlock
+    )
+    transport = _build_controller_codex_transport(
+        ["/usr/bin/env", f"DENY_PATHS={sealed}", "codex", "exec", "--yolo", "PROMPT"],
+        read_only_path=tmp_path,
+    )
+    proc = subprocess.run(
+        transport,
+        cwd=tmp_path,
+        env={"HOME": str(private_home), "PATH": service_path},
+        input="{}\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert str(pathlib.Path("/usr/bin/true")) in transport
+    read_paths = observed["read_paths"]
+    assert isinstance(read_paths, list)
+    assert pathlib.Path("/usr/bin") in read_paths
+
+
+@linux_only
 def test_codex_runtime_allows_private_primary_group_directory(tmp_path, monkeypatch):
     from types import SimpleNamespace
 
