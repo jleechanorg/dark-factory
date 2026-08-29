@@ -860,6 +860,28 @@ def _reset_linux_landlock_launcher_cache_for_tests() -> None:
     _linux_landlock_launcher_checked = False
 
 
+def _linux_codex_real_binary(executable: pathlib.Path) -> pathlib.Path | None:
+    """Resolve a trusted launcher declaration to an absolute executable."""
+    try:
+        resolved = executable.resolve(strict=True)
+        for line in resolved.read_text(encoding="utf-8").splitlines():
+            if line.startswith("REAL_BIN="):
+                candidate = line.split("=", 1)[1].strip()
+            elif "real-bin:" in line:
+                candidate = line.split("real-bin:", 1)[1].strip()
+            else:
+                continue
+            candidate_path = pathlib.Path(candidate)
+            if not candidate_path.is_absolute():
+                continue
+            candidate_path = candidate_path.resolve(strict=True)
+            if candidate_path.is_file() and candidate_path.stat().st_mode & stat.S_IXUSR:
+                return candidate_path
+    except (OSError, UnicodeDecodeError, RuntimeError):
+        return None
+    return None
+
+
 def _linux_codex_runtime_paths(executable: pathlib.Path) -> list[pathlib.Path] | None:
     """Return exact installed Codex roots needed by a JS/native launcher."""
     try:
@@ -950,21 +972,13 @@ def _linux_codex_runtime_paths(executable: pathlib.Path) -> list[pathlib.Path] |
                 paths.append(interpreter_root)
             except (OSError, RuntimeError):
                 return None
-    try:
-        for line in resolved.read_text(encoding="utf-8").splitlines():
-            if "real-bin:" not in line and not line.startswith("REAL_BIN="):
-                continue
-            candidate = line.split(":", 1)[1].strip() if "real-bin:" in line else line.split("=", 1)[1].strip()
-            candidate_path = pathlib.Path(candidate)
-            if candidate_path.is_file():
-                candidate_path = candidate_path.resolve(strict=True)
-                candidate_root = trusted_directory(candidate_path.parent)
-                if candidate_root is None:
-                    return None
-                paths.append(candidate_root)
-                add_package_roots(candidate_path)
-    except (OSError, UnicodeDecodeError, RuntimeError):
-        return None
+    real_binary = _linux_codex_real_binary(resolved)
+    if real_binary is not None:
+        candidate_root = trusted_directory(real_binary.parent)
+        if candidate_root is None:
+            return None
+        paths.append(candidate_root)
+        add_package_roots(real_binary)
     # Codex's JS launcher resolves the platform package with Node's normal
     # module lookup.  npm may hoist that optional package beside the primary
     # package, while pnpm may keep it nested under the primary package.  Add

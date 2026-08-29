@@ -336,6 +336,61 @@ def test_codex_js_launcher_rejects_mutable_native_runtime_root(tmp_path):
 
 
 @linux_only
+def test_controller_transport_uses_declared_real_codex_with_private_home(
+    tmp_path, monkeypatch
+):
+    """A PATH wrapper must not resolve its real Codex through private HOME."""
+    wrapper_dir = tmp_path / "bin"
+    wrapper_dir.mkdir()
+    wrapper = wrapper_dir / "codex"
+    real_codex = tmp_path / "libexec" / "codex"
+    real_codex.parent.mkdir()
+    real_codex.write_text(
+        "#!/bin/sh\n"
+        "printf REAL-CODEX-RAN\\n\n",
+        encoding="utf-8",
+    )
+    real_codex.chmod(0o755)
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        f"REAL_BIN={real_codex}\n"
+        "exec \"$HOME/.local/libexec/codex\" \"$@\"\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    private_home = tmp_path / "private-home"
+    private_home.mkdir()
+    sealed = tmp_path / "sealed"
+    sealed.mkdir()
+    monkeypatch.setenv("PATH", f"{wrapper_dir}:/usr/bin:/bin")
+    monkeypatch.setattr(
+        "runner.handlers._linux_controller_sandbox_prefix",
+        lambda **kwargs: ["/usr/bin/env", f"DENY_PATHS={sealed}"],
+    )
+
+    transport = _build_controller_codex_transport(
+        ["/usr/bin/env", f"DENY_PATHS={sealed}", "codex", "exec", "--yolo", "PROMPT"],
+        read_only_path=tmp_path,
+    )
+    proc = subprocess.run(
+        transport,
+        cwd=tmp_path,
+        env={"HOME": str(private_home), "PATH": f"{wrapper_dir}:/usr/bin:/bin"},
+        input="{}\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    # The current transport executes bare ``codex`` and therefore runs the
+    # wrapper under private HOME, which exits 127 on Linux (126 on macOS's
+    # shell).  It must instead invoke this trusted target.
+    assert proc.returncode == 0, proc.stderr
+    assert "REAL-CODEX-RAN" in proc.stdout
+    assert str(real_codex) in transport
+
+
+@linux_only
 def test_codex_runtime_allows_private_primary_group_directory(tmp_path, monkeypatch):
     from types import SimpleNamespace
 

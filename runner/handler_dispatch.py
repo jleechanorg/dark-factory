@@ -764,14 +764,22 @@ def _build_controller_codex_transport(
                 )
         if not denied_paths:
             raise ValueError("controller Linux transport lacks holdout denial paths")
+        from . import handler_sandbox as _sandbox
+
         executable = prepared[codex_index]
         resolved_executable = (
             shutil.which(executable) if pathlib.Path(executable).name == "codex" else executable
         ) or executable
-        executable_path = pathlib.Path(resolved_executable)
-        runtime_paths = _handlers_shim._linux_codex_runtime_paths(executable_path)
+        launcher_path = pathlib.Path(resolved_executable)
+        runtime_paths = _handlers_shim._linux_codex_runtime_paths(launcher_path)
         if runtime_paths is None:
             raise ValueError("controller Linux transport cannot resolve Codex runtime")
+        real_binary = _sandbox._linux_codex_real_binary(launcher_path)
+        if real_binary is not None:
+            executable = str(real_binary)
+            executable_path = real_binary
+        else:
+            executable_path = launcher_path
         landlock_prefix = _handlers_shim._linux_controller_sandbox_prefix(
             denied_paths=denied_paths,
             read_paths=[
