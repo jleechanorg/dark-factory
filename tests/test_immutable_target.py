@@ -722,7 +722,7 @@ class ControllerSnapshotTests(unittest.TestCase):
                     "--backend",
                     "echo",
                     "--max-steps",
-                    "4",
+                    "6",
                     "--checkpoint",
                     str(checkpoint),
                     "--evidence-bundle",
