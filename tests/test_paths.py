@@ -125,3 +125,43 @@ def test_resolve_pipeline_no_match_returns_resolved_candidate(tmp_path, monkeypa
     # No files anywhere — both workdir, subdir, and factory home are empty.
     resolved = resolve_pipeline_path("does_not_exist.dot", workdir=tmp_path)
     assert resolved == (tmp_path / "does_not_exist.dot").resolve()
+
+
+def test_resolve_pipeline_short_alias_ready_finds_slim_ready(tmp_path, monkeypatch):
+    """Short alias 'ready' resolves to pipelines/slim/ready.dot under factory home."""
+    home = tmp_path / "factory_home"
+    ready_dot = _write(home / "pipelines" / "slim" / "ready.dot")
+    monkeypatch.setenv("DARK_FACTORY_HOME", str(home))
+
+    target_repo = tmp_path / "target_repo"
+    target_repo.mkdir()
+    monkeypatch.chdir(target_repo)
+
+    resolved = resolve_pipeline_path("ready", workdir=target_repo)
+    assert resolved == ready_dot.resolve()
+
+    resolved_ext = resolve_pipeline_path("ready.dot", workdir=target_repo)
+    assert resolved_ext == ready_dot.resolve()
+
+
+def test_resolve_pipeline_short_alias_target_repo_precedence(tmp_path, monkeypatch):
+    """Target repo's local ready.dot or dark-factory/pipelines/ready.dot takes precedence over factory alias."""
+    home = tmp_path / "factory_home"
+    factory_ready = _write(home / "pipelines" / "slim" / "ready.dot", "digraph factory_ready {}")
+    monkeypatch.setenv("DARK_FACTORY_HOME", str(home))
+
+    # 1. Target repo dark-factory/pipelines/ready.dot beats factory default
+    target_repo = tmp_path / "target_repo"
+    repo_subdir_ready = _write(target_repo / "dark-factory" / "pipelines" / "ready.dot", "digraph repo_ready {}")
+    monkeypatch.chdir(target_repo)
+
+    resolved = resolve_pipeline_path("ready", workdir=target_repo)
+    assert resolved == repo_subdir_ready.resolve()
+    assert resolved != factory_ready.resolve()
+
+    # 2. Target repo root ready.dot beats target repo dark-factory/pipelines/ready.dot
+    repo_root_ready = _write(target_repo / "ready.dot", "digraph root_ready {}")
+    resolved2 = resolve_pipeline_path("ready", workdir=target_repo)
+    assert resolved2 == repo_root_ready.resolve()
+    assert resolved2 != repo_subdir_ready.resolve()
+

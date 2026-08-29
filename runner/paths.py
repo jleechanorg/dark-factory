@@ -6,6 +6,23 @@ import os
 import pathlib
 
 
+SHORT_PIPELINE_ALIASES: dict[str, str] = {
+    "two_node": "pipelines/slim/two_node.dot",
+    "ready": "pipelines/slim/ready.dot",
+    "gates": "pipelines/factory/gates.dot",
+    "hello": "pipelines/factory/hello.dot",
+    "pr_gates": "pipelines/factory/pr_gates.dot",
+    "minimal_feature": "pipelines/slim/minimal_feature.dot",
+    "minimal_pr": "pipelines/slim/minimal_pr.dot",
+    "minimal_research": "pipelines/slim/minimal_research.dot",
+    "review_slim": "benchmarks/attractor-spec-review/pipelines/review_slim.dot",
+    "review_full": "benchmarks/attractor-spec-review/pipelines/review_full.dot",
+    "spec_gen": "pipelines/slim/spec_gen.dot",
+    "bug_fix": "pipelines/bug_fix.dot",
+    "level5_feature": "pipelines/factory/level5_feature.dot",
+}
+
+
 def factory_home() -> pathlib.Path | None:
     raw = os.environ.get("DARK_FACTORY_HOME", "").strip()
     if not raw:
@@ -20,17 +37,32 @@ def resolve_factory_path(path: pathlib.Path) -> pathlib.Path:
         return candidate
     if candidate.exists():
         return candidate.resolve()
+    if candidate.suffix != ".dot" and candidate.with_suffix(".dot").exists():
+        return candidate.with_suffix(".dot").resolve()
     home = factory_home()
-    if home is not None:
-        under_home = (home / candidate).resolve()
-        if under_home.exists():
-            return under_home
-        for sub in ["pipelines/slim", "pipelines/factory", "pipelines"]:
-            under_sub = (home / sub / candidate).resolve()
+    roots = [home] if home is not None else [pathlib.Path.cwd(), pathlib.Path(__file__).resolve().parent.parent]
+    for root in roots:
+        under_root = (root / candidate).resolve()
+        if under_root.exists():
+            return under_root
+        if candidate.suffix != ".dot":
+            under_dot = (root / candidate.with_suffix(".dot")).resolve()
+            if under_dot.exists():
+                return under_dot
+        for sub in [
+            "pipelines/slim",
+            "pipelines/factory",
+            "pipelines",
+            "benchmarks/attractor-spec-review/pipelines",
+        ]:
+            under_sub = (root / sub / candidate).resolve()
             if under_sub.exists():
                 return under_sub
+            if candidate.suffix != ".dot":
+                under_sub_dot = (root / sub / candidate.with_suffix(".dot")).resolve()
+                if under_sub_dot.exists():
+                    return under_sub_dot
     return candidate.resolve()
-
 
 
 def resolve_pipeline_path(
@@ -42,14 +74,14 @@ def resolve_pipeline_path(
     Resolution order (first match wins):
 
     1. Absolute path → returned as resolved.
-    2. ``<workdir>/<name>`` if it exists (operator is already in the target
-       repo and the file lives at a normal relative path).
-    3. ``<workdir>/dark-factory/pipelines/<name>`` **when `name` is a bare
-       filename** (no path separators) — this is the target-repo
-       `dark-factory/pipelines/*.dot` convention that lets a downstream repo
-       ship its own repo-specific graphs (e.g. ones that hardcode that
-       repo's slash commands) without leaking them into dark-factory itself.
-    4. Delegate to :func:`resolve_factory_path` (cwd → ``$DARK_FACTORY_HOME``).
+    2. ``<workdir>/<name>`` (and ``<name>.dot``) if it exists (operator is
+       already in the target repo and the file lives at a normal relative path).
+    3. ``<workdir>/dark-factory/pipelines/<name>`` (and ``<name>.dot``)
+       **when `name` is a bare filename** (no path separators) — this is the
+       target-repo `dark-factory/pipelines/*.dot` convention that lets a
+       downstream repo ship its own repo-specific graphs without leaking them.
+    4. Documented short pipeline aliases (e.g. ``ready`` → ``pipelines/slim/ready.dot``).
+    5. Delegate to :func:`resolve_factory_path` (cwd → ``$DARK_FACTORY_HOME``).
 
     Parameters
     ----------
@@ -75,14 +107,27 @@ def resolve_pipeline_path(
     local = base / candidate
     if local.exists():
         return local.resolve()
+    if candidate.suffix != ".dot" and (base / candidate.with_suffix(".dot")).exists():
+        return (base / candidate.with_suffix(".dot")).resolve()
 
     # Target-repo subdir convention: only when the user passed a bare filename.
     # A path like `pipelines/factory/gates.dot` is intentionally not rewritten
     # — the subdir convention is for short names that the operator expects to
     # resolve in their own repo, not the factory home.
     if "/" not in str(candidate) and "\\" not in str(candidate):
-        subdir_candidate = base / "dark-factory" / "pipelines" / candidate
+        subdir = base / "dark-factory" / "pipelines"
+        subdir_candidate = subdir / candidate
         if subdir_candidate.exists():
             return subdir_candidate.resolve()
+        if candidate.suffix != ".dot" and (subdir / candidate.with_suffix(".dot")).exists():
+            return (subdir / candidate.with_suffix(".dot")).resolve()
+
+    # Short aliases
+    raw_key = candidate.stem if candidate.suffix == ".dot" else str(candidate)
+    if raw_key in SHORT_PIPELINE_ALIASES:
+        alias_rel = pathlib.Path(SHORT_PIPELINE_ALIASES[raw_key])
+        resolved_alias = resolve_factory_path(alias_rel)
+        if resolved_alias.exists():
+            return resolved_alias
 
     return resolve_factory_path(candidate)
