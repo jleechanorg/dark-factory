@@ -333,3 +333,260 @@ def test_pipeline_alias_ready_resolution_precedence(tmp_path, monkeypatch):
     resolved_custom = resolve_pipeline_path("ready", workdir=target_repo)
     assert resolved_custom == custom_ready.resolve()
 
+
+def test_ready_runs_all_five_members_for_each_failed_round_even_with_identical_fix_output(
+    monkeypatch, tmp_path
+):
+    """Round budget, rather than fix output repetition, bounds validation rounds."""
+    from runner.handlers import _codergen
+
+    calls: list[str] = []
+
+    def always_fail(node, ctx):
+        calls.append(node.name)
+        return Result(outcome="failure", output="identical failure")
+
+    def always_fix(node, ctx):
+        calls.append(node.name)
+        return Result(outcome="success", output="identical fix")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "tool", always_fail)
+    monkeypatch.setitem(TYPE_REGISTRY, "gate_es", always_fail)
+    monkeypatch.setitem(TYPE_REGISTRY, "gate_er", always_fail)
+    monkeypatch.setitem(TYPE_REGISTRY, "gate_slash", always_fail)
+    monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", always_fail)
+    monkeypatch.setitem(TYPE_REGISTRY, "codergen", always_fix)
+    graph = parse(pathlib.Path("pipelines/slim/ready.dot"))
+    ctx = Context(
+        goal="ready rounds",
+        workdir=tmp_path,
+        backend="echo",
+        state={"feature": "ready_feature", "slim.test_command": "true"},
+    )
+
+    history = run(graph, ctx, max_steps=100, max_rounds=3)
+
+    assert history[-1].outcome == "exhausted"
+    assert calls.count("fix") == 2
+    for member in ("test", "gate_es", "gate_er", "gate_advice", "holdout"):
+        assert calls.count(member) == 3
+
+
+def test_member_exception_is_recorded_as_error_in_round_ledger(monkeypatch, tmp_path):
+    def fake_member(node, ctx):
+        if node.name == "check_a":
+            raise RuntimeError("check_a crashed")
+        return Result(outcome="success", output="check_b passed")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "tool", fake_member)
+    ctx = Context(goal="ledger error", workdir=tmp_path, backend="echo")
+    history = run(_round_graph(tmp_path), ctx, max_steps=100, max_rounds=1)
+
+    round_end = next(step for step in history if step.node == "round_end")
+    member_outcomes = json.loads(round_end.metadata["member_outcomes"])
+    assert member_outcomes == {"check_a": "error", "check_b": "success"}
+
+
+def test_runner_owned_round_state_override_is_rejected(monkeypatch):
+    from runner.__main__ import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "--pipeline",
+                "two_node",
+                "--goal",
+                "reject reserved state",
+                "--backend",
+                "echo",
+                "--state",
+                "rounds.requested=0",
+            ]
+        )
+    assert exc_info.value.code == 2
+
+
+def test_max_rounds_is_authoritative_over_preseeded_round_state(monkeypatch, tmp_path):
+    calls: list[str] = []
+
+    def fake_member(node, ctx):
+        calls.append(node.name)
+        return Result(outcome="failure", output="failure")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "tool", fake_member)
+    ctx = Context(
+        goal="authoritative rounds",
+        workdir=tmp_path,
+        backend="echo",
+        state={"rounds.requested": "1"},
+    )
+    history = run(_round_graph(tmp_path), ctx, max_steps=100, max_rounds=3)
+
+    assert history[-1].outcome == "exhausted"
+    assert calls.count("check_a") == 3
+    assert ctx.state["rounds.requested"] == 3
+
+
+def test_terminal_round_end_exhausted_resume_returns_history_without_extra_run(
+    monkeypatch, tmp_path
+):
+    """Resuming a checkpoint ending in terminal round_end exhausted returns history immediately."""
+    calls: list[str] = []
+
+    def fake_member(node, ctx):
+        calls.append(node.name)
+        return Result(outcome="success", output="should not be called")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "tool", fake_member)
+
+    checkpoint = tmp_path / "checkpoint.json"
+    checkpoint.write_text(
+        json.dumps(
+            [
+                {"node": "start", "outcome": "success", "ts": 1.0, "output_preview": ""},
+                {"node": "round_begin", "outcome": "success", "ts": 2.0, "output_preview": "", "metadata": {"round": "3", "max_rounds": "3", "members": "check_a,check_b"}},
+                {"node": "check_a", "outcome": "failure", "ts": 3.0, "output_preview": "fail a"},
+                {"node": "check_b", "outcome": "failure", "ts": 4.0, "output_preview": "fail b"},
+                {"node": "round_end", "outcome": "exhausted", "ts": 5.0, "output_preview": "exhausted", "metadata": {"aggregate": "exhausted", "exhausted": "true"}},
+            ]
+        )
+    )
+
+    ctx = Context(goal="resume terminal", workdir=tmp_path, backend="echo")
+    history = run(_round_graph(tmp_path), ctx, resume=checkpoint, max_steps=100)
+
+    assert len(history) == 5
+    assert history[-1].node == "round_end"
+    assert history[-1].outcome == "exhausted"
+    assert calls == []
+
+
+def test_mid_round_resume_reconstructs_ledger_without_unknown_members(
+    monkeypatch, tmp_path
+):
+    """Mid-round resume reconstructs prior member outcomes from checkpoint history."""
+    calls: list[str] = []
+
+    def fake_member(node, ctx):
+        calls.append(node.name)
+        return Result(outcome="failure", output="check_b failed")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "tool", fake_member)
+
+    checkpoint = tmp_path / "checkpoint.json"
+    checkpoint.write_text(
+        json.dumps(
+            [
+                {"node": "start", "outcome": "success", "ts": 1.0, "output_preview": ""},
+                {
+                    "node": "round_begin",
+                    "outcome": "success",
+                    "ts": 2.0,
+                    "output_preview": "",
+                    "metadata": {"round": "1", "max_rounds": "2", "members": "check_a,check_b"},
+                },
+                {
+                    "node": "check_a",
+                    "outcome": "success",
+                    "ts": 3.0,
+                    "output_preview": "check_a passed",
+                    "metadata": {},
+                },
+            ]
+        )
+    )
+
+    ctx = Context(goal="resume mid-round", workdir=tmp_path, backend="echo")
+    history = run(_round_graph(tmp_path), ctx, resume=checkpoint, max_steps=100, max_rounds=2)
+
+    assert calls[0] == "check_b"  # check_a in round 1 was restored from checkpoint
+    round_end_step = next(s for s in history if s.node == "round_end")
+    member_outcomes = json.loads(round_end_step.metadata["member_outcomes"])
+    assert member_outcomes == {"check_a": "success", "check_b": "failure"}
+
+
+def test_cli_resume_from_manifest_preserves_requested_max_rounds(
+    monkeypatch, tmp_path, capsys
+):
+    """CLI resume loads and respects max_rounds from run manifest."""
+    from runner.__main__ import main
+
+    run_id = "testrounds12"
+    runs_dir = tmp_path / ".dark-factory" / "runs" / run_id
+    runs_dir.mkdir(parents=True)
+    manifest_file = runs_dir / "manifest.json"
+    manifest_file.write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "pipeline": "pipelines/slim/ready.dot",
+                "goal": "manifest resume test",
+                "backend": "echo",
+                "workdir": str(tmp_path),
+                "max_rounds": 5,
+                "rounds_requested": 5,
+                "state": {
+                    "feature": "test_feat",
+                    "slim.test_command": "true",
+                },
+            }
+        )
+    )
+    checkpoint_file = runs_dir / "checkpoint.json"
+    checkpoint_file.write_text(
+        json.dumps(
+            [
+                {"node": "start", "outcome": "success", "ts": 1.0, "output_preview": ""},
+                {
+                    "node": "round_begin",
+                    "outcome": "success",
+                    "ts": 2.0,
+                    "output_preview": "",
+                    "metadata": {"round": "1", "max_rounds": "5", "members": "test,gate_es,gate_er,gate_advice,holdout"},
+                },
+            ]
+        )
+    )
+
+    def fake_handler(node, ctx):
+        return Result(outcome="success", output="ok")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "tool", fake_handler)
+    monkeypatch.setitem(TYPE_REGISTRY, "gate_es", fake_handler)
+    monkeypatch.setitem(TYPE_REGISTRY, "gate_er", fake_handler)
+    monkeypatch.setitem(TYPE_REGISTRY, "gate_slash", fake_handler)
+    monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_handler)
+    monkeypatch.setattr(pathlib.Path, "home", lambda: tmp_path)
+
+    rc = main(["--resume", run_id])
+    assert rc == 0
+    captured = capsys.readouterr()
+    summary = json.loads(captured.out)
+    assert summary["rounds_requested"] == 5
+
+
+def test_two_node_round_ledger_records_both_worker_and_reviewer(
+    monkeypatch, tmp_path
+):
+    """two_node round ledger captures outcomes for both worker and cold_reviewer."""
+    calls: list[str] = []
+
+    def fake_worker(node, ctx):
+        calls.append("worker")
+        return Result(outcome="failure", output="worker error")
+
+    def fake_reviewer(node, ctx):
+        calls.append("cold_reviewer")
+        return Result(outcome="success", output="reviewer passed")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "codergen", fake_worker)
+    monkeypatch.setitem(TYPE_REGISTRY, "parallel_reviewer", fake_reviewer)
+
+    graph = parse(pathlib.Path("pipelines/slim/two_node.dot"))
+    ctx = Context(goal="two_node ledger test", workdir=tmp_path, backend="echo")
+    history = run(graph, ctx, max_steps=100, max_rounds=1)
+
+    round_end_step = next(s for s in history if s.node == "round_end")
+    member_outcomes = json.loads(round_end_step.metadata["member_outcomes"])
+    assert member_outcomes == {"worker": "failure", "cold_reviewer": "success"}
+    assert history[-1].outcome == "exhausted"

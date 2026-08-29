@@ -164,4 +164,3 @@ def test_resolve_pipeline_short_alias_target_repo_precedence(tmp_path, monkeypat
     resolved2 = resolve_pipeline_path("ready", workdir=target_repo)
     assert resolved2 == repo_root_ready.resolve()
     assert resolved2 != repo_subdir_ready.resolve()
-

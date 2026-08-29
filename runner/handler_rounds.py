@@ -18,7 +18,102 @@ from .handler_core import Result
 
 if TYPE_CHECKING:
     from .handler_core import Context
-    from .parser import Node
+    from .parser import Graph, Node
+
+
+def _record_round_ledger(
+    node: Node,
+    ctx: Context,
+    outcome: str,
+    output: str | None = None,
+    metadata: dict[str, str] | None = None,
+) -> None:
+    """Record member execution outcome to the current round's ledger."""
+    if "rounds.current" not in ctx.state or node.attrs.get("type") in ("round_begin", "round_end"):
+        return
+    raw_ledger = ctx.state.get("rounds.ledger", "{}")
+    if isinstance(raw_ledger, str):
+        try:
+            ledger = json.loads(raw_ledger)
+        except Exception:
+            ledger = {}
+    elif isinstance(raw_ledger, dict):
+        ledger = raw_ledger
+    else:
+        ledger = {}
+    ledger[node.name] = {
+        "outcome": outcome,
+        "output": (output or "")[:500],
+        "metadata": metadata or {},
+    }
+    ctx.state["rounds.ledger"] = json.dumps(ledger)
+    ctx.state[f"{node.name}.outcome"] = outcome
+
+
+def _reconstruct_round_state_on_resume(
+    graph: Graph,
+    ctx: Context,
+    history: list,
+) -> None:
+    """Reconstruct validation rounds state and ledger from checkpoint history."""
+    if not history:
+        return
+    last_rb_idx = -1
+    for idx, step in enumerate(history):
+        s_node_name = getattr(step, "node", "")
+        if s_node_name == "round_begin" or (
+            graph.nodes.get(s_node_name)
+            and graph.nodes[s_node_name].attrs.get("type") == "round_begin"
+        ):
+            last_rb_idx = idx
+
+    if last_rb_idx == -1:
+        return
+
+    rb_step = history[last_rb_idx]
+    rb_node = graph.nodes.get(getattr(rb_step, "node", ""))
+    round_meta = getattr(rb_step, "metadata", {}) or {}
+
+    round_num = int(round_meta.get("round", 1))
+    max_rounds = int(round_meta.get("max_rounds", ctx.state.get("rounds.requested", 3)))
+    members_raw = round_meta.get("members", "")
+    if members_raw:
+        members = [m.strip() for m in members_raw.split(",") if m.strip()]
+    elif rb_node:
+        members = _parse_members(rb_node, ctx)
+    else:
+        members = []
+
+    ctx.state["rounds.current"] = round_num
+    ctx.state["rounds.effective"] = round_num
+    ctx.state["rounds.requested"] = max_rounds
+    ctx.state["rounds.max"] = max_rounds
+    ctx.state["rounds.members"] = json.dumps(members)
+
+    has_round_end = any(
+        (
+            getattr(step, "node", None) == "round_end"
+            or (
+                graph.nodes.get(getattr(step, "node", ""))
+                and graph.nodes[step.node].attrs.get("type") == "round_end"
+            )
+        )
+        for step in history[last_rb_idx + 1 :]
+    )
+
+    if not has_round_end:
+        ledger: dict[str, dict] = {}
+        for step in history[last_rb_idx + 1 :]:
+            s_node = getattr(step, "node", "")
+            if s_node in members:
+                s_outcome = getattr(step, "outcome", "unknown")
+                ledger[s_node] = {
+                    "outcome": s_outcome,
+                    "output": getattr(step, "output_preview", "")[:500],
+                    "metadata": getattr(step, "metadata", {}) or {},
+                }
+                ctx.state[f"{s_node}.outcome"] = s_outcome
+        ctx.state["rounds.ledger"] = json.dumps(ledger)
 
 
 def _parse_members(node: Node, ctx: Context) -> list[str]:

@@ -93,6 +93,8 @@ def _handle_node_exception(
         seq,
     )
     _persist._update_failure_state(current, ctx, error_result)
+    from .handler_rounds import _record_round_ledger
+    _record_round_ledger(current, ctx, "error", tb_text, {"exception": type(exc).__name__})
 
     # A crash is a failure: only a deliberate recovery edge may catch it. That
     # means a goal_gate `retry_target` or a *conditional* edge that matches the

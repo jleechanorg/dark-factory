@@ -798,10 +798,8 @@ def run(
     if resume is not None and _is_controller_graph(graph):
         raise ValueError("resume is not supported for cold-review-v1 graphs")
 
-    if ctx.state.get("rounds.requested") is None:
-        ctx.state["rounds.requested"] = max_rounds
-    if ctx.state.get("rounds.max") is None:
-        ctx.state["rounds.max"] = max_rounds
+    ctx.state["rounds.requested"] = max_rounds
+    ctx.state["rounds.max"] = max_rounds
 
     # Resume uses the checkpoint's run directory as the durable journal owner.
     # Establish that identity before any terminal resume fast path can return.
@@ -849,9 +847,17 @@ def run(
             if is_exit_node(last_node):
                 _cleanup_controller_snapshot(ctx)
                 return history
+            if last_node.attrs.get("type") == "round_end" and last.outcome == "exhausted":
+                _cleanup_controller_snapshot(ctx)
+                return history
             if len(history) - _resumed_overhead >= max_steps:
                 _cleanup_controller_snapshot(ctx)
                 return history
+
+            # Reconstruct validation round state from resumed history
+            from .handler_rounds import _reconstruct_round_state_on_resume
+            _reconstruct_round_state_on_resume(graph, ctx, resumed)
+
             synthetic = _obs._normalized_result(Result(outcome=last.outcome))
             # Detect incomplete parallel fan-out: the fan-out step was checkpointed
             # but branches never ran (job was interrupted between the fan-out record
@@ -1530,23 +1536,8 @@ def run(
                 _failure_node = _para_jump_to if _para_jump_to is not None else current
                 _persist._update_failure_state(_failure_node, ctx, result)
 
-            if "rounds.current" in ctx.state and current.attrs.get("type") not in ("round_begin", "round_end"):
-                raw_ledger = ctx.state.get("rounds.ledger", "{}")
-                if isinstance(raw_ledger, str):
-                    try:
-                        ledger = json.loads(raw_ledger)
-                    except Exception:
-                        ledger = {}
-                elif isinstance(raw_ledger, dict):
-                    ledger = raw_ledger
-                else:
-                    ledger = {}
-                ledger[current.name] = {
-                    "outcome": result.outcome,
-                    "output": (result.output or "")[:500],
-                    "metadata": result.metadata or {},
-                }
-                ctx.state["rounds.ledger"] = json.dumps(ledger)
+            from .handler_rounds import _record_round_ledger
+            _record_round_ledger(current, ctx, result.outcome, result.output, result.metadata)
 
             _obs._perf_node_exit(
                 ctx,

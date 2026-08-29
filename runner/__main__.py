@@ -384,7 +384,14 @@ def main(argv: list[str] | None = None) -> int:
                         if manifest.get("workdir"):
                             args.workdir = pathlib.Path(manifest["workdir"])
                         state_dict = manifest.get("state", {})
-                        args.state = [f"{k}={v}" for k, v in state_dict.items()]
+                        args.state = [f"{k}={v}" for k, v in state_dict.items() if not str(k).startswith("rounds.")]
+                        if not any(arg == "--max-rounds" or str(arg).startswith("--max-rounds=") for arg in (argv or [])):
+                            if "max_rounds" in manifest:
+                                args.max_rounds = int(manifest["max_rounds"])
+                            elif "rounds_requested" in manifest:
+                                args.max_rounds = int(manifest["rounds_requested"])
+                            elif "rounds.requested" in state_dict:
+                                args.max_rounds = int(state_dict["rounds.requested"])
                     except Exception as exc:
                         sys.stderr.write(f"Error loading manifest from {manifest_file}: {exc}\n")
                         return 1
@@ -442,11 +449,13 @@ def main(argv: list[str] | None = None) -> int:
             if "=" not in kv:
                 p.error(f"--state requires KEY=VALUE format, got: {kv!r}")
             k, v = kv.split("=", 1)
+            k = k.strip()
+            v = v.strip()
+            if k.startswith("rounds."):
+                p.error(f"reserved runner state key cannot be set via --state: {k!r}")
             initial_state[k] = v
-        if "rounds.requested" not in initial_state:
-            initial_state["rounds.requested"] = args.max_rounds
-        if "rounds.max" not in initial_state:
-            initial_state["rounds.max"] = args.max_rounds
+        initial_state["rounds.requested"] = args.max_rounds
+        initial_state["rounds.max"] = args.max_rounds
         if args.feature:
             initial_state["feature"] = args.feature
         if args.require_holdouts:
