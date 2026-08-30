@@ -368,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn reroll_temp_open_failure_preserves_original() {
+    fn reroll_post_open_read_failure_preserves_original() {
         let temp_dir = std::env::temp_dir().join(format!("afd_constraints_temp_open_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp_dir);
         std::fs::create_dir_all(&temp_dir).unwrap();

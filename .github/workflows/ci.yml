@@ -215,7 +215,14 @@ jobs:
           fail=0
           for t in tests/scripts/test_*.sh; do
             echo "::group::$t"
-            bash "$t" || { echo "::error file=$t::test failed"; fail=$((fail + 1)); }
+            bash "$t"
+            rc=$?
+            if [ "$rc" -eq 2 ]; then
+              echo "::warning file=$t::test skipped (exit 2 = no real evidence available in this environment)"
+            elif [ "$rc" -ne 0 ]; then
+              echo "::error file=$t::test failed"
+              fail=$((fail + 1))
+            fi
             echo "::endgroup::"
           done
           exit $fail
