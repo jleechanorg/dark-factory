@@ -590,30 +590,38 @@ pub fn dispatch_ready_with_vcs(
             return Err(err);
         }
 
+        let target_branch = if overlay.is_adopted || overlay.pr_number.is_some() {
+            &branch
+        } else {
+            &cfg.base_branch
+        };
         let expected_revision = match vcs {
-            Some(vcs) => match vcs.base_head_for_repo(&repo, &cfg.base_branch) {
+            Some(vcs) => match vcs.head_sha_within_for_repo(&repo, target_branch, 30) {
                 Ok(sha) if !sha.trim().is_empty() => sha,
-                Ok(_) => {
-                    let error = DaemonError::Config(format!(
-                        "authoritative base revision for repo {repo:?} is empty"
-                    ));
-                    overlay.state = OverlayState::HumanHeld;
-                    set_human_hold_reason(&mut overlay, HumanHoldReason::TargetCheckoutUnconfigured);
-                    store.save(&overlay)?;
-                    report.failures.push(failure(
-                        bead, overlay.attempt, None, "expected_revision_unavailable", error,
-                    ));
-                    continue;
-                }
-                Err(error) => {
-                    overlay.state = OverlayState::HumanHeld;
-                    set_human_hold_reason(&mut overlay, HumanHoldReason::TargetCheckoutUnconfigured);
-                    store.save(&overlay)?;
-                    report.failures.push(failure(
-                        bead, overlay.attempt, None, "expected_revision_unavailable", error,
-                    ));
-                    continue;
-                }
+                _ => match vcs.base_head_for_repo(&repo, target_branch) {
+                    Ok(sha) if !sha.trim().is_empty() => sha,
+                    Ok(_) => {
+                        let error = DaemonError::Config(format!(
+                            "authoritative revision for branch {target_branch:?} in repo {repo:?} is empty"
+                        ));
+                        overlay.state = OverlayState::HumanHeld;
+                        set_human_hold_reason(&mut overlay, HumanHoldReason::TargetCheckoutUnconfigured);
+                        store.save(&overlay)?;
+                        report.failures.push(failure(
+                            bead, overlay.attempt, None, "expected_revision_unavailable", error,
+                        ));
+                        continue;
+                    }
+                    Err(error) => {
+                        overlay.state = OverlayState::HumanHeld;
+                        set_human_hold_reason(&mut overlay, HumanHoldReason::TargetCheckoutUnconfigured);
+                        store.save(&overlay)?;
+                        report.failures.push(failure(
+                            bead, overlay.attempt, None, "expected_revision_unavailable", error,
+                        ));
+                        continue;
+                    }
+                },
             },
             None => overlay
                 .pre_session_head_sha
@@ -2045,11 +2053,30 @@ mod tests {
     #[test]
     fn capacity_40_workers_15_batch_boundaries() {
         let store = FakeStateStore::new();
+
+        // Verify ALL canonical production configuration files specify max_workers = 40, max_batch = 15
+        let canonical_paths = [
+            std::path::Path::new("contracts/daemon.toml.example"),
+            std::path::Path::new("config.toml"),
+            std::path::Path::new("../config/daemon.toml"),
+        ];
+        for path in canonical_paths {
+            let loaded = crate::config::load(path)
+                .unwrap_or_else(|e| panic!("failed to load canonical config {}: {e}", path.display()));
+            assert_eq!(
+                loaded.max_workers, 40,
+                "canonical config {} must specify max_workers = 40",
+                path.display()
+            );
+            assert_eq!(
+                loaded.max_batch, 15,
+                "canonical config {} must specify max_batch = 15",
+                path.display()
+            );
+        }
+
         let prod_example = crate::config::load(std::path::Path::new("contracts/daemon.toml.example"))
             .expect("canonical contracts/daemon.toml.example must be valid");
-        assert_eq!(prod_example.max_workers, 40, "canonical max_workers must be 40");
-        assert_eq!(prod_example.max_batch, 15, "canonical max_batch must be 15");
-
         let mut cfg = cfg();
         cfg.max_workers = prod_example.max_workers;
         cfg.max_batch = prod_example.max_batch;

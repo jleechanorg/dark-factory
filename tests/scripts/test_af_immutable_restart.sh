@@ -38,18 +38,29 @@ UNIT_EXEC_START="$(systemctl --user show "$UNIT" --property=ExecStart --value | 
 PROC_EXE="$(readlink -f "/proc/$DAEMON_PID_BEFORE/exe" 2>/dev/null || echo "$UNIT_EXEC_START")"
 BINARY_SHA256="$(sha256sum "$PROC_EXE" | awk '{print $1}')"
 
-# Extract release commit: from releases/<sha> path or manifest
+# Extract release commit from releases/<sha> path
 RELEASE_COMMIT="$(echo "$PROC_EXE" | grep -oE 'releases/[a-f0-9]+' | cut -d/ -f2 || true)"
 if [ -z "$RELEASE_COMMIT" ]; then
   RELEASE_COMMIT="$(basename "$(dirname "$(dirname "$PROC_EXE")")")"
 fi
 
-# Inventory of unrelated sessions/processes before (project-scoped per invariant)
+# Inventory of unrelated sessions/processes before (strictly project-scoped)
 UNRELATED_BEFORE="$(ao status -p "$AO_PROJECT" --json 2>/dev/null || echo '[]')"
 
-AO_SESSION="session-af-immutable-proof"
+# Resolve dynamic target worktree & branch from live checkout
 WORKTREE="/home/jleechan/.dark-factory/target-worktrees/jleechanorg/dark-factory"
-BRANCH="main"
+if [ -d "$WORKTREE/.git" ]; then
+  BRANCH="$(git -C "$WORKTREE" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")"
+  if [ "$BRANCH" = "HEAD" ]; then
+    BRANCH="$(git -C "$WORKTREE" rev-parse HEAD 2>/dev/null || echo "main")"
+  fi
+else
+  BRANCH="main"
+fi
+
+# Derive live AO session identity from active status if present, else dynamic proof session
+LIVE_SESSION="$(echo "$UNRELATED_BEFORE" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data[0]['id'] if isinstance(data, list) and len(data)>0 and 'id' in data[0] else 'session-af-immutable-proof')" 2>/dev/null || echo "session-af-immutable-proof")"
+AO_SESSION="$LIVE_SESSION"
 
 # Spawn a detached test child to simulate live worker session preserved across restart
 TEST_CHILD_PID="$(setsid sleep 300 < /dev/null > /dev/null 2>&1 & echo $!)"
@@ -91,7 +102,7 @@ if [ "$reaped" -ne 1 ]; then
   exit 1
 fi
 
-# Inventory of unrelated sessions after (project-scoped per invariant)
+# Inventory of unrelated sessions after (strictly project-scoped)
 UNRELATED_AFTER="$(ao status -p "$AO_PROJECT" --json 2>/dev/null || echo '[]')"
 JOURNAL_END="$(date -u +"%Y-%m-%d %H:%M:%S")"
 JOURNAL_WINDOW="${JOURNAL_START} .. ${JOURNAL_END}"
@@ -104,6 +115,13 @@ python3 -c "
 import json
 import os
 import sys
+
+unrelated_before = json.loads(os.environ.get('UNRELATED_BEFORE', '[]'))
+unrelated_after = json.loads(os.environ.get('UNRELATED_AFTER', '[]'))
+
+if unrelated_before != unrelated_after:
+    sys.stderr.write('FAIL: unrelated inventory was perturbed across daemon restart\n')
+    sys.exit(1)
 
 report = {
     'status': 'passed',
@@ -118,8 +136,8 @@ report = {
     'branch': os.environ['BRANCH'],
     'worker_pid_before': os.environ['WORKER_PID_BEFORE'],
     'worker_pid_after': os.environ['WORKER_PID_AFTER'],
-    'unrelated_inventory_before': json.loads(os.environ.get('UNRELATED_BEFORE', '[]')),
-    'unrelated_inventory_after': json.loads(os.environ.get('UNRELATED_AFTER', '[]')),
+    'unrelated_inventory_before': unrelated_before,
+    'unrelated_inventory_after': unrelated_after,
     'journal_window': os.environ['JOURNAL_WINDOW']
 }
 

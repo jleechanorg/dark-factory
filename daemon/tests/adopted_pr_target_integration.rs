@@ -21,6 +21,7 @@ fn adopted_pr_rejects_sibling_worktree_before_spawn() {
     let managed_worktree = temp_root.join("managed-wa-worktree");
     let sibling_worktree = temp_root.join("sibling-wa-worktree");
     let kill_log = temp_root.join("kill.log");
+    let spawn_log = temp_root.join("spawn.log");
     std::fs::create_dir_all(&fake_bin).unwrap();
     std::fs::create_dir_all(&managed_worktree).unwrap();
     std::fs::create_dir_all(&sibling_worktree).unwrap();
@@ -73,7 +74,9 @@ if args[:2] == ["session", "kill"]:
         f.write(" ".join(args) + "\n")
     sys.exit(0)
 
-if args[0] == "spawn":
+if args and args[0] == "spawn":
+    with open("{spawn_log}", "a", encoding="utf-8") as f:
+        f.write(" ".join(args) + "\n")
     return_wt = os.environ.get("TEST_RETURN_WORKTREE", "{managed}")
     print("SESSION=wa-session-3551")
     print(f"  Worktree: {{return_wt}}")
@@ -84,6 +87,7 @@ print(f"unknown command: {{args}}", file=sys.stderr)
 sys.exit(1)
 "#,
             kill_log = kill_log.display(),
+            spawn_log = spawn_log.display(),
             managed = managed_worktree.display(),
         ),
     )
@@ -115,49 +119,76 @@ sys.exit(1)
 
     let sessions = CliSessions::new("worldarchitect.ai", "minimax");
 
-    // 1. NEGATIVE CONTROL: AO spawns into sibling worktree
     unsafe {
         std::env::set_var("PATH", &new_path);
-        std::env::set_var("TEST_RETURN_WORKTREE", sibling_worktree.to_string_lossy().as_ref());
     }
-    let res_sibling = sessions.spawn(&spec);
-    assert!(res_sibling.is_err(), "spawn into sibling worktree must be rejected");
-    let err = res_sibling.unwrap_err();
-    let is_mismatch = match &err {
+
+    // 1. PRE-SPAWN NEGATIVE CONTROL: local_checkout points to sibling worktree (fails BEFORE AO spawn)
+    spec.local_checkout = Some(sibling_worktree.clone());
+    let _ = std::fs::remove_file(&spawn_log);
+    let res_pre_spawn_sibling = sessions.spawn(&spec);
+    assert!(res_pre_spawn_sibling.is_err(), "pre-spawn sibling local_checkout must be rejected");
+    match res_pre_spawn_sibling.unwrap_err() {
         DaemonError::WorktreeCwdMismatch { expected, actual } => {
-            expected.contains("managed-wa-worktree") && actual.contains("sibling-wa-worktree")
+            assert!(expected.contains("managed-wa-worktree"));
+            assert!(actual.contains("sibling-wa-worktree"));
         }
         DaemonError::SpawnFallbackExhausted(list) => {
-            list.iter().any(|(_, e)| match e {
+            assert!(list.iter().any(|(_, e)| match e {
                 DaemonError::WorktreeCwdMismatch { expected, actual } => {
                     expected.contains("managed-wa-worktree") && actual.contains("sibling-wa-worktree")
                 }
                 _ => false,
-            })
+            }));
         }
-        DaemonError::Config(msg) => {
-            msg.contains("working directory") || msg.contains("refusing to spawn")
-        }
-        _ => false,
-    };
-    assert!(is_mismatch, "error must report WorktreeCwdMismatch for sibling worktree drift, got: {err:?}");
-    // Verify session was killed immediately
-    let kills = std::fs::read_to_string(&kill_log).unwrap_or_default();
-    assert!(kills.contains("session kill wa-session-3551"), "sibling session must be killed on drift");
+        other => panic!("expected WorktreeCwdMismatch pre-spawn, got: {other:?}"),
+    }
+    assert!(!spawn_log.exists(), "pre-spawn rejection must execute ZERO AO spawns");
 
-    // 2. POSITIVE CONTROL: AO spawns into exact managed worktree and head revision
+    // 2. PRE-SPAWN NEGATIVE CONTROL: Stale/drifted expected revision fails BEFORE AO spawn
+    spec.local_checkout = Some(managed_worktree.clone());
+    spec.expected_revision = Some("deadbeef00000000000000000000000000000000".to_string());
+    let _ = std::fs::remove_file(&spawn_log);
+    let res_drifted_sha = sessions.spawn(&spec);
+    assert!(res_drifted_sha.is_err(), "stale expected revision must be rejected pre-spawn");
+    assert!(!spawn_log.exists(), "stale revision rejection must execute ZERO AO spawns");
+
+    // 3. POST-SPAWN DRIFT NEGATIVE CONTROL: AO spawn returns sibling worktree -> kills session immediately
+    spec.expected_revision = Some(head_rev.clone());
     let _ = std::fs::remove_file(&kill_log);
+    let _ = std::fs::remove_file(&spawn_log);
+    unsafe {
+        std::env::set_var("TEST_RETURN_WORKTREE", sibling_worktree.to_string_lossy().as_ref());
+    }
+    let res_post_drift = sessions.spawn(&spec);
+    assert!(res_post_drift.is_err(), "spawn returning sibling worktree must be rejected");
+    match res_post_drift.unwrap_err() {
+        DaemonError::WorktreeCwdMismatch { expected, actual } => {
+            assert!(expected.contains("managed-wa-worktree"));
+            assert!(actual.contains("sibling-wa-worktree"));
+        }
+        DaemonError::SpawnFallbackExhausted(list) => {
+            assert!(list.iter().any(|(_, e)| match e {
+                DaemonError::WorktreeCwdMismatch { expected, actual } => {
+                    expected.contains("managed-wa-worktree") && actual.contains("sibling-wa-worktree")
+                }
+                _ => false,
+            }));
+        }
+        other => panic!("expected WorktreeCwdMismatch post-spawn, got: {other:?}"),
+    }
+    let kills = std::fs::read_to_string(&kill_log).unwrap_or_default();
+    assert!(kills.contains("session kill wa-session-3551"), "drifted session must be killed immediately");
+
+    // 4. POSITIVE CONTROL: exact managed worktree and head revision succeeds cleanly
+    let _ = std::fs::remove_file(&kill_log);
+    let _ = std::fs::remove_file(&spawn_log);
     unsafe {
         std::env::set_var("TEST_RETURN_WORKTREE", managed_worktree.to_string_lossy().as_ref());
     }
     let res_ok = sessions.spawn(&spec);
     assert!(res_ok.is_ok(), "exact managed target worktree must succeed, got: {res_ok:?}");
     assert_eq!(res_ok.unwrap().0, "wa-session-3551");
-
-    // 3. NEGATIVE CONTROL: Stale/drifted expected revision fails closed
-    spec.expected_revision = Some("deadbeef00000000000000000000000000000000".to_string());
-    let res_drifted_sha = sessions.spawn(&spec);
-    assert!(res_drifted_sha.is_err(), "stale expected revision must be rejected");
 
     unsafe {
         std::env::set_var("PATH", original_path);

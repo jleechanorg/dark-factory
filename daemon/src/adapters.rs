@@ -3294,13 +3294,11 @@ fn is_ao_not_running_error(err: &DaemonError) -> bool {
     };
     let lower = msg.to_lowercase();
     lower.contains("daemon is not running")
-        || lower.contains("is not running")
-        || lower.contains("connection refused")
-        || lower.contains("cannot connect")
-        || lower.contains("failed to connect")
+        || lower.contains("orchestrator not running")
         || lower.contains("unknown project")
         || lower.contains("no such project")
-        || lower.contains("orchestrator not running")
+        || lower.contains("failed to connect to daemon")
+        || lower.contains("cannot connect to daemon")
 }
 
 pub fn ensure_ao_project_recovered(project: &str, target_path_or_url: &str) -> Result<(), DaemonError> {
@@ -3363,13 +3361,11 @@ pub fn ensure_ao_project_recovered(project: &str, target_path_or_url: &str) -> R
     })?;
 
     // 4. Recheck project-scoped health: ao status -p <project-id> --json
-    let recheck = run_tool("ao", &["status", "-p", project, "--json"], 30).map_err(|e| {
-        DaemonError::Config(format!("ao status health check failed for project {project} after start: {e}"))
-    })?;
-    let json_start = recheck.find('[').unwrap_or(0);
-    serde_json::from_str::<serde_json::Value>(&recheck[json_start..]).map_err(|e| {
-        DaemonError::Parse(format!("failed to parse ao status JSON after start: {e}"))
-    })?;
+    if !is_ao_project_healthy(project) {
+        return Err(DaemonError::Config(format!(
+            "ao status health check failed for project {project} after start (valid JSON array expected)"
+        )));
+    }
 
     Ok(())
 }
@@ -3386,7 +3382,10 @@ pub struct CliSessions {
 
 impl CliSessions {
     pub fn new(repo: &str, agent: &str) -> Self {
-        let mut project = repo.split('/').next_back().unwrap_or(repo).to_string();
+        let mut project = repo.rsplit('/').next().unwrap_or(repo).to_string();
+        if project.ends_with(".git") {
+            project.truncate(project.len() - 4);
+        }
         if project == "worldarchitect.ai" {
             project = "worldarchitect".to_string();
         }
@@ -3399,6 +3398,21 @@ impl CliSessions {
     }
 
     fn run_spawn_process(&self, agent: &str, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
+        // Pre-spawn validation: if local_checkout is specified, validate it before calling ao spawn
+        if let Some(ref local_checkout) = spec.local_checkout {
+            if let Err(err) = crate::tools::check_cwd_guard(spec.expected_cwd.as_deref(), local_checkout) {
+                return Err(err);
+            }
+            if let Some(expected_revision) = spec.expected_revision.as_deref() {
+                if let Err(err) = crate::target_worktree::validate_existing_target_worktree(
+                    &spec.repo,
+                    local_checkout,
+                    Some(expected_revision),
+                ) {
+                    return Err(err);
+                }
+            }
+        }
         // jleechan-bqdv Stage C: spawn into `spec.ao_project` (resolved per
         // bead by `Config::resolve_repo`, Stage B), not `self.project` (the
         // daemon's single global project bound once at `CliSessions::new`

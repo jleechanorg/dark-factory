@@ -385,43 +385,43 @@ mod tests {
         );
         let temp_path = temp_dir.join(&temp_filename);
 
-        // Make temp_dir read-only (0o555) simulating the immutable release layout
-        let mut ro_perms = std::fs::metadata(&temp_dir).unwrap().permissions();
-        ro_perms.set_mode(0o555);
-        std::fs::set_permissions(&temp_dir, ro_perms).unwrap();
+        // Make spec_file unreadable (0o000) so temp file opens successfully but read_existing fails
+        let mut unreadable_perms = std::fs::metadata(&spec_file).unwrap().permissions();
+        unreadable_perms.set_mode(0o000);
+        std::fs::set_permissions(&spec_file, unreadable_perms).unwrap();
 
         let res = append_mutation(&spec_file, "inhibition_specs = [\"fail\"]\n");
-        assert!(res.is_err(), "append_mutation must fail when directory is read-only");
+        assert!(res.is_err(), "append_mutation must fail when existing spec cannot be read");
         let err = res.unwrap_err();
         match err {
             DaemonError::Tool { tool, stderr, .. } => {
                 assert_eq!(tool, "fs");
                 assert!(
-                    stderr.contains("open temp file:"),
-                    "error must specifically name the atomic temp file open failure, got: {stderr}"
+                    stderr.contains("read existing spec:"),
+                    "error must specifically name read failure after temp open, got: {stderr}"
                 );
             }
             other => panic!("expected DaemonError::Tool fs error, got: {other:?}"),
         }
 
-        // 3. The original constraint/spec file is byte-identical after failure
+        // Assert that TempCleanup actively deleted the opened temp file on drop
+        assert!(
+            !temp_path.exists(),
+            "temp file {} must be deleted by TempCleanup guard on failure",
+            temp_path.display()
+        );
+
+        // Restore permissions and verify original spec file is completely unmodified
+        let mut readable_perms = std::fs::metadata(&spec_file).unwrap().permissions();
+        readable_perms.set_mode(0o644);
+        std::fs::set_permissions(&spec_file, readable_perms).unwrap();
+
         assert_eq!(
             std::fs::read_to_string(&spec_file).unwrap(),
             initial_bytes,
             "original spec file must remain completely unmodified on failure"
         );
 
-        // Assert NO temp debris exists before deleting the fixture
-        assert!(
-            !temp_path.exists(),
-            "temp file {} must not exist as debris after open failure",
-            temp_path.display()
-        );
-
-        // Restore permissions to allow cleanup
-        let mut rw_perms = std::fs::metadata(&temp_dir).unwrap().permissions();
-        rw_perms.set_mode(0o755);
-        let _ = std::fs::set_permissions(&temp_dir, rw_perms);
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
