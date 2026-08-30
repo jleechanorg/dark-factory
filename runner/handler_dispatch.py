@@ -1004,6 +1004,7 @@ def _run_gate_once(
     review_output = proc.stdout
     transport_error = ""
     controller_review = None
+    controller_prevalidated_review: dict[str, Any] | None = None
     if controller_json and proc.returncode == 0:
         try:
             from .review_controller import (
@@ -1023,6 +1024,17 @@ def _run_gate_once(
             if transport_receipt.head_sha != expected_sha:
                 raise ValueError("tool-free controller receipt head binding mismatch")
             command_receipts = ()
+            # Stash the fully-validated review so the contract-adjustment layer
+            # (handler_parallel_reviewer._contract_adjusted_result) can
+            # reconstruct a ValidatedReview without re-parsing/re-validating
+            # the same JSON a second time. See PR consolidating duplicate
+            # validation between _run_gate_once and _contract_adjusted_result.
+            controller_prevalidated_review = {
+                "verdict": controller_review.verdict,
+                "checks": list(controller_review.checks),
+                "response_sha256": controller_review.response_sha256,
+                "commands_executed": list(controller_review.commands_executed),
+            }
         except Exception as exc:
             transport_error = str(exc)
             review_output = proc.stdout
@@ -1105,6 +1117,8 @@ def _run_gate_once(
             }
         if transport_error:
             metadata["review_transport_error"] = transport_error
+        if controller_prevalidated_review is not None:
+            metadata["_controller_prevalidated_review"] = controller_prevalidated_review
         # The parallel controller lane persists this exact raw JSONL through
         # the shared controller artifact writer after contract adjustment.
         # Keep it transiently in metadata so the graph path cannot fall back
