@@ -55,6 +55,90 @@ LOG_DIR="${AFD_LOG_DIR:-$HOME/Library/Logs/dark-factory}"
 STATE_DIR="${AFD_SPAWN_STATE_DIR:-$HOME/Library/Application Support/dark-factory/spawns}"
 SPAWN_LOG="$LOG_DIR/remediate-${BEAD_ID}-$(date -u +%Y%m%dT%H%M%SZ).log"
 STATE_FILE="$STATE_DIR/${BEAD_ID}-${PR}.state"
+DB="${AFD_DB:-$HOME/.dark-factory/daemon-cxdb.sqlite}"
+
+# Bead dark-factory-w2fr: compute the target-identity tokens the worker
+# session will need to validate its worktree / branch / repo before
+# writing any tracked file. These four env vars are injected into the AO
+# spawn so they reach the worker session; `daemon/scripts/af-target-identity-guard.sh`
+# reads them at every pre-write / pre-push check.
+#
+# AF_TARGET_CHECKOUT: the absolute path of the daemon-managed target
+#   checkout for $TARGET_REPO, resolved from the same `[repos]`
+#   routing table the Rust adapter consults (see
+#   `Config::resolve_repo` / `daemon/src/config.rs`). Failing closed
+#   means we deliberately do NOT default to $ROOT or any guess — a
+#   remediation worker without an authoritative checkout path is
+#   exactly the silent-drift condition we are trying to surface.
+CONFIG="${CONFIG:-$ROOT/config/daemon.toml}"
+[ -f "$CONFIG" ] || CONFIG="$ROOT/daemon/contracts/daemon.toml.example"
+
+# Resolve AF_TARGET_CHECKOUT from the [repos] table; fall back to the
+# global default_repo's `local_checkout` only when present (legacy
+# single-repo deployments). When neither path is known, AF_TARGET_CHECKOUT
+# is left empty — `af-target-identity-guard.sh` treats that as a
+# fail-closed missing-env condition (no silent pass).
+AF_TARGET_CHECKOUT="$(TARGET_REPO="$TARGET_REPO" CONFIG="$CONFIG" python3 -c '
+import os, sys
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib
+    except ImportError:
+        sys.exit(0)
+cfg_path = os.environ.get("CONFIG", "")
+target = os.environ.get("TARGET_REPO", "")
+try:
+    with open(cfg_path, "rb") as fp:
+        cfg = tomllib.load(fp)
+except Exception:
+    sys.exit(0)
+repos = cfg.get("repos") or {}
+entry = repos.get(target) or {}
+local = entry.get("local_checkout")
+if local:
+    print(local)
+    sys.exit(0)
+sys.exit(0)
+')"
+
+# AF_TARGET_BRANCH: the PR's head branch. Look it up via `gh pr view`
+# first (the source of truth the worker will land on); fall back to the
+# bead's stored branch from the SQLite overlay (the path the daemon
+# already validated as part of `dispatch-record`). `gh pr view` failures
+# are non-fatal — the worker will still get the repo + checkout token,
+# and its own `af-target-identity-guard.sh` will surface the missing
+# branch via a drift sentinel. Final fallback: the factory-fabricated
+# default `refs/heads/factory/<BEAD_ID>-r1` (the branch the dispatch
+# path uses for an ordinary create-new-work bead); if THAT is wrong, the
+# guard catches it on the first pre-write / pre-push invocation.
+AF_TARGET_BRANCH=""
+if command -v gh >/dev/null 2>&1; then
+  AF_TARGET_BRANCH="$(gh pr view "$PR" --repo "$TARGET_REPO" --json headRefName -q '.headRefName // empty' 2>/dev/null || true)"
+  if [ -n "$AF_TARGET_BRANCH" ]; then
+    AF_TARGET_BRANCH="refs/heads/${AF_TARGET_BRANCH}"
+  fi
+fi
+if [ -z "$AF_TARGET_BRANCH" ] && [ -r "$DB" ]; then
+  AF_TARGET_BRANCH="$(sqlite3 "$DB" "SELECT branch FROM bead_overlay WHERE bead_id='$(printf "%s" "$BEAD_ID" | sed "s/'/''/g")' AND branch IS NOT NULL;" 2>/dev/null || true)"
+fi
+# Normalize: if the resolved branch is bare (no `refs/heads/` prefix),
+# add it. The guard's `normalize_branch` accepts both forms, but
+# canonicalizing here makes the sentinel + drift message easier to read.
+case "$AF_TARGET_BRANCH" in
+  refs/heads/*) ;;
+  "") AF_TARGET_BRANCH="refs/heads/factory/${BEAD_ID}-r1" ;;
+  *) AF_TARGET_BRANCH="refs/heads/${AF_TARGET_BRANCH}" ;;
+esac
+
+# AF_TARGET_REPO: passed-through canonical form the guard normalizes
+# (lowercase, strip `.git`). Set from $3 (the explicit target_repo arg)
+# so the worker has the same owner/name the dispatch path chose.
+AF_TARGET_REPO="$TARGET_REPO"
+
+export AF_TARGET_CHECKOUT AF_TARGET_BRANCH AF_TARGET_REPO AF_BEAD_ID AF_PR_NUMBER
+export AF_BEAD_ID="$BEAD_ID" AF_PR_NUMBER="$PR"
 
 # Mode resolution: SYNC=1 OR ASYNC=0 → sync; otherwise async (default).
 if [ "${SYNC:-0}" = "1" ] || [ "${ASYNC:-1}" = "0" ]; then
@@ -94,8 +178,42 @@ else:
 # activates structured goal-tracking in the spawned worker; the bead's
 # description + acceptance are appended so the worker reads the goal
 # artifact rather than re-deriving it from IDs.
+#
+# Bead dark-factory-w2fr: the prompt also embeds the target-identity
+# preamble so the worker is told (in plain language) to validate its
+# worktree / branch / repo BEFORE writing any tracked file or running
+# `git push`, and to invoke
+# `daemon/scripts/af-target-identity-guard.sh` (which reads the
+# AF_TARGET_* tokens injected below) on each such event. The
+# dark-factory-o74s / wa-3551 incident reproduced by this bead
+# (a remediation worker for PR #9462 that ended up editing
+# provenance-narrow/mvp_site/schemas/prompt_tool_contracts.json — a
+# path in a different repo from the assignment) is exactly what this
+# guard is designed to refuse.
 PROMPT="/goal
 Factory bead ${BEAD_ID}: drive PR #${PR} on ${TARGET_REPO} to /green + /er. Push to existing branch only; do NOT open new PR; do NOT merge.
+
+# TARGET IDENTITY (bead dark-factory-w2fr)
+# Before writing any tracked file or running \`git push\`, you MUST verify
+# your worker's identity matches the assignment below. Run:
+#
+#     bash daemon/scripts/af-target-identity-guard.sh
+#
+# (or invoke the pre-push wrapper
+# \`daemon/scripts/af-push-identity-guard.sh\` instead of \`git push\`
+# directly — it runs the same check then exec's the underlying push).
+# The guard reads AF_TARGET_CHECKOUT / AF_TARGET_BRANCH / AF_TARGET_REPO
+# from your environment (set by the factory at spawn time) and refuses
+# the action on any mismatch. Failure is fail-closed: you halt on a
+# drift sentinel and the bead is parked HUMAN_HELD — the operator must
+# reconcile the worktree / branch / repo identity before any further
+# dispatch.
+#
+#   Assigned worktree: \${AF_TARGET_CHECKOUT}
+#   Assigned branch:   \${AF_TARGET_BRANCH}
+#   Assigned repo:     \${AF_TARGET_REPO}
+#   Assigned bead:     ${BEAD_ID}
+#   Assigned PR:       #${PR}
 
 --- Bead goal artifact (br show --json) ---
 ${BEAD_DESC}"

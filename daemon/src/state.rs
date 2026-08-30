@@ -708,6 +708,17 @@ pub enum HumanHoldReason {
     /// bare requeue would replay the same leak. Excluded from
     /// `recoverable_exact_values()`.
     WorktreeCwdMismatch,
+    /// Bead dark-factory-w2fr: an adopted-PR remediation worker's actual
+    /// identity (worktree path / branch / repo) did not match the
+    /// assignment captured at spawn time — the exact drift pattern
+    /// reproduced by wa-3551 / dark-factory-o74s for PR #9462, where the
+    /// worker ended up on PR #9512's branch / a sibling worktree of a
+    /// different repo and edited `provenance-narrow/mvp_site/schemas/`
+    /// files. Permanent (NOT in `recoverable_exact_values()`): a bare
+    /// requeue replays the same drift, so an operator must reconcile the
+    /// underlying worktree / branch / repo identity before the next
+    /// dispatch attempt.
+    TargetIdentityDrift,
 }
 
 impl HumanHoldReason {
@@ -756,6 +767,7 @@ impl HumanHoldReason {
                 return format!("escalation_local_fallback:{reason}");
             }
             Self::WorktreeCwdMismatch => "worktree_cwd_mismatch",
+            Self::TargetIdentityDrift => "target_identity_drift",
         }
         .to_string()
     }

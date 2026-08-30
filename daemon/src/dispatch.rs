@@ -664,6 +664,22 @@ pub fn dispatch_ready_with_vcs(
             // path under `cfg.agent_worktree_root`; for the legacy layout
             // it is simply the worker_checkout path itself.
             expected_cwd: Some(worker_checkout),
+            // Bead dark-factory-w2fr (live incident wa-3551 / dark-factory-o74s
+            // for PR #9462): the worker session's expected HEAD branch. The
+            // adapter validates this against `git rev-parse --abbrev-ref HEAD`
+            // before returning Ok; a mismatch parks
+            // `HUMAN_HELD reason=target_identity_drift`. The factory-side
+            // `daemon/scripts/af-target-identity-guard.sh` performs the same
+            // check immediately before any tracked file write or `git push`,
+            // so a worker that drifts after spawn is still caught before it
+            // can leak the change to an unrelated PR.
+            expected_branch: Some(branch.clone()),
+            // Bead dark-factory-w2fr: the worker session's expected `origin`
+            // repo. Validated against `git remote get-url origin` in the
+            // checkout; a mismatch (the exact dark-factory-ik0v shape —
+            // dark-factory worker writing to a worldarchitect.ai path)
+            // parks `HUMAN_HELD reason=target_identity_drift`.
+            expected_repo: Some(repo.clone()),
         };
         let session_id = match sessions.spawn(&spec) {
             Ok(session_id) => session_id,
@@ -786,6 +802,30 @@ pub fn dispatch_ready_with_vcs(
                     overlay.attempt,
                     Some(branch.clone()),
                     "worktree_cwd_mismatch",
+                    err,
+                ));
+                continue;
+            }
+            // Bead dark-factory-w2fr: a worker session's resolved
+            // workspace / branch / repo did not match the assignment —
+            // the exact drift pattern reproduced by wa-3551 /
+            // dark-factory-o74s (a remediation worker for PR #9462 that
+            // ended up on PR #9512's branch / a sibling worktree of
+            // provenance-narrow/mvp_site/schemas/). Permanent (NOT in
+            // `recoverable_exact_values()`): requeuing would replay the
+            // same drift, so the operator must reconcile the
+            // worktree / branch / repo identity before the next
+            // dispatch attempt.
+            Err(err @ DaemonError::TargetIdentityDrift { .. }) => {
+                overlay.state = OverlayState::HumanHeld;
+                overlay.session_id = None;
+                set_human_hold_reason(&mut overlay, HumanHoldReason::TargetIdentityDrift);
+                store.save(&overlay)?;
+                report.failures.push(failure(
+                    bead,
+                    overlay.attempt,
+                    Some(branch.clone()),
+                    "target_identity_drift",
                     err,
                 ));
                 continue;
@@ -1390,6 +1430,22 @@ mod tests {
         /// process's own cwd (which matches the expected cwd when the
         /// spec's `local_checkout` is also the test cwd).
         spawn_cwd_for: RefCell<HashMap<String, std::path::PathBuf>>,
+        /// Bead dark-factory-w2fr: scripted branch to report per bead id
+        /// when the fake spawn is called. Used by the target-identity-drift
+        /// regression test to simulate a worker whose resolved branch
+        /// disagrees with `spec.expected_branch` (the live wa-3551 /
+        /// dark-factory-o74s shape: a remediation worker for PR #9462
+        /// ended up on PR #9512's branch). Missing entries default to
+        /// `spec.branch`, so a clean run matches the assignment.
+        spawn_branch_for: RefCell<HashMap<String, String>>,
+        /// Bead dark-factory-w2fr: scripted repo to report per bead id
+        /// when the fake spawn is called. Used by the target-identity-drift
+        /// regression test to simulate a worker whose resolved repo
+        /// disagrees with `spec.expected_repo` (the dark-factory-ik0v /
+        /// j9id shape: dark-factory worker writing to a worldarchitect.ai
+        /// path). Missing entries default to `spec.repo`, so a clean run
+        /// matches the assignment.
+        spawn_repo_for: RefCell<HashMap<String, String>>,
     }
 
     impl FakeSessions {
@@ -1419,6 +1475,8 @@ mod tests {
                 scripted_worktree_remote: RefCell::new(scripted_worktree_remote),
                 ignore_cwd_guard_for: RefCell::new(Vec::new()),
                 spawn_cwd_for: RefCell::new(HashMap::new()),
+                spawn_branch_for: RefCell::new(HashMap::new()),
+                spawn_repo_for: RefCell::new(HashMap::new()),
             }
         }
 
@@ -1484,6 +1542,26 @@ mod tests {
                 .insert(bead_id.to_string(), path);
         }
 
+        /// Bead dark-factory-w2fr: script `spawn` to report a divergent
+        /// branch for `bead_id`, simulating a worker that ended up on the
+        /// wrong local branch (the wa-3551 / PR #9462 -> PR #9512 shape).
+        fn set_spawn_branch(&self, bead_id: &str, branch: &str) {
+            self.spawn_branch_for
+                .borrow_mut()
+                .insert(bead_id.to_string(), branch.to_string());
+        }
+
+        /// Bead dark-factory-w2fr: script `spawn` to report a divergent
+        /// repo for `bead_id`, simulating a worker whose `origin` URL
+        /// belongs to a different repository than the assignment (the
+        /// dark-factory-ik0v shape: dark-factory worker writing to a
+        /// worldarchitect.ai path).
+        fn set_spawn_repo(&self, bead_id: &str, repo: &str) {
+            self.spawn_repo_for
+                .borrow_mut()
+                .insert(bead_id.to_string(), repo.to_string());
+        }
+
         /// Bead jleechan-jw4c: opt a bead id out of the cwd guard for
         /// legacy layout coverage. Tests that exercise the dispatch path
         /// without the new isolation layout call this so the FakeSessions
@@ -1514,13 +1592,37 @@ mod tests {
                 .borrow()
                 .contains(&spec.bead_id)
             {
-                let actual = self
+                let actual_cwd = self
                     .spawn_cwd_for
                     .borrow()
                     .get(&spec.bead_id)
                     .cloned()
                     .unwrap_or_else(|| spec.expected_cwd.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_default()));
-                crate::tools::check_cwd_guard(spec.expected_cwd.as_deref(), &actual)?;
+                crate::tools::check_cwd_guard(spec.expected_cwd.as_deref(), &actual_cwd)?;
+                // Bead dark-factory-w2fr: also enforce the target-identity
+                // guard (worktree + branch + repo). Mirrors the production
+                // adapter's post-spawn check; the dispatch path catches
+                // drift before the worker session is ever created.
+                let actual_branch = self
+                    .spawn_branch_for
+                    .borrow()
+                    .get(&spec.bead_id)
+                    .cloned()
+                    .unwrap_or_else(|| spec.branch.clone());
+                let actual_repo = self
+                    .spawn_repo_for
+                    .borrow()
+                    .get(&spec.bead_id)
+                    .cloned()
+                    .unwrap_or_else(|| spec.repo.clone());
+                crate::tools::check_target_identity_guard(
+                    spec.expected_cwd.as_deref(),
+                    spec.expected_branch.as_deref(),
+                    spec.expected_repo.as_deref(),
+                    &actual_cwd,
+                    &actual_branch,
+                    &actual_repo,
+                )?;
             }
             self.calls
                 .borrow_mut()
@@ -4446,6 +4548,65 @@ mod tests {
         assert!(
             overlay.park_reason.is_none(),
             "matching cwd must not park the bead"
+        );
+    }
+
+    /// Bead dark-factory-w2fr: a worker session whose resolved branch
+    /// disagrees with `spec.expected_branch` must be refused and the
+    /// bead parked `HUMAN_HELD reason=target_identity_drift`. Mirrors
+    /// the live wa-3551 / dark-factory-o74s shape (remediation worker
+    /// for PR #9462 ended up on PR #9512's branch). The dispatch path
+    /// catches the drift BEFORE the worker is created — no live session
+    /// is left untracked.
+    #[test]
+    fn target_identity_drift_branch_park_bead_human_held() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        // Script the fake to report a divergent branch for bead-0 — the
+        // exact wa-3551 / PR #9462 -> PR #9512 shape.
+        sessions.set_spawn_branch("bead-0", "factory/wa-9512-r9");
+        let ready = beads(1);
+
+        let _ = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(
+            overlay.state,
+            OverlayState::HumanHeld,
+            "branch drift must park the bead, not silently accept"
+        );
+        assert_eq!(
+            overlay.park_reason.as_deref(),
+            Some("target_identity_drift"),
+            "the park reason must match the dedicated TargetIdentityDrift variant"
+        );
+    }
+
+    /// Bead dark-factory-w2fr: a worker session whose resolved repo
+    /// disagrees with `spec.expected_repo` must be refused and the
+    /// bead parked `HUMAN_HELD reason=target_identity_drift`. Mirrors
+    /// the dark-factory-ik0v / j9id shape (dark-factory worker writing
+    /// to a worldarchitect.ai path).
+    #[test]
+    fn target_identity_drift_repo_park_bead_human_held() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        // Script the fake to report a divergent repo for bead-0.
+        sessions.set_spawn_repo("bead-0", "jleechanorg/worldarchitect.ai");
+        let ready = beads(1);
+
+        let _ = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(
+            overlay.state,
+            OverlayState::HumanHeld,
+            "repo drift must park the bead, not silently accept"
+        );
+        assert_eq!(
+            overlay.park_reason.as_deref(),
+            Some("target_identity_drift"),
+            "the park reason must match the dedicated TargetIdentityDrift variant"
         );
     }
 }

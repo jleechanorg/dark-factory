@@ -6,6 +6,17 @@ pub struct SpawnBatchCleanupFailure {
     pub error: DaemonError,
 }
 
+/// Bead dark-factory-w2fr: companion to `DaemonError::TargetIdentityDrift`.
+/// Lives in `errors` (not `tools`) so the dispatch path can pattern-match
+/// on it without taking a dependency on the tools module's private
+/// canonicalization helpers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetIdentityDriftKind {
+    Worktree,
+    Branch,
+    Repo,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum DaemonError {
     #[error("tool {tool} failed (rc={rc}): {stderr}")]
@@ -51,6 +62,24 @@ pub enum DaemonError {
     /// (a new `HumanHoldReason`).
     #[error("worker cwd mismatch: expected {expected:?}, got {actual:?}")]
     WorktreeCwdMismatch { expected: String, actual: String },
+    /// Bead dark-factory-w2fr (live incident wa-3551 / dark-factory-o74s):
+    /// an adopted-PR remediation worker was supposed to operate on
+    /// `expected_cwd`/`expected_branch`/`expected_repo` captured at spawn
+    /// time, but at the time of the spawn adapter's post-spawn identity
+    /// check (or — for the runtime path — the worker itself's pre-push
+    /// guard) one of those dimensions disagrees with what the live session
+    /// actually has. Each `kind` names the specific drifted dimension
+    /// (worktree path / branch / repo) so triage can route the failure to
+    /// the right fix without grepping the daemon log. Permanent (NOT in
+    /// `recoverable_exact_values()`): requeueing would just re-spawn the
+    /// same drift pattern — the operator must resolve the underlying
+    /// worktree / branch / repo mismatch before the next dispatch.
+    #[error("target-identity drift ({kind:?}): expected {expected:?}, got {actual:?}")]
+    TargetIdentityDrift {
+        kind: TargetIdentityDriftKind,
+        expected: String,
+        actual: String,
+    },
     /// The re-roll circuit-breaker's semantic comparator
     /// (`same_underlying_issue` in `reroll.rs`) makes a real LLM call to
     /// judge whether two consecutive rejection reviews describe the same
@@ -204,6 +233,7 @@ impl DaemonError {
             DaemonError::SpawnCleanupFailed { .. } => "spawn_cleanup_failed",
             DaemonError::SpawnBatchCleanupFailed { .. } => "spawn_batch_cleanup_failed",
             DaemonError::WorktreeCwdMismatch { .. } => "worktree_cwd_mismatch",
+            DaemonError::TargetIdentityDrift { .. } => "target_identity_drift",
         }
     }
 

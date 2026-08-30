@@ -2,7 +2,7 @@
 // one external tool; production impls (Cli*) are thin `Command` wrappers sharing
 // `run_tool`. Test fakes live in `daemon/tests/common/mod.rs` (scripted responses,
 // call log, no subprocess use).
-use crate::errors::DaemonError;
+use crate::errors::{DaemonError, TargetIdentityDriftKind};
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -274,6 +274,22 @@ pub struct SpawnSpec {
     /// for legacy single-checkout layouts where the operator has not flipped
     /// on the new isolation root.
     pub expected_cwd: Option<std::path::PathBuf>,
+    /// Bead dark-factory-w2fr (live incident wa-3551 / dark-factory-o74s
+    /// for PR #9462): the worker session's expected HEAD branch. Stored
+    /// on the spec so the adapter and worker-side guards can validate
+    /// `git rev-parse --abbrev-ref HEAD` matches the bead's assigned
+    /// branch before any tracked file is written or `git push` is run.
+    /// `None` disables this dimension (legacy layout — only `expected_cwd`
+    /// is enforced, mirroring `check_cwd_guard`'s pre-fix behavior).
+    pub expected_branch: Option<String>,
+    /// Bead dark-factory-w2fr: the worker session's expected `origin`
+    /// repo (`owner/name` form, case-insensitive). A worker that ends up
+    /// inside a checkout whose `origin` points at a different repo (the
+    /// dark-factory-ik0v / j9id shape — dark-factory worker writing to a
+    /// worldarchitect.ai path) is refused and parked `HUMAN_HELD` with
+    /// `park_reason = "target_identity_drift"`. `None` disables this
+    /// dimension.
+    pub expected_repo: Option<String>,
 }
 
 /// Opaque handle to an AO/`aow` session.
@@ -441,6 +457,126 @@ pub fn check_cwd_guard(
             actual: actual_canon.display().to_string(),
         })
     }
+}
+
+/// Bead dark-factory-w2fr: fail-closed guard that validates every
+/// dimension of an adopted-PR remediation worker's identity — worktree
+/// path, branch, and repo — before allowing the spawn to return `Ok` or
+/// the worker to push. Companion to [`check_cwd_guard`] (which validates
+/// only the worktree path) and supersedes it on the adopted-PR path.
+///
+/// The guard is silent (Ok) only when every supplied `expected_*` is
+/// `None` (legacy layout, kept for backward compatibility — the
+/// non-adopted path still uses `check_cwd_guard`). Any non-`None`
+/// `expected_*` that disagrees with the matching `actual_*` returns
+/// `Err(DaemonError::TargetIdentityDrift)`, which the dispatch path
+/// converts into a `HUMAN_HELD` park with `park_reason =
+/// "target_identity_drift"` (see `HumanHoldReason::TargetIdentityDrift`).
+///
+/// Canonicalization is applied to the worktree paths so a worker that
+/// resolves its cwd via `realpath` cannot escape the comparison by
+/// landing at `..`-relative form; branches are normalized by stripping
+/// `refs/heads/` so callers can pass either form; repos are normalized
+/// by lowercasing and dropping a trailing `.git`.
+pub fn check_target_identity_guard(
+    expected_cwd: Option<&std::path::Path>,
+    expected_branch: Option<&str>,
+    expected_repo: Option<&str>,
+    actual_cwd: &std::path::Path,
+    actual_branch: &str,
+    actual_repo: &str,
+) -> Result<(), DaemonError> {
+    if let (Some(expected), Some(expected_branch), Some(expected_repo)) =
+        (expected_cwd, expected_branch, expected_repo)
+    {
+        // All three dimensions were supplied — fail closed on the first
+        // disagreement. The order matters for telemetry: worktree first
+        // (most common wa-3551 shape), then branch (next most common),
+        // then repo (rare — only fires when AO creates a worker in the
+        // wrong project entirely).
+        let expected_canon = expected
+            .canonicalize()
+            .unwrap_or_else(|_| expected.to_path_buf());
+        let actual_canon = actual_cwd
+            .canonicalize()
+            .unwrap_or_else(|_| actual_cwd.to_path_buf());
+        if expected_canon != actual_canon {
+            return Err(DaemonError::TargetIdentityDrift {
+                kind: TargetIdentityDriftKind::Worktree,
+                expected: expected_canon.display().to_string(),
+                actual: actual_canon.display().to_string(),
+            });
+        }
+        let expected_branch_norm = normalize_branch(expected_branch);
+        let actual_branch_norm = normalize_branch(actual_branch);
+        if expected_branch_norm != actual_branch_norm {
+            return Err(DaemonError::TargetIdentityDrift {
+                kind: TargetIdentityDriftKind::Branch,
+                expected: expected_branch_norm,
+                actual: actual_branch_norm,
+            });
+        }
+        let expected_repo_norm = normalize_repo(expected_repo);
+        let actual_repo_norm = normalize_repo(actual_repo);
+        if expected_repo_norm != actual_repo_norm {
+            return Err(DaemonError::TargetIdentityDrift {
+                kind: TargetIdentityDriftKind::Repo,
+                expected: expected_repo_norm,
+                actual: actual_repo_norm,
+            });
+        }
+        return Ok(());
+    }
+    // Partial-spec path: at least one expected_* is None. Only fail
+    // closed on the dimensions that WERE supplied — partial specs are
+    // used during the incremental rollout of the guard (legacy
+    // single-checkout layouts only set `expected_cwd`).
+    if let Some(expected) = expected_cwd {
+        let expected_canon = expected
+            .canonicalize()
+            .unwrap_or_else(|_| expected.to_path_buf());
+        let actual_canon = actual_cwd
+            .canonicalize()
+            .unwrap_or_else(|_| actual_cwd.to_path_buf());
+        if expected_canon != actual_canon {
+            return Err(DaemonError::TargetIdentityDrift {
+                kind: TargetIdentityDriftKind::Worktree,
+                expected: expected_canon.display().to_string(),
+                actual: actual_canon.display().to_string(),
+            });
+        }
+    }
+    if let Some(expected) = expected_branch {
+        let expected_norm = normalize_branch(expected);
+        let actual_norm = normalize_branch(actual_branch);
+        if expected_norm != actual_norm {
+            return Err(DaemonError::TargetIdentityDrift {
+                kind: TargetIdentityDriftKind::Branch,
+                expected: expected_norm,
+                actual: actual_norm,
+            });
+        }
+    }
+    if let Some(expected) = expected_repo {
+        let expected_norm = normalize_repo(expected);
+        let actual_norm = normalize_repo(actual_repo);
+        if expected_norm != actual_norm {
+            return Err(DaemonError::TargetIdentityDrift {
+                kind: TargetIdentityDriftKind::Repo,
+                expected: expected_norm,
+                actual: actual_norm,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn normalize_branch(branch: &str) -> String {
+    branch.trim().trim_start_matches("refs/heads/").to_string()
+}
+
+fn normalize_repo(repo: &str) -> String {
+    repo.trim().trim_end_matches(".git").to_ascii_lowercase()
 }
 
 pub fn claude_project_slug(worktree_path: &std::path::Path) -> String {
@@ -1649,6 +1785,126 @@ mod tests {
             parent_cwd.canonicalize().unwrap(),
             "run_tool must NOT change the child's cwd; got {out:?}, parent cwd {parent_cwd:?}"
         );
+    }
+
+    // Bead dark-factory-w2fr: the target-identity guard rejects a worker
+    // whose actual cwd / branch / repo does not match the assignment
+    // captured at spawn time. The guard is silent (Ok) when every expected
+    // value is `None` (legacy layout, kept for backward compatibility)
+    // and FAIL CLOSED when any non-empty expected value disagrees with the
+    // actual. Distinct from `check_cwd_guard` (which validates only the
+    // worktree path) — this guard exists because a worker may sit in the
+    // correct worktree but on a sibling's branch, or on the right branch
+    // but inside the wrong repo's checkout (the exact drift pattern that
+    // wa-3551 / dark-factory-o74s reproduced: a remediation worker for
+    // PR #9462 ended up writing into `provenance-narrow/mvp_site/schemas/`
+    // — a sibling worktree of a different repository).
+
+    #[test]
+    fn target_identity_guard_passes_when_every_expected_is_none() {
+        let result = check_target_identity_guard(
+            None,
+            None,
+            None,
+            std::path::Path::new("/tmp"),
+            "any-branch",
+            "any/repo",
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn target_identity_guard_passes_when_cwd_branch_repo_all_match() {
+        let dir = std::env::temp_dir().join(format!("afd_target_id_match_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let result = check_target_identity_guard(
+            Some(dir.as_path()),
+            Some("refs/heads/factory/bead-r1"),
+            Some("owner/repo"),
+            &dir,
+            "factory/bead-r1",
+            "owner/repo",
+        );
+        assert!(result.is_ok(), "all-matching identity must pass the guard");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn target_identity_guard_rejects_sibling_worktree_with_matching_repo() {
+        // The exact wa-3551 drift pattern: same repo, different worktree.
+        let expected = std::env::temp_dir().join(format!("afd_target_id_sibling_{}", std::process::id()));
+        let actual = std::env::temp_dir().join(format!("afd_target_id_sibling_actual_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&expected);
+        let _ = std::fs::remove_dir_all(&actual);
+        std::fs::create_dir_all(&expected).unwrap();
+        std::fs::create_dir_all(&actual).unwrap();
+        let err = check_target_identity_guard(
+            Some(expected.as_path()),
+            Some("refs/heads/factory/wa-9462-r1"),
+            Some("jleechanorg/dark-factory"),
+            &actual,
+            "factory/wa-9462-r1",
+            "jleechanorg/dark-factory",
+        )
+        .unwrap_err();
+        match err {
+            DaemonError::TargetIdentityDrift { kind, .. } => {
+                assert_eq!(kind, TargetIdentityDriftKind::Worktree);
+            }
+            other => panic!("expected TargetIdentityDrift::Worktree, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&expected);
+        let _ = std::fs::remove_dir_all(&actual);
+    }
+
+    #[test]
+    fn target_identity_guard_rejects_cross_repo_worktree() {
+        // The exact wa-3551 path drift: right worktree path, but a
+        // different repository inside it.
+        let shared_worktree = std::env::temp_dir().join(format!("afd_target_id_xrepo_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&shared_worktree);
+        std::fs::create_dir_all(&shared_worktree).unwrap();
+        let err = check_target_identity_guard(
+            Some(shared_worktree.as_path()),
+            Some("refs/heads/factory/wa-9462-r1"),
+            Some("jleechanorg/dark-factory"),
+            &shared_worktree,
+            "factory/wa-9462-r1",
+            "jleechanorg/worldarchitect.ai",
+        )
+        .unwrap_err();
+        match err {
+            DaemonError::TargetIdentityDrift { kind, .. } => {
+                assert_eq!(kind, TargetIdentityDriftKind::Repo);
+            }
+            other => panic!("expected TargetIdentityDrift::Repo, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&shared_worktree);
+    }
+
+    #[test]
+    fn target_identity_guard_rejects_branch_drift_on_same_repo() {
+        // Worker spawned for PR #9462 ends up on PR #9512's branch.
+        let dir = std::env::temp_dir().join(format!("afd_target_id_branch_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = check_target_identity_guard(
+            Some(dir.as_path()),
+            Some("refs/heads/factory/wa-9462-r1"),
+            Some("jleechanorg/dark-factory"),
+            &dir,
+            "factory/wa-9512-r1",
+            "jleechanorg/dark-factory",
+        )
+        .unwrap_err();
+        match err {
+            DaemonError::TargetIdentityDrift { kind, .. } => {
+                assert_eq!(kind, TargetIdentityDriftKind::Branch);
+            }
+            other => panic!("expected TargetIdentityDrift::Branch, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Bead jleechan-jw4c: the cwd guard rejects a worker whose actual cwd

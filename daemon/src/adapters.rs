@@ -3168,6 +3168,8 @@ pub fn verify_ao_bridge_compatibility(
         expected_revision: None,
         managed_checkout: false,
         expected_cwd: None,
+        expected_branch: None,
+        expected_repo: None,
     };
     let mut command = ao_spawn_command_with_mode(agent, &spec, true)?;
     command
@@ -3363,6 +3365,53 @@ impl CliSessions {
                 session.0
             ))
         })?;
+
+        // Bead dark-factory-w2fr: post-spawn target-identity verification.
+        // Even when the bridge (ao-spawn-v013-bridge.mjs) accepted the spawn,
+        // AO's workspace may have been created from a different checkout
+        // than the assignment (the live wa-3551 / dark-factory-o74s drift
+        // pattern: remediation worker for PR #9462 ended up on a sibling
+        // worktree of `provenance-narrow/mvp_site/schemas/`). Validate
+        // the resolved workspace against every supplied `expected_*` from
+        // the SpawnSpec; a disagreement is fail-closed (park HUMAN_HELD
+        // reason=target_identity_drift, NOT silently accepted).
+        if spec.expected_cwd.is_some() || spec.expected_branch.is_some() || spec.expected_repo.is_some() {
+            // Resolved branch + repo from the live workspace. These mirror
+            // what the worker-side bash guard (`af-target-identity-guard.sh`)
+            // will re-check at every pre-write / pre-push invocation, but
+            // catching the drift here means the worker session never
+            // starts in the first place.
+            let actual_branch_resolved: String = match observed_branch.as_deref() {
+                Some(branch) if branch != "HEAD" => format!("refs/heads/{branch}"),
+                _ => {
+                    // AO can report the resolved branch as `HEAD` when the
+                    // workspace is in a detached state — surface that as
+                    // branch drift rather than silently accepting it.
+                    "HEAD".to_string()
+                }
+            };
+            let actual_repo_resolved: String = std::process::Command::new("git")
+                .args(["-C", workspace.to_string_lossy().as_ref(), "remote", "get-url", "origin"])
+                .output()
+                .ok()
+                .and_then(|out| {
+                    if out.status.success() {
+                        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default();
+            crate::tools::check_target_identity_guard(
+                spec.expected_cwd.as_deref(),
+                spec.expected_branch.as_deref(),
+                spec.expected_repo.as_deref(),
+                &workspace,
+                &actual_branch_resolved,
+                &actual_repo_resolved,
+            )?;
+        }
+
         self.spawned_worktrees
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3845,6 +3894,8 @@ mod ao_spawn_contract_tests {
             expected_revision: None,
             managed_checkout: false,
             expected_cwd: None,
+            expected_branch: None,
+            expected_repo: None,
         }
     }
 

@@ -1394,7 +1394,7 @@ fn execute_adopted(
         bead_id: bead.bead_id.clone(),
         branch: branch.clone(),
         prompt,
-        repo: adopted_repo,
+        repo: adopted_repo.clone(),
         ao_project: adopted_routing.ao_project,
         remote: adopted_routing.push_remote,
         local_checkout: Some(adopted_checkout.clone()),
@@ -1405,6 +1405,13 @@ fn execute_adopted(
         // route to `cfg.agent_worktree_root/<repo>/<agent_id>` once the
         // spawn adapter exposes the agent_id it just claimed.
         expected_cwd: Some(adopted_checkout),
+        // Bead dark-factory-w2fr: an adopted-PR remediation dispatch is
+        // exactly the path that needs the strongest target-identity
+        // enforcement — the live incident that motivates this guard
+        // (wa-3551 / dark-factory-o74s for PR #9462) was an adopted-PR
+        // remediation worker that drifted onto sibling worktrees.
+        expected_branch: Some(branch.clone()),
+        expected_repo: Some(adopted_repo.clone()),
     };
 
     // Persist an ambiguous pre-spawn intent before crossing the external AO

@@ -125,6 +125,8 @@ fn test_cli_sessions_real_spawn_v013_contract() {
             expected_revision: None,
             managed_checkout: false,
             expected_cwd: None,
+            expected_branch: None,
+            expected_repo: None,
         })
         .expect("real AO v0.1.3 adapter spawn failed");
 
