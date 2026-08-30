@@ -158,7 +158,7 @@ route-record)
 capacity)
   active="$(sql "SELECT count(*) FROM bead_overlay WHERE state IN ('DISPATCHED','ATTESTED');")"
   mw="$(cfg max_workers)"; mb="$(cfg max_batch)"
-  mw="${mw:-30}"; mb="${mb:-15}"
+  mw="${mw:-40}"; mb="${mb:-15}"
   free=$(( mw - active )); [ "$free" -lt 0 ] && free=0
   [ "$free" -gt "$mb" ] && free="$mb"
   echo "$free"

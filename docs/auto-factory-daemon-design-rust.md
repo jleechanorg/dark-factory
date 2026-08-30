@@ -133,7 +133,7 @@ pub struct Config {
     pub target_repo: String,            // exactly one (pilot scope)
     pub base_branch: String,            // "main"
     pub stage: u8,                      // 1 = verifier plane only; 2 = re-roll enabled
-    pub max_workers: usize,             // 30 (spec §4.2.8)
+    pub max_workers: usize,             // 40 (spec §4.2.8; canonical contract, bead dark-factory-59wt)
     pub max_batch: usize,               // 15
     pub fast_tick_secs: u64,            // 60
     pub slow_tick_secs: u64,            // 600

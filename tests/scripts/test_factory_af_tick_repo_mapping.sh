@@ -129,7 +129,7 @@ write_config() {
   cat > "$cfg" <<TOML_EOF
 target_repo = "jleechanorg/worldarchitect.ai"
 ao_project = "worldarchitect"
-max_workers = 30
+max_workers = 40
 max_batch = 15
 TOML_EOF
   printf '%s' "$cfg"

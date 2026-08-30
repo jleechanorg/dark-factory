@@ -79,7 +79,8 @@ mod tests {
     fn parses_example_config() {
         let cfg = load(std::path::Path::new("contracts/daemon.toml.example")).unwrap();
         assert_eq!(cfg.stage, 1);
-        assert_eq!(cfg.max_workers, 30);
+        // Canonical factory capacity contract (bead dark-factory-59wt): 40/15.
+        assert_eq!(cfg.max_workers, 40);
         assert_eq!(cfg.max_batch, 15);
         assert_eq!(cfg.base_branch, "main");
     }
@@ -279,7 +280,7 @@ subprocess helper: spawn, wait with deadline (poll `try_wait` every 100ms; kill 
 
 **Files:** Create `daemon/src/dispatch.rs`
 
-- [ ] **Step 1:** Failing tests: 40 ready beads, 0 active → exactly 15 spawned (max_batch); 28 active of 30 → exactly 2 spawned; 30 active → 0 spawned and no `Sessions::spawn` calls (assert via fake call log); each spawn registers `factory/<bead>-r<attempt>` in the store and flips state QUEUED→DISPATCHED.
+- [ ] **Step 1:** Failing tests: 40 ready beads, 0 active → exactly 15 spawned (max_batch); 38 active of 40 → exactly 2 spawned; 40 active → 0 spawned and no `Sessions::spawn` calls (assert via fake call log); each spawn registers `factory/<bead>-r<attempt>` in the store and flips state QUEUED→DISPATCHED. (Canonical factory capacity contract, bead dark-factory-59wt: max_workers=40, max_batch=15.)
 - [ ] **Step 2:** Implement `dispatch_ready(sessions,store,cfg,ready)`; `cargo test dispatch` pass → commit `feat(daemon): dispatcher with 30/15 caps`
 
 ### Task 10: Tick loop + integration — Layer 2

@@ -1827,7 +1827,9 @@ mod tests {
             ao_project: None,
             base_branch: "main".into(),
             stage: 1,
-            max_workers: 30,
+            // Canonical factory capacity contract (bead dark-factory-59wt):
+            // max_workers=40, max_batch=15 across all tracked config.
+            max_workers: 40,
             max_batch: 15,
             fast_tick_secs: 60,
             slow_tick_secs: 600,
@@ -2031,7 +2033,7 @@ mod tests {
         assert_eq!(
             report.success_count(),
             15,
-            "must cap at max_batch even with 30 free slots"
+            "must cap at max_batch even with 40 free slots"
         );
         let spawn_calls = sessions
             .calls
@@ -2043,8 +2045,8 @@ mod tests {
     }
 
     #[test]
-    fn twenty_eight_active_of_thirty_spawns_exactly_two() {
-        let sessions = FakeSessions::new(28);
+    fn thirty_eight_active_of_forty_spawns_exactly_two() {
+        let sessions = FakeSessions::new(38);
         let store = FakeStateStore::new();
         let cfg = cfg();
         let ready = beads(40);
@@ -2054,7 +2056,7 @@ mod tests {
         assert_eq!(
             report.success_count(),
             2,
-            "only 2 free slots remain under the 30-worker cap"
+            "only 2 free slots remain under the 40-worker cap"
         );
         let spawn_calls = sessions
             .calls
@@ -2066,8 +2068,8 @@ mod tests {
     }
 
     #[test]
-    fn thirty_active_spawns_nothing_and_never_calls_spawn() {
-        let sessions = FakeSessions::new(30);
+    fn forty_active_spawns_nothing_and_never_calls_spawn() {
+        let sessions = FakeSessions::new(40);
         let store = FakeStateStore::new();
         let cfg = cfg();
         let ready = beads(40);
@@ -2744,7 +2746,7 @@ mod tests {
 
     #[test]
     fn dispatch_order_follows_ready_slice_order() {
-        let sessions = FakeSessions::new(29);
+        let sessions = FakeSessions::new(39);
         let store = FakeStateStore::new();
         let cfg = cfg();
         let ready = beads(5);
@@ -2753,7 +2755,7 @@ mod tests {
         assert_eq!(
             report.success_count(),
             1,
-            "only 1 free slot under the 30-worker cap"
+            "only 1 free slot under the 40-worker cap"
         );
 
         let spawn_calls: Vec<String> = sessions

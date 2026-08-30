@@ -223,7 +223,7 @@ export AFD_LOG="$SCRATCH_DIR/cxdb.jsonl"
 export CONFIG="$SCRATCH_DIR/cfg.toml"
 
 cat > "$CONFIG" <<TOML
-max_workers = 30
+max_workers = 40
 max_batch = 15
 TOML
 
@@ -256,7 +256,7 @@ assert "dispatch-record over capacity (rc=3 EX_OVER_CAP)" "3" "$rc"
 
 # require_state: rc=5 (EX_REQUIRE_STATE)
 cat > "$CONFIG" <<TOML
-max_workers = 30
+max_workers = 40
 max_batch = 15
 TOML
 "$OVERLAY" intake-upsert jleechan-twice 'twice' >/dev/null

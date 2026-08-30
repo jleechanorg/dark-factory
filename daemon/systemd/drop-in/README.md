@@ -55,7 +55,7 @@ systemctl --user restart ai.dark-factory.daemon.service
 ## Why `github-token.conf` was added (2026-08-17)
 
 The daemon's INTAKE probe polls ~70 PRs at `fast_tick_secs` cadence.
-Combined with worker-side `gh` calls (`max_workers=80`), the daemon burned
+Combined with worker-side `gh` calls (`max_workers=40`), the daemon burned
 through GitHub's 5000/hr core and 5000/hr GraphQL rate-limit pools and
 started emitting `gh: API rate limit exceeded (HTTP 403)` for the
 `jleechanorg/worldarchitect.ai#8958` (and 69 other) PR probes. Two-part fix:

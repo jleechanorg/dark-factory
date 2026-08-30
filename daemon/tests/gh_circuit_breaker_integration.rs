@@ -98,7 +98,7 @@ fn test_cfg() -> Config {
         ao_project: None,
         base_branch: "main".into(),
         stage: 1,
-        max_workers: 30,
+        max_workers: 40,
         max_batch: 15,
         fast_tick_secs: 60,
         slow_tick_secs: 600,

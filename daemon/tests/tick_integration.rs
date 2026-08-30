@@ -54,7 +54,7 @@ fn test_cfg() -> Config {
         ao_project: None,
         base_branch: "main".into(),
         stage: 1,
-        max_workers: 30,
+        max_workers: 40,
         max_batch: 15,
         // fast_tick_secs == slow_tick_secs so the slow tier is due on every
         // `run_tick` call in this test (ratio == 1) — both driven ticks

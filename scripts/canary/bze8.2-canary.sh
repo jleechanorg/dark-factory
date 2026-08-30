@@ -245,8 +245,8 @@ target_repo = "jleechanorg/worldarchitect.ai"
 ao_project = "worldarchitect"
 base_branch = "main"
 stage = 2
-max_workers = 80
-max_batch = 25
+max_workers = 40
+max_batch = 15
 autonomy_timebox_secs = 10800
 
 [repos."jleechanorg/worldarchitect.ai"]

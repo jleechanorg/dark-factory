@@ -324,7 +324,9 @@ mod tests {
         let cfg = load(std::path::Path::new("contracts/daemon.toml.example")).unwrap();
         assert_eq!(cfg.ao_project.as_deref(), Some("dark-factory"));
         assert_eq!(cfg.stage, 1);
-        assert_eq!(cfg.max_workers, 30);
+        // Canonical factory capacity contract (bead dark-factory-59wt):
+        // max_workers=40, max_batch=15.
+        assert_eq!(cfg.max_workers, 40);
         assert_eq!(cfg.max_batch, 15);
         assert_eq!(cfg.base_branch, "main");
     }
@@ -353,7 +355,7 @@ mod tests {
 target_repo = "owner/repo"
 base_branch = "main"
 stage = 1
-max_workers = 30
+max_workers = 40
 max_batch = 15
 fast_tick_secs = 10
 slow_tick_secs = 30
@@ -392,7 +394,7 @@ spec_dir = ".factory/specs/"
 target_repo = "owner/repo"
 base_branch = "main"
 stage = 1
-max_workers = 30
+max_workers = 40
 max_batch = 15
 fast_tick_secs = 10
 slow_tick_secs = 30
@@ -418,7 +420,7 @@ pre_gate_validation_enabled = false
 target_repo = "owner/repo"
 base_branch = "main"
 stage = 1
-max_workers = 30
+max_workers = 40
 max_batch = 15
 fast_tick_secs = 10
 slow_tick_secs = 30
@@ -450,7 +452,7 @@ target_repo = "owner/repo"
 ao_project = "repo"
 base_branch = "main"
 stage = 1
-max_workers = 30
+max_workers = 40
 max_batch = 15
 fast_tick_secs = 10
 slow_tick_secs = 30
@@ -488,7 +490,7 @@ target_repo = "jleechanorg/dark-factory"
 ao_project = "dark-factory"
 base_branch = "main"
 stage = 1
-max_workers = 30
+max_workers = 40
 max_batch = 15
 fast_tick_secs = 10
 slow_tick_secs = 30
@@ -539,7 +541,7 @@ target_repo = "jleechanorg/dark-factory"
 ao_project = "dark-factory"
 base_branch = "main"
 stage = 1
-max_workers = 30
+max_workers = 40
 max_batch = 15
 fast_tick_secs = 10
 slow_tick_secs = 30
@@ -574,7 +576,7 @@ push_remote = "origin"
 target_repo = "jleechanorg/worldarchitect.ai"
 base_branch = "main"
 stage = 1
-max_workers = 30
+max_workers = 40
 max_batch = 15
 fast_tick_secs = 10
 slow_tick_secs = 30
