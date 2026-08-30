@@ -900,6 +900,57 @@ def test_tool_free_transport_still_rejects_unrelated_error_items():
         parse_tool_free_codex_jsonl(raw, request=request)
 
 
+def test_tool_free_transport_rejects_error_that_merely_mentions_bypass_flag():
+    """A genuine transport/hook failure that happens to *mention* the bypass
+    flag in its message (but doesn't match the known benign advisory's exact
+    wording) must still fail closed — the allowance is not a loose substring
+    match (review finding on PR #789)."""
+    request = create_review_request(_inputs())
+    response = _response(request, commands=[])
+    raw = "\n".join(
+        (
+            json.dumps({
+                "type": "item.completed",
+                "item": {
+                    "type": "error",
+                    "message": (
+                        "hook execution failed while "
+                        "--dangerously-bypass-hook-trust is enabled: timeout"
+                    ),
+                },
+            }),
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": response}}),
+            json.dumps({"type": "turn.completed", "usage": {}}),
+        )
+    )
+    with pytest.raises(ReviewContractError, match="unknown item type"):
+        parse_tool_free_codex_jsonl(raw, request=request)
+
+
+def test_tool_free_transport_rejects_benign_advisory_message_on_item_started():
+    """The benign-advisory allowance only applies to the terminal
+    `item.completed` event — the same advisory message on `item.started` or
+    `item.updated` must still fail closed (review finding on PR #789)."""
+    request = create_review_request(_inputs())
+    response = _response(request, commands=[])
+    advisory_message = (
+        "`--dangerously-bypass-hook-trust` is enabled. "
+        "Enabled hooks may run without review for this invocation."
+    )
+    raw = "\n".join(
+        (
+            json.dumps({
+                "type": "item.started",
+                "item": {"id": "item_0", "type": "error", "message": advisory_message},
+            }),
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": response}}),
+            json.dumps({"type": "turn.completed", "usage": {}}),
+        )
+    )
+    with pytest.raises(ReviewContractError, match="unknown item type"):
+        parse_tool_free_codex_jsonl(raw, request=request)
+
+
 def test_review_transport_receipt_binds_all_controller_digests():
     request = create_review_request(_inputs())
     receipt = ReviewTransportReceipt.from_request(

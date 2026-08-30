@@ -1278,7 +1278,13 @@ def parse_codex_jsonl(raw: str) -> tuple[str, tuple[ExecutionReceipt, ...]]:
 #: `parse_tool_free_codex_jsonl` raised on it before ever reaching the real
 #: verdict later in the stream, so every cold-review-v1 run failed
 #: unconditionally regardless of the actual verdict (2026-08-29 incident).
-_BENIGN_ADVISORY_ITEM_MARKER = "--dangerously-bypass-hook-trust"
+#:
+#: This must match the KNOWN advisory message exactly (as a prefix), not a
+#: loose substring, and only on the terminal ``item.completed`` event — a
+#: genuine transport/hook failure that merely *mentions* the flag (e.g.
+#: "hook execution failed while --dangerously-bypass-hook-trust is enabled")
+#: must still fail closed (PR #789 review finding).
+_BENIGN_ADVISORY_ITEM_PREFIX = "`--dangerously-bypass-hook-trust` is enabled."
 
 
 def parse_tool_free_codex_jsonl(
@@ -1339,9 +1345,10 @@ def parse_tool_free_codex_jsonl(
         if item_type not in safe_item_types:
             message = item.get("message")
             is_benign_advisory = (
-                item_type == "error"
+                event_type == "item.completed"
+                and item_type == "error"
                 and isinstance(message, str)
-                and _BENIGN_ADVISORY_ITEM_MARKER in message
+                and message.startswith(_BENIGN_ADVISORY_ITEM_PREFIX)
             )
             if not is_benign_advisory:
                 raise ReviewContractError(
