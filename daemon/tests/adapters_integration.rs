@@ -978,14 +978,22 @@ sys.exit(1)
     let log_content = std::fs::read_to_string(&log_file).expect("failed to read fake ao recovery log");
     let calls: Vec<&str> = log_content.lines().collect();
     let recovery_calls: Vec<&str> = calls.iter().skip_while(|c| c.starts_with("spawn")).copied().collect();
-    assert_eq!(recovery_calls.len(), 4, "expected exactly 4 calls in recovery lifecycle, got: {recovery_calls:?}");
+    // jleechan round-2 fix (late-arrival Condvar race, daemon/src/adapters.rs
+    // `ensure_ao_project_recovered`): after acquiring the starter-election
+    // lock and finding no other starter in progress, the caller now
+    // re-checks health BEFORE electing itself starter, so it doesn't start
+    // AO a second time if a just-finished prior caller already fixed
+    // things. That inserts one extra `status` call between the initial
+    // health check and `start`, so the lifecycle is 5 calls, not 4.
+    assert_eq!(recovery_calls.len(), 5, "expected exactly 5 calls in recovery lifecycle, got: {recovery_calls:?}");
 
-    assert!(recovery_calls[0].starts_with("status -p dark-factory"), "Recovery Call 1 must be status -p: {}", recovery_calls[0]);
-    assert!(recovery_calls[1].starts_with("start"), "Recovery Call 2 must be start: {}", recovery_calls[1]);
-    assert!(recovery_calls[1].contains("--no-dashboard") && recovery_calls[1].contains("--no-open"), "Recovery Call 2 must contain --no-dashboard and --no-open: {}", recovery_calls[1]);
-    assert!(!recovery_calls[1].contains("--headless"), "Recovery Call 2 must NOT contain --headless: {}", recovery_calls[1]);
-    assert!(recovery_calls[2].starts_with("status -p dark-factory"), "Recovery Call 3 must be recheck status -p: {}", recovery_calls[2]);
-    assert!(recovery_calls[3].starts_with("spawn"), "Recovery Call 4 must be original spawn retry: {}", recovery_calls[3]);
+    assert!(recovery_calls[0].starts_with("status -p dark-factory"), "Recovery Call 1 must be initial status -p: {}", recovery_calls[0]);
+    assert!(recovery_calls[1].starts_with("status -p dark-factory"), "Recovery Call 2 must be the post-lock-acquisition health recheck (late-arrival race fix): {}", recovery_calls[1]);
+    assert!(recovery_calls[2].starts_with("start"), "Recovery Call 3 must be start: {}", recovery_calls[2]);
+    assert!(recovery_calls[2].contains("--no-dashboard") && recovery_calls[2].contains("--no-open"), "Recovery Call 3 must contain --no-dashboard and --no-open: {}", recovery_calls[2]);
+    assert!(!recovery_calls[2].contains("--headless"), "Recovery Call 3 must NOT contain --headless: {}", recovery_calls[2]);
+    assert!(recovery_calls[3].starts_with("status -p dark-factory"), "Recovery Call 4 must be post-start confirm status -p: {}", recovery_calls[3]);
+    assert!(recovery_calls[4].starts_with("spawn"), "Recovery Call 5 must be original spawn retry: {}", recovery_calls[4]);
 
     let _ = std::fs::remove_dir_all(&fake_bin_dir);
 }
