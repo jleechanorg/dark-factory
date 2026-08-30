@@ -369,13 +369,17 @@ mod tests {
 
     #[test]
     fn reroll_temp_open_failure_preserves_original() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp_dir = std::env::temp_dir().join(format!("afd_constraints_temp_open_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp_dir);
         std::fs::create_dir_all(&temp_dir).unwrap();
         let spec_file = temp_dir.join("spec.toml");
-        let initial_bytes = "initial_key = \"initial_value\"\n";
+        // Invalid UTF-8 (a bare continuation byte with no leading byte) makes
+        // read_to_string fail deterministically regardless of file
+        // permissions or process uid, unlike a chmod(0o000) fixture, which
+        // root bypasses (root ignores POSIX permission bits, so the read
+        // would silently succeed and this test would falsely pass under
+        // root-run CI/sandboxes).
+        let initial_bytes: &[u8] = &[0x80, 0x81, 0x82];
         std::fs::write(&spec_file, initial_bytes).unwrap();
 
         let temp_filename = format!(
@@ -385,13 +389,8 @@ mod tests {
         );
         let temp_path = temp_dir.join(&temp_filename);
 
-        // Make spec_file unreadable (0o000) so temp file opens successfully but read_existing fails
-        let mut unreadable_perms = std::fs::metadata(&spec_file).unwrap().permissions();
-        unreadable_perms.set_mode(0o000);
-        std::fs::set_permissions(&spec_file, unreadable_perms).unwrap();
-
         let res = append_mutation(&spec_file, "inhibition_specs = [\"fail\"]\n");
-        assert!(res.is_err(), "append_mutation must fail when existing spec cannot be read");
+        assert!(res.is_err(), "append_mutation must fail when existing spec is not valid UTF-8");
         let err = res.unwrap_err();
         match err {
             DaemonError::Tool { tool, stderr, .. } => {
@@ -411,13 +410,9 @@ mod tests {
             temp_path.display()
         );
 
-        // Restore permissions and verify original spec file is completely unmodified
-        let mut readable_perms = std::fs::metadata(&spec_file).unwrap().permissions();
-        readable_perms.set_mode(0o644);
-        std::fs::set_permissions(&spec_file, readable_perms).unwrap();
-
+        // Verify original spec file is completely unmodified
         assert_eq!(
-            std::fs::read_to_string(&spec_file).unwrap(),
+            std::fs::read(&spec_file).unwrap(),
             initial_bytes,
             "original spec file must remain completely unmodified on failure"
         );
