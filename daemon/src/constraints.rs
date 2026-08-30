@@ -419,5 +419,40 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+
+    /// jleechan review finding P2-C1: a dedicated, single-responsibility
+    /// test for the TempCleanup deletion behavior itself, independent of
+    /// `reroll_post_open_read_failure_preserves_original`'s combined
+    /// error-shape + original-content assertions above. Retroactively
+    /// verified RED (against a Drop body temporarily neutered to a no-op
+    /// in-session, per the same discipline used for the sibling test in
+    /// the prior commit) before this test was written against the correct
+    /// TempCleanup implementation.
+    #[test]
+    fn reroll_post_open_failure_removes_temp() {
+        let temp_dir = std::env::temp_dir().join(format!("afd_constraints_removes_temp_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let spec_file = temp_dir.join("spec.toml");
+        let invalid_bytes: &[u8] = &[0x80, 0x81, 0x82];
+        std::fs::write(&spec_file, invalid_bytes).unwrap();
+
+        let temp_filename = format!(
+            ".{}.tmp.{}",
+            spec_file.file_name().and_then(|f| f.to_str()).unwrap_or("spec"),
+            std::process::id()
+        );
+        let temp_path = temp_dir.join(&temp_filename);
+
+        let res = append_mutation(&spec_file, "inhibition_specs = [\"fail\"]\n");
+        assert!(res.is_err(), "append_mutation must fail when existing spec is not valid UTF-8");
+        assert!(
+            !temp_path.exists(),
+            "TempCleanup must delete the opened temp file {} when append_mutation fails",
+            temp_path.display()
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }
 

@@ -675,6 +675,95 @@ push_remote = "origin"
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// jleechan review finding P1-C4: `resolve_spec_path` had zero direct
+    /// test coverage. A relative `spec_dir` (the production default,
+    /// `.factory/specs/`) must resolve under the TARGET repo's worktree
+    /// root, never the daemon's own cwd -- release binaries commonly run
+    /// from an immutable uv/archive path unrelated to any repo checkout.
+    #[test]
+    fn relative_spec_dir_uses_target_worktree() {
+        let root = std::env::temp_dir().join(format!("afd_relative_spec_dir_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let previous = std::env::var_os("DARK_FACTORY_TARGET_WORKTREE_ROOT");
+        std::env::set_var("DARK_FACTORY_TARGET_WORKTREE_ROOT", &root);
+
+        let cfg = Config {
+            target_repo: "owner/daemon".into(),
+            ao_project: None,
+            base_branch: "main".into(),
+            stage: 1,
+            max_workers: 1,
+            max_batch: 1,
+            fast_tick_secs: 1,
+            slow_tick_secs: 1,
+            autonomy_timebox_secs: 60,
+            budget_warn_usd: 1.0,
+            spec_dir: ".factory/specs/".into(),
+            reroll_head_stability_window_secs: 30,
+            reroll_death_confirm_secs: 5,
+            held_recheck_cooldown_secs: 900,
+            repos: std::collections::HashMap::new(),
+            pre_gate_validation_enabled: false,
+            escalation_refire_secs: 3600,
+            agent_worktree_root: None,
+            worktree_ttl_secs: 14 * 24 * 60 * 60,
+            worktree_max_count: 200,
+        };
+
+        let resolved = cfg.resolve_spec_path("owner/target", "bead-123");
+        let expected = root
+            .join("owner")
+            .join("target")
+            .join(".factory/specs/")
+            .join("bead-123.toml");
+        assert_eq!(
+            resolved, expected,
+            "a relative spec_dir must resolve under the target repo's worktree root, not the daemon's own cwd"
+        );
+
+        match previous {
+            Some(value) => std::env::set_var("DARK_FACTORY_TARGET_WORKTREE_ROOT", value),
+            None => std::env::remove_var("DARK_FACTORY_TARGET_WORKTREE_ROOT"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Companion to the relative case above: an ABSOLUTE `spec_dir` must be
+    /// used as-is, never joined onto the target worktree root at all.
+    #[test]
+    fn absolute_spec_dir_ignores_target_worktree() {
+        let root = std::env::temp_dir().join(format!("afd_absolute_spec_dir_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let absolute_spec_dir = root.join("shared-specs");
+
+        let cfg = Config {
+            target_repo: "owner/daemon".into(),
+            ao_project: None,
+            base_branch: "main".into(),
+            stage: 1,
+            max_workers: 1,
+            max_batch: 1,
+            fast_tick_secs: 1,
+            slow_tick_secs: 1,
+            autonomy_timebox_secs: 60,
+            budget_warn_usd: 1.0,
+            spec_dir: absolute_spec_dir.display().to_string(),
+            reroll_head_stability_window_secs: 30,
+            reroll_death_confirm_secs: 5,
+            held_recheck_cooldown_secs: 900,
+            repos: std::collections::HashMap::new(),
+            pre_gate_validation_enabled: false,
+            escalation_refire_secs: 3600,
+            agent_worktree_root: None,
+            worktree_ttl_secs: 14 * 24 * 60 * 60,
+            worktree_max_count: 200,
+        };
+
+        let resolved = cfg.resolve_spec_path("owner/target", "bead-456");
+        assert_eq!(resolved, absolute_spec_dir.join("bead-456.toml"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn explicit_production_repo_without_checkout_is_clone_eligible() {
         let cfg = Config {
