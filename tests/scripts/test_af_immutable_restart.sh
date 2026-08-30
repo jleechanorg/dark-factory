@@ -2,13 +2,31 @@
 # test_af_immutable_restart.sh — Immutable Linux release layout & restart proof.
 #
 # Emits machine-readable JSON satisfying the 5 criteria of .5:
-# 1. Manifest commit/SHA256, systemd ExecStart, /proc/<pid>/exe, and running binary SHA all agree.
-# 2. Restart changes daemon PID while preserving exact bound AO project, session, worktree, branch, and worker process.
-# 3. Explicit stop reaps only Dark Factory-owned children and leaves unrelated AO sessions/worktrees unchanged.
-# 4. JSON output contains all required fields:
-#    release_commit, binary_sha256, unit_exec_start, daemon_pid_before, daemon_pid_after,
-#    ao_project, ao_session, worktree, branch, worker_pid_before, worker_pid_after,
-#    unrelated_inventory_before, unrelated_inventory_after, journal_window.
+# 1. systemd ExecStart, /proc/<pid>/exe, and the running binary SHA all agree
+#    (self-consistency proof — see manifest_cross_check note below on the
+#    limits of this proof).
+# 2. Restart changes daemon PID while preserving the exact bound worker
+#    process for a real AO session this script owns.
+# 3. Explicit stop reaps only Dark Factory-owned children and leaves
+#    unrelated AO sessions/worktrees unchanged.
+# 4. JSON output contains all required evidence fields, honestly split
+#    across two identities that this script never conflates:
+#      - restart_target: {release_commit, binary_sha256, unit_exec_start,
+#        exec_start_matches_running_binary, manifest_cross_check,
+#        daemon_pid_before, daemon_pid_after, ao_project, worktree, branch,
+#        unrelated_inventory_before, unrelated_inventory_after}
+#        describes the PRODUCTION daemon/worktree/branch under restart test.
+#      - worker_continuity_proof: {worker_continuity_ao_project, ao_session,
+#        session_branch, worker_pid_before, worker_pid_after} describes the
+#        REAL but disposable AO session bound for the worker-continuity /
+#        stop-path proof. Its ao_session does NOT belong to restart_target's
+#        ao_project — see the opt-in comment below for why they must be
+#        different projects. worktree/branch are never inferred for this
+#        session from the production checkout; session_branch comes only
+#        from the session's own "branch" field in `ao status --json`, and no
+#        per-session worktree field exists in that schema (see adapters.rs),
+#        so worker_continuity_proof deliberately has no worktree field.
+#      - journal_window is top-level (applies to the whole restart run).
 # 5. Changes no production code.
 #
 # EXIT CODE CONTRACT (never conflate SKIP with PASS):
@@ -82,8 +100,37 @@ if [ -z "$DAEMON_PID_BEFORE" ] || [ "$DAEMON_PID_BEFORE" = "0" ]; then
 fi
 
 UNIT_EXEC_START="$(systemctl --user show "$UNIT" --property=ExecStart --value | awk '{print $2}' | tr -d ';')"
-PROC_EXE="$(readlink -f "/proc/$DAEMON_PID_BEFORE/exe" 2>/dev/null || echo "$UNIT_EXEC_START")"
+
+# Real evidence of the running binary requires a real /proc read. A silent
+# fallback to the (unresolved) ExecStart path here would make the
+# ExecStart-vs-running-binary comparison below vacuously self-compare the
+# same string instead of proving anything real.
+PROC_EXE="$(readlink -f "/proc/$DAEMON_PID_BEFORE/exe" 2>/dev/null || true)"
+if [ -z "$PROC_EXE" ]; then
+  skip "cannot resolve /proc/$DAEMON_PID_BEFORE/exe; no real evidence of the running daemon binary"
+fi
 BINARY_SHA256="$(sha256sum "$PROC_EXE" | awk '{print $1}')"
+
+# --- Criterion 1: prove the running binary is actually the one systemd is
+# configured to run, not just that both paths were read without comparing
+# them. Resolve ExecStart the same way (readlink -f) since it may itself be
+# a symlink (e.g. into an immutable releases/<sha> layout), then compare
+# resolved real paths, not raw strings. ---
+EXEC_START_RESOLVED="$(readlink -f "$UNIT_EXEC_START" 2>/dev/null || echo "$UNIT_EXEC_START")"
+if [ "$PROC_EXE" != "$EXEC_START_RESOLVED" ]; then
+  echo "FAIL: running binary ($PROC_EXE) does not match systemd ExecStart ($UNIT_EXEC_START, resolved: $EXEC_START_RESOLVED)" >&2
+  exit 1
+fi
+EXEC_START_MATCHES_RUNNING_BINARY="true"
+
+# NOTE on provenance: the check above only proves self-consistency -- that
+# the live process matches its own systemd unit config. This repo's deploy
+# tooling (daemon/systemd/install-systemd-user.sh) has no independent
+# build-provenance manifest file convention (no MANIFEST/manifest.json
+# mapping release_commit -> expected binary_sha256) to cross-check against.
+# Do not fabricate one; report the gap honestly instead.
+MANIFEST_CROSS_CHECK_STATUS="not_available"
+MANIFEST_CROSS_CHECK_REASON="no build-provenance manifest file convention (e.g. MANIFEST/manifest.json) exists in this repo's deploy tooling; only self-consistency between the running process, /proc/<pid>/exe, and systemd ExecStart is verified above, not independent build provenance for binary_sha256 given release_commit"
 
 # Extract release commit from releases/<sha> path
 RELEASE_COMMIT="$(echo "$PROC_EXE" | grep -oE 'releases/[a-f0-9]+' | cut -d/ -f2 || true)"
@@ -106,7 +153,20 @@ fi
 # This is compared byte-for-byte against the same call after the restart +
 # explicit stop below to prove neither perturbed sessions outside the ones
 # this script explicitly owns and stops.
-UNRELATED_BEFORE="$(ao status -p "$AO_PROJECT" --json 2>/dev/null || echo '[]')"
+#
+# A failed `ao status` call is NOT "zero unrelated sessions" -- silently
+# substituting '[]' would make a query failure indistinguishable from a
+# genuine empty inventory, and if both the before/after calls fail
+# independently the byte-for-byte comparison below would trivially "pass"
+# on zero real evidence. Capture the real exit code and SKIP (consistent
+# with this script's never-fabricate philosophy) rather than proceeding.
+set +e
+UNRELATED_BEFORE="$(ao status -p "$AO_PROJECT" --json 2>/dev/null)"
+UNRELATED_BEFORE_RC=$?
+set -e
+if [ "$UNRELATED_BEFORE_RC" -ne 0 ]; then
+  skip "'ao status -p $AO_PROJECT --json' failed (rc=$UNRELATED_BEFORE_RC) before restart; cannot produce real unrelated-inventory evidence"
+fi
 
 # --- Bind to a REAL, currently-tracked, non-terminal AO session this script
 # owns, so the stop-path proof below can legitimately call the real product
@@ -203,12 +263,40 @@ fi
 # Inventory of unrelated sessions after (strictly project-scoped) -- must be
 # byte-identical to before: neither the restart nor the explicit stop of our
 # own owned test-project session may perturb the production project's list.
-UNRELATED_AFTER="$(ao status -p "$AO_PROJECT" --json 2>/dev/null || echo '[]')"
+# Same rationale as UNRELATED_BEFORE: a query failure here is "no proof",
+# never a fabricated empty match.
+set +e
+UNRELATED_AFTER="$(ao status -p "$AO_PROJECT" --json 2>/dev/null)"
+UNRELATED_AFTER_RC=$?
+set -e
+if [ "$UNRELATED_AFTER_RC" -ne 0 ]; then
+  skip "'ao status -p $AO_PROJECT --json' failed (rc=$UNRELATED_AFTER_RC) after restart; cannot produce real unrelated-inventory evidence"
+fi
+
+# --- Real branch for the worker-continuity session comes only from that
+# session's own "branch" field in `ao status --json` (never the separately
+# resolved production $BRANCH, which describes a different project). ---
+SESSION_BRANCH="$(echo "$TEST_PROJECT_SESSIONS" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    data = []
+session_name = sys.argv[1]
+for e in (data if isinstance(data, list) else []):
+    if isinstance(e, dict) and e.get('name') == session_name:
+        print(e.get('branch', ''))
+        break
+" "$AO_SESSION" 2>/dev/null || true)"
+
 JOURNAL_END="$(date -u +"%Y-%m-%d %H:%M:%S")"
 JOURNAL_WINDOW="${JOURNAL_START} .. ${JOURNAL_END}"
 
-export RELEASE_COMMIT BINARY_SHA256 UNIT_EXEC_START DAEMON_PID_BEFORE DAEMON_PID_AFTER
-export AO_PROJECT AO_SESSION WORKTREE BRANCH WORKER_PID_BEFORE WORKER_PID_AFTER
+export RELEASE_COMMIT BINARY_SHA256 UNIT_EXEC_START EXEC_START_MATCHES_RUNNING_BINARY
+export MANIFEST_CROSS_CHECK_STATUS MANIFEST_CROSS_CHECK_REASON
+export DAEMON_PID_BEFORE DAEMON_PID_AFTER
+export AO_PROJECT WORKTREE BRANCH
+export AO_TEST_PROJECT AO_SESSION SESSION_BRANCH WORKER_PID_BEFORE WORKER_PID_AFTER
 export UNRELATED_BEFORE UNRELATED_AFTER JOURNAL_WINDOW
 
 python3 -c "
@@ -223,28 +311,51 @@ if unrelated_before != unrelated_after:
     sys.stderr.write('FAIL: unrelated inventory was perturbed across daemon restart\n')
     sys.exit(1)
 
+# restart_target describes the PRODUCTION daemon/worktree/branch under
+# restart test. worker_continuity_proof describes the separate, disposable
+# AO_TEST_PROJECT session bound only to prove worker-process continuity
+# across the restart and the real stop path -- its ao_session belongs to
+# worker_continuity_ao_project, never to restart_target's ao_project, and
+# this script never implies otherwise.
 report = {
     'status': 'passed',
-    'release_commit': os.environ['RELEASE_COMMIT'],
-    'binary_sha256': os.environ['BINARY_SHA256'],
-    'unit_exec_start': os.environ['UNIT_EXEC_START'],
-    'daemon_pid_before': os.environ['DAEMON_PID_BEFORE'],
-    'daemon_pid_after': os.environ['DAEMON_PID_AFTER'],
-    'ao_project': os.environ['AO_PROJECT'],
-    'ao_session': os.environ['AO_SESSION'],
-    'worktree': os.environ['WORKTREE'],
-    'branch': os.environ['BRANCH'],
-    'worker_pid_before': os.environ['WORKER_PID_BEFORE'],
-    'worker_pid_after': os.environ['WORKER_PID_AFTER'],
-    'unrelated_inventory_before': unrelated_before,
-    'unrelated_inventory_after': unrelated_after,
-    'journal_window': os.environ['JOURNAL_WINDOW']
+    'restart_target': {
+        'release_commit': os.environ['RELEASE_COMMIT'],
+        'binary_sha256': os.environ['BINARY_SHA256'],
+        'unit_exec_start': os.environ['UNIT_EXEC_START'],
+        'exec_start_matches_running_binary': os.environ['EXEC_START_MATCHES_RUNNING_BINARY'] == 'true',
+        'manifest_cross_check': {
+            'status': os.environ['MANIFEST_CROSS_CHECK_STATUS'],
+            'reason': os.environ['MANIFEST_CROSS_CHECK_REASON'],
+        },
+        'daemon_pid_before': os.environ['DAEMON_PID_BEFORE'],
+        'daemon_pid_after': os.environ['DAEMON_PID_AFTER'],
+        'ao_project': os.environ['AO_PROJECT'],
+        'worktree': os.environ['WORKTREE'],
+        'branch': os.environ['BRANCH'],
+        'unrelated_inventory_before': unrelated_before,
+        'unrelated_inventory_after': unrelated_after,
+    },
+    'worker_continuity_proof': {
+        'worker_continuity_ao_project': os.environ['AO_TEST_PROJECT'],
+        'ao_session': os.environ['AO_SESSION'],
+        'session_branch': os.environ.get('SESSION_BRANCH', ''),
+        'worker_pid_before': os.environ['WORKER_PID_BEFORE'],
+        'worker_pid_after': os.environ['WORKER_PID_AFTER'],
+    },
+    'journal_window': os.environ['JOURNAL_WINDOW'],
 }
 
-for k, v in report.items():
-    if v is None or v == '':
-        sys.stderr.write(f'Field {k} is empty\n')
-        sys.exit(1)
+def check(prefix, d):
+    for k, v in d.items():
+        path = f'{prefix}.{k}' if prefix else k
+        if isinstance(v, dict):
+            check(path, v)
+        elif v is None or v == '':
+            sys.stderr.write(f'Field {path} is empty\n')
+            sys.exit(1)
+
+check('', report)
 
 print(json.dumps(report, indent=2))
 "
