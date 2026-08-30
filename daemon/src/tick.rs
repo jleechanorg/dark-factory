@@ -2366,6 +2366,65 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         if ready.is_empty() {
             return Ok(());
         }
+
+        // Bead dark-factory-8d1o: factory self-heal for project-scoped AO
+        // unavailability BEFORE coder spawn. Runs once per dispatch tick
+        // (not once per bead) so multi-bead batches see one heal, not N.
+        // The heal outcome is fail-closed: if `ao` cannot be brought up
+        // for `cfg.target_repo` we park every ready bead HUMAN_HELD with
+        // reason `ao_unavailable`, carrying the preflight + start +
+        // re-probe diagnostics verbatim so an operator can act without
+        // cross-referencing other logs. The heal itself never
+        // increments `spawn_failure_count`; that counter remains the
+        // post-spawn transient-retry mechanism, distinct from this
+        // pre-spawn structural check.
+        if should_heal_ao_for_dispatch() {
+            let heal_project = deps.cfg.target_repo.as_str();
+            match crate::ao_self_heal::ensure_ao_available(
+                &crate::ao_self_heal::RunToolProbe::from_env(),
+                heal_project,
+            ) {
+                crate::ao_self_heal::HealAction::Noop
+                | crate::ao_self_heal::HealAction::Restarted => {
+                    // Healthy OR just-restarted: proceed with dispatch.
+                    // Restarted still requires an actual spawn per bead —
+                    // the heal only restored the daemon. The spawn itself
+                    // happens in `dispatch::dispatch_ready_with_vcs`.
+                }
+                crate::ao_self_heal::HealAction::FailClosed { reason } => {
+                    for (bead, _verdict, _drive_branch) in ready.iter() {
+                        let mut overlay = match deps.store.load(&bead.id) {
+                            Ok(Some(o)) => o,
+                            Ok(None) => continue,
+                            Err(_) => continue,
+                        };
+                        overlay.state = OverlayState::HumanHeld;
+                        crate::state::set_human_hold_reason(
+                            &mut overlay,
+                            crate::state::HumanHoldReason::AoUnavailable,
+                        );
+                        let _ = deps.store.save(&overlay);
+                        let _ = emit(
+                            deps.telemetry_log,
+                            &bead.id,
+                            overlay.attempt,
+                            OverlayState::HumanHeld.as_str(),
+                            "PARKED_HUMAN_HELD",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "reason": "ao_unavailable",
+                                "branch": serde_json::Value::Null,
+                                "heal_reason": reason.clone(),
+                                "source": "ao_self_heal::ensure_ao_available",
+                            }),
+                        );
+                        summary.beads_parked_human_held += 1;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
         let dispatch_report =
             dispatch::dispatch_ready_with_vcs(
                 deps.sessions,
@@ -6290,6 +6349,17 @@ fn escalation_already_recorded(deps: &TickDeps, bead_id: &str) -> Result<bool, D
             .load_rejection(bead_id, ESCALATION_SENTINEL_ATTEMPT)?,
         Some((reviewer, _)) if reviewer == ESCALATION_REVIEWER
     ))
+}
+
+/// Bead dark-factory-8d1o: gate the factory self-heal on a per-deployment
+/// env opt-in. Default ON; set `DARK_FACTORY_AO_SELF_HEAL=0` to disable
+/// the pre-spawn heal-and-retry (e.g. for environments where AO is
+/// managed externally and the factory must NOT attempt to start it).
+fn should_heal_ao_for_dispatch() -> bool {
+    match std::env::var("DARK_FACTORY_AO_SELF_HEAL") {
+        Ok(v) => !matches!(v.as_str(), "0" | "false" | "no" | "off"),
+        Err(_) => true,
+    }
 }
 
 /// jleechan-rln6: returns true once the daemon has already told this bead's

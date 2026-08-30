@@ -708,6 +708,16 @@ pub enum HumanHoldReason {
     /// bare requeue would replay the same leak. Excluded from
     /// `recoverable_exact_values()`.
     WorktreeCwdMismatch,
+    /// Bead dark-factory-8d1o: the factory attempted to self-heal a
+    /// project-scoped AO outage via `ensure_ao_available` and the heal
+    /// either could not start the daemon or the daemon came back but
+    /// still refused the re-probe. Fail-closed: parking the bead with
+    /// this reason is the only correct response so a human or operator
+    /// hook can investigate the AO install. The same overlay must NOT
+    /// be requeued silently (see `HumanHoldReason::recoverable_exact_values`
+    /// absence), because the failure mode is structural (`ao <cmd>`
+    /// failing), not transient.
+    AoUnavailable,
 }
 
 impl HumanHoldReason {
@@ -756,6 +766,7 @@ impl HumanHoldReason {
                 return format!("escalation_local_fallback:{reason}");
             }
             Self::WorktreeCwdMismatch => "worktree_cwd_mismatch",
+            Self::AoUnavailable => "ao_unavailable",
         }
         .to_string()
     }

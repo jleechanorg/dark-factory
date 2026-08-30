@@ -31,3 +31,4 @@ pub mod vendor_health;
 pub mod session_health_markers;
 pub mod vendor_aliases;
 pub mod gh_circuit_breaker;
+pub mod ao_self_heal;
