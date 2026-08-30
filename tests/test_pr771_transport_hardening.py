@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import pathlib
@@ -20,6 +21,7 @@ from runner.handler_sandbox import _build_sandbox_profile, _holdout_denied_paths
 from runner.review_controller import (
     EvidenceArtifact,
     ReviewInputs,
+    ReviewTransportReceipt,
     create_review_request,
 )
 
@@ -529,3 +531,137 @@ def test_controller_graph_rejects_nonzero_transport_with_valid_fail_response(
     assert result.outcome == "failure"
     assert result.metadata["review_contract_status"] == "invalid"
     assert "exited with 7" in result.metadata["review_contract_gap"]
+
+
+def _frozen_request(tmp_path: pathlib.Path):
+    """A tool-free (frozen-bundle) request, matching how the real primary
+    lane always builds requests (handler_parallel_reviewer.py always calls
+    ``build_frozen_review_bundle`` before ``create_review_request``)."""
+    sha = "a" * 40
+    evidence = tmp_path / "evidence.txt"
+    evidence.write_text("proof\n", encoding="utf-8")
+    return create_review_request(
+        ReviewInputs(
+            repository="example",
+            workspace_path=str(tmp_path),
+            base_sha=sha,
+            head_sha="b" * 40,
+            tree_sha="c" * 40,
+            task_text="Review the change.",
+            changed_files=("evidence.txt",),
+            evidence=(
+                EvidenceArtifact(
+                    path="evidence.txt",
+                    size_bytes=evidence.stat().st_size,
+                    sha256=hashlib.sha256(evidence.read_bytes()).hexdigest(),
+                ),
+            ),
+        ),
+        frozen_bundle=json.dumps(
+            {"evidence_origin": None, "schema": 2},
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
+
+
+def test_contract_adjusted_result_reuses_prevalidated_review_without_reparsing(
+    tmp_path, monkeypatch
+):
+    """``_run_gate_once`` (handler_dispatch.py) already runs the FULL
+    parse+validate pass for the controller_json lane on a clean success and
+    stashes the result under ``_controller_prevalidated_review``.
+    ``_contract_adjusted_result`` must reuse those stashed fields instead of
+    re-parsing/re-validating ``result.output`` a second time.
+
+    Proven here by handing ``output`` text that is NOT valid JSON (it would
+    raise ``ReviewContractError("review response must be one JSON object")``
+    if ``validate_review_response`` ran on it again) while the transport
+    receipt is correctly bound to that same text — this only validates if
+    the fast (reconstruct-from-stash) path is taken, never the re-parse path.
+    """
+    request = _frozen_request(tmp_path)
+    monkeypatch.setattr(
+        "runner.handler_parallel_reviewer._verify_controller_workspace",
+        lambda ctx, req: None,
+    )
+    garbage_output = "not valid json at all {{{"
+    receipt = ReviewTransportReceipt.from_request(
+        request, response=garbage_output, transport="tool-free"
+    )
+    result = _contract_adjusted_result(
+        Result(
+            outcome="success",
+            output=garbage_output,
+            metadata={
+                "returncode": "0",
+                "reviewer_backend": "codex",
+                "_controller_prevalidated_review": {
+                    "verdict": "pass",
+                    "checks": [],
+                    "response_sha256": hashlib.sha256(
+                        garbage_output.encode("utf-8")
+                    ).hexdigest(),
+                    "commands_executed": [],
+                },
+                "_controller_transport_receipt": dataclasses.asdict(receipt),
+            },
+        ),
+        request,
+        Context(goal="review", workdir=tmp_path),
+        lane="primary",
+        backend="codex",
+    )
+
+    assert result.outcome == "success"
+    assert result.metadata["review_contract_status"] == "valid"
+    assert result.metadata["verdict"] == "pass"
+
+
+def test_contract_adjusted_result_surfaces_specific_upstream_transport_error(
+    tmp_path, monkeypatch
+):
+    """Regression for the 2026-08-29 incident: when ``_run_gate_once``'s
+    FIRST validation pass fails and records the SPECIFIC reason in
+    ``metadata["review_transport_error"]`` (e.g. codex-cli emitting an
+    unrecognized transport item), ``_contract_adjusted_result`` must surface
+    that exact reason in ``review_contract_gap`` — NOT a second, generic
+    ``ReviewContractError`` re-derived from re-parsing the raw fallback text
+    (``"review response must be one JSON object"``), which is what actually
+    surfaced in the pipeline trace before this fix and cost real debugging
+    depth to trace back to the true root cause (see PR #789).
+    """
+    request = _frozen_request(tmp_path)
+    monkeypatch.setattr(
+        "runner.handler_parallel_reviewer._verify_controller_workspace",
+        lambda ctx, req: None,
+    )
+    specific_error = "tool-free transport emitted unknown item type: 'error'"
+    # Raw JSONL transport text: NOT a single JSON object, so re-parsing it
+    # with validate_review_response would raise the generic message this
+    # test guards against.
+    raw_fallback_text = (
+        '{"type": "thread.started"}\n'
+        '{"type": "item.completed", "item": {"type": "error", '
+        '"message": "some transport problem"}}\n'
+    )
+    result = _contract_adjusted_result(
+        Result(
+            outcome="failure",
+            output=raw_fallback_text,
+            metadata={
+                "returncode": "0",
+                "reviewer_backend": "codex",
+                "review_transport_error": specific_error,
+            },
+        ),
+        request,
+        Context(goal="review", workdir=tmp_path),
+        lane="primary",
+        backend="codex",
+    )
+
+    assert result.outcome == "failure"
+    assert result.metadata["review_contract_status"] == "invalid"
+    assert result.metadata["review_contract_gap"] == specific_error
+    assert "one JSON object" not in result.metadata["review_contract_gap"]

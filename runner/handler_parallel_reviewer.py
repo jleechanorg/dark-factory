@@ -1208,8 +1208,10 @@ def _contract_adjusted_result(
         ExecutionReceipt,
         ReviewContractError,
         ReviewTransportReceipt,
+        ValidatedReview,
         validate_execution_receipts,
         validate_review_response,
+        verify_request_integrity,
     )
 
     metadata = dict(result.metadata or {})
@@ -1234,9 +1236,44 @@ def _contract_adjusted_result(
                     f"review backend exited with {returncode}"
                 )
         _verify_controller_workspace(ctx, request)
-        validated = validate_review_response(
-            result.output or "", request, tool_free=bool(request.bundle_sha256)
-        )
+        transport_error = metadata.get("review_transport_error")
+        prevalidated = metadata.get("_controller_prevalidated_review")
+        if isinstance(prevalidated, dict) and not transport_error:
+            # ``_run_gate_once`` (handler_dispatch.py) already ran the FULL
+            # parse+validate pass for the controller_json lane and stashed
+            # the result. Reconstruct the ValidatedReview from those fields
+            # instead of re-parsing/re-validating the same response text a
+            # second time. ``verify_request_integrity`` is the one check
+            # ``validate_review_response`` would otherwise run first (its
+            # very first line) — it must still run here since we are
+            # skipping the rest of that function.
+            verify_request_integrity(request)
+            validated = ValidatedReview(
+                verdict=prevalidated["verdict"],
+                checks=tuple(tuple(item) for item in prevalidated.get("checks", ())),
+                response_sha256=prevalidated["response_sha256"],
+                commands_executed=tuple(prevalidated.get("commands_executed", ())),
+            )
+        elif transport_error:
+            # Upstream already attempted the parse+validate pass and recorded
+            # the SPECIFIC failure reason (e.g. a real transport-contract
+            # violation). Surface that reason directly instead of re-parsing
+            # raw fallback text into a second, less specific
+            # ReviewContractError — this is the exact misleading-error
+            # incident from PR #789's investigation, where the true
+            # "tool-free transport emitted unknown item type: 'error'" was
+            # discarded in favor of the generic "review response must be one
+            # JSON object" once re-validation ran on the raw fallback text.
+            raise ReviewContractError(str(transport_error))
+        else:
+            # Fallback lane: no prevalidated data available (e.g. the shadow
+            # gate-review lane, which does not go through
+            # ``_run_gate_once``'s ``controller_json`` branch, or any other
+            # caller of this function). Run the full validation exactly as
+            # before — behavior for this path is unchanged.
+            validated = validate_review_response(
+                result.output or "", request, tool_free=bool(request.bundle_sha256)
+            )
         if request.bundle_sha256:
             raw_receipt = metadata.get("_controller_transport_receipt")
             if not isinstance(raw_receipt, dict):
