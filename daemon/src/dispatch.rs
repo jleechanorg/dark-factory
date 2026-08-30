@@ -1,5 +1,5 @@
 // Task 9: slot supervisor (design doc §5, spec §4.2.2/§4.2.4). Enforces the
-// operator safety envelope from spec §4.2.8: <= 30 concurrent workers total,
+// operator safety envelope from spec §4.2.8: <= 40 concurrent workers total,
 // <= 15 spawned in a single dispatch call. Pure arithmetic over `Sessions` +
 // `StateStore` trait calls — no subprocess use, no LLM judgment (ZFC: routing
 // to SMALL_PATH/STANDARD_PATH already happened in router.rs; this module only
@@ -1913,7 +1913,7 @@ mod tests {
             ao_project: None,
             base_branch: "main".into(),
             stage: 1,
-            max_workers: 30,
+            max_workers: 40,
             max_batch: 15,
             fast_tick_secs: 60,
             slow_tick_secs: 600,
@@ -2117,7 +2117,7 @@ mod tests {
         assert_eq!(
             report.success_count(),
             15,
-            "must cap at max_batch even with 30 free slots"
+            "must cap at max_batch even with 40 free slots"
         );
         let spawn_calls = sessions
             .calls
@@ -2207,10 +2207,64 @@ mod tests {
     }
 
     #[test]
+    fn production_capacity_config_integration() {
+        // `capacity_40_workers_15_batch_boundaries` above already loads a
+        // fixed enumeration of canonical config paths through the real
+        // `config::load` parser. This test instead mirrors the actual
+        // runtime SELECTION rule the daemon binary applies at startup
+        // (`daemon/src/main.rs::default_config_path`: prefer the live
+        // deployed `config/daemon.toml`, else fall back to the shipped
+        // example) so the file proven correct here is the one production
+        // would truly load, not merely one candidate among several that
+        // happen to agree today.
+        let live = std::path::Path::new("../config/daemon.toml");
+        let selected = if live.exists() {
+            live
+        } else {
+            std::path::Path::new("contracts/daemon.toml.example")
+        };
+
+        let prod_cfg = crate::config::load(selected).unwrap_or_else(|e| {
+            panic!(
+                "production-selected config {} failed to load: {e}",
+                selected.display()
+            )
+        });
+        assert_eq!(
+            prod_cfg.max_workers, 40,
+            "daemon startup config must resolve max_workers = 40"
+        );
+        assert_eq!(
+            prod_cfg.max_batch, 15,
+            "daemon startup config must resolve max_batch = 15"
+        );
+
+        // Prove the production-loaded capacity values actually gate
+        // dispatch_ready's real slot arithmetic end-to-end, not merely that
+        // they deserialize correctly.
+        let mut cfg = cfg();
+        cfg.max_workers = prod_cfg.max_workers;
+        cfg.max_batch = prod_cfg.max_batch;
+
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        let ready = beads(prod_cfg.max_batch + 5);
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        assert_eq!(
+            report.success_count(),
+            prod_cfg.max_batch,
+            "a single tick against the production-selected config must cap dispatch at max_batch"
+        );
+    }
+
+    #[test]
     fn twenty_eight_active_of_thirty_spawns_exactly_two() {
         let sessions = FakeSessions::new(28);
         let store = FakeStateStore::new();
-        let cfg = cfg();
+        // Pinned to 30 (independent of cfg()'s default max_workers) so this
+        // test keeps exercising the 30-worker boundary it's named for.
+        let mut cfg = cfg();
+        cfg.max_workers = 30;
         let ready = beads(40);
 
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
@@ -2233,7 +2287,10 @@ mod tests {
     fn thirty_active_spawns_nothing_and_never_calls_spawn() {
         let sessions = FakeSessions::new(30);
         let store = FakeStateStore::new();
-        let cfg = cfg();
+        // Pinned to 30 (independent of cfg()'s default max_workers) so this
+        // test keeps exercising the 30-worker boundary it's named for.
+        let mut cfg = cfg();
+        cfg.max_workers = 30;
         let ready = beads(40);
 
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
@@ -2910,7 +2967,10 @@ mod tests {
     fn dispatch_order_follows_ready_slice_order() {
         let sessions = FakeSessions::new(29);
         let store = FakeStateStore::new();
-        let cfg = cfg();
+        // Pinned to 30 (independent of cfg()'s default max_workers) so this
+        // test keeps exercising the 30-worker boundary it's named for.
+        let mut cfg = cfg();
+        cfg.max_workers = 30;
         let ready = beads(5);
 
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
