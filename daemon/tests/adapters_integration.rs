@@ -873,3 +873,120 @@ fn test_cli_sessions_ao_status_includes_project_arg_scoped() {
 
     let _ = std::fs::remove_dir_all(&fake_bin_dir);
 }
+
+#[test]
+fn ao_not_running_starts_project_then_retries_once() {
+    let fake_bin_dir = std::env::temp_dir().join(format!(
+        "afd_ao_recovery_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
+    std::fs::create_dir_all(&fake_bin_dir).unwrap();
+
+    let log_file = fake_bin_dir.join("ao_recovery_calls.log");
+    let state_file = fake_bin_dir.join("ao_state.txt");
+    let fake_ao = fake_bin_dir.join("ao");
+
+    // Write a fake ao that fails initial status, handles start, succeeds subsequent status, and handles spawn
+    std::fs::write(
+        &fake_ao,
+        format!(
+            r#"#!/usr/bin/env python3
+import os
+import sys
+
+args = sys.argv[1:]
+log_path = "{log_path}"
+state_path = "{state_path}"
+
+with open(log_path, "a", encoding="utf-8") as f:
+    f.write(" ".join(args) + "\n")
+
+if "--headless" in args:
+    print("error: unknown option '--headless'", file=sys.stderr)
+    sys.exit(1)
+
+if args[:3] == ["status", "-p", "dark-factory"]:
+    if not os.path.exists(state_path):
+        print("error: daemon is not running", file=sys.stderr)
+        sys.exit(1)
+    else:
+        print("[]")
+        sys.exit(0)
+
+if args[0] == "start":
+    assert "--no-dashboard" in args, f"start missing --no-dashboard: {{args}}"
+    assert "--no-open" in args, f"start missing --no-open: {{args}}"
+    with open(state_path, "w", encoding="utf-8") as f:
+        f.write("running\n")
+    print("Orchestrator started.")
+    sys.exit(0)
+
+if args[0] == "spawn":
+    if not os.path.exists(state_path):
+        print("error: daemon is not running", file=sys.stderr)
+        sys.exit(1)
+    print("SESSION=df-recovery-session-1")
+    print("  Worktree: /tmp/fake-recovery-worktree")
+    print("  Branch:   factory/test-recovery-branch")
+    sys.exit(0)
+
+print(f"unknown command: {{args}}", file=sys.stderr)
+sys.exit(1)
+"#,
+            log_path = log_file.display(),
+            state_path = state_file.display(),
+        ),
+    )
+    .unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&fake_ao).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_ao, permissions).unwrap();
+    }
+
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
+    let _env_guard = EnvVarGuard::set(&[
+        ("PATH", &new_path),
+    ]);
+
+    let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+    let spec = SpawnSpec {
+        bead_id: "test-recovery-bead".to_string(),
+        branch: "factory/test-recovery-branch".to_string(),
+        prompt: "test recovery prompt".to_string(),
+        repo: "jleechanorg/dark-factory".to_string(),
+        ao_project: "dark-factory".to_string(),
+        remote: "origin".to_string(),
+        local_checkout: Some(std::env::current_dir().unwrap()),
+        expected_revision: None,
+        managed_checkout: false,
+        expected_cwd: None,
+    };
+
+    let session = sessions.spawn(&spec).expect("spawn with AO auto-start must succeed");
+    assert_eq!(session.0, "df-recovery-session-1");
+
+    let log_content = std::fs::read_to_string(&log_file).expect("failed to read fake ao recovery log");
+    let calls: Vec<&str> = log_content.lines().collect();
+    let recovery_calls: Vec<&str> = calls.iter().skip_while(|c| c.starts_with("spawn")).copied().collect();
+    assert_eq!(recovery_calls.len(), 4, "expected exactly 4 calls in recovery lifecycle, got: {recovery_calls:?}");
+
+    assert!(recovery_calls[0].starts_with("status -p dark-factory"), "Recovery Call 1 must be status -p: {}", recovery_calls[0]);
+    assert!(recovery_calls[1].starts_with("start"), "Recovery Call 2 must be start: {}", recovery_calls[1]);
+    assert!(recovery_calls[1].contains("--no-dashboard") && recovery_calls[1].contains("--no-open"), "Recovery Call 2 must contain --no-dashboard and --no-open: {}", recovery_calls[1]);
+    assert!(!recovery_calls[1].contains("--headless"), "Recovery Call 2 must NOT contain --headless: {}", recovery_calls[1]);
+    assert!(recovery_calls[2].starts_with("status -p dark-factory"), "Recovery Call 3 must be recheck status -p: {}", recovery_calls[2]);
+    assert!(recovery_calls[3].starts_with("spawn"), "Recovery Call 4 must be original spawn retry: {}", recovery_calls[3]);
+
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}
+

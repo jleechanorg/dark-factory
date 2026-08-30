@@ -782,7 +782,14 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
         deps.review_text
     );
 
-    let spec_path = Path::new(&deps.cfg.spec_dir).join(format!("{}.toml", bead.bead_id));
+    let spec_path = if Path::new(&deps.cfg.spec_dir).is_relative() {
+        deps.cfg
+            .target_worktree_path(&bead_repo)
+            .map(|root| root.join(&deps.cfg.spec_dir).join(format!("{}.toml", bead.bead_id)))
+            .unwrap_or_else(|| Path::new(&deps.cfg.spec_dir).join(format!("{}.toml", bead.bead_id)))
+    } else {
+        Path::new(&deps.cfg.spec_dir).join(format!("{}.toml", bead.bead_id))
+    };
     constraints::append_mutation(&spec_path, &block)?;
 
     // Transition to RECOVERY

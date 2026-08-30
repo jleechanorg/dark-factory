@@ -324,7 +324,7 @@ mod tests {
         let cfg = load(std::path::Path::new("contracts/daemon.toml.example")).unwrap();
         assert_eq!(cfg.ao_project.as_deref(), Some("dark-factory"));
         assert_eq!(cfg.stage, 1);
-        assert_eq!(cfg.max_workers, 30);
+        assert_eq!(cfg.max_workers, 40);
         assert_eq!(cfg.max_batch, 15);
         assert_eq!(cfg.base_branch, "main");
     }

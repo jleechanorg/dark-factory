@@ -3263,6 +3263,78 @@ pub fn verify_ao_bridge_compatibility(
     Ok(())
 }
 
+static AO_PROJECT_START_MUTEX: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+
+fn is_ao_not_running_error(err: &DaemonError) -> bool {
+    let msg = match err {
+        DaemonError::Tool { stderr, .. } => stderr.as_str(),
+        DaemonError::Config(msg) => msg.as_str(),
+        DaemonError::Parse(msg) => msg.as_str(),
+        DaemonError::SpawnFallbackExhausted(list) => {
+            return list.iter().any(|(_, e)| is_ao_not_running_error(e));
+        }
+        _ => return false,
+    };
+    let lower = msg.to_lowercase();
+    lower.contains("daemon is not running")
+        || lower.contains("is not running")
+        || lower.contains("connection refused")
+        || lower.contains("cannot connect")
+        || lower.contains("failed to connect")
+        || lower.contains("unknown project")
+        || lower.contains("no such project")
+        || lower.contains("orchestrator not running")
+}
+
+pub fn ensure_ao_project_recovered(project: &str, target_path_or_url: &str) -> Result<(), DaemonError> {
+    // 1. Initial health check probe to record project-scoped status: ao status -p <project-id> --json
+    let _ = run_tool("ao", &["status", "-p", project, "--json"], 30);
+
+    let map = AO_PROJECT_START_MUTEX.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let elected = {
+        let mut guard = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.insert(project.to_string())
+    };
+
+    if !elected {
+        // Another thread is starting, recheck health
+        let recheck = run_tool("ao", &["status", "-p", project, "--json"], 30)?;
+        let json_start = recheck.find('[').unwrap_or(0);
+        serde_json::from_str::<serde_json::Value>(&recheck[json_start..]).map_err(|e| {
+            DaemonError::Parse(format!("failed to parse ao status after concurrent start: {e}"))
+        })?;
+        return Ok(());
+    }
+
+    struct StarterGuard<'a>(&'a str);
+    impl<'a> Drop for StarterGuard<'a> {
+        fn drop(&mut self) {
+            let map = AO_PROJECT_START_MUTEX.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+            let mut guard = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.remove(self.0);
+        }
+    }
+    let _guard = StarterGuard(project);
+
+    // 2. Start: ao start <configured-project-path-or-url> --no-dashboard --no-open
+    // Note: --headless is explicitly rejected per Linux AO 0.1.3 contract
+    let start_args = ["start", target_path_or_url, "--no-dashboard", "--no-open"];
+    run_tool("ao", &start_args, 60).map_err(|e| {
+        DaemonError::Config(format!("ao start failed for project {project}: {e}"))
+    })?;
+
+    // 3. Recheck project health: ao status -p <project-id> --json
+    let recheck = run_tool("ao", &["status", "-p", project, "--json"], 30).map_err(|e| {
+        DaemonError::Config(format!("ao status health check failed for project {project} after start: {e}"))
+    })?;
+    let json_start = recheck.find('[').unwrap_or(0);
+    serde_json::from_str::<serde_json::Value>(&recheck[json_start..]).map_err(|e| {
+        DaemonError::Parse(format!("failed to parse ao status JSON after start: {e}"))
+    })?;
+
+    Ok(())
+}
+
 pub struct CliSessions {
     pub project: String,
     pub agent: String,
@@ -3330,6 +3402,8 @@ impl CliSessions {
                         "ao spawn --agent {agent} returned session {} with branch {:?}, expected {:?}; refusing to dispatch a branch-mismatched worker",
                         session.0, observed_branch, spec.branch
                     )))
+                } else if let Err(err) = crate::tools::check_cwd_guard(spec.expected_cwd.as_deref(), workspace_path) {
+                    Some(err)
                 } else if let Some(expected_revision) = spec.expected_revision.as_deref() {
                     match crate::target_worktree::validate_existing_target_worktree(
                         &spec.repo,
@@ -6317,7 +6391,23 @@ impl Sessions for CliSessions {
     }
 
     fn spawn(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
-        self.spawn_with_fallback(spec)
+        let res = self.spawn_with_fallback(spec);
+        match res {
+            Ok(session) => Ok(session),
+            Err(err) => {
+                if is_ao_not_running_error(&err) {
+                    let start_target = spec
+                        .local_checkout
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|| format!("https://github.com/{}.git", spec.repo));
+                    ensure_ao_project_recovered(&spec.ao_project, &start_target)?;
+                    self.spawn_with_fallback(spec)
+                } else {
+                    Err(err)
+                }
+            }
+        }
     }
 
     fn spawn_batch(&self, specs: &[SpawnSpec]) -> Result<Vec<SessionId>, DaemonError> {

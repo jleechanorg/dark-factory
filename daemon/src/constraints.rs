@@ -128,6 +128,17 @@ pub fn append_mutation(spec_path: &Path, block: &str) -> Result<(), DaemonError>
     );
     let temp_path = parent.join(temp_filename);
 
+    struct TempCleanup<'a>(&'a Path, bool);
+    impl<'a> Drop for TempCleanup<'a> {
+        fn drop(&mut self) {
+            if self.1 {
+                let _ = std::fs::remove_file(self.0);
+            }
+        }
+    }
+
+    let mut cleanup = TempCleanup(&temp_path, false);
+
     {
         let mut temp_file = OpenOptions::new()
             .create(true)
@@ -139,6 +150,8 @@ pub fn append_mutation(spec_path: &Path, block: &str) -> Result<(), DaemonError>
                 rc: -1,
                 stderr: format!("open temp file: {e}"),
             })?;
+
+        cleanup.1 = true;
 
         if spec_path.exists() {
             let existing = std::fs::read_to_string(spec_path).map_err(|e| DaemonError::Tool {
@@ -175,6 +188,8 @@ pub fn append_mutation(spec_path: &Path, block: &str) -> Result<(), DaemonError>
         rc: -1,
         stderr: format!("rename temp to target: {e}"),
     })?;
+
+    cleanup.1 = false;
 
     Ok(())
 }
@@ -351,4 +366,49 @@ mod tests {
 
         std::fs::remove_dir_all(&temp_dir).ok();
     }
+
+    #[test]
+    fn reroll_temp_open_failure_preserves_original() {
+        let temp_dir = std::env::temp_dir().join(format!("afd_constraints_temp_open_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let spec_file = temp_dir.join("spec.toml");
+        let initial_bytes = "initial_key = \"initial_value\"\n";
+        std::fs::write(&spec_file, initial_bytes).unwrap();
+
+        // Deterministically create a sibling temp file path that cannot be opened for writing
+        let temp_filename = format!(
+            ".{}.tmp.{}",
+            spec_file.file_name().and_then(|f| f.to_str()).unwrap_or("spec"),
+            std::process::id()
+        );
+        let temp_path = temp_dir.join(&temp_filename);
+
+        // Pre-create temp_path as a directory so OpenOptions open(write=true) deterministically fails
+        std::fs::create_dir_all(&temp_path).unwrap();
+
+        let res = append_mutation(&spec_file, "inhibition_specs = [\"fail\"]\n");
+        assert!(res.is_err(), "append_mutation must fail when sibling temp file cannot be opened");
+        let err = res.unwrap_err();
+        match err {
+            DaemonError::Tool { tool, stderr, .. } => {
+                assert_eq!(tool, "fs");
+                assert!(
+                    stderr.contains("open temp file:"),
+                    "error must specifically name the atomic temp file open failure, got: {stderr}"
+                );
+            }
+            other => panic!("expected DaemonError::Tool fs error, got: {other:?}"),
+        }
+
+        // The original constraint/spec file is byte-identical after failure
+        assert_eq!(
+            std::fs::read_to_string(&spec_file).unwrap(),
+            initial_bytes,
+            "original spec file must remain completely unmodified on failure"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }
+

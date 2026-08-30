@@ -2043,6 +2043,60 @@ mod tests {
     }
 
     #[test]
+    fn capacity_40_workers_15_batch_boundaries() {
+        let store = FakeStateStore::new();
+        let mut cfg = cfg();
+        cfg.max_workers = 40;
+        cfg.max_batch = 15;
+        let ready = beads(40);
+
+        // 1. With 39 active sessions exactly one capacity slot remains
+        let sessions_39 = FakeSessions::new(39);
+        let report_39 = dispatch_ready(&sessions_39, &store, &cfg, &ready).unwrap();
+        assert_eq!(
+            report_39.success_count(),
+            1,
+            "with 39 active workers out of 40 capacity, exactly 1 slot must be dispatched"
+        );
+
+        // With 40 active sessions, zero remain
+        let sessions_40 = FakeSessions::new(40);
+        let report_40 = dispatch_ready(&sessions_40, &store, &cfg, &ready).unwrap();
+        assert_eq!(
+            report_40.success_count(),
+            0,
+            "with 40 active workers out of 40 capacity, 0 slots must be dispatched"
+        );
+
+        // 2. Forty ready tasks with 0 active dispatch at most 15 in one tick
+        let sessions_0 = FakeSessions::new(0);
+        let report_0 = dispatch_ready(&sessions_0, &store, &cfg, &ready).unwrap();
+        assert_eq!(
+            report_0.success_count(),
+            15,
+            "with 0 active workers and 40 ready tasks, tick 1 must dispatch exactly max_batch (15)"
+        );
+
+        // Next tick with 15 active sessions and remaining ready tasks dispatches next batch of 15 (total 30 <= 40)
+        let sessions_15 = FakeSessions::new(15);
+        let report_15 = dispatch_ready(&sessions_15, &store, &cfg, &ready[15..]).unwrap();
+        assert_eq!(
+            report_15.success_count(),
+            15,
+            "tick 2 with 15 active workers must dispatch at most 15"
+        );
+
+        // Tick 3 with 30 active workers dispatches remaining 10 (30 + 10 = 40 cap)
+        let sessions_30 = FakeSessions::new(30);
+        let report_30 = dispatch_ready(&sessions_30, &store, &cfg, &ready[30..]).unwrap();
+        assert_eq!(
+            report_30.success_count(),
+            10,
+            "tick 3 with 30 active workers must dispatch remaining 10 capacity slots"
+        );
+    }
+
+    #[test]
     fn twenty_eight_active_of_thirty_spawns_exactly_two() {
         let sessions = FakeSessions::new(28);
         let store = FakeStateStore::new();
