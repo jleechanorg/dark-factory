@@ -309,7 +309,21 @@ jobs:
         working-directory: daemon
         # The self-hosted runner can concurrently run the Python test job;
         # serial compilation prevents rustc from being OOM-killed mid-suite.
-        run: cargo test --verbose -j 1
+        # --test-threads=1 (jleechan 2026-08-30): `-j 1` only serializes
+        # compilation, not test execution -- within each test binary, libtest
+        # still runs tests on multiple threads by default. Several tests
+        # (both in the lib crate's own unit-test binary and in
+        # adapters_integration.rs) mutate global process state (PATH env var
+        # via EnvVarGuard, ao_spawn_contract_tests' current-dir dependency)
+        # without full mutual exclusion against every other test in the same
+        # binary. Empirically: `cargo test --lib` and `cargo test --test
+        # adapters_integration` each flake under default parallelism (3/3
+        # clean at --test-threads=1 vs intermittent failures at default
+        # threading, confirmed via repeated local reruns of this exact `-j 1`
+        # command). Root-causing every individual race is a separate,
+        # larger test-isolation project; serializing here trades wall-clock
+        # time for deterministic CI on this self-hosted runner.
+        run: cargo test --verbose -j 1 -- --test-threads=1
 
       - name: cargo clippy (deny warnings)
         working-directory: daemon
