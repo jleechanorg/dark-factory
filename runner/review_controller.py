@@ -1271,6 +1271,22 @@ def parse_codex_jsonl(raw: str) -> tuple[str, tuple[ExecutionReceipt, ...]]:
     return response, tuple(receipts)
 
 
+#: codex-cli >=0.147 emits a benign informational ``item.completed`` item of
+#: ``type: "error"`` disclosing that hook trust was bypassed for the
+#: invocation (dark-factory always passes this flag to run non-interactively).
+#: It is CLI boilerplate, not a review failure — without this allowance,
+#: `parse_tool_free_codex_jsonl` raised on it before ever reaching the real
+#: verdict later in the stream, so every cold-review-v1 run failed
+#: unconditionally regardless of the actual verdict (2026-08-29 incident).
+#:
+#: This must match the KNOWN advisory message exactly (as a prefix), not a
+#: loose substring, and only on the terminal ``item.completed`` event — a
+#: genuine transport/hook failure that merely *mentions* the flag (e.g.
+#: "hook execution failed while --dangerously-bypass-hook-trust is enabled")
+#: must still fail closed (PR #789 review finding).
+_BENIGN_ADVISORY_ITEM_PREFIX = "`--dangerously-bypass-hook-trust` is enabled."
+
+
 def parse_tool_free_codex_jsonl(
     raw: str, *, request: ReviewRequest
 ) -> tuple[str, ReviewTransportReceipt]:
@@ -1327,9 +1343,17 @@ def parse_tool_free_codex_jsonl(
             )
         item_type = item.get("type")
         if item_type not in safe_item_types:
-            raise ReviewContractError(
-                f"tool-free transport emitted unknown item type: {item_type!r}"
+            message = item.get("message")
+            is_benign_advisory = (
+                event_type == "item.completed"
+                and item_type == "error"
+                and isinstance(message, str)
+                and message.startswith(_BENIGN_ADVISORY_ITEM_PREFIX)
             )
+            if not is_benign_advisory:
+                raise ReviewContractError(
+                    f"tool-free transport emitted unknown item type: {item_type!r}"
+                )
         if event_type == "item.completed":
             if item_type != "agent_message":
                 continue
