@@ -10,16 +10,63 @@
 #    ao_project, ao_session, worktree, branch, worker_pid_before, worker_pid_after,
 #    unrelated_inventory_before, unrelated_inventory_after, journal_window.
 # 5. Changes no production code.
+#
+# EXIT CODE CONTRACT (never conflate SKIP with PASS):
+#   0 = PASS  — every criterion above was checked against real, live state
+#               (real daemon, real `ao` session, real worker process) and
+#               all checks passed.
+#   1 = FAIL  — a real check ran against real state and failed.
+#   2 = SKIP  — this environment cannot produce real evidence for one or
+#               more criteria (no systemd --user manager, `ao` unreachable,
+#               no real branch-tracked target worktree, or no real AO
+#               session available to bind worker-continuity/stop-path proof
+#               to). This NEVER falls back to fabricated evidence — no
+#               synthetic session ids, no `setsid sleep` stand-in "worker"
+#               processes, and no raw `kill -9` in place of the real
+#               product stop path. A SKIP means "no proof was produced",
+#               never "proof of success".
+#
+# Real product stop/reap path used for criterion 3: `CliSessions::stop` in
+# daemon/src/adapters.rs runs `ao session kill <id>` — this script invokes
+# that exact command (never a raw `kill -9`) against a session it owns.
+#
+# Worker-continuity + stop-path proof (criterion 2/3) requires binding to a
+# REAL AO session. Spawning a brand-new real AO session from inside this
+# script (`ao spawn`) starts an actual paid coding-agent harness in a fresh
+# worktree — that is not a safe or deterministic thing for an automated
+# restart-boundary smoke test to trigger as a side effect. Reusing an
+# arbitrary pre-existing real session from the production project is even
+# less acceptable: this script must never call the real stop path
+# (`ao session kill`) against a session it does not own, since that would
+# destroy someone else's in-progress work. So real evidence for this part
+# is opt-in: set AO_IMMUTABLE_RESTART_TEST_PROJECT to a dedicated, disposable
+# AO project that already has exactly one active session parked for this
+# test to bind to and legitimately stop. Without that opt-in, this script
+# SKIPs the worker-continuity/stop-path criteria rather than fabricating.
 
 set -euo pipefail
 
+SKIP_EXIT=2
 UNIT="ai.dark-factory.daemon.service"
 AO_PROJECT="dark-factory"
+WORKTREE="/home/jleechan/.dark-factory/target-worktrees/jleechanorg/dark-factory"
 
-# Probe: systemd user session available?
+skip() {
+  local reason="$1"
+  echo "SKIPPED: $reason" >&2
+  python3 -c "import json,sys; print(json.dumps({'status': 'skipped', 'reason': sys.argv[1]}, indent=2))" "$reason"
+  exit "$SKIP_EXIT"
+}
+
+# --- Probe: systemd user session available? ---
 if ! systemctl --user show-environment >/dev/null 2>&1; then
-  echo '{"status": "skipped", "reason": "no systemd --user manager available on this host"}'
-  exit 0
+  skip "no systemd --user manager available on this host"
+fi
+
+# --- Probe: is the real `ao` CLI reachable? Required for every AO-bound
+# criterion (project inventory, session binding, stop path). ---
+if ! command -v ao >/dev/null 2>&1; then
+  skip "ao CLI not found on PATH; cannot bind to a real AO session or stop path"
 fi
 
 # Ensure service is active
@@ -44,27 +91,74 @@ if [ -z "$RELEASE_COMMIT" ]; then
   RELEASE_COMMIT="$(basename "$(dirname "$(dirname "$PROC_EXE")")")"
 fi
 
-# Inventory of unrelated sessions/processes before (strictly project-scoped)
-UNRELATED_BEFORE="$(ao status -p "$AO_PROJECT" --json 2>/dev/null || echo '[]')"
-
-# Resolve dynamic target worktree & branch from live checkout
-WORKTREE="/home/jleechan/.dark-factory/target-worktrees/jleechanorg/dark-factory"
-if [ -d "$WORKTREE/.git" ]; then
-  BRANCH="$(git -C "$WORKTREE" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")"
-  if [ "$BRANCH" = "HEAD" ]; then
-    BRANCH="$(git -C "$WORKTREE" rev-parse HEAD 2>/dev/null || echo "main")"
-  fi
-else
-  BRANCH="main"
+# --- Resolve dynamic target worktree & branch from the live checkout. A
+# missing worktree or a detached HEAD means we cannot bind to a real
+# branch-tracked worktree, so this is a SKIP, never a fabricated branch. ---
+if [ ! -d "$WORKTREE/.git" ]; then
+  skip "target worktree $WORKTREE has no .git; cannot verify a real branch-tracked worktree"
+fi
+BRANCH="$(git -C "$WORKTREE" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+if [ -z "$BRANCH" ] || [ "$BRANCH" = "HEAD" ]; then
+  skip "target worktree $WORKTREE is on a detached HEAD ($(git -C "$WORKTREE" rev-parse HEAD 2>/dev/null || echo unknown)); cannot verify a real branch-tracked worktree"
 fi
 
-# Derive live AO session identity from active status if present, else dynamic proof session
-LIVE_SESSION="$(echo "$UNRELATED_BEFORE" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data[0]['id'] if isinstance(data, list) and len(data)>0 and 'id' in data[0] else 'session-af-immutable-proof')" 2>/dev/null || echo "session-af-immutable-proof")"
-AO_SESSION="$LIVE_SESSION"
+# Inventory of unrelated sessions/processes before (strictly project-scoped).
+# This is compared byte-for-byte against the same call after the restart +
+# explicit stop below to prove neither perturbed sessions outside the ones
+# this script explicitly owns and stops.
+UNRELATED_BEFORE="$(ao status -p "$AO_PROJECT" --json 2>/dev/null || echo '[]')"
 
-# Spawn a detached test child to simulate live worker session preserved across restart
-TEST_CHILD_PID="$(setsid sleep 300 < /dev/null > /dev/null 2>&1 & echo $!)"
-WORKER_PID_BEFORE="$TEST_CHILD_PID"
+# --- Bind to a REAL, currently-tracked, non-terminal AO session this script
+# owns, so the stop-path proof below can legitimately call the real product
+# stop path without touching anyone else's in-progress session. Opt-in only
+# via AO_IMMUTABLE_RESTART_TEST_PROJECT (a dedicated disposable project) --
+# never fabricated, and never taken from the production $AO_PROJECT list. ---
+AO_TEST_PROJECT="${AO_IMMUTABLE_RESTART_TEST_PROJECT:-}"
+if [ -z "$AO_TEST_PROJECT" ]; then
+  skip "AO_IMMUTABLE_RESTART_TEST_PROJECT is not set; no disposable AO project is configured to safely own a real session for worker-continuity/stop-path proof (refusing to fabricate a session or reuse a production one)"
+fi
+
+TEST_PROJECT_SESSIONS="$(ao status -p "$AO_TEST_PROJECT" --json 2>/dev/null || echo '[]')"
+
+# Real schema (verified against daemon/src/adapters.rs session_for_branch /
+# session_is_quiescent / session_activity): each entry has "name" (the
+# session id), "branch", "activity", and "status" — never "id".
+AO_SESSION="$(echo "$TEST_PROJECT_SESSIONS" | python3 -c "
+import json, sys
+
+TERMINAL = {'killed', 'terminated', 'done', 'cleanup', 'errored', 'merged'}
+
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    data = []
+
+def is_terminal(entry):
+    return entry.get('status') in TERMINAL or entry.get('activity') == 'exited'
+
+active = [
+    e for e in (data if isinstance(data, list) else [])
+    if isinstance(e, dict) and e.get('name') and not is_terminal(e)
+]
+if len(active) == 1:
+    print(active[0]['name'])
+" 2>/dev/null || true)"
+
+if [ -z "$AO_SESSION" ]; then
+  skip "AO_IMMUTABLE_RESTART_TEST_PROJECT='$AO_TEST_PROJECT' does not have exactly one real active AO session to bind worker-continuity/stop-path proof to"
+fi
+
+# --- Resolve the REAL worker process PID for this session via its tmux
+# pane -- never a synthetic `setsid sleep` stand-in. AO sessions run in
+# tmux (confirmed by the daemon's own tmux pane-capture calls in
+# adapters.rs); the tmux session name matches the AO session's "name". ---
+WORKER_PID_BEFORE=""
+if command -v tmux >/dev/null 2>&1; then
+  WORKER_PID_BEFORE="$(tmux list-panes -t "$AO_SESSION" -F '#{pane_pid}' 2>/dev/null | head -1 || true)"
+fi
+if [ -z "$WORKER_PID_BEFORE" ] || ! kill -0 "$WORKER_PID_BEFORE" 2>/dev/null; then
+  skip "could not resolve a live real worker PID for AO session '$AO_SESSION' via tmux; refusing to fabricate a stand-in process"
+fi
 
 JOURNAL_START="$(date -u +"%Y-%m-%d %H:%M:%S")"
 
@@ -75,34 +169,40 @@ sleep 2
 DAEMON_PID_AFTER="$(systemctl --user show "$UNIT" --property=MainPID --value)"
 if [ -z "$DAEMON_PID_AFTER" ] || [ "$DAEMON_PID_AFTER" = "0" ] || [ "$DAEMON_PID_AFTER" = "$DAEMON_PID_BEFORE" ]; then
   echo "FAIL: daemon PID did not advance on restart ($DAEMON_PID_BEFORE -> $DAEMON_PID_AFTER)" >&2
-  kill -9 "$TEST_CHILD_PID" 2>/dev/null || true
   exit 1
 fi
 
-# Verify worker process survived restart
-if kill -0 "$TEST_CHILD_PID" 2>/dev/null; then
-  WORKER_PID_AFTER="$TEST_CHILD_PID"
+# Verify the REAL worker process survived restart
+if kill -0 "$WORKER_PID_BEFORE" 2>/dev/null; then
+  WORKER_PID_AFTER="$WORKER_PID_BEFORE"
 else
-  echo "FAIL: worker process $TEST_CHILD_PID did not survive restart" >&2
+  echo "FAIL: real AO worker process $WORKER_PID_BEFORE (session $AO_SESSION) did not survive restart" >&2
   exit 1
 fi
 
-# Explicit stop / reap verification
-kill -9 "$TEST_CHILD_PID" 2>/dev/null || true
+# --- Explicit stop / reap verification via the REAL product stop path.
+# CliSessions::stop (daemon/src/adapters.rs) runs `ao session kill <id>` --
+# this invokes that exact command, never a raw `kill -9`. ---
+if ! ao session kill "$AO_SESSION" >/dev/null 2>&1; then
+  echo "FAIL: real product stop path 'ao session kill $AO_SESSION' failed to execute" >&2
+  exit 1
+fi
 reaped=0
 for _ in $(seq 1 20); do
-  if ! kill -0 "$TEST_CHILD_PID" 2>/dev/null; then
+  if ! kill -0 "$WORKER_PID_BEFORE" 2>/dev/null; then
     reaped=1
     break
   fi
   sleep 0.1
 done
 if [ "$reaped" -ne 1 ]; then
-  echo "FAIL: worker process $TEST_CHILD_PID was not cleanly reaped" >&2
+  echo "FAIL: worker process $WORKER_PID_BEFORE was not cleanly reaped by 'ao session kill $AO_SESSION'" >&2
   exit 1
 fi
 
-# Inventory of unrelated sessions after (strictly project-scoped)
+# Inventory of unrelated sessions after (strictly project-scoped) -- must be
+# byte-identical to before: neither the restart nor the explicit stop of our
+# own owned test-project session may perturb the production project's list.
 UNRELATED_AFTER="$(ao status -p "$AO_PROJECT" --json 2>/dev/null || echo '[]')"
 JOURNAL_END="$(date -u +"%Y-%m-%d %H:%M:%S")"
 JOURNAL_WINDOW="${JOURNAL_START} .. ${JOURNAL_END}"
