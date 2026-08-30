@@ -3061,6 +3061,24 @@ fn ao_spawn_command(agent: &str, spec: &SpawnSpec) -> Result<Command, DaemonErro
     ao_spawn_command_with_mode(agent, spec, false)
 }
 
+/// Single source of truth for the repo+revision identity check `run_spawn_process`
+/// applies both before dispatch (against `spec.local_checkout`, when it already
+/// exists) and after dispatch (against the AO-reported workspace). A no-op
+/// unless `expected_revision` is set, so pre/post-spawn call sites cannot drift
+/// into re-implementing the "only check when a revision is pinned" policy
+/// independently.
+fn validate_target_identity_if_expected(
+    repo: &str,
+    path: &std::path::Path,
+    expected_revision: Option<&str>,
+) -> Result<(), DaemonError> {
+    let Some(expected_revision) = expected_revision else {
+        return Ok(());
+    };
+    crate::target_worktree::validate_existing_target_worktree(repo, path, Some(expected_revision))
+        .map(|_| ())
+}
+
 /// Maps legacy vendor aliases onto their canonical AO plugin names. The
 /// runtime and startup paths consult this single source so a renamed plugin
 /// never silently disappears from `--agent` argv or preflight checks.
@@ -3282,16 +3300,30 @@ pub fn is_ao_project_healthy(project: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// SPEC #4 residual limitation: this is still lexical stderr classification
+/// for any `ao` CLI invocation that actually ran and returned a real exit
+/// code (AO does not expose a structured failure-reason taxonomy over its
+/// CLI, so there is nothing else to key on for e.g. "unknown project"). The
+/// one case this function CAN classify structurally is `rc == -1` on a
+/// `DaemonError::Tool`: `run_tool_with_cwd` (tools.rs) and the `ao spawn`
+/// invocation in `run_spawn_process` only ever produce `rc == -1` when the
+/// `ao`/`sandbox-exec` binary itself could not be spawned or waited on (or
+/// was killed by a signal, so `Command::status().code()` is `None`) — never
+/// as a real `ao` CLI exit code. That is checked first, before any lexical
+/// matching, so it does not depend on stderr wording at all.
 fn is_ao_not_running_error(err: &DaemonError) -> bool {
-    let msg = match err {
-        DaemonError::Tool { stderr, .. } => stderr.as_str(),
-        DaemonError::Config(msg) => msg.as_str(),
-        DaemonError::Parse(msg) => msg.as_str(),
+    let (msg, rc) = match err {
+        DaemonError::Tool { stderr, rc, .. } => (stderr.as_str(), Some(*rc)),
+        DaemonError::Config(msg) => (msg.as_str(), None),
+        DaemonError::Parse(msg) => (msg.as_str(), None),
         DaemonError::SpawnFallbackExhausted(list) => {
             return list.iter().any(|(_, e)| is_ao_not_running_error(e));
         }
         _ => return false,
     };
+    if rc == Some(-1) {
+        return true;
+    }
     let lower = msg.to_lowercase();
     lower.contains("daemon is not running")
         || lower.contains("orchestrator not running")
@@ -3299,6 +3331,69 @@ fn is_ao_not_running_error(err: &DaemonError) -> bool {
         || lower.contains("no such project")
         || lower.contains("failed to connect to daemon")
         || lower.contains("cannot connect to daemon")
+}
+
+#[cfg(test)]
+mod is_ao_not_running_error_tests {
+    use super::is_ao_not_running_error;
+    use crate::errors::DaemonError;
+
+    #[test]
+    fn rc_negative_one_is_classified_structurally_regardless_of_stderr_wording() {
+        // Before this fix, only lexical stderr substrings drove
+        // classification, so a `rc=-1` "could not even launch the binary"
+        // failure with unrelated wording (e.g. a sandbox-exec spawn error)
+        // was NOT recognized as an AO-not-running condition.
+        let err = DaemonError::Tool {
+            tool: "ao".to_string(),
+            rc: -1,
+            stderr: "execution failed: No such file or directory (os error 2)".to_string(),
+        };
+        assert!(is_ao_not_running_error(&err));
+    }
+
+    #[test]
+    fn real_exit_code_still_requires_lexical_match() {
+        let err = DaemonError::Tool {
+            tool: "ao spawn --agent minimax".to_string(),
+            rc: 1,
+            stderr: "some unrelated ao CLI validation error".to_string(),
+        };
+        assert!(!is_ao_not_running_error(&err));
+    }
+
+    #[test]
+    fn real_exit_code_with_recognized_phrase_still_matches() {
+        let err = DaemonError::Tool {
+            tool: "ao spawn --agent minimax".to_string(),
+            rc: 1,
+            stderr: "Error: daemon is not running".to_string(),
+        };
+        assert!(is_ao_not_running_error(&err));
+    }
+
+    #[test]
+    fn spawn_fallback_exhausted_recurses_into_each_agent_error() {
+        let err = DaemonError::SpawnFallbackExhausted(vec![
+            (
+                "minimax".to_string(),
+                DaemonError::Tool {
+                    tool: "ao spawn --agent minimax".to_string(),
+                    rc: 1,
+                    stderr: "some unrelated ao CLI validation error".to_string(),
+                },
+            ),
+            (
+                "antigravity".to_string(),
+                DaemonError::Tool {
+                    tool: "ao spawn --agent antigravity".to_string(),
+                    rc: -1,
+                    stderr: "execution failed: No such file or directory (os error 2)".to_string(),
+                },
+            ),
+        ]);
+        assert!(is_ao_not_running_error(&err));
+    }
 }
 
 pub fn ensure_ao_project_recovered(project: &str, target_path_or_url: &str) -> Result<(), DaemonError> {
@@ -3370,6 +3465,240 @@ pub fn ensure_ao_project_recovered(project: &str, target_path_or_url: &str) -> R
     Ok(())
 }
 
+#[cfg(test)]
+mod ao_project_recovery_tests {
+    use super::{ensure_ao_project_recovered, gh_env_test_lock};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// Writes a fake `ao` on PATH that answers `status -p <project> --json`
+    /// based on whether `healthy_marker` exists, and `start <target>
+    /// --no-dashboard --no-open` by appending a timestamp line to
+    /// `start_log`, sleeping `start_delay_ms`, then either creating
+    /// `healthy_marker` and exiting 0 (when `start_exit_code == 0`) or
+    /// printing to stderr and exiting `start_exit_code`.
+    struct FakeAoRecoveryEnv {
+        root: std::path::PathBuf,
+        healthy_marker: std::path::PathBuf,
+        start_log: std::path::PathBuf,
+        old_path: Option<std::ffi::OsString>,
+    }
+
+    impl FakeAoRecoveryEnv {
+        fn set_up(test_name: &str, start_delay_ms: u64, start_exit_code: i32) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "afd_ao_project_recovery_{test_name}_{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let healthy_marker = root.join("healthy.marker");
+            let start_log = root.join("start.log");
+            let fake_ao = root.join("ao");
+            std::fs::write(
+                &fake_ao,
+                format!(
+                    r#"#!/usr/bin/env python3
+import os, sys, time
+args = sys.argv[1:]
+marker = {marker:?}
+start_log = {start_log:?}
+if args[:1] == ["status"]:
+    if os.path.exists(marker):
+        print("[]")
+        sys.exit(0)
+    sys.exit(1)
+if args[:1] == ["start"]:
+    with open(start_log, "a", encoding="utf-8") as fh:
+        fh.write(str(time.time()) + "\n")
+    time.sleep({delay_ms} / 1000.0)
+    if {exit_code} != 0:
+        print("scripted start failure", file=sys.stderr)
+        sys.exit({exit_code})
+    with open(marker, "w", encoding="utf-8") as fh:
+        fh.write("healthy\n")
+    sys.exit(0)
+sys.exit(1)
+"#,
+                    marker = healthy_marker.to_string_lossy(),
+                    start_log = start_log.to_string_lossy(),
+                    delay_ms = start_delay_ms,
+                    exit_code = start_exit_code,
+                ),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = std::fs::metadata(&fake_ao).unwrap().permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(&fake_ao, permissions).unwrap();
+            }
+            let old_path = std::env::var_os("PATH");
+            let new_path = std::env::join_paths(
+                std::iter::once(root.clone()).chain(
+                    old_path
+                        .as_deref()
+                        .into_iter()
+                        .flat_map(std::env::split_paths),
+                ),
+            )
+            .unwrap();
+            std::env::set_var("PATH", new_path);
+            Self {
+                root,
+                healthy_marker,
+                start_log,
+                old_path,
+            }
+        }
+
+        fn mark_healthy_up_front(&self) {
+            std::fs::write(&self.healthy_marker, "healthy\n").unwrap();
+        }
+
+        fn start_invocation_count(&self) -> usize {
+            std::fs::read_to_string(&self.start_log)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .count()
+        }
+    }
+
+    impl Drop for FakeAoRecoveryEnv {
+        fn drop(&mut self) {
+            match self.old_path.take() {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn unique_project(label: &str) -> String {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("afd-recovery-{label}-{}-{nonce}", std::process::id())
+    }
+
+    /// Joins a thread through a channel with a hard bound so a Condvar
+    /// liveness regression fails the test instead of hanging the suite.
+    fn join_with_timeout<T: Send + 'static>(
+        handle: std::thread::JoinHandle<T>,
+        timeout: Duration,
+        label: &'static str,
+    ) -> T {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = handle.join().unwrap_or_else(|_| panic!("{label} panicked"));
+            let _ = tx.send(result);
+        });
+        rx.recv_timeout(timeout)
+            .unwrap_or_else(|_| panic!("{label} did not complete within {timeout:?} (hang)"))
+    }
+
+    #[test]
+    fn healthy_project_skips_start_entirely() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = FakeAoRecoveryEnv::set_up("healthy_skip", 0, 0);
+        env.mark_healthy_up_front();
+        let project = unique_project("healthy-skip");
+
+        let result = ensure_ao_project_recovered(&project, "https://github.com/jleechanorg/dark-factory.git");
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            env.start_invocation_count(),
+            0,
+            "an already-healthy project must never invoke ao start"
+        );
+    }
+
+    #[test]
+    fn concurrent_callers_elect_a_single_starter_and_both_observe_health() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // 400ms start delay gives the second caller a wide window to observe
+        // `in_progress == true` and enter the Condvar wait instead of racing
+        // to elect itself as a second starter.
+        let env = FakeAoRecoveryEnv::set_up("concurrent_race", 400, 0);
+        let project = unique_project("concurrent-race");
+        let target = "https://github.com/jleechanorg/dark-factory.git".to_string();
+
+        let project_a = project.clone();
+        let target_a = target.clone();
+        let handle_a = std::thread::spawn(move || ensure_ao_project_recovered(&project_a, &target_a));
+        std::thread::sleep(Duration::from_millis(75));
+        let project_b = project.clone();
+        let target_b = target.clone();
+        let handle_b = std::thread::spawn(move || ensure_ao_project_recovered(&project_b, &target_b));
+
+        let result_a = join_with_timeout(handle_a, Duration::from_secs(10), "starter thread");
+        let result_b = join_with_timeout(handle_b, Duration::from_secs(10), "waiter thread");
+
+        assert!(result_a.is_ok(), "{result_a:?}");
+        assert!(result_b.is_ok(), "{result_b:?}");
+        assert_eq!(
+            env.start_invocation_count(),
+            1,
+            "exactly one caller must run ao start; the other must wait on the Condvar and reuse its result"
+        );
+    }
+
+    #[test]
+    fn start_failure_releases_condvar_waiters_with_failure_instead_of_hanging() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = FakeAoRecoveryEnv::set_up("batch_failure", 400, 7);
+        let project = unique_project("batch-failure");
+        let target = "https://github.com/jleechanorg/dark-factory.git".to_string();
+
+        let project_a = project.clone();
+        let target_a = target.clone();
+        let handle_a = std::thread::spawn(move || ensure_ao_project_recovered(&project_a, &target_a));
+        std::thread::sleep(Duration::from_millis(75));
+        let project_b = project.clone();
+        let target_b = target.clone();
+        let handle_b = std::thread::spawn(move || ensure_ao_project_recovered(&project_b, &target_b));
+
+        // The bounded join is the liveness proof: a Condvar bug that leaves
+        // the waiter blocked forever (e.g. the starter's guard not firing on
+        // an early-return error path) times out here instead of hanging the
+        // whole test binary.
+        let result_a = join_with_timeout(handle_a, Duration::from_secs(10), "starter thread");
+        let result_b = join_with_timeout(handle_b, Duration::from_secs(10), "waiter thread");
+
+        let errors: Vec<String> = [&result_a, &result_b]
+            .iter()
+            .map(|r| r.as_ref().err().map(|e| e.to_string()).unwrap_or_default())
+            .collect();
+        assert!(result_a.is_err(), "{result_a:?}");
+        assert!(result_b.is_err(), "{result_b:?}");
+        assert!(
+            errors.iter().any(|e| e.contains("ao start failed")),
+            "the elected starter must surface the real ao start failure: {errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("did not restore health for waiting caller")),
+            "the Condvar waiter must be released with a failure, not left blocked: {errors:?}"
+        );
+        assert_eq!(
+            env.start_invocation_count(),
+            1,
+            "a failed start must not be retried by the waiting caller"
+        );
+    }
+}
+
 pub struct CliSessions {
     pub project: String,
     pub agent: String,
@@ -3398,19 +3727,24 @@ impl CliSessions {
     }
 
     fn run_spawn_process(&self, agent: &str, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
-        // Pre-spawn validation: if local_checkout is specified, validate it before calling ao spawn
+        // Pre-spawn validation: if local_checkout is specified, validate it before calling ao spawn.
+        // Skip the identity check when the checkout does not exist yet: for a
+        // managed checkout, `ao_spawn_command` (via `ensure_managed_target_worktree`
+        // / `ensure_target_worktree`) is what provisions a missing checkout by
+        // cloning it, so validating existence here first would fail every
+        // first-ever spawn before provisioning gets a chance to run. The
+        // post-spawn check further below re-validates the AO-reported
+        // workspace unconditionally, so a genuinely wrong/stale existing
+        // checkout is still caught before dispatch, and any bad provisioning
+        // result is still caught after.
         if let Some(ref local_checkout) = spec.local_checkout {
-            if let Err(err) = crate::tools::check_cwd_guard(spec.expected_cwd.as_deref(), local_checkout) {
-                return Err(err);
-            }
-            if let Some(expected_revision) = spec.expected_revision.as_deref() {
-                if let Err(err) = crate::target_worktree::validate_existing_target_worktree(
+            crate::tools::check_cwd_guard(spec.expected_cwd.as_deref(), local_checkout)?;
+            if local_checkout.is_dir() {
+                validate_target_identity_if_expected(
                     &spec.repo,
                     local_checkout,
-                    Some(expected_revision),
-                ) {
-                    return Err(err);
-                }
+                    spec.expected_revision.as_deref(),
+                )?;
             }
         }
         // jleechan-bqdv Stage C: spawn into `spec.ao_project` (resolved per
@@ -3457,20 +3791,20 @@ impl CliSessions {
                     )))
                 } else if let Err(err) = crate::tools::check_cwd_guard(spec.expected_cwd.as_deref(), workspace_path) {
                     Some(err)
-                } else if let Some(expected_revision) = spec.expected_revision.as_deref() {
-                    match crate::target_worktree::validate_existing_target_worktree(
+                } else {
+                    match validate_target_identity_if_expected(
                         &spec.repo,
                         workspace_path,
-                        Some(expected_revision),
+                        spec.expected_revision.as_deref(),
                     ) {
-                        Ok(_) => None,
+                        Ok(()) => None,
                         Err(error) => Some(DaemonError::Config(format!(
                             "AO worker workspace for session {} is not bound to repo {} at expected revision {}: {error}",
-                            session.0, spec.repo, expected_revision
+                            session.0,
+                            spec.repo,
+                            spec.expected_revision.as_deref().unwrap_or("?")
                         ))),
                     }
-                } else {
-                    None
                 }
             }
         };
@@ -4853,6 +5187,179 @@ export const isTerminalSession = () => false;
             .collect();
         assert_eq!(rows.iter().filter(|row| row["kind"] == "spawn").count(), 1);
         assert_eq!(rows.iter().filter(|row| row["kind"] == "kill").count(), 1);
+    }
+
+    /// jleechan finding P1: pre-spawn validation used to run
+    /// `validate_existing_target_worktree` (which hard-requires the checkout
+    /// to already be a directory) before `ao_spawn_command`, even though
+    /// `ao_spawn_command` -> `ensure_managed_target_worktree` is the code
+    /// that provisions a missing managed checkout by cloning it. That made
+    /// every first-ever spawn into a brand new managed checkout fail closed
+    /// with "is not a directory" before the provisioning step ever ran. This
+    /// test drives the real `ensure_managed_target_worktree` clone path
+    /// (redirected to a local, offline "origin") through the same call
+    /// sequence `run_spawn_process` uses, so it fails red on the ordering bug
+    /// and passes once pre-spawn validation only applies to checkouts that
+    /// already exist.
+    #[test]
+    fn worker_spawn_provisions_missing_managed_checkout_before_pre_spawn_validation() {
+        // Deliberately distinct from `fake_ao_dir`'s
+        // `afd_ao_spawn_contract_<test_name>_<pid>` naming scheme: that
+        // helper `remove_dir_all`s its own directory on entry, which would
+        // otherwise wipe this root (and the source repo staged inside it)
+        // the moment `with_fake_ao` starts.
+        let root = std::env::temp_dir().join(format!(
+            "afd_missing_managed_checkout_src_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Local "source" repo stands in for the real GitHub remote so the
+        // clone `ao_spawn_command` performs for a missing managed checkout
+        // stays fully offline.
+        let source = root.join("source-repo");
+        std::fs::create_dir_all(&source).unwrap();
+        let source_str = source.to_string_lossy().to_string();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&source)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "uploadpack.allowReachableSHA1InWant", "true"])
+            .current_dir(&source)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "seed",
+            ])
+            .current_dir(&source)
+            .status()
+            .unwrap();
+        let expected_revision = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&source)
+            .output()
+            .unwrap();
+        let expected_revision = String::from_utf8(expected_revision.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let prompt = "missing managed checkout prompt";
+        let branch = "factory/jleechan-contract-missing-managed-checkout-r1";
+        let repo = "jleechanorg/dark-factory-managed-missing-test";
+        let checkout = root.join("managed-target");
+        assert!(!checkout.exists(), "checkout must start out missing");
+
+        let real_git = std::env::var_os("PATH")
+            .as_deref()
+            .into_iter()
+            .flat_map(std::env::split_paths)
+            .map(|dir| dir.join("git"))
+            .find(|path| path.is_file())
+            .expect("test environment must provide git");
+
+        let (spawn_result, calls) = with_fake_ao(
+            "missing_managed_checkout",
+            serde_json::json!({prompt: branch}),
+            |log| {
+                let fake_bin_dir = log.parent().unwrap();
+                let fake_git = fake_bin_dir.join("git");
+                std::fs::write(
+                    &fake_git,
+                    r#"#!/usr/bin/env python3
+import os, subprocess, sys
+args = sys.argv[1:]
+real_git = os.environ["FAKE_GIT_REAL_BIN"]
+local_source = os.environ["FAKE_GIT_LOCAL_SOURCE"]
+expected_origin = os.environ.get("FAKE_GIT_EXPECTED_ORIGIN")
+if args and args[0] == "clone":
+    new_args = [local_source if a.startswith("https://github.com/") else a for a in args]
+    sys.exit(subprocess.call([real_git] + new_args))
+if len(args) >= 2 and args[0] == "checkout" and args[1] == "--detach" and expected_origin:
+    rc = subprocess.call([real_git] + args)
+    if rc == 0:
+        subprocess.call([real_git, "remote", "set-url", "origin", expected_origin])
+    sys.exit(rc)
+os.execv(real_git, [real_git] + args)
+"#,
+                )
+                .unwrap();
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut permissions = std::fs::metadata(&fake_git).unwrap().permissions();
+                    permissions.set_mode(0o755);
+                    std::fs::set_permissions(&fake_git, permissions).unwrap();
+                }
+
+                let expected_origin = format!("https://github.com/{repo}.git");
+                let old_real = std::env::var("FAKE_GIT_REAL_BIN").ok();
+                let old_source = std::env::var("FAKE_GIT_LOCAL_SOURCE").ok();
+                let old_origin = std::env::var("FAKE_GIT_EXPECTED_ORIGIN").ok();
+                let old_worktree = std::env::var("AO_FAKE_WORKTREE").ok();
+                std::env::set_var("FAKE_GIT_REAL_BIN", &real_git);
+                std::env::set_var("FAKE_GIT_LOCAL_SOURCE", &source_str);
+                std::env::set_var("FAKE_GIT_EXPECTED_ORIGIN", &expected_origin);
+                std::env::set_var("AO_FAKE_WORKTREE", &checkout);
+
+                let sessions = CliSessions::new(repo, "minimax");
+                let mut managed = spec(prompt, branch);
+                managed.repo = repo.to_string();
+                managed.local_checkout = Some(checkout.clone());
+                managed.managed_checkout = true;
+                managed.expected_revision = Some(expected_revision.clone());
+                let result = sessions.spawn(&managed);
+                let calls = std::fs::read_to_string(log).unwrap_or_default();
+
+                match old_real {
+                    Some(v) => std::env::set_var("FAKE_GIT_REAL_BIN", v),
+                    None => std::env::remove_var("FAKE_GIT_REAL_BIN"),
+                }
+                match old_source {
+                    Some(v) => std::env::set_var("FAKE_GIT_LOCAL_SOURCE", v),
+                    None => std::env::remove_var("FAKE_GIT_LOCAL_SOURCE"),
+                }
+                match old_origin {
+                    Some(v) => std::env::set_var("FAKE_GIT_EXPECTED_ORIGIN", v),
+                    None => std::env::remove_var("FAKE_GIT_EXPECTED_ORIGIN"),
+                }
+                match old_worktree {
+                    Some(v) => std::env::set_var("AO_FAKE_WORKTREE", v),
+                    None => std::env::remove_var("AO_FAKE_WORKTREE"),
+                }
+
+                (result, calls)
+            },
+        );
+
+        let checkout_has_git_dir = checkout.join(".git").is_dir();
+        let _ = std::fs::remove_dir_all(&root);
+
+        let session = spawn_result.unwrap_or_else(|error| {
+            panic!(
+                "missing managed checkout must be provisioned by ao_spawn_command \
+                 before pre-spawn validation runs, got: {error}"
+            )
+        });
+        assert!(!session.0.is_empty());
+        assert!(
+            checkout_has_git_dir,
+            "ao_spawn_command must provision the missing managed checkout"
+        );
+        assert!(
+            !calls.trim().is_empty(),
+            "ao spawn must have been invoked once provisioning succeeded"
+        );
     }
 
     #[test]
