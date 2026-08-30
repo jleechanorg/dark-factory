@@ -845,6 +845,61 @@ def test_tool_free_transport_accepts_safe_codex_lifecycle_items_and_rejects_unkn
             parse_tool_free_codex_jsonl(unknown, request=request)
 
 
+def test_tool_free_transport_tolerates_benign_hook_trust_advisory():
+    """codex-cli >=0.147 emits a benign `item.completed` of type "error"
+    disclosing `--dangerously-bypass-hook-trust` was used. This is CLI
+    boilerplate, not a review failure, and must not block extraction of the
+    real verdict that follows later in the stream (2026-08-29 incident: every
+    cold-review-v1 run failed unconditionally because this advisory raised
+    before the real agent_message was ever reached)."""
+    request = create_review_request(_inputs())
+    response = _response(request, commands=[]).replace(
+        '"evidence_checked":["changed files and test output"]',
+        '"evidence_checked":["changed files and evidence manifest"]',
+    )
+    raw = "\n".join(
+        (
+            json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+            json.dumps({
+                "type": "item.completed",
+                "item": {
+                    "id": "item_0",
+                    "type": "error",
+                    "message": (
+                        "`--dangerously-bypass-hook-trust` is enabled. "
+                        "Enabled hooks may run without review for this invocation."
+                    ),
+                },
+            }),
+            json.dumps({"type": "turn.started"}),
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": response}}),
+            json.dumps({"type": "turn.completed", "usage": {}}),
+        )
+    )
+    extracted, receipt = parse_tool_free_codex_jsonl(raw, request=request)
+    assert extracted == response
+    assert receipt.transport == "tool-free"
+
+
+def test_tool_free_transport_still_rejects_unrelated_error_items():
+    """The hook-trust advisory allowance must stay narrow: an `error`-typed
+    item with an unrelated message must still fail closed."""
+    request = create_review_request(_inputs())
+    response = _response(request, commands=[])
+    raw = "\n".join(
+        (
+            json.dumps({
+                "type": "item.completed",
+                "item": {"type": "error", "message": "model call failed: rate limited"},
+            }),
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": response}}),
+            json.dumps({"type": "turn.completed", "usage": {}}),
+        )
+    )
+    with pytest.raises(ReviewContractError, match="unknown item type"):
+        parse_tool_free_codex_jsonl(raw, request=request)
+
+
 def test_review_transport_receipt_binds_all_controller_digests():
     request = create_review_request(_inputs())
     receipt = ReviewTransportReceipt.from_request(

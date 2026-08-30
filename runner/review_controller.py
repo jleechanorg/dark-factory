@@ -1271,6 +1271,16 @@ def parse_codex_jsonl(raw: str) -> tuple[str, tuple[ExecutionReceipt, ...]]:
     return response, tuple(receipts)
 
 
+#: codex-cli >=0.147 emits a benign informational ``item.completed`` item of
+#: ``type: "error"`` disclosing that hook trust was bypassed for the
+#: invocation (dark-factory always passes this flag to run non-interactively).
+#: It is CLI boilerplate, not a review failure — without this allowance,
+#: `parse_tool_free_codex_jsonl` raised on it before ever reaching the real
+#: verdict later in the stream, so every cold-review-v1 run failed
+#: unconditionally regardless of the actual verdict (2026-08-29 incident).
+_BENIGN_ADVISORY_ITEM_MARKER = "--dangerously-bypass-hook-trust"
+
+
 def parse_tool_free_codex_jsonl(
     raw: str, *, request: ReviewRequest
 ) -> tuple[str, ReviewTransportReceipt]:
@@ -1327,9 +1337,16 @@ def parse_tool_free_codex_jsonl(
             )
         item_type = item.get("type")
         if item_type not in safe_item_types:
-            raise ReviewContractError(
-                f"tool-free transport emitted unknown item type: {item_type!r}"
+            message = item.get("message")
+            is_benign_advisory = (
+                item_type == "error"
+                and isinstance(message, str)
+                and _BENIGN_ADVISORY_ITEM_MARKER in message
             )
+            if not is_benign_advisory:
+                raise ReviewContractError(
+                    f"tool-free transport emitted unknown item type: {item_type!r}"
+                )
         if event_type == "item.completed":
             if item_type != "agent_message":
                 continue
