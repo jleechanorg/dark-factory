@@ -590,7 +590,7 @@ pub fn dispatch_ready_with_vcs(
             return Err(err);
         }
 
-        let target_branch = if overlay.is_adopted || overlay.pr_number.is_some() {
+        let target_branch = if overlay.is_adopted || branch_mode == "pr_head" {
             &branch
         } else {
             &cfg.base_branch
@@ -1651,6 +1651,84 @@ mod tests {
                 .borrow()
                 .get(ao_project)
                 .cloned())
+        }
+    }
+
+    /// Minimal `Vcs` fake for the `target_branch` regression coverage below:
+    /// scripts `head_sha_within_for_repo`/`base_head_for_repo` to return a
+    /// SHA only for a known-good branch (e.g. `cfg.base_branch`) and an
+    /// error for any other branch name, so a test can distinguish "dispatch
+    /// queried the correct branch" from "dispatch queried a stale/not-yet-
+    /// created branch" by observing whether `expected_revision` resolution
+    /// succeeds. Every other `Vcs` method is unused by `dispatch_ready_with_vcs`
+    /// and panics if called, so an unexpected call fails loudly.
+    struct FakeVcs {
+        known_branches: HashMap<String, String>,
+    }
+
+    impl FakeVcs {
+        fn new(known_branches: &[(&str, &str)]) -> Self {
+            Self {
+                known_branches: known_branches
+                    .iter()
+                    .map(|(branch, sha)| (branch.to_string(), sha.to_string()))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Vcs for FakeVcs {
+        fn base_head(&self, _base_branch: &str) -> Result<String, DaemonError> {
+            unimplemented!("FakeVcs::base_head not scripted for this test")
+        }
+        fn create_branch_at(&self, _name: &str, _sha: &str) -> Result<(), DaemonError> {
+            unimplemented!("FakeVcs::create_branch_at not scripted for this test")
+        }
+        fn head_sha(&self, _branch: &str) -> Result<String, DaemonError> {
+            unimplemented!("FakeVcs::head_sha not scripted for this test")
+        }
+        fn head_sha_within_for_repo(
+            &self,
+            _repo: &str,
+            branch: &str,
+            _timeout_secs: u64,
+        ) -> Result<String, DaemonError> {
+            self.known_branches.get(branch).cloned().ok_or_else(|| {
+                DaemonError::Tool {
+                    tool: "gh api".into(),
+                    rc: 1,
+                    stderr: format!("branch {branch:?} not found"),
+                }
+            })
+        }
+        fn base_head_for_repo(
+            &self,
+            _repo: &str,
+            base_branch: &str,
+        ) -> Result<String, DaemonError> {
+            self.known_branches.get(base_branch).cloned().ok_or_else(|| {
+                DaemonError::Tool {
+                    tool: "gh api".into(),
+                    rc: 1,
+                    stderr: format!("branch {base_branch:?} not found"),
+                }
+            })
+        }
+        fn is_remote_ahead(&self, _branch: &str, _remote_sha: &str) -> Result<bool, DaemonError> {
+            unimplemented!("FakeVcs::is_remote_ahead not scripted for this test")
+        }
+        fn remote_head_sha(&self, _branch: &str) -> Result<String, DaemonError> {
+            unimplemented!("FakeVcs::remote_head_sha not scripted for this test")
+        }
+        fn is_ancestor(
+            &self,
+            _ancestor_sha: &str,
+            _descendant_sha: &str,
+        ) -> Result<bool, DaemonError> {
+            unimplemented!("FakeVcs::is_ancestor not scripted for this test")
+        }
+        fn push_fix_commit(&self, _branch: &str, _message: &str) -> Result<(), DaemonError> {
+            unimplemented!("FakeVcs::push_fix_commit not scripted for this test")
         }
     }
 
@@ -4363,6 +4441,83 @@ mod tests {
             !overlay.is_adopted,
             "an ordinary bead must never be permanently flipped into adopted mode \
              just because it happens to carry a pr_number"
+        );
+    }
+
+    #[test]
+    fn human_held_recovered_ordinary_bead_with_stale_pr_number_queries_base_branch_revision() {
+        // Regression test for the `target_branch` sibling of the bug fixed by
+        // `human_held_recovered_ordinary_bead_with_stale_pr_number_generates_next_attempt_branch`
+        // above. That test proves the branch-NAME decision (`branch`/`branch_mode`)
+        // and `overlay.is_adopted` are computed correctly for an ordinary bead
+        // carrying a stale `pr_number` — but it calls `dispatch_ready` (`vcs: None`),
+        // which skips the `target_branch` computation entirely (the `None` arm at
+        // line ~626 just falls back to `overlay.pre_session_head_sha` unconditionally).
+        // It therefore does NOT exercise the separate `target_branch` condition
+        // (`overlay.is_adopted || overlay.pr_number.is_some()`) that selects which
+        // branch's revision to look up as the worker's `expected_revision`. That
+        // condition has the exact same overreach bug: a non-adopted bead with a
+        // stale `pr_number` wrongly takes the `&branch` (the freshly-computed
+        // NEXT-attempt branch, e.g. `-r2`) arm instead of `&cfg.base_branch` — and
+        // since the `-r2` branch does not exist yet (this dispatch is what will
+        // create it), looking up its revision fails and wrongly parks the bead
+        // HUMAN_HELD instead of dispatching it.
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let vcs = FakeVcs::new(&[(cfg.base_branch.as_str(), "BASE_SHA")]);
+
+        let recovered_overlay = BeadOverlay {
+            bead_id: "recovered-ordinary-bead-789".into(),
+            state: OverlayState::Queued,
+            attempt: 2,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(999),
+            branch: Some("factory/recovered-ordinary-bead-789-r1".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: Some(cfg.target_repo.clone()),
+            attempt_started_at: None,
+        };
+        store.save(&recovered_overlay).unwrap();
+
+        let ready = vec![(
+            Bead {
+                id: "recovered-ordinary-bead-789".into(),
+                title: "recovered ordinary bead".into(),
+                description: String::new(),
+                notes: String::new(),
+                file_tree_summary: String::new(),
+                external_ref: None,
+            },
+            RoutingVerdict::StandardPath,
+            DriveBranchDecision::Generated,
+        )];
+
+        let report = dispatch_ready_with_vcs(&sessions, &store, &cfg, &ready, Some(&vcs)).unwrap();
+
+        assert_eq!(
+            report.success_count(),
+            1,
+            "ordinary bead with a stale pr_number must dispatch successfully by \
+             querying cfg.base_branch's revision, not fail by querying the \
+             not-yet-created next-attempt branch: failures={:?}",
+            report.failures
+        );
+        let overlay = store
+            .load("recovered-ordinary-bead-789")
+            .unwrap()
+            .expect("overlay must be persisted");
+        assert_eq!(
+            overlay.pre_session_head_sha.as_deref(),
+            Some("BASE_SHA"),
+            "expected_revision must resolve from cfg.base_branch, not the stale \
+             pr_number-triggered branch"
         );
     }
 
