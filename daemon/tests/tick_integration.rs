@@ -3778,7 +3778,18 @@ fn drive_existing_pr_bead_dispatches_onto_pr_head_branch_not_generated_branch() 
     ));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = test_vcs();
+    let mut vcs = test_vcs();
+    // This bead must dispatch onto the PR's own head branch
+    // ("factory/jleechan-xa99-reconciliation-rebased"), not the generated
+    // branch -- `test_vcs()` only seeds a SHA for "main", so without this
+    // the expected-revision lookup (dispatch.rs) fails for the PR head
+    // branch and the bead wrongly parks HUMAN_HELD
+    // (park_reason=TargetCheckoutUnconfigured, phase=
+    // expected_revision_unavailable) instead of dispatching.
+    vcs.heads.insert(
+        "factory/jleechan-xa99-reconciliation-rebased".into(),
+        "pr-head-sha-456".into(),
+    );
     let telemetry_log = std::env::temp_dir().join(format!(
         "afd_drive_pr_branch_binding_{}.jsonl",
         std::process::id()
