@@ -3263,7 +3263,24 @@ pub fn verify_ao_bridge_compatibility(
     Ok(())
 }
 
-static AO_PROJECT_START_MUTEX: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+struct ProjectStarterEntry {
+    in_progress: std::sync::Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+static AO_PROJECT_STARTERS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<ProjectStarterEntry>>>> = std::sync::OnceLock::new();
+
+/// Checks structured health of a project: returns true if project is running and valid JSON array returned.
+pub fn is_ao_project_healthy(project: &str) -> bool {
+    let out = match run_tool("ao", &["status", "-p", project, "--json"], 30) {
+        Ok(out) => out,
+        Err(_) => return false,
+    };
+    let json_start = out.find('[').unwrap_or(0);
+    serde_json::from_str::<serde_json::Value>(&out[json_start..])
+        .map(|v| v.is_array())
+        .unwrap_or(false)
+}
 
 fn is_ao_not_running_error(err: &DaemonError) -> bool {
     let msg = match err {
@@ -3287,43 +3304,65 @@ fn is_ao_not_running_error(err: &DaemonError) -> bool {
 }
 
 pub fn ensure_ao_project_recovered(project: &str, target_path_or_url: &str) -> Result<(), DaemonError> {
-    // 1. Initial health check probe to record project-scoped status: ao status -p <project-id> --json
-    let _ = run_tool("ao", &["status", "-p", project, "--json"], 30);
-
-    let map = AO_PROJECT_START_MUTEX.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-    let elected = {
-        let mut guard = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.insert(project.to_string())
-    };
-
-    if !elected {
-        // Another thread is starting, recheck health
-        let recheck = run_tool("ao", &["status", "-p", project, "--json"], 30)?;
-        let json_start = recheck.find('[').unwrap_or(0);
-        serde_json::from_str::<serde_json::Value>(&recheck[json_start..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse ao status after concurrent start: {e}"))
-        })?;
+    // 1. Initial health check: if project is already healthy, do not start
+    if is_ao_project_healthy(project) {
         return Ok(());
     }
 
-    struct StarterGuard<'a>(&'a str);
+    // 2. Concurrency-safe starter election with Condvar waiting
+    let entry = {
+        let map_mutex = AO_PROJECT_STARTERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let mut map = map_mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.entry(project.to_string())
+            .or_insert_with(|| {
+                std::sync::Arc::new(ProjectStarterEntry {
+                    in_progress: std::sync::Mutex::new(false),
+                    cv: std::sync::Condvar::new(),
+                })
+            })
+            .clone()
+    };
+
+    let mut in_progress = entry.in_progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *in_progress {
+        // Another thread is currently running start for this project; wait for completion
+        while *in_progress {
+            in_progress = entry.cv.wait(in_progress).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        // Re-check health after waiting
+        if is_ao_project_healthy(project) {
+            return Ok(());
+        }
+        return Err(DaemonError::Config(format!(
+            "AO auto-start for project {project} did not restore health for waiting caller"
+        )));
+    }
+
+    // Elect this thread as the active starter
+    *in_progress = true;
+    drop(in_progress);
+
+    struct StarterGuard<'a>(&'a std::sync::Arc<ProjectStarterEntry>);
     impl<'a> Drop for StarterGuard<'a> {
         fn drop(&mut self) {
-            let map = AO_PROJECT_START_MUTEX.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-            let mut guard = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.remove(self.0);
+            let mut guard = self.0.in_progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            *guard = false;
+            self.0.cv.notify_all();
         }
     }
-    let _guard = StarterGuard(project);
+    let _guard = StarterGuard(&entry);
 
-    // 2. Start: ao start <configured-project-path-or-url> --no-dashboard --no-open
-    // Note: --headless is explicitly rejected per Linux AO 0.1.3 contract
+    // 3. Start: ao start <configured-project-path-or-url> --no-dashboard --no-open
+    // Reject --headless if present
+    if target_path_or_url.contains("--headless") {
+        return Err(DaemonError::Config("ao start argument --headless is forbidden".into()));
+    }
     let start_args = ["start", target_path_or_url, "--no-dashboard", "--no-open"];
     run_tool("ao", &start_args, 60).map_err(|e| {
         DaemonError::Config(format!("ao start failed for project {project}: {e}"))
     })?;
 
-    // 3. Recheck project health: ao status -p <project-id> --json
+    // 4. Recheck project-scoped health: ao status -p <project-id> --json
     let recheck = run_tool("ao", &["status", "-p", project, "--json"], 30).map_err(|e| {
         DaemonError::Config(format!("ao status health check failed for project {project} after start: {e}"))
     })?;
@@ -6419,7 +6458,7 @@ impl Sessions for CliSessions {
         // admission, fallback, workspace, and error semantics.
         let mut spawned = Vec::with_capacity(specs.len());
         for spec in specs {
-            match self.spawn_with_fallback(spec) {
+            match self.spawn(spec) {
                 Ok(session) => spawned.push((session, spec)),
                 Err(spawn_error) => {
                     let mut cleanup_errors = Vec::new();

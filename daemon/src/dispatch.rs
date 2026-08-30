@@ -2045,9 +2045,14 @@ mod tests {
     #[test]
     fn capacity_40_workers_15_batch_boundaries() {
         let store = FakeStateStore::new();
+        let prod_example = crate::config::load(std::path::Path::new("contracts/daemon.toml.example"))
+            .expect("canonical contracts/daemon.toml.example must be valid");
+        assert_eq!(prod_example.max_workers, 40, "canonical max_workers must be 40");
+        assert_eq!(prod_example.max_batch, 15, "canonical max_batch must be 15");
+
         let mut cfg = cfg();
-        cfg.max_workers = 40;
-        cfg.max_batch = 15;
+        cfg.max_workers = prod_example.max_workers;
+        cfg.max_batch = prod_example.max_batch;
         let ready = beads(40);
 
         // 1. With 39 active sessions exactly one capacity slot remains

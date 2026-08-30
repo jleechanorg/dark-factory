@@ -201,6 +201,18 @@ impl Config {
         path.is_dir().then_some(path)
     }
 
+    /// Resolve the spec path for a bead, respecting target worktree when `spec_dir` is relative.
+    pub fn resolve_spec_path(&self, repo: &str, bead_id: &str) -> PathBuf {
+        let filename = format!("{bead_id}.toml");
+        if Path::new(&self.spec_dir).is_relative() {
+            self.target_worktree_path(repo)
+                .map(|root| root.join(&self.spec_dir).join(&filename))
+                .unwrap_or_else(|| Path::new(&self.spec_dir).join(&filename))
+        } else {
+            Path::new(&self.spec_dir).join(&filename)
+        }
+    }
+
     /// Bead jleechan-jw4c: resolve the per-agent worktree directory under
     /// `agent_worktree_root`. Returns `None` when the operator has not
     /// flipped on the new layout (the config knob is `None`), in which

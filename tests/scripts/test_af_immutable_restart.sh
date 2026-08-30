@@ -14,6 +14,7 @@
 set -euo pipefail
 
 UNIT="ai.dark-factory.daemon.service"
+AO_PROJECT="dark-factory"
 
 # Probe: systemd user session available?
 if ! systemctl --user show-environment >/dev/null 2>&1; then
@@ -21,7 +22,7 @@ if ! systemctl --user show-environment >/dev/null 2>&1; then
   exit 0
 fi
 
-# Ensure service is running
+# Ensure service is active
 if ! systemctl --user is-active --quiet "$UNIT"; then
   systemctl --user start "$UNIT"
   sleep 2
@@ -36,14 +37,16 @@ fi
 UNIT_EXEC_START="$(systemctl --user show "$UNIT" --property=ExecStart --value | awk '{print $2}' | tr -d ';')"
 PROC_EXE="$(readlink -f "/proc/$DAEMON_PID_BEFORE/exe" 2>/dev/null || echo "$UNIT_EXEC_START")"
 BINARY_SHA256="$(sha256sum "$PROC_EXE" | awk '{print $1}')"
-RELEASE_DIR="$(dirname "$PROC_EXE")"
-RELEASE_COMMIT="$(basename "$RELEASE_DIR")"
 
-# Inventory of unrelated sessions/processes before
-UNRELATED_BEFORE="$(ao status --json 2>/dev/null || echo '[]')"
+# Extract release commit: from releases/<sha> path or manifest
+RELEASE_COMMIT="$(echo "$PROC_EXE" | grep -oE 'releases/[a-f0-9]+' | cut -d/ -f2 || true)"
+if [ -z "$RELEASE_COMMIT" ]; then
+  RELEASE_COMMIT="$(basename "$(dirname "$(dirname "$PROC_EXE")")")"
+fi
 
-# Worker process / AO project context
-AO_PROJECT="dark-factory"
+# Inventory of unrelated sessions/processes before (project-scoped per invariant)
+UNRELATED_BEFORE="$(ao status -p "$AO_PROJECT" --json 2>/dev/null || echo '[]')"
+
 AO_SESSION="session-af-immutable-proof"
 WORKTREE="/home/jleechan/.dark-factory/target-worktrees/jleechanorg/dark-factory"
 BRANCH="main"
@@ -73,35 +76,57 @@ else
   exit 1
 fi
 
-# Clean up test child
+# Explicit stop / reap verification
 kill -9 "$TEST_CHILD_PID" 2>/dev/null || true
+reaped=0
+for _ in $(seq 1 20); do
+  if ! kill -0 "$TEST_CHILD_PID" 2>/dev/null; then
+    reaped=1
+    break
+  fi
+  sleep 0.1
+done
+if [ "$reaped" -ne 1 ]; then
+  echo "FAIL: worker process $TEST_CHILD_PID was not cleanly reaped" >&2
+  exit 1
+fi
 
-# Inventory of unrelated sessions after
-UNRELATED_AFTER="$(ao status --json 2>/dev/null || echo '[]')"
+# Inventory of unrelated sessions after (project-scoped per invariant)
+UNRELATED_AFTER="$(ao status -p "$AO_PROJECT" --json 2>/dev/null || echo '[]')"
 JOURNAL_END="$(date -u +"%Y-%m-%d %H:%M:%S")"
 JOURNAL_WINDOW="${JOURNAL_START} .. ${JOURNAL_END}"
 
+export RELEASE_COMMIT BINARY_SHA256 UNIT_EXEC_START DAEMON_PID_BEFORE DAEMON_PID_AFTER
+export AO_PROJECT AO_SESSION WORKTREE BRANCH WORKER_PID_BEFORE WORKER_PID_AFTER
+export UNRELATED_BEFORE UNRELATED_AFTER JOURNAL_WINDOW
+
 python3 -c "
 import json
+import os
+import sys
+
 report = {
     'status': 'passed',
-    'release_commit': '$RELEASE_COMMIT',
-    'binary_sha256': '$BINARY_SHA256',
-    'unit_exec_start': '$UNIT_EXEC_START',
-    'daemon_pid_before': '$DAEMON_PID_BEFORE',
-    'daemon_pid_after': '$DAEMON_PID_AFTER',
-    'ao_project': '$AO_PROJECT',
-    'ao_session': '$AO_SESSION',
-    'worktree': '$WORKTREE',
-    'branch': '$BRANCH',
-    'worker_pid_before': '$WORKER_PID_BEFORE',
-    'worker_pid_after': '$WORKER_PID_AFTER',
-    'unrelated_inventory_before': json.loads('''$UNRELATED_BEFORE'''),
-    'unrelated_inventory_after': json.loads('''$UNRELATED_AFTER'''),
-    'journal_window': '$JOURNAL_WINDOW'
+    'release_commit': os.environ['RELEASE_COMMIT'],
+    'binary_sha256': os.environ['BINARY_SHA256'],
+    'unit_exec_start': os.environ['UNIT_EXEC_START'],
+    'daemon_pid_before': os.environ['DAEMON_PID_BEFORE'],
+    'daemon_pid_after': os.environ['DAEMON_PID_AFTER'],
+    'ao_project': os.environ['AO_PROJECT'],
+    'ao_session': os.environ['AO_SESSION'],
+    'worktree': os.environ['WORKTREE'],
+    'branch': os.environ['BRANCH'],
+    'worker_pid_before': os.environ['WORKER_PID_BEFORE'],
+    'worker_pid_after': os.environ['WORKER_PID_AFTER'],
+    'unrelated_inventory_before': json.loads(os.environ.get('UNRELATED_BEFORE', '[]')),
+    'unrelated_inventory_after': json.loads(os.environ.get('UNRELATED_AFTER', '[]')),
+    'journal_window': os.environ['JOURNAL_WINDOW']
 }
+
 for k, v in report.items():
     if v is None or v == '':
-        raise ValueError(f'Field {k} is empty')
+        sys.stderr.write(f'Field {k} is empty\n')
+        sys.exit(1)
+
 print(json.dumps(report, indent=2))
 "

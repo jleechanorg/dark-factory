@@ -6131,14 +6131,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             continue;
                         }
                         let bead_repo = overlay.repo(deps.cfg).to_string();
-                        let spec_path = if std::path::Path::new(&deps.cfg.spec_dir).is_relative() {
-                            deps.cfg
-                                .target_worktree_path(&bead_repo)
-                                .map(|root| root.join(&deps.cfg.spec_dir).join(format!("{}.toml", overlay.bead_id)))
-                                .unwrap_or_else(|| std::path::Path::new(&deps.cfg.spec_dir).join(format!("{}.toml", overlay.bead_id)))
-                        } else {
-                            std::path::Path::new(&deps.cfg.spec_dir).join(format!("{}.toml", overlay.bead_id))
-                        };
+                        let spec_path = deps.cfg.resolve_spec_path(&bead_repo, &overlay.bead_id);
                         let validation_pass = if spec_path.exists() {
                             if let Ok(c) = std::fs::read_to_string(&spec_path) {
                                 toml::from_str::<serde_json::Value>(&c).is_ok()
