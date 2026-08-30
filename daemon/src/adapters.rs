@@ -3303,14 +3303,25 @@ pub fn is_ao_project_healthy(project: &str) -> bool {
 /// SPEC #4 residual limitation: this is still lexical stderr classification
 /// for any `ao` CLI invocation that actually ran and returned a real exit
 /// code (AO does not expose a structured failure-reason taxonomy over its
-/// CLI, so there is nothing else to key on for e.g. "unknown project"). The
-/// one case this function CAN classify structurally is `rc == -1` on a
-/// `DaemonError::Tool`: `run_tool_with_cwd` (tools.rs) and the `ao spawn`
-/// invocation in `run_spawn_process` only ever produce `rc == -1` when the
-/// `ao`/`sandbox-exec` binary itself could not be spawned or waited on (or
-/// was killed by a signal, so `Command::status().code()` is `None`) — never
-/// as a real `ao` CLI exit code. That is checked first, before any lexical
-/// matching, so it does not depend on stderr wording at all.
+/// CLI, so there is nothing else to key on for e.g. "unknown project").
+///
+/// `rc == -1` on a `DaemonError::Tool` is NOT unconditional evidence of
+/// "AO is not running" — `run_tool_with_cwd` (tools.rs) produces `rc == -1`
+/// in THREE distinct cases: (a) the `ao`/`sandbox-exec` binary itself could
+/// not be spawned (`Command::spawn()` failed, e.g. missing/unresolvable on
+/// PATH — this DOES mean AO needs attention), (b) the child was killed by an
+/// external signal after successfully launching (`status.code()` is `None`
+/// on signal death, e.g. OOM killer or an operator `kill -9` unrelated to AO
+/// itself), or (c) the OS-level `try_wait()` poll itself failed (a wait(2)
+/// error, not an AO condition at all). Only case (a) implies AO is absent;
+/// (b) and (c) mean the binary ran/launched fine, so `ao start` would not
+/// address whatever actually happened. Distinguish them by requiring the
+/// stderr shape that `Command::spawn()` failures and PATH-resolution
+/// failures actually produce (see the "spawn failed: {e}" /
+/// "execution failed" wording in `run_tool_with_cwd`) before short-circuiting
+/// on `rc == -1`; otherwise fall through to the general lexical matching
+/// below, which still applies to the `rc == -1` case if the message happens
+/// to independently mention e.g. "daemon is not running".
 fn is_ao_not_running_error(err: &DaemonError) -> bool {
     let (msg, rc) = match err {
         DaemonError::Tool { stderr, rc, .. } => (stderr.as_str(), Some(*rc)),
@@ -3321,10 +3332,14 @@ fn is_ao_not_running_error(err: &DaemonError) -> bool {
         }
         _ => return false,
     };
-    if rc == Some(-1) {
+    let lower = msg.to_lowercase();
+    if rc == Some(-1)
+        && (lower.contains("no such file or directory")
+            || lower.contains("execution failed")
+            || lower.contains("spawn failed"))
+    {
         return true;
     }
-    let lower = msg.to_lowercase();
     lower.contains("daemon is not running")
         || lower.contains("orchestrator not running")
         || lower.contains("unknown project")
@@ -3350,6 +3365,36 @@ mod is_ao_not_running_error_tests {
             stderr: "execution failed: No such file or directory (os error 2)".to_string(),
         };
         assert!(is_ao_not_running_error(&err));
+    }
+
+    #[test]
+    fn rc_negative_one_killed_by_signal_without_spawn_failure_wording_is_not_ao_not_running() {
+        // A process that WAS launched (the `ao` binary exists and ran) but
+        // was killed by an external signal (e.g. OOM killer, operator
+        // `kill -9`) also surfaces as `rc == -1` because
+        // `Command::status().code()` is `None` on signal death -- see
+        // `run_tool_with_cwd`'s `status.code().unwrap_or(-1)`. That is NOT
+        // evidence AO needs (re)starting: the binary itself launched fine,
+        // so `ao start` would not address whatever killed it.
+        let err = DaemonError::Tool {
+            tool: "ao spawn --agent minimax".to_string(),
+            rc: -1,
+            stderr: "Killed".to_string(),
+        };
+        assert!(!is_ao_not_running_error(&err));
+    }
+
+    #[test]
+    fn rc_negative_one_try_wait_failure_is_not_ao_not_running() {
+        // `run_tool_with_cwd` also produces `rc == -1` when the OS-level
+        // `try_wait()` poll itself errors -- an unrelated wait(2) failure,
+        // not evidence AO is not running.
+        let err = DaemonError::Tool {
+            tool: "ao".to_string(),
+            rc: -1,
+            stderr: "try_wait failed: some os error".to_string(),
+        };
+        assert!(!is_ao_not_running_error(&err));
     }
 
     #[test]
@@ -3431,6 +3476,20 @@ pub fn ensure_ao_project_recovered(project: &str, target_path_or_url: &str) -> R
         )));
     }
 
+    // jleechan round-2 finding P1: `*in_progress == false` here does NOT
+    // necessarily mean no starter has EVER run for this project since our
+    // step-1 health check above -- it can also mean a DIFFERENT caller
+    // already elected itself starter, ran `ao start`, and fully released
+    // the guard (in_progress back to false) entirely in the window between
+    // this caller's step-1 check and this caller acquiring the
+    // `in_progress` lock. Re-check health now, under the lock, before
+    // electing self as starter: if a prior caller's start already fixed
+    // things, skip starting again instead of invoking `ao start` a second,
+    // redundant time.
+    if is_ao_project_healthy(project) {
+        return Ok(());
+    }
+
     // Elect this thread as the active starter
     *in_progress = true;
     drop(in_progress);
@@ -3477,6 +3536,18 @@ mod ao_project_recovery_tests {
     /// `start_log`, sleeping `start_delay_ms`, then either creating
     /// `healthy_marker` and exiting 0 (when `start_exit_code == 0`) or
     /// printing to stderr and exiting `start_exit_code`.
+    ///
+    /// jleechan round-2 finding P2: the fake used to accept ANY argv whose
+    /// first element was "status" or "start" (`args[:1] == ["status"]`),
+    /// so a production argv regression (missing `-p <project>`, missing
+    /// `--json`, wrong `ao start` flags) would sail through undetected --
+    /// the fake would still answer as if the call were well-formed. It now
+    /// asserts the EXACT argv shape production sends
+    /// (`is_ao_project_healthy`: `["status", "-p", <project>, "--json"]`;
+    /// the `ensure_ao_project_recovered` start call:
+    /// `["start", <target>, "--no-dashboard", "--no-open"]`) and exits
+    /// loudly (nonzero + stderr) on anything else, so a future argv
+    /// regression fails these tests instead of passing silently.
     struct FakeAoRecoveryEnv {
         root: std::path::PathBuf,
         healthy_marker: std::path::PathBuf,
@@ -3485,7 +3556,53 @@ mod ao_project_recovery_tests {
     }
 
     impl FakeAoRecoveryEnv {
-        fn set_up(test_name: &str, start_delay_ms: u64, start_exit_code: i32) -> Self {
+        fn set_up(
+            test_name: &str,
+            start_delay_ms: u64,
+            start_exit_code: i32,
+            project: &str,
+            target: &str,
+        ) -> Self {
+            Self::build(test_name, start_delay_ms, start_exit_code, project, target, None, 0)
+        }
+
+        /// Like `set_up`, but the Nth `ao status` invocation across the
+        /// WHOLE test (1-indexed, tracked via a counter file since each
+        /// invocation is a separate subprocess) sleeps `slow_delay_ms`
+        /// AFTER capturing whether `healthy_marker` exists but BEFORE
+        /// replying. This lets a test deterministically widen the window
+        /// between "a caller observed unhealthy state" and "that caller
+        /// acts on it", reproducing the round-2 P1 late-arrival Condvar
+        /// race without needing a production-code test hook.
+        fn set_up_with_slow_status(
+            test_name: &str,
+            start_delay_ms: u64,
+            start_exit_code: i32,
+            project: &str,
+            target: &str,
+            slow_status_ordinal: usize,
+            slow_status_delay_ms: u64,
+        ) -> Self {
+            Self::build(
+                test_name,
+                start_delay_ms,
+                start_exit_code,
+                project,
+                target,
+                Some(slow_status_ordinal),
+                slow_status_delay_ms,
+            )
+        }
+
+        fn build(
+            test_name: &str,
+            start_delay_ms: u64,
+            start_exit_code: i32,
+            project: &str,
+            target: &str,
+            slow_status_ordinal: Option<usize>,
+            slow_status_delay_ms: u64,
+        ) -> Self {
             let root = std::env::temp_dir().join(format!(
                 "afd_ao_project_recovery_{test_name}_{}",
                 std::process::id()
@@ -3494,21 +3611,37 @@ mod ao_project_recovery_tests {
             std::fs::create_dir_all(&root).unwrap();
             let healthy_marker = root.join("healthy.marker");
             let start_log = root.join("start.log");
+            let status_calls_log = root.join("status_calls.log");
             let fake_ao = root.join("ao");
+            let slow_ordinal_py = slow_status_ordinal
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "None".to_string());
             std::fs::write(
                 &fake_ao,
                 format!(
                     r#"#!/usr/bin/env python3
-import os, sys, time
+import json, os, sys, time
 args = sys.argv[1:]
 marker = {marker:?}
 start_log = {start_log:?}
-if args[:1] == ["status"]:
-    if os.path.exists(marker):
+status_calls_log = {status_calls_log:?}
+expected_project = {project:?}
+expected_target = {target:?}
+slow_ordinal = {slow_ordinal_py}
+slow_delay = {slow_delay_ms} / 1000.0
+if args == ["status", "-p", expected_project, "--json"]:
+    healthy = os.path.exists(marker)
+    with open(status_calls_log, "a", encoding="utf-8") as fh:
+        fh.write("x\n")
+    with open(status_calls_log, "r", encoding="utf-8") as fh:
+        ordinal = sum(1 for _ in fh)
+    if slow_ordinal is not None and ordinal == slow_ordinal:
+        time.sleep(slow_delay)
+    if healthy:
         print("[]")
         sys.exit(0)
     sys.exit(1)
-if args[:1] == ["start"]:
+if args == ["start", expected_target, "--no-dashboard", "--no-open"]:
     with open(start_log, "a", encoding="utf-8") as fh:
         fh.write(str(time.time()) + "\n")
     time.sleep({delay_ms} / 1000.0)
@@ -3518,10 +3651,16 @@ if args[:1] == ["start"]:
     with open(marker, "w", encoding="utf-8") as fh:
         fh.write("healthy\n")
     sys.exit(0)
-sys.exit(1)
+print("UNEXPECTED ARGV: " + json.dumps(args), file=sys.stderr)
+sys.exit(99)
 "#,
                     marker = healthy_marker.to_string_lossy(),
                     start_log = start_log.to_string_lossy(),
+                    status_calls_log = status_calls_log.to_string_lossy(),
+                    project = project,
+                    target = target,
+                    slow_ordinal_py = slow_ordinal_py,
+                    slow_delay_ms = slow_status_delay_ms,
                     delay_ms = start_delay_ms,
                     exit_code = start_exit_code,
                 ),
@@ -3564,6 +3703,10 @@ sys.exit(1)
                 .filter(|l| !l.trim().is_empty())
                 .count()
         }
+
+        fn fake_ao_path(&self) -> std::path::PathBuf {
+            self.root.join("ao")
+        }
     }
 
     impl Drop for FakeAoRecoveryEnv {
@@ -3605,11 +3748,12 @@ sys.exit(1)
         let _guard = gh_env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let env = FakeAoRecoveryEnv::set_up("healthy_skip", 0, 0);
-        env.mark_healthy_up_front();
         let project = unique_project("healthy-skip");
+        let target = "https://github.com/jleechanorg/dark-factory.git";
+        let env = FakeAoRecoveryEnv::set_up("healthy_skip", 0, 0, &project, target);
+        env.mark_healthy_up_front();
 
-        let result = ensure_ao_project_recovered(&project, "https://github.com/jleechanorg/dark-factory.git");
+        let result = ensure_ao_project_recovered(&project, target);
 
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(
@@ -3627,9 +3771,9 @@ sys.exit(1)
         // 400ms start delay gives the second caller a wide window to observe
         // `in_progress == true` and enter the Condvar wait instead of racing
         // to elect itself as a second starter.
-        let env = FakeAoRecoveryEnv::set_up("concurrent_race", 400, 0);
         let project = unique_project("concurrent-race");
         let target = "https://github.com/jleechanorg/dark-factory.git".to_string();
+        let env = FakeAoRecoveryEnv::set_up("concurrent_race", 400, 0, &project, &target);
 
         let project_a = project.clone();
         let target_a = target.clone();
@@ -3656,9 +3800,9 @@ sys.exit(1)
         let _guard = gh_env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let env = FakeAoRecoveryEnv::set_up("batch_failure", 400, 7);
         let project = unique_project("batch-failure");
         let target = "https://github.com/jleechanorg/dark-factory.git".to_string();
+        let env = FakeAoRecoveryEnv::set_up("batch_failure", 400, 7, &project, &target);
 
         let project_a = project.clone();
         let target_a = target.clone();
@@ -3697,6 +3841,174 @@ sys.exit(1)
             "a failed start must not be retried by the waiting caller"
         );
     }
+
+    /// jleechan round-2 finding P2 regression guard: proves the fake `ao`
+    /// binary itself enforces the real invocation shape rather than
+    /// accepting any argv starting with "status"/"start". Before the
+    /// tightening this fake would have answered `[]` (healthy) or "started"
+    /// for ANY argv shape, so a production regression that dropped `-p
+    /// <project>` or `--json` (or an `ao start` call missing
+    /// `--no-dashboard`/`--no-open`) would have sailed through the other
+    /// tests in this module undetected.
+    #[test]
+    fn fake_ao_binary_rejects_unexpected_argv_shapes() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let project = unique_project("argv-shape");
+        let target = "https://github.com/jleechanorg/dark-factory.git".to_string();
+        let env = FakeAoRecoveryEnv::set_up("argv_shape", 0, 0, &project, &target);
+        let ao = env.fake_ao_path();
+
+        let missing_json_flag = std::process::Command::new(&ao)
+            .args(["status", "-p", &project])
+            .output()
+            .unwrap();
+        assert!(!missing_json_flag.status.success(), "must reject status call missing --json");
+        assert!(
+            String::from_utf8_lossy(&missing_json_flag.stderr).contains("UNEXPECTED ARGV"),
+            "{}",
+            String::from_utf8_lossy(&missing_json_flag.stderr)
+        );
+
+        let wrong_project = std::process::Command::new(&ao)
+            .args(["status", "-p", "some-other-project", "--json"])
+            .output()
+            .unwrap();
+        assert!(!wrong_project.status.success(), "must reject status call for a different project");
+
+        let missing_start_flags = std::process::Command::new(&ao)
+            .args(["start", &target])
+            .output()
+            .unwrap();
+        assert!(!missing_start_flags.status.success(), "must reject start call missing --no-dashboard --no-open");
+        assert!(
+            String::from_utf8_lossy(&missing_start_flags.stderr).contains("UNEXPECTED ARGV"),
+            "{}",
+            String::from_utf8_lossy(&missing_start_flags.stderr)
+        );
+    }
+
+    /// jleechan round-2 finding P1: a caller that observes unhealthy state
+    /// at its OWN step-1 check can still reach the `in_progress` election
+    /// point AFTER a different, prior caller has already elected itself
+    /// starter, run `ao start` to completion, and fully released the
+    /// guard. Without the fix, that late-arriving caller sees
+    /// `in_progress == false` (not because no starter ran, but because one
+    /// already finished) and starts AO a second, redundant time.
+    ///
+    /// This is deliberately NOT the same shape as
+    /// `concurrent_callers_elect_a_single_starter_and_both_observe_health`:
+    /// that test overlaps two threads DURING an in-flight start (the
+    /// second thread sees `in_progress == true` and waits on the
+    /// Condvar). This test instead forces caller B's step-1 health check
+    /// to (a) capture "unhealthy" while the marker is still absent, then
+    /// (b) not return control to caller B until well AFTER caller A has
+    /// fully completed its own start-and-release cycle -- so caller B
+    /// evaluates the `in_progress` boolean only once it is back to
+    /// `false` for the "already finished" reason, not the "never started"
+    /// reason.
+    #[test]
+    fn late_arriving_caller_rechecks_health_before_starting_again() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let project = unique_project("late-arrival");
+        let target = "https://github.com/jleechanorg/dark-factory.git".to_string();
+        // Ordinal 2 (1-indexed across the whole test) is caller B's step-1
+        // check: caller A's step-1 check is ordinal 1 (fast), caller A's
+        // start takes `start_delay_ms`, then caller A's step-4 recheck is
+        // ordinal 3 (fast). Sleeping ordinal 2 for far longer than caller
+        // A's entire start-to-release cycle guarantees caller B evaluates
+        // `in_progress` only after caller A's guard has already dropped.
+        let env = FakeAoRecoveryEnv::set_up_with_slow_status(
+            "late_arrival",
+            50,
+            0,
+            &project,
+            &target,
+            2,
+            400,
+        );
+
+        let project_a = project.clone();
+        let target_a = target.clone();
+        let handle_a = std::thread::spawn(move || ensure_ao_project_recovered(&project_a, &target_a));
+        // Small offset so caller A's step-1 (fast) check is unambiguously
+        // ordinal 1, and caller B's step-1 check is unambiguously ordinal 2.
+        std::thread::sleep(Duration::from_millis(20));
+        let project_b = project.clone();
+        let target_b = target.clone();
+        let handle_b = std::thread::spawn(move || ensure_ao_project_recovered(&project_b, &target_b));
+
+        let result_a = join_with_timeout(handle_a, Duration::from_secs(10), "caller A");
+        let result_b = join_with_timeout(handle_b, Duration::from_secs(10), "caller B (late arrival)");
+
+        assert!(result_a.is_ok(), "{result_a:?}");
+        assert!(result_b.is_ok(), "{result_b:?}");
+        assert_eq!(
+            env.start_invocation_count(),
+            1,
+            "a late-arriving caller must re-check health and skip starting again \
+             once a prior caller's start already succeeded"
+        );
+    }
+
+    /// jleechan round-2 finding P1 (4a): single source-of-truth contract test
+    /// for `ensure_ao_project_recovered`'s public behavior, distinct from the
+    /// scattered unit tests above (`healthy_project_skips_start_entirely`,
+    /// `concurrent_callers_elect_a_single_starter_and_both_observe_health`,
+    /// `start_failure_releases_condvar_waiters_with_failure_instead_of_hanging`,
+    /// `late_arriving_caller_rechecks_health_before_starting_again`) each of
+    /// which drills into one specific concurrency edge case. This test
+    /// asserts the three-clause contract in one place: healthy -> no-op Ok,
+    /// unhealthy -> starts exactly once then Ok, and a failed start ->
+    /// propagates a typed error without silently swallowing it.
+    #[test]
+    fn ao_recovery_contract() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Clause 1: healthy project is a no-op -- `ao start` is never invoked.
+        {
+            let project = unique_project("contract-healthy");
+            let target = "https://github.com/jleechanorg/dark-factory.git";
+            let env = FakeAoRecoveryEnv::set_up("contract_healthy", 0, 0, &project, target);
+            env.mark_healthy_up_front();
+
+            let result = ensure_ao_project_recovered(&project, target);
+
+            assert!(result.is_ok(), "{result:?}");
+            assert_eq!(env.start_invocation_count(), 0, "healthy project must never invoke ao start");
+        }
+
+        // Clause 2: unhealthy project is started exactly once, then reports Ok.
+        {
+            let project = unique_project("contract-unhealthy");
+            let target = "https://github.com/jleechanorg/dark-factory.git";
+            let env = FakeAoRecoveryEnv::set_up("contract_unhealthy", 0, 0, &project, target);
+
+            let result = ensure_ao_project_recovered(&project, target);
+
+            assert!(result.is_ok(), "{result:?}");
+            assert_eq!(env.start_invocation_count(), 1, "unhealthy project must be started exactly once");
+        }
+
+        // Clause 3: a failed `ao start` propagates a typed, non-silent error.
+        {
+            let project = unique_project("contract-failure");
+            let target = "https://github.com/jleechanorg/dark-factory.git";
+            let env = FakeAoRecoveryEnv::set_up("contract_failure", 0, 9, &project, target);
+
+            let result = ensure_ao_project_recovered(&project, target);
+
+            let error = result.expect_err("scripted ao start failure must propagate");
+            assert!(error.to_string().contains("ao start failed"), "{error}");
+            assert_eq!(env.start_invocation_count(), 1, "a failed start must still be attempted exactly once");
+        }
+    }
+
 }
 
 pub struct CliSessions {
@@ -5109,11 +5421,76 @@ export const isTerminalSession = () => false;
         assert!(calls.is_empty(), "AO must not be invoked on a stale checkout");
     }
 
+    /// jleechan round-2 finding P1 (4c): "adopted PR" is not a separate
+    /// boolean/struct field in this file -- `SpawnSpec.expected_revision`'s
+    /// doc comment (tools.rs) says explicitly: "For adopted remediation this
+    /// is the remote branch SHA captured immediately before dispatch; a
+    /// same-origin checkout at another HEAD is unsafe." That IS the
+    /// adopted-PR-drift mechanism this file has, and it is the exact same
+    /// pre-spawn gate `worker_spawn_rejects_stale_expected_revision_before_ao`
+    /// exercises above. This test is intentionally that same mechanism,
+    /// explicitly named and framed for the adopted-PR review finding (using
+    /// the real checkout at its real HEAD, with `expected_revision` set to a
+    /// distinct placeholder standing in for "the adopted PR's head captured
+    /// at intake time", which the checkout has since drifted away from) --
+    /// it is NOT a new code path, since adapters.rs has no separate
+    /// adopted-PR-specific construct beyond `expected_revision`.
+    #[test]
+    fn adopted_pr_rejects_drift_before_ao_spawn() {
+        let prompt = "adopted PR drift prompt";
+        let branch = "factory/jleechan-contract-adopted-pr-drift-r1";
+        // Real checkout (CARGO_MANIFEST_DIR, not `std::env::current_dir()` --
+        // see `worker_spawn_rejects_same_origin_stale_ao_workspace_after_spawn`
+        // above for why the latter is a cross-test cwd race).
+        let checkout = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        // Stands in for "the adopted PR's remote branch head captured before
+        // dispatch" -- a real-shaped SHA the checkout's actual HEAD does not
+        // match, i.e. drift since intake.
+        let adopted_pr_head = "f".repeat(40);
+
+        let (spawn_result, calls) = with_fake_ao(
+            "adopted_pr_drift",
+            serde_json::json!({prompt: branch}),
+            |log| {
+                let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+                let mut adopted = spec(prompt, branch);
+                adopted.local_checkout = Some(checkout.clone());
+                adopted.expected_revision = Some(adopted_pr_head.clone());
+                let result = sessions.spawn(&adopted);
+                let calls = std::fs::read_to_string(log).unwrap_or_default();
+                (result, calls)
+            },
+        );
+
+        let error = spawn_result.expect_err("drifted adopted-PR checkout must fail closed before ao spawn");
+        assert!(error.to_string().contains("expected snapshot"), "{error}");
+        assert!(calls.is_empty(), "AO must never be invoked when the adopted PR's checkout has drifted");
+    }
+
     #[test]
     fn worker_spawn_rejects_same_origin_stale_ao_workspace_after_spawn() {
         let prompt = "same origin stale AO workspace";
         let branch = "factory/jleechan-contract-stale-ao-workspace-r1";
-        let checkout = std::env::current_dir().unwrap();
+        // jleechan round-2 CI-blocking finding: this used to read
+        // `std::env::current_dir()`, a PROCESS-WIDE mutable value. Under
+        // `cargo test`'s default parallel execution, `offline_cache_tests`'
+        // `OfflineDir` calls `std::env::set_current_dir` (guarded by
+        // `gh_env_test_lock()`) for the FULL lifetime of its own tests. This
+        // test read `current_dir()` here BEFORE ever acquiring
+        // `gh_env_test_lock()` (that only happens later, inside
+        // `with_fake_ao`), so it could observe `OfflineDir`'s temp
+        // directory instead of the real checkout, making `git rev-parse
+        // HEAD` below fail/return something unrelated to the actual repo
+        // state and silently flipping this test's outcome. `CARGO_MANIFEST_DIR`
+        // is a compile-time constant embedded by the build (already used
+        // by `ao_spawn_bridge_path` above for the same reason) and is
+        // exactly what `current_dir()` resolves to here in the unraced
+        // case anyway (Cargo sets a test binary's cwd to its package root),
+        // so this is a like-for-like substitution that removes the shared
+        // mutable global dependency instead of adding a lock (locking here
+        // would deadlock: `with_fake_ao` below re-acquires the same
+        // non-reentrant `gh_env_test_lock()`).
+        let checkout = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let expected_revision = std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(&checkout)
@@ -5607,6 +5984,199 @@ os.execv(real_git, [real_git] + args)
             1,
             "calls={calls}"
         );
+    }
+
+    /// jleechan round-2 finding P1 (4b): `ensure_ao_project_recovered` is
+    /// keyed per-`ao_project`, and `CliSessions::spawn` (called once per
+    /// item by `spawn_batch`) invokes it independently for each spec. This
+    /// proves recovery is driven correctly when a SINGLE `spawn_batch` call
+    /// covers TWO DIFFERENT projects that both start out "AO not running":
+    /// each project must get its own `ao start`, and each spawn must only
+    /// succeed after ITS OWN project's recovery completes -- one project's
+    /// recovery must not be mistaken for the other's.
+    ///
+    /// There is no separate "batch recovery" entrypoint in this file distinct
+    /// from `spawn_batch` + the per-item `ensure_ao_project_recovered` call
+    /// inside `CliSessions::spawn` -- this test exercises that real
+    /// production path end-to-end (a fresh, bespoke fake `ao` binary, not
+    /// the shared `with_fake_ao`/`fake_ao_dir` fixture, since it must also
+    /// answer `status`/`start` for two distinct projects).
+    #[test]
+    fn adapters_batch_recovery_integration() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let root = std::env::temp_dir().join(format!(
+            "afd_batch_recovery_integration_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let repo = "jleechanorg/dark-factory";
+        let init_checkout = |name: &str| -> std::path::PathBuf {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&dir)
+                .status()
+                .unwrap();
+            std::process::Command::new("git")
+                .args(["remote", "add", "origin", &format!("https://github.com/{repo}.git")])
+                .current_dir(&dir)
+                .status()
+                .unwrap();
+            dir
+        };
+        let target_a = init_checkout("checkout-a");
+        let target_b = init_checkout("checkout-b");
+        let marker_a = root.join("healthy-a.marker");
+        let marker_b = root.join("healthy-b.marker");
+        let log = root.join("calls.jsonl");
+
+        let project_a = "afd-batch-recovery-project-a";
+        let project_b = "afd-batch-recovery-project-b";
+        let branch_a = "factory/jleechan-batch-recovery-a-r1";
+        let branch_b = "factory/jleechan-batch-recovery-b-r1";
+
+        let fake_ao = root.join("ao");
+        std::fs::write(
+            &fake_ao,
+            format!(
+                r#"#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+log_path = {log:?}
+project_a = {project_a:?}
+project_b = {project_b:?}
+target_a = {target_a:?}
+target_b = {target_b:?}
+branch_a = {branch_a:?}
+branch_b = {branch_b:?}
+marker_a = {marker_a:?}
+marker_b = {marker_b:?}
+
+def log_call(entry):
+    with open(log_path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry) + "\n")
+
+if args == ["status", "-p", project_a, "--json"]:
+    log_call({{"kind": "status", "project": project_a}})
+    if os.path.exists(marker_a):
+        print("[]")
+        sys.exit(0)
+    sys.exit(1)
+if args == ["status", "-p", project_b, "--json"]:
+    log_call({{"kind": "status", "project": project_b}})
+    if os.path.exists(marker_b):
+        print("[]")
+        sys.exit(0)
+    sys.exit(1)
+if len(args) == 4 and args[0] == "start" and args[2:] == ["--no-dashboard", "--no-open"]:
+    target = args[1]
+    if target == target_a:
+        log_call({{"kind": "start", "project": project_a}})
+        open(marker_a, "w", encoding="utf-8").close()
+        sys.exit(0)
+    if target == target_b:
+        log_call({{"kind": "start", "project": project_b}})
+        open(marker_b, "w", encoding="utf-8").close()
+        sys.exit(0)
+    print("UNEXPECTED start target: " + target, file=sys.stderr)
+    sys.exit(2)
+if len(args) == 7 and args[:2] == ["spawn", "--project"]:
+    project = args[2]
+    prompt = args[6]
+    if project == project_a:
+        marker, target, branch = marker_a, target_a, branch_a
+    elif project == project_b:
+        marker, target, branch = marker_b, target_b, branch_b
+    else:
+        print("UNEXPECTED project: " + project, file=sys.stderr)
+        sys.exit(3)
+    if not os.path.exists(marker):
+        log_call({{"kind": "spawn-rejected", "project": project}})
+        print("ao daemon is not running for project " + project, file=sys.stderr)
+        sys.exit(1)
+    log_call({{"kind": "spawn-ok", "project": project, "prompt": prompt}})
+    print("SESSION=fake-" + project)
+    print("  Worktree: " + target)
+    print("  Branch:   " + branch)
+    sys.exit(0)
+print("UNEXPECTED ARGV: " + json.dumps(args), file=sys.stderr)
+sys.exit(99)
+"#,
+                log = log.to_string_lossy(),
+                project_a = project_a,
+                project_b = project_b,
+                target_a = target_a.to_string_lossy(),
+                target_b = target_b.to_string_lossy(),
+                branch_a = branch_a,
+                branch_b = branch_b,
+                marker_a = marker_a.to_string_lossy(),
+                marker_b = marker_b.to_string_lossy(),
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&fake_ao).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&fake_ao, permissions).unwrap();
+        }
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_fallback = std::env::var("DARK_FACTORY_CODER_FALLBACK_CHAIN").ok();
+        std::env::set_var("PATH", format!("{}:{old_path}", root.display()));
+        // Empty fallback chain: only the default agent is attempted, so each
+        // project's recovery cycle is exactly one rejected spawn -> one
+        // `ao start` -> one accepted spawn, keeping the call log easy to
+        // reason about.
+        std::env::set_var("DARK_FACTORY_CODER_FALLBACK_CHAIN", "");
+
+        let mut spec_a = spec("batch recovery prompt a", branch_a);
+        spec_a.ao_project = project_a.to_string();
+        spec_a.local_checkout = Some(target_a.clone());
+        let mut spec_b = spec("batch recovery prompt b", branch_b);
+        spec_b.ao_project = project_b.to_string();
+        spec_b.local_checkout = Some(target_b.clone());
+
+        let sessions = CliSessions::new(repo, "minimax");
+        let result = sessions.spawn_batch(&[spec_a, spec_b]);
+
+        std::env::set_var("PATH", old_path);
+        match old_fallback {
+            Some(v) => std::env::set_var("DARK_FACTORY_CODER_FALLBACK_CHAIN", v),
+            None => std::env::remove_var("DARK_FACTORY_CODER_FALLBACK_CHAIN"),
+        }
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(result.is_ok(), "batch recovery across two projects failed: {result:?}; calls={calls}");
+        let rows: Vec<serde_json::Value> = calls
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for project in [project_a, project_b] {
+            assert_eq!(
+                rows.iter().filter(|r| r["kind"] == "spawn-rejected" && r["project"] == project).count(),
+                1,
+                "each project must be rejected exactly once before recovery: {calls}"
+            );
+            assert_eq!(
+                rows.iter().filter(|r| r["kind"] == "start" && r["project"] == project).count(),
+                1,
+                "each project must be started exactly once: {calls}"
+            );
+            assert_eq!(
+                rows.iter().filter(|r| r["kind"] == "spawn-ok" && r["project"] == project).count(),
+                1,
+                "each project must succeed exactly once after its own recovery: {calls}"
+            );
+        }
     }
 
     #[test]
