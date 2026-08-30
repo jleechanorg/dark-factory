@@ -2,6 +2,7 @@
 
 ## Recent activity (by day)
 
+- [2026-08-30](activity/2026-08-30.md) — `/af` E2E remediation: stale-dispatch P0 ([#792](https://github.com/jleechanorg/dark-factory/issues/792)), reroll/AO prerequisites, immutable-release proof, and one real correction-loop gate
 - [2026-08-24](activity/2026-08-24.md) — PR #714 merged; 100% AO prompt indirection verified; runner pool outage (0 online) & 4 follow-up beads triaged (jleechan-azso/57ym/gagl/xn4n)
 - [2026-08-22](activity/2026-08-22.md) — PR #665 + #666 merged via --admin (dark-factory runner outage); PR #655 /web-advice verdict follow-up complete (chatgpt INCOMPLETE-AGAIN, 5 grok findings triaged, fail-open /web-advice integration built + verified); 3 follow-up beads filed (jleechan-azso/57ym/gagl)
 - [2026-08-21](activity/2026-08-21.md) — 100% AO standardization & prompt indirection specification; multi-model advice verification panel (jleechan-s779)
