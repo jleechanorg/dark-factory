@@ -527,22 +527,37 @@ def _codergen_workdir(ctx: "Context") -> "Path | str | None":
             return None
 
 
-def _tracked_state(
+@dataclass(frozen=True)
+class _TrackedFingerprint:
+    head: str | None = None
+    unstaged_diff: str | None = None
+    staged_diff: str | None = None
+    untracked: str | None = None
+    git_error: str = ""
+    digest: str | None = None
+
+
+def _compute_tracked_fingerprint(
     workdir: "Path | str | None", *, include_untracked: bool = False
-) -> str | None:
-    """Hash HEAD plus staged/unstaged changes, optionally including untracked artifacts."""
+) -> _TrackedFingerprint:
+    """Compute component-level git fingerprint with diagnostic attribution."""
     if not workdir:
-        return None
+        return _TrackedFingerprint(git_error="empty workdir")
     path = pathlib.Path(str(workdir))
     if not path.is_absolute() or ".." in path.parts or not path.is_dir():
-        return None
-    outputs: list[str] = []
+        return _TrackedFingerprint(git_error=f"invalid workdir path: {workdir}")
+
+    head_val: str | None = None
+    unstaged_val: str | None = None
+    staged_val: str | None = None
+    untracked_val: str | None = None
+
     commands = (
-        ("rev-parse", "HEAD"),
-        ("diff", "--binary"),
-        ("diff", "--cached", "--binary"),
+        ("head", ("rev-parse", "HEAD")),
+        ("unstaged", ("diff", "--binary")),
+        ("staged", ("diff", "--cached", "--binary")),
     )
-    for tail in commands:
+    for name, tail in commands:
         try:
             proc = subprocess.run(
                 ["git", "-C", str(path), *tail],
@@ -551,11 +566,22 @@ def _tracked_state(
                 timeout=30,
                 check=False,
             )
-        except (OSError, subprocess.TimeoutExpired):
-            return None
+        except subprocess.TimeoutExpired:
+            return _TrackedFingerprint(git_error=f"git {tail[0]} timed out")
+        except OSError as exc:
+            return _TrackedFingerprint(git_error=f"git {tail[0]} OSError: {exc}")
         if proc.returncode != 0:
-            return None
-        outputs.append(proc.stdout)
+            err = proc.stderr.strip() or proc.stdout.strip() or f"exit code {proc.returncode}"
+            return _TrackedFingerprint(git_error=f"git {tail[0]} failed: {err}")
+        if name == "head":
+            head_val = proc.stdout
+        elif name == "unstaged":
+            unstaged_val = proc.stdout
+        elif name == "staged":
+            staged_val = proc.stdout
+
+    outputs = [head_val or "", unstaged_val or "", staged_val or ""]
+
     if include_untracked:
         try:
             proc = subprocess.run(
@@ -565,10 +591,14 @@ def _tracked_state(
                 timeout=30,
                 check=False,
             )
-        except (OSError, subprocess.TimeoutExpired):
-            return None
+        except subprocess.TimeoutExpired:
+            return _TrackedFingerprint(git_error="git ls-files timed out")
+        except OSError as exc:
+            return _TrackedFingerprint(git_error=f"git ls-files OSError: {exc}")
         if proc.returncode != 0:
-            return None
+            err = proc.stderr.strip() or proc.stdout.strip() or f"exit code {proc.returncode}"
+            return _TrackedFingerprint(git_error=f"git ls-files failed: {err}")
+
         raw_files = [p for p in (proc.stdout or "").split("\0") if p]
         untracked_entries: list[str] = []
         for rel_str in sorted(raw_files):
@@ -584,10 +614,27 @@ def _tracked_state(
                 else:
                     entry_hash = "missing"
                 untracked_entries.append(f"{rel_str}:{entry_hash}")
-            except OSError:
-                return None
-        outputs.append("\0".join(untracked_entries))
-    return hashlib.sha256("\0".join(outputs).encode("utf-8")).hexdigest()
+            except OSError as exc:
+                return _TrackedFingerprint(git_error=f"cannot read untracked entry {rel_str}: {exc}")
+        untracked_val = "\0".join(untracked_entries)
+        outputs.append(untracked_val)
+
+    digest = hashlib.sha256("\0".join(outputs).encode("utf-8")).hexdigest()
+    return _TrackedFingerprint(
+        head=head_val,
+        unstaged_diff=unstaged_val,
+        staged_diff=staged_val,
+        untracked=untracked_val,
+        git_error="",
+        digest=digest,
+    )
+
+
+def _tracked_state(
+    workdir: "Path | str | None", *, include_untracked: bool = False
+) -> str | None:
+    """Hash HEAD plus staged/unstaged changes, optionally including untracked artifacts."""
+    return _compute_tracked_fingerprint(workdir, include_untracked=include_untracked).digest
 
 
 
@@ -1342,12 +1389,18 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                 output="fresh reviewer target must be a real, non-symlinked directory",
                 metadata={"verdict": "unknown", "fresh_session": "true"},
             ))
-        target_tracked_before = _tracked_state(target_workdir, include_untracked=True) if verdict_gate else None
+        target_before_fp = _compute_tracked_fingerprint(target_workdir, include_untracked=True) if verdict_gate else None
+        target_tracked_before = target_before_fp.digest if target_before_fp is not None else None
         if verdict_gate and target_tracked_before is None:
+            err_msg = target_before_fp.git_error if target_before_fp is not None else ""
             return _finalize(Result(
                 outcome="error",
                 output="fresh reviewer could not fingerprint the tracked repository state",
-                metadata={"verdict": "unknown", "fresh_session": "true"},
+                metadata={
+                    "verdict": "unknown",
+                    "fresh_session": "true",
+                    "fingerprint_git_error": err_msg,
+                },
             ))
         workdir_cm = (
             _isolated_review_workdir(target_workdir)
@@ -1356,7 +1409,8 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         )
         try:
             with workdir_cm as codex_workdir:
-                snapshot_tracked_before = _tracked_state(codex_workdir) if verdict_gate else None
+                snapshot_before_fp = _compute_tracked_fingerprint(codex_workdir) if verdict_gate else None
+                snapshot_tracked_before = snapshot_before_fp.digest if snapshot_before_fp is not None else None
                 codex_command = ["codex", "exec"]
                 if str(node.attrs.get("fresh_session", "false")).strip().lower() in {
                     "true", "1", "yes", "on",
@@ -1454,8 +1508,10 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                 meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
                 if verdict_gate:
                     verdict, parsed_outcome = _handlers_shim._parse_verdict(output, gate_strict=True)
-                    snapshot_tracked_after = _tracked_state(codex_workdir)
-                    target_tracked_after = _tracked_state(target_workdir, include_untracked=True)
+                    snapshot_after_fp = _compute_tracked_fingerprint(codex_workdir)
+                    target_after_fp = _compute_tracked_fingerprint(target_workdir, include_untracked=True)
+                    snapshot_tracked_after = snapshot_after_fp.digest
+                    target_tracked_after = target_after_fp.digest
                     snapshot_mutated = (
                         snapshot_tracked_before is None
                         or snapshot_tracked_after is None
@@ -1467,6 +1523,30 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                         or target_tracked_before != target_tracked_after
                     )
                     mutated = snapshot_mutated or target_mutated
+
+                    # Component-level attribution
+                    head_changed = (
+                        (snapshot_before_fp is not None and snapshot_after_fp is not None and snapshot_before_fp.head != snapshot_after_fp.head)
+                        or (target_before_fp is not None and target_after_fp is not None and target_before_fp.head != target_after_fp.head)
+                    )
+                    unstaged_changed = (
+                        (snapshot_before_fp is not None and snapshot_after_fp is not None and snapshot_before_fp.unstaged_diff != snapshot_after_fp.unstaged_diff)
+                        or (target_before_fp is not None and target_after_fp is not None and target_before_fp.unstaged_diff != target_after_fp.unstaged_diff)
+                    )
+                    staged_changed = (
+                        (snapshot_before_fp is not None and snapshot_after_fp is not None and snapshot_before_fp.staged_diff != snapshot_after_fp.staged_diff)
+                        or (target_before_fp is not None and target_after_fp is not None and target_before_fp.staged_diff != target_after_fp.staged_diff)
+                    )
+                    untracked_changed = (
+                        target_before_fp is not None and target_after_fp is not None and target_before_fp.untracked != target_after_fp.untracked
+                    )
+                    git_error = (
+                        (snapshot_before_fp.git_error if snapshot_before_fp else "")
+                        or (snapshot_after_fp.git_error if snapshot_after_fp else "")
+                        or (target_before_fp.git_error if target_before_fp else "")
+                        or (target_after_fp.git_error if target_after_fp else "")
+                    )
+
                     if proc.returncode != 0 or verdict == "unknown":
                         outcome = "error"
                     else:
@@ -1477,6 +1557,11 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                             "fresh_session": "true",
                             "review_workdir": str(target_workdir),
                             "reviewer_mutated_tracked_files": str(mutated).lower(),
+                            "fingerprint_head_changed": str(head_changed).lower(),
+                            "fingerprint_unstaged_changed": str(unstaged_changed).lower(),
+                            "fingerprint_staged_changed": str(staged_changed).lower(),
+                            "fingerprint_untracked_changed": str(untracked_changed).lower(),
+                            "fingerprint_git_error": git_error,
                         }
                     )
                     if mutated:

@@ -1367,3 +1367,201 @@ def test_fresh_reviewer_fails_closed_when_real_controller_auth_is_missing(
     assert result.outcome == "error"
     assert "failed to initialize private codex runtime" in result.output.lower()
     assert launched == []
+
+
+def test_fresh_reviewer_linked_worktree_with_dirty_calc_passes_and_not_mutated(
+    tmp_path, monkeypatch
+):
+    main_repo = _repo(tmp_path / "main")
+    (main_repo / "calc.py").write_text("def add(a, b):\n    return 0\n")
+    subprocess.run(["git", "-C", str(main_repo), "add", "calc.py"], check=True)
+    subprocess.run(
+        ["git", "-C", str(main_repo), "commit", "-qm", "add calc.py"], check=True
+    )
+
+    wt_dir = tmp_path / "worker_wt"
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(main_repo),
+            "worktree",
+            "add",
+            "-b",
+            "worker-feature",
+            str(wt_dir),
+        ],
+        check=True,
+    )
+    (wt_dir / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    node = _review_node(prompt)
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="codex",
+        state={"ao.worktree": str(wt_dir)},
+    )
+
+    calls: list[tuple[list[str], pathlib.Path]] = []
+    real_run = subprocess.run
+
+    def fake_run(args, **kwargs):
+        if args and any("codex" in str(a) for a in args):
+            cwd = pathlib.Path(kwargs["cwd"])
+            calls.append((list(args), cwd))
+            assert (cwd / "calc.py").read_text() == "def add(a, b):\n    return a + b\n"
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout="No blocking findings.\nVerdict: PASS\n",
+                stderr="",
+            )
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", fake_run)
+
+    result = _codergen(node, ctx)
+
+    assert result.outcome == "success", f"Reviewer failed: {result.output}"
+    assert result.metadata["verdict"] == "pass"
+    assert result.metadata["reviewer_mutated_tracked_files"] == "false"
+    assert len(calls) == 1
+    assert calls[0][1] != wt_dir
+    assert (wt_dir / "calc.py").read_text() == "def add(a, b):\n    return a + b\n"
+
+
+def test_fresh_reviewer_fingerprint_component_attribution_on_unstaged_mutation(
+    tmp_path, monkeypatch
+):
+    main_repo = _repo(tmp_path / "main")
+    (main_repo / "calc.py").write_text("def add(a, b):\n    return 0\n")
+    subprocess.run(["git", "-C", str(main_repo), "add", "calc.py"], check=True)
+    subprocess.run(
+        ["git", "-C", str(main_repo), "commit", "-qm", "add calc.py"], check=True
+    )
+
+    wt_dir = tmp_path / "worker_wt"
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(main_repo),
+            "worktree",
+            "add",
+            "-b",
+            "worker-feature",
+            str(wt_dir),
+        ],
+        check=True,
+    )
+    (wt_dir / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    node = _review_node(prompt)
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="codex",
+        state={"ao.worktree": str(wt_dir)},
+    )
+
+    real_run = subprocess.run
+
+    def fake_run(args, **kwargs):
+        if args and any("codex" in str(a) for a in args):
+            cwd = pathlib.Path(kwargs["cwd"])
+            # Reviewer mutates unstaged calc.py in snapshot
+            (cwd / "calc.py").write_text("def add(a, b):\n    return a + b + 1\n")
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout="No blocking findings.\nVerdict: PASS\n",
+                stderr="",
+            )
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", fake_run)
+
+    result = _codergen(node, ctx)
+
+    assert result.outcome == "error"
+    assert result.metadata["reviewer_mutated_tracked_files"] == "true"
+    assert result.metadata["fingerprint_unstaged_changed"] == "true"
+    assert result.metadata["fingerprint_head_changed"] == "false"
+    assert result.metadata["fingerprint_staged_changed"] == "false"
+    assert result.metadata["fingerprint_untracked_changed"] == "false"
+    assert result.metadata["fingerprint_git_error"] == ""
+
+
+def test_fresh_reviewer_fingerprint_component_attribution_on_git_diff_failure(
+    tmp_path, monkeypatch
+):
+    main_repo = _repo(tmp_path / "main")
+    (main_repo / "calc.py").write_text("def add(a, b):\n    return 0\n")
+    subprocess.run(["git", "-C", str(main_repo), "add", "calc.py"], check=True)
+    subprocess.run(
+        ["git", "-C", str(main_repo), "commit", "-qm", "add calc.py"], check=True
+    )
+
+    wt_dir = tmp_path / "worker_wt"
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(main_repo),
+            "worktree",
+            "add",
+            "-b",
+            "worker-feature",
+            str(wt_dir),
+        ],
+        check=True,
+    )
+    (wt_dir / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    node = _review_node(prompt)
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="codex",
+        state={"ao.worktree": str(wt_dir)},
+    )
+
+    real_run = subprocess.run
+    codex_executed = False
+
+    def fake_run(args, **kwargs):
+        nonlocal codex_executed
+        if args and any("codex" in str(a) for a in args):
+            codex_executed = True
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout="No blocking findings.\nVerdict: PASS\n",
+                stderr="",
+            )
+        if (
+            codex_executed
+            and args
+            and "diff" in args
+            and "--binary" in args
+            and "--cached" not in args
+        ):
+            return subprocess.CompletedProcess(
+                args, 1, stdout="", stderr="simulated git diff error\n"
+            )
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", fake_run)
+
+    result = _codergen(node, ctx)
+
+    assert result.outcome == "error"
+    assert result.metadata["reviewer_mutated_tracked_files"] == "true"
+    assert "simulated git diff error" in result.metadata["fingerprint_git_error"]
