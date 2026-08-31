@@ -34,6 +34,7 @@ fn test_cli_vcs_real_git() {
     if std::env::var("GITHUB_ACTIONS").is_ok() {
         return;
     }
+    let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let vcs = CliVcs::new("jleechanorg/dark-factory".to_string());
     let sha = vcs.base_head("main").expect("base_head main failed");
     assert_eq!(sha.len(), 40);
@@ -875,7 +876,8 @@ fn test_cli_sessions_ao_status_includes_project_arg_scoped() {
 }
 
 #[test]
-fn ao_not_running_starts_project_then_retries_once() {
+fn ao_recovery_contract() {
+    let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let fake_bin_dir = std::env::temp_dir().join(format!(
         "afd_ao_recovery_{}_{}",
         std::process::id(),
@@ -910,7 +912,12 @@ if "--headless" in args:
     print("error: unknown option '--headless'", file=sys.stderr)
     sys.exit(1)
 
-if args[:3] == ["status", "-p", "dark-factory"]:
+if args != ["status", "-p", "dark-factory", "--json"]:
+    if args[:1] == ["status"]:
+        print(f"status must be project-scoped JSON: {{args}}", file=sys.stderr)
+        sys.exit(1)
+
+if args == ["status", "-p", "dark-factory", "--json"]:
     if not os.path.exists(state_path):
         print("error: daemon is not running", file=sys.stderr)
         sys.exit(1)
@@ -997,4 +1004,3 @@ sys.exit(1)
 
     let _ = std::fs::remove_dir_all(&fake_bin_dir);
 }
-

@@ -331,6 +331,9 @@ pub fn load(path: &Path) -> Result<Config, DaemonError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static TARGET_WORKTREE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn parses_example_config() {
         let cfg = load(std::path::Path::new("contracts/daemon.toml.example")).unwrap();
@@ -642,6 +645,9 @@ local_checkout = "{}"
 
     #[test]
     fn target_worktree_reuses_isolated_checkout_when_local_checkout_is_missing() {
+        let _lock = TARGET_WORKTREE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let root = std::env::temp_dir().join(format!("afd_isolated_target_{}", std::process::id()));
         let isolated = root.join("owner").join("target");
         std::fs::create_dir_all(&isolated).unwrap();
@@ -682,6 +688,9 @@ push_remote = "origin"
     /// from an immutable uv/archive path unrelated to any repo checkout.
     #[test]
     fn relative_spec_dir_uses_target_worktree() {
+        let _lock = TARGET_WORKTREE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let root = std::env::temp_dir().join(format!("afd_relative_spec_dir_{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let previous = std::env::var_os("DARK_FACTORY_TARGET_WORKTREE_ROOT");
@@ -885,6 +894,9 @@ push_remote = "origin"
 
     #[test]
     fn isolated_target_worktree_path_keeps_same_name_repositories_separate() {
+        let _lock = TARGET_WORKTREE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let root = std::env::temp_dir().join(format!(
             "afd_isolated_same_name_{}",
             std::process::id()

@@ -10273,7 +10273,13 @@ fn run_slow_tier_pr_existence_probe_targets_bead_own_repo_not_global_cfg() {
 
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
-    let _env_guard = EnvVarGuard::set(&[("PATH", &new_path)]);
+    let breaker_path = fake_bin_dir.join("gh_circuit_breaker.json");
+    let breaker_path = breaker_path.to_string_lossy();
+    let _env_guard = EnvVarGuard::set(&[
+        ("PATH", &new_path),
+        ("DARK_FACTORY_GH_CIRCUIT_BREAKER_PATH", &breaker_path),
+    ]);
+    daemon::gh_circuit_breaker::reset();
 
     let mut scm = FakeScm::new();
     // external_ref names a DIFFERENT repo than cfg.target_repo ("owner/repo"
@@ -10348,6 +10354,7 @@ fn run_slow_tier_pr_existence_probe_targets_bead_own_repo_not_global_cfg() {
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
+    daemon::gh_circuit_breaker::reset();
     let _ = std::fs::remove_dir_all(&fake_bin_dir);
 }
 
@@ -10376,7 +10383,13 @@ fn run_slow_tier_pr_existence_probe_unchanged_for_single_repo_legacy_bead() {
 
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
-    let _env_guard = EnvVarGuard::set(&[("PATH", &new_path)]);
+    let breaker_path = fake_bin_dir.join("gh_circuit_breaker.json");
+    let breaker_path = breaker_path.to_string_lossy();
+    let _env_guard = EnvVarGuard::set(&[
+        ("PATH", &new_path),
+        ("DARK_FACTORY_GH_CIRCUIT_BREAKER_PATH", &breaker_path),
+    ]);
+    daemon::gh_circuit_breaker::reset();
 
     let mut scm = FakeScm::new();
     // external_ref's repo prefix MATCHES cfg.target_repo — the single-repo
@@ -10439,6 +10452,7 @@ fn run_slow_tier_pr_existence_probe_unchanged_for_single_repo_legacy_bead() {
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
+    daemon::gh_circuit_breaker::reset();
     let _ = std::fs::remove_dir_all(&fake_bin_dir);
 }
 

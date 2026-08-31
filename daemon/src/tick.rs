@@ -1657,7 +1657,7 @@ fn run_quota_watchdog_wake(deps: &TickDeps, summary: &mut TickSummary) -> Result
 }
 
 /// Slow tier: intake new beads, route each freshly-queued bead, dispatch as
-/// many QUEUED beads as the safety envelope (30/15) allows.
+/// many QUEUED beads as the safety envelope (40/15) allows.
 fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), DaemonError> {
     // jleechan-gib: recovery runs AFTER this slow-tier dispatch pass (see
     // `run_tick`), so freshly-recovered QUEUED beads are NOT dispatched this

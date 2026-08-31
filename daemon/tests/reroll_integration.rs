@@ -956,6 +956,39 @@ fn test_reroll_adopted_unconfigured_repo_uses_daemon_owned_target_worktree() {
 }
 
 #[test]
+fn relative_spec_dir_uses_target_worktree() {
+    let root = std::env::temp_dir().join(format!(
+        "afd_relative_spec_dir_integration_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+
+    let mut cfg = test_cfg();
+    cfg.spec_dir = ".factory/specs/".into();
+    cfg.repos.insert(
+        "owner/target".into(),
+        RepoConfig {
+            ao_project: "target".into(),
+            push_remote: "origin".into(),
+            local_checkout: Some(root.clone()),
+        },
+    );
+    let resolved = cfg.resolve_spec_path("owner/target", "bead-123");
+    let expected = root.join(".factory/specs/bead-123.toml");
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert_eq!(
+        resolved, expected,
+        "relative spec_dir must resolve under the target repository worktree"
+    );
+}
+
+#[test]
 fn test_reroll_adopted_explicit_target_without_checkout_never_spawns() {
     let scm = FakeScm::new();
     let sessions = FakeSessions::new();
