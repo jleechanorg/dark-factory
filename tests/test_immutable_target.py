@@ -661,82 +661,15 @@ class ControllerSnapshotTests(unittest.TestCase):
         self.assertEqual(seen, ["codex"])
         self.assertEqual(result.metadata["reviewer_backend"], "codex")
 
-    def test_cli_echo_two_node_runs_one_controller_reviewer_by_default(self) -> None:
-        """The default two-node runtime runs in echo mode when --backend echo is passed."""
-        from unittest.mock import patch
+    def test_default_two_node_reviewer_does_not_inherit_echo_backend(self) -> None:
+        """The default reviewer stays Codex even when the worker backend is echo."""
+        from runner.parser import parse
 
-        from runner import __main__ as cli
-        from runner.handler_core import Result
-        from runner.handlers import TYPE_REGISTRY
-
-        (self.repo / "README.md").write_text("worker output\n")
-        checkpoint = self.tmp / "checkpoint.json"
-        bundle = self.tmp / "evidence"
-        production_pipeline = Path(__file__).parent.parent / "pipelines/slim/two_node.dot"
-        fixture_pipeline = self.tmp / "two_node_fixture.dot"
-        fixture_pipeline.write_text(
-            production_pipeline.read_text(encoding="utf-8").replace(
-                '        review_contract="cold-review-v1",\n',
-                '        review_contract="cold-review-v1",\n'
-                '        test_fixture="true",\n',
-            ),
-            encoding="utf-8",
-        )
-
-        def _worker_with_inherited_reviewer_outcome(node, ctx):
-            receipt = ctx.workdir / "evidence" / "worker-verification.json"
-            receipt.parent.mkdir()
-            receipt.write_text(
-                json.dumps(
-                    {
-                        "schema_version": 1,
-                        "target_head_sha": _git(self.repo, "rev-parse", "HEAD").strip(),
-                        "goal": ctx.goal,
-                        "changed_files": ["README.md"],
-                        "commands": [],
-                        "not_applicable": {
-                            "reason": "E2E controller transport mock",
-                            "primary_inspection_commands": [],
-                        },
-                    }
-                )
-            )
-            return Result(
-                outcome="success",
-                output="worker completed",
-                context_updates={
-                    "_df_controller_fixture": "cold-review-v1",
-                    "cold_reviewer.outcome": "success",
-                },
-            )
-
-        with patch.dict(TYPE_REGISTRY, {"codergen": _worker_with_inherited_reviewer_outcome}):
-            rc = cli.main(
-                [
-                    "--pipeline",
-                    str(fixture_pipeline),
-                    "--workdir",
-                    str(self.repo),
-                    "--goal",
-                    "E2E smoke only: validate controller transport selection.",
-                    "--backend",
-                    "echo",
-                    "--max-steps",
-                    "4",
-                    "--checkpoint",
-                    str(checkpoint),
-                    "--evidence-bundle",
-                    str(bundle),
-                    "--no-perf-log",
-                ]
-            )
-
-        self.assertEqual(rc, 0)
-        cold_reviewer = next(
-            record for record in json.loads(checkpoint.read_text())
-            if record["node"] == "cold_reviewer"
-        )
-        self.assertEqual(cold_reviewer["metadata"]["reviewer_backend"], "echo")
+        pipeline = Path(__file__).parent.parent / "pipelines/slim/two_node.dot"
+        reviewer = parse(pipeline).nodes["cold_reviewer"]
+        self.assertEqual(reviewer.attrs["backend"], "codex")
+        self.assertEqual(reviewer.attrs["fresh_session"], "true")
+        self.assertNotIn("review_contract", reviewer.attrs)
 
 
 def replace_evidence(

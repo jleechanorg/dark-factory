@@ -2,8 +2,7 @@
 //
 // Default graph for `/f` (and `/factory`). Exactly two productive nodes:
 //   worker         — generic codergen; light prompt; does whatever the user asked.
-//   cold_reviewer  — controller-owned cold reviewer using the SHA-pinned
-//                    cold-review-v1 execution path (prompts/catalog/controller_cold_review_v1.md).
+//   cold_reviewer  — fresh, fully tooled Codex process in the coder worktree.
 //
 // Wiring:
 //   start -> worker -> cold_reviewer -> exit                (on success)
@@ -12,9 +11,7 @@
 // Backend routing:
 //   - worker          honors the run-level --backend (the coder tier the user
 //                     chose; default = whatever /f's Step 0.5 detector picks).
-//   - cold_reviewer   uses review_contract="cold-review-v1" and
-//                     backend_priority="codex" because the controller has
-//                     a receipt-capable transport only for Codex.
+//   - cold_reviewer   always launches a fresh Codex CLI session.
 //
 // Failure semantics:
 //   - cold_reviewer is goal_gate=true. On success the run exits.
@@ -23,7 +20,7 @@
 
 digraph SlimTwoNode {
     graph [
-        goal="Generic worker does the user's task; controller-owned cold-review-v1 reviewer gates it. Slim default for /f."
+        goal="Generic worker does the user's task; a fresh Codex reviewer gates it. Slim default for /f."
         rankdir=LR
         label="SlimTwoNode (default /f graph)"
     ]
@@ -42,13 +39,13 @@ digraph SlimTwoNode {
     ]
 
     cold_reviewer [
-        type="parallel_reviewer",
-        label="Cold Reviewer (controller cold-review-v1)",
+        type="codergen",
+        label="Fresh Codex Reviewer",
         class="review",
-        review_contract="cold-review-v1",
-        backend_priority="codex",
-        evidence_paths="evidence/worker-verification.json",
-        receipt_required="true",
+        backend="codex",
+        prompt="@prompts/slim/fresh_review.md",
+        verdict_gate="true",
+        fresh_session="true",
         goal_gate=true,
         timeout=600
     ]
@@ -58,5 +55,5 @@ digraph SlimTwoNode {
     worker -> worker        [condition="outcome!=success"]
 
     cold_reviewer -> exit   [condition="outcome=success"]
-    cold_reviewer -> worker [condition="outcome!=success"]
+    cold_reviewer -> worker [condition="outcome=failure"]
 }

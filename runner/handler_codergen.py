@@ -63,12 +63,13 @@ the full empirical distribution and the citation.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pathlib
 import re
-import signal
 import shutil
+import signal
 import subprocess
 import time
 from dataclasses import dataclass
@@ -518,6 +519,53 @@ def _codergen_workdir(ctx: "Context") -> "Path | str | None":
             return None
 
 
+def _tracked_state(workdir: "Path | str | None") -> str | None:
+    """Hash HEAD plus staged and unstaged tracked changes, ignoring untracked files."""
+    if not workdir:
+        return None
+    path = pathlib.Path(str(workdir))
+    if not path.is_absolute() or ".." in path.parts or not path.is_dir():
+        return None
+    outputs: list[str] = []
+    commands = (
+        ("rev-parse", "HEAD"),
+        ("diff", "--binary"),
+        ("diff", "--cached", "--binary"),
+    )
+    for tail in commands:
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(path), *tail],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if proc.returncode != 0:
+            return None
+        outputs.append(proc.stdout)
+    return hashlib.sha256("\0".join(outputs).encode("utf-8")).hexdigest()
+
+
+def _fresh_review_workdir(ctx: "Context") -> pathlib.Path | None:
+    """Return a real, non-symlinked target directory for a fresh reviewer."""
+    raw = _codergen_workdir(ctx)
+    if not raw:
+        return None
+    candidate = pathlib.Path(str(raw))
+    if not candidate.is_absolute() or ".." in candidate.parts:
+        return None
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if candidate.is_symlink() or not resolved.is_dir():
+        return None
+    return resolved
+
+
 
 def _parse_commands_run_md(text: str) -> list[tuple[str, int]]:
     """Mechanical line-format parser for the ``commands_run.md`` #406 artifact.
@@ -605,6 +653,9 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
     if isinstance(backend, bool):
         backend = ctx.backend
     backend = str(backend)
+    verdict_gate = str(node.attrs.get("verdict_gate", "false")).strip().lower() in {
+        "true", "1", "yes", "on",
+    }
     _start_ts = time.monotonic()
     shadow_review = _start_shadow_codex_review(node, ctx, backend, prompt_text)
 
@@ -921,17 +972,40 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             _stash_codergen_receipt(node, ctx)
         return _finalize(Result(outcome=outcome, output=output, metadata=meta))
     elif backend == "codex":
+        codex_workdir = _fresh_review_workdir(ctx) if verdict_gate else ctx.workdir
+        if codex_workdir is None:
+            return _finalize(Result(
+                outcome="error",
+                output="fresh reviewer target must be a real, non-symlinked directory",
+                metadata={"verdict": "unknown", "fresh_session": "true"},
+            ))
+        tracked_before = _tracked_state(codex_workdir) if verdict_gate else None
+        if verdict_gate and tracked_before is None:
+            return _finalize(Result(
+                outcome="error",
+                output="fresh reviewer could not fingerprint the tracked repository state",
+                metadata={"verdict": "unknown", "fresh_session": "true"},
+            ))
+        codex_command = ["codex", "exec"]
+        if str(node.attrs.get("fresh_session", "false")).strip().lower() in {
+            "true", "1", "yes", "on",
+        }:
+            codex_command.append("--ephemeral")
+        codex_command.extend(["--yolo", "--skip-git-repo-check", prompt_text])
         args = _handlers_shim._sandboxed_args_for_workdir(
-            ["codex", "exec", "--yolo", "--skip-git-repo-check", prompt_text],
-            ctx.workdir,
+            codex_command,
+            codex_workdir,
         )
         if args is None:
-            return _finalize(Result(outcome="failure", output="sandbox-exec unavailable"))
+            return _finalize(Result(
+                outcome="error" if verdict_gate else "failure",
+                output="sandbox-exec unavailable",
+            ))
         timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1800"), 1800)
         try:
             proc = subprocess.run(
                 args,
-                cwd=ctx.workdir,
+                cwd=codex_workdir,
                 capture_output=True,
                 text=True,
                 timeout=timeout_s,
@@ -941,7 +1015,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             )
         except subprocess.TimeoutExpired as exc:
             return _finalize(Result(
-                outcome="failure",
+                outcome="error" if verdict_gate else "failure",
                 output=_subprocess_output(exc.stdout, exc.stderr)
                 or f"codex backend timed out after {timeout_s} seconds",
                 metadata={
@@ -1066,7 +1140,26 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
     metrics = _handlers_shim._codergen_metrics(proc.stdout, proc.stderr, wall_ms)
     meta = {"returncode": str(proc.returncode)}
     meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
-    if outcome == "success":
+    if verdict_gate:
+        verdict, parsed_outcome = _handlers_shim._parse_verdict(output, gate_strict=True)
+        tracked_after = _tracked_state(codex_workdir)
+        mutated = tracked_before is None or tracked_after is None or tracked_before != tracked_after
+        if proc.returncode != 0 or verdict == "unknown":
+            outcome = "error"
+        else:
+            outcome = parsed_outcome
+        meta.update(
+            {
+                "verdict": verdict,
+                "fresh_session": "true",
+                "review_workdir": str(codex_workdir),
+                "reviewer_mutated_tracked_files": str(mutated).lower(),
+            }
+        )
+        if mutated:
+            outcome = "error"
+            output = output.rstrip() + "\n\nReviewer changed tracked files; changes must be made by the coder.\n"
+    elif outcome == "success":
         _stash_diff(node, ctx)
         _stash_codergen_receipt(node, ctx)
     return _finalize(Result(

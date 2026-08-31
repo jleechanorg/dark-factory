@@ -745,11 +745,14 @@ def _run_single_node(
         records: list = []
         for attempt in results:
             attempt = _obs._normalized_result(attempt)
+            is_review = (
+                str(node.attrs.get("class", "")).strip().lower() == "review"
+            )
             ctx.state.update(attempt.context_updates)
             ctx.state["_last_node"] = node.name
             ctx.state["_last_outcome"] = attempt.outcome
             ctx.state["_last_output"] = attempt.output
-            if str(node.attrs.get("class", "")).strip().lower() == "review":
+            if is_review:
                 ctx.state["_last_review_feedback"] = attempt.output
             
             # Surface Coder Handoff section + verdict token (P5)
@@ -766,13 +769,16 @@ def _run_single_node(
                 ctx.state.pop("_last_coder_handoff", None)
 
             normalized_results.append(attempt)
+            record_metadata = dict(attempt.metadata)
+            if is_review:
+                record_metadata["_review_feedback"] = attempt.output
             records.append(
                 _persist.StepRecord(
                     node=node.name,
                     outcome=attempt.outcome,
                     ts=time.time(),
                     output_preview=attempt.output[:280],
-                    metadata=attempt.metadata,
+                    metadata=record_metadata,
                 )
             )
             _persist._update_failure_state(node, ctx, attempt)
@@ -794,7 +800,8 @@ def run(
     If `resume` is provided, execution restarts from the successor of the
     checkpointed last step.
     """
-    if resume is not None and _is_controller_graph(graph):
+    controller_graph = _is_controller_graph(graph)
+    if resume is not None and controller_graph:
         raise ValueError("resume is not supported for cold-review-v1 graphs")
 
     # Resume uses the checkpoint's run directory as the durable journal owner.
@@ -807,12 +814,14 @@ def run(
                 ctx.run_id = candidate_run_id
     if not ctx.run_id:
         ctx.run_id = uuid.uuid4().hex[:12]
-    _load_controller_snapshot_journal(ctx)
+    if controller_graph or resume is not None:
+        _load_controller_snapshot_journal(ctx)
 
     # Capture the controller-owned base before the first worker visit.  This
     # runs after CLI/AO state has been assembled, so an explicitly selected AO
     # worktree is the target whose immutable HEAD is bound.
-    _seed_controller_base_sha(ctx, graph)
+    if controller_graph or resume is not None:
+        _seed_controller_base_sha(ctx, graph)
     history: list = []
     visits: dict[str, int] = {}
     # Per-node ring of recent output hashes for the no_progress detector
@@ -847,6 +856,17 @@ def run(
                 _cleanup_controller_snapshot(ctx)
                 return history
             synthetic = _obs._normalized_result(Result(outcome=last.outcome))
+            is_review = (
+                str(last_node.attrs.get("class", "")).strip().lower() == "review"
+            )
+            if is_review and "_review_feedback" in last.metadata:
+                feedback = str(last.metadata["_review_feedback"])
+                ctx.state["_last_review_feedback"] = feedback
+                ctx.state["_last_output"] = feedback
+                ctx.state["_last_node"] = last.node
+                ctx.state["_last_outcome"] = last.outcome
+                if "verdict" in last.metadata:
+                    ctx.state["_last_verdict"] = str(last.metadata["verdict"])
             # Detect incomplete parallel fan-out: the fan-out step was checkpointed
             # but branches never ran (job was interrupted between the fan-out record
             # write and the ThreadPoolExecutor completing).  Re-run from the parallel
@@ -862,6 +882,29 @@ def run(
                 if next_node is None:
                     _cleanup_controller_snapshot(ctx)
                     return history
+                if (
+                    str(next_node.attrs.get("class", "")).strip().lower()
+                    == "worker"
+                ):
+                    for previous in reversed(resumed):
+                        previous_node = graph.nodes.get(previous.node)
+                        if previous_node is None or (
+                            str(previous_node.attrs.get("class", ""))
+                            .strip()
+                            .lower()
+                            != "review"
+                        ):
+                            continue
+                        if str(previous.outcome).strip().lower() == "failure":
+                            if "_review_feedback" not in previous.metadata:
+                                raise ValueError(
+                                    "checkpoint is missing full reviewer feedback required "
+                                    "for worker retry"
+                                )
+                            ctx.state["_last_review_feedback"] = str(
+                                previous.metadata["_review_feedback"]
+                            )
+                        break
                 current = next_node
 
     # Always have an addressable run_id so diagnostics are locatable even when
@@ -1594,6 +1637,8 @@ def run(
                 continue
 
             if next_node is None:
+                if _classify_outcome(result.outcome) == "error":
+                    break
                 _stuck_node = _para_jump_to if _para_jump_to is not None else current
                 record = _persist.StepRecord(
                     node=_stuck_node.name,

@@ -40,7 +40,6 @@ _SUBPROCESS_NODE_TYPES = frozenset(
         "gate_er",
         "gate_code_standards",
         "human_gate",
-        "parallel_reviewer",
         "agy",
         "ao",
     }
@@ -78,9 +77,11 @@ def test_two_node_dot_parses_and_has_expected_topology() -> None:
     # Worker and cold_reviewer are the only goal-producing nodes.
     assert g.nodes["worker"].attrs.get("type") == "codergen"
     assert g.nodes["worker"].attrs.get("class") == "worker"
-    assert g.nodes["cold_reviewer"].attrs.get("type") == "parallel_reviewer"
+    assert g.nodes["cold_reviewer"].attrs.get("type") == "codergen"
     assert g.nodes["cold_reviewer"].attrs.get("class") == "review"
-    assert g.nodes["cold_reviewer"].attrs.get("review_contract") == "cold-review-v1"
+    assert g.nodes["cold_reviewer"].attrs.get("backend") == "codex"
+    assert g.nodes["cold_reviewer"].attrs.get("verdict_gate") == "true"
+    assert "review_contract" not in g.nodes["cold_reviewer"].attrs
 
 
 def test_two_node_dot_declares_timeout_on_every_subprocess_node() -> None:
@@ -111,74 +112,50 @@ def test_two_node_dot_declares_timeout_on_every_subprocess_node() -> None:
     )
 
 
-def test_two_node_dot_cold_reviewer_uses_only_its_supported_transport() -> None:
-    """Cold-review-v1 advertises only Codex, its sole receipt-capable transport."""
+def test_two_node_dot_cold_reviewer_is_a_fresh_codex_session() -> None:
+    """The default reviewer is a direct fresh Codex invocation, not a controller."""
     g = parse(ROOT / _PIPELINE)
     reviewer = g.nodes["cold_reviewer"]
-    priority = reviewer.attrs.get("backend_priority", "")
-    entries = [p.strip() for p in str(priority).split(",") if p.strip()]
-    assert entries == ["codex"], (
-        "cold-review-v1 must not advertise minimax/agy/claude fallbacks: "
-        "the controller has no compatible receipt transport for them"
-    )
+    assert reviewer.attrs.get("backend") == "codex"
+    assert reviewer.attrs.get("fresh_session") == "true"
+    assert reviewer.attrs.get("prompt") == "@prompts/slim/fresh_review.md"
 
 
-def test_two_node_dot_cold_reviewer_controller_binding() -> None:
-    """The cold_reviewer must bind to the SHA-pinned controller cold-review-v1 prompt contract.
-
-    This pins the requirement: use the existing SHA-pinned cold-review-v1
-    controller execution path (prompts/catalog/controller_cold_review_v1.md)
-    rather than any divergent prompt copy.
-    """
+def test_two_node_dot_default_bypasses_controller_machinery() -> None:
+    """The simple default path must not select the frozen controller stack."""
     g = parse(ROOT / _PIPELINE)
-    contract = g.nodes["cold_reviewer"].attrs.get("review_contract", "")
-    assert contract == "cold-review-v1", (
-        f"cold_reviewer review_contract must be cold-review-v1; got {contract!r}"
-    )
-    from runner.review_controller import PROMPT_ID, _TEMPLATE_PATH
-    assert PROMPT_ID == "controller-cold-review-v1"
-    assert _TEMPLATE_PATH.exists()
+    reviewer = g.nodes["cold_reviewer"]
+    for key in ("review_contract", "backend_priority", "receipt_required", "evidence_paths"):
+        assert key not in reviewer.attrs
 
 
-def test_two_node_dot_reviewer_has_no_target_authored_prompt_and_docs_agree() -> None:
-    """The slim graph cannot override its controller-owned reviewer contract."""
+def test_worker_prompt_does_not_reference_deleted_controller_receipts() -> None:
+    """The default worker prompt must describe only the slim feedback loop."""
+    prompt = (ROOT / _WORKER_PROMPT).read_text(encoding="utf-8")
+    assert "verification receipt" not in prompt.lower()
+
+
+def test_two_node_dot_reviewer_prompt_is_short_and_docs_agree() -> None:
+    """The default prompt states the goal directly without a controller packet."""
     reviewer = parse(ROOT / _PIPELINE).nodes["cold_reviewer"]
-    assert "prompt" not in reviewer.attrs
-    assert reviewer.attrs.get("type") == "parallel_reviewer"
-    assert reviewer.attrs.get("review_contract") == "cold-review-v1"
-    assert reviewer.attrs.get("backend_priority") == "codex"
+    assert reviewer.attrs.get("prompt") == "@prompts/slim/fresh_review.md"
+    assert reviewer.attrs.get("type") == "codergen"
     skill = (ROOT / ".claude/skills/dark-factory/SKILL.md").read_text()
-    assert "controller-owned `cold-review-v1`" in skill
-    assert '`type="parallel_reviewer"`' in skill
-    assert '`backend_priority="codex"`' in skill
-    assert not (ROOT / "prompts/slim/cold_reviewer.md").exists()
+    assert "fresh Codex reviewer" in skill
+    assert "static Codex cold reviewer" not in skill
+    prompt = (ROOT / "prompts/slim/fresh_review.md").read_text()
+    assert len([line for line in prompt.splitlines() if line.strip()]) <= 6
+    assert "Use all available tools" in prompt
+    assert "Verdict: PASS" in prompt and "Verdict: FAIL" in prompt
 
 
-def test_two_node_dot_binds_the_worker_verification_receipt() -> None:
-    """The default cold reviewer receives the worker's declared evidence file."""
-    reviewer = parse(ROOT / _PIPELINE).nodes["cold_reviewer"]
-    assert reviewer.attrs.get("evidence_paths") == "evidence/worker-verification.json"
-
-
-def test_worker_prompt_requires_a_bounded_structured_verification_receipt() -> None:
-    """Every default worker must provide reproducible, non-fabricated review data."""
+def test_worker_prompt_is_direct_and_receipt_free() -> None:
+    """The worker receives the goal and copied review, without packet ceremony."""
     prompt = (ROOT / _WORKER_PROMPT).read_text()
-    assert "evidence/worker-verification.json" in prompt
-    assert "1 MiB" in prompt
-    for field in (
-        "schema_version",
-        "target_head_sha",
-        "goal",
-        "changed_files",
-        "commands",
-        "not_applicable",
-        "cwd",
-        "exit_code",
-        "stdout",
-        "stderr",
-    ):
-        assert field in prompt
-    assert "Do not fabricate" in prompt
+    assert "${goal}" in prompt
+    assert "${state._last_review_feedback}" in prompt
+    assert "evidence/worker-verification.json" not in prompt
+    assert "schema_version" not in prompt
 
 
 def test_worker_prompt_renders_untrusted_reviewer_feedback_only_on_retry() -> None:
@@ -194,3 +171,224 @@ def test_worker_prompt_renders_untrusted_reviewer_feedback_only_on_retry() -> No
     retry_attempt = _render_prompt(worker, ctx)
     assert "Finding: bind the snapshot lineage." in retry_attempt
     assert "${state._last_review_feedback}" not in retry_attempt
+
+
+def test_two_node_loop_copies_exact_review_output_to_worker_retry(tmp_path, monkeypatch) -> None:
+    from runner.engine import run
+    from runner.handler_core import Context, Result
+    from runner.handlers import TYPE_REGISTRY
+
+    review = (
+        "Blocking: src/value.py:7 mishandles zero.\n"
+        + ("context " * 50)
+        + "TAIL-MARKER\nVerdict: FAIL\n"
+    )
+    worker_feedback: list[str | None] = []
+    review_visits = 0
+
+    def fake_codergen(node, ctx):
+        nonlocal review_visits
+        if node.name == "worker":
+            worker_feedback.append(ctx.state.get("_last_review_feedback"))
+            return Result(outcome="success", output="worker done")
+        review_visits += 1
+        if review_visits == 1:
+            return Result(outcome="failure", output=review)
+        return Result(outcome="success", output="Verdict: PASS\n")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "codergen", fake_codergen)
+    history = run(
+        parse(ROOT / _PIPELINE),
+        Context(goal="fix zero handling", workdir=tmp_path, backend="echo"),
+    )
+
+    assert history[-1].outcome == "success"
+    assert worker_feedback == [None, review]
+
+
+def test_two_node_resume_copies_exact_review_output_to_worker_retry(
+    tmp_path, monkeypatch
+) -> None:
+    """A process restart between review failure and retry must retain findings."""
+    from runner.engine import run
+    from runner.handler_core import Context, Result
+    from runner.handlers import TYPE_REGISTRY
+
+    review = (
+        "Blocking: src/value.py:7 mishandles zero.\n"
+        + ("context " * 50)
+        + "TAIL-MARKER\nVerdict: FAIL\n"
+    )
+    worker_feedback: list[str | None] = []
+    review_visits = 0
+
+    def fake_codergen(node, ctx):
+        nonlocal review_visits
+        if node.name == "worker":
+            worker_feedback.append(ctx.state.get("_last_review_feedback"))
+            return Result(outcome="success", output="worker done")
+        review_visits += 1
+        if review_visits == 1:
+            return Result(outcome="failure", output=review)
+        return Result(outcome="success", output="Verdict: PASS\n")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "codergen", fake_codergen)
+    checkpoint = tmp_path / "checkpoint.json"
+    graph = parse(ROOT / _PIPELINE)
+    from runner import engine_persist
+
+    append_record = engine_persist._append_record
+
+    def interrupt_after_review(*args, **kwargs):
+        seq = append_record(*args, **kwargs)
+        record = args[5]
+        if record.node == "cold_reviewer":
+            raise KeyboardInterrupt("simulated process interruption")
+        return seq
+
+    monkeypatch.setattr(engine_persist, "_append_record", interrupt_after_review)
+    import pytest
+
+    with pytest.raises(KeyboardInterrupt, match="simulated process interruption"):
+        run(
+            graph,
+            Context(goal="fix zero handling", workdir=ROOT, backend="echo"),
+            checkpoint=checkpoint,
+        )
+    assert "TAIL-MARKER" in checkpoint.read_text(encoding="utf-8")
+    monkeypatch.setattr(engine_persist, "_append_record", append_record)
+
+    resumed = run(
+        graph,
+        Context(goal="fix zero handling", workdir=ROOT, backend="echo"),
+        checkpoint=checkpoint,
+        resume=checkpoint,
+    )
+
+    assert resumed[-1].outcome == "success"
+    assert worker_feedback == [None, review]
+
+
+def test_two_node_second_resume_retains_review_feedback_after_worker_failure(
+    tmp_path, monkeypatch
+) -> None:
+    """A second restart after a failed worker retry must retain the review."""
+    from runner.engine import run
+    from runner.handler_core import Context, Result
+    from runner.handlers import TYPE_REGISTRY
+
+    review = (
+        "Blocking: src/value.py:7 mishandles zero.\n"
+        + ("context " * 50)
+        + "TAIL-MARKER\nVerdict: FAIL\n"
+    )
+    worker_feedback: list[str | None] = []
+    worker_visits = 0
+    review_visits = 0
+
+    def fake_codergen(node, ctx):
+        nonlocal review_visits, worker_visits
+        if node.name == "worker":
+            worker_feedback.append(ctx.state.get("_last_review_feedback"))
+            worker_visits += 1
+            outcome = "failure" if worker_visits == 2 else "success"
+            return Result(outcome=outcome, output=f"worker visit {worker_visits}")
+        review_visits += 1
+        if review_visits == 1:
+            return Result(outcome="failure", output=review)
+        return Result(outcome="success", output="Verdict: PASS\n")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "codergen", fake_codergen)
+    checkpoint = tmp_path / "checkpoint.json"
+    graph = parse(ROOT / _PIPELINE)
+    graph.nodes["worker"].attrs["max_retries"] = "0"
+    from runner import engine_persist
+
+    append_record = engine_persist._append_record
+
+    def interrupt_after_review(*args, **kwargs):
+        seq = append_record(*args, **kwargs)
+        if args[5].node == "cold_reviewer":
+            raise KeyboardInterrupt("interrupt after review")
+        return seq
+
+    monkeypatch.setattr(engine_persist, "_append_record", interrupt_after_review)
+    import pytest
+
+    with pytest.raises(KeyboardInterrupt, match="interrupt after review"):
+        run(
+            graph,
+            Context(goal="fix zero handling", workdir=ROOT, backend="echo"),
+            checkpoint=checkpoint,
+        )
+
+    def interrupt_after_failed_worker(*args, **kwargs):
+        seq = append_record(*args, **kwargs)
+        record = args[5]
+        if record.node == "worker" and record.outcome == "failure":
+            raise KeyboardInterrupt("interrupt after failed worker")
+        return seq
+
+    monkeypatch.setattr(
+        engine_persist, "_append_record", interrupt_after_failed_worker
+    )
+    with pytest.raises(KeyboardInterrupt, match="interrupt after failed worker"):
+        run(
+            graph,
+            Context(goal="fix zero handling", workdir=ROOT, backend="echo"),
+            checkpoint=checkpoint,
+            resume=checkpoint,
+        )
+
+    import json
+
+    legacy_checkpoint = tmp_path / "legacy-checkpoint.json"
+    legacy_payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+    for record in legacy_payload:
+        if record["node"] == "cold_reviewer":
+            record["metadata"].pop("_review_feedback", None)
+    legacy_checkpoint.write_text(
+        json.dumps(legacy_payload, indent=2), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="missing full reviewer feedback"):
+        run(
+            graph,
+            Context(goal="fix zero handling", workdir=ROOT, backend="echo"),
+            checkpoint=legacy_checkpoint,
+            resume=legacy_checkpoint,
+        )
+
+    monkeypatch.setattr(engine_persist, "_append_record", append_record)
+    resumed = run(
+        graph,
+        Context(goal="fix zero handling", workdir=ROOT, backend="echo"),
+        checkpoint=checkpoint,
+        resume=checkpoint,
+    )
+
+    assert resumed[-1].outcome == "success"
+    assert worker_feedback == [None, review, review]
+
+
+def test_two_node_reviewer_error_is_terminal(tmp_path, monkeypatch) -> None:
+    from runner.engine import run
+    from runner.handler_core import Context, Result
+    from runner.handlers import TYPE_REGISTRY
+
+    worker_visits = 0
+
+    def fake_codergen(node, ctx):
+        nonlocal worker_visits
+        if node.name == "worker":
+            worker_visits += 1
+            return Result(outcome="success", output="worker done")
+        return Result(outcome="error", output="reviewer infrastructure failed")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "codergen", fake_codergen)
+    history = run(
+        parse(ROOT / _PIPELINE),
+        Context(goal="review without mutation", workdir=tmp_path, backend="echo"),
+    )
+
+    assert history[-1].outcome == "error"
+    assert worker_visits == 1
