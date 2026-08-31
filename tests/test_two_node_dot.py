@@ -269,6 +269,107 @@ def test_two_node_resume_copies_exact_review_output_to_worker_retry(
     assert worker_feedback == [None, review]
 
 
+def test_two_node_second_resume_retains_review_feedback_after_worker_failure(
+    tmp_path, monkeypatch
+) -> None:
+    """A second restart after a failed worker retry must retain the review."""
+    from runner.engine import run
+    from runner.handler_core import Context, Result
+    from runner.handlers import TYPE_REGISTRY
+
+    review = (
+        "Blocking: src/value.py:7 mishandles zero.\n"
+        + ("context " * 50)
+        + "TAIL-MARKER\nVerdict: FAIL\n"
+    )
+    worker_feedback: list[str | None] = []
+    worker_visits = 0
+    review_visits = 0
+
+    def fake_codergen(node, ctx):
+        nonlocal review_visits, worker_visits
+        if node.name == "worker":
+            worker_feedback.append(ctx.state.get("_last_review_feedback"))
+            worker_visits += 1
+            outcome = "failure" if worker_visits == 2 else "success"
+            return Result(outcome=outcome, output=f"worker visit {worker_visits}")
+        review_visits += 1
+        if review_visits == 1:
+            return Result(outcome="failure", output=review)
+        return Result(outcome="success", output="Verdict: PASS\n")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "codergen", fake_codergen)
+    checkpoint = tmp_path / "checkpoint.json"
+    graph = parse(ROOT / _PIPELINE)
+    graph.nodes["worker"].attrs["max_retries"] = "0"
+    from runner import engine_persist
+
+    append_record = engine_persist._append_record
+
+    def interrupt_after_review(*args, **kwargs):
+        seq = append_record(*args, **kwargs)
+        if args[5].node == "cold_reviewer":
+            raise KeyboardInterrupt("interrupt after review")
+        return seq
+
+    monkeypatch.setattr(engine_persist, "_append_record", interrupt_after_review)
+    import pytest
+
+    with pytest.raises(KeyboardInterrupt, match="interrupt after review"):
+        run(
+            graph,
+            Context(goal="fix zero handling", workdir=ROOT, backend="echo"),
+            checkpoint=checkpoint,
+        )
+
+    def interrupt_after_failed_worker(*args, **kwargs):
+        seq = append_record(*args, **kwargs)
+        record = args[5]
+        if record.node == "worker" and record.outcome == "failure":
+            raise KeyboardInterrupt("interrupt after failed worker")
+        return seq
+
+    monkeypatch.setattr(
+        engine_persist, "_append_record", interrupt_after_failed_worker
+    )
+    with pytest.raises(KeyboardInterrupt, match="interrupt after failed worker"):
+        run(
+            graph,
+            Context(goal="fix zero handling", workdir=ROOT, backend="echo"),
+            checkpoint=checkpoint,
+            resume=checkpoint,
+        )
+
+    import json
+
+    legacy_checkpoint = tmp_path / "legacy-checkpoint.json"
+    legacy_payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+    for record in legacy_payload:
+        if record["node"] == "cold_reviewer":
+            record["metadata"].pop("_review_feedback", None)
+    legacy_checkpoint.write_text(
+        json.dumps(legacy_payload, indent=2), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="missing full reviewer feedback"):
+        run(
+            graph,
+            Context(goal="fix zero handling", workdir=ROOT, backend="echo"),
+            checkpoint=legacy_checkpoint,
+            resume=legacy_checkpoint,
+        )
+
+    monkeypatch.setattr(engine_persist, "_append_record", append_record)
+    resumed = run(
+        graph,
+        Context(goal="fix zero handling", workdir=ROOT, backend="echo"),
+        checkpoint=checkpoint,
+        resume=checkpoint,
+    )
+
+    assert resumed[-1].outcome == "success"
+    assert worker_feedback == [None, review, review]
+
+
 def test_two_node_reviewer_error_is_terminal(tmp_path, monkeypatch) -> None:
     from runner.engine import run
     from runner.handler_core import Context, Result

@@ -883,15 +883,28 @@ def run(
                     _cleanup_controller_snapshot(ctx)
                     return history
                 if (
-                    is_review
-                    and "_review_feedback" not in last.metadata
-                    and str(last.outcome).strip().lower() == "failure"
-                    and str(next_node.attrs.get("class", "")).strip().lower()
+                    str(next_node.attrs.get("class", "")).strip().lower()
                     == "worker"
                 ):
-                    raise ValueError(
-                        "checkpoint is missing full reviewer feedback required for worker retry"
-                    )
+                    for previous in reversed(resumed):
+                        previous_node = graph.nodes.get(previous.node)
+                        if previous_node is None or (
+                            str(previous_node.attrs.get("class", ""))
+                            .strip()
+                            .lower()
+                            != "review"
+                        ):
+                            continue
+                        if str(previous.outcome).strip().lower() == "failure":
+                            if "_review_feedback" not in previous.metadata:
+                                raise ValueError(
+                                    "checkpoint is missing full reviewer feedback required "
+                                    "for worker retry"
+                                )
+                            ctx.state["_last_review_feedback"] = str(
+                                previous.metadata["_review_feedback"]
+                            )
+                        break
                 current = next_node
 
     # Always have an addressable run_id so diagnostics are locatable even when
