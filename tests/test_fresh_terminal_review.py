@@ -45,6 +45,52 @@ def _review_node(prompt: pathlib.Path):
     return node
 
 
+def test_real_slim_prompt_link_remains_a_symlink_in_isolated_snapshot(
+    tmp_path, monkeypatch
+):
+    source_link = ROOT / "pipelines/slim/prompts/prompts"
+    repo = _repo(tmp_path)
+    (repo / "prompts").mkdir()
+    (repo / "prompts" / "worker.md").write_text("worker prompt\n")
+    snapshot_link = repo / source_link.relative_to(ROOT)
+    snapshot_link.parent.mkdir(parents=True)
+    snapshot_link.symlink_to(source_link.readlink(), target_is_directory=True)
+    subprocess.run(["git", "-C", str(repo), "add", "prompts", "pipelines"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "add slim prompt link"], check=True)
+
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="echo",
+        state={"ao.worktree": str(repo)},
+    )
+    calls: list[pathlib.Path] = []
+    real_run = subprocess.run
+
+    def check_snapshot_link(args, **kwargs):
+        if args and args[0] == "codex":
+            cwd = pathlib.Path(kwargs["cwd"])
+            copied_link = cwd / source_link.relative_to(ROOT)
+            calls.append(copied_link)
+            assert copied_link.is_symlink()
+            assert copied_link.readlink() == source_link.readlink()
+            assert copied_link.resolve(strict=True) == cwd.resolve(strict=True) / "prompts"
+            assert (copied_link / "worker.md").read_text() == "worker prompt\n"
+            return subprocess.CompletedProcess(args, 0, stdout="Verdict: PASS\n", stderr="")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr("runner.handlers._sandboxed_args_for_workdir", lambda args, workdir: args)
+    monkeypatch.setattr("runner.handlers._sanitized_env", lambda: {})
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", check_snapshot_link)
+
+    result = _codergen(_review_node(prompt), ctx)
+
+    assert result.outcome == "success", result.output
+    assert len(calls) == 1
+
+
 def _run_review(tmp_path, monkeypatch, output: str, *, mutate: bool = False):
     repo = _repo(tmp_path)
     prompt = tmp_path / "review.md"
@@ -97,7 +143,7 @@ def test_fresh_reviewer_runs_codex_ephemeral_in_isolated_review_workdir(tmp_path
         "No blocking findings.\nVerdict: PASS\n",
     )
 
-    assert result.outcome == "success"
+    assert result.outcome == "success", result.output
     assert result.metadata["verdict"] == "pass"
     assert len(calls) == 1
     argv, cwd = calls[0]
@@ -242,6 +288,56 @@ def test_fresh_reviewer_excludes_git_ignored_runtime_directory(tmp_path, monkeyp
 
     assert result.outcome == "success"
     assert len(calls) == 1
+
+
+def test_fresh_reviewer_rejects_tracked_alias_to_git_ignored_directory_before_copy(
+    tmp_path, monkeypatch
+):
+    repo = _repo(tmp_path)
+    runtime = repo / "runtime-cache"
+    (runtime / "bin").mkdir(parents=True)
+    (runtime / ".gitignore").write_text("*\n")
+    interpreter = tmp_path / "external-python"
+    interpreter.write_text("external interpreter\n")
+    (runtime / "bin" / "python").symlink_to(interpreter)
+    (repo / "runtime-alias").symlink_to("runtime-cache", target_is_directory=True)
+    subprocess.run(["git", "-C", str(repo), "add", "runtime-alias"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "track runtime alias"], check=True)
+
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="echo",
+        state={"ao.worktree": str(repo)},
+    )
+    copied_sources: list[pathlib.Path] = []
+    codex_calls: list[list[str]] = []
+    real_copytree = __import__("shutil").copytree
+    real_run = subprocess.run
+
+    def record_copytree(src, dst, *args, **kwargs):
+        copied_sources.append(pathlib.Path(src))
+        return real_copytree(src, dst, *args, **kwargs)
+
+    def intercept_run(args, **kwargs):
+        if args and args[0] == "codex":
+            codex_calls.append(list(args))
+            return subprocess.CompletedProcess(args, 0, stdout="Verdict: PASS\n", stderr="")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr("runner.handlers._sandboxed_args_for_workdir", lambda args, workdir: args)
+    monkeypatch.setattr("runner.handlers._sanitized_env", lambda: {})
+    monkeypatch.setattr("runner.handler_codergen.shutil.copytree", record_copytree)
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", intercept_run)
+
+    result = _codergen(_review_node(prompt), ctx)
+
+    assert result.outcome == "error"
+    assert "ignored" in result.output.lower()
+    assert codex_calls == []
+    assert copied_sources == [], "ignored contents must never enter a review snapshot"
 
 
 def test_fresh_reviewer_git_worktree_target_isolation(tmp_path, monkeypatch):
@@ -394,7 +490,9 @@ def test_default_graph_does_not_initialize_controller_state(tmp_path, monkeypatc
     assert history[-1].outcome == "success"
 
 
-def test_fresh_reviewer_materializes_in_tree_symlinks_without_write_through(tmp_path, monkeypatch):
+def test_fresh_reviewer_preserves_safe_relative_symlinks_and_isolates_absolute_links(
+    tmp_path, monkeypatch
+):
     repo = _repo(tmp_path)
     (repo / "sub").mkdir()
     (repo / "sub" / "data.txt").write_text("sub data\n")
@@ -420,14 +518,19 @@ def test_fresh_reviewer_materializes_in_tree_symlinks_without_write_through(tmp_
         if args and args[0] == "codex":
             cwd = pathlib.Path(kwargs["cwd"])
             calls.append(cwd)
-            # Verify symlinks are materialized as real files, not symlinks
-            assert not (cwd / "rel_link.txt").is_symlink()
-            assert not (cwd / "sub_link.txt").is_symlink()
+            assert (cwd / "rel_link.txt").is_symlink()
+            assert (cwd / "rel_link.txt").readlink() == pathlib.Path("value.txt")
+            assert (cwd / "rel_link.txt").resolve(strict=True) == cwd.resolve(strict=True) / "value.txt"
+            assert (cwd / "sub_link.txt").is_symlink()
+            assert (cwd / "sub_link.txt").readlink() == pathlib.Path("sub/data.txt")
+            assert (cwd / "sub_link.txt").resolve(strict=True) == cwd.resolve(strict=True) / "sub/data.txt"
             assert not (cwd / "abs_link.txt").is_symlink()
             assert (cwd / "rel_link.txt").read_text() == "before\n"
             assert (cwd / "sub_link.txt").read_text() == "sub data\n"
             assert (cwd / "abs_link.txt").read_text() == "before\n"
-            # Mutating a materialized file in review dir must not touch target
+            (cwd / "rel_link.txt").write_text("mutated through relative link\n")
+            assert (repo / "value.txt").read_text() == "before\n"
+            (cwd / "rel_link.txt").write_text("before\n")
             (cwd / "abs_link.txt").write_text("mutated in review dir\n")
             assert (repo / "value.txt").read_text() == "before\n"
             (cwd / "abs_link.txt").write_text("before\n")
@@ -439,7 +542,7 @@ def test_fresh_reviewer_materializes_in_tree_symlinks_without_write_through(tmp_
     monkeypatch.setattr("runner.handler_codergen.subprocess.run", check_and_mutate_symlink)
 
     result = _codergen(_review_node(prompt), ctx)
-    assert result.outcome == "success"
+    assert result.outcome == "success", result.output
     assert result.metadata["verdict"] == "pass"
     assert len(calls) == 1
     assert (repo / "value.txt").read_text() == "before\n"
@@ -627,7 +730,7 @@ def test_fresh_reviewer_blocks_absolute_writes_to_original_target(tmp_path, monk
     monkeypatch.setattr("runner.handler_codergen.subprocess.run", behavioral_boundary_runner)
     result = _codergen(node, ctx)
 
-    assert result.outcome == "success"
+    assert result.outcome == "success", result.output
     assert result.metadata["verdict"] == "pass"
     assert len(calls) == 1
     assert (repo / "value.txt").read_text() == "before\n"

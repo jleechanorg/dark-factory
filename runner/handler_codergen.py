@@ -665,11 +665,20 @@ def _validate_snapshot_symlinks(
                     raise RuntimeError(
                         f"Target workspace contains unsafe escaping symlink: {entry} -> {resolved}"
                     )
+                resolved_relative = resolved.relative_to(target_real)
+                if any(
+                    ignored == resolved_relative or ignored in resolved_relative.parents
+                    for ignored in ignored_paths
+                ):
+                    raise RuntimeError(
+                        f"Target workspace symlink resolves into a Git-ignored path: {entry}"
+                    )
 
 
 def _materialize_snapshot_symlinks(target_workdir: pathlib.Path, review_dir: pathlib.Path) -> None:
-    """Materialize all in-tree symlinks in review_dir into real regular files/directories."""
+    """Preserve safe relative links and materialize links that retain source reachability."""
     target_real = target_workdir.resolve(strict=True)
+    review_real = review_dir.resolve(strict=True)
     for root, dirs, files in os.walk(review_dir, topdown=False, followlinks=False):
         root_path = pathlib.Path(root)
         for name in dirs + files:
@@ -683,6 +692,13 @@ def _materialize_snapshot_symlinks(target_workdir: pathlib.Path, review_dir: pat
                     raise RuntimeError(f"Cannot resolve in-tree symlink {entry}") from exc
                 if not (target_resolved == target_real or target_real in target_resolved.parents):
                     raise RuntimeError(f"Escaping symlink found during materialization: {entry}")
+                if not pathlib.Path(os.readlink(orig)).is_absolute():
+                    try:
+                        review_resolved = entry.resolve(strict=True)
+                    except (OSError, RuntimeError) as exc:
+                        raise RuntimeError(f"Cannot resolve copied symlink {entry}") from exc
+                    if review_real in review_resolved.parents:
+                        continue
                 entry.unlink()
                 if target_resolved.is_dir():
                     shutil.copytree(target_resolved, entry, symlinks=False)
