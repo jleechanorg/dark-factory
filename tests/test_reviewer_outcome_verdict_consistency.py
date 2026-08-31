@@ -354,7 +354,7 @@ class TestEnforceOutcomeVerdictConsistency:
             for i, line in enumerate(text.splitlines(), 1):
                 if pattern.match(line):
                     definitions.append(py.relative_to(ROOT).as_posix() + f":{i}")
-        assert definitions == ["runner/handler_verdict.py:182"], (
+        assert definitions == ["runner/handler_verdict.py:230"], (
             f"expected exactly one canonical definition in handler_verdict.py, "
             f"got: {definitions}"
         )

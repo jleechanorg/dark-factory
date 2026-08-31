@@ -1,0 +1,62 @@
+digraph ReadyAdviceBlockingRed {
+  // Issue #784 RED fixture: gate_advice must fail closed when the lane's
+  // output contains a blocking inner-review verdict (REQUEST CHANGES /
+  // NOT APPROVED), even when an outer synthesizer wraps it as
+  // `verdict: warn` or, worst case, misbehaves and emits `verdict: pass`.
+  //
+  // This fixture is the durable, graph-level evidence the PR body's
+  // ## Evidence section quotes. It exercises the SAME pipelines/slim/ready.dot
+  // wiring as production /ready runs (gate_strict=true, max_visits=3,
+  // retry_target=fix), shrunk to two nodes so the runner stub can inject
+  // any gate_advice output shape — including the issue #784 bug inputs.
+  graph [
+    goal="RED fixture: gate_advice fails closed on blocking inner review (issue #784)"
+    label="Ready gate_advice blocking inner review RED"
+    skip_explore="true"
+    skip_plan="true"
+    skip_implement="true"
+    rankdir=LR
+    model_stylesheet="../slim/minimal_feature.model.css"
+  ]
+
+  start  [shape=Mdiamond, label="Start"]
+  exit   [shape=Msquare,  label="Exit - Ready to Merge"]
+
+  // The gate under test: identical shape to pipelines/slim/ready.dot::gate_advice.
+  // - type="gate_slash" + command="advice" routes through _gate_slash.
+  // - gate_strict="true" forces warn→failure (legacy warn→success is closed).
+  // - retry_target="fix" wires the !success branch to the bounded fix loop.
+  gate_advice [
+    type="gate_slash",
+    command="advice",
+    label="/advice Independent Review",
+    gate_strict="true",
+    timeout=600,
+    goal_gate=true,
+    retry_target="fix"
+  ]
+
+  // The bounded fix loop. max_visits=3 caps the rerun budget so a
+  // misbehaving synthesizer cannot loop forever.
+  fix [
+    type="codergen",
+    label="Fix & Iterate (max N=3)",
+    class="fix",
+    prompt="@prompts/slim/ready_fix.md",
+    max_retries=2,
+    max_visits="3",
+    no_progress_max="2",
+    timeout=600
+  ]
+
+  // Routing mirrors pipelines/slim/ready.dot exactly:
+  //   start → gate_advice
+  //   success → exit
+  //   !success → fix (bounded retry)
+  //   fix → gate_advice (re-enter the gate on each iteration, capped at
+  //   max_visits=3 by the engine)
+  start -> gate_advice
+  gate_advice -> exit [condition="outcome=success"]
+  gate_advice -> fix  [condition="outcome!=success"]
+  fix -> gate_advice
+}

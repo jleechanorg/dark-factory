@@ -128,10 +128,49 @@ _STANDALONE_RE = re.compile(
 )
 
 
+# Blocking inner-review markers (dark-factory issue #784). A reviewer that
+# returns one of these is registering a hard veto, regardless of what the
+# outer synthesizer claims. The pattern deliberately tolerates the
+# `REQUEST_CHANGES` / `NOT_APPROVED` snake-case forms alongside the natural
+# prose forms (`REQUEST CHANGES` / `NOT APPROVED`) because the /advice lane
+# has been observed to emit both depending on the backend. A veto cannot be
+# silently outvoted by a downstream synthesized `verdict: pass` or
+# `verdict: warn` — see `_BLOCKING_INNER_REVIEW_TOKENS` and the gate's
+# fail-closed contract below.
+_BLOCKING_INNER_REVIEW_PATTERNS = (
+    r"\brequest[_\s]+changes\b",
+    r"\bnot[_\s]+approved\b",
+)
+_BLOCKING_INNER_REVIEW_RE = re.compile(
+    "|".join(_BLOCKING_INNER_REVIEW_PATTERNS),
+    re.IGNORECASE,
+)
+# The canonical raw verdict token reported to callers + CXDB metadata when
+# the fail-closed blocking-review override fires. Distinct from "fail" so
+# downstream readers can tell the override from a real fail verdict.
+_BLOCKING_INNER_REVIEW_OVERRIDE_TOKEN = "blocking_inner_review"
+
+
+def _has_blocking_inner_review(text: str) -> bool:
+    """True iff ``text`` contains a blocking inner-review veto.
+
+    Centralized here so the gate's fail-closed override has a single
+    authoritative detector and the test suite can exercise the exact same
+    predicate the production path uses.
+    """
+    return bool(_BLOCKING_INNER_REVIEW_RE.search(text or ""))
+
+
 def _parse_verdict(text: str, *, gate_strict: bool = False) -> tuple[str, str]:
     """Extract a normalized verdict from gate output.
 
     Strategy:
+      0. Scan the output for a *blocking inner-review* veto
+         (``REQUEST CHANGES`` / ``NOT APPROVED``). A veto is a hard fail
+         regardless of the synthesized outer verdict (issue #784). This
+         closes the path where AGY-style multi-reviewer synthesis emits
+         ``verdict: warn`` or even ``verdict: pass`` despite a blocking
+         inner reviewer.
       1. Look for explicit marker lines (`Verdict: PASS`). The LAST valid marker
          wins — gates may emit progress lines before the authoritative one.
       2. If a marker word was present but no matching token followed it,
@@ -148,8 +187,17 @@ def _parse_verdict(text: str, *, gate_strict: bool = False) -> tuple[str, str]:
         legacy warn→success mapping so existing graphs do not regress.
 
     Returns (raw_verdict, normalized_outcome). Unknown returns ("unknown", "failure").
+    A blocking inner-review veto returns
+    (``"blocking_inner_review"``, ``"failure"``) — never success.
     """
     body = text or ""
+
+    # Step 0: fail-closed on blocking inner-review veto. Must run BEFORE the
+    # marker-line parse, otherwise a synthesized `verdict: pass` could mask
+    # the inner reviewer's veto. Issue #784.
+    if _has_blocking_inner_review(body):
+        return _BLOCKING_INNER_REVIEW_OVERRIDE_TOKEN, "failure"
+
     matches = list(_MARKER_RE.finditer(body))
     if matches:
         raw = matches[-1].group(1).lower()
