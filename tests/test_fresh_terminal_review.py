@@ -1421,6 +1421,10 @@ def test_fresh_reviewer_linked_worktree_with_dirty_calc_passes_and_not_mutated(
             )
         return real_run(args, **kwargs)
 
+    monkeypatch.setattr(
+        "runner.handler_codergen._sandboxed_args_for_fresh_review",
+        lambda command, *args, **kwargs: command,
+    )
     monkeypatch.setattr("runner.handler_codergen.subprocess.run", fake_run)
 
     result = _codergen(node, ctx)
@@ -1484,6 +1488,10 @@ def test_fresh_reviewer_fingerprint_component_attribution_on_unstaged_mutation(
             )
         return real_run(args, **kwargs)
 
+    monkeypatch.setattr(
+        "runner.handler_codergen._sandboxed_args_for_fresh_review",
+        lambda command, *args, **kwargs: command,
+    )
     monkeypatch.setattr("runner.handler_codergen.subprocess.run", fake_run)
 
     result = _codergen(node, ctx)
@@ -1558,6 +1566,10 @@ def test_fresh_reviewer_fingerprint_component_attribution_on_git_diff_failure(
             )
         return real_run(args, **kwargs)
 
+    monkeypatch.setattr(
+        "runner.handler_codergen._sandboxed_args_for_fresh_review",
+        lambda command, *args, **kwargs: command,
+    )
     monkeypatch.setattr("runner.handler_codergen.subprocess.run", fake_run)
 
     result = _codergen(node, ctx)
