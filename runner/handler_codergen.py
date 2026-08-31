@@ -568,6 +568,151 @@ def _fresh_review_workdir(ctx: "Context") -> pathlib.Path | None:
     return resolved
 
 
+def _validate_snapshot_symlinks(target_workdir: pathlib.Path) -> None:
+    """Validate that target_workdir contains no unsafe, escaping, or dangling symlinks."""
+    target_real = target_workdir.resolve(strict=True)
+    for root, dirs, files in os.walk(target_workdir, followlinks=False):
+        root_path = pathlib.Path(root)
+        for name in dirs + files:
+            entry = root_path / name
+            if entry.is_symlink():
+                try:
+                    resolved = entry.resolve(strict=True)
+                except (OSError, RuntimeError) as exc:
+                    raise RuntimeError(
+                        f"Target workspace contains unsafe dangling or looping symlink: {entry}"
+                    ) from exc
+                if not (resolved == target_real or target_real in resolved.parents):
+                    raise RuntimeError(
+                        f"Target workspace contains unsafe escaping symlink: {entry} -> {resolved}"
+                    )
+
+
+def _materialize_snapshot_symlinks(target_workdir: pathlib.Path, review_dir: pathlib.Path) -> None:
+    """Materialize all in-tree symlinks in review_dir into real regular files/directories."""
+    target_real = target_workdir.resolve(strict=True)
+    for root, dirs, files in os.walk(review_dir, topdown=False, followlinks=False):
+        root_path = pathlib.Path(root)
+        for name in dirs + files:
+            entry = root_path / name
+            if entry.is_symlink():
+                rel = entry.relative_to(review_dir)
+                orig = target_workdir / rel
+                try:
+                    target_resolved = orig.resolve(strict=True)
+                except (OSError, RuntimeError) as exc:
+                    raise RuntimeError(f"Cannot resolve in-tree symlink {entry}") from exc
+                if not (target_resolved == target_real or target_real in target_resolved.parents):
+                    raise RuntimeError(f"Escaping symlink found during materialization: {entry}")
+                entry.unlink()
+                if target_resolved.is_dir():
+                    shutil.copytree(target_resolved, entry, symlinks=False)
+                else:
+                    shutil.copy2(target_resolved, entry)
+
+
+def _normalize_and_validate_review_git(target_workdir: pathlib.Path, review_dir: pathlib.Path) -> None:
+    """Normalize linked-worktree git metadata into a standalone repo and validate isolation."""
+    git_target = target_workdir / ".git"
+    git_review = review_dir / ".git"
+    gitdir_path: pathlib.Path | None = None
+    main_git_dir: pathlib.Path | None = None
+
+    if git_target.is_file():
+        gitdir_content = git_target.read_text(encoding="utf-8").strip()
+        if not gitdir_content.startswith("gitdir:"):
+            raise RuntimeError(f"Invalid worktree .git pointer file in {target_workdir}: {gitdir_content}")
+        gitdir_raw = gitdir_content[len("gitdir:"):].strip()
+        gitdir_path = (target_workdir / gitdir_raw).resolve()
+        if not gitdir_path.is_dir():
+            raise RuntimeError(f"Worktree gitdir does not exist or is not a directory: {gitdir_path}")
+
+        commondir_file = gitdir_path / "commondir"
+        if commondir_file.is_file():
+            commondir_raw = commondir_file.read_text(encoding="utf-8").strip()
+            main_git_dir = (gitdir_path / commondir_raw).resolve()
+        else:
+            main_git_dir = gitdir_path
+        if not main_git_dir.is_dir():
+            raise RuntimeError(f"Common gitdir does not exist or is not a directory: {main_git_dir}")
+
+        if git_review.exists() or git_review.is_symlink():
+            if git_review.is_dir():
+                shutil.rmtree(git_review)
+            else:
+                git_review.unlink()
+
+        shutil.copytree(
+            main_git_dir,
+            git_review,
+            symlinks=True,
+            ignore_dangling_symlinks=False,
+        )
+
+        for entry in gitdir_path.rglob("*"):
+            if entry.is_dir() or entry.name in ("commondir", "gitdir"):
+                continue
+            rel = entry.relative_to(gitdir_path)
+            dest = git_review / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if dest.exists() or dest.is_symlink():
+                if dest.is_dir():
+                    shutil.rmtree(dest)
+                else:
+                    dest.unlink()
+            shutil.copy2(entry, dest)
+
+    if git_review.exists():
+        if not git_review.is_dir() or git_review.is_symlink():
+            raise RuntimeError(f"Review worktree .git is not a real directory: {git_review}")
+
+        wt_sub = git_review / "worktrees"
+        if wt_sub.exists():
+            if wt_sub.is_dir():
+                shutil.rmtree(wt_sub)
+            else:
+                wt_sub.unlink()
+
+        for name in ("commondir", "gitdir"):
+            p = git_review / name
+            if p.exists():
+                p.unlink()
+
+        cfg_file = git_review / "config"
+        if cfg_file.is_file():
+            content = cfg_file.read_text(encoding="utf-8")
+            new_content = re.sub(r"bare\s*=\s*true", "bare = false", content, flags=re.IGNORECASE)
+            new_lines = [
+                line for line in new_content.splitlines()
+                if not line.strip().lower().startswith("worktree =")
+                and not line.strip().lower().startswith("worktreerepo =")
+            ]
+            cfg_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+
+        # Validate that no metadata file in git_review references original repository paths
+        forbidden_paths: list[bytes] = [str(target_workdir).encode("utf-8")]
+        if gitdir_path is not None:
+            forbidden_paths.append(str(gitdir_path).encode("utf-8"))
+        if main_git_dir is not None:
+            forbidden_paths.append(str(main_git_dir).encode("utf-8"))
+
+        for f in git_review.rglob("*"):
+            if f.is_symlink():
+                try:
+                    sym_target = f.resolve(strict=True)
+                except Exception as exc:
+                    raise RuntimeError(f"Unsafe symlink in review git metadata: {f}") from exc
+                if not (sym_target == git_review or git_review in sym_target.parents):
+                    raise RuntimeError(f"Escaping symlink in review git metadata: {f} -> {sym_target}")
+            elif f.is_file():
+                content = f.read_bytes()
+                for forbidden in forbidden_paths:
+                    if forbidden in content:
+                        raise RuntimeError(
+                            f"Review git metadata references original repository path: {f}"
+                        )
+
+
 @contextlib.contextmanager
 def _isolated_review_workdir(target_workdir: pathlib.Path):
     """Create an isolated, temporary workspace for fresh reviewer execution.
@@ -577,6 +722,7 @@ def _isolated_review_workdir(target_workdir: pathlib.Path):
     tools and inspect worker output, while containing any reviewer writes away
     from the actual coder target worktree.
     """
+    _validate_snapshot_symlinks(target_workdir)
     with tempfile.TemporaryDirectory(prefix="df-fresh-review-") as tmpdir:
         tmp_path = pathlib.Path(tmpdir)
         review_dir = tmp_path / "workspace"
@@ -584,59 +730,10 @@ def _isolated_review_workdir(target_workdir: pathlib.Path):
             target_workdir,
             review_dir,
             symlinks=True,
-            ignore_dangling_symlinks=True,
+            ignore_dangling_symlinks=False,
         )
-
-        git_target = target_workdir / ".git"
-        git_review = review_dir / ".git"
-        if git_target.is_file() and git_review.is_file():
-            try:
-                gitdir_content = git_target.read_text(encoding="utf-8").strip()
-                if gitdir_content.startswith("gitdir:"):
-                    gitdir_raw = gitdir_content[len("gitdir:"):].strip()
-                    gitdir_path = (target_workdir / gitdir_raw).resolve()
-                    if gitdir_path.is_dir():
-                        commondir_file = gitdir_path / "commondir"
-                        if commondir_file.is_file():
-                            commondir_raw = commondir_file.read_text(encoding="utf-8").strip()
-                            main_git_dir = (gitdir_path / commondir_raw).resolve()
-                        else:
-                            main_git_dir = gitdir_path
-                        if main_git_dir.is_dir():
-                            git_review.unlink()
-                            shutil.copytree(
-                                main_git_dir,
-                                git_review,
-                                symlinks=True,
-                                ignore_dangling_symlinks=True,
-                            )
-                            for entry in gitdir_path.rglob("*"):
-                                if entry.name in ("commondir", "gitdir") or entry.is_dir():
-                                    continue
-                                rel = entry.relative_to(gitdir_path)
-                                dest = git_review / rel
-                                dest.parent.mkdir(parents=True, exist_ok=True)
-                                shutil.copy2(entry, dest)
-            except Exception:
-                pass
-
-        if git_review.is_dir():
-            wt_sub = git_review / "worktrees"
-            if wt_sub.exists():
-                shutil.rmtree(wt_sub, ignore_errors=True)
-            cfg_file = git_review / "config"
-            if cfg_file.is_file():
-                try:
-                    content = cfg_file.read_text(encoding="utf-8")
-                    new_content = re.sub(r"bare\s*=\s*true", "bare = false", content, flags=re.IGNORECASE)
-                    new_lines = [
-                        line for line in new_content.splitlines()
-                        if not line.strip().lower().startswith("worktree =")
-                    ]
-                    cfg_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-                except Exception:
-                    pass
-
+        _materialize_snapshot_symlinks(target_workdir, review_dir)
+        _normalize_and_validate_review_git(target_workdir, review_dir)
         yield review_dir
 
 
@@ -1053,8 +1150,8 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                 output="fresh reviewer target must be a real, non-symlinked directory",
                 metadata={"verdict": "unknown", "fresh_session": "true"},
             ))
-        tracked_before = _tracked_state(target_workdir) if verdict_gate else None
-        if verdict_gate and tracked_before is None:
+        target_tracked_before = _tracked_state(target_workdir) if verdict_gate else None
+        if verdict_gate and target_tracked_before is None:
             return _finalize(Result(
                 outcome="error",
                 output="fresh reviewer could not fingerprint the tracked repository state",
@@ -1065,88 +1162,107 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             if verdict_gate
             else contextlib.nullcontext(target_workdir)
         )
-        with workdir_cm as codex_workdir:
-            codex_command = ["codex", "exec"]
-            if str(node.attrs.get("fresh_session", "false")).strip().lower() in {
-                "true", "1", "yes", "on",
-            }:
-                codex_command.append("--ephemeral")
-            codex_command.extend(["--yolo", "--skip-git-repo-check", prompt_text])
-            args = _handlers_shim._sandboxed_args_for_workdir(
-                codex_command,
-                codex_workdir,
-            )
-            if args is None:
-                return _finalize(Result(
-                    outcome="error" if verdict_gate else "failure",
-                    output="sandbox-exec unavailable",
-                ))
-            timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1800"), 1800)
-            try:
-                proc = subprocess.run(
-                    args,
-                    cwd=codex_workdir,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout_s,
-                    check=False,
-                    input="",
-                    env=_handlers_shim._sanitized_env(),
+        try:
+            with workdir_cm as codex_workdir:
+                snapshot_tracked_before = _tracked_state(codex_workdir) if verdict_gate else None
+                codex_command = ["codex", "exec"]
+                if str(node.attrs.get("fresh_session", "false")).strip().lower() in {
+                    "true", "1", "yes", "on",
+                }:
+                    codex_command.append("--ephemeral")
+                codex_command.extend(["--yolo", "--skip-git-repo-check", prompt_text])
+                args = _handlers_shim._sandboxed_args_for_workdir(
+                    codex_command,
+                    codex_workdir,
                 )
-            except subprocess.TimeoutExpired as exc:
-                return _finalize(Result(
-                    outcome="error" if verdict_gate else "failure",
-                    output=_subprocess_output(exc.stdout, exc.stderr)
-                    or f"codex backend timed out after {timeout_s} seconds",
-                    metadata={
-                        "timed_out": "true",
-                        "timeout": str(timeout_s),
-                        "returncode": "",
-                    },
-                ))
-            except Exception as exc:
-                return _finalize(Result(
-                    outcome="error",
-                    output=f"codex backend error: {exc}",
-                    metadata={
-                        "timed_out": "false",
-                        "timeout": str(timeout_s),
-                        "returncode": "",
-                    },
-                ))
+                if args is None:
+                    return _finalize(Result(
+                        outcome="error" if verdict_gate else "failure",
+                        output="sandbox-exec unavailable",
+                    ))
+                timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1800"), 1800)
+                try:
+                    proc = subprocess.run(
+                        args,
+                        cwd=codex_workdir,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout_s,
+                        check=False,
+                        input="",
+                        env=_handlers_shim._sanitized_env(),
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    return _finalize(Result(
+                        outcome="error" if verdict_gate else "failure",
+                        output=_subprocess_output(exc.stdout, exc.stderr)
+                        or f"codex backend timed out after {timeout_s} seconds",
+                        metadata={
+                            "timed_out": "true",
+                            "timeout": str(timeout_s),
+                            "returncode": "",
+                        },
+                    ))
+                except Exception as exc:
+                    return _finalize(Result(
+                        outcome="error",
+                        output=f"codex backend error: {exc}",
+                        metadata={
+                            "timed_out": "false",
+                            "timeout": str(timeout_s),
+                            "returncode": "",
+                        },
+                    ))
 
-            output = proc.stdout + ("\nSTDERR:\n" + proc.stderr if proc.stderr else "")
-            outcome = "success" if proc.returncode == 0 else "failure"
-            wall_ms = int((time.monotonic() - _start_ts) * 1000)
-            metrics = _handlers_shim._codergen_metrics(proc.stdout, proc.stderr, wall_ms)
-            meta = {"returncode": str(proc.returncode)}
-            meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
-            if verdict_gate:
-                verdict, parsed_outcome = _handlers_shim._parse_verdict(output, gate_strict=True)
-                tracked_after = _tracked_state(codex_workdir)
-                mutated = tracked_before is None or tracked_after is None or tracked_before != tracked_after
-                if proc.returncode != 0 or verdict == "unknown":
-                    outcome = "error"
-                else:
-                    outcome = parsed_outcome
-                meta.update(
-                    {
-                        "verdict": verdict,
-                        "fresh_session": "true",
-                        "review_workdir": str(target_workdir),
-                        "reviewer_mutated_tracked_files": str(mutated).lower(),
-                    }
-                )
-                if mutated:
-                    outcome = "error"
-                    output = output.rstrip() + "\n\nReviewer changed tracked files; changes must be made by the coder.\n"
-            elif outcome == "success":
-                _stash_diff(node, ctx)
-                _stash_codergen_receipt(node, ctx)
+                output = proc.stdout + ("\nSTDERR:\n" + proc.stderr if proc.stderr else "")
+                outcome = "success" if proc.returncode == 0 else "failure"
+                wall_ms = int((time.monotonic() - _start_ts) * 1000)
+                metrics = _handlers_shim._codergen_metrics(proc.stdout, proc.stderr, wall_ms)
+                meta = {"returncode": str(proc.returncode)}
+                meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
+                if verdict_gate:
+                    verdict, parsed_outcome = _handlers_shim._parse_verdict(output, gate_strict=True)
+                    snapshot_tracked_after = _tracked_state(codex_workdir)
+                    target_tracked_after = _tracked_state(target_workdir)
+                    snapshot_mutated = (
+                        snapshot_tracked_before is None
+                        or snapshot_tracked_after is None
+                        or snapshot_tracked_before != snapshot_tracked_after
+                    )
+                    target_mutated = (
+                        target_tracked_before is None
+                        or target_tracked_after is None
+                        or target_tracked_before != target_tracked_after
+                    )
+                    mutated = snapshot_mutated or target_mutated
+                    if proc.returncode != 0 or verdict == "unknown":
+                        outcome = "error"
+                    else:
+                        outcome = parsed_outcome
+                    meta.update(
+                        {
+                            "verdict": verdict,
+                            "fresh_session": "true",
+                            "review_workdir": str(target_workdir),
+                            "reviewer_mutated_tracked_files": str(mutated).lower(),
+                        }
+                    )
+                    if mutated:
+                        outcome = "error"
+                        output = output.rstrip() + "\n\nReviewer changed tracked files; changes must be made by the coder.\n"
+                elif outcome == "success":
+                    _stash_diff(node, ctx)
+                    _stash_codergen_receipt(node, ctx)
+                return _finalize(Result(
+                    outcome=outcome,
+                    output=output,
+                    metadata=meta,
+                ))
+        except Exception as exc:
             return _finalize(Result(
-                outcome=outcome,
-                output=output,
-                metadata=meta,
+                outcome="error",
+                output=f"failed to isolate review workspace: {exc}",
+                metadata={"verdict": "unknown", "fresh_session": "true"},
             ))
     elif backend == "agy":
         timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "600"), 600)

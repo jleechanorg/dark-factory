@@ -334,3 +334,159 @@ def test_default_graph_does_not_initialize_controller_state(tmp_path, monkeypatc
     )
 
     assert history[-1].outcome == "success"
+
+
+def test_fresh_reviewer_materializes_in_tree_symlinks_without_write_through(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    (repo / "sub").mkdir()
+    (repo / "sub" / "data.txt").write_text("sub data\n")
+    # Relative in-tree symlink
+    (repo / "rel_link.txt").symlink_to("value.txt")
+    # In-tree symlink pointing to sub directory file
+    (repo / "sub_link.txt").symlink_to(pathlib.Path("sub") / "data.txt")
+    # Absolute in-tree symlink
+    (repo / "abs_link.txt").symlink_to((repo / "value.txt").resolve())
+
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="echo",
+        state={"ao.worktree": str(repo)},
+    )
+    calls: list[pathlib.Path] = []
+    real_run = subprocess.run
+
+    def check_and_mutate_symlink(args, **kwargs):
+        if args and args[0] == "codex":
+            cwd = pathlib.Path(kwargs["cwd"])
+            calls.append(cwd)
+            # Verify symlinks are materialized as real files, not symlinks
+            assert not (cwd / "rel_link.txt").is_symlink()
+            assert not (cwd / "sub_link.txt").is_symlink()
+            assert not (cwd / "abs_link.txt").is_symlink()
+            assert (cwd / "rel_link.txt").read_text() == "before\n"
+            assert (cwd / "sub_link.txt").read_text() == "sub data\n"
+            assert (cwd / "abs_link.txt").read_text() == "before\n"
+            # Mutating a materialized file in review dir must not touch target
+            (cwd / "abs_link.txt").write_text("mutated in review dir\n")
+            assert (repo / "value.txt").read_text() == "before\n"
+            return subprocess.CompletedProcess(args, 0, stdout="Verdict: PASS\n", stderr="")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr("runner.handlers._sandboxed_args_for_workdir", lambda args, workdir: args)
+    monkeypatch.setattr("runner.handlers._sanitized_env", lambda: {})
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", check_and_mutate_symlink)
+
+    result = _codergen(_review_node(prompt), ctx)
+    assert len(calls) == 1
+    assert (repo / "value.txt").read_text() == "before\n"
+
+
+def test_fresh_reviewer_rejects_escaping_and_dangling_symlinks_without_launch(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside data\n")
+    (repo / "escaping_link").symlink_to(outside)
+
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="echo",
+        state={"ao.worktree": str(repo)},
+    )
+    codex_calls: list[list[str]] = []
+    real_run = subprocess.run
+
+    def intercept_run(args, **kwargs):
+        if args and any("codex" in str(a) for a in args):
+            codex_calls.append(list(args))
+            return subprocess.CompletedProcess(args, 0, stdout="Verdict: PASS\n", stderr="")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr("runner.handlers._sandboxed_args_for_workdir", lambda args, workdir: args)
+    monkeypatch.setattr("runner.handlers._sanitized_env", lambda: {})
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", intercept_run)
+    result = _codergen(_review_node(prompt), ctx)
+
+    assert result.outcome == "error"
+    assert len(codex_calls) == 0, "Codex must not be launched when source has escaping symlink"
+    assert "symlink" in result.output.lower() or "isolation" in result.output.lower()
+
+    # Now test dangling symlink
+    (repo / "escaping_link").unlink()
+    (repo / "dangling_link").symlink_to(repo / "nonexistent.txt")
+    codex_calls.clear()
+    result_dangling = _codergen(_review_node(prompt), ctx)
+    assert result_dangling.outcome == "error"
+    assert len(codex_calls) == 0, "Codex must not be launched when source has dangling symlink"
+    assert "symlink" in result_dangling.output.lower() or "isolation" in result_dangling.output.lower()
+
+
+def test_fresh_reviewer_injected_linked_worktree_conversion_failure_rejects(tmp_path, monkeypatch):
+    main_repo = _repo(tmp_path / "main")
+    wt_dir = tmp_path / "wt"
+    subprocess.run(["git", "-C", str(main_repo), "worktree", "add", "-b", "feature-wt", str(wt_dir)], check=True)
+
+    # Injected corruption: overwrite .git in wt_dir with invalid gitdir reference
+    (wt_dir / ".git").write_text("gitdir: /nonexistent/path/worktrees/wt\n")
+
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="echo",
+        state={"ao.worktree": str(wt_dir)},
+    )
+    codex_calls: list[list[str]] = []
+    real_run = subprocess.run
+
+    def intercept_run(args, **kwargs):
+        if args and any("codex" in str(a) for a in args):
+            codex_calls.append(list(args))
+            return subprocess.CompletedProcess(args, 0, stdout="Verdict: PASS\n", stderr="")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr("runner.handlers._sandboxed_args_for_workdir", lambda args, workdir: args)
+    monkeypatch.setattr("runner.handlers._sanitized_env", lambda: {})
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", intercept_run)
+    result = _codergen(_review_node(prompt), ctx)
+
+    assert result.outcome == "error"
+    assert len(codex_calls) == 0, "Codex must not be launched when worktree conversion fails"
+    assert result.metadata["verdict"] == "unknown"
+
+
+def test_fresh_reviewer_detects_original_target_mutation_fails_closed(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="echo",
+        state={"ao.worktree": str(repo)},
+    )
+    real_run = subprocess.run
+
+    def mutate_original_target(args, **kwargs):
+        if args and args[0] == "codex":
+            # Simulate a bypass where original coder target is mutated directly during review
+            (repo / "value.txt").write_text("corrupted original\n")
+            return subprocess.CompletedProcess(args, 0, stdout="Verdict: PASS\n", stderr="")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr("runner.handlers._sandboxed_args_for_workdir", lambda args, workdir: args)
+    monkeypatch.setattr("runner.handlers._sanitized_env", lambda: {})
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", mutate_original_target)
+
+    result = _codergen(_review_node(prompt), ctx)
+
+    assert result.outcome == "error"
+    assert result.metadata["reviewer_mutated_tracked_files"] == "true"
+    assert "reviewer changed tracked files" in result.output.lower()
+
