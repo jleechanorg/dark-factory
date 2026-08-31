@@ -507,11 +507,13 @@ def test_fail_response_remains_valid_without_evidence_or_receipts() -> None:
     validate_execution_receipts((), validated)
 
 
-def test_two_node_controller_requires_receipt() -> None:
+def test_two_node_default_does_not_require_controller_receipt() -> None:
     from runner.parser import parse
 
     graph = parse(Path(__file__).parents[1] / "pipelines/slim/two_node.dot")
-    assert graph.nodes["cold_reviewer"].attrs.get("receipt_required") == "true"
+    reviewer = graph.nodes["cold_reviewer"]
+    assert "receipt_required" not in reviewer.attrs
+    assert "review_contract" not in reviewer.attrs
 
 
 @pytest.mark.parametrize(

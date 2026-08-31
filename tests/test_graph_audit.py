@@ -103,10 +103,14 @@ def test_resolved_type_label_matches_engine(name, attrs, want_label):
         ({"shape": "point"}, False, False),
         # No type, no shape — default codergen.
         ({}, True, False),
-        # class="review" on a codergen — STILL not a reviewer (the
-        # engine never resolves class to a handler; only type/shape
-        # participate in dispatch).
+        # class="review" alone is only a styling hint.
         ({"type": "codergen", "class": "review"}, True, False),
+        # The explicit verdict gate turns a review-class codergen into a gate.
+        (
+            {"type": "codergen", "class": "review", "verdict_gate": "true"},
+            False,
+            True,
+        ),
     ],
 )
 def test_classification_table(attrs, is_code, is_review):

@@ -40,7 +40,6 @@ _SUBPROCESS_NODE_TYPES = frozenset(
         "gate_er",
         "gate_code_standards",
         "human_gate",
-        "parallel_reviewer",
         "agy",
         "ao",
     }
@@ -78,9 +77,11 @@ def test_two_node_dot_parses_and_has_expected_topology() -> None:
     # Worker and cold_reviewer are the only goal-producing nodes.
     assert g.nodes["worker"].attrs.get("type") == "codergen"
     assert g.nodes["worker"].attrs.get("class") == "worker"
-    assert g.nodes["cold_reviewer"].attrs.get("type") == "parallel_reviewer"
+    assert g.nodes["cold_reviewer"].attrs.get("type") == "codergen"
     assert g.nodes["cold_reviewer"].attrs.get("class") == "review"
-    assert g.nodes["cold_reviewer"].attrs.get("review_contract") == "cold-review-v1"
+    assert g.nodes["cold_reviewer"].attrs.get("backend") == "codex"
+    assert g.nodes["cold_reviewer"].attrs.get("verdict_gate") == "true"
+    assert "review_contract" not in g.nodes["cold_reviewer"].attrs
 
 
 def test_two_node_dot_declares_timeout_on_every_subprocess_node() -> None:
@@ -111,74 +112,43 @@ def test_two_node_dot_declares_timeout_on_every_subprocess_node() -> None:
     )
 
 
-def test_two_node_dot_cold_reviewer_uses_only_its_supported_transport() -> None:
-    """Cold-review-v1 advertises only Codex, its sole receipt-capable transport."""
+def test_two_node_dot_cold_reviewer_is_a_fresh_codex_session() -> None:
+    """The default reviewer is a direct fresh Codex invocation, not a controller."""
     g = parse(ROOT / _PIPELINE)
     reviewer = g.nodes["cold_reviewer"]
-    priority = reviewer.attrs.get("backend_priority", "")
-    entries = [p.strip() for p in str(priority).split(",") if p.strip()]
-    assert entries == ["codex"], (
-        "cold-review-v1 must not advertise minimax/agy/claude fallbacks: "
-        "the controller has no compatible receipt transport for them"
-    )
+    assert reviewer.attrs.get("backend") == "codex"
+    assert reviewer.attrs.get("fresh_session") == "true"
+    assert reviewer.attrs.get("prompt") == "@prompts/slim/fresh_review.md"
 
 
-def test_two_node_dot_cold_reviewer_controller_binding() -> None:
-    """The cold_reviewer must bind to the SHA-pinned controller cold-review-v1 prompt contract.
-
-    This pins the requirement: use the existing SHA-pinned cold-review-v1
-    controller execution path (prompts/catalog/controller_cold_review_v1.md)
-    rather than any divergent prompt copy.
-    """
+def test_two_node_dot_default_bypasses_controller_machinery() -> None:
+    """The simple default path must not select the frozen controller stack."""
     g = parse(ROOT / _PIPELINE)
-    contract = g.nodes["cold_reviewer"].attrs.get("review_contract", "")
-    assert contract == "cold-review-v1", (
-        f"cold_reviewer review_contract must be cold-review-v1; got {contract!r}"
-    )
-    from runner.review_controller import PROMPT_ID, _TEMPLATE_PATH
-    assert PROMPT_ID == "controller-cold-review-v1"
-    assert _TEMPLATE_PATH.exists()
+    reviewer = g.nodes["cold_reviewer"]
+    for key in ("review_contract", "backend_priority", "receipt_required", "evidence_paths"):
+        assert key not in reviewer.attrs
 
 
-def test_two_node_dot_reviewer_has_no_target_authored_prompt_and_docs_agree() -> None:
-    """The slim graph cannot override its controller-owned reviewer contract."""
+def test_two_node_dot_reviewer_prompt_is_short_and_docs_agree() -> None:
+    """The default prompt states the goal directly without a controller packet."""
     reviewer = parse(ROOT / _PIPELINE).nodes["cold_reviewer"]
-    assert "prompt" not in reviewer.attrs
-    assert reviewer.attrs.get("type") == "parallel_reviewer"
-    assert reviewer.attrs.get("review_contract") == "cold-review-v1"
-    assert reviewer.attrs.get("backend_priority") == "codex"
+    assert reviewer.attrs.get("prompt") == "@prompts/slim/fresh_review.md"
+    assert reviewer.attrs.get("type") == "codergen"
     skill = (ROOT / ".claude/skills/dark-factory/SKILL.md").read_text()
-    assert "controller-owned `cold-review-v1`" in skill
-    assert '`type="parallel_reviewer"`' in skill
-    assert '`backend_priority="codex"`' in skill
-    assert not (ROOT / "prompts/slim/cold_reviewer.md").exists()
+    assert "fresh Codex reviewer" in skill
+    prompt = (ROOT / "prompts/slim/fresh_review.md").read_text()
+    assert len([line for line in prompt.splitlines() if line.strip()]) <= 6
+    assert "Use all available tools" in prompt
+    assert "Verdict: PASS" in prompt and "Verdict: FAIL" in prompt
 
 
-def test_two_node_dot_binds_the_worker_verification_receipt() -> None:
-    """The default cold reviewer receives the worker's declared evidence file."""
-    reviewer = parse(ROOT / _PIPELINE).nodes["cold_reviewer"]
-    assert reviewer.attrs.get("evidence_paths") == "evidence/worker-verification.json"
-
-
-def test_worker_prompt_requires_a_bounded_structured_verification_receipt() -> None:
-    """Every default worker must provide reproducible, non-fabricated review data."""
+def test_worker_prompt_is_direct_and_receipt_free() -> None:
+    """The worker receives the goal and copied review, without packet ceremony."""
     prompt = (ROOT / _WORKER_PROMPT).read_text()
-    assert "evidence/worker-verification.json" in prompt
-    assert "1 MiB" in prompt
-    for field in (
-        "schema_version",
-        "target_head_sha",
-        "goal",
-        "changed_files",
-        "commands",
-        "not_applicable",
-        "cwd",
-        "exit_code",
-        "stdout",
-        "stderr",
-    ):
-        assert field in prompt
-    assert "Do not fabricate" in prompt
+    assert "${goal}" in prompt
+    assert "${state._last_review_feedback}" in prompt
+    assert "evidence/worker-verification.json" not in prompt
+    assert "schema_version" not in prompt
 
 
 def test_worker_prompt_renders_untrusted_reviewer_feedback_only_on_retry() -> None:
@@ -194,3 +164,32 @@ def test_worker_prompt_renders_untrusted_reviewer_feedback_only_on_retry() -> No
     retry_attempt = _render_prompt(worker, ctx)
     assert "Finding: bind the snapshot lineage." in retry_attempt
     assert "${state._last_review_feedback}" not in retry_attempt
+
+
+def test_two_node_loop_copies_exact_review_output_to_worker_retry(tmp_path, monkeypatch) -> None:
+    from runner.engine import run
+    from runner.handler_core import Context, Result
+    from runner.handlers import TYPE_REGISTRY
+
+    review = "Blocking: src/value.py:7 mishandles zero.\nVerdict: FAIL\n"
+    worker_feedback: list[str | None] = []
+    review_visits = 0
+
+    def fake_codergen(node, ctx):
+        nonlocal review_visits
+        if node.name == "worker":
+            worker_feedback.append(ctx.state.get("_last_review_feedback"))
+            return Result(outcome="success", output="worker done")
+        review_visits += 1
+        if review_visits == 1:
+            return Result(outcome="failure", output=review)
+        return Result(outcome="success", output="Verdict: PASS\n")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "codergen", fake_codergen)
+    history = run(
+        parse(ROOT / _PIPELINE),
+        Context(goal="fix zero handling", workdir=tmp_path, backend="echo"),
+    )
+
+    assert history[-1].outcome == "success"
+    assert worker_feedback == [None, review]

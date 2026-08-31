@@ -448,7 +448,7 @@ dark-factory/
 
 ## ⭐ Recommended default: Agent Orchestrator (AO) with Antigravity
 
-For day-to-day work, the factory runs with the `--backend ao` default (configured to use the `--ao-agent antigravity` plugin to route headlessly through the Antigravity CLI, but swappable to other agents like `--ao-agent claude-code`). When `--pipeline` is omitted, `/f` and `/factory` default to `pipelines/slim/two_node.dot` (generic worker + controller cold reviewer); pass explicit `--pipeline <name>` to opt into non-default pipelines. The full decision table is [docs/pipeline-selection.md](docs/pipeline-selection.md); the common picks:
+For day-to-day work, the factory runs with the `--backend ao` default (configured to use the `--ao-agent antigravity` plugin to route headlessly through the Antigravity CLI, but swappable to other agents like `--ao-agent claude-code`). When `--pipeline` is omitted, `/f` and `/factory` default to `pipelines/slim/two_node.dot` (generic worker + fresh fully tooled Codex reviewer); pass explicit `--pipeline <name>` to opt into non-default pipelines. The full decision table is [docs/pipeline-selection.md](docs/pipeline-selection.md); the common picks:
 
 | Task | Pipeline |
 |------|----------|
