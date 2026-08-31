@@ -665,9 +665,16 @@ def _validate_snapshot_symlinks(
                     raise RuntimeError(
                         f"Target workspace contains unsafe escaping symlink: {entry} -> {resolved}"
                     )
+                entry_parent = entry.parent.resolve(strict=True)
+                if resolved == entry_parent or resolved in entry_parent.parents:
+                    raise RuntimeError(
+                        f"Target workspace symlink resolves to its own ancestor or root: {entry}"
+                    )
                 resolved_relative = resolved.relative_to(target_real)
                 if any(
-                    ignored == resolved_relative or ignored in resolved_relative.parents
+                    ignored == resolved_relative
+                    or ignored in resolved_relative.parents
+                    or resolved_relative in ignored.parents
                     for ignored in ignored_paths
                 ):
                     raise RuntimeError(

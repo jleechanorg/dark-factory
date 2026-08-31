@@ -340,6 +340,67 @@ def test_fresh_reviewer_rejects_tracked_alias_to_git_ignored_directory_before_co
     assert copied_sources == [], "ignored contents must never enter a review snapshot"
 
 
+def test_fresh_reviewer_rejects_absolute_alias_containing_ignored_descendant_before_copy(
+    tmp_path, monkeypatch
+):
+    repo = _repo(tmp_path)
+    runtime = repo / "runtime-cache"
+    ignored = runtime / "ignored"
+    ignored.mkdir(parents=True)
+    (runtime / ".gitignore").write_text("ignored/\n")
+    external = tmp_path / "external-runtime"
+    external.write_text("external runtime\n")
+    (ignored / "nested-link").symlink_to(external)
+    (repo / "runtime-alias").symlink_to(runtime.resolve(), target_is_directory=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "runtime-cache/.gitignore", "runtime-alias"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-qm", "track ignore and absolute alias"],
+        check=True,
+    )
+
+    assert _git_ignored_snapshot_paths(repo) == {
+        pathlib.Path("runtime-cache/ignored")
+    }
+
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="echo",
+        state={"ao.worktree": str(repo)},
+    )
+    copied_sources: list[pathlib.Path] = []
+    codex_calls: list[list[str]] = []
+    real_copytree = __import__("shutil").copytree
+    real_run = subprocess.run
+
+    def record_copytree(src, dst, *args, **kwargs):
+        copied_sources.append(pathlib.Path(src))
+        return real_copytree(src, dst, *args, **kwargs)
+
+    def intercept_run(args, **kwargs):
+        if args and args[0] == "codex":
+            codex_calls.append(list(args))
+            return subprocess.CompletedProcess(args, 0, stdout="Verdict: PASS\n", stderr="")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr("runner.handlers._sandboxed_args_for_workdir", lambda args, workdir: args)
+    monkeypatch.setattr("runner.handlers._sanitized_env", lambda: {})
+    monkeypatch.setattr("runner.handler_codergen.shutil.copytree", record_copytree)
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", intercept_run)
+
+    result = _codergen(_review_node(prompt), ctx)
+
+    assert result.outcome == "error"
+    assert "ignored" in result.output.lower()
+    assert codex_calls == []
+    assert copied_sources == [], "ignored contents must never enter a review snapshot"
+
+
 def test_fresh_reviewer_git_worktree_target_isolation(tmp_path, monkeypatch):
     main_repo = _repo(tmp_path / "main")
     wt_dir = tmp_path / "wt"
@@ -546,6 +607,53 @@ def test_fresh_reviewer_preserves_safe_relative_symlinks_and_isolates_absolute_l
     assert result.metadata["verdict"] == "pass"
     assert len(calls) == 1
     assert (repo / "value.txt").read_text() == "before\n"
+
+
+def test_fresh_reviewer_rejects_relative_link_to_snapshot_root_before_copy(
+    tmp_path, monkeypatch
+):
+    repo = _repo(tmp_path)
+    (repo / "sub").mkdir()
+    (repo / "sub" / "back").symlink_to("..", target_is_directory=True)
+    subprocess.run(["git", "-C", str(repo), "add", "sub/back"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-qm", "track root alias"], check=True
+    )
+
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="echo",
+        state={"ao.worktree": str(repo)},
+    )
+    copied_sources: list[pathlib.Path] = []
+    codex_calls: list[list[str]] = []
+    real_copytree = __import__("shutil").copytree
+    real_run = subprocess.run
+
+    def record_copytree(src, dst, *args, **kwargs):
+        copied_sources.append(pathlib.Path(src))
+        return real_copytree(src, dst, *args, **kwargs)
+
+    def intercept_run(args, **kwargs):
+        if args and args[0] == "codex":
+            codex_calls.append(list(args))
+            return subprocess.CompletedProcess(args, 0, stdout="Verdict: PASS\n", stderr="")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr("runner.handlers._sandboxed_args_for_workdir", lambda args, workdir: args)
+    monkeypatch.setattr("runner.handlers._sanitized_env", lambda: {})
+    monkeypatch.setattr("runner.handler_codergen.shutil.copytree", record_copytree)
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", intercept_run)
+
+    result = _codergen(_review_node(prompt), ctx)
+
+    assert result.outcome == "error"
+    assert "ancestor" in result.output.lower() or "root" in result.output.lower()
+    assert codex_calls == []
+    assert copied_sources == [], "ancestor links must be rejected before snapshot copy"
 
 
 def test_fresh_reviewer_rejects_escaping_and_dangling_symlinks_without_launch(tmp_path, monkeypatch):
