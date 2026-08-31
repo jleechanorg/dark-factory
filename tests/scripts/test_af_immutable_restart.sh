@@ -554,6 +554,7 @@ import json, sys
 
 terminal = {'killed', 'terminated', 'done', 'cleanup', 'errored', 'merged'}
 expected = sys.argv[1]
+expected_project = sys.argv[2]
 try:
     data = json.load(sys.stdin)
 except Exception as error:
@@ -561,13 +562,17 @@ except Exception as error:
 if not isinstance(data, list) or any(not isinstance(entry, dict) for entry in data):
     raise SystemExit('ao status JSON must be an array of objects')
 for entry in (data if isinstance(data, list) else []):
-    if not isinstance(entry, dict) or entry.get('name') != expected:
+    if (
+        not isinstance(entry, dict)
+        or entry.get('name') != expected
+        or entry.get('project') != expected_project
+    ):
         continue
     if entry.get('status') in terminal or entry.get('activity') == 'exited':
         break
     print(entry.get('branch', ''))
     break
-" "$AO_SESSION" 2>/dev/null || true)"
+" "$AO_SESSION" "$AO_TEST_PROJECT" 2>/dev/null || true)"
 if [ -z "$SESSION_BRANCH_AFTER" ] || [ "$SESSION_BRANCH_AFTER" != "$SESSION_BRANCH_BEFORE" ]; then
   echo "FAIL: AO session identity changed across restart (session=$AO_SESSION, branch=$SESSION_BRANCH_BEFORE -> ${SESSION_BRANCH_AFTER:-missing})" >&2
   exit 1
@@ -609,7 +614,7 @@ fi
 # --- Explicit stop / reap verification via the REAL product stop path.
 # CliSessions::stop (daemon/src/adapters.rs) runs `ao session kill <id>` --
 # this invokes that exact command, never a raw `kill -9`. ---
-if ! ao session kill "$AO_SESSION" >/dev/null 2>&1; then
+if ! AO_PROJECT_ID="$AO_TEST_PROJECT" ao session kill "$AO_SESSION" >/dev/null 2>&1; then
   echo "FAIL: real product stop path 'ao session kill $AO_SESSION' failed to execute" >&2
   exit 1
 fi
