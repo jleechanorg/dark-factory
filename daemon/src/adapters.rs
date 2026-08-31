@@ -4052,6 +4052,7 @@ pub struct CliSessions {
     spawned_session_worktrees: std::sync::Mutex<
         std::collections::HashMap<String, (String, std::path::PathBuf)>,
     >,
+    spawned_session_projects: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl CliSessions {
@@ -4068,6 +4069,7 @@ impl CliSessions {
             agent: agent.to_string(),
             spawned_worktrees: std::sync::Mutex::new(std::collections::HashMap::new()),
             spawned_session_worktrees: std::sync::Mutex::new(std::collections::HashMap::new()),
+            spawned_session_projects: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -4184,6 +4186,10 @@ impl CliSessions {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(session.0.clone(), (spec.branch.clone(), workspace));
+        self.spawned_session_projects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session.0.clone(), spec.ao_project.clone());
         Ok(session)
     }
 
@@ -5685,6 +5691,7 @@ exec "$FAKE_GIT_REAL_BIN" "$@"
 
     #[test]
     fn worker_spawn_rejects_same_origin_stale_ao_workspace_after_spawn() {
+        let real_git = system_git();
         let prompt = "same origin stale AO workspace";
         let branch = "factory/jleechan-contract-stale-ao-workspace-r1";
         // jleechan round-2 CI-blocking finding: this used to read
@@ -5707,11 +5714,12 @@ exec "$FAKE_GIT_REAL_BIN" "$@"
         // would deadlock: `with_fake_ao` below re-acquires the same
         // non-reentrant `crate::test_env_lock()`).
         let checkout = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let expected_revision = std::process::Command::new("git")
+        let expected_revision = std::process::Command::new(&real_git)
             .args(["rev-parse", "HEAD"])
             .current_dir(&checkout)
             .output()
             .unwrap();
+        assert!(expected_revision.status.success());
         let expected_revision = String::from_utf8(expected_revision.stdout)
             .unwrap()
             .trim()
@@ -5722,12 +5730,13 @@ exec "$FAKE_GIT_REAL_BIN" "$@"
         ));
         let _ = std::fs::remove_dir_all(&workspace);
         std::fs::create_dir_all(&workspace).unwrap();
-        std::process::Command::new("git")
+        assert!(std::process::Command::new(&real_git)
             .args(["init", "-q"])
             .current_dir(&workspace)
             .status()
-            .unwrap();
-        std::process::Command::new("git")
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new(&real_git)
             .args([
                 "remote",
                 "add",
@@ -5736,8 +5745,9 @@ exec "$FAKE_GIT_REAL_BIN" "$@"
             ])
             .current_dir(&workspace)
             .status()
-            .unwrap();
-        std::process::Command::new("git")
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new(&real_git)
             .args([
                 "-c",
                 "user.email=test@example.invalid",
@@ -5750,7 +5760,8 @@ exec "$FAKE_GIT_REAL_BIN" "$@"
             ])
             .current_dir(&workspace)
             .status()
-            .unwrap();
+            .unwrap()
+            .success());
 
         let (spawn_result, calls) = with_fake_ao(
             "stale_ao_workspace",
@@ -6047,6 +6058,34 @@ os.execv(real_git, [real_git] + args)
             serde_json::json!(["session", "kill", "session-project-bound", "-p", "dark-factory"])
         );
         assert_eq!(row["project"], "dark-factory");
+    }
+
+    #[test]
+    fn stop_uses_the_project_recorded_for_a_routed_session() {
+        let (_, calls) = with_fake_ao("routed_project_stop", serde_json::json!({}), |log| {
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            sessions
+                .spawned_session_projects
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert("session-routed-project".to_string(), "secondary-project".to_string());
+            let result = sessions.stop(&crate::tools::SessionId(
+                "session-routed-project".to_string(),
+            ));
+            (result, std::fs::read_to_string(log).unwrap_or_default())
+        });
+
+        let row: serde_json::Value = calls.lines().next().unwrap().parse().unwrap();
+        assert_eq!(
+            row["args"],
+            serde_json::json!([
+                "session",
+                "kill",
+                "session-routed-project",
+                "-p",
+                "secondary-project"
+            ])
+        );
     }
 
     #[test]
@@ -7861,7 +7900,19 @@ impl Sessions for CliSessions {
     }
 
     fn stop(&self, id: &SessionId) -> Result<(), DaemonError> {
-        Self::kill_in_project(&self.project, id)
+        let project = self
+            .spawned_session_projects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&id.0)
+            .cloned()
+            .unwrap_or_else(|| self.project.clone());
+        Self::kill_in_project(&project, id)?;
+        self.spawned_session_projects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id.0);
+        Ok(())
     }
 
     fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError> {
