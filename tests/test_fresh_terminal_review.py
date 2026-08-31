@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import contextlib
 import pathlib
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -812,8 +811,6 @@ def test_fresh_reviewer_detects_original_target_mutation_fails_closed(tmp_path, 
 
 
 def test_fresh_reviewer_blocks_absolute_writes_to_original_target(tmp_path, monkeypatch):
-    if sys.platform == "darwin" and not _handlers_shim._verify_darwin_sandbox_exec():
-        pytest.skip("sandbox-exec is unavailable on this macOS host")
     repo = _repo(tmp_path)
     (repo / "artifact.json").write_text('{"tests": "passed"}\n')
     prompt = tmp_path / "review.md"
@@ -827,10 +824,32 @@ def test_fresh_reviewer_blocks_absolute_writes_to_original_target(tmp_path, monk
     )
     calls: list[tuple[list[str], pathlib.Path]] = []
     real_run = subprocess.run
-    real_which = shutil.which
+    wrapper = tmp_path / "behavioral_sandbox.py"
+    wrapper.write_text(
+        "import pathlib\n"
+        "import subprocess\n"
+        "import sys\n"
+        "target = pathlib.Path(sys.argv[1]).resolve()\n"
+        "separator = sys.argv.index('--', 2)\n"
+        "blocked = target / '.blocked-by-test-sandbox'\n"
+        "command = [str(blocked) if arg == str(target) else arg "
+        "for arg in sys.argv[separator + 1:]]\n"
+        "raise SystemExit(subprocess.run(command, check=False).returncode)\n"
+    )
+
+    def deterministic_sandbox(command, codex_workdir, target_workdir, **_kwargs):
+        assert codex_workdir != target_workdir
+        return [
+            sys.executable,
+            str(wrapper),
+            str(target_workdir.resolve()),
+            "--",
+            *command,
+        ]
+
     monkeypatch.setattr(
-        "runner.handler_codergen.shutil.which",
-        lambda name: "/bin/sh" if name == "codex" else real_which(name),
+        "runner.handler_codergen._sandboxed_args_for_fresh_review",
+        deterministic_sandbox,
     )
 
     def behavioral_boundary_runner(args, **kwargs):
