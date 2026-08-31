@@ -621,6 +621,7 @@ def _git_ignored_snapshot_paths(target_workdir: pathlib.Path) -> set[pathlib.Pat
                 "--ignored",
                 "--exclude-standard",
                 "--directory",
+                "--no-empty-directory",
                 "-z",
             ],
             capture_output=True,

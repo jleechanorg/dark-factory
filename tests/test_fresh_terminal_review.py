@@ -12,6 +12,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 from conftest import make_node  # noqa: E402
 from runner.handlers import Context, _codergen  # noqa: E402
+from runner.handler_codergen import _git_ignored_snapshot_paths  # noqa: E402
 
 
 def _repo(tmp_path: pathlib.Path) -> pathlib.Path:
@@ -205,14 +206,14 @@ def test_fresh_reviewer_preserves_untracked_artifacts_and_unstaged_edits(tmp_pat
 
 def test_fresh_reviewer_excludes_git_ignored_runtime_directory(tmp_path, monkeypatch):
     repo = _repo(tmp_path)
-    (repo / ".gitignore").write_text(".venv/\n")
-    subprocess.run(["git", "-C", str(repo), "add", ".gitignore"], check=True)
-    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "ignore runtime"], check=True)
 
     interpreter = tmp_path / "python3"
     interpreter.write_text("external interpreter\n")
     (repo / ".venv" / "bin").mkdir(parents=True)
+    (repo / ".venv" / ".gitignore").write_text("*\n")
     (repo / ".venv" / "bin" / "python3").symlink_to(interpreter)
+
+    assert _git_ignored_snapshot_paths(repo) == {pathlib.Path(".venv")}
 
     prompt = tmp_path / "review.md"
     prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
@@ -449,6 +450,8 @@ def test_fresh_reviewer_rejects_escaping_and_dangling_symlinks_without_launch(tm
     outside = tmp_path / "outside.txt"
     outside.write_text("outside data\n")
     (repo / "escaping_link").symlink_to(outside)
+    subprocess.run(["git", "-C", str(repo), "add", "escaping_link"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "track link"], check=True)
 
     prompt = tmp_path / "review.md"
     prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
