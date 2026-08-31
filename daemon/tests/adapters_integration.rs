@@ -1,4 +1,6 @@
-use daemon::adapters::{ChainLlm, CliScm, CliSessions, CliTracker, CliVcs};
+use daemon::adapters::{
+    ChainLlm, CliScm, CliSessions, CliTracker, CliVcs, RecoveryOutcome, ensure_ao_recovery,
+};
 use daemon::tools::{Llm, Scm, SessionActivity, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
 
 /// Guard for setting environment variables during tests.
@@ -872,4 +874,616 @@ fn test_cli_sessions_ao_status_includes_project_arg_scoped() {
     );
 
     let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}
+
+// ============================================================================
+// RED tests for dark-factory #778: project-scoped AO recovery contract
+// ============================================================================
+//
+// Bead dark-factory-5ep4 (P0/factory). The contract for
+// `daemon::adapters::ensure_ao_recovery(project)` is being defined in this
+// PR. These are the RED tests — they reference an API surface that does not
+// yet exist in `daemon/src/adapters.rs`, so `cargo test
+// --test adapters_integration` MUST fail to compile until the GREEN side
+// lands (out of scope for this PR per the bead's "RED ONLY" rule).
+//
+// Acceptance criteria pinned by these tests:
+//
+//   * Healthy AO preflight MUST NOT shell out to `ao start`.
+//   * Unrelated preflight failures (e.g. quota, parse errors) MUST NOT
+//     shell out to `ao start` — only the canonical "AO unavailable"
+//     anchors trigger recovery.
+//   * Unavailable preflight MUST shell out to `ao start` exactly once
+//     per recovery attempt, and the argv MUST be the exact AO v0.1.3
+//     shape: `ao start --project <project>` (long flag, single space,
+//     project value immediately after). No `--project=foo`, no `-pfoo`,
+//     no substring-only matches.
+//   * Status probes used by the recovery loop MUST be project-scoped:
+//     `ao status -p <project> --json` (the same exact argv the existing
+//     #752 contract pins for `CliSessions::active_count`/`attach`/...).
+//   * Concurrent callers of `ensure_ao_recovery` for the same project
+//     MUST elect exactly one starter; the losers MUST NOT shell out to
+//     `ao start` while the starter is in flight.
+//   * A failed `ao start` MUST release the per-project lock so the next
+//     caller can retry — there is no permanent deadlock from a transient
+//     miss.
+//   * `rc = -1` (subprocess exec failure: PATH lookup, permissions,
+//     signal kill) MUST NOT be overclassified as "AO unavailable ->
+//     restart". The contract must treat that as `Unknown` and propagate
+//     the underlying failure verbatim.
+//
+// Every test below acquires `FAKE_ENV_LOCK` for every PATH/env mutation,
+// matching the file-wide invariant for tests that touch `PATH`. The fake
+// `ao` scripts are planted in a unique per-test tempdir and removed at
+// the end so concurrent test execution cannot observe leftover binaries.
+
+/// Project name the GREEN contract must derive for `worldarchitect.ai`,
+/// matching the existing `CliSessions::new` rule (`worldarchitect.ai` ->
+/// `worldarchitect`). Pinning this here ensures the recovery contract
+/// inherits the same project-naming convention as every other adapter
+/// method that already passes `bdd worldarchitect #9615` review.
+const RECOVERY_TEST_PROJECT: &str = "worldarchitect";
+
+/// Plant a fake `ao` binary at `<dir>/ao` that records every invocation
+/// to `FAKE_AO_LOG` and dispatches on `argv[1]` (the subcommand) into one
+/// of the configured response handlers.
+///
+/// `mode` controls how the fake responds:
+///   * `"healthy"`             -> `status` returns a valid 1-element JSON
+///                                array, `start` is never invoked.
+///   * `"unrelated_quota"`     -> `status` exits 1 with stderr containing
+///                                `quota exceeded` (NOT a restart anchor).
+///                                `start` is never invoked.
+///   * `"unavailable_then_healthy"` -> first `status` returns
+///                                "daemon not running" + exit 2; subsequent
+///                                `status` returns valid JSON. `start` is
+///                                invoked exactly once.
+///   * `"unavailable_then_fail"`    -> first `status` returns
+///                                "daemon not running" + exit 2; `start`
+///                                fails (exit 1, "could not bind port").
+///   * `"exec_failure"`        -> the fake `ao` exec itself fails (we
+///                                arrange this by NOT placing the script
+///                                on PATH and instead letting the daemon
+///                                invoke a real `ao` if present — the
+///                                expected contract behavior is to
+///                                propagate the rc=-1, NOT start).
+#[cfg(unix)]
+fn write_fake_ao_with_mode(dir: &std::path::Path, mode: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("ao");
+    let start_block: String = match mode {
+        "unavailable_then_healthy" => r#"
+        if [ "$1" = "start" ]; then
+            echo "AO_FAKE_START_INVOKED"
+            exit 0
+        fi
+"#
+        .to_string(),
+        "unavailable_then_fail" => r#"
+        if [ "$1" = "start" ]; then
+            echo "AO_FAKE_START_INVOKED_BUT_FAILED" >&2
+            exit 1
+        fi
+"#
+        .to_string(),
+        _ => String::new(),
+    };
+    let status_block: String = match mode {
+        "healthy" => r#"
+        if [ "$1" = "status" ]; then
+            echo '[{"name":"session-1","branch":"feature-branch","status":"working","activity":"working"}]'
+            exit 0
+        fi
+"#
+        .to_string(),
+        "unrelated_quota" => r#"
+        if [ "$1" = "status" ]; then
+            echo "quota exceeded: 5000 points/hr reset at 23:00Z" >&2
+            exit 1
+        fi
+"#
+        .to_string(),
+        "unavailable_then_healthy" => {
+            let mut s = String::from(
+                r#"
+        STATUS_CALL_COUNT=0
+        if [ "$1" = "status" ]; then
+            STATUS_CALL_COUNT=$((STATUS_CALL_COUNT + 1))
+            if [ "$STATUS_CALL_COUNT" = "1" ]; then
+                echo "Error: AO daemon not running for project 'worldarchitect'" >&2
+                exit 2
+            fi
+            echo '[{"name":"session-1","branch":"feature-branch","status":"working","activity":"working"}]'
+            exit 0
+        fi
+"#,
+            );
+            s.push_str(&start_block);
+            s
+        }
+        "unavailable_then_fail" => {
+            let mut s = String::from(
+                r#"
+        if [ "$1" = "status" ]; then
+            echo "Error: AO daemon not running for project 'worldarchitect'" >&2
+            exit 2
+        fi
+"#,
+            );
+            s.push_str(&start_block);
+            s
+        }
+        _ => String::new(),
+    };
+    let script = format!(
+        r#"#!/bin/sh
+# Log all argv to FAKE_AO_LOG
+if [ -n "$FAKE_AO_LOG" ]; then
+    echo "$@" >> "$FAKE_AO_LOG"
+fi
+{status_block}
+exit 0
+"#,
+    );
+    std::fs::write(&path, &script).unwrap_or_else(|e| panic!("failed to write fake ao: {e}"));
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+}
+
+/// Counts the number of `ao start` invocations in the fake-ao log file.
+#[cfg(unix)]
+fn count_ao_start_calls(log_file: &std::path::Path) -> usize {
+    let content = std::fs::read_to_string(log_file).unwrap_or_default();
+    content
+        .lines()
+        .filter(|line| {
+            // Filter to lines whose argv starts with `start` — i.e. a real
+            // `start` subcommand invocation, not a `-status` substring match.
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            tokens.first().copied() == Some("start")
+        })
+        .count()
+}
+
+/// Counts the number of `ao status` invocations in the fake-ao log file.
+#[cfg(unix)]
+fn count_ao_status_calls(log_file: &std::path::Path) -> usize {
+    let content = std::fs::read_to_string(log_file).unwrap_or_default();
+    content
+        .lines()
+        .filter(|line| {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            tokens.first().copied() == Some("status")
+        })
+        .count()
+}
+
+/// Returns the argv of the Nth `ao start` invocation (0-indexed) for exact
+/// shape assertions. Returns `None` if no Nth start was logged.
+#[cfg(unix)]
+fn nth_ao_start_argv(log_file: &std::path::Path, n: usize) -> Option<Vec<String>> {
+    let content = std::fs::read_to_string(log_file).unwrap_or_default();
+    let mut starts = content.lines().filter(|line| {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        tokens.first().copied() == Some("start")
+    });
+    starts.nth(n).map(|line| {
+        line.split_whitespace()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+    })
+}
+
+/// Returns the argv of the Nth `ao status` invocation (0-indexed).
+#[cfg(unix)]
+fn nth_ao_status_argv(log_file: &std::path::Path, n: usize) -> Option<Vec<String>> {
+    let content = std::fs::read_to_string(log_file).unwrap_or_default();
+    let mut statuses = content.lines().filter(|line| {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        tokens.first().copied() == Some("status")
+    });
+    statuses.nth(n).map(|line| {
+        line.split_whitespace()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+    })
+}
+
+/// Set up a unique fake-ao tempdir + PATH shim + FAKE_AO_LOG, with the
+/// per-test recovery mode applied. Returns `(fake_bin_dir, log_file)`.
+/// Caller is responsible for `remove_dir_all` + EnvVarGuard + lock release.
+#[cfg(unix)]
+fn setup_recovery_test_env(mode: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let fake_bin_dir = std::env::temp_dir().join(format!(
+        "afd_recovery_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&fake_bin_dir).expect("create fake_bin_dir");
+    write_fake_ao_with_mode(&fake_bin_dir, mode);
+    let log_file = fake_bin_dir.join("ao_calls.log");
+    (fake_bin_dir, log_file)
+}
+
+/// Install PATH + FAKE_AO_LOG for a recovery test, returning an
+/// `EnvVarGuard` that restores the previous values on Drop.
+#[cfg(unix)]
+fn install_recovery_test_path(
+    fake_bin_dir: &std::path::Path,
+    log_file: &std::path::Path,
+) -> EnvVarGuard {
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!(
+        "{}:{}",
+        fake_bin_dir.display(),
+        original_path
+    );
+    let log_file_str = log_file.to_string_lossy().to_string();
+    EnvVarGuard::set(&[("PATH", &new_path), ("FAKE_AO_LOG", &log_file_str)])
+}
+
+// ----------------------------------------------------------------------------
+// Contract test 1: healthy AO preflight MUST NOT trigger `ao start`.
+// ----------------------------------------------------------------------------
+
+#[test]
+#[cfg(unix)]
+fn test_ao_recovery_healthy_preflight_never_starts_daemon() {
+    let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (fake_bin_dir, log_file) = setup_recovery_test_env("healthy");
+    let _env_guard = install_recovery_test_path(&fake_bin_dir, &log_file);
+
+    let outcome = ensure_ao_recovery(RECOVERY_TEST_PROJECT);
+
+    assert!(
+        matches!(outcome, RecoveryOutcome::Healthy { .. }),
+        "healthy preflight must produce RecoveryOutcome::Healthy, got: {outcome:?}"
+    );
+    assert_eq!(
+        count_ao_start_calls(&log_file),
+        0,
+        "healthy preflight MUST NOT shell out to `ao start` (logged calls: {:?})",
+        std::fs::read_to_string(&log_file).unwrap_or_default()
+    );
+    assert!(
+        count_ao_status_calls(&log_file) >= 1,
+        "recovery contract MUST probe `ao status` at least once for the project, got 0 calls"
+    );
+    let status_argv = nth_ao_status_argv(&log_file, 0).expect("first status call");
+    assert!(
+        status_argv.iter().any(|t| t == "-p"),
+        "status argv must include `-p` flag (the AO v0.1.3 project short form), got: {status_argv:?}"
+    );
+    assert_eq!(
+        status_argv
+            .iter()
+            .position(|t| t == "-p")
+            .and_then(|i| status_argv.get(i + 1)),
+        Some(&RECOVERY_TEST_PROJECT.to_string()),
+        "status argv must scope to project `{RECOVERY_TEST_PROJECT}` after `-p`, got: {status_argv:?}"
+    );
+    assert!(
+        status_argv.iter().any(|t| t == "--json"),
+        "status argv must include `--json` for parseable recovery outcomes, got: {status_argv:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}
+
+// ----------------------------------------------------------------------------
+// Contract test 2: unrelated preflight failure MUST NOT trigger `ao start`.
+// ----------------------------------------------------------------------------
+
+#[test]
+#[cfg(unix)]
+fn test_ao_recovery_unrelated_failure_never_starts_daemon() {
+    let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (fake_bin_dir, log_file) = setup_recovery_test_env("unrelated_quota");
+    let _env_guard = install_recovery_test_path(&fake_bin_dir, &log_file);
+
+    let outcome = ensure_ao_recovery(RECOVERY_TEST_PROJECT);
+
+    // An unrelated stderr like "quota exceeded" must surface as
+    // `Unknown` (NOT a restart trigger) and MUST NOT shell out to
+    // `ao start`. The exact contract surface is pinned here so a
+    // substring-only matcher (e.g. "contains `not running`") cannot
+    // accidentally reclassify quota as Unavailable.
+    assert!(
+        matches!(outcome, RecoveryOutcome::Unknown { .. }),
+        "quota/preflight unrelated failure must produce RecoveryOutcome::Unknown, got: {outcome:?}"
+    );
+    assert_eq!(
+        count_ao_start_calls(&log_file),
+        0,
+        "unrelated preflight failure MUST NOT shell out to `ao start` (the entire recovery contract exists specifically to avoid restarting AO for non-AO failures), got calls: {:?}",
+        std::fs::read_to_string(&log_file).unwrap_or_default()
+    );
+
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}
+
+// ----------------------------------------------------------------------------
+// Contract test 3: `ao start` argv MUST be the exact AO v0.1.3 shape.
+// ----------------------------------------------------------------------------
+
+#[test]
+#[cfg(unix)]
+fn test_ao_recovery_unavailable_starts_with_exact_v013_argv() {
+    let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (fake_bin_dir, log_file) = setup_recovery_test_env("unavailable_then_healthy");
+    let _env_guard = install_recovery_test_path(&fake_bin_dir, &log_file);
+
+    let outcome = ensure_ao_recovery(RECOVERY_TEST_PROJECT);
+
+    assert!(
+        matches!(outcome, RecoveryOutcome::Restarted { .. }),
+        "Unavailable -> healthy-after-start must produce RecoveryOutcome::Restarted, got: {outcome:?}"
+    );
+
+    let start_argv = nth_ao_start_argv(&log_file, 0).expect("ao start invocation");
+    // AO v0.1.3 contract: argv[0] == "start", argv[1..2] == ["--project",
+    // <project>]. Exactly one `--project` flag, exactly one project value,
+    // no `--project=foo`, no `-pfoo`, no `-project`. Reject substring-only
+    // matches: `--project` must appear as its own whitespace-delimited token
+    // AND the project value must be the immediately-following token.
+    assert_eq!(
+        start_argv.first().map(|s| s.as_str()),
+        Some("start"),
+        "first token of recovery `ao start` invocation must be the literal `start` subcommand, got: {start_argv:?}"
+    );
+    let p_idx = start_argv
+        .iter()
+        .position(|t| t == "--project")
+        .unwrap_or_else(|| panic!("`ao start` argv missing `--project` flag (must be its own whitespace-delimited token, NOT `--project=foo` or substring `-project`): {start_argv:?}"));
+    assert_eq!(
+        start_argv.get(p_idx + 1).map(|s| s.as_str()),
+        Some(RECOVERY_TEST_PROJECT),
+        "the token immediately after `--project` must be the project name `{RECOVERY_TEST_PROJECT}`, got: {start_argv:?}"
+    );
+    // Substring-only overclassification guard: ensure no `--project=...`
+    // (which would also match `--project` as a substring) appears.
+    assert!(
+        !start_argv.iter().any(|t| t.starts_with("--project=")),
+        "`--project=...` form is NOT the AO v0.1.3 recovery contract (this is exactly the substring-only classification the contract must reject), got: {start_argv:?}"
+    );
+    // No `--headless` / `--json` aliases leaking in: AO v0.1.3's `start`
+    // argv is exactly `[start, --project, <project>]` for the recovery
+    // case (the headless flag, if needed, is the operator's job via
+    // DARK_FACTORY_AO_START_CMD env var, NOT the daemon's argv).
+    assert_eq!(
+        start_argv.len(),
+        3,
+        "AO v0.1.3 recovery `ao start` argv must be exactly `[start, --project, <project>]` (no extra flags injected), got: {start_argv:?}"
+    );
+
+    // Re-probe MUST happen after start to confirm AO is now healthy.
+    let status_count_after_start = count_ao_status_calls(&log_file);
+    assert!(
+        status_count_after_start >= 2,
+        "recovery loop MUST re-probe with `ao status` after `ao start` (got {status_count_after_start} status calls, expected >=2: preflight + post-start)"
+    );
+    let re_probe_argv =
+        nth_ao_status_argv(&log_file, 1).expect("post-start re-probe");
+    assert_eq!(
+        re_probe_argv
+            .iter()
+            .position(|t| t == "-p")
+            .and_then(|i| re_probe_argv.get(i + 1)),
+        Some(&RECOVERY_TEST_PROJECT.to_string()),
+        "post-start re-probe MUST also be project-scoped (`-p {RECOVERY_TEST_PROJECT}`), got: {re_probe_argv:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}
+
+// ----------------------------------------------------------------------------
+// Contract test 4: concurrent callers MUST elect exactly one starter.
+// ----------------------------------------------------------------------------
+
+#[test]
+#[cfg(unix)]
+fn test_ao_recovery_concurrent_callers_elect_one_starter() {
+    let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (fake_bin_dir, log_file) = setup_recovery_test_env("unavailable_then_healthy");
+    let _env_guard = install_recovery_test_path(&fake_bin_dir, &log_file);
+
+    // Fan out 4 concurrent callers onto the daemon's threadpool. Each
+    // will independently try `ensure_ao_recovery("worldarchitect")`.
+    // The contract must serialize the actual `ao start` invocation:
+    // exactly one starter wins, the others observe the start already
+    // succeeded (via the post-start re-probe) and resolve as
+    // `Restarted` WITHOUT shelling out to `ao start` themselves.
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            std::thread::spawn(|| -> RecoveryOutcome {
+                ensure_ao_recovery(RECOVERY_TEST_PROJECT)
+            })
+        })
+        .collect();
+    let outcomes: Vec<RecoveryOutcome> = handles
+        .into_iter()
+        .map(|h: std::thread::JoinHandle<RecoveryOutcome>| {
+            h.join().expect("recovery thread panicked")
+        })
+        .collect();
+
+    // Every caller must observe a successful recovery (they all
+    // started from the same Unavailable state and the one starter
+    // brought AO back).
+    for (i, outcome) in outcomes.iter().enumerate() {
+        assert!(
+            matches!(outcome, RecoveryOutcome::Restarted { .. }),
+            "concurrent caller #{i} must observe Restarted (the elected starter's start succeeded), got: {outcome:?}"
+        );
+    }
+
+    // Exactly ONE `ao start` invocation must have been shelled out.
+    // This is the election guarantee: N concurrent callers do NOT
+    // produce N `ao start` calls.
+    let start_count = count_ao_start_calls(&log_file);
+    assert_eq!(
+        start_count, 1,
+        "concurrent recovery callers MUST elect exactly one starter (got {start_count} `ao start` invocations — each extra one is a duplicate-port-bind race the contract forbids), logged: {:?}",
+        std::fs::read_to_string(&log_file).unwrap_or_default()
+    );
+
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}
+
+// ----------------------------------------------------------------------------
+// Contract test 5: failed `ao start` MUST release the per-project lock.
+// ----------------------------------------------------------------------------
+
+#[test]
+#[cfg(unix)]
+fn test_ao_recovery_failed_start_releases_lock_for_next_caller() {
+    let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (fake_bin_dir, log_file) = setup_recovery_test_env("unavailable_then_fail");
+    let _env_guard = install_recovery_test_path(&fake_bin_dir, &log_file);
+
+    // First caller: AO is unavailable, the recovery loop attempts
+    // `ao start`, the start fails -> FailClosed outcome.
+    let first = ensure_ao_recovery(RECOVERY_TEST_PROJECT);
+    assert!(
+        matches!(first, RecoveryOutcome::FailClosed { .. }),
+        "first caller with failed start MUST observe FailClosed, got: {first:?}"
+    );
+    assert_eq!(
+        count_ao_start_calls(&log_file),
+        1,
+        "first caller MUST shell out to `ao start` exactly once (preflight + start), got: {:?}",
+        std::fs::read_to_string(&log_file).unwrap_or_default()
+    );
+
+    // Second caller: the per-project lock MUST be released so this
+    // caller can attempt again. If the lock were leaked (a common
+    // bug in lazy-initialized Mutex patterns), this caller would
+    // observe a stale `Unavailable` and silently skip the second
+    // start — which is the failure mode the contract exists to
+    // prevent.
+    let second = ensure_ao_recovery(RECOVERY_TEST_PROJECT);
+    assert!(
+        matches!(second, RecoveryOutcome::FailClosed { .. }),
+        "second caller (after a failed start) MUST be allowed to retry and observe FailClosed again (not blocked on a leaked lock), got: {second:?}"
+    );
+    assert_eq!(
+        count_ao_start_calls(&log_file),
+        2,
+        "second caller MUST shell out to `ao start` exactly once more (proves the per-project lock was released after the first failure), got: {:?}",
+        std::fs::read_to_string(&log_file).unwrap_or_default()
+    );
+
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}
+
+// ----------------------------------------------------------------------------
+// Contract test 6: argv parser MUST reject substring-only classification.
+// ----------------------------------------------------------------------------
+
+#[test]
+#[cfg(unix)]
+fn test_ao_recovery_argv_parser_rejects_substring_only_classification() {
+    let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (fake_bin_dir, log_file) = setup_recovery_test_env("healthy");
+    let _env_guard = install_recovery_test_path(&fake_bin_dir, &log_file);
+
+    let _outcome = ensure_ao_recovery(RECOVERY_TEST_PROJECT);
+
+    // Walk every logged `ao status` invocation and assert the
+    // project-scoping flag is its own whitespace-delimited token
+    // followed by the project name. A substring-only matcher would
+    // let `-project` or `--projects` or `--project=foo` slip through.
+    let log = std::fs::read_to_string(&log_file).unwrap_or_default();
+    assert!(!log.is_empty(), "fake ao must have logged at least one call");
+    for line in log.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.first().copied() != Some("status") {
+            continue;
+        }
+        // Reject substring-only forms of the project flag.
+        assert!(
+            !tokens
+                .iter()
+                .any(|t| t.starts_with("--project=") || t.starts_with("-p=") || *t == "-pproject" || *t == "-project"),
+            "argv contains a substring-only or `-Xfoo`-style project flag (the contract MUST reject these so a future code path can't classify an unrelated flag as the project): {tokens:?}"
+        );
+        // Reject a `--projects` (plural) variant: a substring-only
+        // matcher would accept `--projects` as containing the
+        // substring `--project`.
+        assert!(
+            !tokens.iter().any(|t| *t == "--projects" || *t == "--Project"),
+            "argv contains a `--projects`/`--Project` variant that a substring-only matcher would misclassify as the project flag: {tokens:?}"
+        );
+        // The exact, project-scoped argv shape.
+        let p_idx = tokens
+            .iter()
+            .position(|&t| t == "-p")
+            .unwrap_or_else(|| panic!("status argv missing `-p` flag (must be its own whitespace-delimited token, NOT `-pfoo` or `-project`): {tokens:?}"));
+        assert_eq!(
+            tokens.get(p_idx + 1).copied(),
+            Some(RECOVERY_TEST_PROJECT),
+            "status argv token after `-p` must be exactly `{RECOVERY_TEST_PROJECT}` (substring-only `RECOVERY` or `worldarchi` would have been caught by the explicit equality check), got: {tokens:?}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}
+
+// ----------------------------------------------------------------------------
+// Contract test 7: rc=-1 (exec failure) MUST NOT trigger `ao start`.
+// ----------------------------------------------------------------------------
+
+#[test]
+#[cfg(unix)]
+fn test_ao_recovery_rc_minus_one_exec_failure_does_not_classify_as_unavailable() {
+    let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Force `Command::new("ao").output()` to fail at the OS layer by
+    // pointing PATH at a directory that contains NO executable named
+    // `ao`. `Command::output()` returns `Err` in that case (which the
+    // adapter layer surfaces as `rc: -1`), NOT a successful spawn
+    // with a non-zero exit code. A naive classifier that treats
+    // `rc = -1` as "AO unavailable -> restart" would then call
+    // `ao start --project worldarchitect`, which would ALSO fail at
+    // the exec layer (no `ao` on PATH), and the contract would be
+    // silently broken. The contract must surface this as
+    // `Unknown` (or surface the exec error directly) and MUST NOT
+    // shell out to `ao start`.
+    let empty_dir = std::env::temp_dir().join(format!(
+        "afd_recovery_empty_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&empty_dir).expect("create empty_dir");
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", empty_dir.display(), original_path);
+    let _env_guard = EnvVarGuard::set(&[("PATH", &new_path)]);
+    // Sentinel log file path (never written, but if the contract
+    // accidentally invokes `ao start` we want a place to record the
+    // leak — there's no executable to write to, so the absence of
+    // the file is itself the assertion).
+    let sentinel_log = empty_dir.join("ao_calls.log");
+    assert!(
+        !sentinel_log.exists(),
+        "sentinel log file must not exist before the test runs"
+    );
+
+    let outcome = ensure_ao_recovery(RECOVERY_TEST_PROJECT);
+
+    // The contract MUST surface the exec failure. The exact outcome
+    // variant is intentionally left to the GREEN side, but it MUST
+    // NOT be `Restarted` (which would imply the recovery loop
+    // successfully invoked `ao start`).
+    assert!(
+        !matches!(outcome, RecoveryOutcome::Restarted { .. }),
+        "exec-layer failure (rc=-1) MUST NOT be overclassified as `Restarted` (the contract exists specifically to avoid this: an exec failure on PATH means the daemon cannot invoke `ao` AT ALL, so a successful `ao start` is impossible), got: {outcome:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&empty_dir);
 }
