@@ -2264,12 +2264,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         match router::route(deps.llm, bead) {
             Ok(verdict) => {
                 summary.beads_routed += 1;
-                let verdict_str = match verdict {
-                    RoutingVerdict::SmallPath => "SMALL_PATH",
-                    RoutingVerdict::StandardPath => "STANDARD_PATH",
-                    RoutingVerdict::ResearchPath => "RESEARCH_PATH",
-                    RoutingVerdict::GenericPath => "GENERIC_PATH",
-                };
+                let verdict_str = dispatch::routing_verdict_label(verdict);
                 emit(
                     deps.telemetry_log,
                     &bead.id,
