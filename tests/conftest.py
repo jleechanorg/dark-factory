@@ -46,6 +46,21 @@ def _pipeline(name: str) -> pathlib.Path:
     return ROOT / "pipelines" / "factory" / name
 
 
+def install_adversarial_reviewer_stub(monkeypatch) -> None:
+    """Stub only the external fresh reviewer while preserving real codergen nodes."""
+    from runner.handlers import Result, TYPE_REGISTRY
+
+    original_codergen = TYPE_REGISTRY["codergen"]
+
+    def fake_codergen(node, ctx):
+        if node.name != "adversarial_reviewer":
+            return original_codergen(node, ctx)
+        outcome = ctx.state.get("adversarial_reviewer.outcome") or "success"
+        return Result(outcome=outcome, output="fake_adversarial_reviewer")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "codergen", fake_codergen)
+
+
 def run_conformance(*args: str, timeout: int = 600, env: dict | None = None) -> "subprocess.CompletedProcess[str]":
     """Run `bin/conformance` with the given args, return CompletedProcess.
 

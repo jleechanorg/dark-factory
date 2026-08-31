@@ -14,7 +14,7 @@ ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from conftest import _pipeline  # noqa: E402
+from conftest import _pipeline, install_adversarial_reviewer_stub  # noqa: E402
 
 from runner.engine import run  # noqa: E402
 from runner.handlers import Context, Result, TYPE_REGISTRY  # noqa: E402
@@ -30,6 +30,8 @@ def _stub_fail_open_web_advice(monkeypatch):
     the graph reach its exit without invoking ``gh``/browser transports or
     depending on operator credentials.
     """
+    install_adversarial_reviewer_stub(monkeypatch)
+
     def fake_web_advice(node, ctx):
         return Result(
             outcome="success",
@@ -48,7 +50,6 @@ def test_pr_gates_runs_holdout_before_evidence_gates(monkeypatch):
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
     g = parse(_pipeline("pr_gates.dot"))
     assert g.nodes["holdout"].attrs.get("type") == "holdout_eval"
-    g.nodes["adversarial_reviewer"].attrs["test_fixture"] = "true"
 
     ctx = Context(goal="t", workdir=ROOT, backend="echo")
     ctx.state["gate_skeptic.outcome"] = "success"
@@ -98,7 +99,6 @@ def test_gate_failure_short_circuits(monkeypatch):
         return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
     g = parse(_pipeline("gates.dot"))
-    g.nodes["adversarial_reviewer"].attrs["test_fixture"] = "true"
     ctx = Context(goal="t", workdir=ROOT, backend="echo")
     ctx.state["_df_controller_fixture"] = "cold-review-v1"
     ctx.state["gate_skeptic.outcome"] = "success"
@@ -127,10 +127,7 @@ def test_gate_nonzero_returncode_cannot_spoof_pass(monkeypatch, tmp_path):
         pre = ctx.state.get(f"{node.name}.outcome")
         return Result(outcome=pre or "success", output=f"fake_skeptic({node.name})")
     monkeypatch.setitem(TYPE_REGISTRY, "gate_skeptic", fake_skeptic)
-    def fake_parallel_reviewer(node, ctx):
-        pre = ctx.state.get(f"{node.name}.outcome")
-        return Result(outcome=pre or "success", output=f"fake_parallel_reviewer({node.name})")
-    monkeypatch.setitem(TYPE_REGISTRY, "parallel_reviewer", fake_parallel_reviewer)
+    install_adversarial_reviewer_stub(monkeypatch)
 
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
