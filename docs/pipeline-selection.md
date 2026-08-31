@@ -20,6 +20,7 @@ the default two-node graph does not select that contract.
 | Task | Pipeline | Notes |
 |------|----------|-------|
 | **Default `/f` / `/factory` invocation** | **`pipelines/slim/two_node.dot`** | Generic worker + fresh fully tooled Codex reviewer + verbatim feedback loop. The user-stated default since 2026-08-02. |
+| Two-node with holdouts (opt-in) | `pipelines/slim/two_node_holdout.dot` | Optional opt-in: generic worker + fresh Codex reviewer + behavioral holdout eval. Does not alter the default `/f` / `/factory` pipeline. |
 | Wiring smoke / install verify | `pipelines/factory/hello.dot` | `--backend echo`; explore → plan → implement → holdout → fix (max 3) → exit |
 | New feature, full production loop | `pipelines/slim/minimal_feature.dot` | explore → plan → test → review → holdout → gates |
 | New feature, minimal loop | `pipelines/factory/hello.dot` | plan → implement → holdout → fix |
