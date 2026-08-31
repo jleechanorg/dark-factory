@@ -5507,18 +5507,20 @@ export const isTerminalSession = () => false;
 
     #[test]
     fn worker_spawn_refreshes_clean_managed_checkout_before_exact_head_validation() {
+        let real_git = system_git();
         let root = std::env::temp_dir().join(format!(
             "afd_clean_managed_stale_checkout_{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        std::process::Command::new("git")
+        assert!(std::process::Command::new(&real_git)
             .args(["init", "-q"])
             .current_dir(&root)
             .status()
-            .unwrap();
-        std::process::Command::new("git")
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new(&real_git)
             .args([
                 "remote",
                 "add",
@@ -5527,9 +5529,10 @@ export const isTerminalSession = () => false;
             ])
             .current_dir(&root)
             .status()
-            .unwrap();
+            .unwrap()
+            .success());
         let commit = |message: &str| {
-            std::process::Command::new("git")
+            assert!(std::process::Command::new(&real_git)
                 .args([
                     "-c",
                     "core.hooksPath=/dev/null",
@@ -5544,9 +5547,10 @@ export const isTerminalSession = () => false;
                 ])
                 .current_dir(&root)
                 .status()
-                .unwrap();
+                .unwrap()
+                .success());
             String::from_utf8(
-                std::process::Command::new("git")
+                std::process::Command::new(&real_git)
                     .args(["rev-parse", "HEAD"])
                     .current_dir(&root)
                     .output()
@@ -5560,13 +5564,12 @@ export const isTerminalSession = () => false;
         let stale_head = commit("stale managed snapshot");
         let expected_head = commit("adopted PR head");
         assert_ne!(stale_head, expected_head);
-        std::process::Command::new("git")
+        assert!(std::process::Command::new(&real_git)
             .args(["checkout", "-q", "--detach", &stale_head])
             .current_dir(&root)
             .status()
-            .unwrap();
-
-        let real_git = system_git();
+            .unwrap()
+            .success());
         let prompt = "refresh clean managed stale checkout";
         let branch = "factory/jleechan-contract-clean-managed-refresh-r1";
         let (spawn_result, calls) = with_fake_ao(
@@ -5610,7 +5613,7 @@ exec "$FAKE_GIT_REAL_BIN" "$@"
             },
         );
         let observed_head = String::from_utf8(
-            std::process::Command::new("git")
+            std::process::Command::new(&real_git)
                 .args(["rev-parse", "HEAD"])
                 .current_dir(&root)
                 .output()
