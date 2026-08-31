@@ -64,13 +64,16 @@ the full empirical distribution and the citation.
 from __future__ import annotations
 
 import contextlib
+import grp
 import hashlib
 import json
 import os
 import pathlib
+import pwd
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -86,6 +89,7 @@ from .handler_core import Result
 if TYPE_CHECKING:
     from .parser import Node
     from .handler_core import Context
+
 
 # G4 diff-injection cap. Hard limit on the diff we paste into reviewer
 # prompts to avoid blowing past LLM context windows on large PRs. The
@@ -846,6 +850,190 @@ def _isolated_review_workdir(target_workdir: pathlib.Path):
         yield review_dir
 
 
+def _private_group(info: os.stat_result) -> bool:
+    if not info.st_mode & stat.S_IWGRP:
+        return True
+    try:
+        uid = os.getuid()
+        gid = os.getgid()
+        username = pwd.getpwuid(uid).pw_name
+        if info.st_gid != gid:
+            return False
+        for entry in pwd.getpwall():
+            if entry.pw_gid == gid and (entry.pw_uid != uid or entry.pw_name != username):
+                return False
+        for entry in grp.getgrall():
+            if entry.gr_gid == gid and any(member != username for member in entry.gr_mem):
+                return False
+    except (KeyError, OSError, RuntimeError):
+        return False
+    return True
+
+
+def _trusted_directory(path: pathlib.Path) -> pathlib.Path | None:
+    try:
+        current = path.resolve(strict=True)
+        if not current.is_dir():
+            return None
+        while True:
+            info = current.lstat()
+            if info.st_uid not in {0, os.getuid()}:
+                return None
+            if info.st_mode & stat.S_IWOTH:
+                if info.st_uid == 0 and info.st_mode & stat.S_ISVTX:
+                    break
+                return None
+            if not _private_group(info):
+                return None
+            if current == pathlib.Path(current.anchor):
+                break
+            current = current.parent
+        return path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+
+
+def _inspect_executable_runtime_paths(
+    exe_path: pathlib.Path,
+    paths: list[pathlib.Path],
+) -> bool:
+    try:
+        raw_parent = _trusted_directory(exe_path.parent)
+        if raw_parent is None:
+            return False
+        paths.append(raw_parent)
+
+        try:
+            resolved_exe = exe_path.resolve(strict=True)
+        except (OSError, RuntimeError):
+            return False
+
+        if not resolved_exe.is_file():
+            return False
+
+        resolved_parent = _trusted_directory(resolved_exe.parent)
+        if resolved_parent is None:
+            return False
+        paths.append(resolved_parent)
+
+        if resolved_exe.parent.name in ("bin", "Scripts"):
+            env_root = _trusted_directory(resolved_exe.parent.parent)
+            if env_root is not None:
+                paths.append(env_root)
+
+        # Inspect shebang if present
+        first_line = ""
+        try:
+            with resolved_exe.open("rb") as stream:
+                prefix = stream.read(2)
+                if prefix == b"#!":
+                    first_line = (prefix + stream.readline()).decode(
+                        "utf-8", errors="replace"
+                    )
+        except OSError:
+            return False
+
+        if first_line:
+            shebang_body = first_line[2:].strip()
+            tokens = shebang_body.split()
+            if tokens:
+                if pathlib.Path(tokens[0]).name == "env" and len(tokens) > 1:
+                    interp_candidate = shutil.which(tokens[1])
+                else:
+                    interp_candidate = tokens[0]
+
+                if not interp_candidate:
+                    return False
+
+                interp_path = pathlib.Path(interp_candidate)
+                try:
+                    resolved_interp = interp_path.resolve(strict=True)
+                except (OSError, RuntimeError):
+                    return False
+
+                if not resolved_interp.is_file():
+                    return False
+
+                interp_parent = _trusted_directory(resolved_interp.parent)
+                if interp_parent is None:
+                    return False
+                paths.append(interp_parent)
+
+                if resolved_interp.parent.name in ("bin", "Scripts"):
+                    interp_root = _trusted_directory(resolved_interp.parent.parent)
+                    if interp_root is not None:
+                        paths.append(interp_root)
+
+                pyvenv_cfg = resolved_interp.parent.parent / "pyvenv.cfg"
+                if pyvenv_cfg.is_file():
+                    try:
+                        for line in pyvenv_cfg.read_text(
+                            encoding="utf-8", errors="replace"
+                        ).splitlines():
+                            line = line.strip()
+                            if line.startswith("home =") or line.startswith("home="):
+                                base_home = pathlib.Path(line.split("=", 1)[1].strip())
+                                trusted_base = _trusted_directory(base_home)
+                                if trusted_base is not None:
+                                    paths.append(trusted_base)
+                                    if trusted_base.name in ("bin", "Scripts"):
+                                        trusted_base_root = _trusted_directory(
+                                            trusted_base.parent
+                                        )
+                                        if trusted_base_root is not None:
+                                            paths.append(trusted_base_root)
+                    except OSError:
+                        pass
+        return True
+    except (OSError, RuntimeError):
+        return False
+
+
+def _linux_python_reviewer_runtime_paths() -> list[pathlib.Path] | None:
+    paths: list[pathlib.Path] = []
+
+    pytest_candidates: list[pathlib.Path] = []
+    raw_which = shutil.which("pytest")
+    if raw_which:
+        pytest_candidates.append(pathlib.Path(raw_which))
+
+    if not pytest_candidates:
+        for candidate_loc in (
+            pathlib.Path(sys.executable).parent / "pytest",
+            pathlib.Path(sys.prefix) / "bin" / "pytest",
+            pathlib.Path.home() / ".local" / "bin" / "pytest",
+        ):
+            if candidate_loc.is_file() or candidate_loc.is_symlink():
+                pytest_candidates.append(candidate_loc)
+                break
+
+    for candidate in pytest_candidates:
+        if not candidate.exists() and not candidate.is_symlink():
+            continue
+        if not _inspect_executable_runtime_paths(candidate, paths):
+            return None
+
+    # Include active Python executable runtime for direct Python reviewer commands
+    if sys.executable:
+        sys_exe = pathlib.Path(sys.executable)
+        if sys_exe.exists() or sys_exe.is_symlink():
+            if not _inspect_executable_runtime_paths(sys_exe, paths):
+                return None
+
+    for prefix_dir in (sys.prefix, getattr(sys, "base_prefix", None)):
+        if prefix_dir:
+            try:
+                trusted = _trusted_directory(
+                    pathlib.Path(prefix_dir).resolve(strict=True)
+                )
+                if trusted is not None:
+                    paths.append(trusted)
+            except (OSError, RuntimeError):
+                return None
+
+    return sorted(set(paths), key=str)
+
+
 def _sandboxed_args_for_fresh_review(
     command: list[str],
     codex_workdir: pathlib.Path,
@@ -895,6 +1083,14 @@ def _sandboxed_args_for_fresh_review(
         runtime_paths = _handlers_shim._linux_codex_runtime_paths(launcher_path)
         if runtime_paths is None:
             return None
+        python_paths_fn = getattr(
+            _handlers_shim,
+            "_linux_python_runtime_paths",
+            _linux_python_reviewer_runtime_paths,
+        )
+        python_runtime_paths = python_paths_fn()
+        if python_runtime_paths is None:
+            return None
         real_binary = _sandbox._linux_codex_real_binary(launcher_path)
         if real_binary is not None:
             executable_path = real_binary
@@ -903,7 +1099,7 @@ def _sandboxed_args_for_fresh_review(
             executable_path = launcher_path
             cmd_args = command
 
-        read_paths = [*runtime_paths, codex_workdir.resolve()]
+        read_paths = [*runtime_paths, *python_runtime_paths, codex_workdir.resolve()]
         writable_paths = [codex_workdir.resolve()]
         if runtime_home is not None:
             read_paths.append(runtime_home.resolve())
