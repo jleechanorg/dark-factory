@@ -4039,18 +4039,18 @@ impl CliSessions {
     }
 
     fn run_spawn_process(&self, agent: &str, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
-        // Pre-spawn validation: if local_checkout is specified, validate it before calling ao spawn.
-        // Skip the identity check when the checkout does not exist yet: for a
-        // managed checkout, `ao_spawn_command` (via `ensure_managed_target_worktree`
-        // / `ensure_target_worktree`) is what provisions a missing checkout by
-        // cloning it, so validating existence here first would fail every
-        // first-ever spawn before provisioning gets a chance to run. The
-        // post-spawn check further below re-validates the AO-reported
-        // workspace unconditionally, so a genuinely wrong/stale existing
-        // checkout is still caught before dispatch, and any bad provisioning
-        // result is still caught after.
+        // Validate the path boundary before allowing checkout preparation to
+        // touch disk. `ao_spawn_command` provisions missing managed checkouts
+        // and refreshes clean daemon-owned stale snapshots; construct it before
+        // the exact-head check so both paths can reach the expected revision.
         if let Some(ref local_checkout) = spec.local_checkout {
             crate::tools::check_cwd_guard(spec.expected_cwd.as_deref(), local_checkout)?;
+        }
+        let mut cmd = ao_spawn_command(agent, spec)?;
+        // Preparation above fails closed for dirty, operator-owned, or
+        // wrong-origin checkouts without executing AO. Re-check the resulting
+        // checkout identity immediately before dispatch.
+        if let Some(ref local_checkout) = spec.local_checkout {
             if local_checkout.is_dir() {
                 validate_target_identity_if_expected(
                     &spec.repo,
@@ -4070,7 +4070,6 @@ impl CliSessions {
         // `target_repo` names a DIFFERENT `[repos.*]` entry spawn into ITS
         // project instead of silently landing in the global one (the
         // jleechan-9sh5 root cause).
-        let mut cmd = ao_spawn_command(agent, spec)?;
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let output = cmd.output().map_err(|e| DaemonError::Tool {
@@ -5419,6 +5418,141 @@ export const isTerminalSession = () => false;
         let error = spawn_result.expect_err("stale checkout must fail closed");
         assert!(error.to_string().contains("expected snapshot"), "{error}");
         assert!(calls.is_empty(), "AO must not be invoked on a stale checkout");
+    }
+
+    #[test]
+    fn worker_spawn_refreshes_clean_managed_checkout_before_exact_head_validation() {
+        let root = std::env::temp_dir().join(format!(
+            "afd_clean_managed_stale_checkout_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/jleechanorg/dark-factory.git",
+            ])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        let commit = |message: &str| {
+            std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "-c",
+                    "user.name=Test",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    message,
+                ])
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            String::from_utf8(
+                std::process::Command::new("git")
+                    .args(["rev-parse", "HEAD"])
+                    .current_dir(&root)
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+            .trim()
+            .to_string()
+        };
+        let stale_head = commit("stale managed snapshot");
+        let expected_head = commit("adopted PR head");
+        assert_ne!(stale_head, expected_head);
+        std::process::Command::new("git")
+            .args(["checkout", "-q", "--detach", &stale_head])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+
+        let real_git = std::env::var_os("PATH")
+            .as_deref()
+            .into_iter()
+            .flat_map(std::env::split_paths)
+            .map(|dir| dir.join("git"))
+            .find(|path| path.is_file())
+            .expect("test environment must provide git");
+        let prompt = "refresh clean managed stale checkout";
+        let branch = "factory/jleechan-contract-clean-managed-refresh-r1";
+        let (spawn_result, calls) = with_fake_ao(
+            "clean_managed_refresh",
+            serde_json::json!({prompt: branch}),
+            |log| {
+                let fake_git = log.parent().unwrap().join("git");
+                std::fs::write(
+                    &fake_git,
+                    r#"#!/bin/sh
+if [ "$1" = "fetch" ]; then
+  exit 0
+fi
+exec "$FAKE_GIT_REAL_BIN" "$@"
+"#,
+                )
+                .unwrap();
+                let mut permissions = std::fs::metadata(&fake_git).unwrap().permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(&fake_git, permissions).unwrap();
+
+                let saved_real_git = std::env::var_os("FAKE_GIT_REAL_BIN");
+                let saved_workspace = std::env::var_os("AO_FAKE_WORKTREE");
+                std::env::set_var("FAKE_GIT_REAL_BIN", &real_git);
+                std::env::set_var("AO_FAKE_WORKTREE", &root);
+                let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+                let mut managed = spec(prompt, branch);
+                managed.local_checkout = Some(root.clone());
+                managed.managed_checkout = true;
+                managed.expected_revision = Some(expected_head.clone());
+                let result = sessions.spawn(&managed);
+                match saved_real_git {
+                    Some(value) => std::env::set_var("FAKE_GIT_REAL_BIN", value),
+                    None => std::env::remove_var("FAKE_GIT_REAL_BIN"),
+                }
+                match saved_workspace {
+                    Some(value) => std::env::set_var("AO_FAKE_WORKTREE", value),
+                    None => std::env::remove_var("AO_FAKE_WORKTREE"),
+                }
+                (result, std::fs::read_to_string(log).unwrap_or_default())
+            },
+        );
+        let observed_head = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&root)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let _ = std::fs::remove_dir_all(&root);
+
+        let session = spawn_result.unwrap_or_else(|error| {
+            panic!("clean daemon-managed checkout must refresh before validation: {error}")
+        });
+        assert!(!session.0.is_empty());
+        assert_eq!(observed_head, expected_head);
+        assert_eq!(
+            calls.lines().filter(|line| !line.trim().is_empty()).count(),
+            1,
+            "AO must spawn exactly once after refresh: {calls}"
+        );
     }
 
     /// jleechan round-2 finding P1 (4c): "adopted PR" is not a separate
