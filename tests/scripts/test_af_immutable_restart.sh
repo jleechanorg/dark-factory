@@ -18,8 +18,10 @@
 #        unrelated_inventory_before, unrelated_inventory_after}
 #        describes the PRODUCTION daemon/worktree/branch under restart test.
 #      - worker_continuity_proof: {worker_continuity_ao_project, ao_session,
-#        session_branch_before, session_branch_after, worker_pid_before,
-#        worker_pid_after} describes the
+#        session_branch_before, session_branch_after, tmux_session_before,
+#        tmux_session_after, tmux_pane_current_path_before,
+#        tmux_pane_current_path_after, tmux_pane_branch_before,
+#        tmux_pane_branch_after, worker_pid_before, worker_pid_after} describes the
 #        REAL but disposable AO session bound for the worker-continuity /
 #        stop-path proof. Its ao_session does NOT belong to restart_target's
 #        ao_project — see the opt-in comment below for why they must be
@@ -88,6 +90,14 @@ fi
 # criterion (project inventory, session binding, stop path). ---
 if ! command -v ao >/dev/null 2>&1; then
   skip "ao CLI not found on PATH; cannot bind to a real AO session or stop path"
+fi
+
+AO_TEST_PROJECT="${AO_IMMUTABLE_RESTART_TEST_PROJECT:-}"
+if [ -z "$AO_TEST_PROJECT" ]; then
+  skip "AO_IMMUTABLE_RESTART_TEST_PROJECT is not set; no disposable AO project is configured to safely own a real session for worker-continuity/stop-path proof (refusing to fabricate a session or reuse a production one)"
+fi
+if [ "$AO_TEST_PROJECT" = "$AO_PROJECT" ]; then
+  skip "AO_IMMUTABLE_RESTART_TEST_PROJECT must be distinct from production AO project '$AO_PROJECT'; refusing to stop a production session"
 fi
 
 # Ensure service is active
@@ -216,6 +226,180 @@ if [ -z "$BRANCH" ] || [ "$BRANCH" = "HEAD" ]; then
   skip "target worktree $WORKTREE is on a detached HEAD ($(git -C "$WORKTREE" rev-parse HEAD 2>/dev/null || echo unknown)); cannot verify a real branch-tracked worktree"
 fi
 
+# Parse `ao status --json`, allowing notifier text only before the first JSON
+# array. A successful command with malformed JSON remains a parse failure.
+parse_ao_json() {
+  local payload="$1"
+  printf '%s' "$payload" | python3 -c '
+import json
+import sys
+
+raw = sys.stdin.read()
+start = raw.find("[")
+if start < 0:
+    raise SystemExit("ao status output has no JSON array")
+try:
+    data = json.loads(raw[start:])
+except Exception as error:
+    raise SystemExit(f"invalid ao status JSON: {error}")
+if not isinstance(data, list) or any(not isinstance(entry, dict) for entry in data):
+    raise SystemExit("ao status JSON must be an array of objects")
+print(json.dumps(data, sort_keys=True, separators=(",", ":")))
+'
+}
+
+# Parse the authoritative project-scoped session inspection response. Unlike
+# `ao status`, this interface must supply every identity field needed for a
+# live proof; missing fields are a SKIP, never an inferred value.
+parse_ao_session_json() {
+  local payload="$1"
+  printf '%s' "$payload" | python3 -c '
+import json
+import sys
+
+raw = sys.stdin.read()
+start = raw.find("{")
+if start < 0:
+    raise SystemExit("ao session inspection has no JSON object")
+try:
+    data = json.loads(raw[start:])
+except Exception as error:
+    raise SystemExit(f"invalid ao session inspection JSON: {error}")
+if not isinstance(data, dict):
+    raise SystemExit("ao session inspection JSON must be an object")
+required = ("project", "branch", "workspace_path", "worker_pid", "runtime", "tmux_session")
+if any(not data.get(field) for field in required):
+    raise SystemExit("ao session inspection is missing required identity fields")
+if data["runtime"] != "tmux":
+    raise SystemExit("ao session inspection runtime is not tmux")
+if not str(data["worker_pid"]).isdigit():
+    raise SystemExit("ao session inspection worker_pid is not numeric")
+print(json.dumps(data, sort_keys=True, separators=(",", ":")))
+'
+}
+
+# Normalize successful status arrays into deterministic inventories. Keep only
+# stable identity/liveness fields; volatile lastActivity/review metadata is
+# deliberately excluded. The only row removed is the exact AO session this
+# script owns; all other rows remain evidence.
+normalize_ao_inventory() {
+  local payload="$1"
+  local owned_session="$2"
+  printf '%s' "$payload" | python3 -c '
+import json
+import sys
+
+owned = sys.argv[1]
+try:
+    data = json.load(sys.stdin)
+except Exception as error:
+    raise SystemExit(f"invalid ao status JSON: {error}")
+if not isinstance(data, list) or any(not isinstance(entry, dict) for entry in data):
+    raise SystemExit("ao status JSON must be an array of objects")
+stable_fields = ("name", "project", "branch", "role", "status", "activity")
+rows = [
+    {key: entry[key] for key in stable_fields if key in entry}
+    for entry in data
+    if entry.get("name") != owned
+]
+rows.sort(key=lambda entry: json.dumps(entry, sort_keys=True, separators=(",", ":")))
+print(json.dumps(rows, sort_keys=True, separators=(",", ":")))
+' "$owned_session"
+}
+
+# Normalize the all-pane view for the unrelated-resource comparison while
+# excluding only this run's resolved tmux session artifact.
+normalize_tmux_inventory() {
+  local payload="$1"
+  local owned_tmux_session="$2"
+  printf '%s' "$payload" | python3 -c '
+import json
+import sys
+
+owned = sys.argv[1]
+rows = []
+for line in sys.stdin:
+    fields = line.rstrip("\n").split("\t")
+    if len(fields) != 3 or any(not field for field in fields):
+        raise SystemExit("tmux all-pane output is malformed")
+    session, pid, path = fields
+    if session != owned:
+        rows.append({"session_name": session, "pane_pid": pid, "pane_current_path": path})
+rows.sort(key=lambda entry: json.dumps(entry, sort_keys=True, separators=(",", ":")))
+print(json.dumps(rows, sort_keys=True, separators=(",", ":")))
+' "$owned_tmux_session"
+}
+
+# Resolve the authoritative tmux session identity to exactly one pane from
+# the all-pane query. The runtime session name comes from `ao session get`; no
+# AO-row-derived name is accepted.
+resolve_tmux_identity() {
+  local payload="$1"
+  local expected_session="$2"
+  local expected_pid="$3"
+  local expected_path="$4"
+  printf '%s' "$payload" | python3 -c '
+import sys
+
+expected = sys.argv[1]
+expected_pid = str(sys.argv[2])
+expected_path = sys.argv[3]
+candidates = {}
+for line in sys.stdin:
+    fields = line.rstrip("\n").split("\t")
+    if len(fields) != 3:
+        continue
+    session, pid, path = fields
+    if session == expected and pid == expected_pid and path == expected_path:
+        candidates.setdefault(session, []).append((pid, path))
+if len(candidates) != 1:
+    raise SystemExit("authoritative AO session did not correlate to exactly one tmux session")
+session, panes = next(iter(candidates.items()))
+if len(panes) != 1:
+    raise SystemExit("authoritative AO session correlated to an ambiguous tmux pane set")
+print("\t".join((session, panes[0][0], panes[0][1])))
+' "$expected_session" "$expected_pid" "$expected_path"
+}
+
+owned_ao_row_state() {
+  local payload="$1"
+  local owned_session="$2"
+  printf '%s' "$payload" | python3 -c '
+import json
+import sys
+
+owned = sys.argv[1]
+terminal = {"killed", "terminated", "done", "cleanup", "errored", "merged"}
+data = json.load(sys.stdin)
+matches = [entry for entry in data if entry.get("name") == owned]
+if not matches:
+    print("absent")
+elif all(entry.get("status") in terminal or entry.get("activity") == "exited" for entry in matches):
+    print("terminal")
+else:
+    print("active")
+' "$owned_session"
+}
+
+count_tmux_identity_matches() {
+  local payload="$1"
+  local expected_session="$2"
+  printf '%s' "$payload" | python3 -c '
+import sys
+
+expected = sys.argv[1]
+sessions = set()
+for line in sys.stdin:
+    fields = line.rstrip("\n").split("\t")
+    if len(fields) != 3:
+        raise SystemExit("tmux all-pane output is malformed")
+    session = fields[0]
+    if session == expected:
+        sessions.add(session)
+print(len(sessions))
+' "$expected_session"
+}
+
 # Inventory of unrelated sessions/processes before (strictly project-scoped).
 # This is compared byte-for-byte against the same call after the restart +
 # explicit stop below to prove neither perturbed sessions outside the ones
@@ -234,17 +418,19 @@ set -e
 if [ "$UNRELATED_BEFORE_RC" -ne 0 ]; then
   skip "'ao status -p $AO_PROJECT --json' failed (rc=$UNRELATED_BEFORE_RC) before restart; cannot produce real unrelated-inventory evidence"
 fi
+set +e
+PRODUCTION_STATUS_BEFORE="$(parse_ao_json "$UNRELATED_BEFORE")"
+PRODUCTION_STATUS_BEFORE_RC=$?
+set -e
+if [ "$PRODUCTION_STATUS_BEFORE_RC" -ne 0 ]; then
+  skip "'ao status -p $AO_PROJECT --json' returned malformed JSON before restart; cannot produce real unrelated-inventory evidence"
+fi
 
 # --- Bind to a REAL, currently-tracked, non-terminal AO session this script
 # owns, so the stop-path proof below can legitimately call the real product
 # stop path without touching anyone else's in-progress session. Opt-in only
 # via AO_IMMUTABLE_RESTART_TEST_PROJECT (a dedicated disposable project) --
 # never fabricated, and never taken from the production $AO_PROJECT list. ---
-AO_TEST_PROJECT="${AO_IMMUTABLE_RESTART_TEST_PROJECT:-}"
-if [ -z "$AO_TEST_PROJECT" ]; then
-  skip "AO_IMMUTABLE_RESTART_TEST_PROJECT is not set; no disposable AO project is configured to safely own a real session for worker-continuity/stop-path proof (refusing to fabricate a session or reuse a production one)"
-fi
-
 set +e
 TEST_PROJECT_SESSIONS_BEFORE="$(ao status -p "$AO_TEST_PROJECT" --json 2>/dev/null)"
 TEST_PROJECT_SESSIONS_BEFORE_RC=$?
@@ -252,19 +438,28 @@ set -e
 if [ "$TEST_PROJECT_SESSIONS_BEFORE_RC" -ne 0 ]; then
   skip "'ao status -p $AO_TEST_PROJECT --json' failed (rc=$TEST_PROJECT_SESSIONS_BEFORE_RC) before restart; cannot bind a real test session"
 fi
+set +e
+TEST_PROJECT_STATUS_BEFORE="$(parse_ao_json "$TEST_PROJECT_SESSIONS_BEFORE")"
+TEST_PROJECT_STATUS_BEFORE_RC=$?
+set -e
+if [ "$TEST_PROJECT_STATUS_BEFORE_RC" -ne 0 ]; then
+  skip "'ao status -p $AO_TEST_PROJECT --json' returned malformed JSON before restart; cannot bind a real test session"
+fi
 
 # Real schema (verified against daemon/src/adapters.rs session_for_branch /
 # session_is_quiescent / session_activity): each entry has "name" (the
 # session id), "branch", "activity", and "status" — never "id".
-SESSION_IDENTITY_BEFORE="$(echo "$TEST_PROJECT_SESSIONS_BEFORE" | python3 -c "
+SESSION_IDENTITY_BEFORE="$(printf '%s' "$TEST_PROJECT_STATUS_BEFORE" | python3 -c "
 import json, sys
 
 TERMINAL = {'killed', 'terminated', 'done', 'cleanup', 'errored', 'merged'}
 
 try:
     data = json.load(sys.stdin)
-except Exception:
-    data = []
+except Exception as error:
+    raise SystemExit(f'invalid ao status JSON: {error}')
+if not isinstance(data, list) or any(not isinstance(entry, dict) for entry in data):
+    raise SystemExit('ao status JSON must be an array of objects')
 
 def is_terminal(entry):
     return entry.get('status') in TERMINAL or entry.get('activity') == 'exited'
@@ -273,8 +468,8 @@ active = [
     e for e in (data if isinstance(data, list) else [])
     if isinstance(e, dict) and e.get('name') and not is_terminal(e)
 ]
-if len(active) == 1:
-    print(active[0]['name'] + '\t' + str(active[0].get('branch', '')))
+if len(active) == 1 and active[0].get('branch'):
+    print(active[0]['name'] + '\t' + str(active[0]['branch']))
 " 2>/dev/null || true)"
 IFS=$'\t' read -r AO_SESSION SESSION_BRANCH_BEFORE <<< "$SESSION_IDENTITY_BEFORE"
 
@@ -282,16 +477,76 @@ if [ -z "$AO_SESSION" ] || [ -z "$SESSION_BRANCH_BEFORE" ]; then
   skip "AO_IMMUTABLE_RESTART_TEST_PROJECT='$AO_TEST_PROJECT' does not have exactly one real active AO session with a branch to bind worker-continuity/stop-path proof to"
 fi
 
-# --- Resolve the REAL worker process PID for this session via its tmux
-# pane -- never a synthetic `setsid sleep` stand-in. AO sessions run in
-# tmux (confirmed by the daemon's own tmux pane-capture calls in
-# adapters.rs); the tmux session name matches the AO session's "name". ---
-WORKER_PID_BEFORE=""
-if command -v tmux >/dev/null 2>&1; then
-  WORKER_PID_BEFORE="$(tmux list-panes -t "$AO_SESSION" -F '#{pane_pid}' 2>/dev/null | head -1 || true)"
+# --- Resolve the REAL worker process PID for this session via the tmux
+# all-pane query -- never a synthetic `setsid sleep` stand-in. Capture the
+# tmux session and pane path as part of the identity tuple. ---
+if ! command -v tmux >/dev/null 2>&1; then
+  skip "tmux CLI not found on PATH; cannot correlate the AO row to a real worker pane"
 fi
-if [ -z "$WORKER_PID_BEFORE" ] || ! kill -0 "$WORKER_PID_BEFORE" 2>/dev/null; then
-  skip "could not resolve a live real worker PID for AO session '$AO_SESSION' via tmux; refusing to fabricate a stand-in process"
+set +e
+AO_SESSION_INFO_BEFORE_RAW="$(ao session get "$AO_SESSION" -p "$AO_TEST_PROJECT" --json 2>/dev/null)"
+AO_SESSION_INFO_BEFORE_RC=$?
+set -e
+if [ "$AO_SESSION_INFO_BEFORE_RC" -ne 0 ]; then
+  skip "'ao session get $AO_SESSION -p $AO_TEST_PROJECT --json' failed; authoritative worker identity is unavailable"
+fi
+set +e
+AO_SESSION_INFO_BEFORE="$(parse_ao_session_json "$AO_SESSION_INFO_BEFORE_RAW")"
+AO_SESSION_INFO_BEFORE_PARSE_RC=$?
+set -e
+if [ "$AO_SESSION_INFO_BEFORE_PARSE_RC" -ne 0 ]; then
+  skip "'ao session get $AO_SESSION -p $AO_TEST_PROJECT --json' lacks authoritative project/branch/workspace/PID/tmux identity fields"
+fi
+SESSION_INFO_FIELDS_BEFORE="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print("\t".join(str(d[k]) for k in ("project", "branch", "workspace_path", "worker_pid", "runtime", "tmux_session")))' "$AO_SESSION_INFO_BEFORE")"
+IFS=$'\t' read -r SESSION_PROJECT_BEFORE SESSION_BRANCH_INSPECTED_BEFORE SESSION_WORKSPACE_PATH_BEFORE SESSION_WORKER_PID_BEFORE SESSION_RUNTIME_BEFORE TMUX_SESSION_BEFORE <<< "$SESSION_INFO_FIELDS_BEFORE"
+if [ "$SESSION_PROJECT_BEFORE" != "$AO_TEST_PROJECT" ] || [ "$SESSION_BRANCH_INSPECTED_BEFORE" != "$SESSION_BRANCH_BEFORE" ]; then
+  echo "FAIL: authoritative AO session identity does not match requested project/branch" >&2
+  exit 1
+fi
+if [ ! -d "$SESSION_WORKSPACE_PATH_BEFORE" ]; then
+  skip "authoritative AO session workspace path '$SESSION_WORKSPACE_PATH_BEFORE' is not available"
+fi
+if [ -z "$SESSION_WORKER_PID_BEFORE" ] || ! kill -0 "$SESSION_WORKER_PID_BEFORE" 2>/dev/null; then
+  skip "authoritative AO session worker PID '$SESSION_WORKER_PID_BEFORE' is not live"
+fi
+TMUX_PANE_BRANCH_BEFORE="$(git -C "$SESSION_WORKSPACE_PATH_BEFORE" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+if [ -z "$TMUX_PANE_BRANCH_BEFORE" ] || [ "$TMUX_PANE_BRANCH_BEFORE" = "HEAD" ]; then
+  skip "authoritative AO session workspace '$SESSION_WORKSPACE_PATH_BEFORE' is not branch-tracked"
+fi
+if [ "$TMUX_PANE_BRANCH_BEFORE" != "$SESSION_BRANCH_INSPECTED_BEFORE" ]; then
+  echo "FAIL: authoritative AO workspace branch '$TMUX_PANE_BRANCH_BEFORE' does not match AO branch '$SESSION_BRANCH_INSPECTED_BEFORE'" >&2
+  exit 1
+fi
+set +e
+TMUX_PANES_BEFORE="$(tmux list-panes -a -F '#{session_name}\t#{pane_pid}\t#{pane_current_path}' 2>/dev/null)"
+TMUX_PANES_BEFORE_RC=$?
+set -e
+if [ "$TMUX_PANES_BEFORE_RC" -ne 0 ]; then
+  skip "tmux all-pane query failed before restart (rc=$TMUX_PANES_BEFORE_RC); cannot correlate a real worker pane"
+fi
+set +e
+TMUX_IDENTITY_BEFORE="$(resolve_tmux_identity "$TMUX_PANES_BEFORE" "$TMUX_SESSION_BEFORE" "$SESSION_WORKER_PID_BEFORE" "$SESSION_WORKSPACE_PATH_BEFORE")"
+TMUX_IDENTITY_BEFORE_RC=$?
+set -e
+if [ "$TMUX_IDENTITY_BEFORE_RC" -ne 0 ]; then
+  skip "AO session '$AO_SESSION' did not correlate to exactly one live tmux session/pane via the all-pane query"
+fi
+IFS=$'\t' read -r TMUX_SESSION_MATCHED_BEFORE WORKER_PID_BEFORE TMUX_PANE_CURRENT_PATH_BEFORE <<< "$TMUX_IDENTITY_BEFORE"
+if [ "$TMUX_SESSION_MATCHED_BEFORE" != "$TMUX_SESSION_BEFORE" ] || [ "$WORKER_PID_BEFORE" != "$SESSION_WORKER_PID_BEFORE" ] || [ "$TMUX_PANE_CURRENT_PATH_BEFORE" != "$SESSION_WORKSPACE_PATH_BEFORE" ]; then
+  echo "FAIL: all-pane tmux identity does not match authoritative AO session inspection" >&2
+  exit 1
+fi
+
+set +e
+PRODUCTION_UNRELATED_BEFORE="$(normalize_ao_inventory "$PRODUCTION_STATUS_BEFORE" "__no_owned_production_session__")"
+PRODUCTION_UNRELATED_BEFORE_RC=$?
+DISPOSABLE_UNRELATED_BEFORE="$(normalize_ao_inventory "$TEST_PROJECT_STATUS_BEFORE" "$AO_SESSION")"
+DISPOSABLE_UNRELATED_BEFORE_RC=$?
+TMUX_UNRELATED_BEFORE="$(normalize_tmux_inventory "$TMUX_PANES_BEFORE" "$TMUX_SESSION_BEFORE")"
+TMUX_UNRELATED_BEFORE_RC=$?
+set -e
+if [ "$PRODUCTION_UNRELATED_BEFORE_RC" -ne 0 ] || [ "$DISPOSABLE_UNRELATED_BEFORE_RC" -ne 0 ] || [ "$TMUX_UNRELATED_BEFORE_RC" -ne 0 ]; then
+  skip "could not parse an AO or tmux inventory before restart; no unrelated-resource evidence was produced"
 fi
 
 JOURNAL_START="$(date -u +"%Y-%m-%d %H:%M:%S")"
@@ -330,15 +585,24 @@ set -e
 if [ "$TEST_PROJECT_SESSIONS_AFTER_RC" -ne 0 ]; then
   skip "'ao status -p $AO_TEST_PROJECT --json' failed (rc=$TEST_PROJECT_SESSIONS_AFTER_RC) after restart; cannot prove session continuity"
 fi
-SESSION_BRANCH_AFTER="$(echo "$TEST_PROJECT_SESSIONS_AFTER" | python3 -c "
+set +e
+TEST_PROJECT_STATUS_AFTER="$(parse_ao_json "$TEST_PROJECT_SESSIONS_AFTER")"
+TEST_PROJECT_STATUS_AFTER_RC=$?
+set -e
+if [ "$TEST_PROJECT_STATUS_AFTER_RC" -ne 0 ]; then
+  skip "'ao status -p $AO_TEST_PROJECT --json' returned malformed JSON after restart; cannot prove session continuity"
+fi
+SESSION_BRANCH_AFTER="$(printf '%s' "$TEST_PROJECT_STATUS_AFTER" | python3 -c "
 import json, sys
 
 terminal = {'killed', 'terminated', 'done', 'cleanup', 'errored', 'merged'}
 expected = sys.argv[1]
 try:
     data = json.load(sys.stdin)
-except Exception:
-    data = []
+except Exception as error:
+    raise SystemExit(f'invalid ao status JSON: {error}')
+if not isinstance(data, list) or any(not isinstance(entry, dict) for entry in data):
+    raise SystemExit('ao status JSON must be an array of objects')
 for entry in (data if isinstance(data, list) else []):
     if not isinstance(entry, dict) or entry.get('name') != expected:
         continue
@@ -352,11 +616,57 @@ if [ -z "$SESSION_BRANCH_AFTER" ] || [ "$SESSION_BRANCH_AFTER" != "$SESSION_BRAN
   exit 1
 fi
 
-# Verify the REAL worker process survived restart
-if kill -0 "$WORKER_PID_BEFORE" 2>/dev/null; then
-  WORKER_PID_AFTER="$WORKER_PID_BEFORE"
-else
-  echo "FAIL: real AO worker process $WORKER_PID_BEFORE (session $AO_SESSION) did not survive restart" >&2
+set +e
+AO_SESSION_INFO_AFTER_RAW="$(ao session get "$AO_SESSION" -p "$AO_TEST_PROJECT" --json 2>/dev/null)"
+AO_SESSION_INFO_AFTER_RC=$?
+set -e
+if [ "$AO_SESSION_INFO_AFTER_RC" -ne 0 ]; then
+  skip "'ao session get $AO_SESSION -p $AO_TEST_PROJECT --json' failed after restart; cannot reverify authoritative worker identity"
+fi
+set +e
+AO_SESSION_INFO_AFTER="$(parse_ao_session_json "$AO_SESSION_INFO_AFTER_RAW")"
+AO_SESSION_INFO_AFTER_PARSE_RC=$?
+set -e
+if [ "$AO_SESSION_INFO_AFTER_PARSE_RC" -ne 0 ]; then
+  skip "'ao session get $AO_SESSION -p $AO_TEST_PROJECT --json' returned incomplete identity after restart"
+fi
+SESSION_INFO_FIELDS_AFTER="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print("\t".join(str(d[k]) for k in ("project", "branch", "workspace_path", "worker_pid", "runtime", "tmux_session")))' "$AO_SESSION_INFO_AFTER")"
+IFS=$'\t' read -r SESSION_PROJECT_AFTER SESSION_BRANCH_INSPECTED_AFTER SESSION_WORKSPACE_PATH_AFTER SESSION_WORKER_PID_AFTER SESSION_RUNTIME_AFTER TMUX_SESSION_AFTER <<< "$SESSION_INFO_FIELDS_AFTER"
+if [ "$SESSION_PROJECT_AFTER" != "$SESSION_PROJECT_BEFORE" ] || [ "$SESSION_BRANCH_INSPECTED_AFTER" != "$SESSION_BRANCH_INSPECTED_BEFORE" ] || [ "$SESSION_WORKSPACE_PATH_AFTER" != "$SESSION_WORKSPACE_PATH_BEFORE" ] || [ "$SESSION_WORKER_PID_AFTER" != "$SESSION_WORKER_PID_BEFORE" ] || [ "$SESSION_RUNTIME_AFTER" != "$SESSION_RUNTIME_BEFORE" ] || [ "$TMUX_SESSION_AFTER" != "$TMUX_SESSION_BEFORE" ]; then
+  echo "FAIL: authoritative AO session identity tuple changed across restart" >&2
+  exit 1
+fi
+
+# Re-resolve and compare the exact tmux identity tuple after restart.
+set +e
+TMUX_PANES_AFTER="$(tmux list-panes -a -F '#{session_name}\t#{pane_pid}\t#{pane_current_path}' 2>/dev/null)"
+TMUX_PANES_AFTER_RC=$?
+set -e
+if [ "$TMUX_PANES_AFTER_RC" -ne 0 ]; then
+  skip "tmux all-pane query failed after restart (rc=$TMUX_PANES_AFTER_RC); cannot reverify worker identity"
+fi
+set +e
+TMUX_IDENTITY_AFTER="$(resolve_tmux_identity "$TMUX_PANES_AFTER" "$TMUX_SESSION_AFTER" "$SESSION_WORKER_PID_AFTER" "$SESSION_WORKSPACE_PATH_AFTER")"
+TMUX_IDENTITY_AFTER_RC=$?
+set -e
+if [ "$TMUX_IDENTITY_AFTER_RC" -ne 0 ]; then
+  skip "AO session '$AO_SESSION' did not correlate to exactly one live tmux session/pane after restart"
+fi
+IFS=$'\t' read -r TMUX_SESSION_MATCHED_AFTER WORKER_PID_AFTER TMUX_PANE_CURRENT_PATH_AFTER <<< "$TMUX_IDENTITY_AFTER"
+if [ "$TMUX_SESSION_MATCHED_AFTER" != "$TMUX_SESSION_AFTER" ] || [ "$WORKER_PID_AFTER" != "$WORKER_PID_BEFORE" ] || [ "$TMUX_PANE_CURRENT_PATH_AFTER" != "$TMUX_PANE_CURRENT_PATH_BEFORE" ]; then
+  echo "FAIL: tmux worker identity tuple changed across restart (session=$TMUX_SESSION_BEFORE/$TMUX_SESSION_AFTER, pid=$WORKER_PID_BEFORE/$WORKER_PID_AFTER, pane=$TMUX_PANE_CURRENT_PATH_BEFORE/$TMUX_PANE_CURRENT_PATH_AFTER)" >&2
+  exit 1
+fi
+if ! kill -0 "$WORKER_PID_AFTER" 2>/dev/null; then
+  echo "FAIL: real AO worker process $WORKER_PID_AFTER (session $AO_SESSION) did not survive restart" >&2
+  exit 1
+fi
+TMUX_PANE_BRANCH_AFTER="$(git -C "$TMUX_PANE_CURRENT_PATH_AFTER" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+if [ -z "$TMUX_PANE_BRANCH_AFTER" ] || [ "$TMUX_PANE_BRANCH_AFTER" = "HEAD" ]; then
+  skip "tmux pane path '$TMUX_PANE_CURRENT_PATH_AFTER' is not a branch-tracked checkout after restart"
+fi
+if [ "$TMUX_PANE_BRANCH_AFTER" != "$SESSION_BRANCH_AFTER" ]; then
+  echo "FAIL: tmux pane branch '$TMUX_PANE_BRANCH_AFTER' does not match AO session branch '$SESSION_BRANCH_AFTER' after restart" >&2
   exit 1
 fi
 
@@ -380,17 +690,62 @@ if [ "$reaped" -ne 1 ]; then
   exit 1
 fi
 
-# Inventory of unrelated sessions after (strictly project-scoped) -- must be
-# byte-identical to before: neither the restart nor the explicit stop of our
-# own owned test-project session may perturb the production project's list.
-# Same rationale as UNRELATED_BEFORE: a query failure here is "no proof",
-# never a fabricated empty match.
+# Inventory of unrelated resources after (strictly project-scoped) -- must be
+# identical to before for both projects. The owned AO row and resolved tmux
+# artifact are excluded; no unrelated row or pane is suppressed.
 set +e
 UNRELATED_AFTER="$(ao status -p "$AO_PROJECT" --json 2>/dev/null)"
 UNRELATED_AFTER_RC=$?
+TEST_PROJECT_SESSIONS_FINAL="$(ao status -p "$AO_TEST_PROJECT" --json 2>/dev/null)"
+TEST_PROJECT_SESSIONS_FINAL_RC=$?
+TMUX_PANES_FINAL="$(tmux list-panes -a -F '#{session_name}\t#{pane_pid}\t#{pane_current_path}' 2>/dev/null)"
+TMUX_PANES_FINAL_RC=$?
 set -e
 if [ "$UNRELATED_AFTER_RC" -ne 0 ]; then
   skip "'ao status -p $AO_PROJECT --json' failed (rc=$UNRELATED_AFTER_RC) after restart; cannot produce real unrelated-inventory evidence"
+fi
+if [ "$TEST_PROJECT_SESSIONS_FINAL_RC" -ne 0 ]; then
+  skip "'ao status -p $AO_TEST_PROJECT --json' failed (rc=$TEST_PROJECT_SESSIONS_FINAL_RC) after stop; cannot produce real unrelated-inventory evidence"
+fi
+if [ "$TMUX_PANES_FINAL_RC" -ne 0 ]; then
+  skip "tmux all-pane query failed after stop (rc=$TMUX_PANES_FINAL_RC); cannot produce real unrelated-resource evidence"
+fi
+set +e
+PRODUCTION_STATUS_AFTER="$(parse_ao_json "$UNRELATED_AFTER")"
+PRODUCTION_STATUS_AFTER_RC=$?
+TEST_PROJECT_STATUS_FINAL="$(parse_ao_json "$TEST_PROJECT_SESSIONS_FINAL")"
+TEST_PROJECT_STATUS_FINAL_RC=$?
+TMUX_OWNED_COUNT_FINAL="$(count_tmux_identity_matches "$TMUX_PANES_FINAL" "$AO_SESSION")"
+TMUX_OWNED_COUNT_FINAL_RC=$?
+set -e
+if [ "$PRODUCTION_STATUS_AFTER_RC" -ne 0 ]; then
+  skip "'ao status -p $AO_PROJECT --json' returned malformed JSON after stop; cannot produce real unrelated-inventory evidence"
+fi
+if [ "$TEST_PROJECT_STATUS_FINAL_RC" -ne 0 ]; then
+  skip "'ao status -p $AO_TEST_PROJECT --json' returned malformed JSON after stop; cannot verify owned session cleanup"
+fi
+OWNED_AO_ROW_STATE_FINAL="$(owned_ao_row_state "$TEST_PROJECT_STATUS_FINAL" "$AO_SESSION")"
+if [ "$OWNED_AO_ROW_STATE_FINAL" = "active" ]; then
+  echo "FAIL: owned AO session '$AO_SESSION' remains active after 'ao session kill'" >&2
+  exit 1
+fi
+if [ "$TMUX_OWNED_COUNT_FINAL_RC" -ne 0 ]; then
+  skip "tmux all-pane output was malformed after stop; cannot verify owned pane cleanup"
+fi
+if [ "$TMUX_OWNED_COUNT_FINAL" -ne 0 ]; then
+  echo "FAIL: owned tmux session/pane for AO session '$AO_SESSION' remains after 'ao session kill'" >&2
+  exit 1
+fi
+set +e
+PRODUCTION_UNRELATED_AFTER="$(normalize_ao_inventory "$PRODUCTION_STATUS_AFTER" "__no_owned_production_session__")"
+PRODUCTION_UNRELATED_AFTER_RC=$?
+DISPOSABLE_UNRELATED_AFTER="$(normalize_ao_inventory "$TEST_PROJECT_STATUS_FINAL" "$AO_SESSION")"
+DISPOSABLE_UNRELATED_AFTER_RC=$?
+TMUX_UNRELATED_AFTER="$(normalize_tmux_inventory "$TMUX_PANES_FINAL" "$TMUX_SESSION_BEFORE")"
+TMUX_UNRELATED_AFTER_RC=$?
+set -e
+if [ "$PRODUCTION_UNRELATED_AFTER_RC" -ne 0 ] || [ "$DISPOSABLE_UNRELATED_AFTER_RC" -ne 0 ] || [ "$TMUX_UNRELATED_AFTER_RC" -ne 0 ]; then
+  skip "could not parse an AO or tmux inventory after stop; no unrelated-resource evidence was produced"
 fi
 
 JOURNAL_END="$(date -u +"%Y-%m-%d %H:%M:%S")"
@@ -402,16 +757,21 @@ export RELEASE_MANIFEST MANIFEST_SHA256 MANIFEST_CROSS_CHECK_STATUS
 export DAEMON_PID_BEFORE DAEMON_PID_AFTER
 export AO_PROJECT WORKTREE BRANCH
 export AO_TEST_PROJECT AO_SESSION SESSION_BRANCH_BEFORE SESSION_BRANCH_AFTER
+export TMUX_SESSION_BEFORE TMUX_SESSION_AFTER
+export TMUX_PANE_CURRENT_PATH_BEFORE TMUX_PANE_CURRENT_PATH_AFTER
+export TMUX_PANE_BRANCH_BEFORE TMUX_PANE_BRANCH_AFTER
 export WORKER_PID_BEFORE WORKER_PID_AFTER
-export UNRELATED_BEFORE UNRELATED_AFTER JOURNAL_WINDOW
+UNRELATED_INVENTORY_BEFORE="$(python3 -c 'import json,sys; print(json.dumps({"production": json.loads(sys.argv[1]), "disposable": json.loads(sys.argv[2]), "tmux": json.loads(sys.argv[3])}, sort_keys=True, separators=(",", ":")))' "$PRODUCTION_UNRELATED_BEFORE" "$DISPOSABLE_UNRELATED_BEFORE" "$TMUX_UNRELATED_BEFORE")"
+UNRELATED_INVENTORY_AFTER="$(python3 -c 'import json,sys; print(json.dumps({"production": json.loads(sys.argv[1]), "disposable": json.loads(sys.argv[2]), "tmux": json.loads(sys.argv[3])}, sort_keys=True, separators=(",", ":")))' "$PRODUCTION_UNRELATED_AFTER" "$DISPOSABLE_UNRELATED_AFTER" "$TMUX_UNRELATED_AFTER")"
+export UNRELATED_INVENTORY_BEFORE UNRELATED_INVENTORY_AFTER JOURNAL_WINDOW
 
 python3 -c "
 import json
 import os
 import sys
 
-unrelated_before = json.loads(os.environ.get('UNRELATED_BEFORE', '[]'))
-unrelated_after = json.loads(os.environ.get('UNRELATED_AFTER', '[]'))
+unrelated_before = json.loads(os.environ['UNRELATED_INVENTORY_BEFORE'])
+unrelated_after = json.loads(os.environ['UNRELATED_INVENTORY_AFTER'])
 
 if unrelated_before != unrelated_after:
     sys.stderr.write('FAIL: unrelated inventory was perturbed across daemon restart\n')
@@ -451,6 +811,12 @@ report = {
         'ao_session': os.environ['AO_SESSION'],
         'session_branch_before': os.environ['SESSION_BRANCH_BEFORE'],
         'session_branch_after': os.environ['SESSION_BRANCH_AFTER'],
+        'tmux_session_before': os.environ['TMUX_SESSION_BEFORE'],
+        'tmux_session_after': os.environ['TMUX_SESSION_AFTER'],
+        'tmux_pane_current_path_before': os.environ['TMUX_PANE_CURRENT_PATH_BEFORE'],
+        'tmux_pane_current_path_after': os.environ['TMUX_PANE_CURRENT_PATH_AFTER'],
+        'tmux_pane_branch_before': os.environ['TMUX_PANE_BRANCH_BEFORE'],
+        'tmux_pane_branch_after': os.environ['TMUX_PANE_BRANCH_AFTER'],
         'worker_pid_before': os.environ['WORKER_PID_BEFORE'],
         'worker_pid_after': os.environ['WORKER_PID_AFTER'],
     },

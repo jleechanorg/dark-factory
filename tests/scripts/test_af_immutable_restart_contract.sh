@@ -13,6 +13,8 @@ WORKTREE="$TMP/target-worktree"
 DAEMON_PID_FILE="$TMP/daemon.pid"
 DAEMON_PATHS_FILE="$TMP/daemon-paths"
 WORKER_PID_FILE="$TMP/worker.pid"
+AO_KILLED_FILE="$TMP/ao-killed"
+AO_MALFORMED_AFTER_RESTART_FILE="$TMP/ao-malformed-after-restart"
 
 cleanup() {
   local rc=$?
@@ -72,6 +74,9 @@ if [ "${args[*]}" = "--user show $DARK_FACTORY_RESTART_UNIT --property=ExecStart
   exit 0
 fi
 if [ "${args[*]}" = "--user restart $DARK_FACTORY_RESTART_UNIT" ]; then
+  if [ "${FAKE_AO_MALFORMED_AFTER_RESTART:-0}" = "1" ]; then
+    touch "$FAKE_AO_MALFORMED_AFTER_RESTART_FILE"
+  fi
   old_pid="$(cat "$FAKE_DAEMON_PID_FILE")"
   kill "$old_pid" >/dev/null 2>&1 || true
   "$FAKE_DAEMON_BINARY" 120 &
@@ -115,9 +120,26 @@ chmod +x "$FAKE_BIN/sha256sum"
 cat > "$FAKE_BIN/ao" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
+if [ "${1:-}" = "session" ] && [ "${2:-}" = "get" ] && [ "${3:-}" = "restart-contract-session" ] && [ "${4:-}" = "-p" ] && [ "${6:-}" = "--json" ]; then
+  if [ "${FAKE_AO_SESSION_GET_MISSING:-0}" = "1" ]; then
+    printf '{"project":"dark-factory-contract-owned","branch":"factory/restart-contract","workspace_path":"%s","worker_pid":"%s","runtime":"tmux"}\n' "$FAKE_WORKER_PANE_PATH" "$(cat "$FAKE_WORKER_PID_FILE")"
+  elif [ "${FAKE_AO_SESSION_GET_UNPREFIXED:-0}" = "1" ]; then
+    printf '{"project":"dark-factory-contract-owned","branch":"factory/restart-contract","workspace_path":"%s","worker_pid":"%s","runtime":"tmux","tmux_session":"restart-contract-session"}\n' "$FAKE_WORKER_PANE_PATH" "$(cat "$FAKE_WORKER_PID_FILE")"
+  else
+    printf '{"project":"dark-factory-contract-owned","branch":"factory/restart-contract","workspace_path":"%s","worker_pid":"%s","runtime":"tmux","tmux_session":"host-restart-contract-session"}\n' "$FAKE_WORKER_PANE_PATH" "$(cat "$FAKE_WORKER_PID_FILE")"
+  fi
+  exit 0
+fi
 if [ "${1:-}" = "status" ] && [ "${2:-}" = "-p" ] && [ "${4:-}" = "--json" ]; then
   if [ "$3" = "$DARK_FACTORY_RESTART_AO_PROJECT" ]; then
-    printf '[]\n'
+    if [ "${FAKE_AO_MALFORMED:-0}" = "1" ]; then
+      printf '{malformed status json\n'
+      exit 0
+    fi
+    if [ "${FAKE_AO_PREAMBLE:-0}" = "1" ]; then
+      printf 'ao notifier: status follows\n'
+    fi
+    printf '[{"name":"unrelated-production-session","project":"dark-factory-contract","branch":"factory/unrelated","role":"worker","status":"done","activity":"exited","lastActivity":"volatile","review":{"state":"stale"}}]\n'
     exit 0
   fi
   if [ "$3" = "$AO_IMMUTABLE_RESTART_TEST_PROJECT" ]; then
@@ -125,11 +147,22 @@ if [ "${1:-}" = "status" ] && [ "${2:-}" = "-p" ] && [ "${4:-}" = "--json" ]; th
       printf 'scripted test-project status failure\n' >&2
       exit 17
     fi
-    printf '[{"name":"restart-contract-session","branch":"factory/restart-contract","status":"working","activity":"ready"}]\n'
+    if [ -f "$FAKE_AO_MALFORMED_AFTER_RESTART_FILE" ]; then
+      printf '{malformed post-restart status json\n'
+      exit 0
+    fi
+    if [ -f "$FAKE_AO_KILLED_FILE" ] && [ "${FAKE_AO_KEEP_OWNED:-0}" != "1" ]; then
+      printf '[{"name":"restart-contract-session","project":"dark-factory-contract-owned","branch":"factory/restart-contract","role":"worker","status":"killed","activity":"exited","lastActivity":"volatile","review":{"state":"stale"}},{"name":"unrelated-test-session","project":"dark-factory-contract-owned","branch":"factory/unrelated","role":"worker","status":"done","activity":"exited","lastActivity":"volatile","review":{"state":"stale"}}]\n'
+      exit 0
+    fi
+    printf '[{"name":"restart-contract-session","project":"dark-factory-contract-owned","branch":"factory/restart-contract","role":"worker","status":"working","activity":"ready","lastActivity":"volatile","review":{"state":"stale"}},{"name":"unrelated-test-session","project":"dark-factory-contract-owned","branch":"factory/unrelated","role":"worker","status":"done","activity":"exited","lastActivity":"volatile","review":{"state":"stale"}}]\n'
     exit 0
   fi
 fi
 if [ "${1:-}" = "session" ] && [ "${2:-}" = "kill" ] && [ "${3:-}" = "restart-contract-session" ]; then
+  if [ "${FAKE_AO_KEEP_OWNED:-0}" != "1" ]; then
+    touch "$FAKE_AO_KILLED_FILE"
+  fi
   kill "$(cat "$FAKE_WORKER_PID_FILE")"
   exit 0
 fi
@@ -141,8 +174,12 @@ chmod +x "$FAKE_BIN/ao"
 cat > "$FAKE_BIN/tmux" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-if [ "${1:-}" = "list-panes" ] && [ "${2:-}" = "-t" ] && [ "${3:-}" = "restart-contract-session" ]; then
-  cat "$FAKE_WORKER_PID_FILE"
+if [ "${1:-}" = "list-panes" ] && [ "${2:-}" = "-a" ] && [ "${3:-}" = "-F" ]; then
+  if [ ! -f "$FAKE_AO_KILLED_FILE" ] || [ "${FAKE_AO_KEEP_OWNED:-0}" = "1" ]; then
+    printf 'host-restart-contract-session\t%s\t%s\n' \
+      "$(cat "$FAKE_WORKER_PID_FILE")" "$FAKE_WORKER_PANE_PATH"
+  fi
+  printf 'unrelated-contract-session\t999999\t%s\n' "$FAKE_UNRELATED_PANE_PATH"
   exit 0
 fi
 exit 99
@@ -174,6 +211,10 @@ export FAKE_DAEMON_BINARY="$DAEMON_BINARY"
 export FAKE_DAEMON_PID_FILE="$DAEMON_PID_FILE"
 export FAKE_DAEMON_PATHS_FILE="$DAEMON_PATHS_FILE"
 export FAKE_WORKER_PID_FILE="$WORKER_PID_FILE"
+export FAKE_AO_KILLED_FILE="$AO_KILLED_FILE"
+export FAKE_AO_MALFORMED_AFTER_RESTART_FILE="$AO_MALFORMED_AFTER_RESTART_FILE"
+export FAKE_WORKER_PANE_PATH="$WORKTREE"
+export FAKE_UNRELATED_PANE_PATH="$TMP/unrelated-worktree"
 
 set +e
 skip_output="$(FAKE_AO_FAIL_TEST_STATUS=1 bash "$HARNESS" 2>&1)"
@@ -191,6 +232,41 @@ start = text.find("{")
 payload = json.loads(text[start:])
 assert payload["status"] == "skipped", payload
 assert "status" in payload["reason"] and "rc=17" in payload["reason"], payload
+'
+
+set +e
+same_project_output="$(DARK_FACTORY_RESTART_AO_PROJECT="${AO_IMMUTABLE_RESTART_TEST_PROJECT}" bash "$HARNESS" 2>&1)"
+same_project_rc=$?
+set -e
+if [ "$same_project_rc" -ne 2 ]; then
+  echo "FAIL: production and disposable AO projects must be distinct (rc=2), got rc=$same_project_rc" >&2
+  echo "$same_project_output" >&2
+  exit 1
+fi
+printf '%s\n' "$same_project_output" | python3 -c '
+import json, sys
+text = sys.stdin.read()
+start = text.find("{")
+payload = json.loads(text[start:])
+assert payload["status"] == "skipped", payload
+assert "distinct" in payload["reason"], payload
+'
+
+set +e
+malformed_output="$(FAKE_AO_MALFORMED=1 bash "$HARNESS" 2>&1)"
+malformed_rc=$?
+set -e
+if [ "$malformed_rc" -ne 2 ]; then
+  echo "FAIL: malformed production status JSON must be an explicit SKIP (rc=2), got rc=$malformed_rc" >&2
+  echo "$malformed_output" >&2
+  exit 1
+fi
+printf '%s\n' "$malformed_output" | python3 -c '
+import json, sys
+text = sys.stdin.read()
+start = text.find("{")
+payload = json.loads(text[start:])
+assert payload["status"] == "skipped", payload
 '
 
 cp "$MANIFEST" "$MANIFEST.good"
@@ -219,7 +295,7 @@ if [[ "$bad_manifest_output" != *"manifest"* ]]; then
 fi
 mv "$MANIFEST.good" "$MANIFEST"
 
-output="$(bash "$HARNESS")"
+output="$(FAKE_AO_PREAMBLE=1 bash "$HARNESS")"
 REPORT_JSON="$output" python3 - "$RELEASE_COMMIT" "$DAEMON_SHA256" "$DAEMON_BINARY" <<'PY'
 import json
 import os
@@ -241,7 +317,95 @@ assert target["manifest_cross_check"]["path"].endswith("/release-manifest.json")
 assert worker["ao_session"] == "restart-contract-session", worker
 assert worker["session_branch_before"] == "factory/restart-contract", worker
 assert worker["session_branch_after"] == "factory/restart-contract", worker
+assert worker["tmux_session_before"] == "host-restart-contract-session", worker
+assert worker["tmux_session_after"] == "host-restart-contract-session", worker
+assert worker["tmux_pane_current_path_before"] == os.environ.get("FAKE_WORKER_PANE_PATH"), worker
+assert worker["tmux_pane_current_path_after"] == os.environ.get("FAKE_WORKER_PANE_PATH"), worker
+assert worker["tmux_pane_branch_before"] == "factory/restart-contract", worker
+assert worker["tmux_pane_branch_after"] == "factory/restart-contract", worker
+assert target["unrelated_inventory_before"]["production"] == target["unrelated_inventory_after"]["production"], target
+assert target["unrelated_inventory_before"]["disposable"] == target["unrelated_inventory_after"]["disposable"], target
+assert target["unrelated_inventory_before"]["tmux"] == target["unrelated_inventory_after"]["tmux"], target
+stable = {"name", "project", "branch", "role", "status", "activity"}
+for inventory in (target["unrelated_inventory_before"]["production"], target["unrelated_inventory_before"]["disposable"]):
+    for row in inventory:
+        assert set(row) <= stable, row
+        assert "lastActivity" not in row and "review" not in row, row
 assert "worktree" not in worker, worker
 PY
+
+rm -f "$AO_KILLED_FILE"
+worker_pid="$(python3 -c '
+import subprocess
+p = subprocess.Popen(["sleep", "120"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+print(p.pid)
+')"
+printf '%s\n' "$worker_pid" > "$WORKER_PID_FILE"
+set +e
+post_restart_malformed_output="$(FAKE_AO_MALFORMED_AFTER_RESTART=1 bash "$HARNESS" 2>&1)"
+post_restart_malformed_rc=$?
+set -e
+if [ "$post_restart_malformed_rc" -ne 2 ]; then
+  echo "FAIL: malformed post-restart status JSON must be an explicit SKIP (rc=2), got rc=$post_restart_malformed_rc" >&2
+  echo "$post_restart_malformed_output" >&2
+  exit 1
+fi
+printf '%s\n' "$post_restart_malformed_output" | python3 -c '
+import json, sys
+text = sys.stdin.read()
+start = text.find("{")
+payload = json.loads(text[start:])
+assert payload["status"] == "skipped", payload
+assert "after restart" in payload["reason"], payload
+'
+rm -f "$AO_MALFORMED_AFTER_RESTART_FILE"
+set +e
+missing_fields_output="$(FAKE_AO_SESSION_GET_MISSING=1 bash "$HARNESS" 2>&1)"
+missing_fields_rc=$?
+set -e
+if [ "$missing_fields_rc" -ne 2 ]; then
+  echo "FAIL: missing authoritative session fields must be an explicit SKIP, got rc=$missing_fields_rc" >&2
+  echo "$missing_fields_output" >&2
+  exit 1
+fi
+printf '%s\n' "$missing_fields_output" | python3 -c '
+import json, sys
+text = sys.stdin.read()
+start = text.find("{")
+payload = json.loads(text[start:])
+assert payload["status"] == "skipped", payload
+assert "authoritative" in payload["reason"], payload
+'
+set +e
+unprefixed_output="$(FAKE_AO_SESSION_GET_UNPREFIXED=1 bash "$HARNESS" 2>&1)"
+unprefixed_rc=$?
+set -e
+if [ "$unprefixed_rc" -ne 2 ]; then
+  echo "FAIL: unprefixed inspection name must not suffix-match a host-prefixed pane, got rc=$unprefixed_rc" >&2
+  echo "$unprefixed_output" >&2
+  exit 1
+fi
+printf '%s\n' "$unprefixed_output" | python3 -c '
+import json, sys
+text = sys.stdin.read()
+start = text.find("{")
+payload = json.loads(text[start:])
+assert payload["status"] == "skipped", payload
+assert "correlate" in payload["reason"], payload
+'
+set +e
+owned_persists_output="$(FAKE_AO_KEEP_OWNED=1 bash "$HARNESS" 2>&1)"
+owned_persists_rc=$?
+set -e
+if [ "$owned_persists_rc" -ne 1 ]; then
+  echo "FAIL: active owned AO row/replacement tmux pane must fail cleanup proof, got rc=$owned_persists_rc" >&2
+  echo "$owned_persists_output" >&2
+  exit 1
+fi
+if [[ "$owned_persists_output" != *"remains active"* ]]; then
+  echo "FAIL: cleanup failure must identify the active owned AO row" >&2
+  echo "$owned_persists_output" >&2
+  exit 1
+fi
 
 echo "PASS: immutable restart manifest and identity contract"
