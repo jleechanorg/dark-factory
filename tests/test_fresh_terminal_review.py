@@ -372,6 +372,7 @@ def test_fresh_reviewer_materializes_in_tree_symlinks_without_write_through(tmp_
             # Mutating a materialized file in review dir must not touch target
             (cwd / "abs_link.txt").write_text("mutated in review dir\n")
             assert (repo / "value.txt").read_text() == "before\n"
+            (cwd / "abs_link.txt").write_text("before\n")
             return subprocess.CompletedProcess(args, 0, stdout="Verdict: PASS\n", stderr="")
         return real_run(args, **kwargs)
 
@@ -380,6 +381,8 @@ def test_fresh_reviewer_materializes_in_tree_symlinks_without_write_through(tmp_
     monkeypatch.setattr("runner.handler_codergen.subprocess.run", check_and_mutate_symlink)
 
     result = _codergen(_review_node(prompt), ctx)
+    assert result.outcome == "success"
+    assert result.metadata["verdict"] == "pass"
     assert len(calls) == 1
     assert (repo / "value.txt").read_text() == "before\n"
 
@@ -427,12 +430,18 @@ def test_fresh_reviewer_rejects_escaping_and_dangling_symlinks_without_launch(tm
 
 
 def test_fresh_reviewer_injected_linked_worktree_conversion_failure_rejects(tmp_path, monkeypatch):
+    import shutil
     main_repo = _repo(tmp_path / "main")
     wt_dir = tmp_path / "wt"
     subprocess.run(["git", "-C", str(main_repo), "worktree", "add", "-b", "feature-wt", str(wt_dir)], check=True)
 
-    # Injected corruption: overwrite .git in wt_dir with invalid gitdir reference
-    (wt_dir / ".git").write_text("gitdir: /nonexistent/path/worktrees/wt\n")
+    real_copytree = shutil.copytree
+
+    def failing_copytree(src, dst, *args, **kwargs):
+        src_path = pathlib.Path(src).resolve()
+        if src_path == (main_repo / ".git").resolve():
+            raise OSError("injected main gitdir copy failure")
+        return real_copytree(src, dst, *args, **kwargs)
 
     prompt = tmp_path / "review.md"
     prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
@@ -451,6 +460,7 @@ def test_fresh_reviewer_injected_linked_worktree_conversion_failure_rejects(tmp_
             return subprocess.CompletedProcess(args, 0, stdout="Verdict: PASS\n", stderr="")
         return real_run(args, **kwargs)
 
+    monkeypatch.setattr("runner.handler_codergen.shutil.copytree", failing_copytree)
     monkeypatch.setattr("runner.handlers._sandboxed_args_for_workdir", lambda args, workdir: args)
     monkeypatch.setattr("runner.handlers._sanitized_env", lambda: {})
     monkeypatch.setattr("runner.handler_codergen.subprocess.run", intercept_run)
