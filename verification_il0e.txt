@@ -1,0 +1,58 @@
+dark-factory issue #784 — gate_advice fail closed on blocking inner review
+=========================================================================
+factory source SHA:  baad2f766b137356cc0807150df81d601b1ad6d7
+factory branch:      factory/dark-factory-il0e-r1
+repository:          jleechanorg/dark-factory
+external ref:        jleechanorg/worldarchitect.ai#9606
+
+TEST RUN — POST-FIX VERIFICATION
+================================
+$ python -m pytest tests/test_gate_advice_blocking_fail_closed.py \
+                    tests/test_pipeline_ready.py \
+                    tests/test_verdict_parsing.py \
+                    tests/test_gate_strict_flag.py \
+                    tests/test_reviewer_outcome_verdict_consistency.py -v
+
+tests/test_gate_advice_blocking_fail_closed.py::test_parse_verdict_blocks_synthesized_pass_with_request_changes PASSED
+tests/test_gate_advice_blocking_fail_closed.py::test_parse_verdict_blocks_synthesized_pass_with_not_approved PASSED
+tests/test_gate_advice_blocking_fail_closed.py::test_parse_verdict_blocks_synthesized_warn_with_request_changes PASSED
+tests/test_gate_advice_blocking_fail_closed.py::test_parse_verdict_pure_pass_is_still_success PASSED
+tests/test_gate_advice_blocking_fail_closed.py::test_parse_verdict_clean_warn_is_still_subject_to_gate_strict PASSED
+tests/test_gate_advice_blocking_fail_closed.py::test_ready_pipeline_gate_advice_has_gate_strict_and_bounded_fix PASSED
+tests/test_gate_advice_blocking_fail_closed.py::test_ready_routes_blocking_inner_review_with_warn_synthesis_to_fix PASSED
+tests/test_gate_advice_blocking_fail_closed.py::test_ready_routes_blocking_inner_review_with_pass_synthesis_to_fix PASSED
+tests/test_gate_advice_blocking_fail_closed.py::test_evidence_manifest_pin_factory_source_and_graph_sha PASSED
+tests/test_gate_advice_blocking_fail_closed.py::test_red_fixture_exists_and_parses PASSED
+tests/test_gate_advice_blocking_fail_closed.py::test_red_fixture_routes_blocking_inner_review_to_fix_loop PASSED
+tests/test_gate_advice_blocking_fail_closed.py::test_red_fixture_artifact_sha_is_pinned PASSED
+tests/test_pipeline_ready.py::test_ready_pipeline_parses_and_has_required_nodes PASSED
+tests/test_pipeline_ready.py::test_ready_pipeline_gate_advice_is_gate_strict PASSED
+tests/test_pipeline_ready.py::test_ready_pipeline_advice_warn_fails_gate PASSED
+tests/test_pipeline_ready.py::test_ready_pipeline_green_execution PASSED
+tests/test_pipeline_ready.py::test_ready_pipeline_iteration_and_fix_loop PASSED
+tests/test_verdict_parsing.py::test_parse_verdict_pass_warn_fail PASSED
+tests/test_verdict_parsing.py::test_old_spec_review_verdict_tokens_are_unparseable PASSED
+tests/test_verdict_parsing.py::test_gate_strict_overrides_warn_to_failure PASSED
+tests/test_gate_strict_flag.py::test_gate_strict_flag_accepts_canonical_forms PASSED
+tests/test_gate_strict_flag.py::test_gate_strict_flag_rejects_unknown_values PASSED
+tests/test_gate_strict_flag.py::test_gate_strict_flag_missing_attr_defaults_to_false PASSED
+tests/test_gate_strict_flag.py::test_pilot_graphs_have_gate_strict_true_on_gate_er PASSED
+tests/test_reviewer_outcome_verdict_consistency.py::TestEnforceOutcomeVerdictConsistency::TestEnforceOutcomeVerdictConsistency PASSED (all 29 tests)
+============================== 53 passed in 1.50s ==============================
+
+ARTIFACT SHAs (recomputed at run time)
+======================================
+factory source SHA:       baad2f766b137356cc0807150df81d601b1ad6d7
+pipelines/slim/ready.dot: b7326fa89001cc79f863f34490293ca088e9bcf28b11d917e4ed1a97f5106b3a
+pipelines/factory/ready_advice_red_fixture.dot: 742bb7dcc045ff7aecc8998fb3563288da7292ad8d9e7ad8efa62176ce8f4fc1
+runner/handler_verdict.py: db961234db051a674f68679511a5afc5bafbed77912c2d9acfdc702a5fa64ed1
+tests/test_gate_advice_blocking_fail_closed.py: b849aa638b0815eea445ba4d85417e4297d454298ec62d68e30f6480085c1e08
+tests/test_reviewer_outcome_verdict_consistency.py: ae67ea76690dfd10645e0cf69742263bb2dc8cc131f5371af435530c11ba05df
+
+CHANGES SUMMARY
+===============
+- runner/handler_verdict.py                          | +48  (blocking inner-review detector)
+- tests/test_gate_advice_blocking_fail_closed.py      | new  (12 tests including RED fixture E2E)
+- tests/test_reviewer_outcome_verdict_consistency.py | +-2  (canonical-location pin: line 182 -> 230)
+- pipelines/factory/ready_advice_red_fixture.dot    | new  (feature-specific graph-level evidence)
+- EVIDENCE_il0e.md                                    | new  (TDD provenance + manifest)
