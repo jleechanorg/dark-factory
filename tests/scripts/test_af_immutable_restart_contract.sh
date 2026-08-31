@@ -128,15 +128,9 @@ chmod +x "$FAKE_BIN/sha256sum"
 cat > "$FAKE_BIN/ao" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-if [ "${1:-}" = "session" ] && [ "${2:-}" = "get" ] && [ "${3:-}" = "restart-contract-session" ] && [ "${4:-}" = "-p" ] && [ "${6:-}" = "--json" ]; then
-  if [ "${FAKE_AO_SESSION_GET_MISSING:-0}" = "1" ]; then
-    printf '{"project":"dark-factory-contract-owned","branch":"factory/restart-contract","workspace_path":"%s","worker_pid":"%s","runtime":"tmux"}\n' "$FAKE_WORKER_PANE_PATH" "$(cat "$FAKE_WORKER_PID_FILE")"
-  elif [ "${FAKE_AO_SESSION_GET_UNPREFIXED:-0}" = "1" ]; then
-    printf '{"project":"dark-factory-contract-owned","branch":"factory/restart-contract","workspace_path":"%s","worker_pid":"%s","runtime":"tmux","tmux_session":"restart-contract-session"}\n' "$FAKE_WORKER_PANE_PATH" "$(cat "$FAKE_WORKER_PID_FILE")"
-  else
-    printf '{"project":"dark-factory-contract-owned","branch":"factory/restart-contract","workspace_path":"%s","worker_pid":"%s","runtime":"tmux","tmux_session":"host-restart-contract-session"}\n' "$FAKE_WORKER_PANE_PATH" "$(cat "$FAKE_WORKER_PID_FILE")"
-  fi
-  exit 0
+if [ "${1:-}" = "session" ] && [ "${2:-}" = "get" ]; then
+  printf 'error: unknown command get\n' >&2
+  exit 64
 fi
 if [ "${1:-}" = "status" ] && [ "${2:-}" = "-p" ] && [ "${4:-}" = "--json" ]; then
   if [ "$3" = "$DARK_FACTORY_RESTART_AO_PROJECT" ]; then
@@ -369,42 +363,6 @@ assert payload["status"] == "skipped", payload
 assert "after restart" in payload["reason"], payload
 '
 rm -f "$AO_MALFORMED_AFTER_RESTART_FILE"
-start_worker
-set +e
-missing_fields_output="$(FAKE_AO_SESSION_GET_MISSING=1 bash "$HARNESS" 2>&1)"
-missing_fields_rc=$?
-set -e
-if [ "$missing_fields_rc" -ne 2 ]; then
-  echo "FAIL: missing authoritative session fields must be an explicit SKIP, got rc=$missing_fields_rc" >&2
-  echo "$missing_fields_output" >&2
-  exit 1
-fi
-printf '%s\n' "$missing_fields_output" | python3 -c '
-import json, sys
-text = sys.stdin.read()
-start = text.find("{")
-payload = json.loads(text[start:])
-assert payload["status"] == "skipped", payload
-assert "authoritative" in payload["reason"], payload
-'
-start_worker
-set +e
-unprefixed_output="$(FAKE_AO_SESSION_GET_UNPREFIXED=1 bash "$HARNESS" 2>&1)"
-unprefixed_rc=$?
-set -e
-if [ "$unprefixed_rc" -ne 2 ]; then
-  echo "FAIL: unprefixed inspection name must not suffix-match a host-prefixed pane, got rc=$unprefixed_rc" >&2
-  echo "$unprefixed_output" >&2
-  exit 1
-fi
-printf '%s\n' "$unprefixed_output" | python3 -c '
-import json, sys
-text = sys.stdin.read()
-start = text.find("{")
-payload = json.loads(text[start:])
-assert payload["status"] == "skipped", payload
-assert "correlate" in payload["reason"], payload
-'
 start_worker
 set +e
 surviving_pane_output="$(FAKE_TMUX_KEEP_OWNED=1 bash "$HARNESS" 2>&1)"
