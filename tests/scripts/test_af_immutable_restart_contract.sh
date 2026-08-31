@@ -163,8 +163,8 @@ if [ "${1:-}" = "status" ] && [ "${2:-}" = "-p" ] && [ "${4:-}" = "--json" ]; th
   fi
 fi
 if [ "${1:-}" = "session" ] && [ "${2:-}" = "kill" ] && [ "${3:-}" = "restart-contract-session" ]; then
-  if [ "${AO_PROJECT_ID:-}" != "$AO_IMMUTABLE_RESTART_TEST_PROJECT" ]; then
-    printf 'session kill must be scoped through AO_PROJECT_ID\n' >&2
+  if [ "${4:-}" != "-p" ] || [ "${5:-}" != "$AO_IMMUTABLE_RESTART_TEST_PROJECT" ]; then
+    printf 'session kill must include -p for the test project\n' >&2
     exit 95
   fi
   if [ "${FAKE_AO_KEEP_OWNED:-0}" != "1" ]; then

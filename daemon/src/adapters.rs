@@ -1,6 +1,6 @@
 use crate::errors::{DaemonError, SpawnBatchCleanupFailure};
 use crate::tools::{
-    run_tool, run_tool_in_dir, run_tool_with_env, Bead, Issue, LabeledPr, Llm, Permission,
+    run_tool, run_tool_in_dir, Bead, Issue, LabeledPr, Llm, Permission,
     PrHeadBranch, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs,
     WorktreeHeadAncestry,
 };
@@ -4072,12 +4072,7 @@ impl CliSessions {
     }
 
     fn kill_in_project(project: &str, id: &SessionId) -> Result<(), DaemonError> {
-        run_tool_with_env(
-            "ao",
-            &["session", "kill", &id.0],
-            &[("AO_PROJECT_ID", project)],
-            30,
-        )?;
+        run_tool("ao", &["session", "kill", &id.0, "-p", project], 30)?;
         Ok(())
     }
 
@@ -4776,9 +4771,11 @@ import os
 import sys
 
 args = sys.argv[1:]
-if args[:2] == ["session", "kill"] and len(args) == 3:
+if args[:2] == ["session", "kill"]:
+    assert len(args) == 5, args
+    assert args[3] == "-p", args
     with open(os.environ["AO_FAKE_LOG"], "a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"kind": "kill", "args": args, "session": args[2], "project": os.environ.get("AO_PROJECT_ID")}) + "\n")
+        handle.write(json.dumps({"kind": "kill", "args": args, "session": args[2], "project": args[4]}) + "\n")
     if os.environ.get("AO_FAKE_KILL_FAIL") == "1":
         print("scripted batch cleanup failure", file=sys.stderr)
         raise SystemExit(8)
@@ -6044,7 +6041,7 @@ os.execv(real_git, [real_git] + args)
         let row: serde_json::Value = calls.lines().next().unwrap().parse().unwrap();
         assert_eq!(
             row["args"],
-            serde_json::json!(["session", "kill", "session-project-bound"])
+            serde_json::json!(["session", "kill", "session-project-bound", "-p", "dark-factory"])
         );
         assert_eq!(row["project"], "dark-factory");
     }
@@ -6148,7 +6145,7 @@ os.execv(real_git, [real_git] + args)
         assert_eq!(kills.len(), successful_spawns.len(), "calls={calls}");
         assert_eq!(
             kills[0]["args"],
-            serde_json::json!(["session", "kill", kills[0]["session"]])
+            serde_json::json!(["session", "kill", kills[0]["session"], "-p", first.ao_project])
         );
         assert_eq!(kills[0]["project"], first.ao_project);
     }
@@ -6454,7 +6451,7 @@ with open(os.environ["AO_FAKE_CLEANUP_LOG"], "a", encoding="utf-8") as handle:
 if sys.argv[1] == "spawn":
     print("SESSION=missing-worktree-session")
     raise SystemExit(0)
-if sys.argv[1:] == ["session", "kill", "missing-worktree-session"]:
+if sys.argv[1:] == ["session", "kill", "missing-worktree-session", "-p", "dark-factory"]:
     raise SystemExit(0)
 raise SystemExit(9)
 "#,
@@ -6494,7 +6491,7 @@ raise SystemExit(9)
         assert!(result.is_err(), "missing Worktree must fail closed");
         assert_eq!(
             calls.last().unwrap(),
-            &serde_json::json!(["session", "kill", "missing-worktree-session"])
+            &serde_json::json!(["session", "kill", "missing-worktree-session", "-p", "dark-factory"])
         );
         assert!(!calls.iter().any(|call| call == &serde_json::json!(["stop", "missing-worktree-session"])));
     }
@@ -6521,7 +6518,7 @@ with open(os.environ["AO_FAKE_CLEANUP_LOG"], "a", encoding="utf-8") as handle:
 if sys.argv[1] == "spawn":
     print("SESSION=untracked-session")
     raise SystemExit(0)
-if sys.argv[1:] == ["session", "kill", "untracked-session"]:
+if sys.argv[1:] == ["session", "kill", "untracked-session", "-p", "dark-factory"]:
     print("scripted kill failure", file=sys.stderr)
     raise SystemExit(8)
 raise SystemExit(9)
@@ -6566,7 +6563,7 @@ raise SystemExit(9)
         );
         assert_eq!(
             calls.last().unwrap(),
-            &serde_json::json!(["session", "kill", "untracked-session"])
+            &serde_json::json!(["session", "kill", "untracked-session", "-p", "dark-factory"])
         );
     }
 

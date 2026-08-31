@@ -49,7 +49,7 @@
 #               never "proof of success".
 #
 # Real product stop/reap path used for criterion 3: `CliSessions::stop` in
-# daemon/src/adapters.rs runs `ao session kill <id>` — this script invokes
+# daemon/src/adapters.rs runs `ao session kill <id> -p <project>` — this script invokes
 # that exact command (never a raw `kill -9`) against a session it owns.
 #
 # Worker-continuity + stop-path proof (criterion 2/3) requires binding to a
@@ -633,10 +633,10 @@ if [ "$TMUX_PANE_BRANCH_AFTER" != "$SESSION_BRANCH_AFTER" ]; then
 fi
 
 # --- Explicit stop / reap verification via the REAL product stop path.
-# CliSessions::stop (daemon/src/adapters.rs) runs `ao session kill <id>` --
+# CliSessions::stop (daemon/src/adapters.rs) runs `ao session kill <id> -p <project>` --
 # this invokes that exact command, never a raw `kill -9`. ---
-if ! AO_PROJECT_ID="$AO_TEST_PROJECT" ao session kill "$AO_SESSION" >/dev/null 2>&1; then
-  echo "FAIL: real product stop path 'ao session kill $AO_SESSION' failed to execute" >&2
+if ! ao session kill "$AO_SESSION" -p "$AO_TEST_PROJECT" >/dev/null 2>&1; then
+  echo "FAIL: real product stop path 'ao session kill $AO_SESSION -p $AO_TEST_PROJECT' failed to execute" >&2
   exit 1
 fi
 reaped=0
