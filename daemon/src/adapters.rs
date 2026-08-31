@@ -3381,7 +3381,8 @@ fn is_ao_not_running_error(err: &DaemonError) -> bool {
     {
         return true;
     }
-    lower.contains("daemon is not running")
+    lower.contains("ao is not running")
+        || lower.contains("daemon is not running")
         || lower.contains("orchestrator not running")
         || lower.contains("unknown project")
         || lower.contains("no such project")
@@ -3454,6 +3455,17 @@ mod is_ao_not_running_error_tests {
             tool: "ao spawn --agent minimax".to_string(),
             rc: 1,
             stderr: "Error: daemon is not running".to_string(),
+        };
+        assert!(is_ao_not_running_error(&err));
+    }
+
+    #[test]
+    fn bridge_ao_is_not_running_phrase_triggers_recovery() {
+        let err = DaemonError::Tool {
+            tool: "ao spawn --agent minimax".to_string(),
+            rc: 1,
+            stderr: "[dark-factory AO bridge] AO is not running; run `ao start` before factory dispatch"
+                .to_string(),
         };
         assert!(is_ao_not_running_error(&err));
     }
