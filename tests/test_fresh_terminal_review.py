@@ -763,6 +763,60 @@ def test_fresh_reviewer_rejects_disable_sandbox_before_snapshot_or_launch(tmp_pa
 
 
 @pytest.mark.parametrize("platform", ["darwin", "linux"])
+def test_fresh_reviewer_rejects_disable_sandbox_before_shadow_review_popen_or_snapshot(tmp_path, monkeypatch, platform):
+    import tempfile
+    from runner.handler_codergen import _isolated_review_workdir
+
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setenv("DISABLE_SANDBOX", "1")
+    monkeypatch.setattr("runner.handler_codergen.shutil.which", lambda name: "/usr/bin/codex")
+
+    repo = _repo(tmp_path)
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    node = _review_node(prompt)
+    assert str(node.attrs.get("verdict_gate", "")).lower() in {"true", "1"}
+    assert str(node.attrs.get("class", "")).lower() == "review"
+
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="codex",
+        state={
+            "ao.worktree": str(repo),
+            "_df_shadow_codex_review": "true",
+        },
+    )
+
+    def fail_popen(*args, **kwargs):
+        raise AssertionError(f"Popen must not be called when DISABLE_SANDBOX is set on verdict review: {args}")
+
+    def fail_run(*args, **kwargs):
+        raise AssertionError(f"subprocess.run must not be called when DISABLE_SANDBOX is set on verdict review: {args}")
+
+    def fail_isolated_workdir(*args, **kwargs):
+        raise AssertionError(f"_isolated_review_workdir must not be called when DISABLE_SANDBOX is set on verdict review: {args}")
+
+    def fail_temp_dir(*args, **kwargs):
+        raise AssertionError(f"tempfile.TemporaryDirectory must not be called when DISABLE_SANDBOX is set on verdict review: {args}")
+
+    monkeypatch.setattr("runner.handler_codergen.subprocess.Popen", fail_popen)
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", fail_run)
+    monkeypatch.setattr("runner.handler_codergen._isolated_review_workdir", fail_isolated_workdir)
+    monkeypatch.setattr("runner.handler_codergen.tempfile.TemporaryDirectory", fail_temp_dir)
+    monkeypatch.setattr(tempfile, "TemporaryDirectory", fail_temp_dir)
+
+    result = _codergen(node, ctx)
+
+    assert result.outcome == "error"
+    assert result.metadata.get("verdict") == "unknown"
+    assert result.metadata.get("fresh_session") == "true"
+    assert "verdict-gated fresh review refuses DISABLE_SANDBOX; isolation is required" in result.output
+    assert "shadow_codex_review" not in result.metadata
+
+
+
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
 def test_sandboxed_args_for_fresh_review_rejects_disable_sandbox(tmp_path, monkeypatch, platform):
     from runner.handler_codergen import _sandboxed_args_for_fresh_review
 

@@ -942,6 +942,12 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
     verdict_gate = str(node.attrs.get("verdict_gate", "false")).strip().lower() in {
         "true", "1", "yes", "on",
     }
+    if backend == "codex" and verdict_gate and os.environ.get("DISABLE_SANDBOX"):
+        return Result(
+            outcome="error",
+            output="verdict-gated fresh review refuses DISABLE_SANDBOX; isolation is required",
+            metadata={"verdict": "unknown", "fresh_session": "true"},
+        )
     _start_ts = time.monotonic()
     shadow_review = _start_shadow_codex_review(node, ctx, backend, prompt_text)
 
@@ -1258,12 +1264,6 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             _stash_codergen_receipt(node, ctx)
         return _finalize(Result(outcome=outcome, output=output, metadata=meta))
     elif backend == "codex":
-        if verdict_gate and os.environ.get("DISABLE_SANDBOX"):
-            return _finalize(Result(
-                outcome="error",
-                output="verdict-gated fresh review refuses DISABLE_SANDBOX; isolation is required",
-                metadata={"verdict": "unknown", "fresh_session": "true"},
-            ))
         target_workdir = _fresh_review_workdir(ctx) if verdict_gate else ctx.workdir
         if target_workdir is None:
             return _finalize(Result(
