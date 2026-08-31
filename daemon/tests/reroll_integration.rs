@@ -495,6 +495,192 @@ fn test_reroll_routes_vcs_ops_through_bead_repo_for_cross_repo_bead() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+/// Bead dark-factory-yvk9 (issue #787, external ref
+/// `jleechanorg/worldarchitect.ai#9617`): the reroll's spec-mutation
+/// step (`reroll.rs` line 785, `let spec_path = Path::new(&deps.cfg
+/// .spec_dir).join(format!("{}.toml", bead.bead_id));`) treats the
+/// configured `spec_dir` as a path relative to the daemon's CURRENT
+/// WORKING DIRECTORY. The production default is a relative path
+/// (`.factory/specs/`), so when a cross-repo bead's spec file actually
+/// lives inside the routed target worktree under
+/// `<DARK_FACTORY_TARGET_WORKTREE_ROOT>/<owner>/<repo>/.factory/specs/`,
+/// the daemon instead creates/mutates the file at
+/// `<daemon_cwd>/.factory/specs/<bead_id>.toml` — a path that exists
+/// only inside the daemon's own source-repo checkout, never in the
+/// routed target repo where the next coder session will actually read
+/// it. The contract is: a RELATIVE `cfg.spec_dir` MUST resolve against
+/// the routed target worktree (the same path
+/// `cfg.target_worktree_path(bead.repo(cfg))` returns), NEVER against
+/// the daemon's process cwd. This test pins the contract and is RED
+/// against current main.
+#[test]
+fn relative_spec_dir_uses_target_worktree() {
+    use std::sync::{Mutex, OnceLock};
+
+    static SPEC_DIR_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    let _env_lock = SPEC_DIR_ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // Build an isolated daemon-owned target worktree root exactly the way
+    // `Config::target_worktree_path` resolves it: `$DARK_FACTORY_TARGET_
+    // WORKTREE_ROOT/<owner>/<repo>`.
+    let target_worktree_root = std::env::temp_dir().join(format!(
+        "afd_rel_spec_dir_yvk9_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let previous = std::env::var_os("DARK_FACTORY_TARGET_WORKTREE_ROOT");
+    std::env::set_var("DARK_FACTORY_TARGET_WORKTREE_ROOT", &target_worktree_root);
+
+    // Track previous cwd and restore on Drop so a cwd mutation by a
+    // future regression in this test cannot poison other tests in the
+    // same `cargo test` invocation. (We do NOT mutate cwd here; the
+    // guard is purely defensive.)
+    let _cwd_guard = CwdRestoreGuard::capture();
+
+    // Make sure no leftover `bead-rel-spec-yvk9-r1.toml` from a prior
+    // run is silently satisfying the assertion.
+    let daemon_cwd = std::env::current_dir().unwrap();
+    let daemon_cwd_spec_path = daemon_cwd
+        .join(".factory")
+        .join("specs")
+        .join("bead-rel-spec-yvk9-r1.toml");
+    let _ = std::fs::remove_file(&daemon_cwd_spec_path);
+
+    let scm = FakeScm::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = true;
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert("main".into(), "base-sha-rel-spec".into());
+    vcs.heads.insert(
+        "factory/bead-rel-spec-yvk9-r1".into(),
+        "head-sha-rel-spec".into(),
+    );
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"inhibitionSpecs":["no print"],"positiveAssertions":["log errors"],"securityRedactionEncountered":false}"#.into()
+    ));
+
+    let mut cfg = test_cfg();
+    // PRODUCTION DEFAULT shape: relative `.factory/specs` — the
+    // daemon MUST route this through the target worktree, not its cwd.
+    cfg.spec_dir = ".factory/specs".to_string();
+    // The bead's resolved repo DIFFERS from `cfg.target_repo`
+    // ("owner/repo"); this is the cross-repo shape that surfaces the
+    // cwd-vs-target-worktree mismatch. The external ref for this bead
+    // is `jleechanorg/worldarchitect.ai#9617`.
+    let mut bead = BeadOverlay {
+        bead_id: "bead-rel-spec-yvk9-r1".into(),
+        state: OverlayState::Attested,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 20,
+        spend_usd: 0.5,
+        pr_number: Some(9617),
+        branch: Some("factory/bead-rel-spec-yvk9-r1".into()),
+        session_id: None,
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: Some("jleechanorg/worldarchitect.ai".into()),
+        attempt_started_at: None,
+    };
+    store.save(&bead).unwrap();
+
+    let telemetry_log = target_worktree_root.join("rel_spec_telemetry.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "skeptic".into(),
+        review_text: "Don't print to stdout, log errors.".into(),
+    };
+
+    let outcome = reroll::execute(&deps, &mut bead);
+    match &outcome {
+        Ok(RerollOutcome::Rerolled { .. }) => {}
+        other => panic!(
+            "reroll must succeed and mutate the routed spec file; got: {:?}",
+            other
+        ),
+    }
+
+    // The contract: the spec file MUST live under the routed target
+    // worktree, NOT under the daemon cwd.
+    let routed_spec_path = cfg
+        .target_worktree_path("jleechanorg/worldarchitect.ai")
+        .expect("target_worktree_path must resolve when DARK_FACTORY_TARGET_WORKTREE_ROOT is set")
+        .join(".factory")
+        .join("specs")
+        .join("bead-rel-spec-yvk9-r1.toml");
+    assert!(
+        routed_spec_path.exists(),
+        "reroll must mutate the spec file at the routed target worktree ({}) — not the daemon cwd. \
+         This is the bead-rel-spec / issue #787 contract: a RELATIVE `cfg.spec_dir` must resolve \
+         against `cfg.target_worktree_path(bead.repo(cfg))`, never the daemon cwd.",
+        routed_spec_path.display(),
+    );
+    let routed_spec_content = std::fs::read_to_string(&routed_spec_path).unwrap();
+    assert!(routed_spec_content.contains("reviewer = \"skeptic\""));
+    assert!(routed_spec_content.contains("inhibition_specs = ["));
+    assert!(routed_spec_content.contains("\"no print\""));
+
+    // Negative assertion: the spec file MUST NOT have been written to
+    // the daemon cwd. (Pre-cleans at the top ensure leftover state from
+    // prior runs cannot spuriously pass this assertion.)
+    assert!(
+        !daemon_cwd_spec_path.exists(),
+        "reroll MUST NOT mutate the spec file at the daemon cwd ({}); a \
+         relative `cfg.spec_dir` must resolve against the routed target \
+         worktree, never the daemon's process cwd.",
+        daemon_cwd_spec_path.display(),
+    );
+
+    // Best-effort cleanup. The DARK_FACTORY_TARGET_WORKTREE_ROOT
+    // env var and the temp target-worktree root are restored below in
+    // the explicit drop guard section.
+    let _ = std::fs::remove_file(&telemetry_log);
+    let _ = std::fs::remove_dir_all(&target_worktree_root);
+
+    match previous {
+        Some(value) => std::env::set_var("DARK_FACTORY_TARGET_WORKTREE_ROOT", value),
+        None => std::env::remove_var("DARK_FACTORY_TARGET_WORKTREE_ROOT"),
+    }
+}
+
+/// Defensive cwd guard: if any future regression in this test
+/// accidentally mutates the daemon cwd, restore the original on Drop
+/// so the rest of the `cargo test` invocation is not poisoned.
+struct CwdRestoreGuard(Option<std::path::PathBuf>);
+
+impl CwdRestoreGuard {
+    fn capture() -> Self {
+        Self(Some(std::env::current_dir().unwrap()))
+    }
+}
+
+impl Drop for CwdRestoreGuard {
+    fn drop(&mut self) {
+        if let Some(ref cwd) = self.0 {
+            let _ = std::env::set_current_dir(cwd);
+        }
+    }
+}
+
 #[test]
 fn test_tick_stage2_integration() {
     let mut scm = FakeScm::new();
