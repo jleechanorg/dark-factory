@@ -14,7 +14,7 @@ from runner.handlers import Context, _codergen  # noqa: E402
 
 def _repo(tmp_path: pathlib.Path) -> pathlib.Path:
     repo = tmp_path / "target"
-    repo.mkdir()
+    repo.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
     subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
     subprocess.run(
@@ -58,9 +58,11 @@ def _run_review(tmp_path, monkeypatch, output: str, *, mutate: bool = False):
 
     def fake_run(args, **kwargs):
         if args and args[0] == "codex":
-            calls.append((list(args), pathlib.Path(kwargs["cwd"])))
+            review_dir = pathlib.Path(kwargs["cwd"])
+            calls.append((list(args), review_dir))
+            assert (review_dir / "value.txt").read_text() == "before\n"
             if mutate:
-                (repo / "value.txt").write_text("reviewer changed this\n")
+                (review_dir / "value.txt").write_text("reviewer changed this\n")
             return subprocess.CompletedProcess(args, 0, stdout=output, stderr="")
         return real_run(args, **kwargs)
 
@@ -70,7 +72,7 @@ def _run_review(tmp_path, monkeypatch, output: str, *, mutate: bool = False):
     return _codergen(node, ctx), calls, repo
 
 
-def test_fresh_reviewer_runs_codex_ephemeral_in_target_worktree(tmp_path, monkeypatch):
+def test_fresh_reviewer_runs_codex_ephemeral_in_isolated_review_workdir(tmp_path, monkeypatch):
     result, calls, repo = _run_review(
         tmp_path,
         monkeypatch,
@@ -83,7 +85,9 @@ def test_fresh_reviewer_runs_codex_ephemeral_in_target_worktree(tmp_path, monkey
     argv, cwd = calls[0]
     assert argv[:5] == ["codex", "exec", "--ephemeral", "--yolo", "--skip-git-repo-check"]
     assert not {"--disable", "--ignore-rules"}.intersection(argv)
-    assert cwd == repo
+    assert cwd != repo
+    # Review workdir was temporary and cleaned up on exit
+    assert not cwd.exists()
 
 
 def test_fresh_reviewer_failure_is_relayable_output(tmp_path, monkeypatch):
@@ -141,7 +145,99 @@ def test_fresh_reviewer_tracked_mutation_fails_closed(tmp_path, monkeypatch):
     assert result.outcome == "error"
     assert result.metadata["reviewer_mutated_tracked_files"] == "true"
     assert "reviewer changed tracked files" in result.output.lower()
-    assert (repo / "value.txt").read_text() == "reviewer changed this\n"
+    assert (repo / "value.txt").read_text() == "before\n"
+
+
+def test_fresh_reviewer_preserves_untracked_artifacts_and_unstaged_edits(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    (repo / "value.txt").write_text("worker modified this\n")
+    (repo / "artifact.json").write_text('{"tests": "passed"}\n')
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="echo",
+        state={"ao.worktree": str(repo)},
+    )
+    calls: list[pathlib.Path] = []
+    real_run = subprocess.run
+
+    def check_review_tree(args, **kwargs):
+        if args and args[0] == "codex":
+            cwd = pathlib.Path(kwargs["cwd"])
+            calls.append(cwd)
+            assert (cwd / "value.txt").read_text() == "worker modified this\n"
+            assert (cwd / "artifact.json").read_text() == '{"tests": "passed"}\n'
+            return subprocess.CompletedProcess(args, 0, stdout="Verdict: PASS\n", stderr="")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr("runner.handlers._sandboxed_args_for_workdir", lambda args, workdir: args)
+    monkeypatch.setattr("runner.handlers._sanitized_env", lambda: {})
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", check_review_tree)
+
+    result = _codergen(_review_node(prompt), ctx)
+
+    assert result.outcome == "success"
+    assert len(calls) == 1
+    assert calls[0] != repo
+    # Coder worktree is untouched and retains its edits/artifacts
+    assert (repo / "value.txt").read_text() == "worker modified this\n"
+    assert (repo / "artifact.json").read_text() == '{"tests": "passed"}\n'
+
+
+def test_fresh_reviewer_git_worktree_target_isolation(tmp_path, monkeypatch):
+    main_repo = _repo(tmp_path / "main")
+    wt_dir = tmp_path / "wt"
+    subprocess.run(["git", "-C", str(main_repo), "worktree", "add", "-b", "feature-wt", str(wt_dir)], check=True)
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="echo",
+        state={"ao.worktree": str(wt_dir)},
+    )
+    calls: list[pathlib.Path] = []
+    real_run = subprocess.run
+
+    main_head_before = subprocess.run(["git", "-C", str(main_repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    wt_head_before = subprocess.run(["git", "-C", str(wt_dir), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+
+    def mutate_wt_git(args, **kwargs):
+        if args and args[0] == "codex":
+            cwd = pathlib.Path(kwargs["cwd"])
+            calls.append(cwd)
+            # Verify no git metadata in review dir references original main_repo or wt_dir
+            for f in (cwd / ".git").rglob("*"):
+                if f.is_file():
+                    content = f.read_bytes()
+                    assert str(main_repo).encode() not in content
+                    assert str(wt_dir).encode() not in content
+            # Exercise a git write in review dir
+            (cwd / "value.txt").write_text("reviewer corrupted wt\n")
+            subprocess.run(["git", "-C", str(cwd), "add", "value.txt"], check=True)
+            subprocess.run(["git", "-C", str(cwd), "commit", "-qm", "reviewer commit"], check=True)
+            return subprocess.CompletedProcess(args, 0, stdout="Verdict: PASS\n", stderr="")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr("runner.handlers._sandboxed_args_for_workdir", lambda args, workdir: args)
+    monkeypatch.setattr("runner.handlers._sanitized_env", lambda: {})
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", mutate_wt_git)
+
+    result = _codergen(_review_node(prompt), ctx)
+
+    assert result.outcome == "error"
+    assert result.metadata["reviewer_mutated_tracked_files"] == "true"
+    assert len(calls) == 1
+    assert calls[0] != wt_dir
+    # Linked worktree and main repo remain pristine in content and git refs
+    assert (wt_dir / "value.txt").read_text() == "before\n"
+    assert (main_repo / "value.txt").read_text() == "before\n"
+    main_head_after = subprocess.run(["git", "-C", str(main_repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    wt_head_after = subprocess.run(["git", "-C", str(wt_dir), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    assert main_head_after == main_head_before
+    assert wt_head_after == wt_head_before
 
 
 def test_fresh_reviewer_rejects_symlinked_target_before_codex(tmp_path, monkeypatch):
@@ -191,7 +287,9 @@ def test_fresh_reviewer_allows_real_target_beneath_symlinked_parent(
 
     def pass_review(args, **kwargs):
         if args and args[0] == "codex":
-            calls.append(pathlib.Path(kwargs["cwd"]))
+            cwd = pathlib.Path(kwargs["cwd"])
+            calls.append(cwd)
+            assert (cwd / "value.txt").read_text() == "before\n"
             return subprocess.CompletedProcess(
                 args, 0, stdout="Verdict: PASS\n", stderr=""
             )
@@ -206,7 +304,8 @@ def test_fresh_reviewer_allows_real_target_beneath_symlinked_parent(
     result = _codergen(_review_node(prompt), ctx)
 
     assert result.outcome == "success"
-    assert calls == [repo.resolve()]
+    assert len(calls) == 1
+    assert calls[0] != repo
 
 
 def test_default_graph_does_not_initialize_controller_state(tmp_path, monkeypatch):

@@ -63,6 +63,7 @@ the full empirical distribution and the citation.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -71,6 +72,7 @@ import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -566,6 +568,78 @@ def _fresh_review_workdir(ctx: "Context") -> pathlib.Path | None:
     return resolved
 
 
+@contextlib.contextmanager
+def _isolated_review_workdir(target_workdir: pathlib.Path):
+    """Create an isolated, temporary workspace for fresh reviewer execution.
+
+    Preserves the full working tree (tracked files, staged/unstaged changes,
+    untracked artifacts, and git repository state) so the reviewer can run
+    tools and inspect worker output, while containing any reviewer writes away
+    from the actual coder target worktree.
+    """
+    with tempfile.TemporaryDirectory(prefix="df-fresh-review-") as tmpdir:
+        tmp_path = pathlib.Path(tmpdir)
+        review_dir = tmp_path / "workspace"
+        shutil.copytree(
+            target_workdir,
+            review_dir,
+            symlinks=True,
+            ignore_dangling_symlinks=True,
+        )
+
+        git_target = target_workdir / ".git"
+        git_review = review_dir / ".git"
+        if git_target.is_file() and git_review.is_file():
+            try:
+                gitdir_content = git_target.read_text(encoding="utf-8").strip()
+                if gitdir_content.startswith("gitdir:"):
+                    gitdir_raw = gitdir_content[len("gitdir:"):].strip()
+                    gitdir_path = (target_workdir / gitdir_raw).resolve()
+                    if gitdir_path.is_dir():
+                        commondir_file = gitdir_path / "commondir"
+                        if commondir_file.is_file():
+                            commondir_raw = commondir_file.read_text(encoding="utf-8").strip()
+                            main_git_dir = (gitdir_path / commondir_raw).resolve()
+                        else:
+                            main_git_dir = gitdir_path
+                        if main_git_dir.is_dir():
+                            git_review.unlink()
+                            shutil.copytree(
+                                main_git_dir,
+                                git_review,
+                                symlinks=True,
+                                ignore_dangling_symlinks=True,
+                            )
+                            for entry in gitdir_path.rglob("*"):
+                                if entry.name in ("commondir", "gitdir") or entry.is_dir():
+                                    continue
+                                rel = entry.relative_to(gitdir_path)
+                                dest = git_review / rel
+                                dest.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.copy2(entry, dest)
+            except Exception:
+                pass
+
+        if git_review.is_dir():
+            wt_sub = git_review / "worktrees"
+            if wt_sub.exists():
+                shutil.rmtree(wt_sub, ignore_errors=True)
+            cfg_file = git_review / "config"
+            if cfg_file.is_file():
+                try:
+                    content = cfg_file.read_text(encoding="utf-8")
+                    new_content = re.sub(r"bare\s*=\s*true", "bare = false", content, flags=re.IGNORECASE)
+                    new_lines = [
+                        line for line in new_content.splitlines()
+                        if not line.strip().lower().startswith("worktree =")
+                    ]
+                    cfg_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+                except Exception:
+                    pass
+
+        yield review_dir
+
+
 
 def _parse_commands_run_md(text: str) -> list[tuple[str, int]]:
     """Mechanical line-format parser for the ``commands_run.md`` #406 artifact.
@@ -972,67 +1046,107 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             _stash_codergen_receipt(node, ctx)
         return _finalize(Result(outcome=outcome, output=output, metadata=meta))
     elif backend == "codex":
-        codex_workdir = _fresh_review_workdir(ctx) if verdict_gate else ctx.workdir
-        if codex_workdir is None:
+        target_workdir = _fresh_review_workdir(ctx) if verdict_gate else ctx.workdir
+        if target_workdir is None:
             return _finalize(Result(
                 outcome="error",
                 output="fresh reviewer target must be a real, non-symlinked directory",
                 metadata={"verdict": "unknown", "fresh_session": "true"},
             ))
-        tracked_before = _tracked_state(codex_workdir) if verdict_gate else None
+        tracked_before = _tracked_state(target_workdir) if verdict_gate else None
         if verdict_gate and tracked_before is None:
             return _finalize(Result(
                 outcome="error",
                 output="fresh reviewer could not fingerprint the tracked repository state",
                 metadata={"verdict": "unknown", "fresh_session": "true"},
             ))
-        codex_command = ["codex", "exec"]
-        if str(node.attrs.get("fresh_session", "false")).strip().lower() in {
-            "true", "1", "yes", "on",
-        }:
-            codex_command.append("--ephemeral")
-        codex_command.extend(["--yolo", "--skip-git-repo-check", prompt_text])
-        args = _handlers_shim._sandboxed_args_for_workdir(
-            codex_command,
-            codex_workdir,
+        workdir_cm = (
+            _isolated_review_workdir(target_workdir)
+            if verdict_gate
+            else contextlib.nullcontext(target_workdir)
         )
-        if args is None:
-            return _finalize(Result(
-                outcome="error" if verdict_gate else "failure",
-                output="sandbox-exec unavailable",
-            ))
-        timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1800"), 1800)
-        try:
-            proc = subprocess.run(
-                args,
-                cwd=codex_workdir,
-                capture_output=True,
-                text=True,
-                timeout=timeout_s,
-                check=False,
-                input="",
-                env=_handlers_shim._sanitized_env(),
+        with workdir_cm as codex_workdir:
+            codex_command = ["codex", "exec"]
+            if str(node.attrs.get("fresh_session", "false")).strip().lower() in {
+                "true", "1", "yes", "on",
+            }:
+                codex_command.append("--ephemeral")
+            codex_command.extend(["--yolo", "--skip-git-repo-check", prompt_text])
+            args = _handlers_shim._sandboxed_args_for_workdir(
+                codex_command,
+                codex_workdir,
             )
-        except subprocess.TimeoutExpired as exc:
+            if args is None:
+                return _finalize(Result(
+                    outcome="error" if verdict_gate else "failure",
+                    output="sandbox-exec unavailable",
+                ))
+            timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1800"), 1800)
+            try:
+                proc = subprocess.run(
+                    args,
+                    cwd=codex_workdir,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_s,
+                    check=False,
+                    input="",
+                    env=_handlers_shim._sanitized_env(),
+                )
+            except subprocess.TimeoutExpired as exc:
+                return _finalize(Result(
+                    outcome="error" if verdict_gate else "failure",
+                    output=_subprocess_output(exc.stdout, exc.stderr)
+                    or f"codex backend timed out after {timeout_s} seconds",
+                    metadata={
+                        "timed_out": "true",
+                        "timeout": str(timeout_s),
+                        "returncode": "",
+                    },
+                ))
+            except Exception as exc:
+                return _finalize(Result(
+                    outcome="error",
+                    output=f"codex backend error: {exc}",
+                    metadata={
+                        "timed_out": "false",
+                        "timeout": str(timeout_s),
+                        "returncode": "",
+                    },
+                ))
+
+            output = proc.stdout + ("\nSTDERR:\n" + proc.stderr if proc.stderr else "")
+            outcome = "success" if proc.returncode == 0 else "failure"
+            wall_ms = int((time.monotonic() - _start_ts) * 1000)
+            metrics = _handlers_shim._codergen_metrics(proc.stdout, proc.stderr, wall_ms)
+            meta = {"returncode": str(proc.returncode)}
+            meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
+            if verdict_gate:
+                verdict, parsed_outcome = _handlers_shim._parse_verdict(output, gate_strict=True)
+                tracked_after = _tracked_state(codex_workdir)
+                mutated = tracked_before is None or tracked_after is None or tracked_before != tracked_after
+                if proc.returncode != 0 or verdict == "unknown":
+                    outcome = "error"
+                else:
+                    outcome = parsed_outcome
+                meta.update(
+                    {
+                        "verdict": verdict,
+                        "fresh_session": "true",
+                        "review_workdir": str(target_workdir),
+                        "reviewer_mutated_tracked_files": str(mutated).lower(),
+                    }
+                )
+                if mutated:
+                    outcome = "error"
+                    output = output.rstrip() + "\n\nReviewer changed tracked files; changes must be made by the coder.\n"
+            elif outcome == "success":
+                _stash_diff(node, ctx)
+                _stash_codergen_receipt(node, ctx)
             return _finalize(Result(
-                outcome="error" if verdict_gate else "failure",
-                output=_subprocess_output(exc.stdout, exc.stderr)
-                or f"codex backend timed out after {timeout_s} seconds",
-                metadata={
-                    "timed_out": "true",
-                    "timeout": str(timeout_s),
-                    "returncode": "",
-                },
-            ))
-        except Exception as exc:
-            return _finalize(Result(
-                outcome="error",
-                output=f"codex backend error: {exc}",
-                metadata={
-                    "timed_out": "false",
-                    "timeout": str(timeout_s),
-                    "returncode": "",
-                },
+                outcome=outcome,
+                output=output,
+                metadata=meta,
             ))
     elif backend == "agy":
         timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "600"), 600)
@@ -1131,39 +1245,3 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         return _finalize(Result(outcome=outcome, output=output, metadata=meta))
     else:
         return _finalize(Result(outcome="failure", output=f"unknown backend {backend!r}"))
-
-    output = proc.stdout + ("\nSTDERR:\n" + proc.stderr if proc.stderr else "")
-    outcome = "success" if proc.returncode == 0 else "failure"
-    if backend == "agy" and output.strip().startswith("Error: timed out waiting for response"):
-        outcome = "failure"
-    wall_ms = int((time.monotonic() - _start_ts) * 1000)
-    metrics = _handlers_shim._codergen_metrics(proc.stdout, proc.stderr, wall_ms)
-    meta = {"returncode": str(proc.returncode)}
-    meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
-    if verdict_gate:
-        verdict, parsed_outcome = _handlers_shim._parse_verdict(output, gate_strict=True)
-        tracked_after = _tracked_state(codex_workdir)
-        mutated = tracked_before is None or tracked_after is None or tracked_before != tracked_after
-        if proc.returncode != 0 or verdict == "unknown":
-            outcome = "error"
-        else:
-            outcome = parsed_outcome
-        meta.update(
-            {
-                "verdict": verdict,
-                "fresh_session": "true",
-                "review_workdir": str(codex_workdir),
-                "reviewer_mutated_tracked_files": str(mutated).lower(),
-            }
-        )
-        if mutated:
-            outcome = "error"
-            output = output.rstrip() + "\n\nReviewer changed tracked files; changes must be made by the coder.\n"
-    elif outcome == "success":
-        _stash_diff(node, ctx)
-        _stash_codergen_receipt(node, ctx)
-    return _finalize(Result(
-        outcome=outcome,
-        output=output,
-        metadata=meta,
-    ))
