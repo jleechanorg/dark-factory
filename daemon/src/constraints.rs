@@ -351,4 +351,119 @@ mod tests {
 
         std::fs::remove_dir_all(&temp_dir).ok();
     }
+
+    /// RED test for dark-factory #777 (reroll post-open failure cleanup).
+    ///
+    /// `append_mutation` opens a temporary mutation file inside the
+    /// spec file's parent directory (`.{filename}.tmp.{pid}`) and only
+    /// renames it onto the target at the very last step. If anything
+    /// fails between `open` and `rename`, the temporary file MUST be
+    /// removed so reroll loops don't accumulate stale `.tmp.*` files in
+    /// the spec directory, and the original spec_path bytes MUST be
+    /// preserved (i.e. not partially overwritten or corrupted).
+    ///
+    /// This test induces a post-open failure by making `spec_path`
+    /// itself a directory: `append_mutation` successfully opens the
+    /// temp file, then fails at `read_to_string(spec_path)` because the
+    /// target is not a regular file. After the call returns:
+    ///   1. `spec_path` MUST still exist with its original kind
+    ///      (preserved bytes / unchanged identity), AND
+    ///   2. The temp file created by THIS call (matching
+    ///      `.{filename}.tmp.{pid}` for our pid) MUST be gone, AND
+    ///   3. A sibling decoy temp file with a different filename base
+    ///      (also matching `*.tmp.{pid}`) MUST remain untouched, proving
+    ///      the cleanup removes ONLY the temp file this function
+    ///      created — not arbitrary unrelated `.tmp.{pid}` files in the
+    ///      parent directory.
+    ///
+    /// On current main the cleanup step is missing, so assertion (2)
+    /// fires: the temp file from this call is still on disk after the
+    /// function returns its error. This is the RED state — do NOT add
+    /// the GREEN implementation in this PR.
+    #[test]
+    fn reroll_post_open_failure_removes_temp() {
+        // Isolated parent directory for this test run; named after the
+        // pid so parallel runs don't collide.
+        let temp_dir = std::env::temp_dir().join(format!(
+            "acd_reroll_post_open_failure_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).expect("create isolated temp dir");
+
+        let spec_path = temp_dir.join("spec.toml");
+
+        // Decoy temp file: matches the `*.tmp.{pid}` naming pattern
+        // append_mutation uses, but with a DIFFERENT filename base so
+        // the cleanup logic must target only the file this call
+        // created. If a future implementation accidentally removes
+        // every `*.tmp.{pid}` file in the parent (or removes by
+        // glob/suffix), the decoy disappears and this test catches it.
+        let decoy_temp_name = format!(".other.tmp.{}", std::process::id());
+        let decoy_temp_path = temp_dir.join(&decoy_temp_name);
+        std::fs::write(&decoy_temp_path, b"DECOY_SHOULD_NOT_BE_REMOVED\n")
+            .expect("write decoy temp file");
+        let decoy_bytes_before = std::fs::read(&decoy_temp_path).expect("read decoy");
+
+        // Induce a post-open failure: `spec_path` is a directory, so
+        // inside `append_mutation` the temp file is opened (and exists
+        // on disk) BEFORE `read_to_string(spec_path)` fails with EISDIR.
+        // That is the canonical post-open failure window we need to
+        // exercise. The spec_path identity (directory, not file) MUST
+        // survive unchanged.
+        std::fs::create_dir(&spec_path).expect("create spec_path as directory");
+
+        // Capture whether the function still leaves a stale temp file
+        // behind — we read this back AFTER asserting the contract.
+        let our_temp_name = format!(".spec.toml.tmp.{}", std::process::id());
+        let our_temp_path = temp_dir.join(&our_temp_name);
+
+        // The call itself must surface the failure (not silently swallow
+        // it). We don't care which DaemonError variant is returned —
+        // only that an error is produced.
+        let result = append_mutation(&spec_path, "NEW_BLOCK\n");
+        assert!(
+            result.is_err(),
+            "append_mutation must return Err when spec_path is a directory; got Ok: {:?}",
+            result
+        );
+
+        // (1) Original spec_path identity preserved. It must still be a
+        // directory — i.e. the failed call did not partially corrupt or
+        // remove the target.
+        let meta = std::fs::metadata(&spec_path)
+            .expect("spec_path must still exist after failed append_mutation");
+        assert!(
+            meta.is_dir(),
+            "spec_path must remain a directory (original bytes / identity preserved) \
+             after failed append_mutation; metadata: {:?}",
+            meta
+        );
+
+        // (2) The temp file created by THIS call must be removed.
+        // On current main this is the assertion that fails (RED).
+        assert!(
+            !our_temp_path.exists(),
+            "temp file created by append_mutation at {:?} must be removed on \
+             post-open failure; it still exists on disk",
+            our_temp_path
+        );
+
+        // (3) The decoy temp file must remain untouched — only the temp
+        // file THIS function created is removed, not arbitrary sibling
+        // `.tmp.{pid}` files in the parent directory.
+        assert!(
+            decoy_temp_path.exists(),
+            "decoy temp file at {:?} must NOT be removed by append_mutation; \
+             cleanup must target only this call's own temp file",
+            decoy_temp_path
+        );
+        let decoy_bytes_after = std::fs::read(&decoy_temp_path).expect("read decoy after");
+        assert_eq!(
+            decoy_bytes_after, decoy_bytes_before,
+            "decoy temp file contents must be unchanged after failed append_mutation"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }
