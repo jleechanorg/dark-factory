@@ -608,3 +608,199 @@ fn sqlite_escalation_dedup_terminal_marker_survives_real_upsert() {
         "record_escalation_emit after mark_escalation_undeliverable must NOT clear terminal"
     );
 }
+
+/// PR #755 Slice 2 r2 (P1 production restart proof): the stranded-`RE_ROLL`
+/// recovery path MUST survive a real daemon restart — i.e. it must work
+/// when the overlay row is persisted to a real `SqliteStateStore`, the
+/// store is closed and re-opened against the same on-disk file, and the
+/// tick is run again. Catches a class of bugs where the fast-tier's
+/// `if overlay.state == OverlayState::ReRoll && overlay.session_id.is_none()`
+/// check is correct against `FakeStateStore` but crashes / silently
+/// no-ops against the real SQLite backend (transaction boundary, schema
+/// migration, column-type drift). Also pins the dedup contract:
+/// persisting the demote-to-ATTESTED means a SECOND tick after restart
+/// does NOT re-emit `REROLL_RESUMED_AFTER_RESTART` — the recovery is
+/// one-shot, not every-tick.
+#[test]
+fn sqlite_reroll_overlay_survives_real_restart_and_recovery_event_dedups() {
+    // Build the test fixture once: a RE_ROLL overlay with no session
+    // handle AND its branch registered. This is exactly the state a
+    // daemon leaves behind when it crashes between
+    // `reroll::execute`'s `state = ReRoll` save and `execute_adopted`'s
+    // `state = Dispatching` save (see reroll.rs ~line 338 and ~line
+    // 1414). Persist via a real `SqliteStateStore`, drop the
+    // connection entirely, then REOPEN against the same on-disk file
+    // — i.e. simulate a daemon restart with no in-memory state.
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "dark-factory-reroll-restart-{}-{}.sqlite",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+    ));
+    let branch = format!("factory/sqlite-reroll-restart-r2");
+
+    {
+        let store = SqliteStateStore::open(&path).expect("initial open must succeed");
+        store
+            .save(&BeadOverlay {
+                bead_id: "sqlite-reroll-restart".into(),
+                state: OverlayState::ReRoll,
+                attempt: 2,
+                reroll_count: 1,
+                autonomy_secs: 5,
+                spend_usd: 0.0,
+                pr_number: Some(7031),
+                branch: Some(branch.clone()),
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("owner/repo".to_string()),
+                attempt_started_at: None,
+            })
+            .expect("save stranded RE_ROLL overlay");
+        store
+            .register_branch("sqlite-reroll-restart", &branch)
+            .expect("register_branch");
+    } // store dropped here — first SQLite handle closed.
+
+    // ── Restart #1: reopen the SAME on-disk DB and run one tick ──
+    // The post-crash overlay MUST survive the cross-process boundary,
+    // and the fast tier's stranded-RE_ROLL guard MUST demote it back
+    // to ATTESTED + emit `REROLL_RESUMED_AFTER_RESTART` exactly once.
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let mut cfg = test_cfg();
+    cfg.stage = 2; // enable the reroll lane in fast tier
+    cfg.reroll_head_stability_window_secs = 1;
+    cfg.reroll_death_confirm_secs = 0;
+    let vcs = test_vcs();
+
+    let telemetry_log_1 = std::env::temp_dir().join(format!(
+        "afd_sqlite_reroll_restart_t1_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log_1);
+
+    {
+        let store = SqliteStateStore::open(&path)
+            .expect("first restart reopen must succeed");
+
+        // Dispatch the tick against the re-opened store.
+        let _ = run_tick(
+            &TickDeps {
+                scm: &scm,
+                tracker: &tracker,
+                sessions: &sessions,
+                llm: &llm,
+                store: &store,
+                vcs: &vcs,
+                cfg: &cfg,
+                telemetry_log: &telemetry_log_1,
+                vendor_health: None,
+            },
+            1,
+            0,
+        )
+        .expect("tick 1 must succeed");
+
+        // Read back the overlay from SQLite (NOT from memory) — proves
+        // the demote-to-ATTESTED was persisted across processes.
+        let overlay = store
+            .load("sqlite-reroll-restart")
+            .expect("load must succeed")
+            .expect("overlay row must be present after the restart");
+        assert_ne!(
+            overlay.state,
+            OverlayState::ReRoll,
+            "after tick 1, the stranded RE_ROLL MUST be demoted (state == ReRoll \
+             would leave the bead invisible to the reroll lane forever); got {:?}",
+            overlay.state
+        );
+        assert_eq!(
+            overlay.state,
+            OverlayState::Attested,
+            "after tick 1, the stranded RE_ROLL must be promoted back to \
+             ATTESTED so reroll::execute's freshness guard re-fires; got {:?}",
+            overlay.state
+        );
+    } // store re-dropped — simulated second restart.
+
+    let log1 = std::fs::read_to_string(&telemetry_log_1).unwrap_or_default();
+    let recovery_count_1 = log1.matches("REROLL_RESUMED_AFTER_RESTART").count();
+    assert_eq!(
+        recovery_count_1, 1,
+        "tick 1 after restart MUST emit exactly one REROLL_RESUMED_AFTER_RESTART \
+         event (recovered from the stranded RE_ROLL); got {recovery_count_1} in \
+         log:\n{log1}"
+    );
+
+    // ── Restart #2: same on-disk DB, fresh tick ──
+    // The overlay is now ATTESTED in SQLite. A second restart + tick
+    // MUST NOT re-emit `REROLL_RESUMED_AFTER_RESTART` — the demote is
+    // persisted, so the recovery predicate (`state == ReRoll && \
+    // session_id == None`) no longer matches. Without the save() in
+    // the guard, this tick would re-emit the event every restart,
+    // spamming the telemetry log and (worse) re-firing the reroll
+    // lane's freshness check on a bead that's already mid-recovery.
+    let telemetry_log_2 = std::env::temp_dir().join(format!(
+        "afd_sqlite_reroll_restart_t2_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log_2);
+
+    {
+        let store = SqliteStateStore::open(&path)
+            .expect("second restart reopen must succeed");
+        let _ = run_tick(
+            &TickDeps {
+                scm: &scm,
+                tracker: &tracker,
+                sessions: &sessions,
+                llm: &llm,
+                store: &store,
+                vcs: &vcs,
+                cfg: &cfg,
+                telemetry_log: &telemetry_log_2,
+                vendor_health: None,
+            },
+            2,
+            0,
+        )
+        .expect("tick 2 must succeed");
+
+        // Confirm the overlay is still ATTESTED (not RE_ROLL) after
+        // tick 2 — if the recovery guard re-fires and demotes again,
+        // the save() inside the guard would clobber a clean
+        // ATTESTED row, regressing state on a healthy bead.
+        let overlay_after = store
+            .load("sqlite-reroll-restart")
+            .expect("load must succeed on tick 2")
+            .expect("overlay row must still be present on tick 2");
+        assert_ne!(
+            overlay_after.state,
+            OverlayState::ReRoll,
+            "tick 2 must NOT re-enter RE_ROLL — the overlay is ATTESTED and \
+             is on the reroll/fast-tier assessment path normally"
+        );
+    }
+
+    let log2 = std::fs::read_to_string(&telemetry_log_2).unwrap_or_default();
+    let recovery_count_2 = log2.matches("REROLL_RESUMED_AFTER_RESTART").count();
+    assert_eq!(
+        recovery_count_2, 0,
+        "tick 2 must NOT re-emit REROLL_RESUMED_AFTER_RESTART — the recovery \
+         is one-shot per stranded RE_ROLL across the daemon restart; \
+         got {recovery_count_2} in tick 2 log:\n{log2}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log_1);
+    let _ = std::fs::remove_file(&telemetry_log_2);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}

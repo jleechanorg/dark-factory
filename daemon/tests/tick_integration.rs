@@ -31,8 +31,204 @@ use daemon::state::{BeadOverlay, OverlayState, StateStore};
 use daemon::tick::{combine_dual_verdict, run_tick, TickDeps};
 use daemon::tools::{
     Bead, Issue, LabeledPr, Llm, Permission, PrComment, PrHeadBranch, PrSnapshot, Scm,
+    SessionId, Sessions, SpawnSpec,
 };
 use daemon::verifier::SkepticVerdict;
+use std::cell::{Cell, RefCell};
+
+/// Models AO's non-idempotent `session kill`: the first stop succeeds, while
+/// any accidental second stop fails so promotion cannot hide a duplicate kill
+/// behind a stale DISPATCHED handle.
+struct StopFailsOnSecond {
+    inner: FakeSessions,
+    stop_calls: Cell<usize>,
+    runtime_worktree: Option<std::path::PathBuf>,
+    post_stop_activity: daemon::tools::SessionActivity,
+}
+
+impl StopFailsOnSecond {
+    fn new(inner: FakeSessions) -> Self {
+        Self {
+            inner,
+            stop_calls: Cell::new(0),
+            runtime_worktree: None,
+            post_stop_activity: daemon::tools::SessionActivity::Terminal,
+        }
+    }
+
+    fn set_runtime_worktree(&mut self, path: std::path::PathBuf) {
+        self.runtime_worktree = Some(path);
+    }
+
+    fn set_post_stop_activity(&mut self, activity: daemon::tools::SessionActivity) {
+        self.post_stop_activity = activity;
+    }
+
+}
+
+impl Sessions for StopFailsOnSecond {
+    fn active_count(&self) -> Result<usize, DaemonError> {
+        self.inner.active_count()
+    }
+
+    fn spawn(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
+        self.inner.spawn(spec)
+    }
+
+    fn attach(&self, branch: &str, bead_id: &str) -> Result<SessionId, DaemonError> {
+        self.inner.attach(branch, bead_id)
+    }
+
+    fn stop(&self, id: &SessionId) -> Result<(), DaemonError> {
+        let calls = self.stop_calls.get() + 1;
+        self.stop_calls.set(calls);
+        if calls > 1 {
+            return Err(DaemonError::Tool {
+                tool: "ao".into(),
+                rc: 1,
+                stderr: "scripted second stop failure".into(),
+            });
+        }
+        self.inner.stop(id)
+    }
+
+    fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError> {
+        self.inner.is_quiescent(id)
+    }
+
+    fn session_activity(
+        &self,
+        id: &SessionId,
+    ) -> Result<daemon::tools::SessionActivity, DaemonError> {
+        if self.inner.stop_succeeded.get() {
+            return Ok(self.post_stop_activity);
+        }
+        self.inner.session_activity(id)
+    }
+
+    fn resolve_runtime_in_project(
+        &self,
+        project: &str,
+        id: &SessionId,
+    ) -> Result<Option<daemon::tools::SessionRuntimeIdentity>, DaemonError> {
+        Ok(Some(daemon::tools::SessionRuntimeIdentity {
+            session_id: id.clone(),
+            project: project.to_string(),
+            runtime_id: Some(id.0.clone()),
+            worktree_path: self.runtime_worktree.clone(),
+            branch: None,
+        }))
+    }
+}
+
+impl std::ops::Deref for StopFailsOnSecond {
+    type Target = FakeSessions;
+    fn deref(&self) -> &Self::Target { &self.inner }
+}
+
+impl std::ops::DerefMut for StopFailsOnSecond {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.inner }
+}
+
+/// Models two AO projects sharing a session id namespace. The unscoped
+/// probes deliberately report the primary project's quiescent result, while
+/// project-aware probes report the secondary project's live session.
+struct ProjectAwareSessions {
+    inner: FakeSessions,
+    project_calls: RefCell<Vec<String>>,
+}
+
+impl ProjectAwareSessions {
+    fn new() -> Self {
+        Self {
+            inner: FakeSessions::new(),
+            project_calls: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl Sessions for ProjectAwareSessions {
+    fn active_count(&self) -> Result<usize, DaemonError> {
+        self.inner.active_count()
+    }
+
+    fn spawn(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
+        self.inner.spawn(spec)
+    }
+
+    fn attach(&self, branch: &str, bead_id: &str) -> Result<SessionId, DaemonError> {
+        self.inner.attach(branch, bead_id)
+    }
+
+    fn stop(&self, id: &SessionId) -> Result<(), DaemonError> {
+        self.inner.stop(id)
+    }
+
+    fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError> {
+        self.inner.is_quiescent(id)
+    }
+
+    fn session_activity(
+        &self,
+        id: &SessionId,
+    ) -> Result<daemon::tools::SessionActivity, DaemonError> {
+        self.inner.session_activity(id)
+    }
+
+    fn stop_in_project(
+        &self,
+        project: &str,
+        id: &SessionId,
+    ) -> Result<(), DaemonError> {
+        self.project_calls
+            .borrow_mut()
+            .push(format!("stop_in_project({project},{})", id.0));
+        self.inner.stop(id)
+    }
+
+    fn is_quiescent_in_project(
+        &self,
+        project: &str,
+        id: &SessionId,
+    ) -> Result<bool, DaemonError> {
+        self.project_calls
+            .borrow_mut()
+            .push(format!("is_quiescent_in_project({project},{})", id.0));
+        Ok(project != "secondary-project")
+    }
+
+    fn session_activity_in_project(
+        &self,
+        project: &str,
+        id: &SessionId,
+    ) -> Result<daemon::tools::SessionActivity, DaemonError> {
+        self.project_calls
+            .borrow_mut()
+            .push(format!("session_activity_in_project({project},{})", id.0));
+        if project == "secondary-project" {
+            Ok(daemon::tools::SessionActivity::Running)
+        } else {
+            Ok(daemon::tools::SessionActivity::NotFound)
+        }
+    }
+}
+
+fn init_cleanup_test_repo(path: &std::path::Path) {
+    let git = if std::path::Path::new("/usr/bin/git").is_file() {
+        "/usr/bin/git"
+    } else {
+        "git"
+    };
+    let status = std::process::Command::new(git)
+        .args(["init", "--quiet"])
+        .current_dir(path)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
 
 fn test_repo_cfg(project: &str) -> RepoConfig {
     RepoConfig {
@@ -104,7 +300,20 @@ fn one_full_tick_cycle_keeps_unknown_only_gate_attested() {
         r#"{"routingVerdict":"SMALL_PATH","justification":"single small change"}"#.into(),
     ));
     let store = FakeStateStore::new();
-    let cfg = test_cfg();
+    let worktree_root = std::env::temp_dir().join(format!(
+        "afd_tick_one_full_cycle_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let cfg = Config {
+        agent_worktree_root: Some(worktree_root.display().to_string()),
+        ..test_cfg()
+    };
+    let worktree = worktree_root.join("owner/repo/fake-session-1");
+    std::fs::create_dir_all(&worktree).unwrap();
+    init_cleanup_test_repo(&worktree);
+    sessions.set_runtime_worktree(worktree.clone());
+
     let vcs = test_vcs();
     let telemetry_dir = std::env::temp_dir().join("afd_tick_integration_test");
     std::fs::create_dir_all(&telemetry_dir).unwrap();
@@ -336,6 +545,7 @@ fn one_full_tick_cycle_keeps_unknown_only_gate_attested() {
         }
     }
 
+    let _ = std::fs::remove_dir_all(&worktree_root);
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
@@ -10730,6 +10940,129 @@ fn tick_resets_reroll_deferral_when_fresh_attempt_pr_opens() {
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+/// PR #755 Slice 2: a bead left `RE_ROLL` after a daemon crash (no session was
+/// ever spawned — `execute` set the state but `execute_adopted` never reached
+/// the `DISPATCHING` save) must NOT strand forever in RE_ROLL. The fast tier's
+/// `if overlay.state != OverlayState::Attested` filter (tick.rs line ~4819)
+/// skips non-ATTESTED overlays, so an orphan RE_ROLL overlay is invisible to
+/// gate assessment AND to the reroll lane. After restart, the durable state
+/// MUST resume the existing reroll path with existing bounds: demote the
+/// stranded RE_ROLL back to ATTESTED so the reroll lane re-fires
+/// `reroll::execute` (which still accepts ATTESTED|RE_ROLL via its freshness
+/// guard), and emit `REROLL_RESUMED_AFTER_RESTART` telemetry so the operator
+/// can audit the recovery from the daemon log alone.
+#[test]
+fn tick_resumes_stranded_reroll_overlay_after_restart() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let vcs = test_vcs();
+    let cfg = reroll_stage2_cfg();
+
+    // Simulate a daemon that crashed AFTER `reroll::execute`'s `state = ReRoll`
+    // save (reroll.rs line ~338) but BEFORE `execute_adopted`'s
+    // `state = Dispatching` save (reroll.rs line ~1414). No coder session was
+    // ever spawned; the bead is stranded in RE_ROLL with no live worker.
+    let branch = format!("factory/reroll-resume-r2");
+    store
+        .save(&BeadOverlay {
+            bead_id: "reroll-resume".into(),
+            state: OverlayState::ReRoll,
+            attempt: 2,
+            reroll_count: 1,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(6001),
+            branch: Some(branch.clone()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        })
+        .unwrap();
+    store.register_branch("reroll-resume", &branch).unwrap();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    scm.pr_snapshots.insert(
+        6001,
+        PrSnapshot {
+            pr_number: 6001,
+            ci_success: false, // -> CI gate RED -> reroll lane
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "deadbeef".into(),
+            body: "".into(),
+            comments: vec![PrComment {
+                author: "reviewer".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: now,
+            }],
+            files: vec![],
+            updated_at_epoch: now,
+            ci_status: "red".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: now.saturating_sub(60),
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_reroll_resume_after_restart.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        1,
+        0,
+    )
+    .expect("tick should resume the stranded RE_ROLL overlay");
+
+    let overlay = store.load("reroll-resume").unwrap().unwrap();
+    assert_ne!(
+        overlay.state,
+        OverlayState::ReRoll,
+        "stranded RE_ROLL overlay must NOT remain RE_ROLL after the tick \
+         (would be invisible to the reroll lane and strand forever); got {:?}",
+        overlay.state
+    );
+
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("REROLL_RESUMED_AFTER_RESTART"),
+        "REROLL_RESUMED_AFTER_RESTART telemetry must be emitted so the recovery \
+         is auditable from the daemon log alone; full log: {log}"
+    );
+    assert!(
+        summary.gates_assessed >= 1,
+        "resumed bead must be gate-assessed (reroll lane must reach the bead); \
+         got gates_assessed={}",
+        summary.gates_assessed
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
 // jleechan-park-leaves-zombie-session-mh9o: regression for the U4-class
 // zero-touch blocker where every PARKED_* transition leaked its AO session.
 //
@@ -10759,8 +11092,21 @@ fn autonomy_timebox_park_kills_associated_ao_session_and_clears_handle() {
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
-    let mut cfg = test_cfg();
+    let worktree_root = std::env::temp_dir().join(format!(
+        "afd_test_mh9o_timebox_wt_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let mut cfg = Config {
+        agent_worktree_root: Some(worktree_root.display().to_string()),
+        ..test_cfg()
+    };
     cfg.autonomy_timebox_secs = 3600;
+
+    let worktree = worktree_root.join("owner/repo/df-mh9o-timebox");
+    std::fs::create_dir_all(&worktree).unwrap();
+    init_cleanup_test_repo(&worktree);
+    sessions.set_runtime_worktree(worktree.clone());
 
     let now_epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -10846,6 +11192,7 @@ fn autonomy_timebox_park_kills_associated_ao_session_and_clears_handle() {
         sessions.calls.borrow()
     );
 
+    let _ = std::fs::remove_dir_all(&worktree_root);
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
@@ -10856,7 +11203,20 @@ fn coder_silent_park_kills_associated_ao_session_and_clears_handle() {
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
-    let cfg = test_cfg();
+    let worktree_root = std::env::temp_dir().join(format!(
+        "afd_test_mh9o_silent_wt_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let cfg = Config {
+        agent_worktree_root: Some(worktree_root.display().to_string()),
+        ..test_cfg()
+    };
+
+    let worktree = worktree_root.join("owner/repo/df-mh9o-silent");
+    std::fs::create_dir_all(&worktree).unwrap();
+    init_cleanup_test_repo(&worktree);
+    sessions.set_runtime_worktree(worktree.clone());
 
     // DISPATCHED bead whose remote branch has had no commit for >30 minutes,
     // no recent transcript activity → the wedge-detection sweep must park
@@ -10932,6 +11292,7 @@ fn coder_silent_park_kills_associated_ao_session_and_clears_handle() {
         sessions.calls.borrow()
     );
 
+    let _ = std::fs::remove_dir_all(&worktree_root);
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
@@ -11120,7 +11481,20 @@ fn adopted_branch_history_rewrite_park_kills_associated_ao_session() {
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
-    let cfg = test_cfg();
+    let worktree_root = std::env::temp_dir().join(format!(
+        "afd_test_mh9o_adopted_wt_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let cfg = Config {
+        agent_worktree_root: Some(worktree_root.display().to_string()),
+        ..test_cfg()
+    };
+
+    let worktree = worktree_root.join("owner/repo/df-mh9o-adopted");
+    std::fs::create_dir_all(&worktree).unwrap();
+    init_cleanup_test_repo(&worktree);
+    sessions.set_runtime_worktree(worktree.clone());
 
     // Pre-seed an adopted DISPATCHED bead whose pre_session_head_sha is
     // NOT an ancestor of the live remote head (positive history rewrite).
@@ -11199,6 +11573,7 @@ fn adopted_branch_history_rewrite_park_kills_associated_ao_session() {
         sessions.calls.borrow()
     );
 
+    let _ = std::fs::remove_dir_all(&worktree_root);
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
@@ -14644,14 +15019,11 @@ fn test_non_default_repository_branch_collision_telemetry_attribution() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
-/// Bead jleechan-w0r4: verify that when an adopted remediation session transitions
-/// to idle (finished prompt execution), the daemon reaps the worker session via
-/// stop() and promotes the bead to ATTESTED, clearing the session handle.
 #[test]
-fn test_dispatched_adopted_idle_session_reaped_and_promoted() {
+fn test_dispatched_adopted_idle_without_worktree_preserves_session() {
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
-    let mut sessions = FakeSessions::new();
+    let mut sessions = StopFailsOnSecond::new(FakeSessions::new());
     // Non-terminal quiescence but idle activity
     sessions.quiescent = false;
     sessions.set_activity(daemon::tools::SessionActivity::Idle);
@@ -14727,19 +15099,17 @@ fn test_dispatched_adopted_idle_session_reaped_and_promoted() {
     assert_eq!(summary.beads_parked_human_held, 0);
 
     let o = store.load("bead-w0r4").unwrap().unwrap();
+    assert_eq!(o.state, OverlayState::Dispatched);
     assert_eq!(
-        o.state,
-        OverlayState::Attested,
-        "idle adopted session must promote to ATTESTED"
+        o.session_id.as_deref(),
+        Some("wa-9999"),
+        "missing worktree must preserve the session handle"
     );
-    assert_eq!(
-        o.session_id, None,
-        "session handle must be cleared after reaping"
-    );
-    assert!(
-        sessions.stop_succeeded.get(),
-        "sessions.stop() must be called to reap idle worker"
-    );
+    assert!(!sessions.stop_succeeded.get());
+    assert!(!telemetry_log.exists() || {
+        let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+        !log.contains("BEAD_SESSION_KILLED") && !log.contains("WORKTREE_")
+    });
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
@@ -14756,7 +15126,7 @@ fn test_dispatched_adopted_idle_session_reaped_and_promoted() {
 fn test_worktree_cleaned_up_on_coder_session_exit_promotion() {
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
-    let mut sessions = FakeSessions::new();
+    let mut sessions = StopFailsOnSecond::new(FakeSessions::new());
     sessions.quiescent = false;
     sessions.set_activity(daemon::tools::SessionActivity::Idle);
 
@@ -14781,8 +15151,10 @@ fn test_worktree_cleaned_up_on_coder_session_exit_promotion() {
     // encodes.
     let stale_worktree = worktree_root.join("owner/repo/wa-3538");
     std::fs::create_dir_all(&stale_worktree).unwrap();
+    init_cleanup_test_repo(&stale_worktree);
     std::fs::write(stale_worktree.join("marker"), b"leftover coder worktree").unwrap();
     assert!(stale_worktree.is_dir(), "fixture must actually create the dir");
+    sessions.set_runtime_worktree(stale_worktree.clone());
 
     store.overlays.borrow_mut().insert(
         "bead-rev3lm8k".into(),
@@ -14862,8 +15234,696 @@ fn test_worktree_cleaned_up_on_coder_session_exit_promotion() {
 
     let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
     assert!(
-        telemetry.contains("WORKTREE_CLEANED_ON_SESSION_EXIT"),
-        "telemetry must record the worktree cleanup: {telemetry}"
+        telemetry.contains("WORKTREE_QUARANTINED_ON_SESSION_EXIT"),
+        "telemetry must record the worktree quarantine: {telemetry}"
+    );
+
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// PR #755 Slice 4: Idle promotion must NOT delete a still-running worker.
+/// The fast-tier DISPATCHED->ATTESTED promotion path on
+/// `tick::run_fast_tier` calls `deps.sessions.stop(&sid)` when
+/// `session_activity` reports `Idle` and IGNORES the result
+/// (`let _ = deps.sessions.stop(&sid); true`) — if `stop()` fails
+/// transiently (e.g. AO still has the session alive but our RPC timed
+/// out), the code below still proceeds to `clean_stale_worktree` which
+/// deletes the AO-managed worktree dir while the worker is still
+/// running. This is the U4-class zero-touch blocker: a deleted
+/// worktree + a still-running worker is an undefined-state wedge. The
+/// fix: when `stop()` returns Err, treat the Idle signal as
+/// unconfirmed — DO NOT promote (return false), DO NOT clean the
+/// worktree, preserve the session handle, and emit
+/// `IDLE_STOP_FAILED_NO_PROMOTION` telemetry so the wedge is auditable.
+/// A subsequent fresh `Terminal`/`NotFound` observation (or successful
+/// stop) is the ONLY signal that authorizes promotion.
+#[test]
+fn tick_idle_promotion_with_failing_stop_does_not_promote_or_clean_worktree() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = false; // force the Idle branch (default true would short-circuit)
+    sessions.set_activity(daemon::tools::SessionActivity::Idle);
+    sessions.fail_stop_for("idle-stop-fail");
+
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let worktree_root = std::env::temp_dir().join(format!(
+        "afd_slice4_idle_stop_fail_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let cfg = Config {
+        agent_worktree_root: Some(worktree_root.display().to_string()),
+        ..test_cfg()
+    };
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_slice4_idle_stop_fail.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    // A live AO-managed worktree the still-running worker depends on.
+    // The slice 4 fix must NOT delete this even though session_activity
+    // said "Idle" — the failing stop() means the worker is still live.
+    let live_worktree = worktree_root.join("owner/repo/idle-stop-fail");
+    std::fs::create_dir_all(&live_worktree).unwrap();
+    std::fs::write(live_worktree.join("marker"), b"live coder worktree").unwrap();
+
+    store.overlays.borrow_mut().insert(
+        "idle-stop-fail-bead".into(),
+        BeadOverlay {
+            bead_id: "idle-stop-fail-bead".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(1101),
+            branch: Some("fix/slice4-idle-stop".into()),
+            session_id: Some("idle-stop-fail".into()),
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+    store
+        .register_branch("idle-stop-fail-bead", "fix/slice4-idle-stop")
+        .unwrap();
+
+    scm.pr_numbers_for_branch.insert(
+        ("owner/repo".into(), "fix/slice4-idle-stop".into()),
+        Some(1101),
+    );
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 1101),
+        daemon::tools::PrHeadBranch::SameRepo("fix/slice4-idle-stop".into()),
+    );
+    scm.pr_snapshots.insert(
+        1101,
+        PrSnapshot {
+            pr_number: 1101,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "head-1101".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        0,
+        10,
+    )
+    .expect("tick must isolate the failing stop and continue");
+
+    let overlay = store.load("idle-stop-fail-bead").unwrap().unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::Dispatched,
+        "Idle promotion with failing stop() must NOT promote to ATTESTED — \
+         the worker is still live; got {:?}",
+        overlay.state
+    );
+    assert_eq!(
+        overlay.session_id.as_deref(),
+        Some("idle-stop-fail"),
+        "session handle MUST be preserved so the next tick (with a fresh \
+         Terminal/NotFound probe) can retry; got {:?}",
+        overlay.session_id
+    );
+    assert!(
+        live_worktree.is_dir(),
+        "live worktree MUST NOT be deleted when stop() failed — the worker \
+         is still running and depends on this dir; deleted-by-bug would \
+         leave an undefined-state wedge (live worker, missing worktree)"
+    );
+
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("IDLE_STOP_FAILED_NO_PROMOTION"),
+        "the safety action MUST emit IDLE_STOP_FAILED_NO_PROMOTION telemetry so \
+         the wedge is auditable from the daemon log alone; full log: {log}"
+    );
+    assert!(
+        !log.contains("WORKTREE_CLEANED_ON_SESSION_EXIT"),
+        "WORKTREE_CLEANED_ON_SESSION_EXIT must NOT fire when stop() failed; full log: {log}"
+    );
+    assert!(
+        summary.beads_parked_human_held == 0,
+        "the safety action must NOT park the bead — it must stay DISPATCHED \
+         with the session handle preserved; got {} HUMAN_HELD",
+        summary.beads_parked_human_held
+    );
+
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Slice 4 control: when the Idle path's `stop()` succeeds (the common
+/// case), the bead DOES promote to ATTESTED and the worktree IS cleaned
+/// in the same tick. This pins the regression — the slice 4 fix must
+/// narrow the safety guard to ONLY the failure path, not break the
+/// happy path.
+#[test]
+fn tick_idle_promotion_with_succeeding_stop_promotes_and_cleans() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let scripted_sessions = FakeSessions::new();
+    scripted_sessions.set_activity(daemon::tools::SessionActivity::Idle);
+    // The first stop succeeds; a second stop would fail like non-idempotent
+    // production `ao session kill`.
+    let sessions = StopFailsOnSecond::new(scripted_sessions);
+
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let worktree_root = std::env::temp_dir().join(format!(
+        "afd_slice4_idle_ok_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let cfg = Config {
+        agent_worktree_root: Some(worktree_root.display().to_string()),
+        ..test_cfg()
+    };
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_slice4_idle_ok.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let worktree = worktree_root.join("owner/repo/idle-ok");
+    std::fs::create_dir_all(&worktree).unwrap();
+    init_cleanup_test_repo(&worktree);
+    std::fs::write(worktree.join("marker"), b"idle worker worktree").unwrap();
+    let mut sessions = sessions;
+    sessions.set_runtime_worktree(worktree.clone());
+
+    store.overlays.borrow_mut().insert(
+        "idle-ok-bead".into(),
+        BeadOverlay {
+            bead_id: "idle-ok-bead".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(1102),
+            branch: Some("fix/slice4-idle-ok".into()),
+            session_id: Some("idle-ok".into()),
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+    store.register_branch("idle-ok-bead", "fix/slice4-idle-ok").unwrap();
+
+    scm.pr_numbers_for_branch.insert(
+        ("owner/repo".into(), "fix/slice4-idle-ok".into()),
+        Some(1102),
+    );
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 1102),
+        daemon::tools::PrHeadBranch::SameRepo("fix/slice4-idle-ok".into()),
+    );
+    scm.pr_snapshots.insert(
+        1102,
+        PrSnapshot {
+            pr_number: 1102,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "head-1102".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let _ = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        0,
+        10,
+    )
+    .expect("happy-path tick must succeed");
+
+    let overlay = store.load("idle-ok-bead").unwrap().unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::Attested,
+        "Idle promotion with successful stop() MUST still promote; got {:?}",
+        overlay.state
+    );
+    assert_eq!(
+        overlay.session_id, None,
+        "session handle MUST be cleared after a successful reap"
+    );
+    assert_eq!(
+        sessions.stop_calls.get(),
+        1,
+        "adopted Idle promotion must stop the session exactly once"
+    );
+    assert!(
+        !worktree.is_dir(),
+        "worktree MUST be cleaned on the successful-stop happy path"
+    );
+
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("WORKTREE_QUARANTINED_ON_SESSION_EXIT"),
+        "happy path must emit WORKTREE_QUARANTINED_ON_SESSION_EXIT; full log: {log}"
+    );
+    assert!(
+        !log.contains("IDLE_STOP_FAILED_NO_PROMOTION"),
+        "happy path must NOT emit IDLE_STOP_FAILED_NO_PROMOTION; full log: {log}"
+    );
+
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// A session missing from the daemon's primary AO project can still be live
+/// in the project resolved for a secondary repository. The fast tier must
+/// query that owning project and preserve the live worker and its worktree.
+#[test]
+fn tick_secondary_project_live_session_is_not_notfound_or_cleaned() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = ProjectAwareSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let worktree_root = std::env::temp_dir().join(format!(
+        "afd_secondary_project_liveness_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let mut cfg = test_cfg();
+    cfg.agent_worktree_root = Some(worktree_root.display().to_string());
+    cfg.repos.insert(
+        "jleechanorg/secondary-repo".into(),
+        RepoConfig {
+            ao_project: "secondary-project".into(),
+            push_remote: "origin".into(),
+            local_checkout: None,
+        },
+    );
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_secondary_project_liveness.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let worktree = worktree_root.join("jleechanorg/secondary-repo/secondary-session");
+    std::fs::create_dir_all(&worktree).unwrap();
+    init_cleanup_test_repo(&worktree);
+    std::fs::write(worktree.join("marker"), b"live secondary worker").unwrap();
+
+    store.overlays.borrow_mut().insert(
+        "secondary-bead".into(),
+        BeadOverlay {
+            bead_id: "secondary-bead".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(1105),
+            branch: Some("fix/secondary-live".into()),
+            session_id: Some("secondary-session".into()),
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: Some("jleechanorg/secondary-repo".into()),
+            attempt_started_at: None,
+        },
+    );
+    store
+        .register_branch("secondary-bead", "fix/secondary-live")
+        .unwrap();
+    scm.pr_numbers_for_branch.insert(
+        (
+            "jleechanorg/secondary-repo".into(),
+            "fix/secondary-live".into(),
+        ),
+        Some(1105),
+    );
+    scm.open_pr_head_refs.insert(
+        ("jleechanorg/secondary-repo".into(), 1105),
+        PrHeadBranch::SameRepo("fix/secondary-live".into()),
+    );
+    scm.pr_snapshots.insert(
+        1105,
+        PrSnapshot {
+            pr_number: 1105,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "head-1105".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".into(),
+            coderabbit_status: "green".into(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        0,
+        10,
+    )
+    .expect("secondary-project liveness probe must succeed");
+
+    let overlay = store.load("secondary-bead").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::Dispatched);
+    assert_eq!(overlay.session_id.as_deref(), Some("secondary-session"));
+    assert!(worktree.is_dir(), "live secondary worktree must be preserved");
+    let project_calls = sessions.project_calls.borrow();
+    assert!(
+        !project_calls.is_empty()
+            && project_calls
+                .iter()
+                .all(|call| call.contains("secondary-project")),
+        "every lifecycle lookup must use the owning AO project: {project_calls:?}"
+    );
+    assert!(
+        !project_calls.iter().any(|call| call.starts_with("stop_in_project")),
+        "a live secondary session must not be stopped: {project_calls:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// A positive NotFound activity result means AO has already reaped the
+/// session. Promotion must skip the non-idempotent stop and still clean up
+/// the orphaned worktree in the same tick.
+#[test]
+fn tick_not_found_promotion_skips_stop_and_cleans() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = StopFailsOnSecond::new(FakeSessions::new());
+    sessions.quiescent = false;
+    sessions.set_activity(daemon::tools::SessionActivity::NotFound);
+
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let worktree_root = std::env::temp_dir().join(format!(
+        "afd_not_found_promotion_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let cfg = Config {
+        agent_worktree_root: Some(worktree_root.display().to_string()),
+        ..test_cfg()
+    };
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_not_found_promotion.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let worktree = worktree_root.join("owner/repo/not-found-session");
+    std::fs::create_dir_all(&worktree).unwrap();
+    init_cleanup_test_repo(&worktree);
+    std::fs::write(worktree.join("marker"), b"reaped worker worktree").unwrap();
+    sessions.set_runtime_worktree(worktree.clone());
+    sessions.set_post_stop_activity(daemon::tools::SessionActivity::NotFound);
+
+    store.overlays.borrow_mut().insert(
+        "not-found-bead".into(),
+        BeadOverlay {
+            bead_id: "not-found-bead".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(1103),
+            branch: Some("fix/not-found".into()),
+            session_id: Some("not-found-session".into()),
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+    store
+        .register_branch("not-found-bead", "fix/not-found")
+        .unwrap();
+
+    scm.pr_numbers_for_branch.insert(
+        ("owner/repo".into(), "fix/not-found".into()),
+        Some(1103),
+    );
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 1103),
+        daemon::tools::PrHeadBranch::SameRepo("fix/not-found".into()),
+    );
+    scm.pr_snapshots.insert(
+        1103,
+        PrSnapshot {
+            pr_number: 1103,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "head-1103".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        0,
+        10,
+    )
+    .expect("NotFound must fail closed without promotion");
+
+    let overlay = store.load("not-found-bead").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::Dispatched);
+    assert_eq!(overlay.session_id.as_deref(), Some("not-found-session"));
+    assert!(
+        !sessions
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call.starts_with("stop(")),
+        "positive NotFound must skip the non-idempotent stop; calls: {:?}",
+        sessions.calls.borrow()
+    );
+    assert!(worktree.is_dir(), "NotFound must preserve the worktree");
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        !telemetry.contains("WORKTREE_CLEANED_ON_SESSION_EXIT"),
+        "NotFound must not emit cleanup telemetry: {telemetry}"
+    );
+
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn tick_not_found_normal_dispatch_promotion_skips_stop_and_cleans() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = StopFailsOnSecond::new(FakeSessions::new());
+    sessions.quiescent = false;
+    sessions.set_activity(daemon::tools::SessionActivity::NotFound);
+
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let worktree_root = std::env::temp_dir().join(format!(
+        "afd_not_found_normal_promotion_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let cfg = Config {
+        agent_worktree_root: Some(worktree_root.display().to_string()),
+        ..test_cfg()
+    };
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_not_found_normal_promotion.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let worktree = worktree_root.join("owner/repo/not-found-normal-session");
+    std::fs::create_dir_all(&worktree).unwrap();
+    init_cleanup_test_repo(&worktree);
+    std::fs::write(worktree.join("marker"), b"reaped worker worktree").unwrap();
+    sessions.set_runtime_worktree(worktree.clone());
+    sessions.set_post_stop_activity(daemon::tools::SessionActivity::NotFound);
+
+    store.overlays.borrow_mut().insert(
+        "not-found-normal-bead".into(),
+        BeadOverlay {
+            bead_id: "not-found-normal-bead".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(1104),
+            branch: Some("fix/not-found-normal".into()),
+            session_id: Some("not-found-normal-session".into()),
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+    store
+        .register_branch("not-found-normal-bead", "fix/not-found-normal")
+        .unwrap();
+
+    scm.pr_numbers_for_branch.insert(
+        ("owner/repo".into(), "fix/not-found-normal".into()),
+        Some(1104),
+    );
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 1104),
+        daemon::tools::PrHeadBranch::SameRepo("fix/not-found-normal".into()),
+    );
+    scm.pr_snapshots.insert(
+        1104,
+        PrSnapshot {
+            pr_number: 1104,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "head-1104".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        0,
+        10,
+    )
+    .expect("normal NotFound must fail closed without promotion");
+
+    let overlay = store.load("not-found-normal-bead").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::Dispatched);
+    assert_eq!(overlay.session_id.as_deref(), Some("not-found-normal-session"));
+    assert!(
+        !sessions
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call.starts_with("stop(")),
+        "normal NotFound must skip the non-idempotent stop; calls: {:?}",
+        sessions.calls.borrow()
+    );
+    assert!(worktree.is_dir(), "normal NotFound must preserve the worktree");
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        !telemetry.contains("WORKTREE_CLEANED_ON_SESSION_EXIT"),
+        "normal NotFound must not emit cleanup telemetry: {telemetry}"
     );
 
     let _ = std::fs::remove_dir_all(&worktree_root);
@@ -14877,10 +15937,23 @@ fn session_health_failure_reaps_session_and_requeues_bead() {
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
-    let cfg = test_cfg();
+    let worktree_root = std::env::temp_dir().join(format!(
+        "afd_test_session_health_wt_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let cfg = Config {
+        agent_worktree_root: Some(worktree_root.display().to_string()),
+        ..test_cfg()
+    };
     let vcs = FakeVcs::new();
     let telemetry_log = std::env::temp_dir().join("afd_test_session_health.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
+
+    let worktree = worktree_root.join("owner/repo/wa-dead-auth");
+    std::fs::create_dir_all(&worktree).unwrap();
+    init_cleanup_test_repo(&worktree);
+    sessions.set_runtime_worktree(worktree.clone());
 
     store.overlays.borrow_mut().insert(
         "bead-health-fail".into(),
@@ -14943,6 +16016,263 @@ fn session_health_failure_reaps_session_and_requeues_bead() {
         "SESSION_HEALTH_FAILED event must be emitted; telemetry:\n{telemetry}"
     );
 
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// PR #755 Slice 4 r3 (P0): the EARLY adopted-session path inside
+/// `run_fast_tier` (around the `check_session_health Ok(Some(...))` arm)
+/// still did `let _ = deps.sessions.stop(&sid); overlay.session_id = None; …`,
+/// which on a transient `stop()` failure would (a) clear the durable handle,
+/// (b) skip the spawn-failure increment / retry logic that needs the handle,
+/// (c) leave a live worker running against a missing worktree if the
+/// nearby idle/health-stop branches later decided to clean. Every path
+/// that calls `stop()` MUST require `Ok` before removing `session_id`,
+/// promoting, or cleaning the worktree. On `Err`, keep DISPATCHED and
+/// `session_id`, preserve the worktree, emit
+/// `ADOPTED_HEALTH_STOP_FAILED_NO_PROMOTION`, and let the next tick's
+/// fresh liveness probe decide whether the session is finally dead.
+#[test]
+fn adopted_session_health_failure_with_failing_stop_preserves_session_and_worktree() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    sessions.set_session_health_failure(
+        "adopted-stop-fail",
+        "terminal session error in tmux pane: login expired",
+    );
+    // `fail_stop_for` makes EVERY call to `stop("adopted-stop-fail")` Err —
+    // mirrors the AO-RPC-failed transient case.
+    sessions.fail_stop_for("adopted-stop-fail");
+
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let worktree_root = std::env::temp_dir().join(format!(
+        "afd_slice4_adopted_stop_fail_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let cfg = Config {
+        agent_worktree_root: Some(worktree_root.display().to_string()),
+        ..test_cfg()
+    };
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_slice4_adopted_stop_fail.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    // A live AO-managed worktree the still-running worker depends on.
+    // The slice 4 r3 fix MUST NOT delete this even though health said
+    // "session dead" — the failing stop() means the worker may still be live.
+    let live_worktree = worktree_root.join("owner/repo/adopted-stop-fail");
+    std::fs::create_dir_all(&live_worktree).unwrap();
+    std::fs::write(live_worktree.join("marker"), b"live coder worktree").unwrap();
+
+    store.overlays.borrow_mut().insert(
+        "adopted-stop-fail-bead".into(),
+        BeadOverlay {
+            bead_id: "adopted-stop-fail-bead".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(1115),
+            branch: Some("fix/slice4-adopted-stop".into()),
+            session_id: Some("adopted-stop-fail".into()),
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+    store
+        .register_branch(
+            "adopted-stop-fail-bead",
+            "fix/slice4-adopted-stop",
+        )
+        .unwrap();
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        0,
+        10,
+    )
+    .expect("tick must isolate the failing stop and continue");
+
+    let overlay = store
+        .load("adopted-stop-fail-bead")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::Dispatched,
+        "adopted-session health failure with failing stop() must NOT park \
+         HUMAN_HELD and must NOT auto-requeue — the worker is still live; \
+         got {:?}",
+        overlay.state
+    );
+    assert_eq!(
+        overlay.session_id.as_deref(),
+        Some("adopted-stop-fail"),
+        "session handle MUST be preserved so the next tick (with a fresh \
+         Terminal/NotFound probe) can retry; got {:?}",
+        overlay.session_id
+    );
+    assert_eq!(
+        overlay.spawn_failure_count, 0,
+        "spawn_failure_count MUST NOT increment when stop() failed — \
+         preserved until a fresh liveness probe confirms the worker is dead"
+    );
+    assert!(
+        live_worktree.is_dir(),
+        "live worktree MUST NOT be deleted when stop() failed — the worker \
+         may still be running and depends on this dir; deleted-by-bug would \
+         leave an undefined-state wedge (live worker, missing worktree)"
+    );
+
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("ADOPTED_HEALTH_STOP_FAILED_NO_PROMOTION"),
+        "the safety action MUST emit ADOPTED_HEALTH_STOP_FAILED_NO_PROMOTION \
+         telemetry so the wedge is auditable from the daemon log alone; \
+         full log: {log}"
+    );
+    assert!(
+        !log.contains("WORKTREE_CLEANED_ON_SESSION_EXIT"),
+        "WORKTREE_CLEANED_ON_SESSION_EXIT must NOT fire when stop() failed; \
+         full log: {log}"
+    );
+    assert!(
+        summary.beads_parked_human_held == 0
+            && summary.beads_dispatched == 0,
+        "the safety action must NOT park and must NOT spawn a replacement — \
+         it must stay DISPATCHED with the session handle preserved; \
+         got parked={} dispatched={}",
+        summary.beads_parked_human_held,
+        summary.beads_dispatched
+    );
+
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// PR #755 Slice 4 r3 (P0) control: the EARLY adopted-session path
+/// with a SUCCESSFUL `stop()` MUST clear the handle, reap the worktree,
+/// and run the existing retry / park bookkeeping exactly as before.
+/// This pins the slice 4 r3 fix to the failure path only — the happy
+/// path is unchanged.
+#[test]
+fn adopted_session_health_failure_with_succeeding_stop_clears_and_reaps() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = StopFailsOnSecond::new(FakeSessions::new());
+    sessions.set_session_health_failure(
+        "adopted-stop-ok",
+        "terminal session error in tmux pane: login expired",
+    );
+    // No fail_stop_for("adopted-stop-ok") — stop() succeeds.
+
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let worktree_root = std::env::temp_dir().join(format!(
+        "afd_slice4_adopted_stop_ok_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&worktree_root);
+    let cfg = Config {
+        agent_worktree_root: Some(worktree_root.display().to_string()),
+        ..test_cfg()
+    };
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_slice4_adopted_stop_ok.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let worktree = worktree_root.join("owner/repo/adopted-stop-ok");
+    std::fs::create_dir_all(&worktree).unwrap();
+    init_cleanup_test_repo(&worktree);
+    std::fs::write(worktree.join("marker"), b"reaped worker worktree").unwrap();
+    sessions.set_runtime_worktree(worktree.clone());
+
+    store.overlays.borrow_mut().insert(
+        "adopted-stop-ok-bead".into(),
+        BeadOverlay {
+            bead_id: "adopted-stop-ok-bead".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(1116),
+            branch: Some("fix/slice4-adopted-ok".into()),
+            session_id: Some("adopted-stop-ok".into()),
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+    store
+        .register_branch("adopted-stop-ok-bead", "fix/slice4-adopted-ok")
+        .unwrap();
+
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        0,
+        10,
+    )
+    .expect("happy-path tick must succeed");
+
+    let overlay = store.load("adopted-stop-ok-bead").unwrap().unwrap();
+    // pr_number is set, so the post-stop path goes through the
+    // `else { deps.store.save(&overlay)?; }` arm — state stays
+    // Dispatched but the handle is cleared.
+    assert_eq!(
+        overlay.session_id, None,
+        "successful stop() MUST clear the session handle so the next retry \
+         does not collide with the dead session; got {:?}",
+        overlay.session_id
+    );
+    assert!(
+        !worktree.is_dir(),
+        "happy path: worktree MUST be reaped after a successful stop()"
+    );
+
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("WORKTREE_QUARANTINED_ON_SESSION_EXIT"),
+        "happy path must emit WORKTREE_QUARANTINED_ON_SESSION_EXIT; full log: {log}"
+    );
+    assert!(
+        !log.contains("ADOPTED_HEALTH_STOP_FAILED_NO_PROMOTION"),
+        "happy path must NOT emit ADOPTED_HEALTH_STOP_FAILED_NO_PROMOTION; \
+         full log: {log}"
+    );
+
+    let _ = std::fs::remove_dir_all(&worktree_root);
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
@@ -15135,6 +16465,163 @@ fn quota_watchdog_wakes_paused_pane_after_reset_grace_elapses() {
     assert!(
         telemetry.contains("QUOTA_WATCHDOG_WOKE_PANE"),
         "QUOTA_WATCHDOG_WOKE_PANE event must be emitted; telemetry:\n{telemetry}"
+    );
+
+    daemon::health::quota_watchdog::clear(bead_id);
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// PR #755 Slice 1 ACCEPTANCE #1: a DISPATCHED overlay with BOTH session_id=None
+/// AND pr_number=None (the "orphaned DISPATCHED" shape) must not strand forever.
+/// After exhausting spawn_failure_count cap, it must be parked HUMAN_HELD with
+/// TransientSpawnRetryCapExceeded and emit DISPATCHED_NO_SESSION_OR_PR telemetry.
+#[test]
+fn dispatched_orphan_no_session_no_pr_parks_human_held_after_cap() {
+    let bead_id = "bead-orphan-dispatched";
+    daemon::health::quota_watchdog::clear(bead_id);
+
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir()
+        .join("afd_test_dispatched_orphan_parks.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    use daemon::dispatch::MAX_TRANSIENT_SPAWN_RETRY;
+    store.overlays.borrow_mut().insert(
+        bead_id.into(),
+        BeadOverlay {
+            bead_id: bead_id.into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/bead-orphan-dispatched-r1".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: MAX_TRANSIENT_SPAWN_RETRY - 1,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+    store
+        .register_branch(bead_id, "factory/bead-orphan-dispatched-r1")
+        .unwrap();
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+
+    let overlay = store.load(bead_id).unwrap().unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::HumanHeld,
+        "orphaned DISPATCHED (no session, no PR) must be parked HUMAN_HELD after cap; got: {:?}",
+        overlay.state
+    );
+    assert_eq!(
+        summary.beads_parked_human_held, 1,
+        "one bead must be parked human held"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("DISPATCHED_NO_SESSION_OR_PR"),
+        "DISPATCHED_NO_SESSION_OR_PR event must be emitted; telemetry:\n{telemetry}"
+    );
+
+    daemon::health::quota_watchdog::clear(bead_id);
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// PR #755 Slice 1 ACCEPTANCE #2: a DISPATCHED overlay with both session_id=None
+/// and pr_number=None BUT with a live quota watchdog arm must be LEFT UNTOUCHED.
+#[test]
+fn dispatched_orphan_with_quota_arm_is_preserved_untouched() {
+    let bead_id = "bead-orphan-quota-armed";
+    daemon::health::quota_watchdog::clear(bead_id);
+    daemon::health::quota_watchdog::record_quota_reset(
+        bead_id,
+        "wa-paused-session",
+        u64::MAX,
+    );
+
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir()
+        .join("afd_test_dispatched_orphan_quota_preserved.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    store.overlays.borrow_mut().insert(
+        bead_id.into(),
+        BeadOverlay {
+            bead_id: bead_id.into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/bead-orphan-quota-armed-r1".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+    store
+        .register_branch(bead_id, "factory/bead-orphan-quota-armed-r1")
+        .unwrap();
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+
+    let overlay = store.load(bead_id).unwrap().unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::Dispatched,
+        "quota-armed orphaned DISPATCHED must remain DISPATCHED"
+    );
+    assert_eq!(
+        summary.beads_parked_human_held, 0,
+        "no park must occur for quota-armed orphan"
     );
 
     daemon::health::quota_watchdog::clear(bead_id);

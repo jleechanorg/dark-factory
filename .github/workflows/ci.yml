@@ -215,6 +215,11 @@ jobs:
           fail=0
           for t in tests/scripts/test_*.sh; do
             echo "::group::$t"
+            if [ "$t" = "tests/scripts/test_pr755_runtime_continuity.sh" ]; then
+              echo "::warning title=Infrastructure canary skipped::SKIP: PR755 continuity canary requires explicit jeff-ubuntu invocation"
+              echo "::endgroup::"
+              continue
+            fi
             bash "$t" || { echo "::error file=$t::test failed"; fail=$((fail + 1)); }
             echo "::endgroup::"
           done

@@ -72,7 +72,7 @@ fn dispatch_prompt_preamble(repo: &str, remote: &str, branch: &str) -> String {
 /// `tick::MAX_HUMAN_HELD_RECOVERY_ATTEMPT`'s order of magnitude (10); set
 /// slightly higher because transient spawn hiccups are expected to be more
 /// frequent/short-lived than a full gate-rejection HUMAN_HELD cycle.
-pub(crate) const MAX_TRANSIENT_SPAWN_RETRY: u32 = 15;
+pub const MAX_TRANSIENT_SPAWN_RETRY: u32 = 15;
 
 /// Caller-resolved drive-PR branch-binding decision (bead
 /// jleechan-drive-pr-branch-binding-pcpr), threaded from

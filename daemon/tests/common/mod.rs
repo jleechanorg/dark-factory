@@ -495,6 +495,8 @@ pub struct FakeSessions {
     pub transcript_activity_for: RefCell<HashMap<String, u64>>,
     pub worktree_ancestor_for: RefCell<HashMap<String, bool>>,
     pub worktree_ancestor_error_for: RefCell<HashMap<String, String>>,
+    pub runtime_worktree: RefCell<Option<std::path::PathBuf>>,
+    pub post_stop_activity: RefCell<Option<SessionActivity>>,
 }
 
 impl Default for FakeSessions {
@@ -527,6 +529,8 @@ impl Default for FakeSessions {
             worktree_ancestor_for: RefCell::new(HashMap::new()),
             worktree_ancestor_error_for: RefCell::new(HashMap::new()),
             session_health_failure_for: RefCell::new(HashMap::new()),
+            runtime_worktree: RefCell::new(None),
+            post_stop_activity: RefCell::new(None),
         }
     }
 }
@@ -687,6 +691,14 @@ impl FakeSessions {
             message.to_string(),
         );
     }
+
+    pub fn set_runtime_worktree(&self, path: std::path::PathBuf) {
+        *self.runtime_worktree.borrow_mut() = Some(path);
+    }
+
+    pub fn set_post_stop_activity(&self, activity: SessionActivity) {
+        *self.post_stop_activity.borrow_mut() = Some(activity);
+    }
 }
 
 impl Sessions for FakeSessions {
@@ -830,6 +842,11 @@ impl Sessions for FakeSessions {
         self.calls
             .borrow_mut()
             .push(format!("session_activity({})", id.0));
+        if self.stop_succeeded.get() {
+            if let Some(post) = *self.post_stop_activity.borrow() {
+                return Ok(post);
+            }
+        }
         // Permanent error takes precedence — must PROPAGATE, not defer.
         if let Some(msg) = self.activity_permanent_error.borrow().as_ref() {
             return Err(DaemonError::Parse(msg.clone()));
@@ -957,6 +974,20 @@ impl Sessions for FakeSessions {
                 head_sha: "fake-local-worktree-head".to_string(),
                 contains_ancestor,
             }))
+    }
+
+    fn resolve_runtime_in_project(
+        &self,
+        project: &str,
+        id: &SessionId,
+    ) -> Result<Option<daemon::tools::SessionRuntimeIdentity>, DaemonError> {
+        Ok(Some(daemon::tools::SessionRuntimeIdentity {
+            session_id: id.clone(),
+            project: project.to_string(),
+            runtime_id: Some(id.0.clone()),
+            worktree_path: self.runtime_worktree.borrow().clone(),
+            branch: self.branch_for.borrow().get(&id.0).cloned(),
+        }))
     }
 }
 
@@ -1861,3 +1892,21 @@ impl StateStore for FakeStateStore {
         Ok(())
     }
 }
+
+pub fn init_cleanup_test_repo(path: &std::path::Path) {
+    let git = if std::path::Path::new("/usr/bin/git").is_file() {
+        "/usr/bin/git"
+    } else {
+        "git"
+    };
+    let status = std::process::Command::new(git)
+        .args(["init", "--quiet"])
+        .current_dir(path)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+

@@ -70,9 +70,27 @@ echo "==> git-lfs $(git-lfs version | head -1)"
 # it is running). Snapshot the source into a versioned UV-managed release and
 # point the installed launcher at that immutable copy. macOS keeps the
 # repo-local development layout for backwards compatibility with launchd.
-if [[ "$(uname -s)" == "Linux" && "${DARK_FACTORY_DISABLE_IMMUTABLE_ARTIFACT:-0}" != "1" ]]; then
+if [[ "$(uname -s)" == "Linux" && ( "${DARK_FACTORY_DISABLE_IMMUTABLE_ARTIFACT:-0}" != "1" || -n "${DARK_FACTORY_EXPECTED_RELEASE_SHA:-}" ) ]]; then
   ARTIFACT_ROOT="${DARK_FACTORY_INSTALL_ROOT:-${HOME}/.local/share/dark-factory}"
-  if ARTIFACT_VERSION="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null)"; then
+  if [[ -n "${DARK_FACTORY_EXPECTED_RELEASE_SHA:-}" ]]; then
+    if [[ ! "${DARK_FACTORY_EXPECTED_RELEASE_SHA}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+      echo "ERROR: DARK_FACTORY_EXPECTED_RELEASE_SHA must be exactly 40 hexadecimal characters: '${DARK_FACTORY_EXPECTED_RELEASE_SHA}'" >&2
+      exit 1
+    fi
+    if ! ARTIFACT_VERSION="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null)"; then
+      echo "ERROR: expected release SHA requested (${DARK_FACTORY_EXPECTED_RELEASE_SHA}), but git HEAD is unavailable." >&2
+      exit 1
+    fi
+    if [[ "${ARTIFACT_VERSION}" != "${DARK_FACTORY_EXPECTED_RELEASE_SHA}" ]]; then
+      echo "ERROR: requested release SHA (${DARK_FACTORY_EXPECTED_RELEASE_SHA}) does not match git HEAD (${ARTIFACT_VERSION})." >&2
+      exit 1
+    fi
+    if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=normal 2>/dev/null)" ]]; then
+      echo "ERROR: refusing to publish an immutable release from a dirty Git checkout." >&2
+      echo "Commit or remove tracked/untracked changes, then rerun install.sh." >&2
+      exit 1
+    fi
+  elif ARTIFACT_VERSION="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null)"; then
     if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=normal 2>/dev/null)" ]]; then
       echo "ERROR: refusing to publish an immutable release from a dirty Git checkout." >&2
       echo "Commit or remove tracked/untracked changes, then rerun install.sh." >&2
@@ -81,6 +99,8 @@ if [[ "$(uname -s)" == "Linux" && "${DARK_FACTORY_DISABLE_IMMUTABLE_ARTIFACT:-0}
   else
     ARTIFACT_VERSION="$(sha256sum "${REPO_ROOT}/install.sh" | cut -c1-40)"
   fi
+  mkdir -p "${ARTIFACT_ROOT}"
+  ARTIFACT_ROOT="$(cd "${ARTIFACT_ROOT}" && pwd -P)"
   ARTIFACT_DIR="${ARTIFACT_ROOT}/releases/${ARTIFACT_VERSION}"
   if [[ "${CLEAR}" -eq 1 && -d "${ARTIFACT_DIR}" ]]; then
     echo "==> removing immutable release (${ARTIFACT_DIR})"
@@ -99,6 +119,15 @@ if [[ "$(uname -s)" == "Linux" && "${DARK_FACTORY_DISABLE_IMMUTABLE_ARTIFACT:-0}
     echo "==> snapshotted immutable release: ${ARTIFACT_DIR}"
   else
     echo "==> reusing immutable release: ${ARTIFACT_DIR}"
+    DAEMON_BIN="${ARTIFACT_DIR}/daemon/target/release/daemon"
+    STORED_DAEMON_DIGEST="$(cat "${ARTIFACT_DIR}/.dark-factory-daemon-sha256" 2>/dev/null || true)"
+    if [[ ! -f "${ARTIFACT_DIR}/.dark-factory-release-sha" || "$(cat "${ARTIFACT_DIR}/.dark-factory-release-sha")" != "${ARTIFACT_VERSION}" || \
+          ! -x "${DAEMON_BIN}" || ! "${STORED_DAEMON_DIGEST}" =~ ^[0-9a-fA-F]{64}$ || \
+          "$(sha256sum "${DAEMON_BIN}" 2>/dev/null | cut -c1-64)" != "${STORED_DAEMON_DIGEST}" ]]; then
+      echo "ERROR: immutable release ${ARTIFACT_DIR} failed provenance/integrity validation." >&2
+      echo "Rerun install.sh --clear to rebuild the release." >&2
+      exit 1
+    fi
   fi
   RUNTIME_ROOT="${ARTIFACT_DIR}"
 fi
@@ -210,6 +239,13 @@ fi
 chmod +x "${BIN_DIR}/dark-factory" "${BIN_DIR}/df-healer" "${BIN_DIR}/df-validate" "${BIN_DIR}/df-funnel" "${BIN_DIR}/df-funnel-lanes"
 
 if [[ "${ARTIFACT_CREATED}" -eq 1 ]]; then
+  DAEMON_BINARY="${RUNTIME_ROOT}/daemon/target/release/daemon"
+  if [[ ! -x "${DAEMON_BINARY}" ]]; then
+    echo "ERROR: immutable release daemon binary is not executable: ${DAEMON_BINARY}" >&2
+    exit 1
+  fi
+  printf '%s\n' "${ARTIFACT_VERSION}" > "${RUNTIME_ROOT}/.dark-factory-release-sha"
+  sha256sum "${DAEMON_BINARY}" | cut -c1-64 > "${RUNTIME_ROOT}/.dark-factory-daemon-sha256"
   # Runtime code and the venv are complete before this point. Removing write
   # permission makes accidental in-place edits fail instead of silently
   # changing the release used by systemd.

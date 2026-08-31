@@ -750,13 +750,89 @@ pub struct WorktreeHeadAncestry {
     pub contains_ancestor: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRuntimeIdentity {
+    pub session_id: SessionId,
+    pub project: String,
+    pub runtime_id: Option<String>,
+    pub worktree_path: Option<std::path::PathBuf>,
+    pub branch: Option<String>,
+}
+
 /// `ao` / `aow` CLIs.
 pub trait Sessions {
     fn active_count(&self) -> Result<usize, DaemonError>;
     fn spawn(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError>;
     fn attach(&self, branch: &str, bead_id: &str) -> Result<SessionId, DaemonError>;
+    /// Resolve a branch within its owning AO project. The default preserves
+    /// compatibility with single-project adapters and test doubles.
+    fn attach_in_project(
+        &self,
+        project: &str,
+        branch: &str,
+        bead_id: &str,
+    ) -> Result<SessionId, DaemonError> {
+        let _ = project;
+        self.attach(branch, bead_id)
+    }
     fn stop(&self, id: &SessionId) -> Result<(), DaemonError>;
+    /// Stop a session while the caller has resolved its owning AO project.
+    /// The default preserves compatibility with fakes and adapters whose
+    /// session ids are globally addressable.
+    fn stop_in_project(
+        &self,
+        project: &str,
+        id: &SessionId,
+    ) -> Result<(), DaemonError> {
+        let _ = project;
+        self.stop(id)
+    }
+    fn stop_runtime_in_project(&self, project: &str, id: &SessionId) -> Result<(), DaemonError> {
+        self.stop_in_project(project, id)
+    }
+    fn confirm_runtime_absent_in_project(
+        &self,
+        project: &str,
+        id: &SessionId,
+    ) -> Result<bool, DaemonError> {
+        let _ = (project, id);
+        Ok(true)
+    }
+    fn archive_session_metadata_in_project(
+        &self,
+        project: &str,
+        id: &SessionId,
+        quarantined_worktree: Option<&std::path::Path>,
+        dirty_hash: Option<&str>,
+    ) -> Result<(), DaemonError> {
+        let _ = (project, id, quarantined_worktree, dirty_hash);
+        Ok(())
+    }
+    fn resolve_runtime_in_project(
+        &self,
+        project: &str,
+        id: &SessionId,
+    ) -> Result<Option<SessionRuntimeIdentity>, DaemonError> {
+        let _ = (project, id);
+        Ok(Some(SessionRuntimeIdentity {
+            session_id: id.clone(),
+            project: project.to_string(),
+            runtime_id: Some(id.0.clone()),
+            worktree_path: None,
+            branch: None,
+        }))
+    }
     fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError>;
+    /// Project-scoped liveness probe. The default delegates so existing
+    /// adapters and test doubles remain source-compatible.
+    fn is_quiescent_in_project(
+        &self,
+        project: &str,
+        id: &SessionId,
+    ) -> Result<bool, DaemonError> {
+        let _ = project;
+        self.is_quiescent(id)
+    }
     /// Budget-bounded `attach` (bead jleechan-zeij / issue #322 r4 P2). The
     /// re-roll proceed poll caps each probe at the time remaining until its
     /// window deadline so a single poll cannot block for multiples of the
@@ -773,6 +849,16 @@ pub trait Sessions {
         let _ = timeout_secs;
         self.attach(branch, bead_id)
     }
+    fn attach_within_in_project(
+        &self,
+        project: &str,
+        branch: &str,
+        bead_id: &str,
+        timeout_secs: u64,
+    ) -> Result<SessionId, DaemonError> {
+        let _ = project;
+        self.attach_within(branch, bead_id, timeout_secs)
+    }
     /// Budget-bounded [`session_activity`](Sessions::session_activity) (bead
     /// jleechan-zeij / issue #322 r4 P2). Default delegates to the unbounded
     /// method; `CliSessions` overrides to pass `timeout_secs` to `ao status`.
@@ -783,6 +869,15 @@ pub trait Sessions {
     ) -> Result<SessionActivity, DaemonError> {
         let _ = timeout_secs;
         self.session_activity(id)
+    }
+    fn session_activity_within_in_project(
+        &self,
+        project: &str,
+        id: &SessionId,
+        timeout_secs: u64,
+    ) -> Result<SessionActivity, DaemonError> {
+        let _ = project;
+        self.session_activity_within(id, timeout_secs)
     }
     /// Activity probe distinguishing idle vs running vs terminal (bead
     /// jleechan-zeij / issue #322 r2 — see [`SessionActivity`]). The default
@@ -798,6 +893,16 @@ pub trait Sessions {
         } else {
             Ok(SessionActivity::Running)
         }
+    }
+    /// Project-scoped activity probe. The default delegates so existing
+    /// adapters and test doubles remain source-compatible.
+    fn session_activity_in_project(
+        &self,
+        project: &str,
+        id: &SessionId,
+    ) -> Result<SessionActivity, DaemonError> {
+        let _ = project;
+        self.session_activity(id)
     }
     /// Post-spawn session health monitor: checks if an active session died,
     /// failed authentication, hit quota limits, or suffered terminal errors in its terminal.

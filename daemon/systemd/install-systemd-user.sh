@@ -55,6 +55,20 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+if [ "$RENDER_ONLY" -eq 1 ] && [ "$UNINSTALL" -eq 1 ]; then
+    echo "ERROR: --render-only and --uninstall are mutually exclusive." >&2
+    exit 2
+fi
+
+if [ -n "${DARK_FACTORY_EXPECTED_RELEASE_SHA:-}" ]; then
+    if [[ ! "$DARK_FACTORY_EXPECTED_RELEASE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+        echo "ERROR: DARK_FACTORY_EXPECTED_RELEASE_SHA must be exactly 40 hexadecimal characters: '$DARK_FACTORY_EXPECTED_RELEASE_SHA'" >&2
+        exit 1
+    fi
+    INSTALL_ROOT="${DARK_FACTORY_INSTALL_ROOT:-$HOME/.local/share/dark-factory}"
+    REPO="$INSTALL_ROOT/releases/$DARK_FACTORY_EXPECTED_RELEASE_SHA"
+fi
+
 run() {
     if [ "$DRY_RUN" -eq 1 ]; then
         printf '[dry-run] %s\n' "$*"
@@ -97,16 +111,50 @@ ensure_linger() {
     fi
 }
 
-if [ "$RENDER_ONLY" -eq 1 ]; then
-    render_unit
-    exit 0
-fi
-
 if [ "$UNINSTALL" -eq 1 ]; then
     run systemctl --user disable --now "$UNIT_NAME"
     run rm -f "$UNIT_PATH"
     run systemctl --user daemon-reload
     echo "Uninstalled $UNIT_NAME"
+    exit 0
+fi
+
+if [ -n "${DARK_FACTORY_EXPECTED_RELEASE_SHA:-}" ]; then
+    [ -d "$INSTALL_ROOT" ] || { echo "ERROR: install root does not exist: $INSTALL_ROOT" >&2; exit 1; }
+    [ -d "$REPO" ] || { echo "ERROR: expected release directory does not exist: $REPO" >&2; exit 1; }
+    CANONICAL_INSTALL_ROOT="$(cd "$INSTALL_ROOT" 2>/dev/null && pwd -P)"
+    [ -n "$CANONICAL_INSTALL_ROOT" ] || { echo "ERROR: failed to resolve install root: $INSTALL_ROOT" >&2; exit 1; }
+    EXPECTED_PHYSICAL_PATH="$CANONICAL_INSTALL_ROOT/releases/$DARK_FACTORY_EXPECTED_RELEASE_SHA"
+    PHYSICAL_RELEASE="$(cd "$REPO" 2>/dev/null && pwd -P)"
+    [ -n "$PHYSICAL_RELEASE" ] || { echo "ERROR: failed to resolve release directory: $REPO" >&2; exit 1; }
+    if [ "$PHYSICAL_RELEASE" != "$EXPECTED_PHYSICAL_PATH" ]; then
+        echo "ERROR: expected release resolves to $PHYSICAL_RELEASE, escaping canonical install root $EXPECTED_PHYSICAL_PATH" >&2
+        exit 1
+    fi
+    REPO="$EXPECTED_PHYSICAL_PATH"
+    PINNED_ROOT=""
+    if [ -f "$REPO/.dark-factory-runtime-root" ]; then
+        IFS= read -r PINNED_ROOT < "$REPO/.dark-factory-runtime-root"
+    fi
+    if [ "$PINNED_ROOT" != "$REPO" ]; then
+        echo "ERROR: expected release directory $REPO missing valid .dark-factory-runtime-root" >&2
+        exit 1
+    fi
+    if [ ! -x "$REPO/daemon/target/release/daemon" ]; then
+        echo "ERROR: expected release is missing executable daemon: $REPO/daemon/target/release/daemon" >&2
+        exit 1
+    fi
+    [ -f "$REPO/.dark-factory-release-sha" ] && [ "$(cat "$REPO/.dark-factory-release-sha")" = "$DARK_FACTORY_EXPECTED_RELEASE_SHA" ] || {
+        echo "ERROR: expected release source marker missing or mismatch in $REPO" >&2; exit 1;
+    }
+    STORED_DAEMON_SHA="$(cat "$REPO/.dark-factory-daemon-sha256" 2>/dev/null || true)"
+    if [[ ! "$STORED_DAEMON_SHA" =~ ^[0-9a-fA-F]{64}$ ]] || [ "$(sha256sum "$REPO/daemon/target/release/daemon" 2>/dev/null | cut -c1-64)" != "$STORED_DAEMON_SHA" ]; then
+        echo "ERROR: expected release daemon digest missing or mismatch in $REPO" >&2; exit 1;
+    fi
+fi
+
+if [ "$RENDER_ONLY" -eq 1 ]; then
+    render_unit
     exit 0
 fi
 
