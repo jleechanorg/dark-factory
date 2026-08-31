@@ -814,7 +814,7 @@ def run(
     # Capture the controller-owned base before the first worker visit.  This
     # runs after CLI/AO state has been assembled, so an explicitly selected AO
     # worktree is the target whose immutable HEAD is bound.
-    if controller_graph:
+    if controller_graph or resume is not None:
         _seed_controller_base_sha(ctx, graph)
     history: list = []
     visits: dict[str, int] = {}
