@@ -174,6 +174,22 @@ pub struct PrFile {
     pub deletions: u32,
 }
 
+/// A bounded, structured copy of one unresolved GitHub review thread.
+///
+/// These fields are transport data only.  The daemon does not interpret the
+/// review body or attempt to classify its intent; the remediation coder gets
+/// the exact bounded payload as untrusted feedback in a separately delimited
+/// prompt section.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UnresolvedReviewThread {
+    pub id: String,
+    pub author: String,
+    pub path: Option<String>,
+    pub line: Option<u32>,
+    pub is_outdated: bool,
+    pub body: String,
+}
+
 /// One gate's read from the SCM, gathered for the 7/8-green verifier (spec §4.2.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrSnapshot {
@@ -198,6 +214,11 @@ pub struct PrSnapshot {
     /// failure or malformed GraphQL response is not evidence that zero
     /// threads are unresolved.
     pub unresolved_thread_count: Option<u32>,
+    /// Structured details for unresolved review threads when the GraphQL
+    /// response was successfully fetched and decoded. `None` means the
+    /// details were not proven (for example, GraphQL failed); an empty vector
+    /// is an authoritative zero-thread result.
+    pub unresolved_threads: Option<Vec<UnresolvedReviewThread>>,
     pub head_sha: String,
     pub body: String,
     pub comments: Vec<PrComment>,
@@ -1082,6 +1103,12 @@ pub trait Vcs {
 /// ZFC: ALL judgment goes through here — no keyword/heuristic routing in callers.
 pub trait Llm {
     fn judge(&self, prompt: &str) -> Result<String, DaemonError>;
+    /// Execute external review data without repository-write capabilities.
+    /// Implementations must opt in; silently falling back to `judge` would
+    /// turn public review text into a write-capable agent prompt.
+    fn judge_read_only(&self, _prompt: &str) -> Result<String, DaemonError> {
+        Err(DaemonError::Config("read-only LLM judgment is not implemented".into()))
+    }
     fn is_real(&self) -> bool {
         false
     }

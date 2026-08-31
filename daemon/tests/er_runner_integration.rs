@@ -339,6 +339,7 @@ fn all_green_snapshot(pr: u64) -> PrSnapshot {
         coderabbit_approved: true,
         bugbot_error_count: 0,
         unresolved_thread_count: Some(0),
+        unresolved_threads: Some(Vec::new()),
         head_sha: "deadbeef".into(),
         body: String::new(),
         comments: Vec::new(),

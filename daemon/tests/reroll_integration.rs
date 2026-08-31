@@ -223,7 +223,7 @@ fn test_reroll_success() {
     let llm = FakeLlm::new();
     // mock LLM reply for constraint extraction
     *llm.response.borrow_mut() = Some(Ok(
-        r#"{"inhibitionSpecs":["no print"],"positiveAssertions":["log errors"],"securityRedactionEncountered":false}"#.into()
+        r#"{"inhibitionSpecs":["no \\ path\nline\r\n\t\u0001 🦀"],"positiveAssertions":["log \"quoted\" [table] = 1"],"securityRedactionEncountered":false}"#.into()
     ));
 
     let mut cfg = test_cfg();
@@ -266,8 +266,8 @@ fn test_reroll_success() {
         llm: &llm,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        reviewer: "skeptic".into(),
-        review_text: "Don't print to stdout, log errors.".into(),
+        reviewer: "skeptic\"\n[forged]".into(),
+        review_text: "Don't \"\"\" print\r\n\\tab\t🦀\n[[forged]]".into(),
     };
 
     let outcome = reroll::execute(&deps, &mut bead).unwrap();
@@ -283,6 +283,12 @@ fn test_reroll_success() {
     assert_eq!(updated.state, OverlayState::Recovery);
     assert_eq!(updated.attempt, 2);
     assert_eq!(updated.reroll_count, 1);
+    let spec = std::fs::read_to_string(spec_dir.join("bead-success.toml")).unwrap();
+    let parsed: toml::Value = toml::from_str(&spec).expect("reroll spec remains valid TOML");
+    assert_eq!(parsed["reroll"][0]["reviewer"].as_str(), Some("skeptic\"\n[forged]"));
+    assert_eq!(parsed["reroll"][0]["raw_feedback"].as_str(), Some("Don't \"\"\" print\r\n\\tab\t🦀\n[[forged]]"));
+    assert_eq!(parsed["reroll"][0]["inhibition_specs"][0].as_str(), Some("no \\ path\nline\r\n\t\u{1} 🦀"));
+    assert_eq!(parsed["reroll"][0]["positive_assertions"][0].as_str(), Some("log \"quoted\" [table] = 1"));
     assert_eq!(updated.branch, Some("factory/bead-success-r2".into()));
     assert_eq!(updated.pr_number, None); // Old PR number cleared
 
@@ -336,12 +342,41 @@ fn test_reroll_success() {
     let spec_path = spec_dir.join("bead-success.toml");
     assert!(spec_path.exists());
     let spec_content = std::fs::read_to_string(&spec_path).unwrap();
-    assert!(spec_content.contains("reviewer = \"skeptic\""));
+    assert!(spec_content.contains("reviewer = "));
     assert!(spec_content.contains("inhibition_specs = ["));
-    assert!(spec_content.contains("\"no print\""));
+    assert!(spec_content.contains("inhibition_specs"));
 
     std::fs::remove_dir_all(spec_dir).ok();
     let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn extractor_outage_precedes_factory_reroll_supersession() {
+    let scm = FakeScm::new();
+    let sessions = FakeSessions::new();
+    let vcs = FakeVcs::new();
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Err("read-only extractor unavailable".into()));
+    let cfg = test_cfg();
+    let telemetry_log = std::env::temp_dir().join("afd_reroll_extractor_outage.jsonl");
+    let mut bead = BeadOverlay {
+        bead_id: "bead-extractor-outage".into(), state: OverlayState::Attested,
+        attempt: 1, reroll_count: 0, autonomy_secs: 0, spend_usd: 0.0,
+        pr_number: Some(99), branch: Some("factory/bead-extractor-outage-r1".into()),
+        session_id: None, is_adopted: false, spawn_failure_count: 0,
+        pre_session_head_sha: None, park_reason: None, target_repo: None, attempt_started_at: None,
+    };
+    store.save(&bead).unwrap();
+    sessions.attach_not_found_for("factory/bead-extractor-outage-r1");
+    let deps = RerollDeps { scm: &scm, sessions: &sessions, vcs: &vcs, store: &store,
+        llm: &llm, cfg: &cfg, telemetry_log: &telemetry_log, reviewer: "reviewer".into(), review_text: "untrusted feedback".into() };
+    let outcome = reroll::execute(&deps, &mut bead);
+    assert!(outcome.is_err(), "expected extractor outage, got {outcome:?}; LLM calls: {:?}", llm.calls.borrow());
+    assert!(vcs.calls.borrow().is_empty(), "extractor failure must precede VCS branch/base effects");
+    assert!(scm.calls.borrow().is_empty(), "extractor failure must precede PR closure");
+    assert!(store.branches.borrow().is_empty(), "extractor failure must not register a replacement branch");
+    let _ = std::fs::remove_file(telemetry_log);
 }
 
 /// Regression test for issue #349 / bead jleechan-wuts — the
@@ -574,6 +609,7 @@ fn test_tick_stage2_integration() {
             coderabbit_approved: true,
             bugbot_error_count: 0,
             unresolved_thread_count: Some(0),
+            unresolved_threads: Some(Vec::new()),
             head_sha: "head-sha-abc".into(),
             body: "".into(),
             comments: vec![],
@@ -612,6 +648,9 @@ fn test_tick_stage2_integration() {
             } else {
                 Ok(r#"{"routingVerdict":"SMALL_PATH","justification":"x"}"#.into())
             }
+        }
+        fn judge_read_only(&self, prompt: &str) -> Result<String, DaemonError> {
+            self.judge(prompt)
         }
     }
     let smart_llm = SmartLlm {
@@ -831,6 +870,77 @@ fn test_reroll_adopted_success_spawns_remediation_session_leaves_pr_open() {
             .iter()
             .all(|c| !c.starts_with("close_pr_for_repo(") && !c.starts_with("close_pr(")),
         "adopted remediation must never close the contributor's PR: {scm_calls:?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// A trusted branch identifier can exceed the remediation payload budget even
+/// when review feedback is tiny. The daemon must park the bead before calling
+/// VCS or AO, returning a structured over-budget outcome rather than looping
+/// in feedback truncation or dispatching an oversized spawn request.
+#[test]
+fn test_reroll_adopted_oversized_trusted_prompt_parks_without_dispatch() {
+    let scm = FakeScm::new();
+    let sessions = FakeSessions::new();
+    let mut vcs = FakeVcs::new();
+    let branch = (0..20)
+        .map(|index| format!("segment{index:02}{}", "x".repeat(200)))
+        .collect::<Vec<_>>()
+        .join("/");
+    assert!(branch.len() > 4_015, "regression branch must exceed baseline budget");
+    vcs.heads.insert(branch.clone(), "pre-session-sha-long".into());
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    let cfg = test_cfg();
+    let telemetry_log = std::env::temp_dir().join("afd_reroll_prompt_over_budget_telemetry.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let mut bead = BeadOverlay {
+        bead_id: "bead-prompt-over-budget".into(),
+        state: OverlayState::Attested,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 5,
+        spend_usd: 0.0,
+        pr_number: Some(778),
+        branch: Some(branch.clone()),
+        session_id: None,
+        is_adopted: true,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: None,
+        attempt_started_at: None,
+    };
+    store.save(&bead).unwrap();
+    store.register_branch(&bead.bead_id, &branch).unwrap();
+
+    let deps = RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "verifier".into(),
+        review_text: "short feedback".into(),
+    };
+
+    let outcome = reroll::execute(&deps, &mut bead).unwrap();
+    assert!(
+        matches!(outcome, RerollOutcome::Held(ref reason) if reason.contains("remediation prompt rejected before spawn") && reason.contains("trusted remediation prompt baseline")),
+        "expected structured fail-closed outcome, got {outcome:?}"
+    );
+    let updated = store.load(&bead.bead_id).unwrap().unwrap();
+    assert_eq!(updated.state, OverlayState::HumanHeld);
+    assert_eq!(updated.park_reason.as_deref(), Some("remediation_prompt_over_budget"));
+    assert!(sessions.spawn_prompts.borrow().is_empty(), "oversized prompt must never dispatch");
+    assert!(
+        vcs.calls.borrow().iter().all(|call| !call.starts_with("remote_head_sha(")),
+        "pre-session VCS capture must not run after prompt rejection: {:?}",
+        vcs.calls.borrow()
     );
 
     let _ = std::fs::remove_file(&telemetry_log);

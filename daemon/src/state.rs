@@ -678,6 +678,11 @@ pub enum HumanHoldReason {
     AdoptedSessionAttachFailed,
     AdoptedSessionAlreadyActive,
     AdoptedSpawnFailed,
+    /// The trusted remediation prompt metadata alone exceeded the bounded
+    /// AO payload budget. This is permanent until an operator or policy
+    /// change addresses the oversized reviewer/branch metadata; silently
+    /// retrying would reproduce the same pre-dispatch failure.
+    RemediationPromptOverBudget,
     UnknownOnlyGateCapped,
     CircuitBreaker,
     /// Bead jleechan-6l1f: gate regression hit `MAX_GATE_REGRESSIONS`
@@ -748,6 +753,7 @@ impl HumanHoldReason {
             Self::AdoptedSessionAttachFailed => "adopted_session_attach_failed",
             Self::AdoptedSessionAlreadyActive => "adopted_session_already_active",
             Self::AdoptedSpawnFailed => "adopted_spawn_failed",
+            Self::RemediationPromptOverBudget => "remediation_prompt_over_budget",
             Self::UnknownOnlyGateCapped => "unknown_only_gate_report_with_er_runner_capped",
             Self::CircuitBreaker => CIRCUIT_BREAKER_PARK_REASON,
             Self::GateRegressionCapped => "gate_regression_capped",
