@@ -148,10 +148,29 @@ def test_level5_factory_graphs_accept_fresh_codex_reviewer_hard_tier():
 @pytest.mark.parametrize(
     "reviewer_attrs",
     [
-        'class="review", backend="codex", verdict_gate="true"',
-        'class="review", backend="codex", fresh_session="true"',
-        'class="review", fresh_session="true", verdict_gate="true"',
-        'backend="codex", fresh_session="true", verdict_gate="true"',
+        # One case for each missing required field.
+        'class="review", backend="codex", prompt="@prompts/slim/fresh_review.md", fresh_session="true", verdict_gate="true", timeout="600"',
+        'type="codergen", backend="codex", prompt="@prompts/slim/fresh_review.md", fresh_session="true", verdict_gate="true", timeout="600"',
+        'type="codergen", class="review", prompt="@prompts/slim/fresh_review.md", fresh_session="true", verdict_gate="true", timeout="600"',
+        'type="codergen", class="review", backend="codex", fresh_session="true", verdict_gate="true", timeout="600"',
+        'type="codergen", class="review", backend="codex", prompt="@prompts/slim/fresh_review.md", verdict_gate="true", timeout="600"',
+        'type="codergen", class="review", backend="codex", prompt="@prompts/slim/fresh_review.md", fresh_session="true", timeout="600"',
+        'type="codergen", class="review", backend="codex", prompt="@prompts/slim/fresh_review.md", fresh_session="true", verdict_gate="true"',
+        # One case for each retired controller/parallel/shadow field.
+        'type="codergen", class="review", backend="codex", prompt="@prompts/slim/fresh_review.md", fresh_session="true", verdict_gate="true", timeout="600", review_contract="cold-review-v1"',
+        'type="codergen", class="review", backend="codex", prompt="@prompts/slim/fresh_review.md", fresh_session="true", verdict_gate="true", timeout="600", backend_priority="codex"',
+        'type="codergen", class="review", backend="codex", prompt="@prompts/slim/fresh_review.md", fresh_session="true", verdict_gate="true", timeout="600", prefer_adversarial="true"',
+        'type="codergen", class="review", backend="codex", prompt="@prompts/slim/fresh_review.md", fresh_session="true", verdict_gate="true", timeout="600", gate_strict="true"',
+        'type="codergen", class="review", backend="codex", prompt="@prompts/slim/fresh_review.md", fresh_session="true", verdict_gate="true", timeout="600", receipt_required="true"',
+        'type="codergen", class="review", backend="codex", prompt="@prompts/slim/fresh_review.md", fresh_session="true", verdict_gate="true", timeout="600", evidence_paths="x"',
+        'type="codergen", class="review", backend="codex", prompt="@prompts/slim/fresh_review.md", fresh_session="true", verdict_gate="true", timeout="600", parallel="true"',
+        'type="codergen", class="review", backend="codex", prompt="@prompts/slim/fresh_review.md", fresh_session="true", verdict_gate="true", timeout="600", allow_partial="true"',
+        'type="codergen", class="review", backend="codex", prompt="@prompts/slim/fresh_review.md", fresh_session="true", verdict_gate="true", timeout="600", join_quorum="1"',
+        'type="codergen", class="review", backend="codex", prompt="@prompts/slim/fresh_review.md", fresh_session="true", verdict_gate="true", timeout="600", n_shadows="1"',
+        'type="codergen", class="review", backend="codex", prompt="@prompts/slim/fresh_review.md", fresh_session="true", verdict_gate="true", timeout="600", shadow_codex_review="true"',
+        'type="codergen", class="review", backend="codex", prompt="@prompts/slim/fresh_review.md", fresh_session="true", verdict_gate="true", timeout="600", shadow_review_target="diff"',
+        'type="codergen", class="review", backend="codex", prompt="@prompts/slim/fresh_review.md", fresh_session="true", verdict_gate="true", timeout="600", shadow_codex_timeout="600"',
+        'type="codergen", class="review", backend="codex", prompt="@prompts/slim/fresh_review.md", fresh_session="true", verdict_gate="true", timeout="600", shadow_backends="codex"',
     ],
 )
 def test_level5_rejects_incomplete_fresh_codex_reviewer_contract(tmp_path, reviewer_attrs):
@@ -165,7 +184,7 @@ digraph incomplete_fresh_reviewer {{
     exit [shape=Msquare]
     gate_er [type="gate_er"]
     gate_skeptic [type="gate_skeptic"]
-    adversarial_reviewer [type="codergen", {reviewer_attrs}]
+    adversarial_reviewer [{reviewer_attrs}]
     start -> gate_er -> gate_skeptic -> adversarial_reviewer -> exit
 }}
 """.strip()

@@ -23,6 +23,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from runner.engine import run as run_graph  # noqa: E402
+from runner.graph_audit import (  # noqa: E402
+    is_complete_fresh_codex_reviewer,
+)
 from runner.handlers import Context, TYPE_REGISTRY, resolve  # noqa: E402
 from runner.parser import is_exit_node, is_start_node, parse  # noqa: E402
 from runner.prompt_substitution_audit import (  # noqa: E402
@@ -199,17 +202,9 @@ def _is_codergen_node(node) -> bool:
     return resolve(node) is TYPE_REGISTRY["codergen"]
 
 
-def _is_fresh_codex_reviewer(node) -> bool:
-    """Return whether a node declares the fully-tooled fresh Codex gate."""
-    enabled = {"true", "1", "yes", "on"}
-    return (
-        str(node.attrs.get("type", "")).strip().lower() == "codergen"
-        and _is_codergen_node(node)
-        and str(node.attrs.get("class", "")).strip().lower() == "review"
-        and str(node.attrs.get("backend", "")).strip().lower() == "codex"
-        and str(node.attrs.get("fresh_session", "")).strip().lower() in enabled
-        and str(node.attrs.get("verdict_gate", "")).strip().lower() in enabled
-    )
+# Keep the historical private name for callers while ensuring conformance and
+# graph_audit use one complete reviewer contract predicate.
+_is_fresh_codex_reviewer = is_complete_fresh_codex_reviewer
 
 
 def _check_level5(graph, path: pathlib.Path) -> list[dict]:
