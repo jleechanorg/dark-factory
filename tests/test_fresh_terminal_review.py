@@ -827,6 +827,11 @@ def test_fresh_reviewer_blocks_absolute_writes_to_original_target(tmp_path, monk
     )
     calls: list[tuple[list[str], pathlib.Path]] = []
     real_run = subprocess.run
+    real_which = shutil.which
+    monkeypatch.setattr(
+        "runner.handler_codergen.shutil.which",
+        lambda name: "/bin/sh" if name == "codex" else real_which(name),
+    )
 
     def behavioral_boundary_runner(args, **kwargs):
         if args and any("codex" in str(a) for a in args):
