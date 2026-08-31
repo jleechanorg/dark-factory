@@ -449,9 +449,6 @@ def test_fresh_reviewer_rejects_escaping_and_dangling_symlinks_without_launch(tm
     repo = _repo(tmp_path)
     outside = tmp_path / "outside.txt"
     outside.write_text("outside data\n")
-    (repo / "escaping_link").symlink_to(outside)
-    subprocess.run(["git", "-C", str(repo), "add", "escaping_link"], check=True)
-    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "track link"], check=True)
 
     prompt = tmp_path / "review.md"
     prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
@@ -473,13 +470,24 @@ def test_fresh_reviewer_rejects_escaping_and_dangling_symlinks_without_launch(tm
     monkeypatch.setattr("runner.handlers._sandboxed_args_for_workdir", lambda args, workdir: args)
     monkeypatch.setattr("runner.handlers._sanitized_env", lambda: {})
     monkeypatch.setattr("runner.handler_codergen.subprocess.run", intercept_run)
-    result = _codergen(_review_node(prompt), ctx)
 
-    assert result.outcome == "error"
-    assert len(codex_calls) == 0, "Codex must not be launched when source has escaping symlink"
-    assert "symlink" in result.output.lower() or "isolation" in result.output.lower()
+    # 1. Untracked escaping symlink
+    (repo / "escaping_link").symlink_to(outside)
+    result_untracked = _codergen(_review_node(prompt), ctx)
+    assert result_untracked.outcome == "error"
+    assert len(codex_calls) == 0, "Codex must not be launched when source has untracked escaping symlink"
+    assert "symlink" in result_untracked.output.lower() or "isolation" in result_untracked.output.lower()
 
-    # Now test dangling symlink
+    # 2. Tracked escaping symlink
+    subprocess.run(["git", "-C", str(repo), "add", "escaping_link"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "track link"], check=True)
+    codex_calls.clear()
+    result_tracked = _codergen(_review_node(prompt), ctx)
+    assert result_tracked.outcome == "error"
+    assert len(codex_calls) == 0, "Codex must not be launched when source has tracked escaping symlink"
+    assert "symlink" in result_tracked.output.lower() or "isolation" in result_tracked.output.lower()
+
+    # 3. Dangling symlink
     (repo / "escaping_link").unlink()
     (repo / "dangling_link").symlink_to(repo / "nonexistent.txt")
     codex_calls.clear()
