@@ -148,12 +148,16 @@ def _has_cross_vendor_reviewer(graph, graph_backend: str | None) -> bool:
 
     Legacy graphs used raw tool commands (`codex exec`, `agy --print`,
     `claude -p`). New graphs should use `type="parallel_reviewer"` with a
-    backend priority queue so the normal review and shadow Codex output are
-    one logged/audited node. Empty/unset graph backend always passes the
-    cross-vendor requirement because the runner decides at run-time.
+    backend priority queue, or an explicit fresh fully-tooled Codex
+    `type="codergen"` verdict gate. Empty/unset graph backend always passes
+    the cross-vendor requirement because the runner decides at run-time.
     """
     graph_vendor = (graph_backend or "").strip().lower() or None
     for node in graph.nodes.values():
+        if _is_fresh_codex_reviewer(node):
+            if graph_vendor is None or _vendor_name("codex") != graph_vendor:
+                return True
+
         node_type = str(node.attrs.get("type", "") or "").strip().lower()
         if node_type == "parallel_reviewer":
             raw_priority = str(node.attrs.get("backend_priority", "") or "").strip()
@@ -193,6 +197,19 @@ def _has_cross_vendor_reviewer(graph, graph_backend: str | None) -> bool:
 
 def _is_codergen_node(node) -> bool:
     return resolve(node) is TYPE_REGISTRY["codergen"]
+
+
+def _is_fresh_codex_reviewer(node) -> bool:
+    """Return whether a node declares the fully-tooled fresh Codex gate."""
+    enabled = {"true", "1", "yes", "on"}
+    return (
+        str(node.attrs.get("type", "")).strip().lower() == "codergen"
+        and _is_codergen_node(node)
+        and str(node.attrs.get("class", "")).strip().lower() == "review"
+        and str(node.attrs.get("backend", "")).strip().lower() == "codex"
+        and str(node.attrs.get("fresh_session", "")).strip().lower() in enabled
+        and str(node.attrs.get("verdict_gate", "")).strip().lower() in enabled
+    )
 
 
 def _check_level5(graph, path: pathlib.Path) -> list[dict]:
@@ -310,7 +327,8 @@ def _check_level5(graph, path: pathlib.Path) -> list[dict]:
                 "missing_hard_tier_gate",
                 "error",
                 "Level-5 graph must contain a cross-vendor adversarial "
-                "reviewer node (type=\"parallel_reviewer\" or command starting with one of: "
+                "reviewer node (fresh Codex type=\"codergen\" verdict gate, "
+                "type=\"parallel_reviewer\", or command starting with one of: "
                 + ", ".join(_LEVEL5_HARD_TIER_REVIEWERS)
                 + ") that is not the same vendor as the graph backend.",
             )

@@ -179,12 +179,15 @@ def _resolved_type_label(node: Node) -> str:
 
 
 def _is_codergen_verdict_gate(node: Node) -> bool:
-    """Return whether a codergen explicitly declares review-gate behavior."""
+    """Return whether a codergen declares the fresh Codex review contract."""
+    fresh = str(node.attrs.get("fresh_session", "false")).strip().lower()
     enabled = str(node.attrs.get("verdict_gate", "false")).strip().lower()
     return (
-        _resolved_type_label(node) == "codergen"
+        str(node.attrs.get("type", "")).strip().lower() == "codergen"
+        and _resolved_type_label(node) == "codergen"
         and str(node.attrs.get("class", "")).strip().lower() == "review"
         and str(node.attrs.get("backend", "")).strip().lower() == "codex"
+        and fresh in {"true", "1", "yes", "on"}
         and enabled in {"true", "1", "yes", "on"}
     )
 
@@ -212,7 +215,8 @@ def _is_reviewer(node: Node) -> bool:
 
     Includes both ``type="gate_*"`` / ``type="holdout_eval"`` AND any
     future aliasing added to ``TYPE_REGISTRY`` under those names. A codergen
-    counts only when it explicitly combines ``class="review"`` with
+    counts only when it explicitly combines ``class="review"``,
+    ``backend="codex"``, ``fresh_session="true"``, and
     ``verdict_gate="true"``; class alone remains a styling hint.
     """
     return (

@@ -105,7 +105,20 @@ def test_resolved_type_label_matches_engine(name, attrs, want_label):
         ({}, True, False),
         # class="review" alone is only a styling hint.
         ({"type": "codergen", "class": "review"}, True, False),
-        # The explicit Codex verdict gate turns a review-class codergen into a gate.
+        # The explicit fresh Codex verdict gate turns a review-class codergen into a gate.
+        (
+            {
+                "type": "codergen",
+                "class": "review",
+                "backend": "codex",
+                "fresh_session": "true",
+                "verdict_gate": "true",
+            },
+            False,
+            True,
+        ),
+        # A Codex verdict gate without a fresh session is still code-producing,
+        # not a hard-tier reviewer.
         (
             {
                 "type": "codergen",
@@ -113,8 +126,20 @@ def test_resolved_type_label_matches_engine(name, attrs, want_label):
                 "backend": "codex",
                 "verdict_gate": "true",
             },
-            False,
             True,
+            False,
+        ),
+        # A default-resolved codergen without an explicit type is not the
+        # declared fresh reviewer contract.
+        (
+            {
+                "class": "review",
+                "backend": "codex",
+                "fresh_session": "true",
+                "verdict_gate": "true",
+            },
+            True,
+            False,
         ),
         # Other codergen backends do not implement verdict-gate parsing.
         (

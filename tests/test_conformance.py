@@ -130,18 +130,54 @@ def test_level5_valid_passes():
     assert payload["diagnostics"] == [], payload
 
 
-def test_level5_factory_graphs_accept_parallel_reviewer_hard_tier():
-    """Typed parallel reviewer nodes satisfy the cross-vendor hard tier."""
+def test_level5_factory_graphs_accept_fresh_codex_reviewer_hard_tier():
+    """Fresh fully-tooled Codex reviewer nodes satisfy the hard tier."""
     for path in (
         "pipelines/factory/gates.dot",
         "pipelines/factory/pr_gates.dot",
         "pipelines/factory/level5_feature.dot",
+        "pipelines/factory/web-advice-failopen.dot",
     ):
         proc = run_conformance("validate", path)
         assert proc.returncode == 0, proc.stdout + proc.stderr
         payload = json.loads(proc.stdout)
         error_diags = [d for d in payload["diagnostics"] if d.get("severity") == "error"]
         assert error_diags == [], (path, payload)
+
+
+@pytest.mark.parametrize(
+    "reviewer_attrs",
+    [
+        'class="review", backend="codex", verdict_gate="true"',
+        'class="review", backend="codex", fresh_session="true"',
+        'class="review", fresh_session="true", verdict_gate="true"',
+        'backend="codex", fresh_session="true", verdict_gate="true"',
+    ],
+)
+def test_level5_rejects_incomplete_fresh_codex_reviewer_contract(tmp_path, reviewer_attrs):
+    """A codergen reviewer must carry every hard-tier contract attribute."""
+    level5_dot = tmp_path / "incomplete_fresh_reviewer.dot"
+    level5_dot.write_text(
+        f"""
+digraph incomplete_fresh_reviewer {{
+    graph [level5="true", skip_explore="true", skip_plan="true", skip_implement="true", skip_fix="true"]
+    start [shape=Mdiamond]
+    exit [shape=Msquare]
+    gate_er [type="gate_er"]
+    gate_skeptic [type="gate_skeptic"]
+    adversarial_reviewer [type="codergen", {reviewer_attrs}]
+    start -> gate_er -> gate_skeptic -> adversarial_reviewer -> exit
+}}
+""".strip()
+    )
+    proc = run_conformance("validate", str(level5_dot))
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    payload = json.loads(proc.stdout)
+    assert any(
+        d.get("rule") == "missing_hard_tier_gate"
+        and d.get("severity") == "error"
+        for d in payload["diagnostics"]
+    ), payload
 
 
 def test_level5_missing_gate_fails():
