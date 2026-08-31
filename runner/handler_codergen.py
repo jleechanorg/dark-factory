@@ -72,6 +72,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -521,8 +522,10 @@ def _codergen_workdir(ctx: "Context") -> "Path | str | None":
             return None
 
 
-def _tracked_state(workdir: "Path | str | None") -> str | None:
-    """Hash HEAD plus staged and unstaged tracked changes, ignoring untracked files."""
+def _tracked_state(
+    workdir: "Path | str | None", *, include_untracked: bool = False
+) -> str | None:
+    """Hash HEAD plus staged/unstaged changes, optionally including untracked artifacts."""
     if not workdir:
         return None
     path = pathlib.Path(str(workdir))
@@ -548,7 +551,39 @@ def _tracked_state(workdir: "Path | str | None") -> str | None:
         if proc.returncode != 0:
             return None
         outputs.append(proc.stdout)
+    if include_untracked:
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(path), "ls-files", "--others", "-z"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if proc.returncode != 0:
+            return None
+        raw_files = [p for p in (proc.stdout or "").split("\0") if p]
+        untracked_entries: list[str] = []
+        for rel_str in sorted(raw_files):
+            try:
+                file_path = path / rel_str
+                if file_path.is_symlink():
+                    target = os.readlink(file_path)
+                    entry_hash = hashlib.sha256(f"symlink:{target}".encode("utf-8")).hexdigest()
+                elif file_path.is_file():
+                    entry_hash = hashlib.sha256(file_path.read_bytes()).hexdigest()
+                elif file_path.is_dir():
+                    entry_hash = "dir"
+                else:
+                    entry_hash = "missing"
+                untracked_entries.append(f"{rel_str}:{entry_hash}")
+            except OSError:
+                return None
+        outputs.append("\0".join(untracked_entries))
     return hashlib.sha256("\0".join(outputs).encode("utf-8")).hexdigest()
+
 
 
 def _fresh_review_workdir(ctx: "Context") -> pathlib.Path | None:
@@ -735,6 +770,76 @@ def _isolated_review_workdir(target_workdir: pathlib.Path):
         _materialize_snapshot_symlinks(target_workdir, review_dir)
         _normalize_and_validate_review_git(target_workdir, review_dir)
         yield review_dir
+
+
+def _sandboxed_args_for_fresh_review(
+    command: list[str],
+    codex_workdir: pathlib.Path,
+    target_workdir: pathlib.Path,
+) -> list[str] | None:
+    """Build sandboxed arguments for fresh review isolating against target_workdir writes.
+
+    On macOS: Seatbelt sandbox-exec profile with holdouts denied, sealed benchmark docs
+    denied, and target_workdir write-denied ((deny file-write* (subpath ...))).
+    On Linux: Landlock allow-list allowing only codex_workdir (and codex runtime paths)
+    and denying target_workdir, holdouts, and sealed benchmark docs. Fails closed if
+    Landlock kernel boundary is unavailable.
+    """
+    if os.environ.get("DISABLE_SANDBOX"):
+        return command
+    from . import handler_sandbox as _sandbox
+
+    shim_fn = getattr(_handlers_shim, "_sandboxed_args_for_workdir", None)
+    if shim_fn is not None and shim_fn is not _sandbox._sandboxed_args_for_workdir:
+        return shim_fn(command, codex_workdir)
+
+    if sys.platform == "darwin":
+        if not _handlers_shim._verify_darwin_sandbox_exec():
+            return None
+        sandbox_exec = shutil.which("sandbox-exec")
+        if sandbox_exec is None:
+            return None
+        sealed_docs = _handlers_shim._sealed_benchmark_doc_paths(codex_workdir)
+        extra_denied = sealed_docs + [target_workdir.resolve()]
+        profile = _sandbox._build_sandbox_profile(extra_denied)
+        return [sandbox_exec, "-p", profile] + command
+
+    if sys.platform.startswith("linux"):
+        launcher = _handlers_shim._linux_landlock_launcher_path()
+        if launcher is None:
+            return None
+        abi = _handlers_shim._linux_landlock_abi()
+        if abi is None or abi < 3:
+            return None
+        sealed_docs = _handlers_shim._sealed_benchmark_doc_paths(codex_workdir)
+        denied_paths = _handlers_shim._holdout_denied_paths() + sealed_docs + [target_workdir.resolve()]
+
+        executable = command[0]
+        resolved_executable = shutil.which(executable) or executable
+        launcher_path = pathlib.Path(resolved_executable)
+        runtime_paths = _handlers_shim._linux_codex_runtime_paths(launcher_path)
+        if runtime_paths is None:
+            return None
+        real_binary = _sandbox._linux_codex_real_binary(launcher_path)
+        if real_binary is not None:
+            executable_path = real_binary
+            cmd_args = [str(real_binary), *command[1:]]
+        else:
+            executable_path = launcher_path
+            cmd_args = command
+
+        landlock_prefix = _handlers_shim._linux_controller_sandbox_prefix(
+            denied_paths=denied_paths,
+            read_paths=[*runtime_paths, codex_workdir.resolve()],
+            writable_paths=[codex_workdir.resolve()],
+            executable_paths=[executable_path],
+        )
+        if landlock_prefix is None:
+            return None
+        return _handlers_shim._extend_pinned_launcher_command(
+            landlock_prefix, cmd_args
+        )
+    return None
 
 
 
@@ -1150,7 +1255,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                 output="fresh reviewer target must be a real, non-symlinked directory",
                 metadata={"verdict": "unknown", "fresh_session": "true"},
             ))
-        target_tracked_before = _tracked_state(target_workdir) if verdict_gate else None
+        target_tracked_before = _tracked_state(target_workdir, include_untracked=True) if verdict_gate else None
         if verdict_gate and target_tracked_before is None:
             return _finalize(Result(
                 outcome="error",
@@ -1171,14 +1276,23 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                 }:
                     codex_command.append("--ephemeral")
                 codex_command.extend(["--yolo", "--skip-git-repo-check", prompt_text])
-                args = _handlers_shim._sandboxed_args_for_workdir(
-                    codex_command,
-                    codex_workdir,
+                args = (
+                    _sandboxed_args_for_fresh_review(
+                        codex_command,
+                        codex_workdir,
+                        target_workdir,
+                    )
+                    if verdict_gate
+                    else _handlers_shim._sandboxed_args_for_workdir(
+                        codex_command,
+                        codex_workdir,
+                    )
                 )
                 if args is None:
                     return _finalize(Result(
                         outcome="error" if verdict_gate else "failure",
-                        output="sandbox-exec unavailable",
+                        output="sandbox-exec unavailable" if sys.platform == "darwin" else "isolation unavailable",
+                        metadata={"verdict": "unknown", "fresh_session": "true"} if verdict_gate else {},
                     ))
                 timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1800"), 1800)
                 try:
@@ -1191,6 +1305,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                         check=False,
                         input="",
                         env=_handlers_shim._sanitized_env(),
+                        pass_fds=getattr(args, "pass_fds", ()),
                     )
                 except subprocess.TimeoutExpired as exc:
                     return _finalize(Result(
@@ -1213,6 +1328,8 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                             "returncode": "",
                         },
                     ))
+                finally:
+                    _handlers_shim._close_pinned_launcher_command(args)
 
                 output = proc.stdout + ("\nSTDERR:\n" + proc.stderr if proc.stderr else "")
                 outcome = "success" if proc.returncode == 0 else "failure"
@@ -1223,7 +1340,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                 if verdict_gate:
                     verdict, parsed_outcome = _handlers_shim._parse_verdict(output, gate_strict=True)
                     snapshot_tracked_after = _tracked_state(codex_workdir)
-                    target_tracked_after = _tracked_state(target_workdir)
+                    target_tracked_after = _tracked_state(target_workdir, include_untracked=True)
                     snapshot_mutated = (
                         snapshot_tracked_before is None
                         or snapshot_tracked_after is None

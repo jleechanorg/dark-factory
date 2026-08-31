@@ -499,3 +499,212 @@ def test_fresh_reviewer_detects_original_target_mutation_fails_closed(tmp_path, 
     assert result.outcome == "error"
     assert result.metadata["reviewer_mutated_tracked_files"] == "true"
     assert "reviewer changed tracked files" in result.output.lower()
+
+
+def test_fresh_reviewer_blocks_absolute_writes_to_original_target(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    (repo / "artifact.json").write_text('{"tests": "passed"}\n')
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    node = _review_node(prompt)
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="echo",
+        state={"ao.worktree": str(repo)},
+    )
+    calls: list[tuple[list[str], pathlib.Path]] = []
+    real_run = subprocess.run
+
+    def boundary_runner(args, **kwargs):
+        if args and any("codex" in str(a) for a in args):
+            cwd = pathlib.Path(kwargs["cwd"])
+            calls.append((list(args), cwd))
+            args_list = list(args)
+            target_str = str(repo.resolve())
+            target_write_blocked = False
+            # Check Seatbelt profile (macOS)
+            if "-p" in args_list:
+                p_idx = args_list.index("-p") + 1
+                profile = args_list[p_idx]
+                if f'(deny file-write* (subpath "{target_str}"))' in profile:
+                    target_write_blocked = True
+            # Check Landlock prefix (Linux)
+            elif any(isinstance(a, str) and a.startswith("/proc/self/fd/") for a in args_list):
+                write_allowed = [args_list[i + 1] for i, a in enumerate(args_list) if a == "--write"]
+                if not any(target_str == w or target_str.startswith(w.rstrip("/") + "/") for w in write_allowed):
+                    target_write_blocked = True
+
+            attempted_writes = [
+                (repo / "value.txt", "reviewer corrupted tracked\n"),
+                (repo / "artifact.json", '{"tests": "tampered"}\n'),
+                (repo / "untracked_leak.txt", "reviewer created untracked\n"),
+            ]
+            for target_file, content in attempted_writes:
+                if target_write_blocked:
+                    pass
+                else:
+                    target_file.write_text(content)
+
+            # Reviewer writes inside snapshot workdir (allowed)
+            (cwd / "snapshot_output.txt").write_text("snapshot output\n")
+            return subprocess.CompletedProcess(
+                args, 0, stdout="No blocking findings.\nVerdict: PASS\n", stderr=""
+            )
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", boundary_runner)
+    result = _codergen(node, ctx)
+
+    assert result.outcome == "success"
+    assert result.metadata["verdict"] == "pass"
+    assert len(calls) == 1
+    assert (repo / "value.txt").read_text() == "before\n"
+    assert (repo / "artifact.json").read_text() == '{"tests": "passed"}\n'
+    assert not (repo / "untracked_leak.txt").exists()
+
+
+def test_fresh_reviewer_detects_untracked_target_mutation_fails_closed(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    (repo / "artifact.json").write_text('{"tests": "passed"}\n')
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="echo",
+        state={"ao.worktree": str(repo)},
+    )
+    real_run = subprocess.run
+
+    def mutate_untracked_target(args, **kwargs):
+        if args and any("codex" in str(a) for a in args):
+            (repo / "artifact.json").write_text('{"tests": "tampered"}\n')
+            (repo / "leak.txt").write_text("untracked leak\n")
+            return subprocess.CompletedProcess(args, 0, stdout="Verdict: PASS\n", stderr="")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr("runner.handlers._sandboxed_args_for_workdir", lambda args, workdir: args)
+    monkeypatch.setattr("runner.handlers._sanitized_env", lambda: {})
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", mutate_untracked_target)
+
+    result = _codergen(_review_node(prompt), ctx)
+
+    assert result.outcome == "error"
+    assert result.metadata["reviewer_mutated_tracked_files"] == "true"
+    assert "reviewer changed tracked files" in result.output.lower()
+
+
+def test_fresh_reviewer_linux_landlock_boundary_and_pass_fds(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    node = _review_node(prompt)
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="echo",
+        state={"ao.worktree": str(repo)},
+    )
+    calls: list[tuple[list[str], dict]] = []
+    fake_fd = 42
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        "runner.handlers._linux_landlock_launcher_path",
+        lambda: pathlib.Path("/fake/landlock-launcher"),
+    )
+    monkeypatch.setattr("runner.handlers._linux_landlock_abi", lambda: 3)
+    monkeypatch.setattr(
+        "runner.handlers._linux_codex_runtime_paths",
+        lambda path: [pathlib.Path("/usr/bin")],
+    )
+
+    observed_landlock: dict[str, object] = {}
+
+    def fake_landlock_prefix(**kwargs):
+        observed_landlock.update(kwargs)
+        from runner.handler_sandbox import _PinnedLauncherCommand
+        cmd = _PinnedLauncherCommand([f"/proc/self/fd/{fake_fd}", "--read", "/usr/bin", "--write", str(kwargs["writable_paths"][0]), "--"], fake_fd)
+        return cmd
+
+    monkeypatch.setattr(
+        "runner.handlers._linux_controller_sandbox_prefix", fake_landlock_prefix
+    )
+
+    real_run = subprocess.run
+
+    def intercept_run(args, **kwargs):
+        if args and any("codex" in str(a) or f"/proc/self/fd/{fake_fd}" in str(a) for a in args):
+            calls.append((list(args), kwargs))
+            return subprocess.CompletedProcess(
+                args, 0, stdout="No blocking findings.\nVerdict: PASS\n", stderr=""
+            )
+        return real_run(args, **kwargs)
+
+    closed_fds: list[object] = []
+    monkeypatch.setattr(
+        "runner.handlers._close_pinned_launcher_command",
+        lambda cmd: closed_fds.append(getattr(cmd, "launcher_fd", None)),
+    )
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", intercept_run)
+
+    result = _codergen(node, ctx)
+
+    assert result.outcome == "success"
+    assert result.metadata["verdict"] == "pass"
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert kwargs.get("pass_fds") == (fake_fd,)
+    assert closed_fds == [fake_fd]
+
+    # Verify Landlock boundary paths
+    denied = observed_landlock.get("denied_paths", [])
+    assert repo.resolve() in denied
+    writable = observed_landlock.get("writable_paths", [])
+    assert repo.resolve() not in writable
+    assert all(not repo.resolve().is_relative_to(w) for w in writable)
+
+    # Verify full codex tool access preserved (no restrictive flags)
+    codex_idx = args.index("codex") if "codex" in args else next(i for i, a in enumerate(args) if "codex" in a)
+    codex_args = args[codex_idx:]
+    assert codex_args[:5] == ["codex", "exec", "--ephemeral", "--yolo", "--skip-git-repo-check"]
+    assert "--disable" not in codex_args
+    assert "shell_tool" not in codex_args
+
+
+def test_fresh_reviewer_linux_unavailable_landlock_fails_closed(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    node = _review_node(prompt)
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="echo",
+        state={"ao.worktree": str(repo)},
+    )
+    codex_calls: list[list[str]] = []
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr("runner.handlers._linux_landlock_launcher_path", lambda: None)
+    monkeypatch.setattr("runner.handlers._linux_landlock_abi", lambda: None)
+
+    real_run = subprocess.run
+
+    def intercept_run(args, **kwargs):
+        if args and any("codex" in str(a) for a in args):
+            codex_calls.append(list(args))
+            return subprocess.CompletedProcess(args, 0, stdout="Verdict: PASS\n", stderr="")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", intercept_run)
+
+    result = _codergen(node, ctx)
+
+    assert result.outcome == "error"
+    assert len(codex_calls) == 0, "Codex must not be launched when Landlock is unavailable on Linux"
+    assert result.metadata["verdict"] == "unknown"
+
+
