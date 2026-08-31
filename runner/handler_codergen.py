@@ -855,10 +855,9 @@ def _sandboxed_args_for_fresh_review(
 ) -> list[str] | None:
     """Build sandboxed arguments for fresh review isolating against target_workdir writes.
 
-    On macOS: Seatbelt sandbox-exec profile with holdouts denied, sealed benchmark docs
-    denied, and target_workdir write-denied ((deny file-write* (subpath ...))).
+    On macOS: Seatbelt sandbox-exec profile with holdouts denied and target_workdir denied.
     On Linux: Landlock allow-list allowing only codex_workdir, private codex runtime home,
-    and codex runtime paths, and denying target_workdir, holdouts, and sealed benchmark docs.
+    and codex runtime paths, and denying target_workdir and holdouts.
     Fails closed if Landlock kernel boundary is unavailable.
     """
     if os.environ.get("DISABLE_SANDBOX"):
@@ -877,8 +876,7 @@ def _sandboxed_args_for_fresh_review(
         sandbox_exec = shutil.which("sandbox-exec")
         if sandbox_exec is None:
             return None
-        sealed_docs = _handlers_shim._sealed_benchmark_doc_paths(codex_workdir)
-        extra_denied = sealed_docs + [target_workdir.resolve()]
+        extra_denied = [target_workdir.resolve()]
         profile = _sandbox._build_sandbox_profile(extra_denied)
         return [sandbox_exec, "-p", profile] + command
 
@@ -889,8 +887,7 @@ def _sandboxed_args_for_fresh_review(
         abi = _handlers_shim._linux_landlock_abi()
         if abi is None or abi < 3:
             return None
-        sealed_docs = _handlers_shim._sealed_benchmark_doc_paths(codex_workdir)
-        denied_paths = _handlers_shim._holdout_denied_paths() + sealed_docs + [target_workdir.resolve()]
+        denied_paths = _handlers_shim._holdout_denied_paths() + [target_workdir.resolve()]
 
         executable = command[0]
         resolved_executable = shutil.which(executable) or executable

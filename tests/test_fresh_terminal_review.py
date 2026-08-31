@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pathlib
+import shutil
 import subprocess
 import sys
 
@@ -1225,3 +1226,140 @@ def test_verdict_gated_review_disables_and_ignores_shadow_codex_review(tmp_path,
     assert cwd != repo
     assert cwd != tmp_path
     assert not cwd.exists()
+
+
+def test_sandboxed_args_for_fresh_review_macos_allows_snapshot_docs_and_denies_target_and_holdouts(tmp_path, monkeypatch):
+    from runner.handler_codergen import _sandboxed_args_for_fresh_review
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr("runner.handler_codergen.shutil.which", lambda name: "/usr/bin/sandbox-exec")
+    monkeypatch.setattr("runner.handlers._verify_darwin_sandbox_exec", lambda: True)
+
+    holdouts = tmp_path / "holdouts"
+    holdouts.mkdir()
+    (holdouts / "secret.txt").write_text("holdout secret\n")
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(holdouts))
+
+    target_repo = _repo(tmp_path / "target")
+    review_ws = tmp_path / "review_ws"
+    bench_dir = review_ws / "benchmarks" / "feature"
+    bench_dir.mkdir(parents=True)
+    (bench_dir / "README.md").write_text("doc\n")
+    (bench_dir / "DESIGN.md").write_text("design\n")
+
+    args = _sandboxed_args_for_fresh_review(
+        ["codex", "exec", "--ephemeral", "prompt"],
+        codex_workdir=review_ws,
+        target_workdir=target_repo,
+    )
+    assert args is not None
+    assert args[0] == "/usr/bin/sandbox-exec"
+    assert args[1] == "-p"
+    profile = args[2]
+    assert f'(deny file-read* (subpath "{target_repo.resolve()}"))' in profile
+    assert f'(deny file-write* (subpath "{target_repo.resolve()}"))' in profile
+    assert f'(deny file-read* (subpath "{holdouts.resolve()}"))' in profile
+    assert f'(deny file-write* (subpath "{holdouts.resolve()}"))' in profile
+    assert str(review_ws.resolve()) not in profile
+    assert f'(deny file-read* (subpath "{review_ws.resolve() / "benchmarks" / "feature" / "README.md"}"))' not in profile
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS Seatbelt sandbox-exec regression")
+def test_fresh_reviewer_macos_allows_snapshot_benchmark_docs_while_denying_target_and_holdouts(tmp_path, monkeypatch):
+    if shutil.which("sandbox-exec") is None:
+        pytest.skip("sandbox-exec not available")
+
+    holdouts = tmp_path / "holdouts"
+    holdouts.mkdir()
+    (holdouts / "secret_holdout.txt").write_text("sealed test case\n")
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(holdouts))
+
+    repo = _repo(tmp_path)
+    bench_dir = repo / "benchmarks" / "task1"
+    bench_dir.mkdir(parents=True, exist_ok=True)
+    (bench_dir / "README.md").write_text("benchmark design notes\n")
+    (bench_dir / "DESIGN.md").write_text("benchmark design\n")
+    (bench_dir / "SCORING.md").write_text("benchmark scoring\n")
+    (bench_dir / "SCENARIOS.md").write_text("benchmark scenarios\n")
+    subprocess.run(["git", "-C", str(repo), "add", "benchmarks"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "add benchmarks"], check=True)
+
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    node = _review_node(prompt)
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="codex",
+        state={"ao.worktree": str(repo)},
+    )
+
+    calls: list[tuple[list[str], pathlib.Path]] = []
+    real_run = subprocess.run
+
+    def behavioral_runner(args, **kwargs):
+        if args and any("codex" in str(a) for a in args):
+            cwd = pathlib.Path(kwargs["cwd"])
+            calls.append((list(args), cwd))
+
+            args_list = list(args)
+            codex_idx = next(i for i, a in enumerate(args_list) if "codex" in str(a))
+            sandbox_wrapper = args_list[:codex_idx]
+
+            probe_code = (
+                "import pathlib, sys\n"
+                "repo = pathlib.Path(sys.argv[1])\n"
+                "holdouts = pathlib.Path(sys.argv[2])\n"
+                "cwd = pathlib.Path.cwd()\n"
+                "# 1. Snapshot benchmark docs must be readable\n"
+                "for doc in ['README.md', 'DESIGN.md', 'SCORING.md', 'SCENARIOS.md']:\n"
+                "    p = cwd / 'benchmarks' / 'task1' / doc\n"
+                "    content = p.read_text()\n"
+                "    assert len(content) > 0, f'Empty snapshot doc {p}'\n"
+                "# 2. Original target reads must be denied\n"
+                "target_read_denied = False\n"
+                "try:\n"
+                "    (repo / 'value.txt').read_text()\n"
+                "except OSError:\n"
+                "    target_read_denied = True\n"
+                "assert target_read_denied, 'Read from original target must be denied by sandbox'\n"
+                "# 3. Holdout reads must be denied\n"
+                "holdout_read_denied = False\n"
+                "try:\n"
+                "    (holdouts / 'secret_holdout.txt').read_text()\n"
+                "except OSError:\n"
+                "    holdout_read_denied = True\n"
+                "assert holdout_read_denied, 'Read from holdouts must be denied by sandbox'\n"
+                "# 4. Target writes must be denied\n"
+                "target_write_denied = False\n"
+                "try:\n"
+                "    (repo / 'value.txt').write_text('tampered\\n')\n"
+                "except OSError:\n"
+                "    target_write_denied = True\n"
+                "assert target_write_denied, 'Write to original target must be denied by sandbox'\n"
+                "print('No blocking findings.\\nVerdict: PASS\\n')\n"
+            )
+            probe_cmd = sandbox_wrapper + [sys.executable, "-c", probe_code, str(repo), str(holdouts)]
+            probe_proc = real_run(
+                probe_cmd,
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                env=kwargs.get("env"),
+                pass_fds=kwargs.get("pass_fds", ()),
+                check=False,
+            )
+            return subprocess.CompletedProcess(
+                args, probe_proc.returncode, stdout=probe_proc.stdout, stderr=probe_proc.stderr
+            )
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", behavioral_runner)
+    result = _codergen(node, ctx)
+
+    assert result.outcome == "success", f"Reviewer failed: {result.output}"
+    assert result.metadata["verdict"] == "pass"
+    assert result.metadata["reviewer_mutated_tracked_files"] == "false"
+    assert len(calls) == 1
+    assert (repo / "value.txt").read_text() == "before\n"
+    assert (repo / "benchmarks" / "task1" / "README.md").read_text() == "benchmark design notes\n"
