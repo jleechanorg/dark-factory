@@ -745,11 +745,14 @@ def _run_single_node(
         records: list = []
         for attempt in results:
             attempt = _obs._normalized_result(attempt)
+            is_review = (
+                str(node.attrs.get("class", "")).strip().lower() == "review"
+            )
             ctx.state.update(attempt.context_updates)
             ctx.state["_last_node"] = node.name
             ctx.state["_last_outcome"] = attempt.outcome
             ctx.state["_last_output"] = attempt.output
-            if str(node.attrs.get("class", "")).strip().lower() == "review":
+            if is_review:
                 ctx.state["_last_review_feedback"] = attempt.output
             
             # Surface Coder Handoff section + verdict token (P5)
@@ -766,13 +769,16 @@ def _run_single_node(
                 ctx.state.pop("_last_coder_handoff", None)
 
             normalized_results.append(attempt)
+            record_metadata = dict(attempt.metadata)
+            if is_review:
+                record_metadata["_review_feedback"] = attempt.output
             records.append(
                 _persist.StepRecord(
                     node=node.name,
                     outcome=attempt.outcome,
                     ts=time.time(),
                     output_preview=attempt.output[:280],
-                    metadata=attempt.metadata,
+                    metadata=record_metadata,
                 )
             )
             _persist._update_failure_state(node, ctx, attempt)
@@ -850,6 +856,17 @@ def run(
                 _cleanup_controller_snapshot(ctx)
                 return history
             synthetic = _obs._normalized_result(Result(outcome=last.outcome))
+            is_review = (
+                str(last_node.attrs.get("class", "")).strip().lower() == "review"
+            )
+            if is_review and "_review_feedback" in last.metadata:
+                feedback = str(last.metadata["_review_feedback"])
+                ctx.state["_last_review_feedback"] = feedback
+                ctx.state["_last_output"] = feedback
+                ctx.state["_last_node"] = last.node
+                ctx.state["_last_outcome"] = last.outcome
+                if "verdict" in last.metadata:
+                    ctx.state["_last_verdict"] = str(last.metadata["verdict"])
             # Detect incomplete parallel fan-out: the fan-out step was checkpointed
             # but branches never ran (job was interrupted between the fan-out record
             # write and the ThreadPoolExecutor completing).  Re-run from the parallel
@@ -865,6 +882,16 @@ def run(
                 if next_node is None:
                     _cleanup_controller_snapshot(ctx)
                     return history
+                if (
+                    is_review
+                    and "_review_feedback" not in last.metadata
+                    and str(last.outcome).strip().lower() == "failure"
+                    and str(next_node.attrs.get("class", "")).strip().lower()
+                    == "worker"
+                ):
+                    raise ValueError(
+                        "checkpoint is missing full reviewer feedback required for worker retry"
+                    )
                 current = next_node
 
     # Always have an addressable run_id so diagnostics are locatable even when

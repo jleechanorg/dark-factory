@@ -178,7 +178,11 @@ def test_two_node_loop_copies_exact_review_output_to_worker_retry(tmp_path, monk
     from runner.handler_core import Context, Result
     from runner.handlers import TYPE_REGISTRY
 
-    review = "Blocking: src/value.py:7 mishandles zero.\nVerdict: FAIL\n"
+    review = (
+        "Blocking: src/value.py:7 mishandles zero.\n"
+        + ("context " * 50)
+        + "TAIL-MARKER\nVerdict: FAIL\n"
+    )
     worker_feedback: list[str | None] = []
     review_visits = 0
 
@@ -199,6 +203,69 @@ def test_two_node_loop_copies_exact_review_output_to_worker_retry(tmp_path, monk
     )
 
     assert history[-1].outcome == "success"
+    assert worker_feedback == [None, review]
+
+
+def test_two_node_resume_copies_exact_review_output_to_worker_retry(
+    tmp_path, monkeypatch
+) -> None:
+    """A process restart between review failure and retry must retain findings."""
+    from runner.engine import run
+    from runner.handler_core import Context, Result
+    from runner.handlers import TYPE_REGISTRY
+
+    review = (
+        "Blocking: src/value.py:7 mishandles zero.\n"
+        + ("context " * 50)
+        + "TAIL-MARKER\nVerdict: FAIL\n"
+    )
+    worker_feedback: list[str | None] = []
+    review_visits = 0
+
+    def fake_codergen(node, ctx):
+        nonlocal review_visits
+        if node.name == "worker":
+            worker_feedback.append(ctx.state.get("_last_review_feedback"))
+            return Result(outcome="success", output="worker done")
+        review_visits += 1
+        if review_visits == 1:
+            return Result(outcome="failure", output=review)
+        return Result(outcome="success", output="Verdict: PASS\n")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "codergen", fake_codergen)
+    checkpoint = tmp_path / "checkpoint.json"
+    graph = parse(ROOT / _PIPELINE)
+    from runner import engine_persist
+
+    append_record = engine_persist._append_record
+
+    def interrupt_after_review(*args, **kwargs):
+        seq = append_record(*args, **kwargs)
+        record = args[5]
+        if record.node == "cold_reviewer":
+            raise KeyboardInterrupt("simulated process interruption")
+        return seq
+
+    monkeypatch.setattr(engine_persist, "_append_record", interrupt_after_review)
+    import pytest
+
+    with pytest.raises(KeyboardInterrupt, match="simulated process interruption"):
+        run(
+            graph,
+            Context(goal="fix zero handling", workdir=ROOT, backend="echo"),
+            checkpoint=checkpoint,
+        )
+    assert "TAIL-MARKER" in checkpoint.read_text(encoding="utf-8")
+    monkeypatch.setattr(engine_persist, "_append_record", append_record)
+
+    resumed = run(
+        graph,
+        Context(goal="fix zero handling", workdir=ROOT, backend="echo"),
+        checkpoint=checkpoint,
+        resume=checkpoint,
+    )
+
+    assert resumed[-1].outcome == "success"
     assert worker_feedback == [None, review]
 
 
