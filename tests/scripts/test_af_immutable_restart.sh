@@ -2,22 +2,24 @@
 # test_af_immutable_restart.sh — Immutable Linux release layout & restart proof.
 #
 # Emits machine-readable JSON satisfying the 5 criteria of .5:
-# 1. systemd ExecStart, /proc/<pid>/exe, and the running binary SHA all agree
-#    (self-consistency proof — see manifest_cross_check note below on the
-#    limits of this proof).
+# 1. The release manifest source commit/SHA256, systemd ExecStart,
+#    /proc/<pid>/exe before and after restart, and both live binary hashes
+#    agree.
 # 2. Restart changes daemon PID while preserving the exact bound worker
 #    process for a real AO session this script owns.
 # 3. Explicit stop reaps only Dark Factory-owned children and leaves
 #    unrelated AO sessions/worktrees unchanged.
 # 4. JSON output contains all required evidence fields, honestly split
 #    across two identities that this script never conflates:
-#      - restart_target: {release_commit, binary_sha256, unit_exec_start,
+#      - restart_target: {release_commit, binary_sha256_before,
+#        binary_sha256_after, proc_exe_before, proc_exe_after, unit_exec_start,
 #        exec_start_matches_running_binary, manifest_cross_check,
 #        daemon_pid_before, daemon_pid_after, ao_project, worktree, branch,
 #        unrelated_inventory_before, unrelated_inventory_after}
 #        describes the PRODUCTION daemon/worktree/branch under restart test.
 #      - worker_continuity_proof: {worker_continuity_ao_project, ao_session,
-#        session_branch, worker_pid_before, worker_pid_after} describes the
+#        session_branch_before, session_branch_after, worker_pid_before,
+#        worker_pid_after} describes the
 #        REAL but disposable AO session bound for the worker-continuity /
 #        stop-path proof. Its ao_session does NOT belong to restart_target's
 #        ao_project — see the opt-in comment below for why they must be
@@ -65,9 +67,10 @@
 set -euo pipefail
 
 SKIP_EXIT=2
-UNIT="ai.dark-factory.daemon.service"
-AO_PROJECT="dark-factory"
-WORKTREE="/home/jleechan/.dark-factory/target-worktrees/jleechanorg/dark-factory"
+UNIT="${DARK_FACTORY_RESTART_UNIT:-ai.dark-factory.daemon.service}"
+AO_PROJECT="${DARK_FACTORY_RESTART_AO_PROJECT:-dark-factory}"
+WORKTREE="${DARK_FACTORY_RESTART_WORKTREE:-/home/jleechan/.dark-factory/target-worktrees/jleechanorg/dark-factory}"
+SETTLE_SECS="${DARK_FACTORY_RESTART_SETTLE_SECS:-2}"
 
 skip() {
   local reason="$1"
@@ -90,7 +93,7 @@ fi
 # Ensure service is active
 if ! systemctl --user is-active --quiet "$UNIT"; then
   systemctl --user start "$UNIT"
-  sleep 2
+  sleep "$SETTLE_SECS"
 fi
 
 DAEMON_PID_BEFORE="$(systemctl --user show "$UNIT" --property=MainPID --value)"
@@ -99,44 +102,108 @@ if [ -z "$DAEMON_PID_BEFORE" ] || [ "$DAEMON_PID_BEFORE" = "0" ]; then
   exit 1
 fi
 
-UNIT_EXEC_START="$(systemctl --user show "$UNIT" --property=ExecStart --value | awk '{print $2}' | tr -d ';')"
+EXEC_START_RAW="$(systemctl --user show "$UNIT" --property=ExecStart --value)"
+UNIT_EXEC_START="$(python3 -c '
+import re
+import shlex
+import sys
+
+raw = sys.argv[1].strip()
+match = re.search(r"(?:^|[{;\s])path=([^;}]+?)(?=\s*;|\s*})", raw)
+if match:
+    print(match.group(1).strip())
+elif raw:
+    fields = shlex.split(raw)
+    if fields:
+        print(fields[0])
+' "$EXEC_START_RAW")"
+if [ -z "$UNIT_EXEC_START" ]; then
+  echo "FAIL: could not parse systemd ExecStart: $EXEC_START_RAW" >&2
+  exit 1
+fi
 
 # Real evidence of the running binary requires a real /proc read. A silent
 # fallback to the (unresolved) ExecStart path here would make the
 # ExecStart-vs-running-binary comparison below vacuously self-compare the
 # same string instead of proving anything real.
-PROC_EXE="$(readlink -f "/proc/$DAEMON_PID_BEFORE/exe" 2>/dev/null || true)"
-if [ -z "$PROC_EXE" ]; then
+PROC_EXE_BEFORE="$(readlink -f "/proc/$DAEMON_PID_BEFORE/exe" 2>/dev/null || true)"
+if [ -z "$PROC_EXE_BEFORE" ]; then
   skip "cannot resolve /proc/$DAEMON_PID_BEFORE/exe; no real evidence of the running daemon binary"
 fi
-BINARY_SHA256="$(sha256sum "$PROC_EXE" | awk '{print $1}')"
+BINARY_SHA256_BEFORE="$(sha256sum "$PROC_EXE_BEFORE" | awk '{print $1}')"
 
 # --- Criterion 1: prove the running binary is actually the one systemd is
 # configured to run, not just that both paths were read without comparing
 # them. Resolve ExecStart the same way (readlink -f) since it may itself be
 # a symlink (e.g. into an immutable releases/<sha> layout), then compare
 # resolved real paths, not raw strings. ---
-EXEC_START_RESOLVED="$(readlink -f "$UNIT_EXEC_START" 2>/dev/null || echo "$UNIT_EXEC_START")"
-if [ "$PROC_EXE" != "$EXEC_START_RESOLVED" ]; then
-  echo "FAIL: running binary ($PROC_EXE) does not match systemd ExecStart ($UNIT_EXEC_START, resolved: $EXEC_START_RESOLVED)" >&2
+EXEC_START_RESOLVED="$(readlink -f "$UNIT_EXEC_START" 2>/dev/null || true)"
+if [ -z "$EXEC_START_RESOLVED" ]; then
+  echo "FAIL: cannot resolve systemd ExecStart executable: $UNIT_EXEC_START" >&2
+  exit 1
+fi
+if [ "$PROC_EXE_BEFORE" != "$EXEC_START_RESOLVED" ]; then
+  echo "FAIL: running binary ($PROC_EXE_BEFORE) does not match systemd ExecStart ($UNIT_EXEC_START, resolved: $EXEC_START_RESOLVED)" >&2
   exit 1
 fi
 EXEC_START_MATCHES_RUNNING_BINARY="true"
 
-# NOTE on provenance: the check above only proves self-consistency -- that
-# the live process matches its own systemd unit config. This repo's deploy
-# tooling (daemon/systemd/install-systemd-user.sh) has no independent
-# build-provenance manifest file convention (no MANIFEST/manifest.json
-# mapping release_commit -> expected binary_sha256) to cross-check against.
-# Do not fabricate one; report the gap honestly instead.
-MANIFEST_CROSS_CHECK_STATUS="not_available"
-MANIFEST_CROSS_CHECK_REASON="no build-provenance manifest file convention (e.g. MANIFEST/manifest.json) exists in this repo's deploy tooling; only self-consistency between the running process, /proc/<pid>/exe, and systemd ExecStart is verified above, not independent build provenance for binary_sha256 given release_commit"
-
-# Extract release commit from releases/<sha> path
-RELEASE_COMMIT="$(echo "$PROC_EXE" | grep -oE 'releases/[a-f0-9]+' | cut -d/ -f2 || true)"
-if [ -z "$RELEASE_COMMIT" ]; then
-  RELEASE_COMMIT="$(basename "$(dirname "$(dirname "$PROC_EXE")")")"
+# The installer writes this manifest only after the daemon build completes.
+# Require the canonical immutable layout; an arbitrary parent-directory name
+# is never accepted as a source commit.
+DAEMON_RELATIVE_PATH="daemon/target/release/daemon"
+case "$PROC_EXE_BEFORE" in
+  */releases/*/"$DAEMON_RELATIVE_PATH")
+    RELEASE_DIR="${PROC_EXE_BEFORE%/"$DAEMON_RELATIVE_PATH"}"
+    ;;
+  *)
+    echo "FAIL: daemon executable is not in the immutable releases/<commit>/$DAEMON_RELATIVE_PATH layout: $PROC_EXE_BEFORE" >&2
+    exit 1
+    ;;
+esac
+RELEASE_COMMIT="$(basename "$RELEASE_DIR")"
+if [[ ! "$RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "FAIL: immutable release directory is not an exact 40-hex source commit: $RELEASE_COMMIT" >&2
+  exit 1
 fi
+RELEASE_MANIFEST="$RELEASE_DIR/release-manifest.json"
+if [ ! -f "$RELEASE_MANIFEST" ]; then
+  echo "FAIL: immutable release manifest is missing: $RELEASE_MANIFEST" >&2
+  exit 1
+fi
+if ! MANIFEST_SHA256="$(python3 - "$RELEASE_MANIFEST" "$RELEASE_COMMIT" "$DAEMON_RELATIVE_PATH" <<'PY'
+import json
+import re
+import sys
+
+path, expected_commit, expected_binary = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as handle:
+        manifest = json.load(handle)
+except Exception as error:
+    raise SystemExit(f"invalid release manifest {path}: {error}")
+
+if manifest.get("schema_version") != 1:
+    raise SystemExit("release manifest schema_version must be 1")
+if manifest.get("source_commit") != expected_commit:
+    raise SystemExit("release manifest source_commit does not match release directory")
+daemon = manifest.get("daemon")
+if not isinstance(daemon, dict) or daemon.get("path") != expected_binary:
+    raise SystemExit("release manifest daemon.path does not match the canonical daemon path")
+digest = daemon.get("sha256", "")
+if not re.fullmatch(r"[0-9a-f]{64}", digest):
+    raise SystemExit("release manifest daemon.sha256 is not 64 lowercase hex characters")
+print(digest)
+PY
+)"; then
+  echo "FAIL: release manifest validation failed: $RELEASE_MANIFEST" >&2
+  exit 1
+fi
+if [ "$BINARY_SHA256_BEFORE" != "$MANIFEST_SHA256" ]; then
+  echo "FAIL: running daemon SHA256 does not match release manifest ($BINARY_SHA256_BEFORE != $MANIFEST_SHA256)" >&2
+  exit 1
+fi
+MANIFEST_CROSS_CHECK_STATUS="verified"
 
 # --- Resolve dynamic target worktree & branch from the live checkout. A
 # missing worktree or a detached HEAD means we cannot bind to a real
@@ -178,12 +245,18 @@ if [ -z "$AO_TEST_PROJECT" ]; then
   skip "AO_IMMUTABLE_RESTART_TEST_PROJECT is not set; no disposable AO project is configured to safely own a real session for worker-continuity/stop-path proof (refusing to fabricate a session or reuse a production one)"
 fi
 
-TEST_PROJECT_SESSIONS="$(ao status -p "$AO_TEST_PROJECT" --json 2>/dev/null || echo '[]')"
+set +e
+TEST_PROJECT_SESSIONS_BEFORE="$(ao status -p "$AO_TEST_PROJECT" --json 2>/dev/null)"
+TEST_PROJECT_SESSIONS_BEFORE_RC=$?
+set -e
+if [ "$TEST_PROJECT_SESSIONS_BEFORE_RC" -ne 0 ]; then
+  skip "'ao status -p $AO_TEST_PROJECT --json' failed (rc=$TEST_PROJECT_SESSIONS_BEFORE_RC) before restart; cannot bind a real test session"
+fi
 
 # Real schema (verified against daemon/src/adapters.rs session_for_branch /
 # session_is_quiescent / session_activity): each entry has "name" (the
 # session id), "branch", "activity", and "status" — never "id".
-AO_SESSION="$(echo "$TEST_PROJECT_SESSIONS" | python3 -c "
+SESSION_IDENTITY_BEFORE="$(echo "$TEST_PROJECT_SESSIONS_BEFORE" | python3 -c "
 import json, sys
 
 TERMINAL = {'killed', 'terminated', 'done', 'cleanup', 'errored', 'merged'}
@@ -201,11 +274,12 @@ active = [
     if isinstance(e, dict) and e.get('name') and not is_terminal(e)
 ]
 if len(active) == 1:
-    print(active[0]['name'])
+    print(active[0]['name'] + '\t' + str(active[0].get('branch', '')))
 " 2>/dev/null || true)"
+IFS=$'\t' read -r AO_SESSION SESSION_BRANCH_BEFORE <<< "$SESSION_IDENTITY_BEFORE"
 
-if [ -z "$AO_SESSION" ]; then
-  skip "AO_IMMUTABLE_RESTART_TEST_PROJECT='$AO_TEST_PROJECT' does not have exactly one real active AO session to bind worker-continuity/stop-path proof to"
+if [ -z "$AO_SESSION" ] || [ -z "$SESSION_BRANCH_BEFORE" ]; then
+  skip "AO_IMMUTABLE_RESTART_TEST_PROJECT='$AO_TEST_PROJECT' does not have exactly one real active AO session with a branch to bind worker-continuity/stop-path proof to"
 fi
 
 # --- Resolve the REAL worker process PID for this session via its tmux
@@ -224,11 +298,57 @@ JOURNAL_START="$(date -u +"%Y-%m-%d %H:%M:%S")"
 
 # Perform restart
 systemctl --user restart "$UNIT"
-sleep 2
+sleep "$SETTLE_SECS"
 
 DAEMON_PID_AFTER="$(systemctl --user show "$UNIT" --property=MainPID --value)"
 if [ -z "$DAEMON_PID_AFTER" ] || [ "$DAEMON_PID_AFTER" = "0" ] || [ "$DAEMON_PID_AFTER" = "$DAEMON_PID_BEFORE" ]; then
   echo "FAIL: daemon PID did not advance on restart ($DAEMON_PID_BEFORE -> $DAEMON_PID_AFTER)" >&2
+  exit 1
+fi
+
+PROC_EXE_AFTER="$(readlink -f "/proc/$DAEMON_PID_AFTER/exe" 2>/dev/null || true)"
+if [ -z "$PROC_EXE_AFTER" ]; then
+  echo "FAIL: cannot resolve /proc/$DAEMON_PID_AFTER/exe after restart" >&2
+  exit 1
+fi
+BINARY_SHA256_AFTER="$(sha256sum "$PROC_EXE_AFTER" | awk '{print $1}')"
+if [ "$PROC_EXE_AFTER" != "$EXEC_START_RESOLVED" ] || [ "$PROC_EXE_AFTER" != "$PROC_EXE_BEFORE" ]; then
+  echo "FAIL: restarted daemon executable changed ($PROC_EXE_BEFORE -> $PROC_EXE_AFTER; ExecStart=$EXEC_START_RESOLVED)" >&2
+  exit 1
+fi
+if [ "$BINARY_SHA256_AFTER" != "$MANIFEST_SHA256" ] || [ "$BINARY_SHA256_AFTER" != "$BINARY_SHA256_BEFORE" ]; then
+  echo "FAIL: restarted daemon SHA256 does not match the release manifest ($BINARY_SHA256_BEFORE -> $BINARY_SHA256_AFTER; manifest=$MANIFEST_SHA256)" >&2
+  exit 1
+fi
+
+# Re-query the disposable project after restart. A surviving PID alone is not
+# enough: AO must still report the same session on the same branch.
+set +e
+TEST_PROJECT_SESSIONS_AFTER="$(ao status -p "$AO_TEST_PROJECT" --json 2>/dev/null)"
+TEST_PROJECT_SESSIONS_AFTER_RC=$?
+set -e
+if [ "$TEST_PROJECT_SESSIONS_AFTER_RC" -ne 0 ]; then
+  skip "'ao status -p $AO_TEST_PROJECT --json' failed (rc=$TEST_PROJECT_SESSIONS_AFTER_RC) after restart; cannot prove session continuity"
+fi
+SESSION_BRANCH_AFTER="$(echo "$TEST_PROJECT_SESSIONS_AFTER" | python3 -c "
+import json, sys
+
+terminal = {'killed', 'terminated', 'done', 'cleanup', 'errored', 'merged'}
+expected = sys.argv[1]
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    data = []
+for entry in (data if isinstance(data, list) else []):
+    if not isinstance(entry, dict) or entry.get('name') != expected:
+        continue
+    if entry.get('status') in terminal or entry.get('activity') == 'exited':
+        break
+    print(entry.get('branch', ''))
+    break
+" "$AO_SESSION" 2>/dev/null || true)"
+if [ -z "$SESSION_BRANCH_AFTER" ] || [ "$SESSION_BRANCH_AFTER" != "$SESSION_BRANCH_BEFORE" ]; then
+  echo "FAIL: AO session identity changed across restart (session=$AO_SESSION, branch=$SESSION_BRANCH_BEFORE -> ${SESSION_BRANCH_AFTER:-missing})" >&2
   exit 1
 fi
 
@@ -273,30 +393,16 @@ if [ "$UNRELATED_AFTER_RC" -ne 0 ]; then
   skip "'ao status -p $AO_PROJECT --json' failed (rc=$UNRELATED_AFTER_RC) after restart; cannot produce real unrelated-inventory evidence"
 fi
 
-# --- Real branch for the worker-continuity session comes only from that
-# session's own "branch" field in `ao status --json` (never the separately
-# resolved production $BRANCH, which describes a different project). ---
-SESSION_BRANCH="$(echo "$TEST_PROJECT_SESSIONS" | python3 -c "
-import json, sys
-try:
-    data = json.load(sys.stdin)
-except Exception:
-    data = []
-session_name = sys.argv[1]
-for e in (data if isinstance(data, list) else []):
-    if isinstance(e, dict) and e.get('name') == session_name:
-        print(e.get('branch', ''))
-        break
-" "$AO_SESSION" 2>/dev/null || true)"
-
 JOURNAL_END="$(date -u +"%Y-%m-%d %H:%M:%S")"
 JOURNAL_WINDOW="${JOURNAL_START} .. ${JOURNAL_END}"
 
-export RELEASE_COMMIT BINARY_SHA256 UNIT_EXEC_START EXEC_START_MATCHES_RUNNING_BINARY
-export MANIFEST_CROSS_CHECK_STATUS MANIFEST_CROSS_CHECK_REASON
+export RELEASE_COMMIT BINARY_SHA256_BEFORE BINARY_SHA256_AFTER
+export PROC_EXE_BEFORE PROC_EXE_AFTER UNIT_EXEC_START EXEC_START_MATCHES_RUNNING_BINARY
+export RELEASE_MANIFEST MANIFEST_SHA256 MANIFEST_CROSS_CHECK_STATUS
 export DAEMON_PID_BEFORE DAEMON_PID_AFTER
 export AO_PROJECT WORKTREE BRANCH
-export AO_TEST_PROJECT AO_SESSION SESSION_BRANCH WORKER_PID_BEFORE WORKER_PID_AFTER
+export AO_TEST_PROJECT AO_SESSION SESSION_BRANCH_BEFORE SESSION_BRANCH_AFTER
+export WORKER_PID_BEFORE WORKER_PID_AFTER
 export UNRELATED_BEFORE UNRELATED_AFTER JOURNAL_WINDOW
 
 python3 -c "
@@ -321,12 +427,16 @@ report = {
     'status': 'passed',
     'restart_target': {
         'release_commit': os.environ['RELEASE_COMMIT'],
-        'binary_sha256': os.environ['BINARY_SHA256'],
+        'binary_sha256_before': os.environ['BINARY_SHA256_BEFORE'],
+        'binary_sha256_after': os.environ['BINARY_SHA256_AFTER'],
+        'proc_exe_before': os.environ['PROC_EXE_BEFORE'],
+        'proc_exe_after': os.environ['PROC_EXE_AFTER'],
         'unit_exec_start': os.environ['UNIT_EXEC_START'],
         'exec_start_matches_running_binary': os.environ['EXEC_START_MATCHES_RUNNING_BINARY'] == 'true',
         'manifest_cross_check': {
             'status': os.environ['MANIFEST_CROSS_CHECK_STATUS'],
-            'reason': os.environ['MANIFEST_CROSS_CHECK_REASON'],
+            'path': os.environ['RELEASE_MANIFEST'],
+            'daemon_sha256': os.environ['MANIFEST_SHA256'],
         },
         'daemon_pid_before': os.environ['DAEMON_PID_BEFORE'],
         'daemon_pid_after': os.environ['DAEMON_PID_AFTER'],
@@ -339,7 +449,8 @@ report = {
     'worker_continuity_proof': {
         'worker_continuity_ao_project': os.environ['AO_TEST_PROJECT'],
         'ao_session': os.environ['AO_SESSION'],
-        'session_branch': os.environ.get('SESSION_BRANCH', ''),
+        'session_branch_before': os.environ['SESSION_BRANCH_BEFORE'],
+        'session_branch_after': os.environ['SESSION_BRANCH_AFTER'],
         'worker_pid_before': os.environ['WORKER_PID_BEFORE'],
         'worker_pid_after': os.environ['WORKER_PID_AFTER'],
     },
