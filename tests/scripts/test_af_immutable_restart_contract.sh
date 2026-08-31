@@ -9,6 +9,7 @@ RELEASE_COMMIT="0123456789abcdef0123456789abcdef01234567"
 RELEASE="$TMP/releases/$RELEASE_COMMIT"
 DAEMON_BINARY="$RELEASE/daemon/target/release/daemon"
 MANIFEST="$RELEASE/release-manifest.json"
+TARGET_REPO="$TMP/target-repo"
 WORKTREE="$TMP/target-worktree"
 WORKER_WORKTREE="$TMP/worker-worktree"
 DAEMON_PID_FILE="$TMP/daemon.pid"
@@ -30,16 +31,16 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-mkdir -p "$FAKE_BIN" "$(dirname "$DAEMON_BINARY")" "$WORKTREE" "$WORKER_WORKTREE"
+mkdir -p "$FAKE_BIN" "$(dirname "$DAEMON_BINARY")" "$TARGET_REPO" "$WORKER_WORKTREE"
 cp "$(command -v sleep)" "$DAEMON_BINARY"
 chmod +x "$DAEMON_BINARY"
 
-git -C "$WORKTREE" init -q
-git -C "$WORKTREE" checkout -q -b factory/restart-contract
-git -C "$WORKTREE" -c user.name=test -c user.email=test@example.invalid \
+git -C "$TARGET_REPO" init -q
+git -C "$TARGET_REPO" checkout -q -b factory/restart-contract
+git -C "$TARGET_REPO" -c user.name=test -c user.email=test@example.invalid \
   commit -q --allow-empty -m initial
-git -C "$WORKTREE" remote add origin https://github.com/jleechanorg/dark-factory.git
-git -C "$WORKTREE" checkout -q --detach
+git -C "$TARGET_REPO" remote add origin https://github.com/jleechanorg/dark-factory.git
+git -C "$TARGET_REPO" worktree add -q --detach "$WORKTREE" HEAD
 
 git -C "$WORKER_WORKTREE" init -q
 git -C "$WORKER_WORKTREE" checkout -q -b factory/restart-contract
@@ -285,6 +286,23 @@ start = text.find("{")
 payload = json.loads(text[start:])
 assert payload["status"] == "skipped", payload
 '
+
+git -C "$TARGET_REPO" remote set-url origin https://github.com/other-owner/other-repo.git
+set +e
+wrong_origin_output="$(bash "$HARNESS" 2>&1)"
+wrong_origin_rc=$?
+set -e
+if [ "$wrong_origin_rc" -ne 1 ]; then
+  echo "FAIL: mismatched managed-checkout origin must fail, got rc=$wrong_origin_rc" >&2
+  echo "$wrong_origin_output" >&2
+  exit 1
+fi
+if [[ "$wrong_origin_output" != *"origin does not match expected repository"* ]]; then
+  echo "FAIL: origin mismatch failure must name the provenance contract" >&2
+  echo "$wrong_origin_output" >&2
+  exit 1
+fi
+git -C "$TARGET_REPO" remote set-url origin https://github.com/jleechanorg/dark-factory.git
 
 cp "$MANIFEST" "$MANIFEST.good"
 python3 - "$MANIFEST" <<'PY'

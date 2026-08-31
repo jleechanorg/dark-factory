@@ -72,6 +72,7 @@ SKIP_EXIT=2
 UNIT="${DARK_FACTORY_RESTART_UNIT:-ai.dark-factory.daemon.service}"
 AO_PROJECT="${DARK_FACTORY_RESTART_AO_PROJECT:-dark-factory}"
 WORKTREE="${DARK_FACTORY_RESTART_WORKTREE:-/home/jleechan/.dark-factory/target-worktrees/jleechanorg/dark-factory}"
+EXPECTED_REPO="${DARK_FACTORY_RESTART_EXPECTED_REPO:-jleechanorg/dark-factory}"
 SETTLE_SECS="${DARK_FACTORY_RESTART_SETTLE_SECS:-2}"
 
 skip() {
@@ -218,8 +219,8 @@ MANIFEST_CROSS_CHECK_STATUS="verified"
 # --- Bind the production managed target by immutable Git identity. Managed
 # targets are intentionally detached; branch identity belongs to the separate
 # AO worker checkout proved below. ---
-if [ ! -d "$WORKTREE/.git" ]; then
-  skip "target worktree $WORKTREE has no .git; cannot verify a real managed checkout"
+if [ "$(git -C "$WORKTREE" rev-parse --is-inside-work-tree 2>/dev/null || true)" != "true" ]; then
+  skip "target worktree $WORKTREE is not a Git worktree; cannot verify a real managed checkout"
 fi
 TARGET_HEAD_BEFORE="$(git -C "$WORKTREE" rev-parse HEAD 2>/dev/null || true)"
 TARGET_SYMBOLIC_REF_BEFORE="$(git -C "$WORKTREE" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
@@ -227,6 +228,26 @@ TARGET_ORIGIN_BEFORE="$(git -C "$WORKTREE" remote get-url origin 2>/dev/null || 
 TARGET_STATUS_BEFORE="$(git -C "$WORKTREE" status --porcelain 2>/dev/null || true)"
 if [[ ! "$TARGET_HEAD_BEFORE" =~ ^[0-9a-f]{40}$ ]] || [ -n "$TARGET_SYMBOLIC_REF_BEFORE" ] || [ -z "$TARGET_ORIGIN_BEFORE" ]; then
   skip "target worktree $WORKTREE is not a detached exact-SHA checkout with an origin"
+fi
+TARGET_ORIGIN_REPO="$(python3 -c '
+import re
+import sys
+
+url = sys.argv[1].strip()
+patterns = (
+    r"^(?:https?://)(?:[^/@]+@)?github\.com/([^/]+/[^/]+?)(?:\.git)?/?$",
+    r"^git@github\.com:([^/]+/[^/]+?)(?:\.git)?$",
+    r"^ssh://git@github\.com/([^/]+/[^/]+?)(?:\.git)?/?$",
+)
+for pattern in patterns:
+    match = re.match(pattern, url, re.IGNORECASE)
+    if match:
+        print(match.group(1).lower())
+        break
+' "$TARGET_ORIGIN_BEFORE")"
+if [ "$TARGET_ORIGIN_REPO" != "${EXPECTED_REPO,,}" ]; then
+  echo "FAIL: target worktree origin does not match expected repository ($TARGET_ORIGIN_BEFORE != $EXPECTED_REPO)" >&2
+  exit 1
 fi
 if [ -n "$TARGET_STATUS_BEFORE" ]; then
   skip "target worktree $WORKTREE is dirty; immutable restart proof requires a clean managed checkout"
