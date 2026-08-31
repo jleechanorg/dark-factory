@@ -869,3 +869,82 @@ def test_non_verdict_codex_preserves_disable_sandbox(tmp_path, monkeypatch):
     assert result.outcome == "success"
     assert len(codex_calls) == 1
     assert any(pathlib.Path(a).name == "codex" for a in codex_calls[0])
+
+
+@pytest.mark.parametrize("verdict_gate_val", ["true", "1", "yes", "on"])
+@pytest.mark.parametrize("shadow_source", ["state", "node_attr", "both"])
+def test_verdict_gated_review_disables_and_ignores_shadow_codex_review(tmp_path, monkeypatch, verdict_gate_val, shadow_source):
+    repo = _repo(tmp_path)
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    node_attrs = {
+        "name": "cold_reviewer",
+        "type": "codergen",
+        "backend": "codex",
+        "class_": "review",
+        "prompt": f"@{prompt}",
+        "verdict_gate": verdict_gate_val,
+        "fresh_session": "true",
+    }
+    if shadow_source in ("node_attr", "both"):
+        node_attrs["shadow_codex_review"] = "true"
+    node = make_node(**node_attrs)
+    node.attrs["class"] = "review"
+    node.attrs.pop("class_", None)
+
+    state = {"ao.worktree": str(repo)}
+    if shadow_source in ("state", "both"):
+        state["_df_shadow_codex_review"] = "true"
+
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="echo",
+        state=state,
+    )
+
+    real_popen = subprocess.Popen
+
+    def fail_popen(*args, **kwargs):
+        cmd = args[0] if args else kwargs.get("args", [])
+        if cmd and any("codex" in str(arg) for arg in cmd):
+            pytest.fail(f"subprocess.Popen must not be called for codex shadow review: {cmd}")
+        return real_popen(*args, **kwargs)
+
+    codex_calls: list[tuple[list[str], pathlib.Path]] = []
+    real_run = subprocess.run
+
+    def fake_run(args, **kwargs):
+        if args and args[0] == "codex":
+            cwd = pathlib.Path(kwargs["cwd"])
+            codex_calls.append((list(args), cwd))
+            assert (cwd / "value.txt").read_text() == "before\n"
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout="No blocking findings.\nVerdict: PASS\n",
+                stderr="",
+            )
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr("runner.handler_codergen.shutil.which", lambda name: "/usr/bin/codex")
+    monkeypatch.setattr("runner.handlers._sandboxed_args_for_workdir", lambda args, workdir: args)
+    monkeypatch.setattr("runner.handlers._sanitized_env", lambda: {})
+    monkeypatch.setattr("runner.handler_codergen.subprocess.Popen", fail_popen)
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", fake_run)
+
+    result = _codergen(node, ctx)
+
+    assert result.outcome == "success"
+    assert result.metadata["verdict"] == "pass"
+    assert result.metadata.get("fresh_session") == "true"
+    assert not any(k.startswith("shadow_codex_") for k in result.metadata)
+    assert not any("shadow_codex" in k for k in result.context_updates)
+    assert "## Parallel Codex Review" not in result.output
+    assert "## Review Comparison" not in result.output
+    assert len(codex_calls) == 1
+    argv, cwd = codex_calls[0]
+    assert argv[:5] == ["codex", "exec", "--ephemeral", "--yolo", "--skip-git-repo-check"]
+    assert cwd != repo
+    assert cwd != tmp_path
+    assert not cwd.exists()
