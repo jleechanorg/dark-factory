@@ -1990,3 +1990,98 @@ def test_fresh_reviewer_linux_custom_controller_runtime_shim_is_used(
     assert result.metadata["verdict"] == "pass"
     assert len(observed_env) == 1
     assert observed_env[0].get("CUSTOM_KEY") == "CUSTOM_VAL"
+
+
+def test_fresh_reviewer_linux_landlock_denied_paths_excludes_snapshot_sealed_docs(
+    tmp_path, monkeypatch
+):
+    repo = _repo(tmp_path)
+    bench_dir = repo / "benchmarks" / "suite1"
+    bench_dir.mkdir(parents=True)
+    (bench_dir / "README.md").write_text("sealed benchmark readme\n")
+    (bench_dir / "DESIGN.md").write_text("sealed benchmark design\n")
+    subprocess.run(["git", "-C", str(repo), "add", "benchmarks"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "add benchmarks"], check=True)
+
+    fake_holdout = tmp_path / "fake_holdout"
+    fake_holdout.mkdir()
+
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    node = _review_node(prompt)
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="echo",
+        state={"ao.worktree": str(repo)},
+    )
+    fake_fd = 42
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys, "executable", "/usr/bin/python3")
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        "runner.handlers._linux_landlock_launcher_path",
+        lambda: pathlib.Path("/fake/landlock-launcher"),
+    )
+    monkeypatch.setattr("runner.handlers._linux_landlock_abi", lambda: 3)
+    monkeypatch.setattr(
+        "runner.handlers._linux_codex_runtime_paths",
+        lambda path: [pathlib.Path("/usr/bin")],
+    )
+    monkeypatch.setattr(
+        "runner.handlers._holdout_denied_paths",
+        lambda: [fake_holdout.resolve()],
+    )
+
+    observed_landlock: dict[str, object] = {}
+
+    def fake_landlock_prefix(**kwargs):
+        observed_landlock.update(kwargs)
+        from runner.handler_sandbox import _PinnedLauncherCommand
+
+        return _PinnedLauncherCommand(
+            [
+                f"/proc/self/fd/{fake_fd}",
+                "--read",
+                "/usr/bin",
+                "--write",
+                str(kwargs["writable_paths"][0]),
+                "--",
+            ],
+            fake_fd,
+        )
+
+    monkeypatch.setattr(
+        "runner.handlers._linux_controller_sandbox_prefix", fake_landlock_prefix
+    )
+
+    real_run = subprocess.run
+
+    def intercept_run(args, **kwargs):
+        if args and any(
+            "codex" in str(a) or f"/proc/self/fd/{fake_fd}" in str(a) for a in args
+        ):
+            return subprocess.CompletedProcess(
+                args, 0, stdout="No blocking findings.\nVerdict: PASS\n", stderr=""
+            )
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(
+        "runner.handlers._close_pinned_launcher_command",
+        lambda cmd: None,
+    )
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", intercept_run)
+
+    result = _codergen(node, ctx)
+
+    assert result.outcome == "success", result.output
+    assert result.metadata["verdict"] == "pass"
+
+    denied = observed_landlock.get("denied_paths", [])
+    # 1. Target repository worktree is denied
+    assert repo.resolve() in denied
+    # 2. Sibling holdouts are denied
+    assert fake_holdout.resolve() in denied
+    # 3. Snapshot sealed docs must NOT be denied under Landlock
+    assert not any("benchmarks" in str(p) for p in denied)
