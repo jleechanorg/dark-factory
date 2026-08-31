@@ -499,4 +499,3 @@ def test_fresh_reviewer_detects_original_target_mutation_fails_closed(tmp_path, 
     assert result.outcome == "error"
     assert result.metadata["reviewer_mutated_tracked_files"] == "true"
     assert "reviewer changed tracked files" in result.output.lower()
-
