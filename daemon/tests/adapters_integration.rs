@@ -30,6 +30,30 @@ impl Drop for EnvVarGuard {
     }
 }
 
+/// Isolates process-global circuit-breaker persistence for fake-CLI tests.
+struct BreakerPathGuard;
+
+impl BreakerPathGuard {
+    fn install(
+        state_file_path: std::path::PathBuf,
+        telemetry_log_path: std::path::PathBuf,
+    ) -> Self {
+        daemon::gh_circuit_breaker::set_state_file_path(Some(state_file_path));
+        daemon::gh_circuit_breaker::set_telemetry_log_path(Some(telemetry_log_path));
+        daemon::adapters::clear_graphql_rate_limited();
+        Self
+    }
+}
+
+impl Drop for BreakerPathGuard {
+    fn drop(&mut self) {
+        // Persist the reset to the private test path before restoring defaults.
+        daemon::adapters::clear_graphql_rate_limited();
+        daemon::gh_circuit_breaker::set_state_file_path(None);
+        daemon::gh_circuit_breaker::set_telemetry_log_path(None);
+    }
+}
+
 #[test]
 fn test_cli_vcs_real_git() {
     if std::env::var("GITHUB_ACTIONS").is_ok() {
@@ -623,7 +647,6 @@ esac
 #[cfg(unix)]
 fn test_cli_scm_pr_snapshot_graphql_command_failure_reports_unknown_not_green() {
     let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    daemon::adapters::clear_graphql_rate_limited();
 
     // Unique PR number to avoid cache/collision
     let pr_num = 900001;
@@ -644,15 +667,14 @@ fn test_cli_scm_pr_snapshot_graphql_command_failure_reports_unknown_not_green() 
     // Prepend fake gh to PATH
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
+    let breaker_state_path = fake_bin_dir.join("gh_circuit_breaker.json");
+    let telemetry_path = fake_bin_dir.join("daemon.jsonl");
 
-    // Guard both PATH and the mode env var our fake gh reads together so a
-    // panic mid-test still restores prior state via Drop.
     let _env_guard = EnvVarGuard::set(&[("PATH", &new_path), ("FAKE_GH_GRAPHQL_MODE", "fail")]);
+    let _breaker_guard = BreakerPathGuard::install(breaker_state_path, telemetry_path);
 
     let scm = CliScm::new("jleechanorg/dark-factory".to_string());
     let result = scm.pr_snapshot(pr_num);
-
-    daemon::adapters::clear_graphql_rate_limited();
 
     // The snapshot fetch should succeed (only the thread count is unknown)
     assert!(result.is_ok(), "pr_snapshot should succeed even when GraphQL fails: {:?}", result);
@@ -672,7 +694,6 @@ fn test_cli_scm_pr_snapshot_graphql_command_failure_reports_unknown_not_green() 
 #[cfg(unix)]
 fn test_cli_scm_pr_snapshot_graphql_malformed_output_reports_unknown_not_green() {
     let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    daemon::adapters::clear_graphql_rate_limited();
 
     let pr_num = 900002;
 
@@ -690,14 +711,15 @@ fn test_cli_scm_pr_snapshot_graphql_malformed_output_reports_unknown_not_green()
 
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
+    let breaker_state_path = fake_bin_dir.join("gh_circuit_breaker.json");
+    let telemetry_path = fake_bin_dir.join("daemon.jsonl");
 
     let _env_guard =
         EnvVarGuard::set(&[("PATH", &new_path), ("FAKE_GH_GRAPHQL_MODE", "malformed")]);
+    let _breaker_guard = BreakerPathGuard::install(breaker_state_path, telemetry_path);
 
     let scm = CliScm::new("jleechanorg/dark-factory".to_string());
     let result = scm.pr_snapshot(pr_num);
-
-    daemon::adapters::clear_graphql_rate_limited();
 
     assert!(result.is_ok(), "pr_snapshot should succeed even when GraphQL is malformed: {:?}", result);
     let snapshot = result.unwrap();

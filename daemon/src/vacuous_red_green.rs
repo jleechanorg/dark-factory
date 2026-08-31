@@ -1901,14 +1901,6 @@ fn run_pytest_baseline_check(
 mod unit_tests {
     use super::*;
 
-    // Serializes tests that mutate the process-wide PATH/CARGO_HOME env
-    // vars. Rust runs tests in parallel by default, so without this lock
-    // a sibling test adding `.cargo/bin` to PATH races with a test
-    // trying to assert PATH is empty — the resolution result is then
-    // a coin-flip. The NOTIFY_ENV_LOCK pattern in main.rs uses the same
-    // idea.
-    static PATH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn discovers_plain_test_fn() {
         let src = r#"
@@ -2287,7 +2279,7 @@ fn b() {
     // Test helper: returns the host PATH stripped of any directory that
     // contains a `cargo` binary. This isolates the resolver from the
     // host's cargo (which would otherwise mask the "missing toolchain"
-    // signal). The PATH_ENV_LOCK guard ensures no sibling test adds a
+    // signal). The crate-wide test environment lock ensures no sibling test adds a
     // cargo directory between the snapshot and the assertion.
     fn path_without_cargo() -> std::ffi::OsString {
         let path = std::env::var_os("PATH").unwrap_or_default();
@@ -2299,7 +2291,7 @@ fn b() {
 
     #[test]
     fn resolve_cargo_returns_not_found_when_path_and_cargo_home_both_empty() {
-        let _guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
         // cargo_home pointing at an empty dir + a PATH that has no
         // cargo binary anywhere. Resolver must surface NotFound without
         // requiring PATH mutation (the test pins the resolver, not the
@@ -2323,7 +2315,7 @@ fn b() {
 
     #[test]
     fn resolve_cargo_finds_cargo_in_cargo_home_bin_when_path_is_empty() {
-        let _guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
         // Reproduce the systemd-unit failure mode: PATH without cargo,
         // but `~/.cargo/bin/cargo` exists. The resolver must find it.
         let fake_home = tempdir_unique("cargo-fallback");
@@ -2353,7 +2345,7 @@ fn b() {
 
     #[test]
     fn resolve_cargo_prefers_path_over_cargo_home() {
-        let _guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
         // When cargo is on PATH AND the cargo_home has a shim, the
         // resolver must prefer PATH (no network/disk dependency for the
         // common case). We strip the cargo from PATH first, then add a
@@ -2392,7 +2384,7 @@ fn b() {
 
     #[test]
     fn resolve_cargo_surfaces_not_found_when_path_is_empty() {
-        let _guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
         // Reproduce the systemd-unit failure mode: PATH-stripped (no
         // cargo directories), cargo_home doesn't exist. The resolver
         // must surface NotFound (or Found via rustup which cargo, when

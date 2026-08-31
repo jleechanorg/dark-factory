@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 
-/// jleechan-9sl1 test-isolation fix: a single process-wide lock shared by
-/// EVERY `#[cfg(test)]` module in this file that mutates the global `PATH`
+/// jleechan-9sl1 test-isolation fix: the crate-wide process-global lock shared
+/// by EVERY `#[cfg(test)]` module in this file that mutates the global `PATH`
 /// (and related) env vars to inject a fake `gh`/`codex` binary for hermetic
 /// subprocess testing (`chain_llm_fallback_argv_tests`,
 /// `pr_snapshot_checks_fetch_failure_tests`, `cli_vcs_gh_tests`). Those
@@ -22,14 +22,50 @@ use std::time::{Duration, Instant};
 /// intermittently fail with "No such file or directory" pointing at a
 /// DIFFERENT module's already-cleaned-up temp shim dir once a third
 /// PATH-mutating module (`cli_vcs_gh_tests`) was added. Every module below
-/// must call `gh_env_test_lock()` (directly or via a thin per-module
-/// `env_lock()` wrapper) instead of defining its own `ENV_LOCK` -- do not
-/// reintroduce a module-local lock for PATH/env mutation in this file.
+/// must call `crate::test_env_lock()` (directly or via a thin per-module
+/// `env_lock()` wrapper) instead of defining its own `ENV_LOCK`.
+
+/// Point the shared GitHub circuit breaker's state file and telemetry log at
+/// a private temp dir for the duration of a test. Every test that can trip the
+/// breaker must hold the process-wide environment lock while creating one.
 #[cfg(test)]
-static GH_ENV_TEST_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+pub(crate) struct BreakerSandbox<'a> {
+    dir: std::path::PathBuf,
+    _env_guard: std::sync::MutexGuard<'a, ()>,
+}
+
 #[cfg(test)]
-fn gh_env_test_lock() -> &'static Mutex<()> {
-    GH_ENV_TEST_LOCK.get_or_init(|| Mutex::new(()))
+impl<'a> BreakerSandbox<'a> {
+    pub(crate) fn new(
+        tag: &str,
+        env_guard: std::sync::MutexGuard<'a, ()>,
+    ) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "df_cb_{tag}_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::gh_circuit_breaker::set_state_file_path(Some(dir.join("state.json")));
+        crate::gh_circuit_breaker::set_telemetry_log_path(Some(dir.join("daemon.jsonl")));
+        Self {
+            dir,
+            _env_guard: env_guard,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for BreakerSandbox<'_> {
+    fn drop(&mut self) {
+        crate::gh_circuit_breaker::reset();
+        crate::gh_circuit_breaker::set_state_file_path(None);
+        crate::gh_circuit_breaker::set_telemetry_log_path(None);
+        std::fs::remove_dir_all(&self.dir).ok();
+    }
 }
 
 
@@ -245,13 +281,13 @@ impl Tracker for CliTracker {
 
 #[cfg(test)]
 mod cli_tracker_br_db_tests {
-    use super::{gh_env_test_lock, CliTracker};
+    use super::CliTracker;
     use crate::tools::Tracker;
 
     #[test]
     #[cfg(unix)]
     fn cli_tracker_passes_configured_db_to_br_read_and_write_calls() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let nonce = std::time::SystemTime::now()
@@ -348,7 +384,7 @@ esac
     #[test]
     #[cfg(unix)]
     fn cli_tracker_resumes_each_partial_two_phase_failure() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let nonce = std::time::SystemTime::now()
@@ -468,7 +504,7 @@ esac
     #[test]
     #[cfg(unix)]
     fn cli_tracker_rejects_wrong_id_object_and_array_without_label_update() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let nonce = std::time::SystemTime::now()
@@ -1603,7 +1639,8 @@ mod graphql_rate_limit_circuit_breaker_tests {
 
     #[test]
     fn circuit_breaker_state_and_timeout() {
-        let _guard = gh_env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = BreakerSandbox::new("state_timeout", _guard);
         clear_graphql_rate_limited();
         assert!(!is_graphql_rate_limited(), "initially not rate limited");
 
@@ -1621,7 +1658,8 @@ mod graphql_rate_limit_circuit_breaker_tests {
     /// exceeded") must trip the shared circuit breaker and report `true`.
     #[test]
     fn detect_and_mark_rate_limit_error_trips_breaker() {
-        let _guard = gh_env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = BreakerSandbox::new("detect_trips", _guard);
         clear_graphql_rate_limited();
         let err = DaemonError::Tool {
             tool: "gh".to_string(),
@@ -1641,7 +1679,8 @@ mod graphql_rate_limit_circuit_breaker_tests {
     /// leave the circuit breaker untouched and report `false`.
     #[test]
     fn detect_and_mark_non_rate_limit_error_does_not_trip_breaker() {
-        let _guard = gh_env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = BreakerSandbox::new("detect_no_trip", _guard);
         clear_graphql_rate_limited();
         let err = DaemonError::Tool {
             tool: "gh".to_string(),
@@ -1661,7 +1700,8 @@ mod graphql_rate_limit_circuit_breaker_tests {
     /// `if let DaemonError::Tool { stderr, .. } = err` guard.
     #[test]
     fn detect_and_mark_non_tool_error_does_not_trip_breaker() {
-        let _guard = gh_env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = BreakerSandbox::new("detect_non_tool", _guard);
         clear_graphql_rate_limited();
         let err = DaemonError::Parse("rate limit mentioned but not a Tool error".to_string());
 
@@ -1690,7 +1730,8 @@ mod graphql_rate_limit_circuit_breaker_tests {
             }
         }
 
-        let _guard = gh_env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = BreakerSandbox::new("sixth_site", _guard);
 
         clear_graphql_rate_limited();
         let rate_limited_err = DaemonError::Tool {
@@ -2840,11 +2881,11 @@ fn resolve_holdouts_path_or_fail() -> Result<String, DaemonError> {
 
 #[cfg(test)]
 mod resolve_holdouts_path_tests {
-    use super::{gh_env_test_lock, resolve_holdouts_path_or_fail};
+    use super::resolve_holdouts_path_or_fail;
 
     #[test]
     fn fails_loud_when_no_env_and_default_missing() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prev_holdouts = std::env::var("DARK_FACTORY_HOLDOUTS").ok();
@@ -2870,7 +2911,7 @@ mod resolve_holdouts_path_tests {
 
     #[test]
     fn fails_loud_when_env_set_but_missing() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prev = std::env::var("DARK_FACTORY_HOLDOUTS").ok();
@@ -2892,7 +2933,7 @@ mod resolve_holdouts_path_tests {
 
     #[test]
     fn succeeds_when_env_points_at_real_dir() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = std::env::temp_dir().join("resolve_holdouts_path_tests_real_dir");
@@ -3526,7 +3567,7 @@ pub fn ensure_ao_project_recovered(project: &str, target_path_or_url: &str) -> R
 
 #[cfg(test)]
 mod ao_project_recovery_tests {
-    use super::{ensure_ao_project_recovered, gh_env_test_lock};
+    use super::ensure_ao_project_recovered;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -3745,7 +3786,7 @@ sys.exit(99)
 
     #[test]
     fn healthy_project_skips_start_entirely() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let project = unique_project("healthy-skip");
@@ -3765,7 +3806,7 @@ sys.exit(99)
 
     #[test]
     fn concurrent_callers_elect_a_single_starter_and_both_observe_health() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // 400ms start delay gives the second caller a wide window to observe
@@ -3797,7 +3838,7 @@ sys.exit(99)
 
     #[test]
     fn start_failure_releases_condvar_waiters_with_failure_instead_of_hanging() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let project = unique_project("batch-failure");
@@ -3852,7 +3893,7 @@ sys.exit(99)
     /// tests in this module undetected.
     #[test]
     fn fake_ao_binary_rejects_unexpected_argv_shapes() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let project = unique_project("argv-shape");
@@ -3910,7 +3951,7 @@ sys.exit(99)
     /// reason.
     #[test]
     fn late_arriving_caller_rechecks_health_before_starting_again() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let project = unique_project("late-arrival");
@@ -3966,7 +4007,7 @@ sys.exit(99)
     /// propagates a typed error without silently swallowing it.
     #[test]
     fn ao_recovery_contract() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
@@ -4600,7 +4641,7 @@ mod spawn_classification_tests {
 
 #[cfg(test)]
 mod ao_spawn_contract_tests {
-    use super::{ao_spawn_bridge_path, gh_env_test_lock, CliSessions};
+    use super::{ao_spawn_bridge_path, CliSessions};
     use crate::errors::DaemonError;
     use crate::tools::{Sessions, SpawnSpec};
     use std::os::unix::fs::PermissionsExt;
@@ -4708,7 +4749,7 @@ print("  Branch:   " + os.environ.get("AO_FAKE_RETURN_BRANCH", os.environ["DARK_
         bindings: serde_json::Value,
         run: impl FnOnce(&std::path::Path) -> T,
     ) -> T {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = fake_ao_dir(test_name);
@@ -5139,7 +5180,7 @@ export const isTerminalSession = () => false;
 
     #[test]
     fn bridge_fails_closed_when_adopted_origin_ref_head_diverges_from_expected_revision() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Build a remote whose `alice/<branch>` is at SHA X, but pass
@@ -5609,9 +5650,9 @@ exec "$FAKE_GIT_REAL_BIN" "$@"
         // `std::env::current_dir()`, a PROCESS-WIDE mutable value. Under
         // `cargo test`'s default parallel execution, `offline_cache_tests`'
         // `OfflineDir` calls `std::env::set_current_dir` (guarded by
-        // `gh_env_test_lock()`) for the FULL lifetime of its own tests. This
+        // `crate::test_env_lock()`) for the FULL lifetime of its own tests. This
         // test read `current_dir()` here BEFORE ever acquiring
-        // `gh_env_test_lock()` (that only happens later, inside
+        // `crate::test_env_lock()` (that only happens later, inside
         // `with_fake_ao`), so it could observe `OfflineDir`'s temp
         // directory instead of the real checkout, making `git rev-parse
         // HEAD` below fail/return something unrelated to the actual repo
@@ -5623,7 +5664,7 @@ exec "$FAKE_GIT_REAL_BIN" "$@"
         // so this is a like-for-like substitution that removes the shared
         // mutable global dependency instead of adding a lock (locking here
         // would deadlock: `with_fake_ao` below re-acquires the same
-        // non-reentrant `gh_env_test_lock()`).
+        // non-reentrant `crate::test_env_lock()`).
         let checkout = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let expected_revision = std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
@@ -6137,7 +6178,7 @@ os.execv(real_git, [real_git] + args)
     /// answer `status`/`start` for two distinct projects).
     #[test]
     fn adapters_batch_recovery_integration() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
@@ -6335,7 +6376,7 @@ sys.exit(99)
 
     #[test]
     fn missing_worktree_uses_session_kill_cleanup_contract() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -6404,7 +6445,7 @@ raise SystemExit(9)
 
     #[test]
     fn missing_worktree_kill_failure_does_not_spawn_fallback_vendor() {
-        let _guard = gh_env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
             "afd_ao_missing_worktree_kill_failure_{}",
             std::process::id()
@@ -6524,7 +6565,7 @@ raise SystemExit(9)
 
     #[test]
     fn bridge_resolves_import_only_ao_core_from_hoisted_node_modules() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -6616,7 +6657,7 @@ export const isTerminalSession = () => false;
 
     #[test]
     fn bridge_runs_v013_guards_and_defers_at_active_cap_without_spawning() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -6726,7 +6767,7 @@ export const ensureLifecycleWorker = async () => appendFileSync(process.env.AO_F
 
     #[test]
     fn bridge_sanitizes_prompt_preserves_branch_and_cleans_worker_environment() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -6849,7 +6890,7 @@ export const isTerminalSession = () => false;
 
     #[test]
     fn bridge_backed_batch_and_invalid_workspace_cleanup_are_fail_closed() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -7058,7 +7099,7 @@ os.execvp(os.environ["AO_FAKE_NODE"], [os.environ["AO_FAKE_NODE"], os.environ["A
 
     #[test]
     fn bridge_creates_worktree_at_expected_revision_for_adopted_pr() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -7374,7 +7415,7 @@ export const isTerminalSession = () => false;
 
     #[test]
     fn bridge_remediates_and_resets_stale_branch_on_clean_retry() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -8435,7 +8476,7 @@ mod active_session_count_tests {
 
 #[cfg(test)]
 mod worktree_remote_url_tests {
-    use super::{gh_env_test_lock, CliSessions};
+    use super::CliSessions;
     use crate::tools::{SessionId, Sessions};
 
     fn record_workspace(
@@ -8639,7 +8680,7 @@ mod worktree_remote_url_tests {
     /// one from the factory branch.
     #[test]
     fn worktree_remote_url_reads_real_git_remote() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -8692,7 +8733,7 @@ mod worktree_remote_url_tests {
     /// get-url --push` fix.
     #[test]
     fn worktree_remote_url_reports_pushurl_when_distinct_from_fetch_url() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -8753,7 +8794,7 @@ mod worktree_remote_url_tests {
 
     #[test]
     fn worktree_remote_url_fails_closed_for_unconfigured_remote_name() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -8788,7 +8829,7 @@ mod worktree_remote_url_tests {
 
 #[cfg(test)]
 mod worktree_transcript_last_activity_epoch_tests {
-    use super::{gh_env_test_lock, CliSessions};
+    use super::CliSessions;
     use crate::tools::Sessions;
 
     fn record_workspace(
@@ -8827,7 +8868,7 @@ mod worktree_transcript_last_activity_epoch_tests {
     /// remote branch.
     #[test]
     fn reports_latest_jsonl_mtime_from_derived_transcript_dir() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -8877,7 +8918,7 @@ mod worktree_transcript_last_activity_epoch_tests {
     /// the naming convention drifted) is "no evidence", not an error.
     #[test]
     fn no_evidence_when_transcript_dir_missing() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -9723,14 +9764,14 @@ mod chain_llm_fallback_argv_tests {
     /// `ChainLlm::judge` window, so a single shared binary mutex is
     /// sufficient even though two tests exist.
     ///
-    /// jleechan-9sl1: delegates to the file-level `gh_env_test_lock()` shared
+    /// jleechan-9sl1: delegates to the crate-wide `test_env_lock()` shared
     /// by every PATH/env-mutating test module in this file -- see that
     /// function's doc comment for why a module-local lock is insufficient
     /// (it only serializes within one module, not across the
     /// `chain_llm_fallback_argv_tests` / `pr_snapshot_checks_fetch_failure_tests`
     /// / `cli_vcs_gh_tests` modules, which all mutate the same global `PATH`).
     fn env_lock() -> &'static Mutex<()> {
-        super::gh_env_test_lock()
+        crate::test_env_lock()
     }
 
     /// Write an executable shell script at `path` that prints every element
@@ -9957,14 +9998,14 @@ mod pr_snapshot_checks_fetch_failure_tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
 
-    /// jleechan-9sl1: delegates to the file-level `gh_env_test_lock()` shared
+    /// jleechan-9sl1: delegates to the crate-wide `test_env_lock()` shared
     /// by every PATH/env-mutating test module in this file (previously this
     /// module had its own independent lock, which only serialized against
     /// itself, not against `chain_llm_fallback_argv_tests` or
-    /// `cli_vcs_gh_tests` -- see `gh_env_test_lock`'s doc comment for the
+    /// `cli_vcs_gh_tests` -- see `test_env_lock`'s crate-root docs for the
     /// cross-module race that caused).
     fn env_lock() -> &'static Mutex<()> {
-        super::gh_env_test_lock()
+        crate::test_env_lock()
     }
 
     /// Write a `gh` shim that answers every call `CliScm::pr_snapshot` makes:
@@ -10072,6 +10113,7 @@ exit 1
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = super::BreakerSandbox::new("pr_snapshot_fake_gh", _guard);
 
         super::clear_graphql_rate_limited();
 
@@ -10117,8 +10159,6 @@ exit 1
                 std::env::remove_var("GH_TEST_FALLBACK_CHECKS");
             }
         }
-        drop(_guard);
-
         std::fs::remove_dir_all(&dir).ok();
         result
     }
@@ -10204,6 +10244,7 @@ exit 1
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = super::BreakerSandbox::new("primary_checks_trip", _guard);
         super::clear_graphql_rate_limited();
 
         let dir = make_fake_gh_dir("rate_limit_trip");
@@ -10467,15 +10508,15 @@ mod cli_vcs_gh_tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
 
-    /// jleechan-9sl1: delegates to the file-level `gh_env_test_lock()` shared
+    /// jleechan-9sl1: delegates to the crate-wide `test_env_lock()` shared
     /// by every PATH/env-mutating test module in this file -- a module-local
     /// lock here would only serialize this module's own tests against each
     /// other, not against `chain_llm_fallback_argv_tests` or
     /// `pr_snapshot_checks_fetch_failure_tests`, which mutate the same
-    /// global `PATH`. See `gh_env_test_lock`'s doc comment for the
+    /// global `PATH`. See `test_env_lock`'s crate-root docs for the
     /// cross-module flake this fixes.
     fn env_lock() -> &'static Mutex<()> {
-        super::gh_env_test_lock()
+        crate::test_env_lock()
     }
 
     /// Write a `gh` shim that answers `gh api <path> --jq <filter>` calls for
@@ -11195,7 +11236,7 @@ mod offline_cache_tests {
     /// fixture never bleeds into a sibling test.
     ///
     /// `set_current_dir` is a PROCESS-WIDE mutation, so every test in
-    /// this mod must serialize on the file-level `gh_env_test_lock()`
+    /// this mod must serialize on the crate-wide `test_env_lock()`
     /// (also used by `chain_llm_fallback_argv_tests`,
     /// `pr_snapshot_checks_fetch_failure_tests`, `cli_vcs_gh_tests` for
     /// PATH-env mutations). Without that lock, two parallel tests would
@@ -11213,7 +11254,7 @@ mod offline_cache_tests {
             // other `#[cfg(test)]` mod in this file) can mutate
             // cwd/PATH concurrently with us. Poisoned lock recovery
             // matches the established pattern in this file.
-            let lock = super::gh_env_test_lock()
+            let lock = crate::test_env_lock()
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let nanos = std::time::SystemTime::now()

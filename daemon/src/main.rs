@@ -879,11 +879,13 @@ fn main() {
 mod tests {
     use super::*;
 
-    // Serializes tests that mutate the process-wide NOTIFY_SOCKET env var. Rust
-    // runs tests in parallel by default, so without this lock two tests can each
-    // set NOTIFY_SOCKET and systemd_notify may send its datagram to the sibling
-    // test's socket, leaving this listener's recv() to time out (WouldBlock).
-    static NOTIFY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // The daemon binary's unit tests are a separate crate from the daemon
+    // library tests, so they need their own process-wide environment lock.
+    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn test_env_lock() -> &'static std::sync::Mutex<()> {
+        &TEST_ENV_LOCK
+    }
 
     #[test]
     fn scaffold_compiles() {
@@ -950,6 +952,9 @@ mod tests {
     // preflight sees the same vendor order the runtime fallback chain does.
     #[test]
     fn configured_vendor_list_resolves_aliases_and_dedupes() {
+        let _env_guard = test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Snapshot the existing env, mutate it for the test, restore after.
         let prior_default = std::env::var("DARK_FACTORY_REVIEWER_DEFAULT").ok();
         let prior_chain = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok();
@@ -1323,7 +1328,9 @@ mod tests {
         use std::os::unix::net::UnixDatagram;
         use std::time::Duration;
 
-        let _env_guard = NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env_guard = test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let socket_path = std::path::PathBuf::from(format!(
             "/tmp/df-notify-{}.sock",
@@ -1355,7 +1362,9 @@ mod tests {
         use std::os::unix::net::{SocketAddr, UnixDatagram};
         use std::time::Duration;
 
-        let _env_guard = NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env_guard = test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let socket_name = format!(
             "df-abs-{}",
@@ -1383,6 +1392,9 @@ mod tests {
     /// under `--dry-run` (tests construct synthetic envs).
     #[test]
     fn startup_cargo_check_is_silent_under_dry_run() {
+        let _env_guard = test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Even with PATH stripped to "/tmp/some_empty_dir" and a
         // nonexistent CARGO_HOME, the dry-run flag must keep the
         // startup function silent — no stderr write, no panic.
