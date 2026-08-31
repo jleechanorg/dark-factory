@@ -229,8 +229,8 @@ Honor these flags inside `$ARGUMENTS`:
 - `--pipeline <name>` — short name (`two_node`, `gates`, `hello`, `pr_gates`,
   `minimal_pr`, `minimal_feature`, `review_slim`, `review_full`) or path to a
   `.dot`. If omitted, the runner dispatches the slim two-node default graph
-  (`pipelines/slim/two_node.dot`) — a generic worker + static Codex cold
-  reviewer — for every `/f` and `/factory` invocation. To opt into the
+  (`pipelines/slim/two_node.dot`) — a generic worker + fresh, fully tooled
+  Codex reviewer — for every `/f` and `/factory` invocation. To opt into the
   heavyweight pipelines (gates / minimal_feature / etc.) pass an explicit
   `--pipeline <name>`. The previous "auto-select from the goal" behavior is
   retired; the slim two-node shape is the new default across the board.

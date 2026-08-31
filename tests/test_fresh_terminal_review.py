@@ -98,7 +98,7 @@ def test_fresh_reviewer_failure_is_relayable_output(tmp_path, monkeypatch):
 def test_fresh_reviewer_unknown_verdict_fails_closed(tmp_path, monkeypatch):
     result, _, _ = _run_review(tmp_path, monkeypatch, "Looks plausible.\n")
 
-    assert result.outcome == "failure"
+    assert result.outcome == "error"
     assert result.metadata["verdict"] == "unknown"
 
 
@@ -125,7 +125,7 @@ def test_fresh_reviewer_timeout_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setattr("runner.handler_codergen.subprocess.run", time_out)
     result = _codergen(_review_node(prompt), ctx)
 
-    assert result.outcome == "failure"
+    assert result.outcome == "error"
     assert result.metadata["timed_out"] == "true"
     assert "timed out" in result.output
 
@@ -138,7 +138,7 @@ def test_fresh_reviewer_tracked_mutation_fails_closed(tmp_path, monkeypatch):
         mutate=True,
     )
 
-    assert result.outcome == "failure"
+    assert result.outcome == "error"
     assert result.metadata["reviewer_mutated_tracked_files"] == "true"
     assert "reviewer changed tracked files" in result.output.lower()
     assert (repo / "value.txt").read_text() == "reviewer changed this\n"
@@ -147,23 +147,91 @@ def test_fresh_reviewer_tracked_mutation_fails_closed(tmp_path, monkeypatch):
 def test_fresh_reviewer_rejects_symlinked_target_before_codex(tmp_path, monkeypatch):
     repo = _repo(tmp_path)
     alias = tmp_path / "alias"
-    alias.symlink_to(tmp_path, target_is_directory=True)
+    alias.symlink_to(repo, target_is_directory=True)
     prompt = tmp_path / "review.md"
     prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
     ctx = Context(
         goal="review this change",
         workdir=tmp_path,
         backend="echo",
-        state={"ao.worktree": str(alias / repo.name)},
+        state={"ao.worktree": str(alias)},
     )
+    real_run = subprocess.run
 
     def unexpected_run(args, **kwargs):
         if args and args[0] == "codex":
             raise AssertionError("Codex launched for a symlinked target")
-        return subprocess.run(args, **kwargs)
+        return real_run(args, **kwargs)
 
     monkeypatch.setattr("runner.handler_codergen.subprocess.run", unexpected_run)
     result = _codergen(_review_node(prompt), ctx)
 
-    assert result.outcome == "failure"
+    assert result.outcome == "error"
     assert "non-symlinked" in result.output
+
+
+def test_fresh_reviewer_allows_real_target_beneath_symlinked_parent(
+    tmp_path, monkeypatch
+):
+    real_parent = tmp_path / "real"
+    real_parent.mkdir()
+    repo = _repo(real_parent)
+    alias_parent = tmp_path / "alias"
+    alias_parent.symlink_to(real_parent, target_is_directory=True)
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="echo",
+        state={"ao.worktree": str(alias_parent / repo.name)},
+    )
+    calls: list[pathlib.Path] = []
+    real_run = subprocess.run
+
+    def pass_review(args, **kwargs):
+        if args and args[0] == "codex":
+            calls.append(pathlib.Path(kwargs["cwd"]))
+            return subprocess.CompletedProcess(
+                args, 0, stdout="Verdict: PASS\n", stderr=""
+            )
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(
+        "runner.handlers._sandboxed_args_for_workdir", lambda args, workdir: args
+    )
+    monkeypatch.setattr("runner.handlers._sanitized_env", lambda: {})
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", pass_review)
+
+    result = _codergen(_review_node(prompt), ctx)
+
+    assert result.outcome == "success"
+    assert calls == [repo.resolve()]
+
+
+def test_default_graph_does_not_initialize_controller_state(tmp_path, monkeypatch):
+    from runner import engine_run
+    from runner.handler_core import Result
+    from runner.handlers import TYPE_REGISTRY
+    from runner.parser import parse
+
+    def unexpected_controller_call(*args, **kwargs):
+        raise AssertionError("default fresh-terminal graph touched controller state")
+
+    monkeypatch.setattr(
+        engine_run, "_load_controller_snapshot_journal", unexpected_controller_call
+    )
+    monkeypatch.setattr(engine_run, "_seed_controller_base_sha", unexpected_controller_call)
+    monkeypatch.setitem(
+        TYPE_REGISTRY,
+        "codergen",
+        lambda node, ctx: Result(outcome="success", output="Verdict: PASS\n"),
+    )
+
+    graph = parse(ROOT / "pipelines/slim/two_node.dot")
+    history = engine_run.run(
+        graph,
+        Context(goal="review the default", workdir=tmp_path, backend="echo"),
+    )
+
+    assert history[-1].outcome == "success"

@@ -794,7 +794,8 @@ def run(
     If `resume` is provided, execution restarts from the successor of the
     checkpointed last step.
     """
-    if resume is not None and _is_controller_graph(graph):
+    controller_graph = _is_controller_graph(graph)
+    if resume is not None and controller_graph:
         raise ValueError("resume is not supported for cold-review-v1 graphs")
 
     # Resume uses the checkpoint's run directory as the durable journal owner.
@@ -807,12 +808,14 @@ def run(
                 ctx.run_id = candidate_run_id
     if not ctx.run_id:
         ctx.run_id = uuid.uuid4().hex[:12]
-    _load_controller_snapshot_journal(ctx)
+    if controller_graph or resume is not None:
+        _load_controller_snapshot_journal(ctx)
 
     # Capture the controller-owned base before the first worker visit.  This
     # runs after CLI/AO state has been assembled, so an explicitly selected AO
     # worktree is the target whose immutable HEAD is bound.
-    _seed_controller_base_sha(ctx, graph)
+    if controller_graph:
+        _seed_controller_base_sha(ctx, graph)
     history: list = []
     visits: dict[str, int] = {}
     # Per-node ring of recent output hashes for the no_progress detector
@@ -1594,6 +1597,8 @@ def run(
                 continue
 
             if next_node is None:
+                if _classify_outcome(result.outcome) == "error":
+                    break
                 _stuck_node = _para_jump_to if _para_jump_to is not None else current
                 record = _persist.StepRecord(
                     node=_stuck_node.name,

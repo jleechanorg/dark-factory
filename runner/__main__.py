@@ -272,7 +272,7 @@ def main(argv: list[str] | None = None) -> int:
             default=pathlib.Path("two_node.dot"),
             help=(
                 "Pipeline `.dot` to run. Defaults to the slim two-node graph "
-                "(`two_node.dot`) — a generic worker + static Codex cold "
+                "(`two_node.dot`) — a generic worker + fresh Codex "
                 "reviewer — which is the standing rule for /f and /factory "
                 "invocations (set 2026-08-02). Pass a short name (e.g. "
                 "`gates`, `minimal_feature`, `bug_fix`) or an absolute path "

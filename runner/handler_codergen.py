@@ -561,7 +561,7 @@ def _fresh_review_workdir(ctx: "Context") -> pathlib.Path | None:
         resolved = candidate.resolve(strict=True)
     except (OSError, RuntimeError):
         return None
-    if candidate != resolved or not resolved.is_dir():
+    if candidate.is_symlink() or not resolved.is_dir():
         return None
     return resolved
 
@@ -975,14 +975,14 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         codex_workdir = _fresh_review_workdir(ctx) if verdict_gate else ctx.workdir
         if codex_workdir is None:
             return _finalize(Result(
-                outcome="failure",
+                outcome="error",
                 output="fresh reviewer target must be a real, non-symlinked directory",
                 metadata={"verdict": "unknown", "fresh_session": "true"},
             ))
         tracked_before = _tracked_state(codex_workdir) if verdict_gate else None
         if verdict_gate and tracked_before is None:
             return _finalize(Result(
-                outcome="failure",
+                outcome="error",
                 output="fresh reviewer could not fingerprint the tracked repository state",
                 metadata={"verdict": "unknown", "fresh_session": "true"},
             ))
@@ -997,7 +997,10 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             codex_workdir,
         )
         if args is None:
-            return _finalize(Result(outcome="failure", output="sandbox-exec unavailable"))
+            return _finalize(Result(
+                outcome="error" if verdict_gate else "failure",
+                output="sandbox-exec unavailable",
+            ))
         timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1800"), 1800)
         try:
             proc = subprocess.run(
@@ -1012,7 +1015,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             )
         except subprocess.TimeoutExpired as exc:
             return _finalize(Result(
-                outcome="failure",
+                outcome="error" if verdict_gate else "failure",
                 output=_subprocess_output(exc.stdout, exc.stderr)
                 or f"codex backend timed out after {timeout_s} seconds",
                 metadata={
@@ -1141,7 +1144,10 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         verdict, parsed_outcome = _handlers_shim._parse_verdict(output, gate_strict=True)
         tracked_after = _tracked_state(codex_workdir)
         mutated = tracked_before is None or tracked_after is None or tracked_before != tracked_after
-        outcome = parsed_outcome if proc.returncode == 0 else "failure"
+        if proc.returncode != 0 or verdict == "unknown":
+            outcome = "error"
+        else:
+            outcome = parsed_outcome
         meta.update(
             {
                 "verdict": verdict,
@@ -1151,7 +1157,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             }
         )
         if mutated:
-            outcome = "failure"
+            outcome = "error"
             output = output.rstrip() + "\n\nReviewer changed tracked files; changes must be made by the coder.\n"
     elif outcome == "success":
         _stash_diff(node, ctx)

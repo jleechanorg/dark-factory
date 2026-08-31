@@ -105,11 +105,27 @@ def test_resolved_type_label_matches_engine(name, attrs, want_label):
         ({}, True, False),
         # class="review" alone is only a styling hint.
         ({"type": "codergen", "class": "review"}, True, False),
-        # The explicit verdict gate turns a review-class codergen into a gate.
+        # The explicit Codex verdict gate turns a review-class codergen into a gate.
         (
-            {"type": "codergen", "class": "review", "verdict_gate": "true"},
+            {
+                "type": "codergen",
+                "class": "review",
+                "backend": "codex",
+                "verdict_gate": "true",
+            },
             False,
             True,
+        ),
+        # Other codergen backends do not implement verdict-gate parsing.
+        (
+            {
+                "type": "codergen",
+                "class": "review",
+                "backend": "echo",
+                "verdict_gate": "true",
+            },
+            True,
+            False,
         ),
     ],
 )

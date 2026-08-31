@@ -136,6 +136,7 @@ def test_two_node_dot_reviewer_prompt_is_short_and_docs_agree() -> None:
     assert reviewer.attrs.get("type") == "codergen"
     skill = (ROOT / ".claude/skills/dark-factory/SKILL.md").read_text()
     assert "fresh Codex reviewer" in skill
+    assert "static Codex cold reviewer" not in skill
     prompt = (ROOT / "prompts/slim/fresh_review.md").read_text()
     assert len([line for line in prompt.splitlines() if line.strip()]) <= 6
     assert "Use all available tools" in prompt
@@ -193,3 +194,27 @@ def test_two_node_loop_copies_exact_review_output_to_worker_retry(tmp_path, monk
 
     assert history[-1].outcome == "success"
     assert worker_feedback == [None, review]
+
+
+def test_two_node_reviewer_error_is_terminal(tmp_path, monkeypatch) -> None:
+    from runner.engine import run
+    from runner.handler_core import Context, Result
+    from runner.handlers import TYPE_REGISTRY
+
+    worker_visits = 0
+
+    def fake_codergen(node, ctx):
+        nonlocal worker_visits
+        if node.name == "worker":
+            worker_visits += 1
+            return Result(outcome="success", output="worker done")
+        return Result(outcome="error", output="reviewer infrastructure failed")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "codergen", fake_codergen)
+    history = run(
+        parse(ROOT / _PIPELINE),
+        Context(goal="review without mutation", workdir=tmp_path, backend="echo"),
+    )
+
+    assert history[-1].outcome == "error"
+    assert worker_visits == 1

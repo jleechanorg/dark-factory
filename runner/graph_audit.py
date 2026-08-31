@@ -184,6 +184,7 @@ def _is_codergen_verdict_gate(node: Node) -> bool:
     return (
         _resolved_type_label(node) == "codergen"
         and str(node.attrs.get("class", "")).strip().lower() == "review"
+        and str(node.attrs.get("backend", "")).strip().lower() == "codex"
         and enabled in {"true", "1", "yes", "on"}
     )
 
