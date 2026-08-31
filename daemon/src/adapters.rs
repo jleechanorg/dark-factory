@@ -32,6 +32,49 @@ fn gh_env_test_lock() -> &'static Mutex<()> {
     GH_ENV_TEST_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// Point the shared GitHub circuit breaker's state file and telemetry log at
+/// a private temp dir for the duration of a test; restores the defaults on
+/// drop. Every test that can trip the breaker must hold one.
+///
+/// Without it, a test that trips the breaker writes an OPEN deadline into the
+/// operator's real `~/.dark-factory/gh_circuit_breaker.json` and appends
+/// synthetic `GH_CIRCUIT_BREAKER_OPENED` records to the real
+/// `~/Library/Logs/dark-factory/daemon.jsonl` -- the same files the running
+/// daemon and `/af` monitoring use. Observed 2026-08-25 while working bead
+/// rev-x92c8: a `cargo test` run left `reason=primary_rate_limit,
+/// suppressed_calls=4` in the live state file, and other test binaries loaded
+/// it and had their `gh` calls suppressed ("gh pr view was never called").
+#[cfg(test)]
+pub(crate) struct BreakerSandbox {
+    dir: std::path::PathBuf,
+}
+
+#[cfg(test)]
+impl BreakerSandbox {
+    pub(crate) fn new(tag: &str) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("df_cb_{tag}_{}_{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::gh_circuit_breaker::set_state_file_path(Some(dir.join("state.json")));
+        crate::gh_circuit_breaker::set_telemetry_log_path(Some(dir.join("daemon.jsonl")));
+        Self { dir }
+    }
+}
+
+#[cfg(test)]
+impl Drop for BreakerSandbox {
+    fn drop(&mut self) {
+        crate::gh_circuit_breaker::reset();
+        crate::gh_circuit_breaker::set_state_file_path(None);
+        crate::gh_circuit_breaker::set_telemetry_log_path(None);
+        std::fs::remove_dir_all(&self.dir).ok();
+    }
+}
+
 
 pub struct CliTracker;
 
@@ -1604,6 +1647,7 @@ mod graphql_rate_limit_circuit_breaker_tests {
     #[test]
     fn circuit_breaker_state_and_timeout() {
         let _guard = gh_env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = BreakerSandbox::new("state_timeout");
         clear_graphql_rate_limited();
         assert!(!is_graphql_rate_limited(), "initially not rate limited");
 
@@ -1622,6 +1666,7 @@ mod graphql_rate_limit_circuit_breaker_tests {
     #[test]
     fn detect_and_mark_rate_limit_error_trips_breaker() {
         let _guard = gh_env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = BreakerSandbox::new("detect_trips");
         clear_graphql_rate_limited();
         let err = DaemonError::Tool {
             tool: "gh".to_string(),
@@ -1642,6 +1687,7 @@ mod graphql_rate_limit_circuit_breaker_tests {
     #[test]
     fn detect_and_mark_non_rate_limit_error_does_not_trip_breaker() {
         let _guard = gh_env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = BreakerSandbox::new("detect_no_trip");
         clear_graphql_rate_limited();
         let err = DaemonError::Tool {
             tool: "gh".to_string(),
@@ -1662,6 +1708,7 @@ mod graphql_rate_limit_circuit_breaker_tests {
     #[test]
     fn detect_and_mark_non_tool_error_does_not_trip_breaker() {
         let _guard = gh_env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = BreakerSandbox::new("detect_non_tool");
         clear_graphql_rate_limited();
         let err = DaemonError::Parse("rate limit mentioned but not a Tool error".to_string());
 
@@ -1691,6 +1738,7 @@ mod graphql_rate_limit_circuit_breaker_tests {
         }
 
         let _guard = gh_env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = BreakerSandbox::new("sixth_site");
 
         clear_graphql_rate_limited();
         let rate_limited_err = DaemonError::Tool {
@@ -1715,6 +1763,136 @@ mod graphql_rate_limit_circuit_breaker_tests {
             !is_graphql_rate_limited(),
             "a non-rate-limit error at the hypothetical 6th site must not trip the breaker"
         );
+    }
+
+    /// Bead rev-x92c8 REGRESSION PIN. Live symptom: the daemon emitted
+    /// `GH_CIRCUIT_BREAKER_OPENED reason=primary_rate_limit
+    /// retry_after_secs=null` every few seconds while GitHub quota was
+    /// healthy -- `gh api rate_limit` reported core 2692/5000 and graphql
+    /// 4209/5000 remaining at the same moment. Root cause: the shared
+    /// classifier matched the bare tokens `rate limit` / `rate_limit` /
+    /// `ratelimit` / `retry-after` anywhere in stderr, so failures that only
+    /// MENTION rate limiting were laundered into a primary-quota trip.
+    ///
+    /// Each case below carries healthy-quota or non-quota evidence and must
+    /// (a) not trip the breaker, and (b) classify under its own reason
+    /// string, never `primary_rate_limit`.
+    #[test]
+    fn healthy_quota_non_rate_limit_gh_failures_do_not_trip_breaker() {
+        use crate::gh_circuit_breaker::classify_gh_failure;
+
+        let _guard = gh_env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = BreakerSandbox::new("healthy_quota");
+
+        let cases: &[(&str, i32, &str)] = &[
+            // The `gh api rate_limit` quota probe itself timing out: the
+            // probe URL contains "rate_limit", which used to be enough.
+            (
+                "gh: Get \"https://api.github.com/rate_limit\": net/http: request canceled (Client.Timeout exceeded while awaiting headers)",
+                1,
+                "gh_timeout",
+            ),
+            // A permission 403 that echoes response headers proving the
+            // quota is FINE (4209 of 5000 left).
+            (
+                "HTTP 403: Resource not accessible by integration\nx-ratelimit-limit: 5000\nx-ratelimit-remaining: 4209",
+                1,
+                "gh_forbidden",
+            ),
+            // The breaker's OWN suppression stderr, previously re-read as a
+            // fresh GitHub primary-limit signal (self-feeding trip loop).
+            (
+                "gh call suppressed by rate limit circuit breaker (cooldown active for 47s until epoch 1756000000, suppressed_calls=3)",
+                403,
+                "circuit_breaker_suppressed",
+            ),
+            // Plain transport failure.
+            ("gh: connection refused", 1, "gh_network_error"),
+            // Empty/garbage response.
+            ("gh: unexpected empty response from api.github.com", 1, "gh_network_error"),
+        ];
+
+        for (stderr, rc, expected_reason) in cases {
+            clear_graphql_rate_limited();
+            let kind = classify_gh_failure(stderr, *rc);
+            assert_eq!(
+                kind.reason(),
+                *expected_reason,
+                "stderr {stderr:?} must classify as {expected_reason}, got {}",
+                kind.reason()
+            );
+            assert!(
+                !kind.is_rate_limit(),
+                "stderr {stderr:?} is not a GitHub rate limit"
+            );
+            assert!(
+                crate::gh_circuit_breaker::parse_rate_limit_error(stderr, *rc).is_none(),
+                "stderr {stderr:?} must produce no rate-limit signal"
+            );
+
+            let err = DaemonError::Tool {
+                tool: "gh".to_string(),
+                rc: *rc,
+                stderr: (*stderr).to_string(),
+            };
+            let tripped = detect_and_mark_graphql_rate_limit(&err, Duration::from_secs(60));
+            assert!(!tripped, "stderr {stderr:?} must not be treated as a rate limit");
+            assert!(
+                !is_graphql_rate_limited(),
+                "breaker must stay closed for {stderr:?} while quota is healthy"
+            );
+        }
+        clear_graphql_rate_limited();
+    }
+
+    /// Bead rev-x92c8 counterpart: tightening the classifier must NOT make
+    /// the breaker blind to real exhaustion. Includes the 2026-08-17 shape
+    /// (quota exhaustion delivered as a 403, the inverse misread of this
+    /// bug) and a zero-remaining header.
+    #[test]
+    fn real_rate_limit_signals_still_trip_breaker() {
+        use crate::gh_circuit_breaker::classify_gh_failure;
+
+        let _guard = gh_env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = BreakerSandbox::new("real_rate_limit");
+
+        let cases: &[(&str, i32, &str)] = &[
+            ("gh: API rate limit exceeded for installation ID 99999", 1, "primary_rate_limit"),
+            ("gh: GraphQL API rate limit already exceeded", 1, "primary_rate_limit"),
+            // 2026-08-17: real exhaustion arriving as a 403.
+            ("HTTP 403: rate limit hit for user ID 42", 1, "primary_rate_limit"),
+            (
+                "HTTP 403: Resource protected\nx-ratelimit-limit: 5000\nx-ratelimit-remaining: 0",
+                1,
+                "primary_rate_limit",
+            ),
+            ("gh: {\"errors\":[{\"type\":\"RATE_LIMITED\"}]}", 1, "primary_rate_limit"),
+            (
+                "HTTP 403: You have exceeded a secondary rate limit. Please wait 2 minutes before you try again.",
+                1,
+                "secondary_rate_limit",
+            ),
+        ];
+
+        for (stderr, rc, expected_reason) in cases {
+            clear_graphql_rate_limited();
+            assert_eq!(
+                classify_gh_failure(stderr, *rc).reason(),
+                *expected_reason,
+                "stderr {stderr:?} must classify as {expected_reason}"
+            );
+            let err = DaemonError::Tool {
+                tool: "gh".to_string(),
+                rc: *rc,
+                stderr: (*stderr).to_string(),
+            };
+            assert!(
+                detect_and_mark_graphql_rate_limit(&err, Duration::from_secs(60)),
+                "stderr {stderr:?} is a real rate limit and must trip the breaker"
+            );
+            assert!(is_graphql_rate_limited(), "breaker must be open for {stderr:?}");
+        }
+        clear_graphql_rate_limited();
     }
 }
 
@@ -8711,6 +8889,7 @@ exit 1
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = super::BreakerSandbox::new("pr_snapshot_fake_gh");
 
         super::clear_graphql_rate_limited();
 
@@ -8843,6 +9022,7 @@ exit 1
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = super::BreakerSandbox::new("primary_checks_trip");
         super::clear_graphql_rate_limited();
 
         let dir = make_fake_gh_dir("rate_limit_trip");
