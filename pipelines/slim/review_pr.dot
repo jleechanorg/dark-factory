@@ -8,15 +8,18 @@ digraph ReviewPR {
     start  [shape=Mdiamond, label="Start"]
     exit   [shape=Msquare,  label="Exit"]
 
-    // Cold fresh-eyes review. type=codergen → honors the run-level --backend
-    // (set --backend agy for an independent adversarial pass). It can edit, so
-    // it is NOT the merge-confidence reviewer; the gate below is.
+    // Cold fresh-eyes review. The direct Codex verdict gate is read-only and
+    // fail-closed; the evidence gate below remains the merge-confidence bar.
     review  [
         type="codergen",
         label="Cold Review",
         class="review",
-        prompt="@prompts/slim/review.md",
-        goal_gate=true
+        backend="codex",
+        prompt="@prompts/slim/fresh_review.md",
+        verdict_gate="true",
+        fresh_session="true",
+        goal_gate=true,
+        timeout=600
     ]
 
     // Real evidence reviewer: SHA-bound, read-only, verdict-parsed. Resolves

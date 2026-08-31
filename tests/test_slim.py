@@ -46,14 +46,35 @@ def test_slim_stylesheet_routes_roles_by_class():
     assert "model_name" not in fix
 
     assert review.get("class") == "review"
-    assert review["backend"] == "agy"
+    assert review["backend"] == "codex"
+
+
+def test_slim_generic_review_nodes_use_fresh_codex_contract():
+    """Every generic slim review node uses the bounded fresh reviewer contract."""
+    pipelines = (
+        "minimal_feature.dot",
+        "bugfix_noholdout.dot",
+        "brownfield_delete_first.dot",
+        "minimal_pr.dot",
+        "minimal_feature_cs.dot",
+        "review_pr.dot",
+    )
+    for filename in pipelines:
+        graph = parse(ROOT / "pipelines" / "slim" / filename)
+        review = graph.nodes["review"]
+        assert review.attrs.get("type") == "codergen", filename
+        assert review.attrs.get("class") == "review", filename
+        assert review.attrs.get("backend") == "codex", filename
+        assert review.attrs.get("prompt") == "@prompts/slim/fresh_review.md", filename
+        assert review.attrs.get("fresh_session") == "true", filename
+        assert review.attrs.get("verdict_gate") == "true", filename
 
 
 def test_minimal_feature_factory_runs_with_deterministic_gates(monkeypatch, tmp_path):
     monkeypatch.setattr(handlers_mod, "_sandboxed_args", lambda args: args)
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", lambda node, ctx: Result(outcome="success", output="ok"))
     graph = parse(ROOT / "pipelines" / "slim" / "minimal_feature.dot")
-    # production routes plan→claude opus and review→agy; pin echo for offline determinism
+    # production routes plan→claude opus and review→codex; pin echo for offline determinism
     graph.nodes["plan"].attrs["backend"] = "echo"
     graph.nodes["review"].attrs["backend"] = "echo"
     ctx = Context(goal="ship a tiny feature", workdir=SCRATCH, backend="echo")
@@ -100,7 +121,7 @@ def test_minimal_pr_factory_runs_with_deterministic_gates(monkeypatch, tmp_path)
     monkeypatch.setattr(handlers_mod, "_sandboxed_args", lambda args: args)
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", lambda node, ctx: Result(outcome="success", output="ok"))
     graph = parse(ROOT / "pipelines" / "slim" / "minimal_pr.dot")
-    # production routes plan→claude opus and review→agy; pin echo for offline determinism
+    # production routes plan→claude opus and review→codex; pin echo for offline determinism
     graph.nodes["plan"].attrs["backend"] = "echo"
     graph.nodes["review"].attrs["backend"] = "echo"
     ctx = Context(goal="refactor a tiny thing in-flight", workdir=SCRATCH, backend="echo")
@@ -161,5 +182,4 @@ def test_minimal_research_factory_runs_with_deterministic_gates(monkeypatch, tmp
         "gate_er",
         "exit",
     ]
-
 
