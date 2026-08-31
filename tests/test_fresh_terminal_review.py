@@ -516,44 +516,47 @@ def test_fresh_reviewer_blocks_absolute_writes_to_original_target(tmp_path, monk
     calls: list[tuple[list[str], pathlib.Path]] = []
     real_run = subprocess.run
 
-    def boundary_runner(args, **kwargs):
+    def behavioral_boundary_runner(args, **kwargs):
         if args and any("codex" in str(a) for a in args):
             cwd = pathlib.Path(kwargs["cwd"])
             calls.append((list(args), cwd))
+
             args_list = list(args)
-            target_str = str(repo.resolve())
-            target_write_blocked = False
-            # Check Seatbelt profile (macOS)
-            if "-p" in args_list:
-                p_idx = args_list.index("-p") + 1
-                profile = args_list[p_idx]
-                if f'(deny file-write* (subpath "{target_str}"))' in profile:
-                    target_write_blocked = True
-            # Check Landlock prefix (Linux)
-            elif any(isinstance(a, str) and a.startswith("/proc/self/fd/") for a in args_list):
-                write_allowed = [args_list[i + 1] for i, a in enumerate(args_list) if a == "--write"]
-                if not any(target_str == w or target_str.startswith(w.rstrip("/") + "/") for w in write_allowed):
-                    target_write_blocked = True
+            codex_idx = next(i for i, a in enumerate(args_list) if "codex" in str(a))
+            sandbox_wrapper = args_list[:codex_idx]
 
-            attempted_writes = [
-                (repo / "value.txt", "reviewer corrupted tracked\n"),
-                (repo / "artifact.json", '{"tests": "tampered"}\n'),
-                (repo / "untracked_leak.txt", "reviewer created untracked\n"),
-            ]
-            for target_file, content in attempted_writes:
-                if target_write_blocked:
-                    pass
-                else:
-                    target_file.write_text(content)
-
-            # Reviewer writes inside snapshot workdir (allowed)
-            (cwd / "snapshot_output.txt").write_text("snapshot output\n")
+            probe_code = (
+                "import pathlib, sys\n"
+                "target = pathlib.Path(sys.argv[1])\n"
+                "cwd = pathlib.Path.cwd()\n"
+                "for name, content in [\n"
+                "    ('value.txt', 'reviewer corrupted tracked\\n'),\n"
+                "    ('artifact.json', '{\"tests\": \"tampered\"}\\n'),\n"
+                "    ('untracked_leak.txt', 'reviewer created untracked\\n'),\n"
+                "]:\n"
+                "    try:\n"
+                "        (target / name).write_text(content)\n"
+                "    except OSError:\n"
+                "        pass\n"
+                "(cwd / 'snapshot_output.txt').write_text('snapshot output\\n')\n"
+                "print('No blocking findings.\\nVerdict: PASS\\n')\n"
+            )
+            probe_cmd = sandbox_wrapper + [sys.executable, "-c", probe_code, str(repo)]
+            probe_proc = real_run(
+                probe_cmd,
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                env=kwargs.get("env"),
+                pass_fds=kwargs.get("pass_fds", ()),
+                check=False,
+            )
             return subprocess.CompletedProcess(
-                args, 0, stdout="No blocking findings.\nVerdict: PASS\n", stderr=""
+                args, probe_proc.returncode, stdout=probe_proc.stdout, stderr=probe_proc.stderr
             )
         return real_run(args, **kwargs)
 
-    monkeypatch.setattr("runner.handler_codergen.subprocess.run", boundary_runner)
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", behavioral_boundary_runner)
     result = _codergen(node, ctx)
 
     assert result.outcome == "success"

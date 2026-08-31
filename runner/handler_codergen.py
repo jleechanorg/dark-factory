@@ -776,14 +776,16 @@ def _sandboxed_args_for_fresh_review(
     command: list[str],
     codex_workdir: pathlib.Path,
     target_workdir: pathlib.Path,
+    *,
+    runtime_home: pathlib.Path | None = None,
 ) -> list[str] | None:
     """Build sandboxed arguments for fresh review isolating against target_workdir writes.
 
     On macOS: Seatbelt sandbox-exec profile with holdouts denied, sealed benchmark docs
     denied, and target_workdir write-denied ((deny file-write* (subpath ...))).
-    On Linux: Landlock allow-list allowing only codex_workdir (and codex runtime paths)
-    and denying target_workdir, holdouts, and sealed benchmark docs. Fails closed if
-    Landlock kernel boundary is unavailable.
+    On Linux: Landlock allow-list allowing only codex_workdir, private codex runtime home,
+    and codex runtime paths, and denying target_workdir, holdouts, and sealed benchmark docs.
+    Fails closed if Landlock kernel boundary is unavailable.
     """
     if os.environ.get("DISABLE_SANDBOX"):
         return command
@@ -828,10 +830,16 @@ def _sandboxed_args_for_fresh_review(
             executable_path = launcher_path
             cmd_args = command
 
+        read_paths = [*runtime_paths, codex_workdir.resolve()]
+        writable_paths = [codex_workdir.resolve()]
+        if runtime_home is not None:
+            read_paths.append(runtime_home.resolve())
+            writable_paths.append(runtime_home.resolve())
+
         landlock_prefix = _handlers_shim._linux_controller_sandbox_prefix(
             denied_paths=denied_paths,
-            read_paths=[*runtime_paths, codex_workdir.resolve()],
-            writable_paths=[codex_workdir.resolve()],
+            read_paths=read_paths,
+            writable_paths=writable_paths,
             executable_paths=[executable_path],
         )
         if landlock_prefix is None:
@@ -1276,11 +1284,30 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                 }:
                     codex_command.append("--ephemeral")
                 codex_command.extend(["--yolo", "--skip-git-repo-check", prompt_text])
+
+                runtime = None
+                env = _handlers_shim._sanitized_env()
+                if (
+                    verdict_gate
+                    and sys.platform.startswith("linux")
+                    and not os.environ.get("DISABLE_SANDBOX")
+                ):
+                    try:
+                        runtime = _handlers_shim._create_controller_runtime()
+                        env = runtime.env
+                    except Exception as exc:
+                        return _finalize(Result(
+                            outcome="error",
+                            output=f"failed to initialize private codex runtime: {exc}",
+                            metadata={"verdict": "unknown", "fresh_session": "true"},
+                        ))
+
                 args = (
                     _sandboxed_args_for_fresh_review(
                         codex_command,
                         codex_workdir,
                         target_workdir,
+                        runtime_home=runtime.codex_home if runtime is not None else None,
                     )
                     if verdict_gate
                     else _handlers_shim._sandboxed_args_for_workdir(
@@ -1289,6 +1316,11 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                     )
                 )
                 if args is None:
+                    if runtime is not None:
+                        try:
+                            _handlers_shim._cleanup_controller_runtime(runtime.run_dir)
+                        except Exception:
+                            pass
                     return _finalize(Result(
                         outcome="error" if verdict_gate else "failure",
                         output="sandbox-exec unavailable" if sys.platform == "darwin" else "isolation unavailable",
@@ -1304,7 +1336,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                         timeout=timeout_s,
                         check=False,
                         input="",
-                        env=_handlers_shim._sanitized_env(),
+                        env=env,
                         pass_fds=getattr(args, "pass_fds", ()),
                     )
                 except subprocess.TimeoutExpired as exc:
@@ -1330,6 +1362,11 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                     ))
                 finally:
                     _handlers_shim._close_pinned_launcher_command(args)
+                    if runtime is not None:
+                        try:
+                            _handlers_shim._cleanup_controller_runtime(runtime.run_dir)
+                        except Exception:
+                            pass
 
                 output = proc.stdout + ("\nSTDERR:\n" + proc.stderr if proc.stderr else "")
                 outcome = "success" if proc.returncode == 0 else "failure"
