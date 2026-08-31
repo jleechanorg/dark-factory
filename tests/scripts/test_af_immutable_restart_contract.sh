@@ -10,6 +10,7 @@ RELEASE="$TMP/releases/$RELEASE_COMMIT"
 DAEMON_BINARY="$RELEASE/daemon/target/release/daemon"
 MANIFEST="$RELEASE/release-manifest.json"
 WORKTREE="$TMP/target-worktree"
+WORKER_WORKTREE="$TMP/worker-worktree"
 DAEMON_PID_FILE="$TMP/daemon.pid"
 DAEMON_PATHS_FILE="$TMP/daemon-paths"
 WORKER_PID_FILE="$TMP/worker.pid"
@@ -29,7 +30,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-mkdir -p "$FAKE_BIN" "$(dirname "$DAEMON_BINARY")" "$WORKTREE"
+mkdir -p "$FAKE_BIN" "$(dirname "$DAEMON_BINARY")" "$WORKTREE" "$WORKER_WORKTREE"
 cp "$(command -v sleep)" "$DAEMON_BINARY"
 chmod +x "$DAEMON_BINARY"
 
@@ -37,6 +38,13 @@ git -C "$WORKTREE" init -q
 git -C "$WORKTREE" checkout -q -b factory/restart-contract
 git -C "$WORKTREE" -c user.name=test -c user.email=test@example.invalid \
   commit -q --allow-empty -m initial
+git -C "$WORKTREE" remote add origin https://github.com/jleechanorg/dark-factory.git
+git -C "$WORKTREE" checkout -q --detach
+
+git -C "$WORKER_WORKTREE" init -q
+git -C "$WORKER_WORKTREE" checkout -q -b factory/restart-contract
+git -C "$WORKER_WORKTREE" -c user.name=test -c user.email=test@example.invalid \
+  commit -q --allow-empty -m worker
 
 DAEMON_SHA256="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$DAEMON_BINARY")"
 python3 - "$MANIFEST" "$RELEASE_COMMIT" "$DAEMON_SHA256" <<'PY'
@@ -175,7 +183,7 @@ cat > "$FAKE_BIN/tmux" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 if [ "${1:-}" = "list-panes" ] && [ "${2:-}" = "-a" ] && [ "${3:-}" = "-F" ]; then
-  if [ ! -f "$FAKE_AO_KILLED_FILE" ] || [ "${FAKE_AO_KEEP_OWNED:-0}" = "1" ]; then
+  if [ ! -f "$FAKE_AO_KILLED_FILE" ] || [ "${FAKE_AO_KEEP_OWNED:-0}" = "1" ] || [ "${FAKE_TMUX_KEEP_OWNED:-0}" = "1" ]; then
     printf 'host-restart-contract-session\t%s\t%s\n' \
       "$(cat "$FAKE_WORKER_PID_FILE")" "$FAKE_WORKER_PANE_PATH"
   fi
@@ -194,12 +202,19 @@ print(p.pid)
 ' "$DAEMON_BINARY")"
 printf '%s\n' "$daemon_pid" > "$DAEMON_PID_FILE"
 printf '%s %s\n' "$daemon_pid" "$DAEMON_BINARY" > "$DAEMON_PATHS_FILE"
-worker_pid="$(python3 -c '
+start_worker() {
+  if [ -s "$WORKER_PID_FILE" ]; then
+    kill "$(cat "$WORKER_PID_FILE")" >/dev/null 2>&1 || true
+  fi
+  local worker_pid
+  worker_pid="$(python3 -c '
 import subprocess
 p = subprocess.Popen(["sleep", "120"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 print(p.pid)
 ')"
-printf '%s\n' "$worker_pid" > "$WORKER_PID_FILE"
+  printf '%s\n' "$worker_pid" > "$WORKER_PID_FILE"
+}
+start_worker
 
 export PATH="$FAKE_BIN:$PATH"
 export DARK_FACTORY_RESTART_UNIT="ai.dark-factory.contract-test.service"
@@ -213,7 +228,7 @@ export FAKE_DAEMON_PATHS_FILE="$DAEMON_PATHS_FILE"
 export FAKE_WORKER_PID_FILE="$WORKER_PID_FILE"
 export FAKE_AO_KILLED_FILE="$AO_KILLED_FILE"
 export FAKE_AO_MALFORMED_AFTER_RESTART_FILE="$AO_MALFORMED_AFTER_RESTART_FILE"
-export FAKE_WORKER_PANE_PATH="$WORKTREE"
+export FAKE_WORKER_PANE_PATH="$WORKER_WORKTREE"
 export FAKE_UNRELATED_PANE_PATH="$TMP/unrelated-worktree"
 
 set +e
@@ -335,12 +350,7 @@ assert "worktree" not in worker, worker
 PY
 
 rm -f "$AO_KILLED_FILE"
-worker_pid="$(python3 -c '
-import subprocess
-p = subprocess.Popen(["sleep", "120"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-print(p.pid)
-')"
-printf '%s\n' "$worker_pid" > "$WORKER_PID_FILE"
+start_worker
 set +e
 post_restart_malformed_output="$(FAKE_AO_MALFORMED_AFTER_RESTART=1 bash "$HARNESS" 2>&1)"
 post_restart_malformed_rc=$?
@@ -359,6 +369,7 @@ assert payload["status"] == "skipped", payload
 assert "after restart" in payload["reason"], payload
 '
 rm -f "$AO_MALFORMED_AFTER_RESTART_FILE"
+start_worker
 set +e
 missing_fields_output="$(FAKE_AO_SESSION_GET_MISSING=1 bash "$HARNESS" 2>&1)"
 missing_fields_rc=$?
@@ -376,6 +387,7 @@ payload = json.loads(text[start:])
 assert payload["status"] == "skipped", payload
 assert "authoritative" in payload["reason"], payload
 '
+start_worker
 set +e
 unprefixed_output="$(FAKE_AO_SESSION_GET_UNPREFIXED=1 bash "$HARNESS" 2>&1)"
 unprefixed_rc=$?
@@ -393,6 +405,23 @@ payload = json.loads(text[start:])
 assert payload["status"] == "skipped", payload
 assert "correlate" in payload["reason"], payload
 '
+start_worker
+set +e
+surviving_pane_output="$(FAKE_TMUX_KEEP_OWNED=1 bash "$HARNESS" 2>&1)"
+surviving_pane_rc=$?
+set -e
+if [ "$surviving_pane_rc" -ne 1 ]; then
+  echo "FAIL: a surviving owned tmux pane with a removed AO row must fail cleanup proof, got rc=$surviving_pane_rc" >&2
+  echo "$surviving_pane_output" >&2
+  exit 1
+fi
+if [[ "$surviving_pane_output" != *"owned tmux session/pane"* ]]; then
+  echo "FAIL: surviving-pane failure must identify the owned tmux artifact" >&2
+  echo "$surviving_pane_output" >&2
+  exit 1
+fi
+rm -f "$AO_KILLED_FILE"
+start_worker
 set +e
 owned_persists_output="$(FAKE_AO_KEEP_OWNED=1 bash "$HARNESS" 2>&1)"
 owned_persists_rc=$?

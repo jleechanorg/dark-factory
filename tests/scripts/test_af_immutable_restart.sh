@@ -215,16 +215,23 @@ if [ "$BINARY_SHA256_BEFORE" != "$MANIFEST_SHA256" ]; then
 fi
 MANIFEST_CROSS_CHECK_STATUS="verified"
 
-# --- Resolve dynamic target worktree & branch from the live checkout. A
-# missing worktree or a detached HEAD means we cannot bind to a real
-# branch-tracked worktree, so this is a SKIP, never a fabricated branch. ---
+# --- Bind the production managed target by immutable Git identity. Managed
+# targets are intentionally detached; branch identity belongs to the separate
+# AO worker checkout proved below. ---
 if [ ! -d "$WORKTREE/.git" ]; then
-  skip "target worktree $WORKTREE has no .git; cannot verify a real branch-tracked worktree"
+  skip "target worktree $WORKTREE has no .git; cannot verify a real managed checkout"
 fi
-BRANCH="$(git -C "$WORKTREE" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
-if [ -z "$BRANCH" ] || [ "$BRANCH" = "HEAD" ]; then
-  skip "target worktree $WORKTREE is on a detached HEAD ($(git -C "$WORKTREE" rev-parse HEAD 2>/dev/null || echo unknown)); cannot verify a real branch-tracked worktree"
+TARGET_HEAD_BEFORE="$(git -C "$WORKTREE" rev-parse HEAD 2>/dev/null || true)"
+TARGET_SYMBOLIC_REF_BEFORE="$(git -C "$WORKTREE" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+TARGET_ORIGIN_BEFORE="$(git -C "$WORKTREE" remote get-url origin 2>/dev/null || true)"
+TARGET_STATUS_BEFORE="$(git -C "$WORKTREE" status --porcelain 2>/dev/null || true)"
+if [[ ! "$TARGET_HEAD_BEFORE" =~ ^[0-9a-f]{40}$ ]] || [ -n "$TARGET_SYMBOLIC_REF_BEFORE" ] || [ -z "$TARGET_ORIGIN_BEFORE" ]; then
+  skip "target worktree $WORKTREE is not a detached exact-SHA checkout with an origin"
 fi
+if [ -n "$TARGET_STATUS_BEFORE" ]; then
+  skip "target worktree $WORKTREE is dirty; immutable restart proof requires a clean managed checkout"
+fi
+BRANCH="detached@$TARGET_HEAD_BEFORE"
 
 # Parse `ao status --json`, allowing notifier text only before the first JSON
 # array. A successful command with malformed JSON remains a parse failure.
@@ -576,6 +583,15 @@ if [ "$BINARY_SHA256_AFTER" != "$MANIFEST_SHA256" ] || [ "$BINARY_SHA256_AFTER" 
   exit 1
 fi
 
+TARGET_HEAD_AFTER="$(git -C "$WORKTREE" rev-parse HEAD 2>/dev/null || true)"
+TARGET_SYMBOLIC_REF_AFTER="$(git -C "$WORKTREE" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+TARGET_ORIGIN_AFTER="$(git -C "$WORKTREE" remote get-url origin 2>/dev/null || true)"
+TARGET_STATUS_AFTER="$(git -C "$WORKTREE" status --porcelain 2>/dev/null || true)"
+if [ "$TARGET_HEAD_AFTER" != "$TARGET_HEAD_BEFORE" ] || [ -n "$TARGET_SYMBOLIC_REF_AFTER" ] || [ "$TARGET_ORIGIN_AFTER" != "$TARGET_ORIGIN_BEFORE" ] || [ -n "$TARGET_STATUS_AFTER" ]; then
+  echo "FAIL: managed target identity or cleanliness changed across restart" >&2
+  exit 1
+fi
+
 # Re-query the disposable project after restart. A surviving PID alone is not
 # enough: AO must still report the same session on the same branch.
 set +e
@@ -715,7 +731,7 @@ PRODUCTION_STATUS_AFTER="$(parse_ao_json "$UNRELATED_AFTER")"
 PRODUCTION_STATUS_AFTER_RC=$?
 TEST_PROJECT_STATUS_FINAL="$(parse_ao_json "$TEST_PROJECT_SESSIONS_FINAL")"
 TEST_PROJECT_STATUS_FINAL_RC=$?
-TMUX_OWNED_COUNT_FINAL="$(count_tmux_identity_matches "$TMUX_PANES_FINAL" "$AO_SESSION")"
+TMUX_OWNED_COUNT_FINAL="$(count_tmux_identity_matches "$TMUX_PANES_FINAL" "$TMUX_SESSION_BEFORE")"
 TMUX_OWNED_COUNT_FINAL_RC=$?
 set -e
 if [ "$PRODUCTION_STATUS_AFTER_RC" -ne 0 ]; then
@@ -756,6 +772,7 @@ export PROC_EXE_BEFORE PROC_EXE_AFTER UNIT_EXEC_START EXEC_START_MATCHES_RUNNING
 export RELEASE_MANIFEST MANIFEST_SHA256 MANIFEST_CROSS_CHECK_STATUS
 export DAEMON_PID_BEFORE DAEMON_PID_AFTER
 export AO_PROJECT WORKTREE BRANCH
+export TARGET_HEAD_BEFORE TARGET_HEAD_AFTER TARGET_ORIGIN_BEFORE TARGET_ORIGIN_AFTER
 export AO_TEST_PROJECT AO_SESSION SESSION_BRANCH_BEFORE SESSION_BRANCH_AFTER
 export TMUX_SESSION_BEFORE TMUX_SESSION_AFTER
 export TMUX_PANE_CURRENT_PATH_BEFORE TMUX_PANE_CURRENT_PATH_AFTER
@@ -803,6 +820,11 @@ report = {
         'ao_project': os.environ['AO_PROJECT'],
         'worktree': os.environ['WORKTREE'],
         'branch': os.environ['BRANCH'],
+        'target_head_before': os.environ['TARGET_HEAD_BEFORE'],
+        'target_head_after': os.environ['TARGET_HEAD_AFTER'],
+        'checkout_mode': 'detached',
+        'origin_before': os.environ['TARGET_ORIGIN_BEFORE'],
+        'origin_after': os.environ['TARGET_ORIGIN_AFTER'],
         'unrelated_inventory_before': unrelated_before,
         'unrelated_inventory_after': unrelated_after,
     },

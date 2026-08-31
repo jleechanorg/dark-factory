@@ -3346,41 +3346,21 @@ pub fn is_ao_project_healthy(project: &str) -> bool {
 /// code (AO does not expose a structured failure-reason taxonomy over its
 /// CLI, so there is nothing else to key on for e.g. "unknown project").
 ///
-/// `rc == -1` on a `DaemonError::Tool` is NOT unconditional evidence of
-/// "AO is not running" — `run_tool_with_cwd` (tools.rs) produces `rc == -1`
-/// in THREE distinct cases: (a) the `ao`/`sandbox-exec` binary itself could
-/// not be spawned (`Command::spawn()` failed, e.g. missing/unresolvable on
-/// PATH — this DOES mean AO needs attention), (b) the child was killed by an
-/// external signal after successfully launching (`status.code()` is `None`
-/// on signal death, e.g. OOM killer or an operator `kill -9` unrelated to AO
-/// itself), or (c) the OS-level `try_wait()` poll itself failed (a wait(2)
-/// error, not an AO condition at all). Only case (a) implies AO is absent;
-/// (b) and (c) mean the binary ran/launched fine, so `ao start` would not
-/// address whatever actually happened. Distinguish them by requiring the
-/// stderr shape that `Command::spawn()` failures and PATH-resolution
-/// failures actually produce (see the "spawn failed: {e}" /
-/// "execution failed" wording in `run_tool_with_cwd`) before short-circuiting
-/// on `rc == -1`; otherwise fall through to the general lexical matching
-/// below, which still applies to the `rc == -1` case if the message happens
-/// to independently mention e.g. "daemon is not running".
+/// `rc == -1` is never sufficient evidence: it also represents a missing AO
+/// executable, signal death, and wait errors. Only an explicit AO lifecycle
+/// diagnostic may trigger `ao start`; starting a daemon cannot repair a CLI
+/// binary that the process failed to execute.
 fn is_ao_not_running_error(err: &DaemonError) -> bool {
-    let (msg, rc) = match err {
-        DaemonError::Tool { stderr, rc, .. } => (stderr.as_str(), Some(*rc)),
-        DaemonError::Config(msg) => (msg.as_str(), None),
-        DaemonError::Parse(msg) => (msg.as_str(), None),
+    let msg = match err {
+        DaemonError::Tool { stderr, .. } => stderr.as_str(),
+        DaemonError::Config(msg) => msg.as_str(),
+        DaemonError::Parse(msg) => msg.as_str(),
         DaemonError::SpawnFallbackExhausted(list) => {
             return list.iter().any(|(_, e)| is_ao_not_running_error(e));
         }
         _ => return false,
     };
     let lower = msg.to_lowercase();
-    if rc == Some(-1)
-        && (lower.contains("no such file or directory")
-            || lower.contains("execution failed")
-            || lower.contains("spawn failed"))
-    {
-        return true;
-    }
     lower.contains("ao is not running")
         || lower.contains("daemon is not running")
         || lower.contains("orchestrator not running")
@@ -3396,17 +3376,13 @@ mod is_ao_not_running_error_tests {
     use crate::errors::DaemonError;
 
     #[test]
-    fn rc_negative_one_is_classified_structurally_regardless_of_stderr_wording() {
-        // Before this fix, only lexical stderr substrings drove
-        // classification, so a `rc=-1` "could not even launch the binary"
-        // failure with unrelated wording (e.g. a sandbox-exec spawn error)
-        // was NOT recognized as an AO-not-running condition.
+    fn rc_negative_one_cli_launch_failure_is_not_ao_not_running() {
         let err = DaemonError::Tool {
             tool: "ao".to_string(),
             rc: -1,
             stderr: "execution failed: No such file or directory (os error 2)".to_string(),
         };
-        assert!(is_ao_not_running_error(&err));
+        assert!(!is_ao_not_running_error(&err));
     }
 
     #[test]
@@ -3485,8 +3461,8 @@ mod is_ao_not_running_error_tests {
                 "antigravity".to_string(),
                 DaemonError::Tool {
                     tool: "ao spawn --agent antigravity".to_string(),
-                    rc: -1,
-                    stderr: "execution failed: No such file or directory (os error 2)".to_string(),
+                    rc: 1,
+                    stderr: "AO is not running; start the project first".to_string(),
                 },
             ),
         ]);
@@ -4658,6 +4634,69 @@ mod ao_spawn_contract_tests {
     use crate::tools::{Sessions, SpawnSpec};
     use std::os::unix::fs::PermissionsExt;
 
+    struct TestEnvGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        cleanup_dir: std::path::PathBuf,
+    }
+
+    impl TestEnvGuard {
+        fn install(dir: &std::path::Path, bindings: &serde_json::Value, log: &std::path::Path) -> Self {
+            const KEYS: &[&str] = &[
+                "PATH",
+                "AO_FAKE_EXPECTED_BINDINGS",
+                "AO_FAKE_LOG",
+                "AO_FAKE_FAIL_PROMPT",
+                "AO_FAKE_KILL_FAIL",
+                "AO_FAKE_RETURN_BRANCH",
+                "AO_FAKE_WORKTREE",
+                "DARK_FACTORY_REVIEWER_FALLBACK_CHAIN",
+                "FAKE_GIT_EXPECTED_ORIGIN",
+                "FAKE_GIT_LOCAL_SOURCE",
+                "FAKE_GIT_REAL_BIN",
+            ];
+            let saved = KEYS
+                .iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect();
+            let old_path = std::env::var_os("PATH").unwrap_or_default();
+            let mut paths = vec![dir.to_path_buf()];
+            paths.extend(std::env::split_paths(&old_path));
+            std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+            std::env::set_var("AO_FAKE_EXPECTED_BINDINGS", bindings.to_string());
+            std::env::set_var("AO_FAKE_LOG", log);
+            Self {
+                saved,
+                cleanup_dir: dir.to_path_buf(),
+            }
+        }
+    }
+
+    impl Drop for TestEnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.cleanup_dir);
+        }
+    }
+
+    fn system_git() -> std::path::PathBuf {
+        let canonical = std::path::PathBuf::from("/usr/bin/git");
+        if canonical.is_file() {
+            return canonical;
+        }
+        std::env::var_os("PATH")
+            .as_deref()
+            .into_iter()
+            .flat_map(std::env::split_paths)
+            .map(|dir| dir.join("git"))
+            .find(|path| path.is_file())
+            .expect("test environment must provide git")
+    }
+
     fn spec(prompt: &str, branch: &str) -> SpawnSpec {
         SpawnSpec {
             bead_id: "jleechan-contract-test".to_string(),
@@ -4766,26 +4805,8 @@ print("  Branch:   " + os.environ.get("AO_FAKE_RETURN_BRANCH", os.environ["DARK_
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = fake_ao_dir(test_name);
         let log = dir.join("calls.jsonl");
-        let old_path = std::env::var("PATH").unwrap_or_default();
-        let old_bindings = std::env::var("AO_FAKE_EXPECTED_BINDINGS").ok();
-        let old_log = std::env::var("AO_FAKE_LOG").ok();
-        std::env::set_var("PATH", format!("{}:{old_path}", dir.display()));
-        std::env::set_var("AO_FAKE_EXPECTED_BINDINGS", bindings.to_string());
-        std::env::set_var("AO_FAKE_LOG", &log);
-
-        let result = run(&log);
-
-        std::env::set_var("PATH", old_path);
-        match old_bindings {
-            Some(value) => std::env::set_var("AO_FAKE_EXPECTED_BINDINGS", value),
-            None => std::env::remove_var("AO_FAKE_EXPECTED_BINDINGS"),
-        }
-        match old_log {
-            Some(value) => std::env::set_var("AO_FAKE_LOG", value),
-            None => std::env::remove_var("AO_FAKE_LOG"),
-        }
-        let _ = std::fs::remove_dir_all(dir);
-        result
+        let _env = TestEnvGuard::install(&dir, &bindings, &log);
+        run(&log)
     }
 
     fn run_bridge_with_registered_source(
@@ -5534,13 +5555,7 @@ export const isTerminalSession = () => false;
             .status()
             .unwrap();
 
-        let real_git = std::env::var_os("PATH")
-            .as_deref()
-            .into_iter()
-            .flat_map(std::env::split_paths)
-            .map(|dir| dir.join("git"))
-            .find(|path| path.is_file())
-            .expect("test environment must provide git");
+        let real_git = system_git();
         let prompt = "refresh clean managed stale checkout";
         let branch = "factory/jleechan-contract-clean-managed-refresh-r1";
         let (spawn_result, calls) = with_fake_ao(
@@ -5825,13 +5840,7 @@ exec "$FAKE_GIT_REAL_BIN" "$@"
         let checkout = root.join("managed-target");
         assert!(!checkout.exists(), "checkout must start out missing");
 
-        let real_git = std::env::var_os("PATH")
-            .as_deref()
-            .into_iter()
-            .flat_map(std::env::split_paths)
-            .map(|dir| dir.join("git"))
-            .find(|path| path.is_file())
-            .expect("test environment must provide git");
+        let real_git = system_git();
 
         let (spawn_result, calls) = with_fake_ao(
             "missing_managed_checkout",

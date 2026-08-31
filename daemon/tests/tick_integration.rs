@@ -340,6 +340,62 @@ fn one_full_tick_cycle_keeps_unknown_only_gate_attested() {
 }
 
 #[test]
+fn local_factory_bead_routes_when_github_intake_is_rate_limited() {
+    let scm = FakeScm::new();
+    scm.rate_limit_next_labeled_prs.replace(true);
+    scm.rate_limit_next_labeled_issues.replace(true);
+    let tracker = FakeTracker::new();
+    tracker.candidates.borrow_mut().push(Bead {
+        id: "local-rate-limit-survivor".into(),
+        title: "route local factory work".into(),
+        description: "target_repo: owner/repo\ncontinue without GitHub intake".into(),
+        notes: String::new(),
+        file_tree_summary: String::new(),
+        external_ref: None,
+    });
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"bounded local task"}"#.into(),
+    ));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = test_vcs();
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_local_intake_rate_limit_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        0,
+        0,
+    )
+    .expect("GitHub rate limits must not abort local bead intake");
+
+    assert!(sessions.calls.borrow().iter().any(|call| {
+        call == "spawn(local-rate-limit-survivor)"
+    }), "local bead did not reach dispatch: {:?}", sessions.calls.borrow());
+    let overlay = store
+        .load("local-rate-limit-survivor")
+        .unwrap()
+        .expect("local bead must have a durable overlay");
+    assert_ne!(overlay.state, OverlayState::HumanHeld);
+    let _ = std::fs::remove_file(telemetry_log);
+}
+
+#[test]
 fn run_tick_rejects_non_stage_1_or_2_config() {
     let scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -7422,6 +7478,14 @@ impl Drop for EnvVarGuard {
     }
 }
 
+struct CircuitBreakerResetGuard;
+
+impl Drop for CircuitBreakerResetGuard {
+    fn drop(&mut self) {
+        daemon::gh_circuit_breaker::reset();
+    }
+}
+
 /// Guards every test in this file that needs to mutate process-wide env vars
 /// (`PATH`, `DARK_FACTORY_CODER_DEFAULT`) so a future second such test can't
 /// race this one.
@@ -10258,6 +10322,7 @@ fn run_slow_tier_pr_existence_probe_targets_bead_own_repo_not_global_cfg() {
     let _lock = REAL_TARGET_REPO_TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    let _breaker_guard = CircuitBreakerResetGuard;
 
     let fake_bin_dir = std::env::temp_dir().join(format!(
         "afd_x8tf_probe_own_repo_{}_{}",
@@ -10368,6 +10433,7 @@ fn run_slow_tier_pr_existence_probe_unchanged_for_single_repo_legacy_bead() {
     let _lock = REAL_TARGET_REPO_TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    let _breaker_guard = CircuitBreakerResetGuard;
 
     let fake_bin_dir = std::env::temp_dir().join(format!(
         "afd_x8tf_probe_legacy_repo_{}_{}",

@@ -212,6 +212,7 @@ pub struct FakeScm {
     /// also recorded in the call log as `labeled_prs_rate_limited(...)`
     /// so tests can prove the rate-limit branch fired.
     pub rate_limit_next_labeled_prs: RefCell<bool>,
+    pub rate_limit_next_labeled_issues: RefCell<bool>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -226,6 +227,13 @@ impl Scm for FakeScm {
         self.calls
             .borrow_mut()
             .push(format!("labeled_issues({label})"));
+        if self.rate_limit_next_labeled_issues.replace(false) {
+            return Err(DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr: "gh: API rate limit exceeded for installation ID 12345".into(),
+            });
+        }
         Ok(self.issues.clone())
     }
 

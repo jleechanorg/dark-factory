@@ -9,7 +9,7 @@ use daemon::errors::DaemonError;
 use daemon::reroll::{self, RerollDeps, RerollOutcome};
 use daemon::state::{BeadOverlay, OverlayState, StateStore};
 use daemon::tick::{run_tick, TickDeps};
-use daemon::tools::{Issue, Llm, Permission, PrSnapshot};
+use daemon::tools::{Issue, Llm, Permission, PrSnapshot, Sessions, SpawnSpec};
 
 fn test_cfg() -> Config {
     Config {
@@ -956,7 +956,7 @@ fn test_reroll_adopted_unconfigured_repo_uses_daemon_owned_target_worktree() {
 }
 
 #[test]
-fn relative_spec_dir_uses_target_worktree() {
+fn relative_spec_dir_does_not_dirty_target_worktree() {
     let root = std::env::temp_dir().join(format!(
         "afd_relative_spec_dir_integration_{}_{}",
         std::process::id(),
@@ -967,6 +967,38 @@ fn relative_spec_dir_uses_target_worktree() {
     ));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
+    assert!(std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&root)
+        .status()
+        .unwrap()
+        .success());
+    assert!(std::process::Command::new("git")
+        .args(["remote", "add", "origin", "https://github.com/owner/target.git"])
+        .current_dir(&root)
+        .status()
+        .unwrap()
+        .success());
+    assert!(std::process::Command::new("git")
+        .args([
+            "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "commit", "--allow-empty", "-m", "managed target",
+        ])
+        .current_dir(&root)
+        .status()
+        .unwrap()
+        .success());
+    let head = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
 
     let mut cfg = test_cfg();
     cfg.spec_dir = ".factory/specs/".into();
@@ -979,13 +1011,58 @@ fn relative_spec_dir_uses_target_worktree() {
         },
     );
     let resolved = cfg.resolve_spec_path("owner/target", "bead-123");
-    let expected = root.join(".factory/specs/bead-123.toml");
-    let _ = std::fs::remove_dir_all(&root);
-
+    let expected = daemon::intake::runtime_state_dir()
+        .join("specs/owner/target/bead-123.toml");
     assert_eq!(
         resolved, expected,
-        "relative spec_dir must resolve under the target repository worktree"
+        "relative spec_dir must resolve outside the managed target repository"
     );
+    assert!(
+        !resolved.starts_with(&root),
+        "reroll mutation must not create untracked files in an exact-head target checkout"
+    );
+    constraints::append_mutation(&resolved, "\n[[reroll]]\nattempt = 1\n").unwrap();
+    let status = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&root)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert!(status.is_empty(), "runtime spec mutation dirtied target: {status}");
+    daemon::target_worktree::ensure_managed_target_worktree(
+        "owner/target",
+        &root,
+        Some(&head),
+    )
+    .expect("the next exact-head admission must accept the clean managed target");
+    let sessions = FakeSessions::new();
+    sessions
+        .spawn(&SpawnSpec {
+            bead_id: "next-task".into(),
+            branch: "factory/next-task-r1".into(),
+            prompt: "continue after reroll mutation".into(),
+            repo: "owner/target".into(),
+            ao_project: "target".into(),
+            remote: "origin".into(),
+            local_checkout: Some(root.clone()),
+            expected_revision: Some(head),
+            managed_checkout: true,
+            expected_cwd: Some(root.clone()),
+        })
+        .expect("clean target must reach the AO spawn boundary");
+    assert!(
+        sessions
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call == "spawn(next-task)"),
+        "the clean exact-head target must reach the AO spawn boundary"
+    );
+    let _ = std::fs::remove_file(&resolved);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

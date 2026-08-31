@@ -201,13 +201,19 @@ impl Config {
         path.is_dir().then_some(path)
     }
 
-    /// Resolve the spec path for a bead, respecting target worktree when `spec_dir` is relative.
+    /// Resolve the mutable reroll spec outside managed source checkouts.
+    /// Absolute paths are explicit operator-owned locations. Relative paths
+    /// use the daemon runtime-state tree, sharded by complete repository
+    /// identity, so mutation cannot dirty an exact-head target checkout.
     pub fn resolve_spec_path(&self, repo: &str, bead_id: &str) -> PathBuf {
         let filename = format!("{bead_id}.toml");
         if Path::new(&self.spec_dir).is_relative() {
-            self.target_worktree_path(repo)
-                .map(|root| root.join(&self.spec_dir).join(&filename))
-                .unwrap_or_else(|| Path::new(&self.spec_dir).join(&filename))
+            let (owner, name) = repo.split_once('/').unwrap_or(("unknown", repo));
+            crate::intake::runtime_state_dir()
+                .join("specs")
+                .join(owner)
+                .join(name)
+                .join(filename)
         } else {
             Path::new(&self.spec_dir).join(&filename)
         }
@@ -681,21 +687,9 @@ push_remote = "origin"
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// jleechan review finding P1-C4: `resolve_spec_path` had zero direct
-    /// test coverage. A relative `spec_dir` (the production default,
-    /// `.factory/specs/`) must resolve under the TARGET repo's worktree
-    /// root, never the daemon's own cwd -- release binaries commonly run
-    /// from an immutable uv/archive path unrelated to any repo checkout.
+    /// Relative runtime specs must never dirty the managed target checkout.
     #[test]
-    fn relative_spec_dir_uses_target_worktree() {
-        let _lock = TARGET_WORKTREE_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let root = std::env::temp_dir().join(format!("afd_relative_spec_dir_{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        let previous = std::env::var_os("DARK_FACTORY_TARGET_WORKTREE_ROOT");
-        std::env::set_var("DARK_FACTORY_TARGET_WORKTREE_ROOT", &root);
-
+    fn relative_spec_dir_uses_runtime_state_not_target_worktree() {
         let cfg = Config {
             target_repo: "owner/daemon".into(),
             ao_project: None,
@@ -720,21 +714,15 @@ push_remote = "origin"
         };
 
         let resolved = cfg.resolve_spec_path("owner/target", "bead-123");
-        let expected = root
+        let expected = crate::intake::runtime_state_dir()
+            .join("specs")
             .join("owner")
             .join("target")
-            .join(".factory/specs/")
             .join("bead-123.toml");
         assert_eq!(
             resolved, expected,
-            "a relative spec_dir must resolve under the target repo's worktree root, not the daemon's own cwd"
+            "a relative spec_dir must resolve under daemon runtime state, not a managed source checkout"
         );
-
-        match previous {
-            Some(value) => std::env::set_var("DARK_FACTORY_TARGET_WORKTREE_ROOT", value),
-            None => std::env::remove_var("DARK_FACTORY_TARGET_WORKTREE_ROOT"),
-        }
-        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Companion to the relative case above: an ABSOLUTE `spec_dir` must be

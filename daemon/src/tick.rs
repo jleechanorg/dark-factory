@@ -1858,7 +1858,16 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         }
     }
 
-    let (created, issue_skip_outcomes) = intake::normalize(deps.scm, deps.tracker, deps.cfg)?;
+    let (created, issue_skip_outcomes) = match intake::normalize(deps.scm, deps.tracker, deps.cfg) {
+        Ok(outcome) => outcome,
+        Err(error) if error.is_gh_rate_limit() => {
+            eprintln!(
+                "auto-factory daemon: GitHub issue intake rate-limited; continuing with local bead routing and dispatch"
+            );
+            (Vec::new(), Vec::new())
+        }
+        Err(error) => return Err(error),
+    };
     // jleechan-eazj: same unconditional per-candidate guarantee as the PR
     // path above — every factory-labeled issue that did NOT result in a
     // newly-created bead still gets exactly one verdict event.

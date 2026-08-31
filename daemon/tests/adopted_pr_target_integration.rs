@@ -9,8 +9,35 @@ use daemon::intake;
 use daemon::router;
 use daemon::tools::{Sessions, SpawnSpec};
 
+static PROCESS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct EnvVarGuard {
+    key: &'static str,
+    saved: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let saved = std::env::var_os(key);
+        unsafe { std::env::set_var(key, value) };
+        Self { key, saved }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.saved {
+            Some(value) => unsafe { std::env::set_var(self.key, value) },
+            None => unsafe { std::env::remove_var(self.key) },
+        }
+    }
+}
+
 #[test]
 fn adopted_pr_rejects_sibling_worktree_before_spawn() {
+    let _env_lock = PROCESS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let temp_root = std::env::temp_dir().join(format!(
         "afd_adopted_pr_integration_{}_{}",
         std::process::id(),
@@ -124,9 +151,7 @@ sys.exit(1)
 
     let sessions = CliSessions::new("worldarchitect.ai", "minimax");
 
-    unsafe {
-        std::env::set_var("PATH", &new_path);
-    }
+    let _path_guard = EnvVarGuard::set("PATH", &new_path);
 
     // 1. PRE-SPAWN NEGATIVE CONTROL: local_checkout points to sibling worktree (fails BEFORE AO spawn)
     spec.local_checkout = Some(sibling_worktree.clone());
@@ -162,9 +187,10 @@ sys.exit(1)
     spec.expected_revision = Some(head_rev.clone());
     let _ = std::fs::remove_file(&kill_log);
     let _ = std::fs::remove_file(&spawn_log);
-    unsafe {
-        std::env::set_var("TEST_RETURN_WORKTREE", sibling_worktree.to_string_lossy().as_ref());
-    }
+    let _return_worktree_guard = EnvVarGuard::set(
+        "TEST_RETURN_WORKTREE",
+        sibling_worktree.to_string_lossy().as_ref(),
+    );
     let res_post_drift = sessions.spawn(&spec);
     assert!(res_post_drift.is_err(), "spawn returning sibling worktree must be rejected");
     match res_post_drift.unwrap_err() {
@@ -195,15 +221,14 @@ sys.exit(1)
     assert!(res_ok.is_ok(), "exact managed target worktree must succeed, got: {res_ok:?}");
     assert_eq!(res_ok.unwrap().0, "wa-session-3551");
 
-    unsafe {
-        std::env::set_var("PATH", original_path);
-        std::env::remove_var("TEST_RETURN_WORKTREE");
-    }
     let _ = std::fs::remove_dir_all(&temp_root);
 }
 
 #[test]
 fn adopted_pr_rejects_drift_before_ao_spawn() {
+    let _env_lock = PROCESS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let temp_root = std::env::temp_dir().join(format!(
         "afd_adopted_pr_intake_dispatch_{}_{}",
         std::process::id(),
@@ -381,9 +406,7 @@ sys.exit(1)
     )];
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin.display(), original_path);
-    unsafe {
-        std::env::set_var("PATH", &new_path);
-    }
+    let _path_guard = EnvVarGuard::set("PATH", &new_path);
     let sessions = CliSessions::new(repo, "minimax");
 
     // The public dispatch path pins the PR head SHA in SpawnSpec. A stale
@@ -464,8 +487,5 @@ sys.exit(1)
         .expect("sibling rejection must persist the adopted overlay");
     assert_eq!(sibling_overlay.branch.as_deref(), Some(branch));
 
-    unsafe {
-        std::env::set_var("PATH", original_path);
-    }
     let _ = std::fs::remove_dir_all(&temp_root);
 }

@@ -11,22 +11,35 @@ use std::path::PathBuf;
 fn production_capacity_config_integration() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let live_config = manifest_dir.join("../config/daemon.toml");
-    let example_config = manifest_dir.join("contracts/daemon.toml.example");
-    let selected = if live_config.is_file() {
-        live_config
-    } else {
-        example_config
-    };
+    assert!(
+        live_config.is_file(),
+        "tracked production config is required at {}",
+        live_config.display()
+    );
+    let production = load_capacity_contract(&live_config);
+    assert_dispatch_batch_boundary(&production);
+}
 
-    let production = config::load(&selected).unwrap_or_else(|error| {
+#[test]
+fn example_capacity_config_integration() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let example_config = manifest_dir.join("contracts/daemon.toml.example");
+    load_capacity_contract(&example_config);
+}
+
+fn load_capacity_contract(config_path: &std::path::Path) -> config::Config {
+    let production = config::load(config_path).unwrap_or_else(|error| {
         panic!(
-            "production-selected config {} failed to load: {error}",
-            selected.display()
+            "capacity config {} failed to load: {error}",
+            config_path.display()
         )
     });
     assert_eq!(production.max_workers, 40);
     assert_eq!(production.max_batch, 15);
+    production
+}
 
+fn assert_dispatch_batch_boundary(production: &config::Config) {
     let ready: Vec<_> = (0..20)
         .map(|index| {
             (
@@ -42,7 +55,7 @@ fn production_capacity_config_integration() {
         .collect();
     let sessions = FakeSessions::new();
     let store = FakeStateStore::new();
-    let report = dispatch_ready(&sessions, &store, &production, &ready).unwrap();
+    let report = dispatch_ready(&sessions, &store, production, &ready).unwrap();
 
     assert_eq!(
         report.success_count(),
