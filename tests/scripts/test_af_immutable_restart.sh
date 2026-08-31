@@ -459,7 +459,7 @@ if ! command -v tmux >/dev/null 2>&1; then
   skip "tmux CLI not found on PATH; cannot correlate the AO row to a real worker pane"
 fi
 set +e
-TMUX_PANES_BEFORE="$(tmux list-panes -a -F '#{session_name}\t#{pane_pid}\t#{pane_current_path}' 2>/dev/null)"
+TMUX_PANES_BEFORE="$(tmux list-panes -a -F $'#{session_name}\t#{pane_pid}\t#{pane_current_path}' 2>/dev/null)"
 TMUX_PANES_BEFORE_RC=$?
 set -e
 if [ "$TMUX_PANES_BEFORE_RC" -ne 0 ]; then
@@ -575,7 +575,7 @@ fi
 
 # Re-resolve and compare the exact tmux identity tuple after restart.
 set +e
-TMUX_PANES_AFTER="$(tmux list-panes -a -F '#{session_name}\t#{pane_pid}\t#{pane_current_path}' 2>/dev/null)"
+TMUX_PANES_AFTER="$(tmux list-panes -a -F $'#{session_name}\t#{pane_pid}\t#{pane_current_path}' 2>/dev/null)"
 TMUX_PANES_AFTER_RC=$?
 set -e
 if [ "$TMUX_PANES_AFTER_RC" -ne 0 ]; then
@@ -634,7 +634,7 @@ UNRELATED_AFTER="$(ao status -p "$AO_PROJECT" --json 2>/dev/null)"
 UNRELATED_AFTER_RC=$?
 TEST_PROJECT_SESSIONS_FINAL="$(ao status -p "$AO_TEST_PROJECT" --json 2>/dev/null)"
 TEST_PROJECT_SESSIONS_FINAL_RC=$?
-TMUX_PANES_FINAL="$(tmux list-panes -a -F '#{session_name}\t#{pane_pid}\t#{pane_current_path}' 2>/dev/null)"
+TMUX_PANES_FINAL="$(tmux list-panes -a -F $'#{session_name}\t#{pane_pid}\t#{pane_current_path}' 2>/dev/null)"
 TMUX_PANES_FINAL_RC=$?
 set -e
 if [ "$UNRELATED_AFTER_RC" -ne 0 ]; then

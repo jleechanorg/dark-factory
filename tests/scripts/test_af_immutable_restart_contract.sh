@@ -177,6 +177,10 @@ cat > "$FAKE_BIN/tmux" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 if [ "${1:-}" = "list-panes" ] && [ "${2:-}" = "-a" ] && [ "${3:-}" = "-F" ]; then
+  case "${4:-}" in
+    *$'\t'*) ;;
+    *) printf 'tmux format must contain literal tab separators\n' >&2; exit 99 ;;
+  esac
   if [ ! -f "$FAKE_AO_KILLED_FILE" ] || [ "${FAKE_AO_KEEP_OWNED:-0}" = "1" ] || [ "${FAKE_TMUX_KEEP_OWNED:-0}" = "1" ]; then
     printf 'host-restart-contract-session\t%s\t%s\n' \
       "$(cat "$FAKE_WORKER_PID_FILE")" "$FAKE_WORKER_PANE_PATH"
