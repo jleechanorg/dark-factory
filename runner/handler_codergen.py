@@ -608,13 +608,51 @@ def _fresh_review_workdir(ctx: "Context") -> pathlib.Path | None:
     return resolved
 
 
-def _validate_snapshot_symlinks(target_workdir: pathlib.Path) -> None:
+def _git_ignored_snapshot_paths(target_workdir: pathlib.Path) -> set[pathlib.Path]:
+    """Return ignored, untracked paths that must not enter a review snapshot."""
+    try:
+        proc = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(target_workdir),
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--directory",
+                "-z",
+            ],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("Cannot determine Git-ignored review paths") from exc
+    if proc.returncode != 0:
+        raise RuntimeError("Cannot determine Git-ignored review paths")
+    return {
+        pathlib.Path(os.fsdecode(raw).rstrip("/"))
+        for raw in proc.stdout.split(b"\0")
+        if raw
+    }
+
+
+def _validate_snapshot_symlinks(
+    target_workdir: pathlib.Path, ignored_paths: set[pathlib.Path]
+) -> None:
     """Validate that target_workdir contains no unsafe, escaping, or dangling symlinks."""
     target_real = target_workdir.resolve(strict=True)
-    for root, dirs, files in os.walk(target_workdir, followlinks=False):
+    for root, dirs, files in os.walk(target_workdir, topdown=True, followlinks=False):
         root_path = pathlib.Path(root)
+        root_relative = root_path.relative_to(target_workdir)
+        dirs[:] = [
+            name for name in dirs if root_relative / name not in ignored_paths
+        ]
         for name in dirs + files:
             entry = root_path / name
+            if root_relative / name in ignored_paths:
+                continue
             if entry.is_symlink():
                 try:
                     resolved = entry.resolve(strict=True)
@@ -757,20 +795,27 @@ def _normalize_and_validate_review_git(target_workdir: pathlib.Path, review_dir:
 def _isolated_review_workdir(target_workdir: pathlib.Path):
     """Create an isolated, temporary workspace for fresh reviewer execution.
 
-    Preserves the full working tree (tracked files, staged/unstaged changes,
-    untracked artifacts, and git repository state) so the reviewer can run
-    tools and inspect worker output, while containing any reviewer writes away
-    from the actual coder target worktree.
+    Preserves tracked files, staged/unstaged changes, unignored untracked
+    artifacts, and git repository state so the reviewer can run tools and
+    inspect worker output, while containing any reviewer writes away from the
+    actual coder target worktree.
     """
-    _validate_snapshot_symlinks(target_workdir)
+    ignored_paths = _git_ignored_snapshot_paths(target_workdir)
+    _validate_snapshot_symlinks(target_workdir, ignored_paths)
     with tempfile.TemporaryDirectory(prefix="df-fresh-review-") as tmpdir:
         tmp_path = pathlib.Path(tmpdir)
         review_dir = tmp_path / "workspace"
+
+        def ignore_git_ignored(directory: str, names: list[str]) -> list[str]:
+            relative = pathlib.Path(directory).relative_to(target_workdir)
+            return [name for name in names if relative / name in ignored_paths]
+
         shutil.copytree(
             target_workdir,
             review_dir,
             symlinks=True,
             ignore_dangling_symlinks=False,
+            ignore=ignore_git_ignored,
         )
         _materialize_snapshot_symlinks(target_workdir, review_dir)
         _normalize_and_validate_review_git(target_workdir, review_dir)

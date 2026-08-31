@@ -203,6 +203,46 @@ def test_fresh_reviewer_preserves_untracked_artifacts_and_unstaged_edits(tmp_pat
     assert (repo / "artifact.json").read_text() == '{"tests": "passed"}\n'
 
 
+def test_fresh_reviewer_excludes_git_ignored_runtime_directory(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    (repo / ".gitignore").write_text(".venv/\n")
+    subprocess.run(["git", "-C", str(repo), "add", ".gitignore"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "ignore runtime"], check=True)
+
+    interpreter = tmp_path / "python3"
+    interpreter.write_text("external interpreter\n")
+    (repo / ".venv" / "bin").mkdir(parents=True)
+    (repo / ".venv" / "bin" / "python3").symlink_to(interpreter)
+
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="echo",
+        state={"ao.worktree": str(repo)},
+    )
+    calls: list[pathlib.Path] = []
+    real_run = subprocess.run
+
+    def check_review_tree(args, **kwargs):
+        if args and args[0] == "codex":
+            cwd = pathlib.Path(kwargs["cwd"])
+            calls.append(cwd)
+            assert not (cwd / ".venv").exists()
+            return subprocess.CompletedProcess(args, 0, stdout="Verdict: PASS\n", stderr="")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr("runner.handlers._sandboxed_args_for_workdir", lambda args, workdir: args)
+    monkeypatch.setattr("runner.handlers._sanitized_env", lambda: {})
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", check_review_tree)
+
+    result = _codergen(_review_node(prompt), ctx)
+
+    assert result.outcome == "success"
+    assert len(calls) == 1
+
+
 def test_fresh_reviewer_git_worktree_target_isolation(tmp_path, monkeypatch):
     main_repo = _repo(tmp_path / "main")
     wt_dir = tmp_path / "wt"
