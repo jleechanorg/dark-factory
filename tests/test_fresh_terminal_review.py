@@ -74,6 +74,21 @@ def _run_review(tmp_path, monkeypatch, output: str, *, mutate: bool = False):
     return _codergen(node, ctx), calls, repo
 
 
+def test_slim_prompt_link_resolves_to_repository_prompt_root() -> None:
+    link = ROOT / "pipelines/slim/prompts/prompts"
+    repository_root = ROOT.resolve(strict=True)
+    prompt_root = (ROOT / "prompts").resolve(strict=True)
+
+    assert link.is_symlink(), f"expected tracked prompt link at {link}"
+    try:
+        resolved = link.resolve(strict=True)
+    except OSError as exc:
+        pytest.fail(f"tracked prompt link must not be dangling: {link}: {exc}")
+
+    assert resolved == prompt_root
+    assert resolved.is_relative_to(repository_root)
+
+
 def test_fresh_reviewer_runs_codex_ephemeral_in_isolated_review_workdir(tmp_path, monkeypatch):
     result, calls, repo = _run_review(
         tmp_path,
