@@ -4,6 +4,8 @@ import pathlib
 import subprocess
 import sys
 
+import pytest
+
 ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
@@ -711,3 +713,105 @@ def test_fresh_reviewer_linux_unavailable_landlock_fails_closed(tmp_path, monkey
     assert result.metadata["verdict"] == "unknown"
 
 
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
+def test_fresh_reviewer_rejects_disable_sandbox_before_snapshot_or_launch(tmp_path, monkeypatch, platform):
+    from runner.handler_codergen import _isolated_review_workdir
+
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setenv("DISABLE_SANDBOX", "1")
+
+    repo = _repo(tmp_path)
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    node = _review_node(prompt)
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="codex",
+        state={"ao.worktree": str(repo)},
+    )
+
+    snapshot_calls: list[pathlib.Path] = []
+    real_isolated = _isolated_review_workdir
+
+    def spy_isolated_review_workdir(target_workdir):
+        snapshot_calls.append(target_workdir)
+        return real_isolated(target_workdir)
+
+    monkeypatch.setattr("runner.handler_codergen._isolated_review_workdir", spy_isolated_review_workdir)
+
+    codex_calls: list[list[str]] = []
+    real_run = subprocess.run
+
+    def intercept_run(args, **kwargs):
+        if args and any(pathlib.Path(a).name == "codex" for a in args):
+            codex_calls.append(list(args))
+            return subprocess.CompletedProcess(args, 0, stdout="Verdict: PASS\n", stderr="")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", intercept_run)
+
+    result = _codergen(node, ctx)
+
+    assert result.outcome == "error"
+    assert result.metadata["verdict"] == "unknown"
+    assert result.metadata["fresh_session"] == "true"
+    assert "DISABLE_SANDBOX" in result.output
+    assert "isolation" in result.output.lower()
+    assert len(snapshot_calls) == 0, "Snapshot must not be created when DISABLE_SANDBOX is set"
+    assert len(codex_calls) == 0, "Subprocess must not be launched when DISABLE_SANDBOX is set"
+
+
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
+def test_sandboxed_args_for_fresh_review_rejects_disable_sandbox(tmp_path, monkeypatch, platform):
+    from runner.handler_codergen import _sandboxed_args_for_fresh_review
+
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setenv("DISABLE_SANDBOX", "1")
+
+    repo = _repo(tmp_path)
+    codex_workdir = tmp_path / "review_ws"
+    codex_workdir.mkdir()
+
+    with pytest.raises(ValueError, match="DISABLE_SANDBOX"):
+        _sandboxed_args_for_fresh_review(
+            ["codex", "exec", "--ephemeral", "prompt"],
+            codex_workdir=codex_workdir,
+            target_workdir=repo,
+        )
+
+
+def test_non_verdict_codex_preserves_disable_sandbox(tmp_path, monkeypatch):
+    monkeypatch.setenv("DISABLE_SANDBOX", "1")
+
+    repo = _repo(tmp_path)
+    prompt = tmp_path / "coder.md"
+    prompt.write_text("Implement ${goal}\n")
+    node = make_node(
+        name="coder",
+        type="codergen",
+        backend="codex",
+        prompt=f"@{prompt}",
+        verdict_gate="false",
+    )
+    ctx = Context(
+        goal="do task",
+        workdir=repo,
+        backend="codex",
+    )
+
+    codex_calls: list[list[str]] = []
+    real_run = subprocess.run
+
+    def fake_run(args, **kwargs):
+        if args and any(pathlib.Path(a).name == "codex" for a in args):
+            codex_calls.append(list(args))
+            return subprocess.CompletedProcess(args, 0, stdout="done", stderr="")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", fake_run)
+
+    result = _codergen(node, ctx)
+    assert result.outcome == "success"
+    assert len(codex_calls) == 1
+    assert any(pathlib.Path(a).name == "codex" for a in codex_calls[0])

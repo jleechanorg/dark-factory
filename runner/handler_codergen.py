@@ -788,7 +788,9 @@ def _sandboxed_args_for_fresh_review(
     Fails closed if Landlock kernel boundary is unavailable.
     """
     if os.environ.get("DISABLE_SANDBOX"):
-        return command
+        raise ValueError(
+            "fresh review refuses DISABLE_SANDBOX; isolation is required"
+        )
     from . import handler_sandbox as _sandbox
 
     shim_fn = getattr(_handlers_shim, "_sandboxed_args_for_workdir", None)
@@ -1256,6 +1258,12 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             _stash_codergen_receipt(node, ctx)
         return _finalize(Result(outcome=outcome, output=output, metadata=meta))
     elif backend == "codex":
+        if verdict_gate and os.environ.get("DISABLE_SANDBOX"):
+            return _finalize(Result(
+                outcome="error",
+                output="verdict-gated fresh review refuses DISABLE_SANDBOX; isolation is required",
+                metadata={"verdict": "unknown", "fresh_session": "true"},
+            ))
         target_workdir = _fresh_review_workdir(ctx) if verdict_gate else ctx.workdir
         if target_workdir is None:
             return _finalize(Result(
@@ -1290,7 +1298,6 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                 if (
                     verdict_gate
                     and sys.platform.startswith("linux")
-                    and not os.environ.get("DISABLE_SANDBOX")
                 ):
                     try:
                         runtime = _handlers_shim._create_controller_runtime()
