@@ -129,6 +129,12 @@ def test_two_node_dot_default_bypasses_controller_machinery() -> None:
         assert key not in reviewer.attrs
 
 
+def test_worker_prompt_does_not_reference_deleted_controller_receipts() -> None:
+    """The default worker prompt must describe only the slim feedback loop."""
+    prompt = (ROOT / _WORKER_PROMPT).read_text(encoding="utf-8")
+    assert "verification receipt" not in prompt.lower()
+
+
 def test_two_node_dot_reviewer_prompt_is_short_and_docs_agree() -> None:
     """The default prompt states the goal directly without a controller packet."""
     reviewer = parse(ROOT / _PIPELINE).nodes["cold_reviewer"]
