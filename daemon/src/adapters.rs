@@ -7531,7 +7531,14 @@ impl Sessions for CliSessions {
                         .as_ref()
                         .map(|p| p.to_string_lossy().to_string())
                         .unwrap_or_else(|| format!("https://github.com/{}.git", spec.repo));
-                    ensure_ao_project_recovered(&spec.ao_project, &start_target)?;
+                    if let Err(recovery_error) =
+                        ensure_ao_project_recovered(&spec.ao_project, &start_target)
+                    {
+                        return Err(DaemonError::SpawnRecoveryFailed {
+                            spawn_error: Box::new(err),
+                            recovery_error: Box::new(recovery_error),
+                        });
+                    }
                     self.spawn_with_fallback(spec)
                 } else {
                     Err(err)

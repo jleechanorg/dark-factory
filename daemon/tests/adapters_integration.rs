@@ -1,4 +1,5 @@
 use daemon::adapters::{ChainLlm, CliScm, CliSessions, CliTracker, CliVcs};
+use daemon::errors::DaemonError;
 use daemon::tools::{Llm, Scm, SessionActivity, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
 
 /// Guard for setting environment variables during tests.
@@ -1001,6 +1002,110 @@ sys.exit(1)
     assert!(!recovery_calls[2].contains("--headless"), "Recovery Call 3 must NOT contain --headless: {}", recovery_calls[2]);
     assert!(recovery_calls[3].starts_with("status -p dark-factory"), "Recovery Call 4 must be post-start confirm status -p: {}", recovery_calls[3]);
     assert!(recovery_calls[4].starts_with("spawn"), "Recovery Call 5 must be original spawn retry: {}", recovery_calls[4]);
+
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}
+
+#[test]
+fn ao_recovery_failure_preserves_spawn_and_recovery_errors() {
+    let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_bin_dir = std::env::temp_dir().join(format!(
+        "afd_ao_recovery_failure_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
+    std::fs::create_dir_all(&fake_bin_dir).unwrap();
+
+    let log_file = fake_bin_dir.join("ao_recovery_failure_calls.log");
+    let fake_ao = fake_bin_dir.join("ao");
+    std::fs::write(
+        &fake_ao,
+        format!(
+            r#"#!/usr/bin/env python3
+import sys
+
+args = sys.argv[1:]
+log_path = "{log_path}"
+with open(log_path, "a", encoding="utf-8") as f:
+    f.write(" ".join(args) + "\n")
+
+if args[:1] == ["status"]:
+    print("error: daemon is not running", file=sys.stderr)
+    sys.exit(1)
+if args[:1] == ["start"]:
+    print("RECOVERY_FAILURE_MARKER", file=sys.stderr)
+    sys.exit(7)
+if args[:1] == ["spawn"]:
+    print("SPAWN_FAILURE_MARKER: daemon is not running", file=sys.stderr)
+    sys.exit(1)
+print(f"unknown command: {{args}}", file=sys.stderr)
+sys.exit(1)
+"#,
+            log_path = log_file.display(),
+        ),
+    )
+    .unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&fake_ao).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_ao, permissions).unwrap();
+    }
+
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
+    let _env_guard = EnvVarGuard::set(&[
+        ("PATH", &new_path),
+        ("DARK_FACTORY_CODER_FALLBACK_CHAIN", "minimax"),
+    ]);
+
+    let repo = "jleechanorg/dark-factory";
+    let sessions = CliSessions::new(repo, "minimax");
+    let result = sessions.spawn(&SpawnSpec {
+        bead_id: "ao-recovery-failure-bead".to_string(),
+        branch: "factory/ao-recovery-failure".to_string(),
+        prompt: "recovery failure test".to_string(),
+        repo: repo.to_string(),
+        ao_project: "ao-recovery-failure".to_string(),
+        remote: "origin".to_string(),
+        local_checkout: Some(std::env::current_dir().unwrap()),
+        expected_revision: None,
+        managed_checkout: false,
+        expected_cwd: None,
+    });
+
+    let error = result.expect_err("spawn must report the failed recovery");
+    match &error {
+        DaemonError::SpawnRecoveryFailed {
+            spawn_error,
+            recovery_error,
+        } => {
+            assert_eq!(spawn_error.error_class(), "spawn_fallback_exhausted");
+            assert_eq!(recovery_error.error_class(), "config");
+        }
+        other => panic!("expected structured AO recovery failure, got: {other:?}"),
+    }
+    let rendered = error.to_string();
+    assert!(rendered.contains("SPAWN_FAILURE_MARKER"), "{rendered}");
+    assert!(rendered.contains("RECOVERY_FAILURE_MARKER"), "{rendered}");
+
+    let calls = std::fs::read_to_string(&log_file).unwrap();
+    assert_eq!(
+        calls.lines().filter(|line| line.starts_with("spawn")).count(),
+        1,
+        "initial AO spawn must be attempted once: {calls}"
+    );
+    assert_eq!(
+        calls.lines().filter(|line| line.starts_with("start")).count(),
+        1,
+        "AO recovery start must be attempted exactly once: {calls}"
+    );
 
     let _ = std::fs::remove_dir_all(&fake_bin_dir);
 }
