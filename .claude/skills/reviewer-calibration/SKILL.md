@@ -10,9 +10,11 @@ independent reviewer backends against one frozen target.
 
 ## Rule
 
-Calibration is default-on for real `/f` runs. Treat
-`--reviewer-calibration=true` as present unless the user explicitly passes
-`--reviewer-calibration=false` and gives a reason.
+Calibration is an explicit opt-in workflow for `/f`/`/factory`; it is not part
+of the ordinary default route. Run it only when the user explicitly requests
+`--reviewer-calibration=true` (or invokes this skill directly). The default
+SlimTwoNode graph uses a fresh fully tooled Codex reviewer and does not create
+calibration artifacts.
 
 Do not claim one reviewer underperformed another unless controller receipts
 prove both reviewed the same frozen base/head pair, task digest, prompt digest,

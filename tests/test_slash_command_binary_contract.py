@@ -293,11 +293,12 @@ def test_fs_alias_has_single_owner() -> None:
     assert owners == ["fs.md"]
 
 
-def test_f_defaults_reviewer_calibration_on() -> None:
-    """/f and /factory are thin stubs; the reviewer-calibration contract
-    lives in dark-factory/SKILL.md (single source of truth) rather than
-    being duplicated in each command file. Verify both stubs still point
-    at that skill, and that the skill carries the full contract."""
+def test_f_defaults_to_fresh_reviewer_and_keeps_calibration_explicit() -> None:
+    """The default /f and /factory route is fresh review; calibration is opt-in.
+
+    The reviewer-calibration contract lives in dark-factory/SKILL.md (single
+    source of truth) rather than being duplicated in each command file.
+    """
     f_text = _command("f.md")
     factory_text = _command("factory.md")
     assert "skills/dark-factory/SKILL.md" in f_text, "f.md no longer points at dark-factory/SKILL.md"
@@ -305,8 +306,9 @@ def test_f_defaults_reviewer_calibration_on() -> None:
 
     skill_text = _skill("dark-factory")
     required_phrases = (
-        "--reviewer-calibration=true` is the default",
-        "--reviewer-calibration=false",
+        "--reviewer-calibration=true",
+        "explicit opt-in",
+        "fresh fully tooled",
         "## Reviewer calibration",
         "evidence/<run-id>/reviewer-calibration/",
         "dark-factory review \\",
@@ -324,6 +326,9 @@ def test_f_defaults_reviewer_calibration_on() -> None:
     )
     missing = [phrase for phrase in required_phrases if phrase not in skill_text]
     assert not missing, "dark-factory/SKILL.md missing reviewer calibration contract: " + ", ".join(missing)
+    assert "calibration on" not in f_text.lower()
+    assert "calibration on" not in factory_text.lower()
+    assert "reviewer calibration: not requested" in skill_text.lower()
 
 
 def test_f_resolves_factory_home_from_the_installed_binary() -> None:

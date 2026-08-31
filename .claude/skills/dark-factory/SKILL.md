@@ -207,8 +207,8 @@ When `--pipeline` is a short name (no `/` or `.dot`), expand under
 
 When the user invokes `/f` or `/factory` with no `--pipeline` flag, the
 runner dispatches `pipelines/slim/two_node.dot` by default — exactly two
-productive nodes (a generic `worker` codergen + a `cold_reviewer`
-`type="codergen"` verdict gate), plus a bounded fix loop. The cold reviewer
+productive nodes (a generic `worker` codergen + the `cold_reviewer`
+`type="codergen"` fresh verdict gate), plus a bounded fix loop. The reviewer
 runs as a fresh fully tooled Codex process in the worker's target worktree;
 the engine copies its exact response back into the worker prompt on failure.
 
@@ -326,11 +326,13 @@ resolve_dark_factory_home() {
    `~/projects/dark-factory-holdouts/holdouts/<feature>/` — only the
    PASS/FAIL verdict per scenario name leaked back.
 
-## Reviewer calibration (default on)
+## Reviewer calibration (explicit opt-in)
 
-`--reviewer-calibration=true` is the default for every real `/f`/`/factory`
-run. Treat the flag as present unless the user explicitly passes
-`--reviewer-calibration=false`.
+The ordinary `/f`/`/factory` route does not run reviewer calibration. When
+the user explicitly requests `--reviewer-calibration=true`, run the separate
+matched calibration workflow below. Do not infer calibration from an omitted
+flag, an open PR, or the default SlimTwoNode graph. A legacy
+`--reviewer-calibration=false` is therefore unnecessary for ordinary runs.
 
 Calibration routes the Codex backend through the binary-owned controller
 command:
@@ -364,7 +366,10 @@ and the response's own response SHA-256 digest. Hashing the
 `controller-receipt.json` file itself gives a stable SHA-256 digest for
 the controller receipt.
 
-`prompt.txt` is a binary-emitted audit capture, not an authority file.
+`prompt.txt` is a binary-emitted audit capture, not an authority file. These
+controller artifacts belong only to explicit calibration or legacy
+`cold-review-v1` pipeline runs; they are not produced by the default
+SlimTwoNode reviewer.
 The static authority lives in `prompts/catalog/controller_cold_review_v1.md`
 and is bound by its SHA-256 of the controller receipt.
 
@@ -382,9 +387,10 @@ evidence/<run-id>/reviewer-calibration/
 
 Do not claim delegated subagents underperformed raw Codex unless the same
 envelope and prompt were reviewed at the same SHA and raw Codex found a
-later-confirmed blocker the delegated reviewer missed. If calibration is
-disabled, the final response must say `Reviewer calibration: disabled` and
-give the explicit reason.
+later-confirmed blocker the delegated reviewer missed. If calibration was
+explicitly requested, the final response must identify it as enabled and give
+the artifact path. For ordinary runs, report
+`Reviewer calibration: not requested (default fresh reviewer)`.
 
 The `gate_er` priority queue is `codex > minimax > agy > claude-sonnet` by
 default; passing `--backend claude` for the run itself does not change how
@@ -414,7 +420,7 @@ dark-factory \
 # Wall-clock: <duration>
 # Logs: <path>
 # Evidence envelope: <path>
-# Reviewer calibration: <enabled|disabled> <artifact-path-or-reason>
+# Reviewer calibration: <not-requested|enabled> <artifact-path-or-reason>
 ```
 
 Plus the per-node trace and, on failure, the Healer report.
@@ -468,9 +474,10 @@ Whenever `dark-factory review` completes, the agent MUST immediately report:
   declare the run **invalid** and rerun the pipeline.
 - If `--backend echo` was used, label the run as a wiring smoke, not a real
   validation.
-- Reviewer calibration is default-on. If `--reviewer-calibration=false` is
-  passed, quote the explicit opt-out reason and do not imply raw-Codex-vs-
-  subagent quality was measured.
+- Reviewer calibration is explicit opt-in only. If
+  `--reviewer-calibration=true` is passed, report its artifact path and do
+  not imply raw-Codex-vs-subagent quality was measured unless both lanes have
+  matching controller-bound evidence.
 - Do not claim a factory run based on an in-Claude workflow, `Skill()` call,
   or prose summary. The only valid proof is an actual `dark-factory` binary
   invocation plus the proof block above.

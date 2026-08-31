@@ -14,11 +14,11 @@ execute it as the source of truth.
 ## Usage
 
 ```
-/factory <goal>                          # auto-detect: PR-mode or feature-mode; reviewer calibration on
+/factory <goal>                          # default: SlimTwoNode + fresh fully tooled Codex reviewer
 /factory --pipeline gates <goal>         # explicit pipeline (skips auto-detect)
 /factory --backend echo <goal>           # dry-run wiring smoke
 /factory --feature hello <goal>          # override holdout feature key
-/factory --reviewer-calibration=false <goal>  # explicit opt-out; same as /f
+/factory --reviewer-calibration=true <goal>   # explicit calibration workflow
 ```
 
 ## See also
