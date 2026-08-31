@@ -20,19 +20,16 @@ digraph SpecGenFactory {
     prompt="@prompts/slim/plan.md"
   ]
 
-  // Cold adversarial reviewer plus parallel Codex comparison. The primary
-  // lane uses the adversarial-review priority queue (codex > minimax > agy >
-  // claude-sonnet) via backend_priority=, while the handler also starts the
-  // always-on shadow Codex reviewer and hands both rich outputs downstream.
-  // goal_gate=true means a "failure" verdict routes to fix_main; "success"
-  // routes to plan_attractor.
+  // Fresh, fully tooled Codex reviewer. goal_gate=true means a failed verdict
+  // routes to fix_main; a passing verdict routes to plan_attractor.
   review_main [
-    type="parallel_reviewer",
+    type="codergen",
     label="Cold Review: Main Spec",
     class="review",
-    backend_priority="codex,minimax,agy,claude-sonnet",
-    prefer_adversarial="true",
-    prompt="@prompts/slim/spec_review.md",
+    backend="codex",
+    prompt="@prompts/slim/fresh_review.md",
+    fresh_session="true",
+    verdict_gate="true",
     goal_gate=true,
     retry_target="fix_main",
     timeout=600
@@ -62,12 +59,13 @@ digraph SpecGenFactory {
   ]
 
   review_attractor [
-    type="parallel_reviewer",
+    type="codergen",
     label="Cold Review: Attractor Spec",
     class="review",
-    backend_priority="codex,minimax,agy,claude-sonnet",
-    prefer_adversarial="true",
-    prompt="@prompts/slim/spec_review_attractor.md",
+    backend="codex",
+    prompt="@prompts/slim/fresh_review.md",
+    fresh_session="true",
+    verdict_gate="true",
     goal_gate=true,
     retry_target="fix_attractor",
     timeout=600
