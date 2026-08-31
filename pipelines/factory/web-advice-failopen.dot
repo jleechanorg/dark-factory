@@ -24,12 +24,13 @@ digraph web_advice_failopen {
         timeout=600
     ]
     adversarial_reviewer [
-        type="parallel_reviewer",
-        label="Adversarial reviewer (primary + shadow Codex)",
-        review_contract="cold-review-v1",
-        backend_priority="codex,minimax,agy,claude-sonnet",
-        prefer_adversarial="true",
-        receipt_required="true",
+        type="codergen",
+        label="Fresh Codex Reviewer",
+        class="review",
+        backend="codex",
+        prompt="@prompts/slim/fresh_review.md",
+        fresh_session="true",
+        verdict_gate="true",
         timeout=600
     ]
     gate_es [
