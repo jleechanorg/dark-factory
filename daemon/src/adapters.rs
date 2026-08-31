@@ -1,5 +1,9 @@
 use crate::errors::{DaemonError, SpawnBatchCleanupFailure};
-use crate::tools::{run_tool, run_tool_in_dir, Bead, Issue, LabeledPr, Llm, Permission, PrHeadBranch, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs, WorktreeHeadAncestry};
+use crate::tools::{
+    run_tool, run_tool_in_dir, run_tool_with_env, Bead, Issue, LabeledPr, Llm, Permission,
+    PrHeadBranch, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs,
+    WorktreeHeadAncestry,
+};
 use std::process::{Command, Stdio};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -4067,6 +4071,16 @@ impl CliSessions {
         }
     }
 
+    fn kill_in_project(project: &str, id: &SessionId) -> Result<(), DaemonError> {
+        run_tool_with_env(
+            "ao",
+            &["session", "kill", &id.0],
+            &[("AO_PROJECT_ID", project)],
+            30,
+        )?;
+        Ok(())
+    }
+
     fn run_spawn_process(&self, agent: &str, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
         // Validate the path boundary before allowing checkout preparation to
         // touch disk. `ao_spawn_command` provisions missing managed checkouts
@@ -4149,7 +4163,7 @@ impl CliSessions {
             }
         };
         if let Some(spawn_error) = spawn_error {
-            return match run_tool("ao", &["session", "kill", &session.0], 30) {
+            return match Self::kill_in_project(&spec.ao_project, &session) {
                 Ok(_) => Err(spawn_error),
                 Err(cleanup_error) => Err(DaemonError::SpawnCleanupFailed {
                     session: session.0,
@@ -4764,7 +4778,7 @@ import sys
 args = sys.argv[1:]
 if args[:2] == ["session", "kill"] and len(args) == 3:
     with open(os.environ["AO_FAKE_LOG"], "a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"kind": "kill", "args": args, "session": args[2]}) + "\n")
+        handle.write(json.dumps({"kind": "kill", "args": args, "session": args[2], "project": os.environ.get("AO_PROJECT_ID")}) + "\n")
     if os.environ.get("AO_FAKE_KILL_FAIL") == "1":
         print("scripted batch cleanup failure", file=sys.stderr)
         raise SystemExit(8)
@@ -6013,6 +6027,26 @@ os.execv(real_git, [real_git] + args)
             rows.iter().filter(|row| row["kind"] == "kill").count(),
             1
         );
+        let kill = rows.iter().find(|row| row["kind"] == "kill").unwrap();
+        assert_eq!(kill["project"], "dark-factory");
+    }
+
+    #[test]
+    fn stop_binds_kill_to_the_sessions_project() {
+        let (_, calls) = with_fake_ao("project_bound_stop", serde_json::json!({}), |log| {
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            let result = sessions.stop(&crate::tools::SessionId(
+                "session-project-bound".to_string(),
+            ));
+            (result, std::fs::read_to_string(log).unwrap_or_default())
+        });
+
+        let row: serde_json::Value = calls.lines().next().unwrap().parse().unwrap();
+        assert_eq!(
+            row["args"],
+            serde_json::json!(["session", "kill", "session-project-bound"])
+        );
+        assert_eq!(row["project"], "dark-factory");
     }
 
     #[test]
@@ -6116,6 +6150,7 @@ os.execv(real_git, [real_git] + args)
             kills[0]["args"],
             serde_json::json!(["session", "kill", kills[0]["session"]])
         );
+        assert_eq!(kills[0]["project"], first.ao_project);
     }
 
     #[test]
@@ -7757,7 +7792,9 @@ impl Sessions for CliSessions {
                 Err(spawn_error) => {
                     let mut cleanup_errors = Vec::new();
                     for (session, spawned_spec) in spawned.iter().rev() {
-                        if let Err(cleanup_error) = self.stop(session) {
+                        if let Err(cleanup_error) =
+                            Self::kill_in_project(&spawned_spec.ao_project, session)
+                        {
                             cleanup_errors.push(SpawnBatchCleanupFailure {
                                 session: session.0.clone(),
                                 bead_id: spawned_spec.bead_id.clone(),
@@ -7824,8 +7861,7 @@ impl Sessions for CliSessions {
     }
 
     fn stop(&self, id: &SessionId) -> Result<(), DaemonError> {
-        run_tool("ao", &["session", "kill", &id.0], 30)?;
-        Ok(())
+        Self::kill_in_project(&self.project, id)
     }
 
     fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError> {

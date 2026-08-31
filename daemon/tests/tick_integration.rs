@@ -14507,7 +14507,63 @@ fn test_gate_regression_counter_increments_on_each_green_to_red() {
 }
 
 #[test]
+#[cfg(unix)]
 fn test_non_default_repository_labeled_pr_tick_telemetry_attribution() {
+    let _lock = REAL_TARGET_REPO_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let fake_bin_dir = std::env::temp_dir().join(format!(
+        "afd_non_default_repo_reviewers_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&fake_bin_dir).unwrap();
+    let fake_checkout_dir = fake_bin_dir.with_extension("checkout");
+    std::fs::create_dir_all(&fake_checkout_dir).unwrap();
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["config", "user.email", "test@example.invalid"],
+        vec!["config", "user.name", "test"],
+        vec!["commit", "-q", "--allow-empty", "-m", "fixture"],
+        vec![
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/jleechanorg/worldarchitect.ai.git",
+        ],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&fake_checkout_dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let fixture_head = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&fake_checkout_dir)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    write_fake_reviewer(&fake_bin_dir, "claude", "pass");
+    write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let reviewer_path = format!("{}:{}", fake_bin_dir.display(), original_path);
+    let _env_guard = EnvVarGuard::set(&[
+        ("PATH", &reviewer_path),
+        ("DARK_FACTORY_CODER_DEFAULT", "agy"),
+    ]);
+
     let mut scm = FakeScm::new();
     scm.prs.push(LabeledPr {
         number: 8843,
@@ -14519,21 +14575,20 @@ fn test_non_default_repository_labeled_pr_tick_telemetry_attribution() {
         is_cross_repository: false,
         head_repo_full_name: Some("jleechanorg/worldarchitect.ai".into()),
         head_repo_owner_login: Some("jleechanorg".into()),
-        head_sha: Some("9dc2c198a445450d8fe455e7d691a0492deefe2e".into()),
+        head_sha: Some(fixture_head.clone()),
         updated_at_epoch: Some(1_700_000_000),
     });
     scm.permissions.insert("jleechan2015".into(), Permission::Write);
-    scm.pr_snapshots.insert(
-        8843,
-        qdw_green_snapshot(
+    let mut snapshot = qdw_green_snapshot(
             8843,
             vec![PrComment {
                 author: "dark-factory-er".into(),
                 body: "/er PASS".into(),
                 created_at_epoch: 0,
             }],
-        ),
-    );
+        );
+    snapshot.head_sha = fixture_head.clone();
+    scm.pr_snapshots.insert(8843, snapshot);
 
     let tracker = FakeTracker::new();
     let sessions = FakeSessions::new();
@@ -14547,7 +14602,7 @@ fn test_non_default_repository_labeled_pr_tick_telemetry_attribution() {
         daemon::config::RepoConfig {
             ao_project: "worldarchitect".into(),
             push_remote: "origin".into(),
-            local_checkout: None,
+            local_checkout: Some(fake_checkout_dir.clone()),
         },
     );
     let vcs = test_vcs();
@@ -14593,7 +14648,7 @@ fn test_non_default_repository_labeled_pr_tick_telemetry_attribution() {
         "EXISTING_PR_ADOPTED context must contain branch attribution: {context:?}"
     );
     assert_eq!(
-        context["head_sha"], "9dc2c198a445450d8fe455e7d691a0492deefe2e",
+        context["head_sha"], fixture_head,
         "EXISTING_PR_ADOPTED context must contain head_sha attribution: {context:?}"
     );
     assert_eq!(
@@ -14628,6 +14683,8 @@ fn test_non_default_repository_labeled_pr_tick_telemetry_attribution() {
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
+    let _ = std::fs::remove_dir_all(&fake_checkout_dir);
 }
 
 #[test]
