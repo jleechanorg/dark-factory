@@ -1495,8 +1495,18 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
     meta = {"returncode": str(proc.returncode)}
     meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
     if verdict_gate:
-        terminal_ok, terminal_reason = _verify_terminal_review_report(output)
-        verdict, parsed_outcome = _handlers_shim._parse_verdict(output, gate_strict=True)
+        # Round-4 finding: `output` is stdout+stderr combined, and codex
+        # routinely writes to stderr (progress/warnings) even on a clean
+        # PASS. Feeding the combined text to the terminal-line-exact check
+        # made the appended "STDERR:" block permanently the last line,
+        # so a real terminal `Verdict: PASS` in stdout could never pass —
+        # fail-closed became fail-always. Verdict/terminal-report parsing
+        # must read the reviewer's actual transcript (stdout) only; `output`
+        # (combined) stays the Result/transcript value used everywhere else
+        # (relay, receipts, mutation notice).
+        stdout_only = proc.stdout
+        terminal_ok, terminal_reason = _verify_terminal_review_report(stdout_only)
+        verdict, parsed_outcome = _handlers_shim._parse_verdict(stdout_only, gate_strict=True)
         if not terminal_ok:
             # CRITICAL-4 (external review, round 3): the shared `_parse_verdict`
             # scan is permissive by design (last marker anywhere wins, for

@@ -80,7 +80,7 @@ def _use_tmp_snapshot_root(tmp_path: pathlib.Path, monkeypatch) -> pathlib.Path:
     return snapshot_root
 
 
-def _run_review(tmp_path, monkeypatch, output: str, *, mutate: bool = False):
+def _run_review(tmp_path, monkeypatch, output: str, *, mutate: bool = False, stderr: str = ""):
     repo = _repo(tmp_path)
     prompt = tmp_path / "review.md"
     prompt.write_text(
@@ -111,7 +111,7 @@ def _run_review(tmp_path, monkeypatch, output: str, *, mutate: bool = False):
                 # in, never the live `repo` — that isolation is the point
                 # of the fresh-reviewer snapshot (design item 6).
                 (snapshot_cwd / "value.txt").write_text("reviewer changed this\n")
-            return subprocess.CompletedProcess(args, 0, stdout=output, stderr="")
+            return subprocess.CompletedProcess(args, 0, stdout=output, stderr=stderr)
         return real_run(args, **kwargs)
 
     monkeypatch.setattr("runner.handlers._sandboxed_args_for_workdir", lambda args, workdir: args)
@@ -192,6 +192,40 @@ def test_fresh_reviewer_non_terminal_pass_fails_closed(tmp_path, monkeypatch):
         "Actually wait, let me reconsider one more thing...\n"
     )
     result, _, _ = _run_review(tmp_path, monkeypatch, review)
+
+    assert result.outcome == "error"
+    assert result.metadata["verdict"] == "unknown"
+    assert result.metadata["terminal_report_valid"] == "false"
+
+
+def test_fresh_reviewer_stdout_terminal_pass_accepted_despite_stderr(tmp_path, monkeypatch):
+    """Round-4 finding: codex routinely writes to stderr even on a clean
+    PASS (progress/warnings). The combined stdout+stderr `output` used to
+    feed the terminal-line-exact check, so the appended "STDERR:" block
+    made a real terminal `Verdict: PASS` in stdout permanently unparseable
+    — fail-closed became fail-always. Verdict/terminal parsing must read
+    stdout only; a non-empty stderr must not block a real PASS."""
+    review = "No blocking findings.\nReview completeness: COMPLETE\nVerdict: PASS\n"
+    result, _, _ = _run_review(
+        tmp_path, monkeypatch, review, stderr="codex: some progress/warning noise\n"
+    )
+
+    assert result.outcome == "success"
+    assert result.metadata["verdict"] == "pass"
+    assert result.metadata["terminal_report_valid"] == "true"
+
+
+def test_fresh_reviewer_verdict_only_in_stderr_is_rejected(tmp_path, monkeypatch):
+    """A `Verdict: PASS` line that only appears in stderr (never in
+    stdout — the reviewer's actual transcript) must not be accepted: the
+    reviewer contract is about what the reviewer said, not what leaked to
+    the process's diagnostic stream."""
+    result, _, _ = _run_review(
+        tmp_path,
+        monkeypatch,
+        "No blocking findings.\nReview completeness: COMPLETE\n",
+        stderr="Verdict: PASS\n",
+    )
 
     assert result.outcome == "error"
     assert result.metadata["verdict"] == "unknown"
