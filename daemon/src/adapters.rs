@@ -4359,7 +4359,7 @@ mod spawn_classification_tests {
 
 #[cfg(test)]
 mod ao_spawn_contract_tests {
-    use super::{ao_spawn_bridge_path, gh_env_test_lock, CliSessions};
+    use super::{ao_spawn_bridge_path, gh_env_test_lock, process_start_ticks, CliSessions};
     use crate::errors::DaemonError;
     use crate::tools::{Sessions, SpawnSpec};
     use std::os::unix::fs::PermissionsExt;
@@ -4462,6 +4462,79 @@ print("  Branch:   " + os.environ.get("AO_FAKE_RETURN_BRANCH", os.environ["DARK_
         dir
     }
 
+    struct ReadyAoControllerEnv {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl ReadyAoControllerEnv {
+        fn seed(root: &std::path::Path) -> Self {
+            const ENV_VARS: [(&str, &str); 7] = [
+                ("DARK_FACTORY_AO_CONTROLLER_HOME", ""),
+                ("DARK_FACTORY_OPERATOR_HOME", ""),
+                ("DARK_FACTORY_AO_CONFIG_PATH", ""),
+                ("DARK_FACTORY_AO_RECOVERY_TIMEOUT_MS", "100"),
+                ("DARK_FACTORY_AO_RECOVERY_POLL_MS", "1"),
+                ("DARK_FACTORY_AO_RECOVERY_SUSTAIN_MS", "1"),
+                ("DARK_FACTORY_AO_RECOVERY_COOLDOWN_MS", "1"),
+            ];
+            let controller_home = root.join("controller-home");
+            let operator_home = root.join("operator-home");
+            let config_path = operator_home.join("agent-orchestrator.yaml");
+            std::fs::create_dir_all(controller_home.join(".agent-orchestrator")).unwrap();
+            std::fs::create_dir_all(&operator_home).unwrap();
+
+            let pid = std::process::id();
+            let start_ticks = process_start_ticks(pid)
+                .expect("test process must expose /proc start ticks for AO readiness");
+            std::fs::write(
+                controller_home.join("controller.json"),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "pid": pid,
+                    "process_start_ticks": start_ticks,
+                    "project": "dark-factory",
+                    "target": "dark-factory",
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                controller_home.join(".agent-orchestrator/running.json"),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "pid": pid,
+                    "projects": ["dark-factory"],
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let saved = ENV_VARS
+                .iter()
+                .map(|(key, _)| (*key, std::env::var_os(key)))
+                .collect();
+            for (key, default) in ENV_VARS {
+                let value = match key {
+                    "DARK_FACTORY_AO_CONTROLLER_HOME" => controller_home.as_os_str(),
+                    "DARK_FACTORY_OPERATOR_HOME" => operator_home.as_os_str(),
+                    "DARK_FACTORY_AO_CONFIG_PATH" => config_path.as_os_str(),
+                    _ => std::ffi::OsStr::new(default),
+                };
+                std::env::set_var(key, value);
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for ReadyAoControllerEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
     fn with_fake_ao<T>(
         test_name: &str,
         bindings: serde_json::Value,
@@ -4471,6 +4544,7 @@ print("  Branch:   " + os.environ.get("AO_FAKE_RETURN_BRANCH", os.environ["DARK_
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = fake_ao_dir(test_name);
+        let _ready_controller = ReadyAoControllerEnv::seed(&dir);
         let log = dir.join("calls.jsonl");
         let old_path = std::env::var("PATH").unwrap_or_default();
         let old_bindings = std::env::var("AO_FAKE_EXPECTED_BINDINGS").ok();
@@ -5537,6 +5611,7 @@ export const isTerminalSession = () => false;
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
+        let _ready_controller = ReadyAoControllerEnv::seed(&root);
         let log = root.join("calls.jsonl");
         let fake_ao = root.join("ao");
         std::fs::write(
@@ -5604,6 +5679,7 @@ raise SystemExit(9)
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
+        let _ready_controller = ReadyAoControllerEnv::seed(&root);
         let log = root.join("calls.jsonl");
         let fake_ao = root.join("ao");
         std::fs::write(
@@ -6058,6 +6134,7 @@ export const isTerminalSession = () => false;
         let first_workspace = root.join("df-batch-alpha");
         let second_workspace = root.join("df-batch-beta");
         std::fs::create_dir_all(&bin).unwrap();
+        let _ready_controller = ReadyAoControllerEnv::seed(&root);
         std::fs::create_dir_all(cli.join("dist/lib")).unwrap();
         std::fs::create_dir_all(core.join("dist")).unwrap();
         for workspace in [&first_workspace, &second_workspace] {
@@ -9435,8 +9512,11 @@ exit 1
             }
         }
         std::fs::remove_dir_all(&dir).ok();
-        assert!(result.is_err(), "pr_snapshot must return Err when circuit breaker trips on checks rate limit");
-        assert!(result.unwrap_err().is_gh_rate_limit());
+        let snapshot = result.expect(
+            "the REST fallback must preserve a truthful pending snapshot after the GraphQL breaker trips",
+        );
+        assert!(snapshot.ci_pending);
+        assert_eq!(snapshot.ci_status, "unknown");
         assert!(
             tripped_during_call,
             "detect_and_mark_graphql_rate_limit must trip the shared circuit \

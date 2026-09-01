@@ -321,7 +321,11 @@ mod tests {
     use super::*;
     #[test]
     fn parses_example_config() {
-        let cfg = load(std::path::Path::new("contracts/daemon.toml.example")).unwrap();
+        let cfg = load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("contracts/daemon.toml.example"),
+        )
+        .unwrap();
         assert_eq!(cfg.ao_project.as_deref(), Some("dark-factory"));
         assert_eq!(cfg.stage, 1);
         assert_eq!(cfg.max_workers, 30);
