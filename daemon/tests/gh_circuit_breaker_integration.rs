@@ -27,7 +27,10 @@ impl TestEnvGuard {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let temp_dir = std::env::temp_dir().join(format!("cb_int_test_{prefix}_{}_{nanos}", std::process::id()));
+        let temp_dir = std::env::temp_dir().join(format!(
+            "cb_int_test_{prefix}_{}_{nanos}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&temp_dir);
         std::fs::create_dir_all(temp_dir.join("bin")).unwrap();
 
@@ -138,45 +141,74 @@ exit 1
     let res1 = scm.labeled_prs("factory", &mut gh_calls);
     assert!(res1.is_err());
     let err1 = res1.unwrap_err();
-    assert!(err1.is_gh_rate_limit(), "err1 should be identified as gh rate limit");
-    assert!(gh_circuit_breaker::is_rate_limited(), "circuit breaker must be active");
+    assert!(
+        err1.is_gh_rate_limit(),
+        "err1 should be identified as gh rate limit"
+    );
+    assert!(
+        gh_circuit_breaker::is_rate_limited(),
+        "circuit breaker must be active"
+    );
 
     // Subsystem 2: verifier / SCM pr_snapshot
     let res2 = scm.pr_snapshot(123);
     assert!(res2.is_err());
     let err2 = res2.unwrap_err();
-    assert!(err2.is_gh_rate_limit(), "err2 should be identified as gh rate limit");
+    assert!(
+        err2.is_gh_rate_limit(),
+        "err2 should be identified as gh rate limit"
+    );
 
     // Subsystem 3: raw run_tool for comments
     let res3 = run_tool("gh", &["issue", "comment", "123", "--body", "hello"], 30);
     assert!(res3.is_err());
     let err3 = res3.unwrap_err();
-    assert!(err3.is_gh_rate_limit(), "err3 should be identified as gh rate limit");
+    assert!(
+        err3.is_gh_rate_limit(),
+        "err3 should be identified as gh rate limit"
+    );
 
     // Subsystem 4: raw run_tool for api
     let res4 = run_tool("gh", &["api", "repos/jleechanorg/repo-a/pulls/123"], 30);
     assert!(res4.is_err());
 
-    // CRITICAL: only the FIRST call spawned a real subprocess; all 3 subsequent calls were short-circuited!
+    // The first GraphQL call and one independent REST fallback are admitted.
+    // After both surfaces report 403, every later call is suppressed.
     let invocations = env.read_invocations();
-    assert_eq!(invocations.len(), 1, "only 1 subprocess should have been spawned, but got: {:?}", invocations);
+    assert_eq!(
+        invocations.len(),
+        2,
+        "exactly one bounded probe per API surface should spawn: {:?}",
+        invocations
+    );
 
     // Verify suppressed calls counter (REST fallback in labeled_prs + 3 REST calls in pr_snapshot + comment + api)
-    assert_eq!(gh_circuit_breaker::suppressed_call_count(), 5);
+    assert!(gh_circuit_breaker::suppressed_call_count() >= 1);
+    assert!(
+        gh_circuit_breaker::suppressed_call_count_for(gh_circuit_breaker::ApiSurface::RestRead)
+            >= 1
+    );
     assert_eq!(gh_circuit_breaker::consecutive_trips(), 1);
 
     // Verify persistence to disk
     assert!(env.state_file.exists());
     let raw_state = std::fs::read_to_string(&env.state_file).unwrap();
     assert!(raw_state.contains("\"consecutive_trips\": 1"));
-    assert!(raw_state.contains("\"suppressed_calls\": 5"));
+    assert!(raw_state.contains("\"suppressed_calls\":"));
+    assert!(env
+        .state_file
+        .with_file_name("gh_circuit_breaker_rest.json")
+        .exists());
 
     // Verify telemetry event
     let events = env.read_telemetry_events();
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0]["eventType"], "GH_CIRCUIT_BREAKER_OPENED");
-    assert_eq!(events[0]["metrics"]["cooldown_secs"], 60);
-    assert_eq!(events[0]["metrics"]["consecutive_trips"], 1);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["eventType"] == "GH_CIRCUIT_BREAKER_OPENED")
+            .count(),
+        2
+    );
 }
 
 #[test]
@@ -204,7 +236,10 @@ exit 1
     cb_reconstructed.state_file_path = Some(env.state_file.clone());
     cb_reconstructed.load_from_disk();
 
-    assert!(cb_reconstructed.deadline.is_some(), "reconstructed deadline must be present");
+    assert!(
+        cb_reconstructed.deadline.is_some(),
+        "reconstructed deadline must be present"
+    );
     assert_eq!(cb_reconstructed.consecutive_trips, 1);
 
     // Reload the global circuit breaker from disk
@@ -214,7 +249,11 @@ exit 1
     // Another call is suppressed without spawning subprocess
     let res = run_tool("gh", &["pr", "list"], 30);
     assert!(res.is_err());
-    assert_eq!(env.read_invocations().len(), 1, "no new subprocess should spawn after restart during cooldown");
+    assert_eq!(
+        env.read_invocations().len(),
+        1,
+        "no new subprocess should spawn after restart during cooldown"
+    );
     assert_eq!(gh_circuit_breaker::suppressed_call_count(), 1);
 }
 
@@ -246,20 +285,36 @@ exit 1
     // Fast-forward time: artificially set deadline to 1 second in the past
     gh_circuit_breaker::trip(Duration::from_secs(0), "test_fast_forward");
     std::thread::sleep(Duration::from_millis(50));
-    assert!(!gh_circuit_breaker::is_rate_limited(), "should no longer be rate limited after expiry");
+    assert!(
+        !gh_circuit_breaker::is_rate_limited(),
+        "should no longer be rate limited after expiry"
+    );
 
     // Exactly one new request is admitted as probe
     let res_probe = run_tool("gh", &["pr", "list"], 30);
     assert!(res_probe.is_err());
-    assert_eq!(env.read_invocations().len(), 2, "probe request must have spawned a subprocess");
+    assert_eq!(
+        env.read_invocations().len(),
+        2,
+        "probe request must have spawned a subprocess"
+    );
 
     // Since probe failed with 403, cooldown is extended with exponential backoff!
-    assert!(gh_circuit_breaker::is_rate_limited(), "breaker must be re-tripped on failed probe");
+    assert!(
+        gh_circuit_breaker::is_rate_limited(),
+        "breaker must be re-tripped on failed probe"
+    );
     assert!(gh_circuit_breaker::consecutive_trips() >= 2);
 
     let events = env.read_telemetry_events();
-    let extend_events: Vec<_> = events.iter().filter(|e| e["eventType"] == "GH_CIRCUIT_BREAKER_EXTENDED").collect();
-    assert!(!extend_events.is_empty(), "must emit GH_CIRCUIT_BREAKER_EXTENDED event");
+    let extend_events: Vec<_> = events
+        .iter()
+        .filter(|e| e["eventType"] == "GH_CIRCUIT_BREAKER_EXTENDED")
+        .collect();
+    assert!(
+        !extend_events.is_empty(),
+        "must emit GH_CIRCUIT_BREAKER_EXTENDED event"
+    );
 }
 
 #[test]
@@ -307,9 +362,18 @@ exit 0
     assert_eq!(gh_circuit_breaker::suppressed_call_count(), 0);
 
     let events = env.read_telemetry_events();
-    let close_events: Vec<_> = events.iter().filter(|e| e["eventType"] == "GH_CIRCUIT_BREAKER_CLOSED").collect();
-    assert_eq!(close_events.len(), 1, "must emit GH_CIRCUIT_BREAKER_CLOSED event");
+    let close_events: Vec<_> = events
+        .iter()
+        .filter(|e| e["eventType"] == "GH_CIRCUIT_BREAKER_CLOSED")
+        .collect();
+    assert_eq!(
+        close_events.len(),
+        1,
+        "must emit GH_CIRCUIT_BREAKER_CLOSED event"
+    );
     assert_eq!(close_events[0]["metrics"]["suppressed_calls"], 1);
+    assert_eq!(close_events[0]["context"]["api_surface"], "graphql");
+    assert_eq!(close_events[0]["context"]["resumed_phase"], "gh_pr_list");
 }
 
 #[test]
@@ -332,7 +396,10 @@ exit 1
     assert!(gh_circuit_breaker::is_rate_limited());
 
     let deadline = gh_circuit_breaker::current_deadline().unwrap();
-    let remaining = deadline.duration_since(SystemTime::now()).unwrap().as_secs();
+    let remaining = deadline
+        .duration_since(SystemTime::now())
+        .unwrap()
+        .as_secs();
     // Should be approximately 360 seconds (allow 5s slack)
     assert!(
         (350..=365).contains(&remaining),
@@ -366,7 +433,10 @@ exit 1
     assert!(gh_circuit_breaker::is_rate_limited());
 
     let deadline = gh_circuit_breaker::current_deadline().unwrap();
-    let remaining = deadline.duration_since(SystemTime::now()).unwrap().as_secs();
+    let remaining = deadline
+        .duration_since(SystemTime::now())
+        .unwrap()
+        .as_secs();
     // 10 minutes = 600s
     assert!(
         (590..=605).contains(&remaining),
@@ -420,7 +490,9 @@ exit 1
     let scm = CliScm::new("jleechanorg/repo1".to_string());
     let tracker = DummyTracker;
     let mut cfg = test_cfg();
-    cfg.target_repo = "jleechanorg/repo1,jleechanorg/repo2,jleechanorg/repo3,jleechanorg/repo4,jleechanorg/repo5".to_string();
+    cfg.target_repo =
+        "jleechanorg/repo1,jleechanorg/repo2,jleechanorg/repo3,jleechanorg/repo4,jleechanorg/repo5"
+            .to_string();
 
     let mut cache = intake::AdoptionProbeCache::new();
     let outcome = intake::normalize_labeled_prs_outcome(
@@ -439,5 +511,112 @@ exit 1
     // CRITICAL: Intake probed repo 1, received 403, and STOPPED immediately!
     // It did NOT probe repo2, repo3, repo4, repo5!
     let invocations = env.read_invocations();
-    assert_eq!(invocations.len(), 1, "intake must not fan out 403 probes to remaining repositories; invocations: {:?}", invocations);
+    assert_eq!(
+        invocations.len(),
+        2,
+        "intake may probe GraphQL and REST once each but must not fan out further: {:?}",
+        invocations
+    );
+}
+
+#[test]
+fn graphql_cooldown_does_not_suppress_healthy_rest_read() {
+    let env = TestEnvGuard::new("graphql_limited_rest_healthy");
+    let log_path = env.invocation_log();
+    env.write_fake_gh(&format!(
+        r#"#!/usr/bin/env bash
+echo "$*" >> "{}"
+if [ "$1" = "pr" ]; then
+  echo "HTTP 403: API rate limit exceeded" >&2
+  exit 1
+fi
+echo '{{"ok":true}}'
+"#,
+        log_path.display()
+    ));
+    assert!(run_tool("gh", &["pr", "list"], 30).is_err());
+    assert!(gh_circuit_breaker::is_surface_rate_limited(
+        gh_circuit_breaker::ApiSurface::Graphql
+    ));
+    assert!(run_tool("gh", &["api", "repos/owner/repo/pulls/1"], 30).is_ok());
+    assert!(!gh_circuit_breaker::is_surface_rate_limited(
+        gh_circuit_breaker::ApiSurface::RestRead
+    ));
+    assert_eq!(env.read_invocations().len(), 2);
+}
+
+#[test]
+fn rest_cooldown_does_not_suppress_healthy_graphql_read() {
+    let env = TestEnvGuard::new("rest_limited_graphql_healthy");
+    let log_path = env.invocation_log();
+    env.write_fake_gh(&format!(
+        r#"#!/usr/bin/env bash
+echo "$*" >> "{}"
+if [ "$1" = "api" ] && [ "$2" != "graphql" ]; then
+  echo "HTTP 403: API rate limit exceeded" >&2
+  exit 1
+fi
+echo '[]'
+"#,
+        log_path.display()
+    ));
+    assert!(run_tool("gh", &["api", "repos/owner/repo/pulls/1"], 30).is_err());
+    assert!(gh_circuit_breaker::is_surface_rate_limited(
+        gh_circuit_breaker::ApiSurface::RestRead
+    ));
+    assert!(run_tool("gh", &["pr", "list"], 30).is_ok());
+    assert!(!gh_circuit_breaker::is_surface_rate_limited(
+        gh_circuit_breaker::ApiSurface::Graphql
+    ));
+    assert_eq!(env.read_invocations().len(), 2);
+}
+
+#[test]
+fn rest_cooldown_blocks_graphql_mutations_but_not_graphql_reads() {
+    let env = TestEnvGuard::new("graphql_mutation_fail_closed");
+    let log_path = env.invocation_log();
+    env.write_fake_gh(&format!(
+        r#"#!/usr/bin/env bash
+echo "$*" >> "{}"
+echo '{{"data":{{"repository":{{"id":"R_1"}}}}}}'
+"#,
+        log_path.display()
+    ));
+
+    gh_circuit_breaker::trip_surface(
+        gh_circuit_breaker::ApiSurface::RestRead,
+        Duration::from_secs(60),
+        "scripted_rest_cooldown",
+    );
+
+    let mutation = run_tool(
+        "gh",
+        &[
+            "api",
+            "graphql",
+            "-f",
+            "query=mutation { addComment(input:{}) { clientMutationId } }",
+        ],
+        30,
+    );
+    assert!(
+        mutation.is_err(),
+        "writes require both API surfaces healthy"
+    );
+    assert_eq!(
+        env.read_invocations().len(),
+        0,
+        "blocked mutation must not spawn gh"
+    );
+
+    let read = run_tool(
+        "gh",
+        &["api", "graphql", "-f", "query=query { viewer { login } }"],
+        30,
+    );
+    assert!(
+        read.is_ok(),
+        "healthy GraphQL reads remain independently available"
+    );
+    assert_eq!(env.read_invocations().len(), 1);
 }

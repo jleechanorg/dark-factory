@@ -316,10 +316,7 @@ impl Scm for FakeScm {
         self.calls
             .borrow_mut()
             .push(format!("close_pr({pr},{comment})"));
-        if let Some(stderr) = self
-            .pr_already_terminal
-            .get(&("default".to_string(), pr))
-        {
+        if let Some(stderr) = self.pr_already_terminal.get(&("default".to_string(), pr)) {
             return Err(DaemonError::Tool {
                 tool: "gh".into(),
                 rc: 1,
@@ -978,6 +975,10 @@ impl Sessions for FakeSessions {
 #[derive(Default)]
 pub struct FakeVcs {
     pub heads: HashMap<String, String>,
+    /// Optional transient failure for `base_head_for_repo`, keyed by
+    /// `repo@branch`. Removing the entry models the API recovering on a
+    /// later daemon tick.
+    pub fail_base_head_for_repo: RefCell<HashMap<String, String>>,
     /// Per-(branch, remote_sha) script for `is_remote_ahead`. When absent the
     /// default is `false` so tests that don't exercise the stall-bypass guard
     /// don't have to set it up. Tests that DO exercise the guard
@@ -1046,6 +1047,18 @@ impl FakeVcs {
             .push(branch.to_string());
     }
 
+    pub fn fail_base_head_for_repo(&self, repo: &str, branch: &str, message: &str) {
+        self.fail_base_head_for_repo
+            .borrow_mut()
+            .insert(format!("{repo}@{branch}"), message.to_string());
+    }
+
+    pub fn clear_base_head_for_repo_failure(&self, repo: &str, branch: &str) {
+        self.fail_base_head_for_repo
+            .borrow_mut()
+            .remove(&format!("{repo}@{branch}"));
+    }
+
     /// Script `head_sha(branch)` to return `sha_before` until real instant
     /// `at`, then `sha_after` from `at` onward — i.e. a single simulated
     /// push landing at wall-clock instant `at`. Call multiple times with
@@ -1111,6 +1124,13 @@ impl Vcs for FakeVcs {
             .borrow_mut()
             .push(format!("base_head_for_repo({repo},{base_branch})"));
         let scoped_key = format!("{repo}@{base_branch}");
+        if let Some(message) = self.fail_base_head_for_repo.borrow().get(&scoped_key) {
+            return Err(DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr: message.clone(),
+            });
+        }
         if let Some(sha) = self.heads.get(&scoped_key) {
             return Ok(sha.clone());
         }
@@ -1167,11 +1187,7 @@ impl Vcs for FakeVcs {
     /// override via a wrapper. Recording the call here lets us verify
     /// the reroll reached the recovery branch on a scripted stale
     /// `create_branch_at_for_repo` 422.
-    fn delete_branch_at_for_repo(
-        &self,
-        repo: &str,
-        name: &str,
-    ) -> Result<(), DaemonError> {
+    fn delete_branch_at_for_repo(&self, repo: &str, name: &str) -> Result<(), DaemonError> {
         self.calls
             .borrow_mut()
             .push(format!("delete_branch_at_for_repo({repo},{name})"));
@@ -1212,9 +1228,9 @@ impl Vcs for FakeVcs {
         branch: &str,
         timeout_secs: u64,
     ) -> Result<String, DaemonError> {
-        self.calls
-            .borrow_mut()
-            .push(format!("head_sha_within_for_repo({repo},{branch},{timeout_secs})"));
+        self.calls.borrow_mut().push(format!(
+            "head_sha_within_for_repo({repo},{branch},{timeout_secs})"
+        ));
         let scoped_key = format!("{repo}@{branch}");
         let permanent_map = self.fail_head_sha_permanent_for.borrow();
         if let Some(msg) = permanent_map
@@ -1233,7 +1249,10 @@ impl Vcs for FakeVcs {
             });
         }
         let schedule_map = self.head_sha_schedule.borrow();
-        if let Some(schedule) = schedule_map.get(&scoped_key).or_else(|| schedule_map.get(branch)) {
+        if let Some(schedule) = schedule_map
+            .get(&scoped_key)
+            .or_else(|| schedule_map.get(branch))
+        {
             let now = std::time::Instant::now();
             if let Some((_, sha)) = schedule.iter().rfind(|(at, _)| *at <= now) {
                 return Ok(sha.clone());
@@ -1402,8 +1421,7 @@ pub struct FakeStateStore {
     /// `escalation_should_emit`/`record_escalation_emit`/
     /// `mark_escalation_undeliverable` impls so tick-integration tests can
     /// exercise the dedup + terminal-marking paths without a real SQLite DB.
-    pub escalation_ledger:
-        RefCell<HashMap<(String, String), EscalationLedgerEntry>>,
+    pub escalation_ledger: RefCell<HashMap<(String, String), EscalationLedgerEntry>>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -1933,9 +1951,9 @@ impl StateStore for FakeStateStore {
         now_epoch: u64,
         refire_secs: u64,
     ) -> Result<bool, DaemonError> {
-        self.calls.borrow_mut().push(format!(
-            "escalation_should_emit({bead_id},{reason})"
-        ));
+        self.calls
+            .borrow_mut()
+            .push(format!("escalation_should_emit({bead_id},{reason})"));
         match self
             .escalation_ledger
             .borrow()
@@ -1961,9 +1979,9 @@ impl StateStore for FakeStateStore {
         context_hash: &str,
         now_epoch: u64,
     ) -> Result<(), DaemonError> {
-        self.calls.borrow_mut().push(format!(
-            "record_escalation_emit({bead_id},{reason})"
-        ));
+        self.calls
+            .borrow_mut()
+            .push(format!("record_escalation_emit({bead_id},{reason})"));
         let mut ledger = self.escalation_ledger.borrow_mut();
         let entry = ledger
             .entry((bead_id.to_string(), reason.to_string()))
@@ -1981,9 +1999,9 @@ impl StateStore for FakeStateStore {
         bead_id: &str,
         reason: &str,
     ) -> Result<(), DaemonError> {
-        self.calls.borrow_mut().push(format!(
-            "mark_escalation_undeliverable({bead_id},{reason})"
-        ));
+        self.calls
+            .borrow_mut()
+            .push(format!("mark_escalation_undeliverable({bead_id},{reason})"));
         let mut ledger = self.escalation_ledger.borrow_mut();
         let entry = ledger
             .entry((bead_id.to_string(), reason.to_string()))
