@@ -813,6 +813,40 @@ def _run_single_node(
         _obs._write_heartbeat(ctx, graph, node, is_complete=True)
 
 
+def _restore_target_mint_state(ctx: Context, graph: Graph, resumed: list) -> None:
+    """D3/D8a: on resume, restore the mint-state keys from the most recent
+    worker-success step into `ctx.state` before letting either a worker retry
+    or a reviewer visit proceed. Without this, a process restart re-anchors
+    `_target_base_sha`/`_target_pin_chain` from the resumed HEAD instead of
+    the original frozen base. Only applies to graphs that opted into the
+    mint contract (`_df_mint_review_target`); fail-closed if opted in but the
+    keys are missing from that step's metadata.
+    """
+    mint_enabled = str(
+        ctx.state.get("_df_mint_review_target", "false")
+    ).strip().lower() in {"true", "1", "yes", "on"}
+    if not mint_enabled:
+        return
+    for previous in reversed(resumed):
+        previous_node = graph.nodes.get(previous.node)
+        if previous_node is None or (
+            str(previous_node.attrs.get("class", "")).strip().lower() != "worker"
+        ):
+            continue
+        if str(previous.outcome).strip().lower() == "success":
+            missing = [
+                key for key in _TARGET_MINT_STATE_KEYS if key not in previous.metadata
+            ]
+            if missing:
+                raise ValueError(
+                    "checkpoint is missing review-target mint state required "
+                    f"to resume: {missing!r}"
+                )
+            for key in _TARGET_MINT_STATE_KEYS:
+                ctx.state[key] = str(previous.metadata[key])
+        break
+
+
 def run(
     graph: Graph,
     ctx: Context,
@@ -930,52 +964,24 @@ def run(
                                 previous.metadata["_review_feedback"]
                             )
                         break
+                    # D3/D8a: the retry visit re-mints from ctx.state["_target_base_sha"]
+                    # / ctx.state["_target_pin_chain"] (handler_codergen._mint_post_worker_target).
+                    # Those keys are memory-only and would not survive a
+                    # process restart between the reviewer's FAIL and this
+                    # worker retry, so restore them from the prior
+                    # worker-success step before the retry launches — mirrors
+                    # the review-branch restoration below.
+                    _restore_target_mint_state(ctx, graph, resumed)
                 elif (
                     str(next_node.attrs.get("class", "")).strip().lower()
                     == "review"
                 ):
-                    # D3/D8a fail-closed, mirrors the worker-retry block
-                    # above: a successful worker visit mints the review
-                    # target locator, intent envelope, and pin chain
-                    # directly into ctx.state (stashed onto that worker
-                    # step's metadata above in `_run_single_node`). Those
-                    # keys are otherwise memory-only and would not survive
-                    # a process restart, so restore them from the most
-                    # recent worker-success step before letting the
-                    # reviewer visit launch. Only required for graphs that
-                    # opted into the mint contract — `_df_mint_review_target`
-                    # is re-derived from the graph shape on every
-                    # invocation (see runner/__main__.py), including this
-                    # resume, so it reflects the same value the interrupted
-                    # run used.
-                    mint_enabled = str(
-                        ctx.state.get("_df_mint_review_target", "false")
-                    ).strip().lower() in {"true", "1", "yes", "on"}
-                    if mint_enabled:
-                        for previous in reversed(resumed):
-                            previous_node = graph.nodes.get(previous.node)
-                            if previous_node is None or (
-                                str(previous_node.attrs.get("class", ""))
-                                .strip()
-                                .lower()
-                                != "worker"
-                            ):
-                                continue
-                            if str(previous.outcome).strip().lower() == "success":
-                                missing = [
-                                    key
-                                    for key in _TARGET_MINT_STATE_KEYS
-                                    if key not in previous.metadata
-                                ]
-                                if missing:
-                                    raise ValueError(
-                                        "checkpoint is missing review-target mint "
-                                        "state required to resume into a reviewer "
-                                        f"visit: {missing!r}"
-                                    )
-                                for key in _TARGET_MINT_STATE_KEYS:
-                                    ctx.state[key] = str(previous.metadata[key])
-                            break
+                    # D3/D8a: a successful worker visit mints the review
+                    # target locator, intent envelope, and pin chain directly
+                    # into ctx.state (stashed onto that worker step's
+                    # metadata above in `_run_single_node`). Restore them
+                    # before the reviewer visit launches.
+                    _restore_target_mint_state(ctx, graph, resumed)
                 current = next_node
 
     # Always have an addressable run_id so diagnostics are locatable even when

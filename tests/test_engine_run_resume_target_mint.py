@@ -285,3 +285,173 @@ def test_resume_into_review_visit_without_mint_opt_in_is_unaffected(
     ctx2 = Context(goal="fix the thing", workdir=ROOT, backend="echo")
     history = run(graph, ctx2, checkpoint=checkpoint, resume=checkpoint)
     assert history[-1].outcome == "success"
+
+
+def test_checkpoint_resume_into_worker_retry_continues_pin_chain_after_reviewer_fail(
+    git_repo, tmp_path, monkeypatch
+) -> None:
+    """Mirror-image gap of the review-branch restoration: resuming into a
+    WORKER retry (the more common restart point — right after a reviewer
+    FAIL) must also restore the mint-state keys, not just
+    `_last_review_feedback`. Restart between a reviewer's FAIL and the
+    worker's next retry visit must keep the pin chain anchored at the
+    ORIGINAL base — not re-anchor from whatever HEAD happens to be current
+    when the run resumes."""
+    dispatcher = _make_reviewer_dispatcher("fix", ["FAIL", "PASS"])
+    monkeypatch.setitem(TYPE_REGISTRY, "codergen", dispatcher)
+
+    graph = parse(ROOT / _PIPELINE)
+    checkpoint = tmp_path / "checkpoint.json"
+    append_record = engine_persist._append_record
+
+    def interrupt_after_reviewer_failure(*args, **kwargs):
+        seq = append_record(*args, **kwargs)
+        record = args[5]
+        if record.node == "cold_reviewer" and record.outcome == "failure":
+            raise KeyboardInterrupt("simulated restart before worker retry")
+        return seq
+
+    monkeypatch.setattr(engine_persist, "_append_record", interrupt_after_reviewer_failure)
+
+    from runner.engine import run
+
+    ctx1 = Context(
+        goal="fix the thing",
+        workdir=git_repo,
+        backend="echo",
+        state={"_df_mint_review_target": "true"},
+    )
+    with pytest.raises(KeyboardInterrupt, match="simulated restart"):
+        run(graph, ctx1, checkpoint=checkpoint)
+
+    checkpoint_records = json.loads(checkpoint.read_text(encoding="utf-8"))
+    worker_records = [r for r in checkpoint_records if r["node"] == "worker"]
+    assert len(worker_records) == 1
+    original_base_sha = worker_records[0]["metadata"]["_target_base_sha"]
+
+    monkeypatch.setattr(engine_persist, "_append_record", append_record)
+
+    # A brand-new Context simulates an actual process restart: no leftover
+    # in-memory ctx.state, only what the checkpoint + fresh CLI init provide.
+    ctx2 = Context(
+        goal="fix the thing",
+        workdir=git_repo,
+        backend="echo",
+        state={"_df_mint_review_target": "true"},
+    )
+    history = run(graph, ctx2, checkpoint=checkpoint, resume=checkpoint)
+
+    assert history[-1].outcome == "success"
+    final_worker_records = [
+        r for r in json.loads(checkpoint.read_text(encoding="utf-8")) if r["node"] == "worker"
+    ]
+    assert len(final_worker_records) == 2
+    # The retry visit's re-mint (post-resume) must still show the ORIGINAL
+    # base — not a fresh base re-anchored from the resumed HEAD — and the
+    # chain must CONTINUE (length 2), not reset to length 1.
+    assert final_worker_records[1]["metadata"]["_target_base_sha"] == original_base_sha
+    assert len(json.loads(final_worker_records[1]["metadata"]["_target_pin_chain"])) == 2
+
+
+def test_resume_into_worker_retry_fails_closed_when_target_state_missing(
+    git_repo, tmp_path, monkeypatch
+) -> None:
+    """Reviewer-feedback metadata present but target-mint metadata missing
+    on the most recent worker-success record must raise the fail-closed
+    ValueError when resuming into a worker retry, mirroring the existing
+    review-branch fail-closed contract."""
+    dispatcher = _make_reviewer_dispatcher("fix", ["FAIL", "PASS"])
+    monkeypatch.setitem(TYPE_REGISTRY, "codergen", dispatcher)
+
+    graph = parse(ROOT / _PIPELINE)
+    checkpoint = tmp_path / "checkpoint.json"
+    append_record = engine_persist._append_record
+
+    def interrupt_after_reviewer_failure(*args, **kwargs):
+        seq = append_record(*args, **kwargs)
+        record = args[5]
+        if record.node == "cold_reviewer" and record.outcome == "failure":
+            raise KeyboardInterrupt("simulated restart")
+        return seq
+
+    monkeypatch.setattr(engine_persist, "_append_record", interrupt_after_reviewer_failure)
+
+    from runner.engine import run
+
+    ctx1 = Context(
+        goal="fix the thing",
+        workdir=git_repo,
+        backend="echo",
+        state={"_df_mint_review_target": "true"},
+    )
+    with pytest.raises(KeyboardInterrupt, match="simulated restart"):
+        run(graph, ctx1, checkpoint=checkpoint)
+
+    monkeypatch.setattr(engine_persist, "_append_record", append_record)
+
+    # Simulate a checkpoint that has full reviewer feedback but is missing
+    # the target-mint state on the worker's success record (the exact gap
+    # this fix closes).
+    payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+    stripped_any = False
+    for record in payload:
+        if record["node"] == "worker" and record["outcome"] == "success":
+            for key in ("target", "intent", "_target_pin_chain", "_target_base_sha"):
+                record["metadata"].pop(key, None)
+            stripped_any = True
+    assert stripped_any
+    checkpoint.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    ctx2 = Context(
+        goal="fix the thing",
+        workdir=git_repo,
+        backend="echo",
+        state={"_df_mint_review_target": "true"},
+    )
+    with pytest.raises(ValueError, match="review-target mint state"):
+        run(graph, ctx2, checkpoint=checkpoint, resume=checkpoint)
+
+
+def test_resume_into_worker_retry_without_mint_opt_in_is_unaffected(
+    tmp_path, monkeypatch
+) -> None:
+    """Graphs that never opted into the mint contract (`_df_mint_review_target`
+    unset) must resume into a worker retry exactly as before — no new
+    requirement, no raise, `_last_review_feedback`-only behavior unchanged."""
+    from runner.engine import run
+    from runner.parser import parse as _parse
+
+    review_visits = {"n": 0}
+
+    def fake_codergen(node, ctx):
+        if node.name == "worker":
+            return Result(outcome="success", output="worker done")
+        review_visits["n"] += 1
+        if review_visits["n"] == 1:
+            return Result(outcome="failure", output="Blocking.\nVerdict: FAIL\n")
+        return Result(outcome="success", output="Verdict: PASS\n")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "codergen", fake_codergen)
+
+    graph = _parse(ROOT / _PIPELINE)
+    checkpoint = tmp_path / "checkpoint.json"
+    append_record = engine_persist._append_record
+
+    def interrupt_after_reviewer_failure(*args, **kwargs):
+        seq = append_record(*args, **kwargs)
+        record = args[5]
+        if record.node == "cold_reviewer" and record.outcome == "failure":
+            raise KeyboardInterrupt("simulated restart")
+        return seq
+
+    monkeypatch.setattr(engine_persist, "_append_record", interrupt_after_reviewer_failure)
+
+    ctx1 = Context(goal="fix the thing", workdir=ROOT, backend="echo")
+    with pytest.raises(KeyboardInterrupt, match="simulated restart"):
+        run(graph, ctx1, checkpoint=checkpoint)
+
+    monkeypatch.setattr(engine_persist, "_append_record", append_record)
+
+    ctx2 = Context(goal="fix the thing", workdir=ROOT, backend="echo")
+    history = run(graph, ctx2, checkpoint=checkpoint, resume=checkpoint)
+    assert history[-1].outcome == "success"
