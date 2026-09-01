@@ -995,6 +995,243 @@ def _copy_regular_git_metadata_file(source: pathlib.Path, destination: pathlib.P
     os.chmod(destination, source_mode)
 
 
+def _copy_pinned_git_metadata_tree(
+    source_root: pathlib.Path,
+    destination_root: pathlib.Path,
+    expected_identity: tuple[int, int],
+) -> None:
+    """Copy a validated Git metadata tree through pinned directory FDs.
+
+    The source root is opened with ``O_NOFOLLOW`` and ``O_DIRECTORY`` and all
+    descendants are addressed relative to that pinned descriptor.  A
+    pathname-only copy would reopen a replaced common Git directory after the
+    validation pass and could copy attacker-controlled metadata into review.
+    """
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory is None:
+        raise RuntimeError("Safe Git metadata copy requires O_NOFOLLOW and O_DIRECTORY")
+    source_root = pathlib.Path(source_root)
+    destination_root = pathlib.Path(destination_root)
+    destination_parent = destination_root.parent
+    _validate_git_metadata_path(source_root, "common Git metadata")
+    _validate_git_metadata_path(destination_parent, "review Git metadata destination")
+
+    directory_flags = os.O_RDONLY | nofollow | directory
+    source_fd: int | None = None
+    destination_parent_fd: int | None = None
+    destination_fd: int | None = None
+
+    def identity(info: os.stat_result) -> tuple[int, int]:
+        return (int(info.st_dev), int(info.st_ino))
+
+    def fail_swap(path: pathlib.Path) -> RuntimeError:
+        return RuntimeError(f"Git metadata path changed during copy: {path}")
+
+    def entry_stat(parent_fd: int, name: str, relative: pathlib.Path) -> os.stat_result:
+        try:
+            return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot inspect common Git metadata entry: {relative}"
+            ) from exc
+
+    def assert_entry_unchanged(
+        parent_fd: int,
+        name: str,
+        expected: tuple[int, int],
+        relative: pathlib.Path,
+    ) -> None:
+        current = entry_stat(parent_fd, name, relative)
+        if identity(current) != expected:
+            raise fail_swap(relative)
+
+    def copy_directory(src_dir_fd: int, dst_dir_fd: int, relative: pathlib.Path) -> None:
+        try:
+            with os.scandir(src_dir_fd) as iterator:
+                names = [entry.name for entry in iterator]
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot enumerate common Git metadata: {relative or pathlib.Path('.') }"
+            ) from exc
+
+        for name in names:
+            child_relative = relative / name if relative != pathlib.Path(".") else pathlib.Path(name)
+            source_entry = entry_stat(src_dir_fd, name, child_relative)
+            source_identity = identity(source_entry)
+            mode = source_entry.st_mode
+            if stat.S_ISDIR(mode):
+                try:
+                    child_src_fd = os.open(
+                        name, directory_flags, dir_fd=src_dir_fd
+                    )
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"Cannot safely open common Git metadata directory: {child_relative}"
+                    ) from exc
+                try:
+                    opened = os.fstat(child_src_fd)
+                    if identity(opened) != source_identity:
+                        raise fail_swap(child_relative)
+                    try:
+                        os.mkdir(
+                            name,
+                            stat.S_IMODE(mode),
+                            dir_fd=dst_dir_fd,
+                        )
+                    except FileExistsError as exc:
+                        raise RuntimeError(
+                            f"Review Git metadata destination already exists: {child_relative}"
+                        ) from exc
+                    except OSError as exc:
+                        raise RuntimeError(
+                            f"Cannot create review Git metadata directory: {child_relative}"
+                        ) from exc
+                    try:
+                        child_dst_fd = os.open(
+                            name,
+                            directory_flags,
+                            dir_fd=dst_dir_fd,
+                        )
+                    except OSError as exc:
+                        raise RuntimeError(
+                            f"Cannot safely open review Git metadata directory: {child_relative}"
+                        ) from exc
+                    try:
+                        copy_directory(child_src_fd, child_dst_fd, child_relative)
+                        os.fchmod(child_dst_fd, stat.S_IMODE(mode))
+                    finally:
+                        os.close(child_dst_fd)
+                    if identity(os.fstat(child_src_fd)) != source_identity:
+                        raise fail_swap(child_relative)
+                    assert_entry_unchanged(
+                        src_dir_fd,
+                        name,
+                        source_identity,
+                        child_relative,
+                    )
+                finally:
+                    os.close(child_src_fd)
+                continue
+
+            if not stat.S_ISREG(mode):
+                raise RuntimeError(
+                    f"Unsafe non-regular file in common Git metadata: {child_relative}"
+                )
+            try:
+                child_src_fd = os.open(
+                    name,
+                    os.O_RDONLY | nofollow,
+                    dir_fd=src_dir_fd,
+                )
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Cannot safely open common Git metadata file: {child_relative}"
+                ) from exc
+            try:
+                opened = os.fstat(child_src_fd)
+                if identity(opened) != source_identity or not stat.S_ISREG(opened.st_mode):
+                    raise fail_swap(child_relative)
+                try:
+                    child_dst_fd = os.open(
+                        name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow,
+                        stat.S_IMODE(mode),
+                        dir_fd=dst_dir_fd,
+                    )
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"Cannot safely create review Git metadata file: {child_relative}"
+                    ) from exc
+                try:
+                    while True:
+                        chunk = os.read(child_src_fd, 1024 * 1024)
+                        if not chunk:
+                            break
+                        offset = 0
+                        while offset < len(chunk):
+                            written = os.write(child_dst_fd, chunk[offset:])
+                            if written <= 0:
+                                raise RuntimeError(
+                                    f"Cannot copy review Git metadata file: {child_relative}"
+                                )
+                            offset += written
+                    os.fchmod(child_dst_fd, stat.S_IMODE(mode))
+                finally:
+                    os.close(child_dst_fd)
+                if identity(os.fstat(child_src_fd)) != source_identity:
+                    raise fail_swap(child_relative)
+                assert_entry_unchanged(
+                    src_dir_fd,
+                    name,
+                    source_identity,
+                    child_relative,
+                )
+            finally:
+                os.close(child_src_fd)
+
+    try:
+        try:
+            source_fd = os.open(source_root, directory_flags)
+        except OSError as exc:
+            raise RuntimeError(f"Cannot safely open common Git metadata: {source_root}") from exc
+        source_stat = os.fstat(source_fd)
+        if identity(source_stat) != expected_identity or not stat.S_ISDIR(source_stat.st_mode):
+            raise fail_swap(source_root)
+
+        try:
+            destination_parent_fd = os.open(destination_parent, directory_flags)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot safely open review Git metadata destination: {destination_parent}"
+            ) from exc
+        try:
+            os.mkdir(
+                destination_root.name,
+                stat.S_IMODE(source_stat.st_mode),
+                dir_fd=destination_parent_fd,
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot create review Git metadata root: {destination_root}"
+            ) from exc
+        try:
+            destination_fd = os.open(
+                destination_root.name,
+                directory_flags,
+                dir_fd=destination_parent_fd,
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot safely open review Git metadata root: {destination_root}"
+            ) from exc
+        copy_directory(source_fd, destination_fd, pathlib.Path("."))
+        os.fchmod(destination_fd, stat.S_IMODE(source_stat.st_mode))
+        if identity(os.fstat(source_fd)) != expected_identity:
+            raise fail_swap(source_root)
+        try:
+            source_path_after = _git_metadata_path_fingerprint(
+                source_root, "common Git metadata"
+            )
+        except RuntimeError as exc:
+            raise fail_swap(source_root) from exc
+        if not source_path_after:
+            raise fail_swap(source_root)
+        try:
+            source_path_stat = source_root.lstat()
+        except OSError as exc:
+            raise fail_swap(source_root) from exc
+        if identity(source_path_stat) != expected_identity:
+            raise fail_swap(source_root)
+    finally:
+        if destination_fd is not None:
+            os.close(destination_fd)
+        if destination_parent_fd is not None:
+            os.close(destination_parent_fd)
+        if source_fd is not None:
+            os.close(source_fd)
+
+
 def _normalize_and_validate_review_git(target_workdir: pathlib.Path, review_dir: pathlib.Path) -> None:
     """Normalize linked-worktree git metadata into a standalone repo and validate isolation."""
     git_target = target_workdir / ".git"
@@ -1067,6 +1304,13 @@ def _normalize_and_validate_review_git(target_workdir: pathlib.Path, review_dir:
                 f"Linked-worktree Git metadata has no commondir: {gitdir_path}"
             )
         _validate_regular_git_metadata_tree(main_git_dir, "common Git metadata")
+        try:
+            main_git_stat = main_git_dir.lstat()
+        except OSError as exc:
+            raise RuntimeError(f"Cannot inspect common Git metadata: {main_git_dir}") from exc
+        if not stat.S_ISDIR(main_git_stat.st_mode):
+            raise RuntimeError(f"Common Git metadata is not a real directory: {main_git_dir}")
+        main_git_identity = (int(main_git_stat.st_dev), int(main_git_stat.st_ino))
 
         worktrees_dir = main_git_dir / "worktrees"
         _validate_regular_git_metadata_tree(
@@ -1110,11 +1354,14 @@ def _normalize_and_validate_review_git(target_workdir: pathlib.Path, review_dir:
             else:
                 git_review.unlink()
 
-        shutil.copytree(
+        # The common metadata root is opened and copied through pinned
+        # descriptors.  Reopening ``main_git_dir`` by pathname here would
+        # permit a validated directory to be swapped before copy.
+        git_review = git_review.parent.resolve(strict=True) / git_review.name
+        _copy_pinned_git_metadata_tree(
             main_git_dir,
             git_review,
-            symlinks=True,
-            ignore_dangling_symlinks=False,
+            main_git_identity,
         )
         try:
             git_review = git_review.resolve(strict=True)
