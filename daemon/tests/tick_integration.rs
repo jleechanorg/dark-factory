@@ -3747,6 +3747,137 @@ fn test_manual_bead_input_auto_queued_and_dispatched() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+fn dependency_admission_fixture(
+    state: OverlayState,
+) -> (
+    FakeScm,
+    FakeTracker,
+    FakeSessions,
+    FakeLlm,
+    FakeStateStore,
+    Config,
+    FakeVcs,
+    std::path::PathBuf,
+) {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    tracker.candidates.borrow_mut().push(Bead {
+        id: "dependency-bead".into(),
+        title: "blocked by prerequisite".into(),
+        description: "target_repo: owner/repo".into(),
+        notes: String::new(),
+        file_tree_summary: String::new(),
+        external_ref: Some("owner/repo#810".into()),
+    });
+    *tracker.ready_ids.borrow_mut() = Some(std::collections::HashSet::new());
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"ready"}"#.into(),
+    ));
+    let store = FakeStateStore::new();
+    store
+        .save(&BeadOverlay {
+            bead_id: "dependency-bead".into(),
+            state,
+            attempt: 3,
+            reroll_count: 1,
+            autonomy_secs: 77,
+            spend_usd: 2.5,
+            pr_number: None,
+            branch: None,
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 2,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: Some("owner/repo".into()),
+            attempt_started_at: None,
+        })
+        .unwrap();
+    let telemetry = std::env::temp_dir().join(format!(
+        "afd_dependency_admission_{}_{}.jsonl",
+        std::process::id(),
+        state.as_str()
+    ));
+    let _ = std::fs::remove_file(&telemetry);
+    (scm, tracker, sessions, llm, store, test_cfg(), test_vcs(), telemetry)
+}
+
+fn assert_dependency_blocked_without_counter_burn(state: OverlayState) {
+    let (scm, tracker, sessions, llm, store, cfg, vcs, telemetry_log) =
+        dependency_admission_fixture(state);
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        0,
+        0,
+    )
+    .unwrap();
+    assert_eq!(summary.beads_routed, 0);
+    assert_eq!(summary.beads_dispatched, 0);
+    assert!(llm.calls.borrow().is_empty());
+    assert!(sessions.calls.borrow().is_empty());
+    let overlay = store.load("dependency-bead").unwrap().unwrap();
+    assert_eq!(overlay.state, state);
+    assert_eq!(overlay.attempt, 3);
+    assert_eq!(overlay.autonomy_secs, 77);
+    assert_eq!(overlay.spawn_failure_count, 2);
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap();
+    assert!(telemetry.contains("DEPENDENCY_BLOCKED"), "{telemetry}");
+    assert!(!telemetry.contains("TASK_ROUTED"), "{telemetry}");
+    let _ = std::fs::remove_file(telemetry_log);
+}
+
+#[test]
+fn queued_dependency_blocked_bead_does_not_route_spawn_or_burn_counters() {
+    assert_dependency_blocked_without_counter_burn(OverlayState::Queued);
+}
+
+#[test]
+fn redispatched_dependency_blocked_bead_does_not_route_spawn_or_burn_counters() {
+    assert_dependency_blocked_without_counter_burn(OverlayState::Redispatched);
+}
+
+#[test]
+fn dependency_bead_dispatches_once_after_entering_ready_snapshot() {
+    let (scm, tracker, sessions, llm, store, cfg, vcs, telemetry_log) =
+        dependency_admission_fixture(OverlayState::Queued);
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+    run_tick(&deps, 0, 0).unwrap();
+    tracker
+        .ready_ids
+        .borrow_mut()
+        .as_mut()
+        .unwrap()
+        .insert("dependency-bead".into());
+    let summary = run_tick(&deps, 1, 0).unwrap();
+    assert_eq!(summary.beads_routed, 1);
+    assert_eq!(summary.beads_dispatched, 1);
+    assert_eq!(sessions.calls.borrow().iter().filter(|call| call.starts_with("spawn(")).count(), 1);
+    assert_eq!(store.load("dependency-bead").unwrap().unwrap().state, OverlayState::Dispatched);
+    let _ = std::fs::remove_file(telemetry_log);
+}
+
 /// jleechan-drive-pr-branch-binding-pcpr red-proof: a manually-created
 /// "drive an existing PR" bead (`external_ref` names a currently-OPEN PR in
 /// the daemon's configured repo) must dispatch onto that PR's own head

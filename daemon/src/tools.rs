@@ -478,6 +478,16 @@ mod claude_project_slug_tests {
 /// `br` CLI. `fetch_candidates` == `br list --status open --label factory --json`.
 pub trait Tracker {
     fn fetch_candidates(&self) -> Result<Vec<Bead>, DaemonError>;
+    /// Authoritative dependency admission snapshot. Production uses
+    /// `br ready`; the default preserves existing fake adapters by treating
+    /// all broad candidates as ready unless a test explicitly overrides it.
+    fn fetch_ready_ids(&self) -> Result<std::collections::HashSet<String>, DaemonError> {
+        Ok(self
+            .fetch_candidates()?
+            .into_iter()
+            .map(|bead| bead.id)
+            .collect())
+    }
     fn fetch_all_external_refs(&self) -> Result<std::collections::HashSet<String>, DaemonError>;
     fn create_bead(
         &self,

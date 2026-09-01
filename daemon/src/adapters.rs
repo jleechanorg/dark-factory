@@ -155,6 +155,22 @@ impl Tracker for CliTracker {
         Ok(beads)
     }
 
+    fn fetch_ready_ids(&self) -> Result<std::collections::HashSet<String>, DaemonError> {
+        let out = run_tool(
+            "br",
+            &["ready", "--label", "factory", "--json", "--limit", "0"],
+            30,
+        )?;
+        let json_start = out.find('[').unwrap_or(0);
+        #[derive(serde::Deserialize)]
+        struct ReadyBead {
+            id: String,
+        }
+        let rows: Vec<ReadyBead> = serde_json::from_str(&out[json_start..])
+            .map_err(|error| DaemonError::Parse(format!("failed to parse br ready JSON: {error}")))?;
+        Ok(rows.into_iter().map(|bead| bead.id).collect())
+    }
+
     fn fetch_all_external_refs(&self) -> Result<std::collections::HashSet<String>, DaemonError> {
         // `br list --status all` returns zero rows; merge open + closed so closed beads
         // (e.g. jleechan-9byt.5 → worldarchitect.ai#8171) block duplicate create_bead.

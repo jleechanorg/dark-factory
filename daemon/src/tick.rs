@@ -1866,6 +1866,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         emit_intake_outcome(deps.telemetry_log, outcome)?;
     }
     let tracker_candidates = deps.tracker.fetch_candidates()?;
+    let dependency_ready_ids = deps.tracker.fetch_ready_ids()?;
     let mut routing_candidates: Vec<Bead> = Vec::new();
     for bead_id in &created {
         let mut pr_number = None;
@@ -2260,6 +2261,22 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 o
             }
         };
+
+        if !dependency_ready_ids.contains(&bead.id) {
+            emit(
+                deps.telemetry_log,
+                &bead.id,
+                overlay.attempt,
+                overlay.state.as_str(),
+                "DEPENDENCY_BLOCKED",
+                serde_json::json!({}),
+                serde_json::json!({
+                    "reason": "absent_from_br_ready",
+                    "admission_source": "br ready --label factory --json --limit 0",
+                }),
+            )?;
+            continue;
+        }
 
         match router::route(deps.llm, bead) {
             Ok(verdict) => {

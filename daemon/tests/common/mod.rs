@@ -17,7 +17,7 @@ use daemon::tools::{
     SessionId, Sessions, SpawnSpec, Tracker, Vcs, WorktreeHeadAncestry,
 };
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Scripted `Tracker` fake: pre-seeded candidates + a call log of every method
 /// invocation (method name + key args), so tests can assert both output and
@@ -31,6 +31,9 @@ use std::collections::HashMap;
 #[derive(Default)]
 pub struct FakeTracker {
     pub candidates: RefCell<Vec<Bead>>,
+    /// Explicit dependency-ready snapshot. `None` preserves the historical
+    /// fake behavior where every broad candidate is admitted.
+    pub ready_ids: RefCell<Option<HashSet<String>>>,
     pub create_bead_result: RefCell<Option<Result<String, String>>>,
     /// Scripts `create_bead` to fail with the exact `br create` duplicate
     /// error shape (`DaemonError::duplicate_external_ref_bead_id` parses
@@ -73,6 +76,17 @@ impl Tracker for FakeTracker {
             });
         }
         Ok(self.candidates.borrow().clone())
+    }
+
+    fn fetch_ready_ids(&self) -> Result<HashSet<String>, DaemonError> {
+        self.calls.borrow_mut().push("fetch_ready_ids".into());
+        Ok(self.ready_ids.borrow().clone().unwrap_or_else(|| {
+            self.candidates
+                .borrow()
+                .iter()
+                .map(|bead| bead.id.clone())
+                .collect()
+        }))
     }
 
     fn fetch_all_external_refs(&self) -> Result<std::collections::HashSet<String>, DaemonError> {
