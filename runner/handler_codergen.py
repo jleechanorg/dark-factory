@@ -104,6 +104,53 @@ _CMD_RUN_EXIT_RE = re.compile(
 )
 
 
+def _fresh_reviewer_check_gap(text: str) -> str:
+    """Return a gap when an attempted reviewer check only failed.
+
+    A fully-tooled reviewer is allowed to choose the repository's relevant
+    checks.  If it does choose a test/build runner, however, a process-level
+    PASS cannot hide an unavailable runtime (for example ``pytest`` returning
+    126 or failing to import).  A successful check in the same transcript
+    satisfies the requirement; otherwise the reviewer result fails closed.
+    Narrative-only PASSes remain compatible with the existing slim contract.
+    """
+    body = text or ""
+    from .handler_verdict import _RECEIPT_EXIT_RE, _RECEIPT_RUNNER_RE
+
+    if not _RECEIPT_RUNNER_RE.search(body):
+        return ""
+    exit_codes = [int(match.group(1)) for match in _RECEIPT_EXIT_RE.finditer(body)]
+    exit_codes.extend(
+        int(match.group(1))
+        for match in re.finditer(
+            r"(?:\brc|\breturncode|\bstatus)\s*[:=]\s*(\d+)\b",
+            body,
+            re.IGNORECASE,
+        )
+    )
+    if 0 in exit_codes:
+        return ""
+    runtime_failure = re.search(
+        r"(?:no module named|module not found|command not found|not found|"
+        r"permission denied|operation not permitted|cannot execute|"
+        r"failed to (?:run|start)|could not (?:run|start))",
+        body,
+        re.IGNORECASE,
+    )
+    if not exit_codes and runtime_failure is None:
+        return ""
+    detail = (
+        f"captured nonzero exit codes {sorted(set(exit_codes))}"
+        if exit_codes
+        else "runtime error without a successful exit code"
+    )
+    return (
+        "required reviewer check failed; the reviewer returned PASS without a "
+        f"successful test/build reproduction ({detail}). Restore the reviewer "
+        "runtime or rerun the check successfully before accepting PASS."
+    )
+
+
 def _subprocess_output(stdout: str | bytes | None, stderr: str | bytes | None) -> str:
     """Combine subprocess output, including byte payloads from timeouts."""
     if isinstance(stdout, bytes):
@@ -893,6 +940,37 @@ def _isolated_review_workdir(target_workdir: pathlib.Path):
         yield review_dir
 
 
+def _linux_python_reviewer_runtime_paths() -> list[pathlib.Path] | None:
+    """Resolve trusted Python and pytest runtimes for Linux review tools.
+
+    Landlock starts with an allow-list.  The Codex launcher paths alone are
+    insufficient for a reviewer command such as ``pytest``: its executable,
+    interpreter, and virtual-environment roots must also be readable.  Reuse
+    the existing trusted executable resolver so a broken or untrusted PATH
+    entry fails closed instead of making a reviewer report a false PASS.
+    """
+    candidates: list[pathlib.Path] = []
+    pytest_path = shutil.which("pytest")
+    if pytest_path:
+        candidates.append(pathlib.Path(pytest_path))
+    if sys.executable:
+        candidates.append(pathlib.Path(sys.executable))
+
+    paths: list[pathlib.Path] = []
+    for candidate in candidates:
+        if not candidate.exists() and not candidate.is_symlink():
+            # ``shutil.which`` may be replaced by a test harness or may point
+            # at a stale optional test runner.  Do not make Codex itself
+            # unavailable because pytest is absent; if the reviewer elects
+            # that check, ``_fresh_reviewer_check_gap`` fails the PASS closed.
+            continue
+        runtime = _handlers_shim._linux_codex_runtime_paths(candidate)
+        if runtime is None:
+            return None
+        paths.extend(runtime)
+    return sorted(set(paths), key=str)
+
+
 def _sandboxed_args_for_fresh_review(
     command: list[str],
     codex_workdir: pathlib.Path,
@@ -942,6 +1020,9 @@ def _sandboxed_args_for_fresh_review(
         runtime_paths = _handlers_shim._linux_codex_runtime_paths(launcher_path)
         if runtime_paths is None:
             return None
+        python_runtime_paths = _linux_python_reviewer_runtime_paths()
+        if python_runtime_paths is None:
+            return None
         real_binary = _sandbox._linux_codex_real_binary(launcher_path)
         if real_binary is not None:
             executable_path = real_binary
@@ -950,7 +1031,11 @@ def _sandboxed_args_for_fresh_review(
             executable_path = launcher_path
             cmd_args = command
 
-        read_paths = [*runtime_paths, codex_workdir.resolve()]
+        read_paths = [
+            *runtime_paths,
+            *python_runtime_paths,
+            codex_workdir.resolve(),
+        ]
         writable_paths = [codex_workdir.resolve()]
         if runtime_home is not None:
             read_paths.append(runtime_home.resolve())
@@ -1551,6 +1636,17 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                         outcome = "error"
                     else:
                         outcome = parsed_outcome
+                    if outcome == "success":
+                        check_gap = _fresh_reviewer_check_gap(output)
+                        if check_gap:
+                            outcome = "error"
+                            meta.update(
+                                {
+                                    "reviewer_check_failed": "true",
+                                    "reviewer_check_gap": check_gap,
+                                }
+                            )
+                            output = output.rstrip() + "\n\n" + check_gap + "\n"
                     meta.update(
                         {
                             "verdict": verdict,

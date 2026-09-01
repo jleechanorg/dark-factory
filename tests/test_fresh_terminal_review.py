@@ -200,6 +200,82 @@ def test_fresh_reviewer_unknown_verdict_fails_closed(tmp_path, monkeypatch):
     assert result.metadata["verdict"] == "unknown"
 
 
+def test_fresh_reviewer_pass_with_only_failed_required_checks_fails_closed(
+    tmp_path, monkeypatch
+):
+    """A reviewer cannot turn an unavailable test runtime into PASS."""
+    review = (
+        "I ran the required reviewer checks.\n"
+        "$ python -m pytest\n"
+        "/usr/bin/python: No module named pytest\n"
+        "exit code: 126\n"
+        "$ pytest tests/test_app.py\n"
+        "pytest: command not found\n"
+        "rc=126\n"
+        "No blocking findings.\n"
+        "Verdict: PASS\n"
+    )
+
+    result, _, _ = _run_review(tmp_path, monkeypatch, review)
+
+    assert result.outcome == "error"
+    assert result.metadata["verdict"] == "pass"
+    assert result.metadata["reviewer_check_failed"] == "true"
+    assert "required reviewer check" in result.output.lower()
+    assert "126" in result.output
+
+
+def test_linux_fresh_reviewer_allows_python_and_pytest_runtime_paths(
+    tmp_path, monkeypatch
+):
+    from runner.handler_codergen import _sandboxed_args_for_fresh_review
+
+    repo = _repo(tmp_path / "target")
+    review_ws = tmp_path / "review"
+    review_ws.mkdir()
+    python_exe = tmp_path / "uv" / "bin" / "python3"
+    pytest_exe = tmp_path / "venv" / "bin" / "pytest"
+    python_exe.parent.mkdir(parents=True)
+    pytest_exe.parent.mkdir(parents=True)
+    python_exe.write_text("#!/bin/sh\n")
+    pytest_exe.write_text(f"#!{python_exe}\n")
+    python_exe.chmod(0o755)
+    pytest_exe.chmod(0o755)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys, "executable", str(python_exe))
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: str(pytest_exe) if name == "pytest" else f"/usr/bin/{name}",
+    )
+    monkeypatch.setattr(
+        "runner.handlers._linux_landlock_launcher_path",
+        lambda: pathlib.Path("/fake/landlock-launcher"),
+    )
+    monkeypatch.setattr("runner.handlers._linux_landlock_abi", lambda: 3)
+    monkeypatch.setattr(
+        "runner.handlers._linux_codex_runtime_paths",
+        lambda path: [pathlib.Path(path).parent],
+    )
+    monkeypatch.setattr(
+        "runner.handlers._holdout_denied_paths", lambda: [tmp_path / "holdouts"]
+    )
+    observed: dict[str, object] = {}
+    monkeypatch.setattr(
+        "runner.handlers._linux_controller_sandbox_prefix",
+        lambda **kwargs: observed.update(kwargs) or ["/fake/launcher", "--"],
+    )
+
+    args = _sandboxed_args_for_fresh_review(
+        ["codex", "exec", "review"], review_ws, repo
+    )
+
+    assert args == ["/fake/launcher", "--", "codex", "exec", "review"]
+    assert python_exe.parent in observed["read_paths"]
+    assert pytest_exe.parent in observed["read_paths"]
+    assert repo.resolve() not in observed["writable_paths"]
+
+
 def test_fresh_reviewer_timeout_fails_closed(tmp_path, monkeypatch):
     repo = _repo(tmp_path)
     prompt = tmp_path / "review.md"
