@@ -578,6 +578,7 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
         // later step can create a recoverable hold.
         deps.store.reset_reroll_deferral(&bead.bead_id)?;
         bead.session_id = None;
+        bead.session_ao_project = None;
         deps.store.save(bead)?;
 
         emit_telemetry(
@@ -1022,7 +1023,7 @@ fn evaluate_proceed(
             match deps.sessions.attach_within_in_project(
                 branch,
                 &bead.bead_id,
-                &ao_project,
+                ao_project,
                 budget_or_defer!(),
             ) {
                 Err(DaemonError::SessionNotFound { .. }) => (true, None),
@@ -1044,7 +1045,7 @@ fn evaluate_proceed(
                         .sessions
                         .session_activity_within_in_project(
                             &session_id,
-                            &ao_project,
+                            ao_project,
                             budget_or_defer!(),
                         )
                     {
@@ -1327,6 +1328,7 @@ fn execute_adopted(
     {
         bead.state = OverlayState::HumanHeld;
         bead.session_id = None;
+        bead.session_ao_project = None;
         set_human_hold_reason(bead, HumanHoldReason::TargetCheckoutUnconfigured);
         deps.store.save(bead)?;
         emit_telemetry(
@@ -1351,6 +1353,7 @@ fn execute_adopted(
         None => {
             bead.state = OverlayState::HumanHeld;
             bead.session_id = None;
+            bead.session_ao_project = None;
             set_human_hold_reason(bead, HumanHoldReason::TargetCheckoutUnconfigured);
             deps.store.save(bead)?;
             emit_telemetry(
@@ -1381,6 +1384,7 @@ fn execute_adopted(
             // quiescent above; persist that no-live-session proof with the
             // recoverable pre-spawn hold.
             bead.session_id = None;
+            bead.session_ao_project = None;
             set_human_hold_reason(
                 bead,
                 HumanHoldReason::AdoptedPreSessionShaCaptureFailed,

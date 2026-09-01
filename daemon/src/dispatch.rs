@@ -398,6 +398,7 @@ pub fn dispatch_ready_with_vcs(
             ));
             overlay.state = OverlayState::HumanHeld;
             overlay.session_id = None;
+            overlay.session_ao_project = None;
             set_human_hold_reason(
                 &mut overlay,
                 HumanHoldReason::TargetCheckoutUnconfigured,
@@ -429,6 +430,7 @@ pub fn dispatch_ready_with_vcs(
                 ));
                 overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = None;
+                overlay.session_ao_project = None;
                 set_human_hold_reason(
                     &mut overlay,
                     HumanHoldReason::TargetCheckoutUnconfigured,
@@ -732,6 +734,7 @@ pub fn dispatch_ready_with_vcs(
             Err(err) if err.is_deferred() => {
                 overlay.state = OverlayState::Queued;
                 overlay.session_id = None;
+                overlay.session_ao_project = None;
                 store.save(&overlay)?;
                 report.failures.push(failure(
                     bead,
@@ -745,6 +748,7 @@ pub fn dispatch_ready_with_vcs(
             Err(err) if err.is_transient() => {
                 overlay.spawn_failure_count += 1;
                 overlay.session_id = None;
+                overlay.session_ao_project = None;
                 if overlay.spawn_failure_count > MAX_TRANSIENT_SPAWN_RETRY {
                     // Cap exceeded: stop silently cycling Queued<->Dispatching
                     // forever (the livelock this bead-follow-up closes — see
@@ -791,6 +795,7 @@ pub fn dispatch_ready_with_vcs(
             Err(err @ DaemonError::WorktreeCwdMismatch { .. }) => {
                 overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = None;
+                overlay.session_ao_project = None;
                 set_human_hold_reason(&mut overlay, HumanHoldReason::WorktreeCwdMismatch);
                 store.save(&overlay)?;
                 report.failures.push(failure(
@@ -805,6 +810,7 @@ pub fn dispatch_ready_with_vcs(
             Err(err) => {
                 overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = None;
+                overlay.session_ao_project = None;
                 set_human_hold_reason(&mut overlay, HumanHoldReason::SpawnFailed);
                 store.save(&overlay)?;
                 report.failures.push(failure(
@@ -850,6 +856,7 @@ pub fn dispatch_ready_with_vcs(
                 }
                 overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = None;
+                overlay.session_ao_project = None;
                 set_human_hold_reason(&mut overlay, HumanHoldReason::SpawnBranchMismatch);
                 store.save(&overlay)?;
                 report.failures.push(failure(
@@ -903,6 +910,7 @@ pub fn dispatch_ready_with_vcs(
                 }
                 overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = None;
+                overlay.session_ao_project = None;
                 set_human_hold_reason(
                     &mut overlay,
                     HumanHoldReason::WorktreeRemoteUnverifiable,
@@ -949,6 +957,7 @@ pub fn dispatch_ready_with_vcs(
             }
             overlay.state = OverlayState::HumanHeld;
             overlay.session_id = None;
+            overlay.session_ao_project = None;
             set_human_hold_reason(&mut overlay, HumanHoldReason::WorktreeRemoteMismatch);
             store.save(&overlay)?;
             report.failures.push(failure(
@@ -1007,6 +1016,7 @@ pub fn dispatch_ready_with_vcs(
             if save_err.is_transient() {
                 overlay.state = OverlayState::Queued;
                 overlay.session_id = None;
+                overlay.session_ao_project = None;
                 store.save(&overlay)?;
                 report.failures.push(failure(
                     bead,

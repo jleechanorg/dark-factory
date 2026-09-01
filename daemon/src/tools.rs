@@ -903,6 +903,15 @@ pub trait Sessions {
         let _ = project;
         self.session_branch(id)
     }
+    /// Returns the PR number AO reports for a given session in a project, if known.
+    fn session_pr_number_in_project(
+        &self,
+        id: &SessionId,
+        project: &str,
+    ) -> Result<Option<u64>, DaemonError> {
+        let _ = (id, project);
+        Ok(None)
+    }
     /// Returns the git remote URL configured for `remote_name` inside the
     /// worktree backing a just-spawned session for `ao_project`/`branch`,
     /// or `None` when it cannot be determined (bead jleechan-bqdv, Stage C —

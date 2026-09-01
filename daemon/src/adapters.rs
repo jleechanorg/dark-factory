@@ -8145,6 +8145,30 @@ impl Sessions for CliSessions {
         Ok(None)
     }
 
+    fn session_pr_number_in_project(
+        &self,
+        id: &SessionId,
+        project: &str,
+    ) -> Result<Option<u64>, DaemonError> {
+        let out = match run_tool("ao", &["status", "-p", project, "--json"], 30) {
+            Ok(o) => o,
+            Err(_) => return Ok(None),
+        };
+        let json_start = out.find('[').unwrap_or(0);
+        let data: serde_json::Value = match serde_json::from_str(&out[json_start..]) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        if let Some(arr) = data.as_array() {
+            for entry in arr {
+                if entry.get("name").and_then(|v| v.as_str()) == Some(&id.0) {
+                    return Ok(entry.get("prNumber").and_then(|v| v.as_u64()));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// jleechan-bqdv Stage C: the spawn-time worktree remote assertion's data
     /// source. Uses the exact absolute `workspacePath` AO returned during
     /// spawn and reads back whatever `remote_name` would actually be pushed

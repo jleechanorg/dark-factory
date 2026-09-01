@@ -570,24 +570,15 @@ fn emit_intake_outcome(telemetry_log: &Path, outcome: &IntakeOutcome) -> Result<
 /// operators the durable evidence they need to retry cleanup or kill the
 /// session manually. The `BEAD_SESSION_KILL_FAILED` telemetry event
 /// preserves visibility into the still-leaked session.
-fn overlay_session_project(deps: &TickDeps, overlay: &BeadOverlay) -> Result<String, DaemonError> {
-    // Rows written before `session_ao_project` was introduced have no stored
-    // project. Their repository is still durable, so resolve that repository
-    // through the current explicit routing table. Never fall back to the
-    // process-wide default AO project: that can kill a sibling-repo worker.
+fn overlay_session_project(_deps: &TickDeps, overlay: &BeadOverlay) -> Result<String, DaemonError> {
     overlay
         .session_ao_project
         .as_deref()
         .map(str::to_owned)
-        .or_else(|| {
-            deps.cfg
-                .resolve_repo(overlay.repo(deps.cfg))
-                .map(|routing| routing.ao_project)
-        })
         .ok_or_else(|| {
             DaemonError::Config(format!(
-                "AO project ownership is unavailable on repo {}; refusing session operation",
-                overlay.repo(deps.cfg)
+                "persisted AO session project ownership is unavailable for bead {}; refusing unowned session operation",
+                overlay.bead_id
             ))
         })
 }
@@ -1064,55 +1055,56 @@ pub fn run_tick(
                 // mismatch (or a confirmed-dead session) parks the bead.
                 if let Some(session_id_str) = overlay.session_id.clone() {
                     let session_id = SessionId(session_id_str.clone());
-                    let project = overlay_session_project(deps, &overlay)?;
-                    if let Ok(Some(actual_branch)) = deps
-                        .sessions
-                        .session_branch_in_project(&session_id, &project)
-                    {
-                        let expected_branch = overlay.branch.clone().unwrap_or_default();
-                        if actual_branch != expected_branch {
-                            overlay.state = OverlayState::HumanHeld;
-                            // jleechan-park-leaves-zombie-session-mh9o:
-                            // `session_branch` just proved the live session
-                            // belongs to a DIFFERENT bead/branch (the
-                            // `jleechan-5ia2` corruption case), so we MUST
-                            // NOT call `sessions.stop()` here — that would
-                            // terminate another bead's legitimate worker.
-                            // The right fix is to drop OUR overlay's bad
-                            // handle (the durable record pointing at a
-                            // session that was never ours to own) without
-                            // touching AO. The leaked overlay can then
-                            // never poison a future redispatch of THIS
-                            // bead via the AO dedup guard.
-                            overlay.session_id = None;
-                            overlay.session_ao_project = None;
-                            set_human_hold_reason(
-                                &mut overlay,
-                                HumanHoldReason::SessionBranchMismatch,
-                            );
-                            deps.store.save(&overlay)?;
-                            emit(
-                                deps.telemetry_log,
-                                &overlay.bead_id,
-                                overlay.attempt,
-                                OverlayState::HumanHeld.as_str(),
-                                "PARKED_HUMAN_HELD",
-                                serde_json::json!({}),
-                                serde_json::json!({
-                                    "reason": "session_branch_mismatch",
-                                    "session_id": session_id_str,
-                                    "expected_branch": expected_branch,
-                                    "actual_branch": actual_branch,
-                                }),
-                            )?;
-                            let comment_body = format!(
-                                "🤖 **[dark-factory]** Escalation required: bead `{}` was recorded DISPATCHED with session `{}`, but that session's live branch (`{}`) does not match the bead's registered branch (`{}`). This record cannot be trusted and has been parked HUMAN_HELD for manual review (see jleechan-5ia2).",
-                                overlay.bead_id, session_id_str, actual_branch, expected_branch
-                            );
-                            let _ =
-                                post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
-                            summary.beads_parked_human_held += 1;
-                            continue;
+                    if let Ok(project) = overlay_session_project(deps, &overlay) {
+                        if let Ok(Some(actual_branch)) = deps
+                            .sessions
+                            .session_branch_in_project(&session_id, &project)
+                        {
+                            let expected_branch = overlay.branch.clone().unwrap_or_default();
+                            if actual_branch != expected_branch {
+                                overlay.state = OverlayState::HumanHeld;
+                                // jleechan-park-leaves-zombie-session-mh9o:
+                                // `session_branch` just proved the live session
+                                // belongs to a DIFFERENT bead/branch (the
+                                // `jleechan-5ia2` corruption case), so we MUST
+                                // NOT call `sessions.stop()` here — that would
+                                // terminate another bead's legitimate worker.
+                                // The right fix is to drop OUR overlay's bad
+                                // handle (the durable record pointing at a
+                                // session that was never ours to own) without
+                                // touching AO. The leaked overlay can then
+                                // never poison a future redispatch of THIS
+                                // bead via the AO dedup guard.
+                                overlay.session_id = None;
+                                overlay.session_ao_project = None;
+                                set_human_hold_reason(
+                                    &mut overlay,
+                                    HumanHoldReason::SessionBranchMismatch,
+                                );
+                                deps.store.save(&overlay)?;
+                                emit(
+                                    deps.telemetry_log,
+                                    &overlay.bead_id,
+                                    overlay.attempt,
+                                    OverlayState::HumanHeld.as_str(),
+                                    "PARKED_HUMAN_HELD",
+                                    serde_json::json!({}),
+                                    serde_json::json!({
+                                        "reason": "session_branch_mismatch",
+                                        "session_id": session_id_str,
+                                        "expected_branch": expected_branch,
+                                        "actual_branch": actual_branch,
+                                    }),
+                                )?;
+                                let comment_body = format!(
+                                    "🤖 **[dark-factory]** Escalation required: bead `{}` was recorded DISPATCHED with session `{}`, but that session's live branch (`{}`) does not match the bead's registered branch (`{}`). This record cannot be trusted and has been parked HUMAN_HELD for manual review (see jleechan-5ia2).",
+                                    overlay.bead_id, session_id_str, actual_branch, expected_branch
+                                );
+                                let _ =
+                                    post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
+                                summary.beads_parked_human_held += 1;
+                                continue;
+                            }
                         }
                     }
                 }
@@ -1265,9 +1257,13 @@ pub fn run_tick(
                         let is_stalled_or_dead =
                             if let Some(ref session_id_str) = overlay.session_id {
                                 let session_id = SessionId(session_id_str.clone());
-                                let project = overlay_session_project(deps, &overlay)?;
-                                deps.sessions
-                                    .is_quiescent_in_project(&session_id, &project)?
+                                match overlay_session_project(deps, &overlay) {
+                                    Ok(project) => {
+                                        deps.sessions
+                                            .is_quiescent_in_project(&session_id, &project)?
+                                    }
+                                    Err(_) => false,
+                                }
                             } else {
                                 emit(
                                     deps.telemetry_log,
@@ -4489,34 +4485,17 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             && overlay.pr_number.is_none()
             && !is_test_repo
         {
-            if let Some(ref session_id) = overlay.session_id {
-                    let mut project = repo.split('/').next_back().unwrap_or(&repo).to_string();
-                    if project == "worldarchitect.ai" {
-                        project = "worldarchitect".to_string();
-                    }
-
-                    let r = crate::tools::run_tool("ao", &["status", "-p", &project, "--json"], 30);
-                    if let Ok(out) = r {
-                        let json_start = out.find('[').unwrap_or(0);
-                        if let Ok(val) =
-                            serde_json::from_str::<serde_json::Value>(&out[json_start..])
-                        {
-                            if let Some(arr) = val.as_array() {
-                                if let Some(entry) = arr.iter().find(|e| {
-                                    e.get("name").and_then(|v| v.as_str())
-                                        == Some(session_id.as_str())
-                                }) {
-                                    if let Some(pr_num) =
-                                        entry.get("prNumber").and_then(|v| v.as_u64())
-                                    {
-                                        overlay.pr_number = Some(pr_num);
-                                        deps.store.save(&overlay)?;
-                                    }
-                                }
-                            }
-                        }
+            if let Some(ref session_id_str) = overlay.session_id {
+                let sid = SessionId(session_id_str.clone());
+                if let Ok(project) = overlay_session_project(deps, &overlay) {
+                    if let Ok(Some(pr_num)) =
+                        deps.sessions.session_pr_number_in_project(&sid, &project)
+                    {
+                        overlay.pr_number = Some(pr_num);
+                        deps.store.save(&overlay)?;
                     }
                 }
+            }
         }
 
         // Promote DISPATCHED -> ATTESTED once a PR is open (spec §4.2.7).

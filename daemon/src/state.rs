@@ -1642,7 +1642,7 @@ fn save_overlay_conn(conn: &Connection, overlay: &BeadOverlay) -> Result<(), Dae
     let session_ao_project = overlay
         .session_id
         .as_ref()
-        .and_then(|_| overlay.session_ao_project.as_ref());
+        .and(overlay.session_ao_project.as_ref());
     conn.execute(
         "INSERT INTO bead_overlay \
          (bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id, updated_at, is_adopted, spawn_failure_count, pre_session_head_sha, park_reason, target_repo, session_ao_project, attempt_started_at) \

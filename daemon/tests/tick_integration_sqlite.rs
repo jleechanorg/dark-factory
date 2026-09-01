@@ -417,6 +417,94 @@ fn restarted_tick_retains_a_routed_session_when_scoped_cleanup_fails() {
     }
 }
 
+#[test]
+fn restarted_tick_fails_closed_and_refuses_session_ops_on_legacy_null_project_row() {
+    let path = std::env::temp_dir().join(format!(
+        "dark-factory-session-project-legacy-null-{}-{}.sqlite",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+    let overlay = BeadOverlay {
+        bead_id: "legacy-null-bead".into(),
+        state: OverlayState::Dispatched,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 0,
+        spend_usd: 0.0,
+        pr_number: None,
+        branch: Some("factory/legacy-null-bead-r1".into()),
+        session_id: Some("session-legacy-null".into()),
+        session_ao_project: None,
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: Some("owner/repo".into()),
+        attempt_started_at: None,
+    };
+    {
+        let store = SqliteStateStore::open(&path).unwrap();
+        store.save(&overlay).unwrap();
+        store
+            .register_branch(&overlay.bead_id, overlay.branch.as_deref().unwrap())
+            .unwrap();
+    }
+
+    // Reopen the store to model a daemon process restart with a legacy NULL project row.
+    // The tick MUST NOT guess authority from mutable routing or default projects;
+    // it must refuse session operations and retain the handle.
+    let store = SqliteStateStore::open(&path).unwrap();
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    sessions.set_session_health_failure("session-legacy-null", "login expired");
+    let llm = FakeLlm::new();
+    let cfg = test_cfg();
+    let vcs = test_vcs();
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_legacy_null_{}_{}.jsonl",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        0,
+        10,
+    )
+    .unwrap();
+
+    assert!(
+        sessions.stop_in_project_calls.borrow().is_empty(),
+        "unowned legacy session must not execute AO kill against any inferred project"
+    );
+    let persisted = store.load("legacy-null-bead").unwrap().unwrap();
+    assert_eq!(persisted.state, OverlayState::Dispatched);
+    assert_eq!(
+        persisted.session_id.as_deref(),
+        Some("session-legacy-null"),
+        "legacy unowned session handle must be retained for operator triage"
+    );
+    assert_eq!(persisted.session_ao_project, None);
+
+    drop(store);
+    let _ = std::fs::remove_file(&telemetry_log);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
 fn test_repo_cfg(project: &str) -> RepoConfig {
     RepoConfig {
         ao_project: project.into(),
