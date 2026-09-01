@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 import shutil
 import stat
@@ -7,6 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 RELEASE_SHA = "0123456789abcdef0123456789abcdef01234567"
+RELEASE_TREE = "89abcdef0123456789abcdef0123456789abcdef"
 
 
 def _write_executable(path: Path, body: str) -> None:
@@ -20,6 +23,7 @@ def test_linux_install_keeps_all_runtime_payloads_outside_git_checkout(tmp_path)
     checkout.mkdir()
     shutil.copy2(ROOT / "install.sh", checkout / "install.sh")
     (checkout / "requirements.lock").write_text("")
+    (checkout / "ignored-sentinel.bin").write_text("must not enter release")
     seed_beads = checkout / ".beads" / "issues.jsonl"
     seed_beads.parent.mkdir(parents=True, exist_ok=True)
     seed_beads.write_text('{"id":"factory-tdd"}\n')
@@ -54,6 +58,10 @@ def test_linux_install_keeps_all_runtime_payloads_outside_git_checkout(tmp_path)
         f"""#!/bin/sh
 if [ "${{3:-}}" = "rev-parse" ] && [ "${{4:-}}" = "HEAD" ]; then
   printf '{RELEASE_SHA}\\n'
+elif [ "${{3:-}}" = "rev-parse" ] && [ "${{4:-}}" = '{RELEASE_SHA}^{{tree}}' ]; then
+  printf '{RELEASE_TREE}\\n'
+elif [ "${{3:-}}" = "archive" ]; then
+  tar -C "${{2}}" --exclude=ignored-sentinel.bin -cf - .
 elif [ "${{3:-}}" = "status" ] && [ "${{DARK_FACTORY_FAKE_DIRTY:-0}}" = "1" ]; then
   printf ' M runner/engine.py\\n'
 fi
@@ -88,6 +96,9 @@ elif [ "${1:-}" = "venv" ]; then
   mkdir -p "$2/bin"
   cat > "$2/bin/python" <<'PY'
 #!/bin/sh
+if [ "${1:-}" = "-" ]; then
+  exec /usr/bin/python3 "$@"
+fi
 if [ -n "${DARK_FACTORY_RUNTIME_LOG:-}" ]; then
   printf '%s\n' "${DARK_FACTORY_HOME:-}" >> "$DARK_FACTORY_RUNTIME_LOG"
 fi
@@ -155,10 +166,21 @@ touch "$db"
     assert (release / "bin" / "df-funnel-lanes").stat().st_mode & stat.S_IXUSR
 
     assert not (release / ".git").exists()
+    assert not (release / "ignored-sentinel.bin").exists()
     assert not ((release / "install.sh").stat().st_mode & stat.S_IWUSR)
     daemon_binary = release / "daemon" / "target" / "release" / "daemon"
     assert daemon_binary.is_file()
     assert not (daemon_binary.stat().st_mode & stat.S_IWUSR)
+    release_manifest = json.loads((release / "release-manifest.json").read_text())
+    assert release_manifest == {
+        "schema_version": 1,
+        "source_commit": RELEASE_SHA,
+        "source_tree": RELEASE_TREE,
+        "daemon": {
+            "path": "daemon/target/release/daemon",
+            "sha256": hashlib.sha256(daemon_binary.read_bytes()).hexdigest(),
+        },
+    }
     state_root = home / ".local" / "state" / "dark-factory"
     state_db = state_root / ".beads" / "beads.db"
     assert state_db.is_file()
@@ -197,6 +219,34 @@ touch "$db"
     runtime_homes = runtime_log.read_text().splitlines()
     assert runtime_homes
     assert all(Path(path) == release for path in runtime_homes)
+
+    # Reuse must validate both immutability and the manifest-to-binary
+    # binding instead of accepting a merely present JSON file.
+    daemon_binary.chmod(daemon_binary.stat().st_mode | stat.S_IWUSR)
+    daemon_binary.write_text("#!/bin/sh\nexit 9\n")
+    daemon_binary.chmod(daemon_binary.stat().st_mode & ~stat.S_IWUSR)
+    tampered = subprocess.run(
+        [str(checkout / "install.sh"), "--no-smoke"],
+        cwd=checkout,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert tampered.returncode != 0
+    assert "manifest does not match source and daemon binary" in tampered.stderr
+
+    release.chmod(release.stat().st_mode | stat.S_IWUSR)
+    mutable = subprocess.run(
+        [str(checkout / "install.sh"), "--no-smoke"],
+        cwd=checkout,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert mutable.returncode != 0
+    assert "refusing to reuse mutable release" in mutable.stderr
 
     dirty_env = env.copy()
     dirty_env["DARK_FACTORY_FAKE_DIRTY"] = "1"

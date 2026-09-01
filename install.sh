@@ -72,14 +72,23 @@ echo "==> git-lfs $(git-lfs version | head -1)"
 # repo-local development layout for backwards compatibility with launchd.
 if [[ "$(uname -s)" == "Linux" && "${DARK_FACTORY_DISABLE_IMMUTABLE_ARTIFACT:-0}" != "1" ]]; then
   ARTIFACT_ROOT="${DARK_FACTORY_INSTALL_ROOT:-${HOME}/.local/share/dark-factory}"
-  if ARTIFACT_VERSION="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null)"; then
-    if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=normal 2>/dev/null)" ]]; then
-      echo "ERROR: refusing to publish an immutable release from a dirty Git checkout." >&2
-      echo "Commit or remove tracked/untracked changes, then rerun install.sh." >&2
-      exit 1
-    fi
-  else
-    ARTIFACT_VERSION="$(sha256sum "${REPO_ROOT}/install.sh" | cut -c1-40)"
+  if ! ARTIFACT_VERSION="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null)"; then
+    echo "ERROR: immutable Linux releases require an exact Git source commit." >&2
+    exit 1
+  fi
+  if [[ ! "${ARTIFACT_VERSION}" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "ERROR: Git HEAD is not an exact 40-hex source commit: ${ARTIFACT_VERSION}" >&2
+    exit 1
+  fi
+  ARTIFACT_TREE="$(git -C "${REPO_ROOT}" rev-parse "${ARTIFACT_VERSION}^{tree}")"
+  if [[ ! "${ARTIFACT_TREE}" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "ERROR: Git source tree is not an exact 40-hex object: ${ARTIFACT_TREE}" >&2
+    exit 1
+  fi
+  if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=normal 2>/dev/null)" ]]; then
+    echo "ERROR: refusing to publish an immutable release from a dirty Git checkout." >&2
+    echo "Commit or remove tracked/untracked changes, then rerun install.sh." >&2
+    exit 1
   fi
   ARTIFACT_DIR="${ARTIFACT_ROOT}/releases/${ARTIFACT_VERSION}"
   if [[ "${CLEAR}" -eq 1 && -d "${ARTIFACT_DIR}" ]]; then
@@ -90,8 +99,11 @@ if [[ "$(uname -s)" == "Linux" && "${DARK_FACTORY_DISABLE_IMMUTABLE_ARTIFACT:-0}
     mkdir -p "${ARTIFACT_ROOT}/releases"
     STAGING_DIR="$(mktemp -d "${ARTIFACT_ROOT}/.release-${ARTIFACT_VERSION}.XXXXXX")"
     trap 'rm -rf "${STAGING_DIR:-}"' EXIT
-    tar --exclude=.git --exclude=.venv --exclude='__pycache__' \
-      -cf - -C "${REPO_ROOT}" . | tar -xf - -C "${STAGING_DIR}"
+    # Snapshot bytes directly from the named Git object. Reading tracked
+    # paths from the working tree would leave a status→archive race where a
+    # concurrent edit could enter a release that claims ARTIFACT_TREE.
+    git -C "${REPO_ROOT}" archive --format=tar "${ARTIFACT_VERSION}" \
+      | tar -xf - -C "${STAGING_DIR}"
     mv "${STAGING_DIR}" "${ARTIFACT_DIR}"
     printf '%s\n' "${ARTIFACT_DIR}" > "${ARTIFACT_DIR}/.dark-factory-runtime-root"
     trap - EXIT
@@ -145,6 +157,7 @@ echo "==> verifying import"
 
 if [[ "${RUNTIME_ROOT}" != "${REPO_ROOT}" && -f "${RUNTIME_ROOT}/daemon/Cargo.toml" ]]; then
   DAEMON_BINARY="${RUNTIME_ROOT}/daemon/target/release/daemon"
+  RELEASE_MANIFEST="${RUNTIME_ROOT}/release-manifest.json"
   if [[ "${ARTIFACT_CREATED}" -eq 1 ]]; then
     if ! command -v cargo >/dev/null 2>&1; then
       echo "ERROR: cargo not found on PATH; required to build the immutable Linux daemon." >&2
@@ -152,11 +165,52 @@ if [[ "${RUNTIME_ROOT}" != "${REPO_ROOT}" && -f "${RUNTIME_ROOT}/daemon/Cargo.to
     fi
     echo "==> building immutable Rust daemon"
     cargo build --release --manifest-path "${RUNTIME_ROOT}/daemon/Cargo.toml"
+    DAEMON_SHA256="$(sha256sum "${DAEMON_BINARY}" | awk '{print $1}')"
+    if [[ ! "${DAEMON_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+      echo "ERROR: could not calculate the immutable daemon SHA256." >&2
+      exit 1
+    fi
+    MANIFEST_TMP="${RELEASE_MANIFEST}.tmp.$$"
+    printf '{\n  "schema_version": 1,\n  "source_commit": "%s",\n  "source_tree": "%s",\n  "daemon": {\n    "path": "daemon/target/release/daemon",\n    "sha256": "%s"\n  }\n}\n' \
+      "${ARTIFACT_VERSION}" "${ARTIFACT_TREE}" "${DAEMON_SHA256}" > "${MANIFEST_TMP}"
+    mv "${MANIFEST_TMP}" "${RELEASE_MANIFEST}"
   elif [[ ! -x "${DAEMON_BINARY}" ]]; then
     echo "ERROR: immutable release is missing ${DAEMON_BINARY}." >&2
     echo "Rerun install.sh --clear to rebuild the release." >&2
     exit 1
+  elif [[ ! -f "${RELEASE_MANIFEST}" ]]; then
+    echo "ERROR: immutable release is missing ${RELEASE_MANIFEST}." >&2
+    echo "Rerun install.sh --clear to rebuild the release with provenance." >&2
+    exit 1
   fi
+  if [[ "${ARTIFACT_CREATED}" -eq 0 ]] && find "${RUNTIME_ROOT}" -perm /222 -print -quit | grep -q .; then
+    echo "ERROR: refusing to reuse mutable release ${RUNTIME_ROOT}." >&2
+    echo "Rerun install.sh --clear to rebuild it atomically." >&2
+    exit 1
+  fi
+  "${PYTHON_BIN}" - "${RELEASE_MANIFEST}" "${ARTIFACT_VERSION}" "${ARTIFACT_TREE}" "${DAEMON_BINARY}" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+manifest_path, source_commit, source_tree, binary_path = sys.argv[1:]
+try:
+    manifest = json.loads(pathlib.Path(manifest_path).read_text(encoding="utf-8"))
+    daemon = manifest["daemon"]
+    actual_digest = hashlib.sha256(pathlib.Path(binary_path).read_bytes()).hexdigest()
+    valid = (
+        manifest.get("schema_version") == 1
+        and manifest.get("source_commit") == source_commit
+        and manifest.get("source_tree") == source_tree
+        and daemon.get("path") == "daemon/target/release/daemon"
+        and daemon.get("sha256") == actual_digest
+    )
+except (OSError, ValueError, KeyError, TypeError):
+    valid = False
+if not valid:
+    raise SystemExit("ERROR: immutable release manifest does not match source and daemon binary")
+PY
 fi
 
 # Configure repo-local git hooks (.githooks/) so the pre-push graph-audit
