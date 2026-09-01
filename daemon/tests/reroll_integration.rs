@@ -55,6 +55,17 @@ fn test_cfg() -> Config {
     }
 }
 
+fn configure_routed_repo(cfg: &mut Config, repo: &str, ao_project: &str) {
+    cfg.repos.insert(
+        repo.into(),
+        RepoConfig {
+            ao_project: ao_project.into(),
+            push_remote: "origin".into(),
+            local_checkout: Some(std::env::current_dir().unwrap()),
+        },
+    );
+}
+
 fn adopted_overlay(bead_id: &str) -> BeadOverlay {
     BeadOverlay {
         bead_id: bead_id.into(),
@@ -66,6 +77,7 @@ fn adopted_overlay(bead_id: &str) -> BeadOverlay {
         pr_number: Some(777),
         branch: Some("alice/my-cool-feature".into()),
         session_id: None,
+        session_ao_project: None,
         is_adopted: true,
         spawn_failure_count: 0,
         pre_session_head_sha: None,
@@ -136,6 +148,7 @@ fn test_circuit_breaker() {
         pr_number: Some(102),
         branch: Some("factory/bead-breaker-r2".into()),
         session_id: None,
+        session_ao_project: None,
         is_adopted: false,
         spawn_failure_count: 0,
         pre_session_head_sha: None,
@@ -249,6 +262,7 @@ fn test_reroll_success() {
         pr_number: Some(201),
         branch: Some("factory/bead-success-r1".into()),
         session_id: None,
+        session_ao_project: None,
         is_adopted: false,
         spawn_failure_count: 0,
         pre_session_head_sha: None,
@@ -388,6 +402,7 @@ fn test_reroll_routes_vcs_ops_through_bead_repo_for_cross_repo_bead() {
     ));
 
     let mut cfg = test_cfg();
+    configure_routed_repo(&mut cfg, "jleechanorg/other-repo", "other-repo");
     cfg.spec_dir = std::env::temp_dir()
         .join("afd_spec_dir_cross_repo_test")
         .to_string_lossy()
@@ -409,6 +424,7 @@ fn test_reroll_routes_vcs_ops_through_bead_repo_for_cross_repo_bead() {
         pr_number: Some(4242),
         branch: Some("factory/bead-cross-repo-r1".into()),
         session_id: None,
+        session_ao_project: None,
         is_adopted: false,
         spawn_failure_count: 0,
         pre_session_head_sha: None,
@@ -684,6 +700,7 @@ fn test_reroll_adopted_success_spawns_remediation_session_leaves_pr_open() {
         pr_number: Some(777),
         branch: Some("alice/my-cool-feature".into()),
         session_id: None,
+        session_ao_project: None,
         is_adopted: true,
         spawn_failure_count: 0,
         pre_session_head_sha: None,
@@ -924,6 +941,14 @@ fn test_reroll_adopted_unconfigured_repo_uses_daemon_owned_target_worktree() {
     let llm = FakeLlm::new();
     let mut cfg = test_cfg();
     cfg.repos.clear();
+    cfg.repos.insert(
+        "jleechanorg/worldarchitect.ai".into(),
+        RepoConfig {
+            ao_project: "worldarchitect".into(),
+            push_remote: "origin".into(),
+            local_checkout: None,
+        },
+    );
     let mut bead = adopted_overlay("bead-adopted-unconfigured-repo");
     bead.target_repo = Some("jleechanorg/worldarchitect.ai".into());
     store.save(&bead).unwrap();
@@ -1374,6 +1399,7 @@ fn test_reroll_adopted_spawn_failure_parks_human_held() {
         pr_number: Some(778),
         branch: Some("alice/my-cool-feature".into()),
         session_id: None,
+        session_ao_project: None,
         is_adopted: true,
         spawn_failure_count: 0,
         pre_session_head_sha: None,
@@ -1585,6 +1611,7 @@ fn test_reroll_adopted_skips_duplicate_spawn_when_session_already_active() {
         pr_number: Some(777),
         branch: Some("alice/my-cool-feature".into()),
         session_id: None,
+        session_ao_project: None,
         is_adopted: true,
         spawn_failure_count: 0,
         pre_session_head_sha: None,
@@ -1747,6 +1774,7 @@ mod quiescence_timeout_races {
             pr_number: Some(900),
             branch: Some(branch.into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -2691,6 +2719,7 @@ fn same_underlying_issue_malformed_reply_is_transient_not_fatal() {
         pr_number: Some(900),
         branch: Some("factory/cq8r-bead-r2".into()),
         session_id: None,
+        session_ao_project: None,
         is_adopted: false,
         spawn_failure_count: 0,
         pre_session_head_sha: None,
@@ -2793,6 +2822,7 @@ fn test_reroll_close_pr_uses_bead_resolved_repo_not_cfg_target_repo() {
     // call when the bead has a different resolved `target_repo`.
     let mut cfg = test_cfg();
     cfg.target_repo = "jleechanorg/worldarchitect.ai".into();
+    configure_routed_repo(&mut cfg, "jleechanorg/dark-factory", "dark-factory");
     cfg.spec_dir = std::env::temp_dir()
         .join("afd_spec_dir_v6ud_test")
         .to_string_lossy()
@@ -2816,6 +2846,7 @@ fn test_reroll_close_pr_uses_bead_resolved_repo_not_cfg_target_repo() {
         pr_number: Some(315), // same number as the merged default-repo PR
         branch: Some("factory/jleechan-8jxr-r1".into()),
         session_id: None,
+        session_ao_project: None,
         is_adopted: false,
         spawn_failure_count: 0,
         pre_session_head_sha: None,
@@ -2946,6 +2977,7 @@ fn test_reroll_recovers_from_stale_local_remote_branch_on_retry() {
         pr_number: Some(303),
         branch: Some("factory/bead-stale-r1".into()),
         session_id: None,
+        session_ao_project: None,
         is_adopted: false,
         spawn_failure_count: 0,
         pre_session_head_sha: None,
@@ -3097,6 +3129,7 @@ fn test_reroll_close_pr_already_merged_is_tolerated_as_successful_supersede() {
         pr_number: Some(404),
         branch: Some("factory/bead-merged-r1".into()),
         session_id: None,
+        session_ao_project: None,
         is_adopted: false,
         spawn_failure_count: 0,
         pre_session_head_sha: None,
@@ -3182,6 +3215,7 @@ fn test_reroll_quiescence_head_probe_routes_through_bead_repo_and_defers_on_fail
     ));
 
     let mut cfg = test_cfg();
+    configure_routed_repo(&mut cfg, target_repo, "custom-routed-repo");
     cfg.spec_dir = std::env::temp_dir()
         .join("afd_spec_dir_mw85_test")
         .to_string_lossy()
@@ -3203,6 +3237,7 @@ fn test_reroll_quiescence_head_probe_routes_through_bead_repo_and_defers_on_fail
         pr_number: Some(888),
         branch: Some(branch.into()),
         session_id: Some("session-mw85".into()),
+        session_ao_project: None,
         is_adopted: false,
         spawn_failure_count: 0,
         pre_session_head_sha: None,
@@ -3263,6 +3298,7 @@ fn test_reroll_quiescence_head_probe_error_warns_and_defers_without_crashing() {
     let llm = FakeLlm::new();
 
     let mut cfg = test_cfg();
+    configure_routed_repo(&mut cfg, target_repo, "custom-routed-repo-fail");
     cfg.spec_dir = std::env::temp_dir()
         .join("afd_spec_dir_mw85_fail_test")
         .to_string_lossy()
@@ -3284,6 +3320,7 @@ fn test_reroll_quiescence_head_probe_error_warns_and_defers_without_crashing() {
         pr_number: Some(889),
         branch: Some(branch.into()),
         session_id: Some("session-mw85-fail".into()),
+        session_ao_project: None,
         is_adopted: false,
         spawn_failure_count: 0,
         pre_session_head_sha: None,
@@ -3367,6 +3404,7 @@ fn test_reroll_quiescence_head_probe_permanent_failure_escalates_after_threshold
     let llm = FakeLlm::new();
 
     let mut cfg = test_cfg();
+    configure_routed_repo(&mut cfg, target_repo, "custom-routed-repo-permfail");
     cfg.spec_dir = std::env::temp_dir()
         .join("afd_spec_dir_mw85_permfail_test")
         .to_string_lossy()
@@ -3388,6 +3426,7 @@ fn test_reroll_quiescence_head_probe_permanent_failure_escalates_after_threshold
         pr_number: Some(890),
         branch: Some(branch.into()),
         session_id: Some("session-mw85-permfail".into()),
+        session_ao_project: None,
         is_adopted: false,
         spawn_failure_count: 0,
         pre_session_head_sha: None,
@@ -3488,6 +3527,7 @@ fn test_reroll_quiescence_head_probe_transient_failure_never_escalates() {
     let llm = FakeLlm::new();
 
     let mut cfg = test_cfg();
+    configure_routed_repo(&mut cfg, target_repo, "custom-routed-repo-transient");
     cfg.spec_dir = std::env::temp_dir()
         .join("afd_spec_dir_mw85_transient_test")
         .to_string_lossy()
@@ -3509,6 +3549,7 @@ fn test_reroll_quiescence_head_probe_transient_failure_never_escalates() {
         pr_number: Some(891),
         branch: Some(branch.into()),
         session_id: Some("session-mw85-transient".into()),
+        session_ao_project: None,
         is_adopted: false,
         spawn_failure_count: 0,
         pre_session_head_sha: None,

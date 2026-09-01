@@ -570,12 +570,44 @@ fn emit_intake_outcome(telemetry_log: &Path, outcome: &IntakeOutcome) -> Result<
 /// operators the durable evidence they need to retry cleanup or kill the
 /// session manually. The `BEAD_SESSION_KILL_FAILED` telemetry event
 /// preserves visibility into the still-leaked session.
+fn overlay_session_project(deps: &TickDeps, overlay: &BeadOverlay) -> Result<String, DaemonError> {
+    // Rows written before `session_ao_project` was introduced have no stored
+    // project. Their repository is still durable, so resolve that repository
+    // through the current explicit routing table. Never fall back to the
+    // process-wide default AO project: that can kill a sibling-repo worker.
+    overlay
+        .session_ao_project
+        .as_deref()
+        .map(str::to_owned)
+        .or_else(|| {
+            deps.cfg
+                .resolve_repo(overlay.repo(deps.cfg))
+                .map(|routing| routing.ao_project)
+        })
+        .ok_or_else(|| {
+            DaemonError::Config(format!(
+                "AO project ownership is unavailable on repo {}; refusing session operation",
+                overlay.repo(deps.cfg)
+            ))
+        })
+}
+
+fn stop_overlay_session(
+    deps: &TickDeps,
+    overlay: &BeadOverlay,
+    session_id: &SessionId,
+) -> Result<(), DaemonError> {
+    let project = overlay_session_project(deps, overlay)?;
+    deps.sessions
+        .stop_in_project(session_id, &project)
+}
+
 fn kill_session_and_clear_handle(deps: &TickDeps, overlay: &mut BeadOverlay) {
     let Some(session_id_str) = overlay.session_id.clone() else {
         return;
     };
     let session_id = SessionId(session_id_str.clone());
-    match deps.sessions.stop(&session_id) {
+    match stop_overlay_session(deps, overlay, &session_id) {
         Ok(()) => {
             let _ = emit(
                 deps.telemetry_log,
@@ -593,6 +625,7 @@ fn kill_session_and_clear_handle(deps: &TickDeps, overlay: &mut BeadOverlay) {
             // recover_human_held and any operator-driven requeue without
             // risking a duplicate worker or AO dedup collision.
             overlay.session_id = None;
+            overlay.session_ao_project = None;
             // Bead rev-3lm8k: the session is now provably dead, so its
             // AO-managed worktree dir (if any) is stale immediately — do
             // not wait for the TTL sweep. `clean_stale_worktree` is a
@@ -1031,7 +1064,11 @@ pub fn run_tick(
                 // mismatch (or a confirmed-dead session) parks the bead.
                 if let Some(session_id_str) = overlay.session_id.clone() {
                     let session_id = SessionId(session_id_str.clone());
-                    if let Ok(Some(actual_branch)) = deps.sessions.session_branch(&session_id) {
+                    let project = overlay_session_project(deps, &overlay)?;
+                    if let Ok(Some(actual_branch)) = deps
+                        .sessions
+                        .session_branch_in_project(&session_id, &project)
+                    {
                         let expected_branch = overlay.branch.clone().unwrap_or_default();
                         if actual_branch != expected_branch {
                             overlay.state = OverlayState::HumanHeld;
@@ -1048,6 +1085,7 @@ pub fn run_tick(
                             // never poison a future redispatch of THIS
                             // bead via the AO dedup guard.
                             overlay.session_id = None;
+                            overlay.session_ao_project = None;
                             set_human_hold_reason(
                                 &mut overlay,
                                 HumanHoldReason::SessionBranchMismatch,
@@ -1227,7 +1265,9 @@ pub fn run_tick(
                         let is_stalled_or_dead =
                             if let Some(ref session_id_str) = overlay.session_id {
                                 let session_id = SessionId(session_id_str.clone());
-                                deps.sessions.is_quiescent(&session_id)?
+                                let project = overlay_session_project(deps, &overlay)?;
+                                deps.sessions
+                                    .is_quiescent_in_project(&session_id, &project)?
                             } else {
                                 emit(
                                     deps.telemetry_log,
@@ -1301,6 +1341,7 @@ pub fn run_tick(
                             // handle with the recoverable hold so recovery
                             // cannot overlap a live worker.
                             overlay.session_id = None;
+                            overlay.session_ao_project = None;
                             set_human_hold_reason(&mut overlay, HumanHoldReason::SessionStalled);
                             deps.store.save(&overlay)?;
                             emit(
@@ -1802,6 +1843,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 pr_number: Some(adopted.pr_number),
                 branch: Some(adopted.head_ref_name.clone()),
                 session_id: None,
+                session_ao_project: None,
                 is_adopted: true,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -1953,6 +1995,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             pr_number,
             branch: None,
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -2071,6 +2114,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         pr_number: None,
                         branch: None,
                         session_id: None,
+                        session_ao_project: None,
                         is_adopted: false,
                         spawn_failure_count: 0,
                         pre_session_head_sha: None,
@@ -2248,6 +2292,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     pr_number: None,
                     branch: None,
                     session_id: None,
+                    session_ao_project: None,
                     is_adopted: false,
                     spawn_failure_count: 0,
                     pre_session_head_sha: None,
@@ -4399,8 +4444,27 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         )?;
                         continue;
                     }
-                    let _ = deps.sessions.stop(&sid);
+                    if let Err(stop_err) = stop_overlay_session(deps, &overlay, &sid) {
+                        emit(
+                            deps.telemetry_log,
+                            bead_id,
+                            overlay.attempt,
+                            OverlayState::Dispatched.as_str(),
+                            "BEAD_SESSION_KILL_FAILED",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "session_id": session_id_str,
+                                "error": format!("{stop_err:?}"),
+                                "phase": "health_failure",
+                            }),
+                        )?;
+                        // Retain the durable handle: requeueing here could
+                        // overlap a still-live worker on the next dispatch.
+                        deps.store.save(&overlay)?;
+                        continue;
+                    }
                     overlay.session_id = None;
+                    overlay.session_ao_project = None;
                     if overlay.pr_number.is_none() {
                         overlay.spawn_failure_count += 1;
                         if overlay.spawn_failure_count >= MAX_TRANSIENT_SPAWN_RETRY {
@@ -4588,8 +4652,8 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 // verifier checks real landed work, not the stale pre-fix
                 // commit.
                 let ready_to_promote = if overlay.is_adopted {
-                    match &overlay.session_id {
-                        Some(session_id_str) => {
+                    match (&overlay.session_id, overlay_session_project(deps, &overlay)) {
+                        (Some(session_id_str), Ok(project)) => {
                             let sid = SessionId(session_id_str.clone());
                             if let Ok(Some(health_failure)) = deps.sessions.check_session_health(&sid) {
                                 emit(
@@ -4605,15 +4669,17 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                         "branch": overlay.branch,
                                     }),
                                 )?;
-                                let _ = deps.sessions.stop(&sid);
-                                true
-                            } else if deps.sessions.is_quiescent(&sid).unwrap_or(false) {
+                                stop_overlay_session(deps, &overlay, &sid).is_ok()
+                            } else if deps
+                                .sessions
+                                .is_quiescent_in_project(&sid, &project)
+                                .unwrap_or(false)
+                            {
                                 true
                             } else {
-                                match deps.sessions.session_activity(&sid) {
+                                match deps.sessions.session_activity_in_project(&sid, &project) {
                                     Ok(crate::tools::SessionActivity::Idle) => {
-                                        let _ = deps.sessions.stop(&sid);
-                                        true
+                                        stop_overlay_session(deps, &overlay, &sid).is_ok()
                                     }
                                     Ok(
                                         crate::tools::SessionActivity::Terminal
@@ -4623,7 +4689,8 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                 }
                             }
                         }
-                        None => true,
+                        (Some(_), Err(_)) => false,
+                        (None, _) => true,
                     }
                 } else {
                     true
@@ -4631,9 +4698,27 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
 
                 if ready_to_promote {
                     // Reap completed worker session to immediately release AO worker slot
-                    if let Some(session_id_str) = overlay.session_id.take() {
+                    if let Some(session_id_str) = overlay.session_id.clone() {
                         let sid = SessionId(session_id_str.clone());
-                        let _ = deps.sessions.stop(&sid);
+                        if let Err(stop_err) = stop_overlay_session(deps, &overlay, &sid) {
+                            emit(
+                                deps.telemetry_log,
+                                bead_id,
+                                overlay.attempt,
+                                OverlayState::Dispatched.as_str(),
+                                "BEAD_SESSION_KILL_FAILED",
+                                serde_json::json!({}),
+                                serde_json::json!({
+                                    "session_id": session_id_str,
+                                    "error": format!("{stop_err:?}"),
+                                    "phase": "promotion",
+                                }),
+                            )?;
+                            deps.store.save(&overlay)?;
+                            continue;
+                        }
+                        overlay.session_id = None;
+                        overlay.session_ao_project = None;
                         // Bead rev-3lm8k: the coder session has finished and
                         // is being reaped right here — its AO-managed
                         // worktree dir (if any) is stale immediately, so
@@ -6051,6 +6136,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 // ATTESTED is reached only after positive worker quiescence;
                 // make that no-live-session proof durable in this same save.
                 overlay.session_id = None;
+                overlay.session_ao_project = None;
                 set_human_hold_reason(&mut overlay, HumanHoldReason::Stage1GateNotGreen);
                 deps.store.save(&overlay)?;
                 summary.beads_parked_human_held += 1;

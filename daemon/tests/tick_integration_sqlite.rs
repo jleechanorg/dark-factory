@@ -250,6 +250,173 @@ fn adopted_remediation_marker_is_migrated_and_persistent() {
     }
 }
 
+#[test]
+fn restarted_tick_reaps_a_persisted_routed_session_in_its_recorded_project() {
+    let path = std::env::temp_dir().join(format!(
+        "dark-factory-session-project-restart-{}-{}.sqlite",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+    let overlay = BeadOverlay {
+        bead_id: "routed-restart-bead".into(),
+        state: OverlayState::Dispatched,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 0,
+        spend_usd: 0.0,
+        pr_number: None,
+        branch: Some("factory/routed-restart-bead-r1".into()),
+        session_id: Some("session-routed-restart".into()),
+        session_ao_project: Some("secondary-project".into()),
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: Some("owner/repo".into()),
+        attempt_started_at: None,
+    };
+    {
+        let store = SqliteStateStore::open(&path).unwrap();
+        store.save(&overlay).unwrap();
+        store
+            .register_branch(&overlay.bead_id, overlay.branch.as_deref().unwrap())
+            .unwrap();
+    }
+
+    // Reopen the store to model a daemon process restart. The current route
+    // deliberately differs from the recorded owner: cleanup must use the
+    // persisted `secondary-project`, not the config's `repo` project.
+    let store = SqliteStateStore::open(&path).unwrap();
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    sessions.set_session_health_failure("session-routed-restart", "login expired");
+    let llm = FakeLlm::new();
+    let cfg = test_cfg();
+    let vcs = test_vcs();
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_routed_restart_{}_{}.jsonl",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        0,
+        10,
+    )
+    .unwrap();
+
+    assert_eq!(
+        sessions.stop_in_project_calls.borrow().as_slice(),
+        [("session-routed-restart".into(), "secondary-project".into())],
+        "restart cleanup must retain the durable routed AO project"
+    );
+    let persisted = store.load("routed-restart-bead").unwrap().unwrap();
+    assert_eq!(persisted.state, OverlayState::Queued);
+    assert_eq!(persisted.session_id, None);
+    assert_eq!(persisted.session_ao_project, None);
+
+    drop(store);
+    let _ = std::fs::remove_file(&telemetry_log);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[test]
+fn restarted_tick_retains_a_routed_session_when_scoped_cleanup_fails() {
+    let path = std::env::temp_dir().join(format!(
+        "dark-factory-session-project-stop-failure-{}-{}.sqlite",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+    let overlay = BeadOverlay {
+        bead_id: "routed-stop-failure-bead".into(),
+        state: OverlayState::Dispatched,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 0,
+        spend_usd: 0.0,
+        pr_number: None,
+        branch: Some("factory/routed-stop-failure-bead-r1".into()),
+        session_id: Some("session-routed-stop-failure".into()),
+        session_ao_project: Some("secondary-project".into()),
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: Some("owner/repo".into()),
+        attempt_started_at: None,
+    };
+    {
+        let store = SqliteStateStore::open(&path).unwrap();
+        store.save(&overlay).unwrap();
+        store
+            .register_branch(&overlay.bead_id, overlay.branch.as_deref().unwrap())
+            .unwrap();
+    }
+
+    let store = SqliteStateStore::open(&path).unwrap();
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    sessions.set_session_health_failure("session-routed-stop-failure", "login expired");
+    sessions.fail_stop_for("session-routed-stop-failure");
+    let llm = FakeLlm::new();
+    let cfg = test_cfg();
+    let vcs = test_vcs();
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_routed_stop_failure_{}_{}.jsonl",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        0,
+        10,
+    )
+    .unwrap();
+
+    assert_eq!(
+        sessions.stop_in_project_calls.borrow().as_slice(),
+        [("session-routed-stop-failure".into(), "secondary-project".into())]
+    );
+    let persisted = store.load("routed-stop-failure-bead").unwrap().unwrap();
+    assert_eq!(persisted.state, OverlayState::Dispatched);
+    assert_eq!(persisted.session_id.as_deref(), Some("session-routed-stop-failure"));
+    assert_eq!(persisted.session_ao_project.as_deref(), Some("secondary-project"));
+
+    drop(store);
+    let _ = std::fs::remove_file(&telemetry_log);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
 fn test_repo_cfg(project: &str) -> RepoConfig {
     RepoConfig {
         ao_project: project.into(),
@@ -331,6 +498,7 @@ fn sqlite_dispatch_guarantee_queued_bead_dispatched_despite_escalation_backlog()
                 pr_number: Some(pr_number),
                 branch: Some(format!("factory/{bead_id}-r10")),
                 session_id: None,
+                session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -360,6 +528,7 @@ fn sqlite_dispatch_guarantee_queued_bead_dispatched_despite_escalation_backlog()
             pr_number: None,
             branch: None,
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -444,6 +613,7 @@ fn sqlite_escalation_dedup_tick_level_identical_payload_suppressed_changed_conte
             pr_number: Some(9006),
             branch: Some("factory/bead-dedup-r10".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,

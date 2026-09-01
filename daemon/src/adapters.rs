@@ -4786,6 +4786,14 @@ if args[:2] == ["session", "kill"]:
         print("scripted batch cleanup failure", file=sys.stderr)
         raise SystemExit(8)
     raise SystemExit(0)
+if args[:1] == ["status"]:
+    assert len(args) == 4, args
+    assert args[1] == "-p", args
+    assert args[3] == "--json", args
+    with open(os.environ["AO_FAKE_LOG"], "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"kind": "status", "args": args, "project": args[2]}) + "\n")
+    print(os.environ.get("AO_FAKE_STATUS_JSON", "[]"))
+    raise SystemExit(0)
 assert len(args) == 7, args
 assert args[:5] == ["spawn", "--project", "dark-factory", "--agent", "minimax"], args
 assert not {"--prompt", "--name", "--branch"}.intersection(args), args
@@ -6043,12 +6051,13 @@ os.execv(real_git, [real_git] + args)
     }
 
     #[test]
-    fn stop_binds_kill_to_the_sessions_project() {
+    fn explicit_stop_binds_kill_to_the_sessions_project() {
         let (_, calls) = with_fake_ao("project_bound_stop", serde_json::json!({}), |log| {
             let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
-            let result = sessions.stop(&crate::tools::SessionId(
-                "session-project-bound".to_string(),
-            ));
+            let result = sessions.stop_in_project(
+                &crate::tools::SessionId("session-project-bound".to_string()),
+                "dark-factory",
+            );
             (result, std::fs::read_to_string(log).unwrap_or_default())
         });
 
@@ -6086,6 +6095,89 @@ os.execv(real_git, [real_git] + args)
                 "secondary-project"
             ])
         );
+    }
+
+    #[test]
+    fn restarted_cleanup_uses_the_callers_resolved_project() {
+        let (_, calls) = with_fake_ao("restarted_routed_project_stop", serde_json::json!({}), |log| {
+            // A new adapter has no process-local spawn map, as after a daemon
+            // restart. The durable overlay caller must still bind cleanup to
+            // its resolved repository project.
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            let result = sessions.stop_in_project(
+                &crate::tools::SessionId("session-routed-after-restart".to_string()),
+                "secondary-project",
+            );
+            (result, std::fs::read_to_string(log).unwrap_or_default())
+        });
+
+        let row: serde_json::Value = calls.lines().next().unwrap().parse().unwrap();
+        assert_eq!(
+            row["args"],
+            serde_json::json!([
+                "session",
+                "kill",
+                "session-routed-after-restart",
+                "-p",
+                "secondary-project"
+            ])
+        );
+    }
+
+    #[test]
+    fn routed_session_status_operations_use_the_explicit_project() {
+        let (_, calls) = with_fake_ao("routed_status_project", serde_json::json!({}), |log| {
+            let previous = std::env::var("AO_FAKE_STATUS_JSON").ok();
+            std::env::set_var(
+                "AO_FAKE_STATUS_JSON",
+                r#"[{"name":"session-routed-status","branch":"factory/routed-status","activity":"idle","status":"running"}]"#,
+            );
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            let id = sessions
+                .attach_in_project("factory/routed-status", "bead-status", "secondary-project")
+                .unwrap();
+            assert!(!sessions.is_quiescent_in_project(&id, "secondary-project").unwrap());
+            assert_eq!(
+                sessions
+                    .session_activity_in_project(&id, "secondary-project")
+                    .unwrap(),
+                crate::tools::SessionActivity::Idle
+            );
+            assert_eq!(
+                sessions
+                    .session_branch_in_project(&id, "secondary-project")
+                    .unwrap()
+                    .as_deref(),
+                Some("factory/routed-status")
+            );
+            match previous {
+                Some(value) => std::env::set_var("AO_FAKE_STATUS_JSON", value),
+                None => std::env::remove_var("AO_FAKE_STATUS_JSON"),
+            }
+            ((), std::fs::read_to_string(log).unwrap_or_default())
+        });
+
+        let rows: Vec<serde_json::Value> = calls
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 4);
+        for row in rows {
+            assert_eq!(row["kind"], "status");
+            assert_eq!(row["args"], serde_json::json!(["status", "-p", "secondary-project", "--json"]));
+        }
+    }
+
+    #[test]
+    fn unscoped_stop_rejects_an_unowned_session() {
+        let (result, calls) = with_fake_ao("unowned_project_stop", serde_json::json!({}), |log| {
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            let result = sessions.stop(&crate::tools::SessionId("unknown-session".to_string()));
+            (result, std::fs::read_to_string(log).unwrap_or_default())
+        });
+
+        assert!(result.unwrap_err().to_string().contains("refusing unscoped cleanup"));
+        assert!(calls.is_empty(), "unowned session must not issue an AO kill");
     }
 
     #[test]
@@ -7878,7 +7970,16 @@ impl Sessions for CliSessions {
     /// verbatim in telemetry a human reads, so the message names the branch
     /// and bead explicitly instead of a generic "not found".
     fn attach(&self, branch: &str, bead_id: &str) -> Result<SessionId, DaemonError> {
-        self.attach_within(branch, bead_id, 30)
+        self.attach_in_project(branch, bead_id, &self.project)
+    }
+
+    fn attach_in_project(
+        &self,
+        branch: &str,
+        bead_id: &str,
+        project: &str,
+    ) -> Result<SessionId, DaemonError> {
+        self.attach_within_in_project(branch, bead_id, project, 30)
     }
 
     /// Bead jleechan-zeij / issue #322 r4 P2: budget-bounded `attach` — the
@@ -7891,7 +7992,17 @@ impl Sessions for CliSessions {
         bead_id: &str,
         timeout_secs: u64,
     ) -> Result<SessionId, DaemonError> {
-        let out = run_tool("ao", &["status", "-p", &self.project, "--json"], timeout_secs)?;
+        self.attach_within_in_project(branch, bead_id, &self.project, timeout_secs)
+    }
+
+    fn attach_within_in_project(
+        &self,
+        branch: &str,
+        bead_id: &str,
+        project: &str,
+        timeout_secs: u64,
+    ) -> Result<SessionId, DaemonError> {
+        let out = run_tool("ao", &["status", "-p", project, "--json"], timeout_secs)?;
         let json_start = out.find('[').unwrap_or(0);
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
@@ -7906,7 +8017,12 @@ impl Sessions for CliSessions {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&id.0)
             .cloned()
-            .unwrap_or_else(|| self.project.clone());
+            .ok_or_else(|| {
+                DaemonError::Config(format!(
+                    "AO project ownership for session {} is unavailable; refusing unscoped cleanup",
+                    id.0
+                ))
+            })?;
         Self::kill_in_project(&project, id)?;
         self.spawned_session_projects
             .lock()
@@ -7915,8 +8031,21 @@ impl Sessions for CliSessions {
         Ok(())
     }
 
+    fn stop_in_project(&self, id: &SessionId, project: &str) -> Result<(), DaemonError> {
+        Self::kill_in_project(project, id)?;
+        self.spawned_session_projects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id.0);
+        Ok(())
+    }
+
     fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError> {
-        let out = run_tool("ao", &["status", "-p", &self.project, "--json"], 30)?;
+        self.is_quiescent_in_project(id, &self.project)
+    }
+
+    fn is_quiescent_in_project(&self, id: &SessionId, project: &str) -> Result<bool, DaemonError> {
+        let out = run_tool("ao", &["status", "-p", project, "--json"], 30)?;
         let json_start = out.find('[').unwrap_or(0);
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
@@ -7934,7 +8063,15 @@ impl Sessions for CliSessions {
         &self,
         id: &SessionId,
     ) -> Result<crate::tools::SessionActivity, DaemonError> {
-        self.session_activity_within(id, 30)
+        self.session_activity_in_project(id, &self.project)
+    }
+
+    fn session_activity_in_project(
+        &self,
+        id: &SessionId,
+        project: &str,
+    ) -> Result<crate::tools::SessionActivity, DaemonError> {
+        self.session_activity_within_in_project(id, project, 30)
     }
 
     /// Bead jleechan-zeij / issue #322 r4 P2: budget-bounded
@@ -7944,7 +8081,16 @@ impl Sessions for CliSessions {
         id: &SessionId,
         timeout_secs: u64,
     ) -> Result<crate::tools::SessionActivity, DaemonError> {
-        let out = run_tool("ao", &["status", "-p", &self.project, "--json"], timeout_secs)?;
+        self.session_activity_within_in_project(id, &self.project, timeout_secs)
+    }
+
+    fn session_activity_within_in_project(
+        &self,
+        id: &SessionId,
+        project: &str,
+        timeout_secs: u64,
+    ) -> Result<crate::tools::SessionActivity, DaemonError> {
+        let out = run_tool("ao", &["status", "-p", project, "--json"], timeout_secs)?;
         let json_start = out.find('[').unwrap_or(0);
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
@@ -7969,7 +8115,15 @@ impl Sessions for CliSessions {
     /// callers only ever reject a dispatch on a *positive* mismatch, never
     /// on an inability to check.
     fn session_branch(&self, id: &SessionId) -> Result<Option<String>, DaemonError> {
-        let out = match run_tool("ao", &["status", "-p", &self.project, "--json"], 30) {
+        self.session_branch_in_project(id, &self.project)
+    }
+
+    fn session_branch_in_project(
+        &self,
+        id: &SessionId,
+        project: &str,
+    ) -> Result<Option<String>, DaemonError> {
+        let out = match run_tool("ao", &["status", "-p", project, "--json"], 30) {
             Ok(o) => o,
             Err(_) => return Ok(None),
         };

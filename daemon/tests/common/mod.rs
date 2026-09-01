@@ -431,6 +431,10 @@ pub struct FakeSessions {
     pub fail_spawn_deferred_for: RefCell<Vec<String>>,
     pub spawn_prompts: RefCell<Vec<(String, String)>>,
     pub calls: RefCell<Vec<String>>,
+    /// Exact project-scoped AO cleanup calls. This is separate from `calls`
+    /// so restart tests can prove a persisted routed project is not replaced
+    /// by the fake's/default process project.
+    pub stop_in_project_calls: RefCell<Vec<(String, String)>>,
     /// jleechan-5ia2: scripted `session_branch` override, keyed by session
     /// id. Empty by default (matches the trait's `Ok(None)` default —
     /// "cannot verify") so pre-existing tests are unaffected; tests that
@@ -518,6 +522,7 @@ impl Default for FakeSessions {
             fail_spawn_deferred_for: RefCell::new(Vec::new()),
             spawn_prompts: RefCell::new(Vec::new()),
             calls: RefCell::new(Vec::new()),
+            stop_in_project_calls: RefCell::new(Vec::new()),
             branch_for: RefCell::new(HashMap::new()),
             terminal_at: RefCell::new(None),
             quiescence_check_error: RefCell::new(None),
@@ -815,6 +820,13 @@ impl Sessions for FakeSessions {
         // session as terminated (positive death) unless flagged as an orphan.
         self.stop_succeeded.set(true);
         Ok(())
+    }
+
+    fn stop_in_project(&self, id: &SessionId, project: &str) -> Result<(), DaemonError> {
+        self.stop_in_project_calls
+            .borrow_mut()
+            .push((id.0.clone(), project.to_string()));
+        self.stop(id)
     }
 
     fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError> {

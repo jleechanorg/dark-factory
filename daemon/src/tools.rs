@@ -755,8 +755,34 @@ pub trait Sessions {
     fn active_count(&self) -> Result<usize, DaemonError>;
     fn spawn(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError>;
     fn attach(&self, branch: &str, bead_id: &str) -> Result<SessionId, DaemonError>;
+    fn attach_in_project(
+        &self,
+        branch: &str,
+        bead_id: &str,
+        project: &str,
+    ) -> Result<SessionId, DaemonError> {
+        let _ = project;
+        self.attach(branch, bead_id)
+    }
     fn stop(&self, id: &SessionId) -> Result<(), DaemonError>;
+    /// Stop a session using the AO project resolved by its durable owner.
+    ///
+    /// The default preserves existing fakes and single-project adapters. The
+    /// production adapter overrides it so restart recovery never guesses from
+    /// a process-local spawn map.
+    fn stop_in_project(&self, id: &SessionId, project: &str) -> Result<(), DaemonError> {
+        let _ = project;
+        self.stop(id)
+    }
     fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError>;
+    fn is_quiescent_in_project(
+        &self,
+        id: &SessionId,
+        project: &str,
+    ) -> Result<bool, DaemonError> {
+        let _ = project;
+        self.is_quiescent(id)
+    }
     /// Budget-bounded `attach` (bead jleechan-zeij / issue #322 r4 P2). The
     /// re-roll proceed poll caps each probe at the time remaining until its
     /// window deadline so a single poll cannot block for multiples of the
@@ -773,6 +799,16 @@ pub trait Sessions {
         let _ = timeout_secs;
         self.attach(branch, bead_id)
     }
+    fn attach_within_in_project(
+        &self,
+        branch: &str,
+        bead_id: &str,
+        project: &str,
+        timeout_secs: u64,
+    ) -> Result<SessionId, DaemonError> {
+        let _ = project;
+        self.attach_within(branch, bead_id, timeout_secs)
+    }
     /// Budget-bounded [`session_activity`](Sessions::session_activity) (bead
     /// jleechan-zeij / issue #322 r4 P2). Default delegates to the unbounded
     /// method; `CliSessions` overrides to pass `timeout_secs` to `ao status`.
@@ -783,6 +819,15 @@ pub trait Sessions {
     ) -> Result<SessionActivity, DaemonError> {
         let _ = timeout_secs;
         self.session_activity(id)
+    }
+    fn session_activity_within_in_project(
+        &self,
+        id: &SessionId,
+        project: &str,
+        timeout_secs: u64,
+    ) -> Result<SessionActivity, DaemonError> {
+        let _ = project;
+        self.session_activity_within(id, timeout_secs)
     }
     /// Activity probe distinguishing idle vs running vs terminal (bead
     /// jleechan-zeij / issue #322 r2 — see [`SessionActivity`]). The default
@@ -798,6 +843,14 @@ pub trait Sessions {
         } else {
             Ok(SessionActivity::Running)
         }
+    }
+    fn session_activity_in_project(
+        &self,
+        id: &SessionId,
+        project: &str,
+    ) -> Result<SessionActivity, DaemonError> {
+        let _ = project;
+        self.session_activity(id)
     }
     /// Post-spawn session health monitor: checks if an active session died,
     /// failed authentication, hit quota limits, or suffered terminal errors in its terminal.
@@ -841,6 +894,14 @@ pub trait Sessions {
     fn session_branch(&self, id: &SessionId) -> Result<Option<String>, DaemonError> {
         let _ = id;
         Ok(None)
+    }
+    fn session_branch_in_project(
+        &self,
+        id: &SessionId,
+        project: &str,
+    ) -> Result<Option<String>, DaemonError> {
+        let _ = project;
+        self.session_branch(id)
     }
     /// Returns the git remote URL configured for `remote_name` inside the
     /// worktree backing a just-spawned session for `ao_project`/`branch`,

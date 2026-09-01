@@ -19,6 +19,7 @@ fn record_spawn_cleanup_failure(
     store: &dyn StateStore,
     overlay: &mut BeadOverlay,
     session_id: &crate::tools::SessionId,
+    ao_project: &str,
     root_error: DaemonError,
     cleanup_error: DaemonError,
 ) -> DaemonError {
@@ -27,6 +28,7 @@ fn record_spawn_cleanup_failure(
     // startup reconciliation would blindly requeue.
     overlay.state = OverlayState::HumanHeld;
     overlay.session_id = Some(session_id.0.clone());
+    overlay.session_ao_project = Some(ao_project.to_string());
     set_human_hold_reason(overlay, HumanHoldReason::SpawnCleanupFailed);
     let cleanup_error = match store.save(overlay) {
         Ok(()) => cleanup_error,
@@ -239,6 +241,7 @@ pub fn dispatch_ready_with_vcs(
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -688,6 +691,7 @@ pub fn dispatch_ready_with_vcs(
                 };
                 overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = Some(session.clone());
+                overlay.session_ao_project = Some(routing.ao_project.clone());
                 set_human_hold_reason(&mut overlay, HumanHoldReason::SpawnCleanupFailed);
                 if let Err(state_error) = store.save(&overlay) {
                     return Err(DaemonError::SpawnCleanupFailed {
@@ -825,18 +829,21 @@ pub fn dispatch_ready_with_vcs(
         // newly-created id whose live status contradicts that contract. The
         // id came directly from this spawn call, so it is owned by this
         // dispatch and must be stopped rather than leaked and requeued.
-        if let Ok(Some(actual_branch)) = sessions.session_branch(&session_id) {
+        if let Ok(Some(actual_branch)) =
+            sessions.session_branch_in_project(&session_id, &routing.ao_project)
+        {
             if actual_branch != branch {
                 let phase = "spawn_branch_mismatch";
                 let branch_error = DaemonError::Parse(format!(
                     "ao spawn returned session {} but its live branch is {actual_branch:?}, expected {branch:?} — refusing to record as DISPATCHED",
                     session_id.0
                 ));
-                if let Err(cleanup_error) = sessions.stop(&session_id) {
+                if let Err(cleanup_error) = sessions.stop_in_project(&session_id, &routing.ao_project) {
                     return Err(record_spawn_cleanup_failure(
                         store,
                         &mut overlay,
                         &session_id,
+                        &routing.ao_project,
                         branch_error,
                         cleanup_error,
                     ));
@@ -884,11 +891,12 @@ pub fn dispatch_ready_with_vcs(
         let remote_url = match verified_remote {
             Ok(url) => url,
             Err(error) => {
-                if let Err(cleanup_error) = sessions.stop(&session_id) {
+                if let Err(cleanup_error) = sessions.stop_in_project(&session_id, &routing.ao_project) {
                     return Err(record_spawn_cleanup_failure(
                         store,
                         &mut overlay,
                         &session_id,
+                        &routing.ao_project,
                         error,
                         cleanup_error,
                     ));
@@ -929,11 +937,12 @@ pub fn dispatch_ready_with_vcs(
                  (jleechan-9sh5 discipline).",
                 bead.id, routing.push_remote
             ));
-            if let Err(cleanup_error) = sessions.stop(&session_id) {
+            if let Err(cleanup_error) = sessions.stop_in_project(&session_id, &routing.ao_project) {
                 return Err(record_spawn_cleanup_failure(
                     store,
                     &mut overlay,
                     &session_id,
+                    &routing.ao_project,
                     remote_error,
                     cleanup_error,
                 ));
@@ -954,6 +963,7 @@ pub fn dispatch_ready_with_vcs(
 
         overlay.state = OverlayState::Dispatched;
         overlay.session_id = Some(session_id.0.clone());
+        overlay.session_ao_project = Some(routing.ao_project.clone());
         // Real progress: whatever was previously blocking spawn (session cap,
         // transient tool error, ...) has cleared, so the retry-cap counter no
         // longer needs to remember it.
@@ -984,11 +994,12 @@ pub fn dispatch_ready_with_vcs(
             // we now have an untracked live session we can't even kill —
             // that's a more urgent operator-facing failure than the original
             // save error, so it takes priority and is returned instead.
-            if let Err(cleanup_error) = sessions.stop(&session_id) {
+            if let Err(cleanup_error) = sessions.stop_in_project(&session_id, &routing.ao_project) {
                 return Err(record_spawn_cleanup_failure(
                     store,
                     &mut overlay,
                     &session_id,
+                    &routing.ao_project,
                     save_err,
                     cleanup_error,
                 ));
@@ -2324,6 +2335,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -2377,6 +2389,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -2437,6 +2450,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -2488,6 +2502,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -2540,6 +2555,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -2595,6 +2611,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -2704,6 +2721,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -2780,6 +2798,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -2851,6 +2870,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -2936,6 +2956,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -4053,6 +4074,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -4337,6 +4359,7 @@ mod tests {
             pr_number: Some(622),
             branch: Some("factory/dark-factory-2xt8-r1".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: true,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -4394,6 +4417,7 @@ mod tests {
             pr_number: None,
             branch: Some("factory/ordinary-retry-bead-123-r1".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -4460,6 +4484,7 @@ mod tests {
             pr_number: Some(999),
             branch: Some("factory/recovered-ordinary-bead-456-r1".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -4534,10 +4559,11 @@ mod tests {
             reroll_count: 0,
             autonomy_secs: 0,
             spend_usd: 0.0,
-            pr_number: Some(999),
-            branch: Some("factory/recovered-ordinary-bead-789-r1".into()),
-            session_id: None,
-            is_adopted: false,
+           pr_number: Some(999),
+           branch: Some("factory/recovered-ordinary-bead-789-r1".into()),
+           session_id: None,
+            session_ao_project: None,
+           is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
@@ -4750,4 +4776,3 @@ mod tests {
         );
     }
 }
-

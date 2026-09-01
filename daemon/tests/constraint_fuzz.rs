@@ -349,6 +349,7 @@ fn run_cb_case(case: &CbCase, spec_dir: &std::path::Path, llm: &dyn Llm) -> CbRe
         pr_number: Some(900),
         branch: Some(branch),
         session_id: None,
+        session_ao_project: None,
         is_adopted: false,
         spawn_failure_count: 0,
             pre_session_head_sha: None,
