@@ -3838,6 +3838,9 @@ pub struct CliSessions {
         std::collections::HashMap<String, (String, std::path::PathBuf)>,
     >,
     spawned_session_projects: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    spawned_branch_projects: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    spawned_session_branches: std::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
+    allow_default_project_fallback: bool,
 }
 
 impl CliSessions {
@@ -3852,7 +3855,54 @@ impl CliSessions {
             spawned_worktrees: std::sync::Mutex::new(std::collections::HashMap::new()),
             spawned_session_worktrees: std::sync::Mutex::new(std::collections::HashMap::new()),
             spawned_session_projects: std::sync::Mutex::new(std::collections::HashMap::new()),
+            spawned_branch_projects: std::sync::Mutex::new(std::collections::HashMap::new()),
+            spawned_session_branches: std::sync::Mutex::new(std::collections::HashMap::new()),
+            allow_default_project_fallback: true,
         }
+    }
+
+    pub fn with_restored_projects<I>(
+        repo: &str,
+        agent: &str,
+        bindings: I,
+        allow_default_project_fallback: bool,
+    ) -> Result<Self, DaemonError>
+    where
+        I: IntoIterator<Item = (Option<String>, Option<String>, String)>,
+    {
+        let mut sessions = Self::new(repo, agent);
+        sessions.allow_default_project_fallback = allow_default_project_fallback;
+        for (session, branch, project) in bindings {
+            if let Some(session) = session {
+                let mut owners = sessions.spawned_session_projects.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if owners.insert(session.clone(), project.clone())
+                    .is_some_and(|prior| prior != project) {
+                    return Err(DaemonError::Config(format!(
+                        "durable AO session {session:?} has conflicting project owners"
+                    )));
+                }
+                let mut branches = sessions.spawned_session_branches.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if branches.insert(session.clone(), branch.clone())
+                    .is_some_and(|prior| prior != branch) {
+                    return Err(DaemonError::Config(format!(
+                        "durable AO session {session:?} has conflicting branch identities"
+                    )));
+                }
+            }
+            if let Some(branch) = branch {
+                let mut owners = sessions.spawned_branch_projects.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if owners.insert(branch.clone(), project.clone())
+                    .is_some_and(|prior| prior != project) {
+                    return Err(DaemonError::Config(format!(
+                        "durable AO branch {branch:?} has conflicting project owners"
+                    )));
+                }
+            }
+        }
+        Ok(sessions)
     }
 
     fn record_session_project(&self, session: &SessionId, project: &str) {
@@ -3862,22 +3912,44 @@ impl CliSessions {
             .insert(session.0.clone(), project.to_string());
     }
 
-    fn project_for_session(&self, session: &SessionId) -> String {
-        self.spawned_session_projects
+    fn project_for_session(&self, session: &SessionId) -> Result<String, DaemonError> {
+        if let Some(project) = self.spawned_session_projects
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&session.0)
-            .cloned()
-            .unwrap_or_else(|| self.project.clone())
+            .cloned() {
+            return Ok(project);
+        }
+        if self.allow_default_project_fallback {
+            return Ok(self.project.clone());
+        }
+        Err(DaemonError::Config(format!(
+            "AO session {:?} has no durable project owner; refusing default-project fallback",
+            session.0
+        )))
     }
 
-    fn project_for_branch(&self, branch: &str) -> String {
-        self.spawned_worktrees
+    fn project_for_branch(&self, branch: &str) -> Result<String, DaemonError> {
+        if let Some(project) = self.spawned_branch_projects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(branch)
+            .cloned() {
+            return Ok(project);
+        }
+        if let Some(project) = self.spawned_worktrees
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .keys()
-            .find_map(|(project, candidate)| (candidate == branch).then(|| project.clone()))
-            .unwrap_or_else(|| self.project.clone())
+            .find_map(|(project, candidate)| (candidate == branch).then(|| project.clone())) {
+            return Ok(project);
+        }
+        if self.allow_default_project_fallback {
+            return Ok(self.project.clone());
+        }
+        Err(DaemonError::Config(format!(
+            "AO branch {branch:?} has no durable project owner; refusing default-project fallback"
+        )))
     }
 
     fn run_spawn_process(&self, agent: &str, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
@@ -3967,7 +4039,13 @@ impl CliSessions {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(session.0.clone(), (spec.branch.clone(), workspace));
+        self.spawned_branch_projects.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(spec.branch.clone(), spec.ao_project.clone());
         self.record_session_project(&session, &spec.ao_project);
+        self.spawned_session_branches.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session.0.clone(), Some(spec.branch.clone()));
         Ok(session)
     }
 
@@ -4482,8 +4560,40 @@ mod ao_spawn_contract_tests {
         let unknown = SessionId("wa-unknown".to_string());
         sessions.record_session_project(&owned, "worldarchitect");
 
-        assert_eq!(sessions.project_for_session(&owned), "worldarchitect");
-        assert_eq!(sessions.project_for_session(&unknown), "dark-factory");
+        assert_eq!(sessions.project_for_session(&owned).unwrap(), "worldarchitect");
+        assert_eq!(sessions.project_for_session(&unknown).unwrap(), "dark-factory");
+    }
+
+    #[test]
+    fn restored_session_and_branch_owners_survive_new_adapter_instance() {
+        let restarted = CliSessions::with_restored_projects(
+            "jleechanorg/dark-factory",
+            "minimax",
+            [(Some("wa-owned".to_string()), Some("factory/wa-owned-r1".to_string()), "worldarchitect".to_string())],
+            false,
+        ).unwrap();
+        assert_eq!(restarted.project_for_session(&SessionId("wa-owned".into())).unwrap(), "worldarchitect");
+        assert_eq!(restarted.project_for_branch("factory/wa-owned-r1").unwrap(), "worldarchitect");
+        assert!(restarted.project_for_session(&SessionId("unknown".into())).is_err());
+        assert!(restarted.project_for_branch("factory/unknown-r1").is_err());
+    }
+
+    #[test]
+    fn restored_session_rejects_conflicting_branch_identity() {
+        let result = CliSessions::with_restored_projects(
+            "jleechanorg/dark-factory",
+            "minimax",
+            [
+                (Some("wa-owned".to_string()), Some("factory/first-r1".to_string()), "worldarchitect".to_string()),
+                (Some("wa-owned".to_string()), Some("factory/second-r1".to_string()), "worldarchitect".to_string()),
+            ],
+            false,
+        );
+        let error = match result {
+            Ok(_) => panic!("conflicting durable identity must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("conflicting branch identities"));
     }
 
     fn bridge_test_node() -> std::path::PathBuf {
@@ -7109,7 +7219,7 @@ impl Sessions for CliSessions {
         bead_id: &str,
         timeout_secs: u64,
     ) -> Result<SessionId, DaemonError> {
-        let project = self.project_for_branch(branch);
+        let project = self.project_for_branch(branch)?;
         let out = run_ao_tool(
             &project,
             &["status", "-p", &project, "--json"],
@@ -7123,13 +7233,13 @@ impl Sessions for CliSessions {
     }
 
     fn stop(&self, id: &SessionId) -> Result<(), DaemonError> {
-        let project = self.project_for_session(id);
+        let project = self.project_for_session(id)?;
         run_ao_tool(&project, &["session", "kill", &id.0], 30)?;
         Ok(())
     }
 
     fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError> {
-        let project = self.project_for_session(id);
+        let project = self.project_for_session(id)?;
         let out = run_ao_tool(&project, &["status", "-p", &project, "--json"], 30)?;
         let json_start = out.find('[').unwrap_or(0);
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
@@ -7158,7 +7268,7 @@ impl Sessions for CliSessions {
         id: &SessionId,
         timeout_secs: u64,
     ) -> Result<crate::tools::SessionActivity, DaemonError> {
-        let project = self.project_for_session(id);
+        let project = self.project_for_session(id)?;
         let out = run_ao_tool(
             &project,
             &["status", "-p", &project, "--json"],
@@ -7188,7 +7298,10 @@ impl Sessions for CliSessions {
     /// callers only ever reject a dispatch on a *positive* mismatch, never
     /// on an inability to check.
     fn session_branch(&self, id: &SessionId) -> Result<Option<String>, DaemonError> {
-        let project = self.project_for_session(id);
+        let project = match self.project_for_session(id) {
+            Ok(project) => project,
+            Err(_) => return Ok(None),
+        };
         let out = match run_ao_tool(
             &project,
             &["status", "-p", &project, "--json"],

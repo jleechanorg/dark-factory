@@ -567,6 +567,22 @@ fn run(args: Args) -> Result<(), DaemonError> {
 
     store.reconcile_dispatching()?;
 
+    let restored_session_projects = store.session_routing_bindings()?
+        .into_iter()
+        .map(|binding| {
+            let project = if let Some(project) = binding.ao_project {
+                project
+            } else {
+                let repo = binding.target_repo.as_deref().unwrap_or(&cfg.target_repo);
+                cfg.resolve_repo(repo).ok_or_else(|| DaemonError::Config(format!(
+                    "durable AO identity {:?}/{:?} references unmapped target repo {repo:?}",
+                    binding.session_id, binding.branch
+                )))?.ao_project
+            };
+            Ok((binding.session_id, binding.branch, project))
+        })
+        .collect::<Result<Vec<_>, DaemonError>>()?;
+
     let (scm, tracker, sessions, llm, vcs): DaemonAdapters = if args.dry_run {
         #[cfg(any(test, debug_assertions))]
         {
@@ -589,7 +605,12 @@ fn run(args: Args) -> Result<(), DaemonError> {
         (
             Box::new(CliScm::new(cfg.target_repo.clone())),
             Box::new(CliTracker),
-            Box::new(CliSessions::new(&ao_project, &default_agent)),
+            Box::new(CliSessions::with_restored_projects(
+                &ao_project,
+                &default_agent,
+                restored_session_projects,
+                cfg.repos.is_empty(),
+            )?),
             Box::new(ChainLlm),
             Box::new(CliVcs::new(cfg.target_repo.clone())),
         )

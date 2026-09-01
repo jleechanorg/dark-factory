@@ -568,7 +568,7 @@ pub fn dispatch_ready_with_vcs(
                     .and_then(|num| num.parse::<u64>().ok());
             }
         }
-        if let Err(err) = store.save(&overlay) {
+        if let Err(err) = store.save_dispatch_intent(&overlay, &routing.ao_project) {
             if err.is_transient() {
                 report.failures.push(failure(
                     bead,
@@ -992,7 +992,7 @@ pub fn dispatch_ready_with_vcs(
             .as_secs();
         overlay.attempt_started_at = Some(now_epoch);
         overlay.autonomy_secs = 0;
-        if let Err(save_err) = store.save(&overlay) {
+        if let Err(save_err) = store.save_dispatched_session(&overlay, &routing.ao_project) {
             // The worker process now exists but the daemon failed to
             // durably record it as DISPATCHED. Kill the just-spawned worker
             // so no live session survives without a matching on-disk record

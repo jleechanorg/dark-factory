@@ -1414,7 +1414,7 @@ fn execute_adopted(
     bead.state = OverlayState::Dispatching;
     bead.session_id = None;
     bead.pre_session_head_sha = Some(pre_session_sha.clone());
-    deps.store.save(bead)?;
+    deps.store.save_dispatch_intent(bead, &spec.ao_project)?;
 
     match deps.sessions.spawn(&spec) {
         Ok(session_id) => {
@@ -1429,7 +1429,7 @@ fn execute_adopted(
             bead.pre_session_head_sha = Some(pre_session_sha);
             if let Err(save_error) = deps
                 .store
-                .save_remediation_session_spawned(bead, remediation_attempt)
+                .save_remediation_session_spawned(bead, remediation_attempt, &spec.ao_project)
             {
                 if let Err(cleanup_error) = deps.sessions.stop(&session_id) {
                     bead.state = OverlayState::HumanHeld;

@@ -176,6 +176,14 @@ pub struct BeadOverlay {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRoutingBinding {
+    pub session_id: Option<String>,
+    pub branch: Option<String>,
+    pub target_repo: Option<String>,
+    pub ao_project: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdoptedPrIdentity {
     pub repo: String,
     pub default_repo: String,
@@ -211,6 +219,23 @@ pub trait StateStore {
     fn load(&self, bead_id: &str) -> Result<Option<BeadOverlay>, DaemonError>;
     fn save(&self, overlay: &BeadOverlay) -> Result<(), DaemonError>;
     fn register_branch(&self, bead_id: &str, branch: &str) -> Result<(), DaemonError>;
+    fn session_routing_bindings(&self) -> Result<Vec<SessionRoutingBinding>, DaemonError> {
+        Ok(Vec::new())
+    }
+    fn save_dispatched_session(
+        &self,
+        overlay: &BeadOverlay,
+        _ao_project: &str,
+    ) -> Result<(), DaemonError> {
+        self.save(overlay)
+    }
+    fn save_dispatch_intent(
+        &self,
+        overlay: &BeadOverlay,
+        ao_project: &str,
+    ) -> Result<(), DaemonError> {
+        self.save_dispatched_session(overlay, ao_project)
+    }
     /// Deletion guard: daemon may delete ONLY refs returned here (spec §4.2.8).
     fn owned_branches(&self) -> Result<Vec<String>, DaemonError>;
     /// Reverse-lookup: branch → bead_id (used by fast_tier to find drive-existing-pr beads).
@@ -334,8 +359,9 @@ pub trait StateStore {
         &self,
         overlay: &BeadOverlay,
         attempt: u32,
+        ao_project: &str,
     ) -> Result<(), DaemonError> {
-        self.save(overlay)?;
+        self.save_dispatched_session(overlay, ao_project)?;
         self.mark_remediation_session_spawned(&overlay.bead_id, attempt)
     }
     /// Read the `(attempt_count, last_attempt_epoch_secs)` pair for the
@@ -846,6 +872,7 @@ impl SqliteStateStore {
         Self::ensure_pre_session_head_sha_column(&conn)?;
         Self::ensure_park_reason_column(&conn)?;
         Self::ensure_target_repo_column(&conn)?;
+        Self::ensure_ao_project_column(&conn)?;
         Self::ensure_reroll_deferral_count_column(&conn)?;
         Self::ensure_reroll_head_permanent_failure_count_column(&conn)?;
         Self::ensure_held_recheck_after_column(&conn)?;
@@ -874,6 +901,7 @@ impl SqliteStateStore {
         Self::ensure_pre_session_head_sha_column(&conn)?;
         Self::ensure_park_reason_column(&conn)?;
         Self::ensure_target_repo_column(&conn)?;
+        Self::ensure_ao_project_column(&conn)?;
         Self::ensure_reroll_deferral_count_column(&conn)?;
         Self::ensure_reroll_head_permanent_failure_count_column(&conn)?;
         Self::ensure_held_recheck_after_column(&conn)?;
@@ -1380,6 +1408,7 @@ impl SqliteStateStore {
         "pre_session_head_sha",
         "park_reason",
         "target_repo",
+        "ao_project",
         "reroll_deferral_count",
         "held_recheck_after",
         "last_er_evidence_hash",
@@ -1411,6 +1440,7 @@ impl SqliteStateStore {
         pre_session_head_sha TEXT, \
         park_reason TEXT, \
         target_repo TEXT, \
+        ao_project TEXT, \
         reroll_deferral_count INTEGER NOT NULL DEFAULT 0, \
         held_recheck_after INTEGER, \
         last_er_evidence_hash TEXT)";
@@ -1527,6 +1557,22 @@ impl SqliteStateStore {
                 [],
             )
             .map_err(|e| tool_err("ensure_attempt_started_at_column: add column", e))?;
+        }
+        Ok(())
+    }
+
+    fn ensure_ao_project_column(conn: &Connection) -> Result<(), DaemonError> {
+        let has_col: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
+                 WHERE name = 'ao_project'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_ao_project_column: pragma", e))?;
+        if !has_col {
+            conn.execute("ALTER TABLE bead_overlay ADD COLUMN ao_project TEXT", [])
+                .map_err(|e| tool_err("ensure_ao_project_column: add column", e))?;
         }
         Ok(())
     }
@@ -1680,6 +1726,21 @@ impl StateStore for SqliteStateStore {
         Ok(())
     }
 
+    fn session_routing_bindings(&self) -> Result<Vec<SessionRoutingBinding>, DaemonError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, branch, target_repo, ao_project FROM bead_overlay \
+             WHERE session_id IS NOT NULL OR branch IS NOT NULL",
+        ).map_err(|e| tool_err("session_routing_bindings prepare", e))?;
+        let rows = stmt.query_map([], |row| Ok(SessionRoutingBinding {
+            session_id: row.get(0)?,
+            branch: row.get(1)?,
+            target_repo: row.get(2)?,
+            ao_project: row.get(3)?,
+        })).map_err(|e| tool_err("session_routing_bindings query", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| tool_err("session_routing_bindings row", e))
+    }
+
     fn load(&self, bead_id: &str) -> Result<Option<BeadOverlay>, DaemonError> {
         self.conn
             .query_row(
@@ -1729,6 +1790,36 @@ impl StateStore for SqliteStateStore {
 
     fn save(&self, overlay: &BeadOverlay) -> Result<(), DaemonError> {
         save_overlay_conn(&self.conn, overlay)
+    }
+
+    fn save_dispatched_session(
+        &self,
+        overlay: &BeadOverlay,
+        ao_project: &str,
+    ) -> Result<(), DaemonError> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| tool_err("save_dispatched_session begin", e))?;
+        let result = (|| {
+            save_overlay_conn(&self.conn, overlay)?;
+            self.conn.execute(
+                "UPDATE bead_overlay SET ao_project = ?2 WHERE bead_id = ?1",
+                params![overlay.bead_id, ao_project],
+            ).map_err(|e| tool_err("save_dispatched_session project", e))?;
+            Ok::<(), DaemonError>(())
+        })();
+        match result {
+            Ok(()) => match self.conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    Err(tool_err("save_dispatched_session commit", error))
+                }
+            },
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     fn stamp_attempt_started_at(
@@ -2353,12 +2444,17 @@ impl StateStore for SqliteStateStore {
         &self,
         overlay: &BeadOverlay,
         attempt: u32,
+        ao_project: &str,
     ) -> Result<(), DaemonError> {
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| tool_err("save_remediation_session_spawned begin", e))?;
         let result = (|| {
             save_overlay_conn(&self.conn, overlay)?;
+            self.conn.execute(
+                "UPDATE bead_overlay SET ao_project = ?2 WHERE bead_id = ?1",
+                params![overlay.bead_id, ao_project],
+            ).map_err(|e| tool_err("save_remediation_session_spawned project", e))?;
             self.conn
                 .execute(
                     "INSERT INTO remediation_session_spawned (bead_id, attempt, updated_at) \
@@ -3400,6 +3496,57 @@ mod tests {
         assert_eq!(got.session_id.as_deref(), Some("known-live-session"));
         assert_eq!(got.branch.as_deref(), Some("factory/cleanup-held-r1"));
         assert_eq!(got.park_reason.as_deref(), Some("spawn_cleanup_failed"));
+    }
+
+    #[test]
+    fn session_routing_restores_sessions_branches_and_exact_spawn_project() {
+        let s = store();
+        let mut routed = BeadOverlay {
+            bead_id: "routed".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/routed-r1".into()),
+            session_id: Some("wa-404".into()),
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: Some("jleechanorg/worldarchitect.ai".into()),
+            attempt_started_at: None,
+        };
+        routed.session_id = None;
+        routed.state = OverlayState::Dispatching;
+        s.save_dispatch_intent(&routed, "worldarchitect-old").unwrap();
+        let intent = s.session_routing_bindings().unwrap().into_iter()
+            .find(|binding| binding.branch.as_deref() == Some("factory/routed-r1"))
+            .unwrap();
+        assert_eq!(intent.ao_project.as_deref(), Some("worldarchitect-old"));
+
+        routed.session_id = Some("wa-404".into());
+        routed.state = OverlayState::Dispatched;
+        s.save_dispatched_session(&routed, "worldarchitect-old").unwrap();
+        routed.state = OverlayState::Attested;
+        s.save(&routed).unwrap();
+
+        let mut branch_only = routed.clone();
+        branch_only.bead_id = "branch-only".into();
+        branch_only.branch = Some("contributor/fix".into());
+        branch_only.session_id = None;
+        s.save(&branch_only).unwrap();
+
+        let bindings = s.session_routing_bindings().unwrap();
+        let session = bindings.iter().find(|binding| {
+            binding.session_id.as_deref() == Some("wa-404")
+        }).unwrap();
+        assert_eq!(session.ao_project.as_deref(), Some("worldarchitect-old"));
+        assert!(bindings.iter().any(|binding| {
+            binding.session_id.is_none()
+                && binding.branch.as_deref() == Some("contributor/fix")
+        }));
     }
 
     #[test]

@@ -89,6 +89,8 @@ CREATE TABLE IF NOT EXISTS bead_overlay (
   -- `ensure_target_repo_column` migration in `SqliteStateStore::open` (same
   -- guard pattern as `ensure_is_adopted_column`).
   target_repo TEXT,
+  -- Immutable spawn-time routing provenance for a persisted AO session.
+  ao_project TEXT,
   -- Consecutive re-roll deferral counter (bead jleechan-zeij / issue #322
   -- r2). The fail-closed re-roll proceed predicate in daemon/src/reroll.rs
   -- supersedes a worker ONLY once it can positively confirm the previous

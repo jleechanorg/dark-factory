@@ -1931,6 +1931,7 @@ impl StateStore for FakeStateStore {
         &self,
         overlay: &BeadOverlay,
         attempt: u32,
+        _ao_project: &str,
     ) -> Result<(), DaemonError> {
         if *self.fail_remediation_session_spawned.borrow() {
             return Err(DaemonError::Tool {

@@ -154,8 +154,9 @@ impl StateStore for SqliteTestStore {
         &self,
         overlay: &BeadOverlay,
         attempt: u32,
+        ao_project: &str,
     ) -> Result<(), daemon::errors::DaemonError> {
-        self.store.save_remediation_session_spawned(overlay, attempt)
+        self.store.save_remediation_session_spawned(overlay, attempt, ao_project)
     }
     fn escalation_should_emit(
         &self,
