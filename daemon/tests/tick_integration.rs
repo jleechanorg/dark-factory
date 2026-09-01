@@ -27,8 +27,8 @@ use daemon::config::{Config, RepoConfig};
 
 use daemon::er_runner;
 use daemon::errors::DaemonError;
-use daemon::state::{BeadOverlay, OverlayState, StateStore};
-use daemon::tick::{combine_dual_verdict, run_tick, TickDeps};
+use daemon::state::{BeadOverlay, OverlayState, StateStore, CIRCUIT_BREAKER_PARK_REASON};
+use daemon::tick::{combine_dual_verdict, run_tick, TickDeps, TickSummary};
 use daemon::tools::{
     Bead, Issue, LabeledPr, Llm, Permission, PrComment, PrHeadBranch, PrSnapshot, Scm,
 };
@@ -2626,6 +2626,217 @@ fn factory_labeled_pr_branch_collision_is_refused_without_stealing_mapping() {
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
+}
+
+fn identical_adoption_collision_fixture(
+    owner_state: OverlayState,
+    owner_session: Option<&str>,
+    park_reason: Option<&str>,
+    suffix: &str,
+) -> (FakeStateStore, FakeTracker, FakeSessions, std::path::PathBuf, TickSummary) {
+    let mut scm = FakeScm::new();
+    scm.prs.push(LabeledPr {
+        number: 607,
+        title: "Identical adopted PR".into(),
+        body: "same PR identity".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#607".into(),
+        head_ref_name: "factory/shared-607".into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("owner/repo".into()),
+        head_repo_owner_login: Some("owner".into()),
+        head_sha: Some("head-607".into()),
+        updated_at_epoch: Some(1_700_000_000),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    store
+        .save(&BeadOverlay {
+            bead_id: "old-owner-607".into(),
+            state: owner_state,
+            attempt: 4,
+            reroll_count: 2,
+            autonomy_secs: 91,
+            spend_usd: 3.0,
+            pr_number: Some(607),
+            branch: Some("factory/shared-607".into()),
+            session_id: owner_session.map(str::to_string),
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: park_reason.map(str::to_string),
+            target_repo: Some("owner/repo".into()),
+            attempt_started_at: None,
+        })
+        .unwrap();
+    store
+        .register_branch("old-owner-607", "factory/shared-607")
+        .unwrap();
+    let cfg = test_cfg();
+    let vcs = test_vcs();
+    let telemetry = std::env::temp_dir().join(format!(
+        "afd_identical_adoption_collision_{}_{}.jsonl",
+        std::process::id(), suffix
+    ));
+    let _ = std::fs::remove_file(&telemetry);
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry,
+            vendor_health: None,
+        },
+        0,
+        0,
+    )
+    .unwrap();
+    (store, tracker, sessions, telemetry, summary)
+}
+
+#[test]
+fn issue_607_identical_circuit_breaker_owner_is_atomically_replaced() {
+    let (store, _tracker, _sessions, telemetry, summary) = identical_adoption_collision_fixture(
+        OverlayState::HumanHeld,
+        None,
+        Some(CIRCUIT_BREAKER_PARK_REASON),
+        "607",
+    );
+    assert_eq!(summary.beads_escalated, 0);
+    assert_eq!(
+        store.bead_id_for_branch("factory/shared-607").unwrap(),
+        Some("fake-bead-1".into())
+    );
+    assert_eq!(
+        store.load("fake-bead-1").unwrap().unwrap().state,
+        OverlayState::Attested
+    );
+    let events = std::fs::read_to_string(&telemetry).unwrap();
+    assert!(events.contains("EXISTING_PR_OWNER_REPLACED"), "{events}");
+    assert!(!events.contains("adoption_branch_collision"), "{events}");
+    let _ = std::fs::remove_file(telemetry);
+}
+
+#[test]
+fn issue_683_identical_coder_silent_owner_is_atomically_replaced() {
+    let (store, _tracker, _sessions, telemetry, summary) = identical_adoption_collision_fixture(
+        OverlayState::HumanHeld,
+        None,
+        Some("coder_silent"),
+        "683",
+    );
+    assert_eq!(summary.beads_escalated, 0);
+    assert_eq!(
+        store.bead_id_for_branch("factory/shared-607").unwrap(),
+        Some("fake-bead-1".into())
+    );
+    assert!(std::fs::read_to_string(&telemetry)
+        .unwrap()
+        .contains("EXISTING_PR_OWNER_REPLACED"));
+    let _ = std::fs::remove_file(telemetry);
+}
+
+#[test]
+fn identical_active_owner_is_retained_and_duplicate_never_routes() {
+    let (store, _tracker, sessions, telemetry, summary) = identical_adoption_collision_fixture(
+        OverlayState::Dispatched,
+        Some("active-owner-session"),
+        None,
+        "active",
+    );
+    assert_eq!(summary.beads_escalated, 0);
+    assert_eq!(summary.beads_routed, 0);
+    assert_eq!(summary.beads_dispatched, 0);
+    assert_eq!(
+        store.bead_id_for_branch("factory/shared-607").unwrap(),
+        Some("old-owner-607".into())
+    );
+    assert!(store.load("fake-bead-1").unwrap().is_none());
+    assert!(!sessions.calls.borrow().iter().any(|call| call.starts_with("spawn(")));
+    let events = std::fs::read_to_string(&telemetry).unwrap();
+    assert!(events.contains("EXISTING_PR_COALESCED"), "{events}");
+    assert!(!events.contains("adoption_branch_collision"), "{events}");
+    let _ = std::fs::remove_file(telemetry);
+}
+
+#[test]
+fn missing_pr_head_defers_without_fabricating_collision_owner() {
+    for bound in [false, true] {
+        let mut scm = FakeScm::new();
+        scm.prs.push(LabeledPr {
+            number: 608,
+            title: "Incomplete PR identity".into(),
+            body: "head not returned yet".into(),
+            author_login: "alice".into(),
+            external_ref: "owner/repo#608".into(),
+            head_ref_name: "factory/incomplete-608".into(),
+            is_cross_repository: false,
+            head_repo_full_name: Some("owner/repo".into()),
+            head_repo_owner_login: Some("owner".into()),
+            head_sha: None,
+            updated_at_epoch: Some(1_700_000_000),
+        });
+        scm.permissions.insert("alice".into(), Permission::Write);
+        let tracker = FakeTracker::new();
+        let sessions = FakeSessions::new();
+        let llm = FakeLlm::new();
+        let store = FakeStateStore::new();
+        if bound {
+            store
+                .register_branch("prior-owner", "factory/incomplete-608")
+                .unwrap();
+        }
+        let cfg = test_cfg();
+        let vcs = test_vcs();
+        let telemetry = std::env::temp_dir().join(format!(
+            "afd_missing_adoption_head_{}_{}.jsonl",
+            std::process::id(), bound
+        ));
+        let _ = std::fs::remove_file(&telemetry);
+        let summary = run_tick(
+            &TickDeps {
+                scm: &scm,
+                tracker: &tracker,
+                sessions: &sessions,
+                llm: &llm,
+                store: &store,
+                vcs: &vcs,
+                cfg: &cfg,
+                telemetry_log: &telemetry,
+                vendor_health: None,
+            },
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(summary.beads_escalated, 0);
+        assert_eq!(summary.beads_routed, 0);
+        assert_eq!(summary.beads_dispatched, 0);
+        assert!(store.load("fake-bead-1").unwrap().is_none());
+        let events = std::fs::read_to_string(&telemetry).unwrap();
+        assert!(events.contains("EXISTING_PR_IDENTITY_DEFERRED"), "{events}");
+        assert!(!events.contains("adoption_branch_collision"), "{events}");
+        assert!(!tracker
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call.contains("already registered to bead")));
+        assert_ne!(
+            store
+                .bead_id_for_branch("factory/incomplete-608")
+                .unwrap()
+                .as_deref(),
+            Some("fake-bead-1")
+        );
+        let _ = std::fs::remove_file(telemetry);
+    }
 }
 
 /// jleechan-sniw re-review gap #1: `daemon/tests/intake.rs`'s

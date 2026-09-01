@@ -9,8 +9,8 @@
 
 use daemon::errors::DaemonError;
 use daemon::state::{
-    is_permanent_human_hold_reason, set_human_hold_reason, BeadOverlay, HumanHoldReason,
-    OverlayState, StateStore,
+    is_permanent_human_hold_reason, set_human_hold_reason, AdoptedPrClaim, AdoptedPrIdentity,
+    BeadOverlay, HumanHoldReason, OverlayState, StateStore,
 };
 use daemon::tools::{
     Bead, Issue, LabeledPr, Llm, Permission, PrHeadBranch, PrSnapshot, Scm, SessionActivity,
@@ -1361,6 +1361,7 @@ pub struct FakeStateStore {
     pub overlays: RefCell<HashMap<String, BeadOverlay>>,
     pub branches: RefCell<Vec<String>>,
     pub branch_beads: RefCell<HashMap<String, String>>,
+    pub adopted_bindings: RefCell<HashMap<String, (String, u64, String, String)>>,
     pub rejections: RefCell<HashMap<(String, u32), RejectionRecord>>,
     pub fail_save_for_state: RefCell<Vec<(String, OverlayState)>>,
     /// Bead jleechan-zeij / issue #322 r2: consecutive re-roll deferral count
@@ -1484,6 +1485,122 @@ impl StateStore for FakeStateStore {
             .borrow_mut()
             .push(format!("bead_id_for_branch({branch})"));
         Ok(self.branch_beads.borrow().get(branch).cloned())
+    }
+
+    fn claim_adopted_pr(
+        &self,
+        identity: &AdoptedPrIdentity,
+        candidate: &BeadOverlay,
+    ) -> Result<AdoptedPrClaim, DaemonError> {
+        let owner = self.branch_beads.borrow().get(&identity.branch).cloned();
+        let Some(owner_bead_id) = owner else {
+            self.save(candidate)?;
+            self.branches.borrow_mut().push(identity.branch.clone());
+            self.branch_beads
+                .borrow_mut()
+                .insert(identity.branch.clone(), candidate.bead_id.clone());
+            self.adopted_bindings.borrow_mut().insert(
+                identity.branch.clone(),
+                (
+                    identity.repo.clone(),
+                    identity.pr_number,
+                    identity.head_sha.clone(),
+                    candidate.bead_id.clone(),
+                ),
+            );
+            return Ok(AdoptedPrClaim::Owned);
+        };
+        let owner_overlay = self.overlays.borrow().get(&owner_bead_id).cloned();
+        let tuple_matches = self
+            .adopted_bindings
+            .borrow()
+            .get(&identity.branch)
+            .map(|(repo, pr, head, bound_owner)| {
+                repo == &identity.repo
+                    && *pr == identity.pr_number
+                    && !head.is_empty()
+                    && bound_owner == &owner_bead_id
+            })
+            .unwrap_or_else(|| {
+                owner_overlay.as_ref().is_some_and(|overlay| {
+                    overlay
+                        .target_repo
+                        .as_deref()
+                        .unwrap_or(&identity.default_repo)
+                        == identity.repo
+                        && overlay.pr_number == Some(identity.pr_number)
+                        && overlay.branch.as_deref() == Some(identity.branch.as_str())
+                })
+            });
+        if !tuple_matches {
+            return Ok(AdoptedPrClaim::RefusedMismatch {
+                owner_bead_id,
+                reason: "stored owner identity does not match repo/PR/branch/exact head".into(),
+            });
+        }
+        if owner_bead_id == candidate.bead_id {
+            self.save(candidate)?;
+            self.adopted_bindings.borrow_mut().insert(
+                identity.branch.clone(),
+                (
+                    identity.repo.clone(),
+                    identity.pr_number,
+                    identity.head_sha.clone(),
+                    owner_bead_id.clone(),
+                ),
+            );
+            return Ok(AdoptedPrClaim::Owned);
+        }
+        let Some(owner_overlay) = owner_overlay else {
+            return Ok(AdoptedPrClaim::RefusedMismatch {
+                owner_bead_id,
+                reason: "registered owner overlay is missing".into(),
+            });
+        };
+        if owner_overlay.state == OverlayState::HumanHeld && owner_overlay.session_id.is_none() {
+            self.save(candidate)?;
+            self.branch_beads
+                .borrow_mut()
+                .insert(identity.branch.clone(), candidate.bead_id.clone());
+            self.adopted_bindings.borrow_mut().insert(
+                identity.branch.clone(),
+                (
+                    identity.repo.clone(),
+                    identity.pr_number,
+                    identity.head_sha.clone(),
+                    candidate.bead_id.clone(),
+                ),
+            );
+            return Ok(AdoptedPrClaim::ReplacedHumanHeld { owner_bead_id });
+        }
+        if matches!(
+            owner_overlay.state,
+            OverlayState::Queued
+                | OverlayState::Dispatching
+                | OverlayState::Dispatched
+                | OverlayState::Attested
+                | OverlayState::ReRoll
+                | OverlayState::Recovery
+                | OverlayState::Redispatched
+        ) {
+            self.adopted_bindings.borrow_mut().insert(
+                identity.branch.clone(),
+                (
+                    identity.repo.clone(),
+                    identity.pr_number,
+                    identity.head_sha.clone(),
+                    owner_bead_id.clone(),
+                ),
+            );
+            return Ok(AdoptedPrClaim::CoalescedActive { owner_bead_id });
+        }
+        Ok(AdoptedPrClaim::RefusedMismatch {
+            owner_bead_id,
+            reason: format!(
+                "registered owner state {} is not replaceable",
+                owner_overlay.state.as_str()
+            ),
+        })
     }
 
     fn owned_branches(&self) -> Result<Vec<String>, DaemonError> {

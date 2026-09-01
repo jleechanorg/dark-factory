@@ -206,6 +206,21 @@ CREATE TABLE IF NOT EXISTS branch_registry (
   created_at TEXT NOT NULL
 );
 
+-- Exact identity bound to an adopted PR branch.  branch_registry remains the
+-- deletion guard; this table is the proof used when deciding whether a second
+-- intake bead is the same PR or an attempted branch steal.
+CREATE TABLE IF NOT EXISTS adopted_pr_binding (
+  branch     TEXT PRIMARY KEY,
+  repo       TEXT NOT NULL,
+  pr_number  INTEGER NOT NULL,
+  head_sha   TEXT NOT NULL,
+  bead_id    TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK (length(repo) > 0),
+  CHECK (pr_number > 0),
+  CHECK (length(head_sha) > 0)
+);
+
 
 -- Circuit breaker: tracking of review rejections per attempt to detect consecutive failures
 CREATE TABLE IF NOT EXISTS review_rejection (
