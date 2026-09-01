@@ -813,7 +813,7 @@ def _safe_relative_symlink_target(
 def _validate_snapshot_symlinks(
     target_workdir: pathlib.Path, ignored_paths: set[pathlib.Path]
 ) -> None:
-    """Validate that target_workdir contains no unsafe, escaping, or dangling symlinks."""
+    """Validate only tracked, relative, in-tree, non-looping symlinks."""
     target_real = target_workdir.resolve(strict=True)
     tracked_symlinks = _git_tracked_symlink_paths(target_workdir)
     for root, dirs, files in os.walk(target_workdir, topdown=True, followlinks=False):
@@ -828,78 +828,37 @@ def _validate_snapshot_symlinks(
                 continue
             if entry.is_symlink():
                 try:
-                    resolved = entry.resolve(strict=True)
-                except (OSError, RuntimeError) as exc:
-                    relative_entry = entry.relative_to(target_workdir)
-                    safe_target = _safe_relative_symlink_target(entry, target_workdir)
-                    if relative_entry in tracked_symlinks and safe_target is not None:
-                        safe_relative = safe_target.relative_to(target_real)
-                        if _git_path_is_ignored(target_workdir, safe_relative):
-                            raise RuntimeError(
-                                f"Target workspace symlink resolves into a Git-ignored path: {entry}"
-                            )
-                        if not any(
-                            ignored == safe_relative
-                            or ignored in safe_relative.parents
-                            or safe_relative in ignored.parents
-                            for ignored in ignored_paths
-                        ):
-                            continue
+                    raw_target = os.readlink(entry)
+                except OSError as exc:
+                    raise RuntimeError(f"Cannot read workspace symlink: {entry}") from exc
+                if os.path.isabs(raw_target):
+                    raise RuntimeError(
+                        f"Target workspace contains unsupported absolute symlink: {entry}"
+                    )
+                relative_entry = entry.relative_to(target_workdir)
+                if relative_entry not in tracked_symlinks:
+                    raise RuntimeError(
+                        f"Target workspace contains untracked symlink: {entry}"
+                    )
+                safe_target = _safe_relative_symlink_target(entry, target_workdir)
+                if safe_target is None:
                     raise RuntimeError(
                         f"Target workspace contains unsafe dangling or looping symlink: {entry}"
-                    ) from exc
-                if not (resolved == target_real or target_real in resolved.parents):
-                    raise RuntimeError(
-                        f"Target workspace contains unsafe escaping symlink: {entry} -> {resolved}"
                     )
-                entry_parent = entry.parent.resolve(strict=True)
-                if resolved == entry_parent or resolved in entry_parent.parents:
+                safe_relative = safe_target.relative_to(target_real)
+                if _git_path_is_ignored(target_workdir, safe_relative):
                     raise RuntimeError(
-                        f"Target workspace symlink resolves to its own ancestor or root: {entry}"
+                        f"Target workspace symlink resolves into a Git-ignored path: {entry}"
                     )
-                resolved_relative = resolved.relative_to(target_real)
                 if any(
-                    ignored == resolved_relative
-                    or ignored in resolved_relative.parents
-                    or resolved_relative in ignored.parents
+                    ignored == safe_relative
+                    or ignored in safe_relative.parents
+                    or safe_relative in ignored.parents
                     for ignored in ignored_paths
                 ):
                     raise RuntimeError(
                         f"Target workspace symlink resolves into a Git-ignored path: {entry}"
                     )
-
-
-def _materialize_snapshot_symlinks(target_workdir: pathlib.Path, review_dir: pathlib.Path) -> None:
-    """Preserve safe relative links and materialize links that retain source reachability."""
-    target_real = target_workdir.resolve(strict=True)
-    review_real = review_dir.resolve(strict=True)
-    for root, dirs, files in os.walk(review_dir, topdown=False, followlinks=False):
-        root_path = pathlib.Path(root)
-        for name in dirs + files:
-            entry = root_path / name
-            if entry.is_symlink():
-                rel = entry.relative_to(review_dir)
-                orig = target_workdir / rel
-                try:
-                    target_resolved = orig.resolve(strict=True)
-                except (OSError, RuntimeError) as exc:
-                    if _safe_relative_symlink_target(orig, target_workdir) is not None:
-                        continue
-                    raise RuntimeError(f"Cannot resolve in-tree symlink {entry}") from exc
-                if not (target_resolved == target_real or target_real in target_resolved.parents):
-                    raise RuntimeError(f"Escaping symlink found during materialization: {entry}")
-                if not pathlib.Path(os.readlink(orig)).is_absolute():
-                    try:
-                        review_resolved = entry.resolve(strict=True)
-                    except (OSError, RuntimeError) as exc:
-                        raise RuntimeError(f"Cannot resolve copied symlink {entry}") from exc
-                    if review_real in review_resolved.parents:
-                        continue
-                entry.unlink()
-                if target_resolved.is_dir():
-                    shutil.copytree(target_resolved, entry, symlinks=False)
-                else:
-                    shutil.copy2(target_resolved, entry)
 
 
 def _normalize_and_validate_review_git(target_workdir: pathlib.Path, review_dir: pathlib.Path) -> None:
@@ -1030,10 +989,11 @@ def _isolated_review_workdir(target_workdir: pathlib.Path):
             ignore_dangling_symlinks=False,
             ignore=ignore_git_ignored,
         )
-        _materialize_snapshot_symlinks(target_workdir, review_dir)
         _normalize_and_validate_review_git(target_workdir, review_dir)
-        if _git_ignored_snapshot_paths(review_dir):
+        review_ignored_paths = _git_ignored_snapshot_paths(review_dir)
+        if review_ignored_paths:
             raise RuntimeError("Review snapshot contains Git-ignored paths after copy")
+        _validate_snapshot_symlinks(review_dir, review_ignored_paths)
         yield review_dir
 
 
