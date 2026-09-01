@@ -115,6 +115,120 @@ if [[ "$(uname -s)" == "Linux" && "${DARK_FACTORY_DISABLE_IMMUTABLE_ARTIFACT:-0}
   RUNTIME_ROOT="${ARTIFACT_DIR}"
 fi
 
+generate_release_manifest() {
+  local destination="$1"
+  "${SYSTEM_PYTHON}" - "${RUNTIME_ROOT}" "${ARTIFACT_VERSION}" "${ARTIFACT_TREE}" "${destination}" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+source_commit, source_tree, destination = sys.argv[2:]
+files = {}
+for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+    relative = path.relative_to(root).as_posix()
+    if relative == "release-manifest.json":
+        continue
+    if path.is_symlink():
+        target = os.readlink(path)
+        entry = {"kind": "symlink", "target": target}
+        try:
+            resolved = path.resolve(strict=True)
+            if resolved.is_file():
+                entry["resolved_sha256"] = hashlib.sha256(resolved.read_bytes()).hexdigest()
+        except OSError:
+            entry["resolved_sha256"] = None
+        files[relative] = entry
+    elif path.is_file():
+        files[relative] = {
+            "kind": "file",
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+manifest = {
+    "schema_version": 2,
+    "source_commit": source_commit,
+    "source_tree": source_tree,
+    "files": files,
+}
+pathlib.Path(destination).write_text(
+    json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+PY
+}
+
+verify_release_manifest() {
+  "${SYSTEM_PYTHON}" - "${RUNTIME_ROOT}" "${ARTIFACT_VERSION}" "${ARTIFACT_TREE}" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+source_commit, source_tree = sys.argv[2:]
+manifest_path = root / "release-manifest.json"
+try:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    observed = {}
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        relative = path.relative_to(root).as_posix()
+        if relative == "release-manifest.json":
+            continue
+        if path.is_symlink():
+            target = os.readlink(path)
+            entry = {"kind": "symlink", "target": target}
+            try:
+                resolved = path.resolve(strict=True)
+                if resolved.is_file():
+                    entry["resolved_sha256"] = hashlib.sha256(resolved.read_bytes()).hexdigest()
+            except OSError:
+                entry["resolved_sha256"] = None
+            observed[relative] = entry
+        elif path.is_file():
+            observed[relative] = {
+                "kind": "file",
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+    valid = (
+        manifest.get("schema_version") == 2
+        and manifest.get("source_commit") == source_commit
+        and manifest.get("source_tree") == source_tree
+        and manifest.get("files") == observed
+    )
+except (OSError, ValueError, TypeError):
+    valid = False
+if not valid:
+    raise SystemExit("ERROR: release manifest does not match complete runtime payload")
+PY
+}
+
+if [[ "${RUNTIME_ROOT}" != "${REPO_ROOT}" ]]; then
+  SYSTEM_PYTHON="$(command -v python3)"
+  SYSTEM_PYTHON_REAL="$(readlink -f "${SYSTEM_PYTHON}")"
+  case "${SYSTEM_PYTHON_REAL}" in
+    "${RUNTIME_ROOT}"/*)
+      echo "ERROR: release verification requires Python outside the release." >&2
+      exit 1
+      ;;
+  esac
+  RELEASE_MANIFEST="${RUNTIME_ROOT}/release-manifest.json"
+  if [[ "${ARTIFACT_CREATED}" -eq 0 ]]; then
+    if [[ ! -f "${RELEASE_MANIFEST}" ]]; then
+      echo "ERROR: immutable release is missing ${RELEASE_MANIFEST}." >&2
+      echo "Rerun install.sh --clear to rebuild the release with provenance." >&2
+      exit 1
+    fi
+    if find "${RUNTIME_ROOT}" -perm /222 -print -quit | grep -q .; then
+      echo "ERROR: refusing to reuse mutable release ${RUNTIME_ROOT}." >&2
+      echo "Rerun install.sh --clear to rebuild it atomically." >&2
+      exit 1
+    fi
+    verify_release_manifest
+  fi
+fi
+
 VENV_DIR="${RUNTIME_ROOT}/.venv"
 PYTHON_BIN="${VENV_DIR}/bin/python"
 BIN_DIR="${RUNTIME_ROOT}/bin"
@@ -157,7 +271,6 @@ echo "==> verifying import"
 
 if [[ "${RUNTIME_ROOT}" != "${REPO_ROOT}" && -f "${RUNTIME_ROOT}/daemon/Cargo.toml" ]]; then
   DAEMON_BINARY="${RUNTIME_ROOT}/daemon/target/release/daemon"
-  RELEASE_MANIFEST="${RUNTIME_ROOT}/release-manifest.json"
   if [[ "${ARTIFACT_CREATED}" -eq 1 ]]; then
     if ! command -v cargo >/dev/null 2>&1; then
       echo "ERROR: cargo not found on PATH; required to build the immutable Linux daemon." >&2
@@ -165,52 +278,11 @@ if [[ "${RUNTIME_ROOT}" != "${REPO_ROOT}" && -f "${RUNTIME_ROOT}/daemon/Cargo.to
     fi
     echo "==> building immutable Rust daemon"
     cargo build --release --manifest-path "${RUNTIME_ROOT}/daemon/Cargo.toml"
-    DAEMON_SHA256="$(sha256sum "${DAEMON_BINARY}" | awk '{print $1}')"
-    if [[ ! "${DAEMON_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
-      echo "ERROR: could not calculate the immutable daemon SHA256." >&2
-      exit 1
-    fi
-    MANIFEST_TMP="${RELEASE_MANIFEST}.tmp.$$"
-    printf '{\n  "schema_version": 1,\n  "source_commit": "%s",\n  "source_tree": "%s",\n  "daemon": {\n    "path": "daemon/target/release/daemon",\n    "sha256": "%s"\n  }\n}\n' \
-      "${ARTIFACT_VERSION}" "${ARTIFACT_TREE}" "${DAEMON_SHA256}" > "${MANIFEST_TMP}"
-    mv "${MANIFEST_TMP}" "${RELEASE_MANIFEST}"
   elif [[ ! -x "${DAEMON_BINARY}" ]]; then
     echo "ERROR: immutable release is missing ${DAEMON_BINARY}." >&2
     echo "Rerun install.sh --clear to rebuild the release." >&2
     exit 1
-  elif [[ ! -f "${RELEASE_MANIFEST}" ]]; then
-    echo "ERROR: immutable release is missing ${RELEASE_MANIFEST}." >&2
-    echo "Rerun install.sh --clear to rebuild the release with provenance." >&2
-    exit 1
   fi
-  if [[ "${ARTIFACT_CREATED}" -eq 0 ]] && find "${RUNTIME_ROOT}" -perm /222 -print -quit | grep -q .; then
-    echo "ERROR: refusing to reuse mutable release ${RUNTIME_ROOT}." >&2
-    echo "Rerun install.sh --clear to rebuild it atomically." >&2
-    exit 1
-  fi
-  "${PYTHON_BIN}" - "${RELEASE_MANIFEST}" "${ARTIFACT_VERSION}" "${ARTIFACT_TREE}" "${DAEMON_BINARY}" <<'PY'
-import hashlib
-import json
-import pathlib
-import sys
-
-manifest_path, source_commit, source_tree, binary_path = sys.argv[1:]
-try:
-    manifest = json.loads(pathlib.Path(manifest_path).read_text(encoding="utf-8"))
-    daemon = manifest["daemon"]
-    actual_digest = hashlib.sha256(pathlib.Path(binary_path).read_bytes()).hexdigest()
-    valid = (
-        manifest.get("schema_version") == 1
-        and manifest.get("source_commit") == source_commit
-        and manifest.get("source_tree") == source_tree
-        and daemon.get("path") == "daemon/target/release/daemon"
-        and daemon.get("sha256") == actual_digest
-    )
-except (OSError, ValueError, KeyError, TypeError):
-    valid = False
-if not valid:
-    raise SystemExit("ERROR: immutable release manifest does not match source and daemon binary")
-PY
 fi
 
 # Configure repo-local git hooks (.githooks/) so the pre-push graph-audit
@@ -264,6 +336,10 @@ fi
 chmod +x "${BIN_DIR}/dark-factory" "${BIN_DIR}/df-healer" "${BIN_DIR}/df-validate" "${BIN_DIR}/df-funnel" "${BIN_DIR}/df-funnel-lanes"
 
 if [[ "${ARTIFACT_CREATED}" -eq 1 ]]; then
+  MANIFEST_TMP="$(mktemp "${ARTIFACT_ROOT}/.manifest-${ARTIFACT_VERSION}.XXXXXX")"
+  generate_release_manifest "${MANIFEST_TMP}"
+  mv "${MANIFEST_TMP}" "${RELEASE_MANIFEST}"
+  verify_release_manifest
   # Runtime code and the venv are complete before this point. Removing write
   # permission makes accidental in-place edits fail instead of silently
   # changing the release used by systemd.

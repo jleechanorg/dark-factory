@@ -1093,7 +1093,9 @@ sys.exit(99)
     fn two_processes_elect_exactly_one_controller_start() {
         let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let fake = FakeAo::new("two_process", 0, 150);
-        let stale_lock = fake.root.join("controller/recovery.lock");
+        let stale_lock = fake
+            .root
+            .join("controller/dark-factory/recovery.lock");
         std::fs::create_dir_all(stale_lock.parent().unwrap()).unwrap();
         std::fs::write(
             &stale_lock,
@@ -1146,7 +1148,9 @@ sys.exit(99)
             ensure_ao_recovery("dark-factory"),
             daemon::adapters::RecoveryOutcome::Restarted { .. }
         ));
-        let running = fake.root.join("controller/.agent-orchestrator/running.json");
+        let running = fake
+            .root
+            .join("controller/dark-factory/.agent-orchestrator/running.json");
         let mut value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&running).unwrap()).unwrap();
         value["projects"] = serde_json::json!(["other-project"]);
@@ -1201,7 +1205,11 @@ sys.exit(99)
             "start".to_string(), "dark-factory".to_string(),
             "--no-dashboard".to_string(), "--no-open".to_string(),
         ]]);
-        assert!(fake.root.join("controller/controller.json").is_file());
+        assert!(
+            fake.root
+                .join("controller/dark-factory/controller.json")
+                .is_file()
+        );
     }
 
     #[test]
@@ -1255,6 +1263,7 @@ sys.exit(99)
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn controller_that_never_becomes_ready_is_bounded_and_reaped() {
         let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let fake = FakeAo::new("never_ready", 0, 5_000);
@@ -1294,8 +1303,13 @@ sys.exit(99)
     fn missing_ao_with_empty_only_path_does_not_trigger_start() {
         let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!(
-            "df_ao_missing_{}_{}", std::process::id(),
-            Instant::now().elapsed().as_nanos()));
+            "df_ao_missing_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir_all(&root).unwrap();
         let root_string = root.to_string_lossy().into_owned();
         let controller = root.join("controller").to_string_lossy().into_owned();
@@ -1303,11 +1317,12 @@ sys.exit(99)
         let config = root.join("agent-orchestrator.yaml").to_string_lossy().into_owned();
         let _guard = EnvVarGuard::set(&[
             ("PATH", &root_string),
+            ("DARK_FACTORY_AO_RECOVERY_COOLDOWN_MS", "0"),
             ("DARK_FACTORY_AO_CONTROLLER_HOME", &controller),
             ("DARK_FACTORY_OPERATOR_HOME", &operator),
             ("DARK_FACTORY_AO_CONFIG_PATH", &config),
         ]);
-        let result = ensure_ao_recovery("dark-factory");
+        let result = ensure_ao_recovery("missing-ao-contract-test");
         assert!(matches!(result, daemon::adapters::RecoveryOutcome::Unknown { .. }));
         let _ = std::fs::remove_dir_all(root);
     }

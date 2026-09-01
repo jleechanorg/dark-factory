@@ -88,7 +88,11 @@ pub fn classify_gh_request(args: &[&str]) -> ApiSurface {
         if args.get(1) == Some(&"graphql") {
             let mut previous_was_query_field = false;
             for arg in args.iter().skip(2) {
-                if *arg == "--input" || arg.starts_with("--input=") {
+                if *arg == "--input"
+                    || arg.starts_with("--input=")
+                    || arg.starts_with("--field=")
+                    || arg.starts_with("--raw-field=")
+                {
                     return ApiSurface::GraphqlMutation;
                 }
                 let value = if previous_was_query_field {
@@ -126,7 +130,11 @@ pub fn classify_gh_request(args: &[&str]) -> ApiSurface {
                     mutation = true;
                 }
             }
-            if matches!(*arg, "-f" | "--field" | "-F" | "--raw-field" | "--input") {
+            if matches!(*arg, "-f" | "--field" | "-F" | "--raw-field" | "--input")
+                || arg.starts_with("--field=")
+                || arg.starts_with("--raw-field=")
+                || arg.starts_with("--input=")
+            {
                 mutation = true;
             }
         }
@@ -866,6 +874,38 @@ mod tests {
                 "ref=x"
             ]),
             "gh_api_repos"
+        );
+    }
+
+    #[test]
+    fn classifies_attached_graphql_mutation_flags() {
+        assert_eq!(
+            classify_gh_request(&["api", "graphql", "--field=query=x"]),
+            ApiSurface::GraphqlMutation
+        );
+        assert_eq!(
+            classify_gh_request(&["api", "graphql", "--raw-field=query=x"]),
+            ApiSurface::GraphqlMutation
+        );
+        assert_eq!(
+            classify_gh_request(&["api", "graphql", "--input=payload.json"]),
+            ApiSurface::GraphqlMutation
+        );
+    }
+
+    #[test]
+    fn classifies_attached_rest_mutation_flags() {
+        assert_eq!(
+            classify_gh_request(&["api", "repos/o/r/issues/1", "--field=state=closed"]),
+            ApiSurface::RestMutation
+        );
+        assert_eq!(
+            classify_gh_request(&["api", "repos/o/r/issues/1", "--raw-field=state=closed"]),
+            ApiSurface::RestMutation
+        );
+        assert_eq!(
+            classify_gh_request(&["api", "repos/o/r/issues/1", "--input=payload.json"]),
+            ApiSurface::RestMutation
         );
     }
 

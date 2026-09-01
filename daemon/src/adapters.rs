@@ -3041,7 +3041,7 @@ fn ao_controller_home(project: &str) -> Result<std::path::PathBuf, String> {
         .or_else(|_| std::env::var("HOME"))
         .map_err(|_| "HOME/AO_ORIGINAL_HOME is unavailable".to_string())?;
     Ok(std::env::var("DARK_FACTORY_AO_CONTROLLER_HOME")
-        .map(std::path::PathBuf::from)
+        .map(|base| std::path::PathBuf::from(base).join(safe_project_component(project)))
         .unwrap_or_else(|_| {
             std::path::Path::new(&operator_home)
                 .join(".local/state/dark-factory/ao-controller")
@@ -3111,6 +3111,7 @@ fn run_ao_tool(project: &str, args: &[&str], timeout_secs: u64) -> Result<String
     run_tool_with_env("ao", args, &refs, timeout_secs)
 }
 
+#[cfg(target_os = "linux")]
 fn process_start_ticks(pid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // Field 2 is parenthesized and may contain spaces. Everything after its
@@ -3121,6 +3122,40 @@ fn process_start_ticks(pid: u32) -> Option<u64> {
         .nth(19)?
         .parse()
         .ok()
+}
+
+fn process_start_identity_from_ps(output: &[u8]) -> Option<u64> {
+    let value = std::str::from_utf8(output).ok()?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    // Stable FNV-1a over `ps -o lstart=` output. Unlike a process PID alone,
+    // the start-time identity detects PID reuse; unlike DefaultHasher, this
+    // value remains stable across daemon processes and Rust releases.
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Some(hash)
+}
+
+#[cfg(target_os = "macos")]
+fn process_start_ticks(pid: u32) -> Option<u64> {
+    let output = Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| process_start_identity_from_ps(&output.stdout))
+        .flatten()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_start_ticks(_pid: u32) -> Option<u64> {
+    None
 }
 
 fn acquire_ao_recovery_file_lock(project: &str) -> Result<AoRecoveryFileLock, String> {
@@ -3802,6 +3837,7 @@ pub struct CliSessions {
     spawned_session_worktrees: std::sync::Mutex<
         std::collections::HashMap<String, (String, std::path::PathBuf)>,
     >,
+    spawned_session_projects: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl CliSessions {
@@ -3815,7 +3851,33 @@ impl CliSessions {
             agent: agent.to_string(),
             spawned_worktrees: std::sync::Mutex::new(std::collections::HashMap::new()),
             spawned_session_worktrees: std::sync::Mutex::new(std::collections::HashMap::new()),
+            spawned_session_projects: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    fn record_session_project(&self, session: &SessionId, project: &str) {
+        self.spawned_session_projects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session.0.clone(), project.to_string());
+    }
+
+    fn project_for_session(&self, session: &SessionId) -> String {
+        self.spawned_session_projects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&session.0)
+            .cloned()
+            .unwrap_or_else(|| self.project.clone())
+    }
+
+    fn project_for_branch(&self, branch: &str) -> String {
+        self.spawned_worktrees
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .find_map(|(project, candidate)| (candidate == branch).then(|| project.clone()))
+            .unwrap_or_else(|| self.project.clone())
     }
 
     fn run_spawn_process(&self, agent: &str, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
@@ -3905,6 +3967,7 @@ impl CliSessions {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(session.0.clone(), (spec.branch.clone(), workspace));
+        self.record_session_project(&session, &spec.ao_project);
         Ok(session)
     }
 
@@ -4359,9 +4422,12 @@ mod spawn_classification_tests {
 
 #[cfg(test)]
 mod ao_spawn_contract_tests {
-    use super::{ao_spawn_bridge_path, gh_env_test_lock, process_start_ticks, CliSessions};
+    use super::{
+        ao_controller_home, ao_spawn_bridge_path, gh_env_test_lock,
+        process_start_identity_from_ps, process_start_ticks, CliSessions,
+    };
     use crate::errors::DaemonError;
-    use crate::tools::{Sessions, SpawnSpec};
+    use crate::tools::{SessionId, Sessions, SpawnSpec};
     use std::os::unix::fs::PermissionsExt;
 
     fn spec(prompt: &str, branch: &str) -> SpawnSpec {
@@ -4377,6 +4443,47 @@ mod ao_spawn_contract_tests {
             managed_checkout: false,
             expected_cwd: None,
         }
+    }
+
+    #[test]
+    fn explicit_controller_home_is_scoped_by_project() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var_os("DARK_FACTORY_AO_CONTROLLER_HOME");
+        let base = std::env::temp_dir().join(format!(
+            "afd_controller_scope_{}",
+            std::process::id()
+        ));
+        std::env::set_var("DARK_FACTORY_AO_CONTROLLER_HOME", &base);
+
+        let resolved = ao_controller_home("worldarchitect/preview").unwrap();
+
+        match prior {
+            Some(value) => std::env::set_var("DARK_FACTORY_AO_CONTROLLER_HOME", value),
+            None => std::env::remove_var("DARK_FACTORY_AO_CONTROLLER_HOME"),
+        }
+        assert_eq!(resolved, base.join("worldarchitect_preview"));
+    }
+
+    #[test]
+    fn ps_start_identity_is_stable_and_rejects_empty_output() {
+        let first = process_start_identity_from_ps(b"Sun Aug 31 17:00:01 2026\n").unwrap();
+        let second = process_start_identity_from_ps(b"Sun Aug 31 17:00:01 2026\n").unwrap();
+        assert_eq!(first, second);
+        assert_ne!(first, 0);
+        assert!(process_start_identity_from_ps(b"  \n").is_none());
+    }
+
+    #[test]
+    fn session_owner_lookup_uses_spawn_project_and_safe_fallback() {
+        let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+        let owned = SessionId("wa-owned".to_string());
+        let unknown = SessionId("wa-unknown".to_string());
+        sessions.record_session_project(&owned, "worldarchitect");
+
+        assert_eq!(sessions.project_for_session(&owned), "worldarchitect");
+        assert_eq!(sessions.project_for_session(&unknown), "dark-factory");
     }
 
     fn bridge_test_node() -> std::path::PathBuf {
@@ -4477,7 +4584,8 @@ print("  Branch:   " + os.environ.get("AO_FAKE_RETURN_BRANCH", os.environ["DARK_
                 ("DARK_FACTORY_AO_RECOVERY_SUSTAIN_MS", "1"),
                 ("DARK_FACTORY_AO_RECOVERY_COOLDOWN_MS", "1"),
             ];
-            let controller_home = root.join("controller-home");
+            let controller_base = root.join("controller-home");
+            let controller_home = controller_base.join("dark-factory");
             let operator_home = root.join("operator-home");
             let config_path = operator_home.join("agent-orchestrator.yaml");
             std::fs::create_dir_all(controller_home.join(".agent-orchestrator")).unwrap();
@@ -4513,7 +4621,7 @@ print("  Branch:   " + os.environ.get("AO_FAKE_RETURN_BRANCH", os.environ["DARK_
                 .collect();
             for (key, default) in ENV_VARS {
                 let value = match key {
-                    "DARK_FACTORY_AO_CONTROLLER_HOME" => controller_home.as_os_str(),
+                    "DARK_FACTORY_AO_CONTROLLER_HOME" => controller_base.as_os_str(),
                     "DARK_FACTORY_OPERATOR_HOME" => operator_home.as_os_str(),
                     "DARK_FACTORY_AO_CONFIG_PATH" => config_path.as_os_str(),
                     _ => std::ffi::OsStr::new(default),
@@ -6925,15 +7033,7 @@ impl Sessions for CliSessions {
     }
 
     fn spawn(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
-        match ensure_ao_recovery(&spec.ao_project) {
-            RecoveryOutcome::Healthy { .. } | RecoveryOutcome::Restarted { .. } => {}
-            RecoveryOutcome::FailClosed { error } | RecoveryOutcome::Unknown { error } => {
-                return Err(DaemonError::Deferred(format!(
-                    "AO controller readiness unresolved for project {}: {error}",
-                    spec.ao_project
-                )));
-            }
-        }
+        ensure_ao_project_recovered(&spec.ao_project, &spec.ao_project)?;
         self.spawn_with_fallback(spec)
     }
 
@@ -7009,9 +7109,10 @@ impl Sessions for CliSessions {
         bead_id: &str,
         timeout_secs: u64,
     ) -> Result<SessionId, DaemonError> {
+        let project = self.project_for_branch(branch);
         let out = run_ao_tool(
-            &self.project,
-            &["status", "-p", &self.project, "--json"],
+            &project,
+            &["status", "-p", &project, "--json"],
             timeout_secs,
         )?;
         let json_start = out.find('[').unwrap_or(0);
@@ -7022,12 +7123,14 @@ impl Sessions for CliSessions {
     }
 
     fn stop(&self, id: &SessionId) -> Result<(), DaemonError> {
-        run_ao_tool(&self.project, &["session", "kill", &id.0], 30)?;
+        let project = self.project_for_session(id);
+        run_ao_tool(&project, &["session", "kill", &id.0], 30)?;
         Ok(())
     }
 
     fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError> {
-        let out = run_ao_tool(&self.project, &["status", "-p", &self.project, "--json"], 30)?;
+        let project = self.project_for_session(id);
+        let out = run_ao_tool(&project, &["status", "-p", &project, "--json"], 30)?;
         let json_start = out.find('[').unwrap_or(0);
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
@@ -7055,9 +7158,10 @@ impl Sessions for CliSessions {
         id: &SessionId,
         timeout_secs: u64,
     ) -> Result<crate::tools::SessionActivity, DaemonError> {
+        let project = self.project_for_session(id);
         let out = run_ao_tool(
-            &self.project,
-            &["status", "-p", &self.project, "--json"],
+            &project,
+            &["status", "-p", &project, "--json"],
             timeout_secs,
         )?;
         let json_start = out.find('[').unwrap_or(0);
@@ -7084,9 +7188,10 @@ impl Sessions for CliSessions {
     /// callers only ever reject a dispatch on a *positive* mismatch, never
     /// on an inability to check.
     fn session_branch(&self, id: &SessionId) -> Result<Option<String>, DaemonError> {
+        let project = self.project_for_session(id);
         let out = match run_ao_tool(
-            &self.project,
-            &["status", "-p", &self.project, "--json"],
+            &project,
+            &["status", "-p", &project, "--json"],
             30,
         ) {
             Ok(o) => o,

@@ -1977,10 +1977,13 @@ impl StateStore for SqliteStateStore {
         })();
         match result {
             Ok(claim) => {
-                self.conn
-                    .execute_batch("COMMIT")
-                    .map_err(|e| tool_err("claim_adopted_pr commit", e))?;
-                Ok(claim)
+                match self.conn.execute_batch("COMMIT") {
+                    Ok(()) => Ok(claim),
+                    Err(error) => {
+                        let _ = self.conn.execute_batch("ROLLBACK");
+                        Err(tool_err("claim_adopted_pr commit", error))
+                    }
+                }
             }
             Err(error) => {
                 let _ = self.conn.execute_batch("ROLLBACK");
@@ -5615,6 +5618,50 @@ mod tests {
             assert_eq!(binding_count, 0);
             assert!(s.load("invalid-candidate").unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn adopted_pr_claim_rolls_back_when_commit_fails() {
+        let s = store();
+        s.conn
+            .execute_batch(
+                "PRAGMA foreign_keys = ON; \
+                 CREATE TABLE adopted_pr_commit_parent (id TEXT PRIMARY KEY); \
+                 DROP TABLE adopted_pr_binding; \
+                 CREATE TABLE adopted_pr_binding (\
+                   branch TEXT PRIMARY KEY, repo TEXT NOT NULL, pr_number INTEGER NOT NULL,\
+                   head_sha TEXT NOT NULL, bead_id TEXT NOT NULL, updated_at TEXT NOT NULL,\
+                   FOREIGN KEY (bead_id) REFERENCES adopted_pr_commit_parent(id)\
+                     DEFERRABLE INITIALLY DEFERRED\
+                 );",
+            )
+            .unwrap();
+
+        let candidate = adopted_overlay("commit-failure", OverlayState::Attested, 607);
+        let error = s
+            .claim_adopted_pr(&adopted_identity(607, "head-a"), &candidate)
+            .expect_err("deferred foreign key must make COMMIT fail");
+        match error {
+            DaemonError::Tool { stderr, .. } => {
+                assert!(stderr.contains("claim_adopted_pr commit"), "{stderr}");
+                assert!(stderr.to_ascii_lowercase().contains("foreign key"), "{stderr}");
+            }
+            other => panic!("expected the original COMMIT error, got {other:?}"),
+        }
+        assert_eq!(
+            s.bead_id_for_branch("factory/shared-pr").unwrap(),
+            None,
+            "failed COMMIT must roll back the registry write"
+        );
+        let binding_count: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM adopted_pr_binding", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(binding_count, 0, "failed COMMIT must roll back the binding write");
+        assert!(
+            s.load("commit-failure").unwrap().is_none(),
+            "failed COMMIT must roll back the overlay write"
+        );
     }
 
     #[test]
