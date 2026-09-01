@@ -635,6 +635,113 @@ def test_fresh_reviewer_git_worktree_target_isolation(tmp_path, monkeypatch):
     assert wt_head_after == wt_head_before
 
 
+def test_fresh_reviewer_rejects_linked_worktree_metadata_symlink_before_copy(
+    tmp_path, monkeypatch
+):
+    main_repo = _repo(tmp_path / "main")
+    wt_dir = tmp_path / "wt"
+    subprocess.run(
+        ["git", "-C", str(main_repo), "worktree", "add", "-b", "feature-wt", str(wt_dir)],
+        check=True,
+    )
+    gitdir_raw = (wt_dir / ".git").read_text(encoding="utf-8").strip()
+    gitdir_path = pathlib.Path(gitdir_raw.removeprefix("gitdir:").strip())
+    external = tmp_path / "external-metadata"
+    external.write_text("external metadata must not enter snapshot\n")
+    metadata_link = gitdir_path / "malicious-metadata"
+    metadata_link.symlink_to(external)
+
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="echo",
+        state={"ao.worktree": str(wt_dir)},
+    )
+    copied_external_bytes: list[str] = []
+    codex_calls: list[list[str]] = []
+    real_copy2 = shutil.copy2
+    real_run = subprocess.run
+
+    def record_copy2(source, destination, *args, **kwargs):
+        result = real_copy2(source, destination, *args, **kwargs)
+        if pathlib.Path(source) == metadata_link:
+            copied_external_bytes.append(pathlib.Path(destination).read_text())
+        return result
+
+    def intercept_run(args, **kwargs):
+        if args and args[0] == "codex":
+            codex_calls.append(list(args))
+            return subprocess.CompletedProcess(
+                args, 0, stdout="Verdict: PASS\n", stderr=""
+            )
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(
+        "runner.handler_codergen._sandboxed_args_for_fresh_review",
+        lambda command, *args, **kwargs: command,
+    )
+    monkeypatch.setattr("runner.handler_codergen.shutil.copy2", record_copy2)
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", intercept_run)
+
+    result = _codergen(_review_node(prompt), ctx)
+
+    assert result.outcome == "error"
+    assert "metadata" in result.output.lower()
+    assert codex_calls == []
+    assert copied_external_bytes == []
+
+
+@pytest.mark.parametrize("target_kind", ["external", "dangling"])
+def test_fresh_reviewer_rejects_symlinked_common_git_metadata_before_codex(
+    tmp_path, monkeypatch, target_kind
+):
+    main_repo = _repo(tmp_path / "main")
+    wt_dir = tmp_path / "wt"
+    subprocess.run(
+        ["git", "-C", str(main_repo), "worktree", "add", "-b", "feature-wt", str(wt_dir)],
+        check=True,
+    )
+    if target_kind == "external":
+        target = tmp_path / "external-metadata"
+        target.write_text("external metadata\n")
+    else:
+        target = tmp_path / "missing-metadata"
+    (main_repo / ".git" / "malicious-metadata").symlink_to(target)
+
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="echo",
+        state={"ao.worktree": str(wt_dir)},
+    )
+    codex_calls: list[list[str]] = []
+    real_run = subprocess.run
+
+    def intercept_run(args, **kwargs):
+        if args and args[0] == "codex":
+            codex_calls.append(list(args))
+            return subprocess.CompletedProcess(
+                args, 0, stdout="Verdict: PASS\n", stderr=""
+            )
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(
+        "runner.handler_codergen._sandboxed_args_for_fresh_review",
+        lambda command, *args, **kwargs: command,
+    )
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", intercept_run)
+
+    result = _codergen(_review_node(prompt), ctx)
+
+    assert result.outcome == "error"
+    assert "metadata" in result.output.lower()
+    assert codex_calls == []
+
+
 def test_fresh_reviewer_rejects_symlinked_target_before_codex(tmp_path, monkeypatch):
     repo = _repo(tmp_path)
     alias = tmp_path / "alias"

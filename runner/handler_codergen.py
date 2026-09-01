@@ -71,6 +71,7 @@ import pathlib
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -861,6 +862,69 @@ def _validate_snapshot_symlinks(
                     )
 
 
+def _validate_regular_git_metadata_tree(git_dir: pathlib.Path, label: str) -> None:
+    """Reject symlinks and special files before they reach review Git metadata."""
+    try:
+        root_mode = git_dir.lstat().st_mode
+    except OSError as exc:
+        raise RuntimeError(f"Cannot inspect {label}: {git_dir}") from exc
+    if not stat.S_ISDIR(root_mode):
+        raise RuntimeError(f"{label} is not a real directory: {git_dir}")
+    for entry in git_dir.rglob("*"):
+        try:
+            mode = entry.lstat().st_mode
+        except OSError as exc:
+            raise RuntimeError(f"Cannot inspect {label}: {entry}") from exc
+        if stat.S_ISDIR(mode):
+            continue
+        if not stat.S_ISREG(mode):
+            raise RuntimeError(f"Unsafe non-regular file in {label}: {entry}")
+
+
+def _read_regular_git_metadata_file(source: pathlib.Path) -> tuple[bytes, int]:
+    """Read one metadata file without following a symlink at its final path."""
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise RuntimeError("Safe Git metadata copy requires O_NOFOLLOW")
+    try:
+        source_fd = os.open(source, os.O_RDONLY | nofollow)
+    except OSError as exc:
+        raise RuntimeError(f"Cannot safely read Git metadata file: {source}") from exc
+    try:
+        source_stat = os.fstat(source_fd)
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise RuntimeError(f"Unsafe non-regular Git metadata file: {source}")
+        with os.fdopen(source_fd, "rb", closefd=False) as source_file:
+            content = source_file.read()
+    finally:
+        os.close(source_fd)
+    return content, stat.S_IMODE(source_stat.st_mode)
+
+
+def _copy_regular_git_metadata_file(source: pathlib.Path, destination: pathlib.Path) -> None:
+    """Copy one metadata file without following a source or destination symlink."""
+    content, source_mode = _read_regular_git_metadata_file(source)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise RuntimeError("Safe Git metadata copy requires O_NOFOLLOW")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        destination_fd = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | nofollow,
+            source_mode,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"Cannot safely write review Git metadata file: {destination}") from exc
+    try:
+        with os.fdopen(destination_fd, "wb", closefd=False) as destination_file:
+            destination_file.write(content)
+    finally:
+        os.close(destination_fd)
+    os.chmod(destination, source_mode)
+
+
 def _normalize_and_validate_review_git(target_workdir: pathlib.Path, review_dir: pathlib.Path) -> None:
     """Normalize linked-worktree git metadata into a standalone repo and validate isolation."""
     git_target = target_workdir / ".git"
@@ -874,17 +938,21 @@ def _normalize_and_validate_review_git(target_workdir: pathlib.Path, review_dir:
             raise RuntimeError(f"Invalid worktree .git pointer file in {target_workdir}: {gitdir_content}")
         gitdir_raw = gitdir_content[len("gitdir:"):].strip()
         gitdir_path = (target_workdir / gitdir_raw).resolve()
-        if not gitdir_path.is_dir():
-            raise RuntimeError(f"Worktree gitdir does not exist or is not a directory: {gitdir_path}")
+        _validate_regular_git_metadata_tree(gitdir_path, "linked-worktree Git metadata")
 
         commondir_file = gitdir_path / "commondir"
-        if commondir_file.is_file():
-            commondir_raw = commondir_file.read_text(encoding="utf-8").strip()
-            main_git_dir = (gitdir_path / commondir_raw).resolve()
+        try:
+            commondir_file.lstat()
+        except FileNotFoundError:
+            commondir_raw = ""
         else:
+            commondir_raw = _read_regular_git_metadata_file(commondir_file)[0].decode(
+                "utf-8"
+            ).strip()
+            main_git_dir = (gitdir_path / commondir_raw).resolve()
+        if not commondir_raw:
             main_git_dir = gitdir_path
-        if not main_git_dir.is_dir():
-            raise RuntimeError(f"Common gitdir does not exist or is not a directory: {main_git_dir}")
+        _validate_regular_git_metadata_tree(main_git_dir, "common Git metadata")
 
         if git_review.exists() or git_review.is_symlink():
             if git_review.is_dir():
@@ -898,23 +966,31 @@ def _normalize_and_validate_review_git(target_workdir: pathlib.Path, review_dir:
             symlinks=True,
             ignore_dangling_symlinks=False,
         )
+        _validate_regular_git_metadata_tree(git_review, "review Git metadata")
 
         for entry in gitdir_path.rglob("*"):
-            if entry.is_dir() or entry.name in ("commondir", "gitdir"):
+            try:
+                entry_mode = entry.lstat().st_mode
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Cannot inspect linked-worktree Git metadata: {entry}"
+                ) from exc
+            if stat.S_ISDIR(entry_mode):
+                continue
+            if not stat.S_ISREG(entry_mode):
+                raise RuntimeError(
+                    f"Unsafe non-regular file in linked-worktree Git metadata: {entry}"
+                )
+            if entry.name in ("commondir", "gitdir"):
                 continue
             rel = entry.relative_to(gitdir_path)
             dest = git_review / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            if dest.exists() or dest.is_symlink():
-                if dest.is_dir():
-                    shutil.rmtree(dest)
-                else:
-                    dest.unlink()
-            shutil.copy2(entry, dest)
+            _copy_regular_git_metadata_file(entry, dest)
 
     if git_review.exists():
         if not git_review.is_dir() or git_review.is_symlink():
             raise RuntimeError(f"Review worktree .git is not a real directory: {git_review}")
+        _validate_regular_git_metadata_tree(git_review, "review Git metadata")
 
         wt_sub = git_review / "worktrees"
         if wt_sub.exists():
@@ -947,14 +1023,7 @@ def _normalize_and_validate_review_git(target_workdir: pathlib.Path, review_dir:
             forbidden_paths.append(str(main_git_dir).encode("utf-8"))
 
         for f in git_review.rglob("*"):
-            if f.is_symlink():
-                try:
-                    sym_target = f.resolve(strict=True)
-                except Exception as exc:
-                    raise RuntimeError(f"Unsafe symlink in review git metadata: {f}") from exc
-                if not (sym_target == git_review or git_review in sym_target.parents):
-                    raise RuntimeError(f"Escaping symlink in review git metadata: {f} -> {sym_target}")
-            elif f.is_file():
+            if f.is_file():
                 content = f.read_bytes()
                 for forbidden in forbidden_paths:
                     if forbidden in content:
