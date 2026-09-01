@@ -3029,10 +3029,26 @@ fn recovery_duration_ms(name: &str, default_ms: u64) -> Duration {
 }
 
 fn safe_project_component(project: &str) -> String {
-    project
+    if !project.is_empty()
+        && !matches!(project, "." | "..")
+        && project
         .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') { ch } else { '_' })
-        .collect()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return project.to_string();
+    }
+    // Keep legacy paths unchanged for already-safe project IDs, while giving
+    // every unsafe byte string an injective, disjoint namespace. A safe ID
+    // can never start with '~' under the predicate above, and hexadecimal
+    // encoding is reversible, so `a/b` cannot collide with `a_b` (or any
+    // other project) as the old underscore substitution did.
+    let mut encoded = String::with_capacity(1 + project.len() * 2);
+    encoded.push('~');
+    for byte in project.as_bytes() {
+        use std::fmt::Write as _;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
 }
 
 fn ao_controller_home(project: &str) -> Result<std::path::PathBuf, String> {
@@ -3251,6 +3267,20 @@ fn read_controller_manifest(project: &str) -> Result<Option<AoControllerManifest
         .map_err(|error| format!("invalid {}: {error}", path.display()))
 }
 
+fn validate_controller_manifest_project(
+    manifest: &AoControllerManifest,
+    project: &str,
+) -> Result<(), String> {
+    if manifest.project == project {
+        Ok(())
+    } else {
+        Err(format!(
+            "AO controller manifest project {:?} does not match requested project {project:?}; refusing to signal or remove it",
+            manifest.project
+        ))
+    }
+}
+
 fn probe_ao_project(project: &str) -> AoReadiness {
     let manifest = match read_controller_manifest(project) {
         Ok(Some(manifest)) => manifest,
@@ -3307,6 +3337,7 @@ fn reap_owned_controller(project: &str) -> Result<(), String> {
     let Some(manifest) = read_controller_manifest(project)? else {
         return Ok(());
     };
+    validate_controller_manifest_project(&manifest, project)?;
     if process_start_ticks(manifest.pid) == Some(manifest.process_start_ticks) {
         unsafe extern "C" {
             fn kill(pid: i32, signal: i32) -> i32;
@@ -3332,6 +3363,10 @@ fn reap_owned_controller(project: &str) -> Result<(), String> {
 
 #[cfg(not(unix))]
 fn reap_owned_controller(project: &str) -> Result<(), String> {
+    let Some(manifest) = read_controller_manifest(project)? else {
+        return Ok(());
+    };
+    validate_controller_manifest_project(&manifest, project)?;
     let _ = std::fs::remove_file(controller_manifest_path(project)?);
     Ok(())
 }
@@ -4502,7 +4537,8 @@ mod spawn_classification_tests {
 mod ao_spawn_contract_tests {
     use super::{
         ao_controller_home, ao_spawn_bridge_path, gh_env_test_lock,
-        process_start_identity_from_ps, process_start_ticks, CliSessions,
+        process_start_identity_from_ps, process_start_ticks, safe_project_component,
+        validate_controller_manifest_project, AoControllerManifest, CliSessions,
     };
     use crate::errors::DaemonError;
     use crate::tools::{SessionId, Sessions, SpawnSpec};
@@ -4537,11 +4573,35 @@ mod ao_spawn_contract_tests {
 
         let resolved = ao_controller_home("worldarchitect/preview").unwrap();
 
+        assert_eq!(resolved, base.join(safe_project_component("worldarchitect/preview")));
+        assert_ne!(
+            safe_project_component("a/b"),
+            safe_project_component("a_b"),
+            "distinct AO projects must never share a controller namespace"
+        );
+        let special: Vec<_> = ["", ".", ".."]
+            .into_iter()
+            .map(|project| ao_controller_home(project).unwrap())
+            .collect();
+        assert!(special.iter().all(|path| path.starts_with(&base) && path != &base));
+        assert_ne!(special[0], special[1]);
+        assert_ne!(special[1], special[2]);
         match prior {
             Some(value) => std::env::set_var("DARK_FACTORY_AO_CONTROLLER_HOME", value),
             None => std::env::remove_var("DARK_FACTORY_AO_CONTROLLER_HOME"),
         }
-        assert_eq!(resolved, base.join("worldarchitect_preview"));
+    }
+
+    #[test]
+    fn controller_manifest_project_mismatch_fails_before_reaping() {
+        let manifest = AoControllerManifest {
+            pid: std::process::id(),
+            process_start_ticks: process_start_ticks(std::process::id()).unwrap(),
+            project: "other-project".to_string(),
+            target: "other-project".to_string(),
+        };
+        let error = validate_controller_manifest_project(&manifest, "dark-factory").unwrap_err();
+        assert!(error.contains("refusing to signal or remove"));
     }
 
     #[test]
