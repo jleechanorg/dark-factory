@@ -29,6 +29,33 @@ def _stub_run(monkeypatch, captured: dict):
     monkeypatch.setattr("runner.__main__.run", fake_run)
 
 
+def _reviewer_first_pipeline(tmp_path: pathlib.Path) -> pathlib.Path:
+    """Finding 5 (round 3): `--target` now refuses any pipeline whose
+    `start` node doesn't lead directly to a verdict-gated review node
+    (reviewer-first entry-mode wiring). No shipped pipeline is
+    reviewer-first yet, so target-mode CLI tests need their own minimal
+    fixture graph rather than `pipelines/factory/hello.dot` (worker-first)."""
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review target: ${target}\n${intent}\nVerdict: PASS or Verdict: FAIL.\n")
+    dot = tmp_path / "reviewer_first.dot"
+    dot.write_text(
+        f"""
+digraph ReviewerFirst {{
+    graph [goal="target-mode smoke fixture"]
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+    cold_reviewer [
+        type="codergen", class="review", backend="codex",
+        verdict_gate="true", prompt="@{prompt}", timeout=60
+    ]
+    start -> cold_reviewer
+    cold_reviewer -> exit [condition="outcome=success"]
+}}
+"""
+    )
+    return dot
+
+
 class TestTargetFlagResolution:
     def test_unresolvable_target_refuses_to_start(self, tmp_path, capsys):
         with pytest.raises(SystemExit) as exc_info:
@@ -63,9 +90,10 @@ class TestTargetFlagResolution:
         target_file.write_text("spec body")
         captured: dict = {}
         _stub_run(monkeypatch, captured)
+        pipeline = _reviewer_first_pipeline(tmp_path)
 
         rc = main([
-            "--pipeline", "pipelines/factory/hello.dot",
+            "--pipeline", str(pipeline),
             "--target", str(target_file),
             "--backend", "echo",
             "--workdir", str(tmp_path),
@@ -88,9 +116,10 @@ class TestTargetFlagResolution:
         digest = hashlib.sha256(b"body").hexdigest()
         captured: dict = {}
         _stub_run(monkeypatch, captured)
+        pipeline = _reviewer_first_pipeline(tmp_path)
 
         rc = main([
-            "--pipeline", "pipelines/factory/hello.dot",
+            "--pipeline", str(pipeline),
             "--target", f"file://{target_file}@sha256:{digest}",
             "--backend", "echo",
             "--workdir", str(tmp_path),
@@ -130,3 +159,44 @@ class TestTargetFlagResolution:
         assert exc_info.value.code == 2
         err = capsys.readouterr().err
         assert "mutually exclusive" in err
+
+    def test_target_refuses_worker_first_pipeline_instead_of_morphing_into_task_mode(
+        self, tmp_path, capsys
+    ):
+        """Finding 5 (external review, round 3): a pipeline whose `start`
+        leads to a worker (not a verdict-gated review node) has no
+        reviewer-first entry-mode wiring — `--target` must refuse to run
+        rather than silently run the worker on the local workdir and let
+        the first post-worker mint discard the resolved target."""
+        target_file = tmp_path / "spec.md"
+        target_file.write_text("spec body")
+        with pytest.raises(SystemExit) as exc_info:
+            main([
+                "--pipeline", "pipelines/factory/hello.dot",  # worker-first
+                "--target", str(target_file),
+                "--backend", "echo",
+                "--workdir", str(tmp_path),
+                "--no-perf-log",
+            ])
+        assert exc_info.value.code == 2
+        err = capsys.readouterr().err
+        assert "reviewer-first" in err
+
+    def test_pre_seeded_state_intent_cannot_alter_the_rendered_envelope(self, tmp_path, capsys):
+        """D2 fail-closed (external-review CRITICAL finding, round 3):
+        `${intent}` must be sourced ONLY from the runner-recorded run-start
+        intent envelope, never caller-supplied `--state`. `--state
+        intent=...` is refused outright at the CLI boundary rather than
+        silently accepted and later raced by (or masking) the real mint."""
+        with pytest.raises(SystemExit) as exc_info:
+            main([
+                "--pipeline", "pipelines/factory/hello.dot",
+                "--goal", "do something",
+                "--state", "intent=aGFja2VkIGludGVudA==",
+                "--backend", "echo",
+                "--workdir", str(tmp_path),
+                "--no-perf-log",
+            ])
+        assert exc_info.value.code == 2
+        err = capsys.readouterr().err
+        assert "reserved key 'intent'" in err

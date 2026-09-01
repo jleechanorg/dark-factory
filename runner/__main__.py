@@ -446,7 +446,16 @@ def main(argv: list[str] | None = None) -> int:
             except target_locator.DefinedNotResolvable as exc:
                 p.error(f"--target scheme is defined but not resolvable in v1: {exc}")
             except target_locator.InvalidTarget:
-                repo_ctx = target_locator.RepoContext(repo_root=args.workdir)
+                # Finding 5 (external review, round 3): populate owner/repo
+                # from the local git remote (deterministic, no network/LLM)
+                # so freeform PR-shaped text ("PR 811") can actually
+                # resolve — an empty RepoContext made every such reference
+                # unconditionally fail with "requires repo context".
+                owner_repo = target_locator.owner_repo_from_git_remote(args.workdir)
+                owner, repo_name = owner_repo if owner_repo else ("", "")
+                repo_ctx = target_locator.RepoContext(
+                    repo_root=args.workdir, owner=owner, repo=repo_name,
+                )
                 try:
                     resolved_target_locator = target_locator.resolve_freeform(args.target, repo_ctx)
                 except target_locator.TargetLocatorError as exc:
@@ -458,22 +467,69 @@ def main(argv: list[str] | None = None) -> int:
             args.goal = ""
 
         graph = parse(pipeline_path)
+
+        def _is_verdict_gated_review_node(n) -> bool:
+            return (
+                str(n.attrs.get("class", "")).strip().lower() == "review"
+                and str(n.attrs.get("verdict_gate", "false")).strip().lower()
+                in {"true", "1", "yes", "on"}
+            )
+
         initial_state: dict[str, str] = {}
         # Opt-in gate for the runner's post-worker target-mint/checkpoint
         # side effect (D2/D3/D8a of the factory two-node redesign): minting
         # can commit dirty workdir state, so it must only run for graphs
         # that actually declare the fresh, verdict-gated cold-reviewer
         # contract — never for arbitrary pipelines that never asked for it.
-        if any(
-            str(n.attrs.get("class", "")).strip().lower() == "review"
-            and str(n.attrs.get("verdict_gate", "false")).strip().lower() in {"true", "1", "yes", "on"}
-            for n in graph.nodes.values()
-        ):
+        if any(_is_verdict_gated_review_node(n) for n in graph.nodes.values()):
             initial_state["_df_mint_review_target"] = "true"
+        if resolved_target_locator is not None:
+            # Finding 5 (external review, round 3): target mode's whole
+            # point is "reviewer reviews the externally-resolved target
+            # first" (D "Architecture": start -> cold_reviewer). Entry-mode
+            # graph wiring that actually routes `start` to the reviewer is
+            # not implemented yet for any pipeline — if we let the run
+            # proceed anyway, `start` falls through to its literal edge
+            # (the worker), which runs on the LOCAL workdir (unrelated to
+            # the resolved target) and then the first post-worker mint
+            # silently overwrites `ctx.state["target"]` with a local pin,
+            # discarding the operator's resolved locator. Refuse honestly
+            # instead of silently morphing into task mode.
+            from .parser import is_start_node
+
+            start_name = next(
+                (n.name for n in graph.nodes.values() if is_start_node(n)), None
+            )
+            first_hops = graph.outgoing(start_name) if start_name else []
+            reviewer_first = bool(first_hops) and all(
+                e.dst in graph.nodes and _is_verdict_gated_review_node(graph.nodes[e.dst])
+                for e in first_hops
+            )
+            if not reviewer_first:
+                p.error(
+                    "--target requires a reviewer-first pipeline (the start "
+                    "node must lead directly to a verdict-gated review "
+                    f"node); {pipeline_path.name} starts at a worker node "
+                    "instead, so --target would silently run the worker on "
+                    "the local workdir and discard the resolved target "
+                    "rather than reviewing it — reviewer-first entry-mode "
+                    "graph wiring is not yet implemented for this pipeline"
+                )
         for kv in args.state:
             if "=" not in kv:
                 p.error(f"--state requires KEY=VALUE format, got: {kv!r}")
             k, v = kv.split("=", 1)
+            if k == "intent":
+                # D2 fail-closed (external-review CRITICAL finding, round 3):
+                # `${intent}` must be sourced ONLY from the runner-recorded
+                # run-start intent envelope (`_mint_post_worker_target`,
+                # task mode) or the fixed target-mode default — never from
+                # caller-supplied state. `--state intent=...` is the only
+                # write path into `ctx.state["intent"]` outside that
+                # contract, so it is refused outright rather than silently
+                # accepted and later overwritten (a caller could otherwise
+                # race a mint that never fires, e.g. a non-git workdir).
+                p.error("--state cannot set the reserved key 'intent' (runner-minted only, D2)")
             initial_state[k] = v
         if args.feature:
             initial_state["feature"] = args.feature

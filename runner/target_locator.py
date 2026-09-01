@@ -243,6 +243,28 @@ def _worktree_fingerprint(path: "pathlib.Path | str") -> Optional[str]:
     return f"{head}+{dirty_digest[:16]}"
 
 
+_GITHUB_REMOTE_RE = re.compile(
+    r"^(?:https?://|git@|ssh://git@)github\.com[:/](?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$"
+)
+
+
+def owner_repo_from_git_remote(
+    repo_root: "pathlib.Path | str", remote: str = "origin",
+) -> Optional[tuple[str, str]]:
+    """Deterministically parse ``owner/repo`` from a local git remote URL
+    (finding 5, round 3): populates ``RepoContext`` so freeform ``"PR 811"``
+    text can resolve. Local subprocess + regex only — no network call, no
+    LLM. Returns ``None`` when the remote is missing, unreadable, or not a
+    recognized ``github.com`` URL shape (SSH, HTTPS, or ``ssh://`` form)."""
+    url = _run_git(["remote", "get-url", remote], repo_root)
+    if not url:
+        return None
+    m = _GITHUB_REMOTE_RE.match(url.strip())
+    if not m:
+        return None
+    return m.group("owner"), m.group("repo")
+
+
 def _gh_pr_head_sha(owner: str, repo: str, num: str) -> Optional[str]:
     """Ambient-credential ``gh`` CLI lookup (D "Authorization"). No raw
     network fetch; delegates to the operator's authenticated `gh`."""

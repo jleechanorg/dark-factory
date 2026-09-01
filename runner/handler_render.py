@@ -118,6 +118,17 @@ def _assert_reviewer_render_safe(rendered: str, ctx: "Context") -> None:
         raise ReviewPromptRenderError(
             "reviewer prompt leaks ctx.goal text outside the TASK RECORD fence"
         )
+    # D3/D8a fail-closed (external-review finding): a mint failure after a
+    # successful worker visit must never let the reviewer silently run
+    # against the "${target}" placeholder default — `_mint_post_worker_target`
+    # is best-effort by design, so this is the last line of defense before a
+    # reviewer would launch with no real pin at all.
+    if "(no target minted)" in rendered:
+        raise ReviewPromptRenderError(
+            "reviewer prompt contains the unminted-target placeholder "
+            '"(no target minted)" — the review target was never minted '
+            "(fail closed)"
+        )
 
 
 def _resolve_lint_findings(ctx: "Context") -> list[dict]:
@@ -239,6 +250,37 @@ def _render_prompt(node: "Node", ctx: "Context") -> str:
             text = text_path.read_text()
             return _rendered(text)
         from .paths import factory_home
+        if is_review:
+            # CRITICAL-2 (external review, round 3): a reviewer-class node's
+            # prompt template must come from the factory's own trusted
+            # installation, never from `ctx.workdir` — the live coder
+            # worktree the implementing agent just edited. A worker could
+            # otherwise overwrite `prompts/slim/fresh_review.md` in its own
+            # workdir (a real risk: dark-factory's own coder workdir is
+            # frequently a checkout of this same repo) and replace the
+            # reviewer's governing instructions before the reviewer runs.
+            # `$DARK_FACTORY_HOME` wins when set; otherwise fall back to the
+            # runner package's own repo root (derived from `__file__`, which
+            # is never influenced by the coder's workdir).
+            trusted_root = factory_home()
+            if trusted_root is None:
+                trusted_root = pathlib.Path(__file__).resolve().parent.parent
+            p = (trusted_root / ref_path).resolve()
+            try:
+                p.relative_to(trusted_root.resolve())
+            except ValueError:
+                return _fallback("invalid prompt", ref)
+            for deny in _handlers_shim._holdout_denied_paths():
+                try:
+                    p.relative_to(deny)
+                except ValueError:
+                    pass
+                else:
+                    return _fallback("invalid prompt", ref)
+            if not p.exists():
+                return _fallback("missing prompt", ref)
+            text = p.read_text()
+            return _rendered(text)
         root = ctx.workdir.resolve()
         p = (root / ref_path).resolve()
         if not p.exists():

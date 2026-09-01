@@ -5,6 +5,7 @@ runner-minted pin, never the live coder workdir."""
 
 from __future__ import annotations
 
+import json
 import pathlib
 import subprocess
 import sys
@@ -154,6 +155,26 @@ class TestCreateReviewSnapshot:
                 f"file://{doc}@sha256:{digest}", snapshot_root=_snapshot_root(tmp_path)
             )
 
+    def test_git_worktree_scheme_is_not_snapshottable(self, git_repo, tmp_path):
+        """`git-worktree://` pins a dirty-tree fingerprint, not a git ref —
+        not git-resolvable in v1 (design item 6 out-of-scope note)."""
+        head = _git(git_repo, "rev-parse", "HEAD")
+        with pytest.raises(rs.ReviewSnapshotError, match="git-resolvable"):
+            rs.create_review_snapshot(
+                f"git-worktree://{git_repo}@{head}+0000000000000000",
+                snapshot_root=_snapshot_root(tmp_path),
+            )
+
+    def test_gh_pr_scheme_is_not_snapshottable(self, tmp_path):
+        """`gh-pr://` targets an external repository the runner never
+        cloned locally — not git-resolvable in v1 (target-mode write
+        semantics are an explicit out-of-scope follow-up)."""
+        with pytest.raises(rs.ReviewSnapshotError, match="git-resolvable"):
+            rs.create_review_snapshot(
+                f"gh-pr://owner/repo/1@{'a' * 40}",
+                snapshot_root=_snapshot_root(tmp_path),
+            )
+
 
 # ---------------------------------------------------------------------------
 # verify_review_snapshot_pin() — TOCTOU
@@ -241,6 +262,52 @@ def _review_node(prompt: pathlib.Path):
     return node
 
 
+def test_stale_target_out_of_sync_with_pin_chain_aborts_before_codex(
+    git_repo, tmp_path, monkeypatch
+):
+    """D3/D8a fail-closed (external-review finding): if `ctx.state["target"]`
+    ever diverges from the last entry of `_target_pin_chain` — e.g. a stale
+    prior pin left behind after a later mint failure that a caller failed to
+    fail closed on — the verdict-gated reviewer must refuse before codex
+    ever launches, not silently review the stale, superseded pin."""
+    base = _git(git_repo, "rev-parse", "HEAD")
+    (git_repo / "b.txt").write_text("two\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-q", "-m", "second")
+    newer = _git(git_repo, "rev-parse", "HEAD")
+    stale_target = f"git-commit://{git_repo}@{base}"
+    newer_target = f"git-commit://{git_repo}@{newer}"
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review target: ${target}\nEnd with Verdict: PASS or Verdict: FAIL.\n")
+    monkeypatch.setattr(
+        "runner.review_snapshot._default_snapshot_root", lambda: _snapshot_root(tmp_path)
+    )
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="echo",
+        # `target` is stale (points at `base`); the pin chain's last entry
+        # (what the current worker visit actually minted) is `newer_target`.
+        state={"target": stale_target, "_target_pin_chain": json.dumps([newer_target])},
+    )
+    real_run = subprocess.run
+
+    def unexpected_run(args, **kwargs):
+        if args and args[0] == "codex":
+            raise AssertionError("Codex launched against a stale, out-of-sync target")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr("runner.handlers._sandboxed_args_for_workdir", lambda args, workdir: args)
+    monkeypatch.setattr("runner.handlers._sanitized_env", lambda: {})
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", unexpected_run)
+
+    result = _codergen(_review_node(prompt), ctx)
+
+    assert result.outcome == "error"
+    assert result.metadata["target_pin_chain_mismatch"] == "true"
+    assert "stale" in result.output
+
+
 def test_toctou_pin_mismatch_before_launch_fails_closed_without_invoking_codex(
     git_repo, tmp_path, monkeypatch
 ):
@@ -262,11 +329,15 @@ def test_toctou_pin_mismatch_before_launch_fails_closed_without_invoking_codex(
         return verify_calls["n"] == 1
 
     monkeypatch.setattr("runner.review_snapshot.verify_review_snapshot_pin", fake_verify)
+    target = f"git-commit://{git_repo}@{head}"
     ctx = Context(
         goal="review this change",
         workdir=tmp_path,
         backend="echo",
-        state={"target": f"git-commit://{git_repo}@{head}"},
+        # `_target_pin_chain` must end with `target` or the new pin-chain
+        # consistency check (fail-closed finding) refuses before even
+        # reaching the TOCTOU check this test exercises.
+        state={"target": target, "_target_pin_chain": json.dumps([target])},
     )
     real_run = subprocess.run
 
@@ -287,3 +358,49 @@ def test_toctou_pin_mismatch_before_launch_fails_closed_without_invoking_codex(
     # Cleanup still ran even though the visit failed before launch.
     worktrees = _git(git_repo, "worktree", "list", "--porcelain")
     assert "review-" not in worktrees
+
+
+def test_non_snapshottable_scheme_refuses_before_launch_without_degrading_to_live_workdir(
+    tmp_path, monkeypatch
+):
+    """Finding 2 (external review): a `file://` target must REFUSE the
+    verdict-gated visit before codex ever launches, not silently degrade to
+    reviewing the live coder workdir. `git-worktree://`/`gh-pr://` share the
+    same refusal path (`review_snapshot._SNAPSHOTTABLE_SCHEMES`), covered by
+    the unit-level `TestCreateReviewSnapshot` tests above."""
+    doc = tmp_path / "spec.md"
+    doc.write_text("spec body")
+    import hashlib
+
+    digest = hashlib.sha256(b"spec body").hexdigest()
+    target = f"file://{doc}@sha256:{digest}"
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review target: ${target}\nEnd with Verdict: PASS or Verdict: FAIL.\n")
+    monkeypatch.setattr(
+        "runner.review_snapshot._default_snapshot_root", lambda: _snapshot_root(tmp_path)
+    )
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="echo",
+        state={"target": target, "_target_pin_chain": json.dumps([target])},
+    )
+    real_run = subprocess.run
+
+    def unexpected_run(args, **kwargs):
+        if args and args[0] == "codex":
+            raise AssertionError(
+                "Codex launched against a non-snapshottable target instead of refusing"
+            )
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr("runner.handlers._sandboxed_args_for_workdir", lambda args, workdir: args)
+    monkeypatch.setattr("runner.handlers._sanitized_env", lambda: {})
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", unexpected_run)
+
+    result = _codergen(_review_node(prompt), ctx)
+
+    assert result.outcome == "error"
+    assert "git-resolvable" in result.output
+    # No live-workdir fallback: `codex_workdir` was never set to `tmp_path`
+    # or `ctx.workdir` for a verdict-gated node — the visit aborted first.

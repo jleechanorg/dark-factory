@@ -17,6 +17,7 @@ from runner.handlers import Context, _codergen  # noqa: E402
 from runner.handler_codergen import (  # noqa: E402
     _checkpoint_dirty_state,
     _mint_post_worker_target,
+    _verify_terminal_review_report,
     format_typed_findings_relay,
     parse_review_completeness,
     parse_typed_findings,
@@ -72,6 +73,67 @@ class TestParseReviewCompleteness:
     def test_last_marker_wins_when_duplicated(self):
         text = "Review completeness: UNFINISHED\n...\nReview completeness: COMPLETE\nVerdict: PASS\n"
         assert parse_review_completeness(text) == "complete"
+
+
+class TestVerifyTerminalReviewReport:
+    """CRITICAL-4 (external review, round 3): the reviewer's transcript must
+    end with exactly one valid ``Verdict: PASS|FAIL`` line — a verdict token
+    appearing only mid-output is not a terminal verdict, even though the
+    shared, more permissive ``_parse_verdict`` scan (used by other gate node
+    types) would still find it."""
+
+    def test_terminal_verdict_with_completeness_before_it_is_valid(self):
+        text = "No blocking findings.\nReview completeness: COMPLETE\nVerdict: PASS\n"
+        ok, reason = _verify_terminal_review_report(text)
+        assert ok is True
+        assert reason == ""
+
+    def test_verdict_followed_by_trailing_prose_is_rejected(self):
+        """A `Verdict: PASS` line buried mid-output, with more text after
+        it, is not a terminal verdict — the transcript must END there."""
+        text = "Verdict: PASS\nOh wait, actually let me reconsider...\n"
+        ok, reason = _verify_terminal_review_report(text)
+        assert ok is False
+        assert "last non-empty line" in reason
+
+    def test_verdict_line_duplicated_is_rejected(self):
+        text = "Verdict: PASS\nsome more analysis\nVerdict: PASS\n"
+        ok, reason = _verify_terminal_review_report(text)
+        assert ok is False
+        assert "exactly one" in reason
+
+    def test_completeness_marker_after_verdict_is_rejected(self):
+        text = "Verdict: PASS\nReview completeness: COMPLETE\n"
+        ok, reason = _verify_terminal_review_report(text)
+        assert ok is False
+        assert "before the verdict" in reason
+
+    def test_completeness_marker_duplicated_is_rejected(self):
+        text = (
+            "Review completeness: UNFINISHED\n"
+            "Review completeness: COMPLETE\n"
+            "Verdict: PASS\n"
+        )
+        ok, reason = _verify_terminal_review_report(text)
+        assert ok is False
+        assert "more than once" in reason
+
+    def test_no_verdict_line_at_all_is_rejected(self):
+        ok, reason = _verify_terminal_review_report("Looks plausible.\n")
+        assert ok is False
+
+    def test_empty_output_is_rejected(self):
+        ok, reason = _verify_terminal_review_report("")
+        assert ok is False
+        assert reason == "empty output"
+
+    def test_trailing_blank_lines_after_verdict_are_tolerated(self):
+        """Trailing whitespace/blank lines are not "trailing prose" — the
+        contract is about the last NON-EMPTY line, matching how CLI tools
+        commonly terminate output with a trailing newline."""
+        text = "Review completeness: COMPLETE\nVerdict: FAIL\n\n\n"
+        ok, reason = _verify_terminal_review_report(text)
+        assert ok is True
 
 
 class TestParseTypedFindings:
@@ -184,6 +246,12 @@ class TestMintPostWorkerTarget:
         assert decoded == "implement the feature"
 
     def test_dirty_worker_state_checkpointed_into_reviewed_range(self, git_repo):
+        """CRITICAL-1 (external review, round 3): the first mint's base must
+        freeze the PRE-checkpoint HEAD, not the post-checkpoint HEAD — a
+        base==head range would be EMPTY and exclude the worker's own
+        checkpointed commit from the very diff the reviewer is meant to
+        see."""
+        pre_worker_head = _git(git_repo, "rev-parse", "HEAD")
         ctx = Context(
             goal="implement the feature", workdir=git_repo, backend="echo",
             state={"_df_mint_review_target": "true"},
@@ -194,8 +262,9 @@ class TestMintPostWorkerTarget:
         loc = tl.parse(ctx.state["target"])
         assert loc.pin is not None
         base, head = loc.pin.split("..")
-        assert base == head  # first mint: base==head at the freshly-committed HEAD
-        changed = _git(git_repo, "diff", "--name-only", f"{base}~1", head)
+        assert base == pre_worker_head
+        assert base != head  # the checkpoint commit must be inside the range
+        changed = _git(git_repo, "diff", "--name-only", base, head)
         assert "new_file.txt" in changed
 
     def test_pin_chain_grows_and_base_stays_fixed_across_visits(self, git_repo):
@@ -222,6 +291,35 @@ class TestMintPostWorkerTarget:
             assert loc.pin is not None
             assert loc.pin.split("..")[0] == base
 
+    def test_visit_1_range_covers_worker_commit_and_visit_2_covers_both(self, git_repo):
+        """CRITICAL-1 (external review, round 3): every re-mint's range is
+        anchored at the SAME frozen pre-worker base, so visit 2's range
+        cumulatively covers visit 1's worker commit AND visit 2's fix
+        commit — never just the latest fix in isolation."""
+        ctx = Context(
+            goal="implement the feature", workdir=git_repo, backend="echo",
+            state={"_df_mint_review_target": "true"},
+        )
+        node = make_node("worker")
+
+        (git_repo / "worker_change.txt").write_text("worker edit\n")
+        _mint_post_worker_target(node, ctx, git_repo)
+        loc1 = tl.parse(ctx.state["target"])
+        assert loc1.pin is not None
+        base1, head1 = loc1.pin.split("..")
+        visit1_changed = _git(git_repo, "diff", "--name-only", base1, head1)
+        assert "worker_change.txt" in visit1_changed
+
+        (git_repo / "fix_change.txt").write_text("fix edit\n")
+        _mint_post_worker_target(node, ctx, git_repo)
+        loc2 = tl.parse(ctx.state["target"])
+        assert loc2.pin is not None
+        base2, head2 = loc2.pin.split("..")
+        assert base2 == base1  # base stays frozen at the pre-worker HEAD
+        visit2_changed = _git(git_repo, "diff", "--name-only", base2, head2)
+        assert "worker_change.txt" in visit2_changed
+        assert "fix_change.txt" in visit2_changed
+
     def test_intent_set_once_not_overwritten_on_remint(self, git_repo):
         ctx = Context(
             goal="original goal", workdir=git_repo, backend="echo",
@@ -242,8 +340,12 @@ class TestMintPostWorkerTarget:
             goal="do a thing", workdir=plain, backend="echo",
             state={"_df_mint_review_target": "true"},
         )
-        _mint_post_worker_target(make_node("worker"), ctx, plain)
+        minted = _mint_post_worker_target(make_node("worker"), ctx, plain)
         assert "target" not in ctx.state
+        # External-review finding (D3/D8a fail-closed): the return value is
+        # the signal `_stash_diff`/`_codergen` use to fail the worker visit
+        # closed instead of silently continuing with no target.
+        assert minted is False
 
 
 class TestMintOptInSafetyGate:
@@ -296,3 +398,24 @@ class TestCodergenEchoMintsTarget:
         result = _codergen(node, ctx)
         assert result.outcome == "success"
         assert "target" not in ctx.state
+
+    def test_mint_failure_after_worker_success_fails_the_visit_closed(self, tmp_path):
+        """D3/D8a fail-closed (external-review finding): when the opt-in
+        mint gate is active but minting can't produce a fresh target (here:
+        a non-git workdir), the worker visit itself must report `failure`
+        instead of silently reporting `success` with no/stale target — a
+        fresh reviewer must never be let run against the "(no target
+        minted)" placeholder or a target from a prior, superseded visit."""
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        node = make_node("worker", prompt=None)
+        ctx = Context(
+            goal="do the work", workdir=plain, backend="echo",
+            state={"_df_mint_review_target": "true"},
+        )
+        result = _codergen(node, ctx)
+        assert result.outcome == "failure"
+        assert result.metadata["target_mint_failed"] == "true"
+        assert "target" not in ctx.state
+        # The flag is consumed (not left to leak into a later node's visit).
+        assert "_target_mint_failed" not in ctx.state

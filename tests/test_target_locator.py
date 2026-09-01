@@ -262,6 +262,51 @@ class TestResolveFreeform:
             tl.resolve_freeform("bead://abc123", ctx)
 
 
+class TestOwnerRepoFromGitRemote:
+    """Finding 5 (external review, round 3): `owner_repo_from_git_remote`
+    deterministically parses `owner/repo` from a local git remote so
+    freeform `"PR 811"` text can actually resolve (an empty `RepoContext`
+    made every such reference unconditionally fail)."""
+
+    def test_https_remote(self, git_repo):
+        _git(git_repo, "remote", "add", "origin", "https://github.com/jleechanorg/dark-factory.git")
+        assert tl.owner_repo_from_git_remote(git_repo) == ("jleechanorg", "dark-factory")
+
+    def test_https_remote_without_dot_git_suffix(self, git_repo):
+        _git(git_repo, "remote", "add", "origin", "https://github.com/jleechanorg/dark-factory")
+        assert tl.owner_repo_from_git_remote(git_repo) == ("jleechanorg", "dark-factory")
+
+    def test_ssh_scp_style_remote(self, git_repo):
+        _git(git_repo, "remote", "add", "origin", "git@github.com:jleechanorg/dark-factory.git")
+        assert tl.owner_repo_from_git_remote(git_repo) == ("jleechanorg", "dark-factory")
+
+    def test_ssh_url_style_remote(self, git_repo):
+        _git(git_repo, "remote", "add", "origin", "ssh://git@github.com/jleechanorg/dark-factory.git")
+        assert tl.owner_repo_from_git_remote(git_repo) == ("jleechanorg", "dark-factory")
+
+    def test_non_github_remote_returns_none(self, git_repo):
+        _git(git_repo, "remote", "add", "origin", "https://gitlab.com/jleechanorg/dark-factory.git")
+        assert tl.owner_repo_from_git_remote(git_repo) is None
+
+    def test_no_remote_returns_none(self, git_repo):
+        assert tl.owner_repo_from_git_remote(git_repo) is None
+
+    def test_freeform_pr_resolution_end_to_end_via_populated_repo_context(
+        self, git_repo, monkeypatch
+    ):
+        """The actual bug (finding 5): an empty `RepoContext` made `"PR
+        811"` unconditionally fail. A `RepoContext` populated from
+        `owner_repo_from_git_remote` resolves it."""
+        _git(git_repo, "remote", "add", "origin", "https://github.com/jleechanorg/dark-factory.git")
+        monkeypatch.setattr(tl, "_gh_pr_head_sha", lambda owner, repo, num: "a" * 40)
+        owner_repo = tl.owner_repo_from_git_remote(git_repo)
+        assert owner_repo is not None
+        owner, repo = owner_repo
+        ctx = tl.RepoContext(repo_root=git_repo, owner=owner, repo=repo)
+        loc = tl.resolve_freeform("PR 811", ctx)
+        assert loc.canonical == "gh-pr://jleechanorg/dark-factory/811@" + "a" * 40
+
+
 # ---------------------------------------------------------------------------
 # mint_from_workdir() / remint() — pin chaining (D8a)
 # ---------------------------------------------------------------------------

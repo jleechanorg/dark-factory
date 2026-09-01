@@ -59,6 +59,17 @@ def _target_for(repo: pathlib.Path) -> str:
     return f"git-commit://{repo}@{_head_sha(repo)}"
 
 
+def _target_state(repo: pathlib.Path) -> dict[str, str]:
+    """``ctx.state`` keys a real worker-success mint would have set: the
+    target locator plus a pin chain whose last entry matches it. The
+    pin-chain consistency check (fail-closed finding) refuses any
+    verdict-gated visit where these two are out of sync, so every test that
+    seeds a reviewer-ready ``target`` directly (bypassing
+    ``_mint_post_worker_target``) must seed both together."""
+    target = _target_for(repo)
+    return {"target": target, "_target_pin_chain": json.dumps([target])}
+
+
 def _use_tmp_snapshot_root(tmp_path: pathlib.Path, monkeypatch) -> pathlib.Path:
     """Redirect the fresh-reviewer snapshot root under `tmp_path` so tests
     never touch the real `~/.dark-factory/review-snapshots`."""
@@ -81,7 +92,7 @@ def _run_review(tmp_path, monkeypatch, output: str, *, mutate: bool = False):
         goal="review this change",
         workdir=tmp_path,
         backend="echo",
-        state={"ao.worktree": str(repo), "target": _target_for(repo)},
+        state={"ao.worktree": str(repo), **_target_state(repo)},
     )
     calls: list[tuple[list[str], pathlib.Path]] = []
     real_run = subprocess.run
@@ -170,6 +181,23 @@ def test_fresh_reviewer_unknown_verdict_fails_closed(tmp_path, monkeypatch):
     assert result.metadata["verdict"] == "unknown"
 
 
+def test_fresh_reviewer_non_terminal_pass_fails_closed(tmp_path, monkeypatch):
+    """CRITICAL-4 (external review, round 3): a `Verdict: PASS` line buried
+    mid-output, with more text after it, is not a terminal verdict — even
+    though it would otherwise parse as a valid PASS. The transcript must
+    END there, or the visit is treated as an unparseable/untrusted verdict
+    (fail closed), not a validated success."""
+    review = (
+        "Review completeness: COMPLETE\nVerdict: PASS\n"
+        "Actually wait, let me reconsider one more thing...\n"
+    )
+    result, _, _ = _run_review(tmp_path, monkeypatch, review)
+
+    assert result.outcome == "error"
+    assert result.metadata["verdict"] == "unknown"
+    assert result.metadata["terminal_report_valid"] == "false"
+
+
 def test_fresh_reviewer_unfinished_pass_normalizes_to_failure(tmp_path, monkeypatch):
     """D7 (v3.1 delta): `Review completeness: UNFINISHED` + `Verdict: PASS`
     is not a validated PASS — the reviewer ran out of time and must not be
@@ -219,7 +247,7 @@ def test_fresh_reviewer_timeout_fails_closed(tmp_path, monkeypatch):
         goal="review this change",
         workdir=tmp_path,
         backend="echo",
-        state={"ao.worktree": str(repo), "target": _target_for(repo)},
+        state={"ao.worktree": str(repo), **_target_state(repo)},
     )
 
     real_run = subprocess.run
@@ -289,8 +317,14 @@ def test_fresh_reviewer_errors_before_codex_when_no_target_minted(tmp_path, monk
     monkeypatch.setattr("runner.handler_codergen.subprocess.run", unexpected_run)
     result = _codergen(_review_node(prompt), ctx)
 
-    assert result.outcome == "error"
-    assert "no review target has been minted" in result.output
+    # External-review finding: the render-time assertion (handler_render.py)
+    # is now the outermost fail-closed gate — it rejects the rendered
+    # "(no target minted)" placeholder before `_codergen` even dispatches to
+    # a backend, so this aborts as a render failure, not a codex-branch
+    # "error" outcome.
+    assert result.outcome == "failure"
+    assert result.metadata.get("review_render_aborted") == "true"
+    assert "no target minted" in result.output
 
 
 def test_fresh_reviewer_snapshot_resolves_through_symlinked_target_locator(
@@ -311,11 +345,12 @@ def test_fresh_reviewer_snapshot_resolves_through_symlinked_target_locator(
         "Review target: ${target}\nEnd with Verdict: PASS or Verdict: FAIL.\n"
     )
     snapshot_root = _use_tmp_snapshot_root(tmp_path, monkeypatch)
+    aliased_target = f"git-commit://{aliased_repo}@{_head_sha(repo)}"
     ctx = Context(
         goal="review this change",
         workdir=tmp_path,
         backend="echo",
-        state={"target": f"git-commit://{aliased_repo}@{_head_sha(repo)}"},
+        state={"target": aliased_target, "_target_pin_chain": json.dumps([aliased_target])},
     )
     calls: list[pathlib.Path] = []
     real_run = subprocess.run
