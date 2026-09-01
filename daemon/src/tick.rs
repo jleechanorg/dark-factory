@@ -2263,18 +2263,38 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         };
 
         if !dependency_ready_ids.contains(&bead.id) {
-            emit(
-                deps.telemetry_log,
+            let context = serde_json::json!({
+                "reason": "absent_from_br_ready",
+                "admission_source": "br ready --label factory --json --limit 0",
+                "state": overlay.state.as_str(),
+                "attempt": overlay.attempt,
+            });
+            let now_epoch = now_epoch_secs();
+            let (should_emit, context_hash) = escalation_dedup_should_emit(
+                deps,
                 &bead.id,
-                overlay.attempt,
-                overlay.state.as_str(),
-                "DEPENDENCY_BLOCKED",
-                serde_json::json!({}),
-                serde_json::json!({
-                    "reason": "absent_from_br_ready",
-                    "admission_source": "br ready --label factory --json --limit 0",
-                }),
+                "dependency_blocked",
+                &context,
+                now_epoch,
             )?;
+            if should_emit {
+                emit(
+                    deps.telemetry_log,
+                    &bead.id,
+                    overlay.attempt,
+                    overlay.state.as_str(),
+                    "DEPENDENCY_BLOCKED",
+                    serde_json::json!({}),
+                    context,
+                )?;
+                record_escalation_emit_dedup(
+                    deps,
+                    &bead.id,
+                    "dependency_blocked",
+                    &context_hash,
+                    now_epoch,
+                )?;
+            }
             continue;
         }
 

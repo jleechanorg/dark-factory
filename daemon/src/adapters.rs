@@ -291,6 +291,13 @@ printf '%s\n' "$*" >> "$DARK_FACTORY_BR_LOG"
 if [ "$1" = "--db" ]; then shift 2; fi
 case "${1:-}" in
   list) printf '{"issues":[],"has_more":false}\n' ;;
+  ready)
+    if [ "${DARK_FACTORY_BR_READY_MALFORMED:-}" = "1" ]; then
+      printf 'not-json\n'
+    else
+      printf '[{"id":"ready-bead"},{"id":"ready-bead-2"}]\n'
+    fi
+    ;;
   create) printf 'bead-from-fake-br\n' ;;
   show)
     if [ -f "$DARK_FACTORY_BR_LABEL_STATE" ]; then
@@ -312,6 +319,7 @@ esac
         let prior_db = std::env::var_os("DARK_FACTORY_BR_DB");
         let prior_log = std::env::var_os("DARK_FACTORY_BR_LOG");
         let prior_label_state = std::env::var_os("DARK_FACTORY_BR_LABEL_STATE");
+        let prior_ready_malformed = std::env::var_os("DARK_FACTORY_BR_READY_MALFORMED");
         let label_state = root.join("factory-labelled");
         unsafe {
             std::env::set_var(
@@ -325,6 +333,11 @@ esac
 
         let tracker = CliTracker;
         let reads = tracker.fetch_candidates();
+        let ready = tracker.fetch_ready_ids();
+        unsafe {
+            std::env::set_var("DARK_FACTORY_BR_READY_MALFORMED", "1");
+        }
+        let malformed_ready = tracker.fetch_ready_ids();
         let created = tracker.create_bead("test", "body", "owner/repo#1");
 
         unsafe {
@@ -344,14 +357,27 @@ esac
                 Some(value) => std::env::set_var("DARK_FACTORY_BR_LABEL_STATE", value),
                 None => std::env::remove_var("DARK_FACTORY_BR_LABEL_STATE"),
             }
+            match prior_ready_malformed {
+                Some(value) => std::env::set_var("DARK_FACTORY_BR_READY_MALFORMED", value),
+                None => std::env::remove_var("DARK_FACTORY_BR_READY_MALFORMED"),
+            }
         }
 
         assert!(reads.unwrap().is_empty());
+        assert_eq!(
+            ready.unwrap(),
+            ["ready-bead".to_string(), "ready-bead-2".to_string()]
+                .into_iter()
+                .collect()
+        );
+        assert!(malformed_ready.is_err(), "malformed br ready JSON must fail closed");
         assert_eq!(created.unwrap(), "bead-from-fake-br");
         assert_eq!(
             std::fs::read_to_string(&log).unwrap().lines().collect::<Vec<_>>(),
             vec![
                 format!("--db {} list --status open --label factory --json --limit 0", db.display()),
+                format!("--db {} ready --label factory --json --limit 0", db.display()),
+                format!("--db {} ready --label factory --json --limit 0", db.display()),
                 format!("--db {} create --title test --description body --external-ref owner/repo#1 --silent", db.display()),
                 format!("--db {} show bead-from-fake-br --json", db.display()),
                 format!("--db {} update bead-from-fake-br --add-label factory --json", db.display()),

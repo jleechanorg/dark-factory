@@ -20,7 +20,7 @@ use daemon::state::{BeadOverlay, OverlayState, SqliteStateStore, StateStore};
 use daemon::tick::{run_tick, TickDeps};
 use daemon::tools::Bead;
 use rusqlite::{params, Connection};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Wrapper around a `SqliteStateStore` that owns a parallel raw `Connection`
 /// for test-introspection (delete the sentinel row, dump the ledger). The
@@ -202,6 +202,156 @@ fn now_epoch() -> u64 {
 }
 
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[test]
+fn dependency_admission_survives_restarts_then_dispatches_once_when_ready() {
+    let path = std::env::temp_dir().join(format!(
+        "dark-factory-dependency-restart-{}-{}.sqlite",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+    let telemetry = path.with_extension("jsonl");
+    let _ = std::fs::remove_file(&telemetry);
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    tracker.candidates.borrow_mut().push(Bead {
+        id: "dependency-restart-bead".into(),
+        title: "blocked across restart".into(),
+        description: "target_repo: owner/repo".into(),
+        notes: String::new(),
+        file_tree_summary: String::new(),
+        external_ref: Some("owner/repo#810".into()),
+    });
+    *tracker.ready_ids.borrow_mut() = Some(HashSet::new());
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"ready"}"#.into(),
+    ));
+    let cfg = test_cfg();
+    let vcs = test_vcs();
+
+    {
+        let store = SqliteStateStore::open(&path).unwrap();
+        store
+            .save(&BeadOverlay {
+                bead_id: "dependency-restart-bead".into(),
+                state: OverlayState::Queued,
+                attempt: 3,
+                reroll_count: 1,
+                autonomy_secs: 77,
+                spend_usd: 2.5,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 2,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("owner/repo".into()),
+                attempt_started_at: None,
+            })
+            .unwrap();
+        run_tick(
+            &TickDeps {
+                scm: &scm,
+                tracker: &tracker,
+                sessions: &sessions,
+                llm: &llm,
+                store: &store,
+                vcs: &vcs,
+                cfg: &cfg,
+                telemetry_log: &telemetry,
+                vendor_health: None,
+            },
+            0,
+            0,
+        )
+        .unwrap();
+    }
+
+    for tick in [1_u64] {
+        let store = SqliteStateStore::open(&path).unwrap();
+        run_tick(
+            &TickDeps {
+                scm: &scm,
+                tracker: &tracker,
+                sessions: &sessions,
+                llm: &llm,
+                store: &store,
+                vcs: &vcs,
+                cfg: &cfg,
+                telemetry_log: &telemetry,
+                vendor_health: None,
+            },
+            tick,
+            0,
+        )
+        .unwrap();
+        let overlay = store.load("dependency-restart-bead").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::Queued);
+        assert_eq!(overlay.attempt, 3);
+        assert_eq!(overlay.autonomy_secs, 77);
+        assert_eq!(overlay.spawn_failure_count, 2);
+    }
+    assert!(llm.calls.borrow().is_empty());
+    assert!(sessions.calls.borrow().is_empty());
+    assert_eq!(
+        std::fs::read_to_string(&telemetry)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("DEPENDENCY_BLOCKED"))
+            .count(),
+        1,
+        "unchanged blocked disposition must be deduplicated across restart"
+    );
+
+    tracker
+        .ready_ids
+        .borrow_mut()
+        .as_mut()
+        .unwrap()
+        .insert("dependency-restart-bead".into());
+    {
+        let store = SqliteStateStore::open(&path).unwrap();
+        let summary = run_tick(
+            &TickDeps {
+                scm: &scm,
+                tracker: &tracker,
+                sessions: &sessions,
+                llm: &llm,
+                store: &store,
+                vcs: &vcs,
+                cfg: &cfg,
+                telemetry_log: &telemetry,
+                vendor_health: None,
+            },
+            2,
+            0,
+        )
+        .unwrap();
+        assert_eq!(summary.beads_routed, 1);
+        assert_eq!(summary.beads_dispatched, 1);
+        assert_eq!(
+            store.load("dependency-restart-bead").unwrap().unwrap().state,
+            OverlayState::Dispatched
+        );
+    }
+    assert_eq!(
+        sessions
+            .calls
+            .borrow()
+            .iter()
+            .filter(|call| call.starts_with("spawn("))
+            .count(),
+        1
+    );
+
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+    let _ = std::fs::remove_file(telemetry);
+}
 
 #[test]
 fn adopted_remediation_marker_is_migrated_and_persistent() {
