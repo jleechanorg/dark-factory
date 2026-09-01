@@ -1551,7 +1551,14 @@ mod tests {
             .trim()
             .to_owned();
         let pid: unix_signals::Pid = pid.parse().expect("descendant PID must be numeric");
-        let is_alive = process_is_live(pid);
+        let mut is_alive = true;
+        for _ in 0..10 {
+            is_alive = process_is_live(pid);
+            if !is_alive {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         if is_alive {
             unsafe {
                 unix_signals::kill(pid, unix_signals::SIGKILL);
