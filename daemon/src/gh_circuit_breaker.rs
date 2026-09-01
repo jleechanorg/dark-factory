@@ -83,6 +83,16 @@ fn graphql_document_is_mutation(query: &str) -> bool {
     }
 }
 
+fn graphql_query_field_is_mutation(value: &str) -> bool {
+    value.strip_prefix("query=").is_some_and(|query| {
+        // `gh api graphql -f query=@file.graphql` defers the document bytes
+        // to a file that admission cannot safely inspect here. Treat that
+        // unresolved document as a mutation rather than granting read-only
+        // admission to a possible write.
+        query.trim_start().starts_with('@') || graphql_document_is_mutation(query)
+    })
+}
+
 pub fn classify_gh_request(args: &[&str]) -> ApiSurface {
     if args.first() == Some(&"api") {
         if args.get(1) == Some(&"graphql") {
@@ -95,6 +105,14 @@ pub fn classify_gh_request(args: &[&str]) -> ApiSurface {
                 {
                     return ApiSurface::GraphqlMutation;
                 }
+                if arg
+                    .strip_prefix("-f")
+                    .or_else(|| arg.strip_prefix("-F"))
+                    .filter(|value| !value.is_empty())
+                    .is_some_and(graphql_query_field_is_mutation)
+                {
+                    return ApiSurface::GraphqlMutation;
+                }
                 let value = if previous_was_query_field {
                     previous_was_query_field = false;
                     Some(*arg)
@@ -104,11 +122,7 @@ pub fn classify_gh_request(args: &[&str]) -> ApiSurface {
                 } else {
                     Some(*arg)
                 };
-                if value.is_some_and(|value| {
-                    value
-                        .strip_prefix("query=")
-                        .is_some_and(graphql_document_is_mutation)
-                }) {
+                if value.is_some_and(graphql_query_field_is_mutation) {
                     return ApiSurface::GraphqlMutation;
                 }
             }
@@ -891,6 +905,22 @@ mod tests {
             classify_gh_request(&["api", "graphql", "--input=payload.json"]),
             ApiSurface::GraphqlMutation
         );
+        for args in [
+            ["api", "graphql", "-fquery=@mutation.graphql"],
+            ["api", "graphql", "-Fquery=@mutation.graphql"],
+        ] {
+            assert_eq!(classify_gh_request(&args), ApiSurface::GraphqlMutation);
+        }
+    }
+
+    #[test]
+    fn classifies_file_backed_graphql_query_fields_fail_closed() {
+        for args in [
+            ["api", "graphql", "-f", "query=@mutation.graphql"],
+            ["api", "graphql", "-F", "query=@mutation.graphql"],
+        ] {
+            assert_eq!(classify_gh_request(&args), ApiSurface::GraphqlMutation);
+        }
     }
 
     #[test]
