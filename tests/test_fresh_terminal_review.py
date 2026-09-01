@@ -722,7 +722,7 @@ def test_default_graph_does_not_initialize_controller_state(tmp_path, monkeypatc
     graph = parse(ROOT / "pipelines/slim/two_node.dot")
     history = engine_run.run(
         graph,
-        Context(goal="review the default", workdir=tmp_path, backend="echo"),
+        Context(goal="review the default", workdir=_repo(tmp_path), backend="echo"),
     )
 
     assert history[-1].outcome == "success"

@@ -15,7 +15,7 @@ ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from conftest import ROOT  # noqa: E402, F811
+from conftest import ROOT, init_git_repo  # noqa: E402, F811
 
 import pytest  # noqa: E402
 from runner.engine import run  # noqa: E402
@@ -163,7 +163,7 @@ def test_two_node_holdout_engine_success_path(tmp_path, monkeypatch) -> None:
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
 
     graph = parse(ROOT / _PIPELINE)
-    ctx = Context(goal="ship feature with holdout", workdir=tmp_path, backend="echo")
+    ctx = Context(goal="ship feature with holdout", workdir=init_git_repo(tmp_path), backend="echo")
     ctx.state["feature"] = "test_feature"
 
     history = run(graph, ctx)
@@ -195,7 +195,7 @@ def test_two_node_holdout_engine_holdout_failure_routes_to_worker(tmp_path, monk
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
 
     graph = parse(ROOT / _PIPELINE)
-    ctx = Context(goal="ship feature with holdout retry", workdir=tmp_path, backend="echo")
+    ctx = Context(goal="ship feature with holdout retry", workdir=init_git_repo(tmp_path), backend="echo")
     ctx.state["feature"] = "test_feature"
 
     history = run(graph, ctx)
@@ -232,7 +232,7 @@ def test_two_node_holdout_engine_reviewer_failure_routes_to_worker(tmp_path, mon
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
 
     graph = parse(ROOT / _PIPELINE)
-    ctx = Context(goal="fix review comments", workdir=tmp_path, backend="echo")
+    ctx = Context(goal="fix review comments", workdir=init_git_repo(tmp_path), backend="echo")
     ctx.state["feature"] = "test_feature"
 
     history = run(graph, ctx)
@@ -265,7 +265,7 @@ def test_two_node_holdout_engine_worker_visits_bounded(tmp_path, monkeypatch) ->
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
 
     graph = parse(ROOT / _PIPELINE)
-    ctx = Context(goal="test bounded loops", workdir=tmp_path, backend="echo")
+    ctx = Context(goal="test bounded loops", workdir=init_git_repo(tmp_path), backend="echo")
     ctx.state["feature"] = "test_feature"
 
     history = run(graph, ctx)

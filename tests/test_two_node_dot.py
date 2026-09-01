@@ -21,7 +21,7 @@ ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from conftest import ROOT  # noqa: E402, F811
+from conftest import ROOT, init_git_repo  # noqa: E402, F811
 
 from runner.parser import parse  # noqa: E402
 
@@ -199,7 +199,7 @@ def test_two_node_loop_copies_exact_review_output_to_worker_retry(tmp_path, monk
     monkeypatch.setitem(TYPE_REGISTRY, "codergen", fake_codergen)
     history = run(
         parse(ROOT / _PIPELINE),
-        Context(goal="fix zero handling", workdir=tmp_path, backend="echo"),
+        Context(goal="fix zero handling", workdir=init_git_repo(tmp_path), backend="echo"),
     )
 
     assert history[-1].outcome == "success"
@@ -387,7 +387,7 @@ def test_two_node_reviewer_error_is_terminal(tmp_path, monkeypatch) -> None:
     monkeypatch.setitem(TYPE_REGISTRY, "codergen", fake_codergen)
     history = run(
         parse(ROOT / _PIPELINE),
-        Context(goal="review without mutation", workdir=tmp_path, backend="echo"),
+        Context(goal="review without mutation", workdir=init_git_repo(tmp_path), backend="echo"),
     )
 
     assert history[-1].outcome == "error"
