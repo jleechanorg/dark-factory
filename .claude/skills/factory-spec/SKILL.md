@@ -145,7 +145,7 @@ When `--pipeline` is omitted, `/f` and `/factory` default to `two_node` (`pipeli
 
 | Task | Pipeline |
 |------|----------|
-| **Default `/f` / `/factory` invocation** | `pipelines/slim/two_node.dot` (generic worker + controller cold reviewer) |
+| **Default `/f` / `/factory` invocation** | `pipelines/slim/two_node.dot` (generic worker + fresh fully tooled Codex reviewer) |
 | **Create a reviewed spec (main + attractor)** | `pipelines/slim/spec_gen.dot` ← `/fs` create mode (default) |
 | **Create only the main spec** | `pipelines/slim/spec_gen.dot` ← `/fs --skip-attractor` |
 | Smoke / wiring | `pipelines/factory/hello.dot` |
@@ -169,11 +169,10 @@ through to `$DARK_FACTORY_HOME/pipelines/`, so an operator in the target
 repo can pass `--pipeline my_repo_lane.dot` and the runner finds it
 locally.
 
-**When `--pipeline` is omitted (auto-select path),** `/f` and `/factory`
-list the contents of `<workdir>/dark-factory/pipelines/` **before**
-falling back to the built-in decision table, so repo-specific graphs
-surface in the auto-select output. The convention is therefore
-discoverable, not just documentable.
+**When `--pipeline` is omitted,** `/f` and `/factory` use the canonical
+SlimTwoNode graph. Repo-specific graphs are explicit opt-ins: pass their bare
+filename or path with `--pipeline`; they are not selected implicitly from the
+target worktree.
 
 Execution command (from target repo cwd):
 

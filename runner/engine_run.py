@@ -112,6 +112,45 @@ def _is_controller_graph(graph: Graph) -> bool:
     )
 
 
+def _fresh_review_preflight_error(graph: Graph, ctx: Context) -> str | None:
+    """Return an actionable isolation error before a fresh-review graph spends worker tokens."""
+    needs_fresh_review = any(
+        str(node.attrs.get("verdict_gate", "")).strip().lower()
+        in {"true", "1", "yes", "on"}
+        and str(node.attrs.get("fresh_session", "")).strip().lower()
+        in {"true", "1", "yes", "on"}
+        for node in graph.nodes.values()
+    )
+    if not needs_fresh_review:
+        return None
+
+    try:
+        from .handler_codergen import (
+            _compute_tracked_fingerprint,
+            _fresh_review_workdir,
+            _git_ignored_snapshot_paths,
+            _validate_snapshot_symlinks,
+        )
+
+        target_workdir = _fresh_review_workdir(ctx)
+        if target_workdir is None:
+            return "fresh reviewer target must be a real, non-symlinked directory"
+        target_fingerprint = _compute_tracked_fingerprint(
+            target_workdir, include_untracked=True
+        )
+        if target_fingerprint.digest is None:
+            return (
+                "fresh reviewer target must be a Git repository with a readable HEAD: "
+                f"{target_fingerprint.git_error}"
+            )
+        _validate_snapshot_symlinks(
+            target_workdir, _git_ignored_snapshot_paths(target_workdir)
+        )
+    except Exception as exc:  # noqa: BLE001 - reject unsafe target before dispatch
+        return f"fresh reviewer isolation preflight failed: {exc}"
+    return None
+
+
 def _controller_snapshot_journal_path(ctx: Context) -> pathlib.Path | None:
     """Return the durable snapshot journal path for this run, if addressable."""
     run_id = str(
@@ -980,6 +1019,20 @@ def run(
     ended_at_exit = False
 
     try:
+        preflight_error = _fresh_review_preflight_error(graph, ctx)
+        if preflight_error is not None:
+            record = _persist.StepRecord(
+                node="__fresh_review_preflight__",
+                outcome="error",
+                ts=time.time(),
+                output_preview=preflight_error,
+                metadata={"fresh_review_preflight": "true"},
+            )
+            seq = _persist._append_record(
+                history, checkpoint, cxdb, ctx, seq, record, preflight_error
+            )
+            return history
+
         # Branch StepRecords are internal to a fan-out step and should not count
         # against the main pipeline's step budget (max_steps).  Track overhead so
         # the check uses only main-pipeline steps.  On resume, initialize from the

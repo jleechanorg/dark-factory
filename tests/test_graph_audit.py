@@ -105,16 +105,47 @@ def test_resolved_type_label_matches_engine(name, attrs, want_label):
         ({}, True, False),
         # class="review" alone is only a styling hint.
         ({"type": "codergen", "class": "review"}, True, False),
-        # The explicit Codex verdict gate turns a review-class codergen into a gate.
+        # The explicit fresh Codex verdict gate turns a review-class codergen into a gate.
         (
             {
                 "type": "codergen",
                 "class": "review",
                 "backend": "codex",
+                "prompt": "@prompts/slim/fresh_review.md",
+                "fresh_session": "true",
                 "verdict_gate": "true",
+                "timeout": "600",
             },
             False,
             True,
+        ),
+        # A Codex verdict gate without a fresh session is still code-producing,
+        # not a hard-tier reviewer.
+        (
+            {
+                "type": "codergen",
+                "class": "review",
+                "backend": "codex",
+                "prompt": "@prompts/slim/fresh_review.md",
+                "verdict_gate": "true",
+                "timeout": "600",
+            },
+            True,
+            False,
+        ),
+        # A default-resolved codergen without an explicit type is not the
+        # declared fresh reviewer contract.
+        (
+            {
+                "class": "review",
+                "backend": "codex",
+                "prompt": "@prompts/slim/fresh_review.md",
+                "fresh_session": "true",
+                "verdict_gate": "true",
+                "timeout": "600",
+            },
+            True,
+            False,
         ),
         # Other codergen backends do not implement verdict-gate parsing.
         (
@@ -122,7 +153,10 @@ def test_resolved_type_label_matches_engine(name, attrs, want_label):
                 "type": "codergen",
                 "class": "review",
                 "backend": "echo",
+                "prompt": "@prompts/slim/fresh_review.md",
                 "verdict_gate": "true",
+                "fresh_session": "true",
+                "timeout": "600",
             },
             True,
             False,
@@ -133,6 +167,53 @@ def test_classification_table(attrs, is_code, is_review):
     node = make_node("n", **attrs)
     assert graph_audit._is_code_producing(node) is is_code
     assert graph_audit._is_reviewer(node) is is_review
+
+
+_COMPLETE_FRESH_REVIEWER_ATTRS = {
+    "type": "codergen",
+    "class": "review",
+    "backend": "codex",
+    "prompt": "@prompts/slim/fresh_review.md",
+    "fresh_session": "true",
+    "verdict_gate": "true",
+    "timeout": "600",
+}
+
+
+@pytest.mark.parametrize("missing", sorted(_COMPLETE_FRESH_REVIEWER_ATTRS))
+def test_fresh_codex_reviewer_rejects_each_missing_contract_field(missing):
+    attrs = dict(_COMPLETE_FRESH_REVIEWER_ATTRS)
+    attrs.pop(missing)
+    node = make_node("reviewer", **attrs)
+    assert graph_audit.is_complete_fresh_codex_reviewer(node) is False
+    assert graph_audit._is_reviewer(node) is False
+
+
+@pytest.mark.parametrize(
+    "legacy",
+    [
+        "review_contract",
+        "backend_priority",
+        "prefer_adversarial",
+        "gate_strict",
+        "receipt_required",
+        "evidence_paths",
+        "parallel",
+        "allow_partial",
+        "join_quorum",
+        "n_shadows",
+        "shadow_codex_review",
+        "shadow_review_target",
+        "shadow_codex_timeout",
+        "shadow_backends",
+    ],
+)
+def test_fresh_codex_reviewer_rejects_each_legacy_controller_field(legacy):
+    attrs = dict(_COMPLETE_FRESH_REVIEWER_ATTRS)
+    attrs[legacy] = "true"
+    node = make_node("reviewer", **attrs)
+    assert graph_audit.is_complete_fresh_codex_reviewer(node) is False
+    assert graph_audit._is_reviewer(node) is False
 
 
 # ---------------------------------------------------------------------------

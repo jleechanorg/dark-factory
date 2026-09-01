@@ -20,9 +20,10 @@ sys.path.insert(0, str(ROOT))
 # branch_* mkdtemp per fan-out test into the working tree.
 SCRATCH = pathlib.Path(tempfile.mkdtemp(prefix="test_spec_gen_"))
 
-from conftest import register_scratch_dir  # noqa: E402
+from conftest import init_git_repo, register_scratch_dir  # noqa: E402
 
 register_scratch_dir(SCRATCH)
+init_git_repo(SCRATCH)
 
 import runner.handlers as handlers_mod
 from runner.engine import run
@@ -176,30 +177,33 @@ def test_spec_gen_plan_main_prompt_is_plan_md():
     assert g.nodes["plan_main"].attrs.get("prompt") == "@prompts/slim/plan.md"
 
 
-def test_spec_gen_review_main_is_parallel_reviewer():
-    """review_main must run primary review plus shadow Codex comparison."""
+def test_spec_gen_review_main_is_fresh_codex_reviewer():
+    """review_main must use the fresh, fully tooled Codex contract."""
     g = parse(SPEC_GEN)
-    assert g.nodes["review_main"].attrs.get("type") == "parallel_reviewer", (
-        "review_main must be type=parallel_reviewer to preserve adversarial "
-        "priority queue review while logging the parallel Codex comparison"
+    assert g.nodes["review_main"].attrs.get("type") == "codergen", (
+        "review_main must be a fresh codergen reviewer"
     )
 
 
-def test_spec_gen_review_main_has_backend_priority():
+def test_spec_gen_review_main_has_fresh_codex_contract():
     g = parse(SPEC_GEN)
-    bp = g.nodes["review_main"].attrs.get("backend_priority", "")
-    assert bp, "review_main must declare backend_priority for adversarial routing"
-    priority = [p.strip() for p in bp.split(",")]
-    assert "codex" in priority, "codex must be in backend_priority"
-    assert "agy" in priority, "agy must be in backend_priority"
+    attrs = g.nodes["review_main"].attrs
+    assert attrs.get("backend") == "codex"
+    assert str(attrs.get("fresh_session")).lower() in ("true", "1", "yes")
+    assert str(attrs.get("verdict_gate")).lower() in ("true", "1", "yes")
+    assert str(attrs.get("goal_gate")).lower() in ("true", "1", "yes")
 
 
-def test_spec_gen_review_main_prefer_adversarial():
+def test_spec_gen_review_main_drops_controller_routing_attrs():
     g = parse(SPEC_GEN)
-    prefer = g.nodes["review_main"].attrs.get("prefer_adversarial")
-    assert str(prefer).lower() in ("true", "1", "yes"), (
-        "review_main must set prefer_adversarial=true"
-    )
+    attrs = g.nodes["review_main"].attrs
+    assert "backend_priority" not in attrs
+    assert "prefer_adversarial" not in attrs
+
+
+def test_spec_gen_review_main_prompt_is_fresh_review_md():
+    g = parse(SPEC_GEN)
+    assert g.nodes["review_main"].attrs.get("prompt") == "@prompts/slim/fresh_review.md"
 
 
 def test_spec_gen_review_main_goal_gate_true():
@@ -214,13 +218,6 @@ def test_spec_gen_review_main_retry_target_fix_main():
     g = parse(SPEC_GEN)
     assert g.nodes["review_main"].attrs.get("retry_target") == "fix_main", (
         "review_main retry_target must be fix_main"
-    )
-
-
-def test_spec_gen_review_main_prompt_is_spec_review_md():
-    g = parse(SPEC_GEN)
-    assert g.nodes["review_main"].attrs.get("prompt") == "@prompts/slim/spec_review.md", (
-        "review_main must use @prompts/slim/spec_review.md"
     )
 
 
@@ -258,20 +255,34 @@ def test_spec_gen_plan_attractor_prompt_is_plan_attractor_md():
     )
 
 
-def test_spec_gen_review_attractor_is_parallel_reviewer():
-    """review_attractor must run primary review plus shadow Codex comparison."""
+def test_spec_gen_review_attractor_is_fresh_codex_reviewer():
+    """review_attractor must use the fresh, fully tooled Codex contract."""
     g = parse(SPEC_GEN)
-    assert g.nodes["review_attractor"].attrs.get("type") == "parallel_reviewer", (
-        "review_attractor must be type=parallel_reviewer to preserve adversarial "
-        "priority queue review while logging the parallel Codex comparison"
+    assert g.nodes["review_attractor"].attrs.get("type") == "codergen", (
+        "review_attractor must be a fresh codergen reviewer"
     )
 
 
-def test_spec_gen_review_attractor_prompt_is_spec_review_attractor_md():
+def test_spec_gen_review_attractor_has_fresh_codex_contract():
     g = parse(SPEC_GEN)
-    assert g.nodes["review_attractor"].attrs.get("prompt") == (
-        "@prompts/slim/spec_review_attractor.md"
-    ), "review_attractor must use the dedicated attractor review prompt"
+    attrs = g.nodes["review_attractor"].attrs
+    assert attrs.get("backend") == "codex"
+    assert str(attrs.get("fresh_session")).lower() in ("true", "1", "yes")
+    assert str(attrs.get("verdict_gate")).lower() in ("true", "1", "yes")
+    assert str(attrs.get("goal_gate")).lower() in ("true", "1", "yes")
+
+
+def test_spec_gen_review_attractor_drops_controller_routing_attrs():
+    g = parse(SPEC_GEN)
+    attrs = g.nodes["review_attractor"].attrs
+    assert "backend_priority" not in attrs
+    assert "prefer_adversarial" not in attrs
+
+
+def test_spec_gen_review_attractor_prompt_is_fresh_review_md():
+    g = parse(SPEC_GEN)
+    attrs = g.nodes["review_attractor"].attrs
+    assert attrs.get("prompt") == "@prompts/slim/fresh_review.md"
 
 
 def test_spec_gen_review_attractor_retry_target_fix_attractor():
@@ -311,9 +322,11 @@ def test_spec_gen_happy_path_explore_plan_main_review_main_plan_attractor_review
     monkeypatch.setattr(handlers_mod, "_sandboxed_args", lambda args: args)
 
     g = parse(SPEC_GEN)
-    # Pin both plan nodes to echo; reviewer echo mode reads outcome from ctx.state.
+    # Pin plan and reviewer nodes to echo; echo mode reads outcomes from state.
     g.nodes["plan_main"].attrs["backend"] = "echo"
     g.nodes["plan_attractor"].attrs["backend"] = "echo"
+    g.nodes["review_main"].attrs["backend"] = "echo"
+    g.nodes["review_attractor"].attrs["backend"] = "echo"
 
     ctx = Context(goal="define a reviewed spec for a tiny utility", workdir=SCRATCH, backend="echo")
     ctx.state["review_main.outcome"] = "success"
@@ -353,15 +366,17 @@ def test_spec_gen_fix_main_loop_on_review_main_failure(monkeypatch, tmp_path):
     g = parse(SPEC_GEN)
     g.nodes["plan_main"].attrs["backend"] = "echo"
     g.nodes["plan_attractor"].attrs["backend"] = "echo"
+    g.nodes["review_main"].attrs["backend"] = "echo"
+    g.nodes["review_attractor"].attrs["backend"] = "echo"
 
     ctx = Context(goal="bad spec needs one fix", workdir=SCRATCH, backend="echo")
     ctx.state["review_attractor.outcome"] = "success"
 
     # First review_main visit fails; second succeeds.
     call_count = {"n": 0}
-    original_handler = TYPE_REGISTRY["parallel_reviewer"]
+    original_handler = TYPE_REGISTRY["codergen"]
 
-    def patched_parallel_reviewer(node, _ctx):
+    def patched_codergen(node, _ctx):
         if node.name == "review_main":
             call_count["n"] += 1
             if call_count["n"] == 1:
@@ -369,9 +384,12 @@ def test_spec_gen_fix_main_loop_on_review_main_failure(monkeypatch, tmp_path):
                 return Result(outcome="failure", output="spec missing non-goals")
             from runner.handlers import Result
             return Result(outcome="success", output="spec approved after fix")
+        if node.name == "review_attractor":
+            from runner.handlers import Result
+            return Result(outcome="success", output="attractor spec approved")
         return original_handler(node, _ctx)
 
-    monkeypatch.setitem(TYPE_REGISTRY, "parallel_reviewer", patched_parallel_reviewer)
+    monkeypatch.setitem(TYPE_REGISTRY, "codergen", patched_codergen)
 
     history = run(g, ctx, checkpoint=tmp_path / "checkpoint.json")
 
@@ -397,9 +415,12 @@ def test_spec_gen_fix_attractor_loop_on_review_attractor_failure(monkeypatch, tm
 
     # First review_attractor visit fails; second succeeds.
     call_count = {"n": 0}
-    original_handler = TYPE_REGISTRY["parallel_reviewer"]
+    original_handler = TYPE_REGISTRY["codergen"]
 
-    def patched_parallel_reviewer(node, _ctx):
+    def patched_codergen(node, _ctx):
+        if node.name == "review_main":
+            from runner.handlers import Result
+            return Result(outcome="success", output="spec approved")
         if node.name == "review_attractor":
             call_count["n"] += 1
             if call_count["n"] == 1:
@@ -409,7 +430,7 @@ def test_spec_gen_fix_attractor_loop_on_review_attractor_failure(monkeypatch, tm
             return Result(outcome="success", output="attractor spec approved after fix")
         return original_handler(node, _ctx)
 
-    monkeypatch.setitem(TYPE_REGISTRY, "parallel_reviewer", patched_parallel_reviewer)
+    monkeypatch.setitem(TYPE_REGISTRY, "codergen", patched_codergen)
 
     history = run(g, ctx, checkpoint=tmp_path / "checkpoint.json")
 
@@ -428,6 +449,8 @@ def test_spec_gen_full_node_sequence_happy_path(monkeypatch, tmp_path):
     g = parse(SPEC_GEN)
     g.nodes["plan_main"].attrs["backend"] = "echo"
     g.nodes["plan_attractor"].attrs["backend"] = "echo"
+    g.nodes["review_main"].attrs["backend"] = "echo"
+    g.nodes["review_attractor"].attrs["backend"] = "echo"
 
     ctx = Context(goal="spec-gen happy path ordering", workdir=SCRATCH, backend="echo")
     ctx.state["review_main.outcome"] = "success"

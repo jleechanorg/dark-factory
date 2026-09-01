@@ -14,8 +14,6 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Iterable
-
 from runner.review_controller import (
     EvidenceArtifact,
     ReviewContractError,
@@ -119,27 +117,27 @@ class PerLaneIsolationTests(unittest.TestCase):
 
 
 class PipelineOptInTests(unittest.TestCase):
-    """The three hard-tier factory pipelines must opt into cold-review-v1."""
+    """The three hard-tier factory pipelines must use fresh Codex review."""
 
-    def _reviewer_nodes(self, dot_text: str) -> Iterable[str]:
-        # Each reviewer line in pydot-parsed text starts with the node name
-        # then attrs. We grab any node with `review_contract=` or any node
-        # whose shape is Msquare/box (reviewer).
-        for line in dot_text.splitlines():
-            if "review_contract=" in line:
-                yield line.strip()
+    def _assert_fresh_reviewer(self, filename: str) -> None:
+        from runner.parser import parse
 
-    def test_gates_dot_has_review_contract(self) -> None:
-        text = Path("pipelines/factory/gates.dot").read_text()
-        self.assertTrue(any('review_contract="cold-review-v1"' in line for line in text.splitlines()))
+        graph = parse(Path("pipelines/factory") / filename)
+        reviewer = graph.nodes["adversarial_reviewer"]
+        self.assertEqual(reviewer.attrs.get("type"), "codergen")
+        self.assertEqual(reviewer.attrs.get("class"), "review")
+        self.assertEqual(reviewer.attrs.get("backend"), "codex")
+        self.assertEqual(reviewer.attrs.get("fresh_session"), "true")
+        self.assertEqual(reviewer.attrs.get("verdict_gate"), "true")
 
-    def test_level5_feature_dot_has_review_contract(self) -> None:
-        text = Path("pipelines/factory/level5_feature.dot").read_text()
-        self.assertTrue(any('review_contract="cold-review-v1"' in line for line in text.splitlines()))
+    def test_gates_dot_has_fresh_codex_reviewer(self) -> None:
+        self._assert_fresh_reviewer("gates.dot")
 
-    def test_pr_gates_dot_has_review_contract(self) -> None:
-        text = Path("pipelines/factory/pr_gates.dot").read_text()
-        self.assertTrue(any('review_contract="cold-review-v1"' in line for line in text.splitlines()))
+    def test_level5_feature_dot_has_fresh_codex_reviewer(self) -> None:
+        self._assert_fresh_reviewer("level5_feature.dot")
+
+    def test_pr_gates_dot_has_fresh_codex_reviewer(self) -> None:
+        self._assert_fresh_reviewer("pr_gates.dot")
 
 
 if __name__ == "__main__":

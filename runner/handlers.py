@@ -175,6 +175,7 @@ from .handler_holdout import (
 # Prompt template resolution.
 from .handler_render import (
     _render_prompt,
+    _fresh_review_prompt_metadata,
 )
 
 # Parallel fan-out/join.

@@ -141,7 +141,7 @@ source. Run from the **target repo** cwd; pipelines resolve from `$DARK_FACTORY_
 
 ### Pipeline selection
 
-When `--pipeline` is omitted, `/f` and `/factory` default to `pipelines/slim/two_node.dot` (generic worker + controller cold reviewer). Pass explicit `--pipeline <name>` to opt into non-default pipelines (see [docs/pipeline-selection.md](docs/pipeline-selection.md)).
+When `--pipeline` is omitted, `/f` and `/factory` default to `pipelines/slim/two_node.dot` (generic worker + fresh fully tooled Codex reviewer). Pass explicit `--pipeline <name>` to opt into non-default pipelines (see [docs/pipeline-selection.md](docs/pipeline-selection.md)). Controller/cold-review graphs and reviewer calibration are explicit opt-ins, not the ordinary default route.
 
 | Task | Pipeline |
 |------|----------|

@@ -90,6 +90,31 @@ _HARD_TIER_REVIEWER_TYPES: frozenset[str] = frozenset({
     "parallel_reviewer",
 })
 
+# The fresh Codex reviewer is a direct codergen gate. Controller-owned
+# priority/receipt/parallel/shadow attributes belong to the retired
+# ``parallel_reviewer`` path and must not silently alter this contract.
+_FRESH_CODEX_REVIEWER_ENABLED: frozenset[str] = frozenset(
+    {"true", "1", "yes", "on"}
+)
+_FRESH_CODEX_REVIEWER_LEGACY_ATTRS: frozenset[str] = frozenset(
+    {
+        "review_contract",
+        "backend_priority",
+        "prefer_adversarial",
+        "gate_strict",
+        "receipt_required",
+        "evidence_paths",
+        "parallel",
+        "allow_partial",
+        "join_quorum",
+        "n_shadows",
+        "shadow_codex_review",
+        "shadow_review_target",
+        "shadow_codex_timeout",
+        "shadow_backends",
+    }
+)
+
 
 # ---------------------------------------------------------------------------
 # Advisory allowlist — pipelines that are exempt from the audit by
@@ -178,15 +203,28 @@ def _resolved_type_label(node: Node) -> str:
     return "codergen"
 
 
-def _is_codergen_verdict_gate(node: Node) -> bool:
-    """Return whether a codergen explicitly declares review-gate behavior."""
-    enabled = str(node.attrs.get("verdict_gate", "false")).strip().lower()
+def is_complete_fresh_codex_reviewer(node: Node) -> bool:
+    """Return whether ``node`` has the complete direct fresh Codex contract."""
+    if _FRESH_CODEX_REVIEWER_LEGACY_ATTRS.intersection(node.attrs):
+        return False
     return (
-        _resolved_type_label(node) == "codergen"
+        str(node.attrs.get("type", "")).strip().lower() == "codergen"
+        and _resolved_type_label(node) == "codergen"
         and str(node.attrs.get("class", "")).strip().lower() == "review"
         and str(node.attrs.get("backend", "")).strip().lower() == "codex"
-        and enabled in {"true", "1", "yes", "on"}
+        and str(node.attrs.get("fresh_session", "")).strip().lower()
+        in _FRESH_CODEX_REVIEWER_ENABLED
+        and str(node.attrs.get("verdict_gate", "")).strip().lower()
+        in _FRESH_CODEX_REVIEWER_ENABLED
+        and str(node.attrs.get("prompt", "")).strip()
+        == "@prompts/slim/fresh_review.md"
+        and str(node.attrs.get("timeout", "")).strip() == "600"
     )
+
+
+def _is_codergen_verdict_gate(node: Node) -> bool:
+    """Compatibility alias for the complete fresh Codex reviewer predicate."""
+    return is_complete_fresh_codex_reviewer(node)
 
 
 def _is_code_producing(node: Node) -> bool:
@@ -212,7 +250,8 @@ def _is_reviewer(node: Node) -> bool:
 
     Includes both ``type="gate_*"`` / ``type="holdout_eval"`` AND any
     future aliasing added to ``TYPE_REGISTRY`` under those names. A codergen
-    counts only when it explicitly combines ``class="review"`` with
+    counts only when it explicitly combines ``class="review"``,
+    ``backend="codex"``, ``fresh_session="true"``, and
     ``verdict_gate="true"``; class alone remains a styling hint.
     """
     return (

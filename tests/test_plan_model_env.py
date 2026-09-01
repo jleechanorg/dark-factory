@@ -58,12 +58,12 @@ def test_env_var_overrides_default(monkeypatch):
 
 
 def test_env_var_does_not_leak_into_review(monkeypatch):
-    """``.review`` rule has no env-var reference; backend is unchanged."""
+    """``.review`` rule has no env-var reference; the explicit backend is unchanged."""
     monkeypatch.setenv("DARK_FACTORY_PLAN_MODEL", "claude-sonnet-4-6")
     g = parse(ROOT / "pipelines" / "slim" / "minimal_feature.dot")
     # review is added via include from _base.dot.
     review = g.nodes["review"]
-    assert review.attrs["backend"] == "agy"
+    assert review.attrs["backend"] == "codex"
     # No model_name should be set by the stylesheet on review (the .review
     # rule doesn't define one).
     assert "model_name" not in review.attrs or review.attrs["model_name"] != "claude-sonnet-4-6"

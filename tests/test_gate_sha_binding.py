@@ -24,7 +24,7 @@ ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from conftest import _pipeline  # noqa: E402
+from conftest import _pipeline, install_adversarial_reviewer_stub  # noqa: E402
 
 from runner.engine import run  # noqa: E402
 from runner.handlers import Context, Result, TYPE_REGISTRY  # noqa: E402
@@ -87,10 +87,7 @@ def _mock_adversarial_reviewer(monkeypatch) -> None:
         return Result(outcome=pre or "success", output=f"fake_skeptic({node.name})")
     monkeypatch.setitem(TYPE_REGISTRY, "gate_skeptic", fake_skeptic)
 
-    def fake_parallel_reviewer(node, ctx):
-        pre = ctx.state.get(f"{node.name}.outcome")
-        return Result(outcome=pre or "success", output=f"fake_parallel_reviewer({node.name})")
-    monkeypatch.setitem(TYPE_REGISTRY, "parallel_reviewer", fake_parallel_reviewer)
+    install_adversarial_reviewer_stub(monkeypatch)
 
 
 def test_gate_missing_head_sha_echo_is_error(tmp_path, monkeypatch):

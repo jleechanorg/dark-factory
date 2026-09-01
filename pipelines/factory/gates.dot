@@ -21,15 +21,13 @@ digraph gates {
         timeout=600
     ]
     adversarial_reviewer [
-        type="parallel_reviewer",
-        label="Adversarial reviewer (primary + N shadows, density-enforced)",
-        review_contract="cold-review-v1",
-        prompt="@prompts/slim/review_phase5_shadow.md",
-        backend_priority="minimax,agy,codex,claude-sonnet",
-        prefer_adversarial="true",
-        n_shadows="3",
-        gate_strict="true",
-        receipt_required="true",
+        type="codergen",
+        label="Fresh Codex Reviewer",
+        class="review",
+        backend="codex",
+        prompt="@prompts/slim/fresh_review.md",
+        fresh_session="true",
+        verdict_gate="true",
         timeout=600
     ]
     gate_es [

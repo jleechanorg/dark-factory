@@ -22,12 +22,15 @@ extracted per docs/refactor/file-ownership-map.test_gates.md:
 
 import pytest
 
+from conftest import install_adversarial_reviewer_stub
 from runner.handlers import Result, TYPE_REGISTRY
 
 
 @pytest.fixture(autouse=True)
 def _stub_fail_open_web_advice(monkeypatch):
     """Keep the re-exported graph tests off live advisory transports."""
+    install_adversarial_reviewer_stub(monkeypatch)
+
     def fake_web_advice(node, ctx):
         return Result(
             outcome="success",

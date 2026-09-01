@@ -6,6 +6,21 @@ import os
 import pathlib
 
 
+_PIPELINE_SHORT_NAMES = {
+    "two_node": "pipelines/slim/two_node.dot",
+    "gates": "pipelines/factory/gates.dot",
+    "hello": "pipelines/factory/hello.dot",
+    "pr_gates": "pipelines/factory/pr_gates.dot",
+    "minimal_feature": "pipelines/slim/minimal_feature.dot",
+    "minimal_pr": "pipelines/slim/minimal_pr.dot",
+    "review_slim": "benchmarks/attractor-spec-review/pipelines/review_slim.dot",
+    "review_full": "benchmarks/attractor-spec-review/pipelines/review_full.dot",
+    "spec_gen": "pipelines/slim/spec_gen.dot",
+    "bug_fix": "pipelines/bug_fix.dot",
+    "level5_feature": "pipelines/factory/level5_feature.dot",
+}
+
+
 def factory_home() -> pathlib.Path | None:
     raw = os.environ.get("DARK_FACTORY_HOME", "").strip()
     if not raw:
@@ -84,5 +99,12 @@ def resolve_pipeline_path(
         subdir_candidate = base / "dark-factory" / "pipelines" / candidate
         if subdir_candidate.exists():
             return subdir_candidate.resolve()
+
+        alias = _PIPELINE_SHORT_NAMES.get(str(candidate))
+        if alias is not None:
+            home = factory_home()
+            if home is not None:
+                return (home / alias).resolve()
+            return resolve_factory_path(pathlib.Path(alias))
 
     return resolve_factory_path(candidate)

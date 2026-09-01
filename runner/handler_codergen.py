@@ -63,6 +63,7 @@ the full empirical distribution and the citation.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -71,6 +72,8 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -101,6 +104,53 @@ _CMD_RUN_EXIT_RE = re.compile(
 )
 
 
+def _fresh_reviewer_check_gap(text: str) -> str:
+    """Return a gap when an attempted reviewer check only failed.
+
+    A fully-tooled reviewer is allowed to choose the repository's relevant
+    checks.  If it does choose a test/build runner, however, a process-level
+    PASS cannot hide an unavailable runtime (for example ``pytest`` returning
+    126 or failing to import).  A successful check in the same transcript
+    satisfies the requirement; otherwise the reviewer result fails closed.
+    Narrative-only PASSes remain compatible with the existing slim contract.
+    """
+    body = text or ""
+    from .handler_verdict import _RECEIPT_EXIT_RE, _RECEIPT_RUNNER_RE
+
+    if not _RECEIPT_RUNNER_RE.search(body):
+        return ""
+    exit_codes = [int(match.group(1)) for match in _RECEIPT_EXIT_RE.finditer(body)]
+    exit_codes.extend(
+        int(match.group(1))
+        for match in re.finditer(
+            r"(?:\brc|\breturncode|\bstatus)\s*[:=]\s*(\d+)\b",
+            body,
+            re.IGNORECASE,
+        )
+    )
+    if 0 in exit_codes:
+        return ""
+    runtime_failure = re.search(
+        r"(?:no module named|module not found|command not found|not found|"
+        r"permission denied|operation not permitted|cannot execute|"
+        r"failed to (?:run|start)|could not (?:run|start))",
+        body,
+        re.IGNORECASE,
+    )
+    if not exit_codes and runtime_failure is None:
+        return ""
+    detail = (
+        f"captured nonzero exit codes {sorted(set(exit_codes))}"
+        if exit_codes
+        else "runtime error without a successful exit code"
+    )
+    return (
+        "required reviewer check failed; the reviewer returned PASS without a "
+        f"successful test/build reproduction ({detail}). Restore the reviewer "
+        "runtime or rerun the check successfully before accepting PASS."
+    )
+
+
 def _subprocess_output(stdout: str | bytes | None, stderr: str | bytes | None) -> str:
     """Combine subprocess output, including byte payloads from timeouts."""
     if isinstance(stdout, bytes):
@@ -124,6 +174,11 @@ class _ShadowCodexReview:
 
 def _shadow_review_enabled(node: "Node", ctx: "Context", backend: str) -> bool:
     """True when a review node should get a parallel plain-Codex check."""
+    verdict_gate = str(node.attrs.get("verdict_gate", "false")).strip().lower() in {
+        "true", "1", "yes", "on",
+    }
+    if verdict_gate:
+        return False
     raw = node.attrs.get("shadow_codex_review", ctx.state.get("_df_shadow_codex_review", "false"))
     if isinstance(raw, str) and raw.strip().lower() in {"false", "0", "no", "off"}:
         return False
@@ -519,20 +574,37 @@ def _codergen_workdir(ctx: "Context") -> "Path | str | None":
             return None
 
 
-def _tracked_state(workdir: "Path | str | None") -> str | None:
-    """Hash HEAD plus staged and unstaged tracked changes, ignoring untracked files."""
+@dataclass(frozen=True)
+class _TrackedFingerprint:
+    head: str | None = None
+    unstaged_diff: str | None = None
+    staged_diff: str | None = None
+    untracked: str | None = None
+    git_error: str = ""
+    digest: str | None = None
+
+
+def _compute_tracked_fingerprint(
+    workdir: "Path | str | None", *, include_untracked: bool = False
+) -> _TrackedFingerprint:
+    """Compute component-level git fingerprint with diagnostic attribution."""
     if not workdir:
-        return None
+        return _TrackedFingerprint(git_error="empty workdir")
     path = pathlib.Path(str(workdir))
     if not path.is_absolute() or ".." in path.parts or not path.is_dir():
-        return None
-    outputs: list[str] = []
+        return _TrackedFingerprint(git_error=f"invalid workdir path: {workdir}")
+
+    head_val: str | None = None
+    unstaged_val: str | None = None
+    staged_val: str | None = None
+    untracked_val: str | None = None
+
     commands = (
-        ("rev-parse", "HEAD"),
-        ("diff", "--binary"),
-        ("diff", "--cached", "--binary"),
+        ("head", ("rev-parse", "HEAD")),
+        ("unstaged", ("diff", "--binary")),
+        ("staged", ("diff", "--cached", "--binary")),
     )
-    for tail in commands:
+    for name, tail in commands:
         try:
             proc = subprocess.run(
                 ["git", "-C", str(path), *tail],
@@ -541,12 +613,76 @@ def _tracked_state(workdir: "Path | str | None") -> str | None:
                 timeout=30,
                 check=False,
             )
-        except (OSError, subprocess.TimeoutExpired):
-            return None
+        except subprocess.TimeoutExpired:
+            return _TrackedFingerprint(git_error=f"git {tail[0]} timed out")
+        except OSError as exc:
+            return _TrackedFingerprint(git_error=f"git {tail[0]} OSError: {exc}")
         if proc.returncode != 0:
-            return None
-        outputs.append(proc.stdout)
-    return hashlib.sha256("\0".join(outputs).encode("utf-8")).hexdigest()
+            err = proc.stderr.strip() or proc.stdout.strip() or f"exit code {proc.returncode}"
+            return _TrackedFingerprint(git_error=f"git {tail[0]} failed: {err}")
+        if name == "head":
+            head_val = proc.stdout
+        elif name == "unstaged":
+            unstaged_val = proc.stdout
+        elif name == "staged":
+            staged_val = proc.stdout
+
+    outputs = [head_val or "", unstaged_val or "", staged_val or ""]
+
+    if include_untracked:
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(path), "ls-files", "--others", "-z"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return _TrackedFingerprint(git_error="git ls-files timed out")
+        except OSError as exc:
+            return _TrackedFingerprint(git_error=f"git ls-files OSError: {exc}")
+        if proc.returncode != 0:
+            err = proc.stderr.strip() or proc.stdout.strip() or f"exit code {proc.returncode}"
+            return _TrackedFingerprint(git_error=f"git ls-files failed: {err}")
+
+        raw_files = [p for p in (proc.stdout or "").split("\0") if p]
+        untracked_entries: list[str] = []
+        for rel_str in sorted(raw_files):
+            try:
+                file_path = path / rel_str
+                if file_path.is_symlink():
+                    target = os.readlink(file_path)
+                    entry_hash = hashlib.sha256(f"symlink:{target}".encode("utf-8")).hexdigest()
+                elif file_path.is_file():
+                    entry_hash = hashlib.sha256(file_path.read_bytes()).hexdigest()
+                elif file_path.is_dir():
+                    entry_hash = "dir"
+                else:
+                    entry_hash = "missing"
+                untracked_entries.append(f"{rel_str}:{entry_hash}")
+            except OSError as exc:
+                return _TrackedFingerprint(git_error=f"cannot read untracked entry {rel_str}: {exc}")
+        untracked_val = "\0".join(untracked_entries)
+        outputs.append(untracked_val)
+
+    digest = hashlib.sha256("\0".join(outputs).encode("utf-8")).hexdigest()
+    return _TrackedFingerprint(
+        head=head_val,
+        unstaged_diff=unstaged_val,
+        staged_diff=staged_val,
+        untracked=untracked_val,
+        git_error="",
+        digest=digest,
+    )
+
+
+def _tracked_state(
+    workdir: "Path | str | None", *, include_untracked: bool = False
+) -> str | None:
+    """Hash HEAD plus staged/unstaged changes, optionally including untracked artifacts."""
+    return _compute_tracked_fingerprint(workdir, include_untracked=include_untracked).digest
+
 
 
 def _fresh_review_workdir(ctx: "Context") -> pathlib.Path | None:
@@ -564,6 +700,400 @@ def _fresh_review_workdir(ctx: "Context") -> pathlib.Path | None:
     if candidate.is_symlink() or not resolved.is_dir():
         return None
     return resolved
+
+
+def _git_ignored_snapshot_paths(target_workdir: pathlib.Path) -> set[pathlib.Path]:
+    """Return ignored, untracked paths that must not enter a review snapshot."""
+    try:
+        proc = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(target_workdir),
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--directory",
+                "--no-empty-directory",
+                "-z",
+            ],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("Cannot determine Git-ignored review paths") from exc
+    if proc.returncode != 0:
+        raise RuntimeError("Cannot determine Git-ignored review paths")
+    return {
+        pathlib.Path(os.fsdecode(raw).rstrip("/"))
+        for raw in proc.stdout.split(b"\0")
+        if raw
+    }
+
+
+def _validate_snapshot_symlinks(
+    target_workdir: pathlib.Path, ignored_paths: set[pathlib.Path]
+) -> None:
+    """Validate that target_workdir contains no unsafe, escaping, or dangling symlinks."""
+    target_real = target_workdir.resolve(strict=True)
+    for root, dirs, files in os.walk(target_workdir, topdown=True, followlinks=False):
+        root_path = pathlib.Path(root)
+        root_relative = root_path.relative_to(target_workdir)
+        dirs[:] = [
+            name for name in dirs if root_relative / name not in ignored_paths
+        ]
+        for name in dirs + files:
+            entry = root_path / name
+            if root_relative / name in ignored_paths:
+                continue
+            if entry.is_symlink():
+                try:
+                    resolved = entry.resolve(strict=True)
+                except (OSError, RuntimeError) as exc:
+                    raise RuntimeError(
+                        f"Target workspace contains unsafe dangling or looping symlink: {entry}"
+                    ) from exc
+                if not (resolved == target_real or target_real in resolved.parents):
+                    raise RuntimeError(
+                        f"Target workspace contains unsafe escaping symlink: {entry} -> {resolved}"
+                    )
+                entry_parent = entry.parent.resolve(strict=True)
+                if resolved == entry_parent or resolved in entry_parent.parents:
+                    raise RuntimeError(
+                        f"Target workspace symlink resolves to its own ancestor or root: {entry}"
+                    )
+                resolved_relative = resolved.relative_to(target_real)
+                if any(
+                    ignored == resolved_relative
+                    or ignored in resolved_relative.parents
+                    or resolved_relative in ignored.parents
+                    for ignored in ignored_paths
+                ):
+                    raise RuntimeError(
+                        f"Target workspace symlink resolves into a Git-ignored path: {entry}"
+                    )
+
+
+def _materialize_snapshot_symlinks(target_workdir: pathlib.Path, review_dir: pathlib.Path) -> None:
+    """Preserve safe relative links and materialize links that retain source reachability."""
+    target_real = target_workdir.resolve(strict=True)
+    review_real = review_dir.resolve(strict=True)
+    for root, dirs, files in os.walk(review_dir, topdown=False, followlinks=False):
+        root_path = pathlib.Path(root)
+        for name in dirs + files:
+            entry = root_path / name
+            if entry.is_symlink():
+                rel = entry.relative_to(review_dir)
+                orig = target_workdir / rel
+                try:
+                    target_resolved = orig.resolve(strict=True)
+                except (OSError, RuntimeError) as exc:
+                    raise RuntimeError(f"Cannot resolve in-tree symlink {entry}") from exc
+                if not (target_resolved == target_real or target_real in target_resolved.parents):
+                    raise RuntimeError(f"Escaping symlink found during materialization: {entry}")
+                if not pathlib.Path(os.readlink(orig)).is_absolute():
+                    try:
+                        review_resolved = entry.resolve(strict=True)
+                    except (OSError, RuntimeError) as exc:
+                        raise RuntimeError(f"Cannot resolve copied symlink {entry}") from exc
+                    if review_real in review_resolved.parents:
+                        continue
+                entry.unlink()
+                if target_resolved.is_dir():
+                    shutil.copytree(target_resolved, entry, symlinks=False)
+                else:
+                    shutil.copy2(target_resolved, entry)
+
+
+def _normalize_and_validate_review_git(target_workdir: pathlib.Path, review_dir: pathlib.Path) -> None:
+    """Normalize linked-worktree git metadata into a standalone repo and validate isolation."""
+    git_target = target_workdir / ".git"
+    git_review = review_dir / ".git"
+    gitdir_path: pathlib.Path | None = None
+    main_git_dir: pathlib.Path | None = None
+
+    if git_target.is_file():
+        gitdir_content = git_target.read_text(encoding="utf-8").strip()
+        if not gitdir_content.startswith("gitdir:"):
+            raise RuntimeError(f"Invalid worktree .git pointer file in {target_workdir}: {gitdir_content}")
+        gitdir_raw = gitdir_content[len("gitdir:"):].strip()
+        gitdir_path = (target_workdir / gitdir_raw).resolve()
+        if not gitdir_path.is_dir():
+            raise RuntimeError(f"Worktree gitdir does not exist or is not a directory: {gitdir_path}")
+
+        commondir_file = gitdir_path / "commondir"
+        if commondir_file.is_file():
+            commondir_raw = commondir_file.read_text(encoding="utf-8").strip()
+            main_git_dir = (gitdir_path / commondir_raw).resolve()
+        else:
+            main_git_dir = gitdir_path
+        if not main_git_dir.is_dir():
+            raise RuntimeError(f"Common gitdir does not exist or is not a directory: {main_git_dir}")
+
+        if git_review.exists() or git_review.is_symlink():
+            if git_review.is_dir():
+                shutil.rmtree(git_review)
+            else:
+                git_review.unlink()
+
+        shutil.copytree(
+            main_git_dir,
+            git_review,
+            symlinks=True,
+            ignore_dangling_symlinks=False,
+        )
+
+        for entry in gitdir_path.rglob("*"):
+            if entry.is_dir() or entry.name in ("commondir", "gitdir"):
+                continue
+            rel = entry.relative_to(gitdir_path)
+            dest = git_review / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if dest.exists() or dest.is_symlink():
+                if dest.is_dir():
+                    shutil.rmtree(dest)
+                else:
+                    dest.unlink()
+            shutil.copy2(entry, dest)
+
+    if git_review.exists():
+        if not git_review.is_dir() or git_review.is_symlink():
+            raise RuntimeError(f"Review worktree .git is not a real directory: {git_review}")
+
+        wt_sub = git_review / "worktrees"
+        if wt_sub.exists():
+            if wt_sub.is_dir():
+                shutil.rmtree(wt_sub)
+            else:
+                wt_sub.unlink()
+
+        for name in ("commondir", "gitdir"):
+            p = git_review / name
+            if p.exists():
+                p.unlink()
+
+        cfg_file = git_review / "config"
+        if cfg_file.is_file():
+            content = cfg_file.read_text(encoding="utf-8")
+            new_content = re.sub(r"bare\s*=\s*true", "bare = false", content, flags=re.IGNORECASE)
+            new_lines = [
+                line for line in new_content.splitlines()
+                if not line.strip().lower().startswith("worktree =")
+                and not line.strip().lower().startswith("worktreerepo =")
+            ]
+            cfg_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+
+        # Validate that no metadata file in git_review references original repository paths
+        forbidden_paths: list[bytes] = [str(target_workdir).encode("utf-8")]
+        if gitdir_path is not None:
+            forbidden_paths.append(str(gitdir_path).encode("utf-8"))
+        if main_git_dir is not None:
+            forbidden_paths.append(str(main_git_dir).encode("utf-8"))
+
+        for f in git_review.rglob("*"):
+            if f.is_symlink():
+                try:
+                    sym_target = f.resolve(strict=True)
+                except Exception as exc:
+                    raise RuntimeError(f"Unsafe symlink in review git metadata: {f}") from exc
+                if not (sym_target == git_review or git_review in sym_target.parents):
+                    raise RuntimeError(f"Escaping symlink in review git metadata: {f} -> {sym_target}")
+            elif f.is_file():
+                content = f.read_bytes()
+                for forbidden in forbidden_paths:
+                    if forbidden in content:
+                        raise RuntimeError(
+                            f"Review git metadata references original repository path: {f}"
+                        )
+
+
+@contextlib.contextmanager
+def _isolated_review_workdir(target_workdir: pathlib.Path):
+    """Create an isolated, temporary workspace for fresh reviewer execution.
+
+    Preserves tracked files, staged/unstaged changes, unignored untracked
+    artifacts, and git repository state so the reviewer can run tools and
+    inspect worker output, while containing any reviewer writes away from the
+    actual coder target worktree.
+    """
+    ignored_paths = _git_ignored_snapshot_paths(target_workdir)
+    _validate_snapshot_symlinks(target_workdir, ignored_paths)
+    with tempfile.TemporaryDirectory(prefix="df-fresh-review-") as tmpdir:
+        tmp_path = pathlib.Path(tmpdir)
+        review_dir = tmp_path / "workspace"
+
+        def ignore_git_ignored(directory: str, names: list[str]) -> list[str]:
+            relative = pathlib.Path(directory).relative_to(target_workdir)
+            return [name for name in names if relative / name in ignored_paths]
+
+        shutil.copytree(
+            target_workdir,
+            review_dir,
+            symlinks=True,
+            ignore_dangling_symlinks=False,
+            ignore=ignore_git_ignored,
+        )
+        _materialize_snapshot_symlinks(target_workdir, review_dir)
+        _normalize_and_validate_review_git(target_workdir, review_dir)
+        yield review_dir
+
+
+def _linux_python_reviewer_runtime_paths() -> list[pathlib.Path] | None:
+    """Resolve trusted Python and pytest runtimes for Linux review tools.
+
+    Landlock starts with an allow-list.  The Codex launcher paths alone are
+    insufficient for a reviewer command such as ``pytest``: its executable,
+    interpreter, and virtual-environment roots must also be readable.  Reuse
+    the existing trusted executable resolver so a broken or untrusted PATH
+    entry fails closed instead of making a reviewer report a false PASS.
+    """
+    candidates: list[pathlib.Path] = []
+    pytest_path = shutil.which("pytest")
+    if pytest_path:
+        candidates.append(pathlib.Path(pytest_path))
+    if sys.executable:
+        candidates.append(pathlib.Path(sys.executable))
+
+    def runtime_root(executable: pathlib.Path) -> pathlib.Path | None:
+        """Return the exact Python/venv prefix containing ``bin`` and ``lib``."""
+        try:
+            root = executable.resolve(strict=True).parent.parent
+        except (OSError, RuntimeError):
+            return None
+        if (
+            root == pathlib.Path(root.anchor)
+            or not (root / "bin").is_dir()
+            or not (root / "lib").is_dir()
+        ):
+            return None
+        return root
+
+    def shebang_interpreter(executable: pathlib.Path) -> pathlib.Path | None:
+        try:
+            first_line = executable.resolve(strict=True).read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines()[0]
+        except (OSError, IndexError, RuntimeError):
+            return None
+        if not first_line.startswith("#!"):
+            return None
+        interpreter = first_line[2:].strip().split(maxsplit=1)[0]
+        path = pathlib.Path(interpreter)
+        return path if path.is_absolute() else None
+
+    paths: list[pathlib.Path] = []
+    resolved_candidates: list[pathlib.Path] = []
+    for candidate in candidates:
+        if not candidate.exists() and not candidate.is_symlink():
+            # ``shutil.which`` may be replaced by a test harness or may point
+            # at a stale optional test runner.  Do not make Codex itself
+            # unavailable because pytest is absent; if the reviewer elects
+            # that check, ``_fresh_reviewer_check_gap`` fails the PASS closed.
+            continue
+        runtime = _handlers_shim._linux_codex_runtime_paths(candidate)
+        if runtime is None:
+            return None
+        paths.extend(runtime)
+        resolved_candidates.append(candidate)
+        interpreter = shebang_interpreter(candidate)
+        if interpreter is not None:
+            interpreter_runtime = _handlers_shim._linux_codex_runtime_paths(interpreter)
+            if interpreter_runtime is None:
+                return None
+            paths.extend(interpreter_runtime)
+            resolved_candidates.append(interpreter)
+
+    for executable in resolved_candidates:
+        root = runtime_root(executable)
+        if root is not None:
+            paths.append(root)
+    return sorted(set(paths), key=str)
+
+
+def _sandboxed_args_for_fresh_review(
+    command: list[str],
+    codex_workdir: pathlib.Path,
+    target_workdir: pathlib.Path,
+    *,
+    runtime_home: pathlib.Path | None = None,
+) -> list[str] | None:
+    """Build sandboxed arguments for fresh review isolating against target_workdir writes.
+
+    On macOS: Seatbelt sandbox-exec profile with holdouts denied and target_workdir denied.
+    On Linux: Landlock allow-list allowing only codex_workdir, private codex runtime home,
+    and codex runtime paths, and denying target_workdir and holdouts.
+    Fails closed if Landlock kernel boundary is unavailable.
+    """
+    if os.environ.get("DISABLE_SANDBOX"):
+        raise ValueError(
+            "fresh review refuses DISABLE_SANDBOX; isolation is required"
+        )
+    from . import handler_sandbox as _sandbox
+
+    shim_fn = getattr(_handlers_shim, "_sandboxed_args_for_workdir", None)
+    if shim_fn is not None and shim_fn is not _sandbox._sandboxed_args_for_workdir:
+        return shim_fn(command, codex_workdir)
+
+    if sys.platform == "darwin":
+        if not _handlers_shim._verify_darwin_sandbox_exec():
+            return None
+        sandbox_exec = shutil.which("sandbox-exec")
+        if sandbox_exec is None:
+            return None
+        extra_denied = [target_workdir.resolve()]
+        profile = _sandbox._build_sandbox_profile(extra_denied)
+        return [sandbox_exec, "-p", profile] + command
+
+    if sys.platform.startswith("linux"):
+        launcher = _handlers_shim._linux_landlock_launcher_path()
+        if launcher is None:
+            return None
+        abi = _handlers_shim._linux_landlock_abi()
+        if abi is None or abi < 3:
+            return None
+        denied_paths = _handlers_shim._holdout_denied_paths() + [target_workdir.resolve()]
+
+        executable = command[0]
+        resolved_executable = shutil.which(executable) or executable
+        launcher_path = pathlib.Path(resolved_executable)
+        runtime_paths = _handlers_shim._linux_codex_runtime_paths(launcher_path)
+        if runtime_paths is None:
+            return None
+        python_runtime_paths = _linux_python_reviewer_runtime_paths()
+        if python_runtime_paths is None:
+            return None
+        real_binary = _sandbox._linux_codex_real_binary(launcher_path)
+        if real_binary is not None:
+            executable_path = real_binary
+            cmd_args = [str(real_binary), *command[1:]]
+        else:
+            executable_path = launcher_path
+            cmd_args = command
+
+        read_paths = [
+            *runtime_paths,
+            *python_runtime_paths,
+            codex_workdir.resolve(),
+        ]
+        writable_paths = [codex_workdir.resolve()]
+        if runtime_home is not None:
+            read_paths.append(runtime_home.resolve())
+            writable_paths.append(runtime_home.resolve())
+
+        landlock_prefix = _handlers_shim._linux_controller_sandbox_prefix(
+            denied_paths=denied_paths,
+            read_paths=read_paths,
+            writable_paths=writable_paths,
+            executable_paths=[executable_path],
+        )
+        if landlock_prefix is None:
+            return None
+        return _handlers_shim._extend_pinned_launcher_command(
+            landlock_prefix, cmd_args
+        )
+    return None
 
 
 
@@ -656,11 +1186,32 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
     verdict_gate = str(node.attrs.get("verdict_gate", "false")).strip().lower() in {
         "true", "1", "yes", "on",
     }
-    _start_ts = time.monotonic()
-    shadow_review = _start_shadow_codex_review(node, ctx, backend, prompt_text)
+
+    prompt_provenance = _handlers_shim._fresh_review_prompt_metadata(
+        node, backend, prompt_text, ctx
+    )
+    shadow_review = None
 
     def _finalize(result: "Result") -> "Result":
+        if prompt_provenance:
+            result.metadata = {**result.metadata, **prompt_provenance}
         return _finish_shadow_codex_review(result, shadow_review, node, ctx)
+
+    if prompt_provenance.get("review_prompt_error"):
+        return _finalize(Result(
+            outcome="error",
+            output=prompt_provenance["review_prompt_error"],
+            metadata={"verdict": "unknown", "fresh_session": "true"},
+        ))
+
+    if backend == "codex" and verdict_gate and os.environ.get("DISABLE_SANDBOX"):
+        return _finalize(Result(
+            outcome="error",
+            output="verdict-gated fresh review refuses DISABLE_SANDBOX; isolation is required",
+            metadata={"verdict": "unknown", "fresh_session": "true"},
+        ))
+    _start_ts = time.monotonic()
+    shadow_review = _start_shadow_codex_review(node, ctx, backend, prompt_text)
 
     if backend == "echo":
         wall_ms = int((time.monotonic() - _start_ts) * 1000)
@@ -972,67 +1523,215 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             _stash_codergen_receipt(node, ctx)
         return _finalize(Result(outcome=outcome, output=output, metadata=meta))
     elif backend == "codex":
-        codex_workdir = _fresh_review_workdir(ctx) if verdict_gate else ctx.workdir
-        if codex_workdir is None:
+        target_workdir = _fresh_review_workdir(ctx) if verdict_gate else ctx.workdir
+        if target_workdir is None:
             return _finalize(Result(
                 outcome="error",
                 output="fresh reviewer target must be a real, non-symlinked directory",
                 metadata={"verdict": "unknown", "fresh_session": "true"},
             ))
-        tracked_before = _tracked_state(codex_workdir) if verdict_gate else None
-        if verdict_gate and tracked_before is None:
+        target_before_fp = _compute_tracked_fingerprint(target_workdir, include_untracked=True) if verdict_gate else None
+        target_tracked_before = target_before_fp.digest if target_before_fp is not None else None
+        if verdict_gate and target_tracked_before is None:
+            err_msg = target_before_fp.git_error if target_before_fp is not None else ""
             return _finalize(Result(
                 outcome="error",
                 output="fresh reviewer could not fingerprint the tracked repository state",
-                metadata={"verdict": "unknown", "fresh_session": "true"},
-            ))
-        codex_command = ["codex", "exec"]
-        if str(node.attrs.get("fresh_session", "false")).strip().lower() in {
-            "true", "1", "yes", "on",
-        }:
-            codex_command.append("--ephemeral")
-        codex_command.extend(["--yolo", "--skip-git-repo-check", prompt_text])
-        args = _handlers_shim._sandboxed_args_for_workdir(
-            codex_command,
-            codex_workdir,
-        )
-        if args is None:
-            return _finalize(Result(
-                outcome="error" if verdict_gate else "failure",
-                output="sandbox-exec unavailable",
-            ))
-        timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1800"), 1800)
-        try:
-            proc = subprocess.run(
-                args,
-                cwd=codex_workdir,
-                capture_output=True,
-                text=True,
-                timeout=timeout_s,
-                check=False,
-                input="",
-                env=_handlers_shim._sanitized_env(),
-            )
-        except subprocess.TimeoutExpired as exc:
-            return _finalize(Result(
-                outcome="error" if verdict_gate else "failure",
-                output=_subprocess_output(exc.stdout, exc.stderr)
-                or f"codex backend timed out after {timeout_s} seconds",
                 metadata={
-                    "timed_out": "true",
-                    "timeout": str(timeout_s),
-                    "returncode": "",
+                    "verdict": "unknown",
+                    "fresh_session": "true",
+                    "fingerprint_git_error": err_msg,
                 },
             ))
+        workdir_cm = (
+            _isolated_review_workdir(target_workdir)
+            if verdict_gate
+            else contextlib.nullcontext(target_workdir)
+        )
+        try:
+            with workdir_cm as codex_workdir:
+                snapshot_before_fp = _compute_tracked_fingerprint(codex_workdir) if verdict_gate else None
+                snapshot_tracked_before = snapshot_before_fp.digest if snapshot_before_fp is not None else None
+                codex_command = ["codex", "exec"]
+                if str(node.attrs.get("fresh_session", "false")).strip().lower() in {
+                    "true", "1", "yes", "on",
+                }:
+                    codex_command.append("--ephemeral")
+                codex_command.extend(["--yolo", "--skip-git-repo-check", prompt_text])
+
+                runtime = None
+                env = _handlers_shim._sanitized_env()
+                if (
+                    verdict_gate
+                    and sys.platform.startswith("linux")
+                ):
+                    try:
+                        runtime = _handlers_shim._create_controller_runtime()
+                        env = runtime.env
+                    except Exception as exc:
+                        return _finalize(Result(
+                            outcome="error",
+                            output=f"failed to initialize private codex runtime: {exc}",
+                            metadata={"verdict": "unknown", "fresh_session": "true"},
+                        ))
+
+                args = (
+                    _sandboxed_args_for_fresh_review(
+                        codex_command,
+                        codex_workdir,
+                        target_workdir,
+                        runtime_home=runtime.codex_home if runtime is not None else None,
+                    )
+                    if verdict_gate
+                    else _handlers_shim._sandboxed_args_for_workdir(
+                        codex_command,
+                        codex_workdir,
+                    )
+                )
+                if args is None:
+                    if runtime is not None:
+                        try:
+                            _handlers_shim._cleanup_controller_runtime(runtime.run_dir)
+                        except Exception:
+                            pass
+                    return _finalize(Result(
+                        outcome="error" if verdict_gate else "failure",
+                        output="sandbox-exec unavailable" if sys.platform == "darwin" else "isolation unavailable",
+                        metadata={"verdict": "unknown", "fresh_session": "true"} if verdict_gate else {},
+                    ))
+                timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1800"), 1800)
+                try:
+                    proc = subprocess.run(
+                        args,
+                        cwd=codex_workdir,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout_s,
+                        check=False,
+                        input="",
+                        env=env,
+                        pass_fds=getattr(args, "pass_fds", ()),
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    return _finalize(Result(
+                        outcome="error" if verdict_gate else "failure",
+                        output=_subprocess_output(exc.stdout, exc.stderr)
+                        or f"codex backend timed out after {timeout_s} seconds",
+                        metadata={
+                            "timed_out": "true",
+                            "timeout": str(timeout_s),
+                            "returncode": "",
+                        },
+                    ))
+                except Exception as exc:
+                    return _finalize(Result(
+                        outcome="error",
+                        output=f"codex backend error: {exc}",
+                        metadata={
+                            "timed_out": "false",
+                            "timeout": str(timeout_s),
+                            "returncode": "",
+                        },
+                    ))
+                finally:
+                    _handlers_shim._close_pinned_launcher_command(args)
+                    if runtime is not None:
+                        try:
+                            _handlers_shim._cleanup_controller_runtime(runtime.run_dir)
+                        except Exception:
+                            pass
+
+                output = proc.stdout + ("\nSTDERR:\n" + proc.stderr if proc.stderr else "")
+                outcome = "success" if proc.returncode == 0 else "failure"
+                wall_ms = int((time.monotonic() - _start_ts) * 1000)
+                metrics = _handlers_shim._codergen_metrics(proc.stdout, proc.stderr, wall_ms)
+                meta = {"returncode": str(proc.returncode)}
+                meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
+                if verdict_gate:
+                    verdict, parsed_outcome = _handlers_shim._parse_verdict(output, gate_strict=True)
+                    snapshot_after_fp = _compute_tracked_fingerprint(codex_workdir)
+                    target_after_fp = _compute_tracked_fingerprint(target_workdir, include_untracked=True)
+                    snapshot_tracked_after = snapshot_after_fp.digest
+                    target_tracked_after = target_after_fp.digest
+                    snapshot_mutated = (
+                        snapshot_tracked_before is None
+                        or snapshot_tracked_after is None
+                        or snapshot_tracked_before != snapshot_tracked_after
+                    )
+                    target_mutated = (
+                        target_tracked_before is None
+                        or target_tracked_after is None
+                        or target_tracked_before != target_tracked_after
+                    )
+                    mutated = snapshot_mutated or target_mutated
+
+                    # Component-level attribution
+                    head_changed = (
+                        (snapshot_before_fp is not None and snapshot_after_fp is not None and snapshot_before_fp.head != snapshot_after_fp.head)
+                        or (target_before_fp is not None and target_after_fp is not None and target_before_fp.head != target_after_fp.head)
+                    )
+                    unstaged_changed = (
+                        (snapshot_before_fp is not None and snapshot_after_fp is not None and snapshot_before_fp.unstaged_diff != snapshot_after_fp.unstaged_diff)
+                        or (target_before_fp is not None and target_after_fp is not None and target_before_fp.unstaged_diff != target_after_fp.unstaged_diff)
+                    )
+                    staged_changed = (
+                        (snapshot_before_fp is not None and snapshot_after_fp is not None and snapshot_before_fp.staged_diff != snapshot_after_fp.staged_diff)
+                        or (target_before_fp is not None and target_after_fp is not None and target_before_fp.staged_diff != target_after_fp.staged_diff)
+                    )
+                    untracked_changed = (
+                        target_before_fp is not None and target_after_fp is not None and target_before_fp.untracked != target_after_fp.untracked
+                    )
+                    git_error = (
+                        (snapshot_before_fp.git_error if snapshot_before_fp else "")
+                        or (snapshot_after_fp.git_error if snapshot_after_fp else "")
+                        or (target_before_fp.git_error if target_before_fp else "")
+                        or (target_after_fp.git_error if target_after_fp else "")
+                    )
+
+                    if proc.returncode != 0 or verdict == "unknown":
+                        outcome = "error"
+                    else:
+                        outcome = parsed_outcome
+                    if outcome == "success":
+                        check_gap = _fresh_reviewer_check_gap(output)
+                        if check_gap:
+                            outcome = "error"
+                            meta.update(
+                                {
+                                    "reviewer_check_failed": "true",
+                                    "reviewer_check_gap": check_gap,
+                                }
+                            )
+                            output = output.rstrip() + "\n\n" + check_gap + "\n"
+                    meta.update(
+                        {
+                            "verdict": verdict,
+                            "fresh_session": "true",
+                            "review_workdir": str(target_workdir),
+                            "reviewer_mutated_tracked_files": str(mutated).lower(),
+                            "fingerprint_head_changed": str(head_changed).lower(),
+                            "fingerprint_unstaged_changed": str(unstaged_changed).lower(),
+                            "fingerprint_staged_changed": str(staged_changed).lower(),
+                            "fingerprint_untracked_changed": str(untracked_changed).lower(),
+                            "fingerprint_git_error": git_error,
+                        }
+                    )
+                    if mutated:
+                        outcome = "error"
+                        output = output.rstrip() + "\n\nReviewer changed tracked files; changes must be made by the coder.\n"
+                elif outcome == "success":
+                    _stash_diff(node, ctx)
+                    _stash_codergen_receipt(node, ctx)
+                return _finalize(Result(
+                    outcome=outcome,
+                    output=output,
+                    metadata=meta,
+                ))
         except Exception as exc:
             return _finalize(Result(
                 outcome="error",
-                output=f"codex backend error: {exc}",
-                metadata={
-                    "timed_out": "false",
-                    "timeout": str(timeout_s),
-                    "returncode": "",
-                },
+                output=f"failed to isolate review workspace: {exc}",
+                metadata={"verdict": "unknown", "fresh_session": "true"},
             ))
     elif backend == "agy":
         timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "600"), 600)
@@ -1131,39 +1830,3 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         return _finalize(Result(outcome=outcome, output=output, metadata=meta))
     else:
         return _finalize(Result(outcome="failure", output=f"unknown backend {backend!r}"))
-
-    output = proc.stdout + ("\nSTDERR:\n" + proc.stderr if proc.stderr else "")
-    outcome = "success" if proc.returncode == 0 else "failure"
-    if backend == "agy" and output.strip().startswith("Error: timed out waiting for response"):
-        outcome = "failure"
-    wall_ms = int((time.monotonic() - _start_ts) * 1000)
-    metrics = _handlers_shim._codergen_metrics(proc.stdout, proc.stderr, wall_ms)
-    meta = {"returncode": str(proc.returncode)}
-    meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
-    if verdict_gate:
-        verdict, parsed_outcome = _handlers_shim._parse_verdict(output, gate_strict=True)
-        tracked_after = _tracked_state(codex_workdir)
-        mutated = tracked_before is None or tracked_after is None or tracked_before != tracked_after
-        if proc.returncode != 0 or verdict == "unknown":
-            outcome = "error"
-        else:
-            outcome = parsed_outcome
-        meta.update(
-            {
-                "verdict": verdict,
-                "fresh_session": "true",
-                "review_workdir": str(codex_workdir),
-                "reviewer_mutated_tracked_files": str(mutated).lower(),
-            }
-        )
-        if mutated:
-            outcome = "error"
-            output = output.rstrip() + "\n\nReviewer changed tracked files; changes must be made by the coder.\n"
-    elif outcome == "success":
-        _stash_diff(node, ctx)
-        _stash_codergen_receipt(node, ctx)
-    return _finalize(Result(
-        outcome=outcome,
-        output=output,
-        metadata=meta,
-    ))

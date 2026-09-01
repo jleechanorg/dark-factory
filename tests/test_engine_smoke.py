@@ -13,7 +13,7 @@ ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from conftest import _pipeline  # noqa: E402
+from conftest import _pipeline, install_adversarial_reviewer_stub  # noqa: E402
 
 from runner.cxdb import CXDB  # noqa: E402
 from runner.engine import run  # noqa: E402
@@ -25,6 +25,8 @@ from runner.parser import parse  # noqa: E402
 @pytest.fixture(autouse=True)
 def _stub_fail_open_web_advice(monkeypatch):
     """Keep engine smoke tests independent of live advisory transports."""
+    install_adversarial_reviewer_stub(monkeypatch)
+
     def fake_web_advice(node, ctx):
         return Result(
             outcome="success",
@@ -68,7 +70,6 @@ def test_gate_echo_seeded_outcome(monkeypatch):
         return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
     g = parse(_pipeline("gates.dot"))
-    g.nodes["adversarial_reviewer"].attrs["test_fixture"] = "true"
     ctx = Context(goal="t", workdir=ROOT, backend="echo")
     ctx.state.update(
         {
@@ -106,7 +107,6 @@ def test_cxdb_records_steps(tmp_path, monkeypatch):
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
     db_path = tmp_path / "cxdb.sqlite"
     g = parse(_pipeline("gates.dot"))
-    g.nodes["adversarial_reviewer"].attrs["test_fixture"] = "true"
     ctx = Context(goal="t", workdir=ROOT, backend="echo", cxdb_path=db_path)
     ctx.state.update(
         {
@@ -163,7 +163,6 @@ def test_healer_reports_gate_infra_errors(tmp_path, monkeypatch):
         return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
     g = parse(_pipeline("gates.dot"))
-    g.nodes["adversarial_reviewer"].attrs["test_fixture"] = "true"
     ctx = Context(goal="t", workdir=ROOT, backend="echo", cxdb_path=tmp_path / "cxdb.sqlite")
     ctx.state["_df_controller_fixture"] = "cold-review-v1"
     ctx.state["gate_skeptic.outcome"] = "success"
@@ -185,7 +184,6 @@ def test_healer_no_failures(tmp_path, monkeypatch):
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
     db_path = tmp_path / "cxdb.sqlite"
     g = parse(_pipeline("gates.dot"))
-    g.nodes["adversarial_reviewer"].attrs["test_fixture"] = "true"
     ctx = Context(goal="t", workdir=ROOT, backend="echo", cxdb_path=db_path)
     ctx.state.update(
         {

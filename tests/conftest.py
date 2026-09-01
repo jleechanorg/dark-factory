@@ -46,6 +46,21 @@ def _pipeline(name: str) -> pathlib.Path:
     return ROOT / "pipelines" / "factory" / name
 
 
+def install_adversarial_reviewer_stub(monkeypatch) -> None:
+    """Stub only the external fresh reviewer while preserving real codergen nodes."""
+    from runner.handlers import Result, TYPE_REGISTRY
+
+    original_codergen = TYPE_REGISTRY["codergen"]
+
+    def fake_codergen(node, ctx):
+        if node.name != "adversarial_reviewer":
+            return original_codergen(node, ctx)
+        outcome = ctx.state.get("adversarial_reviewer.outcome") or "success"
+        return Result(outcome=outcome, output="fake_adversarial_reviewer")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "codergen", fake_codergen)
+
+
 def run_conformance(*args: str, timeout: int = 600, env: dict | None = None) -> "subprocess.CompletedProcess[str]":
     """Run `bin/conformance` with the given args, return CompletedProcess.
 
@@ -193,6 +208,22 @@ def register_scratch_dir(path: pathlib.Path) -> pathlib.Path:
     ``SCRATCH = register_scratch_dir(pathlib.Path(tempfile.mkdtemp(...)))``.
     """
     _SCRATCH_DIRS.append(path)
+    return path
+
+
+def init_git_repo(path: pathlib.Path) -> pathlib.Path:
+    """Initialize an existing temp directory as a Git repository with a readable HEAD.
+
+    Used by test fixtures for fresh verdict-gated graphs requiring git isolation preflight.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    if not (path / ".git").exists():
+        subprocess.run(["git", "-C", str(path), "init", "-q", "-b", "main"], check=True)
+        subprocess.run(["git", "-C", str(path), "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(path), "config", "user.name", "test"], check=True)
+        (path / "README.md").write_text("fixture\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(path), "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", str(path), "commit", "-qm", "baseline"], check=True)
     return path
 
 

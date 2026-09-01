@@ -53,9 +53,10 @@ sys.path.insert(0, str(ROOT))
 # branch_* mkdtemp per fan-out test into the working tree.
 SCRATCH = pathlib.Path(tempfile.mkdtemp(prefix="test_structured_state_convention_"))
 
-from conftest import register_scratch_dir  # noqa: E402
+from conftest import init_git_repo, register_scratch_dir  # noqa: E402
 
 register_scratch_dir(SCRATCH)
+init_git_repo(SCRATCH)
 
 import runner.handlers as handlers_mod  # noqa: E402
 from runner.engine import run  # noqa: E402
@@ -223,9 +224,9 @@ def test_spec_gen_fix_main_render_survives_dict_list_scalar_state(monkeypatch, t
     ctx.state["some_scalar_value"] = 3
 
     call_count = {"n": 0}
-    original_handler = TYPE_REGISTRY["parallel_reviewer"]
+    original_handler = TYPE_REGISTRY["codergen"]
 
-    def patched_parallel_reviewer(node, _ctx):
+    def patched_codergen(node, _ctx):
         if node.name == "review_main":
             call_count["n"] += 1
             if call_count["n"] == 1:
@@ -233,9 +234,12 @@ def test_spec_gen_fix_main_render_survives_dict_list_scalar_state(monkeypatch, t
                 return Result(outcome="failure", output="spec missing non-goals")
             from runner.handlers import Result
             return Result(outcome="success", output="spec approved after fix")
+        if node.name == "review_attractor":
+            from runner.handlers import Result
+            return Result(outcome="success", output="attractor spec approved")
         return original_handler(node, _ctx)
 
-    monkeypatch.setitem(TYPE_REGISTRY, "parallel_reviewer", patched_parallel_reviewer)
+    monkeypatch.setitem(TYPE_REGISTRY, "codergen", patched_codergen)
 
     # The assertion of record: this must not raise TypeError. On the
     # pre-#228 handler_render.py this call reproduces the exact production

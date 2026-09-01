@@ -43,9 +43,13 @@ digraph MinimalPRNoHoldout {
     type="codergen",
     label="Fresh Eyes Review",
     class="review",
-    prompt="@prompts/slim/review.md",
+    backend="codex",
+    prompt="@prompts/slim/fresh_review.md",
+    verdict_gate="true",
+    fresh_session="true",
     goal_gate=true,
-    retry_target="fix"
+    retry_target="fix",
+    timeout=600
   ]
 
   gate_es [

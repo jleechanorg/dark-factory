@@ -10,19 +10,19 @@ aliases: [f]
 Single writer for the binary-first `/f`/`/factory` contract. Read
 `.claude/skills/dark-factory/SKILL.md` (this repo) and execute it as the
 source of truth — Step 0a (PR-mode vs feature-mode auto-route), Step 0b (CLI
-backend auto-detect), Step 0c (pipeline select), reviewer calibration, and
-the proof-block output contract all live there.
+backend auto-detect), Step 0c (pipeline select), the explicit reviewer
+calibration workflow, and the proof-block output contract all live there.
 
 **Prerequisite:** `./install.sh` once; `dark-factory` on PATH via `~/.local/bin`.
 
 ## Usage
 
 ```
-/f <goal description>                          # DEFAULT: binary-first factory run + reviewer calibration
+/f <goal description>                          # DEFAULT: SlimTwoNode + fresh fully tooled Codex reviewer
 /f --pipeline gates <goal>                     # explicit binary pipeline
 /f --backend echo <goal>                       # wiring smoke (no LLM)
 /f --feature <name> <goal>                     # override holdout feature key
-/f --reviewer-calibration=false <goal>         # explicit opt-out; must explain why
+/f --reviewer-calibration=true <goal>          # explicit calibration workflow
 /f --dynamic-graph <goal>                      # binary-owned dynamic DOT/workflow builder
 /f --phase spec_validation <goal>              # binary-owned dynamic/phase run, if supported
 ```
