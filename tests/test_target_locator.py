@@ -271,6 +271,7 @@ class TestMintAndRemint:
     def test_mint_git_range_first_mint_has_equal_base_and_head(self, git_repo):
         loc = tl.mint_from_workdir(git_repo)
         assert loc.scheme == "git-range"
+        assert loc.pin is not None
         base, head = loc.pin.split("..")
         assert base == head
 
@@ -313,6 +314,7 @@ class TestMintAndRemint:
             _git(git_repo, "add", "-A")
             _git(git_repo, "commit", "-q", "-m", f"visit {i}")
             loc = tl.remint(loc, git_repo)
+        assert loc.pin is not None
         assert loc.pin.startswith(base + "..")
 
     def test_remint_file_recomputes_digest(self, tmp_path):

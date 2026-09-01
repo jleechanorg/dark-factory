@@ -79,7 +79,7 @@ from typing import TYPE_CHECKING
 
 import runner.handlers as _handlers_shim
 
-from . import target_locator
+from . import review_snapshot, target_locator
 from .handler_core import Result
 from .handler_render import ReviewPromptRenderError
 
@@ -567,6 +567,10 @@ def _mint_post_worker_target(node: "Node", ctx: "Context", workdir: "Path | str 
     try:
         if not base_sha:
             locator = target_locator.mint_from_workdir(wd_path)
+            # First mint of a git-range locator always populates `pin`
+            # (`mint_from_workdir` builds it from a git HEAD SHA); the
+            # assert narrows the declared `Optional[str]` for type-checking.
+            assert locator.pin is not None
             ctx.state["_target_base_sha"] = locator.pin.split("..", 1)[0]
         else:
             prior = ctx.state.get("target")
@@ -661,24 +665,6 @@ def _tracked_state(workdir: "Path | str | None") -> str | None:
             return None
         outputs.append(proc.stdout)
     return hashlib.sha256("\0".join(outputs).encode("utf-8")).hexdigest()
-
-
-def _fresh_review_workdir(ctx: "Context") -> pathlib.Path | None:
-    """Return a real, non-symlinked target directory for a fresh reviewer."""
-    raw = _codergen_workdir(ctx)
-    if not raw:
-        return None
-    candidate = pathlib.Path(str(raw))
-    if not candidate.is_absolute() or ".." in candidate.parts:
-        return None
-    try:
-        resolved = candidate.resolve(strict=True)
-    except (OSError, RuntimeError):
-        return None
-    if candidate.is_symlink() or not resolved.is_dir():
-        return None
-    return resolved
-
 
 
 _TYPED_FINDINGS_KEYS = frozenset({"path", "claim", "required_fix"})
@@ -828,7 +814,13 @@ def _stash_codergen_receipt(node: "Node", ctx: "Context") -> None:
         }
         for cmd, ec in parsed
     ]
-    ctx.state[f"{node.name}.structured_receipt"] = records
+    # `Context.state` is declared `dict[str, str]`, but `*.structured_receipt`
+    # keys intentionally store a `list[dict]` — an established, tested
+    # pattern consumed directly as a list by `handler_dispatch.py`'s
+    # `isinstance(v, list)` gate collector and `_check_structured_receipt`.
+    # Widening `Context.state`'s declared type is a repo-wide change outside
+    # this fix's scope; suppress the narrow, intentional mismatch here.
+    ctx.state[f"{node.name}.structured_receipt"] = records  # pyright: ignore[reportArgumentType]
 
 
 def _codergen(node: "Node", ctx: "Context") -> "Result":
@@ -855,8 +847,18 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
     }
     _start_ts = time.monotonic()
     shadow_review = _start_shadow_codex_review(node, ctx, backend, prompt_text)
+    # Holder for a fresh-reviewer snapshot cleanup callback (design item 6):
+    # set by the verdict-gated codex branch below, popped and run exactly
+    # once here regardless of which return path is taken. Best-effort —
+    # cleanup failure is recorded in the result metadata, never raised.
+    _snapshot_cleanup_holder: list = [None]
 
     def _finalize(result: "Result") -> "Result":
+        cleanup = _snapshot_cleanup_holder[0]
+        if cleanup is not None:
+            _snapshot_cleanup_holder[0] = None
+            if not cleanup():
+                result.metadata["snapshot_cleanup_failed"] = "true"
         return _finish_shadow_codex_review(result, shadow_review, node, ctx)
 
     if backend == "echo":
@@ -1169,7 +1171,20 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             _stash_codergen_receipt(node, ctx)
         return _finalize(Result(outcome=outcome, output=output, metadata=meta))
     elif backend == "codex":
-        codex_workdir = _fresh_review_workdir(ctx) if verdict_gate else ctx.workdir
+        review_snap: "review_snapshot.ReviewSnapshot | None" = None
+        if verdict_gate:
+            try:
+                review_snap = review_snapshot.create_review_snapshot(ctx.state.get("target", ""))
+            except review_snapshot.ReviewSnapshotError as exc:
+                return _finalize(Result(
+                    outcome="error",
+                    output=f"fresh reviewer snapshot could not be materialized: {exc}",
+                    metadata={"verdict": "unknown", "fresh_session": "true"},
+                ))
+            codex_workdir = review_snap.path
+            _snapshot_cleanup_holder[0] = lambda: review_snapshot.cleanup_review_snapshot(review_snap)
+        else:
+            codex_workdir = ctx.workdir
         if codex_workdir is None:
             return _finalize(Result(
                 outcome="error",
@@ -1197,6 +1212,16 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             return _finalize(Result(
                 outcome="error" if verdict_gate else "failure",
                 output="sandbox-exec unavailable",
+            ))
+        if review_snap is not None and not review_snapshot.verify_review_snapshot_pin(review_snap):
+            # TOCTOU (design item 6): re-check the snapshot's pinned commit
+            # immediately before launching the reviewer, not only at
+            # creation time. A mismatch aborts the visit as a failure —
+            # cleanup still runs via the `_finalize` holder above.
+            return _finalize(Result(
+                outcome="failure",
+                output="fresh reviewer snapshot pin mismatch detected before launch (TOCTOU)",
+                metadata={"verdict": "unknown", "fresh_session": "true", "snapshot_pin_mismatch": "true"},
             ))
         timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1800"), 1800)
         try:

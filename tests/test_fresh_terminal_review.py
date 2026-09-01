@@ -44,6 +44,31 @@ def _review_node(prompt: pathlib.Path):
     return node
 
 
+def _head_sha(repo: pathlib.Path) -> str:
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    )
+    return proc.stdout.strip()
+
+
+def _target_for(repo: pathlib.Path) -> str:
+    """Mint a ``git-commit://`` locator matching what the runner's D3 mint
+    path (`_mint_post_worker_target`) would have written to
+    ``ctx.state["target"]`` after a worker success visit."""
+    return f"git-commit://{repo}@{_head_sha(repo)}"
+
+
+def _use_tmp_snapshot_root(tmp_path: pathlib.Path, monkeypatch) -> pathlib.Path:
+    """Redirect the fresh-reviewer snapshot root under `tmp_path` so tests
+    never touch the real `~/.dark-factory/review-snapshots`."""
+    snapshot_root = tmp_path / "review-snapshots"
+    monkeypatch.setattr(
+        "runner.review_snapshot._default_snapshot_root", lambda: snapshot_root
+    )
+    return snapshot_root
+
+
 def _run_review(tmp_path, monkeypatch, output: str, *, mutate: bool = False):
     repo = _repo(tmp_path)
     prompt = tmp_path / "review.md"
@@ -51,20 +76,30 @@ def _run_review(tmp_path, monkeypatch, output: str, *, mutate: bool = False):
         "Review target: ${target}\nEnd with Verdict: PASS or Verdict: FAIL.\n"
     )
     node = _review_node(prompt)
+    _use_tmp_snapshot_root(tmp_path, monkeypatch)
     ctx = Context(
         goal="review this change",
         workdir=tmp_path,
         backend="echo",
-        state={"ao.worktree": str(repo)},
+        state={"ao.worktree": str(repo), "target": _target_for(repo)},
     )
     calls: list[tuple[list[str], pathlib.Path]] = []
     real_run = subprocess.run
 
     def fake_run(args, **kwargs):
         if args and args[0] == "codex":
-            calls.append((list(args), pathlib.Path(kwargs["cwd"])))
+            snapshot_cwd = pathlib.Path(kwargs["cwd"])
+            calls.append((list(args), snapshot_cwd))
+            # Snapshot content matches the pinned commit at launch time
+            # (checked here, not after `_codergen` returns, because
+            # cleanup removes the snapshot directory before this function's
+            # caller gets control back).
+            assert (snapshot_cwd / "value.txt").read_text() == "before\n"
             if mutate:
-                (repo / "value.txt").write_text("reviewer changed this\n")
+                # Mutates the isolated snapshot the reviewer actually ran
+                # in, never the live `repo` — that isolation is the point
+                # of the fresh-reviewer snapshot (design item 6).
+                (snapshot_cwd / "value.txt").write_text("reviewer changed this\n")
             return subprocess.CompletedProcess(args, 0, stdout=output, stderr="")
         return real_run(args, **kwargs)
 
@@ -88,7 +123,12 @@ def test_fresh_reviewer_runs_codex_ephemeral_in_target_worktree(tmp_path, monkey
     argv, cwd = calls[0]
     assert argv[:5] == ["codex", "exec", "--ephemeral", "--yolo", "--skip-git-repo-check"]
     assert not {"--disable", "--ignore-rules"}.intersection(argv)
-    assert cwd == repo
+    # Design item 6: the reviewer runs against an isolated snapshot, never
+    # the live coder workdir. `cwd` was captured while codex "ran" (inside
+    # `fake_run`, before cleanup); by now cleanup has already removed it.
+    assert cwd != repo
+    assert not cwd.exists()
+    assert "snapshot_cleanup_failed" not in result.metadata
 
 
 def test_fresh_reviewer_failure_relays_message_when_unparseable(tmp_path, monkeypatch):
@@ -174,11 +214,12 @@ def test_fresh_reviewer_timeout_fails_closed(tmp_path, monkeypatch):
     prompt.write_text(
         "Review target: ${target}\nEnd with Verdict: PASS or Verdict: FAIL.\n"
     )
+    _use_tmp_snapshot_root(tmp_path, monkeypatch)
     ctx = Context(
         goal="review this change",
         workdir=tmp_path,
         backend="echo",
-        state={"ao.worktree": str(repo)},
+        state={"ao.worktree": str(repo), "target": _target_for(repo)},
     )
 
     real_run = subprocess.run
@@ -199,7 +240,7 @@ def test_fresh_reviewer_timeout_fails_closed(tmp_path, monkeypatch):
 
 
 def test_fresh_reviewer_tracked_mutation_fails_closed(tmp_path, monkeypatch):
-    result, _, repo = _run_review(
+    result, calls, repo = _run_review(
         tmp_path,
         monkeypatch,
         "No blocking findings.\nVerdict: PASS\n",
@@ -212,54 +253,69 @@ def test_fresh_reviewer_tracked_mutation_fails_closed(tmp_path, monkeypatch):
     # leak into the worker-facing relay (`result.output`) — it stays in the
     # metadata assertion above (manifest-only per the two-node redesign).
     assert result.output == "review did not produce valid findings; re-run against current pin"
-    assert (repo / "value.txt").read_text() == "reviewer changed this\n"
+    # Design item 6: the reviewer mutated the isolated snapshot, not the
+    # live coder workdir — `repo` is untouched even though the mutation was
+    # detected and fails the visit closed.
+    assert (repo / "value.txt").read_text() == "before\n"
+    _, snapshot_cwd = calls[0]
+    assert snapshot_cwd != repo
 
 
-def test_fresh_reviewer_rejects_symlinked_target_before_codex(tmp_path, monkeypatch):
+def test_fresh_reviewer_errors_before_codex_when_no_target_minted(tmp_path, monkeypatch):
+    """Design item 6 replaces `_fresh_review_workdir`'s live-workdir symlink
+    check with snapshot materialization from `ctx.state["target"]` (D3/D8a).
+    A verdict-gated node with no minted target has nothing to snapshot from
+    and must fail closed before codex is ever launched — mirroring the old
+    contract's "never launch codex against an unsafe target" guarantee."""
     repo = _repo(tmp_path)
-    alias = tmp_path / "alias"
-    alias.symlink_to(repo, target_is_directory=True)
     prompt = tmp_path / "review.md"
     prompt.write_text(
         "Review target: ${target}\nEnd with Verdict: PASS or Verdict: FAIL.\n"
     )
+    _use_tmp_snapshot_root(tmp_path, monkeypatch)
     ctx = Context(
         goal="review this change",
         workdir=tmp_path,
         backend="echo",
-        state={"ao.worktree": str(alias)},
+        state={"ao.worktree": str(repo)},  # no "target" key: mint never ran
     )
     real_run = subprocess.run
 
     def unexpected_run(args, **kwargs):
         if args and args[0] == "codex":
-            raise AssertionError("Codex launched for a symlinked target")
+            raise AssertionError("Codex launched without a minted review target")
         return real_run(args, **kwargs)
 
     monkeypatch.setattr("runner.handler_codergen.subprocess.run", unexpected_run)
     result = _codergen(_review_node(prompt), ctx)
 
     assert result.outcome == "error"
-    assert "non-symlinked" in result.output
+    assert "no review target has been minted" in result.output
 
 
-def test_fresh_reviewer_allows_real_target_beneath_symlinked_parent(
+def test_fresh_reviewer_snapshot_resolves_through_symlinked_target_locator(
     tmp_path, monkeypatch
 ):
+    """A target locator built from a symlinked path still canonicalizes to
+    the real repository at parse time (`target_locator._canon_path`), so the
+    snapshot is materialized from the real repo — never from, or leaking
+    into, the symlinked alias."""
     real_parent = tmp_path / "real"
     real_parent.mkdir()
     repo = _repo(real_parent)
     alias_parent = tmp_path / "alias"
     alias_parent.symlink_to(real_parent, target_is_directory=True)
+    aliased_repo = alias_parent / repo.name
     prompt = tmp_path / "review.md"
     prompt.write_text(
         "Review target: ${target}\nEnd with Verdict: PASS or Verdict: FAIL.\n"
     )
+    snapshot_root = _use_tmp_snapshot_root(tmp_path, monkeypatch)
     ctx = Context(
         goal="review this change",
         workdir=tmp_path,
         backend="echo",
-        state={"ao.worktree": str(alias_parent / repo.name)},
+        state={"target": f"git-commit://{aliased_repo}@{_head_sha(repo)}"},
     )
     calls: list[pathlib.Path] = []
     real_run = subprocess.run
@@ -281,7 +337,11 @@ def test_fresh_reviewer_allows_real_target_beneath_symlinked_parent(
     result = _codergen(_review_node(prompt), ctx)
 
     assert result.outcome == "success"
-    assert calls == [repo.resolve()]
+    assert len(calls) == 1
+    cwd = calls[0]
+    assert cwd != repo
+    assert cwd != aliased_repo
+    assert cwd.is_relative_to(snapshot_root)
 
 
 def test_default_graph_does_not_initialize_controller_state(tmp_path, monkeypatch):
