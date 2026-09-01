@@ -2086,7 +2086,7 @@ mod quiescence_timeout_races {
         let branch = "factory/bead-race-ir-r1";
         vcs.heads.insert(branch.into(), "head-sha-ir".into());
         let store = FakeStateStore::new();
-        let llm = FakeLlm::new();
+        let llm = proceed_llm();
         let mut cfg = test_cfg();
         cfg.reroll_head_stability_window_secs = 1;
         cfg.reroll_death_confirm_secs = 0;
