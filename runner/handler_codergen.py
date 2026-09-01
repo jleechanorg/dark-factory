@@ -1186,17 +1186,32 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
     verdict_gate = str(node.attrs.get("verdict_gate", "false")).strip().lower() in {
         "true", "1", "yes", "on",
     }
+
+    prompt_provenance = _handlers_shim._fresh_review_prompt_metadata(
+        node, backend, prompt_text, ctx
+    )
+    shadow_review = None
+
+    def _finalize(result: "Result") -> "Result":
+        if prompt_provenance:
+            result.metadata = {**result.metadata, **prompt_provenance}
+        return _finish_shadow_codex_review(result, shadow_review, node, ctx)
+
+    if prompt_provenance.get("review_prompt_error"):
+        return _finalize(Result(
+            outcome="error",
+            output=prompt_provenance["review_prompt_error"],
+            metadata={"verdict": "unknown", "fresh_session": "true"},
+        ))
+
     if backend == "codex" and verdict_gate and os.environ.get("DISABLE_SANDBOX"):
-        return Result(
+        return _finalize(Result(
             outcome="error",
             output="verdict-gated fresh review refuses DISABLE_SANDBOX; isolation is required",
             metadata={"verdict": "unknown", "fresh_session": "true"},
-        )
+        ))
     _start_ts = time.monotonic()
     shadow_review = _start_shadow_codex_review(node, ctx, backend, prompt_text)
-
-    def _finalize(result: "Result") -> "Result":
-        return _finish_shadow_codex_review(result, shadow_review, node, ctx)
 
     if backend == "echo":
         wall_ms = int((time.monotonic() - _start_ts) * 1000)
