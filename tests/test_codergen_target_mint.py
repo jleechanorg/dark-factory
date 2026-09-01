@@ -267,6 +267,43 @@ class TestMintPostWorkerTarget:
         changed = _git(git_repo, "diff", "--name-only", base, head)
         assert "new_file.txt" in changed
 
+    def test_self_committing_worker_still_yields_nonempty_range(self, git_repo):
+        """Regression: every existing dirty-state test leaves the worker's
+        edit UNCOMMITTED so `_checkpoint_dirty_state` sweeps it up. Real
+        coder backends (codex/claude) commit their own change as part of
+        finishing the task — by the time `_mint_post_worker_target` runs,
+        HEAD already IS the worker's commit, `_checkpoint_dirty_state` finds
+        nothing dirty, and a naive `base_sha = <HEAD at mint time>` produces
+        an ALWAYS-EMPTY base==head range that excludes the worker's own
+        commit from the very diff the reviewer is meant to see. This is what
+        `ctx.state["_pre_worker_head"]` (captured by `_codergen` BEFORE
+        dispatching to the backend) exists to prevent."""
+        pre_worker_head = _git(git_repo, "rev-parse", "HEAD")
+        ctx = Context(
+            goal="implement the feature", workdir=git_repo, backend="echo",
+            state={
+                "_df_mint_review_target": "true",
+                "_pre_worker_head": pre_worker_head,
+            },
+        )
+        # Simulate a self-committing coder backend: the "worker" commits its
+        # own change directly, exactly like a real codex/claude CLI worker
+        # does when it finishes a task, BEFORE `_mint_post_worker_target`
+        # (which only runs after the backend call returns) ever executes.
+        (git_repo / "worker_change.txt").write_text("worker edit\n")
+        _git(git_repo, "add", "-A")
+        _git(git_repo, "commit", "-q", "-m", "worker: self-committed change")
+
+        _mint_post_worker_target(make_node("worker"), ctx, git_repo)
+
+        loc = tl.parse(ctx.state["target"])
+        assert loc.pin is not None
+        base, head = loc.pin.split("..")
+        assert base == pre_worker_head
+        assert base != head  # must NOT be the always-empty range
+        changed = _git(git_repo, "diff", "--name-only", base, head)
+        assert "worker_change.txt" in changed
+
     def test_pin_chain_grows_and_base_stays_fixed_across_visits(self, git_repo):
         ctx = Context(
             goal="fix the bug", workdir=git_repo, backend="echo",
@@ -419,3 +456,54 @@ class TestCodergenEchoMintsTarget:
         assert "target" not in ctx.state
         # The flag is consumed (not left to leak into a later node's visit).
         assert "_target_mint_failed" not in ctx.state
+
+
+class TestCodergenSelfCommittingWorkerEndToEnd:
+    """End-to-end (no real LLM): drives the actual `_codergen` worker-side
+    `codex` dispatch through a fake subprocess that self-commits, exactly
+    matching what every real codex/claude CLI worker does in production
+    (confirmed live: PR #821 proof runs, e.g. run `cb48e6d1c1a5`, show the
+    worker committing its own change before the reviewer ever launches).
+    Proves `_codergen` itself — not just `_mint_post_worker_target` in
+    isolation — captures and threads the true pre-dispatch HEAD through a
+    full backend call."""
+
+    def test_worker_codex_backend_self_commit_still_reviewed_in_full(
+        self, git_repo, monkeypatch
+    ):
+        pre_worker_head = _git(git_repo, "rev-parse", "HEAD")
+        node = make_node("worker", prompt=None)
+        ctx = Context(
+            goal="implement the feature", workdir=git_repo, backend="codex",
+            state={"_df_mint_review_target": "true"},
+        )
+        real_run = subprocess.run
+
+        def fake_codex_run(args, **kwargs):
+            if args and args[0] == "codex":
+                # Mirror real codex worker behavior: commit the change as
+                # part of "finishing" the task, before returning.
+                (git_repo / "worker_change.txt").write_text("worker edit\n")
+                _git(git_repo, "add", "-A")
+                _git(git_repo, "commit", "-q", "-m", "worker: self-committed change")
+                return subprocess.CompletedProcess(
+                    args, 0, stdout="codex\ndone\n", stderr=""
+                )
+            return real_run(args, **kwargs)
+
+        monkeypatch.setattr(
+            "runner.handlers._sandboxed_args_for_workdir", lambda args, workdir: args
+        )
+        monkeypatch.setattr("runner.handlers._sanitized_env", lambda: {})
+        monkeypatch.setattr("runner.handler_codergen.subprocess.run", fake_codex_run)
+
+        result = _codergen(node, ctx)
+
+        assert result.outcome == "success"
+        loc = tl.parse(ctx.state["target"])
+        assert loc.pin is not None
+        base, head = loc.pin.split("..")
+        assert base == pre_worker_head
+        assert base != head  # must NOT be the always-empty range
+        changed = _git(git_repo, "diff", "--name-only", base, head)
+        assert "worker_change.txt" in changed

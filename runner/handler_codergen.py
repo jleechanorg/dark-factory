@@ -578,7 +578,16 @@ def _mint_post_worker_target(node: "Node", ctx: "Context", workdir: "Path | str 
     base_sha = ctx.state.get("_target_base_sha")
     try:
         if not base_sha:
-            base_sha = pre_checkpoint_head.lower()
+            # `pre_checkpoint_head` above is read AFTER the worker backend
+            # has already returned — a self-committing coder (every real
+            # codex/claude worker) moves HEAD forward as part of finishing
+            # its own task, so by the time this function runs it is already
+            # the worker's own commit, not the true pre-worker base. Prefer
+            # `_pre_worker_head`, captured by `_codergen` immediately before
+            # dispatching to the backend (the only point in the flow that
+            # runs before ANY worker action, committed or not).
+            pre_worker_head = ctx.state.pop("_pre_worker_head", None)
+            base_sha = (pre_worker_head or pre_checkpoint_head).lower()
             locator = target_locator.mint_from_workdir(wd_path, base_sha=base_sha)
             ctx.state["_target_base_sha"] = base_sha
         else:
@@ -951,6 +960,28 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
     verdict_gate = str(node.attrs.get("verdict_gate", "false")).strip().lower() in {
         "true", "1", "yes", "on",
     }
+    # D3/D8a self-commit fix (external review, live-observed): capture the
+    # TRUE pre-worker HEAD here, before ANY backend dispatch — the only
+    # point in this function that runs before the worker has taken any
+    # action, committed or not. `_mint_post_worker_target` (called later,
+    # from `_stash_diff`, only after the backend call has returned) prefers
+    # this over recomputing HEAD at mint time, which would already reflect
+    # a self-committing coder's own commit and produce an always-empty
+    # base==head range. Only the FIRST mint of a run needs this (later
+    # visits reuse the frozen `_target_base_sha`), and only worker nodes
+    # ever mint, so skip the extra git call otherwise.
+    if (
+        not verdict_gate
+        and _mint_review_target_enabled(ctx)
+        and not ctx.state.get("_target_base_sha")
+    ):
+        _pre_dispatch_workdir = _codergen_workdir(ctx)
+        if _pre_dispatch_workdir:
+            _pre_head = target_locator._git_head_sha(
+                pathlib.Path(str(_pre_dispatch_workdir))
+            )
+            if _pre_head is not None:
+                ctx.state["_pre_worker_head"] = _pre_head
     _start_ts = time.monotonic()
     shadow_review = _start_shadow_codex_review(node, ctx, backend, prompt_text)
     # Holder for a fresh-reviewer snapshot cleanup callback (design item 6):
