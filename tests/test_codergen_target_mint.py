@@ -192,6 +192,7 @@ class TestMintPostWorkerTarget:
         _mint_post_worker_target(make_node("worker"), ctx, git_repo)
         assert _git(git_repo, "status", "--porcelain") == ""
         loc = tl.parse(ctx.state["target"])
+        assert loc.pin is not None
         base, head = loc.pin.split("..")
         assert base == head  # first mint: base==head at the freshly-committed HEAD
         changed = _git(git_repo, "diff", "--name-only", f"{base}~1", head)
@@ -218,6 +219,7 @@ class TestMintPostWorkerTarget:
         assert chain[-1] != first_target
         for entry in chain:
             loc = tl.parse(entry)
+            assert loc.pin is not None
             assert loc.pin.split("..")[0] == base
 
     def test_intent_set_once_not_overwritten_on_remint(self, git_repo):

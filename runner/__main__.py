@@ -624,8 +624,8 @@ def main(argv: list[str] | None = None) -> int:
             _write_dispatch_failure_stderr(history=history, ctx=ctx)
         print(json.dumps(summary, indent=2))
         return 0 if dispatch_ok else 1
-    except Exception:
-        payload = _handle_panic(sys.exc_info()[1], args=args, ctx=ctx)
+    except Exception as panic_exc:
+        payload = _handle_panic(panic_exc, args=args, ctx=ctx)
         if (
             args is not None
             and ctx is not None

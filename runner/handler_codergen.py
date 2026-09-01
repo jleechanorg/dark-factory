@@ -1125,8 +1125,11 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         args = _handlers_shim._sandboxed_args_for_workdir(claude_cmd, ctx.workdir)
         if args is None:
             return _finalize(Result(outcome="failure", output="sandbox-exec unavailable"))
+        # Bound before the try so the `except Exception` handler below (which
+        # reports `timeout_s` in its metadata) can never hit an
+        # UnboundLocalError if `_coerce_timeout` itself were to raise.
+        timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1800"), 1800)
         try:
-            timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1800"), 1800)
             proc = subprocess.run(
                 args,
                 cwd=ctx.workdir,
