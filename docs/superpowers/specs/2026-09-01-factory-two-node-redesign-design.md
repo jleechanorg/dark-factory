@@ -26,9 +26,9 @@ The default `/f` graph (`pipelines/slim/two_node.dot`) already has the right sha
 | D2 | *(v2: runner-minted intent envelope; v3: injection-proof encoding)* Intent is carried in a **runner-minted intent envelope**: the runner records the operator's original task text verbatim at run start and delivers it **Base64-encoded** inside the fenced TASK RECORD block (prior art: `prompts/catalog/controller_cold_review_v1.md`), so task text containing fence delimiters cannot escape. The static prompt tells the reviewer to decode it and defines it as evidence, never instructions — authoritative **only for the desired functional outcome**, never for review scope, procedure, tool use, severity, or verdict rules. The reviewer judges the entity against **both** the envelope and the entity's own stated purpose; a mismatch is a blocking finding. |
 | D3 | The **runner mints the locator mechanically** after the worker exits (`git rev-parse`, PR head SHA, file digest). Neither caller nor worker text is used for identity. **Pins are re-minted and chained on every fix visit** (D8a). |
 | D4 | **All target schemes are defined now** (schema below); only a v1 subset is resolvable and normative. Non-v1 schemes are **reserved, non-normative** — names registered, semantics finalized when first implemented. Unknown-but-defined schemes error with "defined, not yet resolvable". |
-| D5 | **Freeform is accepted at the CLI boundary only** (`--target "PR 811"`), resolved mechanically to a canonical locator before the run, or rejected. Freeform never reaches the reviewer. |
+| D5 | **Freeform is accepted at the CLI boundary only** (`--target "PR 811"`), resolved mechanically to a canonical locator before the run, or rejected. Freeform never reaches the reviewer. `--target` and `--goal` are **mutually exclusive** — combining them is a CLI error, so a caller cannot smuggle behavioral prose into a target-mode run. |
 | D6 | The static prompt carries **explicit anti-gaming clauses** (see prompt draft). |
-| D7 | Reviewer budget **1200 s soft / 1320 s hard**. The prompt states the 20-minute soft deadline so the model can emit its UNFINISHED report; the runner kills at the hard deadline. Any exit without a machine-validated terminal `Verdict:` line — timeout, crash, malformed output — is classified `failure` (fail closed), consumes an iteration, and routes to the worker. |
+| D7 | Reviewer budget **1200 s soft / 1320 s hard**. The prompt states the 20-minute soft deadline so the model can emit its UNFINISHED report; the runner kills at the hard deadline. Any exit without a machine-validated terminal `Verdict:` line — timeout, crash, malformed output — is classified `failure` (fail closed), consumes an iteration, and routes to the worker. **PASS additionally requires the machine-checked line `Review completeness: COMPLETE`** (AAR from `~/roadmap/nextsteps-2026-09-01-factory-typed-review-target.md`); `UNFINISHED` + PASS is normalized to `failure`. Tests pinning the old 600 s value migrate in the same change. |
 | D8 | Iteration bound stays **max 3 worker visits**. Reviewer FAIL output crosses to the worker as **typed findings**: a machine-validated JSON list (`{path, claim, required_fix}`), schema-checked by the runner, delivered to the worker Base64-encoded in a fenced block marked untrusted requirements to independently verify — never commands. Raw reviewer prose is **excluded** from the worker prompt (manifest-only). Unparseable reviewer findings degrade to "review did not produce valid findings; re-run against current pin", never to raw prose relay. |
 | D8a | **Pin chaining:** after each worker fix visit the runner re-mints the locator at the new head/digest and records the chain (`pin[0] → pin[1] → …`) in the manifest. Reviewer visit N always receives the pin minted after worker visit N — never a stale pin. |
 
@@ -147,6 +147,8 @@ UNFINISHED, list exactly what remains unreviewed, give the coder concrete next
 actions, and end with Verdict: FAIL.
 
 Report only concrete blocking findings with exact paths and actionable fixes.
+Before the verdict, state exactly one completeness line:
+`Review completeness: COMPLETE` or `Review completeness: UNFINISHED`.
 End with exactly one line: `Verdict: PASS` (no blocking findings and all
 required checks performed) or `Verdict: FAIL`.
 ```
@@ -283,3 +285,20 @@ contains no text whose *authority* is caller- or worker-controlled.
   fully-wired path; target mode lands the CLI flag + resolution and reviewer
   entry, with fix-loop wiring for external targets as follow-up if it exceeds
   the time-box.
+
+### AAR record vs `~/roadmap/nextsteps-2026-09-01-factory-typed-review-target.md`
+
+- **Accepted:** `Review completeness: COMPLETE|UNFINISHED` marker gating PASS
+  (D7); `--target`/`--goal` mutual exclusion (D5); migrate 600 s test pins with
+  the timeout change; its Codex-CLI finding that `--ignore-rules` does *not*
+  suppress project docs (confirms v3's mechanical quarantine over CLI flags).
+- **Adapted:** reviewer-node contract attribute and reviewer-first routing —
+  v1 delivers reviewer-first as target mode alongside task mode, not as the
+  sole default; graph-level `input_contract` enforcement follows with the
+  13-graph migration.
+- **Rejected for v1** (tracked follow-ups, not defects): Task-0 hard gate on a
+  doc-suppression spike (moot — quarantine is mechanical); signed/MAC
+  workspace capability envelope; sealed `factory/`+`subject/` review-root
+  layout with fixed-path (non-interpolating) prompt; repo-authority registry;
+  structured JSON event receipts; Landlock/Seatbelt expansion; atomic
+  13-graph default switch.
