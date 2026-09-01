@@ -1,4 +1,4 @@
-use daemon::adapters::{ChainLlm, CliScm, CliSessions, CliTracker, CliVcs};
+use daemon::adapters::{ChainLlm, CliScm, CliSessions, CliTracker, CliVcs, ensure_ao_recovery};
 use daemon::tools::{Llm, Scm, SessionActivity, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
 
 /// Guard for setting environment variables during tests.
@@ -89,6 +89,25 @@ fn test_cli_sessions_real_ao() {
     let sessions = CliSessions::new("dark-factory", "claude-code");
     let count = sessions.active_count();
     assert!(count.is_ok(), "active_count failed: {:?}", count);
+}
+
+#[test]
+#[ignore] // Starts a real, factory-owned AO controller; run explicitly.
+fn test_real_project_scoped_ao_recovery() {
+    assert_eq!(
+        std::env::var("DARK_FACTORY_RUN_REAL_AO_RECOVERY").as_deref(),
+        Ok("1"),
+        "set DARK_FACTORY_RUN_REAL_AO_RECOVERY=1 to run this ignored real-service test"
+    );
+    let outcome = ensure_ao_recovery("dark-factory");
+    assert!(
+        matches!(
+            outcome,
+            daemon::adapters::RecoveryOutcome::Healthy { .. }
+                | daemon::adapters::RecoveryOutcome::Restarted { .. }
+        ),
+        "real AO recovery did not reach readiness: {outcome:?}"
+    );
 }
 
 #[test]
@@ -872,4 +891,424 @@ fn test_cli_sessions_ao_status_includes_project_arg_scoped() {
     );
 
     let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}
+
+
+// ============================================================================
+// RED contract tests for project-scoped AO recovery.
+//
+// Installed AO v0.1.3 accepts: ao start <project> --no-dashboard --no-open.
+// Health probes must be: ao status -p <project> --json. The fake is a separate
+// process per invocation, so status state is persisted in files. This catches
+// the old fixture bug that reset its counter in every shell process.
+// ============================================================================
+#[cfg(unix)]
+mod ao_recovery_contract {
+    use super::{ensure_ao_recovery, EnvVarGuard, FAKE_ENV_LOCK};
+    use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    struct FakeAo {
+        root: PathBuf,
+        old_path: Option<std::ffi::OsString>,
+        old_cooldown: Option<std::ffi::OsString>,
+        old_timeout: Option<std::ffi::OsString>,
+        old_poll: Option<std::ffi::OsString>,
+        old_sustain: Option<std::ffi::OsString>,
+        old_controller_home: Option<std::ffi::OsString>,
+        old_operator_home: Option<std::ffi::OsString>,
+        old_config_path: Option<std::ffi::OsString>,
+        old_ao_config_path: Option<std::ffi::OsString>,
+    }
+
+    impl FakeAo {
+        fn new(name: &str, start_exit: i32, delay_ms: u64) -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "df_ao_recovery_{name}_{}_{}", std::process::id(), nonce
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let script = format!(r#"#!/usr/bin/env python3
+import json, pathlib, sys, time, os
+args = sys.argv[1:]
+root = pathlib.Path({root:?})
+marker = root / "healthy.marker"
+pidfile = root / "start.pid"
+running = pathlib.Path(os.environ["HOME"]) / ".agent-orchestrator" / "running.json"
+counter = root / "status.count"
+counter_lock = root / "status.lock"
+log = root / "calls.jsonl"
+project = "dark-factory"
+target = "dark-factory"
+with log.open("a", encoding="utf-8") as fh:
+    fh.write(json.dumps(args) + "\n")
+def next_status():
+    while True:
+        try:
+            counter_lock.mkdir()
+            break
+        except FileExistsError:
+            time.sleep(0.005)
+    try:
+        n = int(counter.read_text()) if counter.exists() else 0
+        counter.write_text(str(n + 1))
+        return n + 1
+    finally:
+        counter_lock.rmdir()
+if args == ["status", "-p", project, "--json"]:
+    next_status()
+    # [] is valid JSON but intentionally means AO has no live worker.
+    print('[{{"id":"worker-1","status":"working"}}]' if marker.exists() else "[]")
+    sys.exit(0)
+if args == ["start", target, "--no-dashboard", "--no-open"]:
+    pidfile.write_text(str(os.getpid()))
+    (root / "start.env.json").write_text(json.dumps({{
+        "CLAUDE_CONFIG_DIR": os.environ.get("CLAUDE_CONFIG_DIR"),
+    }}))
+    time.sleep({delay_ms}/1000.0)
+    if {start_exit}:
+        print("scripted start failure", file=sys.stderr)
+        sys.exit({start_exit})
+    marker.write_text("healthy\n")
+    running.parent.mkdir(parents=True, exist_ok=True)
+    running.write_text(json.dumps({{"pid": os.getpid(), "projects": [project]}}))
+    # A real ao start is a persistent controller. Keep the launcher process
+    # alive after readiness so the recovery code cannot mistake a clean
+    # launcher exit for a failed controller.
+    time.sleep(5)
+    sys.exit(0)
+print("UNEXPECTED AO ARGV: " + json.dumps(args), file=sys.stderr)
+sys.exit(99)
+"#,
+                root = root.display(), start_exit = start_exit, delay_ms = delay_ms);
+            let ao = root.join("ao");
+            std::fs::write(&ao, script).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&ao, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let old_path = std::env::var_os("PATH");
+            let old_cooldown = std::env::var_os("DARK_FACTORY_AO_RECOVERY_COOLDOWN_MS");
+            let old_timeout = std::env::var_os("DARK_FACTORY_AO_RECOVERY_TIMEOUT_MS");
+            let old_poll = std::env::var_os("DARK_FACTORY_AO_RECOVERY_POLL_MS");
+            let old_sustain = std::env::var_os("DARK_FACTORY_AO_RECOVERY_SUSTAIN_MS");
+            let old_controller_home = std::env::var_os("DARK_FACTORY_AO_CONTROLLER_HOME");
+            let old_operator_home = std::env::var_os("DARK_FACTORY_OPERATOR_HOME");
+            let old_config_path = std::env::var_os("DARK_FACTORY_AO_CONFIG_PATH");
+            let old_ao_config_path = std::env::var_os("AO_CONFIG_PATH");
+            let path = match old_path.as_deref() {
+                Some(old) => format!("{}:{}", root.display(), old.to_string_lossy()),
+                None => root.display().to_string(),
+            };
+            unsafe {
+                std::env::set_var("PATH", path);
+                // Keep tests hermetic: the production slot's failure cooldown
+                // must not leak from one test into another.
+                std::env::set_var("DARK_FACTORY_AO_RECOVERY_COOLDOWN_MS", "0");
+                std::env::set_var("DARK_FACTORY_AO_RECOVERY_TIMEOUT_MS", "1000");
+                std::env::set_var("DARK_FACTORY_AO_RECOVERY_POLL_MS", "10");
+                std::env::set_var("DARK_FACTORY_AO_RECOVERY_SUSTAIN_MS", "10");
+                std::env::set_var("DARK_FACTORY_AO_CONTROLLER_HOME", root.join("controller"));
+                std::env::set_var("DARK_FACTORY_OPERATOR_HOME", root.join("operator"));
+                std::env::set_var("DARK_FACTORY_AO_CONFIG_PATH", root.join("agent-orchestrator.yaml"));
+            }
+            Self { root, old_path, old_cooldown, old_timeout, old_poll, old_sustain,
+                old_controller_home, old_operator_home, old_config_path, old_ao_config_path }
+        }
+
+        fn calls(&self) -> Vec<Vec<String>> {
+            std::fs::read_to_string(self.root.join("calls.jsonl"))
+                .unwrap_or_default().lines()
+                .filter_map(|line| serde_json::from_str(line).ok()).collect()
+        }
+
+        fn starts(&self) -> Vec<Vec<String>> {
+            self.calls().into_iter().filter(|a: &Vec<String>|
+                a.first().map(String::as_str) == Some("start")).collect()
+        }
+
+        fn start_env(&self) -> serde_json::Value {
+            serde_json::from_slice(
+                &std::fs::read(self.root.join("start.env.json")).unwrap()
+            ).unwrap()
+        }
+
+    }
+
+    impl Drop for FakeAo {
+        fn drop(&mut self) {
+            if let Ok(pid) = std::fs::read_to_string(self.root.join("start.pid")) {
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", &format!("-{}", pid.trim())])
+                    .status();
+            }
+            match self.old_path.take() {
+                Some(value) => unsafe { std::env::set_var("PATH", value) },
+                None => unsafe { std::env::remove_var("PATH") },
+            }
+            for (key, value) in [
+                ("DARK_FACTORY_AO_RECOVERY_COOLDOWN_MS", self.old_cooldown.take()),
+                ("DARK_FACTORY_AO_RECOVERY_TIMEOUT_MS", self.old_timeout.take()),
+                ("DARK_FACTORY_AO_RECOVERY_POLL_MS", self.old_poll.take()),
+                ("DARK_FACTORY_AO_RECOVERY_SUSTAIN_MS", self.old_sustain.take()),
+                ("DARK_FACTORY_AO_CONTROLLER_HOME", self.old_controller_home.take()),
+                ("DARK_FACTORY_OPERATOR_HOME", self.old_operator_home.take()),
+                ("DARK_FACTORY_AO_CONFIG_PATH", self.old_config_path.take()),
+                ("AO_CONFIG_PATH", self.old_ao_config_path.take()),
+            ] {
+                match value {
+                    Some(value) => unsafe { std::env::set_var(key, value) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn join_bounded<T: Send + 'static>(
+        handle: std::thread::JoinHandle<T>, timeout: Duration
+    ) -> T {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(handle.join().expect("recovery thread panicked"));
+        });
+        rx.recv_timeout(timeout).expect("AO recovery exceeded bound")
+    }
+
+    #[test]
+    #[ignore]
+    fn ao_recovery_process_helper() {
+        if std::env::var("DARK_FACTORY_AO_RECOVERY_PROCESS_HELPER").as_deref() != Ok("1") {
+            return;
+        }
+        let outcome = ensure_ao_recovery("dark-factory");
+        assert!(matches!(
+            outcome,
+            daemon::adapters::RecoveryOutcome::Healthy { .. }
+                | daemon::adapters::RecoveryOutcome::Restarted { .. }
+        ), "subprocess recovery failed: {outcome:?}");
+    }
+
+    #[test]
+    fn two_processes_elect_exactly_one_controller_start() {
+        let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fake = FakeAo::new("two_process", 0, 150);
+        let stale_lock = fake.root.join("controller/recovery.lock");
+        std::fs::create_dir_all(stale_lock.parent().unwrap()).unwrap();
+        std::fs::write(
+            &stale_lock,
+            r#"{"pid":99999999,"process_start_ticks":1,"project":"dark-factory"}"#,
+        )
+        .unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let spawn_helper = || {
+            std::process::Command::new(&executable)
+                .args([
+                    "--exact",
+                    "ao_recovery_contract::ao_recovery_process_helper",
+                    "--ignored",
+                    "--test-threads=1",
+                ])
+                .env("DARK_FACTORY_AO_RECOVERY_PROCESS_HELPER", "1")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        let first = spawn_helper();
+        std::thread::sleep(Duration::from_millis(20));
+        let second = spawn_helper();
+        let first = first.wait_with_output().unwrap();
+        let second = second.wait_with_output().unwrap();
+        assert!(first.status.success(), "first helper failed: {}", String::from_utf8_lossy(&first.stderr));
+        assert!(second.status.success(), "second helper failed: {}", String::from_utf8_lossy(&second.stderr));
+        assert_eq!(fake.starts().len(), 1, "cross-process election launched duplicate AO controllers");
+    }
+
+    #[test]
+    fn healthy_project_skips_start_and_uses_scoped_status() {
+        let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fake = FakeAo::new("healthy", 0, 0);
+        let first = ensure_ao_recovery("dark-factory");
+        assert!(matches!(first, daemon::adapters::RecoveryOutcome::Restarted { .. }));
+        std::fs::remove_file(fake.root.join("healthy.marker")).unwrap();
+        let second = ensure_ao_recovery("dark-factory");
+        assert!(matches!(second, daemon::adapters::RecoveryOutcome::Healthy { .. }),
+            "healthy recovery failed: {second:?}");
+        assert_eq!(fake.starts().len(), 1);
+    }
+
+    #[test]
+    fn running_manifest_with_wrong_project_is_replaced() {
+        let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fake = FakeAo::new("wrong_project", 0, 0);
+        assert!(matches!(
+            ensure_ao_recovery("dark-factory"),
+            daemon::adapters::RecoveryOutcome::Restarted { .. }
+        ));
+        let running = fake.root.join("controller/.agent-orchestrator/running.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&running).unwrap()).unwrap();
+        value["projects"] = serde_json::json!(["other-project"]);
+        std::fs::write(&running, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(matches!(
+            ensure_ao_recovery("dark-factory"),
+            daemon::adapters::RecoveryOutcome::Restarted { .. }
+        ));
+        assert_eq!(fake.starts().len(), 2);
+    }
+
+    #[test]
+    fn inherited_personal_claude_profile_is_not_forwarded() {
+        let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fake = FakeAo::new("claude_profile", 0, 0);
+        let personal = fake.root.join("personal-claude").to_string_lossy().into_owned();
+        let _guard = EnvVarGuard::set(&[("CLAUDE_CONFIG_DIR", &personal)]);
+        assert!(matches!(
+            ensure_ao_recovery("dark-factory"),
+            daemon::adapters::RecoveryOutcome::Restarted { .. }
+        ));
+        assert_eq!(
+            fake.start_env()["CLAUDE_CONFIG_DIR"].as_str(),
+            Some(fake.root.join("operator/.claude-wa").to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn explicit_factory_claude_profile_override_is_forwarded() {
+        let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fake = FakeAo::new("claude_profile_override", 0, 0);
+        let expected = fake.root.join("factory-claude").to_string_lossy().into_owned();
+        let _guard = EnvVarGuard::set(&[("DARK_FACTORY_CLAUDE_CONFIG_DIR", &expected)]);
+        assert!(matches!(
+            ensure_ao_recovery("dark-factory"),
+            daemon::adapters::RecoveryOutcome::Restarted { .. }
+        ));
+        assert_eq!(
+            fake.start_env()["CLAUDE_CONFIG_DIR"].as_str(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn empty_status_starts_exact_v013_argv_and_reprobes() {
+        let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fake = FakeAo::new("empty", 0, 0);
+        let result = ensure_ao_recovery("dark-factory");
+        assert!(matches!(result, daemon::adapters::RecoveryOutcome::Restarted { .. }),
+            "empty status should recover: {result:?}");
+        assert_eq!(fake.starts(), vec![vec![
+            "start".to_string(), "dark-factory".to_string(),
+            "--no-dashboard".to_string(), "--no-open".to_string(),
+        ]]);
+        assert!(fake.root.join("controller/controller.json").is_file());
+    }
+
+    #[test]
+    fn concurrent_callers_elect_one_starter_with_bounded_completion() {
+        let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fake = FakeAo::new("concurrent", 0, 150);
+        let project = "dark-factory".to_owned();
+        let p1 = project.clone();
+        let first = std::thread::spawn(move || ensure_ao_recovery(&p1));
+        std::thread::sleep(Duration::from_millis(25));
+        let p2 = project.clone();
+        let second = std::thread::spawn(move || ensure_ao_recovery(&p2));
+        let a = join_bounded(first, Duration::from_secs(5));
+        let b = join_bounded(second, Duration::from_secs(5));
+        assert!(matches!(a, daemon::adapters::RecoveryOutcome::Restarted { .. }),
+            "starter failed: {a:?}");
+        assert!(matches!(
+            b,
+            daemon::adapters::RecoveryOutcome::Restarted { .. }
+                | daemon::adapters::RecoveryOutcome::Healthy { .. }
+        ),
+            "waiter failed: {b:?}");
+        assert_eq!(fake.starts().len(), 1);
+    }
+
+    #[test]
+    fn failed_start_releases_waiter_without_duplicate_start() {
+        let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fake = FakeAo::new("failure", 7, 100);
+        // A failed attempt must not permanently poison the per-project
+        // recovery slot. A later caller is allowed to retry.
+        let first = ensure_ao_recovery("dark-factory");
+        let second = ensure_ao_recovery("dark-factory");
+        assert!(matches!(first, daemon::adapters::RecoveryOutcome::FailClosed { .. }),
+            "failure must propagate: {first:?}");
+        assert!(matches!(second, daemon::adapters::RecoveryOutcome::FailClosed { .. }),
+            "retry failure must propagate: {second:?}");
+        assert_eq!(fake.starts().len(), 2, "a later caller must be able to retry");
+    }
+
+    #[test]
+    fn recovery_returns_within_bound_after_short_detached_start() {
+        let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fake = FakeAo::new("bounded", 0, 25);
+        let began = Instant::now();
+        let result = ensure_ao_recovery("dark-factory");
+        assert!(began.elapsed() < Duration::from_secs(3));
+        assert!(matches!(result, daemon::adapters::RecoveryOutcome::Restarted { .. }),
+            "bounded recovery failed: {result:?}");
+        assert_eq!(fake.starts().len(), 1);
+    }
+
+    #[test]
+    fn controller_that_never_becomes_ready_is_bounded_and_reaped() {
+        let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fake = FakeAo::new("never_ready", 0, 5_000);
+        let began = Instant::now();
+        let result = ensure_ao_recovery("dark-factory");
+        assert!(began.elapsed() < Duration::from_secs(3));
+        assert!(matches!(
+            result,
+            daemon::adapters::RecoveryOutcome::FailClosed { .. }
+        ));
+        let pid = std::fs::read_to_string(fake.root.join("start.pid"))
+            .expect("fake start pid")
+            .trim()
+            .to_string();
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "timed-out AO startup scope was not reaped (pid {pid})"
+        );
+        assert_eq!(fake.starts().len(), 1);
+    }
+
+    #[test]
+    fn status_counter_survives_process_boundaries() {
+        let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fake = FakeAo::new("counter", 0, 0);
+        let ao = fake.root.join("ao");
+        for _ in 0..2 {
+            assert!(std::process::Command::new(&ao)
+                .args(["status", "-p", "dark-factory", "--json"])
+                .output().unwrap().status.success());
+        }
+        assert_eq!(std::fs::read_to_string(fake.root.join("status.count"))
+            .unwrap().trim(), "2");
+    }
+
+    #[test]
+    fn missing_ao_with_empty_only_path_does_not_trigger_start() {
+        let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "df_ao_missing_{}_{}", std::process::id(),
+            Instant::now().elapsed().as_nanos()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root_string = root.to_string_lossy().into_owned();
+        let controller = root.join("controller").to_string_lossy().into_owned();
+        let operator = root.join("operator").to_string_lossy().into_owned();
+        let config = root.join("agent-orchestrator.yaml").to_string_lossy().into_owned();
+        let _guard = EnvVarGuard::set(&[
+            ("PATH", &root_string),
+            ("DARK_FACTORY_AO_CONTROLLER_HOME", &controller),
+            ("DARK_FACTORY_OPERATOR_HOME", &operator),
+            ("DARK_FACTORY_AO_CONFIG_PATH", &config),
+        ]);
+        let result = ensure_ao_recovery("dark-factory");
+        assert!(matches!(result, daemon::adapters::RecoveryOutcome::Unknown { .. }));
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

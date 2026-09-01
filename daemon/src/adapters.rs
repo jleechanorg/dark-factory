@@ -1,5 +1,5 @@
 use crate::errors::{DaemonError, SpawnBatchCleanupFailure};
-use crate::tools::{run_tool, run_tool_in_dir, Bead, Issue, LabeledPr, Llm, Permission, PrHeadBranch, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs, WorktreeHeadAncestry};
+use crate::tools::{run_tool, run_tool_in_dir, run_tool_with_env, Bead, Issue, LabeledPr, Llm, Permission, PrHeadBranch, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs, WorktreeHeadAncestry};
 use std::process::{Command, Stdio};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -2924,6 +2924,494 @@ fn ao_spawn_bridge_path() -> std::path::PathBuf {
         .join("ao-spawn-v013-bridge.mjs")
 }
 
+/// Result of the bounded, project-scoped AO controller readiness check.
+///
+/// `Healthy` means the factory manifest's PID/start-time/project binding
+/// matches AO's private `running.json`. `Restarted` means this process elected
+/// and started a dedicated controller, then observed that binding survive the
+/// configured sustain interval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryOutcome {
+    Healthy { evidence: String },
+    Restarted { evidence: String },
+    FailClosed { error: String },
+    Unknown { error: String },
+}
+
+#[derive(Debug)]
+enum AoReadiness {
+    Ready(String),
+    Unavailable,
+    Unknown(String),
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct AoControllerManifest {
+    pid: u32,
+    process_start_ticks: u64,
+    project: String,
+    target: String,
+}
+
+struct AoRecoveryFileLock {
+    _file: std::fs::File,
+}
+
+#[derive(Default)]
+struct AoRecoverySlot {
+    last_failed_attempt: Option<Instant>,
+}
+
+static AO_RECOVERY_SLOTS: std::sync::OnceLock<
+    Mutex<HashMap<String, Arc<Mutex<AoRecoverySlot>>>>,
+> = std::sync::OnceLock::new();
+
+fn ao_recovery_slot(project: &str) -> Arc<Mutex<AoRecoverySlot>> {
+    let slots = AO_RECOVERY_SLOTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut slots = slots
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    slots
+        .entry(project.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(AoRecoverySlot::default())))
+        .clone()
+}
+
+fn recovery_duration_ms(name: &str, default_ms: u64) -> Duration {
+    Duration::from_millis(
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(default_ms),
+    )
+}
+
+fn safe_project_component(project: &str) -> String {
+    project
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') { ch } else { '_' })
+        .collect()
+}
+
+fn ao_controller_home(project: &str) -> Result<std::path::PathBuf, String> {
+    let operator_home = std::env::var("DARK_FACTORY_OPERATOR_HOME")
+        .or_else(|_| std::env::var("AO_ORIGINAL_HOME"))
+        .or_else(|_| std::env::var("HOME"))
+        .map_err(|_| "HOME/AO_ORIGINAL_HOME is unavailable".to_string())?;
+    Ok(std::env::var("DARK_FACTORY_AO_CONTROLLER_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::Path::new(&operator_home)
+                .join(".local/state/dark-factory/ao-controller")
+                .join(safe_project_component(project))
+        }))
+}
+
+/// Give the factory-owned AO controller a private running-state namespace.
+/// AO 0.1.3 stores `running.json` under `os.homedir()` and cannot attach a
+/// configured project to a different already-running process. A private HOME
+/// therefore avoids disrupting an operator/shared AO instance while the
+/// explicit config and original-home variables preserve the real project,
+/// credentials, and agent configuration.
+fn ao_controller_env(project: &str) -> Result<Vec<(String, String)>, String> {
+    let operator_home = std::env::var("DARK_FACTORY_OPERATOR_HOME")
+        .or_else(|_| std::env::var("AO_ORIGINAL_HOME"))
+        .or_else(|_| std::env::var("HOME"))
+        .map_err(|_| "HOME/AO_ORIGINAL_HOME is unavailable".to_string())?;
+    let controller_home = ao_controller_home(project)?;
+    std::fs::create_dir_all(&controller_home).map_err(|error| {
+        format!(
+            "failed to create AO controller state home {}: {error}",
+            controller_home.display()
+        )
+    })?;
+    let config_path = std::env::var("DARK_FACTORY_AO_CONFIG_PATH")
+        .or_else(|_| std::env::var("AO_CONFIG_PATH"))
+        .unwrap_or_else(|_| format!("{operator_home}/agent-orchestrator.yaml"));
+
+    Ok(vec![
+        ("HOME".to_string(), controller_home.to_string_lossy().into_owned()),
+        ("AO_ORIGINAL_HOME".to_string(), operator_home.clone()),
+        ("AO_CONFIG_PATH".to_string(), config_path),
+        (
+            "GH_CONFIG_DIR".to_string(),
+            std::env::var("GH_CONFIG_DIR")
+                .unwrap_or_else(|_| format!("{operator_home}/.config/gh")),
+        ),
+        (
+            "GIT_CONFIG_GLOBAL".to_string(),
+            std::env::var("GIT_CONFIG_GLOBAL")
+                .unwrap_or_else(|_| format!("{operator_home}/.gitconfig")),
+        ),
+        // Never let a factory-owned fallback silently select the personal
+        // default Claude profile. Explicit service configuration still wins.
+        (
+            "CLAUDE_CONFIG_DIR".to_string(),
+            std::env::var("DARK_FACTORY_CLAUDE_CONFIG_DIR")
+                .unwrap_or_else(|_| format!("{operator_home}/.claude-wa")),
+        ),
+    ])
+}
+
+fn apply_ao_controller_env(command: &mut Command, project: &str) -> Result<(), String> {
+    for (key, value) in ao_controller_env(project)? {
+        command.env(key, value);
+    }
+    Ok(())
+}
+
+fn run_ao_tool(project: &str, args: &[&str], timeout_secs: u64) -> Result<String, DaemonError> {
+    let values = ao_controller_env(project).map_err(DaemonError::Config)?;
+    let refs: Vec<(&str, &str)> = values
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    run_tool_with_env("ao", args, &refs, timeout_secs)
+}
+
+fn process_start_ticks(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Field 2 is parenthesized and may contain spaces. Everything after its
+    // final ')' begins at field 3, so starttime (field 22) is index 19 there.
+    stat.rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+fn acquire_ao_recovery_file_lock(project: &str) -> Result<AoRecoveryFileLock, String> {
+    use std::os::fd::AsRawFd;
+    use std::io::Write;
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    let home = ao_controller_home(project)?;
+    std::fs::create_dir_all(&home)
+        .map_err(|error| format!("failed to create {}: {error}", home.display()))?;
+    let path = home.join("recovery.lock");
+    let pid = std::process::id();
+    let start_ticks = process_start_ticks(pid).ok_or_else(|| {
+        format!("could not read recovery owner process start time for pid {pid}")
+    })?;
+    let token = serde_json::to_vec(&serde_json::json!({
+        "pid": pid,
+        "process_start_ticks": start_ticks,
+        "project": project,
+    }))
+    .map_err(|error| error.to_string())?;
+    let deadline = Instant::now()
+        + recovery_duration_ms("DARK_FACTORY_AO_RECOVERY_LOCK_TIMEOUT_MS", 20_000);
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
+    loop {
+        if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+            file.set_len(0)
+                .and_then(|_| file.write_all(&token))
+                .and_then(|_| file.sync_all())
+                .map_err(|error| format!("failed to initialize {}: {error}", path.display()))?;
+            return Ok(AoRecoveryFileLock { _file: file });
+        }
+        let error = std::io::Error::last_os_error();
+        if !matches!(error.kind(), std::io::ErrorKind::WouldBlock) {
+            return Err(format!("failed to lock {}: {error}", path.display()));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for AO recovery election lock {}",
+                path.display()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn controller_manifest_path(project: &str) -> Result<std::path::PathBuf, String> {
+    Ok(ao_controller_home(project)?.join("controller.json"))
+}
+
+fn write_controller_manifest(
+    project: &str,
+    target: &str,
+    child: &std::process::Child,
+) -> Result<(), String> {
+    let path = controller_manifest_path(project)?;
+    let start_ticks = process_start_ticks(child.id())
+        .ok_or_else(|| format!("could not read process start time for AO pid {}", child.id()))?;
+    let manifest = AoControllerManifest {
+        pid: child.id(),
+        process_start_ticks: start_ticks,
+        project: project.to_string(),
+        target: target.to_string(),
+    };
+    let temp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    std::fs::write(
+        &temp,
+        serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("failed to write {}: {error}", temp.display()))?;
+    std::fs::rename(&temp, &path)
+        .map_err(|error| format!("failed to install {}: {error}", path.display()))
+}
+
+fn read_controller_manifest(project: &str) -> Result<Option<AoControllerManifest>, String> {
+    let path = controller_manifest_path(project)?;
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| format!("invalid {}: {error}", path.display()))
+}
+
+fn probe_ao_project(project: &str) -> AoReadiness {
+    let manifest = match read_controller_manifest(project) {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => return AoReadiness::Unavailable,
+        Err(error) => return AoReadiness::Unknown(error),
+    };
+    if manifest.project != project
+        || process_start_ticks(manifest.pid) != Some(manifest.process_start_ticks)
+    {
+        return AoReadiness::Unavailable;
+    }
+    let running_path = match ao_controller_home(project) {
+        Ok(home) => home.join(".agent-orchestrator/running.json"),
+        Err(error) => return AoReadiness::Unknown(error),
+    };
+    let running: serde_json::Value = match std::fs::read(&running_path)
+        .map_err(|error| error.to_string())
+        .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|error| error.to_string()))
+    {
+        Ok(value) => value,
+        Err(_) => return AoReadiness::Unavailable,
+    };
+    let same_pid = running.get("pid").and_then(serde_json::Value::as_u64)
+        == Some(manifest.pid as u64);
+    let has_project = running
+        .get("projects")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|projects| projects.iter().any(|value| value.as_str() == Some(project)));
+    if same_pid && has_project {
+        AoReadiness::Ready(format!(
+            "project={project} controller_pid={} start_ticks={}",
+            manifest.pid, manifest.process_start_ticks
+        ))
+    } else {
+        AoReadiness::Unavailable
+    }
+}
+
+#[cfg(unix)]
+fn kill_controller_scope(child: &mut std::process::Child) {
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    // The child is placed in its own process group below, so a negative pid
+    // reaps only the startup scope owned by this recovery attempt.
+    unsafe {
+        let _ = kill(-(child.id() as i32), 9);
+    }
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn reap_owned_controller(project: &str) -> Result<(), String> {
+    let Some(manifest) = read_controller_manifest(project)? else {
+        return Ok(());
+    };
+    if process_start_ticks(manifest.pid) == Some(manifest.process_start_ticks) {
+        unsafe extern "C" {
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
+        unsafe {
+            let _ = kill(-(manifest.pid as i32), 15);
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while process_start_ticks(manifest.pid) == Some(manifest.process_start_ticks)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if process_start_ticks(manifest.pid) == Some(manifest.process_start_ticks) {
+            unsafe {
+                let _ = kill(-(manifest.pid as i32), 9);
+            }
+        }
+    }
+    let _ = std::fs::remove_file(controller_manifest_path(project)?);
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn reap_owned_controller(project: &str) -> Result<(), String> {
+    let _ = std::fs::remove_file(controller_manifest_path(project)?);
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn kill_controller_scope(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Ensure AO is persistently polling `project`, without touching a shared AO
+/// instance. The elected caller starts one detached, factory-owned controller
+/// and polls a project-scoped ready condition for a bounded interval.
+fn ensure_ao_recovery_for_target(project: &str, target: &str) -> RecoveryOutcome {
+    let slot = ao_recovery_slot(project);
+    let mut slot = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _election = match acquire_ao_recovery_file_lock(project) {
+        Ok(lock) => lock,
+        Err(error) => return RecoveryOutcome::FailClosed { error },
+    };
+
+    match probe_ao_project(project) {
+        AoReadiness::Ready(evidence) => return RecoveryOutcome::Healthy { evidence },
+        AoReadiness::Unknown(error) => return RecoveryOutcome::Unknown { error },
+        AoReadiness::Unavailable => {}
+    }
+
+    let cooldown = recovery_duration_ms("DARK_FACTORY_AO_RECOVERY_COOLDOWN_MS", 30_000);
+    if slot
+        .last_failed_attempt
+        .is_some_and(|last| last.elapsed() < cooldown)
+    {
+        return RecoveryOutcome::FailClosed {
+            error: format!(
+                "AO controller recovery for project {project} is in its cooldown window"
+            ),
+        };
+    }
+
+
+    if let Err(error) = reap_owned_controller(project) {
+        slot.last_failed_attempt = Some(Instant::now());
+        return RecoveryOutcome::Unknown { error };
+    }
+
+    let mut command = Command::new("ao");
+    command
+        .args(["start", target, "--no-dashboard", "--no-open"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Err(error) = apply_ao_controller_env(&mut command, project) {
+        slot.last_failed_attempt = Some(Instant::now());
+        return RecoveryOutcome::Unknown { error };
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            slot.last_failed_attempt = Some(Instant::now());
+            return RecoveryOutcome::Unknown {
+                error: format!("ao start execution failed: {error}"),
+            };
+        }
+    };
+    if let Err(error) = write_controller_manifest(project, target, &child) {
+        kill_controller_scope(&mut child);
+        slot.last_failed_attempt = Some(Instant::now());
+        return RecoveryOutcome::Unknown { error };
+    }
+
+    let timeout = recovery_duration_ms("DARK_FACTORY_AO_RECOVERY_TIMEOUT_MS", 15_000);
+    let poll = recovery_duration_ms("DARK_FACTORY_AO_RECOVERY_POLL_MS", 250);
+    let sustain = recovery_duration_ms("DARK_FACTORY_AO_RECOVERY_SUSTAIN_MS", 1_000);
+    let deadline = Instant::now() + timeout;
+    loop {
+        match probe_ao_project(project) {
+            AoReadiness::Ready(evidence) => {
+                // Require the PID/start-time/project binding to survive a
+                // sustain interval so a one-sample startup flash cannot
+                // release dispatch.
+                std::thread::sleep(sustain);
+                if matches!(probe_ao_project(project), AoReadiness::Ready(_)) {
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                    slot.last_failed_attempt = None;
+                    return RecoveryOutcome::Restarted { evidence };
+                }
+            }
+            AoReadiness::Unknown(error) => {
+                kill_controller_scope(&mut child);
+                let _ = std::fs::remove_file(controller_manifest_path(project).unwrap_or_default());
+                slot.last_failed_attempt = Some(Instant::now());
+                return RecoveryOutcome::Unknown { error };
+            }
+            AoReadiness::Unavailable => {}
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                slot.last_failed_attempt = Some(Instant::now());
+                return RecoveryOutcome::FailClosed {
+                    error: format!(
+                        "AO controller for project {project} exited before readiness: {status}"
+                    ),
+                };
+            }
+            Err(error) => {
+                kill_controller_scope(&mut child);
+                let _ = std::fs::remove_file(controller_manifest_path(project).unwrap_or_default());
+                slot.last_failed_attempt = Some(Instant::now());
+                return RecoveryOutcome::Unknown {
+                    error: format!("failed to inspect AO controller process: {error}"),
+                };
+            }
+            Ok(None) => {}
+        }
+        if Instant::now() >= deadline {
+            kill_controller_scope(&mut child);
+            let _ = std::fs::remove_file(controller_manifest_path(project).unwrap_or_default());
+            slot.last_failed_attempt = Some(Instant::now());
+            return RecoveryOutcome::FailClosed {
+                error: format!(
+                    "AO controller for project {project} did not become ready within {}ms",
+                    timeout.as_millis()
+                ),
+            };
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+pub fn ensure_ao_recovery(project: &str) -> RecoveryOutcome {
+    ensure_ao_recovery_for_target(project, project)
+}
+
+/// Result-shaped facade used at dispatch boundaries and by integration
+/// contract tests. `target` is the exact AO `start` positional target (project
+/// id, configured path, or repository URL); readiness remains scoped to the
+/// canonical `project` id.
+pub fn ensure_ao_project_recovered(project: &str, target: &str) -> Result<(), DaemonError> {
+    match ensure_ao_recovery_for_target(project, target) {
+        RecoveryOutcome::Healthy { .. } | RecoveryOutcome::Restarted { .. } => Ok(()),
+        RecoveryOutcome::FailClosed { error } | RecoveryOutcome::Unknown { error } => {
+            Err(DaemonError::Deferred(format!(
+                "AO controller readiness unresolved for project {project}: {error}"
+            )))
+        }
+    }
+}
+
 fn ao_spawn_command_with_mode(
     agent: &str,
     spec: &SpawnSpec,
@@ -2956,6 +3444,7 @@ fn ao_spawn_command_with_mode(
     } else {
         Command::new("ao")
     };
+    apply_ao_controller_env(&mut cmd, &spec.ao_project).map_err(DaemonError::Config)?;
 
     // Bind every worker spawn to its routed target checkout. Without this, AO
     // inherits the daemon process cwd (normally the dark-factory checkout),
@@ -3348,7 +3837,7 @@ impl CliSessions {
             }
         };
         if let Some(spawn_error) = spawn_error {
-            return match run_tool("ao", &["session", "kill", &session.0], 30) {
+            return match run_ao_tool(&spec.ao_project, &["session", "kill", &session.0], 30) {
                 Ok(_) => Err(spawn_error),
                 Err(cleanup_error) => Err(DaemonError::SpawnCleanupFailed {
                     session: session.0,
@@ -6308,7 +6797,7 @@ export const isTerminalSession = () => false;
 
 impl Sessions for CliSessions {
     fn active_count(&self) -> Result<usize, DaemonError> {
-        let out = run_tool("ao", &["status", "-p", &self.project, "--json"], 30)?;
+        let out = run_ao_tool(&self.project, &["status", "-p", &self.project, "--json"], 30)?;
         let json_start = out.find('[').unwrap_or(0);
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
@@ -6317,6 +6806,15 @@ impl Sessions for CliSessions {
     }
 
     fn spawn(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
+        match ensure_ao_recovery(&spec.ao_project) {
+            RecoveryOutcome::Healthy { .. } | RecoveryOutcome::Restarted { .. } => {}
+            RecoveryOutcome::FailClosed { error } | RecoveryOutcome::Unknown { error } => {
+                return Err(DaemonError::Deferred(format!(
+                    "AO controller readiness unresolved for project {}: {error}",
+                    spec.ao_project
+                )));
+            }
+        }
         self.spawn_with_fallback(spec)
     }
 
@@ -6329,7 +6827,7 @@ impl Sessions for CliSessions {
         // admission, fallback, workspace, and error semantics.
         let mut spawned = Vec::with_capacity(specs.len());
         for spec in specs {
-            match self.spawn_with_fallback(spec) {
+            match self.spawn(spec) {
                 Ok(session) => spawned.push((session, spec)),
                 Err(spawn_error) => {
                     let mut cleanup_errors = Vec::new();
@@ -6392,7 +6890,11 @@ impl Sessions for CliSessions {
         bead_id: &str,
         timeout_secs: u64,
     ) -> Result<SessionId, DaemonError> {
-        let out = run_tool("ao", &["status", "-p", &self.project, "--json"], timeout_secs)?;
+        let out = run_ao_tool(
+            &self.project,
+            &["status", "-p", &self.project, "--json"],
+            timeout_secs,
+        )?;
         let json_start = out.find('[').unwrap_or(0);
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
@@ -6401,12 +6903,12 @@ impl Sessions for CliSessions {
     }
 
     fn stop(&self, id: &SessionId) -> Result<(), DaemonError> {
-        run_tool("ao", &["session", "kill", &id.0], 30)?;
+        run_ao_tool(&self.project, &["session", "kill", &id.0], 30)?;
         Ok(())
     }
 
     fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError> {
-        let out = run_tool("ao", &["status", "-p", &self.project, "--json"], 30)?;
+        let out = run_ao_tool(&self.project, &["status", "-p", &self.project, "--json"], 30)?;
         let json_start = out.find('[').unwrap_or(0);
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
@@ -6434,7 +6936,11 @@ impl Sessions for CliSessions {
         id: &SessionId,
         timeout_secs: u64,
     ) -> Result<crate::tools::SessionActivity, DaemonError> {
-        let out = run_tool("ao", &["status", "-p", &self.project, "--json"], timeout_secs)?;
+        let out = run_ao_tool(
+            &self.project,
+            &["status", "-p", &self.project, "--json"],
+            timeout_secs,
+        )?;
         let json_start = out.find('[').unwrap_or(0);
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
@@ -6459,7 +6965,11 @@ impl Sessions for CliSessions {
     /// callers only ever reject a dispatch on a *positive* mismatch, never
     /// on an inability to check.
     fn session_branch(&self, id: &SessionId) -> Result<Option<String>, DaemonError> {
-        let out = match run_tool("ao", &["status", "-p", &self.project, "--json"], 30) {
+        let out = match run_ao_tool(
+            &self.project,
+            &["status", "-p", &self.project, "--json"],
+            30,
+        ) {
             Ok(o) => o,
             Err(_) => return Ok(None),
         };
