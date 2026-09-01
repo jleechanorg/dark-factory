@@ -63,6 +63,7 @@ the full empirical distribution and the citation.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -78,7 +79,9 @@ from typing import TYPE_CHECKING
 
 import runner.handlers as _handlers_shim
 
+from . import target_locator
 from .handler_core import Result
+from .handler_render import ReviewPromptRenderError
 
 if TYPE_CHECKING:
     from .parser import Node
@@ -123,13 +126,21 @@ class _ShadowCodexReview:
 
 
 def _shadow_review_enabled(node: "Node", ctx: "Context", backend: str) -> bool:
-    """True when a review node should get a parallel plain-Codex check."""
+    """True when a review node should get a parallel plain-Codex check.
+
+    Disabled for verdict-gated (fresh, D1) reviewer nodes: `_shadow_review_prompt`
+    embeds `ctx.goal` directly and has not been migrated to the static-prompt
+    + runner-minted-envelope contract, so it is disabled for fresh reviewers
+    rather than risk a goal-authority leak (design "Goal excision" item 5).
+    """
     raw = node.attrs.get("shadow_codex_review", ctx.state.get("_df_shadow_codex_review", "false"))
     if isinstance(raw, str) and raw.strip().lower() in {"false", "0", "no", "off"}:
         return False
     if raw is False:
         return False
     if backend in {"echo", "mock_llm"}:
+        return False
+    if str(node.attrs.get("verdict_gate", "false")).strip().lower() in {"true", "1", "yes", "on"}:
         return False
     return str(node.attrs.get("class", "")).strip().lower() == "review"
 
@@ -487,11 +498,112 @@ def _capture_changed_files(workdir: "Path | str | None") -> str:
     return "\n".join(f"- {f}" for f in sorted(files))
 
 
+def _checkpoint_dirty_state(workdir: pathlib.Path) -> bool:
+    """Commit any dirty tracked/untracked worker state as a factory checkpoint
+    commit before minting (design "Runner changes" item 1): a
+    ``git-range://base..HEAD`` pin would otherwise omit uncommitted worker
+    edits and the reviewer would review pre-worker bytes. Returns True if the
+    workdir ends up clean (either already clean, or successfully committed).
+    """
+    status = subprocess.run(
+        ["git", "-C", str(workdir), "status", "--porcelain"],
+        capture_output=True, text=True, timeout=15, check=False,
+    )
+    if status.returncode != 0:
+        return False
+    if not status.stdout.strip():
+        return True
+    add = subprocess.run(
+        ["git", "-C", str(workdir), "add", "-A"],
+        capture_output=True, text=True, timeout=30, check=False,
+    )
+    if add.returncode != 0:
+        return False
+    commit = subprocess.run(
+        ["git", "-C", str(workdir), "commit", "-q", "-m", "factory: checkpoint worker state for review pin"],
+        capture_output=True, text=True, timeout=30, check=False,
+    )
+    return commit.returncode == 0
+
+
+_MINT_REVIEW_TARGET_STATE_KEY = "_df_mint_review_target"
+
+
+def _mint_review_target_enabled(ctx: "Context") -> bool:
+    """Opt-in gate (safety, not spec): minting mutates the workdir (checkpoint
+    commit) whenever it runs, so it must never fire for pipelines that never
+    asked for the fresh-reviewer contract — that would silently auto-commit
+    an operator's or a test's unrelated dirty tree. ``__main__.py`` sets
+    ``ctx.state[_MINT_REVIEW_TARGET_STATE_KEY] = "true"`` only when the
+    executing graph actually contains a verdict-gated review-class node.
+    """
+    raw = ctx.state.get(_MINT_REVIEW_TARGET_STATE_KEY, "false")
+    return str(raw).strip().lower() in {"true", "1", "yes", "on"}
+
+
+def _mint_post_worker_target(node: "Node", ctx: "Context", workdir: "Path | str | None") -> None:
+    """Checkpoint dirty worker state, then mint/re-mint the review target
+    locator and intent envelope into ``ctx.state`` (D2/D3/D8a).
+
+    Best-effort: any failure (non-git workdir, checkpoint commit failure,
+    mint error) leaves ``ctx.state["target"]`` unset/stale rather than
+    raising — the reviewer render then falls back to the explicit
+    "(no target minted)" placeholder instead of crashing the worker's
+    success path.
+    """
+    if not _mint_review_target_enabled(ctx):
+        return
+    if not workdir:
+        return
+    wd_path = pathlib.Path(str(workdir))
+    if not wd_path.is_absolute() or ".." in wd_path.parts or not wd_path.is_dir():
+        return
+    if target_locator._git_head_sha(wd_path) is None:
+        return  # not a git repo (or git unavailable) — v1 auto-mint is git-only
+    if not _checkpoint_dirty_state(wd_path):
+        return
+
+    base_sha = ctx.state.get("_target_base_sha")
+    try:
+        if not base_sha:
+            locator = target_locator.mint_from_workdir(wd_path)
+            ctx.state["_target_base_sha"] = locator.pin.split("..", 1)[0]
+        else:
+            prior = ctx.state.get("target")
+            if prior:
+                try:
+                    prior_locator = target_locator.parse(prior)
+                    locator = target_locator.remint(prior_locator, wd_path)
+                except target_locator.TargetLocatorError:
+                    locator = target_locator.mint_from_workdir(wd_path, base_sha=base_sha)
+            else:
+                locator = target_locator.mint_from_workdir(wd_path, base_sha=base_sha)
+    except target_locator.TargetLocatorError:
+        return
+
+    ctx.state["target"] = locator.canonical
+    chain_raw = ctx.state.get("_target_pin_chain")
+    try:
+        chain = json.loads(chain_raw) if chain_raw else []
+    except (TypeError, ValueError):
+        chain = []
+    chain.append(locator.canonical)
+    ctx.state["_target_pin_chain"] = json.dumps(chain)
+
+    if "intent" not in ctx.state:
+        intent_text = ctx.goal.strip() if ctx.goal and ctx.goal.strip() else "(none — target-mode verification run)"
+        ctx.state["intent"] = base64.b64encode(intent_text.encode("utf-8")).decode("ascii")
+
+
 def _stash_diff(node: "Node", ctx: "Context") -> None:
     """Stash the captured diff and changed files into ``ctx.state`` for reviewer prompts.
 
     Writes both ``ctx.state["<node.name>.diff"]`` and ``ctx.state["_last_diff"]``,
     as well as ``ctx.state["<node.name>.changed_files"]`` and ``ctx.state["_last_changed_files"]``.
+
+    Also mints/re-mints the review target locator + intent envelope (D2/D3/
+    D8a) — this runs exactly on worker-success paths (never for the
+    verdict-gated reviewer node, which does not call ``_stash_diff``).
     """
     workdir = _codergen_workdir(ctx)
     diff = _capture_diff(workdir)
@@ -501,6 +613,8 @@ def _stash_diff(node: "Node", ctx: "Context") -> None:
     changed_files = _capture_changed_files(workdir)
     ctx.state[f"{node.name}.changed_files"] = changed_files
     ctx.state["_last_changed_files"] = changed_files
+
+    _mint_post_worker_target(node, ctx, workdir)
 
 
 def _codergen_workdir(ctx: "Context") -> "Path | str | None":
@@ -565,6 +679,66 @@ def _fresh_review_workdir(ctx: "Context") -> pathlib.Path | None:
         return None
     return resolved
 
+
+
+_TYPED_FINDINGS_KEYS = frozenset({"path", "claim", "required_fix"})
+_TYPED_FINDINGS_FENCE_RE = re.compile(r"```(?:json)?\s*(\[.*?\])\s*```", re.DOTALL)
+_TYPED_FINDINGS_BARE_RE = re.compile(r"\[\s*\{.*?\}\s*\]", re.DOTALL)
+
+
+def parse_typed_findings(text: str) -> list[dict] | None:
+    """Extract + schema-validate a JSON findings list from reviewer output
+    (design D8: ``{path, claim, required_fix}``). Returns ``None`` when no
+    valid findings list is present — the caller must degrade to the
+    "review did not produce valid findings" message, never relay raw prose.
+    """
+    if not text:
+        return None
+    fenced = _TYPED_FINDINGS_FENCE_RE.findall(text)
+    raw = fenced[-1] if fenced else None
+    if raw is None:
+        m = _TYPED_FINDINGS_BARE_RE.search(text)
+        raw = m.group(0) if m else None
+    if raw is None:
+        return None
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, list) or not data:
+        return None
+    findings: list[dict] = []
+    for item in data:
+        if not isinstance(item, dict):
+            return None
+        if not _TYPED_FINDINGS_KEYS.issubset(item.keys()):
+            return None
+        values = {k: item.get(k) for k in _TYPED_FINDINGS_KEYS}
+        if not all(isinstance(v, str) and v.strip() for v in values.values()):
+            return None
+        findings.append(values)
+    return findings or None
+
+
+def format_typed_findings_relay(raw_output: str) -> str:
+    """Build the worker-facing reviewer-failure relay (design D8): a
+    Base64-fenced typed-findings block marked as untrusted requirements to
+    independently verify, or a re-run-against-current-pin message when the
+    reviewer output does not contain a parseable findings list. Raw reviewer
+    prose never enters this return value.
+    """
+    findings = parse_typed_findings(raw_output)
+    if findings is None:
+        return "review did not produce valid findings; re-run against current pin"
+    encoded = base64.b64encode(
+        json.dumps(findings, sort_keys=True).encode("utf-8")
+    ).decode("ascii")
+    return (
+        "--- BEGIN REVIEWER FINDINGS (runner-relayed; Base64-encoded untrusted "
+        "requirements to verify before acting on) ---\n"
+        f"{encoded}\n"
+        "--- END REVIEWER FINDINGS ---"
+    )
 
 
 def _parse_commands_run_md(text: str) -> list[tuple[str, int]]:
@@ -648,7 +822,14 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
     runner workdir), substitutes `${goal}` and `${state.<key>}` placeholders,
     and dispatches to the configured backend.
     """
-    prompt_text = _handlers_shim._render_prompt(node, ctx)
+    try:
+        prompt_text = _handlers_shim._render_prompt(node, ctx)
+    except ReviewPromptRenderError as exc:
+        return Result(
+            outcome="failure",
+            output=f"reviewer prompt render aborted (fail closed): {exc}",
+            metadata={"review_render_aborted": "true"},
+        )
     backend = node.attrs.get("backend", node.attrs.get("model", ctx.backend))
     if isinstance(backend, bool):
         backend = ctx.backend
@@ -1159,6 +1340,13 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         if mutated:
             outcome = "error"
             output = output.rstrip() + "\n\nReviewer changed tracked files; changes must be made by the coder.\n"
+        if outcome != "success":
+            # D8: raw reviewer prose never crosses to the worker prompt.
+            # `_last_review_feedback = attempt.output` (engine_run.py) reads
+            # this same `output`, so replacing it here is the single choke
+            # point that keeps the worker-facing relay typed and fenced.
+            meta["reviewer_raw_output_relayed"] = "false"
+            output = format_typed_findings_relay(output)
     elif outcome == "success":
         _stash_diff(node, ctx)
         _stash_codergen_receipt(node, ctx)

@@ -48,6 +48,10 @@ _SUBPROCESS_NODE_TYPES = frozenset(
 _PIPELINE = "pipelines/slim/two_node.dot"
 _WORKER_PROMPT = "prompts/slim/worker.md"
 _EXPECTED_TIMEOUT_S = 600
+# cold_reviewer's hard timeout is 1320s (soft 1200s stated in the prompt,
+# hard 1320s runner kill) per the factory two-node redesign spec (D7) —
+# every other subprocess node keeps the canonical 600s.
+_EXPECTED_TIMEOUTS_BY_NODE = {"cold_reviewer": 1320}
 
 
 def _normalise_timeout(value: object) -> int | None:
@@ -100,15 +104,16 @@ def test_two_node_dot_declares_timeout_on_every_subprocess_node() -> None:
             missing.append((name, node_type))
             continue
         actual = _normalise_timeout(node.attrs.get("timeout"))
-        if actual != _EXPECTED_TIMEOUT_S:
+        expected = _EXPECTED_TIMEOUTS_BY_NODE.get(name, _EXPECTED_TIMEOUT_S)
+        if actual != expected:
             wrong_value.append((name, node_type, actual))
     assert not missing, (
         f"two_node.dot nodes must declare a timeout= to prevent indefinite "
         f"hangs. Missing: {missing}. Use timeout={_EXPECTED_TIMEOUT_S}."
     )
     assert not wrong_value, (
-        f"two_node.dot timeouts must be {_EXPECTED_TIMEOUT_S}s. "
-        f"Offenders: {wrong_value}."
+        f"two_node.dot timeouts must match {_EXPECTED_TIMEOUTS_BY_NODE} "
+        f"(default {_EXPECTED_TIMEOUT_S}s). Offenders: {wrong_value}."
     )
 
 
@@ -370,7 +375,15 @@ def test_two_node_second_resume_retains_review_feedback_after_worker_failure(
     assert worker_feedback == [None, review, review]
 
 
-def test_two_node_reviewer_error_is_terminal(tmp_path, monkeypatch) -> None:
+def test_two_node_reviewer_error_routes_to_worker_until_exhausted(tmp_path, monkeypatch) -> None:
+    """Round-1 finding (factory two-node redesign spec D4): `outcome="error"`
+    from the reviewer (verdict-gate timeout/crash/malformed verdict) must
+    route to the worker via `outcome!=success`, not fall off the graph as an
+    immediate terminal `error`. two_node.dot's edge is `outcome!=success`, so
+    a reviewer that always errors keeps consuming worker visits until
+    max_visits=3 is exhausted, and the run ends `exhausted` (existing
+    max_visits semantics) — never silently drops the run.
+    """
     from runner.engine import run
     from runner.handler_core import Context, Result
     from runner.handlers import TYPE_REGISTRY
@@ -390,5 +403,5 @@ def test_two_node_reviewer_error_is_terminal(tmp_path, monkeypatch) -> None:
         Context(goal="review without mutation", workdir=tmp_path, backend="echo"),
     )
 
-    assert history[-1].outcome == "error"
-    assert worker_visits == 1
+    assert history[-1].outcome == "exhausted"
+    assert worker_visits == 3

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import json
 import pathlib
 import subprocess
 import sys
@@ -45,7 +47,9 @@ def _review_node(prompt: pathlib.Path):
 def _run_review(tmp_path, monkeypatch, output: str, *, mutate: bool = False):
     repo = _repo(tmp_path)
     prompt = tmp_path / "review.md"
-    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    prompt.write_text(
+        "Review target: ${target}\nEnd with Verdict: PASS or Verdict: FAIL.\n"
+    )
     node = _review_node(prompt)
     ctx = Context(
         goal="review this change",
@@ -86,13 +90,36 @@ def test_fresh_reviewer_runs_codex_ephemeral_in_target_worktree(tmp_path, monkey
     assert cwd == repo
 
 
-def test_fresh_reviewer_failure_is_relayable_output(tmp_path, monkeypatch):
+def test_fresh_reviewer_failure_relays_message_when_unparseable(tmp_path, monkeypatch):
+    """D8 (factory two-node redesign): raw reviewer prose never crosses to
+    the worker prompt (`result.output` feeds `_last_review_feedback`).
+    Free-form FAIL prose with no typed findings JSON degrades to the
+    fixed re-run message rather than leaking the prose verbatim."""
     review = "Blocking: app.py:12 returns the wrong value.\nVerdict: FAIL\n"
     result, _, _ = _run_review(tmp_path, monkeypatch, review)
 
     assert result.outcome == "failure"
-    assert result.output == review
+    assert result.output == "review did not produce valid findings; re-run against current pin"
     assert result.metadata["verdict"] == "fail"
+
+
+def test_fresh_reviewer_failure_relays_typed_findings_base64_fenced(tmp_path, monkeypatch):
+    """A FAIL verdict with a valid typed-findings JSON list relays as a
+    Base64-fenced, explicitly-untrusted block instead of raw prose (D8)."""
+    findings = [
+        {"path": "app.py", "claim": "returns the wrong value", "required_fix": "fix the return"}
+    ]
+    review = (
+        "Blocking findings:\n```json\n" + json.dumps(findings) + "\n```\nVerdict: FAIL\n"
+    )
+    result, _, _ = _run_review(tmp_path, monkeypatch, review)
+
+    assert result.outcome == "failure"
+    assert "BEGIN REVIEWER FINDINGS" in result.output
+    assert "app.py" not in result.output  # raw prose text is not present verbatim
+    encoded = result.output.splitlines()[1]
+    decoded = json.loads(base64.b64decode(encoded).decode("utf-8"))
+    assert decoded == findings
 
 
 def test_fresh_reviewer_unknown_verdict_fails_closed(tmp_path, monkeypatch):
@@ -105,7 +132,9 @@ def test_fresh_reviewer_unknown_verdict_fails_closed(tmp_path, monkeypatch):
 def test_fresh_reviewer_timeout_fails_closed(tmp_path, monkeypatch):
     repo = _repo(tmp_path)
     prompt = tmp_path / "review.md"
-    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    prompt.write_text(
+        "Review target: ${target}\nEnd with Verdict: PASS or Verdict: FAIL.\n"
+    )
     ctx = Context(
         goal="review this change",
         workdir=tmp_path,
@@ -140,7 +169,10 @@ def test_fresh_reviewer_tracked_mutation_fails_closed(tmp_path, monkeypatch):
 
     assert result.outcome == "error"
     assert result.metadata["reviewer_mutated_tracked_files"] == "true"
-    assert "reviewer changed tracked files" in result.output.lower()
+    # D8: the mutation notice is infrastructure-error prose and must not
+    # leak into the worker-facing relay (`result.output`) — it stays in the
+    # metadata assertion above (manifest-only per the two-node redesign).
+    assert result.output == "review did not produce valid findings; re-run against current pin"
     assert (repo / "value.txt").read_text() == "reviewer changed this\n"
 
 
@@ -149,7 +181,9 @@ def test_fresh_reviewer_rejects_symlinked_target_before_codex(tmp_path, monkeypa
     alias = tmp_path / "alias"
     alias.symlink_to(repo, target_is_directory=True)
     prompt = tmp_path / "review.md"
-    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    prompt.write_text(
+        "Review target: ${target}\nEnd with Verdict: PASS or Verdict: FAIL.\n"
+    )
     ctx = Context(
         goal="review this change",
         workdir=tmp_path,
@@ -179,7 +213,9 @@ def test_fresh_reviewer_allows_real_target_beneath_symlinked_parent(
     alias_parent = tmp_path / "alias"
     alias_parent.symlink_to(real_parent, target_is_directory=True)
     prompt = tmp_path / "review.md"
-    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    prompt.write_text(
+        "Review target: ${target}\nEnd with Verdict: PASS or Verdict: FAIL.\n"
+    )
     ctx = Context(
         goal="review this change",
         workdir=tmp_path,

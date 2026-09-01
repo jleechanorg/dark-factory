@@ -280,6 +280,21 @@ def main(argv: list[str] | None = None) -> int:
             ),
         )
         p.add_argument("--goal")
+        p.add_argument(
+            "--target",
+            default=None,
+            help=(
+                "factory.review-target.v1 locator or freeform text (e.g. "
+                "'PR 811', '#811', an absolute path, a commit SHA) resolved "
+                "mechanically before the run starts (D3/D5 of the factory "
+                "two-node redesign). Refuses to start if it cannot be "
+                "resolved. Makes --goal optional (target-mode verification "
+                "run). Entry-mode graph wiring (reviewer-first routing) is "
+                "not yet consumed by the engine/two_node graph — --target "
+                "currently pre-resolves and pins the locator into "
+                "ctx.state['target']; see rev-xfy23 for the follow-up."
+            ),
+        )
         p.add_argument("--workdir", type=pathlib.Path, default=pathlib.Path.cwd())
         p.add_argument("--preflight", action="store_true", help="Validate pipeline and emit diagnostics, then exit.")
         p.add_argument(
@@ -418,11 +433,39 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(payload, sort_keys=True, indent=2))
             return 1 if payload["status"] == "fail" else 0
 
+        resolved_target_locator = None
+        if args.target:
+            from . import target_locator
+
+            try:
+                resolved_target_locator = target_locator.parse(args.target, repo_root=args.workdir)
+            except target_locator.DefinedNotResolvable as exc:
+                p.error(f"--target scheme is defined but not resolvable in v1: {exc}")
+            except target_locator.InvalidTarget:
+                repo_ctx = target_locator.RepoContext(repo_root=args.workdir)
+                try:
+                    resolved_target_locator = target_locator.resolve_freeform(args.target, repo_ctx)
+                except target_locator.TargetLocatorError as exc:
+                    p.error(f"--target could not be resolved: {exc}")
+
+        if not args.goal and not args.target:
+            p.error("--goal is required unless --preflight or --target is set")
         if not args.goal:
-            p.error("--goal is required unless --preflight is set")
+            args.goal = ""
 
         graph = parse(pipeline_path)
         initial_state: dict[str, str] = {}
+        # Opt-in gate for the runner's post-worker target-mint/checkpoint
+        # side effect (D2/D3/D8a of the factory two-node redesign): minting
+        # can commit dirty workdir state, so it must only run for graphs
+        # that actually declare the fresh, verdict-gated cold-reviewer
+        # contract — never for arbitrary pipelines that never asked for it.
+        if any(
+            str(n.attrs.get("class", "")).strip().lower() == "review"
+            and str(n.attrs.get("verdict_gate", "false")).strip().lower() in {"true", "1", "yes", "on"}
+            for n in graph.nodes.values()
+        ):
+            initial_state["_df_mint_review_target"] = "true"
         for kv in args.state:
             if "=" not in kv:
                 p.error(f"--state requires KEY=VALUE format, got: {kv!r}")
@@ -473,6 +516,9 @@ def main(argv: list[str] | None = None) -> int:
             perf_log_root=perf_log_root,
         )
         ctx.state.update(initial_state)
+        if resolved_target_locator is not None:
+            ctx.state["target"] = resolved_target_locator.canonical
+            ctx.state["_df_target_mode"] = "true"
         if args.backend == "ao":
             if not args.ao_project:
                 p.error("--backend ao requires --ao-project")
