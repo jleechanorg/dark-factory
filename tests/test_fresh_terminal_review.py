@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -237,6 +239,8 @@ def test_linux_fresh_reviewer_allows_python_and_pytest_runtime_paths(
     pytest_exe = tmp_path / "venv" / "bin" / "pytest"
     python_exe.parent.mkdir(parents=True)
     pytest_exe.parent.mkdir(parents=True)
+    (python_exe.parent.parent / "lib").mkdir()
+    (pytest_exe.parent.parent / "lib").mkdir()
     python_exe.write_text("#!/bin/sh\n")
     pytest_exe.write_text(f"#!{python_exe}\n")
     python_exe.chmod(0o755)
@@ -273,7 +277,74 @@ def test_linux_fresh_reviewer_allows_python_and_pytest_runtime_paths(
     assert args == ["/fake/launcher", "--", "codex", "exec", "review"]
     assert python_exe.parent in observed["read_paths"]
     assert pytest_exe.parent in observed["read_paths"]
+    assert python_exe.parent.parent in observed["read_paths"]
+    assert pytest_exe.parent.parent in observed["read_paths"]
     assert repo.resolve() not in observed["writable_paths"]
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="requires Linux Landlock"
+)
+def test_linux_landlock_fresh_reviewer_runs_pytest_and_denies_target_write(
+    tmp_path, monkeypatch
+):
+    from runner.handler_codergen import _sandboxed_args_for_fresh_review
+
+    target = _repo(tmp_path / "target")
+    review_ws = tmp_path / "review"
+    review_ws.mkdir()
+    (review_ws / "test_runtime.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n\n"
+        "def test_runtime_and_boundary():\n"
+        "    assert 2 + 3 == 5\n"
+        "    with __import__('pytest').raises(OSError):\n"
+        "        Path(os.environ['DF_DENIED_TARGET']).write_text('blocked')\n"
+        "    with __import__('pytest').raises(OSError):\n"
+        "        Path(os.environ['DF_SEALED_HOLDOUT']).read_text()\n"
+    )
+    holdouts = tmp_path / "holdouts"
+    holdouts.mkdir()
+    sealed_holdout = holdouts / "sealed.txt"
+    sealed_holdout.write_text("sealed\n")
+    pytest_exe = pathlib.Path(sys.executable).parent / "pytest"
+    if not pytest_exe.is_file():
+        pytest.skip("pytest executable unavailable")
+
+    real_which = shutil.which
+
+    def runtime_which(name: str):
+        if name == "pytest":
+            return str(pytest_exe)
+        return real_which(name)
+
+    monkeypatch.setattr("runner.handler_codergen.shutil.which", runtime_which)
+    monkeypatch.setattr(
+        "runner.handlers._holdout_denied_paths", lambda: [holdouts.resolve()]
+    )
+
+    args = _sandboxed_args_for_fresh_review(
+        [sys.executable, "-m", "pytest", "-q", "test_runtime.py"], review_ws, target
+    )
+
+    assert args is not None
+    env = dict(os.environ)
+    env["DF_DENIED_TARGET"] = str(target)
+    env["DF_SEALED_HOLDOUT"] = str(sealed_holdout)
+    proc = subprocess.run(
+        args,
+        cwd=review_ws,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+        pass_fds=getattr(args, "pass_fds", ()),
+    )
+    _handlers_shim._close_pinned_launcher_command(args)
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "1 passed" in proc.stdout
+    assert (target / "value.txt").read_text() == "before\n"
 
 
 def test_fresh_reviewer_timeout_fails_closed(tmp_path, monkeypatch):

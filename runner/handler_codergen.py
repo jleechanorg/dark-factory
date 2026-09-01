@@ -956,7 +956,35 @@ def _linux_python_reviewer_runtime_paths() -> list[pathlib.Path] | None:
     if sys.executable:
         candidates.append(pathlib.Path(sys.executable))
 
+    def runtime_root(executable: pathlib.Path) -> pathlib.Path | None:
+        """Return the exact Python/venv prefix containing ``bin`` and ``lib``."""
+        try:
+            root = executable.resolve(strict=True).parent.parent
+        except (OSError, RuntimeError):
+            return None
+        if (
+            root == pathlib.Path(root.anchor)
+            or not (root / "bin").is_dir()
+            or not (root / "lib").is_dir()
+        ):
+            return None
+        return root
+
+    def shebang_interpreter(executable: pathlib.Path) -> pathlib.Path | None:
+        try:
+            first_line = executable.resolve(strict=True).read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines()[0]
+        except (OSError, IndexError, RuntimeError):
+            return None
+        if not first_line.startswith("#!"):
+            return None
+        interpreter = first_line[2:].strip().split(maxsplit=1)[0]
+        path = pathlib.Path(interpreter)
+        return path if path.is_absolute() else None
+
     paths: list[pathlib.Path] = []
+    resolved_candidates: list[pathlib.Path] = []
     for candidate in candidates:
         if not candidate.exists() and not candidate.is_symlink():
             # ``shutil.which`` may be replaced by a test harness or may point
@@ -968,6 +996,19 @@ def _linux_python_reviewer_runtime_paths() -> list[pathlib.Path] | None:
         if runtime is None:
             return None
         paths.extend(runtime)
+        resolved_candidates.append(candidate)
+        interpreter = shebang_interpreter(candidate)
+        if interpreter is not None:
+            interpreter_runtime = _handlers_shim._linux_codex_runtime_paths(interpreter)
+            if interpreter_runtime is None:
+                return None
+            paths.extend(interpreter_runtime)
+            resolved_candidates.append(interpreter)
+
+    for executable in resolved_candidates:
+        root = runtime_root(executable)
+        if root is not None:
+            paths.append(root)
     return sorted(set(paths), key=str)
 
 
