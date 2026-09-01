@@ -1232,6 +1232,261 @@ def _copy_pinned_git_metadata_tree(
             os.close(source_fd)
 
 
+def _copy_pinned_admin_overlay_files(
+    source_root: pathlib.Path,
+    destination_root: pathlib.Path,
+    expected_identity: tuple[int, int],
+) -> None:
+    """Copy a validated linked-worktree admin overlay through pinned directory FDs.
+
+    The source root is opened with ``O_NOFOLLOW`` and ``O_DIRECTORY`` and
+    each entry is addressed relative to that pinned descriptor.  Reopening
+    ``gitdir_path`` by pathname here would let a swapped admin overlay
+    inject attacker-controlled metadata into the snapshot.
+    """
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory is None:
+        raise RuntimeError(
+            "Safe admin overlay copy requires O_NOFOLLOW and O_DIRECTORY"
+        )
+    source_root = pathlib.Path(source_root)
+    destination_root = pathlib.Path(destination_root)
+    _validate_regular_git_metadata_tree(
+        source_root, "linked-worktree Git metadata"
+    )
+    _validate_regular_git_metadata_tree(
+        destination_root, "review Git metadata"
+    )
+
+    directory_flags = os.O_RDONLY | nofollow | directory
+    source_fd: int | None = None
+    destination_fd: int | None = None
+
+    def identity(info: os.stat_result) -> tuple[int, int]:
+        return (int(info.st_dev), int(info.st_ino))
+
+    def fail_swap(path: pathlib.Path) -> RuntimeError:
+        return RuntimeError(
+            f"Linked-worktree admin overlay path changed during copy: {path}"
+        )
+
+    def entry_stat(
+        parent_fd: int, name: str, relative: pathlib.Path
+    ) -> os.stat_result:
+        try:
+            return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot inspect linked-worktree admin overlay entry: {relative}"
+            ) from exc
+
+    def assert_entry_unchanged(
+        parent_fd: int,
+        name: str,
+        expected: tuple[int, int],
+        relative: pathlib.Path,
+    ) -> None:
+        current = entry_stat(parent_fd, name, relative)
+        if identity(current) != expected:
+            raise fail_swap(relative)
+
+    def copy_directory(
+        src_dir_fd: int, dst_dir_fd: int, relative: pathlib.Path
+    ) -> None:
+        try:
+            with os.scandir(src_dir_fd) as iterator:
+                names = [entry.name for entry in iterator]
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot enumerate linked-worktree admin overlay: "
+                f"{relative or pathlib.Path('.')}"
+            ) from exc
+
+        for name in names:
+            child_relative = (
+                relative / name
+                if relative != pathlib.Path(".")
+                else pathlib.Path(name)
+            )
+            source_entry = entry_stat(src_dir_fd, name, child_relative)
+            source_identity = identity(source_entry)
+            mode = source_entry.st_mode
+            if stat.S_ISDIR(mode):
+                try:
+                    child_src_fd = os.open(
+                        name, directory_flags, dir_fd=src_dir_fd
+                    )
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"Cannot safely open linked-worktree admin overlay "
+                        f"directory: {child_relative}"
+                    ) from exc
+                try:
+                    opened = os.fstat(child_src_fd)
+                    if identity(opened) != source_identity:
+                        raise fail_swap(child_relative)
+                    try:
+                        os.mkdir(
+                            name,
+                            stat.S_IMODE(mode),
+                            dir_fd=dst_dir_fd,
+                        )
+                    except FileExistsError:
+                        # Subdirectory may already exist from the common
+                        # copy; continue to merge its descendants.
+                        pass
+                    except OSError as exc:
+                        raise RuntimeError(
+                            f"Cannot create review admin overlay directory: "
+                            f"{child_relative}"
+                        ) from exc
+                    try:
+                        child_dst_fd = os.open(
+                            name, directory_flags, dir_fd=dst_dir_fd
+                        )
+                    except OSError as exc:
+                        raise RuntimeError(
+                            f"Cannot safely open review admin overlay "
+                            f"directory: {child_relative}"
+                        ) from exc
+                    try:
+                        copy_directory(
+                            child_src_fd, child_dst_fd, child_relative
+                        )
+                        os.fchmod(child_dst_fd, stat.S_IMODE(mode))
+                    finally:
+                        os.close(child_dst_fd)
+                    if identity(os.fstat(child_src_fd)) != source_identity:
+                        raise fail_swap(child_relative)
+                    assert_entry_unchanged(
+                        src_dir_fd,
+                        name,
+                        source_identity,
+                        child_relative,
+                    )
+                finally:
+                    os.close(child_src_fd)
+                continue
+
+            if not stat.S_ISREG(mode):
+                raise RuntimeError(
+                    f"Unsafe non-regular file in linked-worktree admin "
+                    f"overlay: {child_relative}"
+                )
+            if name in ("commondir", "gitdir"):
+                continue
+
+            try:
+                child_src_fd = os.open(
+                    name,
+                    os.O_RDONLY | nofollow,
+                    dir_fd=src_dir_fd,
+                )
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Cannot safely open linked-worktree admin overlay "
+                    f"file: {child_relative}"
+                ) from exc
+            try:
+                opened = os.fstat(child_src_fd)
+                if (
+                    identity(opened) != source_identity
+                    or not stat.S_ISREG(opened.st_mode)
+                ):
+                    raise fail_swap(child_relative)
+                try:
+                    # Destination file may already exist from the common
+                    # copy (e.g. HEAD, packed-refs); overwrite with O_TRUNC.
+                    child_dst_fd = os.open(
+                        name,
+                        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | nofollow,
+                        stat.S_IMODE(mode),
+                        dir_fd=dst_dir_fd,
+                    )
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"Cannot safely create review admin overlay file: "
+                        f"{child_relative}"
+                    ) from exc
+                try:
+                    while True:
+                        chunk = os.read(child_src_fd, 1024 * 1024)
+                        if not chunk:
+                            break
+                        offset = 0
+                        while offset < len(chunk):
+                            written = os.write(
+                                child_dst_fd, chunk[offset:]
+                            )
+                            if written <= 0:
+                                raise RuntimeError(
+                                    f"Cannot copy review admin overlay file: "
+                                    f"{child_relative}"
+                                )
+                            offset += written
+                    os.fchmod(child_dst_fd, stat.S_IMODE(mode))
+                finally:
+                    os.close(child_dst_fd)
+                if identity(os.fstat(child_src_fd)) != source_identity:
+                    raise fail_swap(child_relative)
+                assert_entry_unchanged(
+                    src_dir_fd,
+                    name,
+                    source_identity,
+                    child_relative,
+                )
+            finally:
+                os.close(child_src_fd)
+
+    try:
+        try:
+            source_fd = os.open(source_root, directory_flags)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot safely open linked-worktree admin overlay: "
+                f"{source_root}"
+            ) from exc
+        source_stat = os.fstat(source_fd)
+        if (
+            identity(source_stat) != expected_identity
+            or not stat.S_ISDIR(source_stat.st_mode)
+        ):
+            raise fail_swap(source_root)
+
+        try:
+            destination_fd = os.open(destination_root, directory_flags)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot safely open review admin overlay destination: "
+                f"{destination_root}"
+            ) from exc
+
+        copy_directory(source_fd, destination_fd, pathlib.Path("."))
+
+        if identity(os.fstat(source_fd)) != expected_identity:
+            raise fail_swap(source_root)
+        try:
+            source_path_after = _git_metadata_path_fingerprint(
+                source_root, "linked-worktree Git metadata"
+            )
+        except RuntimeError as exc:
+            raise fail_swap(source_root) from exc
+        if not source_path_after:
+            raise fail_swap(source_root)
+        try:
+            source_path_stat = source_root.lstat()
+        except OSError as exc:
+            raise fail_swap(source_root) from exc
+        if identity(source_path_stat) != expected_identity:
+            raise fail_swap(source_root)
+    finally:
+        if destination_fd is not None:
+            os.close(destination_fd)
+        if source_fd is not None:
+            os.close(source_fd)
+
+
 def _normalize_and_validate_review_git(target_workdir: pathlib.Path, review_dir: pathlib.Path) -> None:
     """Normalize linked-worktree git metadata into a standalone repo and validate isolation."""
     git_target = target_workdir / ".git"
@@ -1260,7 +1515,32 @@ def _normalize_and_validate_review_git(target_workdir: pathlib.Path, review_dir:
             target_workdir,
             "linked-worktree Git metadata path",
         )
+        try:
+            gitdir_stat = gitdir_path.lstat()
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot inspect linked-worktree Git metadata: {gitdir_path}"
+            ) from exc
+        if not stat.S_ISDIR(gitdir_stat.st_mode):
+            raise RuntimeError(
+                f"Linked-worktree Git metadata is not a real directory: {gitdir_path}"
+            )
+        gitdir_identity = (int(gitdir_stat.st_dev), int(gitdir_stat.st_ino))
         _validate_regular_git_metadata_tree(gitdir_path, "linked-worktree Git metadata")
+        try:
+            gitdir_after_validation = gitdir_path.lstat()
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot inspect linked-worktree Git metadata: {gitdir_path}"
+            ) from exc
+        if (
+            not stat.S_ISDIR(gitdir_after_validation.st_mode)
+            or (int(gitdir_after_validation.st_dev), int(gitdir_after_validation.st_ino))
+            != gitdir_identity
+        ):
+            raise RuntimeError(
+                f"Linked-worktree Git metadata changed during validation: {gitdir_path}"
+            )
 
         target_git_path = _resolve_git_metadata_path(
             str(git_target), target_workdir, "target worktree .git path"
@@ -1369,24 +1649,14 @@ def _normalize_and_validate_review_git(target_workdir: pathlib.Path, review_dir:
             raise RuntimeError(f"Cannot resolve review Git metadata: {git_review}") from exc
         _validate_regular_git_metadata_tree(git_review, "review Git metadata")
 
-        for entry in gitdir_path.rglob("*"):
-            try:
-                entry_mode = entry.lstat().st_mode
-            except OSError as exc:
-                raise RuntimeError(
-                    f"Cannot inspect linked-worktree Git metadata: {entry}"
-                ) from exc
-            if stat.S_ISDIR(entry_mode):
-                continue
-            if not stat.S_ISREG(entry_mode):
-                raise RuntimeError(
-                    f"Unsafe non-regular file in linked-worktree Git metadata: {entry}"
-                )
-            if entry.name in ("commondir", "gitdir"):
-                continue
-            rel = entry.relative_to(gitdir_path)
-            dest = git_review / rel
-            _copy_regular_git_metadata_file(entry, dest)
+        # Copy the admin overlay through pinned descriptors.  The previous
+        # pathname walk could copy a swapped directory into the snapshot;
+        # root-identity-before/after validation fails closed on a swap.
+        _copy_pinned_admin_overlay_files(
+            gitdir_path,
+            git_review,
+            gitdir_identity,
+        )
 
     if git_review.exists():
         # ``tempfile`` may return the macOS ``/var`` alias.  Canonicalize the

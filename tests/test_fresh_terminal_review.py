@@ -2375,3 +2375,135 @@ def test_fresh_reviewer_fingerprint_component_attribution_on_git_diff_failure(
     assert result.outcome == "error"
     assert result.metadata["reviewer_mutated_tracked_files"] == "true"
     assert "simulated git diff error" in result.metadata["fingerprint_git_error"]
+
+
+def test_fresh_reviewer_rejects_admin_overlay_swap_after_common_copy(
+    tmp_path, monkeypatch
+):
+    """A validated linked-worktree admin overlay cannot be replaced after the
+    pinned common copy and before the per-worktree overlay copy.
+
+    After ``_copy_pinned_git_metadata_tree`` copies the common git metadata,
+    the per-worktree admin overlay (``gitdir_path``) is reopened by pathname
+    and copied entry-by-entry.  A swap at that point must not let a marker
+    file reach the snapshot or trigger a Codex launch.
+    """
+    main_repo = _repo(tmp_path / "main")
+    wt_dir = tmp_path / "wt"
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(main_repo),
+            "worktree",
+            "add",
+            "-b",
+            "feature-wt",
+            str(wt_dir),
+        ],
+        check=True,
+    )
+    target_pointer = (wt_dir / ".git").read_text(encoding="utf-8").strip()
+    gitdir_path = pathlib.Path(
+        target_pointer.removeprefix("gitdir:").strip()
+    ).resolve()
+
+    # Build a replacement admin overlay that mirrors the original entry set
+    # but adds a single marker file that must never reach the reviewer.
+    replacement = tmp_path / "replacement-admin-overlay"
+    replacement.mkdir()
+    for entry in gitdir_path.iterdir():
+        if entry.is_file() and entry.name not in {"commondir", "gitdir"}:
+            shutil.copy2(entry, replacement / entry.name)
+    marker_name = "injected-marker-after-common-copy"
+    marker_content = "INJECTED-MARKER-admin-overlay-swap-must-not-reach-reviewer\n"
+    (replacement / marker_name).write_text(marker_content, encoding="utf-8")
+
+    original_admin = tmp_path / "original-admin-overlay"
+    real_validate = __import__(
+        "runner.handler_codergen",
+        fromlist=["_validate_regular_git_metadata_tree"],
+    )._validate_regular_git_metadata_tree
+    snapshot_git_reviews: list[pathlib.Path] = []
+    swapped = False
+
+    def swap_then_validate(git_dir: pathlib.Path, label: str) -> None:
+        nonlocal swapped
+        # The post-common-copy validation call is the deterministic hook:
+        # it runs immediately before the per-worktree rglob loop, so a swap
+        # here guarantees the rglob sees the swapped admin overlay.
+        if (
+            not swapped
+            and label == "review Git metadata"
+            and pathlib.Path(git_dir).resolve() != gitdir_path
+        ):
+            snapshot_git_reviews.append(pathlib.Path(git_dir).resolve())
+            os.rename(gitdir_path, original_admin)
+            os.rename(replacement, gitdir_path)
+            swapped = True
+            real_validate(git_dir, label)
+            return
+        real_validate(git_dir, label)
+
+    prompt = tmp_path / "review.md"
+    prompt.write_text(
+        "Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n"
+    )
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="echo",
+        state={"ao.worktree": str(wt_dir)},
+    )
+    codex_calls: list[list[str]] = []
+    real_run = subprocess.run
+
+    def intercept_run(args, **kwargs):
+        if args and args[0] == "codex":
+            codex_calls.append(list(args))
+            return subprocess.CompletedProcess(
+                args, 0, stdout="Verdict: PASS\n", stderr=""
+            )
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(
+        "runner.handler_codergen._validate_regular_git_metadata_tree",
+        swap_then_validate,
+    )
+    monkeypatch.setattr(
+        "runner.handler_codergen._sandboxed_args_for_fresh_review",
+        lambda command, *args, **kwargs: command,
+    )
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", intercept_run)
+
+    try:
+        result = _codergen(_review_node(prompt), ctx)
+    finally:
+        if swapped:
+            os.rename(gitdir_path, replacement)
+            os.rename(original_admin, gitdir_path)
+
+    assert swapped is True, "swap hook never fired"
+    assert result.outcome == "error", (
+        f"admin overlay swap must fail closed; got outcome={result.outcome!r} "
+        f"output={result.output!r}"
+    )
+    assert codex_calls == [], (
+        "Codex must not be launched after an admin overlay swap"
+    )
+    # Defensive: even if the snapshot was partially populated, the marker
+    # content itself must never appear in any artifact surfaced to the
+    # reviewer.  We scan the git_review destination(s) we captured during
+    # the swap for the marker string.
+    assert snapshot_git_reviews, "swap hook did not capture a git_review path"
+    for git_review in snapshot_git_reviews:
+        if git_review.exists():
+            for candidate in git_review.rglob("*"):
+                if candidate.is_file():
+                    text = candidate.read_bytes()
+                    assert marker_content.encode("utf-8") not in text, (
+                        f"marker leaked into review snapshot: {candidate}"
+                    )
+                    assert marker_name.encode("utf-8") not in text, (
+                        f"marker filename leaked into review snapshot: {candidate}"
+                    )
