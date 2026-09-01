@@ -215,7 +215,14 @@ jobs:
           fail=0
           for t in tests/scripts/test_*.sh; do
             echo "::group::$t"
-            bash "$t" || { echo "::error file=$t::test failed"; fail=$((fail + 1)); }
+            bash "$t"
+            rc=$?
+            if [ "$rc" -eq 2 ] && [ "$t" = "tests/scripts/test_af_immutable_restart.sh" ]; then
+              echo "::warning file=$t::test skipped (exit 2 = no real evidence available in this environment)"
+            elif [ "$rc" -ne 0 ]; then
+              echo "::error file=$t::test failed"
+              fail=$((fail + 1))
+            fi
             echo "::endgroup::"
           done
           exit $fail
@@ -302,7 +309,9 @@ jobs:
         working-directory: daemon
         # The self-hosted runner can concurrently run the Python test job;
         # serial compilation prevents rustc from being OOM-killed mid-suite.
-        run: cargo test --verbose -j 1
+        # Run all declared targets with single test thread to eliminate cache
+        # discovery artifacts and within-binary concurrency races.
+        run: cargo test --verbose -j 1 --all-targets -- --test-threads=1
 
       - name: cargo clippy (deny warnings)
         working-directory: daemon

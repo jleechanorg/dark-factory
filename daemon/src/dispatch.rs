@@ -1,5 +1,5 @@
 // Task 9: slot supervisor (design doc §5, spec §4.2.2/§4.2.4). Enforces the
-// operator safety envelope from spec §4.2.8: <= 30 concurrent workers total,
+// operator safety envelope from spec §4.2.8: <= 40 concurrent workers total,
 // <= 15 spawned in a single dispatch call. Pure arithmetic over `Sessions` +
 // `StateStore` trait calls — no subprocess use, no LLM judgment (ZFC: routing
 // to SMALL_PATH/STANDARD_PATH already happened in router.rs; this module only
@@ -19,6 +19,7 @@ fn record_spawn_cleanup_failure(
     store: &dyn StateStore,
     overlay: &mut BeadOverlay,
     session_id: &crate::tools::SessionId,
+    ao_project: &str,
     root_error: DaemonError,
     cleanup_error: DaemonError,
 ) -> DaemonError {
@@ -27,6 +28,7 @@ fn record_spawn_cleanup_failure(
     // startup reconciliation would blindly requeue.
     overlay.state = OverlayState::HumanHeld;
     overlay.session_id = Some(session_id.0.clone());
+    overlay.session_ao_project = Some(ao_project.to_string());
     set_human_hold_reason(overlay, HumanHoldReason::SpawnCleanupFailed);
     let cleanup_error = match store.save(overlay) {
         Ok(()) => cleanup_error,
@@ -239,6 +241,7 @@ pub fn dispatch_ready_with_vcs(
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -395,6 +398,7 @@ pub fn dispatch_ready_with_vcs(
             ));
             overlay.state = OverlayState::HumanHeld;
             overlay.session_id = None;
+            overlay.session_ao_project = None;
             set_human_hold_reason(
                 &mut overlay,
                 HumanHoldReason::TargetCheckoutUnconfigured,
@@ -426,6 +430,7 @@ pub fn dispatch_ready_with_vcs(
                 ));
                 overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = None;
+                overlay.session_ao_project = None;
                 set_human_hold_reason(
                     &mut overlay,
                     HumanHoldReason::TargetCheckoutUnconfigured,
@@ -590,30 +595,38 @@ pub fn dispatch_ready_with_vcs(
             return Err(err);
         }
 
+        let target_branch = if overlay.is_adopted || branch_mode == "pr_head" {
+            &branch
+        } else {
+            &cfg.base_branch
+        };
         let expected_revision = match vcs {
-            Some(vcs) => match vcs.base_head_for_repo(&repo, &cfg.base_branch) {
+            Some(vcs) => match vcs.head_sha_within_for_repo(&repo, target_branch, 30) {
                 Ok(sha) if !sha.trim().is_empty() => sha,
-                Ok(_) => {
-                    let error = DaemonError::Config(format!(
-                        "authoritative base revision for repo {repo:?} is empty"
-                    ));
-                    overlay.state = OverlayState::HumanHeld;
-                    set_human_hold_reason(&mut overlay, HumanHoldReason::TargetCheckoutUnconfigured);
-                    store.save(&overlay)?;
-                    report.failures.push(failure(
-                        bead, overlay.attempt, None, "expected_revision_unavailable", error,
-                    ));
-                    continue;
-                }
-                Err(error) => {
-                    overlay.state = OverlayState::HumanHeld;
-                    set_human_hold_reason(&mut overlay, HumanHoldReason::TargetCheckoutUnconfigured);
-                    store.save(&overlay)?;
-                    report.failures.push(failure(
-                        bead, overlay.attempt, None, "expected_revision_unavailable", error,
-                    ));
-                    continue;
-                }
+                _ => match vcs.base_head_for_repo(&repo, target_branch) {
+                    Ok(sha) if !sha.trim().is_empty() => sha,
+                    Ok(_) => {
+                        let error = DaemonError::Config(format!(
+                            "authoritative revision for branch {target_branch:?} in repo {repo:?} is empty"
+                        ));
+                        overlay.state = OverlayState::HumanHeld;
+                        set_human_hold_reason(&mut overlay, HumanHoldReason::TargetCheckoutUnconfigured);
+                        store.save(&overlay)?;
+                        report.failures.push(failure(
+                            bead, overlay.attempt, None, "expected_revision_unavailable", error,
+                        ));
+                        continue;
+                    }
+                    Err(error) => {
+                        overlay.state = OverlayState::HumanHeld;
+                        set_human_hold_reason(&mut overlay, HumanHoldReason::TargetCheckoutUnconfigured);
+                        store.save(&overlay)?;
+                        report.failures.push(failure(
+                            bead, overlay.attempt, None, "expected_revision_unavailable", error,
+                        ));
+                        continue;
+                    }
+                },
             },
             None => overlay
                 .pre_session_head_sha
@@ -680,6 +693,7 @@ pub fn dispatch_ready_with_vcs(
                 };
                 overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = Some(session.clone());
+                overlay.session_ao_project = Some(routing.ao_project.clone());
                 set_human_hold_reason(&mut overlay, HumanHoldReason::SpawnCleanupFailed);
                 if let Err(state_error) = store.save(&overlay) {
                     return Err(DaemonError::SpawnCleanupFailed {
@@ -720,6 +734,7 @@ pub fn dispatch_ready_with_vcs(
             Err(err) if err.is_deferred() => {
                 overlay.state = OverlayState::Queued;
                 overlay.session_id = None;
+                overlay.session_ao_project = None;
                 store.save(&overlay)?;
                 report.failures.push(failure(
                     bead,
@@ -733,6 +748,7 @@ pub fn dispatch_ready_with_vcs(
             Err(err) if err.is_transient() => {
                 overlay.spawn_failure_count += 1;
                 overlay.session_id = None;
+                overlay.session_ao_project = None;
                 if overlay.spawn_failure_count > MAX_TRANSIENT_SPAWN_RETRY {
                     // Cap exceeded: stop silently cycling Queued<->Dispatching
                     // forever (the livelock this bead-follow-up closes — see
@@ -779,6 +795,7 @@ pub fn dispatch_ready_with_vcs(
             Err(err @ DaemonError::WorktreeCwdMismatch { .. }) => {
                 overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = None;
+                overlay.session_ao_project = None;
                 set_human_hold_reason(&mut overlay, HumanHoldReason::WorktreeCwdMismatch);
                 store.save(&overlay)?;
                 report.failures.push(failure(
@@ -793,6 +810,7 @@ pub fn dispatch_ready_with_vcs(
             Err(err) => {
                 overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = None;
+                overlay.session_ao_project = None;
                 set_human_hold_reason(&mut overlay, HumanHoldReason::SpawnFailed);
                 store.save(&overlay)?;
                 report.failures.push(failure(
@@ -817,24 +835,28 @@ pub fn dispatch_ready_with_vcs(
         // newly-created id whose live status contradicts that contract. The
         // id came directly from this spawn call, so it is owned by this
         // dispatch and must be stopped rather than leaked and requeued.
-        if let Ok(Some(actual_branch)) = sessions.session_branch(&session_id) {
+        if let Ok(Some(actual_branch)) =
+            sessions.session_branch_in_project(&session_id, &routing.ao_project)
+        {
             if actual_branch != branch {
                 let phase = "spawn_branch_mismatch";
                 let branch_error = DaemonError::Parse(format!(
                     "ao spawn returned session {} but its live branch is {actual_branch:?}, expected {branch:?} — refusing to record as DISPATCHED",
                     session_id.0
                 ));
-                if let Err(cleanup_error) = sessions.stop(&session_id) {
+                if let Err(cleanup_error) = sessions.stop_in_project(&session_id, &routing.ao_project) {
                     return Err(record_spawn_cleanup_failure(
                         store,
                         &mut overlay,
                         &session_id,
+                        &routing.ao_project,
                         branch_error,
                         cleanup_error,
                     ));
                 }
                 overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = None;
+                overlay.session_ao_project = None;
                 set_human_hold_reason(&mut overlay, HumanHoldReason::SpawnBranchMismatch);
                 store.save(&overlay)?;
                 report.failures.push(failure(
@@ -876,17 +898,19 @@ pub fn dispatch_ready_with_vcs(
         let remote_url = match verified_remote {
             Ok(url) => url,
             Err(error) => {
-                if let Err(cleanup_error) = sessions.stop(&session_id) {
+                if let Err(cleanup_error) = sessions.stop_in_project(&session_id, &routing.ao_project) {
                     return Err(record_spawn_cleanup_failure(
                         store,
                         &mut overlay,
                         &session_id,
+                        &routing.ao_project,
                         error,
                         cleanup_error,
                     ));
                 }
                 overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = None;
+                overlay.session_ao_project = None;
                 set_human_hold_reason(
                     &mut overlay,
                     HumanHoldReason::WorktreeRemoteUnverifiable,
@@ -921,17 +945,19 @@ pub fn dispatch_ready_with_vcs(
                  (jleechan-9sh5 discipline).",
                 bead.id, routing.push_remote
             ));
-            if let Err(cleanup_error) = sessions.stop(&session_id) {
+            if let Err(cleanup_error) = sessions.stop_in_project(&session_id, &routing.ao_project) {
                 return Err(record_spawn_cleanup_failure(
                     store,
                     &mut overlay,
                     &session_id,
+                    &routing.ao_project,
                     remote_error,
                     cleanup_error,
                 ));
             }
             overlay.state = OverlayState::HumanHeld;
             overlay.session_id = None;
+            overlay.session_ao_project = None;
             set_human_hold_reason(&mut overlay, HumanHoldReason::WorktreeRemoteMismatch);
             store.save(&overlay)?;
             report.failures.push(failure(
@@ -946,6 +972,7 @@ pub fn dispatch_ready_with_vcs(
 
         overlay.state = OverlayState::Dispatched;
         overlay.session_id = Some(session_id.0.clone());
+        overlay.session_ao_project = Some(routing.ao_project.clone());
         // Real progress: whatever was previously blocking spawn (session cap,
         // transient tool error, ...) has cleared, so the retry-cap counter no
         // longer needs to remember it.
@@ -976,11 +1003,12 @@ pub fn dispatch_ready_with_vcs(
             // we now have an untracked live session we can't even kill —
             // that's a more urgent operator-facing failure than the original
             // save error, so it takes priority and is returned instead.
-            if let Err(cleanup_error) = sessions.stop(&session_id) {
+            if let Err(cleanup_error) = sessions.stop_in_project(&session_id, &routing.ao_project) {
                 return Err(record_spawn_cleanup_failure(
                     store,
                     &mut overlay,
                     &session_id,
+                    &routing.ao_project,
                     save_err,
                     cleanup_error,
                 ));
@@ -988,6 +1016,7 @@ pub fn dispatch_ready_with_vcs(
             if save_err.is_transient() {
                 overlay.state = OverlayState::Queued;
                 overlay.session_id = None;
+                overlay.session_ao_project = None;
                 store.save(&overlay)?;
                 report.failures.push(failure(
                     bead,
@@ -1646,6 +1675,84 @@ mod tests {
         }
     }
 
+    /// Minimal `Vcs` fake for the `target_branch` regression coverage below:
+    /// scripts `head_sha_within_for_repo`/`base_head_for_repo` to return a
+    /// SHA only for a known-good branch (e.g. `cfg.base_branch`) and an
+    /// error for any other branch name, so a test can distinguish "dispatch
+    /// queried the correct branch" from "dispatch queried a stale/not-yet-
+    /// created branch" by observing whether `expected_revision` resolution
+    /// succeeds. Every other `Vcs` method is unused by `dispatch_ready_with_vcs`
+    /// and panics if called, so an unexpected call fails loudly.
+    struct FakeVcs {
+        known_branches: HashMap<String, String>,
+    }
+
+    impl FakeVcs {
+        fn new(known_branches: &[(&str, &str)]) -> Self {
+            Self {
+                known_branches: known_branches
+                    .iter()
+                    .map(|(branch, sha)| (branch.to_string(), sha.to_string()))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Vcs for FakeVcs {
+        fn base_head(&self, _base_branch: &str) -> Result<String, DaemonError> {
+            unimplemented!("FakeVcs::base_head not scripted for this test")
+        }
+        fn create_branch_at(&self, _name: &str, _sha: &str) -> Result<(), DaemonError> {
+            unimplemented!("FakeVcs::create_branch_at not scripted for this test")
+        }
+        fn head_sha(&self, _branch: &str) -> Result<String, DaemonError> {
+            unimplemented!("FakeVcs::head_sha not scripted for this test")
+        }
+        fn head_sha_within_for_repo(
+            &self,
+            _repo: &str,
+            branch: &str,
+            _timeout_secs: u64,
+        ) -> Result<String, DaemonError> {
+            self.known_branches.get(branch).cloned().ok_or_else(|| {
+                DaemonError::Tool {
+                    tool: "gh api".into(),
+                    rc: 1,
+                    stderr: format!("branch {branch:?} not found"),
+                }
+            })
+        }
+        fn base_head_for_repo(
+            &self,
+            _repo: &str,
+            base_branch: &str,
+        ) -> Result<String, DaemonError> {
+            self.known_branches.get(base_branch).cloned().ok_or_else(|| {
+                DaemonError::Tool {
+                    tool: "gh api".into(),
+                    rc: 1,
+                    stderr: format!("branch {base_branch:?} not found"),
+                }
+            })
+        }
+        fn is_remote_ahead(&self, _branch: &str, _remote_sha: &str) -> Result<bool, DaemonError> {
+            unimplemented!("FakeVcs::is_remote_ahead not scripted for this test")
+        }
+        fn remote_head_sha(&self, _branch: &str) -> Result<String, DaemonError> {
+            unimplemented!("FakeVcs::remote_head_sha not scripted for this test")
+        }
+        fn is_ancestor(
+            &self,
+            _ancestor_sha: &str,
+            _descendant_sha: &str,
+        ) -> Result<bool, DaemonError> {
+            unimplemented!("FakeVcs::is_ancestor not scripted for this test")
+        }
+        fn push_fix_commit(&self, _branch: &str, _message: &str) -> Result<(), DaemonError> {
+            unimplemented!("FakeVcs::push_fix_commit not scripted for this test")
+        }
+    }
+
     /// Local unit-test fake mirroring `tests/common/mod.rs`'s `FakeStateStore`,
     /// plus a `fail_save_for_state` hook so rollback-on-save-failure tests can
     /// script the SECOND save (the DISPATCHED confirmation) to fail while the
@@ -1827,7 +1934,7 @@ mod tests {
             ao_project: None,
             base_branch: "main".into(),
             stage: 1,
-            max_workers: 30,
+            max_workers: 40,
             max_batch: 15,
             fast_tick_secs: 60,
             slow_tick_secs: 600,
@@ -2031,7 +2138,7 @@ mod tests {
         assert_eq!(
             report.success_count(),
             15,
-            "must cap at max_batch even with 30 free slots"
+            "must cap at max_batch even with 40 free slots"
         );
         let spawn_calls = sessions
             .calls
@@ -2043,10 +2150,142 @@ mod tests {
     }
 
     #[test]
+    fn capacity_40_workers_15_batch_boundaries() {
+        let store = FakeStateStore::new();
+
+        // Verify ALL canonical production configuration files specify max_workers = 40, max_batch = 15
+        let canonical_paths = [
+            std::path::Path::new("contracts/daemon.toml.example"),
+            std::path::Path::new("config.toml"),
+            std::path::Path::new("../config/daemon.toml"),
+        ];
+        for path in canonical_paths {
+            let loaded = crate::config::load(path)
+                .unwrap_or_else(|e| panic!("failed to load canonical config {}: {e}", path.display()));
+            assert_eq!(
+                loaded.max_workers, 40,
+                "canonical config {} must specify max_workers = 40",
+                path.display()
+            );
+            assert_eq!(
+                loaded.max_batch, 15,
+                "canonical config {} must specify max_batch = 15",
+                path.display()
+            );
+        }
+
+        let prod_example = crate::config::load(std::path::Path::new("contracts/daemon.toml.example"))
+            .expect("canonical contracts/daemon.toml.example must be valid");
+        let mut cfg = cfg();
+        cfg.max_workers = prod_example.max_workers;
+        cfg.max_batch = prod_example.max_batch;
+        let ready = beads(40);
+
+        // 1. With 39 active sessions exactly one capacity slot remains
+        let sessions_39 = FakeSessions::new(39);
+        let report_39 = dispatch_ready(&sessions_39, &store, &cfg, &ready).unwrap();
+        assert_eq!(
+            report_39.success_count(),
+            1,
+            "with 39 active workers out of 40 capacity, exactly 1 slot must be dispatched"
+        );
+
+        // With 40 active sessions, zero remain
+        let sessions_40 = FakeSessions::new(40);
+        let report_40 = dispatch_ready(&sessions_40, &store, &cfg, &ready).unwrap();
+        assert_eq!(
+            report_40.success_count(),
+            0,
+            "with 40 active workers out of 40 capacity, 0 slots must be dispatched"
+        );
+
+        // 2. Forty ready tasks with 0 active dispatch at most 15 in one tick
+        let sessions_0 = FakeSessions::new(0);
+        let report_0 = dispatch_ready(&sessions_0, &store, &cfg, &ready).unwrap();
+        assert_eq!(
+            report_0.success_count(),
+            15,
+            "with 0 active workers and 40 ready tasks, tick 1 must dispatch exactly max_batch (15)"
+        );
+
+        // Next tick with 15 active sessions and remaining ready tasks dispatches next batch of 15 (total 30 <= 40)
+        let sessions_15 = FakeSessions::new(15);
+        let report_15 = dispatch_ready(&sessions_15, &store, &cfg, &ready[15..]).unwrap();
+        assert_eq!(
+            report_15.success_count(),
+            15,
+            "tick 2 with 15 active workers must dispatch at most 15"
+        );
+
+        // Tick 3 with 30 active workers dispatches remaining 10 (30 + 10 = 40 cap)
+        let sessions_30 = FakeSessions::new(30);
+        let report_30 = dispatch_ready(&sessions_30, &store, &cfg, &ready[30..]).unwrap();
+        assert_eq!(
+            report_30.success_count(),
+            10,
+            "tick 3 with 30 active workers must dispatch remaining 10 capacity slots"
+        );
+    }
+
+    #[test]
+    fn production_capacity_config_integration() {
+        // `capacity_40_workers_15_batch_boundaries` above already loads a
+        // fixed enumeration of canonical config paths through the real
+        // `config::load` parser. This test instead mirrors the actual
+        // runtime SELECTION rule the daemon binary applies at startup
+        // (`daemon/src/main.rs::default_config_path`: prefer the live
+        // deployed `config/daemon.toml`, else fall back to the shipped
+        // example) so the file proven correct here is the one production
+        // would truly load, not merely one candidate among several that
+        // happen to agree today.
+        let live = std::path::Path::new("../config/daemon.toml");
+        let selected = if live.exists() {
+            live
+        } else {
+            std::path::Path::new("contracts/daemon.toml.example")
+        };
+
+        let prod_cfg = crate::config::load(selected).unwrap_or_else(|e| {
+            panic!(
+                "production-selected config {} failed to load: {e}",
+                selected.display()
+            )
+        });
+        assert_eq!(
+            prod_cfg.max_workers, 40,
+            "daemon startup config must resolve max_workers = 40"
+        );
+        assert_eq!(
+            prod_cfg.max_batch, 15,
+            "daemon startup config must resolve max_batch = 15"
+        );
+
+        // Prove the production-loaded capacity values actually gate
+        // dispatch_ready's real slot arithmetic end-to-end, not merely that
+        // they deserialize correctly.
+        let mut cfg = cfg();
+        cfg.max_workers = prod_cfg.max_workers;
+        cfg.max_batch = prod_cfg.max_batch;
+
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        let ready = beads(prod_cfg.max_batch + 5);
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        assert_eq!(
+            report.success_count(),
+            prod_cfg.max_batch,
+            "a single tick against the production-selected config must cap dispatch at max_batch"
+        );
+    }
+
+    #[test]
     fn twenty_eight_active_of_thirty_spawns_exactly_two() {
         let sessions = FakeSessions::new(28);
         let store = FakeStateStore::new();
-        let cfg = cfg();
+        // Pinned to 30 (independent of cfg()'s default max_workers) so this
+        // test keeps exercising the 30-worker boundary it's named for.
+        let mut cfg = cfg();
+        cfg.max_workers = 30;
         let ready = beads(40);
 
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
@@ -2069,7 +2308,10 @@ mod tests {
     fn thirty_active_spawns_nothing_and_never_calls_spawn() {
         let sessions = FakeSessions::new(30);
         let store = FakeStateStore::new();
-        let cfg = cfg();
+        // Pinned to 30 (independent of cfg()'s default max_workers) so this
+        // test keeps exercising the 30-worker boundary it's named for.
+        let mut cfg = cfg();
+        cfg.max_workers = 30;
         let ready = beads(40);
 
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
@@ -2103,6 +2345,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -2156,6 +2399,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -2216,6 +2460,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -2267,6 +2512,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -2319,6 +2565,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -2374,6 +2621,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -2483,6 +2731,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -2559,6 +2808,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -2630,6 +2880,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -2715,6 +2966,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -2746,7 +2998,10 @@ mod tests {
     fn dispatch_order_follows_ready_slice_order() {
         let sessions = FakeSessions::new(29);
         let store = FakeStateStore::new();
-        let cfg = cfg();
+        // Pinned to 30 (independent of cfg()'s default max_workers) so this
+        // test keeps exercising the 30-worker boundary it's named for.
+        let mut cfg = cfg();
+        cfg.max_workers = 30;
         let ready = beads(5);
 
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
@@ -3829,6 +4084,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -4113,6 +4369,7 @@ mod tests {
             pr_number: Some(622),
             branch: Some("factory/dark-factory-2xt8-r1".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: true,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -4170,6 +4427,7 @@ mod tests {
             pr_number: None,
             branch: Some("factory/ordinary-retry-bead-123-r1".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -4236,6 +4494,7 @@ mod tests {
             pr_number: Some(999),
             branch: Some("factory/recovered-ordinary-bead-456-r1".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -4277,6 +4536,84 @@ mod tests {
             !overlay.is_adopted,
             "an ordinary bead must never be permanently flipped into adopted mode \
              just because it happens to carry a pr_number"
+        );
+    }
+
+    #[test]
+    fn human_held_recovered_ordinary_bead_with_stale_pr_number_queries_base_branch_revision() {
+        // Regression test for the `target_branch` sibling of the bug fixed by
+        // `human_held_recovered_ordinary_bead_with_stale_pr_number_generates_next_attempt_branch`
+        // above. That test proves the branch-NAME decision (`branch`/`branch_mode`)
+        // and `overlay.is_adopted` are computed correctly for an ordinary bead
+        // carrying a stale `pr_number` — but it calls `dispatch_ready` (`vcs: None`),
+        // which skips the `target_branch` computation entirely (the `None` arm at
+        // line ~626 just falls back to `overlay.pre_session_head_sha` unconditionally).
+        // It therefore does NOT exercise the separate `target_branch` condition
+        // (`overlay.is_adopted || overlay.pr_number.is_some()`) that selects which
+        // branch's revision to look up as the worker's `expected_revision`. That
+        // condition has the exact same overreach bug: a non-adopted bead with a
+        // stale `pr_number` wrongly takes the `&branch` (the freshly-computed
+        // NEXT-attempt branch, e.g. `-r2`) arm instead of `&cfg.base_branch` — and
+        // since the `-r2` branch does not exist yet (this dispatch is what will
+        // create it), looking up its revision fails and wrongly parks the bead
+        // HUMAN_HELD instead of dispatching it.
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let vcs = FakeVcs::new(&[(cfg.base_branch.as_str(), "BASE_SHA")]);
+
+        let recovered_overlay = BeadOverlay {
+            bead_id: "recovered-ordinary-bead-789".into(),
+            state: OverlayState::Queued,
+            attempt: 2,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+           pr_number: Some(999),
+           branch: Some("factory/recovered-ordinary-bead-789-r1".into()),
+           session_id: None,
+            session_ao_project: None,
+           is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: Some(cfg.target_repo.clone()),
+            attempt_started_at: None,
+        };
+        store.save(&recovered_overlay).unwrap();
+
+        let ready = vec![(
+            Bead {
+                id: "recovered-ordinary-bead-789".into(),
+                title: "recovered ordinary bead".into(),
+                description: String::new(),
+                notes: String::new(),
+                file_tree_summary: String::new(),
+                external_ref: None,
+            },
+            RoutingVerdict::StandardPath,
+            DriveBranchDecision::Generated,
+        )];
+
+        let report = dispatch_ready_with_vcs(&sessions, &store, &cfg, &ready, Some(&vcs)).unwrap();
+
+        assert_eq!(
+            report.success_count(),
+            1,
+            "ordinary bead with a stale pr_number must dispatch successfully by \
+             querying cfg.base_branch's revision, not fail by querying the \
+             not-yet-created next-attempt branch: failures={:?}",
+            report.failures
+        );
+        let overlay = store
+            .load("recovered-ordinary-bead-789")
+            .unwrap()
+            .expect("overlay must be persisted");
+        assert_eq!(
+            overlay.pre_session_head_sha.as_deref(),
+            Some("BASE_SHA"),
+            "expected_revision must resolve from cfg.base_branch, not the stale \
+             pr_number-triggered branch"
         );
     }
 
@@ -4449,4 +4786,3 @@ mod tests {
         );
     }
 }
-

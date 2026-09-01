@@ -115,7 +115,7 @@ daemon/src/
 ├── tools.rs        ~220  the 5 tool traits + subprocess implementations
 ├── intake.rs       ~140  issue→bead normalizer + write-tier auth (spec §4.2.3)
 ├── router.rs        ~70  ZFC task router: render prompt, 1 LLM call, parse verdict
-├── dispatch.rs     ~120  slot supervisor (≤30 workers, batch ≤15) + handoff
+├── dispatch.rs     ~120  slot supervisor (≤40 workers, batch ≤15) + handoff
 └── verifier.rs     ~220  7/8-green gates, ETag cache, evidence floor (spec §4.2.5)
 ```
 
