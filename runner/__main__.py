@@ -19,6 +19,24 @@ from .paths import resolve_factory_path, resolve_pipeline_path
 
 _PANIC_DIR = pathlib.Path.home() / ".dark-factory" / "panics"
 
+# D2/D3/D8a fail-closed (external-review finding, rounds 3 & 5): the
+# review-target/intent integrity chain (minted locator, pin chain, base
+# SHA, mint-failure signal, mint opt-in gate, target/target-mode) is
+# runner-owned end to end — `--state` must never let a caller write any of
+# these keys directly. Deliberately scoped to this one integrity chain, not
+# every internal `_df_*` bookkeeping key elsewhere in the codebase (e.g.
+# shadow-review toggles, controller-lane fixtures): those are legitimate,
+# unrelated `--state`-seedable operator/test knobs.
+_RESERVED_STATE_KEYS = frozenset({
+    "intent",
+    "target",
+    "_target_base_sha",
+    "_target_pin_chain",
+    "_target_mint_failed",
+    "_df_mint_review_target",
+    "_df_target_mode",
+})
+
 
 def _append_event(path: pathlib.Path, payload: dict[str, str]) -> None:
     try:
@@ -519,17 +537,17 @@ def main(argv: list[str] | None = None) -> int:
             if "=" not in kv:
                 p.error(f"--state requires KEY=VALUE format, got: {kv!r}")
             k, v = kv.split("=", 1)
-            if k == "intent":
-                # D2 fail-closed (external-review CRITICAL finding, round 3):
-                # `${intent}` must be sourced ONLY from the runner-recorded
-                # run-start intent envelope (`_mint_post_worker_target`,
-                # task mode) or the fixed target-mode default — never from
-                # caller-supplied state. `--state intent=...` is the only
-                # write path into `ctx.state["intent"]` outside that
-                # contract, so it is refused outright rather than silently
-                # accepted and later overwritten (a caller could otherwise
-                # race a mint that never fires, e.g. a non-git workdir).
-                p.error("--state cannot set the reserved key 'intent' (runner-minted only, D2)")
+            if k in _RESERVED_STATE_KEYS:
+                # D2/D3/D8a fail-closed (external-review finding, rounds 3 &
+                # 5): the whole review-target/intent integrity chain —
+                # minted pin, pin chain, mint-failure signal, mint opt-in
+                # gate, target/target-mode — is runner-owned end to end.
+                # `--state` is the only caller-controllable write path into
+                # `ctx.state` outside that chain, so every key it owns is
+                # refused outright rather than silently accepted and later
+                # raced, overwritten, or used to fabricate a fake-matching
+                # pin chain / mint result.
+                p.error(f"--state cannot set the reserved key {k!r} (runner-owned, D2/D3/D8a)")
             initial_state[k] = v
         if args.feature:
             initial_state["feature"] = args.feature

@@ -174,6 +174,60 @@ def test_fresh_reviewer_failure_relays_typed_findings_base64_fenced(tmp_path, mo
     assert decoded == findings
 
 
+def test_fresh_reviewer_real_prompt_fail_with_fenced_json_relays_typed_findings(
+    tmp_path, monkeypatch
+):
+    """Round-5 finding: the shipped static prompt (`prompts/slim/
+    fresh_review.md`) now asks the reviewer to emit a fenced JSON findings
+    block on FAIL. A compliant FAIL transcript rendered from the REAL
+    prompt file must parse into typed findings, not degrade to the "no
+    valid findings" message — the live RED run demonstrated every
+    compliant FAIL degrading because the old prompt never asked for JSON."""
+    repo = _repo(tmp_path)
+    _use_tmp_snapshot_root(tmp_path, monkeypatch)
+    monkeypatch.setenv("DARK_FACTORY_HOME", str(ROOT))
+    node = make_node(
+        name="cold_reviewer",
+        type="codergen",
+        backend="codex",
+        class_="review",
+        prompt="@prompts/slim/fresh_review.md",  # the real, shipped prompt
+        verdict_gate="true",
+        fresh_session="true",
+    )
+    node.attrs["class"] = "review"
+    node.attrs.pop("class_", None)
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="echo",
+        state={"ao.worktree": str(repo), **_target_state(repo)},
+    )
+    findings = [
+        {"path": "app.py", "claim": "returns the wrong value", "required_fix": "fix the return"}
+    ]
+    review = (
+        "Blocking findings:\n```json\n" + json.dumps(findings) + "\n```\n"
+        "Review completeness: COMPLETE\nVerdict: FAIL\n"
+    )
+    real_run = subprocess.run
+
+    def fake_run(args, **kwargs):
+        if args and args[0] == "codex":
+            return subprocess.CompletedProcess(args, 0, stdout=review, stderr="")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr("runner.handlers._sandboxed_args_for_workdir", lambda args, workdir: args)
+    monkeypatch.setattr("runner.handlers._sanitized_env", lambda: {})
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", fake_run)
+
+    result = _codergen(node, ctx)
+
+    assert result.outcome == "failure"
+    assert "BEGIN REVIEWER FINDINGS" in result.output
+    assert result.output != "review did not produce valid findings; re-run against current pin"
+
+
 def test_fresh_reviewer_unknown_verdict_fails_closed(tmp_path, monkeypatch):
     result, _, _ = _run_review(tmp_path, monkeypatch, "Looks plausible.\n")
 
@@ -230,6 +284,26 @@ def test_fresh_reviewer_verdict_only_in_stderr_is_rejected(tmp_path, monkeypatch
     assert result.outcome == "error"
     assert result.metadata["verdict"] == "unknown"
     assert result.metadata["terminal_report_valid"] == "false"
+
+
+def test_fresh_reviewer_completeness_only_in_stderr_normalizes_pass_to_failure(
+    tmp_path, monkeypatch
+):
+    """Round-5 finding: mirrors the verdict stdout-only fix for the
+    completeness marker. A stdout with a real terminal `Verdict: PASS` but
+    NO completeness marker, plus a stray "Review completeness: COMPLETE"
+    string in stderr, must not count as a validated PASS — the marker is
+    read from stdout only, same as the verdict itself."""
+    result, _, _ = _run_review(
+        tmp_path,
+        monkeypatch,
+        "No blocking findings.\nVerdict: PASS\n",
+        stderr="Review completeness: COMPLETE\n",
+    )
+
+    assert result.outcome == "failure"
+    assert result.metadata["verdict"] == "pass"
+    assert result.metadata["review_completeness"] == "unknown"
 
 
 def test_fresh_reviewer_unfinished_pass_normalizes_to_failure(tmp_path, monkeypatch):

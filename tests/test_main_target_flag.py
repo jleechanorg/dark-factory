@@ -200,3 +200,33 @@ class TestTargetFlagResolution:
         assert exc_info.value.code == 2
         err = capsys.readouterr().err
         assert "reserved key 'intent'" in err
+
+    @pytest.mark.parametrize(
+        "reserved_key",
+        [
+            "intent",
+            "target",
+            "_target_base_sha",
+            "_target_pin_chain",
+            "_target_mint_failed",
+            "_df_mint_review_target",
+            "_df_target_mode",
+        ],
+    )
+    def test_state_refuses_every_reserved_key(self, reserved_key, tmp_path, capsys):
+        """Round 5: extends the `intent` refusal to every key the
+        review-target/intent integrity chain owns (D2/D3/D8a) — a caller
+        must not be able to fabricate a matching pin chain, a fake mint
+        result, or flip the mint/target-mode gates via `--state`."""
+        with pytest.raises(SystemExit) as exc_info:
+            main([
+                "--pipeline", "pipelines/factory/hello.dot",
+                "--goal", "do something",
+                "--state", f"{reserved_key}=whatever",
+                "--backend", "echo",
+                "--workdir", str(tmp_path),
+                "--no-perf-log",
+            ])
+        assert exc_info.value.code == 2
+        err = capsys.readouterr().err
+        assert f"reserved key {reserved_key!r}" in err

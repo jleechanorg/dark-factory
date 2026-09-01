@@ -147,6 +147,10 @@ UNFINISHED, list exactly what remains unreviewed, give the coder concrete next
 actions, and end with Verdict: FAIL.
 
 Report only concrete blocking findings with exact paths and actionable fixes.
+On Verdict: FAIL, before the completeness line, emit the blocking findings as
+a fenced JSON code block: a JSON array of objects, each with exactly the keys
+`path`, `claim`, and `required_fix` (all non-empty strings) — for example
+`[{"path": "app.py", "claim": "returns the wrong value", "required_fix": "fix the return"}]`.
 Before the verdict, state exactly one completeness line:
 `Review completeness: COMPLETE` or `Review completeness: UNFINISHED`.
 End with exactly one line: `Verdict: PASS` (no blocking findings and all

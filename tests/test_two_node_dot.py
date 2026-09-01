@@ -159,6 +159,24 @@ def test_two_node_dot_reviewer_prompt_is_static_and_docs_agree() -> None:
     assert "Review completeness: COMPLETE" in prompt
     assert "Review completeness: UNFINISHED" in prompt
     assert "untrusted" in prompt.lower()
+    # Round-5 finding: the static prompt must actually ask for the typed
+    # findings JSON `parse_typed_findings` expects on FAIL — otherwise
+    # every compliant FAIL degrades to "no valid findings" (D8).
+    assert "path" in prompt and "claim" in prompt and "required_fix" in prompt
+    assert "fenced" in prompt.lower() and "json" in prompt.lower()
+    # The spec doc's Static reviewer prompt block must stay byte-consistent
+    # with the shipped prompt for this same paragraph.
+    spec = (
+        ROOT / "docs/superpowers/specs/2026-09-01-factory-two-node-redesign-design.md"
+    ).read_text()
+    findings_paragraph = (
+        "On Verdict: FAIL, before the completeness line, emit the blocking findings as\n"
+        "a fenced JSON code block: a JSON array of objects, each with exactly the keys\n"
+        "`path`, `claim`, and `required_fix` (all non-empty strings) — for example\n"
+        '`[{"path": "app.py", "claim": "returns the wrong value", "required_fix": "fix the return"}]`.'
+    )
+    assert findings_paragraph in prompt
+    assert findings_paragraph in spec
 
 
 def test_worker_prompt_is_direct_and_receipt_free() -> None:

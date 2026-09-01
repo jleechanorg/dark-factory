@@ -1528,7 +1528,12 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             # malformed marker, normalizes a PASS to failure (fail closed) —
             # a reviewer that ran out of time cannot report a clean bill of
             # health just by emitting `Verdict: PASS`.
-            completeness = parse_review_completeness(output)
+            # Round-5 finding: mirror the stdout-only fix for the verdict
+            # itself — the combined `output` (stdout+stderr) could let a
+            # stray "Review completeness: COMPLETE"-shaped string in stderr
+            # satisfy this check even though the reviewer's real stdout
+            # transcript never emitted it.
+            completeness = parse_review_completeness(stdout_only)
             if completeness != "complete":
                 outcome = "failure"
         meta.update(
