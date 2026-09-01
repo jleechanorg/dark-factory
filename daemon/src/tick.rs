@@ -570,11 +570,17 @@ fn emit_intake_outcome(telemetry_log: &Path, outcome: &IntakeOutcome) -> Result<
 /// operators the durable evidence they need to retry cleanup or kill the
 /// session manually. The `BEAD_SESSION_KILL_FAILED` telemetry event
 /// preserves visibility into the still-leaked session.
-fn overlay_session_project(_deps: &TickDeps, overlay: &BeadOverlay) -> Result<String, DaemonError> {
+fn overlay_session_project(deps: &TickDeps, overlay: &BeadOverlay) -> Result<String, DaemonError> {
     overlay
         .session_ao_project
         .as_deref()
         .map(str::to_owned)
+        .or_else(|| {
+            deps.cfg
+                .resolve_repo(overlay.repo(deps.cfg))
+                .map(|routing| routing.ao_project)
+        })
+        .or_else(|| deps.cfg.ao_project.clone())
         .ok_or_else(|| {
             DaemonError::Config(format!(
                 "persisted AO session project ownership is unavailable for bead {}; refusing unowned session operation",

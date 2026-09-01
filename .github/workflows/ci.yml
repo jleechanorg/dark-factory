@@ -309,10 +309,9 @@ jobs:
         working-directory: daemon
         # The self-hosted runner can concurrently run the Python test job;
         # serial compilation prevents rustc from being OOM-killed mid-suite.
-        # Test functions retain libtest's default parallelism. Tests that
-        # mutate process-global PATH/CWD use shared locks; tests that touch the
-        # persistent GitHub circuit breaker use isolated state paths.
-        run: cargo test --verbose -j 1
+        # Run all declared targets with single test thread to eliminate cache
+        # discovery artifacts and within-binary concurrency races.
+        run: cargo test --verbose -j 1 --all-targets -- --test-threads=1
 
       - name: cargo clippy (deny warnings)
         working-directory: daemon
