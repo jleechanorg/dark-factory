@@ -20,6 +20,7 @@ from runner.handlers import Context, _codergen  # noqa: E402
 from runner.handler_codergen import (  # noqa: E402
     _git_ignored_snapshot_paths,
     _git_path_is_ignored,
+    _normalize_and_validate_review_git,
 )
 from runner.handler_sandbox import _ControllerRuntime  # noqa: E402
 
@@ -293,7 +294,12 @@ def test_linux_landlock_fresh_reviewer_runs_pytest_and_denies_target_write(
 ):
     from runner.handler_codergen import _sandboxed_args_for_fresh_review
 
-    target = _repo(tmp_path / "target")
+    main_repo = _repo(tmp_path / "main")
+    target = tmp_path / "target"
+    subprocess.run(
+        ["git", "-C", str(main_repo), "worktree", "add", "-b", "target-branch", str(target)],
+        check=True,
+    )
     review_ws = tmp_path / "review"
     review_ws.mkdir()
     (review_ws / "test_runtime.py").write_text(
@@ -691,6 +697,142 @@ def test_fresh_reviewer_rejects_linked_worktree_metadata_symlink_before_copy(
     assert "metadata" in result.output.lower()
     assert codex_calls == []
     assert copied_external_bytes == []
+
+
+def test_fresh_reviewer_rejects_foreign_linked_worktree_gitdir_before_copy_or_codex(
+    tmp_path, monkeypatch
+):
+    """A regular .git pointer must name metadata that identifies this worktree."""
+    target_main = _repo(tmp_path / "target-main")
+    target_worktree = tmp_path / "target-worktree"
+    subprocess.run(
+        ["git", "-C", str(target_main), "worktree", "add", "-b", "target-branch", str(target_worktree)],
+        check=True,
+    )
+    foreign_main = _repo(tmp_path / "foreign-main")
+    foreign_worktree = tmp_path / "foreign-worktree"
+    subprocess.run(
+        ["git", "-C", str(foreign_main), "worktree", "add", "-b", "foreign-branch", str(foreign_worktree)],
+        check=True,
+    )
+    foreign_pointer = (foreign_worktree / ".git").read_text(encoding="utf-8")
+    (target_worktree / ".git").write_text(foreign_pointer, encoding="utf-8")
+
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="echo",
+        state={"ao.worktree": str(target_worktree)},
+    )
+    copied_sources: list[pathlib.Path] = []
+    codex_calls: list[list[str]] = []
+    real_copytree = shutil.copytree
+    real_run = subprocess.run
+
+    def record_copytree(source, destination, *args, **kwargs):
+        copied_sources.append(pathlib.Path(source).resolve())
+        return real_copytree(source, destination, *args, **kwargs)
+
+    def intercept_run(args, **kwargs):
+        if args and args[0] == "codex":
+            codex_calls.append(list(args))
+            return subprocess.CompletedProcess(args, 0, stdout="Verdict: PASS\n", stderr="")
+        return real_run(args, **kwargs)
+
+    foreign_gitdir = pathlib.Path(
+        foreign_pointer.removeprefix("gitdir:").strip()
+    )
+    foreign_common = (foreign_gitdir / "commondir").read_text(encoding="utf-8").strip()
+    foreign_main_git = (foreign_gitdir / foreign_common).resolve()
+    monkeypatch.setattr("runner.handler_codergen.shutil.copytree", record_copytree)
+    monkeypatch.setattr(
+        "runner.handler_codergen._sandboxed_args_for_fresh_review",
+        lambda command, *args, **kwargs: command,
+    )
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", intercept_run)
+
+    result = _codergen(_review_node(prompt), ctx)
+
+    assert result.outcome == "error"
+    assert "gitdir" in result.output.lower() or "metadata" in result.output.lower()
+    assert codex_calls == []
+    assert foreign_main_git not in copied_sources
+
+
+def test_fresh_reviewer_rejects_foreign_linked_worktree_commondir_before_copy_or_codex(
+    tmp_path, monkeypatch
+):
+    """A valid target admin dir cannot be rebound to a foreign common Git dir."""
+    target_main = _repo(tmp_path / "target-main")
+    target_worktree = tmp_path / "target-worktree"
+    subprocess.run(
+        ["git", "-C", str(target_main), "worktree", "add", "-b", "target-branch", str(target_worktree)],
+        check=True,
+    )
+    foreign_main = _repo(tmp_path / "foreign-main")
+    foreign_marker = foreign_main / ".git" / "FOREIGN_REVIEW_METADATA"
+    foreign_marker.write_text("must not enter the review snapshot\n")
+
+    target_pointer = (target_worktree / ".git").read_text(encoding="utf-8").strip()
+    target_gitdir = pathlib.Path(target_pointer.removeprefix("gitdir:").strip())
+    foreign_common = pathlib.Path(
+        os.path.relpath(foreign_main / ".git", target_gitdir)
+    )
+    (target_gitdir / "commondir").write_text(f"{foreign_common}\n", encoding="utf-8")
+
+    review_dir = tmp_path / "review"
+    shutil.copytree(target_worktree, review_dir, symlinks=True)
+
+    with pytest.raises(RuntimeError, match="common|registration"):
+        _normalize_and_validate_review_git(target_worktree, review_dir)
+    assert not (review_dir / ".git" / "FOREIGN_REVIEW_METADATA").exists()
+
+
+def test_fresh_reviewer_rejects_symlinked_linked_worktree_gitdir_parent(
+    tmp_path,
+):
+    """The admin-directory path itself may not traverse a symlinked parent."""
+    main_repo = _repo(tmp_path / "main")
+    target_worktree = tmp_path / "target-worktree"
+    subprocess.run(
+        ["git", "-C", str(main_repo), "worktree", "add", "-b", "target-branch", str(target_worktree)],
+        check=True,
+    )
+    target_pointer = (target_worktree / ".git").read_text(encoding="utf-8").strip()
+    target_gitdir = pathlib.Path(target_pointer.removeprefix("gitdir:").strip())
+    aliased_parent = tmp_path / "admin-parent-alias"
+    aliased_parent.symlink_to(target_gitdir.parent, target_is_directory=True)
+    (target_worktree / ".git").write_text(
+        f"gitdir: {aliased_parent / target_gitdir.name}\n", encoding="utf-8"
+    )
+
+    review_dir = tmp_path / "review"
+    shutil.copytree(target_worktree, review_dir, symlinks=True)
+    with pytest.raises(RuntimeError, match="[Ss]ymlink"):
+        _normalize_and_validate_review_git(target_worktree, review_dir)
+
+
+def test_fresh_reviewer_rejects_symlinked_target_git_pointer(
+    tmp_path,
+):
+    """The target .git pointer itself must be a regular file, never a link."""
+    main_repo = _repo(tmp_path / "main")
+    target = tmp_path / "target"
+    subprocess.run(
+        ["git", "-C", str(main_repo), "worktree", "add", "-b", "target-branch", str(target)],
+        check=True,
+    )
+    external_pointer = tmp_path / "external-git-pointer"
+    external_pointer.write_text("gitdir: /not-a-real-admin-directory\n", encoding="utf-8")
+    (target / ".git").unlink()
+    (target / ".git").symlink_to(external_pointer)
+
+    review_dir = tmp_path / "review"
+    shutil.copytree(target, review_dir, symlinks=True)
+    with pytest.raises(RuntimeError, match="[Ss]ymlink"):
+        _normalize_and_validate_review_git(target, review_dir)
 
 
 @pytest.mark.parametrize("target_kind", ["external", "dangling"])

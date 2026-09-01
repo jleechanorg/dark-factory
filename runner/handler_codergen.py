@@ -864,6 +864,7 @@ def _validate_snapshot_symlinks(
 
 def _validate_regular_git_metadata_tree(git_dir: pathlib.Path, label: str) -> None:
     """Reject symlinks and special files before they reach review Git metadata."""
+    _validate_git_metadata_path(git_dir, label)
     try:
         root_mode = git_dir.lstat().st_mode
     except OSError as exc:
@@ -881,11 +882,74 @@ def _validate_regular_git_metadata_tree(git_dir: pathlib.Path, label: str) -> No
             raise RuntimeError(f"Unsafe non-regular file in {label}: {entry}")
 
 
+def _validate_git_metadata_path(path: pathlib.Path, label: str) -> pathlib.Path:
+    """Reject symlinked path components before accessing Git metadata."""
+    candidate = pathlib.Path(path)
+    if not candidate.is_absolute():
+        candidate = pathlib.Path.cwd() / candidate
+    current = pathlib.Path(candidate.anchor)
+    for component in candidate.parts[1:]:
+        if component in ("", "."):
+            continue
+        if component == "..":
+            current = current.parent
+            continue
+        current /= component
+        try:
+            mode = current.lstat().st_mode
+        except OSError as exc:
+            raise RuntimeError(f"Cannot inspect {label}: {current}") from exc
+        if stat.S_ISLNK(mode):
+            raise RuntimeError(f"Symlinked path component in {label}: {current}")
+    return candidate
+
+
+def _git_metadata_path_fingerprint(
+    path: pathlib.Path, label: str
+) -> tuple[tuple[str, int, int], ...]:
+    """Capture component identities while rejecting symlinked components."""
+    candidate = _validate_git_metadata_path(path, label)
+    current = pathlib.Path(candidate.anchor)
+    fingerprint: list[tuple[str, int, int]] = []
+    for component in candidate.parts[1:]:
+        if component in ("", "."):
+            continue
+        if component == "..":
+            current = current.parent
+            continue
+        current /= component
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            raise RuntimeError(f"Cannot inspect {label}: {current}") from exc
+        fingerprint.append((os.fspath(current), info.st_dev, info.st_ino))
+    return tuple(fingerprint)
+
+
+def _resolve_git_metadata_path(
+    raw_path: str, base_dir: pathlib.Path, label: str
+) -> pathlib.Path:
+    """Resolve a required Git metadata path without traversing symlinks."""
+    raw = pathlib.Path(raw_path)
+    candidate = raw if raw.is_absolute() else base_dir / raw
+    before = _git_metadata_path_fingerprint(candidate, label)
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError(f"Cannot resolve {label}: {candidate}") from exc
+    _validate_git_metadata_path(resolved, label)
+    after = _git_metadata_path_fingerprint(candidate, label)
+    if before != after:
+        raise RuntimeError(f"Git metadata path changed while resolving: {candidate}")
+    return resolved
+
+
 def _read_regular_git_metadata_file(source: pathlib.Path) -> tuple[bytes, int]:
     """Read one metadata file without following a symlink at its final path."""
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
         raise RuntimeError("Safe Git metadata copy requires O_NOFOLLOW")
+    before = _git_metadata_path_fingerprint(source, "Git metadata file")
     try:
         source_fd = os.open(source, os.O_RDONLY | nofollow)
     except OSError as exc:
@@ -898,6 +962,12 @@ def _read_regular_git_metadata_file(source: pathlib.Path) -> tuple[bytes, int]:
             content = source_file.read()
     finally:
         os.close(source_fd)
+    try:
+        after = _git_metadata_path_fingerprint(source, "Git metadata file")
+    except RuntimeError as exc:
+        raise RuntimeError(f"Git metadata file changed while reading: {source}") from exc
+    if before != after:
+        raise RuntimeError(f"Git metadata file changed while reading: {source}")
     return content, stat.S_IMODE(source_stat.st_mode)
 
 
@@ -932,13 +1002,49 @@ def _normalize_and_validate_review_git(target_workdir: pathlib.Path, review_dir:
     gitdir_path: pathlib.Path | None = None
     main_git_dir: pathlib.Path | None = None
 
-    if git_target.is_file():
-        gitdir_content = git_target.read_text(encoding="utf-8").strip()
+    try:
+        git_target_mode = git_target.lstat().st_mode
+    except OSError as exc:
+        raise RuntimeError(f"Cannot inspect target worktree .git path: {git_target}") from exc
+    if stat.S_ISLNK(git_target_mode):
+        raise RuntimeError(f"Target worktree .git path is a symlink: {git_target}")
+    if not stat.S_ISREG(git_target_mode) and not stat.S_ISDIR(git_target_mode):
+        raise RuntimeError(f"Target worktree .git path is not a file or directory: {git_target}")
+
+    if stat.S_ISREG(git_target_mode):
+        gitdir_content = _read_regular_git_metadata_file(git_target)[0].decode(
+            "utf-8"
+        ).strip()
         if not gitdir_content.startswith("gitdir:"):
             raise RuntimeError(f"Invalid worktree .git pointer file in {target_workdir}: {gitdir_content}")
         gitdir_raw = gitdir_content[len("gitdir:"):].strip()
-        gitdir_path = (target_workdir / gitdir_raw).resolve()
+        gitdir_path = _resolve_git_metadata_path(
+            gitdir_raw,
+            target_workdir,
+            "linked-worktree Git metadata path",
+        )
         _validate_regular_git_metadata_tree(gitdir_path, "linked-worktree Git metadata")
+
+        target_git_path = _resolve_git_metadata_path(
+            str(git_target), target_workdir, "target worktree .git path"
+        )
+        admin_gitdir_file = gitdir_path / "gitdir"
+        admin_gitdir_raw = _read_regular_git_metadata_file(admin_gitdir_file)[0].decode(
+            "utf-8"
+        ).strip()
+        if not admin_gitdir_raw:
+            raise RuntimeError(
+                f"Linked-worktree Git metadata has an empty gitdir back-reference: {gitdir_path}"
+            )
+        admin_target_path = _resolve_git_metadata_path(
+            admin_gitdir_raw,
+            gitdir_path,
+            "linked-worktree gitdir back-reference",
+        )
+        if admin_target_path != target_git_path:
+            raise RuntimeError(
+                "Linked-worktree gitdir back-reference does not identify the target worktree"
+            )
 
         commondir_file = gitdir_path / "commondir"
         try:
@@ -949,10 +1055,54 @@ def _normalize_and_validate_review_git(target_workdir: pathlib.Path, review_dir:
             commondir_raw = _read_regular_git_metadata_file(commondir_file)[0].decode(
                 "utf-8"
             ).strip()
-            main_git_dir = (gitdir_path / commondir_raw).resolve()
-        if not commondir_raw:
-            main_git_dir = gitdir_path
+            if not commondir_raw:
+                raise RuntimeError(
+                    f"Linked-worktree Git metadata has an empty commondir: {commondir_file}"
+                )
+            main_git_dir = _resolve_git_metadata_path(
+                commondir_raw, gitdir_path, "common Git metadata path"
+            )
+        if main_git_dir is None:
+            raise RuntimeError(
+                f"Linked-worktree Git metadata has no commondir: {gitdir_path}"
+            )
         _validate_regular_git_metadata_tree(main_git_dir, "common Git metadata")
+
+        worktrees_dir = main_git_dir / "worktrees"
+        _validate_regular_git_metadata_tree(
+            worktrees_dir, "common Git worktree registration"
+        )
+        registered = False
+        for registration in worktrees_dir.iterdir():
+            registration_mode = registration.lstat().st_mode
+            if not stat.S_ISDIR(registration_mode):
+                continue
+            registration_path = _resolve_git_metadata_path(
+                str(registration),
+                worktrees_dir,
+                "common Git worktree registration",
+            )
+            if registration_path != gitdir_path:
+                continue
+            registration_gitdir = registration / "gitdir"
+            registered_target_raw = _read_regular_git_metadata_file(
+                registration_gitdir
+            )[0].decode("utf-8").strip()
+            registered_target = _resolve_git_metadata_path(
+                registered_target_raw,
+                registration_path,
+                "common Git worktree registration target",
+            )
+            if registered_target != target_git_path:
+                raise RuntimeError(
+                    "Common Git worktree registration does not identify the target worktree"
+                )
+            registered = True
+            break
+        if not registered:
+            raise RuntimeError(
+                "Common Git metadata has no registration for the target worktree"
+            )
 
         if git_review.exists() or git_review.is_symlink():
             if git_review.is_dir():
@@ -966,6 +1116,10 @@ def _normalize_and_validate_review_git(target_workdir: pathlib.Path, review_dir:
             symlinks=True,
             ignore_dangling_symlinks=False,
         )
+        try:
+            git_review = git_review.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise RuntimeError(f"Cannot resolve review Git metadata: {git_review}") from exc
         _validate_regular_git_metadata_tree(git_review, "review Git metadata")
 
         for entry in gitdir_path.rglob("*"):
@@ -988,6 +1142,14 @@ def _normalize_and_validate_review_git(target_workdir: pathlib.Path, review_dir:
             _copy_regular_git_metadata_file(entry, dest)
 
     if git_review.exists():
+        # ``tempfile`` may return the macOS ``/var`` alias.  Canonicalize the
+        # controller-owned destination before applying the strict metadata
+        # path-component check; source Git paths remain strictly checked at
+        # their original spelling above.
+        try:
+            git_review = git_review.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise RuntimeError(f"Cannot resolve review Git metadata: {git_review}") from exc
         if not git_review.is_dir() or git_review.is_symlink():
             raise RuntimeError(f"Review worktree .git is not a real directory: {git_review}")
         _validate_regular_git_metadata_tree(git_review, "review Git metadata")
