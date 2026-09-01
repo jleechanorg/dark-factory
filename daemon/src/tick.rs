@@ -580,7 +580,6 @@ fn overlay_session_project(deps: &TickDeps, overlay: &BeadOverlay) -> Result<Str
                 .resolve_repo(overlay.repo(deps.cfg))
                 .map(|routing| routing.ao_project)
         })
-        .or_else(|| deps.cfg.ao_project.clone())
         .ok_or_else(|| {
             DaemonError::Config(format!(
                 "persisted AO session project ownership is unavailable for bead {}; refusing unowned session operation",

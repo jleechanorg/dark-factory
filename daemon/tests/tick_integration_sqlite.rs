@@ -439,7 +439,7 @@ fn restarted_tick_fails_closed_and_refuses_session_ops_on_legacy_null_project_ro
         spawn_failure_count: 0,
         pre_session_head_sha: None,
         park_reason: None,
-        target_repo: Some("owner/repo".into()),
+        target_repo: Some("unrouted/legacy-repo".into()),
         attempt_started_at: None,
     };
     {
