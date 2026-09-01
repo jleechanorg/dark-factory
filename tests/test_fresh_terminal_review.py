@@ -78,11 +78,12 @@ def test_fresh_reviewer_runs_codex_ephemeral_in_target_worktree(tmp_path, monkey
     result, calls, repo = _run_review(
         tmp_path,
         monkeypatch,
-        "No blocking findings.\nVerdict: PASS\n",
+        "No blocking findings.\nReview completeness: COMPLETE\nVerdict: PASS\n",
     )
 
     assert result.outcome == "success"
     assert result.metadata["verdict"] == "pass"
+    assert result.metadata["review_completeness"] == "complete"
     assert len(calls) == 1
     argv, cwd = calls[0]
     assert argv[:5] == ["codex", "exec", "--ephemeral", "--yolo", "--skip-git-repo-check"]
@@ -127,6 +128,44 @@ def test_fresh_reviewer_unknown_verdict_fails_closed(tmp_path, monkeypatch):
 
     assert result.outcome == "error"
     assert result.metadata["verdict"] == "unknown"
+
+
+def test_fresh_reviewer_unfinished_pass_normalizes_to_failure(tmp_path, monkeypatch):
+    """D7 (v3.1 delta): `Review completeness: UNFINISHED` + `Verdict: PASS`
+    is not a validated PASS — the reviewer ran out of time and must not be
+    treated as a clean bill of health."""
+    review = "Ran out of time, reviewed half the diff.\nReview completeness: UNFINISHED\nVerdict: PASS\n"
+    result, _, _ = _run_review(tmp_path, monkeypatch, review)
+
+    assert result.outcome == "failure"
+    assert result.metadata["verdict"] == "pass"
+    assert result.metadata["review_completeness"] == "unfinished"
+
+
+def test_fresh_reviewer_missing_completeness_marker_normalizes_pass_to_failure(
+    tmp_path, monkeypatch
+):
+    """A PASS verdict with no completeness marker at all fails closed the
+    same way as an explicit UNFINISHED — the marker is required, not
+    optional, for a PASS to be machine-validated."""
+    result, _, _ = _run_review(tmp_path, monkeypatch, "No blocking findings.\nVerdict: PASS\n")
+
+    assert result.outcome == "failure"
+    assert result.metadata["verdict"] == "pass"
+    assert result.metadata["review_completeness"] == "unknown"
+
+
+def test_fresh_reviewer_unfinished_fail_stays_failure(tmp_path, monkeypatch):
+    """The completeness marker only gates PASS; a FAIL verdict is failure
+    either way and is not affected by the completeness check."""
+    review = "Blocking: found a real bug.\nReview completeness: UNFINISHED\nVerdict: FAIL\n"
+    result, _, _ = _run_review(tmp_path, monkeypatch, review)
+
+    assert result.outcome == "failure"
+    assert result.metadata["verdict"] == "fail"
+    # The completeness field is only computed on the success path (D7 only
+    # gates PASS); metadata reflects that it was never evaluated.
+    assert result.metadata["review_completeness"] == "n/a"
 
 
 def test_fresh_reviewer_timeout_fails_closed(tmp_path, monkeypatch):
@@ -229,7 +268,7 @@ def test_fresh_reviewer_allows_real_target_beneath_symlinked_parent(
         if args and args[0] == "codex":
             calls.append(pathlib.Path(kwargs["cwd"]))
             return subprocess.CompletedProcess(
-                args, 0, stdout="Verdict: PASS\n", stderr=""
+                args, 0, stdout="Review completeness: COMPLETE\nVerdict: PASS\n", stderr=""
             )
         return real_run(args, **kwargs)
 

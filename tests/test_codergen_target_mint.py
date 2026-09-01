@@ -18,6 +18,7 @@ from runner.handler_codergen import (  # noqa: E402
     _checkpoint_dirty_state,
     _mint_post_worker_target,
     format_typed_findings_relay,
+    parse_review_completeness,
     parse_typed_findings,
 )
 from runner import target_locator as tl  # noqa: E402
@@ -46,6 +47,31 @@ def git_repo(tmp_path: pathlib.Path) -> pathlib.Path:
 # ---------------------------------------------------------------------------
 # parse_typed_findings() / format_typed_findings_relay()
 # ---------------------------------------------------------------------------
+
+
+class TestParseReviewCompleteness:
+    def test_complete_marker(self):
+        text = "prose\nReview completeness: COMPLETE\nVerdict: PASS\n"
+        assert parse_review_completeness(text) == "complete"
+
+    def test_unfinished_marker(self):
+        text = "prose\nReview completeness: UNFINISHED\nVerdict: PASS\n"
+        assert parse_review_completeness(text) == "unfinished"
+
+    def test_missing_marker_is_unknown(self):
+        assert parse_review_completeness("prose\nVerdict: PASS\n") == "unknown"
+
+    def test_empty_text_is_unknown(self):
+        assert parse_review_completeness("") == "unknown"
+
+    def test_lowercase_marker_is_not_matched(self):
+        """The marker is a strict, machine-checked literal (design D7) —
+        lowercase or other casing does not count as a valid marker."""
+        assert parse_review_completeness("Review completeness: complete\n") == "unknown"
+
+    def test_last_marker_wins_when_duplicated(self):
+        text = "Review completeness: UNFINISHED\n...\nReview completeness: COMPLETE\nVerdict: PASS\n"
+        assert parse_review_completeness(text) == "complete"
 
 
 class TestParseTypedFindings:

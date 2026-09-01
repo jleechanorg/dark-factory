@@ -140,8 +140,11 @@ def test_worker_prompt_does_not_reference_deleted_controller_receipts() -> None:
     assert "verification receipt" not in prompt.lower()
 
 
-def test_two_node_dot_reviewer_prompt_is_short_and_docs_agree() -> None:
-    """The default prompt states the goal directly without a controller packet."""
+def test_two_node_dot_reviewer_prompt_is_static_and_docs_agree() -> None:
+    """The default prompt is the static factory two-node redesign contract
+    (D1/D2/D7): no caller/worker text (``${goal}``) reaches the reviewer —
+    only the runner-minted ``${target}``/``${intent}`` envelope, the
+    authority rules, and the completeness + verdict contract."""
     reviewer = parse(ROOT / _PIPELINE).nodes["cold_reviewer"]
     assert reviewer.attrs.get("prompt") == "@prompts/slim/fresh_review.md"
     assert reviewer.attrs.get("type") == "codergen"
@@ -149,9 +152,13 @@ def test_two_node_dot_reviewer_prompt_is_short_and_docs_agree() -> None:
     assert "fresh Codex reviewer" in skill
     assert "static Codex cold reviewer" not in skill
     prompt = (ROOT / "prompts/slim/fresh_review.md").read_text()
-    assert len([line for line in prompt.splitlines() if line.strip()]) <= 6
-    assert "Use all available tools" in prompt
+    assert "${goal}" not in prompt
+    assert "${target}" in prompt and "${intent}" in prompt
+    assert "Use all available" in prompt
     assert "Verdict: PASS" in prompt and "Verdict: FAIL" in prompt
+    assert "Review completeness: COMPLETE" in prompt
+    assert "Review completeness: UNFINISHED" in prompt
+    assert "untrusted" in prompt.lower()
 
 
 def test_worker_prompt_is_direct_and_receipt_free() -> None:

@@ -288,8 +288,9 @@ def main(argv: list[str] | None = None) -> int:
                 "'PR 811', '#811', an absolute path, a commit SHA) resolved "
                 "mechanically before the run starts (D3/D5 of the factory "
                 "two-node redesign). Refuses to start if it cannot be "
-                "resolved. Makes --goal optional (target-mode verification "
-                "run). Entry-mode graph wiring (reviewer-first routing) is "
+                "resolved. Mutually exclusive with --goal (D5): a target-mode "
+                "verification run has no free-text goal. Entry-mode graph "
+                "wiring (reviewer-first routing) is "
                 "not yet consumed by the engine/two_node graph — --target "
                 "currently pre-resolves and pins the locator into "
                 "ctx.state['target']; see rev-xfy23 for the follow-up."
@@ -432,6 +433,9 @@ def main(argv: list[str] | None = None) -> int:
             payload["status"] = "fail" if any(item.get("severity") == "error" for item in diagnostics) else "pass"
             print(json.dumps(payload, sort_keys=True, indent=2))
             return 1 if payload["status"] == "fail" else 0
+
+        if args.target and args.goal:
+            p.error("--target and --goal are mutually exclusive (D5): pass one or the other")
 
         resolved_target_locator = None
         if args.target:

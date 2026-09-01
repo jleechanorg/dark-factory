@@ -113,3 +113,21 @@ class TestTargetFlagResolution:
         assert exc_info.value.code == 2
         err = capsys.readouterr().err
         assert "--goal is required" in err
+
+    def test_target_and_goal_are_mutually_exclusive(self, tmp_path, capsys):
+        """D5 (v3.1 delta): combining --target and --goal is an argparse
+        error — a target-mode verification run has no free-text goal."""
+        target_file = tmp_path / "spec.md"
+        target_file.write_text("body")
+        with pytest.raises(SystemExit) as exc_info:
+            main([
+                "--pipeline", "pipelines/factory/hello.dot",
+                "--target", str(target_file),
+                "--goal", "do something",
+                "--backend", "echo",
+                "--workdir", str(tmp_path),
+                "--no-perf-log",
+            ])
+        assert exc_info.value.code == 2
+        err = capsys.readouterr().err
+        assert "mutually exclusive" in err

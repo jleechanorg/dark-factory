@@ -720,6 +720,22 @@ def parse_typed_findings(text: str) -> list[dict] | None:
     return findings or None
 
 
+_COMPLETENESS_RE = re.compile(r"^Review completeness:\s*(COMPLETE|UNFINISHED)\s*$", re.MULTILINE)
+
+
+def parse_review_completeness(text: str) -> str:
+    """Parse the machine-checked ``Review completeness: COMPLETE|UNFINISHED``
+    marker (design D7, v3.1 delta). Returns ``"complete"``, ``"unfinished"``,
+    or ``"unknown"`` (marker missing/malformed) — the caller treats anything
+    but ``"complete"`` as failing a PASS verdict (fail closed: an UNFINISHED
+    review or a missing marker never counts as a validated PASS).
+    """
+    matches = _COMPLETENESS_RE.findall(text or "")
+    if not matches:
+        return "unknown"
+    return matches[-1].lower()
+
+
 def format_typed_findings_relay(raw_output: str) -> str:
     """Build the worker-facing reviewer-failure relay (design D8): a
     Base64-fenced typed-findings block marked as untrusted requirements to
@@ -1329,12 +1345,23 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             outcome = "error"
         else:
             outcome = parsed_outcome
+        completeness = "n/a"
+        if outcome == "success":
+            # D7 (v3.1 delta): PASS additionally requires the machine-checked
+            # `Review completeness: COMPLETE` line. UNFINISHED, or a missing/
+            # malformed marker, normalizes a PASS to failure (fail closed) —
+            # a reviewer that ran out of time cannot report a clean bill of
+            # health just by emitting `Verdict: PASS`.
+            completeness = parse_review_completeness(output)
+            if completeness != "complete":
+                outcome = "failure"
         meta.update(
             {
                 "verdict": verdict,
                 "fresh_session": "true",
                 "review_workdir": str(codex_workdir),
                 "reviewer_mutated_tracked_files": str(mutated).lower(),
+                "review_completeness": completeness,
             }
         )
         if mutated:
