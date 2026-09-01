@@ -733,11 +733,62 @@ def _git_ignored_snapshot_paths(target_workdir: pathlib.Path) -> set[pathlib.Pat
     }
 
 
+def _git_tracked_symlink_paths(target_workdir: pathlib.Path) -> set[pathlib.Path]:
+    """Return tracked symlink paths from the target repository index."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(target_workdir), "ls-files", "--stage", "-z"],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("Cannot determine tracked review symlinks") from exc
+    if proc.returncode != 0:
+        raise RuntimeError("Cannot determine tracked review symlinks")
+
+    tracked: set[pathlib.Path] = set()
+    for raw in proc.stdout.split(b"\0"):
+        if not raw:
+            continue
+        try:
+            metadata, path = raw.split(b"\t", 1)
+        except ValueError as exc:
+            raise RuntimeError("Cannot parse tracked review symlinks") from exc
+        if metadata.split(maxsplit=1)[0] == b"120000":
+            tracked.add(pathlib.Path(os.fsdecode(path)))
+    return tracked
+
+
+def _safe_relative_symlink_target(
+    entry: pathlib.Path, target_workdir: pathlib.Path
+) -> pathlib.Path | None:
+    """Return an in-tree lexical target for a safe relative symlink."""
+    try:
+        raw_target = os.readlink(entry)
+        if os.path.isabs(raw_target):
+            return None
+        target_real = target_workdir.resolve(strict=True)
+        resolved = (entry.parent / raw_target).resolve(strict=False)
+        if resolved == target_real or resolved == entry:
+            return None
+        entry_parent = entry.parent.resolve(strict=True)
+        if resolved in entry_parent.parents:
+            return None
+        resolved.relative_to(target_real)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if resolved.is_symlink():
+        return None
+    return resolved
+
+
 def _validate_snapshot_symlinks(
     target_workdir: pathlib.Path, ignored_paths: set[pathlib.Path]
 ) -> None:
     """Validate that target_workdir contains no unsafe, escaping, or dangling symlinks."""
     target_real = target_workdir.resolve(strict=True)
+    tracked_symlinks = _git_tracked_symlink_paths(target_workdir)
     for root, dirs, files in os.walk(target_workdir, topdown=True, followlinks=False):
         root_path = pathlib.Path(root)
         root_relative = root_path.relative_to(target_workdir)
@@ -752,6 +803,17 @@ def _validate_snapshot_symlinks(
                 try:
                     resolved = entry.resolve(strict=True)
                 except (OSError, RuntimeError) as exc:
+                    relative_entry = entry.relative_to(target_workdir)
+                    safe_target = _safe_relative_symlink_target(entry, target_workdir)
+                    if relative_entry in tracked_symlinks and safe_target is not None:
+                        safe_relative = safe_target.relative_to(target_real)
+                        if not any(
+                            ignored == safe_relative
+                            or ignored in safe_relative.parents
+                            or safe_relative in ignored.parents
+                            for ignored in ignored_paths
+                        ):
+                            continue
                     raise RuntimeError(
                         f"Target workspace contains unsafe dangling or looping symlink: {entry}"
                     ) from exc
@@ -790,6 +852,8 @@ def _materialize_snapshot_symlinks(target_workdir: pathlib.Path, review_dir: pat
                 try:
                     target_resolved = orig.resolve(strict=True)
                 except (OSError, RuntimeError) as exc:
+                    if _safe_relative_symlink_target(orig, target_workdir) is not None:
+                        continue
                     raise RuntimeError(f"Cannot resolve in-tree symlink {entry}") from exc
                 if not (target_resolved == target_real or target_real in target_resolved.parents):
                     raise RuntimeError(f"Escaping symlink found during materialization: {entry}")

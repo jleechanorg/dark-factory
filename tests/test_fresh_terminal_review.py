@@ -786,6 +786,56 @@ def test_fresh_reviewer_preserves_safe_relative_symlinks_and_isolates_absolute_l
     assert (repo / "value.txt").read_text() == "before\n"
 
 
+def test_fresh_reviewer_allows_tracked_relative_metadata_symlink_without_target(
+    tmp_path, monkeypatch
+):
+    repo = _repo(tmp_path)
+    metadata_link = repo / ".codex" / "skills" / "goal-define"
+    metadata_link.parent.mkdir(parents=True)
+    metadata_link.symlink_to("../../.claude/skills/goal-define")
+    subprocess.run(["git", "-C", str(repo), "add", ".codex"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-qm", "add metadata link"], check=True
+    )
+
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="echo",
+        state={"ao.worktree": str(repo)},
+    )
+    calls: list[pathlib.Path] = []
+    real_run = subprocess.run
+
+    def check_metadata_link(args, **kwargs):
+        if args and args[0] == "codex":
+            cwd = pathlib.Path(kwargs["cwd"])
+            copied_link = cwd / ".codex" / "skills" / "goal-define"
+            calls.append(copied_link)
+            assert copied_link.is_symlink()
+            assert copied_link.readlink() == pathlib.Path(
+                "../../.claude/skills/goal-define"
+            )
+            assert not copied_link.resolve(strict=False).exists()
+            return subprocess.CompletedProcess(
+                args, 0, stdout="Verdict: PASS\n", stderr=""
+            )
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(
+        "runner.handlers._sandboxed_args_for_workdir", lambda args, workdir: args
+    )
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", check_metadata_link)
+
+    result = _codergen(_review_node(prompt), ctx)
+
+    assert result.outcome == "success", result.output
+    assert result.metadata["verdict"] == "pass"
+    assert len(calls) == 1
+
+
 def test_fresh_reviewer_rejects_relative_link_to_snapshot_root_before_copy(
     tmp_path, monkeypatch
 ):
