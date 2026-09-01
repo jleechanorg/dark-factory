@@ -211,6 +211,22 @@ def register_scratch_dir(path: pathlib.Path) -> pathlib.Path:
     return path
 
 
+def init_git_repo(path: pathlib.Path) -> pathlib.Path:
+    """Initialize an existing temp directory as a Git repository with a readable HEAD.
+
+    Used by test fixtures for fresh verdict-gated graphs requiring git isolation preflight.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    if not (path / ".git").exists():
+        subprocess.run(["git", "-C", str(path), "init", "-q", "-b", "main"], check=True)
+        subprocess.run(["git", "-C", str(path), "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(path), "config", "user.name", "test"], check=True)
+        (path / "README.md").write_text("fixture\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(path), "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", str(path), "commit", "-qm", "baseline"], check=True)
+    return path
+
+
 def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
     """Remove every registered module-level SCRATCH workdir at session end.
 
