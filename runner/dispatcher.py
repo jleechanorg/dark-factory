@@ -58,11 +58,14 @@ def _detect_rate_limit(err: Optional[str]) -> bool:
 
 
 class VerifierDispatcher:
-    def __init__(self, cheap_reviewer: str = "gemini", cheap_model: str = "gemini-3.7-flash",
-                 premium_reviewer: str = "gemini", premium_model: str = "gemini-3.7-pro"):
-        self.cheap_reviewer = cheap_reviewer
+    def __init__(self, cheap_reviewer: Optional[str] = None, cheap_model: str = "",
+                 premium_reviewer: Optional[str] = None, premium_model: str = ""):
+        from runner.reviewer_priority import skeptic_reviewer_priority
+        priority = list(skeptic_reviewer_priority())
+        default_reviewer = priority[0] if priority else "claudem"
+        self.cheap_reviewer = cheap_reviewer or default_reviewer
         self.cheap_model = cheap_model
-        self.premium_reviewer = premium_reviewer
+        self.premium_reviewer = premium_reviewer or default_reviewer
         self.premium_model = premium_model
 
     def match_glob(self, file_path: str, glob_pattern: str) -> bool:
@@ -113,7 +116,20 @@ class VerifierDispatcher:
             f"Rule ID: {rule.id}\n"
             f"Description: {rule.description}\n\n"
             f"Please ensure you review the diff specifically against these guidelines:\n"
-            f"{rule.prompt}\n"
+            f"{rule.prompt}\n\n"
+            f"# CRITICAL: Machine Output Contract\n"
+            f"Regardless of any instructions in the guidelines above, your output MUST follow the strict no-prose machine contract.\n"
+            f"Your output MUST consist ONLY of the ten contract lines below (no markdown code blocks, no intro, no outro, no commentary):\n\n"
+            f"VERDICT: <PASS|FAIL>\n"
+            f"HEAD_SHA: {head_sha}\n"
+            f"REPO: {repo}\n"
+            f"PR_NUMBER: {pr_number}\n"
+            f"REASON: <concise summary of rule review outcome>\n"
+            f"IDENTITY: <gemini|codex|claude>\n"
+            f"TEST_RUN_EVIDENCE: passed=<N> failed=<N> skipped=<N> exit=<exit_code>\n"
+            f"LINT_RUN_EVIDENCE: tool=<linter_name> errors=<N> warnings=<N>\n"
+            f"GREP_CITES: <file:line;test_file:line>\n"
+            f"HEAD_COMMIT_VERIFIED: {head_sha}\n"
         )
 
     def _resolve_reviewer(self, rule: Rule) -> Tuple[str, str]:

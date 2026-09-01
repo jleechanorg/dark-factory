@@ -598,12 +598,16 @@ def invoke_reviewer(
     if reviewer == "gemini" and cmd and cmd[0].endswith("gemini"):
         cmd = [
             gemini_bin or "agy",
-            "--model",
-            model,
             "--dangerously-skip-permissions",
+            "--print-timeout",
+            f"{timeout}s",
+            "--effort",
+            "medium",
             "--print",
             prompt,
         ]
+        if model:
+            cmd.extend(["--model", model])
         stdin_input = None
     elif reviewer == "codex" and cmd:
         if "--sandbox" in cmd:
@@ -620,7 +624,7 @@ def invoke_reviewer(
         parent_env if parent_env is not None else os.environ, reviewer
     )
     if reviewer == "gemini":
-        env["HOME"] = "/tmp"
+        env["HOME"] = os.path.expanduser("~")
 
     try:
         proc = subprocess.run(
