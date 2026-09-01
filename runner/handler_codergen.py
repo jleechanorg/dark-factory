@@ -733,6 +733,33 @@ def _git_ignored_snapshot_paths(target_workdir: pathlib.Path) -> set[pathlib.Pat
     }
 
 
+def _git_path_is_ignored(target_workdir: pathlib.Path, relative_path: pathlib.Path) -> bool:
+    """Return whether Git ignores a candidate path, including an absent one."""
+    try:
+        proc = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(target_workdir),
+                "check-ignore",
+                "--quiet",
+                "--no-index",
+                "--",
+                os.fspath(relative_path),
+            ],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("Cannot determine whether review path is Git-ignored") from exc
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == 1:
+        return False
+    raise RuntimeError("Cannot determine whether review path is Git-ignored")
+
+
 def _git_tracked_symlink_paths(target_workdir: pathlib.Path) -> set[pathlib.Path]:
     """Return tracked symlink paths from the target repository index."""
     try:
@@ -807,6 +834,10 @@ def _validate_snapshot_symlinks(
                     safe_target = _safe_relative_symlink_target(entry, target_workdir)
                     if relative_entry in tracked_symlinks and safe_target is not None:
                         safe_relative = safe_target.relative_to(target_real)
+                        if _git_path_is_ignored(target_workdir, safe_relative):
+                            raise RuntimeError(
+                                f"Target workspace symlink resolves into a Git-ignored path: {entry}"
+                            )
                         if not any(
                             ignored == safe_relative
                             or ignored in safe_relative.parents
@@ -1001,6 +1032,8 @@ def _isolated_review_workdir(target_workdir: pathlib.Path):
         )
         _materialize_snapshot_symlinks(target_workdir, review_dir)
         _normalize_and_validate_review_git(target_workdir, review_dir)
+        if _git_ignored_snapshot_paths(review_dir):
+            raise RuntimeError("Review snapshot contains Git-ignored paths after copy")
         yield review_dir
 
 

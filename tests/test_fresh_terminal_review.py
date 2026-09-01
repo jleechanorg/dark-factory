@@ -17,7 +17,10 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from conftest import make_node  # noqa: E402
 import runner.handlers as _handlers_shim  # noqa: E402
 from runner.handlers import Context, _codergen  # noqa: E402
-from runner.handler_codergen import _git_ignored_snapshot_paths  # noqa: E402
+from runner.handler_codergen import (  # noqa: E402
+    _git_ignored_snapshot_paths,
+    _git_path_is_ignored,
+)
 from runner.handler_sandbox import _ControllerRuntime  # noqa: E402
 
 
@@ -834,6 +837,123 @@ def test_fresh_reviewer_allows_tracked_relative_metadata_symlink_without_target(
     assert result.outcome == "success", result.output
     assert result.metadata["verdict"] == "pass"
     assert len(calls) == 1
+
+
+def test_fresh_reviewer_rejects_tracked_dangling_link_to_ignored_path(
+    tmp_path, monkeypatch
+):
+    repo = _repo(tmp_path)
+    (repo / ".gitignore").write_text("ignored/\n")
+    metadata_link = repo / ".codex" / "skills" / "goal-define"
+    metadata_link.parent.mkdir(parents=True)
+    metadata_link.symlink_to("../../ignored/missing.txt")
+    subprocess.run(
+        ["git", "-C", str(repo), "add", ".gitignore", ".codex"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-qm", "add ignored metadata link"],
+        check=True,
+    )
+
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="echo",
+        state={"ao.worktree": str(repo)},
+    )
+    codex_calls: list[list[str]] = []
+    real_run = subprocess.run
+
+    def intercept_run(args, **kwargs):
+        if args and args[0] == "codex":
+            codex_calls.append(list(args))
+            return subprocess.CompletedProcess(
+                args, 0, stdout="Verdict: PASS\n", stderr=""
+            )
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(
+        "runner.handler_codergen._sandboxed_args_for_fresh_review",
+        lambda command, *args, **kwargs: command,
+    )
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", intercept_run)
+
+    result = _codergen(_review_node(prompt), ctx)
+
+    assert result.outcome == "error"
+    assert "ignored" in result.output.lower()
+    assert codex_calls == []
+
+
+def test_git_path_is_ignored_fails_closed_on_git_error(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    real_run = subprocess.run
+
+    def fail_check_ignore(args, **kwargs):
+        if args[3:5] == ["check-ignore", "--quiet"]:
+            return subprocess.CompletedProcess(args, 2, stdout=b"", stderr=b"broken")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", fail_check_ignore)
+
+    with pytest.raises(RuntimeError, match="Cannot determine whether review path"):
+        _git_path_is_ignored(repo, pathlib.Path("ignored/missing.txt"))
+
+
+def test_fresh_reviewer_rejects_ignored_file_added_during_snapshot(
+    tmp_path, monkeypatch
+):
+    repo = _repo(tmp_path)
+    (repo / ".gitignore").write_text("ignored/\n")
+    subprocess.run(["git", "-C", str(repo), "add", ".gitignore"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-qm", "ignore local artifacts"],
+        check=True,
+    )
+
+    prompt = tmp_path / "review.md"
+    prompt.write_text("Review ${goal}. End with Verdict: PASS or Verdict: FAIL.\n")
+    ctx = Context(
+        goal="review this change",
+        workdir=tmp_path,
+        backend="echo",
+        state={"ao.worktree": str(repo)},
+    )
+    codex_calls: list[list[str]] = []
+    real_copytree = shutil.copytree
+    real_run = subprocess.run
+
+    def add_ignored_file_after_validation(source, destination, *args, **kwargs):
+        if pathlib.Path(source) == repo:
+            ignored_file = repo / "ignored" / "late.txt"
+            ignored_file.parent.mkdir()
+            ignored_file.write_text("must not reach reviewer\n")
+        return real_copytree(source, destination, *args, **kwargs)
+
+    def intercept_run(args, **kwargs):
+        if args and args[0] == "codex":
+            codex_calls.append(list(args))
+            return subprocess.CompletedProcess(
+                args, 0, stdout="Verdict: PASS\n", stderr=""
+            )
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(
+        "runner.handler_codergen._sandboxed_args_for_fresh_review",
+        lambda command, *args, **kwargs: command,
+    )
+    monkeypatch.setattr(
+        "runner.handler_codergen.shutil.copytree", add_ignored_file_after_validation
+    )
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", intercept_run)
+
+    result = _codergen(_review_node(prompt), ctx)
+
+    assert result.outcome == "error"
+    assert "ignored" in result.output.lower()
+    assert codex_calls == []
 
 
 def test_fresh_reviewer_rejects_relative_link_to_snapshot_root_before_copy(
