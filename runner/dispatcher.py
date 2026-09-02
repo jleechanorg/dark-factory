@@ -6,7 +6,11 @@ import re
 from typing import List, Optional, Tuple, Dict, Any
 from runner.rule_loader import Rule
 from runner.skeptic_gate_cli import invoke_reviewer as _invoke_reviewer_module_ref
-from runner.skeptic_gate import SkepticResult
+from runner.skeptic_gate import (
+    SkepticResult,
+    IDENTITY_TOKEN_PLACEHOLDER as _IDENTITY_TOKEN_PLACEHOLDER,
+    expected_identity_for_vendor as _expected_identity_for_vendor,
+)
 from runner import skeptic_gate_cli as _cli
 
 # Resolve build_prompt/evaluate/invoke_reviewer through the CLI module
@@ -42,6 +46,24 @@ _RATE_LIMIT_PATTERNS = (
     "insufficient_quota",
     "insufficient quota",
 )
+
+
+# Single source of truth for the IDENTITY placeholder and per-vendor
+# token lives in runner.skeptic_gate (also used directly by
+# bind_reviewer_identity's REVIEWER_CLI_TO_IDENTITY table), so the
+# prompt instruction and the deterministic bind check can never drift
+# apart. PR #819 round-2: the prompt used to hardcode
+# `IDENTITY: <gemini|codex|claude>`, so a claudem/agy/cursor-agent
+# reviewer following the prompt literally could never declare its own
+# configured vendor name — bind_reviewer_identity then rejected every
+# verdict from a non-codex/gemini vendor. The prompt is built once per
+# rule but the walker retargets this token per vendor attempt so a
+# mid-walk fallback also gets the right instruction.
+
+
+def _retarget_identity(prompt: str, vendor: str) -> str:
+    """Substitute the IDENTITY placeholder in ``prompt`` for ``vendor``."""
+    return prompt.replace(_IDENTITY_TOKEN_PLACEHOLDER, _expected_identity_for_vendor(vendor))
 
 
 def _detect_rate_limit(err: Optional[str]) -> bool:
@@ -119,13 +141,16 @@ class VerifierDispatcher:
             f"{rule.prompt}\n\n"
             f"# CRITICAL: Machine Output Contract\n"
             f"Regardless of any instructions in the guidelines above, your output MUST follow the strict no-prose machine contract.\n"
-            f"Your output MUST consist ONLY of the ten contract lines below (no markdown code blocks, no intro, no outro, no commentary):\n\n"
+            f"Your output MUST consist ONLY of the ten contract lines below (no markdown code blocks, no intro, no outro, no commentary). "
+            f"The IDENTITY line below has a placeholder token — it is replaced with the exact "
+            f"identity string you must declare before this prompt reaches you; emit that exact "
+            f"substituted value verbatim, with no other value:\n\n"
             f"VERDICT: <PASS|FAIL>\n"
             f"HEAD_SHA: {head_sha}\n"
             f"REPO: {repo}\n"
             f"PR_NUMBER: {pr_number}\n"
             f"REASON: <concise summary of rule review outcome>\n"
-            f"IDENTITY: <gemini|codex|claude>\n"
+            f"IDENTITY: {_IDENTITY_TOKEN_PLACEHOLDER}\n"
             f"TEST_RUN_EVIDENCE: passed=<N> failed=<N> skipped=<N> exit=<exit_code>\n"
             f"LINT_RUN_EVIDENCE: tool=<linter_name> errors=<N> warnings=<N>\n"
             f"GREP_CITES: <file:line;test_file:line>\n"
@@ -194,7 +219,8 @@ class VerifierDispatcher:
         for vendor in queue:
             last_vendor = vendor
             try:
-                stdout, err = _cli.invoke_reviewer(vendor, original_model, prompt)
+                vendor_prompt = _retarget_identity(prompt, vendor)
+                stdout, err = _cli.invoke_reviewer(vendor, original_model, vendor_prompt)
             except Exception as exc:
                 stdout = None
                 err = str(exc)

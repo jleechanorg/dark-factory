@@ -144,6 +144,29 @@ REVIEWER_CLI_TO_IDENTITY = {
     "gemini": "gemini",
 }
 
+# Placeholder substituted into the prompt's IDENTITY line with the
+# actual vendor's expected token (see ``expected_identity_for_vendor``)
+# just before that vendor is invoked. PR #819 round-2: the prompt used
+# to hardcode a fixed `<codex|gemini|claude|...>` enum, so a claudem/
+# agy/cursor-agent reviewer following the prompt literally could never
+# declare its own configured vendor name — ``bind_reviewer_identity``
+# then rejected every verdict from a non-codex/gemini vendor.
+IDENTITY_TOKEN_PLACEHOLDER = "<<REVIEWER_IDENTITY_TOKEN>>"
+
+
+def expected_identity_for_vendor(vendor: str) -> str:
+    """Return the exact IDENTITY token ``vendor`` must declare.
+
+    Single source of truth for both the prompt-building side (which
+    substitutes this into ``IDENTITY_TOKEN_PLACEHOLDER``) and the
+    verdict-checking side (``bind_reviewer_identity``, which reads
+    ``REVIEWER_CLI_TO_IDENTITY`` directly) — the two therefore can
+    never drift apart. Falls back to the vendor's own lowercased name
+    for anything not yet in the table (matches
+    ``_extend_bind_table_from_priority``'s own fallback).
+    """
+    return REVIEWER_CLI_TO_IDENTITY.get(vendor.strip().lower(), vendor.strip().lower())
+
 
 def _extend_bind_table_from_priority() -> None:
     """Extend REVIEWER_CLI_TO_IDENTITY with each entry in
@@ -1481,7 +1504,7 @@ with no extra commentary or code blocks:
     REPO: {repo}
     PR_NUMBER: {pr_number}
     REASON: <one-sentence justification>
-    IDENTITY: <codex|gemini|claude|unknown>
+    IDENTITY: {identity_placeholder}
     TEST_RUN_EVIDENCE: passed=<N> failed=<N> skipped=<N> exit=<N>
     LINT_RUN_EVIDENCE: tool=<name> errors=<N> warnings=<N>
     GREP_CITES: <file:line;file:line;...>
@@ -1493,9 +1516,12 @@ Rules:
 - Use `VERDICT: PASS` only if the diff is small, well-scoped, and free
   of destructive operations, secret leakage, out-of-scope changes, or
   anything else a reviewer should refuse. Otherwise use `VERDICT: FAIL`.
-- `IDENTITY` MUST be one of `codex`, `gemini`, `claude`, `unknown`.
-  The gate rejects self-review: a verdict whose IDENTITY matches the
-  implementing model will fail closed regardless of the verdict.
+- `IDENTITY` has a placeholder token above — it is replaced with the
+  exact identity string you must declare before this prompt reaches
+  you. Emit that exact substituted value verbatim, with no other
+  value. The gate rejects self-review: a verdict whose IDENTITY
+  matches the implementing model will fail closed regardless of the
+  verdict.
 - `REPO` MUST equal the repository above.
 - `PR_NUMBER` MUST equal the PR number above.
 - Do not include any other text — no extra VERDICT lines, no code
@@ -1690,6 +1716,7 @@ def build_prompt(
         base_sha=base_sha,
         diff=diff,
         implementation_identity=implementation_identity,
+        identity_placeholder=IDENTITY_TOKEN_PLACEHOLDER,
         contract_block=contract_block,
     )
 

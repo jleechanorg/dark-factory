@@ -152,6 +152,31 @@ REVIEWER_ENV_PROVIDER_ALLOWLIST = {
     "gemini": {"GOOGLE_API_KEY"},
     "claudem": {"MINIMAX_API_KEY"},
     "minimax": {"MINIMAX_API_KEY"},
+    # agy and cursor-agent authenticate via a keychain/config-file
+    # session (see the agy-pair-coder/cursor-pair-coder agent
+    # definitions: "Auth is durable in macOS Keychain"), not a single
+    # env-var API key like codex/gemini/claudem. `daemon/src/tick.rs
+    # ::dispatch_reviewer`'s `"agy"` and `"cursor-agent" | "cursor" |
+    # "agentf"` arms both use the plain `run_tool` (full, unsandboxed
+    # env inheritance) — that daemon path never needed a narrow
+    # allowlist entry for these two vendors.
+    #
+    # This Python CI-invoked path is different: it explicitly hard-
+    # denies HOME (and USER/SHELL/etc.) for every reviewer via
+    # REVIEWER_SECRET_ENV_DENY below, checked before this allowlist —
+    # a deliberate security boundary for a PR-diff-driven subprocess
+    # running on shared CI infrastructure, not an oversight. Neither
+    # agy nor cursor-agent has a verified, narrowly-scoped (non-HOME)
+    # credential env var in this codebase, so there is currently no
+    # allowlist entry that would both (a) actually let these two
+    # vendors authenticate in this sandboxed CI path and (b) respect
+    # the HOME deny. Do not add "agy"/"cursor-agent": {"HOME"} here —
+    # REVIEWER_SECRET_ENV_DENY silently defeats it, which is worse
+    # than no entry at all (it looks fixed but isn't). See
+    # test_reviewer_env_allowlist_entries_are_never_shadowed_by_deny_list
+    # for the regression guard, and PR #819 round-3 discussion for the
+    # open question of what these two vendors actually need on the
+    # self-hosted CI runners this gate targets.
 }
 
 
