@@ -139,6 +139,11 @@ PROMPTS_WITHOUT_GOAL_OK: frozenset[str] = frozenset({
     # arrives via the controller-bound envelope (Base64), not via
     # ${goal}, so the prompt itself does not need ${goal}.
     "prompts/catalog/controller_cold_review_v1.md",
+    # The factory two-node redesign (2026-09-01) removes ${goal} from the
+    # fresh reviewer entirely (D1/D2): caller/worker text must never reach
+    # the reviewer with instruction authority. Its task record arrives via
+    # the runner-minted ${intent} envelope (Base64-encoded), not ${goal}.
+    "prompts/slim/fresh_review.md",
 })
 
 
@@ -472,6 +477,27 @@ def check_minimum_content(prompts_dir: pathlib.Path) -> list[Violation]:
                 )
             )
     return violations
+
+
+# ---------------------------------------------------------------------------
+# Rendered-reviewer-prompt check (factory two-node redesign, D "Goal
+# excision + fail-closed rendering") — operates on a *runtime-rendered*
+# prompt string, not a static template file, so it is exposed as a plain
+# function rather than folded into the file-walking checks A-C above.
+# `runner.handler_render._assert_reviewer_render_safe` enforces the same
+# rule inline at render time; this is the standalone, test-friendly form.
+# ---------------------------------------------------------------------------
+
+
+def check_rendered_reviewer_prompt(text: str) -> list[str]:
+    """Return violation messages for unsubstituted ``${target}``/``${intent}``
+    literals in a rendered reviewer prompt. Empty list means clean."""
+    problems: list[str] = []
+    if "${target}" in text:
+        problems.append("unsubstituted ${target} literal in rendered reviewer prompt")
+    if "${intent}" in text:
+        problems.append("unsubstituted ${intent} literal in rendered reviewer prompt")
+    return problems
 
 
 # ---------------------------------------------------------------------------

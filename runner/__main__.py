@@ -19,6 +19,24 @@ from .paths import resolve_factory_path, resolve_pipeline_path
 
 _PANIC_DIR = pathlib.Path.home() / ".dark-factory" / "panics"
 
+# D2/D3/D8a fail-closed (external-review finding, rounds 3 & 5): the
+# review-target/intent integrity chain (minted locator, pin chain, base
+# SHA, mint-failure signal, mint opt-in gate, target/target-mode) is
+# runner-owned end to end — `--state` must never let a caller write any of
+# these keys directly. Deliberately scoped to this one integrity chain, not
+# every internal `_df_*` bookkeeping key elsewhere in the codebase (e.g.
+# shadow-review toggles, controller-lane fixtures): those are legitimate,
+# unrelated `--state`-seedable operator/test knobs.
+_RESERVED_STATE_KEYS = frozenset({
+    "intent",
+    "target",
+    "_target_base_sha",
+    "_target_pin_chain",
+    "_target_mint_failed",
+    "_df_mint_review_target",
+    "_df_target_mode",
+})
+
 
 def _append_event(path: pathlib.Path, payload: dict[str, str]) -> None:
     try:
@@ -280,6 +298,22 @@ def main(argv: list[str] | None = None) -> int:
             ),
         )
         p.add_argument("--goal")
+        p.add_argument(
+            "--target",
+            default=None,
+            help=(
+                "factory.review-target.v1 locator or freeform text (e.g. "
+                "'PR 811', '#811', an absolute path, a commit SHA) resolved "
+                "mechanically before the run starts (D3/D5 of the factory "
+                "two-node redesign). Refuses to start if it cannot be "
+                "resolved. Mutually exclusive with --goal (D5): a target-mode "
+                "verification run has no free-text goal. Entry-mode graph "
+                "wiring (reviewer-first routing) is "
+                "not yet consumed by the engine/two_node graph — --target "
+                "currently pre-resolves and pins the locator into "
+                "ctx.state['target']; see rev-xfy23 for the follow-up."
+            ),
+        )
         p.add_argument("--workdir", type=pathlib.Path, default=pathlib.Path.cwd())
         p.add_argument("--preflight", action="store_true", help="Validate pipeline and emit diagnostics, then exit.")
         p.add_argument(
@@ -418,15 +452,102 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(payload, sort_keys=True, indent=2))
             return 1 if payload["status"] == "fail" else 0
 
+        if args.target and args.goal:
+            p.error("--target and --goal are mutually exclusive (D5): pass one or the other")
+
+        resolved_target_locator = None
+        if args.target:
+            from . import target_locator
+
+            try:
+                resolved_target_locator = target_locator.parse(args.target, repo_root=args.workdir)
+            except target_locator.DefinedNotResolvable as exc:
+                p.error(f"--target scheme is defined but not resolvable in v1: {exc}")
+            except target_locator.InvalidTarget:
+                # Finding 5 (external review, round 3): populate owner/repo
+                # from the local git remote (deterministic, no network/LLM)
+                # so freeform PR-shaped text ("PR 811") can actually
+                # resolve — an empty RepoContext made every such reference
+                # unconditionally fail with "requires repo context".
+                owner_repo = target_locator.owner_repo_from_git_remote(args.workdir)
+                owner, repo_name = owner_repo if owner_repo else ("", "")
+                repo_ctx = target_locator.RepoContext(
+                    repo_root=args.workdir, owner=owner, repo=repo_name,
+                )
+                try:
+                    resolved_target_locator = target_locator.resolve_freeform(args.target, repo_ctx)
+                except target_locator.TargetLocatorError as exc:
+                    p.error(f"--target could not be resolved: {exc}")
+
+        if not args.goal and not args.target:
+            p.error("--goal is required unless --preflight or --target is set")
         if not args.goal:
-            p.error("--goal is required unless --preflight is set")
+            args.goal = ""
 
         graph = parse(pipeline_path)
+
+        def _is_verdict_gated_review_node(n) -> bool:
+            return (
+                str(n.attrs.get("class", "")).strip().lower() == "review"
+                and str(n.attrs.get("verdict_gate", "false")).strip().lower()
+                in {"true", "1", "yes", "on"}
+            )
+
         initial_state: dict[str, str] = {}
+        # Opt-in gate for the runner's post-worker target-mint/checkpoint
+        # side effect (D2/D3/D8a of the factory two-node redesign): minting
+        # can commit dirty workdir state, so it must only run for graphs
+        # that actually declare the fresh, verdict-gated cold-reviewer
+        # contract — never for arbitrary pipelines that never asked for it.
+        if any(_is_verdict_gated_review_node(n) for n in graph.nodes.values()):
+            initial_state["_df_mint_review_target"] = "true"
+        if resolved_target_locator is not None:
+            # Finding 5 (external review, round 3): target mode's whole
+            # point is "reviewer reviews the externally-resolved target
+            # first" (D "Architecture": start -> cold_reviewer). Entry-mode
+            # graph wiring that actually routes `start` to the reviewer is
+            # not implemented yet for any pipeline — if we let the run
+            # proceed anyway, `start` falls through to its literal edge
+            # (the worker), which runs on the LOCAL workdir (unrelated to
+            # the resolved target) and then the first post-worker mint
+            # silently overwrites `ctx.state["target"]` with a local pin,
+            # discarding the operator's resolved locator. Refuse honestly
+            # instead of silently morphing into task mode.
+            from .parser import is_start_node
+
+            start_name = next(
+                (n.name for n in graph.nodes.values() if is_start_node(n)), None
+            )
+            first_hops = graph.outgoing(start_name) if start_name else []
+            reviewer_first = bool(first_hops) and all(
+                e.dst in graph.nodes and _is_verdict_gated_review_node(graph.nodes[e.dst])
+                for e in first_hops
+            )
+            if not reviewer_first:
+                p.error(
+                    "--target requires a reviewer-first pipeline (the start "
+                    "node must lead directly to a verdict-gated review "
+                    f"node); {pipeline_path.name} starts at a worker node "
+                    "instead, so --target would silently run the worker on "
+                    "the local workdir and discard the resolved target "
+                    "rather than reviewing it — reviewer-first entry-mode "
+                    "graph wiring is not yet implemented for this pipeline"
+                )
         for kv in args.state:
             if "=" not in kv:
                 p.error(f"--state requires KEY=VALUE format, got: {kv!r}")
             k, v = kv.split("=", 1)
+            if k in _RESERVED_STATE_KEYS:
+                # D2/D3/D8a fail-closed (external-review finding, rounds 3 &
+                # 5): the whole review-target/intent integrity chain —
+                # minted pin, pin chain, mint-failure signal, mint opt-in
+                # gate, target/target-mode — is runner-owned end to end.
+                # `--state` is the only caller-controllable write path into
+                # `ctx.state` outside that chain, so every key it owns is
+                # refused outright rather than silently accepted and later
+                # raced, overwritten, or used to fabricate a fake-matching
+                # pin chain / mint result.
+                p.error(f"--state cannot set the reserved key {k!r} (runner-owned, D2/D3/D8a)")
             initial_state[k] = v
         if args.feature:
             initial_state["feature"] = args.feature
@@ -473,6 +594,9 @@ def main(argv: list[str] | None = None) -> int:
             perf_log_root=perf_log_root,
         )
         ctx.state.update(initial_state)
+        if resolved_target_locator is not None:
+            ctx.state["target"] = resolved_target_locator.canonical
+            ctx.state["_df_target_mode"] = "true"
         if args.backend == "ao":
             if not args.ao_project:
                 p.error("--backend ao requires --ao-project")
@@ -574,8 +698,8 @@ def main(argv: list[str] | None = None) -> int:
             _write_dispatch_failure_stderr(history=history, ctx=ctx)
         print(json.dumps(summary, indent=2))
         return 0 if dispatch_ok else 1
-    except Exception:
-        payload = _handle_panic(sys.exc_info()[1], args=args, ctx=ctx)
+    except Exception as panic_exc:
+        payload = _handle_panic(panic_exc, args=args, ctx=ctx)
         if (
             args is not None
             and ctx is not None
