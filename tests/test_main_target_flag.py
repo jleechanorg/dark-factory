@@ -211,6 +211,7 @@ class TestTargetFlagResolution:
             "_target_mint_failed",
             "_df_mint_review_target",
             "_df_target_mode",
+            "_pre_worker_head",
         ],
     )
     def test_state_refuses_every_reserved_key(self, reserved_key, tmp_path, capsys):

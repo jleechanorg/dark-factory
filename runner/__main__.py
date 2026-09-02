@@ -35,6 +35,7 @@ _RESERVED_STATE_KEYS = frozenset({
     "_target_mint_failed",
     "_df_mint_review_target",
     "_df_target_mode",
+    "_pre_worker_head",
 })
 
 
