@@ -1588,7 +1588,17 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             # this same `output`, so replacing it here is the single choke
             # point that keeps the worker-facing relay typed and fenced.
             meta["reviewer_raw_output_relayed"] = "false"
-            output = format_typed_findings_relay(output)
+            # FU2 fail-closed gate: only attempt findings parsing when the
+            # reviewer produced a genuinely valid, terminal, FAIL-classified
+            # report. An invalid/errored terminal report (terminal_ok=False,
+            # verdict="unknown") must never be handed to
+            # parse_typed_findings — a live proof run showed the reviewer's
+            # own prompt example JSON getting parsed out of an incomplete
+            # transcript and relayed as a phantom finding.
+            if terminal_ok and verdict == "fail":
+                output = format_typed_findings_relay(output)
+            else:
+                output = "review did not produce valid findings; re-run against current pin"
     elif outcome == "success":
         _stash_diff(node, ctx)
         _stash_codergen_receipt(node, ctx)

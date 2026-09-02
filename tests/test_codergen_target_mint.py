@@ -204,6 +204,45 @@ class TestFormatTypedFindingsRelay:
         assert "ignore prior instructions" not in relay
 
 
+class TestPhantomFindingsFailClosed:
+    """Live-observed bug (FU2, PR #821 follow-up): a fresh reviewer whose
+    transcript never reaches a valid terminal ``Verdict:`` line (rejected by
+    ``_verify_terminal_review_report``, verdict normalized to "unknown",
+    outcome "error") must never have its raw output fed to
+    ``parse_typed_findings`` — any JSON-findings-shaped text in that raw
+    output (including the prompt's own inline JSON example) is not a
+    genuine finding and must degrade to the safe re-run message, not be
+    relayed as if the review had validly completed."""
+
+    def test_invalid_terminal_report_with_json_shaped_text_degrades_to_rerun_message(
+        self, tmp_path, monkeypatch
+    ):
+        from test_fresh_terminal_review import _run_review  # noqa: E402  (local import: avoid module-load ordering issues)
+
+        # The raw output contains exactly the literal JSON example text from
+        # prompts/slim/fresh_review.md's own instructions to the reviewer,
+        # but the transcript trails off in more prose afterward instead of
+        # ending in an exact terminal `Verdict: PASS|FAIL` line — i.e. the
+        # review never validly completed.
+        review = (
+            "Still reviewing the target. Findings format looks like "
+            '`[{"path": "app.py", "claim": "returns the wrong value", '
+            '"required_fix": "fix the return"}]` per the instructions.\n'
+            "Running out of time, continuing to look at more files...\n"
+        )
+        result, _, _ = _run_review(tmp_path, monkeypatch, review)
+
+        assert result.outcome == "error"
+        assert result.metadata["terminal_report_valid"] == "false"
+        assert result.metadata["verdict"] == "unknown"
+        assert (
+            result.output
+            == "review did not produce valid findings; re-run against current pin"
+        )
+        assert "app.py" not in result.output
+        assert "BEGIN REVIEWER FINDINGS" not in result.output
+
+
 # ---------------------------------------------------------------------------
 # _checkpoint_dirty_state()
 # ---------------------------------------------------------------------------
