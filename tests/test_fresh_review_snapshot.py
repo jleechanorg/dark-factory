@@ -247,13 +247,20 @@ class TestCleanupReviewSnapshot:
 # ---------------------------------------------------------------------------
 
 
-def _review_node(prompt: pathlib.Path):
+def _review_node(prompt: pathlib.Path, monkeypatch):
+    """Build a verdict-gated review node with a RELATIVE prompt ref (round-8
+    fix: an absolute ``prompt="@..."`` is now refused outright for review
+    nodes, with no trusted-root exception). Point ``$DARK_FACTORY_HOME`` at
+    ``prompt``'s own directory and reference it by filename only, so these
+    tests' tmp_path-based fixtures keep working under the tightened
+    contract."""
+    monkeypatch.setenv("DARK_FACTORY_HOME", str(prompt.parent))
     node = make_node(
         name="cold_reviewer",
         type="codergen",
         backend="codex",
         class_="review",
-        prompt=f"@{prompt}",
+        prompt=f"@{prompt.name}",
         verdict_gate="true",
         fresh_session="true",
     )
@@ -301,7 +308,7 @@ def test_stale_target_out_of_sync_with_pin_chain_aborts_before_codex(
     monkeypatch.setattr("runner.handlers._sanitized_env", lambda: {})
     monkeypatch.setattr("runner.handler_codergen.subprocess.run", unexpected_run)
 
-    result = _codergen(_review_node(prompt), ctx)
+    result = _codergen(_review_node(prompt, monkeypatch), ctx)
 
     assert result.outcome == "error"
     assert result.metadata["target_pin_chain_mismatch"] == "true"
@@ -350,7 +357,7 @@ def test_toctou_pin_mismatch_before_launch_fails_closed_without_invoking_codex(
     monkeypatch.setattr("runner.handlers._sanitized_env", lambda: {})
     monkeypatch.setattr("runner.handler_codergen.subprocess.run", unexpected_run)
 
-    result = _codergen(_review_node(prompt), ctx)
+    result = _codergen(_review_node(prompt, monkeypatch), ctx)
 
     assert result.outcome == "failure"
     assert result.metadata["snapshot_pin_mismatch"] == "true"
@@ -398,7 +405,7 @@ def test_non_snapshottable_scheme_refuses_before_launch_without_degrading_to_liv
     monkeypatch.setattr("runner.handlers._sanitized_env", lambda: {})
     monkeypatch.setattr("runner.handler_codergen.subprocess.run", unexpected_run)
 
-    result = _codergen(_review_node(prompt), ctx)
+    result = _codergen(_review_node(prompt, monkeypatch), ctx)
 
     assert result.outcome == "error"
     assert "git-resolvable" in result.output

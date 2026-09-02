@@ -229,6 +229,17 @@ def _render_prompt(node: "Node", ctx: "Context") -> str:
         if not ref:
             return _fallback("no prompt ref")
         ref_path = pathlib.Path(ref)
+        if is_review and ref_path.is_absolute():
+            # Round-8 adversarial finding: the round-7 fix routed an
+            # absolute path through trusted-root containment, which still
+            # ACCEPTED it when the path happened to resolve inside the
+            # trusted root — contradicting this fix's own "refuse
+            # absolute... paths" framing and the repo-wide contract
+            # (CLAUDE.md) that prompt refs are always
+            # ``prompt="@relative/path.md"``. No legitimate `.dot` graph
+            # ever writes an absolute prompt path; refuse it outright, with
+            # no trusted-root exception.
+            return _fallback("absolute prompt path refused", ref)
         if ref_path.is_absolute():
             resolved_ref = ref_path
             try:

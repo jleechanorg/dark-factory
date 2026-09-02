@@ -29,13 +29,20 @@ def _repo(tmp_path: pathlib.Path) -> pathlib.Path:
     return repo
 
 
-def _review_node(prompt: pathlib.Path):
+def _review_node(prompt: pathlib.Path, monkeypatch):
+    """Build a verdict-gated review node with a RELATIVE prompt ref (round-8
+    fix: an absolute ``prompt="@..."`` is now refused outright for review
+    nodes, with no trusted-root exception). Point ``$DARK_FACTORY_HOME`` at
+    ``prompt``'s own directory and reference it by filename only, so these
+    tests' tmp_path-based fixtures keep working under the tightened
+    contract."""
+    monkeypatch.setenv("DARK_FACTORY_HOME", str(prompt.parent))
     node = make_node(
         name="cold_reviewer",
         type="codergen",
         backend="codex",
         class_="review",
-        prompt=f"@{prompt}",
+        prompt=f"@{prompt.name}",
         verdict_gate="true",
         fresh_session="true",
     )
@@ -89,7 +96,7 @@ def _run_review(
     prompt.write_text(
         "Review target: ${target}\nEnd with Verdict: PASS or Verdict: FAIL.\n"
     )
-    node = _review_node(prompt)
+    node = _review_node(prompt, monkeypatch)
     _use_tmp_snapshot_root(tmp_path, monkeypatch)
     ctx = Context(
         goal="review this change",
@@ -371,7 +378,7 @@ def test_fresh_reviewer_timeout_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setattr("runner.handlers._sandboxed_args_for_workdir", lambda args, workdir: args)
     monkeypatch.setattr("runner.handlers._sanitized_env", lambda: {})
     monkeypatch.setattr("runner.handler_codergen.subprocess.run", time_out)
-    result = _codergen(_review_node(prompt), ctx)
+    result = _codergen(_review_node(prompt, monkeypatch), ctx)
 
     assert result.outcome == "error"
     assert result.metadata["timed_out"] == "true"
@@ -426,7 +433,7 @@ def test_fresh_reviewer_errors_before_codex_when_no_target_minted(tmp_path, monk
         return real_run(args, **kwargs)
 
     monkeypatch.setattr("runner.handler_codergen.subprocess.run", unexpected_run)
-    result = _codergen(_review_node(prompt), ctx)
+    result = _codergen(_review_node(prompt, monkeypatch), ctx)
 
     # External-review finding: the render-time assertion (handler_render.py)
     # is now the outermost fail-closed gate — it rejects the rendered
@@ -480,7 +487,7 @@ def test_fresh_reviewer_snapshot_resolves_through_symlinked_target_locator(
     monkeypatch.setattr("runner.handlers._sanitized_env", lambda: {})
     monkeypatch.setattr("runner.handler_codergen.subprocess.run", pass_review)
 
-    result = _codergen(_review_node(prompt), ctx)
+    result = _codergen(_review_node(prompt, monkeypatch), ctx)
 
     assert result.outcome == "success"
     assert len(calls) == 1
