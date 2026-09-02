@@ -1588,25 +1588,10 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             # this same `output`, so replacing it here is the single choke
             # point that keeps the worker-facing relay typed and fenced.
             meta["reviewer_raw_output_relayed"] = "false"
-            # FU2 fail-closed gate: only attempt findings parsing when the
-            # reviewer produced a genuinely valid, terminal, FAIL-classified
-            # report. An invalid/errored terminal report (terminal_ok=False,
-            # verdict="unknown") must never be handed to
-            # parse_typed_findings — a live proof run showed the reviewer's
-            # own prompt example JSON getting parsed out of an incomplete
-            # transcript and relayed as a phantom finding.
-            # FU2 round-2 (external review): `terminal_ok and verdict ==
-            # "fail"` alone is not sufficient — a nonzero process exit or a
-            # mutated tracked-file set both force `outcome="error"` above
-            # (lines 1551-1552, 1582-1583) without touching `verdict`, so a
-            # genuinely-terminal FAIL report from an errored/untrusted run
-            # could still relay real findings. Requiring `outcome ==
-            # "failure"` closes that: it is only reachable when the process
-            # exited 0, the workdir was not mutated, and the parsed verdict
-            # was itself "fail" (gate_strict "warn" maps to failure too, but
-            # never sets `verdict == "fail"`, so the combined check still
-            # excludes it) or a clean "pass" report failed completeness
-            # (which also never sets `verdict == "fail"`).
+            # Only relay findings for a genuinely valid, terminal FAIL from
+            # a clean, unmutated run — nonzero exit or tracked-file mutation
+            # forces outcome="error" without clearing verdict, so outcome
+            # must be checked too, not just terminal_ok/verdict.
             if outcome == "failure" and terminal_ok and verdict == "fail":
                 output = format_typed_findings_relay(output)
             else:
