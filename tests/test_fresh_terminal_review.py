@@ -80,7 +80,10 @@ def _use_tmp_snapshot_root(tmp_path: pathlib.Path, monkeypatch) -> pathlib.Path:
     return snapshot_root
 
 
-def _run_review(tmp_path, monkeypatch, output: str, *, mutate: bool = False, stderr: str = ""):
+def _run_review(
+    tmp_path, monkeypatch, output: str, *, mutate: bool = False, stderr: str = "",
+    returncode: int = 0,
+):
     repo = _repo(tmp_path)
     prompt = tmp_path / "review.md"
     prompt.write_text(
@@ -111,7 +114,7 @@ def _run_review(tmp_path, monkeypatch, output: str, *, mutate: bool = False, std
                 # in, never the live `repo` — that isolation is the point
                 # of the fresh-reviewer snapshot (design item 6).
                 (snapshot_cwd / "value.txt").write_text("reviewer changed this\n")
-            return subprocess.CompletedProcess(args, 0, stdout=output, stderr=stderr)
+            return subprocess.CompletedProcess(args, returncode, stdout=output, stderr=stderr)
         return real_run(args, **kwargs)
 
     monkeypatch.setattr("runner.handlers._sandboxed_args_for_workdir", lambda args, workdir: args)

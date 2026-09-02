@@ -242,6 +242,71 @@ class TestPhantomFindingsFailClosed:
         assert "app.py" not in result.output
         assert "BEGIN REVIEWER FINDINGS" not in result.output
 
+    def test_nonzero_returncode_with_genuine_terminal_fail_degrades_to_rerun_message(
+        self, tmp_path, monkeypatch
+    ):
+        """FU2 round-2 (Codex, live-reproduced): a nonzero codex process exit
+        forces ``outcome="error"`` (infra failure), but the relay decision
+        at the time of this bug only checked ``terminal_ok and verdict ==
+        "fail"`` — so a genuinely valid, terminal ``Verdict: FAIL`` transcript
+        with real typed-findings JSON still got its findings relayed even
+        though the process itself errored. The relay must degrade to the
+        safe re-run message whenever the visit did not cleanly conclude in
+        outcome="failure"."""
+        from test_fresh_terminal_review import _run_review  # noqa: E402
+
+        review = (
+            "No blocking findings besides these:\n"
+            '```json\n[{"path": "app.py", "claim": "off-by-one", '
+            '"required_fix": "fix bounds"}]\n```\n'
+            "Review completeness: COMPLETE\n"
+            "Verdict: FAIL\n"
+        )
+        result, _, _ = _run_review(tmp_path, monkeypatch, review, returncode=1)
+
+        assert result.outcome == "error"
+        assert result.metadata["terminal_report_valid"] == "true"
+        assert result.metadata["verdict"] == "fail"
+        assert (
+            result.output
+            == "review did not produce valid findings; re-run against current pin"
+        )
+        assert "app.py" not in result.output
+        assert "BEGIN REVIEWER FINDINGS" not in result.output
+
+    def test_mutated_workdir_with_genuine_terminal_fail_degrades_to_rerun_message(
+        self, tmp_path, monkeypatch
+    ):
+        """FU2 round-2 (Codex, live-reproduced): a reviewer that mutates
+        tracked files during its run is a real trust violation and forces
+        ``outcome="error"`` — but the relay decision at the time of this bug
+        never looked at ``mutated``/``outcome`` at all, so a genuine terminal
+        ``Verdict: FAIL`` with real typed-findings JSON still relayed those
+        findings even though the reviewer's own report can no longer be
+        trusted. Must degrade to the safe re-run message."""
+        from test_fresh_terminal_review import _run_review  # noqa: E402
+
+        review = (
+            "No blocking findings besides these:\n"
+            '```json\n[{"path": "app.py", "claim": "off-by-one", '
+            '"required_fix": "fix bounds"}]\n```\n'
+            "Review completeness: COMPLETE\n"
+            "Verdict: FAIL\n"
+        )
+        result, _, repo = _run_review(tmp_path, monkeypatch, review, mutate=True)
+
+        assert result.outcome == "error"
+        assert result.metadata["reviewer_mutated_tracked_files"] == "true"
+        assert result.metadata["terminal_report_valid"] == "true"
+        assert result.metadata["verdict"] == "fail"
+        assert (
+            result.output
+            == "review did not produce valid findings; re-run against current pin"
+        )
+        assert "app.py" not in result.output
+        assert "BEGIN REVIEWER FINDINGS" not in result.output
+        assert (repo / "value.txt").read_text() == "before\n"
+
 
 # ---------------------------------------------------------------------------
 # _checkpoint_dirty_state()

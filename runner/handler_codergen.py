@@ -1595,7 +1595,19 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             # parse_typed_findings — a live proof run showed the reviewer's
             # own prompt example JSON getting parsed out of an incomplete
             # transcript and relayed as a phantom finding.
-            if terminal_ok and verdict == "fail":
+            # FU2 round-2 (external review): `terminal_ok and verdict ==
+            # "fail"` alone is not sufficient — a nonzero process exit or a
+            # mutated tracked-file set both force `outcome="error"` above
+            # (lines 1551-1552, 1582-1583) without touching `verdict`, so a
+            # genuinely-terminal FAIL report from an errored/untrusted run
+            # could still relay real findings. Requiring `outcome ==
+            # "failure"` closes that: it is only reachable when the process
+            # exited 0, the workdir was not mutated, and the parsed verdict
+            # was itself "fail" (gate_strict "warn" maps to failure too, but
+            # never sets `verdict == "fail"`, so the combined check still
+            # excludes it) or a clean "pass" report failed completeness
+            # (which also never sets `verdict == "fail"`).
+            if outcome == "failure" and terminal_ok and verdict == "fail":
                 output = format_typed_findings_relay(output)
             else:
                 output = "review did not produce valid findings; re-run against current pin"
