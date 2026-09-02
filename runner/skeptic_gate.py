@@ -202,7 +202,19 @@ def _extend_bind_table_from_priority() -> None:
 # implementation identity.
 COMMIT_PREFIX_TO_IDENTITY = {
     "claude/": "claude",
-    "claudem/": "claude",
+    # PR #819 round-4: `claudem/` used to collapse into "claude", but
+    # round-3 made `claudem` independently reachable as a REVIEWER
+    # identity too (`expected_identity_for_vendor("claudem")` ==
+    # "claudem", since it's not in REVIEWER_CLI_TO_IDENTITY and falls
+    # back to its own name). Collapsing the IMPLEMENTER side to
+    # "claude" while the REVIEWER side legitimately declares
+    # "claudem" made `verify_provenance` compare "claude" != "claudem"
+    # and silently accept self-review for any claudem-authored commit
+    # reviewed by a claudem reviewer. claudem is genuinely a different
+    # backend (Claude CLI routed through MiniMax's API, per ~/.bashrc)
+    # from real Claude, so keeping it distinct here is also the more
+    # accurate provenance claim, not just a security patch.
+    "claudem/": "claudem",
     "codex/": "codex",
     "codexm/": "codex",
     "gemini/": "gemini",
@@ -1689,6 +1701,7 @@ def build_prompt(
     diff: str,
     implementation_identity: str = "unknown",
     contract: Optional[BeadContract] = None,
+    reviewer_identity: Optional[str] = None,
 ) -> str:
     """Assemble the prompt sent to the independent reviewer CLI.
 
@@ -1704,11 +1717,24 @@ def build_prompt(
     item is `ADDRESSED` (or `N-A` with a reason) via
     `evaluate_contract_echo`. Without a contract, the prompt is the
     legacy 10-field form (issue #384).
+
+    ``reviewer_identity``, when given, is the exact IDENTITY token
+    substituted into the template's IDENTITY line via ``.format()``
+    AT CONSTRUCTION TIME. This must never be done as a post-hoc
+    string search/replace over the assembled (diff-bearing) prompt —
+    ``.format()`` only fills its own named template slots and does
+    not re-scan already-substituted content (like ``diff``), so an
+    occurrence of the placeholder text inside the diff itself can
+    never be mistaken for the template's own IDENTITY slot. When
+    omitted, the raw ``IDENTITY_TOKEN_PLACEHOLDER`` is left in place.
     """
     if contract is not None:
         contract_block = _build_contract_block(contract)
     else:
         contract_block = ""
+    identity_value = (
+        reviewer_identity if reviewer_identity is not None else IDENTITY_TOKEN_PLACEHOLDER
+    )
     return _PROMPT_TEMPLATE.format(
         repo=repo,
         pr_number=pr_number,
@@ -1716,7 +1742,7 @@ def build_prompt(
         base_sha=base_sha,
         diff=diff,
         implementation_identity=implementation_identity,
-        identity_placeholder=IDENTITY_TOKEN_PLACEHOLDER,
+        identity_placeholder=identity_value,
         contract_block=contract_block,
     )
 

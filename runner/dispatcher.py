@@ -48,22 +48,28 @@ _RATE_LIMIT_PATTERNS = (
 )
 
 
-# Single source of truth for the IDENTITY placeholder and per-vendor
-# token lives in runner.skeptic_gate (also used directly by
-# bind_reviewer_identity's REVIEWER_CLI_TO_IDENTITY table), so the
-# prompt instruction and the deterministic bind check can never drift
-# apart. PR #819 round-2: the prompt used to hardcode
-# `IDENTITY: <gemini|codex|claude>`, so a claudem/agy/cursor-agent
-# reviewer following the prompt literally could never declare its own
-# configured vendor name — bind_reviewer_identity then rejected every
-# verdict from a non-codex/gemini vendor. The prompt is built once per
-# rule but the walker retargets this token per vendor attempt so a
-# mid-walk fallback also gets the right instruction.
-
-
-def _retarget_identity(prompt: str, vendor: str) -> str:
-    """Substitute the IDENTITY placeholder in ``prompt`` for ``vendor``."""
-    return prompt.replace(_IDENTITY_TOKEN_PLACEHOLDER, _expected_identity_for_vendor(vendor))
+# Single source of truth for the per-vendor IDENTITY token lives in
+# runner.skeptic_gate (also used directly by bind_reviewer_identity's
+# REVIEWER_CLI_TO_IDENTITY table), so the prompt instruction and the
+# deterministic bind check can never drift apart. PR #819 round-2: the
+# prompt used to hardcode `IDENTITY: <gemini|codex|claude>`, so a
+# claudem/agy/cursor-agent reviewer following the prompt literally
+# could never declare its own configured vendor name —
+# bind_reviewer_identity then rejected every verdict from a non-codex/
+# gemini vendor.
+#
+# Round-3 first attempt built ONE placeholder-bearing prompt (with the
+# PR diff already spliced in) and retargeted it per vendor via a blind
+# ``str.replace`` over the *entire* assembled prompt+diff blob. That is
+# unsafe: if the diff under review itself contains the placeholder
+# text — which THIS PR's own diff does, since it introduces the
+# ``IDENTITY_TOKEN_PLACEHOLDER`` constant as literal source — the
+# replace also silently rewrites the reviewer's view of the diff.
+# Round-4 fixes this by never searching assembled content at all: the
+# resolved per-vendor identity is threaded into ``build_rule_prompt``
+# at construction time (``.format()``/f-string substitution happens
+# once, before any diff content could be re-scanned), so the prompt is
+# rebuilt fresh per vendor instead of retargeted after the fact.
 
 
 def _detect_rate_limit(err: Optional[str]) -> bool:
@@ -122,7 +128,34 @@ class VerifierDispatcher:
                     return True
         return False
 
-    def build_rule_prompt(self, rule: Rule, repo: str, pr_number: int, head_sha: str, base_sha: str, diff: str, implementation_identity: str, contract=None) -> str:
+    def build_rule_prompt(
+        self,
+        rule: Rule,
+        repo: str,
+        pr_number: int,
+        head_sha: str,
+        base_sha: str,
+        diff: str,
+        implementation_identity: str,
+        contract=None,
+        reviewer_identity: Optional[str] = None,
+    ) -> str:
+        """Build the full prompt for ``rule``.
+
+        ``reviewer_identity``, when given, is the exact IDENTITY value
+        the invoked reviewer must declare (see ``expected_identity_for_vendor``).
+        It is substituted into both the base contract template
+        (``_cli.build_prompt``) and this method's own appended
+        contract block AT FORMAT TIME — never via a post-hoc string
+        search over the assembled prompt, which would risk matching an
+        occurrence inside the embedded diff instead of the intended
+        template slot. When omitted, the raw placeholder token is left
+        in place (legacy/back-compat callers that don't know the
+        target vendor yet).
+        """
+        identity_value = (
+            reviewer_identity if reviewer_identity is not None else _IDENTITY_TOKEN_PLACEHOLDER
+        )
         base_prompt = _cli.build_prompt(
             repo=repo,
             pr_number=pr_number,
@@ -131,6 +164,7 @@ class VerifierDispatcher:
             diff=diff,
             implementation_identity=implementation_identity,
             contract=contract,
+            reviewer_identity=reviewer_identity,
         )
         return (
             f"{base_prompt}\n\n"
@@ -150,7 +184,7 @@ class VerifierDispatcher:
             f"REPO: {repo}\n"
             f"PR_NUMBER: {pr_number}\n"
             f"REASON: <concise summary of rule review outcome>\n"
-            f"IDENTITY: {_IDENTITY_TOKEN_PLACEHOLDER}\n"
+            f"IDENTITY: {identity_value}\n"
             f"TEST_RUN_EVIDENCE: passed=<N> failed=<N> skipped=<N> exit=<exit_code>\n"
             f"LINT_RUN_EVIDENCE: tool=<linter_name> errors=<N> warnings=<N>\n"
             f"GREP_CITES: <file:line;test_file:line>\n"
@@ -170,12 +204,12 @@ class VerifierDispatcher:
         self,
         *,
         rule: Rule,
-        prompt: str,
         original_reviewer: str,
         original_model: str,
         repo: str,
         pr_number: int,
         head_sha: str,
+        base_sha: str,
         diff: str,
         implementation_identity: str,
         contract,
@@ -219,7 +253,17 @@ class VerifierDispatcher:
         for vendor in queue:
             last_vendor = vendor
             try:
-                vendor_prompt = _retarget_identity(prompt, vendor)
+                vendor_prompt = self.build_rule_prompt(
+                    rule,
+                    repo,
+                    pr_number,
+                    head_sha,
+                    base_sha,
+                    diff,
+                    implementation_identity,
+                    contract=contract,
+                    reviewer_identity=_expected_identity_for_vendor(vendor),
+                )
                 stdout, err = _cli.invoke_reviewer(vendor, original_model, vendor_prompt)
             except Exception as exc:
                 stdout = None
@@ -286,9 +330,6 @@ class VerifierDispatcher:
         results: List[Tuple[Rule, SkepticResult]] = []
 
         def run_one(rule: Rule) -> Tuple[Rule, SkepticResult]:
-            prompt = self.build_rule_prompt(
-                rule, repo, pr_number, head_sha, base_sha, diff, implementation_identity, contract=contract
-            )
             reviewer, model = self._resolve_reviewer(rule)
 
             # Chain-walk: try the resolved reviewer; on rate-limit,
@@ -297,14 +338,17 @@ class VerifierDispatcher:
             # exhausted). The original invoke+evaluate single call is
             # encapsulated in ``_chain_walk_reviewer`` so the surface
             # here is just "invoke once, but resilient to vendor busts".
+            # ``_chain_walk_reviewer`` builds the actual per-vendor
+            # prompt itself (see its docstring / round-4 note) so no
+            # placeholder-bearing prompt is built here.
             res = self._chain_walk_reviewer(
                 rule=rule,
-                prompt=prompt,
                 original_reviewer=reviewer,
                 original_model=model,
                 repo=repo,
                 pr_number=pr_number,
                 head_sha=head_sha,
+                base_sha=base_sha,
                 diff=diff,
                 implementation_identity=implementation_identity,
                 contract=contract,

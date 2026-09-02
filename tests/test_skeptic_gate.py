@@ -1104,14 +1104,19 @@ def test_adversarial_parse_rejects_second_verdict_in_prose():
     assert parse_verdict(out) is None
 
 def test_adversarial_commit_prefix_claudem_minimax_m3():
-    """Commit-subject prefix `claudem/` maps to `claude`."""
+    """Commit-subject prefix `claudem/` maps to its own `claudem`
+    identity (PR #819 round-4: previously collapsed into `claude`,
+    which silently defeated self-review detection once `claudem`
+    became independently reachable as a reviewer identity too — see
+    test_claudem_authored_commit_reviewed_by_claudem_is_rejected_as_self_review
+    in tests/test_pr819_chain_walk_vendor_support.py)."""
     from runner.skeptic_gate import extract_implementation_identity_from_commit
 
     assert (
         extract_implementation_identity_from_commit(
             "claudem/minimax-M3: feat(ci): skeptic gate redesign"
         )
-        == "claude"
+        == "claudem"
     )
 
 def test_adversarial_commit_prefix_codexm_o3():
@@ -1446,7 +1451,7 @@ def test_get_implementation_identity_uses_head_sha_direct_lookup():
         )
     finally:
         cli_mod.gh_api = orig
-    assert identity == "claude"
+    assert identity == "claudem"
     assert calls["commits_sha"] == f"repos/jleechanorg/dark-factory/commits/{head_sha}"
     assert calls["pr_commits"] == 0
 
@@ -1481,7 +1486,7 @@ def test_get_implementation_identity_falls_back_to_pr_commits_when_head_missing(
         )
     finally:
         cli_mod.gh_api = orig
-    assert identity == "claude"
+    assert identity == "claudem"
 
 def test_extract_field_parses_review_and_implementation_provenance():
     """Readback extractors must parse REVIEWER and IMPLEMENTATION_PROVENANCE

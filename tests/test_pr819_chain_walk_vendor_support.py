@@ -149,13 +149,15 @@ def test_build_rule_prompt_never_hardcodes_a_fixed_identity_enum():
 
 
 @pytest.mark.parametrize("vendor", list(skeptic_reviewer_priority()))
-def test_retargeted_prompt_declares_the_correct_identity_for_every_vendor(vendor):
-    """Round-3 fix: ``_retarget_identity`` (invoked per chain-walk
-    attempt in ``_chain_walk_reviewer``) must produce a prompt whose
-    IDENTITY line matches exactly what ``bind_reviewer_identity``
-    will require for that same vendor — closing the gap the hand-
-    written verdict-text tests above could not catch."""
-    from runner.dispatcher import VerifierDispatcher, _retarget_identity
+def test_per_vendor_prompt_declares_the_correct_identity_for_every_vendor(vendor):
+    """Round-4 fix: ``build_rule_prompt(..., reviewer_identity=...)``
+    must produce a prompt whose IDENTITY line matches exactly what
+    ``bind_reviewer_identity`` will require for that same vendor —
+    closing the gap the hand-written verdict-text tests above could
+    not catch. Round-4 replaced round-3's blind ``_retarget_identity``
+    string-replace (removed — see the diff-preservation test below for
+    why) with per-vendor prompt construction."""
+    from runner.dispatcher import VerifierDispatcher
     from runner.rule_loader import Rule
     from runner.skeptic_gate import IDENTITY_TOKEN_PLACEHOLDER, expected_identity_for_vendor
 
@@ -164,20 +166,25 @@ def test_retargeted_prompt_declares_the_correct_identity_for_every_vendor(vendor
         rule_id="r1", name="R1", target_globs=["*"], model_tier="cheap",
         description="d", prompt="p",
     )
+    # Without reviewer_identity, the placeholder is left in place
+    # (legacy/back-compat callers that don't know the target vendor).
     base_prompt = dispatcher.build_rule_prompt(
         rule, "jleechanorg/dark-factory", 819,
         "0123456789abcdef0123456789abcdef01234567",
         "0000000000000000000000000000000000000000",
         "+x", "unknown",
     )
-    assert IDENTITY_TOKEN_PLACEHOLDER in base_prompt, (
-        "build_rule_prompt must leave the identity placeholder for "
-        "_retarget_identity to fill in per chain-walk attempt"
-    )
-
-    vendor_prompt = _retarget_identity(base_prompt, vendor)
+    assert IDENTITY_TOKEN_PLACEHOLDER in base_prompt
 
     expected = expected_identity_for_vendor(vendor)
+    vendor_prompt = dispatcher.build_rule_prompt(
+        rule, "jleechanorg/dark-factory", 819,
+        "0123456789abcdef0123456789abcdef01234567",
+        "0000000000000000000000000000000000000000",
+        "+x", "unknown",
+        reviewer_identity=expected,
+    )
+
     assert f"IDENTITY: {expected}" in vendor_prompt
     assert IDENTITY_TOKEN_PLACEHOLDER not in vendor_prompt
 
@@ -186,6 +193,55 @@ def test_retargeted_prompt_declares_the_correct_identity_for_every_vendor(vendor
     # can never drift apart (single source of truth).
     ok, why = bind_reviewer_identity(vendor, expected)
     assert ok, f"prompt tells {vendor!r} to declare {expected!r}, but bind rejects it: {why}"
+
+
+def test_per_vendor_prompt_construction_never_corrupts_a_diff_containing_the_placeholder(
+):
+    """Round-4 regression test for the round-3 defect both Codex and
+    Opus independently found: ``_retarget_identity`` did a blind
+    ``str.replace(IDENTITY_TOKEN_PLACEHOLDER, ...)`` over the ENTIRE
+    assembled prompt, including the embedded PR diff. THIS PR's own
+    diff contains the literal placeholder text
+    (``IDENTITY_TOKEN_PLACEHOLDER = "<<REVIEWER_IDENTITY_TOKEN>>"``),
+    so reviewing this PR would have silently corrupted the reviewer's
+    view of the diff it was reviewing. Round-4 removed the post-hoc
+    replace entirely in favor of ``.format()``-time substitution, which
+    only fills the template's own named slots and never re-scans
+    already-substituted values (like ``diff``) for further matches."""
+    from runner.dispatcher import VerifierDispatcher
+    from runner.rule_loader import Rule
+    from runner.skeptic_gate import IDENTITY_TOKEN_PLACEHOLDER
+
+    dangerous_diff = (
+        "+IDENTITY_TOKEN_PLACEHOLDER = \"<<REVIEWER_IDENTITY_TOKEN>>\"\n"
+        "+def expected_identity_for_vendor(vendor):\n"
+        "+    return REVIEWER_CLI_TO_IDENTITY.get(vendor)\n"
+    )
+    dispatcher = VerifierDispatcher()
+    rule = Rule(
+        rule_id="r1", name="R1", target_globs=["*"], model_tier="cheap",
+        description="d", prompt="p",
+    )
+    vendor_prompt = dispatcher.build_rule_prompt(
+        rule, "jleechanorg/dark-factory", 819,
+        "0123456789abcdef0123456789abcdef01234567",
+        "0000000000000000000000000000000000000000",
+        dangerous_diff, "unknown",
+        reviewer_identity="claudem",
+    )
+    # The diff content must survive byte-identical: the placeholder
+    # occurrence INSIDE the diff must not have been rewritten.
+    assert dangerous_diff in vendor_prompt, (
+        "the embedded diff was mutated — a per-vendor prompt build must "
+        "never alter diff content, only its own IDENTITY template slot"
+    )
+    # And the actual IDENTITY line (outside the diff) must still be
+    # correctly substituted with the real per-vendor value.
+    assert "IDENTITY: claudem" in vendor_prompt
+    # No bare, un-substituted placeholder should remain anywhere
+    # OUTSIDE the diff (the diff's own occurrence is expected content).
+    outside_diff = vendor_prompt.replace(dangerous_diff, "", 1)
+    assert IDENTITY_TOKEN_PLACEHOLDER not in outside_diff
 
 
 def test_chain_walk_sends_each_vendor_a_prompt_declaring_its_own_identity(monkeypatch):
@@ -321,3 +377,72 @@ def test_reviewer_env_does_not_broaden_codex_or_gemini_scope():
     codex_env = _reviewer_env(parent_env, "codex")
     assert "HOME" not in codex_env
     assert codex_env.get("OPENAI_API_KEY") == "sk-x"
+
+
+# ===========================================================================
+# Round-4 Finding B (advice quorum, both Codex and Opus independently):
+# COMMIT_PREFIX_TO_IDENTITY collapsed `claudem/` into implementation
+# identity "claude", while round-3 made `claudem` independently reachable
+# as a REVIEWER identity too (expected_identity_for_vendor("claudem") ==
+# "claudem", via REVIEWER_CLI_TO_IDENTITY's setdefault extension). That
+# meant a claudem-authored commit reviewed by a claudem reviewer compared
+# implementation_identity="claude" against reviewer_identity="claudem" —
+# a mismatch — so verify_provenance's self-review check silently accepted
+# what is actually a self-review. Round-3's own expansion is what made
+# this specific bypass newly reachable (claudem couldn't appear as a
+# declared reviewer identity before it).
+# ===========================================================================
+
+
+def test_claudem_authored_commit_reviewed_by_claudem_is_rejected_as_self_review():
+    """The exact bypass both reviewers found: a claudem-authored commit
+    (subject starting with `claudem/`) reviewed by a claudem reviewer
+    (declared IDENTITY: claudem) must be refused as self-review, not
+    silently accepted because the implementer side used to collapse to
+    a different string than the reviewer side."""
+    from runner.skeptic_gate import (
+        extract_implementation_identity_from_commit,
+        expected_identity_for_vendor,
+        verify_provenance,
+    )
+
+    impl_identity = extract_implementation_identity_from_commit(
+        "claudem/minimax-M3: feat(x): add thing"
+    )
+    reviewer_identity = expected_identity_for_vendor("claudem")
+
+    assert impl_identity == reviewer_identity == "claudem", (
+        "implementation and reviewer identity namespaces must agree for "
+        "claudem, or verify_provenance cannot detect self-review at all"
+    )
+
+    ok, reason = verify_provenance(impl_identity, reviewer_identity)
+    assert ok is False, (
+        f"a claudem-authored commit reviewed by a claudem reviewer must be "
+        f"rejected as self-review, but verify_provenance returned ok={ok!r} "
+        f"({reason!r})"
+    )
+    assert "self-review" in reason.lower()
+
+
+def test_claude_authored_commit_is_still_distinct_from_claudem_reviewer():
+    """Sanity check the fix didn't over-collapse: a genuinely `claude/`
+    (real Anthropic Claude CLI) authored commit reviewed by a `claudem`
+    (Claude CLI routed through a different backend) reviewer are still
+    treated as distinct identities — they are, in fact, different model
+    backends, so this is correct independence, not a new bypass."""
+    from runner.skeptic_gate import (
+        extract_implementation_identity_from_commit,
+        expected_identity_for_vendor,
+        verify_provenance,
+    )
+
+    impl_identity = extract_implementation_identity_from_commit(
+        "claude/claude-sonnet-5: feat(x): add thing"
+    )
+    reviewer_identity = expected_identity_for_vendor("claudem")
+
+    assert impl_identity == "claude"
+    assert reviewer_identity == "claudem"
+    ok, _reason = verify_provenance(impl_identity, reviewer_identity)
+    assert ok is True
