@@ -353,9 +353,27 @@ _REPO_RE = re.compile(
 _PR_RE = re.compile(r"^\s*PR_NUMBER\s*:\s*(\d+)\s*$", re.MULTILINE | re.IGNORECASE)
 _REASON_RE = re.compile(r"^\s*REASON\s*:\s*(.+?)\s*$", re.MULTILINE | re.IGNORECASE)
 _IDENTITY_RE = re.compile(
-    r"^\s*IDENTITY\s*:\s*(claude|codex|gemini|human|unknown)\s*$",
+    r"^\s*IDENTITY\s*:\s*([A-Za-z0-9_.\-]+)\s*$",
     re.MULTILINE | re.IGNORECASE,
 )
+
+
+def _allowed_identity_tokens() -> frozenset:
+    """Identity tokens ``parse_verdict`` accepts on the ``IDENTITY`` line.
+
+    Always includes the legacy base set, extended with every value in
+    ``REVIEWER_CLI_TO_IDENTITY`` — which ``_extend_bind_table_from_priority()``
+    already broadens to include each vendor in
+    ``skeptic_reviewer_priority()`` (e.g. claudem/agy/cursor-agent). Without
+    this, a chain-walk vendor honestly declaring its own name (e.g.
+    ``IDENTITY: claudem``) was rejected by ``parse_verdict`` before
+    ``bind_reviewer_identity`` — which already supports it — ever ran
+    (PR #819 round-2 finding).
+    """
+    return frozenset(
+        {"claude", "codex", "gemini", "human", "unknown"}
+        | set(REVIEWER_CLI_TO_IDENTITY.values())
+    )
 
 # ---------------------------------------------------------------------------
 # Execution-evidence regexes (issue #384)
@@ -549,7 +567,7 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
         return None
 
     identity_token = identities[0].lower()
-    if identity_token not in ("claude", "codex", "gemini", "human", "unknown"):
+    if identity_token not in _allowed_identity_tokens():
         return None
 
     verdict_token = verdicts[0].upper()

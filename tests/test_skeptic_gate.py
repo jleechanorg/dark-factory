@@ -831,7 +831,7 @@ def test_invoke_reviewer_missing_binary_returns_error():
 
     original = cli_mod._build_reviewer_cmd
 
-    def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
+    def fake_cmd(reviewer, model, **kwargs):
         return ["definitely-not-a-real-binary-xyz"]
 
     cli_mod._build_reviewer_cmd = fake_cmd
@@ -851,7 +851,7 @@ def test_invoke_reviewer_nonzero_exit_returns_error():
 
     original = cli_mod._build_reviewer_cmd
 
-    def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
+    def fake_cmd(reviewer, model, **kwargs):
         return ["/usr/bin/false"]  # absolute path so PATH-empty cases still find it
 
     cli_mod._build_reviewer_cmd = fake_cmd
@@ -954,7 +954,7 @@ def test_cli_forced_pass_with_both_reviewers(monkeypatch, capsys):
         lambda repo, pr, head_sha="": "claude",
     )
 
-    def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
+    def fake_cmd(reviewer, model, **kwargs):
         # Emit the stdout a real reviewer would produce.
         return [
             "python3",
@@ -991,7 +991,7 @@ def test_cli_forced_fail_with_missing_reviewer(monkeypatch, capsys):
         lambda repo, pr, head_sha="": "claude",
     )
 
-    def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
+    def fake_cmd(reviewer, model, **kwargs):
         if reviewer == "codex":
             return ["definitely-not-a-real-binary-xyz"]
         return [
@@ -1033,7 +1033,7 @@ def test_cli_provenance_fails_self_review(monkeypatch, capsys):
         lambda repo, pr, head_sha="": "claude",
     )
 
-    def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
+    def fake_cmd(reviewer, model, **kwargs):
         return [
             "python3",
             "-c",
@@ -1305,7 +1305,7 @@ def test_adversarial_status_failure_is_fail_closed(monkeypatch, capsys):
         lambda repo, pr, head_sha="": "claude",
     )
 
-    def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
+    def fake_cmd(reviewer, model, **kwargs):
         return [
             "python3",
             "-c",
@@ -1583,7 +1583,7 @@ def test_publication_readback_rejects_duplicate_field_in_body(monkeypatch):
         cli_mod, "get_implementation_identity", lambda repo, pr, head_sha="": "claude"
     )
 
-    def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
+    def fake_cmd(reviewer, model, **kwargs):
         return [
             "python3",
             "-c",
@@ -1680,7 +1680,7 @@ def test_status_publish_order_pending_then_success(monkeypatch, capsys):
         cli_mod, "get_implementation_identity", lambda repo, pr, head_sha="": "claude"
     )
 
-    def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
+    def fake_cmd(reviewer, model, **kwargs):
         return [
             "python3",
             "-c",
@@ -1770,7 +1770,7 @@ def test_status_readback_mismatch_overwrites_to_failure(monkeypatch, capsys):
         cli_mod, "get_implementation_identity", lambda repo, pr, head_sha="": "claude"
     )
 
-    def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
+    def fake_cmd(reviewer, model, **kwargs):
         return [
             "python3",
             "-c",
@@ -1848,7 +1848,7 @@ def test_status_overwritten_failure_never_becomes_success(monkeypatch, capsys):
         cli_mod, "get_implementation_identity", lambda repo, pr, head_sha="": "claude"
     )
 
-    def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
+    def fake_cmd(reviewer, model, **kwargs):
         return [
             "python3",
             "-c",

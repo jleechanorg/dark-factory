@@ -150,6 +150,8 @@ REVIEWER_ENV_BASE_ALLOWLIST = {
 REVIEWER_ENV_PROVIDER_ALLOWLIST = {
     "codex": {"OPENAI_API_KEY"},
     "gemini": {"GOOGLE_API_KEY"},
+    "claudem": {"MINIMAX_API_KEY"},
+    "minimax": {"MINIMAX_API_KEY"},
 }
 
 
@@ -456,8 +458,12 @@ def _build_reviewer_cmd(
     reviewer: str,
     model: str,
     *,
+    prompt: str = "",
     codex_bin: str = "",
     gemini_bin: str = "",
+    claude_bin: str = "",
+    agy_bin: str = "",
+    cursor_bin: str = "",
 ) -> list[str]:
     """Sandbox-mode argv for a reviewer CLI.
 
@@ -484,7 +490,45 @@ def _build_reviewer_cmd(
     reviewer binary (defense against mutable PATH — see post-audit
     comment 4953064910). When empty, the bare name is used (the
     workflow's PATH is reduced to a minimal set).
+
+    ``claudem``/``minimax``, ``agy``, and ``cursor-agent`` (plus the
+    ``cursor``/``agentf`` aliases) are the live chain-walk fallback
+    vendors from ``skeptic_reviewer_priority()``
+    (``config/skeptic_reviewer_priority.json``). Their argv mirrors the
+    daemon's already-working table (`daemon/src/tick.rs::dispatch_reviewer`)
+    exactly: none of these CLIs read the prompt from stdin — `agy`'s
+    `--print` and `cursor-agent`'s `-f` take the prompt as their own
+    positional value, so `prompt` is embedded directly in argv, never
+    passed via stdin (PR #819 round-2 finding: the previous version only
+    knew `codex`/`gemini`, so a chain-walk fallback to any of these
+    vendors raised `RuntimeError` instead of advancing the queue).
     """
+    if reviewer in ("claudem", "minimax"):
+        return [
+            claude_bin or "claude",
+            "--print",
+            "--dangerously-skip-permissions",
+            "--setting-sources",
+            "",
+            "--effort",
+            "high",
+            "--model",
+            "MiniMax-M3",
+            prompt,
+        ]
+    if reviewer == "claude":
+        return [
+            claude_bin or "claude",
+            "--print",
+            "--dangerously-skip-permissions",
+            "--setting-sources",
+            "",
+            prompt,
+        ]
+    if reviewer == "agy":
+        return [agy_bin or "agy", "--dangerously-skip-permissions", "--print", prompt]
+    if reviewer in ("cursor-agent", "cursor", "agentf"):
+        return [cursor_bin or "cursor-agent", "-f", prompt]
     if reviewer == "codex":
         cmd = [
             codex_bin or "codex",
@@ -559,6 +603,9 @@ def invoke_reviewer(
     timeout: int = 900,
     codex_bin: str = "",
     gemini_bin: str = "",
+    claude_bin: str = "",
+    agy_bin: str = "",
+    cursor_bin: str = "",
 ) -> Tuple[Optional[str], Optional[str]]:
     """Run the reviewer CLI; return (stdout, error_message).
 
@@ -592,10 +639,22 @@ def invoke_reviewer(
         return fake_stdout, None
 
     cmd = _build_reviewer_cmd(
-        reviewer, model, codex_bin=codex_bin, gemini_bin=gemini_bin
+        reviewer,
+        model,
+        prompt=prompt,
+        codex_bin=codex_bin,
+        gemini_bin=gemini_bin,
+        claude_bin=claude_bin,
+        agy_bin=agy_bin,
+        cursor_bin=cursor_bin,
     )
     stdin_input = prompt
-    if reviewer == "gemini" and cmd and cmd[0].endswith("gemini"):
+    if reviewer in ("claudem", "minimax", "claude", "agy", "cursor-agent", "cursor", "agentf"):
+        # These CLIs take the prompt as a positional argv value (already
+        # embedded in `cmd` above), not via stdin — mirrors the daemon's
+        # `dispatch_reviewer` table (`daemon/src/tick.rs`).
+        stdin_input = None
+    elif reviewer == "gemini" and cmd and cmd[0].endswith("gemini"):
         cmd = [
             gemini_bin or "agy",
             "--dangerously-skip-permissions",
@@ -625,6 +684,19 @@ def invoke_reviewer(
     )
     if reviewer == "gemini":
         env["HOME"] = os.path.expanduser("~")
+    elif reviewer in ("claudem", "minimax"):
+        # bashrc `claudem()`: MiniMax via the Claude Code CLI. Env is
+        # applied to this child only so a sibling `agy`/`codex` reviewer
+        # thread never inherits MiniMax's ANTHROPIC_BASE_URL. Mirrors
+        # `daemon/src/tick.rs::dispatch_reviewer`'s "claudem" | "minimax" arm.
+        minimax_key = env.get("MINIMAX_API_KEY", "")
+        env["CLAUDEM_MODE"] = "1"
+        env["ANTHROPIC_BASE_URL"] = "https://api.minimax.io/anthropic"
+        env["ANTHROPIC_AUTH_TOKEN"] = minimax_key
+        env["ANTHROPIC_API_KEY"] = minimax_key
+        env["ANTHROPIC_MODEL"] = "MiniMax-M3"
+        env["ANTHROPIC_SMALL_FAST_MODEL"] = "MiniMax-M3"
+        env["CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL"] = "0"
 
     try:
         proc = subprocess.run(
