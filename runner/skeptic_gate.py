@@ -142,6 +142,19 @@ ModelIdentity = Literal["claude", "codex", "gemini", "unknown"]
 REVIEWER_CLI_TO_IDENTITY = {
     "codex": "codex",
     "gemini": "gemini",
+    # /wa finding, PR #819 round-5: `invoke_reviewer` treats "claudem"
+    # and "minimax" as the identical backend (same Claude CLI routed
+    # through MiniMax's API — see skeptic_gate_cli.py's
+    # `reviewer in ("claudem", "minimax")` branches), but this table
+    # never canonicalized "minimax" to "claudem" — it fell back to its
+    # own unmapped name "minimax" via expected_identity_for_vendor().
+    # If "minimax" is ever dispatched directly as a reviewer vendor,
+    # verify_provenance would treat a claudem-authored commit and a
+    # minimax-identity reviewer as independent when they are the same
+    # backend — a latent self-review bypass. Not reachable under the
+    # shipped default skeptic_reviewer_priority() (only "claudem" is
+    # listed), but a real gap in the identity table, not hypothetical.
+    "minimax": "claudem",
 }
 
 # Placeholder substituted into the prompt's IDENTITY line with the

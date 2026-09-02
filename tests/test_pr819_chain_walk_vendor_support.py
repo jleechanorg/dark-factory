@@ -446,3 +446,61 @@ def test_claude_authored_commit_is_still_distinct_from_claudem_reviewer():
     assert reviewer_identity == "claudem"
     ok, _reason = verify_provenance(impl_identity, reviewer_identity)
     assert ok is True
+
+
+# ===========================================================================
+# /wa finding (ChatGPT + Perplexity, both independently converged, PR819
+# rebased head 41816b19): `invoke_reviewer` treats "claudem" and "minimax"
+# as the identical backend (same Claude-CLI-via-MiniMax-API code path —
+# see skeptic_gate_cli.py's `reviewer in ("claudem", "minimax")` branches),
+# but REVIEWER_CLI_TO_IDENTITY never canonicalized "minimax" to "claudem",
+# so expected_identity_for_vendor("minimax") fell back to its own unmapped
+# name "minimax" instead. If "minimax" is ever dispatched directly as a
+# reviewer vendor (the dispatch code already accepts it as a valid value),
+# verify_provenance("claudem", "minimax") would treat a claudem-authored
+# commit and a minimax-identity reviewer as independent when they're the
+# same backend — a latent self-review bypass, not currently reachable
+# under the shipped default skeptic_reviewer_priority() (only "claudem"
+# is listed), but a real gap in the identity table.
+# ===========================================================================
+
+
+def test_minimax_vendor_identity_canonicalizes_to_claudem():
+    """`minimax` and `claudem` are the identical backend (same Claude CLI
+    routed through MiniMax's API); expected_identity_for_vendor must map
+    both to the same reviewer-identity token, or verify_provenance cannot
+    detect self-review for whichever alias ever gets dispatched directly."""
+    from runner.skeptic_gate import expected_identity_for_vendor
+
+    assert expected_identity_for_vendor("minimax") == "claudem"
+    assert expected_identity_for_vendor("minimax") == expected_identity_for_vendor("claudem")
+
+
+def test_claudem_authored_commit_reviewed_by_minimax_is_rejected_as_self_review():
+    """The exact latent bypass /wa found: a claudem-authored commit
+    reviewed by a reviewer declaring IDENTITY: minimax (same backend,
+    different alias) must be refused as self-review."""
+    from runner.skeptic_gate import (
+        extract_implementation_identity_from_commit,
+        expected_identity_for_vendor,
+        verify_provenance,
+    )
+
+    impl_identity = extract_implementation_identity_from_commit(
+        "claudem/minimax-M3: feat(x): add thing"
+    )
+    reviewer_identity = expected_identity_for_vendor("minimax")
+
+    assert impl_identity == reviewer_identity == "claudem", (
+        "implementation and reviewer identity namespaces must agree for "
+        "the claudem/minimax alias pair, or verify_provenance cannot "
+        "detect self-review at all"
+    )
+
+    ok, reason = verify_provenance(impl_identity, reviewer_identity)
+    assert ok is False, (
+        f"a claudem-authored commit reviewed by a minimax-identity reviewer "
+        f"(same backend) must be rejected as self-review, but "
+        f"verify_provenance returned ok={ok!r} ({reason!r})"
+    )
+    assert "self-review" in reason.lower()
