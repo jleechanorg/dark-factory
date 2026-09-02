@@ -1,4 +1,5 @@
 use daemon::adapters::{ChainLlm, CliScm, CliSessions, CliTracker, CliVcs};
+use daemon::errors::DaemonError;
 use daemon::tools::{Llm, Scm, SessionActivity, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
 
 /// Guard for setting environment variables during tests.
@@ -29,11 +30,36 @@ impl Drop for EnvVarGuard {
     }
 }
 
+/// Isolates process-global circuit-breaker persistence for fake-CLI tests.
+struct BreakerPathGuard;
+
+impl BreakerPathGuard {
+    fn install(
+        state_file_path: std::path::PathBuf,
+        telemetry_log_path: std::path::PathBuf,
+    ) -> Self {
+        daemon::gh_circuit_breaker::set_state_file_path(Some(state_file_path));
+        daemon::gh_circuit_breaker::set_telemetry_log_path(Some(telemetry_log_path));
+        daemon::adapters::clear_graphql_rate_limited();
+        Self
+    }
+}
+
+impl Drop for BreakerPathGuard {
+    fn drop(&mut self) {
+        // Persist the reset to the private test path before restoring defaults.
+        daemon::adapters::clear_graphql_rate_limited();
+        daemon::gh_circuit_breaker::set_state_file_path(None);
+        daemon::gh_circuit_breaker::set_telemetry_log_path(None);
+    }
+}
+
 #[test]
 fn test_cli_vcs_real_git() {
     if std::env::var("GITHUB_ACTIONS").is_ok() {
         return;
     }
+    let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let vcs = CliVcs::new("jleechanorg/dark-factory".to_string());
     let sha = vcs.base_head("main").expect("base_head main failed");
     assert_eq!(sha.len(), 40);
@@ -621,7 +647,6 @@ esac
 #[cfg(unix)]
 fn test_cli_scm_pr_snapshot_graphql_command_failure_reports_unknown_not_green() {
     let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    daemon::adapters::clear_graphql_rate_limited();
 
     // Unique PR number to avoid cache/collision
     let pr_num = 900001;
@@ -642,15 +667,14 @@ fn test_cli_scm_pr_snapshot_graphql_command_failure_reports_unknown_not_green() 
     // Prepend fake gh to PATH
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
+    let breaker_state_path = fake_bin_dir.join("gh_circuit_breaker.json");
+    let telemetry_path = fake_bin_dir.join("daemon.jsonl");
 
-    // Guard both PATH and the mode env var our fake gh reads together so a
-    // panic mid-test still restores prior state via Drop.
     let _env_guard = EnvVarGuard::set(&[("PATH", &new_path), ("FAKE_GH_GRAPHQL_MODE", "fail")]);
+    let _breaker_guard = BreakerPathGuard::install(breaker_state_path, telemetry_path);
 
     let scm = CliScm::new("jleechanorg/dark-factory".to_string());
     let result = scm.pr_snapshot(pr_num);
-
-    daemon::adapters::clear_graphql_rate_limited();
 
     // The snapshot fetch should succeed (only the thread count is unknown)
     assert!(result.is_ok(), "pr_snapshot should succeed even when GraphQL fails: {:?}", result);
@@ -670,7 +694,6 @@ fn test_cli_scm_pr_snapshot_graphql_command_failure_reports_unknown_not_green() 
 #[cfg(unix)]
 fn test_cli_scm_pr_snapshot_graphql_malformed_output_reports_unknown_not_green() {
     let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    daemon::adapters::clear_graphql_rate_limited();
 
     let pr_num = 900002;
 
@@ -688,14 +711,15 @@ fn test_cli_scm_pr_snapshot_graphql_malformed_output_reports_unknown_not_green()
 
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
+    let breaker_state_path = fake_bin_dir.join("gh_circuit_breaker.json");
+    let telemetry_path = fake_bin_dir.join("daemon.jsonl");
 
     let _env_guard =
         EnvVarGuard::set(&[("PATH", &new_path), ("FAKE_GH_GRAPHQL_MODE", "malformed")]);
+    let _breaker_guard = BreakerPathGuard::install(breaker_state_path, telemetry_path);
 
     let scm = CliScm::new("jleechanorg/dark-factory".to_string());
     let result = scm.pr_snapshot(pr_num);
-
-    daemon::adapters::clear_graphql_rate_limited();
 
     assert!(result.is_ok(), "pr_snapshot should succeed even when GraphQL is malformed: {:?}", result);
     let snapshot = result.unwrap();
@@ -869,6 +893,240 @@ fn test_cli_sessions_ao_status_includes_project_arg_scoped() {
         wa_tokens.get(p_idx + 1).copied(),
         Some("worldarchitect"),
         "expected project 'worldarchitect' following -p"
+    );
+
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}
+
+#[test]
+fn ao_recovery_contract() {
+    let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_bin_dir = std::env::temp_dir().join(format!(
+        "afd_ao_recovery_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
+    std::fs::create_dir_all(&fake_bin_dir).unwrap();
+
+    let log_file = fake_bin_dir.join("ao_recovery_calls.log");
+    let state_file = fake_bin_dir.join("ao_state.txt");
+    let fake_ao = fake_bin_dir.join("ao");
+
+    // Write a fake ao that fails initial status, handles start, succeeds subsequent status, and handles spawn
+    std::fs::write(
+        &fake_ao,
+        format!(
+            r#"#!/usr/bin/env python3
+import os
+import sys
+
+args = sys.argv[1:]
+log_path = "{log_path}"
+state_path = "{state_path}"
+
+with open(log_path, "a", encoding="utf-8") as f:
+    f.write(" ".join(args) + "\n")
+
+if "--headless" in args:
+    print("error: unknown option '--headless'", file=sys.stderr)
+    sys.exit(1)
+
+if args != ["status", "-p", "dark-factory", "--json"]:
+    if args[:1] == ["status"]:
+        print(f"status must be project-scoped JSON: {{args}}", file=sys.stderr)
+        sys.exit(1)
+
+if args == ["status", "-p", "dark-factory", "--json"]:
+    if not os.path.exists(state_path):
+        print("error: daemon is not running", file=sys.stderr)
+        sys.exit(1)
+    else:
+        print("[]")
+        sys.exit(0)
+
+if args[0] == "start":
+    assert "--no-dashboard" in args, f"start missing --no-dashboard: {{args}}"
+    assert "--no-open" in args, f"start missing --no-open: {{args}}"
+    with open(state_path, "w", encoding="utf-8") as f:
+        f.write("running\n")
+    print("Orchestrator started.")
+    sys.exit(0)
+
+if args[0] == "spawn":
+    if not os.path.exists(state_path):
+        print("error: daemon is not running", file=sys.stderr)
+        sys.exit(1)
+    print("SESSION=df-recovery-session-1")
+    print("  Worktree: /tmp/fake-recovery-worktree")
+    print("  Branch:   factory/test-recovery-branch")
+    sys.exit(0)
+
+print(f"unknown command: {{args}}", file=sys.stderr)
+sys.exit(1)
+"#,
+            log_path = log_file.display(),
+            state_path = state_file.display(),
+        ),
+    )
+    .unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&fake_ao).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_ao, permissions).unwrap();
+    }
+
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
+    let _env_guard = EnvVarGuard::set(&[
+        ("PATH", &new_path),
+    ]);
+
+    let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+    let spec = SpawnSpec {
+        bead_id: "test-recovery-bead".to_string(),
+        branch: "factory/test-recovery-branch".to_string(),
+        prompt: "test recovery prompt".to_string(),
+        repo: "jleechanorg/dark-factory".to_string(),
+        ao_project: "dark-factory".to_string(),
+        remote: "origin".to_string(),
+        local_checkout: Some(std::env::current_dir().unwrap()),
+        expected_revision: None,
+        managed_checkout: false,
+        expected_cwd: None,
+    };
+
+    let session = sessions.spawn(&spec).expect("spawn with AO auto-start must succeed");
+    assert_eq!(session.0, "df-recovery-session-1");
+
+    let log_content = std::fs::read_to_string(&log_file).expect("failed to read fake ao recovery log");
+    let calls: Vec<&str> = log_content.lines().collect();
+    let recovery_calls: Vec<&str> = calls.iter().skip_while(|c| c.starts_with("spawn")).copied().collect();
+    // jleechan round-2 fix (late-arrival Condvar race, daemon/src/adapters.rs
+    // `ensure_ao_project_recovered`): after acquiring the starter-election
+    // lock and finding no other starter in progress, the caller now
+    // re-checks health BEFORE electing itself starter, so it doesn't start
+    // AO a second time if a just-finished prior caller already fixed
+    // things. That inserts one extra `status` call between the initial
+    // health check and `start`, so the lifecycle is 5 calls, not 4.
+    assert_eq!(recovery_calls.len(), 5, "expected exactly 5 calls in recovery lifecycle, got: {recovery_calls:?}");
+
+    assert!(recovery_calls[0].starts_with("status -p dark-factory"), "Recovery Call 1 must be initial status -p: {}", recovery_calls[0]);
+    assert!(recovery_calls[1].starts_with("status -p dark-factory"), "Recovery Call 2 must be the post-lock-acquisition health recheck (late-arrival race fix): {}", recovery_calls[1]);
+    assert!(recovery_calls[2].starts_with("start"), "Recovery Call 3 must be start: {}", recovery_calls[2]);
+    assert!(recovery_calls[2].contains("--no-dashboard") && recovery_calls[2].contains("--no-open"), "Recovery Call 3 must contain --no-dashboard and --no-open: {}", recovery_calls[2]);
+    assert!(!recovery_calls[2].contains("--headless"), "Recovery Call 3 must NOT contain --headless: {}", recovery_calls[2]);
+    assert!(recovery_calls[3].starts_with("status -p dark-factory"), "Recovery Call 4 must be post-start confirm status -p: {}", recovery_calls[3]);
+    assert!(recovery_calls[4].starts_with("spawn"), "Recovery Call 5 must be original spawn retry: {}", recovery_calls[4]);
+
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}
+
+#[test]
+fn ao_recovery_failure_preserves_spawn_and_recovery_errors() {
+    let _lock = FAKE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_bin_dir = std::env::temp_dir().join(format!(
+        "afd_ao_recovery_failure_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
+    std::fs::create_dir_all(&fake_bin_dir).unwrap();
+
+    let log_file = fake_bin_dir.join("ao_recovery_failure_calls.log");
+    let fake_ao = fake_bin_dir.join("ao");
+    std::fs::write(
+        &fake_ao,
+        format!(
+            r#"#!/usr/bin/env python3
+import sys
+
+args = sys.argv[1:]
+log_path = "{log_path}"
+with open(log_path, "a", encoding="utf-8") as f:
+    f.write(" ".join(args) + "\n")
+
+if args[:1] == ["status"]:
+    print("error: daemon is not running", file=sys.stderr)
+    sys.exit(1)
+if args[:1] == ["start"]:
+    print("RECOVERY_FAILURE_MARKER", file=sys.stderr)
+    sys.exit(7)
+if args[:1] == ["spawn"]:
+    print("SPAWN_FAILURE_MARKER: daemon is not running", file=sys.stderr)
+    sys.exit(1)
+print(f"unknown command: {{args}}", file=sys.stderr)
+sys.exit(1)
+"#,
+            log_path = log_file.display(),
+        ),
+    )
+    .unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&fake_ao).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_ao, permissions).unwrap();
+    }
+
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
+    let _env_guard = EnvVarGuard::set(&[
+        ("PATH", &new_path),
+        ("DARK_FACTORY_CODER_FALLBACK_CHAIN", "minimax"),
+    ]);
+
+    let repo = "jleechanorg/dark-factory";
+    let sessions = CliSessions::new(repo, "minimax");
+    let result = sessions.spawn(&SpawnSpec {
+        bead_id: "ao-recovery-failure-bead".to_string(),
+        branch: "factory/ao-recovery-failure".to_string(),
+        prompt: "recovery failure test".to_string(),
+        repo: repo.to_string(),
+        ao_project: "ao-recovery-failure".to_string(),
+        remote: "origin".to_string(),
+        local_checkout: Some(std::env::current_dir().unwrap()),
+        expected_revision: None,
+        managed_checkout: false,
+        expected_cwd: None,
+    });
+
+    let error = result.expect_err("spawn must report the failed recovery");
+    match &error {
+        DaemonError::SpawnRecoveryFailed {
+            spawn_error,
+            recovery_error,
+        } => {
+            assert_eq!(spawn_error.error_class(), "spawn_fallback_exhausted");
+            assert_eq!(recovery_error.error_class(), "config");
+        }
+        other => panic!("expected structured AO recovery failure, got: {other:?}"),
+    }
+    let rendered = error.to_string();
+    assert!(rendered.contains("SPAWN_FAILURE_MARKER"), "{rendered}");
+    assert!(rendered.contains("RECOVERY_FAILURE_MARKER"), "{rendered}");
+
+    let calls = std::fs::read_to_string(&log_file).unwrap();
+    assert_eq!(
+        calls.lines().filter(|line| line.starts_with("spawn")).count(),
+        1,
+        "initial AO spawn must be attempted once: {calls}"
+    );
+    assert_eq!(
+        calls.lines().filter(|line| line.starts_with("start")).count(),
+        1,
+        "AO recovery start must be attempted exactly once: {calls}"
     );
 
     let _ = std::fs::remove_dir_all(&fake_bin_dir);

@@ -5,6 +5,20 @@
 // copy of each module's source.
 #![allow(dead_code)]
 
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
+
+/// Process-wide lock for unit tests that mutate inherited environment state.
+///
+/// `libtest` runs tests in parallel, while PATH/HOME and related variables are
+/// process-global. Keep the lock in the crate root so every test module shares
+/// the same serialization point.
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> &'static Mutex<()> {
+    static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    TEST_ENV_LOCK.get_or_init(|| Mutex::new(()))
+}
+
 pub mod config;
 pub mod constraints;
 pub mod reroll;

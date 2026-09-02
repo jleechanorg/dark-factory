@@ -128,6 +128,17 @@ pub fn append_mutation(spec_path: &Path, block: &str) -> Result<(), DaemonError>
     );
     let temp_path = parent.join(temp_filename);
 
+    struct TempCleanup<'a>(&'a Path, bool);
+    impl<'a> Drop for TempCleanup<'a> {
+        fn drop(&mut self) {
+            if self.1 {
+                let _ = std::fs::remove_file(self.0);
+            }
+        }
+    }
+
+    let mut cleanup = TempCleanup(&temp_path, false);
+
     {
         let mut temp_file = OpenOptions::new()
             .create(true)
@@ -139,6 +150,8 @@ pub fn append_mutation(spec_path: &Path, block: &str) -> Result<(), DaemonError>
                 rc: -1,
                 stderr: format!("open temp file: {e}"),
             })?;
+
+        cleanup.1 = true;
 
         if spec_path.exists() {
             let existing = std::fs::read_to_string(spec_path).map_err(|e| DaemonError::Tool {
@@ -175,6 +188,8 @@ pub fn append_mutation(spec_path: &Path, block: &str) -> Result<(), DaemonError>
         rc: -1,
         stderr: format!("rename temp to target: {e}"),
     })?;
+
+    cleanup.1 = false;
 
     Ok(())
 }
@@ -351,4 +366,93 @@ mod tests {
 
         std::fs::remove_dir_all(&temp_dir).ok();
     }
+
+    #[test]
+    fn reroll_post_open_read_failure_preserves_original() {
+        let temp_dir = std::env::temp_dir().join(format!("afd_constraints_temp_open_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let spec_file = temp_dir.join("spec.toml");
+        // Invalid UTF-8 (a bare continuation byte with no leading byte) makes
+        // read_to_string fail deterministically regardless of file
+        // permissions or process uid, unlike a chmod(0o000) fixture, which
+        // root bypasses (root ignores POSIX permission bits, so the read
+        // would silently succeed and this test would falsely pass under
+        // root-run CI/sandboxes).
+        let initial_bytes: &[u8] = &[0x80, 0x81, 0x82];
+        std::fs::write(&spec_file, initial_bytes).unwrap();
+
+        let temp_filename = format!(
+            ".{}.tmp.{}",
+            spec_file.file_name().and_then(|f| f.to_str()).unwrap_or("spec"),
+            std::process::id()
+        );
+        let temp_path = temp_dir.join(&temp_filename);
+
+        let res = append_mutation(&spec_file, "inhibition_specs = [\"fail\"]\n");
+        assert!(res.is_err(), "append_mutation must fail when existing spec is not valid UTF-8");
+        let err = res.unwrap_err();
+        match err {
+            DaemonError::Tool { tool, stderr, .. } => {
+                assert_eq!(tool, "fs");
+                assert!(
+                    stderr.contains("read existing spec:"),
+                    "error must specifically name read failure after temp open, got: {stderr}"
+                );
+            }
+            other => panic!("expected DaemonError::Tool fs error, got: {other:?}"),
+        }
+
+        // Assert that TempCleanup actively deleted the opened temp file on drop
+        assert!(
+            !temp_path.exists(),
+            "temp file {} must be deleted by TempCleanup guard on failure",
+            temp_path.display()
+        );
+
+        // Verify original spec file is completely unmodified
+        assert_eq!(
+            std::fs::read(&spec_file).unwrap(),
+            initial_bytes,
+            "original spec file must remain completely unmodified on failure"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// jleechan review finding P2-C1: a dedicated, single-responsibility
+    /// test for the TempCleanup deletion behavior itself, independent of
+    /// `reroll_post_open_read_failure_preserves_original`'s combined
+    /// error-shape + original-content assertions above. Retroactively
+    /// verified RED (against a Drop body temporarily neutered to a no-op
+    /// in-session, per the same discipline used for the sibling test in
+    /// the prior commit) before this test was written against the correct
+    /// TempCleanup implementation.
+    #[test]
+    fn reroll_post_open_failure_removes_temp() {
+        let temp_dir = std::env::temp_dir().join(format!("afd_constraints_removes_temp_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let spec_file = temp_dir.join("spec.toml");
+        let invalid_bytes: &[u8] = &[0x80, 0x81, 0x82];
+        std::fs::write(&spec_file, invalid_bytes).unwrap();
+
+        let temp_filename = format!(
+            ".{}.tmp.{}",
+            spec_file.file_name().and_then(|f| f.to_str()).unwrap_or("spec"),
+            std::process::id()
+        );
+        let temp_path = temp_dir.join(&temp_filename);
+
+        let res = append_mutation(&spec_file, "inhibition_specs = [\"fail\"]\n");
+        assert!(res.is_err(), "append_mutation must fail when existing spec is not valid UTF-8");
+        assert!(
+            !temp_path.exists(),
+            "TempCleanup must delete the opened temp file {} when append_mutation fails",
+            temp_path.display()
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }
+

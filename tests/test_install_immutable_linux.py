@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 import shutil
 import stat
@@ -159,6 +161,15 @@ touch "$db"
     daemon_binary = release / "daemon" / "target" / "release" / "daemon"
     assert daemon_binary.is_file()
     assert not (daemon_binary.stat().st_mode & stat.S_IWUSR)
+    release_manifest = json.loads((release / "release-manifest.json").read_text())
+    assert release_manifest == {
+        "schema_version": 1,
+        "source_commit": RELEASE_SHA,
+        "daemon": {
+            "path": "daemon/target/release/daemon",
+            "sha256": hashlib.sha256(daemon_binary.read_bytes()).hexdigest(),
+        },
+    }
     state_root = home / ".local" / "state" / "dark-factory"
     state_db = state_root / ".beads" / "beads.db"
     assert state_db.is_file()
