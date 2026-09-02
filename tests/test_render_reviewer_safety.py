@@ -95,7 +95,7 @@ class TestReviewerGoalLeakAssertion:
             "${intent}\n"
             "--- END TASK RECORD ---\n"
         )
-        node = make_node("cold_reviewer", **{"class": "review", "verdict_gate": "true", "prompt": f"@{prompt}"})
+        node = make_node("cold_reviewer", **{"class": "review", "verdict_gate": "true", "prompt": f"@{prompt.name}"})
         intent_b64 = base64.b64encode(b"do the thing").decode("ascii")
         ctx = _ctx(tmp_path, target="git-range://x@a..b", intent=intent_b64)
         rendered = _render_prompt(node, ctx)
@@ -106,7 +106,7 @@ class TestReviewerGoalLeakAssertion:
         prompt = tmp_path / "review.md"
         # `${target}` deliberately not substituted (simulate a renderer bug)
         prompt.write_text("Review target: ${target}\nno intent placeholder here\n")
-        node = make_node("cold_reviewer", **{"class": "review", "verdict_gate": "true", "prompt": f"@{prompt}"})
+        node = make_node("cold_reviewer", **{"class": "review", "verdict_gate": "true", "prompt": f"@{prompt.name}"})
         ctx = _ctx(tmp_path)  # target unset -> falls back to default text, not literal
         # Default substitution means ${target} IS replaced (with the "(no
         # target minted)" default) rather than left as a literal `${target}`
@@ -124,7 +124,7 @@ class TestReviewerGoalLeakAssertion:
         monkeypatch.setenv("DARK_FACTORY_HOME", str(tmp_path))
         prompt = tmp_path / "review.md"
         prompt.write_text("Review target: ${target}\n${intent}\n")
-        node = make_node("cold_reviewer", **{"class": "review", "verdict_gate": "true", "prompt": f"@{prompt}"})
+        node = make_node("cold_reviewer", **{"class": "review", "verdict_gate": "true", "prompt": f"@{prompt.name}"})
         ctx = _ctx(tmp_path)  # no target= kwarg: ctx.state["target"] unset
         with pytest.raises(ReviewPromptRenderError, match="no target minted"):
             _render_prompt(node, ctx)
@@ -133,7 +133,7 @@ class TestReviewerGoalLeakAssertion:
         monkeypatch.setenv("DARK_FACTORY_HOME", str(tmp_path))
         prompt = tmp_path / "review.md"
         prompt.write_text("Review target: ${target}\n${intent}\n")
-        node = make_node("cold_reviewer", **{"class": "review", "verdict_gate": "true", "prompt": f"@{prompt}"})
+        node = make_node("cold_reviewer", **{"class": "review", "verdict_gate": "true", "prompt": f"@{prompt.name}"})
         # A real target is required here so this test exercises only the
         # goal-leak assertion, not the separate no-target-minted guard.
         ctx = _ctx(tmp_path, goal="", target="git-range://x@a..b", intent="aGk=")
@@ -230,6 +230,40 @@ class TestReviewerPromptLoadedFromTrustedInstall:
                 "class": "review",
                 "verdict_gate": "true",
                 "prompt": f"@{attacker_controlled}",
+            },
+        )
+        ctx = Context(goal="do the thing", workdir=tmp_path)
+        ctx.state.update(target="git-range://x@a..b", intent="aGk=")
+
+        with pytest.raises(ReviewPromptRenderError):
+            _render_prompt(node, ctx)
+
+    def test_absolute_prompt_path_rejected_even_inside_trusted_root(self, tmp_path, monkeypatch):
+        """Round-8 adversarial finding: the round-7 fix only refused an
+        absolute ``prompt="@/path"`` when it resolved OUTSIDE the trusted
+        root (``$DARK_FACTORY_HOME``/runner package root) — via a
+        trusted-root-containment check that let an absolute path resolving
+        INSIDE the trusted root through. That contradicts the PR's own
+        claim to "refuse absolute... paths" and the CLAUDE.md contract that
+        prompt refs are always relative (``@relative/path.md``). No
+        legitimate graph ever needs an absolute prompt path, so a
+        verdict-gated review node must refuse ANY absolute path outright,
+        even one that happens to live inside the trusted root."""
+        trusted_home = tmp_path / "trusted-factory-home"
+        trusted_home.mkdir()
+        monkeypatch.setenv("DARK_FACTORY_HOME", str(trusted_home))
+
+        inside_trusted_root = trusted_home / "review.md"
+        inside_trusted_root.write_text(
+            "Review target: ${target}\nEnd with Verdict: PASS or Verdict: FAIL.\n"
+        )
+
+        node = make_node(
+            "cold_reviewer",
+            **{
+                "class": "review",
+                "verdict_gate": "true",
+                "prompt": f"@{inside_trusted_root}",
             },
         )
         ctx = Context(goal="do the thing", workdir=tmp_path)

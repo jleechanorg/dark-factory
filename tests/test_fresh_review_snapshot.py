@@ -248,18 +248,19 @@ class TestCleanupReviewSnapshot:
 
 
 def _review_node(prompt: pathlib.Path, monkeypatch):
-    """Build a verdict-gated review node whose absolute prompt path resolves
-    as trusted (bead rev-xfy23): an absolute ``prompt="@..."`` on a
-    ``class="review"`` node is only honored when it resolves inside
-    ``$DARK_FACTORY_HOME`` — point that at ``prompt``'s own directory so
-    these tests' tmp_path-based fixtures keep working."""
+    """Build a verdict-gated review node with a RELATIVE prompt ref (round-8
+    fix: an absolute ``prompt="@..."`` is now refused outright for review
+    nodes, with no trusted-root exception). Point ``$DARK_FACTORY_HOME`` at
+    ``prompt``'s own directory and reference it by filename only, so these
+    tests' tmp_path-based fixtures keep working under the tightened
+    contract."""
     monkeypatch.setenv("DARK_FACTORY_HOME", str(prompt.parent))
     node = make_node(
         name="cold_reviewer",
         type="codergen",
         backend="codex",
         class_="review",
-        prompt=f"@{prompt}",
+        prompt=f"@{prompt.name}",
         verdict_gate="true",
         fresh_session="true",
     )

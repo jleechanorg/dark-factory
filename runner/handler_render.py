@@ -230,38 +230,16 @@ def _render_prompt(node: "Node", ctx: "Context") -> str:
             return _fallback("no prompt ref")
         ref_path = pathlib.Path(ref)
         if is_review and ref_path.is_absolute():
-            # Round-7 adversarial finding (bead rev-xfy23): an absolute
-            # prompt path must not bypass the trusted-install check applied
-            # to relative review-node paths below (see the `is_review`
-            # branch that resolves against `trusted_root`). Without this,
-            # the generic absolute-path branch further down would read
-            # whatever file it was given — letting a graph author (or a
-            # malicious `.dot` file) point a verdict-gated reviewer's
-            # prompt at any file on disk. Route it through the same
-            # trusted-root containment check instead of trusting it as-is.
-            from .paths import factory_home
-            trusted_root = factory_home()
-            if trusted_root is None:
-                trusted_root = pathlib.Path(__file__).resolve().parent.parent
-            try:
-                resolved_ref = ref_path.resolve()
-            except FileNotFoundError:
-                return _fallback("missing prompt", ref)
-            try:
-                resolved_ref.relative_to(trusted_root.resolve())
-            except ValueError:
-                return _fallback("invalid prompt", ref)
-            for deny in _handlers_shim._holdout_denied_paths():
-                try:
-                    resolved_ref.relative_to(deny)
-                except ValueError:
-                    pass
-                else:
-                    return _fallback("invalid prompt", ref)
-            if not resolved_ref.exists():
-                return _fallback("missing prompt", ref)
-            text = resolved_ref.read_text()
-            return _rendered(text)
+            # Round-8 adversarial finding: the round-7 fix routed an
+            # absolute path through trusted-root containment, which still
+            # ACCEPTED it when the path happened to resolve inside the
+            # trusted root — contradicting this fix's own "refuse
+            # absolute... paths" framing and the repo-wide contract
+            # (CLAUDE.md) that prompt refs are always
+            # ``prompt="@relative/path.md"``. No legitimate `.dot` graph
+            # ever writes an absolute prompt path; refuse it outright, with
+            # no trusted-root exception.
+            return _fallback("absolute prompt path refused", ref)
         if ref_path.is_absolute():
             resolved_ref = ref_path
             try:
