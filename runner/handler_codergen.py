@@ -1588,7 +1588,14 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             # this same `output`, so replacing it here is the single choke
             # point that keeps the worker-facing relay typed and fenced.
             meta["reviewer_raw_output_relayed"] = "false"
-            output = format_typed_findings_relay(output)
+            # Only relay findings for a genuinely valid, terminal FAIL from
+            # a clean, unmutated run — nonzero exit or tracked-file mutation
+            # forces outcome="error" without clearing verdict, so outcome
+            # must be checked too, not just terminal_ok/verdict.
+            if outcome == "failure" and terminal_ok and verdict == "fail":
+                output = format_typed_findings_relay(output)
+            else:
+                output = "review did not produce valid findings; re-run against current pin"
     elif outcome == "success":
         _stash_diff(node, ctx)
         _stash_codergen_receipt(node, ctx)
