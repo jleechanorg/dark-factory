@@ -121,7 +121,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
-from typing import List, Literal, Optional, Tuple, Union
+from typing import Dict, List, Literal, Optional, Tuple, Union
 
 
 # Unique HTML marker used by the GitHub comment upsert logic. Any prior
@@ -139,35 +139,77 @@ ModelIdentity = Literal["claude", "codex", "gemini", "unknown"]
 # process claiming `gemini` (or vice-versa) is rejected outright. This
 # prevents a malicious PR-controlled reviewer invocation from
 # impersonating another reviewer.
-REVIEWER_CLI_TO_IDENTITY = {
-    "codex": "codex",
-    "gemini": "gemini",
-    # /wa finding, PR #819 round-5: `invoke_reviewer` treats "claudem"
-    # and "minimax" as the identical backend (same Claude CLI routed
-    # through MiniMax's API — see skeptic_gate_cli.py's
-    # `reviewer in ("claudem", "minimax")` branches), but this table
-    # never canonicalized "minimax" to "claudem" — it fell back to its
-    # own unmapped name "minimax" via expected_identity_for_vendor().
-    # If "minimax" is ever dispatched directly as a reviewer vendor,
-    # verify_provenance would treat a claudem-authored commit and a
-    # minimax-identity reviewer as independent when they are the same
-    # backend — a latent self-review bypass. Not reachable under the
-    # shipped default skeptic_reviewer_priority() (only "claudem" is
-    # listed), but a real gap in the identity table, not hypothetical.
-    "minimax": "claudem",
-    # Codex /advice finding, PR #819 round-7: `cursor` and `agentf` are
-    # aliases that dispatch the identical `cursor-agent` executable
-    # (see skeptic_gate_cli.py's `reviewer in ("cursor-agent", "cursor",
-    # "agentf")` branch), but this table never canonicalized them —
-    # they fell back to their own distinct, unmapped names via
-    # expected_identity_for_vendor(). A cursor-agent-authored commit
-    # reviewed via the "cursor"/"agentf" alias evaded both the round-6
-    # self-review pre-filter and the post-hoc verify_provenance check,
-    # since the two identity tokens never matched. Reproduced by Codex
-    # during round-7 /advice.
-    "cursor-agent": "cursor-agent",
-    "cursor": "cursor-agent",
-    "agentf": "cursor-agent",
+# PR #819 round-8: rounds 5, 6, and 7 each independently found and
+# fixed the SAME class of gap — an alias/prefix present in one of
+# REVIEWER_CLI_TO_IDENTITY / COMMIT_PREFIX_TO_IDENTITY but missing
+# from the other, because the two tables were hand-maintained
+# separately and kept drifting out of sync (round-5: minimax; round-7:
+# cursor/agentf). VENDOR_REGISTRY is now the single source of truth
+# both tables are derived from — a new vendor/alias is added in ONE
+# place and both the reviewer-CLI-dispatch side and the implementer-
+# commit-prefix side stay in sync automatically.
+@dataclass(frozen=True)
+class VendorIdentity:
+    """One reviewer/implementer identity and every name it is known by."""
+
+    identity: str
+    cli_names: Tuple[str, ...] = ()
+    commit_prefixes: Tuple[str, ...] = ()
+
+
+VENDOR_REGISTRY: Tuple[VendorIdentity, ...] = (
+    VendorIdentity("codex", cli_names=("codex",), commit_prefixes=("codex/", "codexm/")),
+    VendorIdentity("gemini", cli_names=("gemini",), commit_prefixes=("gemini/", "geminim/")),
+    VendorIdentity("claude", cli_names=("claude",), commit_prefixes=("claude/",)),
+    # PR #819 round-4: `claudem/` used to collapse into "claude", but
+    # round-3 made `claudem` independently reachable as a REVIEWER
+    # identity too. Collapsing the IMPLEMENTER side to "claude" while
+    # the REVIEWER side legitimately declares "claudem" made
+    # `verify_provenance` compare "claude" != "claudem" and silently
+    # accept self-review for any claudem-authored commit reviewed by a
+    # claudem reviewer. claudem is genuinely a different backend
+    # (Claude CLI routed through MiniMax's API) from real Claude, so
+    # keeping it distinct is also the more accurate provenance claim.
+    # round-5 additionally found `invoke_reviewer` treats "claudem" and
+    # "minimax" as the identical backend, so "minimax" joins both sides
+    # here too (cli alias + commit prefix, for symmetry with round-7's
+    # cursor-agent handling below).
+    VendorIdentity("claudem", cli_names=("claudem", "minimax"), commit_prefixes=("claudem/", "minimax/")),
+    # round-7 (Codex /advice): `cursor` and `agentf` are aliases that
+    # dispatch the identical `cursor-agent` executable, but were never
+    # canonicalized — a cursor-agent-authored commit reviewed via the
+    # `cursor`/`agentf` alias evaded both the self-review pre-filter
+    # and the post-hoc `verify_provenance` check. round-8: the same gap
+    # existed on the commit-prefix side (`cursor/` was never mapped at
+    # all — Codex found a real `cursor/composer-2.5-fast: ...` commit
+    # in this repo's history that resolved to "unknown").
+    VendorIdentity(
+        "cursor-agent",
+        cli_names=("cursor-agent", "cursor", "agentf"),
+        commit_prefixes=("cursor/", "cursor-agent/", "agentf/"),
+    ),
+    # `agy`/`antig`/`antigravity` route through a variable underlying
+    # model per invocation (repo history shows "agy/gemini-3.7-flash",
+    # "agy/gpt-5.6-sol" — the TOOL name is fixed, the MODEL varies).
+    # PR #289 (commit 7c67efbb, months before PR #819) deliberately
+    # mapped `antig/` to "unknown" rather than guess the model from the
+    # commit subject — ZFC forbids keyword/heuristic classification of
+    # free-form text, and parsing the model name out of the prefix
+    # would be exactly that. `agy/` is added here for the identical
+    # reason, matching that existing, deliberate, fail-closed
+    # precedent — this is NOT a new restriction PR #819 introduces. An
+    # agy/antig-authored commit failing `verify_provenance`'s
+    # unknown-implementer check is pre-existing repository behavior
+    # that predates and is out of scope for PR #819 (round-8 /advice
+    # asked to "fix" this; verified via `git blame` that the antig/
+    # precedent is unrelated prior art, not a PR819 regression — same
+    # category as the gemini/agy HOME-exemption code an earlier /wa
+    # round of this PR already correctly ruled out of scope).
+    VendorIdentity("unknown", commit_prefixes=("agy/", "antig/", "antigravity/")),
+)
+
+REVIEWER_CLI_TO_IDENTITY: Dict[str, str] = {
+    name: v.identity for v in VENDOR_REGISTRY for name in v.cli_names
 }
 
 # Placeholder substituted into the prompt's IDENTITY line with the
@@ -225,29 +267,14 @@ def _extend_bind_table_from_priority() -> None:
 # Adding a new prefix here IS an explicit PR-time decision — the
 # reviewer must review and merge the addition. Comment-only additions
 # (sed/keyword substitutions in commit messages) cannot change the
-# implementation identity.
-COMMIT_PREFIX_TO_IDENTITY = {
-    "claude/": "claude",
-    # PR #819 round-4: `claudem/` used to collapse into "claude", but
-    # round-3 made `claudem` independently reachable as a REVIEWER
-    # identity too (`expected_identity_for_vendor("claudem")` ==
-    # "claudem", since it's not in REVIEWER_CLI_TO_IDENTITY and falls
-    # back to its own name). Collapsing the IMPLEMENTER side to
-    # "claude" while the REVIEWER side legitimately declares
-    # "claudem" made `verify_provenance` compare "claude" != "claudem"
-    # and silently accept self-review for any claudem-authored commit
-    # reviewed by a claudem reviewer. claudem is genuinely a different
-    # backend (Claude CLI routed through MiniMax's API, per ~/.bashrc)
-    # from real Claude, so keeping it distinct here is also the more
-    # accurate provenance claim, not just a security patch.
-    "claudem/": "claudem",
-    "codex/": "codex",
-    "codexm/": "codex",
-    "gemini/": "gemini",
-    "geminim/": "gemini",
-    "human:": "human",
-    "antig/": "unknown",  # Antigravity is the IDE; identity is whatever it spawned
+# implementation identity. Derived from VENDOR_REGISTRY (see above) so
+# this table can never drift out of sync with REVIEWER_CLI_TO_IDENTITY
+# — plus one legacy entry (`human:`) that is not an AI vendor and so
+# is not part of the vendor registry.
+COMMIT_PREFIX_TO_IDENTITY: Dict[str, str] = {
+    prefix: v.identity for v in VENDOR_REGISTRY for prefix in v.commit_prefixes
 }
+COMMIT_PREFIX_TO_IDENTITY["human:"] = "human"
 
 
 @dataclass(frozen=True)
@@ -776,7 +803,7 @@ def extract_implementation_identity_from_commit(commit_subject: str) -> str:
 
     Examples:
         >>> extract_implementation_identity_from_commit("claudem/minimax-M3: feat(x): ...")
-        'claude'
+        'claudem'
         >>> extract_implementation_identity_from_commit("codexm/o3: fix: ...")
         'codex'
         >>> extract_implementation_identity_from_commit("naked commit message")

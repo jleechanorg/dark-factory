@@ -554,3 +554,142 @@ def test_claudem_authored_commit_reviewed_by_minimax_is_rejected_as_self_review(
         f"verify_provenance returned ok={ok!r} ({reason!r})"
     )
     assert "self-review" in reason.lower()
+
+
+# ===========================================================================
+# round-8 /advice findings (Codex + Opus, both independently converged,
+# head 8fd6f92569): REVIEWER_CLI_TO_IDENTITY and COMMIT_PREFIX_TO_IDENTITY
+# were hand-maintained separately and kept drifting out of sync (round-5
+# fixed a REVIEWER_CLI_TO_IDENTITY gap for minimax; round-7 fixed one for
+# cursor/agentf; both left COMMIT_PREFIX_TO_IDENTITY un-mirrored). Codex
+# additionally found a live example in this repo's own history --
+# `cursor/composer-2.5-fast: ...` -- that resolves to "unknown" today.
+# Both tables are now derived from one VENDOR_REGISTRY so this class of
+# gap cannot recur: adding an alias/prefix to a VendorIdentity entry
+# automatically updates both consumers.
+# ===========================================================================
+
+
+def test_cursor_prefix_commit_resolves_to_cursor_agent_identity():
+    """Codex /advice round-7/8: a real commit in this repo's history
+    (`cursor/composer-2.5-fast: ...`) authored via the `cursor` alias for
+    `cursor-agent` must resolve to the SAME implementation identity that
+    `expected_identity_for_vendor("cursor-agent")` declares, or the
+    round-6 self-review pre-filter can never fire for a cursor-agent-
+    authored commit at all."""
+    from runner.skeptic_gate import (
+        extract_implementation_identity_from_commit,
+        expected_identity_for_vendor,
+    )
+
+    impl_identity = extract_implementation_identity_from_commit(
+        "cursor/composer-2.5-fast: feat(daemon): claudem→agy→cursor-agent reviewer"
+    )
+    assert impl_identity == "cursor-agent", (
+        f"a real cursor/-prefixed commit must resolve to 'cursor-agent', "
+        f"got {impl_identity!r} (was previously 'unknown', per Codex's "
+        f"round-8 finding)"
+    )
+    assert impl_identity == expected_identity_for_vendor("cursor-agent")
+
+
+@pytest.mark.parametrize("prefix", ["cursor-agent/", "agentf/"])
+def test_cursor_agent_and_agentf_commit_prefixes_also_resolve(prefix):
+    """Future-proofing: even though only `cursor/` has been observed in
+    this repo's actual git history, the other two dispatch aliases
+    (`cursor-agent`, `agentf`) get symmetric commit-prefix coverage too,
+    matching their reviewer-side canonicalization."""
+    from runner.skeptic_gate import extract_implementation_identity_from_commit
+
+    impl_identity = extract_implementation_identity_from_commit(
+        f"{prefix}some-model: feat(x): add thing"
+    )
+    assert impl_identity == "cursor-agent"
+
+
+def test_minimax_prefix_commit_resolves_to_claudem_identity():
+    """Symmetric with test_cursor_prefix_commit_resolves_to_cursor_agent_
+    identity: `minimax/` is not yet observed in this repo's git history,
+    but gets the same commit-prefix coverage as its `claudem` alias for
+    forward-compatibility with the VENDOR_REGISTRY consolidation."""
+    from runner.skeptic_gate import extract_implementation_identity_from_commit
+
+    impl_identity = extract_implementation_identity_from_commit(
+        "minimax/MiniMax-M3: feat(x): add thing"
+    )
+    assert impl_identity == "claudem"
+
+
+@pytest.mark.parametrize("prefix", ["agy/", "antig/", "antigravity/"])
+def test_agy_and_antigravity_prefixes_deliberately_resolve_to_unknown(prefix):
+    """round-8 /advice (Codex + Opus) flagged that `config/skeptic_
+    reviewer_priority.json`'s `default_coder` is `agy`, and an agy-
+    authored commit's implementation identity resolves to 'unknown' --
+    so round-6's self-review pre-filter can never fire for the actual
+    configured default coder.
+
+    Investigated via `git blame`: `antig/` -> "unknown" is PRE-EXISTING
+    repository behavior (commit 7c67efbb, months before PR #819) --
+    Antigravity/agy route through a variable underlying model per
+    invocation (this repo's own history shows "agy/gemini-3.7-flash",
+    "agy/gpt-5.6-sol" -- the wrapper tool name is fixed, the model
+    varies), and ZFC forbids parsing the model name out of the commit
+    subject as keyword/heuristic classification. `verify_provenance`
+    already fails closed on an 'unknown' implementer (conservative,
+    correct, and predates PR #819). This test asserts that documented,
+    deliberate fail-closed behavior for ALL THREE agy/antigravity
+    aliases (not a bug PR #819 introduces or needs to "fix") -- same
+    category as the pre-existing gemini/agy HOME-exemption code an
+    earlier /wa round of this PR already correctly ruled out of scope.
+    """
+    from runner.skeptic_gate import extract_implementation_identity_from_commit
+
+    impl_identity = extract_implementation_identity_from_commit(
+        f"{prefix}gemini-3.7-flash: feat(x): add thing"
+    )
+    assert impl_identity == "unknown", (
+        f"{prefix!r}-prefixed commits deliberately resolve to 'unknown' "
+        f"(cannot statically know which underlying model ran) -- this "
+        f"is pre-existing, intentional, fail-closed repository behavior, "
+        f"not a PR819 defect; got {impl_identity!r}"
+    )
+
+
+def test_vendor_registry_is_the_single_source_for_both_identity_tables():
+    """Consolidation regression guard: for every non-'unknown' vendor in
+    VENDOR_REGISTRY, every one of its cli_names must resolve (via
+    expected_identity_for_vendor) to the SAME identity that every one of
+    its commit_prefixes resolves to (via extract_implementation_identity_
+    from_commit). This is the property that makes rounds 5/6/7's class of
+    bug (one table updated, the other forgotten) structurally impossible
+    going forward -- both tables are generated from this one list, so
+    they cannot independently drift."""
+    from runner.skeptic_gate import (
+        VENDOR_REGISTRY,
+        expected_identity_for_vendor,
+        extract_implementation_identity_from_commit,
+    )
+
+    checked_any_prefix = False
+    for vendor in VENDOR_REGISTRY:
+        if vendor.identity == "unknown":
+            continue  # `unknown` is the deliberate fail-closed catch-all, not a real vendor identity
+        for cli_name in vendor.cli_names:
+            resolved = expected_identity_for_vendor(cli_name)
+            assert resolved == vendor.identity, (
+                f"cli_name {cli_name!r} in the {vendor.identity!r} vendor "
+                f"entry resolved to {resolved!r} via expected_identity_"
+                f"for_vendor, expected {vendor.identity!r}"
+            )
+        for prefix in vendor.commit_prefixes:
+            checked_any_prefix = True
+            resolved = extract_implementation_identity_from_commit(
+                f"{prefix}some-model: feat(x): add thing"
+            )
+            assert resolved == vendor.identity, (
+                f"commit prefix {prefix!r} in the {vendor.identity!r} "
+                f"vendor entry resolved to {resolved!r} via extract_"
+                f"implementation_identity_from_commit, expected "
+                f"{vendor.identity!r}"
+            )
+    assert checked_any_prefix, "sanity: the registry must have at least one commit-prefixed vendor"

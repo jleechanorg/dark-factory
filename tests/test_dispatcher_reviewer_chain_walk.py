@@ -45,7 +45,7 @@ import pytest
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from runner.dispatcher import VerifierDispatcher, _detect_rate_limit  # noqa: E402
+from runner.dispatcher import VerifierDispatcher, _detect_rate_limit, _detect_vendor_unavailable  # noqa: E402
 from runner.reviewer_priority import skeptic_reviewer_priority  # noqa: E402
 from runner.rule_loader import Rule  # noqa: E402
 from runner.skeptic_gate import (  # noqa: E402
@@ -679,3 +679,91 @@ def test_chain_walk_non_colliding_identity_unaffected(monkeypatch, dispatcher, s
     assert res.reviewer == "claudem"
     assert res.check_state == "success"
     assert "fallback_used" not in res.reason
+
+
+# ===========================================================================
+# round-8 /advice finding (Opus, confirmed against skeptic_gate_cli.py's
+# invoke_reviewer: `if proc.returncode != 0: return proc.stdout, "reviewer
+# rc=...: ..."` -- stdout is NOT nulled on failure): round-7's
+# `_detect_vendor_unavailable` keyed on raw stdout truthiness, so a vendor
+# that printed even one incidental byte to stdout (a banner, partial
+# output) before exiting nonzero was wrongly treated as "produced a
+# result" and the walk never advanced past it -- STRICTER than the
+# original rate-limit-only check for the single most common real failure
+# shape (a CLI that prints something before a quota/auth error).
+# ===========================================================================
+
+
+def test_detect_vendor_unavailable_advances_past_nonempty_stdout_with_error():
+    """The exact regression Opus found: invoke_reviewer can return
+    non-empty stdout ALONGSIDE an error on nonzero return code. If that
+    stdout does not parse as a genuine verdict, the vendor must still be
+    treated as unavailable (advance), not as having produced a result."""
+    garbage_stdout = "quota exceeded, please retry later\n"
+    err = "reviewer rc=1: rate limited"
+    assert _detect_vendor_unavailable(err, garbage_stdout) is True, (
+        "non-empty but non-parseable stdout alongside an error must "
+        "still advance the chain-walk -- round-7 wrongly halted here"
+    )
+
+
+def test_detect_vendor_unavailable_never_skips_a_genuine_verdict():
+    """Safety property: a vendor whose stdout DOES parse as a genuine
+    structured verdict must never be treated as unavailable, even if an
+    error string is also present (e.g. a nonzero exit alongside
+    contract-compliant output) -- a real PASS/FAIL must never be
+    silently discarded while hunting for a more favorable vendor."""
+    assert _detect_vendor_unavailable(None, VALID_OUTPUT) is False
+    # Even with an error present, genuinely parseable stdout must win.
+    assert _detect_vendor_unavailable("reviewer rc=1: odd exit", VALID_OUTPUT) is False
+
+
+def test_detect_vendor_unavailable_advances_on_none_stdout_with_error():
+    """Regression guard: the original launch-failure case (no stdout at
+    all -- missing binary, timeout, exception) must still advance,
+    exactly like round-7 intended."""
+    assert _detect_vendor_unavailable("reviewer binary not found", None) is True
+    assert _detect_vendor_unavailable("reviewer timed out after 600s", "") is True
+
+
+def test_detect_vendor_unavailable_no_error_never_advances():
+    """A vendor with no error at all (err is None) is never treated as
+    unavailable, regardless of stdout shape -- mirrors the original
+    rate-limit check's `if not err: return False` short-circuit."""
+    assert _detect_vendor_unavailable(None, None) is False
+    assert _detect_vendor_unavailable(None, "") is False
+
+
+def test_chain_walk_advances_past_vendor_with_partial_stdout_and_error(
+    monkeypatch, dispatcher, stub_evaluate
+):
+    """End-to-end reproduction of the round-8 regression through the real
+    dispatch() path: claudem crashes mid-write leaving partial/garbage
+    stdout alongside a nonzero-rc error -- the walk must still advance to
+    agy (which succeeds), not dead-end on claudem's garbage output."""
+    fake_invoke, seen = _stub_invoke_reviewer({
+        "claudem": ("Fatal error: co", "reviewer rc=1: connection reset"),
+        "agy": (VALID_OUTPUT, None),
+    })
+    monkeypatch.setattr(
+        "runner.skeptic_gate_cli.invoke_reviewer", fake_invoke
+    )
+
+    results = dispatcher.dispatch(
+        rules=[PREMIUM_RULE],
+        changed_files=["foo.py"],
+        diff="diff",
+        repo="jleechanorg/dark-factory",
+        pr_number=123,
+        head_sha="0123456789abcdef0123456789abcdef01234567",
+        base_sha="0000000000000000000000000000000000000000",
+        implementation_identity="codex",
+    )
+
+    _, res = results[0]
+    assert seen == ["claudem", "agy"], (
+        f"expected the walk to try claudem (partial garbage stdout, "
+        f"fails to parse) then advance to agy, got seen={seen!r}"
+    )
+    assert res.reviewer == "agy"
+    assert res.check_state == "success"

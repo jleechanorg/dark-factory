@@ -94,27 +94,42 @@ def _detect_rate_limit(err: Optional[str]) -> bool:
 # making the round-6 fallback route non-functional in practice for a
 # vendor (like agy) that can be invoked but can't authenticate in this
 # CI-sandboxed path.
+#
+# round-8 /advice finding (Opus, confirmed against skeptic_gate_cli.py:
+# `invoke_reviewer` returns ``proc.stdout`` alongside the error message
+# on ANY nonzero return code — it does not null stdout on failure): the
+# round-7 version of this function keyed on raw ``stdout`` truthiness,
+# so a vendor that printed even one incidental byte (a banner, partial
+# output) before exiting nonzero was treated as "produced a result" and
+# never advanced past — STRICTER than the original rate-limit-only
+# check for the single most common real failure shape. Fixed by keying
+# on whether a genuinely parseable terminal verdict was produced
+# (``parse_verdict(stdout) is not None``), not on stdout's mere
+# presence.
 def _detect_vendor_unavailable(err: Optional[str], stdout: Optional[str]) -> bool:
-    """Return True if this vendor's own invocation failed to produce any
-    reviewable output — rate limit, missing/unauthenticated CLI, nonzero
-    return code, timeout, or any exception during invocation — so the
-    chain-walk should advance to the next vendor exactly like it already
-    does for a rate-limit bust.
+    """Return True if this vendor's own invocation failed to produce a
+    genuine, parseable terminal verdict — rate limit, missing/
+    unauthenticated CLI, nonzero return code, timeout, a crash mid-write
+    that leaves partial/garbage stdout, or any exception during
+    invocation — so the chain-walk should advance to the next vendor
+    exactly like it already does for a rate-limit bust.
 
-    A vendor that produced ANY ``stdout`` is presumed to have actually
-    run and produced content for ``evaluate()`` to judge — this function
-    only ever returns True when there is no stdout at all, so a genuine
-    verdict (PASS or FAIL) is never mistaken for a launch failure and
-    silently retried looking for a more favorable vendor. Deliberately
-    NOT pattern-matched beyond that: any no-stdout+has-error outcome
-    means no verdict was produced, so advancing can never skip a real
-    one — narrowing to specific error-text substrings (as the original
-    rate-limit-only check did) is what caused this gap in the first
-    place (round-7 /advice, Opus).
+    A vendor whose ``stdout`` parses as a genuine structured verdict
+    (``parse_verdict`` returns non-``None``) is presumed to have
+    actually run and produced judgeable content for ``evaluate()`` —
+    this function only ever returns True when NO such verdict could be
+    parsed, so a real PASS/FAIL is never mistaken for a launch failure
+    and silently retried looking for a more favorable vendor. Keying on
+    raw stdout truthiness (as round-7 did) is unsafe: ``invoke_reviewer``
+    can return non-empty stdout alongside a nonzero return code (a
+    banner, partial output before a crash), so "stdout is non-empty"
+    does not mean "a verdict was produced" (round-8 /advice, Opus).
     """
-    if stdout:
+    if err is None:
         return False
-    return bool(err)
+    from runner.skeptic_gate import parse_verdict
+
+    return parse_verdict(stdout) is None
 
 
 class VerifierDispatcher:
