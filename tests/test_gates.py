@@ -20,6 +20,24 @@ extracted per docs/refactor/file-ownership-map.test_gates.md:
   - tests/test_gate_registry_smoke.py
 """
 
+import pytest
+
+from runner.handlers import Result, TYPE_REGISTRY
+
+
+@pytest.fixture(autouse=True)
+def _stub_fail_open_web_advice(monkeypatch):
+    """Keep the re-exported graph tests off live advisory transports."""
+    def fake_web_advice(node, ctx):
+        return Result(
+            outcome="success",
+            output="web_advice fixture: fail-open advisory skipped",
+            metadata={"web_advice_outcome": "fixture_skipped"},
+        )
+
+    monkeypatch.setitem(TYPE_REGISTRY, "web_advice", fake_web_advice)
+
+
 from tests.test_engine_smoke import (  # noqa: F401
     test_gate_echo_seeded_outcome,
     test_cxdb_records_steps,
@@ -50,7 +68,8 @@ from tests.test_gate_agy_fallback import (  # noqa: F401
 )
 from tests.test_gate_priority_queue import (  # noqa: F401
     test_adversarial_priority_picks_first_installed,
-    test_adversarial_priority_skips_coder_backend_when_prefer_adversarial,
+    test_adversarial_priority_demotes_coder_backend_when_prefer_adversarial,
+    test_prefer_adversarial_reviews_on_coder_backend_when_it_is_the_only_option,
     test_adversarial_priority_env_override_honored,
     test_adversarial_priority_falls_through_to_claude_sonnet_when_nothing_else,
     test_adversarial_priority_pinned_across_visits,

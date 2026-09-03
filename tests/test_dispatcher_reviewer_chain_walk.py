@@ -45,7 +45,7 @@ import pytest
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from runner.dispatcher import VerifierDispatcher, _detect_rate_limit  # noqa: E402
+from runner.dispatcher import VerifierDispatcher, _detect_rate_limit, _detect_vendor_unavailable  # noqa: E402
 from runner.reviewer_priority import skeptic_reviewer_priority  # noqa: E402
 from runner.rule_loader import Rule  # noqa: E402
 from runner.skeptic_gate import (  # noqa: E402
@@ -239,6 +239,153 @@ def test_chain_walk_falls_back_on_rate_limit(monkeypatch, dispatcher, stub_evalu
     assert seen == ["claudem", "agy", "cursor-agent"]
 
 
+# ---------------------------------------------------------------------------
+# Chain-walk: fallback on generic launch/auth failure (round-7 /advice
+# finding, Opus). Round-6's self-review pre-filter correctly routes a
+# claudem-authored PR's review to the next queue vendor (typically agy),
+# but the walker used to only advance past a *rate-limit* error — a
+# generic launch failure (missing/unauthenticated CLI, nonzero return
+# code, timeout) dead-ended the walk on that fallback vendor instead of
+# trying the next one, making the round-6 fallback route non-functional
+# in practice for vendors that can launch but can't authenticate.
+# ---------------------------------------------------------------------------
+
+
+def test_chain_walk_falls_back_on_missing_binary(monkeypatch, dispatcher, stub_evaluate):
+    """premium=claudem returns a 'binary not found' launch failure (not a
+    rate-limit), agy returns valid -> the walk must still advance to agy,
+    exactly like a rate-limit bust does."""
+    fake_invoke, seen = _stub_invoke_reviewer({
+        "claudem": (None, "reviewer binary not found: [Errno 2] No such file or directory: 'claude'"),
+        "agy": (VALID_OUTPUT, None),
+    })
+    monkeypatch.setattr(
+        "runner.skeptic_gate_cli.invoke_reviewer", fake_invoke
+    )
+
+    results = dispatcher.dispatch(
+        rules=[PREMIUM_RULE],
+        changed_files=["foo.py"],
+        diff="diff",
+        repo="jleechanorg/dark-factory",
+        pr_number=123,
+        head_sha="0123456789abcdef0123456789abcdef01234567",
+        base_sha="0000000000000000000000000000000000000000",
+        implementation_identity="minimax",
+    )
+
+    assert len(results) == 1
+    _, res = results[0]
+    assert res.reviewer == "agy", (
+        f"expected fallback to agy on a missing-binary launch failure, "
+        f"got reviewer={res.reviewer!r}"
+    )
+    assert seen == ["claudem", "agy"], (
+        f"expected the walk to advance past claudem's launch failure, got {seen!r}"
+    )
+
+
+def test_chain_walk_falls_back_on_nonzero_returncode_auth_failure(monkeypatch, dispatcher, stub_evaluate):
+    """premium=claudem returns a nonzero-rc auth failure (not a
+    rate-limit), agy returns valid -> the walk must still advance to agy."""
+    fake_invoke, seen = _stub_invoke_reviewer({
+        "claudem": (None, "reviewer rc=1: authentication required, please log in"),
+        "agy": (VALID_OUTPUT, None),
+    })
+    monkeypatch.setattr(
+        "runner.skeptic_gate_cli.invoke_reviewer", fake_invoke
+    )
+
+    results = dispatcher.dispatch(
+        rules=[PREMIUM_RULE],
+        changed_files=["foo.py"],
+        diff="diff",
+        repo="jleechanorg/dark-factory",
+        pr_number=123,
+        head_sha="0123456789abcdef0123456789abcdef01234567",
+        base_sha="0000000000000000000000000000000000000000",
+        implementation_identity="minimax",
+    )
+
+    assert len(results) == 1
+    _, res = results[0]
+    assert res.reviewer == "agy", (
+        f"expected fallback to agy on a nonzero-rc auth failure, "
+        f"got reviewer={res.reviewer!r}"
+    )
+    assert seen == ["claudem", "agy"]
+
+
+def test_chain_walk_falls_back_on_raised_exception(monkeypatch, dispatcher, stub_evaluate):
+    """premium=claudem's invoke_reviewer raises (e.g. subprocess plumbing
+    error) -> the walk must still advance to agy, matching the existing
+    try/except handling that already captures the exception as ``err``."""
+    fake_invoke, seen = _stub_invoke_raises({
+        "claudem": OSError("exec format error"),
+        "agy": (VALID_OUTPUT, None),
+    })
+    monkeypatch.setattr(
+        "runner.skeptic_gate_cli.invoke_reviewer", fake_invoke
+    )
+
+    results = dispatcher.dispatch(
+        rules=[PREMIUM_RULE],
+        changed_files=["foo.py"],
+        diff="diff",
+        repo="jleechanorg/dark-factory",
+        pr_number=123,
+        head_sha="0123456789abcdef0123456789abcdef01234567",
+        base_sha="0000000000000000000000000000000000000000",
+        implementation_identity="minimax",
+    )
+
+    assert len(results) == 1
+    _, res = results[0]
+    assert res.reviewer == "agy", (
+        f"expected fallback to agy after claudem's invocation raised, "
+        f"got reviewer={res.reviewer!r}"
+    )
+    assert seen == ["claudem", "agy"]
+
+
+def test_chain_walk_does_not_skip_a_vendor_that_produced_output(monkeypatch, dispatcher, stub_evaluate):
+    """Regression guard: a vendor that produced ANY stdout must be
+    treated as terminal (evaluated, not skipped) even if its ``err``
+    channel has unrelated non-empty noise (e.g. a deprecation warning on
+    stderr) — only a genuine launch failure (no stdout at all) may
+    advance the walk. This must hold for a real FAIL verdict just as
+    much as a PASS: the walker must never silently retry past a
+    legitimate reviewer opinion looking for a more favorable vendor."""
+    fake_invoke, seen = _stub_invoke_reviewer({
+        "claudem": (VALID_OUTPUT, "warning: deprecated --foo flag used"),
+        "agy": (VALID_OUTPUT, None),
+    })
+    monkeypatch.setattr(
+        "runner.skeptic_gate_cli.invoke_reviewer", fake_invoke
+    )
+
+    results = dispatcher.dispatch(
+        rules=[PREMIUM_RULE],
+        changed_files=["foo.py"],
+        diff="diff",
+        repo="jleechanorg/dark-factory",
+        pr_number=123,
+        head_sha="0123456789abcdef0123456789abcdef01234567",
+        base_sha="0000000000000000000000000000000000000000",
+        implementation_identity="minimax",
+    )
+
+    assert len(results) == 1
+    _, res = results[0]
+    assert res.reviewer == "claudem", (
+        f"a vendor that produced stdout must be treated as terminal, not "
+        f"skipped for unrelated stderr noise, got reviewer={res.reviewer!r}"
+    )
+    assert seen == ["claudem"], (
+        f"expected the walk to stop at claudem (it produced output), got {seen!r}"
+    )
+
+
 def test_chain_walk_records_fallback_from(monkeypatch, dispatcher, stub_evaluate):
     """The fallback trail records the original vendor so the operator
     can trace which vendor busted and forced the walk."""
@@ -402,3 +549,278 @@ def test_chain_walk_preserves_provenance_check(monkeypatch, dispatcher, stub_eva
     )
     # And the chain-walk tried every vendor before settling.
     assert _seen_with_spy == ["claudem", "agy", "cursor-agent"]
+
+
+# ---------------------------------------------------------------------------
+# Chain-walk: self-review pre-filter (PR #819 round-6)
+#
+# ``verify_provenance`` used to be the ONLY thing standing between a
+# self-authored commit and a self-reviewed verdict, and it only runs
+# AFTER the chain-walk already picked one vendor and returned a terminal
+# result — so a self-review collision surfaced as a hard failure with
+# no fallback, even when the priority queue has other, non-colliding
+# vendors configured. These tests exercise the pre-filter that skips a
+# self-review match BEFORE dispatch, advancing the queue exactly like a
+# pre-emptively-known rate-limit bust.
+# ---------------------------------------------------------------------------
+
+
+def test_chain_walk_self_review_no_fallback_configured(monkeypatch, stub_evaluate):
+    """Only claudem configured, implementer IS claudem -> the walk must
+    fail with a clear, actionable self-review message (not a raw
+    verify_provenance rejection, not the generic rate-limit-exhaustion
+    message), and invoke_reviewer must never be called."""
+    monkeypatch.setattr(
+        "runner.reviewer_priority.skeptic_reviewer_priority",
+        lambda: ["claudem"],
+    )
+    solo_dispatcher = VerifierDispatcher(
+        cheap_reviewer="claudem", cheap_model="MiniMax-M3",
+        premium_reviewer="claudem", premium_model="MiniMax-M3",
+    )
+    fake_invoke, seen = _stub_invoke_reviewer({
+        "claudem": (VALID_OUTPUT, None),
+    })
+    monkeypatch.setattr(
+        "runner.skeptic_gate_cli.invoke_reviewer", fake_invoke
+    )
+
+    results = solo_dispatcher.dispatch(
+        rules=[PREMIUM_RULE],
+        changed_files=["foo.py"],
+        diff="diff",
+        repo="jleechanorg/dark-factory",
+        pr_number=123,
+        head_sha="0123456789abcdef0123456789abcdef01234567",
+        base_sha="0000000000000000000000000000000000000000",
+        implementation_identity="claudem",
+    )
+
+    _, res = results[0]
+    assert res.verdict is None
+    assert res.check_state == "failure"
+    assert seen == [], (
+        f"invoke_reviewer must never be called when every configured "
+        f"reviewer collides with the implementer's identity; got seen={seen!r}"
+    )
+    assert "self-review" in res.reason, (
+        f"reason must clearly name the self-review condition, got {res.reason!r}"
+    )
+    assert "claudem" in res.reason
+    assert "skeptic_reviewer_priority.json" in res.reason, (
+        f"reason must give the operator an actionable next step, got {res.reason!r}"
+    )
+    assert "all reviewers exhausted" not in res.reason, (
+        "self-review-only exhaustion must not be confused with the "
+        "generic rate-limit exhaustion message"
+    )
+
+
+def test_chain_walk_self_review_skips_to_next_vendor(monkeypatch, dispatcher, stub_evaluate):
+    """Default priority (claudem, agy, cursor-agent), implementer IS
+    claudem -> claudem is skipped as a pre-filtered self-review (never
+    invoked), agy is attempted next and succeeds."""
+    fake_invoke, seen = _stub_invoke_reviewer({
+        "agy": (VALID_OUTPUT, None),
+    })
+    monkeypatch.setattr(
+        "runner.skeptic_gate_cli.invoke_reviewer", fake_invoke
+    )
+
+    results = dispatcher.dispatch(
+        rules=[PREMIUM_RULE],
+        changed_files=["foo.py"],
+        diff="diff",
+        repo="jleechanorg/dark-factory",
+        pr_number=123,
+        head_sha="0123456789abcdef0123456789abcdef01234567",
+        base_sha="0000000000000000000000000000000000000000",
+        implementation_identity="claudem",
+    )
+
+    _, res = results[0]
+    assert "claudem" not in seen, (
+        f"claudem must be pre-filtered out (never invoked) when it "
+        f"collides with the implementer's identity; got seen={seen!r}"
+    )
+    assert seen == ["agy"], f"expected agy to be tried next, got seen={seen!r}"
+    assert res.reviewer == "agy", f"expected fallback to agy, got reviewer={res.reviewer!r}"
+    assert res.check_state == "success"
+
+
+def test_chain_walk_non_colliding_identity_unaffected(monkeypatch, dispatcher, stub_evaluate):
+    """Regression guard: a non-colliding implementer identity (codex)
+    is completely unaffected by the self-review pre-filter -- claudem
+    (the resolved premium reviewer) is invoked normally, first try,
+    no fallback."""
+    fake_invoke, seen = _stub_invoke_reviewer({
+        "claudem": (VALID_OUTPUT, None),
+    })
+    monkeypatch.setattr(
+        "runner.skeptic_gate_cli.invoke_reviewer", fake_invoke
+    )
+
+    results = dispatcher.dispatch(
+        rules=[PREMIUM_RULE],
+        changed_files=["foo.py"],
+        diff="diff",
+        repo="jleechanorg/dark-factory",
+        pr_number=123,
+        head_sha="0123456789abcdef0123456789abcdef01234567",
+        base_sha="0000000000000000000000000000000000000000",
+        implementation_identity="codex",
+    )
+
+    _, res = results[0]
+    assert seen == ["claudem"], (
+        f"non-colliding identity must not perturb the chain-walk at all, "
+        f"got seen={seen!r}"
+    )
+    assert res.reviewer == "claudem"
+    assert res.check_state == "success"
+    assert "fallback_used" not in res.reason
+
+
+# ===========================================================================
+# round-8 /advice finding (Opus, confirmed against skeptic_gate_cli.py's
+# invoke_reviewer: `if proc.returncode != 0: return proc.stdout, "reviewer
+# rc=...: ..."` -- stdout is NOT nulled on failure): round-7's
+# `_detect_vendor_unavailable` keyed on raw stdout truthiness, so a vendor
+# that printed even one incidental byte to stdout (a banner, partial
+# output) before exiting nonzero was wrongly treated as "produced a
+# result" and the walk never advanced past it -- STRICTER than the
+# original rate-limit-only check for the single most common real failure
+# shape (a CLI that prints something before a quota/auth error).
+# ===========================================================================
+
+
+def test_detect_vendor_unavailable_advances_past_nonempty_stdout_with_error():
+    """The exact regression Opus found: invoke_reviewer can return
+    non-empty stdout ALONGSIDE an error on nonzero return code. If that
+    stdout does not parse as a genuine verdict, the vendor must still be
+    treated as unavailable (advance), not as having produced a result."""
+    garbage_stdout = "quota exceeded, please retry later\n"
+    err = "reviewer rc=1: rate limited"
+    assert _detect_vendor_unavailable(err, garbage_stdout) is True, (
+        "non-empty but non-parseable stdout alongside an error must "
+        "still advance the chain-walk -- round-7 wrongly halted here"
+    )
+
+
+def test_detect_vendor_unavailable_never_skips_a_genuine_verdict():
+    """Safety property: a vendor whose stdout DOES parse as a genuine
+    structured verdict must never be treated as unavailable, even if an
+    error string is also present (e.g. a nonzero exit alongside
+    contract-compliant output) -- a real PASS/FAIL must never be
+    silently discarded while hunting for a more favorable vendor."""
+    assert _detect_vendor_unavailable(None, VALID_OUTPUT) is False
+    # Even with an error present, genuinely parseable stdout must win.
+    assert _detect_vendor_unavailable("reviewer rc=1: odd exit", VALID_OUTPUT) is False
+
+
+def test_detect_vendor_unavailable_advances_on_none_stdout_with_error():
+    """Regression guard: the original launch-failure case (no stdout at
+    all -- missing binary, timeout, exception) must still advance,
+    exactly like round-7 intended."""
+    assert _detect_vendor_unavailable("reviewer binary not found", None) is True
+    assert _detect_vendor_unavailable("reviewer timed out after 600s", "") is True
+
+
+def test_detect_vendor_unavailable_no_error_never_advances():
+    """A vendor with no error at all (err is None) is never treated as
+    unavailable, regardless of stdout shape -- mirrors the original
+    rate-limit check's `if not err: return False` short-circuit."""
+    assert _detect_vendor_unavailable(None, None) is False
+    assert _detect_vendor_unavailable(None, "") is False
+
+
+# ===========================================================================
+# round-9 /advice finding (Codex + Opus, independently converged): the
+# REAL evaluation path (`evaluate()` in skeptic_gate.py) strips the
+# `CONTRACT_ECHO:` block from stdout BEFORE calling `parse_verdict` --
+# see `_strip_contract_echo_block` at skeptic_gate.py ~line 1090. Round-8's
+# `_detect_vendor_unavailable` parses RAW stdout directly, so on any
+# contract-enabled run, a vendor that produces a genuine, complete
+# verdict *and* also exits nonzero (contract-echo block still attached)
+# has its stdout wrongly rejected by the strict field parser -- a real
+# verdict is misclassified as "vendor unavailable," and the chain-walk
+# keeps advancing looking for a different (possibly more favorable)
+# vendor. `_detect_vendor_unavailable` and `evaluate()` must never
+# diverge on whether a given stdout blob contains a genuine verdict --
+# that divergence IS the bug.
+# ===========================================================================
+
+
+def test_detect_vendor_unavailable_strips_contract_echo_before_parsing():
+    """The round-9 regression: a genuine verdict followed by a
+    CONTRACT_ECHO block (with an ITEM: line, exactly as a contract-
+    enabled reviewer emits) must NOT be treated as unavailable just
+    because raw `parse_verdict` chokes on the trailing block -- the
+    function must strip it first, exactly like `evaluate()` does."""
+    verdict_with_contract_echo = (
+        VALID_OUTPUT + "CONTRACT_ECHO:\nITEM: a1 VERDICT: ADDRESSED CITE: foo.py:1\n"
+    )
+    assert _detect_vendor_unavailable("reviewer rc=1: odd exit", verdict_with_contract_echo) is False, (
+        "a genuine verdict with a trailing CONTRACT_ECHO block must be "
+        "recognized as available -- evaluate() would successfully parse "
+        "the same stdout after its own contract-echo stripping step"
+    )
+
+
+def test_detect_vendor_unavailable_agrees_with_evaluate_on_contract_echo_stdout():
+    """Regression guard proving the two functions now agree: the exact
+    same raw stdout blob that `_detect_vendor_unavailable` must treat as
+    available must also be what `evaluate()`'s own real path parses
+    successfully -- confirming they never diverge on this judgment."""
+    from runner.skeptic_gate import evaluate, parse_verdict
+    from runner.skeptic_contract_echo import _strip_contract_echo_block
+
+    verdict_with_contract_echo = (
+        VALID_OUTPUT + "CONTRACT_ECHO:\nITEM: a1 VERDICT: ADDRESSED CITE: foo.py:1\n"
+    )
+    assert _detect_vendor_unavailable(None, verdict_with_contract_echo) is False
+
+    # evaluate()'s own stripping step (no `contract=` kwarg here since
+    # this test only needs to prove parse_verdict succeeds post-strip,
+    # not the full contract-echo-enforcement path) must parse the same
+    # stripped content _detect_vendor_unavailable relies on.
+    stripped = _strip_contract_echo_block(verdict_with_contract_echo)
+    assert parse_verdict(stripped) is not None, (
+        "sanity check: the stripped content must itself be genuinely "
+        "parseable, or this test proves nothing"
+    )
+
+
+def test_chain_walk_advances_past_vendor_with_partial_stdout_and_error(
+    monkeypatch, dispatcher, stub_evaluate
+):
+    """End-to-end reproduction of the round-8 regression through the real
+    dispatch() path: claudem crashes mid-write leaving partial/garbage
+    stdout alongside a nonzero-rc error -- the walk must still advance to
+    agy (which succeeds), not dead-end on claudem's garbage output."""
+    fake_invoke, seen = _stub_invoke_reviewer({
+        "claudem": ("Fatal error: co", "reviewer rc=1: connection reset"),
+        "agy": (VALID_OUTPUT, None),
+    })
+    monkeypatch.setattr(
+        "runner.skeptic_gate_cli.invoke_reviewer", fake_invoke
+    )
+
+    results = dispatcher.dispatch(
+        rules=[PREMIUM_RULE],
+        changed_files=["foo.py"],
+        diff="diff",
+        repo="jleechanorg/dark-factory",
+        pr_number=123,
+        head_sha="0123456789abcdef0123456789abcdef01234567",
+        base_sha="0000000000000000000000000000000000000000",
+        implementation_identity="codex",
+    )
+
+    _, res = results[0]
+    assert seen == ["claudem", "agy"], (
+        f"expected the walk to try claudem (partial garbage stdout, "
+        f"fails to parse) then advance to agy, got seen={seen!r}"
+    )
+    assert res.reviewer == "agy"
+    assert res.check_state == "success"

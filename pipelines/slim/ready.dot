@@ -52,6 +52,7 @@ digraph ReadyPRFactory {
     type="gate_slash",
     command="advice",
     label="/advice Independent Review",
+    gate_strict="true",
     timeout=600,
     goal_gate=true,
     retry_target="fix"

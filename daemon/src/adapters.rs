@@ -1,13 +1,17 @@
 use crate::errors::{DaemonError, SpawnBatchCleanupFailure};
-use crate::tools::{run_tool, run_tool_in_dir, Bead, Issue, LabeledPr, Llm, Permission, PrHeadBranch, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs, WorktreeHeadAncestry};
+use crate::tools::{
+    run_tool, run_tool_in_dir, Bead, Issue, LabeledPr, Llm, Permission,
+    PrHeadBranch, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs,
+    WorktreeHeadAncestry,
+};
 use std::process::{Command, Stdio};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 
-/// jleechan-9sl1 test-isolation fix: a single process-wide lock shared by
-/// EVERY `#[cfg(test)]` module in this file that mutates the global `PATH`
+/// jleechan-9sl1 test-isolation fix: the crate-wide process-global lock shared
+/// by EVERY `#[cfg(test)]` module in this file that mutates the global `PATH`
 /// (and related) env vars to inject a fake `gh`/`codex` binary for hermetic
 /// subprocess testing (`chain_llm_fallback_argv_tests`,
 /// `pr_snapshot_checks_fetch_failure_tests`, `cli_vcs_gh_tests`). Those
@@ -22,14 +26,50 @@ use std::time::{Duration, Instant};
 /// intermittently fail with "No such file or directory" pointing at a
 /// DIFFERENT module's already-cleaned-up temp shim dir once a third
 /// PATH-mutating module (`cli_vcs_gh_tests`) was added. Every module below
-/// must call `gh_env_test_lock()` (directly or via a thin per-module
-/// `env_lock()` wrapper) instead of defining its own `ENV_LOCK` -- do not
-/// reintroduce a module-local lock for PATH/env mutation in this file.
+/// must call `crate::test_env_lock()` (directly or via a thin per-module
+/// `env_lock()` wrapper) instead of defining its own `ENV_LOCK`.
+
+/// Point the shared GitHub circuit breaker's state file and telemetry log at
+/// a private temp dir for the duration of a test. Every test that can trip the
+/// breaker must hold the process-wide environment lock while creating one.
 #[cfg(test)]
-static GH_ENV_TEST_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+pub(crate) struct BreakerSandbox<'a> {
+    dir: std::path::PathBuf,
+    _env_guard: std::sync::MutexGuard<'a, ()>,
+}
+
 #[cfg(test)]
-fn gh_env_test_lock() -> &'static Mutex<()> {
-    GH_ENV_TEST_LOCK.get_or_init(|| Mutex::new(()))
+impl<'a> BreakerSandbox<'a> {
+    pub(crate) fn new(
+        tag: &str,
+        env_guard: std::sync::MutexGuard<'a, ()>,
+    ) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "df_cb_{tag}_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::gh_circuit_breaker::set_state_file_path(Some(dir.join("state.json")));
+        crate::gh_circuit_breaker::set_telemetry_log_path(Some(dir.join("daemon.jsonl")));
+        Self {
+            dir,
+            _env_guard: env_guard,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for BreakerSandbox<'_> {
+    fn drop(&mut self) {
+        crate::gh_circuit_breaker::reset();
+        crate::gh_circuit_breaker::set_state_file_path(None);
+        crate::gh_circuit_breaker::set_telemetry_log_path(None);
+        std::fs::remove_dir_all(&self.dir).ok();
+    }
 }
 
 
@@ -245,13 +285,13 @@ impl Tracker for CliTracker {
 
 #[cfg(test)]
 mod cli_tracker_br_db_tests {
-    use super::{gh_env_test_lock, CliTracker};
+    use super::CliTracker;
     use crate::tools::Tracker;
 
     #[test]
     #[cfg(unix)]
     fn cli_tracker_passes_configured_db_to_br_read_and_write_calls() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let nonce = std::time::SystemTime::now()
@@ -348,7 +388,7 @@ esac
     #[test]
     #[cfg(unix)]
     fn cli_tracker_resumes_each_partial_two_phase_failure() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let nonce = std::time::SystemTime::now()
@@ -468,7 +508,7 @@ esac
     #[test]
     #[cfg(unix)]
     fn cli_tracker_rejects_wrong_id_object_and_array_without_label_update() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let nonce = std::time::SystemTime::now()
@@ -1603,7 +1643,8 @@ mod graphql_rate_limit_circuit_breaker_tests {
 
     #[test]
     fn circuit_breaker_state_and_timeout() {
-        let _guard = gh_env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = BreakerSandbox::new("state_timeout", _guard);
         clear_graphql_rate_limited();
         assert!(!is_graphql_rate_limited(), "initially not rate limited");
 
@@ -1621,7 +1662,8 @@ mod graphql_rate_limit_circuit_breaker_tests {
     /// exceeded") must trip the shared circuit breaker and report `true`.
     #[test]
     fn detect_and_mark_rate_limit_error_trips_breaker() {
-        let _guard = gh_env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = BreakerSandbox::new("detect_trips", _guard);
         clear_graphql_rate_limited();
         let err = DaemonError::Tool {
             tool: "gh".to_string(),
@@ -1641,7 +1683,8 @@ mod graphql_rate_limit_circuit_breaker_tests {
     /// leave the circuit breaker untouched and report `false`.
     #[test]
     fn detect_and_mark_non_rate_limit_error_does_not_trip_breaker() {
-        let _guard = gh_env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = BreakerSandbox::new("detect_no_trip", _guard);
         clear_graphql_rate_limited();
         let err = DaemonError::Tool {
             tool: "gh".to_string(),
@@ -1661,7 +1704,8 @@ mod graphql_rate_limit_circuit_breaker_tests {
     /// `if let DaemonError::Tool { stderr, .. } = err` guard.
     #[test]
     fn detect_and_mark_non_tool_error_does_not_trip_breaker() {
-        let _guard = gh_env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = BreakerSandbox::new("detect_non_tool", _guard);
         clear_graphql_rate_limited();
         let err = DaemonError::Parse("rate limit mentioned but not a Tool error".to_string());
 
@@ -1690,7 +1734,8 @@ mod graphql_rate_limit_circuit_breaker_tests {
             }
         }
 
-        let _guard = gh_env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = BreakerSandbox::new("sixth_site", _guard);
 
         clear_graphql_rate_limited();
         let rate_limited_err = DaemonError::Tool {
@@ -2840,11 +2885,11 @@ fn resolve_holdouts_path_or_fail() -> Result<String, DaemonError> {
 
 #[cfg(test)]
 mod resolve_holdouts_path_tests {
-    use super::{gh_env_test_lock, resolve_holdouts_path_or_fail};
+    use super::resolve_holdouts_path_or_fail;
 
     #[test]
     fn fails_loud_when_no_env_and_default_missing() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prev_holdouts = std::env::var("DARK_FACTORY_HOLDOUTS").ok();
@@ -2870,7 +2915,7 @@ mod resolve_holdouts_path_tests {
 
     #[test]
     fn fails_loud_when_env_set_but_missing() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prev = std::env::var("DARK_FACTORY_HOLDOUTS").ok();
@@ -2892,7 +2937,7 @@ mod resolve_holdouts_path_tests {
 
     #[test]
     fn succeeds_when_env_points_at_real_dir() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = std::env::temp_dir().join("resolve_holdouts_path_tests_real_dir");
@@ -3059,6 +3104,24 @@ fn ao_spawn_command_with_mode(
 
 fn ao_spawn_command(agent: &str, spec: &SpawnSpec) -> Result<Command, DaemonError> {
     ao_spawn_command_with_mode(agent, spec, false)
+}
+
+/// Single source of truth for the repo+revision identity check `run_spawn_process`
+/// applies both before dispatch (against `spec.local_checkout`, when it already
+/// exists) and after dispatch (against the AO-reported workspace). A no-op
+/// unless `expected_revision` is set, so pre/post-spawn call sites cannot drift
+/// into re-implementing the "only check when a revision is pinned" policy
+/// independently.
+fn validate_target_identity_if_expected(
+    repo: &str,
+    path: &std::path::Path,
+    expected_revision: Option<&str>,
+) -> Result<(), DaemonError> {
+    let Some(expected_revision) = expected_revision else {
+        return Ok(());
+    };
+    crate::target_worktree::validate_existing_target_worktree(repo, path, Some(expected_revision))
+        .map(|_| ())
 }
 
 /// Maps legacy vendor aliases onto their canonical AO plugin names. The
@@ -3263,6 +3326,724 @@ pub fn verify_ao_bridge_compatibility(
     Ok(())
 }
 
+struct ProjectStarterEntry {
+    in_progress: std::sync::Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+static AO_PROJECT_STARTERS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<ProjectStarterEntry>>>> = std::sync::OnceLock::new();
+
+/// Checks structured health of a project: returns true if project is running and valid JSON array returned.
+pub fn is_ao_project_healthy(project: &str) -> bool {
+    let out = match run_tool("ao", &["status", "-p", project, "--json"], 30) {
+        Ok(out) => out,
+        Err(_) => return false,
+    };
+    let json_start = out.find('[').unwrap_or(0);
+    serde_json::from_str::<serde_json::Value>(&out[json_start..])
+        .map(|v| v.is_array())
+        .unwrap_or(false)
+}
+
+/// SPEC #4 residual limitation: this is still lexical stderr classification
+/// for any `ao` CLI invocation that actually ran and returned a real exit
+/// code (AO does not expose a structured failure-reason taxonomy over its
+/// CLI, so there is nothing else to key on for e.g. "unknown project").
+///
+/// `rc == -1` is never sufficient evidence: it also represents a missing AO
+/// executable, signal death, and wait errors. Only an explicit AO lifecycle
+/// diagnostic may trigger `ao start`; starting a daemon cannot repair a CLI
+/// binary that the process failed to execute.
+fn is_ao_not_running_error(err: &DaemonError) -> bool {
+    let msg = match err {
+        DaemonError::Tool { stderr, .. } => stderr.as_str(),
+        DaemonError::Config(msg) => msg.as_str(),
+        DaemonError::Parse(msg) => msg.as_str(),
+        DaemonError::SpawnFallbackExhausted(list) => {
+            return list.iter().any(|(_, e)| is_ao_not_running_error(e));
+        }
+        _ => return false,
+    };
+    let lower = msg.to_lowercase();
+    lower.contains("ao is not running")
+        || lower.contains("daemon is not running")
+        || lower.contains("orchestrator not running")
+        || lower.contains("unknown project")
+        || lower.contains("no such project")
+        || lower.contains("failed to connect to daemon")
+        || lower.contains("cannot connect to daemon")
+}
+
+#[cfg(test)]
+mod is_ao_not_running_error_tests {
+    use super::is_ao_not_running_error;
+    use crate::errors::DaemonError;
+
+    #[test]
+    fn rc_negative_one_cli_launch_failure_is_not_ao_not_running() {
+        let err = DaemonError::Tool {
+            tool: "ao".to_string(),
+            rc: -1,
+            stderr: "execution failed: No such file or directory (os error 2)".to_string(),
+        };
+        assert!(!is_ao_not_running_error(&err));
+    }
+
+    #[test]
+    fn rc_negative_one_killed_by_signal_without_spawn_failure_wording_is_not_ao_not_running() {
+        // A process that WAS launched (the `ao` binary exists and ran) but
+        // was killed by an external signal (e.g. OOM killer, operator
+        // `kill -9`) also surfaces as `rc == -1` because
+        // `Command::status().code()` is `None` on signal death -- see
+        // `run_tool_with_cwd`'s `status.code().unwrap_or(-1)`. That is NOT
+        // evidence AO needs (re)starting: the binary itself launched fine,
+        // so `ao start` would not address whatever killed it.
+        let err = DaemonError::Tool {
+            tool: "ao spawn --agent minimax".to_string(),
+            rc: -1,
+            stderr: "Killed".to_string(),
+        };
+        assert!(!is_ao_not_running_error(&err));
+    }
+
+    #[test]
+    fn rc_negative_one_try_wait_failure_is_not_ao_not_running() {
+        // `run_tool_with_cwd` also produces `rc == -1` when the OS-level
+        // `try_wait()` poll itself errors -- an unrelated wait(2) failure,
+        // not evidence AO is not running.
+        let err = DaemonError::Tool {
+            tool: "ao".to_string(),
+            rc: -1,
+            stderr: "try_wait failed: some os error".to_string(),
+        };
+        assert!(!is_ao_not_running_error(&err));
+    }
+
+    #[test]
+    fn real_exit_code_still_requires_lexical_match() {
+        let err = DaemonError::Tool {
+            tool: "ao spawn --agent minimax".to_string(),
+            rc: 1,
+            stderr: "some unrelated ao CLI validation error".to_string(),
+        };
+        assert!(!is_ao_not_running_error(&err));
+    }
+
+    #[test]
+    fn real_exit_code_with_recognized_phrase_still_matches() {
+        let err = DaemonError::Tool {
+            tool: "ao spawn --agent minimax".to_string(),
+            rc: 1,
+            stderr: "Error: daemon is not running".to_string(),
+        };
+        assert!(is_ao_not_running_error(&err));
+    }
+
+    #[test]
+    fn bridge_ao_is_not_running_phrase_triggers_recovery() {
+        let err = DaemonError::Tool {
+            tool: "ao spawn --agent minimax".to_string(),
+            rc: 1,
+            stderr: "[dark-factory AO bridge] AO is not running; run `ao start` before factory dispatch"
+                .to_string(),
+        };
+        assert!(is_ao_not_running_error(&err));
+    }
+
+    #[test]
+    fn spawn_fallback_exhausted_recurses_into_each_agent_error() {
+        let err = DaemonError::SpawnFallbackExhausted(vec![
+            (
+                "minimax".to_string(),
+                DaemonError::Tool {
+                    tool: "ao spawn --agent minimax".to_string(),
+                    rc: 1,
+                    stderr: "some unrelated ao CLI validation error".to_string(),
+                },
+            ),
+            (
+                "antigravity".to_string(),
+                DaemonError::Tool {
+                    tool: "ao spawn --agent antigravity".to_string(),
+                    rc: 1,
+                    stderr: "AO is not running; start the project first".to_string(),
+                },
+            ),
+        ]);
+        assert!(is_ao_not_running_error(&err));
+    }
+}
+
+pub fn ensure_ao_project_recovered(project: &str, target_path_or_url: &str) -> Result<(), DaemonError> {
+    // 1. Initial health check: if project is already healthy, do not start
+    if is_ao_project_healthy(project) {
+        return Ok(());
+    }
+
+    // 2. Concurrency-safe starter election with Condvar waiting
+    let entry = {
+        let map_mutex = AO_PROJECT_STARTERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let mut map = map_mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.entry(project.to_string())
+            .or_insert_with(|| {
+                std::sync::Arc::new(ProjectStarterEntry {
+                    in_progress: std::sync::Mutex::new(false),
+                    cv: std::sync::Condvar::new(),
+                })
+            })
+            .clone()
+    };
+
+    let mut in_progress = entry.in_progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *in_progress {
+        // Another thread is currently running start for this project; wait for completion
+        while *in_progress {
+            in_progress = entry.cv.wait(in_progress).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        // Re-check health after waiting
+        if is_ao_project_healthy(project) {
+            return Ok(());
+        }
+        return Err(DaemonError::Config(format!(
+            "AO auto-start for project {project} did not restore health for waiting caller"
+        )));
+    }
+
+    // jleechan round-2 finding P1: `*in_progress == false` here does NOT
+    // necessarily mean no starter has EVER run for this project since our
+    // step-1 health check above -- it can also mean a DIFFERENT caller
+    // already elected itself starter, ran `ao start`, and fully released
+    // the guard (in_progress back to false) entirely in the window between
+    // this caller's step-1 check and this caller acquiring the
+    // `in_progress` lock. Re-check health now, under the lock, before
+    // electing self as starter: if a prior caller's start already fixed
+    // things, skip starting again instead of invoking `ao start` a second,
+    // redundant time.
+    if is_ao_project_healthy(project) {
+        return Ok(());
+    }
+
+    // Elect this thread as the active starter
+    *in_progress = true;
+    drop(in_progress);
+
+    struct StarterGuard<'a>(&'a std::sync::Arc<ProjectStarterEntry>);
+    impl<'a> Drop for StarterGuard<'a> {
+        fn drop(&mut self) {
+            let mut guard = self.0.in_progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            *guard = false;
+            self.0.cv.notify_all();
+        }
+    }
+    let _guard = StarterGuard(&entry);
+
+    // 3. Start: ao start <configured-project-path-or-url> --no-dashboard --no-open
+    // Reject --headless if present
+    if target_path_or_url.contains("--headless") {
+        return Err(DaemonError::Config("ao start argument --headless is forbidden".into()));
+    }
+    let start_args = ["start", target_path_or_url, "--no-dashboard", "--no-open"];
+    run_tool("ao", &start_args, 60).map_err(|e| {
+        DaemonError::Config(format!("ao start failed for project {project}: {e}"))
+    })?;
+
+    // 4. Recheck project-scoped health: ao status -p <project-id> --json
+    if !is_ao_project_healthy(project) {
+        return Err(DaemonError::Config(format!(
+            "ao status health check failed for project {project} after start (valid JSON array expected)"
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod ao_project_recovery_tests {
+    use super::ensure_ao_project_recovered;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// Writes a fake `ao` on PATH that answers `status -p <project> --json`
+    /// based on whether `healthy_marker` exists, and `start <target>
+    /// --no-dashboard --no-open` by appending a timestamp line to
+    /// `start_log`, sleeping `start_delay_ms`, then either creating
+    /// `healthy_marker` and exiting 0 (when `start_exit_code == 0`) or
+    /// printing to stderr and exiting `start_exit_code`.
+    ///
+    /// jleechan round-2 finding P2: the fake used to accept ANY argv whose
+    /// first element was "status" or "start" (`args[:1] == ["status"]`),
+    /// so a production argv regression (missing `-p <project>`, missing
+    /// `--json`, wrong `ao start` flags) would sail through undetected --
+    /// the fake would still answer as if the call were well-formed. It now
+    /// asserts the EXACT argv shape production sends
+    /// (`is_ao_project_healthy`: `["status", "-p", <project>, "--json"]`;
+    /// the `ensure_ao_project_recovered` start call:
+    /// `["start", <target>, "--no-dashboard", "--no-open"]`) and exits
+    /// loudly (nonzero + stderr) on anything else, so a future argv
+    /// regression fails these tests instead of passing silently.
+    struct FakeAoRecoveryEnv {
+        root: std::path::PathBuf,
+        healthy_marker: std::path::PathBuf,
+        start_log: std::path::PathBuf,
+        old_path: Option<std::ffi::OsString>,
+    }
+
+    impl FakeAoRecoveryEnv {
+        fn set_up(
+            test_name: &str,
+            start_delay_ms: u64,
+            start_exit_code: i32,
+            project: &str,
+            target: &str,
+        ) -> Self {
+            Self::build(test_name, start_delay_ms, start_exit_code, project, target, None, 0)
+        }
+
+        /// Like `set_up`, but the Nth `ao status` invocation across the
+        /// WHOLE test (1-indexed, tracked via a counter file since each
+        /// invocation is a separate subprocess) sleeps `slow_delay_ms`
+        /// AFTER capturing whether `healthy_marker` exists but BEFORE
+        /// replying. This lets a test deterministically widen the window
+        /// between "a caller observed unhealthy state" and "that caller
+        /// acts on it", reproducing the round-2 P1 late-arrival Condvar
+        /// race without needing a production-code test hook.
+        fn set_up_with_slow_status(
+            test_name: &str,
+            start_delay_ms: u64,
+            start_exit_code: i32,
+            project: &str,
+            target: &str,
+            slow_status_ordinal: usize,
+            slow_status_delay_ms: u64,
+        ) -> Self {
+            Self::build(
+                test_name,
+                start_delay_ms,
+                start_exit_code,
+                project,
+                target,
+                Some(slow_status_ordinal),
+                slow_status_delay_ms,
+            )
+        }
+
+        fn build(
+            test_name: &str,
+            start_delay_ms: u64,
+            start_exit_code: i32,
+            project: &str,
+            target: &str,
+            slow_status_ordinal: Option<usize>,
+            slow_status_delay_ms: u64,
+        ) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "afd_ao_project_recovery_{test_name}_{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let healthy_marker = root.join("healthy.marker");
+            let start_log = root.join("start.log");
+            let status_calls_log = root.join("status_calls.log");
+            let fake_ao = root.join("ao");
+            let slow_ordinal_py = slow_status_ordinal
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "None".to_string());
+            std::fs::write(
+                &fake_ao,
+                format!(
+                    r#"#!/usr/bin/env python3
+import json, os, sys, time
+args = sys.argv[1:]
+marker = {marker:?}
+start_log = {start_log:?}
+status_calls_log = {status_calls_log:?}
+expected_project = {project:?}
+expected_target = {target:?}
+slow_ordinal = {slow_ordinal_py}
+slow_delay = {slow_delay_ms} / 1000.0
+if args == ["status", "-p", expected_project, "--json"]:
+    healthy = os.path.exists(marker)
+    with open(status_calls_log, "a", encoding="utf-8") as fh:
+        fh.write("x\n")
+    with open(status_calls_log, "r", encoding="utf-8") as fh:
+        ordinal = sum(1 for _ in fh)
+    if slow_ordinal is not None and ordinal == slow_ordinal:
+        time.sleep(slow_delay)
+    if healthy:
+        print("[]")
+        sys.exit(0)
+    sys.exit(1)
+if args == ["start", expected_target, "--no-dashboard", "--no-open"]:
+    with open(start_log, "a", encoding="utf-8") as fh:
+        fh.write(str(time.time()) + "\n")
+    time.sleep({delay_ms} / 1000.0)
+    if {exit_code} != 0:
+        print("scripted start failure", file=sys.stderr)
+        sys.exit({exit_code})
+    with open(marker, "w", encoding="utf-8") as fh:
+        fh.write("healthy\n")
+    sys.exit(0)
+print("UNEXPECTED ARGV: " + json.dumps(args), file=sys.stderr)
+sys.exit(99)
+"#,
+                    marker = healthy_marker.to_string_lossy(),
+                    start_log = start_log.to_string_lossy(),
+                    status_calls_log = status_calls_log.to_string_lossy(),
+                    project = project,
+                    target = target,
+                    slow_ordinal_py = slow_ordinal_py,
+                    slow_delay_ms = slow_status_delay_ms,
+                    delay_ms = start_delay_ms,
+                    exit_code = start_exit_code,
+                ),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = std::fs::metadata(&fake_ao).unwrap().permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(&fake_ao, permissions).unwrap();
+            }
+            let old_path = std::env::var_os("PATH");
+            let new_path = std::env::join_paths(
+                std::iter::once(root.clone()).chain(
+                    old_path
+                        .as_deref()
+                        .into_iter()
+                        .flat_map(std::env::split_paths),
+                ),
+            )
+            .unwrap();
+            std::env::set_var("PATH", new_path);
+            Self {
+                root,
+                healthy_marker,
+                start_log,
+                old_path,
+            }
+        }
+
+        fn mark_healthy_up_front(&self) {
+            std::fs::write(&self.healthy_marker, "healthy\n").unwrap();
+        }
+
+        fn start_invocation_count(&self) -> usize {
+            std::fs::read_to_string(&self.start_log)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .count()
+        }
+
+        fn fake_ao_path(&self) -> std::path::PathBuf {
+            self.root.join("ao")
+        }
+    }
+
+    impl Drop for FakeAoRecoveryEnv {
+        fn drop(&mut self) {
+            match self.old_path.take() {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn unique_project(label: &str) -> String {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("afd-recovery-{label}-{}-{nonce}", std::process::id())
+    }
+
+    /// Joins a thread through a channel with a hard bound so a Condvar
+    /// liveness regression fails the test instead of hanging the suite.
+    fn join_with_timeout<T: Send + 'static>(
+        handle: std::thread::JoinHandle<T>,
+        timeout: Duration,
+        label: &'static str,
+    ) -> T {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = handle.join().unwrap_or_else(|_| panic!("{label} panicked"));
+            let _ = tx.send(result);
+        });
+        rx.recv_timeout(timeout)
+            .unwrap_or_else(|_| panic!("{label} did not complete within {timeout:?} (hang)"))
+    }
+
+    #[test]
+    fn healthy_project_skips_start_entirely() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let project = unique_project("healthy-skip");
+        let target = "https://github.com/jleechanorg/dark-factory.git";
+        let env = FakeAoRecoveryEnv::set_up("healthy_skip", 0, 0, &project, target);
+        env.mark_healthy_up_front();
+
+        let result = ensure_ao_project_recovered(&project, target);
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            env.start_invocation_count(),
+            0,
+            "an already-healthy project must never invoke ao start"
+        );
+    }
+
+    #[test]
+    fn concurrent_callers_elect_a_single_starter_and_both_observe_health() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // 400ms start delay gives the second caller a wide window to observe
+        // `in_progress == true` and enter the Condvar wait instead of racing
+        // to elect itself as a second starter.
+        let project = unique_project("concurrent-race");
+        let target = "https://github.com/jleechanorg/dark-factory.git".to_string();
+        let env = FakeAoRecoveryEnv::set_up("concurrent_race", 400, 0, &project, &target);
+
+        let project_a = project.clone();
+        let target_a = target.clone();
+        let handle_a = std::thread::spawn(move || ensure_ao_project_recovered(&project_a, &target_a));
+        std::thread::sleep(Duration::from_millis(75));
+        let project_b = project.clone();
+        let target_b = target.clone();
+        let handle_b = std::thread::spawn(move || ensure_ao_project_recovered(&project_b, &target_b));
+
+        let result_a = join_with_timeout(handle_a, Duration::from_secs(10), "starter thread");
+        let result_b = join_with_timeout(handle_b, Duration::from_secs(10), "waiter thread");
+
+        assert!(result_a.is_ok(), "{result_a:?}");
+        assert!(result_b.is_ok(), "{result_b:?}");
+        assert_eq!(
+            env.start_invocation_count(),
+            1,
+            "exactly one caller must run ao start; the other must wait on the Condvar and reuse its result"
+        );
+    }
+
+    #[test]
+    fn start_failure_releases_condvar_waiters_with_failure_instead_of_hanging() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let project = unique_project("batch-failure");
+        let target = "https://github.com/jleechanorg/dark-factory.git".to_string();
+        let env = FakeAoRecoveryEnv::set_up("batch_failure", 400, 7, &project, &target);
+
+        let project_a = project.clone();
+        let target_a = target.clone();
+        let handle_a = std::thread::spawn(move || ensure_ao_project_recovered(&project_a, &target_a));
+        std::thread::sleep(Duration::from_millis(75));
+        let project_b = project.clone();
+        let target_b = target.clone();
+        let handle_b = std::thread::spawn(move || ensure_ao_project_recovered(&project_b, &target_b));
+
+        // The bounded join is the liveness proof: a Condvar bug that leaves
+        // the waiter blocked forever (e.g. the starter's guard not firing on
+        // an early-return error path) times out here instead of hanging the
+        // whole test binary.
+        let result_a = join_with_timeout(handle_a, Duration::from_secs(10), "starter thread");
+        let result_b = join_with_timeout(handle_b, Duration::from_secs(10), "waiter thread");
+
+        let errors: Vec<String> = [&result_a, &result_b]
+            .iter()
+            .map(|r| r.as_ref().err().map(|e| e.to_string()).unwrap_or_default())
+            .collect();
+        assert!(result_a.is_err(), "{result_a:?}");
+        assert!(result_b.is_err(), "{result_b:?}");
+        assert!(
+            errors.iter().any(|e| e.contains("ao start failed")),
+            "the elected starter must surface the real ao start failure: {errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("did not restore health for waiting caller")),
+            "the Condvar waiter must be released with a failure, not left blocked: {errors:?}"
+        );
+        assert_eq!(
+            env.start_invocation_count(),
+            1,
+            "a failed start must not be retried by the waiting caller"
+        );
+    }
+
+    /// jleechan round-2 finding P2 regression guard: proves the fake `ao`
+    /// binary itself enforces the real invocation shape rather than
+    /// accepting any argv starting with "status"/"start". Before the
+    /// tightening this fake would have answered `[]` (healthy) or "started"
+    /// for ANY argv shape, so a production regression that dropped `-p
+    /// <project>` or `--json` (or an `ao start` call missing
+    /// `--no-dashboard`/`--no-open`) would have sailed through the other
+    /// tests in this module undetected.
+    #[test]
+    fn fake_ao_binary_rejects_unexpected_argv_shapes() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let project = unique_project("argv-shape");
+        let target = "https://github.com/jleechanorg/dark-factory.git".to_string();
+        let env = FakeAoRecoveryEnv::set_up("argv_shape", 0, 0, &project, &target);
+        let ao = env.fake_ao_path();
+
+        let missing_json_flag = std::process::Command::new(&ao)
+            .args(["status", "-p", &project])
+            .output()
+            .unwrap();
+        assert!(!missing_json_flag.status.success(), "must reject status call missing --json");
+        assert!(
+            String::from_utf8_lossy(&missing_json_flag.stderr).contains("UNEXPECTED ARGV"),
+            "{}",
+            String::from_utf8_lossy(&missing_json_flag.stderr)
+        );
+
+        let wrong_project = std::process::Command::new(&ao)
+            .args(["status", "-p", "some-other-project", "--json"])
+            .output()
+            .unwrap();
+        assert!(!wrong_project.status.success(), "must reject status call for a different project");
+
+        let missing_start_flags = std::process::Command::new(&ao)
+            .args(["start", &target])
+            .output()
+            .unwrap();
+        assert!(!missing_start_flags.status.success(), "must reject start call missing --no-dashboard --no-open");
+        assert!(
+            String::from_utf8_lossy(&missing_start_flags.stderr).contains("UNEXPECTED ARGV"),
+            "{}",
+            String::from_utf8_lossy(&missing_start_flags.stderr)
+        );
+    }
+
+    /// jleechan round-2 finding P1: a caller that observes unhealthy state
+    /// at its OWN step-1 check can still reach the `in_progress` election
+    /// point AFTER a different, prior caller has already elected itself
+    /// starter, run `ao start` to completion, and fully released the
+    /// guard. Without the fix, that late-arriving caller sees
+    /// `in_progress == false` (not because no starter ran, but because one
+    /// already finished) and starts AO a second, redundant time.
+    ///
+    /// This is deliberately NOT the same shape as
+    /// `concurrent_callers_elect_a_single_starter_and_both_observe_health`:
+    /// that test overlaps two threads DURING an in-flight start (the
+    /// second thread sees `in_progress == true` and waits on the
+    /// Condvar). This test instead forces caller B's step-1 health check
+    /// to (a) capture "unhealthy" while the marker is still absent, then
+    /// (b) not return control to caller B until well AFTER caller A has
+    /// fully completed its own start-and-release cycle -- so caller B
+    /// evaluates the `in_progress` boolean only once it is back to
+    /// `false` for the "already finished" reason, not the "never started"
+    /// reason.
+    #[test]
+    fn late_arriving_caller_rechecks_health_before_starting_again() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let project = unique_project("late-arrival");
+        let target = "https://github.com/jleechanorg/dark-factory.git".to_string();
+        // Ordinal 2 (1-indexed across the whole test) is caller B's step-1
+        // check: caller A's step-1 check is ordinal 1 (fast), caller A's
+        // start takes `start_delay_ms`, then caller A's step-4 recheck is
+        // ordinal 3 (fast). Sleeping ordinal 2 for far longer than caller
+        // A's entire start-to-release cycle guarantees caller B evaluates
+        // `in_progress` only after caller A's guard has already dropped.
+        let env = FakeAoRecoveryEnv::set_up_with_slow_status(
+            "late_arrival",
+            50,
+            0,
+            &project,
+            &target,
+            2,
+            400,
+        );
+
+        let project_a = project.clone();
+        let target_a = target.clone();
+        let handle_a = std::thread::spawn(move || ensure_ao_project_recovered(&project_a, &target_a));
+        // Small offset so caller A's step-1 (fast) check is unambiguously
+        // ordinal 1, and caller B's step-1 check is unambiguously ordinal 2.
+        std::thread::sleep(Duration::from_millis(20));
+        let project_b = project.clone();
+        let target_b = target.clone();
+        let handle_b = std::thread::spawn(move || ensure_ao_project_recovered(&project_b, &target_b));
+
+        let result_a = join_with_timeout(handle_a, Duration::from_secs(10), "caller A");
+        let result_b = join_with_timeout(handle_b, Duration::from_secs(10), "caller B (late arrival)");
+
+        assert!(result_a.is_ok(), "{result_a:?}");
+        assert!(result_b.is_ok(), "{result_b:?}");
+        assert_eq!(
+            env.start_invocation_count(),
+            1,
+            "a late-arriving caller must re-check health and skip starting again \
+             once a prior caller's start already succeeded"
+        );
+    }
+
+    /// jleechan round-2 finding P1 (4a): single source-of-truth contract test
+    /// for `ensure_ao_project_recovered`'s public behavior, distinct from the
+    /// scattered unit tests above (`healthy_project_skips_start_entirely`,
+    /// `concurrent_callers_elect_a_single_starter_and_both_observe_health`,
+    /// `start_failure_releases_condvar_waiters_with_failure_instead_of_hanging`,
+    /// `late_arriving_caller_rechecks_health_before_starting_again`) each of
+    /// which drills into one specific concurrency edge case. This test
+    /// asserts the three-clause contract in one place: healthy -> no-op Ok,
+    /// unhealthy -> starts exactly once then Ok, and a failed start ->
+    /// propagates a typed error without silently swallowing it.
+    #[test]
+    fn ao_recovery_contract() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Clause 1: healthy project is a no-op -- `ao start` is never invoked.
+        {
+            let project = unique_project("contract-healthy");
+            let target = "https://github.com/jleechanorg/dark-factory.git";
+            let env = FakeAoRecoveryEnv::set_up("contract_healthy", 0, 0, &project, target);
+            env.mark_healthy_up_front();
+
+            let result = ensure_ao_project_recovered(&project, target);
+
+            assert!(result.is_ok(), "{result:?}");
+            assert_eq!(env.start_invocation_count(), 0, "healthy project must never invoke ao start");
+        }
+
+        // Clause 2: unhealthy project is started exactly once, then reports Ok.
+        {
+            let project = unique_project("contract-unhealthy");
+            let target = "https://github.com/jleechanorg/dark-factory.git";
+            let env = FakeAoRecoveryEnv::set_up("contract_unhealthy", 0, 0, &project, target);
+
+            let result = ensure_ao_project_recovered(&project, target);
+
+            assert!(result.is_ok(), "{result:?}");
+            assert_eq!(env.start_invocation_count(), 1, "unhealthy project must be started exactly once");
+        }
+
+        // Clause 3: a failed `ao start` propagates a typed, non-silent error.
+        {
+            let project = unique_project("contract-failure");
+            let target = "https://github.com/jleechanorg/dark-factory.git";
+            let env = FakeAoRecoveryEnv::set_up("contract_failure", 0, 9, &project, target);
+
+            let result = ensure_ao_project_recovered(&project, target);
+
+            let error = result.expect_err("scripted ao start failure must propagate");
+            assert!(error.to_string().contains("ao start failed"), "{error}");
+            assert_eq!(env.start_invocation_count(), 1, "a failed start must still be attempted exactly once");
+        }
+    }
+
+}
+
 pub struct CliSessions {
     pub project: String,
     pub agent: String,
@@ -3271,11 +4052,15 @@ pub struct CliSessions {
     spawned_session_worktrees: std::sync::Mutex<
         std::collections::HashMap<String, (String, std::path::PathBuf)>,
     >,
+    spawned_session_projects: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl CliSessions {
     pub fn new(repo: &str, agent: &str) -> Self {
-        let mut project = repo.split('/').next_back().unwrap_or(repo).to_string();
+        let mut project = repo.rsplit('/').next().unwrap_or(repo).to_string();
+        if project.ends_with(".git") {
+            project.truncate(project.len() - 4);
+        }
         if project == "worldarchitect.ai" {
             project = "worldarchitect".to_string();
         }
@@ -3284,10 +4069,36 @@ impl CliSessions {
             agent: agent.to_string(),
             spawned_worktrees: std::sync::Mutex::new(std::collections::HashMap::new()),
             spawned_session_worktrees: std::sync::Mutex::new(std::collections::HashMap::new()),
+            spawned_session_projects: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
+    fn kill_in_project(project: &str, id: &SessionId) -> Result<(), DaemonError> {
+        run_tool("ao", &["session", "kill", &id.0, "-p", project], 30)?;
+        Ok(())
+    }
+
     fn run_spawn_process(&self, agent: &str, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
+        // Validate the path boundary before allowing checkout preparation to
+        // touch disk. `ao_spawn_command` provisions missing managed checkouts
+        // and refreshes clean daemon-owned stale snapshots; construct it before
+        // the exact-head check so both paths can reach the expected revision.
+        if let Some(ref local_checkout) = spec.local_checkout {
+            crate::tools::check_cwd_guard(spec.expected_cwd.as_deref(), local_checkout)?;
+        }
+        let mut cmd = ao_spawn_command(agent, spec)?;
+        // Preparation above fails closed for dirty, operator-owned, or
+        // wrong-origin checkouts without executing AO. Re-check the resulting
+        // checkout identity immediately before dispatch.
+        if let Some(ref local_checkout) = spec.local_checkout {
+            if local_checkout.is_dir() {
+                validate_target_identity_if_expected(
+                    &spec.repo,
+                    local_checkout,
+                    spec.expected_revision.as_deref(),
+                )?;
+            }
+        }
         // jleechan-bqdv Stage C: spawn into `spec.ao_project` (resolved per
         // bead by `Config::resolve_repo`, Stage B), not `self.project` (the
         // daemon's single global project bound once at `CliSessions::new`
@@ -3299,7 +4110,6 @@ impl CliSessions {
         // `target_repo` names a DIFFERENT `[repos.*]` entry spawn into ITS
         // project instead of silently landing in the global one (the
         // jleechan-9sh5 root cause).
-        let mut cmd = ao_spawn_command(agent, spec)?;
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let output = cmd.output().map_err(|e| DaemonError::Tool {
@@ -3330,25 +4140,27 @@ impl CliSessions {
                         "ao spawn --agent {agent} returned session {} with branch {:?}, expected {:?}; refusing to dispatch a branch-mismatched worker",
                         session.0, observed_branch, spec.branch
                     )))
-                } else if let Some(expected_revision) = spec.expected_revision.as_deref() {
-                    match crate::target_worktree::validate_existing_target_worktree(
+                } else if let Err(err) = crate::tools::check_cwd_guard(spec.expected_cwd.as_deref(), workspace_path) {
+                    Some(err)
+                } else {
+                    match validate_target_identity_if_expected(
                         &spec.repo,
                         workspace_path,
-                        Some(expected_revision),
+                        spec.expected_revision.as_deref(),
                     ) {
-                        Ok(_) => None,
+                        Ok(()) => None,
                         Err(error) => Some(DaemonError::Config(format!(
                             "AO worker workspace for session {} is not bound to repo {} at expected revision {}: {error}",
-                            session.0, spec.repo, expected_revision
+                            session.0,
+                            spec.repo,
+                            spec.expected_revision.as_deref().unwrap_or("?")
                         ))),
                     }
-                } else {
-                    None
                 }
             }
         };
         if let Some(spawn_error) = spawn_error {
-            return match run_tool("ao", &["session", "kill", &session.0], 30) {
+            return match Self::kill_in_project(&spec.ao_project, &session) {
                 Ok(_) => Err(spawn_error),
                 Err(cleanup_error) => Err(DaemonError::SpawnCleanupFailed {
                     session: session.0,
@@ -3374,6 +4186,10 @@ impl CliSessions {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(session.0.clone(), (spec.branch.clone(), workspace));
+        self.spawned_session_projects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session.0.clone(), spec.ao_project.clone());
         Ok(session)
     }
 
@@ -3828,10 +4644,73 @@ mod spawn_classification_tests {
 
 #[cfg(test)]
 mod ao_spawn_contract_tests {
-    use super::{ao_spawn_bridge_path, gh_env_test_lock, CliSessions};
+    use super::{ao_spawn_bridge_path, CliSessions};
     use crate::errors::DaemonError;
     use crate::tools::{Sessions, SpawnSpec};
     use std::os::unix::fs::PermissionsExt;
+
+    struct TestEnvGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        cleanup_dir: std::path::PathBuf,
+    }
+
+    impl TestEnvGuard {
+        fn install(dir: &std::path::Path, bindings: &serde_json::Value, log: &std::path::Path) -> Self {
+            const KEYS: &[&str] = &[
+                "PATH",
+                "AO_FAKE_EXPECTED_BINDINGS",
+                "AO_FAKE_LOG",
+                "AO_FAKE_FAIL_PROMPT",
+                "AO_FAKE_KILL_FAIL",
+                "AO_FAKE_RETURN_BRANCH",
+                "AO_FAKE_WORKTREE",
+                "DARK_FACTORY_REVIEWER_FALLBACK_CHAIN",
+                "FAKE_GIT_EXPECTED_ORIGIN",
+                "FAKE_GIT_LOCAL_SOURCE",
+                "FAKE_GIT_REAL_BIN",
+            ];
+            let saved = KEYS
+                .iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect();
+            let old_path = std::env::var_os("PATH").unwrap_or_default();
+            let mut paths = vec![dir.to_path_buf()];
+            paths.extend(std::env::split_paths(&old_path));
+            std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+            std::env::set_var("AO_FAKE_EXPECTED_BINDINGS", bindings.to_string());
+            std::env::set_var("AO_FAKE_LOG", log);
+            Self {
+                saved,
+                cleanup_dir: dir.to_path_buf(),
+            }
+        }
+    }
+
+    impl Drop for TestEnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.cleanup_dir);
+        }
+    }
+
+    fn system_git() -> std::path::PathBuf {
+        let canonical = std::path::PathBuf::from("/usr/bin/git");
+        if canonical.is_file() {
+            return canonical;
+        }
+        std::env::var_os("PATH")
+            .as_deref()
+            .into_iter()
+            .flat_map(std::env::split_paths)
+            .map(|dir| dir.join("git"))
+            .find(|path| path.is_file())
+            .expect("test environment must provide git")
+    }
 
     fn spec(prompt: &str, branch: &str) -> SpawnSpec {
         SpawnSpec {
@@ -3898,12 +4777,22 @@ import os
 import sys
 
 args = sys.argv[1:]
-if args[:2] == ["session", "kill"] and len(args) == 3:
+if args[:2] == ["session", "kill"]:
+    assert len(args) == 5, args
+    assert args[3] == "-p", args
     with open(os.environ["AO_FAKE_LOG"], "a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"kind": "kill", "args": args, "session": args[2]}) + "\n")
+        handle.write(json.dumps({"kind": "kill", "args": args, "session": args[2], "project": args[4]}) + "\n")
     if os.environ.get("AO_FAKE_KILL_FAIL") == "1":
         print("scripted batch cleanup failure", file=sys.stderr)
         raise SystemExit(8)
+    raise SystemExit(0)
+if args[:1] == ["status"]:
+    assert len(args) == 4, args
+    assert args[1] == "-p", args
+    assert args[3] == "--json", args
+    with open(os.environ["AO_FAKE_LOG"], "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"kind": "status", "args": args, "project": args[2]}) + "\n")
+    print(os.environ.get("AO_FAKE_STATUS_JSON", "[]"))
     raise SystemExit(0)
 assert len(args) == 7, args
 assert args[:5] == ["spawn", "--project", "dark-factory", "--agent", "minimax"], args
@@ -3936,31 +4825,13 @@ print("  Branch:   " + os.environ.get("AO_FAKE_RETURN_BRANCH", os.environ["DARK_
         bindings: serde_json::Value,
         run: impl FnOnce(&std::path::Path) -> T,
     ) -> T {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = fake_ao_dir(test_name);
         let log = dir.join("calls.jsonl");
-        let old_path = std::env::var("PATH").unwrap_or_default();
-        let old_bindings = std::env::var("AO_FAKE_EXPECTED_BINDINGS").ok();
-        let old_log = std::env::var("AO_FAKE_LOG").ok();
-        std::env::set_var("PATH", format!("{}:{old_path}", dir.display()));
-        std::env::set_var("AO_FAKE_EXPECTED_BINDINGS", bindings.to_string());
-        std::env::set_var("AO_FAKE_LOG", &log);
-
-        let result = run(&log);
-
-        std::env::set_var("PATH", old_path);
-        match old_bindings {
-            Some(value) => std::env::set_var("AO_FAKE_EXPECTED_BINDINGS", value),
-            None => std::env::remove_var("AO_FAKE_EXPECTED_BINDINGS"),
-        }
-        match old_log {
-            Some(value) => std::env::set_var("AO_FAKE_LOG", value),
-            None => std::env::remove_var("AO_FAKE_LOG"),
-        }
-        let _ = std::fs::remove_dir_all(dir);
-        result
+        let _env = TestEnvGuard::install(&dir, &bindings, &log);
+        run(&log)
     }
 
     fn run_bridge_with_registered_source(
@@ -4367,7 +5238,7 @@ export const isTerminalSession = () => false;
 
     #[test]
     fn bridge_fails_closed_when_adopted_origin_ref_head_diverges_from_expected_revision() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Build a remote whose `alice/<branch>` is at SHA X, but pass
@@ -4649,15 +5520,214 @@ export const isTerminalSession = () => false;
     }
 
     #[test]
+    fn worker_spawn_refreshes_clean_managed_checkout_before_exact_head_validation() {
+        let real_git = system_git();
+        let root = std::env::temp_dir().join(format!(
+            "afd_clean_managed_stale_checkout_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(std::process::Command::new(&real_git)
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new(&real_git)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/jleechanorg/dark-factory.git",
+            ])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        let commit = |message: &str| {
+            assert!(std::process::Command::new(&real_git)
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "-c",
+                    "user.name=Test",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    message,
+                ])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success());
+            String::from_utf8(
+                std::process::Command::new(&real_git)
+                    .args(["rev-parse", "HEAD"])
+                    .current_dir(&root)
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+            .trim()
+            .to_string()
+        };
+        let stale_head = commit("stale managed snapshot");
+        let expected_head = commit("adopted PR head");
+        assert_ne!(stale_head, expected_head);
+        assert!(std::process::Command::new(&real_git)
+            .args(["checkout", "-q", "--detach", &stale_head])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        let prompt = "refresh clean managed stale checkout";
+        let branch = "factory/jleechan-contract-clean-managed-refresh-r1";
+        let (spawn_result, calls) = with_fake_ao(
+            "clean_managed_refresh",
+            serde_json::json!({prompt: branch}),
+            |log| {
+                let fake_git = log.parent().unwrap().join("git");
+                std::fs::write(
+                    &fake_git,
+                    r#"#!/bin/sh
+if [ "$1" = "fetch" ]; then
+  exit 0
+fi
+exec "$FAKE_GIT_REAL_BIN" "$@"
+"#,
+                )
+                .unwrap();
+                let mut permissions = std::fs::metadata(&fake_git).unwrap().permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(&fake_git, permissions).unwrap();
+
+                let saved_real_git = std::env::var_os("FAKE_GIT_REAL_BIN");
+                let saved_workspace = std::env::var_os("AO_FAKE_WORKTREE");
+                std::env::set_var("FAKE_GIT_REAL_BIN", &real_git);
+                std::env::set_var("AO_FAKE_WORKTREE", &root);
+                let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+                let mut managed = spec(prompt, branch);
+                managed.local_checkout = Some(root.clone());
+                managed.managed_checkout = true;
+                managed.expected_revision = Some(expected_head.clone());
+                let result = sessions.spawn(&managed);
+                match saved_real_git {
+                    Some(value) => std::env::set_var("FAKE_GIT_REAL_BIN", value),
+                    None => std::env::remove_var("FAKE_GIT_REAL_BIN"),
+                }
+                match saved_workspace {
+                    Some(value) => std::env::set_var("AO_FAKE_WORKTREE", value),
+                    None => std::env::remove_var("AO_FAKE_WORKTREE"),
+                }
+                (result, std::fs::read_to_string(log).unwrap_or_default())
+            },
+        );
+        let observed_head = String::from_utf8(
+            std::process::Command::new(&real_git)
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&root)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let _ = std::fs::remove_dir_all(&root);
+
+        let session = spawn_result.unwrap_or_else(|error| {
+            panic!("clean daemon-managed checkout must refresh before validation: {error}")
+        });
+        assert!(!session.0.is_empty());
+        assert_eq!(observed_head, expected_head);
+        assert_eq!(
+            calls.lines().filter(|line| !line.trim().is_empty()).count(),
+            1,
+            "AO must spawn exactly once after refresh: {calls}"
+        );
+    }
+
+    /// jleechan round-2 finding P1 (4c): "adopted PR" is not a separate
+    /// boolean/struct field in this file -- `SpawnSpec.expected_revision`'s
+    /// doc comment (tools.rs) says explicitly: "For adopted remediation this
+    /// is the remote branch SHA captured immediately before dispatch; a
+    /// same-origin checkout at another HEAD is unsafe." That IS the
+    /// adopted-PR-drift mechanism this file has, and it is the exact same
+    /// pre-spawn gate `worker_spawn_rejects_stale_expected_revision_before_ao`
+    /// exercises above. This test is intentionally that same mechanism,
+    /// explicitly named and framed for the adopted-PR review finding (using
+    /// the real checkout at its real HEAD, with `expected_revision` set to a
+    /// distinct placeholder standing in for "the adopted PR's head captured
+    /// at intake time", which the checkout has since drifted away from) --
+    /// it is NOT a new code path, since adapters.rs has no separate
+    /// adopted-PR-specific construct beyond `expected_revision`.
+    #[test]
+    fn adopted_pr_rejects_drift_before_ao_spawn() {
+        let prompt = "adopted PR drift prompt";
+        let branch = "factory/jleechan-contract-adopted-pr-drift-r1";
+        // Real checkout (CARGO_MANIFEST_DIR, not `std::env::current_dir()` --
+        // see `worker_spawn_rejects_same_origin_stale_ao_workspace_after_spawn`
+        // above for why the latter is a cross-test cwd race).
+        let checkout = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        // Stands in for "the adopted PR's remote branch head captured before
+        // dispatch" -- a real-shaped SHA the checkout's actual HEAD does not
+        // match, i.e. drift since intake.
+        let adopted_pr_head = "f".repeat(40);
+
+        let (spawn_result, calls) = with_fake_ao(
+            "adopted_pr_drift",
+            serde_json::json!({prompt: branch}),
+            |log| {
+                let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+                let mut adopted = spec(prompt, branch);
+                adopted.local_checkout = Some(checkout.clone());
+                adopted.expected_revision = Some(adopted_pr_head.clone());
+                let result = sessions.spawn(&adopted);
+                let calls = std::fs::read_to_string(log).unwrap_or_default();
+                (result, calls)
+            },
+        );
+
+        let error = spawn_result.expect_err("drifted adopted-PR checkout must fail closed before ao spawn");
+        assert!(error.to_string().contains("expected snapshot"), "{error}");
+        assert!(calls.is_empty(), "AO must never be invoked when the adopted PR's checkout has drifted");
+    }
+
+    #[test]
     fn worker_spawn_rejects_same_origin_stale_ao_workspace_after_spawn() {
+        let real_git = system_git();
         let prompt = "same origin stale AO workspace";
         let branch = "factory/jleechan-contract-stale-ao-workspace-r1";
-        let checkout = std::env::current_dir().unwrap();
-        let expected_revision = std::process::Command::new("git")
+        // jleechan round-2 CI-blocking finding: this used to read
+        // `std::env::current_dir()`, a PROCESS-WIDE mutable value. Under
+        // `cargo test`'s default parallel execution, `offline_cache_tests`'
+        // `OfflineDir` calls `std::env::set_current_dir` (guarded by
+        // `crate::test_env_lock()`) for the FULL lifetime of its own tests. This
+        // test read `current_dir()` here BEFORE ever acquiring
+        // `crate::test_env_lock()` (that only happens later, inside
+        // `with_fake_ao`), so it could observe `OfflineDir`'s temp
+        // directory instead of the real checkout, making `git rev-parse
+        // HEAD` below fail/return something unrelated to the actual repo
+        // state and silently flipping this test's outcome. `CARGO_MANIFEST_DIR`
+        // is a compile-time constant embedded by the build (already used
+        // by `ao_spawn_bridge_path` above for the same reason) and is
+        // exactly what `current_dir()` resolves to here in the unraced
+        // case anyway (Cargo sets a test binary's cwd to its package root),
+        // so this is a like-for-like substitution that removes the shared
+        // mutable global dependency instead of adding a lock (locking here
+        // would deadlock: `with_fake_ao` below re-acquires the same
+        // non-reentrant `crate::test_env_lock()`).
+        let checkout = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let expected_revision = std::process::Command::new(&real_git)
             .args(["rev-parse", "HEAD"])
             .current_dir(&checkout)
             .output()
             .unwrap();
+        assert!(expected_revision.status.success());
         let expected_revision = String::from_utf8(expected_revision.stdout)
             .unwrap()
             .trim()
@@ -4668,12 +5738,13 @@ export const isTerminalSession = () => false;
         ));
         let _ = std::fs::remove_dir_all(&workspace);
         std::fs::create_dir_all(&workspace).unwrap();
-        std::process::Command::new("git")
+        assert!(std::process::Command::new(&real_git)
             .args(["init", "-q"])
             .current_dir(&workspace)
             .status()
-            .unwrap();
-        std::process::Command::new("git")
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new(&real_git)
             .args([
                 "remote",
                 "add",
@@ -4682,8 +5753,9 @@ export const isTerminalSession = () => false;
             ])
             .current_dir(&workspace)
             .status()
-            .unwrap();
-        std::process::Command::new("git")
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new(&real_git)
             .args([
                 "-c",
                 "user.email=test@example.invalid",
@@ -4696,7 +5768,8 @@ export const isTerminalSession = () => false;
             ])
             .current_dir(&workspace)
             .status()
-            .unwrap();
+            .unwrap()
+            .success());
 
         let (spawn_result, calls) = with_fake_ao(
             "stale_ao_workspace",
@@ -4726,6 +5799,173 @@ export const isTerminalSession = () => false;
             .collect();
         assert_eq!(rows.iter().filter(|row| row["kind"] == "spawn").count(), 1);
         assert_eq!(rows.iter().filter(|row| row["kind"] == "kill").count(), 1);
+    }
+
+    /// jleechan finding P1: pre-spawn validation used to run
+    /// `validate_existing_target_worktree` (which hard-requires the checkout
+    /// to already be a directory) before `ao_spawn_command`, even though
+    /// `ao_spawn_command` -> `ensure_managed_target_worktree` is the code
+    /// that provisions a missing managed checkout by cloning it. That made
+    /// every first-ever spawn into a brand new managed checkout fail closed
+    /// with "is not a directory" before the provisioning step ever ran. This
+    /// test drives the real `ensure_managed_target_worktree` clone path
+    /// (redirected to a local, offline "origin") through the same call
+    /// sequence `run_spawn_process` uses, so it fails red on the ordering bug
+    /// and passes once pre-spawn validation only applies to checkouts that
+    /// already exist.
+    #[test]
+    fn worker_spawn_provisions_missing_managed_checkout_before_pre_spawn_validation() {
+        // Deliberately distinct from `fake_ao_dir`'s
+        // `afd_ao_spawn_contract_<test_name>_<pid>` naming scheme: that
+        // helper `remove_dir_all`s its own directory on entry, which would
+        // otherwise wipe this root (and the source repo staged inside it)
+        // the moment `with_fake_ao` starts.
+        let root = std::env::temp_dir().join(format!(
+            "afd_missing_managed_checkout_src_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Local "source" repo stands in for the real GitHub remote so the
+        // clone `ao_spawn_command` performs for a missing managed checkout
+        // stays fully offline.
+        let source = root.join("source-repo");
+        std::fs::create_dir_all(&source).unwrap();
+        let source_str = source.to_string_lossy().to_string();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&source)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "uploadpack.allowReachableSHA1InWant", "true"])
+            .current_dir(&source)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "seed",
+            ])
+            .current_dir(&source)
+            .status()
+            .unwrap();
+        let expected_revision = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&source)
+            .output()
+            .unwrap();
+        let expected_revision = String::from_utf8(expected_revision.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let prompt = "missing managed checkout prompt";
+        let branch = "factory/jleechan-contract-missing-managed-checkout-r1";
+        let repo = "jleechanorg/dark-factory-managed-missing-test";
+        let checkout = root.join("managed-target");
+        assert!(!checkout.exists(), "checkout must start out missing");
+
+        let real_git = system_git();
+
+        let (spawn_result, calls) = with_fake_ao(
+            "missing_managed_checkout",
+            serde_json::json!({prompt: branch}),
+            |log| {
+                let fake_bin_dir = log.parent().unwrap();
+                let fake_git = fake_bin_dir.join("git");
+                std::fs::write(
+                    &fake_git,
+                    r#"#!/usr/bin/env python3
+import os, subprocess, sys
+args = sys.argv[1:]
+real_git = os.environ["FAKE_GIT_REAL_BIN"]
+local_source = os.environ["FAKE_GIT_LOCAL_SOURCE"]
+expected_origin = os.environ.get("FAKE_GIT_EXPECTED_ORIGIN")
+if args and args[0] == "clone":
+    new_args = [local_source if a.startswith("https://github.com/") else a for a in args]
+    sys.exit(subprocess.call([real_git] + new_args))
+if len(args) >= 2 and args[0] == "checkout" and args[1] == "--detach" and expected_origin:
+    rc = subprocess.call([real_git] + args)
+    if rc == 0:
+        subprocess.call([real_git, "remote", "set-url", "origin", expected_origin])
+    sys.exit(rc)
+os.execv(real_git, [real_git] + args)
+"#,
+                )
+                .unwrap();
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut permissions = std::fs::metadata(&fake_git).unwrap().permissions();
+                    permissions.set_mode(0o755);
+                    std::fs::set_permissions(&fake_git, permissions).unwrap();
+                }
+
+                let expected_origin = format!("https://github.com/{repo}.git");
+                let old_real = std::env::var("FAKE_GIT_REAL_BIN").ok();
+                let old_source = std::env::var("FAKE_GIT_LOCAL_SOURCE").ok();
+                let old_origin = std::env::var("FAKE_GIT_EXPECTED_ORIGIN").ok();
+                let old_worktree = std::env::var("AO_FAKE_WORKTREE").ok();
+                std::env::set_var("FAKE_GIT_REAL_BIN", &real_git);
+                std::env::set_var("FAKE_GIT_LOCAL_SOURCE", &source_str);
+                std::env::set_var("FAKE_GIT_EXPECTED_ORIGIN", &expected_origin);
+                std::env::set_var("AO_FAKE_WORKTREE", &checkout);
+
+                let sessions = CliSessions::new(repo, "minimax");
+                let mut managed = spec(prompt, branch);
+                managed.repo = repo.to_string();
+                managed.local_checkout = Some(checkout.clone());
+                managed.managed_checkout = true;
+                managed.expected_revision = Some(expected_revision.clone());
+                let result = sessions.spawn(&managed);
+                let calls = std::fs::read_to_string(log).unwrap_or_default();
+
+                match old_real {
+                    Some(v) => std::env::set_var("FAKE_GIT_REAL_BIN", v),
+                    None => std::env::remove_var("FAKE_GIT_REAL_BIN"),
+                }
+                match old_source {
+                    Some(v) => std::env::set_var("FAKE_GIT_LOCAL_SOURCE", v),
+                    None => std::env::remove_var("FAKE_GIT_LOCAL_SOURCE"),
+                }
+                match old_origin {
+                    Some(v) => std::env::set_var("FAKE_GIT_EXPECTED_ORIGIN", v),
+                    None => std::env::remove_var("FAKE_GIT_EXPECTED_ORIGIN"),
+                }
+                match old_worktree {
+                    Some(v) => std::env::set_var("AO_FAKE_WORKTREE", v),
+                    None => std::env::remove_var("AO_FAKE_WORKTREE"),
+                }
+
+                (result, calls)
+            },
+        );
+
+        let checkout_has_git_dir = checkout.join(".git").is_dir();
+        let _ = std::fs::remove_dir_all(&root);
+
+        let session = spawn_result.unwrap_or_else(|error| {
+            panic!(
+                "missing managed checkout must be provisioned by ao_spawn_command \
+                 before pre-spawn validation runs, got: {error}"
+            )
+        });
+        assert!(!session.0.is_empty());
+        assert!(
+            checkout_has_git_dir,
+            "ao_spawn_command must provision the missing managed checkout"
+        );
+        assert!(
+            !calls.trim().is_empty(),
+            "ao spawn must have been invoked once provisioning succeeded"
+        );
     }
 
     #[test]
@@ -4806,6 +6046,138 @@ export const isTerminalSession = () => false;
             rows.iter().filter(|row| row["kind"] == "kill").count(),
             1
         );
+        let kill = rows.iter().find(|row| row["kind"] == "kill").unwrap();
+        assert_eq!(kill["project"], "dark-factory");
+    }
+
+    #[test]
+    fn explicit_stop_binds_kill_to_the_sessions_project() {
+        let (_, calls) = with_fake_ao("project_bound_stop", serde_json::json!({}), |log| {
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            let result = sessions.stop_in_project(
+                &crate::tools::SessionId("session-project-bound".to_string()),
+                "dark-factory",
+            );
+            (result, std::fs::read_to_string(log).unwrap_or_default())
+        });
+
+        let row: serde_json::Value = calls.lines().next().unwrap().parse().unwrap();
+        assert_eq!(
+            row["args"],
+            serde_json::json!(["session", "kill", "session-project-bound", "-p", "dark-factory"])
+        );
+        assert_eq!(row["project"], "dark-factory");
+    }
+
+    #[test]
+    fn stop_uses_the_project_recorded_for_a_routed_session() {
+        let (_, calls) = with_fake_ao("routed_project_stop", serde_json::json!({}), |log| {
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            sessions
+                .spawned_session_projects
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert("session-routed-project".to_string(), "secondary-project".to_string());
+            let result = sessions.stop(&crate::tools::SessionId(
+                "session-routed-project".to_string(),
+            ));
+            (result, std::fs::read_to_string(log).unwrap_or_default())
+        });
+
+        let row: serde_json::Value = calls.lines().next().unwrap().parse().unwrap();
+        assert_eq!(
+            row["args"],
+            serde_json::json!([
+                "session",
+                "kill",
+                "session-routed-project",
+                "-p",
+                "secondary-project"
+            ])
+        );
+    }
+
+    #[test]
+    fn restarted_cleanup_uses_the_callers_resolved_project() {
+        let (_, calls) = with_fake_ao("restarted_routed_project_stop", serde_json::json!({}), |log| {
+            // A new adapter has no process-local spawn map, as after a daemon
+            // restart. The durable overlay caller must still bind cleanup to
+            // its resolved repository project.
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            let result = sessions.stop_in_project(
+                &crate::tools::SessionId("session-routed-after-restart".to_string()),
+                "secondary-project",
+            );
+            (result, std::fs::read_to_string(log).unwrap_or_default())
+        });
+
+        let row: serde_json::Value = calls.lines().next().unwrap().parse().unwrap();
+        assert_eq!(
+            row["args"],
+            serde_json::json!([
+                "session",
+                "kill",
+                "session-routed-after-restart",
+                "-p",
+                "secondary-project"
+            ])
+        );
+    }
+
+    #[test]
+    fn routed_session_status_operations_use_the_explicit_project() {
+        let (_, calls) = with_fake_ao("routed_status_project", serde_json::json!({}), |log| {
+            let previous = std::env::var("AO_FAKE_STATUS_JSON").ok();
+            std::env::set_var(
+                "AO_FAKE_STATUS_JSON",
+                r#"[{"name":"session-routed-status","branch":"factory/routed-status","activity":"idle","status":"running"}]"#,
+            );
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            let id = sessions
+                .attach_in_project("factory/routed-status", "bead-status", "secondary-project")
+                .unwrap();
+            assert!(!sessions.is_quiescent_in_project(&id, "secondary-project").unwrap());
+            assert_eq!(
+                sessions
+                    .session_activity_in_project(&id, "secondary-project")
+                    .unwrap(),
+                crate::tools::SessionActivity::Idle
+            );
+            assert_eq!(
+                sessions
+                    .session_branch_in_project(&id, "secondary-project")
+                    .unwrap()
+                    .as_deref(),
+                Some("factory/routed-status")
+            );
+            match previous {
+                Some(value) => std::env::set_var("AO_FAKE_STATUS_JSON", value),
+                None => std::env::remove_var("AO_FAKE_STATUS_JSON"),
+            }
+            ((), std::fs::read_to_string(log).unwrap_or_default())
+        });
+
+        let rows: Vec<serde_json::Value> = calls
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 4);
+        for row in rows {
+            assert_eq!(row["kind"], "status");
+            assert_eq!(row["args"], serde_json::json!(["status", "-p", "secondary-project", "--json"]));
+        }
+    }
+
+    #[test]
+    fn unscoped_stop_rejects_an_unowned_session() {
+        let (result, calls) = with_fake_ao("unowned_project_stop", serde_json::json!({}), |log| {
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            let result = sessions.stop(&crate::tools::SessionId("unknown-session".to_string()));
+            (result, std::fs::read_to_string(log).unwrap_or_default())
+        });
+
+        assert!(result.unwrap_err().to_string().contains("refusing unscoped cleanup"));
+        assert!(calls.is_empty(), "unowned session must not issue an AO kill");
     }
 
     #[test]
@@ -4907,8 +6279,9 @@ export const isTerminalSession = () => false;
         assert_eq!(kills.len(), successful_spawns.len(), "calls={calls}");
         assert_eq!(
             kills[0]["args"],
-            serde_json::json!(["session", "kill", kills[0]["session"]])
+            serde_json::json!(["session", "kill", kills[0]["session"], "-p", first.ao_project])
         );
+        assert_eq!(kills[0]["project"], first.ao_project);
     }
 
     #[test]
@@ -4975,6 +6348,199 @@ export const isTerminalSession = () => false;
         );
     }
 
+    /// jleechan round-2 finding P1 (4b): `ensure_ao_project_recovered` is
+    /// keyed per-`ao_project`, and `CliSessions::spawn` (called once per
+    /// item by `spawn_batch`) invokes it independently for each spec. This
+    /// proves recovery is driven correctly when a SINGLE `spawn_batch` call
+    /// covers TWO DIFFERENT projects that both start out "AO not running":
+    /// each project must get its own `ao start`, and each spawn must only
+    /// succeed after ITS OWN project's recovery completes -- one project's
+    /// recovery must not be mistaken for the other's.
+    ///
+    /// There is no separate "batch recovery" entrypoint in this file distinct
+    /// from `spawn_batch` + the per-item `ensure_ao_project_recovered` call
+    /// inside `CliSessions::spawn` -- this test exercises that real
+    /// production path end-to-end (a fresh, bespoke fake `ao` binary, not
+    /// the shared `with_fake_ao`/`fake_ao_dir` fixture, since it must also
+    /// answer `status`/`start` for two distinct projects).
+    #[test]
+    fn adapters_batch_recovery_integration() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let root = std::env::temp_dir().join(format!(
+            "afd_batch_recovery_integration_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let repo = "jleechanorg/dark-factory";
+        let init_checkout = |name: &str| -> std::path::PathBuf {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&dir)
+                .status()
+                .unwrap();
+            std::process::Command::new("git")
+                .args(["remote", "add", "origin", &format!("https://github.com/{repo}.git")])
+                .current_dir(&dir)
+                .status()
+                .unwrap();
+            dir
+        };
+        let target_a = init_checkout("checkout-a");
+        let target_b = init_checkout("checkout-b");
+        let marker_a = root.join("healthy-a.marker");
+        let marker_b = root.join("healthy-b.marker");
+        let log = root.join("calls.jsonl");
+
+        let project_a = "afd-batch-recovery-project-a";
+        let project_b = "afd-batch-recovery-project-b";
+        let branch_a = "factory/jleechan-batch-recovery-a-r1";
+        let branch_b = "factory/jleechan-batch-recovery-b-r1";
+
+        let fake_ao = root.join("ao");
+        std::fs::write(
+            &fake_ao,
+            format!(
+                r#"#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+log_path = {log:?}
+project_a = {project_a:?}
+project_b = {project_b:?}
+target_a = {target_a:?}
+target_b = {target_b:?}
+branch_a = {branch_a:?}
+branch_b = {branch_b:?}
+marker_a = {marker_a:?}
+marker_b = {marker_b:?}
+
+def log_call(entry):
+    with open(log_path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry) + "\n")
+
+if args == ["status", "-p", project_a, "--json"]:
+    log_call({{"kind": "status", "project": project_a}})
+    if os.path.exists(marker_a):
+        print("[]")
+        sys.exit(0)
+    sys.exit(1)
+if args == ["status", "-p", project_b, "--json"]:
+    log_call({{"kind": "status", "project": project_b}})
+    if os.path.exists(marker_b):
+        print("[]")
+        sys.exit(0)
+    sys.exit(1)
+if len(args) == 4 and args[0] == "start" and args[2:] == ["--no-dashboard", "--no-open"]:
+    target = args[1]
+    if target == target_a:
+        log_call({{"kind": "start", "project": project_a}})
+        open(marker_a, "w", encoding="utf-8").close()
+        sys.exit(0)
+    if target == target_b:
+        log_call({{"kind": "start", "project": project_b}})
+        open(marker_b, "w", encoding="utf-8").close()
+        sys.exit(0)
+    print("UNEXPECTED start target: " + target, file=sys.stderr)
+    sys.exit(2)
+if len(args) == 7 and args[:2] == ["spawn", "--project"]:
+    project = args[2]
+    prompt = args[6]
+    if project == project_a:
+        marker, target, branch = marker_a, target_a, branch_a
+    elif project == project_b:
+        marker, target, branch = marker_b, target_b, branch_b
+    else:
+        print("UNEXPECTED project: " + project, file=sys.stderr)
+        sys.exit(3)
+    if not os.path.exists(marker):
+        log_call({{"kind": "spawn-rejected", "project": project}})
+        print("ao daemon is not running for project " + project, file=sys.stderr)
+        sys.exit(1)
+    log_call({{"kind": "spawn-ok", "project": project, "prompt": prompt}})
+    print("SESSION=fake-" + project)
+    print("  Worktree: " + target)
+    print("  Branch:   " + branch)
+    sys.exit(0)
+print("UNEXPECTED ARGV: " + json.dumps(args), file=sys.stderr)
+sys.exit(99)
+"#,
+                log = log.to_string_lossy(),
+                project_a = project_a,
+                project_b = project_b,
+                target_a = target_a.to_string_lossy(),
+                target_b = target_b.to_string_lossy(),
+                branch_a = branch_a,
+                branch_b = branch_b,
+                marker_a = marker_a.to_string_lossy(),
+                marker_b = marker_b.to_string_lossy(),
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&fake_ao).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&fake_ao, permissions).unwrap();
+        }
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_fallback = std::env::var("DARK_FACTORY_CODER_FALLBACK_CHAIN").ok();
+        std::env::set_var("PATH", format!("{}:{old_path}", root.display()));
+        // Empty fallback chain: only the default agent is attempted, so each
+        // project's recovery cycle is exactly one rejected spawn -> one
+        // `ao start` -> one accepted spawn, keeping the call log easy to
+        // reason about.
+        std::env::set_var("DARK_FACTORY_CODER_FALLBACK_CHAIN", "");
+
+        let mut spec_a = spec("batch recovery prompt a", branch_a);
+        spec_a.ao_project = project_a.to_string();
+        spec_a.local_checkout = Some(target_a.clone());
+        let mut spec_b = spec("batch recovery prompt b", branch_b);
+        spec_b.ao_project = project_b.to_string();
+        spec_b.local_checkout = Some(target_b.clone());
+
+        let sessions = CliSessions::new(repo, "minimax");
+        let result = sessions.spawn_batch(&[spec_a, spec_b]);
+
+        std::env::set_var("PATH", old_path);
+        match old_fallback {
+            Some(v) => std::env::set_var("DARK_FACTORY_CODER_FALLBACK_CHAIN", v),
+            None => std::env::remove_var("DARK_FACTORY_CODER_FALLBACK_CHAIN"),
+        }
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(result.is_ok(), "batch recovery across two projects failed: {result:?}; calls={calls}");
+        let rows: Vec<serde_json::Value> = calls
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for project in [project_a, project_b] {
+            assert_eq!(
+                rows.iter().filter(|r| r["kind"] == "spawn-rejected" && r["project"] == project).count(),
+                1,
+                "each project must be rejected exactly once before recovery: {calls}"
+            );
+            assert_eq!(
+                rows.iter().filter(|r| r["kind"] == "start" && r["project"] == project).count(),
+                1,
+                "each project must be started exactly once: {calls}"
+            );
+            assert_eq!(
+                rows.iter().filter(|r| r["kind"] == "spawn-ok" && r["project"] == project).count(),
+                1,
+                "each project must succeed exactly once after its own recovery: {calls}"
+            );
+        }
+    }
+
     #[test]
     fn prompt_beginning_with_dash_remains_positional() {
         let prompt = "--not-an-ao-option preserve this prompt verbatim";
@@ -4997,7 +6563,7 @@ export const isTerminalSession = () => false;
 
     #[test]
     fn missing_worktree_uses_session_kill_cleanup_contract() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -5019,7 +6585,7 @@ with open(os.environ["AO_FAKE_CLEANUP_LOG"], "a", encoding="utf-8") as handle:
 if sys.argv[1] == "spawn":
     print("SESSION=missing-worktree-session")
     raise SystemExit(0)
-if sys.argv[1:] == ["session", "kill", "missing-worktree-session"]:
+if sys.argv[1:] == ["session", "kill", "missing-worktree-session", "-p", "dark-factory"]:
     raise SystemExit(0)
 raise SystemExit(9)
 "#,
@@ -5059,14 +6625,14 @@ raise SystemExit(9)
         assert!(result.is_err(), "missing Worktree must fail closed");
         assert_eq!(
             calls.last().unwrap(),
-            &serde_json::json!(["session", "kill", "missing-worktree-session"])
+            &serde_json::json!(["session", "kill", "missing-worktree-session", "-p", "dark-factory"])
         );
         assert!(!calls.iter().any(|call| call == &serde_json::json!(["stop", "missing-worktree-session"])));
     }
 
     #[test]
     fn missing_worktree_kill_failure_does_not_spawn_fallback_vendor() {
-        let _guard = gh_env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
             "afd_ao_missing_worktree_kill_failure_{}",
             std::process::id()
@@ -5086,7 +6652,7 @@ with open(os.environ["AO_FAKE_CLEANUP_LOG"], "a", encoding="utf-8") as handle:
 if sys.argv[1] == "spawn":
     print("SESSION=untracked-session")
     raise SystemExit(0)
-if sys.argv[1:] == ["session", "kill", "untracked-session"]:
+if sys.argv[1:] == ["session", "kill", "untracked-session", "-p", "dark-factory"]:
     print("scripted kill failure", file=sys.stderr)
     raise SystemExit(8)
 raise SystemExit(9)
@@ -5131,7 +6697,7 @@ raise SystemExit(9)
         );
         assert_eq!(
             calls.last().unwrap(),
-            &serde_json::json!(["session", "kill", "untracked-session"])
+            &serde_json::json!(["session", "kill", "untracked-session", "-p", "dark-factory"])
         );
     }
 
@@ -5186,7 +6752,7 @@ raise SystemExit(9)
 
     #[test]
     fn bridge_resolves_import_only_ao_core_from_hoisted_node_modules() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -5278,7 +6844,7 @@ export const isTerminalSession = () => false;
 
     #[test]
     fn bridge_runs_v013_guards_and_defers_at_active_cap_without_spawning() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -5388,7 +6954,7 @@ export const ensureLifecycleWorker = async () => appendFileSync(process.env.AO_F
 
     #[test]
     fn bridge_sanitizes_prompt_preserves_branch_and_cleans_worker_environment() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -5511,7 +7077,7 @@ export const isTerminalSession = () => false;
 
     #[test]
     fn bridge_backed_batch_and_invalid_workspace_cleanup_are_fail_closed() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -5720,7 +7286,7 @@ os.execvp(os.environ["AO_FAKE_NODE"], [os.environ["AO_FAKE_NODE"], os.environ["A
 
     #[test]
     fn bridge_creates_worktree_at_expected_revision_for_adopted_pr() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -6036,7 +7602,7 @@ export const isTerminalSession = () => false;
 
     #[test]
     fn bridge_remediates_and_resets_stale_branch_on_clean_retry() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -6317,7 +7883,30 @@ impl Sessions for CliSessions {
     }
 
     fn spawn(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
-        self.spawn_with_fallback(spec)
+        let res = self.spawn_with_fallback(spec);
+        match res {
+            Ok(session) => Ok(session),
+            Err(err) => {
+                if is_ao_not_running_error(&err) {
+                    let start_target = spec
+                        .local_checkout
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|| format!("https://github.com/{}.git", spec.repo));
+                    if let Err(recovery_error) =
+                        ensure_ao_project_recovered(&spec.ao_project, &start_target)
+                    {
+                        return Err(DaemonError::SpawnRecoveryFailed {
+                            spawn_error: Box::new(err),
+                            recovery_error: Box::new(recovery_error),
+                        });
+                    }
+                    self.spawn_with_fallback(spec)
+                } else {
+                    Err(err)
+                }
+            }
+        }
     }
 
     fn spawn_batch(&self, specs: &[SpawnSpec]) -> Result<Vec<SessionId>, DaemonError> {
@@ -6329,12 +7918,14 @@ impl Sessions for CliSessions {
         // admission, fallback, workspace, and error semantics.
         let mut spawned = Vec::with_capacity(specs.len());
         for spec in specs {
-            match self.spawn_with_fallback(spec) {
+            match self.spawn(spec) {
                 Ok(session) => spawned.push((session, spec)),
                 Err(spawn_error) => {
                     let mut cleanup_errors = Vec::new();
                     for (session, spawned_spec) in spawned.iter().rev() {
-                        if let Err(cleanup_error) = self.stop(session) {
+                        if let Err(cleanup_error) =
+                            Self::kill_in_project(&spawned_spec.ao_project, session)
+                        {
                             cleanup_errors.push(SpawnBatchCleanupFailure {
                                 session: session.0.clone(),
                                 bead_id: spawned_spec.bead_id.clone(),
@@ -6379,7 +7970,16 @@ impl Sessions for CliSessions {
     /// verbatim in telemetry a human reads, so the message names the branch
     /// and bead explicitly instead of a generic "not found".
     fn attach(&self, branch: &str, bead_id: &str) -> Result<SessionId, DaemonError> {
-        self.attach_within(branch, bead_id, 30)
+        self.attach_in_project(branch, bead_id, &self.project)
+    }
+
+    fn attach_in_project(
+        &self,
+        branch: &str,
+        bead_id: &str,
+        project: &str,
+    ) -> Result<SessionId, DaemonError> {
+        self.attach_within_in_project(branch, bead_id, project, 30)
     }
 
     /// Bead jleechan-zeij / issue #322 r4 P2: budget-bounded `attach` — the
@@ -6392,7 +7992,17 @@ impl Sessions for CliSessions {
         bead_id: &str,
         timeout_secs: u64,
     ) -> Result<SessionId, DaemonError> {
-        let out = run_tool("ao", &["status", "-p", &self.project, "--json"], timeout_secs)?;
+        self.attach_within_in_project(branch, bead_id, &self.project, timeout_secs)
+    }
+
+    fn attach_within_in_project(
+        &self,
+        branch: &str,
+        bead_id: &str,
+        project: &str,
+        timeout_secs: u64,
+    ) -> Result<SessionId, DaemonError> {
+        let out = run_tool("ao", &["status", "-p", project, "--json"], timeout_secs)?;
         let json_start = out.find('[').unwrap_or(0);
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
@@ -6401,12 +8011,41 @@ impl Sessions for CliSessions {
     }
 
     fn stop(&self, id: &SessionId) -> Result<(), DaemonError> {
-        run_tool("ao", &["session", "kill", &id.0], 30)?;
+        let project = self
+            .spawned_session_projects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&id.0)
+            .cloned()
+            .ok_or_else(|| {
+                DaemonError::Config(format!(
+                    "AO project ownership for session {} is unavailable; refusing unscoped cleanup",
+                    id.0
+                ))
+            })?;
+        Self::kill_in_project(&project, id)?;
+        self.spawned_session_projects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id.0);
+        Ok(())
+    }
+
+    fn stop_in_project(&self, id: &SessionId, project: &str) -> Result<(), DaemonError> {
+        Self::kill_in_project(project, id)?;
+        self.spawned_session_projects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id.0);
         Ok(())
     }
 
     fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError> {
-        let out = run_tool("ao", &["status", "-p", &self.project, "--json"], 30)?;
+        self.is_quiescent_in_project(id, &self.project)
+    }
+
+    fn is_quiescent_in_project(&self, id: &SessionId, project: &str) -> Result<bool, DaemonError> {
+        let out = run_tool("ao", &["status", "-p", project, "--json"], 30)?;
         let json_start = out.find('[').unwrap_or(0);
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
@@ -6424,7 +8063,15 @@ impl Sessions for CliSessions {
         &self,
         id: &SessionId,
     ) -> Result<crate::tools::SessionActivity, DaemonError> {
-        self.session_activity_within(id, 30)
+        self.session_activity_in_project(id, &self.project)
+    }
+
+    fn session_activity_in_project(
+        &self,
+        id: &SessionId,
+        project: &str,
+    ) -> Result<crate::tools::SessionActivity, DaemonError> {
+        self.session_activity_within_in_project(id, project, 30)
     }
 
     /// Bead jleechan-zeij / issue #322 r4 P2: budget-bounded
@@ -6434,7 +8081,16 @@ impl Sessions for CliSessions {
         id: &SessionId,
         timeout_secs: u64,
     ) -> Result<crate::tools::SessionActivity, DaemonError> {
-        let out = run_tool("ao", &["status", "-p", &self.project, "--json"], timeout_secs)?;
+        self.session_activity_within_in_project(id, &self.project, timeout_secs)
+    }
+
+    fn session_activity_within_in_project(
+        &self,
+        id: &SessionId,
+        project: &str,
+        timeout_secs: u64,
+    ) -> Result<crate::tools::SessionActivity, DaemonError> {
+        let out = run_tool("ao", &["status", "-p", project, "--json"], timeout_secs)?;
         let json_start = out.find('[').unwrap_or(0);
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
@@ -6459,7 +8115,15 @@ impl Sessions for CliSessions {
     /// callers only ever reject a dispatch on a *positive* mismatch, never
     /// on an inability to check.
     fn session_branch(&self, id: &SessionId) -> Result<Option<String>, DaemonError> {
-        let out = match run_tool("ao", &["status", "-p", &self.project, "--json"], 30) {
+        self.session_branch_in_project(id, &self.project)
+    }
+
+    fn session_branch_in_project(
+        &self,
+        id: &SessionId,
+        project: &str,
+    ) -> Result<Option<String>, DaemonError> {
+        let out = match run_tool("ao", &["status", "-p", project, "--json"], 30) {
             Ok(o) => o,
             Err(_) => return Ok(None),
         };
@@ -6475,6 +8139,30 @@ impl Sessions for CliSessions {
                         .get("branch")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn session_pr_number_in_project(
+        &self,
+        id: &SessionId,
+        project: &str,
+    ) -> Result<Option<u64>, DaemonError> {
+        let out = match run_tool("ao", &["status", "-p", project, "--json"], 30) {
+            Ok(o) => o,
+            Err(_) => return Ok(None),
+        };
+        let json_start = out.find('[').unwrap_or(0);
+        let data: serde_json::Value = match serde_json::from_str(&out[json_start..]) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        if let Some(arr) = data.as_array() {
+            for entry in arr {
+                if entry.get("name").and_then(|v| v.as_str()) == Some(&id.0) {
+                    return Ok(entry.get("prNumber").and_then(|v| v.as_u64()));
                 }
             }
         }
@@ -7074,7 +8762,7 @@ mod active_session_count_tests {
 
 #[cfg(test)]
 mod worktree_remote_url_tests {
-    use super::{gh_env_test_lock, CliSessions};
+    use super::CliSessions;
     use crate::tools::{SessionId, Sessions};
 
     fn record_workspace(
@@ -7278,7 +8966,7 @@ mod worktree_remote_url_tests {
     /// one from the factory branch.
     #[test]
     fn worktree_remote_url_reads_real_git_remote() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -7331,7 +9019,7 @@ mod worktree_remote_url_tests {
     /// get-url --push` fix.
     #[test]
     fn worktree_remote_url_reports_pushurl_when_distinct_from_fetch_url() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -7392,7 +9080,7 @@ mod worktree_remote_url_tests {
 
     #[test]
     fn worktree_remote_url_fails_closed_for_unconfigured_remote_name() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -7427,7 +9115,7 @@ mod worktree_remote_url_tests {
 
 #[cfg(test)]
 mod worktree_transcript_last_activity_epoch_tests {
-    use super::{gh_env_test_lock, CliSessions};
+    use super::CliSessions;
     use crate::tools::Sessions;
 
     fn record_workspace(
@@ -7466,7 +9154,7 @@ mod worktree_transcript_last_activity_epoch_tests {
     /// remote branch.
     #[test]
     fn reports_latest_jsonl_mtime_from_derived_transcript_dir() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -7516,7 +9204,7 @@ mod worktree_transcript_last_activity_epoch_tests {
     /// the naming convention drifted) is "no evidence", not an error.
     #[test]
     fn no_evidence_when_transcript_dir_missing() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -8362,14 +10050,14 @@ mod chain_llm_fallback_argv_tests {
     /// `ChainLlm::judge` window, so a single shared binary mutex is
     /// sufficient even though two tests exist.
     ///
-    /// jleechan-9sl1: delegates to the file-level `gh_env_test_lock()` shared
+    /// jleechan-9sl1: delegates to the crate-wide `test_env_lock()` shared
     /// by every PATH/env-mutating test module in this file -- see that
     /// function's doc comment for why a module-local lock is insufficient
     /// (it only serializes within one module, not across the
     /// `chain_llm_fallback_argv_tests` / `pr_snapshot_checks_fetch_failure_tests`
     /// / `cli_vcs_gh_tests` modules, which all mutate the same global `PATH`).
     fn env_lock() -> &'static Mutex<()> {
-        super::gh_env_test_lock()
+        crate::test_env_lock()
     }
 
     /// Write an executable shell script at `path` that prints every element
@@ -8596,14 +10284,14 @@ mod pr_snapshot_checks_fetch_failure_tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
 
-    /// jleechan-9sl1: delegates to the file-level `gh_env_test_lock()` shared
+    /// jleechan-9sl1: delegates to the crate-wide `test_env_lock()` shared
     /// by every PATH/env-mutating test module in this file (previously this
     /// module had its own independent lock, which only serialized against
     /// itself, not against `chain_llm_fallback_argv_tests` or
-    /// `cli_vcs_gh_tests` -- see `gh_env_test_lock`'s doc comment for the
+    /// `cli_vcs_gh_tests` -- see `test_env_lock`'s crate-root docs for the
     /// cross-module race that caused).
     fn env_lock() -> &'static Mutex<()> {
-        super::gh_env_test_lock()
+        crate::test_env_lock()
     }
 
     /// Write a `gh` shim that answers every call `CliScm::pr_snapshot` makes:
@@ -8711,6 +10399,7 @@ exit 1
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = super::BreakerSandbox::new("pr_snapshot_fake_gh", _guard);
 
         super::clear_graphql_rate_limited();
 
@@ -8756,8 +10445,6 @@ exit 1
                 std::env::remove_var("GH_TEST_FALLBACK_CHECKS");
             }
         }
-        drop(_guard);
-
         std::fs::remove_dir_all(&dir).ok();
         result
     }
@@ -8843,6 +10530,7 @@ exit 1
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = super::BreakerSandbox::new("primary_checks_trip", _guard);
         super::clear_graphql_rate_limited();
 
         let dir = make_fake_gh_dir("rate_limit_trip");
@@ -9106,15 +10794,15 @@ mod cli_vcs_gh_tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
 
-    /// jleechan-9sl1: delegates to the file-level `gh_env_test_lock()` shared
+    /// jleechan-9sl1: delegates to the crate-wide `test_env_lock()` shared
     /// by every PATH/env-mutating test module in this file -- a module-local
     /// lock here would only serialize this module's own tests against each
     /// other, not against `chain_llm_fallback_argv_tests` or
     /// `pr_snapshot_checks_fetch_failure_tests`, which mutate the same
-    /// global `PATH`. See `gh_env_test_lock`'s doc comment for the
+    /// global `PATH`. See `test_env_lock`'s crate-root docs for the
     /// cross-module flake this fixes.
     fn env_lock() -> &'static Mutex<()> {
-        super::gh_env_test_lock()
+        crate::test_env_lock()
     }
 
     /// Write a `gh` shim that answers `gh api <path> --jq <filter>` calls for
@@ -9834,7 +11522,7 @@ mod offline_cache_tests {
     /// fixture never bleeds into a sibling test.
     ///
     /// `set_current_dir` is a PROCESS-WIDE mutation, so every test in
-    /// this mod must serialize on the file-level `gh_env_test_lock()`
+    /// this mod must serialize on the crate-wide `test_env_lock()`
     /// (also used by `chain_llm_fallback_argv_tests`,
     /// `pr_snapshot_checks_fetch_failure_tests`, `cli_vcs_gh_tests` for
     /// PATH-env mutations). Without that lock, two parallel tests would
@@ -9852,7 +11540,7 @@ mod offline_cache_tests {
             // other `#[cfg(test)]` mod in this file) can mutate
             // cwd/PATH concurrently with us. Poisoned lock recovery
             // matches the established pattern in this file.
-            let lock = super::gh_env_test_lock()
+            let lock = crate::test_env_lock()
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let nanos = std::time::SystemTime::now()

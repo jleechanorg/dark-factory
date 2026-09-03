@@ -46,6 +46,10 @@ from .handler_sandbox import (
     _holdouts_repo_path,
     _holdout_denied_paths,
     _sealed_benchmark_doc_paths,
+    _macos_read_only_profile,  # noqa: F401 - public handler shim export
+    _create_controller_runtime,  # noqa: F401 - public handler shim export
+    _controller_output_schema,  # noqa: F401 - public handler shim export
+    _cleanup_controller_runtime,  # noqa: F401 - public handler shim export
     _sandboxed_args,
     _sandboxed_args_for_workdir,
     # Linux isolation backend (jleechan-haux) — re-exported so
@@ -54,6 +58,13 @@ from .handler_sandbox import (
     _linux_preload_lib_path,
     _verify_linux_preload_denies,
     _linux_sandbox_prefix,
+    _linux_landlock_launcher_path,  # noqa: F401 - public handler shim export
+    _linux_landlock_abi,  # noqa: F401 - public handler shim export
+    _linux_codex_runtime_paths,  # noqa: F401 - public handler shim export
+    _linux_controller_sandbox_prefix,  # noqa: F401 - public handler shim export
+    _extend_pinned_launcher_command,  # noqa: F401 - public handler shim export
+    _close_pinned_launcher_command,  # noqa: F401 - public handler shim export
+    _reset_linux_landlock_launcher_cache_for_tests,  # noqa: F401 - public handler shim export
     _reset_linux_preload_verification_cache_for_tests,
     _verify_darwin_sandbox_exec,
     _reset_darwin_sandbox_verification_cache_for_tests,

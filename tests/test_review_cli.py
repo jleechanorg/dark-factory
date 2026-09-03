@@ -2,20 +2,85 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
-import re
+import json
+import os
+import pathlib
 import subprocess
+import sys
+import tempfile
+from typing import ClassVar
 
 import pytest
 
-from runner.review_cli import main
-from runner.review_controller import CHECK_IDS
+from runner.review_cli import _parser, _read_validated_task, main
+from runner.handler_sandbox import _PinnedLauncherCommand
+from runner.review_controller import ReviewContractError
+
+
+def _safe_controller_args(_backend, prompt, _ctx, _timeout):
+    """Return the minimal canonical command before controller hardening."""
+    if sys.platform.startswith("linux"):
+        return [
+            "/usr/bin/env",
+            "DENY_PATHS=/sealed/holdouts",
+            "/usr/local/bin/codex",
+            "exec",
+            "--skip-git-repo-check",
+            prompt,
+        ]
+    return ["codex", "exec", "--skip-git-repo-check", prompt]
+
+
+def _raise_controller_setup_error(*_args, **_kwargs):
+    raise ValueError("controller executable trust proof failed")
+
+
+@pytest.fixture(autouse=True)
+def _stub_controller_transport_for_cli_tests(monkeypatch):
+    """Keep CLI contract tests independent of host Landlock availability."""
+    monkeypatch.setattr(
+        "runner.review_cli._controller_codex_args",
+        lambda command, **_kwargs: command,
+    )
+
+
+@pytest.fixture
+def _private_tmp_root():
+    """Create test state below the real home, whose ancestry is private.
+
+    The controller intentionally rejects writable or symlinked path ancestors.
+    Pytest's default ``tmp_path`` is commonly under ``/tmp`` (mode 1777), so it
+    is not a valid home for the controller runtime on Linux CI.  Capture the
+    real home before the test changes ``HOME`` and let TemporaryDirectory clean
+    up the isolated root afterward.
+    """
+    real_home = pathlib.Path.home()
+    with tempfile.TemporaryDirectory(prefix="df-review-cli-", dir=real_home) as root:
+        yield pathlib.Path(root)
+
+
+@pytest.fixture(autouse=True)
+def _private_codex_home(_private_tmp_root, monkeypatch):
+    """Give CLI tests a private, self-contained Codex auth source.
+
+    The controller runtime deliberately refuses symlinked HOME ancestors and
+    must copy auth from the caller's ``~/.codex``.  Build both under the
+    canonicalized pytest temp root so tests do not depend on the operator's
+    home directory or its Codex installation.
+    """
+    home = _private_tmp_root / "home"
+    codex_home = home / ".codex"
+    codex_home.mkdir(mode=0o700, parents=True)
+    auth = codex_home / "auth.json"
+    auth.write_text('{"test":true}\n', encoding="utf-8")
+    auth.chmod(0o600)
+    monkeypatch.setenv("HOME", str(home))
 
 
 def _repo(tmp_path):
     repo = tmp_path / "repo"
-    repo.mkdir()
+    repo.mkdir(mode=0o700)
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.email", "review@example.invalid"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.name", "Review Test"], cwd=repo, check=True)
@@ -33,40 +98,20 @@ def _repo(tmp_path):
     return repo, base, head
 
 
+def _task(repo):
+    return repo / "value.txt"
+
+
 def _valid_response(prompt: str, *, verdict: str = "pass") -> str:
-    keys = (
-        "PROMPT_ID",
-        "PROMPT_SHA256",
-        "ENVELOPE_SHA256",
-        "HEAD_SHA",
-        "TASK_SHA256",
-        "DIFF_SHA256",
-        "CHANGED_FILES_SHA256",
-        "EVIDENCE_MANIFEST_SHA256",
-    )
-    values = {}
-    for key in keys:
-        match = re.search(rf"^{key}: (\S+)$", prompt, re.MULTILINE)
-        assert match, f"prompt is missing required binding line: {key}"
-        values[key] = match.group(1)
-    return "\n".join(
-        [
-            *(f"{key}: {values[key]}" for key in keys),
-            f"VERDICT: {verdict}",
-            *(
-                f"{check_id}: {'pass' if verdict == 'pass' else 'fail'}"
-                for check_id in CHECK_IDS
-            ),
-            "",
-            "## Findings",
-            "None; inspected the changed implementation and callers.",
-            "## Commands Executed",
-            "`python -m pytest` — exit code 0.",
-            "## Evidence Checked",
-            "Changed files and test output.",
-            "## Caveats",
-            "None.",
-        ]
+    return json.dumps(
+        {
+            "verdict": verdict,
+            "findings": [] if verdict == "pass" else ["blocking finding"],
+            "evidence_checked": ["changed files and frozen bundle"],
+            "commands_executed": [],
+            "caveats": [],
+        },
+        separators=(",", ":"),
     )
 
 
@@ -77,36 +122,25 @@ def _valid_transport(prompt: str, *, verdict: str = "pass") -> str:
                 {
                     "type": "item.completed",
                     "item": {
-                        "type": "command_execution",
-                        "command": "python -m pytest -q",
-                        "exit_code": 0,
-                        "aggregated_output": "3 passed",
-                    },
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "item.completed",
-                    "item": {
                         "type": "agent_message",
                         "text": _valid_response(prompt, verdict=verdict),
                     },
                 }
             ),
+            json.dumps({"type": "turn.completed", "usage": {}}),
         )
     )
 
 
 def test_review_command_writes_valid_digest_bound_receipt(tmp_path, monkeypatch, capsys):
     repo, base, head = _repo(tmp_path)
-    task = tmp_path / "task.md"
-    task.write_text("Review the behavior change.", encoding="utf-8")
+    task = _task(repo)
     output = tmp_path / "review-output"
     real_run = subprocess.run
 
     monkeypatch.setattr(
         "runner.review_cli._gate_subprocess_args",
-        lambda backend, prompt, ctx, timeout: ["codex", "exec", prompt],
+        _safe_controller_args,
     )
 
     def fake_run(command, **kwargs):
@@ -131,6 +165,8 @@ def test_review_command_writes_valid_digest_bound_receipt(tmp_path, monkeypatch,
             head,
             "--task-file",
             str(task),
+            "--evidence",
+            "value.txt",
             "--output-dir",
             str(output),
             "--backend",
@@ -149,7 +185,8 @@ def test_review_command_writes_valid_digest_bound_receipt(tmp_path, monkeypatch,
     assert receipt["envelope_path"] == "envelope.json"
     assert receipt["response_path"] == "reviewer.output.md"
     assert receipt["transport_path"] == "transport.jsonl"
-    assert receipt["command_receipts"][0]["exit_code"] == 0
+    assert receipt["command_receipts"] == []
+    assert receipt["transport_receipt"]["transport"] == "tool-free"
     assert receipt["envelope_sha256"] == hashlib.sha256(
         (output / "envelope.json").read_bytes()
     ).hexdigest()
@@ -162,19 +199,193 @@ def test_review_command_writes_valid_digest_bound_receipt(tmp_path, monkeypatch,
     assert json.loads(capsys.readouterr().out)["status"] == "valid"
 
 
+def test_review_cli_passes_and_closes_pinned_linux_launcher(tmp_path, monkeypatch, capsys):
+    """The standalone CLI must inherit and then close a pinned launcher FD."""
+    repo, base, head = _repo(tmp_path)
+    task = _task(repo)
+    output = tmp_path / "review-output"
+    real_run = subprocess.run
+    seen: dict[str, object] = {}
+    launcher_fd = os.open(os.devnull, os.O_RDONLY)
+    command = _PinnedLauncherCommand(["codex", "exec", "-"], launcher_fd)
+
+    class Runtime:
+        run_dir = tmp_path / "runtime"
+        codex_home = tmp_path / "codex-home"
+        env: ClassVar[dict[str, str]] = {}
+
+    Runtime.run_dir.mkdir(mode=0o700)
+
+    monkeypatch.setattr(
+        "runner.review_cli._gate_subprocess_args",
+        _safe_controller_args,
+    )
+    monkeypatch.setattr(
+        "runner.review_cli._controller_output_schema",
+        lambda run_dir: run_dir / "output-schema.json",
+    )
+    monkeypatch.setattr("runner.review_cli._create_controller_runtime", lambda: Runtime())
+    monkeypatch.setattr("runner.review_cli._controller_codex_args", lambda *args, **kwargs: command)
+    monkeypatch.setattr("runner.review_cli._cleanup_controller_runtime", lambda path: None)
+
+    def fake_run(process_args, **kwargs):
+        if process_args[0] == "git":
+            return real_run(process_args, **kwargs)
+        seen["pass_fds"] = kwargs.get("pass_fds")
+        return subprocess.CompletedProcess(
+            process_args, 0, stdout=_valid_transport(kwargs["input"]), stderr=""
+        )
+
+    monkeypatch.setattr("runner.review_cli.subprocess.run", fake_run)
+    rc = main(
+        [
+            "--workdir", str(repo),
+            "--base-sha", base,
+            "--head-sha", head,
+            "--task-file", str(task),
+            "--evidence", "value.txt",
+            "--output-dir", str(output),
+            "--backend", "codex",
+        ]
+    )
+
+    assert rc == 0
+    assert seen["pass_fds"] == (launcher_fd,)
+    assert command.launcher_fd == -1
+    assert json.loads(capsys.readouterr().out)["status"] == "valid"
+
+
+def test_review_cli_preserves_controller_setup_error(tmp_path, monkeypatch, capsys):
+    repo, base, head = _repo(tmp_path)
+    task = _task(repo)
+    output = tmp_path / "review-output"
+
+    class Runtime:
+        run_dir = tmp_path / "runtime"
+        codex_home = tmp_path / "codex-home"
+        env: ClassVar[dict[str, str]] = {}
+
+    Runtime.run_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(
+        "runner.review_cli._gate_subprocess_args", _safe_controller_args
+    )
+    monkeypatch.setattr(
+        "runner.review_cli._controller_output_schema",
+        lambda run_dir: run_dir / "output-schema.json",
+    )
+    monkeypatch.setattr("runner.review_cli._create_controller_runtime", lambda: Runtime())
+    monkeypatch.setattr(
+        "runner.review_cli._controller_codex_args",
+        _raise_controller_setup_error,
+    )
+    monkeypatch.setattr("runner.review_cli._cleanup_controller_runtime", lambda path: None)
+
+    rc = main(
+        [
+            "--workdir", str(repo),
+            "--base-sha", base,
+            "--head-sha", head,
+            "--task-file", str(task),
+            "--evidence", "value.txt",
+            "--output-dir", str(output),
+            "--backend", "codex",
+        ]
+    )
+
+    assert rc == 1
+    receipt = json.loads((output / "controller-receipt.json").read_text())
+    assert "controller executable trust proof failed" in receipt["contract_error"]
+    assert json.loads(capsys.readouterr().out)["status"] == "invalid"
+
+
+def test_review_command_rejects_pass_without_evidence_manifest(
+    tmp_path, monkeypatch, capsys
+):
+    repo, base, head = _repo(tmp_path)
+    task = _task(repo)
+    output = tmp_path / "review-output"
+    real_run = subprocess.run
+    monkeypatch.setattr(
+        "runner.review_cli._gate_subprocess_args",
+        _safe_controller_args,
+    )
+
+    def fake_run(command, **kwargs):
+        if command[0] == "git":
+            return real_run(command, **kwargs)
+        return subprocess.CompletedProcess(
+            command, 0, stdout=_valid_transport(kwargs["input"]), stderr=""
+        )
+
+    monkeypatch.setattr("runner.review_cli.subprocess.run", fake_run)
+    rc = main(
+        [
+            "--workdir", str(repo),
+            "--base-sha", base,
+            "--head-sha", head,
+            "--task-file", str(task),
+            "--output-dir", str(output),
+            "--backend", "codex",
+        ]
+    )
+
+    assert rc == 1
+    receipt = json.loads((output / "controller-receipt.json").read_text())
+    assert receipt["status"] == "invalid"
+    assert "evidence manifest" in receipt["contract_error"]
+    assert json.loads(capsys.readouterr().out)["status"] == "invalid"
+
+
+def test_review_command_rejects_empty_success_receipt(
+    tmp_path, monkeypatch, capsys
+):
+    repo, base, head = _repo(tmp_path)
+    task = _task(repo)
+    output = tmp_path / "review-output"
+    real_run = subprocess.run
+    monkeypatch.setattr(
+        "runner.review_cli._gate_subprocess_args",
+        _safe_controller_args,
+    )
+    empty_transport = _valid_transport("").rsplit("\n", 1)[0]
+
+    def fake_run(command, **kwargs):
+        if command[0] == "git":
+            return real_run(command, **kwargs)
+        return subprocess.CompletedProcess(command, 0, stdout=empty_transport, stderr="")
+
+    monkeypatch.setattr("runner.review_cli.subprocess.run", fake_run)
+    rc = main(
+        [
+            "--workdir", str(repo),
+            "--base-sha", base,
+            "--head-sha", head,
+            "--task-file", str(task),
+            "--evidence", "value.txt",
+            "--output-dir", str(output),
+            "--backend", "codex",
+        ]
+    )
+
+    assert rc == 1
+    receipt = json.loads((output / "controller-receipt.json").read_text())
+    assert receipt["status"] == "invalid"
+    assert "exactly one turn.completed" in receipt["contract_error"]
+    assert json.loads(capsys.readouterr().out)["status"] == "invalid"
+
+
 def test_review_command_returns_two_for_valid_fail_verdict(
     tmp_path, monkeypatch, capsys
 ):
     """Transport validity must never be mistaken for review acceptance."""
     repo, base, head = _repo(tmp_path)
-    task = tmp_path / "task.md"
-    task.write_text("Review the behavior change.", encoding="utf-8")
+    task = _task(repo)
     output = tmp_path / "review-output"
     real_run = subprocess.run
 
     monkeypatch.setattr(
         "runner.review_cli._gate_subprocess_args",
-        lambda backend, prompt, ctx, timeout: ["codex", "exec", prompt],
+        _safe_controller_args,
     )
 
     def fake_run(command, **kwargs):
@@ -214,18 +425,239 @@ def test_review_command_returns_two_for_valid_fail_verdict(
     assert json.loads(capsys.readouterr().out)["verdict"] == "fail"
 
 
+
+@pytest.mark.parametrize(
+    "stub_env",
+    ("DARK_FACTORY_ITERATION_STUB", "DARK_FACTORY_FAKE_LLM"),
+)
+def test_review_command_rejects_pass_under_stub_env(
+    tmp_path, monkeypatch, capsys, stub_env
+):
+    repo, base, head = _repo(tmp_path)
+    task = _task(repo)
+    output = tmp_path / "review-output"
+    real_run = subprocess.run
+    monkeypatch.setenv(stub_env, "1")
+    monkeypatch.setattr(
+        "runner.review_cli._gate_subprocess_args",
+        _safe_controller_args,
+    )
+
+    def fake_run(command, **kwargs):
+        if command[0] == "git":
+            return real_run(command, **kwargs)
+        return subprocess.CompletedProcess(
+            command, 0, stdout=_valid_transport(kwargs["input"]), stderr=""
+        )
+
+    monkeypatch.setattr("runner.review_cli.subprocess.run", fake_run)
+    rc = main(
+        [
+            "--workdir", str(repo),
+            "--base-sha", base,
+            "--head-sha", head,
+            "--task-file", str(task),
+            "--evidence", "value.txt",
+            "--output-dir", str(output),
+            "--backend", "codex",
+        ]
+    )
+
+    assert rc == 1
+    receipt = json.loads((output / "controller-receipt.json").read_text())
+    assert receipt["status"] == "invalid"
+    assert "stub-mode" in receipt["contract_error"]
+    assert json.loads(capsys.readouterr().out)["status"] == "invalid"
+
+
+def test_review_command_rejects_symlinked_parent_before_target_query(
+    tmp_path, monkeypatch
+):
+    repo, base, head = _repo(tmp_path)
+    task = _task(repo)
+    alias_parent = tmp_path / "alias-parent"
+    alias_parent.symlink_to(tmp_path, target_is_directory=True)
+    target_operation_attempted = False
+
+    def unexpected_target_operation(*args, **kwargs):
+        nonlocal target_operation_attempted
+        target_operation_attempted = True
+        raise AssertionError("target must not be queried through a symlink")
+
+    monkeypatch.setattr("runner.review_cli.subprocess.run", unexpected_target_operation)
+    rc = main(
+        [
+            "--workdir", str(alias_parent / repo.name),
+            "--base-sha", base,
+            "--head-sha", head,
+            "--task-file", str(task),
+            "--output-dir", str(tmp_path / "review-output"),
+        ]
+    )
+
+    assert rc == 1
+    assert target_operation_attempted is False
+
+
+@pytest.mark.parametrize(
+    "discovery_error", (OSError("unavailable"), RuntimeError("missing"))
+)
+def test_review_command_fails_closed_when_holdout_discovery_fails(
+    tmp_path, monkeypatch, discovery_error
+):
+    repo, base, head = _repo(tmp_path)
+    task = _task(repo)
+    launched = False
+
+    def unavailable():
+        raise type(discovery_error)(str(discovery_error))
+
+    def unexpected_launch(*args, **kwargs):
+        nonlocal launched
+        launched = True
+        raise AssertionError("holdout discovery must fail before reviewer launch")
+
+    monkeypatch.setattr(
+        "runner.handler_sandbox._holdout_denied_paths", unavailable
+    )
+    monkeypatch.setattr("runner.review_cli._gate_subprocess_args", unexpected_launch)
+    monkeypatch.setattr(
+        "runner.review_cli._snapshot",
+        lambda *args, **kwargs: pytest.fail(
+            "holdout discovery must fail before snapshot"
+        ),
+    )
+
+    rc = main(
+        [
+            "--workdir", str(repo),
+            "--base-sha", base,
+            "--head-sha", head,
+            "--task-file", str(task),
+            "--evidence", "value.txt",
+            "--output-dir", str(tmp_path / "review-output"),
+        ]
+    )
+
+    assert rc == 1
+    assert launched is False
+
+
+def test_task_file_rejects_external_holdout_and_symlink_before_backend(tmp_path, monkeypatch):
+    repo, _base, _head = _repo(tmp_path)
+    outside = tmp_path / "outside.md"
+    outside.write_text("outside", encoding="utf-8")
+    holdout = tmp_path / "holdout"
+    holdout.mkdir()
+    held = holdout / "task.md"
+    held.write_text("sealed", encoding="utf-8")
+    linked = repo / "task-link.md"
+    linked.symlink_to(outside)
+
+    for candidate in (outside, held, linked):
+        with pytest.raises(ReviewContractError):
+            _read_validated_task(candidate, repo, (str(holdout),))
+
+    launched = False
+
+    def unexpected_launch(*args, **kwargs):
+        nonlocal launched
+        launched = True
+        raise AssertionError("invalid task file must fail before backend")
+
+    monkeypatch.setattr("runner.review_cli._gate_subprocess_args", unexpected_launch)
+    rc = main(
+        [
+            "--workdir", str(repo),
+            "--base-sha", _base,
+            "--head-sha", _head,
+            "--task-file", str(outside),
+            "--evidence", "value.txt",
+            "--output-dir", str(tmp_path / "review-output"),
+        ]
+    )
+    assert rc == 1
+    assert launched is False
+
+
+@pytest.mark.parametrize("replacement", ("symlink", "hardlink"))
+def test_task_file_read_binds_descriptor_before_replacement(tmp_path, replacement, monkeypatch):
+    repo, _base, _head = _repo(tmp_path)
+    task = repo / "task.md"
+    task.write_text("review task\n", encoding="utf-8")
+    holdout = tmp_path / "holdout"
+    holdout.mkdir()
+    sealed = holdout / "sealed.md"
+    sealed.write_text("sealed\n", encoding="utf-8")
+    real_open = os.open
+
+    def race_open(path, flags, *args):
+        if pathlib.Path(path) == task:
+            task.unlink()
+            if replacement == "symlink":
+                task.symlink_to(sealed)
+            else:
+                os.link(sealed, task)
+        return real_open(path, flags, *args)
+
+    monkeypatch.setattr("runner.review_cli.os.open", race_open)
+    with pytest.raises(ReviewContractError, match="safe|regular"):
+        _read_validated_task(task, repo, (str(holdout),))
+
+
+def test_review_command_rejects_post_request_symlink_swap(tmp_path, monkeypatch):
+    repo, base, head = _repo(tmp_path)
+    task = _task(repo)
+    output = tmp_path / "review-output"
+    real_run = subprocess.run
+    swapped = False
+    monkeypatch.setattr(
+        "runner.review_cli._gate_subprocess_args",
+        _safe_controller_args,
+    )
+
+    def fake_run(command, **kwargs):
+        nonlocal swapped
+        if command[0] == "git":
+            return real_run(command, **kwargs)
+        moved = tmp_path / "reviewed-repo-moved"
+        repo.rename(moved)
+        repo.symlink_to(moved, target_is_directory=True)
+        swapped = True
+        return subprocess.CompletedProcess(
+            command, 0, stdout=_valid_transport(kwargs["input"]), stderr=""
+        )
+
+    monkeypatch.setattr("runner.review_cli.subprocess.run", fake_run)
+    rc = main(
+        [
+            "--workdir", str(repo),
+            "--base-sha", base,
+            "--head-sha", head,
+            "--task-file", str(task),
+            "--output-dir", str(output),
+            "--backend", "codex",
+        ]
+    )
+
+    assert swapped is True
+    assert rc == 1
+    receipt = json.loads((output / "controller-receipt.json").read_text())
+    assert receipt["status"] == "invalid"
+    assert "symlink" in receipt["contract_error"]
+
+
 def test_review_command_fails_closed_on_unstructured_response(
     tmp_path, monkeypatch
 ):
     repo, base, head = _repo(tmp_path)
-    task = tmp_path / "task.md"
-    task.write_text("Review the behavior change.", encoding="utf-8")
+    task = _task(repo)
     output = tmp_path / "review-output"
     real_run = subprocess.run
 
     monkeypatch.setattr(
         "runner.review_cli._gate_subprocess_args",
-        lambda backend, prompt, ctx, timeout: ["codex", "exec", prompt],
+        _safe_controller_args,
     )
 
     def fake_run(command, **kwargs):
@@ -260,8 +692,7 @@ def test_review_command_rejects_dirty_workspace_before_backend(
     tmp_path, monkeypatch
 ):
     repo, base, head = _repo(tmp_path)
-    task = tmp_path / "task.md"
-    task.write_text("Review the behavior change.", encoding="utf-8")
+    task = _task(repo)
     (repo / "untracked.txt").write_text("not frozen\n", encoding="utf-8")
     launched = False
 
@@ -308,3 +739,50 @@ def test_main_entrypoint_dispatches_review_subcommand(capsys):
     assert "--task-file" in captured.out
     assert "--output-dir" in captured.out
     assert "--backend" in captured.out
+
+
+@pytest.mark.parametrize("backend", ("claude", "agy", "minimax", "claude-sonnet"))
+def test_review_cli_rejects_backends_without_captured_command_receipts(backend):
+    """Standalone controller review accepts only its JSONL Codex transport."""
+    backend_action = next(
+        action for action in _parser()._actions if action.dest == "backend"
+    )
+
+    assert backend not in backend_action.choices
+
+
+def test_review_wrapper_does_not_rewrite_codex_to_non_codex_fallback(tmp_path):
+    """A review request must reach the Codex-only parser unchanged."""
+    root = tmp_path / "dark-factory"
+    wrapper = root / "bin" / "dark-factory"
+    python = root / ".venv" / "bin" / "python"
+    wrapper.parent.mkdir(parents=True)
+    python.parent.mkdir(parents=True)
+    wrapper.write_text(
+        pathlib.Path(__file__).parents[1].joinpath("bin/dark-factory").read_text(),
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    python.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$2\" = runner.preflight ]; then\n"
+        "  printf '%s\\n' '{\"status\":\"warn\",\"fallback_recommendation\":\"claude\"}'\n"
+        "  exit 0\n"
+        "fi\n"
+        "printf '%s\\n' \"$*\"\n",
+        encoding="utf-8",
+    )
+    python.chmod(0o755)
+
+    completed = subprocess.run(
+        [str(wrapper), "review", "--backend", "codex"],
+        cwd=tmp_path,
+        env={"PATH": os.environ["PATH"]},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert "review --backend codex" in completed.stdout
+    assert "review --backend claude" not in completed.stdout

@@ -340,6 +340,62 @@ fn one_full_tick_cycle_keeps_unknown_only_gate_attested() {
 }
 
 #[test]
+fn local_factory_bead_routes_when_github_intake_is_rate_limited() {
+    let scm = FakeScm::new();
+    scm.rate_limit_next_labeled_prs.replace(true);
+    scm.rate_limit_next_labeled_issues.replace(true);
+    let tracker = FakeTracker::new();
+    tracker.candidates.borrow_mut().push(Bead {
+        id: "local-rate-limit-survivor".into(),
+        title: "route local factory work".into(),
+        description: "target_repo: owner/repo\ncontinue without GitHub intake".into(),
+        notes: String::new(),
+        file_tree_summary: String::new(),
+        external_ref: None,
+    });
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"bounded local task"}"#.into(),
+    ));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = test_vcs();
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_local_intake_rate_limit_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        0,
+        0,
+    )
+    .expect("GitHub rate limits must not abort local bead intake");
+
+    assert!(sessions.calls.borrow().iter().any(|call| {
+        call == "spawn(local-rate-limit-survivor)"
+    }), "local bead did not reach dispatch: {:?}", sessions.calls.borrow());
+    let overlay = store
+        .load("local-rate-limit-survivor")
+        .unwrap()
+        .expect("local bead must have a durable overlay");
+    assert_ne!(overlay.state, OverlayState::HumanHeld);
+    let _ = std::fs::remove_file(telemetry_log);
+}
+
+#[test]
 fn run_tick_rejects_non_stage_1_or_2_config() {
     let scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -486,6 +542,7 @@ fn run_tick_emits_dispatched_only_for_actual_dispatch_successes() {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+                session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -598,6 +655,7 @@ fn test_autonomy_increment_and_timebox_envelope() {
             pr_number: None,
             branch: Some("factory/bead-1-r1".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -664,6 +722,7 @@ fn test_autonomy_budget_warning_crossing() {
             pr_number: None,
             branch: Some("factory/bead-2-r1".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -724,6 +783,7 @@ fn test_wedge_detection_dispatched_coder_silent() {
             pr_number: None,
             branch: Some("factory/bead-silent-r1".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -799,6 +859,7 @@ fn test_wedge_detection_dispatched_coder_silent_saved_by_transcript_activity() {
             pr_number: None,
             branch: Some("factory/bead-active-r1".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -894,6 +955,7 @@ fn test_wedge_detection_dispatched_coder_silent_stale_transcript_still_parks() {
             pr_number: None,
             branch: Some("factory/bead-stale-r1".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -977,6 +1039,7 @@ fn test_dispatch_integrity_sweep_parks_session_branch_mismatch() {
             pr_number: Some(8227),
             branch: Some("factory/jleechan-vj89-r1".into()),
             session_id: Some("wa-3004".into()),
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -1099,6 +1162,7 @@ fn test_dispatch_integrity_sweep_leaves_matching_branch_alone() {
             pr_number: None,
             branch: Some("factory/bead-ok-r1".into()),
             session_id: Some("wa-4001".into()),
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -1163,6 +1227,7 @@ fn test_dispatch_integrity_sweep_detects_force_push_on_adopted_branch() {
             pr_number: Some(999),
             branch: Some("alice/my-cool-feature".into()),
             session_id: Some("session-xyz".into()),
+            session_ao_project: None,
             is_adopted: true,
             spawn_failure_count: 0,
             pre_session_head_sha: Some("pre-session-sha-abc123".into()),
@@ -1252,6 +1317,7 @@ fn test_dispatch_integrity_sweep_allows_fast_forward_adopted_commit() {
             pr_number: Some(998),
             branch: Some("bob/another-feature".into()),
             session_id: Some("session-ff".into()),
+            session_ao_project: None,
             is_adopted: true,
             spawn_failure_count: 0,
             pre_session_head_sha: Some("pre-session-sha-def456".into()),
@@ -1323,6 +1389,7 @@ fn append_only_sweep_warns_but_keeps_unpublished_local_descendant_running() {
             pr_number: None,
             branch: Some(branch.into()),
             session_id: Some("session-unpublished".into()),
+            session_ao_project: None,
             is_adopted: true,
             spawn_failure_count: 0,
             pre_session_head_sha: Some(pre_sha.into()),
@@ -1382,6 +1449,7 @@ fn append_only_sweep_parks_local_rewrite_without_trusting_stale_remote() {
             pr_number: None,
             branch: Some(branch.into()),
             session_id: Some("session-local-rewrite".into()),
+            session_ao_project: None,
             is_adopted: true,
             spawn_failure_count: 0,
             pre_session_head_sha: Some(pre_sha.into()),
@@ -1437,6 +1505,7 @@ fn append_only_sweep_falls_back_to_remote_when_local_probe_errors() {
             pr_number: None,
             branch: Some(branch.into()),
             session_id: Some("session-local-error".into()),
+            session_ao_project: None,
             is_adopted: true,
             spawn_failure_count: 0,
             pre_session_head_sha: Some(pre_sha.into()),
@@ -1496,6 +1565,7 @@ fn append_only_sweep_does_not_let_local_proof_override_remote_rewrite() {
             pr_number: None,
             branch: Some(branch.into()),
             session_id: Some("session-remote-rewrite".into()),
+            session_ao_project: None,
             is_adopted: true,
             spawn_failure_count: 0,
             pre_session_head_sha: Some(pre_sha.into()),
@@ -1554,6 +1624,7 @@ fn test_wedge_detection_attested_session_stalled() {
             pr_number: Some(42),
             branch: Some("factory/bead-stalled-r1".into()),
             session_id: Some("session-abc123yz".into()),
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -1674,6 +1745,7 @@ fn test_wedge_detection_attested_session_not_stalled_if_remote_ahead() {
             pr_number: Some(99),
             branch: Some("factory/bead-ubas-r1".into()),
             session_id: Some("session-ubas-1".into()),
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -1794,6 +1866,7 @@ fn test_wedge_detection_still_parks_when_local_matches_remote() {
             pr_number: Some(101),
             branch: Some("factory/bead-genuinely-stalled-r1".into()),
             session_id: Some("session-stuck-1".into()),
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -1890,6 +1963,7 @@ fn test_wedge_detection_still_parks_when_local_is_ahead_of_remote() {
             pr_number: Some(202),
             branch: Some("factory/bead-local-ahead-r1".into()),
             session_id: Some("session-local-ahead-1".into()),
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -2013,6 +2087,7 @@ fn test_wedge_detection_still_parks_when_branches_have_diverged() {
             pr_number: Some(203),
             branch: Some("factory/bead-diverged-r1".into()),
             session_id: Some("session-diverged-1".into()),
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -2562,6 +2637,7 @@ fn factory_labeled_pr_branch_collision_is_refused_without_stealing_mapping() {
             pr_number: Some(111),
             branch: Some("factory/existing-bead-r1".into()),
             session_id: Some("sess-existing".into()),
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -3391,6 +3467,7 @@ fn disposition_required_bead_resumes_when_gates_go_green() {
             pr_number: Some(710),
             branch: Some(branch.into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: true,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -3481,6 +3558,7 @@ fn disposition_required_bead_in_cooldown_is_skipped_without_scm_call() {
             pr_number: Some(711),
             branch: Some(branch.into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: true,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -3572,6 +3650,7 @@ fn disposition_required_reassessment_error_preserves_hold_provenance() {
             pr_number: Some(712),
             branch: Some(branch.into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: true,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -3778,7 +3857,18 @@ fn drive_existing_pr_bead_dispatches_onto_pr_head_branch_not_generated_branch() 
     ));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = test_vcs();
+    let mut vcs = test_vcs();
+    // This bead must dispatch onto the PR's own head branch
+    // ("factory/jleechan-xa99-reconciliation-rebased"), not the generated
+    // branch -- `test_vcs()` only seeds a SHA for "main", so without this
+    // the expected-revision lookup (dispatch.rs) fails for the PR head
+    // branch and the bead wrongly parks HUMAN_HELD
+    // (park_reason=TargetCheckoutUnconfigured, phase=
+    // expected_revision_unavailable) instead of dispatching.
+    vcs.heads.insert(
+        "factory/jleechan-xa99-reconciliation-rebased".into(),
+        "pr-head-sha-456".into(),
+    );
     let telemetry_log = std::env::temp_dir().join(format!(
         "afd_drive_pr_branch_binding_{}.jsonl",
         std::process::id()
@@ -4567,6 +4657,7 @@ fn drive_existing_pr_pending_ci_does_not_reach_ready() {
             pr_number: Some(8060),
             branch: Some("fix/rewards-box-not-showing-8020-v2".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -4663,6 +4754,7 @@ fn drive_existing_pr_failed_ci_parks_human_held() {
             pr_number: Some(8060),
             branch: Some("fix/rewards-box-not-showing-8020-v2".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -4762,6 +4854,7 @@ fn recover_human_held_requeues_queued_bead_with_attempt_below_max() {
             pr_number: Some(4242),
             branch: Some("factory/bead-held-r2".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -4854,6 +4947,7 @@ fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
             pr_number: Some(9001),
             branch: Some("factory/bead-held-cap-r10".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -4875,6 +4969,7 @@ fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
             pr_number: Some(9002),
             branch: Some("factory/bead-held-over-r11".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -5227,6 +5322,7 @@ fn capped_human_held_comment_failure_retries_before_recording_escalation() {
             pr_number: Some(9003),
             branch: Some("factory/bead-held-retry-r10".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -5322,6 +5418,7 @@ fn permanent_gh_error_marks_escalation_undeliverable_and_never_retries() {
             pr_number: Some(9005),
             branch: Some("factory/bead-perm-err-r10".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -5449,6 +5546,7 @@ fn capped_human_held_candidate_lookup_failure_retries_before_recording_escalatio
             pr_number: None,
             branch: Some("factory/bead-held-fallback-r10".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -5565,6 +5663,7 @@ fn capped_human_held_missing_comment_target_records_local_escalation_fallback() 
             pr_number: None,
             branch: Some("factory/bead-held-missing-target-r10".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -5653,6 +5752,7 @@ fn er_runner_capped_unknown_only_gate_report_escalates_and_parks_at_recovery_cap
             pr_number: Some(9101),
             branch: Some("factory/er-capped-unknown-r4".into()),
             session_id: Some("session-er-capped".into()),
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -5817,6 +5917,7 @@ fn er_runner_capped_unknown_only_comment_failure_retries_before_parking() {
             pr_number: Some(9102),
             branch: Some("factory/er-capped-retry-r4".into()),
             session_id: Some("session-er-capped-retry".into()),
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -5933,6 +6034,7 @@ fn attested_ci_pending_does_not_bump_autonomy_secs() {
             pr_number: Some(7000),
             branch: Some("factory/att-bead-r1".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -6039,6 +6141,7 @@ fn attested_ci_pending_does_not_timebox_park() {
             pr_number: Some(7100),
             branch: Some("factory/slow-ci-r1".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -6151,6 +6254,7 @@ fn non_green_bead_reenters_loop_via_automated_human_held_exit() {
             pr_number: Some(5050),
             branch: Some("factory/non-green-r1".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -6257,6 +6361,7 @@ fn attested_ci_not_pending_does_bump_autonomy_secs() {
             pr_number: Some(7001),
             branch: Some("factory/att-active-r1".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -6362,6 +6467,7 @@ fn qdw_per_bead_isolation_snapshot_failure_does_not_abort_fast_tier() {
                 pr_number: Some(pr),
                 branch: Some(format!("factory/{bead}-r1")),
                 session_id: Some("sess-1".into()),
+                session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -6522,6 +6628,7 @@ fn qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead() {
             pr_number: Some(901),
             branch: Some("factory/qdw-near-timebox-r1".into()),
             session_id: Some("sess-1".into()),
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -6546,6 +6653,7 @@ fn qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead() {
             pr_number: Some(902),
             branch: Some("factory/qdw-healthy-r1".into()),
             session_id: Some("sess-1".into()),
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -6992,6 +7100,7 @@ fn qdw_post_er_refetch_failure_skips_bead_without_false_park() {
             pr_number: Some(1901),
             branch: Some("factory/qdw-post-refetch-fails-r1".into()),
             session_id: Some("sess-1".into()),
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -7017,6 +7126,7 @@ fn qdw_post_er_refetch_failure_skips_bead_without_false_park() {
             pr_number: Some(1902),
             branch: Some("factory/qdw-post-refetch-healthy-r1".into()),
             session_id: Some("sess-2".into()),
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -7177,6 +7287,7 @@ fn qdw_assess_refetch_failure_stays_attested_and_never_closes_pr() {
             pr_number: Some(2001),
             branch: Some("factory/qdw-assess-refetch-fails-r1".into()),
             session_id: Some("sess-assess".into()),
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -7411,6 +7522,14 @@ impl Drop for EnvVarGuard {
     }
 }
 
+struct CircuitBreakerResetGuard;
+
+impl Drop for CircuitBreakerResetGuard {
+    fn drop(&mut self) {
+        daemon::gh_circuit_breaker::reset();
+    }
+}
+
 /// Guards every test in this file that needs to mutate process-wide env vars
 /// (`PATH`, `DARK_FACTORY_CODER_DEFAULT`) so a future second such test can't
 /// race this one.
@@ -7504,6 +7623,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
             pr_number: Some(555),
             branch: Some("factory/real-repo-bead-r1".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -7696,6 +7816,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
             pr_number: Some(556),
             branch: Some("factory/real-repo-bead-asym-r1".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -7904,6 +8025,7 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
             pr_number: Some(557),
             branch: Some("factory/real-repo-bead-3rdvendor-r1".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -8094,6 +8216,7 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
             pr_number: Some(558),
             branch: Some("factory/wzgl-gate-report-bead-r1".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -8373,6 +8496,7 @@ fn cross_repo_bead_verification_loop_uses_its_own_repo_not_cfg_target_repo() {
             pr_number: Some(pr),
             branch: Some(format!("factory/{bead_id}-r1")),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -8587,6 +8711,7 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
             pr_number: Some(558),
             branch: Some("factory/real-repo-bead-4thvendor-r1".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -8774,6 +8899,7 @@ fn cross_model_reviewer_cursor_agent_falls_back_and_emits_review_degraded() {
             pr_number: Some(559),
             branch: Some("factory/real-repo-bead-cursoragent-r1".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -9016,6 +9142,7 @@ fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
             pr_number: Some(560),
             branch: Some("factory/real-repo-bead-twofam-r1".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -10051,6 +10178,7 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
                 pr_number: Some(pr),
                 branch: Some(branch.into()),
                 session_id: None,
+                session_ao_project: None,
                 is_adopted: true,
                 spawn_failure_count: 0,
                 // These seeded prior rejections model attempts that reached
@@ -10247,6 +10375,7 @@ fn run_slow_tier_pr_existence_probe_targets_bead_own_repo_not_global_cfg() {
     let _lock = REAL_TARGET_REPO_TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    let _breaker_guard = CircuitBreakerResetGuard;
 
     let fake_bin_dir = std::env::temp_dir().join(format!(
         "afd_x8tf_probe_own_repo_{}_{}",
@@ -10262,7 +10391,13 @@ fn run_slow_tier_pr_existence_probe_targets_bead_own_repo_not_global_cfg() {
 
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
-    let _env_guard = EnvVarGuard::set(&[("PATH", &new_path)]);
+    let breaker_path = fake_bin_dir.join("gh_circuit_breaker.json");
+    let breaker_path = breaker_path.to_string_lossy();
+    let _env_guard = EnvVarGuard::set(&[
+        ("PATH", &new_path),
+        ("DARK_FACTORY_GH_CIRCUIT_BREAKER_PATH", &breaker_path),
+    ]);
+    daemon::gh_circuit_breaker::reset();
 
     let mut scm = FakeScm::new();
     // external_ref names a DIFFERENT repo than cfg.target_repo ("owner/repo"
@@ -10337,6 +10472,7 @@ fn run_slow_tier_pr_existence_probe_targets_bead_own_repo_not_global_cfg() {
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
+    daemon::gh_circuit_breaker::reset();
     let _ = std::fs::remove_dir_all(&fake_bin_dir);
 }
 
@@ -10350,6 +10486,7 @@ fn run_slow_tier_pr_existence_probe_unchanged_for_single_repo_legacy_bead() {
     let _lock = REAL_TARGET_REPO_TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    let _breaker_guard = CircuitBreakerResetGuard;
 
     let fake_bin_dir = std::env::temp_dir().join(format!(
         "afd_x8tf_probe_legacy_repo_{}_{}",
@@ -10365,7 +10502,13 @@ fn run_slow_tier_pr_existence_probe_unchanged_for_single_repo_legacy_bead() {
 
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
-    let _env_guard = EnvVarGuard::set(&[("PATH", &new_path)]);
+    let breaker_path = fake_bin_dir.join("gh_circuit_breaker.json");
+    let breaker_path = breaker_path.to_string_lossy();
+    let _env_guard = EnvVarGuard::set(&[
+        ("PATH", &new_path),
+        ("DARK_FACTORY_GH_CIRCUIT_BREAKER_PATH", &breaker_path),
+    ]);
+    daemon::gh_circuit_breaker::reset();
 
     let mut scm = FakeScm::new();
     // external_ref's repo prefix MATCHES cfg.target_repo — the single-repo
@@ -10428,6 +10571,7 @@ fn run_slow_tier_pr_existence_probe_unchanged_for_single_repo_legacy_bead() {
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
+    daemon::gh_circuit_breaker::reset();
     let _ = std::fs::remove_dir_all(&fake_bin_dir);
 }
 
@@ -10472,6 +10616,7 @@ fn seed_attested_red_ci_bead(
             pr_number: Some(pr),
             branch: Some(branch.clone()),
             session_id: Some("fake-session-1".into()),
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -10785,6 +10930,7 @@ fn autonomy_timebox_park_kills_associated_ao_session_and_clears_handle() {
             pr_number: None,
             branch: Some("factory/bead-mh9o-timebox-r1".into()),
             session_id: Some("df-mh9o-timebox".into()),
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -10873,6 +11019,7 @@ fn coder_silent_park_kills_associated_ao_session_and_clears_handle() {
             pr_number: None,
             branch: Some("factory/bead-mh9o-silent-r1".into()),
             session_id: Some("df-mh9o-silent".into()),
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -10961,6 +11108,7 @@ fn session_branch_mismatch_park_kills_associated_ao_session_and_clears_handle() 
             pr_number: None,
             branch: Some("factory/bead-mh9o-mismatch-r1".into()),
             session_id: Some("df-mh9o-mismatch".into()),
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -11061,6 +11209,7 @@ fn autonomy_timebox_park_retains_handle_when_stop_fails() {
             pr_number: None,
             branch: Some("factory/bead-mh9o-stop-fails-r1".into()),
             session_id: Some("df-mh9o-stop-fails".into()),
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -11136,6 +11285,7 @@ fn adopted_branch_history_rewrite_park_kills_associated_ao_session() {
             pr_number: None,
             branch: Some("factory/bead-mh9o-adopted-r1".into()),
             session_id: Some("df-mh9o-adopted".into()),
+            session_ao_project: None,
             is_adopted: true,
             spawn_failure_count: 0,
             pre_session_head_sha: Some("aaaaaaaaaaaaaaaa".into()),
@@ -11441,6 +11591,7 @@ fn slow_tier_dispatched_branch_mismatch_re_resolves_stale_pr_number() {
             pr_number: Some(3001), // stale
             branch: Some(branch.into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -11595,6 +11746,7 @@ fn slow_tier_dispatched_branch_mismatch_no_op_when_pr_number_already_matches() {
             pr_number: Some(4001),
             branch: Some(branch.into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -11712,6 +11864,7 @@ fn slow_tier_dispatched_branch_mismatch_clears_stale_pr_number_when_branch_has_n
             pr_number: Some(6001), // stale: prior PR merged/closed
             branch: Some(branch.into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -11832,6 +11985,7 @@ fn slow_tier_pre_gate_validation_re_resolves_when_stored_pr_no_longer_open() {
             pr_number: Some(7001),
             branch: Some(branch.into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -11964,6 +12118,7 @@ fn transient_pr_number_reresolve_error_keeps_dispatched_no_promotion() {
             pr_number: Some(999),
             branch: Some(branch.into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -12056,6 +12211,7 @@ fn pre_gate_no_open_pr_demotes_attested_to_dispatched_and_resumes() {
             pr_number: Some(8001),
             branch: Some(branch.into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -12181,6 +12337,7 @@ fn evidence_bead(store: &FakeStateStore, scm: &mut FakeScm, bead_id: &str, pr: u
             pr_number: Some(pr),
             branch: Some(branch.into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -13016,6 +13173,7 @@ fn msmq_verifier_skips_reassessment_when_reroll_deferred() {
         pr_number: Some(901),
         branch: Some("factory/bead-msmq-r1".into()),
         session_id: None,
+        session_ao_project: None,
         is_adopted: false,
         spawn_failure_count: 0,
         pre_session_head_sha: None,
@@ -13299,6 +13457,7 @@ fn dispatch_guarantee_queued_bead_dispatched_despite_escalation_backlog() {
                 pr_number: Some(pr_number),
                 branch: Some(format!("factory/{bead_id}-r10")),
                 session_id: None,
+                session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -13330,6 +13489,7 @@ fn dispatch_guarantee_queued_bead_dispatched_despite_escalation_backlog() {
             pr_number: None,
             branch: None,
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -13444,6 +13604,7 @@ fn escalation_dedup_tick_level_identical_payload_suppressed_changed_context_re_e
         pr_number: Some(9006),
         branch: Some("factory/bead-dedup-r10".into()),
         session_id: None,
+        session_ao_project: None,
         is_adopted: false,
         spawn_failure_count: 0,
         pre_session_head_sha: None,
@@ -13685,6 +13846,7 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
         pr_number: Some(101),
         branch: Some("factory/test-bead-101".to_string()),
         session_id: None,
+        session_ao_project: None,
         is_adopted: false,
         spawn_failure_count: 0,
         pre_session_head_sha: None,
@@ -13747,6 +13909,7 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
         pr_number: Some(102),
         branch: Some("factory/test-bead-102".to_string()),
         session_id: None,
+        session_ao_project: None,
         is_adopted: false,
         spawn_failure_count: 0,
         pre_session_head_sha: None,
@@ -13796,6 +13959,7 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
         pr_number: Some(103),
         branch: Some("factory/test-bead-103".to_string()),
         session_id: None,
+        session_ao_project: None,
         is_adopted: false,
         spawn_failure_count: 0,
         pre_session_head_sha: None,
@@ -13921,6 +14085,7 @@ fn vendor_health_ledger_ci_pending_with_capped_vendor_skips_wait() {
         pr_number: Some(pr),
         branch: Some("factory/ci-wait-bead".to_string()),
         session_id: None,
+        session_ao_project: None,
         is_adopted: false,
         spawn_failure_count: 0,
         pre_session_head_sha: None,
@@ -14036,6 +14201,7 @@ fn test_gate_regression_emits_event_and_demotes_to_attested_when_ci_goes_red() {
             pr_number: Some(pr),
             branch: Some(branch.into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -14176,6 +14342,7 @@ fn test_gate_regression_does_not_fire_when_first_assessment_is_red() {
             pr_number: Some(pr),
             branch: Some(branch.into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -14283,6 +14450,7 @@ fn test_gate_regression_caps_at_max_and_parks_human_held() {
             pr_number: Some(pr),
             branch: Some(branch.into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -14416,7 +14584,63 @@ fn test_gate_regression_counter_increments_on_each_green_to_red() {
 }
 
 #[test]
+#[cfg(unix)]
 fn test_non_default_repository_labeled_pr_tick_telemetry_attribution() {
+    let _lock = REAL_TARGET_REPO_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let fake_bin_dir = std::env::temp_dir().join(format!(
+        "afd_non_default_repo_reviewers_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&fake_bin_dir).unwrap();
+    let fake_checkout_dir = fake_bin_dir.with_extension("checkout");
+    std::fs::create_dir_all(&fake_checkout_dir).unwrap();
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["config", "user.email", "test@example.invalid"],
+        vec!["config", "user.name", "test"],
+        vec!["commit", "-q", "--allow-empty", "-m", "fixture"],
+        vec![
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/jleechanorg/worldarchitect.ai.git",
+        ],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&fake_checkout_dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let fixture_head = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&fake_checkout_dir)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    write_fake_reviewer(&fake_bin_dir, "claude", "pass");
+    write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let reviewer_path = format!("{}:{}", fake_bin_dir.display(), original_path);
+    let _env_guard = EnvVarGuard::set(&[
+        ("PATH", &reviewer_path),
+        ("DARK_FACTORY_CODER_DEFAULT", "agy"),
+    ]);
+
     let mut scm = FakeScm::new();
     scm.prs.push(LabeledPr {
         number: 8843,
@@ -14428,21 +14652,20 @@ fn test_non_default_repository_labeled_pr_tick_telemetry_attribution() {
         is_cross_repository: false,
         head_repo_full_name: Some("jleechanorg/worldarchitect.ai".into()),
         head_repo_owner_login: Some("jleechanorg".into()),
-        head_sha: Some("9dc2c198a445450d8fe455e7d691a0492deefe2e".into()),
+        head_sha: Some(fixture_head.clone()),
         updated_at_epoch: Some(1_700_000_000),
     });
     scm.permissions.insert("jleechan2015".into(), Permission::Write);
-    scm.pr_snapshots.insert(
-        8843,
-        qdw_green_snapshot(
+    let mut snapshot = qdw_green_snapshot(
             8843,
             vec![PrComment {
                 author: "dark-factory-er".into(),
                 body: "/er PASS".into(),
                 created_at_epoch: 0,
             }],
-        ),
-    );
+        );
+    snapshot.head_sha = fixture_head.clone();
+    scm.pr_snapshots.insert(8843, snapshot);
 
     let tracker = FakeTracker::new();
     let sessions = FakeSessions::new();
@@ -14456,7 +14679,7 @@ fn test_non_default_repository_labeled_pr_tick_telemetry_attribution() {
         daemon::config::RepoConfig {
             ao_project: "worldarchitect".into(),
             push_remote: "origin".into(),
-            local_checkout: None,
+            local_checkout: Some(fake_checkout_dir.clone()),
         },
     );
     let vcs = test_vcs();
@@ -14502,7 +14725,7 @@ fn test_non_default_repository_labeled_pr_tick_telemetry_attribution() {
         "EXISTING_PR_ADOPTED context must contain branch attribution: {context:?}"
     );
     assert_eq!(
-        context["head_sha"], "9dc2c198a445450d8fe455e7d691a0492deefe2e",
+        context["head_sha"], fixture_head,
         "EXISTING_PR_ADOPTED context must contain head_sha attribution: {context:?}"
     );
     assert_eq!(
@@ -14537,6 +14760,8 @@ fn test_non_default_repository_labeled_pr_tick_telemetry_attribution() {
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
+    let _ = std::fs::remove_dir_all(&fake_checkout_dir);
 }
 
 #[test]
@@ -14572,6 +14797,7 @@ fn test_non_default_repository_branch_collision_telemetry_attribution() {
             pr_number: Some(123),
             branch: Some("fix/rev-ilwk7-move-modal-validators".into()),
             session_id: Some("sess-legacy".into()),
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -14675,6 +14901,7 @@ fn test_dispatched_adopted_idle_session_reaped_and_promoted() {
             pr_number: Some(999),
             branch: Some("fix/test-w0r4".into()),
             session_id: Some("wa-9999".into()),
+            session_ao_project: None,
             is_adopted: true,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -14796,6 +15023,7 @@ fn test_worktree_cleaned_up_on_coder_session_exit_promotion() {
             pr_number: Some(998),
             branch: Some("fix/test-rev3lm8k".into()),
             session_id: Some("wa-3538".into()),
+            session_ao_project: None,
             is_adopted: true,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -14894,6 +15122,7 @@ fn session_health_failure_reaps_session_and_requeues_bead() {
             pr_number: None,
             branch: Some("factory/bead-health-fail-r1".into()),
             session_id: Some("wa-dead-auth".into()),
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -14980,6 +15209,7 @@ fn quota_reached_health_failure_arms_watchdog_without_killing_session() {
             pr_number: None,
             branch: Some("factory/bead-quota-arm-r1".into()),
             session_id: Some("wa-quota-paused".into()),
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -15087,6 +15317,7 @@ fn quota_watchdog_wakes_paused_pane_after_reset_grace_elapses() {
             pr_number: None,
             branch: Some("factory/bead-quota-wake-r1".into()),
             session_id: Some(session_id.into()),
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,

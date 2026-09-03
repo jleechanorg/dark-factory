@@ -8,6 +8,8 @@ import pathlib
 import stat
 import sys
 
+import pytest
+
 ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
@@ -19,6 +21,25 @@ from runner.handlers import Context, Result, TYPE_REGISTRY  # noqa: E402
 from runner.parser import parse  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _stub_fail_open_web_advice(monkeypatch):
+    """Keep graph-control tests off the host's live /web-advice transport.
+
+    These tests assert gate ordering and short-circuit behavior.  The
+    fail-open advisory node is deliberately an external integration, so let
+    the graph reach its exit without invoking ``gh``/browser transports or
+    depending on operator credentials.
+    """
+    def fake_web_advice(node, ctx):
+        return Result(
+            outcome="success",
+            output="web_advice fixture: fail-open advisory skipped",
+            metadata={"web_advice_outcome": "fixture_skipped"},
+        )
+
+    monkeypatch.setitem(TYPE_REGISTRY, "web_advice", fake_web_advice)
+
+
 def test_pr_gates_runs_holdout_before_evidence_gates(monkeypatch):
     """Holdout-always policy: pr_gates.dot runs sealed holdouts before the
     three adversarial gates, mirroring gates.dot."""
@@ -27,9 +48,11 @@ def test_pr_gates_runs_holdout_before_evidence_gates(monkeypatch):
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
     g = parse(_pipeline("pr_gates.dot"))
     assert g.nodes["holdout"].attrs.get("type") == "holdout_eval"
+    g.nodes["adversarial_reviewer"].attrs["test_fixture"] = "true"
 
     ctx = Context(goal="t", workdir=ROOT, backend="echo")
     ctx.state["gate_skeptic.outcome"] = "success"
+    ctx.state["_df_controller_fixture"] = "cold-review-v1"
     ctx.state["adversarial_reviewer.outcome"] = "success"
     ctx.state["gate_es.outcome"] = "success"
     ctx.state["gate_er.outcome"] = "success"
@@ -75,7 +98,9 @@ def test_gate_failure_short_circuits(monkeypatch):
         return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
     g = parse(_pipeline("gates.dot"))
+    g.nodes["adversarial_reviewer"].attrs["test_fixture"] = "true"
     ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx.state["_df_controller_fixture"] = "cold-review-v1"
     ctx.state["gate_skeptic.outcome"] = "success"
     ctx.state["adversarial_reviewer.outcome"] = "success"
     ctx.state["gate_es.outcome"] = "success"

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import subprocess
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -55,6 +56,7 @@ class Context:
     git_ctx: Optional["GitContext"] = None
     perf_run: Optional["PerfRun"] = None
     last_completed_seq: int = 0
+    _controller_base_sha: str | None = field(default=None, init=False, repr=False)
 
 
 _TIMEOUT_MIN_SECONDS = 5
@@ -155,7 +157,7 @@ def _gate_strict_flag(node: "Node") -> bool:
 
 
 def _target_worktree(ctx: "Context") -> pathlib.Path:
-    """Return the validated target worktree for worker diff and controller review.
+    """Return the caller-selected worktree without changing its lexical spelling.
 
     Prefers `ctx.state["ao.worktree"]` when it is an absolute, non-traversing
     path to an existing directory; otherwise falls back to `ctx.workdir`.
@@ -169,11 +171,18 @@ def _target_worktree(ctx: "Context") -> pathlib.Path:
                 and ".." not in ao_path.parts
                 and ao_path.is_dir()
             ):
-                return ao_path.resolve()
+                # Preserve the caller's lexical spelling until the controller
+                # validates it. Resolving here would erase a symlinked parent
+                # and make the later immutable-target check inspect another
+                # path than the one supplied by the run.
+                return ao_path
     try:
-        return pathlib.Path(ctx.workdir).resolve()
+        # The controller owns canonicalization after lexical validation. Other
+        # callers can still resolve this path at the boundary where they need
+        # a canonical identity.
+        return pathlib.Path(ctx.workdir)
     except (AttributeError, TypeError):
-        return pathlib.Path(".").resolve()
+        return pathlib.Path(".")
 
 
 
@@ -182,6 +191,8 @@ def _start(node: Node, ctx: Context) -> Result:
 
 
 def _exit(node: Node, ctx: Context) -> Result:
+    from .handler_verdict import _worktree_head_sha
+
     unresolved = ctx.state.get("_unresolved_failure")
     if unresolved:
         return Result(outcome=unresolved, output=f"exit after unresolved {unresolved}")
@@ -190,18 +201,121 @@ def _exit(node: Node, ctx: Context) -> Result:
         if previous != "success":
             return Result(outcome=previous, output=f"exit after {previous}")
     
-    # G8: re-pin HEAD SHA at exit node
-    last_validated = ctx.state.get("_last_validated_head_sha")
-    if last_validated:
-        from .handler_verdict import _worktree_head_sha
-        current_sha = _worktree_head_sha(ctx.workdir)
-        if current_sha and current_sha.lower() != last_validated.lower():
+    # G8: re-pin the exact target that the successful controller reviewed.
+    # A cold review may use a detached snapshot while ctx.workdir remains the
+    # dirty worker source, so comparing the snapshot SHA with ctx.workdir is
+    # incorrect. Legacy gates without a structured target retain the old path.
+    bound_target = ctx.state.get("_verified_review_target")
+    contract_target_required = ctx.state.get("_verified_review_target_required")
+    if contract_target_required == "true" and not bound_target:
+        return Result(
+            outcome="error",
+            output="exit blocked: verified controller target binding is missing",
+            metadata={"exit_sha_status": "invalid"},
+        )
+    if bound_target:
+        try:
+            if not isinstance(bound_target, str):
+                raise TypeError("target binding must be JSON text")
+            binding = json.loads(bound_target)
+            if not isinstance(binding, dict):
+                raise TypeError("target binding is not an object")
+            if set(binding) != {"workspace_path", "head_sha", "tree_sha"}:
+                raise ValueError("target binding schema is invalid")
+            if any(
+                not isinstance(binding[name], str)
+                for name in ("workspace_path", "head_sha", "tree_sha")
+            ):
+                raise ValueError("target binding fields must be strings")
+            target_path = pathlib.Path(binding["workspace_path"])
+            if not target_path.is_absolute():
+                raise ValueError("target binding workspace path must be absolute")
+            expected_head = str(binding["head_sha"]).lower()
+            expected_tree = str(binding["tree_sha"]).lower()
+            from .review_controller import ReviewInputs, validate_immutable_target
+
+            target_path = validate_immutable_target(
+                ReviewInputs(
+                    repository="verified-controller-target",
+                    workspace_path=str(target_path),
+                    base_sha=expected_head,
+                    head_sha=expected_head,
+                    tree_sha=expected_tree,
+                    task_text="",
+                )
+            )
+            status = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(target_path),
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if status.returncode != 0 or status.stdout.strip():
+                raise ValueError("verified review target is not clean")
+            symbolic_head = subprocess.run(
+                ["git", "-C", str(target_path), "symbolic-ref", "-q", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if symbolic_head.returncode != 1:
+                raise ValueError("verified review target is not a detached snapshot")
+            current_sha = _worktree_head_sha(target_path)
+            tree_proc = subprocess.run(
+                ["git", "-C", str(target_path), "rev-parse", "HEAD^{tree}"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            current_tree = tree_proc.stdout.strip().lower()
+            if (
+                current_sha != expected_head
+                or tree_proc.returncode != 0
+                or current_tree != expected_tree
+            ):
+                return Result(
+                    outcome="error",
+                    output=(
+                        "exit blocked: verified controller target changed since review "
+                        f"(expected {expected_head}/{expected_tree}, got "
+                        f"{current_sha or 'missing'}/{current_tree or 'missing'})"
+                    ),
+                    metadata={"exit_sha_status": "mismatched"},
+                )
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+            OSError,
+            subprocess.SubprocessError,
+        ) as exc:
             return Result(
                 outcome="error",
-                output=(
-                    f"exit blocked: HEAD SHA changed since last validated review gate. "
-                    f"Expected: {last_validated}, got: {current_sha}"
-                ),
-                metadata={"exit_sha_status": "mismatched"},
+                output=f"exit blocked: invalid verified controller target: {exc}",
+                metadata={"exit_sha_status": "invalid"},
             )
+    else:
+        last_validated = ctx.state.get("_last_validated_head_sha")
+        if last_validated:
+            current_sha = _worktree_head_sha(ctx.workdir)
+            if current_sha and current_sha.lower() != last_validated.lower():
+                return Result(
+                    outcome="error",
+                    output=(
+                        f"exit blocked: HEAD SHA changed since last validated review gate. "
+                        f"Expected: {last_validated}, got: {current_sha}"
+                    ),
+                    metadata={"exit_sha_status": "mismatched"},
+                )
     return Result(outcome="success", output="exit")

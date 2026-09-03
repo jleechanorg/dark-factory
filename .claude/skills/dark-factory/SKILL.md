@@ -57,7 +57,7 @@ echoed in the run evidence.
 
 | `.dot` file | Flow | When to use |
 |-------------|------|-------------|
-| **`pipelines/slim/two_node.dot`** ⭐ default | worker → controller-owned `cold-review-v1` → exit | **Default for `/f` and `/factory`** when no `--pipeline` is passed. Generic worker handles any user goal; its `type="parallel_reviewer"` gate uses controller-owned `cold-review-v1` with Codex-only `backend_priority="codex"`. |
+| **`pipelines/slim/two_node.dot`** ⭐ default | worker → fresh Codex reviewer → exit | **Default for `/f` and `/factory`** when no `--pipeline` is passed. The reviewer is a fresh fully tooled `codex exec --ephemeral --yolo` process; its response is copied to the worker on failure. |
 | `pipelines/factory/hello.dot` | plan → implement → holdout → fix-loop → exit | Add a new feature with a holdout scenario |
 | `pipelines/factory/gates.dot` | start → holdout → /es → /er → /code_standards → exit | Validate an already-implemented diff (Attractor-style 4-gate harness as `.dot`) |
 | `pipelines/factory/pr_gates.dot` | start → holdout → /es → /er → /code_standards → exit | Validate an already-implemented in-flight PR diff (Holdout-always policy; requires `--feature <name>` for the holdout) |
@@ -208,9 +208,9 @@ When `--pipeline` is a short name (no `/` or `.dot`), expand under
 When the user invokes `/f` or `/factory` with no `--pipeline` flag, the
 runner dispatches `pipelines/slim/two_node.dot` by default — exactly two
 productive nodes (a generic `worker` codergen + a `cold_reviewer`
-`type="parallel_reviewer"` gate), plus a bounded fix loop. The cold reviewer
-uses the controller-owned `cold-review-v1` contract and its only
-receipt-capable transport, `backend_priority="codex"`.
+`type="codergen"` verdict gate), plus a bounded fix loop. The cold reviewer
+runs as a fresh fully tooled Codex process in the worker's target worktree;
+the engine copies its exact response back into the worker prompt on failure.
 
 To opt into a richer pipeline, pass an explicit `--pipeline <name>`. To
 roll your own (e.g. a custom slim or feature shape), pass
@@ -229,8 +229,8 @@ Honor these flags inside `$ARGUMENTS`:
 - `--pipeline <name>` — short name (`two_node`, `gates`, `hello`, `pr_gates`,
   `minimal_pr`, `minimal_feature`, `review_slim`, `review_full`) or path to a
   `.dot`. If omitted, the runner dispatches the slim two-node default graph
-  (`pipelines/slim/two_node.dot`) — a generic worker + static Codex cold
-  reviewer — for every `/f` and `/factory` invocation. To opt into the
+  (`pipelines/slim/two_node.dot`) — a generic worker + fresh, fully tooled
+  Codex reviewer — for every `/f` and `/factory` invocation. To opt into the
   heavyweight pipelines (gates / minimal_feature / etc.) pass an explicit
   `--pipeline <name>`. The previous "auto-select from the goal" behavior is
   retired; the slim two-node shape is the new default across the board.
@@ -332,7 +332,7 @@ resolve_dark_factory_home() {
 run. Treat the flag as present unless the user explicitly passes
 `--reviewer-calibration=false`.
 
-Calibration routes every backend through the binary-owned controller
+Calibration routes the Codex backend through the binary-owned controller
 command:
 
 ```bash
@@ -342,17 +342,20 @@ dark-factory review \
   --head-sha <full-40-hex-sha> \
   --task-file <path> \
   --output-dir <dir> \
-  --backend <backend>
+  --backend codex
 ```
 
 `dark-factory review` owns the static prompt, canonical envelope, backend
-dispatch, response validation, and `controller-receipt.json`. The
-selected backend supplies transport only; do not author reviewer
-instructions, do not inline prompts, do not pass vendor CLI flags. The
-controller binds `prompt SHA-256`, `envelope SHA-256`, `task SHA-256`,
-`diff SHA-256`, `changed-files SHA-256`, and `evidence-manifest SHA-256`
-in the controller receipt so calibration lanes can hash the receipt
-itself for provenance.
+dispatch, response validation, and `controller-receipt.json`. Controller v1
+accepts only Codex through its tool-free JSONL transport. A valid PASS requires
+non-empty `evidence_checked` and `commands_executed: []`; the
+`ReviewTransportReceipt` and controller terminal receipt bind the prompt,
+envelope, response, reviewed revision/tree, and evidence manifest. Do not
+author reviewer instructions, do not inline prompts, do not pass vendor CLI
+flags. The controller binds `prompt SHA-256`, `envelope SHA-256`, `task
+SHA-256`, `diff SHA-256`, `changed-files SHA-256`, and
+`evidence-manifest SHA-256` in the controller receipt so calibration lanes can
+hash the receipt itself for provenance.
 
 Each accepted lane must expose a controller receipt digest containing
 the prompt SHA-256, envelope SHA-256, task SHA-256, diff SHA-256,

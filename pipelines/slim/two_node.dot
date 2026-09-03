@@ -2,28 +2,41 @@
 //
 // Default graph for `/f` (and `/factory`). Exactly two productive nodes:
 //   worker         — generic codergen; light prompt; does whatever the user asked.
-//   cold_reviewer  — controller-owned cold reviewer using the SHA-pinned
-//                    cold-review-v1 execution path (prompts/catalog/controller_cold_review_v1.md).
+//   cold_reviewer  — fresh, fully tooled Codex process reviewing an isolated,
+//                    runner-minted snapshot pin (never the live coder workdir).
 //
 // Wiring:
 //   start -> worker -> cold_reviewer -> exit                (on success)
-//                          \-> worker                        (on failure, bounded max_visits=3)
+//                          \-> worker                        (on non-success, bounded max_visits=3)
 //
 // Backend routing:
 //   - worker          honors the run-level --backend (the coder tier the user
 //                     chose; default = whatever /f's Step 0.5 detector picks).
-//   - cold_reviewer   uses review_contract="cold-review-v1" and
-//                     backend_priority="codex" because the controller has
-//                     a receipt-capable transport only for Codex.
+//   - cold_reviewer   always launches a fresh Codex CLI session.
+//
+// Reviewer identity and findings relay (typed targets / ungambeable reviewer,
+// see docs/superpowers/specs/2026-09-01-factory-two-node-redesign-design.md):
+//   - The reviewer never receives caller/worker free text. Its rendered input
+//     is the static prompt + a runner-minted ${target} locator + a
+//     runner-minted, Base64-encoded ${intent} envelope. The runner re-mints
+//     and chains the pin after every worker visit (D8a).
+//   - Reviewer FAIL relays typed, schema-validated findings
+//     ({path, claim, required_fix}) to the worker as untrusted requirements
+//     to verify, never raw prose and never commands.
 //
 // Failure semantics:
 //   - cold_reviewer is goal_gate=true. On success the run exits.
-//   - On a real fail/partial verdict the runner routes back to worker directly.
+//   - Budget is soft 1200 s (stated in the prompt so the model can emit an
+//     UNFINISHED report) / hard 1320 s (runner kill). Any exit without a
+//     machine-validated terminal `Verdict:` line — timeout, crash, malformed
+//     output — classifies as `failure` and is fail-closed.
+//   - Any non-success reviewer outcome (`outcome!=success`, covering both
+//     `failure` and `error` classifications) routes back to worker directly.
 //     Worker handles iteration (max_visits=3). No separate fix node in this graph.
 
 digraph SlimTwoNode {
     graph [
-        goal="Generic worker does the user's task; controller-owned cold-review-v1 reviewer gates it. Slim default for /f."
+        goal="Generic worker does the user's task; a fresh Codex reviewer gates it. Slim default for /f."
         rankdir=LR
         label="SlimTwoNode (default /f graph)"
     ]
@@ -42,14 +55,15 @@ digraph SlimTwoNode {
     ]
 
     cold_reviewer [
-        type="parallel_reviewer",
-        label="Cold Reviewer (controller cold-review-v1)",
+        type="codergen",
+        label="Fresh Codex Reviewer",
         class="review",
-        review_contract="cold-review-v1",
-        backend_priority="codex",
-        evidence_paths="evidence/worker-verification.json",
+        backend="codex",
+        prompt="@prompts/slim/fresh_review.md",
+        verdict_gate="true",
+        fresh_session="true",
         goal_gate=true,
-        timeout=600
+        timeout=1320
     ]
 
     start -> worker
