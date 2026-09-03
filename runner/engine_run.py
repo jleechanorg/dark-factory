@@ -40,6 +40,14 @@ _CONTROLLER_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _CONTROLLER_SNAPSHOT_JOURNAL = "controller-snapshot-journal.json"
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
+# D2/D3/D8a (docs/superpowers/specs/2026-09-01-factory-two-node-redesign-design.md):
+# ctx.state keys a successful worker visit mints via
+# handler_codergen._mint_post_worker_target — the typed target locator, its
+# Base64 intent envelope, the pin chain, and the frozen base SHA. Captured on
+# the worker's StepRecord.metadata (below) and restored on resume (in `run()`)
+# so a process restart never re-anchors the pin chain from a stale HEAD.
+_TARGET_MINT_STATE_KEYS = ("target", "intent", "_target_pin_chain", "_target_base_sha")
+
 
 def _set_controller_base_sha(ctx: Context, base_sha: str) -> None:
     """Set controller provenance through the runner-owned initialization path."""
@@ -745,11 +753,17 @@ def _run_single_node(
         records: list = []
         for attempt in results:
             attempt = _obs._normalized_result(attempt)
+            is_review = (
+                str(node.attrs.get("class", "")).strip().lower() == "review"
+            )
+            is_worker = (
+                str(node.attrs.get("class", "")).strip().lower() == "worker"
+            )
             ctx.state.update(attempt.context_updates)
             ctx.state["_last_node"] = node.name
             ctx.state["_last_outcome"] = attempt.outcome
             ctx.state["_last_output"] = attempt.output
-            if str(node.attrs.get("class", "")).strip().lower() == "review":
+            if is_review:
                 ctx.state["_last_review_feedback"] = attempt.output
             
             # Surface Coder Handoff section + verdict token (P5)
@@ -766,13 +780,30 @@ def _run_single_node(
                 ctx.state.pop("_last_coder_handoff", None)
 
             normalized_results.append(attempt)
+            record_metadata = dict(attempt.metadata)
+            if is_review:
+                record_metadata["_review_feedback"] = attempt.output
+            if is_worker and _classify_outcome(attempt.outcome) == "success":  # pyright: ignore[reportAttributeAccessIssue]
+                # D3/D8a: a successful worker visit mints/re-mints the review
+                # target locator, intent envelope, and pin chain directly
+                # into ctx.state (handler_codergen._mint_post_worker_target).
+                # Those keys are otherwise memory-only and never survive a
+                # checkpoint round-trip, so a process restart between this
+                # visit and the reviewer's next visit would silently lose
+                # pin-chain continuity and the task intent. Mirror the
+                # `_review_feedback` capture above so `run()`'s resume path
+                # can reconstruct them (see _TARGET_MINT_STATE_KEYS below).
+                for key in _TARGET_MINT_STATE_KEYS:
+                    value = ctx.state.get(key)
+                    if value is not None:
+                        record_metadata[key] = str(value)
             records.append(
                 _persist.StepRecord(
                     node=node.name,
                     outcome=attempt.outcome,
                     ts=time.time(),
                     output_preview=attempt.output[:280],
-                    metadata=attempt.metadata,
+                    metadata=record_metadata,
                 )
             )
             _persist._update_failure_state(node, ctx, attempt)
@@ -780,6 +811,40 @@ def _run_single_node(
         return normalized_results, records
     finally:
         _obs._write_heartbeat(ctx, graph, node, is_complete=True)
+
+
+def _restore_target_mint_state(ctx: Context, graph: Graph, resumed: list) -> None:
+    """D3/D8a: on resume, restore the mint-state keys from the most recent
+    worker-success step into `ctx.state` before letting either a worker retry
+    or a reviewer visit proceed. Without this, a process restart re-anchors
+    `_target_base_sha`/`_target_pin_chain` from the resumed HEAD instead of
+    the original frozen base. Only applies to graphs that opted into the
+    mint contract (`_df_mint_review_target`); fail-closed if opted in but the
+    keys are missing from that step's metadata.
+    """
+    mint_enabled = str(
+        ctx.state.get("_df_mint_review_target", "false")
+    ).strip().lower() in {"true", "1", "yes", "on"}
+    if not mint_enabled:
+        return
+    for previous in reversed(resumed):
+        previous_node = graph.nodes.get(previous.node)
+        if previous_node is None or (
+            str(previous_node.attrs.get("class", "")).strip().lower() != "worker"
+        ):
+            continue
+        if str(previous.outcome).strip().lower() == "success":
+            missing = [
+                key for key in _TARGET_MINT_STATE_KEYS if key not in previous.metadata
+            ]
+            if missing:
+                raise ValueError(
+                    "checkpoint is missing review-target mint state required "
+                    f"to resume: {missing!r}"
+                )
+            for key in _TARGET_MINT_STATE_KEYS:
+                ctx.state[key] = str(previous.metadata[key])
+        break
 
 
 def run(
@@ -794,7 +859,8 @@ def run(
     If `resume` is provided, execution restarts from the successor of the
     checkpointed last step.
     """
-    if resume is not None and _is_controller_graph(graph):
+    controller_graph = _is_controller_graph(graph)
+    if resume is not None and controller_graph:
         raise ValueError("resume is not supported for cold-review-v1 graphs")
 
     # Resume uses the checkpoint's run directory as the durable journal owner.
@@ -807,12 +873,14 @@ def run(
                 ctx.run_id = candidate_run_id
     if not ctx.run_id:
         ctx.run_id = uuid.uuid4().hex[:12]
-    _load_controller_snapshot_journal(ctx)
+    if controller_graph or resume is not None:
+        _load_controller_snapshot_journal(ctx)
 
     # Capture the controller-owned base before the first worker visit.  This
     # runs after CLI/AO state has been assembled, so an explicitly selected AO
     # worktree is the target whose immutable HEAD is bound.
-    _seed_controller_base_sha(ctx, graph)
+    if controller_graph or resume is not None:
+        _seed_controller_base_sha(ctx, graph)
     history: list = []
     visits: dict[str, int] = {}
     # Per-node ring of recent output hashes for the no_progress detector
@@ -847,6 +915,17 @@ def run(
                 _cleanup_controller_snapshot(ctx)
                 return history
             synthetic = _obs._normalized_result(Result(outcome=last.outcome))
+            is_review = (
+                str(last_node.attrs.get("class", "")).strip().lower() == "review"
+            )
+            if is_review and "_review_feedback" in last.metadata:
+                feedback = str(last.metadata["_review_feedback"])
+                ctx.state["_last_review_feedback"] = feedback
+                ctx.state["_last_output"] = feedback
+                ctx.state["_last_node"] = last.node
+                ctx.state["_last_outcome"] = last.outcome
+                if "verdict" in last.metadata:
+                    ctx.state["_last_verdict"] = str(last.metadata["verdict"])
             # Detect incomplete parallel fan-out: the fan-out step was checkpointed
             # but branches never ran (job was interrupted between the fan-out record
             # write and the ThreadPoolExecutor completing).  Re-run from the parallel
@@ -862,6 +941,47 @@ def run(
                 if next_node is None:
                     _cleanup_controller_snapshot(ctx)
                     return history
+                if (
+                    str(next_node.attrs.get("class", "")).strip().lower()
+                    == "worker"
+                ):
+                    for previous in reversed(resumed):
+                        previous_node = graph.nodes.get(previous.node)
+                        if previous_node is None or (
+                            str(previous_node.attrs.get("class", ""))
+                            .strip()
+                            .lower()
+                            != "review"
+                        ):
+                            continue
+                        if str(previous.outcome).strip().lower() == "failure":
+                            if "_review_feedback" not in previous.metadata:
+                                raise ValueError(
+                                    "checkpoint is missing full reviewer feedback required "
+                                    "for worker retry"
+                                )
+                            ctx.state["_last_review_feedback"] = str(
+                                previous.metadata["_review_feedback"]
+                            )
+                        break
+                    # D3/D8a: the retry visit re-mints from ctx.state["_target_base_sha"]
+                    # / ctx.state["_target_pin_chain"] (handler_codergen._mint_post_worker_target).
+                    # Those keys are memory-only and would not survive a
+                    # process restart between the reviewer's FAIL and this
+                    # worker retry, so restore them from the prior
+                    # worker-success step before the retry launches — mirrors
+                    # the review-branch restoration below.
+                    _restore_target_mint_state(ctx, graph, resumed)
+                elif (
+                    str(next_node.attrs.get("class", "")).strip().lower()
+                    == "review"
+                ):
+                    # D3/D8a: a successful worker visit mints the review
+                    # target locator, intent envelope, and pin chain directly
+                    # into ctx.state (stashed onto that worker step's
+                    # metadata above in `_run_single_node`). Restore them
+                    # before the reviewer visit launches.
+                    _restore_target_mint_state(ctx, graph, resumed)
                 current = next_node
 
     # Always have an addressable run_id so diagnostics are locatable even when
@@ -1594,6 +1714,8 @@ def run(
                 continue
 
             if next_node is None:
+                if _classify_outcome(result.outcome) == "error":
+                    break
                 _stuck_node = _para_jump_to if _para_jump_to is not None else current
                 record = _persist.StepRecord(
                     node=_stuck_node.name,

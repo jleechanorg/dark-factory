@@ -656,6 +656,9 @@ mod tests {
 
     #[test]
     fn clone_auth_failure_preserves_gate_failure_and_cleans_own_staging() {
+        let _env_guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
             "afd_target_worktree_clone_auth_{}",
             std::process::id()
@@ -762,6 +765,9 @@ mod tests {
     }
 
     fn run_refresh_child(dirty: bool, ignored_conflict: bool) {
+        let _env_guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
             "afd_target_worktree_refresh_child_{}",
             std::process::id()
