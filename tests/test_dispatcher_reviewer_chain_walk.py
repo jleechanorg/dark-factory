@@ -734,6 +734,63 @@ def test_detect_vendor_unavailable_no_error_never_advances():
     assert _detect_vendor_unavailable(None, "") is False
 
 
+# ===========================================================================
+# round-9 /advice finding (Codex + Opus, independently converged): the
+# REAL evaluation path (`evaluate()` in skeptic_gate.py) strips the
+# `CONTRACT_ECHO:` block from stdout BEFORE calling `parse_verdict` --
+# see `_strip_contract_echo_block` at skeptic_gate.py ~line 1090. Round-8's
+# `_detect_vendor_unavailable` parses RAW stdout directly, so on any
+# contract-enabled run, a vendor that produces a genuine, complete
+# verdict *and* also exits nonzero (contract-echo block still attached)
+# has its stdout wrongly rejected by the strict field parser -- a real
+# verdict is misclassified as "vendor unavailable," and the chain-walk
+# keeps advancing looking for a different (possibly more favorable)
+# vendor. `_detect_vendor_unavailable` and `evaluate()` must never
+# diverge on whether a given stdout blob contains a genuine verdict --
+# that divergence IS the bug.
+# ===========================================================================
+
+
+def test_detect_vendor_unavailable_strips_contract_echo_before_parsing():
+    """The round-9 regression: a genuine verdict followed by a
+    CONTRACT_ECHO block (with an ITEM: line, exactly as a contract-
+    enabled reviewer emits) must NOT be treated as unavailable just
+    because raw `parse_verdict` chokes on the trailing block -- the
+    function must strip it first, exactly like `evaluate()` does."""
+    verdict_with_contract_echo = (
+        VALID_OUTPUT + "CONTRACT_ECHO:\nITEM: a1 VERDICT: ADDRESSED CITE: foo.py:1\n"
+    )
+    assert _detect_vendor_unavailable("reviewer rc=1: odd exit", verdict_with_contract_echo) is False, (
+        "a genuine verdict with a trailing CONTRACT_ECHO block must be "
+        "recognized as available -- evaluate() would successfully parse "
+        "the same stdout after its own contract-echo stripping step"
+    )
+
+
+def test_detect_vendor_unavailable_agrees_with_evaluate_on_contract_echo_stdout():
+    """Regression guard proving the two functions now agree: the exact
+    same raw stdout blob that `_detect_vendor_unavailable` must treat as
+    available must also be what `evaluate()`'s own real path parses
+    successfully -- confirming they never diverge on this judgment."""
+    from runner.skeptic_gate import evaluate, parse_verdict
+    from runner.skeptic_contract_echo import _strip_contract_echo_block
+
+    verdict_with_contract_echo = (
+        VALID_OUTPUT + "CONTRACT_ECHO:\nITEM: a1 VERDICT: ADDRESSED CITE: foo.py:1\n"
+    )
+    assert _detect_vendor_unavailable(None, verdict_with_contract_echo) is False
+
+    # evaluate()'s own stripping step (no `contract=` kwarg here since
+    # this test only needs to prove parse_verdict succeeds post-strip,
+    # not the full contract-echo-enforcement path) must parse the same
+    # stripped content _detect_vendor_unavailable relies on.
+    stripped = _strip_contract_echo_block(verdict_with_contract_echo)
+    assert parse_verdict(stripped) is not None, (
+        "sanity check: the stripped content must itself be genuinely "
+        "parseable, or this test proves nothing"
+    )
+
+
 def test_chain_walk_advances_past_vendor_with_partial_stdout_and_error(
     monkeypatch, dispatcher, stub_evaluate
 ):

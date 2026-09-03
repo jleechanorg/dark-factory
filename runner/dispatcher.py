@@ -106,6 +106,24 @@ def _detect_rate_limit(err: Optional[str]) -> bool:
 # on whether a genuinely parseable terminal verdict was produced
 # (``parse_verdict(stdout) is not None``), not on stdout's mere
 # presence.
+#
+# round-9 /advice finding (Codex + Opus, independently converged): the
+# REAL evaluation path, ``evaluate()`` in skeptic_gate.py, strips the
+# ``CONTRACT_ECHO:`` block from stdout via ``_strip_contract_echo_block``
+# BEFORE calling ``parse_verdict`` — it never parses raw stdout directly
+# when a contract is in play. Round-8's version of this function parsed
+# raw stdout, so on any contract-enabled run, a vendor that produced a
+# genuine, complete verdict *and* also exited nonzero (contract-echo
+# block still attached) had its stdout wrongly rejected by the strict
+# field parser — a real verdict was misclassified as "vendor
+# unavailable," and the chain-walk kept advancing hunting for a
+# different (possibly more favorable) vendor. Fixed by stripping the
+# contract-echo block first, exactly like ``evaluate()`` does, via the
+# SAME shared helper — the two functions must never diverge on whether
+# a given stdout blob contains a genuine verdict; that divergence IS
+# the bug. ``_strip_contract_echo_block`` is documented to be a no-op
+# when no ``CONTRACT_ECHO:`` block is present, so this is safe to call
+# unconditionally regardless of whether the run is contract-enabled.
 def _detect_vendor_unavailable(err: Optional[str], stdout: Optional[str]) -> bool:
     """Return True if this vendor's own invocation failed to produce a
     genuine, parseable terminal verdict — rate limit, missing/
@@ -115,21 +133,27 @@ def _detect_vendor_unavailable(err: Optional[str], stdout: Optional[str]) -> boo
     exactly like it already does for a rate-limit bust.
 
     A vendor whose ``stdout`` parses as a genuine structured verdict
-    (``parse_verdict`` returns non-``None``) is presumed to have
-    actually run and produced judgeable content for ``evaluate()`` —
-    this function only ever returns True when NO such verdict could be
+    (``parse_verdict`` returns non-``None``, after stripping any
+    ``CONTRACT_ECHO:`` block exactly like ``evaluate()`` does) is
+    presumed to have actually run and produced judgeable content — this
+    function only ever returns True when NO such verdict could be
     parsed, so a real PASS/FAIL is never mistaken for a launch failure
     and silently retried looking for a more favorable vendor. Keying on
     raw stdout truthiness (as round-7 did) is unsafe: ``invoke_reviewer``
     can return non-empty stdout alongside a nonzero return code (a
     banner, partial output before a crash), so "stdout is non-empty"
     does not mean "a verdict was produced" (round-8 /advice, Opus).
+    Parsing raw (un-stripped) stdout is also unsafe: a genuine verdict
+    followed by a ``CONTRACT_ECHO:`` block fails the strict field parser
+    unless that block is stripped first, exactly as ``evaluate()``
+    already does (round-9 /advice, Codex + Opus).
     """
     if err is None:
         return False
+    from runner.skeptic_contract_echo import _strip_contract_echo_block
     from runner.skeptic_gate import parse_verdict
 
-    return parse_verdict(stdout) is None
+    return parse_verdict(_strip_contract_echo_block(stdout)) is None
 
 
 class VerifierDispatcher:
