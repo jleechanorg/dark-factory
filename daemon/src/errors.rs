@@ -108,6 +108,14 @@ pub enum DaemonError {
         spawn_error: Box<DaemonError>,
         cleanup_errors: Vec<SpawnBatchCleanupFailure>,
     },
+    /// The initial AO spawn indicated that the daemon was unavailable, but
+    /// restarting the AO project failed. Preserve both failures so operators
+    /// can diagnose the original spawn trigger and the recovery failure.
+    #[error("ao spawn failed: {spawn_error}; AO recovery failed: {recovery_error}")]
+    SpawnRecoveryFailed {
+        spawn_error: Box<DaemonError>,
+        recovery_error: Box<DaemonError>,
+    },
 }
 
 /// Renders every `(vendor, error)` pair collected by
@@ -141,6 +149,12 @@ fn format_cleanup_errors(errors: &[SpawnBatchCleanupFailure]) -> String {
 
 impl DaemonError {
     pub fn is_transient(&self) -> bool {
+        // A failed AO recovery is terminal for this dispatch attempt. The
+        // caller must inspect both preserved errors before deciding whether
+        // external intervention is safe; do not silently retry the spawn.
+        if matches!(self, DaemonError::SpawnRecoveryFailed { .. }) {
+            return false;
+        }
         matches!(
             self,
             DaemonError::Tool { .. }
@@ -203,6 +217,7 @@ impl DaemonError {
             DaemonError::SpawnFallbackExhausted(_) => "spawn_fallback_exhausted",
             DaemonError::SpawnCleanupFailed { .. } => "spawn_cleanup_failed",
             DaemonError::SpawnBatchCleanupFailed { .. } => "spawn_batch_cleanup_failed",
+            DaemonError::SpawnRecoveryFailed { .. } => "spawn_recovery_failed",
             DaemonError::WorktreeCwdMismatch { .. } => "worktree_cwd_mismatch",
         }
     }
@@ -285,6 +300,23 @@ mod tests {
     fn classifies_config_and_parse_as_fatal() {
         assert!(!DaemonError::Config("missing config".to_string()).is_transient());
         assert!(!DaemonError::Parse("bad json".to_string()).is_transient());
+    }
+
+    #[test]
+    fn classifies_spawn_recovery_failure_as_fatal_and_names_its_class() {
+        let err = DaemonError::SpawnRecoveryFailed {
+            spawn_error: Box::new(DaemonError::Tool {
+                tool: "ao spawn --agent minimax".to_string(),
+                rc: 1,
+                stderr: "daemon is not running".to_string(),
+            }),
+            recovery_error: Box::new(DaemonError::Config(
+                "ao start failed for project dark-factory".to_string(),
+            )),
+        };
+
+        assert_eq!(err.error_class(), "spawn_recovery_failed");
+        assert!(!err.is_transient());
     }
 
     /// jleechan-5ia2: AO's own internal spawn queue (hit at its active-session

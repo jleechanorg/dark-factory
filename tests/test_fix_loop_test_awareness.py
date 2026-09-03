@@ -232,6 +232,26 @@ def test_tool_does_not_record_state_on_success():
         monkey.undo()
 
 
+def test_tool_executes_compound_shell_commands(monkeypatch, tmp_path):
+    """A tool node with compound shell operators (&&, ||, ;, |) must execute via bash -c."""
+    from runner import handlers as _handlers_shim
+    import runner.handler_control as _hc
+
+    monkeypatch.setattr(_hc, "_check_test_command_paths", lambda cmd, cwd: None)
+    monkeypatch.setattr(_handlers_shim, "_sandboxed_args", lambda args: list(args))
+    monkeypatch.setattr(_handlers_shim, "_sanitized_env", lambda: {})
+
+    node = Node(
+        name="test",
+        attrs={"command": "echo first && echo second", "goal_gate": "true", "timeout": "30"},
+    )
+    ctx = Context(goal="t", workdir=tmp_path, backend="echo")
+    result = _tool(node, ctx)
+    assert result.outcome == "success"
+    assert "first" in result.output
+    assert "second" in result.output
+
+
 def test_coerce_goal_gate_accepts_string_and_bool():
     assert _coerce_goal_gate(Node(name="n", attrs={"goal_gate": True})) is True
     assert _coerce_goal_gate(Node(name="n", attrs={"goal_gate": "true"})) is True

@@ -599,6 +599,7 @@ mod tests {
             pr_number: Some(pr),
             branch: Some(format!("factory/{bead_id}-r1")),
             session_id: Some("s1".into()),
+            session_ao_project: Some("dark-factory".into()),
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,

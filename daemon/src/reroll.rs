@@ -499,20 +499,19 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
     if let Some(branch) = bead.branch.clone() {
         let window = std::time::Duration::from_secs(deps.cfg.reroll_head_stability_window_secs);
         let death_window = std::time::Duration::from_secs(deps.cfg.reroll_death_confirm_secs);
-        // AO project for the idle-liveness transcript probe. Mirrors the
-        // adopted path's resolution; falls back to the repo's last path
-        // segment when unmapped (the probe then simply yields "no evidence").
-        let ao_project = deps
-            .cfg
-            .resolve_repo(bead.repo(deps.cfg))
-            .map(|r| r.ao_project)
-            .unwrap_or_else(|| {
-                bead.repo(deps.cfg)
-                    .split('/')
-                    .next_back()
-                    .unwrap_or("")
-                    .to_string()
-            });
+        // Prefer the project recorded with the live session. Legacy rows
+        // recover through explicit repository routing, never a process-wide
+        // default or an inferred last path component.
+        let ao_project = bead
+            .session_ao_project
+            .clone()
+            .or_else(|| deps.cfg.resolve_repo(bead.repo(deps.cfg)).map(|r| r.ao_project))
+            .ok_or_else(|| {
+                DaemonError::Config(format!(
+                    "AO project ownership is unavailable for reroll session on repo {}; refusing liveness probe",
+                    bead.repo(deps.cfg)
+                ))
+            })?;
 
         emit_telemetry(
             deps.telemetry_log,
@@ -529,7 +528,10 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
 
         // Yields the static proceed reason to fall through to step 4; every
         // non-proceed path early-returns (Deferred / Err) from within.
-        let proceed_reason: &'static str = match deps.sessions.attach(&branch, &bead.bead_id) {
+        let proceed_reason: &'static str = match deps
+            .sessions
+            .attach_in_project(&branch, &bead.bead_id, &ao_project)
+        {
             // (a) No live worker to supersede — fast-path proceed.
             Err(DaemonError::SessionNotFound { .. }) => "no_live_session",
             // Transient `ao status` failure — cannot identify the session this
@@ -544,7 +546,7 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
                 // Ordering: stop() must succeed BEFORE the predicate. A
                 // transient stop failure defers (worker may be alive); a
                 // permanent one propagates.
-                match deps.sessions.stop(&session_id) {
+                match deps.sessions.stop_in_project(&session_id, &ao_project) {
                     Ok(()) => {}
                     Err(e) if e.is_transient() => {
                         emit_telemetry(
@@ -576,6 +578,7 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
         // later step can create a recoverable hold.
         deps.store.reset_reroll_deferral(&bead.bead_id)?;
         bead.session_id = None;
+        bead.session_ao_project = None;
         deps.store.save(bead)?;
 
         emit_telemetry(
@@ -782,7 +785,7 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
         deps.review_text
     );
 
-    let spec_path = Path::new(&deps.cfg.spec_dir).join(format!("{}.toml", bead.bead_id));
+    let spec_path = deps.cfg.resolve_spec_path(&bead_repo, &bead.bead_id);
     constraints::append_mutation(&spec_path, &block)?;
 
     // Transition to RECOVERY
@@ -1017,7 +1020,12 @@ fn evaluate_proceed(
         // is folded into `gone` here, and any successful non-`NotFound`
         // re-attach below resets `not_found_since`, killing the streak.
         let (gone, activity): (bool, Option<SessionActivity>) =
-            match deps.sessions.attach_within(branch, &bead.bead_id, budget_or_defer!()) {
+            match deps.sessions.attach_within_in_project(
+                branch,
+                &bead.bead_id,
+                ao_project,
+                budget_or_defer!(),
+            ) {
                 Err(DaemonError::SessionNotFound { .. }) => (true, None),
                 Err(e) if e.is_transient() => {
                     emit_telemetry(
@@ -1035,7 +1043,11 @@ fn evaluate_proceed(
                 Ok(session_id) => {
                     match deps
                         .sessions
-                        .session_activity_within(&session_id, budget_or_defer!())
+                        .session_activity_within_in_project(
+                            &session_id,
+                            ao_project,
+                            budget_or_defer!(),
+                        )
                     {
                         Ok(SessionActivity::NotFound) => (true, None),
                         Ok(a) => (false, Some(a)),
@@ -1209,6 +1221,20 @@ fn execute_adopted(
             ));
         }
     };
+    let attached_session_project = bead
+        .session_ao_project
+        .clone()
+        .or_else(|| {
+            deps.cfg
+                .resolve_repo(bead.repo(deps.cfg))
+                .map(|routing| routing.ao_project)
+        })
+        .ok_or_else(|| {
+            DaemonError::Config(format!(
+                "no AO project is configured for adopted bead repo {}",
+                bead.repo(deps.cfg)
+            ))
+        })?;
 
     emit_telemetry(
         deps.telemetry_log,
@@ -1224,11 +1250,18 @@ fn execute_adopted(
     // when the bead's freshest stored state is ATTESTED or RE_ROLL. This is
     // a second line of defense against two coder sessions racing commits
     // onto the same contributor-owned branch.
-    match deps.sessions.attach(&branch, &bead.bead_id) {
-        Ok(existing_session) => match deps.sessions.is_quiescent(&existing_session) {
+    match deps
+        .sessions
+        .attach_in_project(&branch, &bead.bead_id, &attached_session_project)
+    {
+        Ok(existing_session) => match deps
+            .sessions
+            .is_quiescent_in_project(&existing_session, &attached_session_project)
+        {
             Ok(false) => {
                 bead.state = OverlayState::HumanHeld;
                 bead.session_id = Some(existing_session.0.clone());
+                bead.session_ao_project = Some(attached_session_project.clone());
                 set_human_hold_reason(bead, HumanHoldReason::AdoptedSessionAlreadyActive);
                 deps.store.save(bead)?;
                 emit_telemetry(
@@ -1249,6 +1282,7 @@ fn execute_adopted(
             Err(e) => {
                 bead.state = OverlayState::HumanHeld;
                 bead.session_id = Some(existing_session.0.clone());
+                bead.session_ao_project = Some(attached_session_project.clone());
                 set_human_hold_reason(bead, HumanHoldReason::AdoptedQuiescenceCheckFailed);
                 deps.store.save(bead)?;
                 emit_telemetry(
@@ -1294,6 +1328,7 @@ fn execute_adopted(
     {
         bead.state = OverlayState::HumanHeld;
         bead.session_id = None;
+        bead.session_ao_project = None;
         set_human_hold_reason(bead, HumanHoldReason::TargetCheckoutUnconfigured);
         deps.store.save(bead)?;
         emit_telemetry(
@@ -1318,6 +1353,7 @@ fn execute_adopted(
         None => {
             bead.state = OverlayState::HumanHeld;
             bead.session_id = None;
+            bead.session_ao_project = None;
             set_human_hold_reason(bead, HumanHoldReason::TargetCheckoutUnconfigured);
             deps.store.save(bead)?;
             emit_telemetry(
@@ -1348,6 +1384,7 @@ fn execute_adopted(
             // quiescent above; persist that no-live-session proof with the
             // recoverable pre-spawn hold.
             bead.session_id = None;
+            bead.session_ao_project = None;
             set_human_hold_reason(
                 bead,
                 HumanHoldReason::AdoptedPreSessionShaCaptureFailed,
@@ -1395,7 +1432,7 @@ fn execute_adopted(
         branch: branch.clone(),
         prompt,
         repo: adopted_repo,
-        ao_project: adopted_routing.ao_project,
+        ao_project: adopted_routing.ao_project.clone(),
         remote: adopted_routing.push_remote,
         local_checkout: Some(adopted_checkout.clone()),
         expected_revision: Some(pre_session_sha.clone()),
@@ -1413,6 +1450,7 @@ fn execute_adopted(
     // converts that to a permanent human hold instead of spawning a duplicate.
     bead.state = OverlayState::Dispatching;
     bead.session_id = None;
+    bead.session_ao_project = None;
     bead.pre_session_head_sha = Some(pre_session_sha.clone());
     deps.store.save_dispatch_intent(bead, &spec.ao_project)?;
 
@@ -1421,6 +1459,7 @@ fn execute_adopted(
             bead.attempt = next_attempt;
             bead.reroll_count += 1;
             bead.session_id = Some(session_id.0.clone());
+            bead.session_ao_project = Some(adopted_routing.ao_project.clone());
             // Reuse DISPATCHED: branch and pr_number are deliberately left
             // unchanged (same branch, same still-open PR). The fast-tier
             // quiescence-gated DISPATCHED -> ATTESTED promotion moves this
@@ -1431,9 +1470,13 @@ fn execute_adopted(
                 .store
                 .save_remediation_session_spawned(bead, remediation_attempt, &spec.ao_project)
             {
-                if let Err(cleanup_error) = deps.sessions.stop(&session_id) {
+                if let Err(cleanup_error) = deps
+                    .sessions
+                    .stop_in_project(&session_id, &adopted_routing.ao_project)
+                {
                     bead.state = OverlayState::HumanHeld;
                     bead.session_id = Some(session_id.0.clone());
+                    bead.session_ao_project = Some(adopted_routing.ao_project.clone());
                     set_human_hold_reason(bead, HumanHoldReason::SpawnCleanupFailed);
                     let cleanup_error = match deps.store.save(bead) {
                         Ok(()) => cleanup_error,
@@ -1450,6 +1493,7 @@ fn execute_adopted(
 
                 bead.state = OverlayState::HumanHeld;
                 bead.session_id = None;
+                bead.session_ao_project = None;
                 set_human_hold_reason(bead, HumanHoldReason::AdoptedSpawnFailed);
                 deps.store.save(bead)?;
                 return Err(save_error);
@@ -1474,6 +1518,7 @@ fn execute_adopted(
             };
             bead.state = OverlayState::HumanHeld;
             bead.session_id = Some(session.clone());
+            bead.session_ao_project = Some(adopted_routing.ao_project.clone());
             set_human_hold_reason(bead, HumanHoldReason::SpawnCleanupFailed);
             if let Err(state_error) = deps.store.save(bead) {
                 return Err(DaemonError::SpawnCleanupFailed {
@@ -1489,6 +1534,7 @@ fn execute_adopted(
         Err(e) => {
             bead.state = OverlayState::HumanHeld;
             bead.session_id = None;
+            bead.session_ao_project = None;
             set_human_hold_reason(bead, HumanHoldReason::AdoptedSpawnFailed);
             deps.store.save(bead)?;
             emit_telemetry(

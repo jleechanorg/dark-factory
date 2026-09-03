@@ -95,6 +95,9 @@ pub struct BeadOverlay {
     pub pr_number: Option<u64>,
     pub branch: Option<String>,
     pub session_id: Option<String>,
+    /// Agent Orchestrator project used by the durable worker session. `None`
+    /// preserves legacy rows that predate per-session project routing.
+    pub session_ao_project: Option<String>,
     /// Adopted-PR provenance (bead jleechan-tfs1): `true` iff `branch` is an
     /// external contributor's own head_ref_name (adopted via
     /// `intake::normalize_labeled_prs`, set in `tick::run_slow_tier` at
@@ -873,6 +876,7 @@ impl SqliteStateStore {
         Self::ensure_park_reason_column(&conn)?;
         Self::ensure_target_repo_column(&conn)?;
         Self::ensure_ao_project_column(&conn)?;
+        Self::ensure_session_ao_project_column(&conn)?;
         Self::ensure_reroll_deferral_count_column(&conn)?;
         Self::ensure_reroll_head_permanent_failure_count_column(&conn)?;
         Self::ensure_held_recheck_after_column(&conn)?;
@@ -902,6 +906,7 @@ impl SqliteStateStore {
         Self::ensure_park_reason_column(&conn)?;
         Self::ensure_target_repo_column(&conn)?;
         Self::ensure_ao_project_column(&conn)?;
+        Self::ensure_session_ao_project_column(&conn)?;
         Self::ensure_reroll_deferral_count_column(&conn)?;
         Self::ensure_reroll_head_permanent_failure_count_column(&conn)?;
         Self::ensure_held_recheck_after_column(&conn)?;
@@ -1138,6 +1143,28 @@ impl SqliteStateStore {
         if !has_col {
             conn.execute("ALTER TABLE bead_overlay ADD COLUMN target_repo TEXT", [])
                 .map_err(|e| tool_err("ensure_target_repo_column: add column", e))?;
+        }
+        Ok(())
+    }
+
+    /// Idempotent migration for the per-session Agent Orchestrator project.
+    /// Nullable so rows written before session-level routing was introduced
+    /// continue to load as `None`.
+    fn ensure_session_ao_project_column(conn: &Connection) -> Result<(), DaemonError> {
+        let has_col: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
+                 WHERE name = 'session_ao_project'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_session_ao_project_column: pragma", e))?;
+        if !has_col {
+            conn.execute(
+                "ALTER TABLE bead_overlay ADD COLUMN session_ao_project TEXT",
+                [],
+            )
+            .map_err(|e| tool_err("ensure_session_ao_project_column: add column", e))?;
         }
         Ok(())
     }
@@ -1409,6 +1436,7 @@ impl SqliteStateStore {
         "park_reason",
         "target_repo",
         "ao_project",
+        "session_ao_project",
         "reroll_deferral_count",
         "held_recheck_after",
         "last_er_evidence_hash",
@@ -1441,6 +1469,7 @@ impl SqliteStateStore {
         park_reason TEXT, \
         target_repo TEXT, \
         ao_project TEXT, \
+        session_ao_project TEXT, \
         reroll_deferral_count INTEGER NOT NULL DEFAULT 0, \
         held_recheck_after INTEGER, \
         last_er_evidence_hash TEXT)";
@@ -1612,7 +1641,7 @@ impl SqliteStateStore {
             .prepare(
                 "SELECT bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
                  pr_number, branch, session_id, is_adopted, spawn_failure_count, pre_session_head_sha, \
-                 park_reason, target_repo, attempt_started_at \
+                 park_reason, target_repo, session_ao_project, attempt_started_at \
                  FROM bead_overlay WHERE state IN ('DISPATCHED', 'ATTESTED')",
             )
             .map_err(|e| tool_err(&format!("{op} prepare"), e))?;
@@ -1633,7 +1662,8 @@ impl SqliteStateStore {
                     row.get::<_, Option<String>>(11)?,
                     row.get::<_, Option<String>>(12)?,
                     row.get::<_, Option<String>>(13)?,
-                    row.get::<_, Option<i64>>(14)?,
+                    row.get::<_, Option<String>>(14)?,
+                    row.get::<_, Option<i64>>(15)?,
                 ))
             })
             .map_err(|e| tool_err(&format!("{op} query"), e))?;
@@ -1654,6 +1684,7 @@ impl SqliteStateStore {
                 pre_session_head_sha,
                 park_reason,
                 target_repo,
+                session_ao_project,
                 attempt_started_at,
             ) = r.map_err(|e| tool_err(&format!("{op} row"), e))?;
             out.push(BeadOverlay {
@@ -1671,6 +1702,7 @@ impl SqliteStateStore {
                 pre_session_head_sha,
                 park_reason,
                 target_repo,
+                session_ao_project,
                 attempt_started_at: attempt_started_at.map(|v| v.max(0) as u64),
             });
         }
@@ -1679,16 +1711,20 @@ impl SqliteStateStore {
 }
 
 fn save_overlay_conn(conn: &Connection, overlay: &BeadOverlay) -> Result<(), DaemonError> {
+    let session_ao_project = overlay
+        .session_id
+        .as_ref()
+        .and(overlay.session_ao_project.as_ref());
     conn.execute(
         "INSERT INTO bead_overlay \
-         (bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id, updated_at, is_adopted, spawn_failure_count, pre_session_head_sha, park_reason, target_repo, attempt_started_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
+         (bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id, updated_at, is_adopted, spawn_failure_count, pre_session_head_sha, park_reason, target_repo, session_ao_project, attempt_started_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) \
          ON CONFLICT(bead_id) DO UPDATE SET \
            state=excluded.state, attempt=excluded.attempt, reroll_count=excluded.reroll_count, \
            autonomy_secs=excluded.autonomy_secs, spend_usd=excluded.spend_usd, \
            pr_number=excluded.pr_number, branch=excluded.branch, session_id=excluded.session_id, updated_at=excluded.updated_at, \
            is_adopted=excluded.is_adopted, spawn_failure_count=excluded.spawn_failure_count, pre_session_head_sha=excluded.pre_session_head_sha, \
-           park_reason=excluded.park_reason, target_repo=excluded.target_repo, attempt_started_at=excluded.attempt_started_at",
+           park_reason=excluded.park_reason, target_repo=excluded.target_repo, session_ao_project=excluded.session_ao_project, attempt_started_at=excluded.attempt_started_at",
         params![
             overlay.bead_id,
             overlay.state.as_str(),
@@ -1705,6 +1741,7 @@ fn save_overlay_conn(conn: &Connection, overlay: &BeadOverlay) -> Result<(), Dae
             overlay.pre_session_head_sha,
             overlay.park_reason,
             overlay.target_repo,
+            session_ao_project,
             overlay.attempt_started_at.map(|v| v as i64),
         ],
     )
@@ -1746,7 +1783,7 @@ impl StateStore for SqliteStateStore {
             .query_row(
                 "SELECT bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
                  pr_number, branch, session_id, is_adopted, spawn_failure_count, pre_session_head_sha, \
-                 park_reason, target_repo, attempt_started_at \
+                 park_reason, target_repo, session_ao_project, attempt_started_at \
                  FROM bead_overlay WHERE bead_id = ?1",
                 params![bead_id],
                 |row| {
@@ -1756,7 +1793,8 @@ impl StateStore for SqliteStateStore {
                     let pre_session_head_sha: Option<String> = row.get(11)?;
                     let park_reason: Option<String> = row.get(12)?;
                     let target_repo: Option<String> = row.get(13)?;
-                    let attempt_started_at: Option<i64> = row.get(14)?;
+                    let session_ao_project: Option<String> = row.get(14)?;
+                    let attempt_started_at: Option<i64> = row.get(15)?;
                     Ok((
                         state_str,
                         BeadOverlay {
@@ -1774,6 +1812,7 @@ impl StateStore for SqliteStateStore {
                             pre_session_head_sha,
                             park_reason,
                             target_repo,
+                            session_ao_project,
                             attempt_started_at: attempt_started_at.map(|v| v.max(0) as u64),
                         },
                     ))
@@ -2187,7 +2226,7 @@ impl StateStore for SqliteStateStore {
             .prepare(
                 "UPDATE bead_overlay \
              SET state = 'QUEUED', attempt = attempt + 1, autonomy_secs = 0, \
-                 pr_number = NULL, session_id = NULL, park_reason = NULL, \
+                 pr_number = NULL, session_id = NULL, session_ao_project = NULL, park_reason = NULL, \
                  attempt_started_at = NULL, updated_at = ?1 \
              WHERE state = 'HUMAN_HELD' \
                AND attempt < ?2 \
@@ -2196,7 +2235,7 @@ impl StateStore for SqliteStateStore {
                     OR substr(park_reason, 1, length(?8)) = ?8) \
              RETURNING bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
                  pr_number, branch, session_id, is_adopted, spawn_failure_count, \
-                 pre_session_head_sha, park_reason, target_repo, attempt_started_at",
+                 pre_session_head_sha, park_reason, target_repo, session_ao_project, attempt_started_at",
             )
             .map_err(|e| tool_err("recover_human_held prepare", e))?;
         let rows = stmt
@@ -2227,7 +2266,8 @@ impl StateStore for SqliteStateStore {
                         row.get::<_, Option<String>>(11)?,
                         row.get::<_, Option<String>>(12)?,
                         row.get::<_, Option<String>>(13)?,
-                        row.get::<_, Option<i64>>(14)?,
+                        row.get::<_, Option<String>>(14)?,
+                        row.get::<_, Option<i64>>(15)?,
                     ))
                 },
             )
@@ -2249,6 +2289,7 @@ impl StateStore for SqliteStateStore {
                 pre_session_head_sha,
                 park_reason,
                 target_repo,
+                session_ao_project,
                 attempt_started_at,
             ) = r.map_err(|e| tool_err("recover_human_held row", e))?;
             out.push(BeadOverlay {
@@ -2266,6 +2307,7 @@ impl StateStore for SqliteStateStore {
                 pre_session_head_sha,
                 park_reason,
                 target_repo,
+                session_ao_project,
                 attempt_started_at: attempt_started_at.map(|v| v.max(0) as u64),
             });
         }
@@ -2281,7 +2323,7 @@ impl StateStore for SqliteStateStore {
             .prepare(
                 "SELECT bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
                  pr_number, branch, session_id, is_adopted, spawn_failure_count, pre_session_head_sha, \
-                 park_reason, target_repo, attempt_started_at \
+                 park_reason, target_repo, session_ao_project, attempt_started_at \
                  FROM bead_overlay WHERE state = 'HUMAN_HELD' AND attempt >= ?1",
             )
             .map_err(|e| tool_err("human_held_at_or_above_attempt prepare", e))?;
@@ -2302,7 +2344,8 @@ impl StateStore for SqliteStateStore {
                     row.get::<_, Option<String>>(11)?,
                     row.get::<_, Option<String>>(12)?,
                     row.get::<_, Option<String>>(13)?,
-                    row.get::<_, Option<i64>>(14)?,
+                    row.get::<_, Option<String>>(14)?,
+                    row.get::<_, Option<i64>>(15)?,
                 ))
             })
             .map_err(|e| tool_err("human_held_at_or_above_attempt query", e))?;
@@ -2323,6 +2366,7 @@ impl StateStore for SqliteStateStore {
                 pre_session_head_sha,
                 park_reason,
                 target_repo,
+                session_ao_project,
                 attempt_started_at,
             ) = r.map_err(|e| tool_err("human_held_at_or_above_attempt row", e))?;
             out.push(BeadOverlay {
@@ -2340,6 +2384,7 @@ impl StateStore for SqliteStateStore {
                 pre_session_head_sha,
                 park_reason,
                 target_repo,
+                session_ao_project,
                 attempt_started_at: attempt_started_at.map(|v| v.max(0) as u64),
             });
         }
@@ -3111,6 +3156,7 @@ mod tests {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+            session_ao_project: None,
         };
         s.save(&o).unwrap();
 
@@ -3151,6 +3197,7 @@ mod tests {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+            session_ao_project: None,
         };
         s.save(&o).unwrap();
 
@@ -3207,6 +3254,7 @@ mod tests {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+            session_ao_project: None,
         };
         s.save(&o).unwrap();
         // Unset by default.
@@ -3354,6 +3402,7 @@ mod tests {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+            session_ao_project: None,
         };
         s.save(&o).expect("DISPOSITION_REQUIRED must persist after open-time migration");
         let got = s.load("held-bead").unwrap().unwrap();
@@ -3380,6 +3429,7 @@ mod tests {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+            session_ao_project: None,
         };
         s.save(&o).unwrap();
         let got = s.load("b1").unwrap().unwrap();
@@ -3388,6 +3438,41 @@ mod tests {
         assert_eq!(got.bead_id, "b1");
         assert_eq!(got.pr_number, None);
         assert_eq!(got.branch, None);
+    }
+
+    #[test]
+    fn session_ao_project_roundtrips_and_legacy_rows_load_none() {
+        let s = store();
+        let o = BeadOverlay {
+            bead_id: "session-project".into(),
+            state: OverlayState::Queued,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: None,
+            session_id: Some("session-project-id".into()),
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+            session_ao_project: Some("dark-factory".into()),
+        };
+        s.save(&o).unwrap();
+        let restored = s.load(&o.bead_id).unwrap().unwrap();
+        assert_eq!(restored.session_id.as_deref(), Some("session-project-id"));
+        assert_eq!(restored.session_ao_project.as_deref(), Some("dark-factory"));
+
+        s.conn
+            .execute(
+                "INSERT INTO bead_overlay (bead_id, state, updated_at) VALUES ('legacy-project', 'QUEUED', 'now')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(s.load("legacy-project").unwrap().unwrap().session_ao_project, None);
     }
 
     #[test]
@@ -3409,6 +3494,7 @@ mod tests {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+            session_ao_project: None,
         };
         s.save(&o).unwrap();
         o.state = OverlayState::Attested;
@@ -3448,6 +3534,7 @@ mod tests {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+            session_ao_project: None,
         };
 
         s.save(&o).unwrap();
@@ -3486,6 +3573,7 @@ mod tests {
             park_reason: Some("spawn_cleanup_failed".into()),
             target_repo: None,
             attempt_started_at: None,
+            session_ao_project: None,
         };
 
         s.save(&o).unwrap();
@@ -3511,6 +3599,7 @@ mod tests {
             pr_number: None,
             branch: Some("factory/routed-r1".into()),
             session_id: Some("wa-404".into()),
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -3593,6 +3682,7 @@ mod tests {
                 park_reason: None,
                 target_repo: None,
                 attempt_started_at: None,
+                session_ao_project: None,
             };
             s.save(&o).unwrap();
             let got = s.load(&o.bead_id).unwrap().unwrap();
@@ -3634,6 +3724,7 @@ mod tests {
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
+            session_ao_project: None,
         };
         s.save(&o).unwrap();
         s.register_branch("b1", "factory/b1-r1").unwrap();
@@ -4207,6 +4298,7 @@ mod tests {
                 park_reason: Some("transient_spawn_retry_cap_exceeded".into()),
                 target_repo: None,
                 attempt_started_at: None,
+                session_ao_project: None,
             },
         );
         overlays.insert(
@@ -4227,6 +4319,7 @@ mod tests {
                 park_reason: None,
                 target_repo: None,
                 attempt_started_at: None,
+                session_ao_project: None,
             },
         );
         overlays.insert(
@@ -4247,6 +4340,7 @@ mod tests {
                 park_reason: None,
                 target_repo: None,
                 attempt_started_at: None,
+                session_ao_project: None,
             },
         );
         for (bead_id, session_id, park_reason) in [
@@ -4280,6 +4374,7 @@ mod tests {
                     park_reason,
                     target_repo: None,
                     attempt_started_at: None,
+                    session_ao_project: None,
                 },
             );
         }
@@ -4302,6 +4397,7 @@ mod tests {
                 park_reason: None,
                 target_repo: None,
                 attempt_started_at: None,
+                session_ao_project: None,
             },
         );
         overlays.insert(
@@ -4322,6 +4418,7 @@ mod tests {
                 park_reason: None,
                 target_repo: None,
                 attempt_started_at: None,
+                session_ao_project: None,
             },
         );
         for overlay in overlays.values() {
@@ -4426,6 +4523,7 @@ mod tests {
                 park_reason: Some(crate::reroll::CIRCUIT_BREAKER_PARK_REASON.to_string()),
                 target_repo: None,
                 attempt_started_at: None,
+                session_ao_project: None,
             },
         );
         overlays.insert(
@@ -4446,6 +4544,7 @@ mod tests {
                 park_reason: Some("session_stalled".to_string()),
                 target_repo: None,
                 attempt_started_at: None,
+                session_ao_project: None,
             },
         );
         for overlay in overlays.values() {
@@ -4525,6 +4624,7 @@ mod tests {
                 park_reason: Some("unmapped_target_repo".to_string()),
                 target_repo: Some("someorg/unrelated-repo".to_string()),
                 attempt_started_at: None,
+                session_ao_project: None,
             },
         );
         overlays.insert(
@@ -4545,6 +4645,7 @@ mod tests {
                 park_reason: Some("session_stalled".to_string()),
                 target_repo: None,
                 attempt_started_at: None,
+                session_ao_project: None,
             },
         );
         for overlay in overlays.values() {
@@ -4612,6 +4713,7 @@ mod tests {
                 park_reason: Some("unmapped_repo".to_string()),
                 target_repo: None,
                 attempt_started_at: None,
+                session_ao_project: None,
             },
         );
         overlays.insert(
@@ -4632,6 +4734,7 @@ mod tests {
                 park_reason: Some("session_stalled".to_string()),
                 target_repo: Some("owner/repo".to_string()),
                 attempt_started_at: None,
+                session_ao_project: None,
             },
         );
         for overlay in overlays.values() {
@@ -4695,6 +4798,7 @@ mod tests {
                 park_reason: Some("worktree_remote_mismatch".to_string()),
                 target_repo: Some("jleechanorg/worldarchitect.ai".to_string()),
                 attempt_started_at: None,
+                session_ao_project: None,
             },
         );
         overlays.insert(
@@ -4715,6 +4819,7 @@ mod tests {
                 park_reason: Some("session_stalled".to_string()),
                 target_repo: None,
                 attempt_started_at: None,
+                session_ao_project: None,
             },
         );
         overlays.insert(
@@ -4735,6 +4840,7 @@ mod tests {
                 park_reason: Some("spawn_cleanup_failed".to_string()),
                 target_repo: None,
                 attempt_started_at: None,
+                session_ao_project: None,
             },
         );
         overlays.insert(
@@ -4755,6 +4861,7 @@ mod tests {
                 park_reason: Some("worktree_remote_unverifiable".to_string()),
                 target_repo: None,
                 attempt_started_at: None,
+                session_ao_project: None,
             },
         );
         overlays.insert(
@@ -4775,6 +4882,7 @@ mod tests {
                 park_reason: Some("spawn_branch_mismatch".to_string()),
                 target_repo: None,
                 attempt_started_at: None,
+                session_ao_project: None,
             },
         );
         for overlay in overlays.values() {
@@ -4874,6 +4982,7 @@ mod tests {
                     park_reason: None,
                     target_repo: None,
                     attempt_started_at: None,
+                    session_ao_project: None,
                 })
                 .unwrap();
         }
@@ -4896,6 +5005,7 @@ mod tests {
                 park_reason: Some("transient_spawn_retry_cap_exceeded".into()),
                 target_repo: None,
                 attempt_started_at: None,
+                session_ao_project: None,
             })
             .unwrap();
 
@@ -4949,6 +5059,7 @@ mod tests {
                     park_reason: Some(park_reason),
                     target_repo: None,
                     attempt_started_at: None,
+                    session_ao_project: None,
                 })
                 .unwrap();
         }
@@ -4990,6 +5101,7 @@ mod tests {
             park_reason: Some(HumanHoldReason::SessionStalled.value()),
             target_repo: Some("jleechanorg/dark-factory".into()),
             attempt_started_at: None,
+            session_ao_project: None,
         };
         recovery_store.save(&overlay).unwrap();
 
@@ -5093,6 +5205,7 @@ mod tests {
                 park_reason: None,
                 target_repo: None,
                 attempt_started_at: None,
+                session_ao_project: None,
             })
             .unwrap();
         store
@@ -5112,6 +5225,7 @@ mod tests {
                 park_reason: None,
                 target_repo: None,
                 attempt_started_at: None,
+                session_ao_project: None,
             })
             .unwrap();
         store
@@ -5131,6 +5245,7 @@ mod tests {
                 park_reason: None,
                 target_repo: None,
                 attempt_started_at: None,
+                session_ao_project: None,
             })
             .unwrap();
 
@@ -5602,6 +5717,7 @@ mod tests {
                 park_reason: None,
                 target_repo: None,
                 attempt_started_at: Some(old_started_at),
+                session_ao_project: None,
             })
             .unwrap();
 
@@ -5622,6 +5738,7 @@ mod tests {
                 park_reason: None,
                 target_repo: None,
                 attempt_started_at: Some(now_epoch),
+                session_ao_project: None,
             })
             .unwrap();
 
@@ -5643,6 +5760,7 @@ mod tests {
             pr_number: Some(pr),
             branch: Some("factory/shared-pr".into()),
             session_id: (state == OverlayState::Dispatched).then(|| "owner-session".into()),
+            session_ao_project: None,
             is_adopted: true,
             spawn_failure_count: 0,
             pre_session_head_sha: None,

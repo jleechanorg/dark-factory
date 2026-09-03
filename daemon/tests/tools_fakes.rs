@@ -108,6 +108,7 @@ fn fake_sessions_spawn_attach_stop_quiescent_roundtrip() {
         fail_spawn_deferred_for: Default::default(),
         spawn_prompts: Default::default(),
         calls: Default::default(),
+        stop_in_project_calls: Default::default(),
         branch_for: Default::default(),
         terminal_at: Default::default(),
         quiescence_check_error: Default::default(),

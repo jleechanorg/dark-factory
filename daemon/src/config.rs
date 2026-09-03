@@ -201,6 +201,24 @@ impl Config {
         path.is_dir().then_some(path)
     }
 
+    /// Resolve the mutable reroll spec outside managed source checkouts.
+    /// Absolute paths are explicit operator-owned locations. Relative paths
+    /// use the daemon runtime-state tree, sharded by complete repository
+    /// identity, so mutation cannot dirty an exact-head target checkout.
+    pub fn resolve_spec_path(&self, repo: &str, bead_id: &str) -> PathBuf {
+        let filename = format!("{bead_id}.toml");
+        if Path::new(&self.spec_dir).is_relative() {
+            let (owner, name) = repo.split_once('/').unwrap_or(("unknown", repo));
+            crate::intake::runtime_state_dir()
+                .join("specs")
+                .join(owner)
+                .join(name)
+                .join(filename)
+        } else {
+            Path::new(&self.spec_dir).join(&filename)
+        }
+    }
+
     /// Bead jleechan-jw4c: resolve the per-agent worktree directory under
     /// `agent_worktree_root`. Returns `None` when the operator has not
     /// flipped on the new layout (the config knob is `None`), in which
@@ -319,6 +337,9 @@ pub fn load(path: &Path) -> Result<Config, DaemonError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static TARGET_WORKTREE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn parses_example_config() {
         let cfg = load(
@@ -328,7 +349,7 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.ao_project.as_deref(), Some("dark-factory"));
         assert_eq!(cfg.stage, 1);
-        assert_eq!(cfg.max_workers, 30);
+        assert_eq!(cfg.max_workers, 40);
         assert_eq!(cfg.max_batch, 15);
         assert_eq!(cfg.base_branch, "main");
     }
@@ -634,6 +655,9 @@ local_checkout = "{}"
 
     #[test]
     fn target_worktree_reuses_isolated_checkout_when_local_checkout_is_missing() {
+        let _lock = TARGET_WORKTREE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let root = std::env::temp_dir().join(format!("afd_isolated_target_{}", std::process::id()));
         let isolated = root.join("owner").join("target");
         std::fs::create_dir_all(&isolated).unwrap();
@@ -664,6 +688,80 @@ push_remote = "origin"
             Some(value) => std::env::set_var("DARK_FACTORY_TARGET_WORKTREE_ROOT", value),
             None => std::env::remove_var("DARK_FACTORY_TARGET_WORKTREE_ROOT"),
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Relative runtime specs must never dirty the managed target checkout.
+    #[test]
+    fn relative_spec_dir_uses_runtime_state_not_target_worktree() {
+        let cfg = Config {
+            target_repo: "owner/daemon".into(),
+            ao_project: None,
+            base_branch: "main".into(),
+            stage: 1,
+            max_workers: 1,
+            max_batch: 1,
+            fast_tick_secs: 1,
+            slow_tick_secs: 1,
+            autonomy_timebox_secs: 60,
+            budget_warn_usd: 1.0,
+            spec_dir: ".factory/specs/".into(),
+            reroll_head_stability_window_secs: 30,
+            reroll_death_confirm_secs: 5,
+            held_recheck_cooldown_secs: 900,
+            repos: std::collections::HashMap::new(),
+            pre_gate_validation_enabled: false,
+            escalation_refire_secs: 3600,
+            agent_worktree_root: None,
+            worktree_ttl_secs: 14 * 24 * 60 * 60,
+            worktree_max_count: 200,
+        };
+
+        let resolved = cfg.resolve_spec_path("owner/target", "bead-123");
+        let expected = crate::intake::runtime_state_dir()
+            .join("specs")
+            .join("owner")
+            .join("target")
+            .join("bead-123.toml");
+        assert_eq!(
+            resolved, expected,
+            "a relative spec_dir must resolve under daemon runtime state, not a managed source checkout"
+        );
+    }
+
+    /// Companion to the relative case above: an ABSOLUTE `spec_dir` must be
+    /// used as-is, never joined onto the target worktree root at all.
+    #[test]
+    fn absolute_spec_dir_ignores_target_worktree() {
+        let root = std::env::temp_dir().join(format!("afd_absolute_spec_dir_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let absolute_spec_dir = root.join("shared-specs");
+
+        let cfg = Config {
+            target_repo: "owner/daemon".into(),
+            ao_project: None,
+            base_branch: "main".into(),
+            stage: 1,
+            max_workers: 1,
+            max_batch: 1,
+            fast_tick_secs: 1,
+            slow_tick_secs: 1,
+            autonomy_timebox_secs: 60,
+            budget_warn_usd: 1.0,
+            spec_dir: absolute_spec_dir.display().to_string(),
+            reroll_head_stability_window_secs: 30,
+            reroll_death_confirm_secs: 5,
+            held_recheck_cooldown_secs: 900,
+            repos: std::collections::HashMap::new(),
+            pre_gate_validation_enabled: false,
+            escalation_refire_secs: 3600,
+            agent_worktree_root: None,
+            worktree_ttl_secs: 14 * 24 * 60 * 60,
+            worktree_max_count: 200,
+        };
+
+        let resolved = cfg.resolve_spec_path("owner/target", "bead-456");
+        assert_eq!(resolved, absolute_spec_dir.join("bead-456.toml"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -788,6 +886,9 @@ push_remote = "origin"
 
     #[test]
     fn isolated_target_worktree_path_keeps_same_name_repositories_separate() {
+        let _lock = TARGET_WORKTREE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let root = std::env::temp_dir().join(format!(
             "afd_isolated_same_name_{}",
             std::process::id()

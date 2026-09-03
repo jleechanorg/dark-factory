@@ -271,6 +271,7 @@ echo "==> verifying import"
 
 if [[ "${RUNTIME_ROOT}" != "${REPO_ROOT}" && -f "${RUNTIME_ROOT}/daemon/Cargo.toml" ]]; then
   DAEMON_BINARY="${RUNTIME_ROOT}/daemon/target/release/daemon"
+  RELEASE_MANIFEST="${RUNTIME_ROOT}/release-manifest.json"
   if [[ "${ARTIFACT_CREATED}" -eq 1 ]]; then
     if ! command -v cargo >/dev/null 2>&1; then
       echo "ERROR: cargo not found on PATH; required to build the immutable Linux daemon." >&2
@@ -278,9 +279,20 @@ if [[ "${RUNTIME_ROOT}" != "${REPO_ROOT}" && -f "${RUNTIME_ROOT}/daemon/Cargo.to
     fi
     echo "==> building immutable Rust daemon"
     cargo build --release --manifest-path "${RUNTIME_ROOT}/daemon/Cargo.toml"
+    DAEMON_SHA256="$(sha256sum "${DAEMON_BINARY}" | awk '{print $1}')"
+    if [[ ! "${DAEMON_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+      echo "ERROR: could not calculate the immutable daemon SHA256." >&2
+      exit 1
+    fi
+    printf '{\n  "schema_version": 1,\n  "source_commit": "%s",\n  "daemon": {\n    "path": "daemon/target/release/daemon",\n    "sha256": "%s"\n  }\n}\n' \
+      "${ARTIFACT_VERSION}" "${DAEMON_SHA256}" > "${RELEASE_MANIFEST}"
   elif [[ ! -x "${DAEMON_BINARY}" ]]; then
     echo "ERROR: immutable release is missing ${DAEMON_BINARY}." >&2
     echo "Rerun install.sh --clear to rebuild the release." >&2
+    exit 1
+  elif [[ ! -f "${RELEASE_MANIFEST}" ]]; then
+    echo "ERROR: immutable release is missing ${RELEASE_MANIFEST}." >&2
+    echo "Rerun install.sh --clear to rebuild the release with provenance." >&2
     exit 1
   fi
 fi
