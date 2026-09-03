@@ -378,6 +378,36 @@ def test_evaluate_malformed_output_fails_closed():
     result = evaluate(review_output="looks good, no extra text", **_ctx())
     assert result.check_state == "failure"
 
+def test_evaluate_genuine_verdict_survives_nonzero_exit_error():
+    """round-10 /advice: a real, complete, parseable FAIL verdict must
+    not be discarded just because `review_error` (e.g. a flaky
+    nonzero exit code) is also set — previously `evaluate()`
+    short-circuited to "reviewer unavailable" the instant
+    `review_error` was truthy, regardless of output content."""
+    out = _valid_output(verdict="FAIL", reason="found a real bug")
+    result = evaluate(
+        review_output=out,
+        review_error="reviewer rc=1: some flaky wrapper noise",
+        **_ctx(),
+    )
+    assert result.check_state == "failure"
+    assert result.verdict == "FAIL"
+    assert result.parsed is not None
+    assert "found a real bug" in result.reason
+
+def test_evaluate_unparseable_output_with_error_folds_error_into_reason():
+    """When review_error is set AND the output still can't be parsed
+    into a genuine verdict, the error diagnostic must not be silently
+    dropped just because output happened to be non-empty."""
+    result = evaluate(
+        review_output="not a real verdict, just prose",
+        review_error="reviewer rc=1: some flaky wrapper noise",
+        **_ctx(),
+    )
+    assert result.check_state == "failure"
+    assert result.parsed is None
+    assert "flaky wrapper noise" in result.reason
+
 # ===========================================================================
 # aggregate_results — multi-reviewer independence
 # ===========================================================================

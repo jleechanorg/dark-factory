@@ -1046,7 +1046,27 @@ def evaluate(
       into the comment body so the read-back verifier can equality-
       check it.
     """
-    if review_error or not (review_output and review_output.strip()):
+    # round-10 /advice finding (Codex + Opus, independently converged):
+    # this used to short-circuit to "reviewer unavailable" whenever
+    # `review_error` was truthy, REGARDLESS of whether `review_output`
+    # contained a genuine, complete, parseable verdict — so round-9's
+    # fix to `_detect_vendor_unavailable` (making the chain-walk
+    # correctly NOT skip a vendor that produced a real verdict even
+    # alongside a nonzero exit code) was undermined: `evaluate()` itself
+    # still discarded that verdict here and reported "unavailable"
+    # instead of the real result. Both reviewers agreed this was
+    # fail-closed/non-exploitable (no security bypass — the gate still
+    # failed safely), but a functional blocker: a reviewer CLI with a
+    # flaky/nonzero exit on an otherwise-valid FAIL verdict always lost
+    # that verdict. Fix: only take the immediate "unavailable" path when
+    # there is truly no output content at all; when output exists,
+    # attempt the SAME parse (contract-echo stripped, same as
+    # `_detect_vendor_unavailable` now does) regardless of `review_error`
+    # — a genuine verdict is used if one is found. `review_error` is
+    # folded into the reason if parsing still fails, so the diagnostic
+    # information is not lost.
+    review_output_has_content = bool(review_output and review_output.strip())
+    if not review_output_has_content:
         reason = "reviewer unavailable"
         if review_error:
             reason = f"reviewer unavailable: {review_error.strip()[:200]}"
@@ -1115,6 +1135,13 @@ def evaluate(
                 "inconsistent with VERDICT, or extra prose/code-block "
                 "present — fail-closed)"
             )
+        if review_error:
+            # round-10: a genuine parse attempt was made despite
+            # `review_error` being set (see the note above), but it
+            # still failed — fold the error back in so the diagnostic
+            # information from the failed invocation is not silently
+            # dropped just because output happened to be non-empty.
+            reason = f"{reason}; reviewer also reported an error: {review_error.strip()[:200]}"
         body = format_comment(
             verdict="FAIL",
             head_sha=head_sha,

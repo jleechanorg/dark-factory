@@ -75,6 +75,19 @@ from runner.skeptic_gate import (
 # silently truncate — a partial review cannot satisfy the gate.
 MAX_DIFF_BYTES = 1024 * 1024  # 1 MiB
 
+# Linux's MAX_ARG_STRLEN kernel constant caps a SINGLE argv element at
+# 131072 bytes (128 KiB) -- unrelated to the larger combined-argv+environ
+# ARG_MAX limit. `agy` has no stdin-based prompt delivery (verified: its
+# `--print` flag requires the prompt as an argv value; a bare `--print`
+# with piped stdin and no positional value errors immediately, it never
+# reads stdin for a plain-text prompt), so its prompt is embedded directly
+# in argv and can hit E2BIG on the real Linux factory host once the diff
+# approaches this limit (`MAX_DIFF_BYTES` above is 1 MiB, well over 128
+# KiB, so this is reachable). A conservative safety margin below the hard
+# 131072-byte kernel limit, to leave room for the rest of `agy`'s argv
+# (binary path, flags) sharing the same limit (round-10 /advice, Opus).
+AGY_ARGV_PROMPT_SAFETY_LIMIT_BYTES = 120 * 1024
+
 # Default reviewer list. Both must PASS.
 DEFAULT_REVIEWERS_JSON = '[["codex", ""], ["gemini", "gemini-3.7-pro"]]'
 
@@ -521,12 +534,39 @@ def _build_reviewer_cmd(
     vendors from ``skeptic_reviewer_priority()``
     (``config/skeptic_reviewer_priority.json``). Their argv mirrors the
     daemon's already-working table (`daemon/src/tick.rs::dispatch_reviewer`)
-    exactly: none of these CLIs read the prompt from stdin — `agy`'s
-    `--print` and `cursor-agent`'s `-f` take the prompt as their own
-    positional value, so `prompt` is embedded directly in argv, never
-    passed via stdin (PR #819 round-2 finding: the previous version only
-    knew `codex`/`gemini`, so a chain-walk fallback to any of these
-    vendors raised `RuntimeError` instead of advancing the queue).
+    for flags, but PR #819 round-10 corrected a wrong claim in this
+    docstring: `claude`/`claudem`/`minimax` and `cursor-agent` (plus its
+    `cursor`/`agentf` aliases) DO read the prompt from stdin when no
+    positional prompt value is given (verified by direct invocation:
+    `claude --print` and `cursor-agent -f -p` both consume piped stdin;
+    `cursor-agent` errors with "No prompt provided for print mode" only
+    when stdin is empty, proving it genuinely reads it). Embedding the
+    full prompt+diff (up to `MAX_DIFF_BYTES` = 1 MiB) as a single argv
+    element exceeds Linux's 131072-byte `MAX_ARG_STRLEN` kernel limit
+    for any diff over ~128 KiB, causing `execve` to fail with `E2BIG` —
+    a silent total-outage bug (round-10 /advice, Opus). These four
+    vendor names now mirror codex/gemini's stdin delivery exactly; only
+    `prompt` itself is omitted from their argv here (the caller,
+    ``invoke_reviewer``, supplies it via ``stdin_input``).
+
+    `agy` is the one exception: verified it has NO stdin-based prompt
+    delivery for plain-text prompts (`--print` requires the prompt as
+    an argv value; a bare `--print` with piped stdin and no positional
+    value errors immediately without ever reading stdin). `agy` does
+    support a `--input-format stream-json` NDJSON-over-stdin mode, but
+    adopting it would require restructuring both the request envelope
+    and the output parser to a different contract — out of proportion
+    for closing an argv-size edge case on a vendor that is separately,
+    already documented as unable to authenticate in this CI-sandboxed
+    path at all (see ``REVIEWER_ENV_PROVIDER_ALLOWLIST`` above). `agy`
+    keeps its prompt in argv but is now guarded by an explicit
+    pre-flight size check in ``invoke_reviewer`` (fails loud with a
+    clear message before ``subprocess.run`` would otherwise crash with
+    an opaque OS-level `E2BIG`), rather than a silent outage.
+
+    PR #819 round-2 finding, still true: the previous version only knew
+    `codex`/`gemini`, so a chain-walk fallback to any of these vendors
+    raised `RuntimeError` instead of advancing the queue.
     """
     if reviewer in ("claudem", "minimax"):
         return [
@@ -539,7 +579,6 @@ def _build_reviewer_cmd(
             "high",
             "--model",
             "MiniMax-M3",
-            prompt,
         ]
     if reviewer == "claude":
         return [
@@ -548,12 +587,11 @@ def _build_reviewer_cmd(
             "--dangerously-skip-permissions",
             "--setting-sources",
             "",
-            prompt,
         ]
     if reviewer == "agy":
         return [agy_bin or "agy", "--dangerously-skip-permissions", "--print", prompt]
     if reviewer in ("cursor-agent", "cursor", "agentf"):
-        return [cursor_bin or "cursor-agent", "-f", prompt]
+        return [cursor_bin or "cursor-agent", "-f"]
     if reviewer == "codex":
         cmd = [
             codex_bin or "codex",
@@ -674,11 +712,31 @@ def invoke_reviewer(
         cursor_bin=cursor_bin,
     )
     stdin_input = prompt
-    if reviewer in ("claudem", "minimax", "claude", "agy", "cursor-agent", "cursor", "agentf"):
-        # These CLIs take the prompt as a positional argv value (already
-        # embedded in `cmd` above), not via stdin — mirrors the daemon's
-        # `dispatch_reviewer` table (`daemon/src/tick.rs`).
+    if reviewer == "agy":
+        # PR #819 round-10: `agy` is the one vendor with no stdin-based
+        # plain-text prompt delivery (verified directly — see
+        # `_build_reviewer_cmd`'s docstring), so its prompt stays in argv
+        # (already embedded in `cmd` above). Guard it explicitly here: a
+        # prompt over the Linux single-argv-element limit would otherwise
+        # make `subprocess.run` below crash with an opaque OS-level
+        # `E2BIG` — fail loud with an actionable message instead.
+        prompt_bytes = len(prompt.encode("utf-8"))
+        if prompt_bytes > AGY_ARGV_PROMPT_SAFETY_LIMIT_BYTES:
+            return None, (
+                f"prompt is too large for agy's argv-only prompt delivery: "
+                f"{prompt_bytes} bytes > {AGY_ARGV_PROMPT_SAFETY_LIMIT_BYTES} "
+                f"(agy has no stdin fallback for plain-text prompts; split "
+                f"the PR or use a different reviewer for this diff size)"
+            )
         stdin_input = None
+    elif reviewer in ("claudem", "minimax", "claude", "cursor-agent", "cursor", "agentf"):
+        # PR #819 round-10: these CLIs DO read the prompt from stdin when
+        # no positional prompt value is given (verified directly — see
+        # `_build_reviewer_cmd`'s docstring). `cmd` above already omits
+        # `prompt` from argv for these vendors, so deliver it via stdin
+        # exactly like codex/gemini already do, avoiding the Linux argv
+        # single-element size limit entirely (round-10 /advice, Opus).
+        stdin_input = prompt
     elif reviewer == "gemini" and cmd and cmd[0].endswith("gemini"):
         cmd = [
             gemini_bin or "agy",

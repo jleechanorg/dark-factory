@@ -693,3 +693,96 @@ def test_vendor_registry_is_the_single_source_for_both_identity_tables():
                 f"{vendor.identity!r}"
             )
     assert checked_any_prefix, "sanity: the registry must have at least one commit-prefixed vendor"
+
+
+# ===========================================================================
+# round-10 /advice finding (Opus): argv-size E2BIG risk
+# ===========================================================================
+#
+# `MAX_DIFF_BYTES` (1 MiB) is well over Linux's 131072-byte
+# `MAX_ARG_STRLEN` single-argv-element limit. `_build_reviewer_cmd`
+# previously embedded the whole prompt+diff directly in argv for
+# `claudem`/`minimax`/`claude`/`agy`/`cursor-agent`/`cursor`/`agentf`,
+# so any PR near the diff-size ceiling would make `execve` fail with
+# `E2BIG` on the real Linux factory host for those vendors — codex and
+# gemini were unaffected since they already deliver the prompt via
+# stdin. Verified directly (not assumed) that `claude`/`cursor-agent`
+# DO read the prompt from stdin when no positional prompt value is
+# given, and that `agy` genuinely does NOT (its `--print` flag requires
+# the prompt as an argv value; piped stdin with no positional value
+# errors immediately without ever being read).
+
+import runner.skeptic_gate_cli as _skeptic_gate_cli_mod  # noqa: E402
+from runner.skeptic_gate_cli import (  # noqa: E402
+    AGY_ARGV_PROMPT_SAFETY_LIMIT_BYTES,
+    invoke_reviewer,
+)
+
+
+@pytest.mark.parametrize(
+    "vendor",
+    ["claudem", "minimax", "claude", "cursor-agent", "cursor", "agentf"],
+)
+def test_stdin_capable_vendors_never_embed_prompt_in_argv(vendor):
+    """These vendors deliver the prompt via stdin (verified directly
+    against the real CLIs), so `_build_reviewer_cmd`'s argv must never
+    contain the prompt text, regardless of prompt size — this is what
+    makes them immune to the Linux argv-size E2BIG risk."""
+    big_prompt = "X" * (AGY_ARGV_PROMPT_SAFETY_LIMIT_BYTES * 4)
+    cmd = _build_reviewer_cmd(vendor, "", prompt=big_prompt)
+    assert big_prompt not in cmd, (
+        f"_build_reviewer_cmd({vendor!r}, ...) embedded the prompt "
+        "directly in argv; it must be delivered via stdin instead"
+    )
+    for element in cmd:
+        assert len(element.encode("utf-8")) < AGY_ARGV_PROMPT_SAFETY_LIMIT_BYTES, (
+            f"argv element for {vendor!r} is unexpectedly large: "
+            f"{element[:80]!r}..."
+        )
+
+
+def test_agy_still_embeds_prompt_in_argv_no_stdin_fallback():
+    """`agy` genuinely has no stdin-based plain-text prompt delivery
+    (verified directly), so it is the one vendor that legitimately
+    keeps the prompt in argv — guarded separately by a pre-flight size
+    check in `invoke_reviewer` (see the tests below), not by switching
+    to stdin."""
+    prompt = "a small prompt"
+    cmd = _build_reviewer_cmd("agy", "", prompt=prompt)
+    assert prompt in cmd
+
+
+def test_agy_oversized_prompt_fails_closed_with_clear_message(monkeypatch):
+    """round-10 /advice (Opus): before this fix, a prompt over ~128 KiB
+    for `agy` would reach `subprocess.run` and crash with an opaque OS
+    `E2BIG` (or hang/behave unpredictably depending on the platform).
+    `invoke_reviewer` must now refuse BEFORE ever calling
+    `subprocess.run`, with a clear, actionable error."""
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError(
+            "subprocess.run must not be reached for an oversized agy prompt"
+        )
+    monkeypatch.setattr(_skeptic_gate_cli_mod.subprocess, "run", _fail_if_called)
+
+    oversized_prompt = "X" * (AGY_ARGV_PROMPT_SAFETY_LIMIT_BYTES + 1)
+    stdout, err = invoke_reviewer("agy", "", oversized_prompt)
+    assert stdout is None
+    assert err is not None
+    assert "too large" in err
+    assert "agy" in err
+
+
+def test_agy_prompt_at_safety_margin_is_not_rejected(monkeypatch):
+    """A prompt right at (not over) the safety margin must still be
+    allowed through to `subprocess.run` — this is a size guard, not a
+    blanket rejection of `agy`."""
+    called = {}
+    def _record_call(cmd, **kwargs):
+        called["cmd"] = cmd
+        import subprocess as _subprocess
+        return _subprocess.CompletedProcess(cmd, 0, stdout="VERDICT: PASS\n", stderr="")
+    monkeypatch.setattr(_skeptic_gate_cli_mod.subprocess, "run", _record_call)
+
+    small_prompt = "X" * (AGY_ARGV_PROMPT_SAFETY_LIMIT_BYTES - 100)
+    stdout, err = invoke_reviewer("agy", "", small_prompt)
+    assert "cmd" in called, "subprocess.run should have been reached for an in-limit prompt"
