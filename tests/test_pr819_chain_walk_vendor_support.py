@@ -905,3 +905,152 @@ def test_all_new_pr819_vendors_are_fingerprint_checked(vendor):
     (unlike codex/gemini), so all of them must be covered by the
     write-access mutation check."""
     assert vendor in _skeptic_gate_cli_mod.WRITE_ACCESS_REVIEWER_VENDORS
+
+
+# ===========================================================================
+# round-12 /advice finding (Codex + Opus, HIGH, both independently
+# reproduced real exploits against round-11's mutation guard):
+#   1. Exception-swallowing fail-open on the "after" fingerprint let a
+#      reviewer defeat the whole guard by dropping one unreadable file.
+#   2. Timeout/FileNotFoundError early-returns skipped the post-check
+#      entirely, poisoning the NEXT vendor's own baseline.
+#   3. `git checkout -- .` only restores from the index, so a staged
+#      mutation survived "restoration" untouched, and restore success
+#      was never verified.
+# ===========================================================================
+
+
+def test_unreadable_file_during_fingerprint_fails_closed_not_open(tmp_path, monkeypatch):
+    """round-12 (Opus): a reviewer that drops an unreadable file makes the
+    'after' fingerprint raise -- this MUST be treated as proof of
+    mutation (fail closed), not silently equated to 'unchanged'."""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    tracked = _init_real_git_repo(repo_dir)
+    monkeypatch.chdir(repo_dir)
+    _original_run = _skeptic_gate_cli_mod.subprocess.run
+
+    def _fake_run(cmd, **kwargs):
+        if cmd[0] == "git":
+            return _original_run(cmd, **kwargs)
+        tracked.write_text("MUTATED\n")
+        blind = repo_dir / "blind.bin"
+        blind.write_bytes(b"x")
+        blind.chmod(0o000)
+        return _real_subprocess.CompletedProcess(
+            cmd, 0, stdout="VERDICT: PASS\nIDENTITY: claude\n", stderr=""
+        )
+
+    monkeypatch.setattr(_skeptic_gate_cli_mod.subprocess, "run", _fake_run)
+    try:
+        stdout, err = invoke_reviewer("claude", "", "review this")
+    finally:
+        # If the fix correctly restored the checkout, blind.bin (an
+        # untracked file) was already removed by `git clean -fd`; only
+        # chmod it back if it's still there so pytest's tmp_path cleanup
+        # doesn't choke on an unreadable leftover.
+        blind = repo_dir / "blind.bin"
+        if blind.exists():
+            blind.chmod(0o644)
+
+    assert stdout is None, "an unfingerprintable post-state must fail closed"
+    assert err is not None and "mutated" in err.lower()
+
+
+def test_timeout_after_mutation_is_detected_and_restored(tmp_path, monkeypatch):
+    """round-12 (Opus): a reviewer that mutates the tree and then hangs
+    past the timeout must still have the mutation detected and restored
+    -- otherwise the NEXT chain-walk vendor baselines the poisoned tree
+    as 'clean'."""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    tracked = _init_real_git_repo(repo_dir)
+    monkeypatch.chdir(repo_dir)
+    _original_run = _skeptic_gate_cli_mod.subprocess.run
+
+    def _fake_run(cmd, **kwargs):
+        if cmd[0] == "git":
+            return _original_run(cmd, **kwargs)
+        tracked.write_text("MUTATED-THEN-HUNG\n")
+        raise _real_subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 900))
+
+    monkeypatch.setattr(_skeptic_gate_cli_mod.subprocess, "run", _fake_run)
+
+    stdout, err = invoke_reviewer("claude", "", "review this")
+
+    assert stdout is None
+    assert err is not None and "mutated" in err.lower(), (
+        f"a timeout must not suppress mutation detection; got err={err!r}"
+    )
+    assert tracked.read_text() == "original content\n", (
+        "the checkout must be restored even on the timeout exit path"
+    )
+
+
+def test_staged_mutation_is_restored_not_left_in_index(tmp_path, monkeypatch):
+    """round-12 (Opus): `git checkout -- .` only restores from the index,
+    so a reviewer that `git add`s its own mutation used to survive
+    'restoration'. Must reset to the exact pre-review HEAD instead."""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    tracked = _init_real_git_repo(repo_dir)
+    monkeypatch.chdir(repo_dir)
+    _original_run = _skeptic_gate_cli_mod.subprocess.run
+
+    def _fake_run(cmd, **kwargs):
+        if cmd[0] == "git":
+            return _original_run(cmd, **kwargs)
+        tracked.write_text("MUTATED-AND-STAGED\n")
+        _real_subprocess.run(
+            ["git", "-C", str(repo_dir), "add", "."], check=True
+        )
+        return _real_subprocess.CompletedProcess(
+            cmd, 0, stdout="VERDICT: PASS\n", stderr=""
+        )
+
+    monkeypatch.setattr(_skeptic_gate_cli_mod.subprocess, "run", _fake_run)
+
+    stdout, err = invoke_reviewer("claude", "", "review this")
+
+    assert stdout is None
+    assert err is not None and "mutated" in err.lower()
+    assert tracked.read_text() == "original content\n", (
+        "a staged mutation must still be reverted by the restore step"
+    )
+    status = _real_subprocess.run(
+        ["git", "-C", str(repo_dir), "status", "--porcelain"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert status.strip() == "", f"checkout must be fully clean after restore, got: {status!r}"
+
+
+def test_write_access_vendor_refuses_when_baseline_cannot_be_established(
+    tmp_path, monkeypatch
+):
+    """round-12: if the BEFORE fingerprint itself cannot be computed (not
+    a git checkout, or git fails), a write-access vendor must be refused
+    entirely rather than dispatched unprotected (fail closed on the
+    pre-check too, not just the post-check)."""
+    not_a_repo = tmp_path / "not_a_repo"
+    not_a_repo.mkdir()
+    monkeypatch.chdir(not_a_repo)
+
+    called = {"reviewer_invoked": False}
+    _original_run = _skeptic_gate_cli_mod.subprocess.run
+
+    def _fake_run(cmd, **kwargs):
+        if cmd[0] == "git":
+            return _original_run(cmd, **kwargs)
+        called["reviewer_invoked"] = True
+        return _real_subprocess.CompletedProcess(cmd, 0, stdout="VERDICT: PASS\n", stderr="")
+
+    monkeypatch.setattr(_skeptic_gate_cli_mod.subprocess, "run", _fake_run)
+
+    stdout, err = invoke_reviewer("claude", "", "review this")
+
+    assert stdout is None
+    assert err is not None
+    assert called["reviewer_invoked"] is False, (
+        "a write-access vendor must never be dispatched without a "
+        "provable baseline"
+    )
