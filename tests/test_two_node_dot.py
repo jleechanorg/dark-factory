@@ -48,6 +48,10 @@ _SUBPROCESS_NODE_TYPES = frozenset(
 _PIPELINE = "pipelines/slim/two_node.dot"
 _WORKER_PROMPT = "prompts/slim/worker.md"
 _EXPECTED_TIMEOUT_S = 600
+# cold_reviewer's hard timeout is 1320s (soft 1200s stated in the prompt,
+# hard 1320s runner kill) per the factory two-node redesign spec (D7) —
+# every other subprocess node keeps the canonical 600s.
+_EXPECTED_TIMEOUTS_BY_NODE = {"cold_reviewer": 1320}
 
 
 def _normalise_timeout(value: object) -> int | None:
@@ -100,15 +104,16 @@ def test_two_node_dot_declares_timeout_on_every_subprocess_node() -> None:
             missing.append((name, node_type))
             continue
         actual = _normalise_timeout(node.attrs.get("timeout"))
-        if actual != _EXPECTED_TIMEOUT_S:
+        expected = _EXPECTED_TIMEOUTS_BY_NODE.get(name, _EXPECTED_TIMEOUT_S)
+        if actual != expected:
             wrong_value.append((name, node_type, actual))
     assert not missing, (
         f"two_node.dot nodes must declare a timeout= to prevent indefinite "
         f"hangs. Missing: {missing}. Use timeout={_EXPECTED_TIMEOUT_S}."
     )
     assert not wrong_value, (
-        f"two_node.dot timeouts must be {_EXPECTED_TIMEOUT_S}s. "
-        f"Offenders: {wrong_value}."
+        f"two_node.dot timeouts must match {_EXPECTED_TIMEOUTS_BY_NODE} "
+        f"(default {_EXPECTED_TIMEOUT_S}s). Offenders: {wrong_value}."
     )
 
 
@@ -135,8 +140,11 @@ def test_worker_prompt_does_not_reference_deleted_controller_receipts() -> None:
     assert "verification receipt" not in prompt.lower()
 
 
-def test_two_node_dot_reviewer_prompt_is_short_and_docs_agree() -> None:
-    """The default prompt states the goal directly without a controller packet."""
+def test_two_node_dot_reviewer_prompt_is_static_and_docs_agree() -> None:
+    """The default prompt is the static factory two-node redesign contract
+    (D1/D2/D7): no caller/worker text (``${goal}``) reaches the reviewer —
+    only the runner-minted ``${target}``/``${intent}`` envelope, the
+    authority rules, and the completeness + verdict contract."""
     reviewer = parse(ROOT / _PIPELINE).nodes["cold_reviewer"]
     assert reviewer.attrs.get("prompt") == "@prompts/slim/fresh_review.md"
     assert reviewer.attrs.get("type") == "codergen"
@@ -144,9 +152,31 @@ def test_two_node_dot_reviewer_prompt_is_short_and_docs_agree() -> None:
     assert "fresh Codex reviewer" in skill
     assert "static Codex cold reviewer" not in skill
     prompt = (ROOT / "prompts/slim/fresh_review.md").read_text()
-    assert len([line for line in prompt.splitlines() if line.strip()]) <= 6
-    assert "Use all available tools" in prompt
+    assert "${goal}" not in prompt
+    assert "${target}" in prompt and "${intent}" in prompt
+    assert "Use all available" in prompt
     assert "Verdict: PASS" in prompt and "Verdict: FAIL" in prompt
+    assert "Review completeness: COMPLETE" in prompt
+    assert "Review completeness: UNFINISHED" in prompt
+    assert "untrusted" in prompt.lower()
+    # Round-5 finding: the static prompt must actually ask for the typed
+    # findings JSON `parse_typed_findings` expects on FAIL — otherwise
+    # every compliant FAIL degrades to "no valid findings" (D8).
+    assert "path" in prompt and "claim" in prompt and "required_fix" in prompt
+    assert "fenced" in prompt.lower() and "json" in prompt.lower()
+    # The spec doc's Static reviewer prompt block must stay byte-consistent
+    # with the shipped prompt for this same paragraph.
+    spec = (
+        ROOT / "docs/superpowers/specs/2026-09-01-factory-two-node-redesign-design.md"
+    ).read_text()
+    findings_paragraph = (
+        "On Verdict: FAIL, before the completeness line, emit the blocking findings as\n"
+        "a fenced JSON code block: a JSON array of objects, each with exactly the keys\n"
+        "`path`, `claim`, and `required_fix` (all non-empty strings) — for example\n"
+        '`[{"path": "app.py", "claim": "returns the wrong value", "required_fix": "fix the return"}]`.'
+    )
+    assert findings_paragraph in prompt
+    assert findings_paragraph in spec
 
 
 def test_worker_prompt_is_direct_and_receipt_free() -> None:
@@ -370,7 +400,15 @@ def test_two_node_second_resume_retains_review_feedback_after_worker_failure(
     assert worker_feedback == [None, review, review]
 
 
-def test_two_node_reviewer_error_is_terminal(tmp_path, monkeypatch) -> None:
+def test_two_node_reviewer_error_routes_to_worker_until_exhausted(tmp_path, monkeypatch) -> None:
+    """Round-1 finding (factory two-node redesign spec D4): `outcome="error"`
+    from the reviewer (verdict-gate timeout/crash/malformed verdict) must
+    route to the worker via `outcome!=success`, not fall off the graph as an
+    immediate terminal `error`. two_node.dot's edge is `outcome!=success`, so
+    a reviewer that always errors keeps consuming worker visits until
+    max_visits=3 is exhausted, and the run ends `exhausted` (existing
+    max_visits semantics) — never silently drops the run.
+    """
     from runner.engine import run
     from runner.handler_core import Context, Result
     from runner.handlers import TYPE_REGISTRY
@@ -390,5 +428,5 @@ def test_two_node_reviewer_error_is_terminal(tmp_path, monkeypatch) -> None:
         Context(goal="review without mutation", workdir=tmp_path, backend="echo"),
     )
 
-    assert history[-1].outcome == "error"
-    assert worker_visits == 1
+    assert history[-1].outcome == "exhausted"
+    assert worker_visits == 3
