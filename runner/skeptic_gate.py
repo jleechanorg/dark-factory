@@ -155,6 +155,19 @@ REVIEWER_CLI_TO_IDENTITY = {
     # shipped default skeptic_reviewer_priority() (only "claudem" is
     # listed), but a real gap in the identity table, not hypothetical.
     "minimax": "claudem",
+    # Codex /advice finding, PR #819 round-7: `cursor` and `agentf` are
+    # aliases that dispatch the identical `cursor-agent` executable
+    # (see skeptic_gate_cli.py's `reviewer in ("cursor-agent", "cursor",
+    # "agentf")` branch), but this table never canonicalized them —
+    # they fell back to their own distinct, unmapped names via
+    # expected_identity_for_vendor(). A cursor-agent-authored commit
+    # reviewed via the "cursor"/"agentf" alias evaded both the round-6
+    # self-review pre-filter and the post-hoc verify_provenance check,
+    # since the two identity tokens never matched. Reproduced by Codex
+    # during round-7 /advice.
+    "cursor-agent": "cursor-agent",
+    "cursor": "cursor-agent",
+    "agentf": "cursor-agent",
 }
 
 # Placeholder substituted into the prompt's IDENTITY line with the

@@ -239,6 +239,153 @@ def test_chain_walk_falls_back_on_rate_limit(monkeypatch, dispatcher, stub_evalu
     assert seen == ["claudem", "agy", "cursor-agent"]
 
 
+# ---------------------------------------------------------------------------
+# Chain-walk: fallback on generic launch/auth failure (round-7 /advice
+# finding, Opus). Round-6's self-review pre-filter correctly routes a
+# claudem-authored PR's review to the next queue vendor (typically agy),
+# but the walker used to only advance past a *rate-limit* error — a
+# generic launch failure (missing/unauthenticated CLI, nonzero return
+# code, timeout) dead-ended the walk on that fallback vendor instead of
+# trying the next one, making the round-6 fallback route non-functional
+# in practice for vendors that can launch but can't authenticate.
+# ---------------------------------------------------------------------------
+
+
+def test_chain_walk_falls_back_on_missing_binary(monkeypatch, dispatcher, stub_evaluate):
+    """premium=claudem returns a 'binary not found' launch failure (not a
+    rate-limit), agy returns valid -> the walk must still advance to agy,
+    exactly like a rate-limit bust does."""
+    fake_invoke, seen = _stub_invoke_reviewer({
+        "claudem": (None, "reviewer binary not found: [Errno 2] No such file or directory: 'claude'"),
+        "agy": (VALID_OUTPUT, None),
+    })
+    monkeypatch.setattr(
+        "runner.skeptic_gate_cli.invoke_reviewer", fake_invoke
+    )
+
+    results = dispatcher.dispatch(
+        rules=[PREMIUM_RULE],
+        changed_files=["foo.py"],
+        diff="diff",
+        repo="jleechanorg/dark-factory",
+        pr_number=123,
+        head_sha="0123456789abcdef0123456789abcdef01234567",
+        base_sha="0000000000000000000000000000000000000000",
+        implementation_identity="minimax",
+    )
+
+    assert len(results) == 1
+    _, res = results[0]
+    assert res.reviewer == "agy", (
+        f"expected fallback to agy on a missing-binary launch failure, "
+        f"got reviewer={res.reviewer!r}"
+    )
+    assert seen == ["claudem", "agy"], (
+        f"expected the walk to advance past claudem's launch failure, got {seen!r}"
+    )
+
+
+def test_chain_walk_falls_back_on_nonzero_returncode_auth_failure(monkeypatch, dispatcher, stub_evaluate):
+    """premium=claudem returns a nonzero-rc auth failure (not a
+    rate-limit), agy returns valid -> the walk must still advance to agy."""
+    fake_invoke, seen = _stub_invoke_reviewer({
+        "claudem": (None, "reviewer rc=1: authentication required, please log in"),
+        "agy": (VALID_OUTPUT, None),
+    })
+    monkeypatch.setattr(
+        "runner.skeptic_gate_cli.invoke_reviewer", fake_invoke
+    )
+
+    results = dispatcher.dispatch(
+        rules=[PREMIUM_RULE],
+        changed_files=["foo.py"],
+        diff="diff",
+        repo="jleechanorg/dark-factory",
+        pr_number=123,
+        head_sha="0123456789abcdef0123456789abcdef01234567",
+        base_sha="0000000000000000000000000000000000000000",
+        implementation_identity="minimax",
+    )
+
+    assert len(results) == 1
+    _, res = results[0]
+    assert res.reviewer == "agy", (
+        f"expected fallback to agy on a nonzero-rc auth failure, "
+        f"got reviewer={res.reviewer!r}"
+    )
+    assert seen == ["claudem", "agy"]
+
+
+def test_chain_walk_falls_back_on_raised_exception(monkeypatch, dispatcher, stub_evaluate):
+    """premium=claudem's invoke_reviewer raises (e.g. subprocess plumbing
+    error) -> the walk must still advance to agy, matching the existing
+    try/except handling that already captures the exception as ``err``."""
+    fake_invoke, seen = _stub_invoke_raises({
+        "claudem": OSError("exec format error"),
+        "agy": (VALID_OUTPUT, None),
+    })
+    monkeypatch.setattr(
+        "runner.skeptic_gate_cli.invoke_reviewer", fake_invoke
+    )
+
+    results = dispatcher.dispatch(
+        rules=[PREMIUM_RULE],
+        changed_files=["foo.py"],
+        diff="diff",
+        repo="jleechanorg/dark-factory",
+        pr_number=123,
+        head_sha="0123456789abcdef0123456789abcdef01234567",
+        base_sha="0000000000000000000000000000000000000000",
+        implementation_identity="minimax",
+    )
+
+    assert len(results) == 1
+    _, res = results[0]
+    assert res.reviewer == "agy", (
+        f"expected fallback to agy after claudem's invocation raised, "
+        f"got reviewer={res.reviewer!r}"
+    )
+    assert seen == ["claudem", "agy"]
+
+
+def test_chain_walk_does_not_skip_a_vendor_that_produced_output(monkeypatch, dispatcher, stub_evaluate):
+    """Regression guard: a vendor that produced ANY stdout must be
+    treated as terminal (evaluated, not skipped) even if its ``err``
+    channel has unrelated non-empty noise (e.g. a deprecation warning on
+    stderr) — only a genuine launch failure (no stdout at all) may
+    advance the walk. This must hold for a real FAIL verdict just as
+    much as a PASS: the walker must never silently retry past a
+    legitimate reviewer opinion looking for a more favorable vendor."""
+    fake_invoke, seen = _stub_invoke_reviewer({
+        "claudem": (VALID_OUTPUT, "warning: deprecated --foo flag used"),
+        "agy": (VALID_OUTPUT, None),
+    })
+    monkeypatch.setattr(
+        "runner.skeptic_gate_cli.invoke_reviewer", fake_invoke
+    )
+
+    results = dispatcher.dispatch(
+        rules=[PREMIUM_RULE],
+        changed_files=["foo.py"],
+        diff="diff",
+        repo="jleechanorg/dark-factory",
+        pr_number=123,
+        head_sha="0123456789abcdef0123456789abcdef01234567",
+        base_sha="0000000000000000000000000000000000000000",
+        implementation_identity="minimax",
+    )
+
+    assert len(results) == 1
+    _, res = results[0]
+    assert res.reviewer == "claudem", (
+        f"a vendor that produced stdout must be treated as terminal, not "
+        f"skipped for unrelated stderr noise, got reviewer={res.reviewer!r}"
+    )
+    assert seen == ["claudem"], (
+        f"expected the walk to stop at claudem (it produced output), got {seen!r}"
+    )
+
+
 def test_chain_walk_records_fallback_from(monkeypatch, dispatcher, stub_evaluate):
     """The fallback trail records the original vendor so the operator
     can trace which vendor busted and forced the walk."""

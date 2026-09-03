@@ -425,6 +425,56 @@ def test_claudem_authored_commit_reviewed_by_claudem_is_rejected_as_self_review(
     assert "self-review" in reason.lower()
 
 
+# ===========================================================================
+# Codex /advice finding, PR #819 round-7: `cursor` and `agentf` are aliases
+# that dispatch the identical `cursor-agent` executable (see
+# skeptic_gate_cli.py's `reviewer in ("cursor-agent", "cursor", "agentf")`
+# branch), but REVIEWER_CLI_TO_IDENTITY never canonicalized them — they
+# fell back to their own distinct, unmapped names via
+# expected_identity_for_vendor(). A cursor-agent-authored commit reviewed
+# via the "cursor"/"agentf" alias evaded both the round-6 self-review
+# pre-filter and the post-hoc verify_provenance check, since the two
+# identity tokens never matched. Reproduced by Codex during round-7
+# /advice.
+# ===========================================================================
+
+
+def test_cursor_and_agentf_vendor_identity_canonicalize_to_cursor_agent():
+    """`cursor` and `agentf` are aliases for the identical `cursor-agent`
+    backend; expected_identity_for_vendor must map all three to the same
+    reviewer-identity token, or verify_provenance cannot detect self-review
+    for whichever alias ever gets dispatched directly."""
+    from runner.skeptic_gate import expected_identity_for_vendor
+
+    assert expected_identity_for_vendor("cursor-agent") == "cursor-agent"
+    assert expected_identity_for_vendor("cursor") == "cursor-agent"
+    assert expected_identity_for_vendor("agentf") == "cursor-agent"
+
+
+def test_cursor_agent_authored_commit_reviewed_by_cursor_alias_is_rejected_as_self_review():
+    """The exact latent bypass Codex reproduced: a cursor-agent-authored
+    commit reviewed by a reviewer declaring IDENTITY: cursor or
+    IDENTITY: agentf (same backend, different alias) must be refused as
+    self-review, not silently accepted as independent."""
+    from runner.skeptic_gate import expected_identity_for_vendor, verify_provenance
+
+    impl_identity = "cursor-agent"
+
+    for alias in ("cursor", "agentf", "cursor-agent"):
+        reviewer_identity = expected_identity_for_vendor(alias)
+        assert reviewer_identity == "cursor-agent", (
+            f"expected_identity_for_vendor({alias!r}) must canonicalize to "
+            f"'cursor-agent', got {reviewer_identity!r}"
+        )
+        ok, reason = verify_provenance(impl_identity, reviewer_identity)
+        assert ok is False, (
+            f"a cursor-agent-authored commit reviewed via the {alias!r} "
+            f"alias (same backend) must be rejected as self-review, but "
+            f"verify_provenance returned ok={ok!r} ({reason!r})"
+        )
+        assert "self-review" in reason.lower()
+
+
 def test_claude_authored_commit_is_still_distinct_from_claudem_reviewer():
     """Sanity check the fix didn't over-collapse: a genuinely `claude/`
     (real Anthropic Claude CLI) authored commit reviewed by a `claudem`

@@ -85,6 +85,38 @@ def _detect_rate_limit(err: Optional[str]) -> bool:
     return any(p in text for p in _RATE_LIMIT_PATTERNS)
 
 
+# PR #819 round-7 /advice finding (Opus): round-6's self-review pre-filter
+# correctly routes a claudem-authored PR's review to the next queue vendor
+# (typically agy), but the walker used to only advance past a *rate-limit*
+# error — a generic launch/auth failure (missing/unauthenticated CLI,
+# nonzero return code, timeout, or an exception during invocation) dead-
+# ended the walk on that fallback vendor instead of trying the next one,
+# making the round-6 fallback route non-functional in practice for a
+# vendor (like agy) that can be invoked but can't authenticate in this
+# CI-sandboxed path.
+def _detect_vendor_unavailable(err: Optional[str], stdout: Optional[str]) -> bool:
+    """Return True if this vendor's own invocation failed to produce any
+    reviewable output — rate limit, missing/unauthenticated CLI, nonzero
+    return code, timeout, or any exception during invocation — so the
+    chain-walk should advance to the next vendor exactly like it already
+    does for a rate-limit bust.
+
+    A vendor that produced ANY ``stdout`` is presumed to have actually
+    run and produced content for ``evaluate()`` to judge — this function
+    only ever returns True when there is no stdout at all, so a genuine
+    verdict (PASS or FAIL) is never mistaken for a launch failure and
+    silently retried looking for a more favorable vendor. Deliberately
+    NOT pattern-matched beyond that: any no-stdout+has-error outcome
+    means no verdict was produced, so advancing can never skip a real
+    one — narrowing to specific error-text substrings (as the original
+    rate-limit-only check did) is what caused this gap in the first
+    place (round-7 /advice, Opus).
+    """
+    if stdout:
+        return False
+    return bool(err)
+
+
 class VerifierDispatcher:
     def __init__(self, cheap_reviewer: Optional[str] = None, cheap_model: str = "",
                  premium_reviewer: Optional[str] = None, premium_model: str = ""):
@@ -305,7 +337,7 @@ class VerifierDispatcher:
             except Exception as exc:
                 stdout = None
                 err = str(exc)
-            if err and _detect_rate_limit(err):
+            if _detect_vendor_unavailable(err, stdout):
                 last_err = err
                 # Hard cap: the queue length is the upper bound on
                 # retries. The for-loop already enforces this.
