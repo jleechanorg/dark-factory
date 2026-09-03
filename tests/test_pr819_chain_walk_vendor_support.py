@@ -786,3 +786,122 @@ def test_agy_prompt_at_safety_margin_is_not_rejected(monkeypatch):
     small_prompt = "X" * (AGY_ARGV_PROMPT_SAFETY_LIMIT_BYTES - 100)
     stdout, err = invoke_reviewer("agy", "", small_prompt)
     assert "cmd" in called, "subprocess.run should have been reached for an in-limit prompt"
+
+
+# ===========================================================================
+# round-11 /advice finding (Codex, HIGH): claudem/minimax/claude/agy/
+# cursor-agent(+cursor/agentf aliases) run with full write access inside
+# the target checkout being reviewed (subprocess.run has no cwd= override,
+# so the child inherits the current process's working directory), with no
+# sandboxing (unlike codex --sandbox=read-only / gemini -s). A malicious
+# PR-controlled diff could induce the reviewer to alter the tree before it
+# reports a verdict, undermining the SHA-bound reviewer contract. Fixed by
+# fingerprinting the checkout before/after and failing closed on mutation.
+# ===========================================================================
+
+import subprocess as _real_subprocess  # noqa: E402
+
+
+def _init_real_git_repo(repo_dir):
+    _real_subprocess.run(["git", "init", "--quiet", str(repo_dir)], check=True)
+    _real_subprocess.run(
+        ["git", "-C", str(repo_dir), "config", "user.email", "jleechan2015@users.noreply.github.com"],
+        check=True,
+    )
+    _real_subprocess.run(
+        ["git", "-C", str(repo_dir), "config", "user.name", "Test"], check=True
+    )
+    tracked = repo_dir / "tracked.txt"
+    tracked.write_text("original content\n")
+    _real_subprocess.run(["git", "-C", str(repo_dir), "add", "."], check=True)
+    _real_subprocess.run(
+        ["git", "-C", str(repo_dir), "commit", "--quiet", "-m", "init"], check=True
+    )
+    return tracked
+
+
+def test_reviewer_mutation_of_checkout_is_detected_and_discarded(
+    tmp_path, monkeypatch
+):
+    """A reviewer subprocess that mutates a tracked file during its
+    'review' must have its verdict discarded entirely (stdout=None,
+    regardless of what it printed) and the checkout restored, not
+    silently trusted."""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    tracked = _init_real_git_repo(repo_dir)
+    monkeypatch.chdir(repo_dir)
+
+    # Capture the REAL, unpatched subprocess.run function object before
+    # monkeypatching -- `import subprocess as _real_subprocess` at module
+    # scope would alias the same mutable module attribute `monkeypatch`
+    # below reassigns, so a naive "pass real git calls through
+    # _real_subprocess.run" would actually recurse into the fake itself.
+    _original_run = _skeptic_gate_cli_mod.subprocess.run
+
+    def _fake_run(cmd, **kwargs):
+        if cmd[0] == "git":
+            return _original_run(cmd, **kwargs)
+        # Simulate a compromised reviewer: mutate the tracked file as a
+        # side effect of "reviewing" it, then still claim a clean PASS.
+        tracked.write_text("MUTATED BY REVIEWER\n")
+        return _real_subprocess.CompletedProcess(
+            cmd, 0, stdout="VERDICT: PASS\nIDENTITY: claude\n", stderr=""
+        )
+
+    monkeypatch.setattr(_skeptic_gate_cli_mod.subprocess, "run", _fake_run)
+
+    stdout, err = invoke_reviewer("claude", "", "review this")
+
+    assert stdout is None, "a mutated checkout's verdict must be fully discarded"
+    assert err is not None and "mutated" in err.lower()
+    assert tracked.read_text() == "original content\n", (
+        "the checkout must be restored to its pre-review state after a "
+        "detected mutation"
+    )
+
+
+def test_reviewer_non_mutating_run_is_unaffected(tmp_path, monkeypatch):
+    """Regression guard: a normal, non-mutating reviewer run must be
+    completely unaffected by the mutation check — no false positives."""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    tracked = _init_real_git_repo(repo_dir)
+    monkeypatch.chdir(repo_dir)
+
+    _original_run = _skeptic_gate_cli_mod.subprocess.run
+
+    def _fake_run(cmd, **kwargs):
+        if cmd[0] == "git":
+            return _original_run(cmd, **kwargs)
+        return _real_subprocess.CompletedProcess(
+            cmd, 0, stdout="VERDICT: PASS\nIDENTITY: claude\n", stderr=""
+        )
+
+    monkeypatch.setattr(_skeptic_gate_cli_mod.subprocess, "run", _fake_run)
+
+    stdout, err = invoke_reviewer("claude", "", "review this")
+
+    assert stdout == "VERDICT: PASS\nIDENTITY: claude\n"
+    assert err is None
+    assert tracked.read_text() == "original content\n"
+
+
+def test_codex_and_gemini_are_not_fingerprint_checked(tmp_path, monkeypatch):
+    """codex/gemini are already sandboxed (--sandbox=read-only / -s), so
+    they are intentionally NOT in WRITE_ACCESS_REVIEWER_VENDORS — this
+    guards against silently expanding the (small) fingerprinting
+    overhead to vendors that don't need it."""
+    assert "codex" not in _skeptic_gate_cli_mod.WRITE_ACCESS_REVIEWER_VENDORS
+    assert "gemini" not in _skeptic_gate_cli_mod.WRITE_ACCESS_REVIEWER_VENDORS
+
+
+@pytest.mark.parametrize(
+    "vendor",
+    ["claudem", "minimax", "claude", "agy", "cursor-agent", "cursor", "agentf"],
+)
+def test_all_new_pr819_vendors_are_fingerprint_checked(vendor):
+    """Every vendor this PR added dispatch support for runs unsandboxed
+    (unlike codex/gemini), so all of them must be covered by the
+    write-access mutation check."""
+    assert vendor in _skeptic_gate_cli_mod.WRITE_ACCESS_REVIEWER_VENDORS
