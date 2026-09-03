@@ -178,6 +178,31 @@ pub struct BeadOverlay {
     pub attempt_started_at: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRoutingBinding {
+    pub session_id: Option<String>,
+    pub branch: Option<String>,
+    pub target_repo: Option<String>,
+    pub ao_project: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdoptedPrIdentity {
+    pub repo: String,
+    pub default_repo: String,
+    pub pr_number: u64,
+    pub branch: String,
+    pub head_sha: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdoptedPrClaim {
+    Owned,
+    CoalescedActive { owner_bead_id: String },
+    ReplacedHumanHeld { owner_bead_id: String },
+    RefusedMismatch { owner_bead_id: String, reason: String },
+}
+
 impl BeadOverlay {
     /// The single accessor for "which repo does this bead belong to".
     /// Returns the bead's explicit `target_repo` when Stage A intake
@@ -197,10 +222,36 @@ pub trait StateStore {
     fn load(&self, bead_id: &str) -> Result<Option<BeadOverlay>, DaemonError>;
     fn save(&self, overlay: &BeadOverlay) -> Result<(), DaemonError>;
     fn register_branch(&self, bead_id: &str, branch: &str) -> Result<(), DaemonError>;
+    fn session_routing_bindings(&self) -> Result<Vec<SessionRoutingBinding>, DaemonError> {
+        Ok(Vec::new())
+    }
+    fn save_dispatched_session(
+        &self,
+        overlay: &BeadOverlay,
+        _ao_project: &str,
+    ) -> Result<(), DaemonError> {
+        self.save(overlay)
+    }
+    fn save_dispatch_intent(
+        &self,
+        overlay: &BeadOverlay,
+        ao_project: &str,
+    ) -> Result<(), DaemonError> {
+        self.save_dispatched_session(overlay, ao_project)
+    }
     /// Deletion guard: daemon may delete ONLY refs returned here (spec §4.2.8).
     fn owned_branches(&self) -> Result<Vec<String>, DaemonError>;
     /// Reverse-lookup: branch → bead_id (used by fast_tier to find drive-existing-pr beads).
     fn bead_id_for_branch(&self, branch: &str) -> Result<Option<String>, DaemonError>;
+    fn claim_adopted_pr(
+        &self,
+        _identity: &AdoptedPrIdentity,
+        _candidate: &BeadOverlay,
+    ) -> Result<AdoptedPrClaim, DaemonError> {
+        Err(DaemonError::Config(
+            "state store does not implement atomic adopted-PR claims".into(),
+        ))
+    }
     /// Return the overlay rows currently in `DISPATCHED` or `ATTESTED`. The
     /// caller decides whether (and when) to bump `autonomy_secs` per row via
     /// [`bump_autonomy_secs`] — splitting these two ops is what lets the
@@ -311,8 +362,9 @@ pub trait StateStore {
         &self,
         overlay: &BeadOverlay,
         attempt: u32,
+        ao_project: &str,
     ) -> Result<(), DaemonError> {
-        self.save(overlay)?;
+        self.save_dispatched_session(overlay, ao_project)?;
         self.mark_remediation_session_spawned(&overlay.bead_id, attempt)
     }
     /// Read the `(attempt_count, last_attempt_epoch_secs)` pair for the
@@ -823,6 +875,7 @@ impl SqliteStateStore {
         Self::ensure_pre_session_head_sha_column(&conn)?;
         Self::ensure_park_reason_column(&conn)?;
         Self::ensure_target_repo_column(&conn)?;
+        Self::ensure_ao_project_column(&conn)?;
         Self::ensure_session_ao_project_column(&conn)?;
         Self::ensure_reroll_deferral_count_column(&conn)?;
         Self::ensure_reroll_head_permanent_failure_count_column(&conn)?;
@@ -852,6 +905,7 @@ impl SqliteStateStore {
         Self::ensure_pre_session_head_sha_column(&conn)?;
         Self::ensure_park_reason_column(&conn)?;
         Self::ensure_target_repo_column(&conn)?;
+        Self::ensure_ao_project_column(&conn)?;
         Self::ensure_session_ao_project_column(&conn)?;
         Self::ensure_reroll_deferral_count_column(&conn)?;
         Self::ensure_reroll_head_permanent_failure_count_column(&conn)?;
@@ -1381,6 +1435,7 @@ impl SqliteStateStore {
         "pre_session_head_sha",
         "park_reason",
         "target_repo",
+        "ao_project",
         "session_ao_project",
         "reroll_deferral_count",
         "held_recheck_after",
@@ -1413,6 +1468,7 @@ impl SqliteStateStore {
         pre_session_head_sha TEXT, \
         park_reason TEXT, \
         target_repo TEXT, \
+        ao_project TEXT, \
         session_ao_project TEXT, \
         reroll_deferral_count INTEGER NOT NULL DEFAULT 0, \
         held_recheck_after INTEGER, \
@@ -1530,6 +1586,22 @@ impl SqliteStateStore {
                 [],
             )
             .map_err(|e| tool_err("ensure_attempt_started_at_column: add column", e))?;
+        }
+        Ok(())
+    }
+
+    fn ensure_ao_project_column(conn: &Connection) -> Result<(), DaemonError> {
+        let has_col: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
+                 WHERE name = 'ao_project'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_ao_project_column: pragma", e))?;
+        if !has_col {
+            conn.execute("ALTER TABLE bead_overlay ADD COLUMN ao_project TEXT", [])
+                .map_err(|e| tool_err("ensure_ao_project_column: add column", e))?;
         }
         Ok(())
     }
@@ -1691,6 +1763,21 @@ impl StateStore for SqliteStateStore {
         Ok(())
     }
 
+    fn session_routing_bindings(&self) -> Result<Vec<SessionRoutingBinding>, DaemonError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, branch, target_repo, ao_project FROM bead_overlay \
+             WHERE session_id IS NOT NULL OR branch IS NOT NULL",
+        ).map_err(|e| tool_err("session_routing_bindings prepare", e))?;
+        let rows = stmt.query_map([], |row| Ok(SessionRoutingBinding {
+            session_id: row.get(0)?,
+            branch: row.get(1)?,
+            target_repo: row.get(2)?,
+            ao_project: row.get(3)?,
+        })).map_err(|e| tool_err("session_routing_bindings query", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| tool_err("session_routing_bindings row", e))
+    }
+
     fn load(&self, bead_id: &str) -> Result<Option<BeadOverlay>, DaemonError> {
         self.conn
             .query_row(
@@ -1742,6 +1829,36 @@ impl StateStore for SqliteStateStore {
 
     fn save(&self, overlay: &BeadOverlay) -> Result<(), DaemonError> {
         save_overlay_conn(&self.conn, overlay)
+    }
+
+    fn save_dispatched_session(
+        &self,
+        overlay: &BeadOverlay,
+        ao_project: &str,
+    ) -> Result<(), DaemonError> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| tool_err("save_dispatched_session begin", e))?;
+        let result = (|| {
+            save_overlay_conn(&self.conn, overlay)?;
+            self.conn.execute(
+                "UPDATE bead_overlay SET ao_project = ?2 WHERE bead_id = ?1",
+                params![overlay.bead_id, ao_project],
+            ).map_err(|e| tool_err("save_dispatched_session project", e))?;
+            Ok::<(), DaemonError>(())
+        })();
+        match result {
+            Ok(()) => match self.conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    Err(tool_err("save_dispatched_session commit", error))
+                }
+            },
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     fn stamp_attempt_started_at(
@@ -1835,6 +1952,173 @@ impl StateStore for SqliteStateStore {
             Ok(Some(bead))
         } else {
             Ok(None)
+        }
+    }
+
+    fn claim_adopted_pr(
+        &self,
+        identity: &AdoptedPrIdentity,
+        candidate: &BeadOverlay,
+    ) -> Result<AdoptedPrClaim, DaemonError> {
+        if identity.repo.is_empty()
+            || identity.branch.is_empty()
+            || identity.head_sha.is_empty()
+            || identity.pr_number == 0
+            || candidate.bead_id.is_empty()
+        {
+            return Err(DaemonError::Config(
+                "adopted PR claim requires non-empty repo/branch/head/bead and positive PR".into(),
+            ));
+        }
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| tool_err("claim_adopted_pr begin", e))?;
+        let result = (|| {
+            let owner: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT bead_id FROM branch_registry WHERE branch = ?1",
+                    params![identity.branch],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| tool_err("claim_adopted_pr owner", e))?;
+            let binding: Option<(String, u64, String, String)> = self
+                .conn
+                .query_row(
+                    "SELECT repo, pr_number, head_sha, bead_id FROM adopted_pr_binding WHERE branch = ?1",
+                    params![identity.branch],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(|e| tool_err("claim_adopted_pr binding", e))?;
+
+            let insert_binding = |owner_bead_id: &str| -> Result<(), DaemonError> {
+                self.conn
+                    .execute(
+                        "INSERT INTO adopted_pr_binding \
+                         (branch, repo, pr_number, head_sha, bead_id, updated_at) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                         ON CONFLICT(branch) DO UPDATE SET repo=excluded.repo, \
+                         pr_number=excluded.pr_number, head_sha=excluded.head_sha, \
+                         bead_id=excluded.bead_id, updated_at=excluded.updated_at",
+                        params![
+                            identity.branch,
+                            identity.repo,
+                            identity.pr_number,
+                            identity.head_sha,
+                            owner_bead_id,
+                            now_iso8601(),
+                        ],
+                    )
+                    .map_err(|e| tool_err("claim_adopted_pr bind", e))?;
+                Ok(())
+            };
+
+            let Some(owner_bead_id) = owner else {
+                self.conn
+                    .execute(
+                        "INSERT INTO branch_registry (branch, bead_id, created_at) VALUES (?1, ?2, ?3)",
+                        params![identity.branch, candidate.bead_id, now_iso8601()],
+                    )
+                    .map_err(|e| tool_err("claim_adopted_pr register", e))?;
+                insert_binding(&candidate.bead_id)?;
+                self.save(candidate)?;
+                return Ok(AdoptedPrClaim::Owned);
+            };
+
+            let owner_overlay = self.load(&owner_bead_id)?;
+            let tuple_matches = match &binding {
+                Some((repo, pr_number, head_sha, bound_owner)) => {
+                    repo == &identity.repo
+                        && *pr_number == identity.pr_number
+                        && !head_sha.is_empty()
+                        && bound_owner == &owner_bead_id
+                }
+                None => owner_overlay.as_ref().is_some_and(|overlay| {
+                    let owner_repo = overlay
+                        .target_repo
+                        .as_deref()
+                        .unwrap_or(&identity.default_repo);
+                    owner_repo == identity.repo
+                        && overlay.pr_number == Some(identity.pr_number)
+                        && overlay.branch.as_deref() == Some(identity.branch.as_str())
+                }),
+            };
+            if !tuple_matches {
+                return Ok(AdoptedPrClaim::RefusedMismatch {
+                    owner_bead_id,
+                    reason: "stored owner identity does not match repo/PR/branch/exact head".into(),
+                });
+            }
+            if owner_bead_id == candidate.bead_id {
+                self.save(candidate)?;
+                insert_binding(&owner_bead_id)?;
+                return Ok(AdoptedPrClaim::Owned);
+            }
+            let Some(owner_overlay) = owner_overlay else {
+                return Ok(AdoptedPrClaim::RefusedMismatch {
+                    owner_bead_id,
+                    reason: "registered owner overlay is missing and legacy identity is unprovable".into(),
+                });
+            };
+            // The stable identity is repo + PR + branch + owner. A new
+            // authoritative intake snapshot may legitimately advance the
+            // same PR to a new head, so refresh that mutable proof inside
+            // the same transaction only after the retained owner is proven.
+            insert_binding(&owner_bead_id)?;
+            if owner_overlay.state == OverlayState::HumanHeld && owner_overlay.session_id.is_none() {
+                let changed = self
+                    .conn
+                    .execute(
+                        "UPDATE branch_registry SET bead_id = ?1, created_at = ?2 \
+                         WHERE branch = ?3 AND bead_id = ?4",
+                        params![candidate.bead_id, now_iso8601(), identity.branch, owner_bead_id],
+                    )
+                    .map_err(|e| tool_err("claim_adopted_pr replace", e))?;
+                if changed != 1 {
+                    return Err(DaemonError::Config(
+                        "adopted PR owner changed during atomic claim".into(),
+                    ));
+                }
+                insert_binding(&candidate.bead_id)?;
+                self.save(candidate)?;
+                return Ok(AdoptedPrClaim::ReplacedHumanHeld { owner_bead_id });
+            }
+            if matches!(
+                owner_overlay.state,
+                OverlayState::Queued
+                    | OverlayState::Dispatching
+                    | OverlayState::Dispatched
+                    | OverlayState::Attested
+                    | OverlayState::ReRoll
+                    | OverlayState::Recovery
+                    | OverlayState::Redispatched
+            ) {
+                return Ok(AdoptedPrClaim::CoalescedActive { owner_bead_id });
+            }
+            Ok(AdoptedPrClaim::RefusedMismatch {
+                owner_bead_id,
+                reason: format!(
+                    "registered owner state {} is not replaceable",
+                    owner_overlay.state.as_str()
+                ),
+            })
+        })();
+        match result {
+            Ok(claim) => {
+                match self.conn.execute_batch("COMMIT") {
+                    Ok(()) => Ok(claim),
+                    Err(error) => {
+                        let _ = self.conn.execute_batch("ROLLBACK");
+                        Err(tool_err("claim_adopted_pr commit", error))
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
         }
     }
 
@@ -2205,12 +2489,17 @@ impl StateStore for SqliteStateStore {
         &self,
         overlay: &BeadOverlay,
         attempt: u32,
+        ao_project: &str,
     ) -> Result<(), DaemonError> {
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| tool_err("save_remediation_session_spawned begin", e))?;
         let result = (|| {
             save_overlay_conn(&self.conn, overlay)?;
+            self.conn.execute(
+                "UPDATE bead_overlay SET ao_project = ?2 WHERE bead_id = ?1",
+                params![overlay.bead_id, ao_project],
+            ).map_err(|e| tool_err("save_remediation_session_spawned project", e))?;
             self.conn
                 .execute(
                     "INSERT INTO remediation_session_spawned (bead_id, attempt, updated_at) \
@@ -3295,6 +3584,58 @@ mod tests {
         assert_eq!(got.session_id.as_deref(), Some("known-live-session"));
         assert_eq!(got.branch.as_deref(), Some("factory/cleanup-held-r1"));
         assert_eq!(got.park_reason.as_deref(), Some("spawn_cleanup_failed"));
+    }
+
+    #[test]
+    fn session_routing_restores_sessions_branches_and_exact_spawn_project() {
+        let s = store();
+        let mut routed = BeadOverlay {
+            bead_id: "routed".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/routed-r1".into()),
+            session_id: Some("wa-404".into()),
+            session_ao_project: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: Some("jleechanorg/worldarchitect.ai".into()),
+            attempt_started_at: None,
+        };
+        routed.session_id = None;
+        routed.state = OverlayState::Dispatching;
+        s.save_dispatch_intent(&routed, "worldarchitect-old").unwrap();
+        let intent = s.session_routing_bindings().unwrap().into_iter()
+            .find(|binding| binding.branch.as_deref() == Some("factory/routed-r1"))
+            .unwrap();
+        assert_eq!(intent.ao_project.as_deref(), Some("worldarchitect-old"));
+
+        routed.session_id = Some("wa-404".into());
+        routed.state = OverlayState::Dispatched;
+        s.save_dispatched_session(&routed, "worldarchitect-old").unwrap();
+        routed.state = OverlayState::Attested;
+        s.save(&routed).unwrap();
+
+        let mut branch_only = routed.clone();
+        branch_only.bead_id = "branch-only".into();
+        branch_only.branch = Some("contributor/fix".into());
+        branch_only.session_id = None;
+        s.save(&branch_only).unwrap();
+
+        let bindings = s.session_routing_bindings().unwrap();
+        let session = bindings.iter().find(|binding| {
+            binding.session_id.as_deref() == Some("wa-404")
+        }).unwrap();
+        assert_eq!(session.ao_project.as_deref(), Some("worldarchitect-old"));
+        assert!(bindings.iter().any(|binding| {
+            binding.session_id.is_none()
+                && binding.branch.as_deref() == Some("contributor/fix")
+        }));
     }
 
     #[test]
@@ -5406,5 +5747,281 @@ mod tests {
         assert_eq!(fresh.autonomy_secs, 0);
         assert_eq!(fresh.state, OverlayState::Dispatched);
         assert_eq!(fresh.attempt, 6);
+    }
+
+    fn adopted_overlay(bead_id: &str, state: OverlayState, pr: u64) -> BeadOverlay {
+        BeadOverlay {
+            bead_id: bead_id.into(),
+            state,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(pr),
+            branch: Some("factory/shared-pr".into()),
+            session_id: (state == OverlayState::Dispatched).then(|| "owner-session".into()),
+            session_ao_project: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: (state == OverlayState::HumanHeld).then(|| "coder_silent".into()),
+            target_repo: Some("owner/repo".into()),
+            attempt_started_at: None,
+        }
+    }
+
+    fn adopted_identity(pr: u64, head: &str) -> AdoptedPrIdentity {
+        AdoptedPrIdentity {
+            repo: "owner/repo".into(),
+            default_repo: "owner/repo".into(),
+            pr_number: pr,
+            branch: "factory/shared-pr".into(),
+            head_sha: head.into(),
+        }
+    }
+
+    #[test]
+    fn adopted_pr_claim_coalesces_exact_active_owner_without_reassignment() {
+        let s = store();
+        let owner = adopted_overlay("owner-bead", OverlayState::Dispatched, 607);
+        s.save(&owner).unwrap();
+        s.register_branch("owner-bead", "factory/shared-pr").unwrap();
+        let duplicate = adopted_overlay("duplicate-bead", OverlayState::Attested, 607);
+        assert_eq!(
+            s.claim_adopted_pr(&adopted_identity(607, "head-a"), &duplicate)
+                .unwrap(),
+            AdoptedPrClaim::CoalescedActive {
+                owner_bead_id: "owner-bead".into()
+            }
+        );
+        assert_eq!(
+            s.bead_id_for_branch("factory/shared-pr").unwrap(),
+            Some("owner-bead".into())
+        );
+        assert!(s.load("duplicate-bead").unwrap().is_none());
+        assert_eq!(
+            s.claim_adopted_pr(&adopted_identity(607, "head-b"), &duplicate)
+                .unwrap(),
+            AdoptedPrClaim::CoalescedActive {
+                owner_bead_id: "owner-bead".into()
+            },
+            "same repo/PR/branch/owner must advance to the newly observed exact head"
+        );
+        let advanced_head: String = s
+            .conn
+            .query_row(
+                "SELECT head_sha FROM adopted_pr_binding WHERE branch = ?1",
+                params!["factory/shared-pr"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(advanced_head, "head-b");
+    }
+
+    #[test]
+    fn adopted_pr_claim_replaces_exact_human_held_owner_and_refuses_pr_mismatch() {
+        let s = store();
+        let owner = adopted_overlay("owner-bead", OverlayState::HumanHeld, 607);
+        s.save(&owner).unwrap();
+        s.register_branch("owner-bead", "factory/shared-pr").unwrap();
+        let mismatch = adopted_overlay("wrong-pr-bead", OverlayState::Attested, 642);
+        assert!(matches!(
+            s.claim_adopted_pr(&adopted_identity(642, "head-a"), &mismatch)
+                .unwrap(),
+            AdoptedPrClaim::RefusedMismatch { .. }
+        ));
+        assert_eq!(
+            s.bead_id_for_branch("factory/shared-pr").unwrap(),
+            Some("owner-bead".into())
+        );
+        let replacement = adopted_overlay("replacement-bead", OverlayState::Attested, 607);
+        assert_eq!(
+            s.claim_adopted_pr(&adopted_identity(607, "head-a"), &replacement)
+                .unwrap(),
+            AdoptedPrClaim::ReplacedHumanHeld {
+                owner_bead_id: "owner-bead".into()
+            }
+        );
+        assert_eq!(
+            s.bead_id_for_branch("factory/shared-pr").unwrap(),
+            Some("replacement-bead".into())
+        );
+        assert_eq!(
+            s.load("replacement-bead").unwrap().unwrap().state,
+            OverlayState::Attested
+        );
+    }
+
+    #[test]
+    fn adopted_pr_claim_rolls_back_registry_and_binding_when_candidate_save_fails() {
+        for replacement in [false, true] {
+            let s = store();
+            if replacement {
+                let owner = adopted_overlay("owner-bead", OverlayState::HumanHeld, 607);
+                s.save(&owner).unwrap();
+                s.register_branch("owner-bead", "factory/shared-pr").unwrap();
+            }
+            s.conn
+                .execute_batch(
+                    "CREATE TRIGGER fail_candidate_save BEFORE INSERT ON bead_overlay \
+                     WHEN NEW.bead_id = 'invalid-candidate' BEGIN \
+                     SELECT RAISE(FAIL, 'scripted candidate save failure'); END;",
+                )
+                .unwrap();
+            let invalid = adopted_overlay("invalid-candidate", OverlayState::Attested, 607);
+            assert!(s
+                .claim_adopted_pr(&adopted_identity(607, "head-a"), &invalid)
+                .is_err());
+            assert_eq!(
+                s.bead_id_for_branch("factory/shared-pr").unwrap(),
+                replacement.then(|| "owner-bead".to_string())
+            );
+            let binding_count: i64 = s
+                .conn
+                .query_row("SELECT COUNT(*) FROM adopted_pr_binding", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(binding_count, 0);
+            assert!(s.load("invalid-candidate").unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn adopted_pr_claim_rolls_back_when_commit_fails() {
+        let s = store();
+        s.conn
+            .execute_batch(
+                "PRAGMA foreign_keys = ON; \
+                 CREATE TABLE adopted_pr_commit_parent (id TEXT PRIMARY KEY); \
+                 DROP TABLE adopted_pr_binding; \
+                 CREATE TABLE adopted_pr_binding (\
+                   branch TEXT PRIMARY KEY, repo TEXT NOT NULL, pr_number INTEGER NOT NULL,\
+                   head_sha TEXT NOT NULL, bead_id TEXT NOT NULL, updated_at TEXT NOT NULL,\
+                   FOREIGN KEY (bead_id) REFERENCES adopted_pr_commit_parent(id)\
+                     DEFERRABLE INITIALLY DEFERRED\
+                 );",
+            )
+            .unwrap();
+
+        let candidate = adopted_overlay("commit-failure", OverlayState::Attested, 607);
+        let error = s
+            .claim_adopted_pr(&adopted_identity(607, "head-a"), &candidate)
+            .expect_err("deferred foreign key must make COMMIT fail");
+        match error {
+            DaemonError::Tool { stderr, .. } => {
+                assert!(stderr.contains("claim_adopted_pr commit"), "{stderr}");
+                assert!(stderr.to_ascii_lowercase().contains("foreign key"), "{stderr}");
+            }
+            other => panic!("expected the original COMMIT error, got {other:?}"),
+        }
+        assert_eq!(
+            s.bead_id_for_branch("factory/shared-pr").unwrap(),
+            None,
+            "failed COMMIT must roll back the registry write"
+        );
+        let binding_count: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM adopted_pr_binding", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(binding_count, 0, "failed COMMIT must roll back the binding write");
+        assert!(
+            s.load("commit-failure").unwrap().is_none(),
+            "failed COMMIT must roll back the overlay write"
+        );
+    }
+
+    #[test]
+    fn adopted_pr_claim_two_sqlite_connections_elect_one_owner_without_split_state() {
+        let path = std::env::temp_dir().join(format!(
+            "dark-factory-adopted-claim-race-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        drop(SqliteStateStore::open(&path).unwrap());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for bead_id in ["racer-a", "racer-b"] {
+            let thread_path = path.clone();
+            let thread_barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                let store = SqliteStateStore::open(&thread_path).unwrap();
+                let candidate = adopted_overlay(bead_id, OverlayState::Attested, 607);
+                thread_barrier.wait();
+                store
+                    .claim_adopted_pr(&adopted_identity(607, "race-head"), &candidate)
+                    .unwrap()
+            }));
+        }
+        let claims: Vec<_> = handles.into_iter().map(|handle| handle.join().unwrap()).collect();
+        assert_eq!(
+            claims
+                .iter()
+                .filter(|claim| matches!(claim, AdoptedPrClaim::Owned))
+                .count(),
+            1
+        );
+        assert_eq!(
+            claims
+                .iter()
+                .filter(|claim| matches!(claim, AdoptedPrClaim::CoalescedActive { .. }))
+                .count(),
+            1
+        );
+        let store = SqliteStateStore::open(&path).unwrap();
+        let registry_owner = store
+            .bead_id_for_branch("factory/shared-pr")
+            .unwrap()
+            .unwrap();
+        let binding_owner: String = store
+            .conn
+            .query_row(
+                "SELECT bead_id FROM adopted_pr_binding WHERE branch = ?1",
+                params!["factory/shared-pr"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(binding_owner, registry_owner);
+        assert!(store.load(&registry_owner).unwrap().is_some());
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[test]
+    fn adopted_pr_claim_orphan_refusal_preserves_prior_binding_head() {
+        let s = store();
+        let owner = adopted_overlay("owner-bead", OverlayState::Dispatched, 607);
+        s.save(&owner).unwrap();
+        s.register_branch("owner-bead", "factory/shared-pr").unwrap();
+        let duplicate = adopted_overlay("duplicate-bead", OverlayState::Attested, 607);
+        assert!(matches!(
+            s.claim_adopted_pr(&adopted_identity(607, "head-a"), &duplicate)
+                .unwrap(),
+            AdoptedPrClaim::CoalescedActive { .. }
+        ));
+        s.conn
+            .execute("DELETE FROM bead_overlay WHERE bead_id = ?1", params!["owner-bead"])
+            .unwrap();
+        assert!(matches!(
+            s.claim_adopted_pr(&adopted_identity(607, "head-b"), &duplicate)
+                .unwrap(),
+            AdoptedPrClaim::RefusedMismatch { .. }
+        ));
+        let preserved_head: String = s
+            .conn
+            .query_row(
+                "SELECT head_sha FROM adopted_pr_binding WHERE branch = ?1",
+                params!["factory/shared-pr"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved_head, "head-a");
+        assert_eq!(
+            s.bead_id_for_branch("factory/shared-pr").unwrap(),
+            Some("owner-bead".into())
+        );
     }
 }

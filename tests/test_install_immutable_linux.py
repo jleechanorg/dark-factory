@@ -9,6 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 RELEASE_SHA = "0123456789abcdef0123456789abcdef01234567"
+RELEASE_TREE = "89abcdef0123456789abcdef0123456789abcdef"
 
 
 def _write_executable(path: Path, body: str) -> None:
@@ -22,6 +23,7 @@ def test_linux_install_keeps_all_runtime_payloads_outside_git_checkout(tmp_path)
     checkout.mkdir()
     shutil.copy2(ROOT / "install.sh", checkout / "install.sh")
     (checkout / "requirements.lock").write_text("")
+    (checkout / "ignored-sentinel.bin").write_text("must not enter release")
     seed_beads = checkout / ".beads" / "issues.jsonl"
     seed_beads.parent.mkdir(parents=True, exist_ok=True)
     seed_beads.write_text('{"id":"factory-tdd"}\n')
@@ -43,6 +45,10 @@ def test_linux_install_keeps_all_runtime_payloads_outside_git_checkout(tmp_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"{name}\n")
     shutil.copytree(ROOT / "daemon" / "systemd", checkout / "daemon" / "systemd")
+    bridge_source = ROOT / "daemon" / "scripts" / "ao-spawn-v013-bridge.mjs"
+    bridge_target = checkout / "daemon" / "scripts" / bridge_source.name
+    bridge_target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(bridge_source, bridge_target)
     (checkout / "daemon" / "Cargo.toml").write_text("[package]\nname = 'daemon'\n")
 
     fake_bin = tmp_path / "fake-bin"
@@ -56,6 +62,10 @@ def test_linux_install_keeps_all_runtime_payloads_outside_git_checkout(tmp_path)
         f"""#!/bin/sh
 if [ "${{3:-}}" = "rev-parse" ] && [ "${{4:-}}" = "HEAD" ]; then
   printf '{RELEASE_SHA}\\n'
+elif [ "${{3:-}}" = "rev-parse" ] && [ "${{4:-}}" = '{RELEASE_SHA}^{{tree}}' ]; then
+  printf '{RELEASE_TREE}\\n'
+elif [ "${{3:-}}" = "archive" ]; then
+  tar -C "${{2}}" --exclude=ignored-sentinel.bin -cf - .
 elif [ "${{3:-}}" = "status" ] && [ "${{DARK_FACTORY_FAKE_DIRTY:-0}}" = "1" ]; then
   printf ' M runner/engine.py\\n'
 fi
@@ -90,6 +100,9 @@ elif [ "${1:-}" = "venv" ]; then
   mkdir -p "$2/bin"
   cat > "$2/bin/python" <<'PY'
 #!/bin/sh
+if [ "${1:-}" = "-" ]; then
+  exec /usr/bin/python3 "$@"
+fi
 if [ -n "${DARK_FACTORY_RUNTIME_LOG:-}" ]; then
   printf '%s\n' "${DARK_FACTORY_HOME:-}" >> "$DARK_FACTORY_RUNTIME_LOG"
 fi
@@ -157,19 +170,20 @@ touch "$db"
     assert (release / "bin" / "df-funnel-lanes").stat().st_mode & stat.S_IXUSR
 
     assert not (release / ".git").exists()
+    assert not (release / "ignored-sentinel.bin").exists()
     assert not ((release / "install.sh").stat().st_mode & stat.S_IWUSR)
     daemon_binary = release / "daemon" / "target" / "release" / "daemon"
     assert daemon_binary.is_file()
     assert not (daemon_binary.stat().st_mode & stat.S_IWUSR)
     release_manifest = json.loads((release / "release-manifest.json").read_text())
-    assert release_manifest == {
-        "schema_version": 1,
-        "source_commit": RELEASE_SHA,
-        "daemon": {
-            "path": "daemon/target/release/daemon",
-            "sha256": hashlib.sha256(daemon_binary.read_bytes()).hexdigest(),
-        },
-    }
+    assert release_manifest["schema_version"] == 2
+    assert release_manifest["source_commit"] == RELEASE_SHA
+    assert release_manifest["source_tree"] == RELEASE_TREE
+    assert release_manifest["files"]["daemon/target/release/daemon"]["sha256"] == (
+        hashlib.sha256(daemon_binary.read_bytes()).hexdigest()
+    )
+    assert ".venv/bin/python" in release_manifest["files"]
+    assert "daemon/scripts/ao-spawn-v013-bridge.mjs" in release_manifest["files"]
     state_root = home / ".local" / "state" / "dark-factory"
     state_db = state_root / ".beads" / "beads.db"
     assert state_db.is_file()
@@ -208,6 +222,74 @@ touch "$db"
     runtime_homes = runtime_log.read_text().splitlines()
     assert runtime_homes
     assert all(Path(path) == release for path in runtime_homes)
+
+    # Reuse must validate the complete executable/runtime payload with a
+    # verifier outside the release. Restoring read-only mode after tampering
+    # must not bypass provenance.
+    venv_python = release / ".venv" / "bin" / "python"
+    original_python = venv_python.read_bytes()
+    original_python_mode = venv_python.stat().st_mode
+    venv_python.chmod(venv_python.stat().st_mode | stat.S_IWUSR)
+    venv_python.write_text("#!/bin/sh\nexit 9\n")
+    venv_python.chmod(original_python_mode & ~stat.S_IWUSR)
+    tampered_python = subprocess.run(
+        [str(checkout / "install.sh"), "--no-smoke"],
+        cwd=checkout,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert tampered_python.returncode != 0
+    assert "release manifest does not match complete runtime payload" in tampered_python.stderr
+    venv_python.chmod(venv_python.stat().st_mode | stat.S_IWUSR)
+    venv_python.write_bytes(original_python)
+    venv_python.chmod(original_python_mode & ~stat.S_IWUSR)
+
+    bridge = release / "daemon" / "scripts" / "ao-spawn-v013-bridge.mjs"
+    original_bridge = bridge.read_bytes()
+    bridge.chmod(bridge.stat().st_mode | stat.S_IWUSR)
+    bridge.write_text("throw new Error('tampered');\n")
+    bridge.chmod(bridge.stat().st_mode & ~stat.S_IWUSR)
+    tampered_bridge = subprocess.run(
+        [str(checkout / "install.sh"), "--no-smoke"],
+        cwd=checkout,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert tampered_bridge.returncode != 0
+    assert "release manifest does not match complete runtime payload" in tampered_bridge.stderr
+    bridge.chmod(bridge.stat().st_mode | stat.S_IWUSR)
+    bridge.write_bytes(original_bridge)
+    bridge.chmod(bridge.stat().st_mode & ~stat.S_IWUSR)
+
+    daemon_binary.chmod(daemon_binary.stat().st_mode | stat.S_IWUSR)
+    daemon_binary.write_text("#!/bin/sh\nexit 9\n")
+    daemon_binary.chmod(daemon_binary.stat().st_mode & ~stat.S_IWUSR)
+    tampered = subprocess.run(
+        [str(checkout / "install.sh"), "--no-smoke"],
+        cwd=checkout,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert tampered.returncode != 0
+    assert "release manifest does not match complete runtime payload" in tampered.stderr
+
+    release.chmod(release.stat().st_mode | stat.S_IWUSR)
+    mutable = subprocess.run(
+        [str(checkout / "install.sh"), "--no-smoke"],
+        cwd=checkout,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert mutable.returncode != 0
+    assert "refusing to reuse mutable release" in mutable.stderr
 
     dirty_env = env.copy()
     dirty_env["DARK_FACTORY_FAKE_DIRTY"] = "1"

@@ -9,15 +9,15 @@
 
 use daemon::errors::DaemonError;
 use daemon::state::{
-    is_permanent_human_hold_reason, set_human_hold_reason, BeadOverlay, HumanHoldReason,
-    OverlayState, StateStore,
+    is_permanent_human_hold_reason, set_human_hold_reason, AdoptedPrClaim, AdoptedPrIdentity,
+    BeadOverlay, HumanHoldReason, OverlayState, StateStore,
 };
 use daemon::tools::{
     Bead, Issue, LabeledPr, Llm, Permission, PrHeadBranch, PrSnapshot, Scm, SessionActivity,
     SessionId, Sessions, SpawnSpec, Tracker, Vcs, WorktreeHeadAncestry,
 };
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Scripted `Tracker` fake: pre-seeded candidates + a call log of every method
 /// invocation (method name + key args), so tests can assert both output and
@@ -31,6 +31,9 @@ use std::collections::HashMap;
 #[derive(Default)]
 pub struct FakeTracker {
     pub candidates: RefCell<Vec<Bead>>,
+    /// Explicit dependency-ready snapshot. `None` preserves the historical
+    /// fake behavior where every broad candidate is admitted.
+    pub ready_ids: RefCell<Option<HashSet<String>>>,
     pub create_bead_result: RefCell<Option<Result<String, String>>>,
     /// Scripts `create_bead` to fail with the exact `br create` duplicate
     /// error shape (`DaemonError::duplicate_external_ref_bead_id` parses
@@ -73,6 +76,17 @@ impl Tracker for FakeTracker {
             });
         }
         Ok(self.candidates.borrow().clone())
+    }
+
+    fn fetch_ready_ids(&self) -> Result<HashSet<String>, DaemonError> {
+        self.calls.borrow_mut().push("fetch_ready_ids".into());
+        Ok(self.ready_ids.borrow().clone().unwrap_or_else(|| {
+            self.candidates
+                .borrow()
+                .iter()
+                .map(|bead| bead.id.clone())
+                .collect()
+        }))
     }
 
     fn fetch_all_external_refs(&self) -> Result<std::collections::HashSet<String>, DaemonError> {
@@ -310,10 +324,7 @@ impl Scm for FakeScm {
         self.calls
             .borrow_mut()
             .push(format!("close_pr({pr},{comment})"));
-        if let Some(stderr) = self
-            .pr_already_terminal
-            .get(&("default".to_string(), pr))
-        {
+        if let Some(stderr) = self.pr_already_terminal.get(&("default".to_string(), pr)) {
             return Err(DaemonError::Tool {
                 tool: "gh".into(),
                 rc: 1,
@@ -984,6 +995,10 @@ impl Sessions for FakeSessions {
 #[derive(Default)]
 pub struct FakeVcs {
     pub heads: HashMap<String, String>,
+    /// Optional transient failure for `base_head_for_repo`, keyed by
+    /// `repo@branch`. Removing the entry models the API recovering on a
+    /// later daemon tick.
+    pub fail_base_head_for_repo: RefCell<HashMap<String, String>>,
     /// Per-(branch, remote_sha) script for `is_remote_ahead`. When absent the
     /// default is `false` so tests that don't exercise the stall-bypass guard
     /// don't have to set it up. Tests that DO exercise the guard
@@ -1052,6 +1067,18 @@ impl FakeVcs {
             .push(branch.to_string());
     }
 
+    pub fn fail_base_head_for_repo(&self, repo: &str, branch: &str, message: &str) {
+        self.fail_base_head_for_repo
+            .borrow_mut()
+            .insert(format!("{repo}@{branch}"), message.to_string());
+    }
+
+    pub fn clear_base_head_for_repo_failure(&self, repo: &str, branch: &str) {
+        self.fail_base_head_for_repo
+            .borrow_mut()
+            .remove(&format!("{repo}@{branch}"));
+    }
+
     /// Script `head_sha(branch)` to return `sha_before` until real instant
     /// `at`, then `sha_after` from `at` onward — i.e. a single simulated
     /// push landing at wall-clock instant `at`. Call multiple times with
@@ -1068,6 +1095,10 @@ impl FakeVcs {
         self.fail_head_sha_for
             .borrow_mut()
             .insert(branch.to_string(), message.to_string());
+    }
+
+    pub fn clear_head_sha_failure(&self, branch: &str) {
+        self.fail_head_sha_for.borrow_mut().remove(branch);
     }
 
     /// advice-627-630-20260809 PR #628 finding 2: script a PERMANENT
@@ -1117,6 +1148,13 @@ impl Vcs for FakeVcs {
             .borrow_mut()
             .push(format!("base_head_for_repo({repo},{base_branch})"));
         let scoped_key = format!("{repo}@{base_branch}");
+        if let Some(message) = self.fail_base_head_for_repo.borrow().get(&scoped_key) {
+            return Err(DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr: message.clone(),
+            });
+        }
         if let Some(sha) = self.heads.get(&scoped_key) {
             return Ok(sha.clone());
         }
@@ -1173,11 +1211,7 @@ impl Vcs for FakeVcs {
     /// override via a wrapper. Recording the call here lets us verify
     /// the reroll reached the recovery branch on a scripted stale
     /// `create_branch_at_for_repo` 422.
-    fn delete_branch_at_for_repo(
-        &self,
-        repo: &str,
-        name: &str,
-    ) -> Result<(), DaemonError> {
+    fn delete_branch_at_for_repo(&self, repo: &str, name: &str) -> Result<(), DaemonError> {
         self.calls
             .borrow_mut()
             .push(format!("delete_branch_at_for_repo({repo},{name})"));
@@ -1218,9 +1252,9 @@ impl Vcs for FakeVcs {
         branch: &str,
         timeout_secs: u64,
     ) -> Result<String, DaemonError> {
-        self.calls
-            .borrow_mut()
-            .push(format!("head_sha_within_for_repo({repo},{branch},{timeout_secs})"));
+        self.calls.borrow_mut().push(format!(
+            "head_sha_within_for_repo({repo},{branch},{timeout_secs})"
+        ));
         let scoped_key = format!("{repo}@{branch}");
         let permanent_map = self.fail_head_sha_permanent_for.borrow();
         if let Some(msg) = permanent_map
@@ -1239,7 +1273,10 @@ impl Vcs for FakeVcs {
             });
         }
         let schedule_map = self.head_sha_schedule.borrow();
-        if let Some(schedule) = schedule_map.get(&scoped_key).or_else(|| schedule_map.get(branch)) {
+        if let Some(schedule) = schedule_map
+            .get(&scoped_key)
+            .or_else(|| schedule_map.get(branch))
+        {
             let now = std::time::Instant::now();
             if let Some((_, sha)) = schedule.iter().rfind(|(at, _)| *at <= now) {
                 return Ok(sha.clone());
@@ -1367,6 +1404,7 @@ pub struct FakeStateStore {
     pub overlays: RefCell<HashMap<String, BeadOverlay>>,
     pub branches: RefCell<Vec<String>>,
     pub branch_beads: RefCell<HashMap<String, String>>,
+    pub adopted_bindings: RefCell<HashMap<String, (String, u64, String, String)>>,
     pub rejections: RefCell<HashMap<(String, u32), RejectionRecord>>,
     pub fail_save_for_state: RefCell<Vec<(String, OverlayState)>>,
     /// Bead jleechan-zeij / issue #322 r2: consecutive re-roll deferral count
@@ -1407,8 +1445,7 @@ pub struct FakeStateStore {
     /// `escalation_should_emit`/`record_escalation_emit`/
     /// `mark_escalation_undeliverable` impls so tick-integration tests can
     /// exercise the dedup + terminal-marking paths without a real SQLite DB.
-    pub escalation_ledger:
-        RefCell<HashMap<(String, String), EscalationLedgerEntry>>,
+    pub escalation_ledger: RefCell<HashMap<(String, String), EscalationLedgerEntry>>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -1490,6 +1527,122 @@ impl StateStore for FakeStateStore {
             .borrow_mut()
             .push(format!("bead_id_for_branch({branch})"));
         Ok(self.branch_beads.borrow().get(branch).cloned())
+    }
+
+    fn claim_adopted_pr(
+        &self,
+        identity: &AdoptedPrIdentity,
+        candidate: &BeadOverlay,
+    ) -> Result<AdoptedPrClaim, DaemonError> {
+        let owner = self.branch_beads.borrow().get(&identity.branch).cloned();
+        let Some(owner_bead_id) = owner else {
+            self.save(candidate)?;
+            self.branches.borrow_mut().push(identity.branch.clone());
+            self.branch_beads
+                .borrow_mut()
+                .insert(identity.branch.clone(), candidate.bead_id.clone());
+            self.adopted_bindings.borrow_mut().insert(
+                identity.branch.clone(),
+                (
+                    identity.repo.clone(),
+                    identity.pr_number,
+                    identity.head_sha.clone(),
+                    candidate.bead_id.clone(),
+                ),
+            );
+            return Ok(AdoptedPrClaim::Owned);
+        };
+        let owner_overlay = self.overlays.borrow().get(&owner_bead_id).cloned();
+        let tuple_matches = self
+            .adopted_bindings
+            .borrow()
+            .get(&identity.branch)
+            .map(|(repo, pr, head, bound_owner)| {
+                repo == &identity.repo
+                    && *pr == identity.pr_number
+                    && !head.is_empty()
+                    && bound_owner == &owner_bead_id
+            })
+            .unwrap_or_else(|| {
+                owner_overlay.as_ref().is_some_and(|overlay| {
+                    overlay
+                        .target_repo
+                        .as_deref()
+                        .unwrap_or(&identity.default_repo)
+                        == identity.repo
+                        && overlay.pr_number == Some(identity.pr_number)
+                        && overlay.branch.as_deref() == Some(identity.branch.as_str())
+                })
+            });
+        if !tuple_matches {
+            return Ok(AdoptedPrClaim::RefusedMismatch {
+                owner_bead_id,
+                reason: "stored owner identity does not match repo/PR/branch/exact head".into(),
+            });
+        }
+        if owner_bead_id == candidate.bead_id {
+            self.save(candidate)?;
+            self.adopted_bindings.borrow_mut().insert(
+                identity.branch.clone(),
+                (
+                    identity.repo.clone(),
+                    identity.pr_number,
+                    identity.head_sha.clone(),
+                    owner_bead_id.clone(),
+                ),
+            );
+            return Ok(AdoptedPrClaim::Owned);
+        }
+        let Some(owner_overlay) = owner_overlay else {
+            return Ok(AdoptedPrClaim::RefusedMismatch {
+                owner_bead_id,
+                reason: "registered owner overlay is missing".into(),
+            });
+        };
+        if owner_overlay.state == OverlayState::HumanHeld && owner_overlay.session_id.is_none() {
+            self.save(candidate)?;
+            self.branch_beads
+                .borrow_mut()
+                .insert(identity.branch.clone(), candidate.bead_id.clone());
+            self.adopted_bindings.borrow_mut().insert(
+                identity.branch.clone(),
+                (
+                    identity.repo.clone(),
+                    identity.pr_number,
+                    identity.head_sha.clone(),
+                    candidate.bead_id.clone(),
+                ),
+            );
+            return Ok(AdoptedPrClaim::ReplacedHumanHeld { owner_bead_id });
+        }
+        if matches!(
+            owner_overlay.state,
+            OverlayState::Queued
+                | OverlayState::Dispatching
+                | OverlayState::Dispatched
+                | OverlayState::Attested
+                | OverlayState::ReRoll
+                | OverlayState::Recovery
+                | OverlayState::Redispatched
+        ) {
+            self.adopted_bindings.borrow_mut().insert(
+                identity.branch.clone(),
+                (
+                    identity.repo.clone(),
+                    identity.pr_number,
+                    identity.head_sha.clone(),
+                    owner_bead_id.clone(),
+                ),
+            );
+            return Ok(AdoptedPrClaim::CoalescedActive { owner_bead_id });
+        }
+        Ok(AdoptedPrClaim::RefusedMismatch {
+            owner_bead_id,
+            reason: format!(
+                "registered owner state {} is not replaceable",
+                owner_overlay.state.as_str()
+            ),
+        })
     }
 
     fn owned_branches(&self) -> Result<Vec<String>, DaemonError> {
@@ -1802,6 +1955,7 @@ impl StateStore for FakeStateStore {
         &self,
         overlay: &BeadOverlay,
         attempt: u32,
+        _ao_project: &str,
     ) -> Result<(), DaemonError> {
         if *self.fail_remediation_session_spawned.borrow() {
             return Err(DaemonError::Tool {
@@ -1822,9 +1976,9 @@ impl StateStore for FakeStateStore {
         now_epoch: u64,
         refire_secs: u64,
     ) -> Result<bool, DaemonError> {
-        self.calls.borrow_mut().push(format!(
-            "escalation_should_emit({bead_id},{reason})"
-        ));
+        self.calls
+            .borrow_mut()
+            .push(format!("escalation_should_emit({bead_id},{reason})"));
         match self
             .escalation_ledger
             .borrow()
@@ -1850,9 +2004,9 @@ impl StateStore for FakeStateStore {
         context_hash: &str,
         now_epoch: u64,
     ) -> Result<(), DaemonError> {
-        self.calls.borrow_mut().push(format!(
-            "record_escalation_emit({bead_id},{reason})"
-        ));
+        self.calls
+            .borrow_mut()
+            .push(format!("record_escalation_emit({bead_id},{reason})"));
         let mut ledger = self.escalation_ledger.borrow_mut();
         let entry = ledger
             .entry((bead_id.to_string(), reason.to_string()))
@@ -1870,9 +2024,9 @@ impl StateStore for FakeStateStore {
         bead_id: &str,
         reason: &str,
     ) -> Result<(), DaemonError> {
-        self.calls.borrow_mut().push(format!(
-            "mark_escalation_undeliverable({bead_id},{reason})"
-        ));
+        self.calls
+            .borrow_mut()
+            .push(format!("mark_escalation_undeliverable({bead_id},{reason})"));
         let mut ledger = self.escalation_ledger.borrow_mut();
         let entry = ledger
             .entry((bead_id.to_string(), reason.to_string()))

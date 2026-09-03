@@ -20,6 +20,7 @@ fn fake_tracker_records_calls_and_returns_scripted_response() {
             file_tree_summary: String::new(),
             external_ref: Some("owner/repo#5".into()),
         }]),
+        ready_ids: Default::default(),
         create_bead_result: std::cell::RefCell::new(Some(Ok("bead-42".into()))),
         create_bead_duplicate_of: Default::default(),
         create_bead_fail_for_ref: Default::default(),

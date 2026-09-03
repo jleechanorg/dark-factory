@@ -1,6 +1,6 @@
 use crate::errors::{DaemonError, SpawnBatchCleanupFailure};
 use crate::tools::{
-    run_tool, run_tool_in_dir, Bead, Issue, LabeledPr, Llm, Permission,
+    run_tool, run_tool_in_dir, run_tool_with_env, Bead, Issue, LabeledPr, Llm, Permission,
     PrHeadBranch, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs,
     WorktreeHeadAncestry,
 };
@@ -195,6 +195,22 @@ impl Tracker for CliTracker {
         Ok(beads)
     }
 
+    fn fetch_ready_ids(&self) -> Result<std::collections::HashSet<String>, DaemonError> {
+        let out = run_tool(
+            "br",
+            &["ready", "--label", "factory", "--json", "--limit", "0"],
+            30,
+        )?;
+        let json_start = out.find('[').unwrap_or(0);
+        #[derive(serde::Deserialize)]
+        struct ReadyBead {
+            id: String,
+        }
+        let rows: Vec<ReadyBead> = serde_json::from_str(&out[json_start..])
+            .map_err(|error| DaemonError::Parse(format!("failed to parse br ready JSON: {error}")))?;
+        Ok(rows.into_iter().map(|bead| bead.id).collect())
+    }
+
     fn fetch_all_external_refs(&self) -> Result<std::collections::HashSet<String>, DaemonError> {
         // `br list --status all` returns zero rows; merge open + closed so closed beads
         // (e.g. jleechan-9byt.5 → worldarchitect.ai#8171) block duplicate create_bead.
@@ -315,6 +331,13 @@ printf '%s\n' "$*" >> "$DARK_FACTORY_BR_LOG"
 if [ "$1" = "--db" ]; then shift 2; fi
 case "${1:-}" in
   list) printf '{"issues":[],"has_more":false}\n' ;;
+  ready)
+    if [ "${DARK_FACTORY_BR_READY_MALFORMED:-}" = "1" ]; then
+      printf 'not-json\n'
+    else
+      printf '[{"id":"ready-bead"},{"id":"ready-bead-2"}]\n'
+    fi
+    ;;
   create) printf 'bead-from-fake-br\n' ;;
   show)
     if [ -f "$DARK_FACTORY_BR_LABEL_STATE" ]; then
@@ -336,6 +359,7 @@ esac
         let prior_db = std::env::var_os("DARK_FACTORY_BR_DB");
         let prior_log = std::env::var_os("DARK_FACTORY_BR_LOG");
         let prior_label_state = std::env::var_os("DARK_FACTORY_BR_LABEL_STATE");
+        let prior_ready_malformed = std::env::var_os("DARK_FACTORY_BR_READY_MALFORMED");
         let label_state = root.join("factory-labelled");
         unsafe {
             std::env::set_var(
@@ -349,6 +373,11 @@ esac
 
         let tracker = CliTracker;
         let reads = tracker.fetch_candidates();
+        let ready = tracker.fetch_ready_ids();
+        unsafe {
+            std::env::set_var("DARK_FACTORY_BR_READY_MALFORMED", "1");
+        }
+        let malformed_ready = tracker.fetch_ready_ids();
         let created = tracker.create_bead("test", "body", "owner/repo#1");
 
         unsafe {
@@ -368,14 +397,27 @@ esac
                 Some(value) => std::env::set_var("DARK_FACTORY_BR_LABEL_STATE", value),
                 None => std::env::remove_var("DARK_FACTORY_BR_LABEL_STATE"),
             }
+            match prior_ready_malformed {
+                Some(value) => std::env::set_var("DARK_FACTORY_BR_READY_MALFORMED", value),
+                None => std::env::remove_var("DARK_FACTORY_BR_READY_MALFORMED"),
+            }
         }
 
         assert!(reads.unwrap().is_empty());
+        assert_eq!(
+            ready.unwrap(),
+            ["ready-bead".to_string(), "ready-bead-2".to_string()]
+                .into_iter()
+                .collect()
+        );
+        assert!(malformed_ready.is_err(), "malformed br ready JSON must fail closed");
         assert_eq!(created.unwrap(), "bead-from-fake-br");
         assert_eq!(
             std::fs::read_to_string(&log).unwrap().lines().collect::<Vec<_>>(),
             vec![
                 format!("--db {} list --status open --label factory --json --limit 0", db.display()),
+                format!("--db {} ready --label factory --json --limit 0", db.display()),
+                format!("--db {} ready --label factory --json --limit 0", db.display()),
                 format!("--db {} create --title test --description body --external-ref owner/repo#1 --silent", db.display()),
                 format!("--db {} show bead-from-fake-br --json", db.display()),
                 format!("--db {} update bead-from-fake-br --add-label factory --json", db.display()),
@@ -2969,6 +3011,564 @@ fn ao_spawn_bridge_path() -> std::path::PathBuf {
         .join("ao-spawn-v013-bridge.mjs")
 }
 
+/// Result of the bounded, project-scoped AO controller readiness check.
+///
+/// `Healthy` means the factory manifest's PID/start-time/project binding
+/// matches AO's private `running.json`. `Restarted` means this process elected
+/// and started a dedicated controller, then observed that binding survive the
+/// configured sustain interval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryOutcome {
+    Healthy { evidence: String },
+    Restarted { evidence: String },
+    FailClosed { error: String },
+    Unknown { error: String },
+}
+
+#[derive(Debug)]
+enum AoReadiness {
+    Ready(String),
+    Unavailable,
+    Unknown(String),
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct AoControllerManifest {
+    pid: u32,
+    process_start_ticks: u64,
+    project: String,
+    target: String,
+}
+
+struct AoRecoveryFileLock {
+    _file: std::fs::File,
+}
+
+#[derive(Default)]
+struct AoRecoverySlot {
+    last_failed_attempt: Option<Instant>,
+}
+
+static AO_RECOVERY_SLOTS: std::sync::OnceLock<
+    Mutex<HashMap<String, Arc<Mutex<AoRecoverySlot>>>>,
+> = std::sync::OnceLock::new();
+
+fn ao_recovery_slot(project: &str) -> Arc<Mutex<AoRecoverySlot>> {
+    let slots = AO_RECOVERY_SLOTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut slots = slots
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    slots
+        .entry(project.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(AoRecoverySlot::default())))
+        .clone()
+}
+
+fn recovery_duration_ms(name: &str, default_ms: u64) -> Duration {
+    Duration::from_millis(
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(default_ms),
+    )
+}
+
+fn safe_project_component(project: &str) -> String {
+    if !project.is_empty()
+        && !matches!(project, "." | "..")
+        && project
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return project.to_string();
+    }
+    // Keep legacy paths unchanged for already-safe project IDs, while giving
+    // every unsafe byte string an injective, disjoint namespace. A safe ID
+    // can never start with '~' under the predicate above, and hexadecimal
+    // encoding is reversible, so `a/b` cannot collide with `a_b` (or any
+    // other project) as the old underscore substitution did.
+    let mut encoded = String::with_capacity(1 + project.len() * 2);
+    encoded.push('~');
+    for byte in project.as_bytes() {
+        use std::fmt::Write as _;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn ao_controller_home(project: &str) -> Result<std::path::PathBuf, String> {
+    let operator_home = std::env::var("DARK_FACTORY_OPERATOR_HOME")
+        .or_else(|_| std::env::var("AO_ORIGINAL_HOME"))
+        .or_else(|_| std::env::var("HOME"))
+        .map_err(|_| "HOME/AO_ORIGINAL_HOME is unavailable".to_string())?;
+    Ok(std::env::var("DARK_FACTORY_AO_CONTROLLER_HOME")
+        .map(|base| std::path::PathBuf::from(base).join(safe_project_component(project)))
+        .unwrap_or_else(|_| {
+            std::path::Path::new(&operator_home)
+                .join(".local/state/dark-factory/ao-controller")
+                .join(safe_project_component(project))
+        }))
+}
+
+/// Give the factory-owned AO controller a private running-state namespace.
+/// AO 0.1.3 stores `running.json` under `os.homedir()` and cannot attach a
+/// configured project to a different already-running process. A private HOME
+/// therefore avoids disrupting an operator/shared AO instance while the
+/// explicit config and original-home variables preserve the real project,
+/// credentials, and agent configuration.
+fn ao_controller_env(project: &str) -> Result<Vec<(String, String)>, String> {
+    let operator_home = std::env::var("DARK_FACTORY_OPERATOR_HOME")
+        .or_else(|_| std::env::var("AO_ORIGINAL_HOME"))
+        .or_else(|_| std::env::var("HOME"))
+        .map_err(|_| "HOME/AO_ORIGINAL_HOME is unavailable".to_string())?;
+    let controller_home = ao_controller_home(project)?;
+    std::fs::create_dir_all(&controller_home).map_err(|error| {
+        format!(
+            "failed to create AO controller state home {}: {error}",
+            controller_home.display()
+        )
+    })?;
+    let config_path = std::env::var("DARK_FACTORY_AO_CONFIG_PATH")
+        .or_else(|_| std::env::var("AO_CONFIG_PATH"))
+        .unwrap_or_else(|_| format!("{operator_home}/agent-orchestrator.yaml"));
+
+    Ok(vec![
+        ("HOME".to_string(), controller_home.to_string_lossy().into_owned()),
+        ("AO_ORIGINAL_HOME".to_string(), operator_home.clone()),
+        ("AO_CONFIG_PATH".to_string(), config_path),
+        (
+            "GH_CONFIG_DIR".to_string(),
+            std::env::var("GH_CONFIG_DIR")
+                .unwrap_or_else(|_| format!("{operator_home}/.config/gh")),
+        ),
+        (
+            "GIT_CONFIG_GLOBAL".to_string(),
+            std::env::var("GIT_CONFIG_GLOBAL")
+                .unwrap_or_else(|_| format!("{operator_home}/.gitconfig")),
+        ),
+        // Never let a factory-owned fallback silently select the personal
+        // default Claude profile. Explicit service configuration still wins.
+        (
+            "CLAUDE_CONFIG_DIR".to_string(),
+            std::env::var("DARK_FACTORY_CLAUDE_CONFIG_DIR")
+                .unwrap_or_else(|_| format!("{operator_home}/.claude-wa")),
+        ),
+    ])
+}
+
+fn apply_ao_controller_env(command: &mut Command, project: &str) -> Result<(), String> {
+    for (key, value) in ao_controller_env(project)? {
+        command.env(key, value);
+    }
+    Ok(())
+}
+
+fn run_ao_tool(project: &str, args: &[&str], timeout_secs: u64) -> Result<String, DaemonError> {
+    let values = ao_controller_env(project).map_err(DaemonError::Config)?;
+    let refs: Vec<(&str, &str)> = values
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    run_tool_with_env("ao", args, &refs, timeout_secs)
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_ticks(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Field 2 is parenthesized and may contain spaces. Everything after its
+    // final ')' begins at field 3, so starttime (field 22) is index 19 there.
+    stat.rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+fn process_start_identity_from_ps(output: &[u8]) -> Option<u64> {
+    let value = std::str::from_utf8(output).ok()?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    // Stable FNV-1a over `ps -o lstart=` output. Unlike a process PID alone,
+    // the start-time identity detects PID reuse; unlike DefaultHasher, this
+    // value remains stable across daemon processes and Rust releases.
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Some(hash)
+}
+
+#[cfg(target_os = "macos")]
+fn process_start_ticks(pid: u32) -> Option<u64> {
+    let output = Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| process_start_identity_from_ps(&output.stdout))
+        .flatten()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_start_ticks(_pid: u32) -> Option<u64> {
+    None
+}
+
+fn acquire_ao_recovery_file_lock(project: &str) -> Result<AoRecoveryFileLock, String> {
+    use std::os::fd::AsRawFd;
+    use std::io::Write;
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    let home = ao_controller_home(project)?;
+    std::fs::create_dir_all(&home)
+        .map_err(|error| format!("failed to create {}: {error}", home.display()))?;
+    let path = home.join("recovery.lock");
+    let pid = std::process::id();
+    let start_ticks = process_start_ticks(pid).ok_or_else(|| {
+        format!("could not read recovery owner process start time for pid {pid}")
+    })?;
+    let token = serde_json::to_vec(&serde_json::json!({
+        "pid": pid,
+        "process_start_ticks": start_ticks,
+        "project": project,
+    }))
+    .map_err(|error| error.to_string())?;
+    let deadline = Instant::now()
+        + recovery_duration_ms("DARK_FACTORY_AO_RECOVERY_LOCK_TIMEOUT_MS", 20_000);
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
+    loop {
+        if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+            file.set_len(0)
+                .and_then(|_| file.write_all(&token))
+                .and_then(|_| file.sync_all())
+                .map_err(|error| format!("failed to initialize {}: {error}", path.display()))?;
+            return Ok(AoRecoveryFileLock { _file: file });
+        }
+        let error = std::io::Error::last_os_error();
+        if !matches!(error.kind(), std::io::ErrorKind::WouldBlock) {
+            return Err(format!("failed to lock {}: {error}", path.display()));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for AO recovery election lock {}",
+                path.display()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn controller_manifest_path(project: &str) -> Result<std::path::PathBuf, String> {
+    Ok(ao_controller_home(project)?.join("controller.json"))
+}
+
+fn write_controller_manifest(
+    project: &str,
+    target: &str,
+    child: &std::process::Child,
+) -> Result<(), String> {
+    let path = controller_manifest_path(project)?;
+    let start_ticks = process_start_ticks(child.id())
+        .ok_or_else(|| format!("could not read process start time for AO pid {}", child.id()))?;
+    let manifest = AoControllerManifest {
+        pid: child.id(),
+        process_start_ticks: start_ticks,
+        project: project.to_string(),
+        target: target.to_string(),
+    };
+    let temp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    std::fs::write(
+        &temp,
+        serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("failed to write {}: {error}", temp.display()))?;
+    std::fs::rename(&temp, &path)
+        .map_err(|error| format!("failed to install {}: {error}", path.display()))
+}
+
+fn read_controller_manifest(project: &str) -> Result<Option<AoControllerManifest>, String> {
+    let path = controller_manifest_path(project)?;
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| format!("invalid {}: {error}", path.display()))
+}
+
+fn validate_controller_manifest_project(
+    manifest: &AoControllerManifest,
+    project: &str,
+) -> Result<(), String> {
+    if manifest.project == project {
+        Ok(())
+    } else {
+        Err(format!(
+            "AO controller manifest project {:?} does not match requested project {project:?}; refusing to signal or remove it",
+            manifest.project
+        ))
+    }
+}
+
+fn probe_ao_project(project: &str) -> AoReadiness {
+    let manifest = match read_controller_manifest(project) {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => return AoReadiness::Unavailable,
+        Err(error) => return AoReadiness::Unknown(error),
+    };
+    if manifest.project != project
+        || process_start_ticks(manifest.pid) != Some(manifest.process_start_ticks)
+    {
+        return AoReadiness::Unavailable;
+    }
+    let running_path = match ao_controller_home(project) {
+        Ok(home) => home.join(".agent-orchestrator/running.json"),
+        Err(error) => return AoReadiness::Unknown(error),
+    };
+    let running: serde_json::Value = match std::fs::read(&running_path)
+        .map_err(|error| error.to_string())
+        .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|error| error.to_string()))
+    {
+        Ok(value) => value,
+        Err(_) => return AoReadiness::Unavailable,
+    };
+    let same_pid = running.get("pid").and_then(serde_json::Value::as_u64)
+        == Some(manifest.pid as u64);
+    let has_project = running
+        .get("projects")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|projects| projects.iter().any(|value| value.as_str() == Some(project)));
+    if same_pid && has_project {
+        AoReadiness::Ready(format!(
+            "project={project} controller_pid={} start_ticks={}",
+            manifest.pid, manifest.process_start_ticks
+        ))
+    } else {
+        AoReadiness::Unavailable
+    }
+}
+
+#[cfg(unix)]
+fn kill_controller_scope(child: &mut std::process::Child) {
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    // The child is placed in its own process group below, so a negative pid
+    // reaps only the startup scope owned by this recovery attempt.
+    unsafe {
+        let _ = kill(-(child.id() as i32), 9);
+    }
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn reap_owned_controller(project: &str) -> Result<(), String> {
+    let Some(manifest) = read_controller_manifest(project)? else {
+        return Ok(());
+    };
+    validate_controller_manifest_project(&manifest, project)?;
+    if process_start_ticks(manifest.pid) == Some(manifest.process_start_ticks) {
+        unsafe extern "C" {
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
+        unsafe {
+            let _ = kill(-(manifest.pid as i32), 15);
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while process_start_ticks(manifest.pid) == Some(manifest.process_start_ticks)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if process_start_ticks(manifest.pid) == Some(manifest.process_start_ticks) {
+            unsafe {
+                let _ = kill(-(manifest.pid as i32), 9);
+            }
+        }
+    }
+    let _ = std::fs::remove_file(controller_manifest_path(project)?);
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn reap_owned_controller(project: &str) -> Result<(), String> {
+    let Some(manifest) = read_controller_manifest(project)? else {
+        return Ok(());
+    };
+    validate_controller_manifest_project(&manifest, project)?;
+    let _ = std::fs::remove_file(controller_manifest_path(project)?);
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn kill_controller_scope(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Ensure AO is persistently polling `project`, without touching a shared AO
+/// instance. The elected caller starts one detached, factory-owned controller
+/// and polls a project-scoped ready condition for a bounded interval.
+fn ensure_ao_recovery_for_target(project: &str, target: &str) -> RecoveryOutcome {
+    let slot = ao_recovery_slot(project);
+    let mut slot = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _election = match acquire_ao_recovery_file_lock(project) {
+        Ok(lock) => lock,
+        Err(error) => return RecoveryOutcome::FailClosed { error },
+    };
+
+    match probe_ao_project(project) {
+        AoReadiness::Ready(evidence) => return RecoveryOutcome::Healthy { evidence },
+        AoReadiness::Unknown(error) => return RecoveryOutcome::Unknown { error },
+        AoReadiness::Unavailable => {}
+    }
+
+    let cooldown = recovery_duration_ms("DARK_FACTORY_AO_RECOVERY_COOLDOWN_MS", 30_000);
+    if slot
+        .last_failed_attempt
+        .is_some_and(|last| last.elapsed() < cooldown)
+    {
+        return RecoveryOutcome::FailClosed {
+            error: format!(
+                "AO controller recovery for project {project} is in its cooldown window"
+            ),
+        };
+    }
+
+
+    if let Err(error) = reap_owned_controller(project) {
+        slot.last_failed_attempt = Some(Instant::now());
+        return RecoveryOutcome::Unknown { error };
+    }
+
+    let mut command = Command::new("ao");
+    command
+        .args(["start", target, "--no-dashboard", "--no-open"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Err(error) = apply_ao_controller_env(&mut command, project) {
+        slot.last_failed_attempt = Some(Instant::now());
+        return RecoveryOutcome::Unknown { error };
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            slot.last_failed_attempt = Some(Instant::now());
+            return RecoveryOutcome::Unknown {
+                error: format!("ao start execution failed: {error}"),
+            };
+        }
+    };
+    if let Err(error) = write_controller_manifest(project, target, &child) {
+        kill_controller_scope(&mut child);
+        slot.last_failed_attempt = Some(Instant::now());
+        return RecoveryOutcome::Unknown { error };
+    }
+
+    let timeout = recovery_duration_ms("DARK_FACTORY_AO_RECOVERY_TIMEOUT_MS", 15_000);
+    let poll = recovery_duration_ms("DARK_FACTORY_AO_RECOVERY_POLL_MS", 250);
+    let sustain = recovery_duration_ms("DARK_FACTORY_AO_RECOVERY_SUSTAIN_MS", 1_000);
+    let deadline = Instant::now() + timeout;
+    loop {
+        match probe_ao_project(project) {
+            AoReadiness::Ready(evidence) => {
+                // Require the PID/start-time/project binding to survive a
+                // sustain interval so a one-sample startup flash cannot
+                // release dispatch.
+                std::thread::sleep(sustain);
+                if matches!(probe_ao_project(project), AoReadiness::Ready(_)) {
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                    slot.last_failed_attempt = None;
+                    return RecoveryOutcome::Restarted { evidence };
+                }
+            }
+            AoReadiness::Unknown(error) => {
+                kill_controller_scope(&mut child);
+                let _ = std::fs::remove_file(controller_manifest_path(project).unwrap_or_default());
+                slot.last_failed_attempt = Some(Instant::now());
+                return RecoveryOutcome::Unknown { error };
+            }
+            AoReadiness::Unavailable => {}
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                slot.last_failed_attempt = Some(Instant::now());
+                return RecoveryOutcome::FailClosed {
+                    error: format!(
+                        "AO controller for project {project} exited before readiness: {status}"
+                    ),
+                };
+            }
+            Err(error) => {
+                kill_controller_scope(&mut child);
+                let _ = std::fs::remove_file(controller_manifest_path(project).unwrap_or_default());
+                slot.last_failed_attempt = Some(Instant::now());
+                return RecoveryOutcome::Unknown {
+                    error: format!("failed to inspect AO controller process: {error}"),
+                };
+            }
+            Ok(None) => {}
+        }
+        if Instant::now() >= deadline {
+            kill_controller_scope(&mut child);
+            let _ = std::fs::remove_file(controller_manifest_path(project).unwrap_or_default());
+            slot.last_failed_attempt = Some(Instant::now());
+            return RecoveryOutcome::FailClosed {
+                error: format!(
+                    "AO controller for project {project} did not become ready within {}ms",
+                    timeout.as_millis()
+                ),
+            };
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+pub fn ensure_ao_recovery(project: &str) -> RecoveryOutcome {
+    ensure_ao_recovery_for_target(project, project)
+}
+
+/// Result-shaped facade used at dispatch boundaries and by integration
+/// contract tests. `target` is the exact AO `start` positional target (project
+/// id, configured path, or repository URL); readiness remains scoped to the
+/// canonical `project` id.
+pub fn ensure_ao_project_recovered(project: &str, target: &str) -> Result<(), DaemonError> {
+    match ensure_ao_recovery_for_target(project, target) {
+        RecoveryOutcome::Healthy { .. } | RecoveryOutcome::Restarted { .. } => Ok(()),
+        RecoveryOutcome::FailClosed { error } | RecoveryOutcome::Unknown { error } => {
+            Err(DaemonError::Deferred(format!(
+                "AO controller readiness unresolved for project {project}: {error}"
+            )))
+        }
+    }
+}
+
 fn ao_spawn_command_with_mode(
     agent: &str,
     spec: &SpawnSpec,
@@ -3001,6 +3601,7 @@ fn ao_spawn_command_with_mode(
     } else {
         Command::new("ao")
     };
+    apply_ao_controller_env(&mut cmd, &spec.ao_project).map_err(DaemonError::Config)?;
 
     // Bind every worker spawn to its routed target checkout. Without this, AO
     // inherits the daemon process cwd (normally the dark-factory checkout),
@@ -3326,25 +3927,6 @@ pub fn verify_ao_bridge_compatibility(
     Ok(())
 }
 
-struct ProjectStarterEntry {
-    in_progress: std::sync::Mutex<bool>,
-    cv: std::sync::Condvar,
-}
-
-static AO_PROJECT_STARTERS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<ProjectStarterEntry>>>> = std::sync::OnceLock::new();
-
-/// Checks structured health of a project: returns true if project is running and valid JSON array returned.
-pub fn is_ao_project_healthy(project: &str) -> bool {
-    let out = match run_tool("ao", &["status", "-p", project, "--json"], 30) {
-        Ok(out) => out,
-        Err(_) => return false,
-    };
-    let json_start = out.find('[').unwrap_or(0);
-    serde_json::from_str::<serde_json::Value>(&out[json_start..])
-        .map(|v| v.is_array())
-        .unwrap_or(false)
-}
-
 /// SPEC #4 residual limitation: this is still lexical stderr classification
 /// for any `ao` CLI invocation that actually ran and returned a real exit
 /// code (AO does not expose a structured failure-reason taxonomy over its
@@ -3474,575 +4056,6 @@ mod is_ao_not_running_error_tests {
     }
 }
 
-pub fn ensure_ao_project_recovered(project: &str, target_path_or_url: &str) -> Result<(), DaemonError> {
-    // 1. Initial health check: if project is already healthy, do not start
-    if is_ao_project_healthy(project) {
-        return Ok(());
-    }
-
-    // 2. Concurrency-safe starter election with Condvar waiting
-    let entry = {
-        let map_mutex = AO_PROJECT_STARTERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-        let mut map = map_mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.entry(project.to_string())
-            .or_insert_with(|| {
-                std::sync::Arc::new(ProjectStarterEntry {
-                    in_progress: std::sync::Mutex::new(false),
-                    cv: std::sync::Condvar::new(),
-                })
-            })
-            .clone()
-    };
-
-    let mut in_progress = entry.in_progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if *in_progress {
-        // Another thread is currently running start for this project; wait for completion
-        while *in_progress {
-            in_progress = entry.cv.wait(in_progress).unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-        // Re-check health after waiting
-        if is_ao_project_healthy(project) {
-            return Ok(());
-        }
-        return Err(DaemonError::Config(format!(
-            "AO auto-start for project {project} did not restore health for waiting caller"
-        )));
-    }
-
-    // jleechan round-2 finding P1: `*in_progress == false` here does NOT
-    // necessarily mean no starter has EVER run for this project since our
-    // step-1 health check above -- it can also mean a DIFFERENT caller
-    // already elected itself starter, ran `ao start`, and fully released
-    // the guard (in_progress back to false) entirely in the window between
-    // this caller's step-1 check and this caller acquiring the
-    // `in_progress` lock. Re-check health now, under the lock, before
-    // electing self as starter: if a prior caller's start already fixed
-    // things, skip starting again instead of invoking `ao start` a second,
-    // redundant time.
-    if is_ao_project_healthy(project) {
-        return Ok(());
-    }
-
-    // Elect this thread as the active starter
-    *in_progress = true;
-    drop(in_progress);
-
-    struct StarterGuard<'a>(&'a std::sync::Arc<ProjectStarterEntry>);
-    impl<'a> Drop for StarterGuard<'a> {
-        fn drop(&mut self) {
-            let mut guard = self.0.in_progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            *guard = false;
-            self.0.cv.notify_all();
-        }
-    }
-    let _guard = StarterGuard(&entry);
-
-    // 3. Start: ao start <configured-project-path-or-url> --no-dashboard --no-open
-    // Reject --headless if present
-    if target_path_or_url.contains("--headless") {
-        return Err(DaemonError::Config("ao start argument --headless is forbidden".into()));
-    }
-    let start_args = ["start", target_path_or_url, "--no-dashboard", "--no-open"];
-    run_tool("ao", &start_args, 60).map_err(|e| {
-        DaemonError::Config(format!("ao start failed for project {project}: {e}"))
-    })?;
-
-    // 4. Recheck project-scoped health: ao status -p <project-id> --json
-    if !is_ao_project_healthy(project) {
-        return Err(DaemonError::Config(format!(
-            "ao status health check failed for project {project} after start (valid JSON array expected)"
-        )));
-    }
-
-    Ok(())
-}
-
-#[cfg(test)]
-mod ao_project_recovery_tests {
-    use super::ensure_ao_project_recovered;
-    use std::sync::mpsc;
-    use std::time::Duration;
-
-    /// Writes a fake `ao` on PATH that answers `status -p <project> --json`
-    /// based on whether `healthy_marker` exists, and `start <target>
-    /// --no-dashboard --no-open` by appending a timestamp line to
-    /// `start_log`, sleeping `start_delay_ms`, then either creating
-    /// `healthy_marker` and exiting 0 (when `start_exit_code == 0`) or
-    /// printing to stderr and exiting `start_exit_code`.
-    ///
-    /// jleechan round-2 finding P2: the fake used to accept ANY argv whose
-    /// first element was "status" or "start" (`args[:1] == ["status"]`),
-    /// so a production argv regression (missing `-p <project>`, missing
-    /// `--json`, wrong `ao start` flags) would sail through undetected --
-    /// the fake would still answer as if the call were well-formed. It now
-    /// asserts the EXACT argv shape production sends
-    /// (`is_ao_project_healthy`: `["status", "-p", <project>, "--json"]`;
-    /// the `ensure_ao_project_recovered` start call:
-    /// `["start", <target>, "--no-dashboard", "--no-open"]`) and exits
-    /// loudly (nonzero + stderr) on anything else, so a future argv
-    /// regression fails these tests instead of passing silently.
-    struct FakeAoRecoveryEnv {
-        root: std::path::PathBuf,
-        healthy_marker: std::path::PathBuf,
-        start_log: std::path::PathBuf,
-        old_path: Option<std::ffi::OsString>,
-    }
-
-    impl FakeAoRecoveryEnv {
-        fn set_up(
-            test_name: &str,
-            start_delay_ms: u64,
-            start_exit_code: i32,
-            project: &str,
-            target: &str,
-        ) -> Self {
-            Self::build(test_name, start_delay_ms, start_exit_code, project, target, None, 0)
-        }
-
-        /// Like `set_up`, but the Nth `ao status` invocation across the
-        /// WHOLE test (1-indexed, tracked via a counter file since each
-        /// invocation is a separate subprocess) sleeps `slow_delay_ms`
-        /// AFTER capturing whether `healthy_marker` exists but BEFORE
-        /// replying. This lets a test deterministically widen the window
-        /// between "a caller observed unhealthy state" and "that caller
-        /// acts on it", reproducing the round-2 P1 late-arrival Condvar
-        /// race without needing a production-code test hook.
-        fn set_up_with_slow_status(
-            test_name: &str,
-            start_delay_ms: u64,
-            start_exit_code: i32,
-            project: &str,
-            target: &str,
-            slow_status_ordinal: usize,
-            slow_status_delay_ms: u64,
-        ) -> Self {
-            Self::build(
-                test_name,
-                start_delay_ms,
-                start_exit_code,
-                project,
-                target,
-                Some(slow_status_ordinal),
-                slow_status_delay_ms,
-            )
-        }
-
-        fn build(
-            test_name: &str,
-            start_delay_ms: u64,
-            start_exit_code: i32,
-            project: &str,
-            target: &str,
-            slow_status_ordinal: Option<usize>,
-            slow_status_delay_ms: u64,
-        ) -> Self {
-            let root = std::env::temp_dir().join(format!(
-                "afd_ao_project_recovery_{test_name}_{}",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(&root).unwrap();
-            let healthy_marker = root.join("healthy.marker");
-            let start_log = root.join("start.log");
-            let status_calls_log = root.join("status_calls.log");
-            let fake_ao = root.join("ao");
-            let slow_ordinal_py = slow_status_ordinal
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "None".to_string());
-            std::fs::write(
-                &fake_ao,
-                format!(
-                    r#"#!/usr/bin/env python3
-import json, os, sys, time
-args = sys.argv[1:]
-marker = {marker:?}
-start_log = {start_log:?}
-status_calls_log = {status_calls_log:?}
-expected_project = {project:?}
-expected_target = {target:?}
-slow_ordinal = {slow_ordinal_py}
-slow_delay = {slow_delay_ms} / 1000.0
-if args == ["status", "-p", expected_project, "--json"]:
-    healthy = os.path.exists(marker)
-    with open(status_calls_log, "a", encoding="utf-8") as fh:
-        fh.write("x\n")
-    with open(status_calls_log, "r", encoding="utf-8") as fh:
-        ordinal = sum(1 for _ in fh)
-    if slow_ordinal is not None and ordinal == slow_ordinal:
-        time.sleep(slow_delay)
-    if healthy:
-        print("[]")
-        sys.exit(0)
-    sys.exit(1)
-if args == ["start", expected_target, "--no-dashboard", "--no-open"]:
-    with open(start_log, "a", encoding="utf-8") as fh:
-        fh.write(str(time.time()) + "\n")
-    time.sleep({delay_ms} / 1000.0)
-    if {exit_code} != 0:
-        print("scripted start failure", file=sys.stderr)
-        sys.exit({exit_code})
-    with open(marker, "w", encoding="utf-8") as fh:
-        fh.write("healthy\n")
-    sys.exit(0)
-print("UNEXPECTED ARGV: " + json.dumps(args), file=sys.stderr)
-sys.exit(99)
-"#,
-                    marker = healthy_marker.to_string_lossy(),
-                    start_log = start_log.to_string_lossy(),
-                    status_calls_log = status_calls_log.to_string_lossy(),
-                    project = project,
-                    target = target,
-                    slow_ordinal_py = slow_ordinal_py,
-                    slow_delay_ms = slow_status_delay_ms,
-                    delay_ms = start_delay_ms,
-                    exit_code = start_exit_code,
-                ),
-            )
-            .unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut permissions = std::fs::metadata(&fake_ao).unwrap().permissions();
-                permissions.set_mode(0o755);
-                std::fs::set_permissions(&fake_ao, permissions).unwrap();
-            }
-            let old_path = std::env::var_os("PATH");
-            let new_path = std::env::join_paths(
-                std::iter::once(root.clone()).chain(
-                    old_path
-                        .as_deref()
-                        .into_iter()
-                        .flat_map(std::env::split_paths),
-                ),
-            )
-            .unwrap();
-            std::env::set_var("PATH", new_path);
-            Self {
-                root,
-                healthy_marker,
-                start_log,
-                old_path,
-            }
-        }
-
-        fn mark_healthy_up_front(&self) {
-            std::fs::write(&self.healthy_marker, "healthy\n").unwrap();
-        }
-
-        fn start_invocation_count(&self) -> usize {
-            std::fs::read_to_string(&self.start_log)
-                .unwrap_or_default()
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .count()
-        }
-
-        fn fake_ao_path(&self) -> std::path::PathBuf {
-            self.root.join("ao")
-        }
-    }
-
-    impl Drop for FakeAoRecoveryEnv {
-        fn drop(&mut self) {
-            match self.old_path.take() {
-                Some(v) => std::env::set_var("PATH", v),
-                None => std::env::remove_var("PATH"),
-            }
-            let _ = std::fs::remove_dir_all(&self.root);
-        }
-    }
-
-    fn unique_project(label: &str) -> String {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        format!("afd-recovery-{label}-{}-{nonce}", std::process::id())
-    }
-
-    /// Joins a thread through a channel with a hard bound so a Condvar
-    /// liveness regression fails the test instead of hanging the suite.
-    fn join_with_timeout<T: Send + 'static>(
-        handle: std::thread::JoinHandle<T>,
-        timeout: Duration,
-        label: &'static str,
-    ) -> T {
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let result = handle.join().unwrap_or_else(|_| panic!("{label} panicked"));
-            let _ = tx.send(result);
-        });
-        rx.recv_timeout(timeout)
-            .unwrap_or_else(|_| panic!("{label} did not complete within {timeout:?} (hang)"))
-    }
-
-    #[test]
-    fn healthy_project_skips_start_entirely() {
-        let _guard = crate::test_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let project = unique_project("healthy-skip");
-        let target = "https://github.com/jleechanorg/dark-factory.git";
-        let env = FakeAoRecoveryEnv::set_up("healthy_skip", 0, 0, &project, target);
-        env.mark_healthy_up_front();
-
-        let result = ensure_ao_project_recovered(&project, target);
-
-        assert!(result.is_ok(), "{result:?}");
-        assert_eq!(
-            env.start_invocation_count(),
-            0,
-            "an already-healthy project must never invoke ao start"
-        );
-    }
-
-    #[test]
-    fn concurrent_callers_elect_a_single_starter_and_both_observe_health() {
-        let _guard = crate::test_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // 400ms start delay gives the second caller a wide window to observe
-        // `in_progress == true` and enter the Condvar wait instead of racing
-        // to elect itself as a second starter.
-        let project = unique_project("concurrent-race");
-        let target = "https://github.com/jleechanorg/dark-factory.git".to_string();
-        let env = FakeAoRecoveryEnv::set_up("concurrent_race", 400, 0, &project, &target);
-
-        let project_a = project.clone();
-        let target_a = target.clone();
-        let handle_a = std::thread::spawn(move || ensure_ao_project_recovered(&project_a, &target_a));
-        std::thread::sleep(Duration::from_millis(75));
-        let project_b = project.clone();
-        let target_b = target.clone();
-        let handle_b = std::thread::spawn(move || ensure_ao_project_recovered(&project_b, &target_b));
-
-        let result_a = join_with_timeout(handle_a, Duration::from_secs(10), "starter thread");
-        let result_b = join_with_timeout(handle_b, Duration::from_secs(10), "waiter thread");
-
-        assert!(result_a.is_ok(), "{result_a:?}");
-        assert!(result_b.is_ok(), "{result_b:?}");
-        assert_eq!(
-            env.start_invocation_count(),
-            1,
-            "exactly one caller must run ao start; the other must wait on the Condvar and reuse its result"
-        );
-    }
-
-    #[test]
-    fn start_failure_releases_condvar_waiters_with_failure_instead_of_hanging() {
-        let _guard = crate::test_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let project = unique_project("batch-failure");
-        let target = "https://github.com/jleechanorg/dark-factory.git".to_string();
-        let env = FakeAoRecoveryEnv::set_up("batch_failure", 400, 7, &project, &target);
-
-        let project_a = project.clone();
-        let target_a = target.clone();
-        let handle_a = std::thread::spawn(move || ensure_ao_project_recovered(&project_a, &target_a));
-        std::thread::sleep(Duration::from_millis(75));
-        let project_b = project.clone();
-        let target_b = target.clone();
-        let handle_b = std::thread::spawn(move || ensure_ao_project_recovered(&project_b, &target_b));
-
-        // The bounded join is the liveness proof: a Condvar bug that leaves
-        // the waiter blocked forever (e.g. the starter's guard not firing on
-        // an early-return error path) times out here instead of hanging the
-        // whole test binary.
-        let result_a = join_with_timeout(handle_a, Duration::from_secs(10), "starter thread");
-        let result_b = join_with_timeout(handle_b, Duration::from_secs(10), "waiter thread");
-
-        let errors: Vec<String> = [&result_a, &result_b]
-            .iter()
-            .map(|r| r.as_ref().err().map(|e| e.to_string()).unwrap_or_default())
-            .collect();
-        assert!(result_a.is_err(), "{result_a:?}");
-        assert!(result_b.is_err(), "{result_b:?}");
-        assert!(
-            errors.iter().any(|e| e.contains("ao start failed")),
-            "the elected starter must surface the real ao start failure: {errors:?}"
-        );
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.contains("did not restore health for waiting caller")),
-            "the Condvar waiter must be released with a failure, not left blocked: {errors:?}"
-        );
-        assert_eq!(
-            env.start_invocation_count(),
-            1,
-            "a failed start must not be retried by the waiting caller"
-        );
-    }
-
-    /// jleechan round-2 finding P2 regression guard: proves the fake `ao`
-    /// binary itself enforces the real invocation shape rather than
-    /// accepting any argv starting with "status"/"start". Before the
-    /// tightening this fake would have answered `[]` (healthy) or "started"
-    /// for ANY argv shape, so a production regression that dropped `-p
-    /// <project>` or `--json` (or an `ao start` call missing
-    /// `--no-dashboard`/`--no-open`) would have sailed through the other
-    /// tests in this module undetected.
-    #[test]
-    fn fake_ao_binary_rejects_unexpected_argv_shapes() {
-        let _guard = crate::test_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let project = unique_project("argv-shape");
-        let target = "https://github.com/jleechanorg/dark-factory.git".to_string();
-        let env = FakeAoRecoveryEnv::set_up("argv_shape", 0, 0, &project, &target);
-        let ao = env.fake_ao_path();
-
-        let missing_json_flag = std::process::Command::new(&ao)
-            .args(["status", "-p", &project])
-            .output()
-            .unwrap();
-        assert!(!missing_json_flag.status.success(), "must reject status call missing --json");
-        assert!(
-            String::from_utf8_lossy(&missing_json_flag.stderr).contains("UNEXPECTED ARGV"),
-            "{}",
-            String::from_utf8_lossy(&missing_json_flag.stderr)
-        );
-
-        let wrong_project = std::process::Command::new(&ao)
-            .args(["status", "-p", "some-other-project", "--json"])
-            .output()
-            .unwrap();
-        assert!(!wrong_project.status.success(), "must reject status call for a different project");
-
-        let missing_start_flags = std::process::Command::new(&ao)
-            .args(["start", &target])
-            .output()
-            .unwrap();
-        assert!(!missing_start_flags.status.success(), "must reject start call missing --no-dashboard --no-open");
-        assert!(
-            String::from_utf8_lossy(&missing_start_flags.stderr).contains("UNEXPECTED ARGV"),
-            "{}",
-            String::from_utf8_lossy(&missing_start_flags.stderr)
-        );
-    }
-
-    /// jleechan round-2 finding P1: a caller that observes unhealthy state
-    /// at its OWN step-1 check can still reach the `in_progress` election
-    /// point AFTER a different, prior caller has already elected itself
-    /// starter, run `ao start` to completion, and fully released the
-    /// guard. Without the fix, that late-arriving caller sees
-    /// `in_progress == false` (not because no starter ran, but because one
-    /// already finished) and starts AO a second, redundant time.
-    ///
-    /// This is deliberately NOT the same shape as
-    /// `concurrent_callers_elect_a_single_starter_and_both_observe_health`:
-    /// that test overlaps two threads DURING an in-flight start (the
-    /// second thread sees `in_progress == true` and waits on the
-    /// Condvar). This test instead forces caller B's step-1 health check
-    /// to (a) capture "unhealthy" while the marker is still absent, then
-    /// (b) not return control to caller B until well AFTER caller A has
-    /// fully completed its own start-and-release cycle -- so caller B
-    /// evaluates the `in_progress` boolean only once it is back to
-    /// `false` for the "already finished" reason, not the "never started"
-    /// reason.
-    #[test]
-    fn late_arriving_caller_rechecks_health_before_starting_again() {
-        let _guard = crate::test_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let project = unique_project("late-arrival");
-        let target = "https://github.com/jleechanorg/dark-factory.git".to_string();
-        // Ordinal 2 (1-indexed across the whole test) is caller B's step-1
-        // check: caller A's step-1 check is ordinal 1 (fast), caller A's
-        // start takes `start_delay_ms`, then caller A's step-4 recheck is
-        // ordinal 3 (fast). Sleeping ordinal 2 for far longer than caller
-        // A's entire start-to-release cycle guarantees caller B evaluates
-        // `in_progress` only after caller A's guard has already dropped.
-        let env = FakeAoRecoveryEnv::set_up_with_slow_status(
-            "late_arrival",
-            50,
-            0,
-            &project,
-            &target,
-            2,
-            400,
-        );
-
-        let project_a = project.clone();
-        let target_a = target.clone();
-        let handle_a = std::thread::spawn(move || ensure_ao_project_recovered(&project_a, &target_a));
-        // Small offset so caller A's step-1 (fast) check is unambiguously
-        // ordinal 1, and caller B's step-1 check is unambiguously ordinal 2.
-        std::thread::sleep(Duration::from_millis(20));
-        let project_b = project.clone();
-        let target_b = target.clone();
-        let handle_b = std::thread::spawn(move || ensure_ao_project_recovered(&project_b, &target_b));
-
-        let result_a = join_with_timeout(handle_a, Duration::from_secs(10), "caller A");
-        let result_b = join_with_timeout(handle_b, Duration::from_secs(10), "caller B (late arrival)");
-
-        assert!(result_a.is_ok(), "{result_a:?}");
-        assert!(result_b.is_ok(), "{result_b:?}");
-        assert_eq!(
-            env.start_invocation_count(),
-            1,
-            "a late-arriving caller must re-check health and skip starting again \
-             once a prior caller's start already succeeded"
-        );
-    }
-
-    /// jleechan round-2 finding P1 (4a): single source-of-truth contract test
-    /// for `ensure_ao_project_recovered`'s public behavior, distinct from the
-    /// scattered unit tests above (`healthy_project_skips_start_entirely`,
-    /// `concurrent_callers_elect_a_single_starter_and_both_observe_health`,
-    /// `start_failure_releases_condvar_waiters_with_failure_instead_of_hanging`,
-    /// `late_arriving_caller_rechecks_health_before_starting_again`) each of
-    /// which drills into one specific concurrency edge case. This test
-    /// asserts the three-clause contract in one place: healthy -> no-op Ok,
-    /// unhealthy -> starts exactly once then Ok, and a failed start ->
-    /// propagates a typed error without silently swallowing it.
-    #[test]
-    fn ao_recovery_contract() {
-        let _guard = crate::test_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        // Clause 1: healthy project is a no-op -- `ao start` is never invoked.
-        {
-            let project = unique_project("contract-healthy");
-            let target = "https://github.com/jleechanorg/dark-factory.git";
-            let env = FakeAoRecoveryEnv::set_up("contract_healthy", 0, 0, &project, target);
-            env.mark_healthy_up_front();
-
-            let result = ensure_ao_project_recovered(&project, target);
-
-            assert!(result.is_ok(), "{result:?}");
-            assert_eq!(env.start_invocation_count(), 0, "healthy project must never invoke ao start");
-        }
-
-        // Clause 2: unhealthy project is started exactly once, then reports Ok.
-        {
-            let project = unique_project("contract-unhealthy");
-            let target = "https://github.com/jleechanorg/dark-factory.git";
-            let env = FakeAoRecoveryEnv::set_up("contract_unhealthy", 0, 0, &project, target);
-
-            let result = ensure_ao_project_recovered(&project, target);
-
-            assert!(result.is_ok(), "{result:?}");
-            assert_eq!(env.start_invocation_count(), 1, "unhealthy project must be started exactly once");
-        }
-
-        // Clause 3: a failed `ao start` propagates a typed, non-silent error.
-        {
-            let project = unique_project("contract-failure");
-            let target = "https://github.com/jleechanorg/dark-factory.git";
-            let env = FakeAoRecoveryEnv::set_up("contract_failure", 0, 9, &project, target);
-
-            let result = ensure_ao_project_recovered(&project, target);
-
-            let error = result.expect_err("scripted ao start failure must propagate");
-            assert!(error.to_string().contains("ao start failed"), "{error}");
-            assert_eq!(env.start_invocation_count(), 1, "a failed start must still be attempted exactly once");
-        }
-    }
-
-}
 
 pub struct CliSessions {
     pub project: String,
@@ -4053,6 +4066,9 @@ pub struct CliSessions {
         std::collections::HashMap<String, (String, std::path::PathBuf)>,
     >,
     spawned_session_projects: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    spawned_branch_projects: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    spawned_session_branches: std::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
+    allow_default_project_fallback: bool,
 }
 
 impl CliSessions {
@@ -4070,7 +4086,101 @@ impl CliSessions {
             spawned_worktrees: std::sync::Mutex::new(std::collections::HashMap::new()),
             spawned_session_worktrees: std::sync::Mutex::new(std::collections::HashMap::new()),
             spawned_session_projects: std::sync::Mutex::new(std::collections::HashMap::new()),
+            spawned_branch_projects: std::sync::Mutex::new(std::collections::HashMap::new()),
+            spawned_session_branches: std::sync::Mutex::new(std::collections::HashMap::new()),
+            allow_default_project_fallback: true,
         }
+    }
+
+    pub fn with_restored_projects<I>(
+        repo: &str,
+        agent: &str,
+        bindings: I,
+        allow_default_project_fallback: bool,
+    ) -> Result<Self, DaemonError>
+    where
+        I: IntoIterator<Item = (Option<String>, Option<String>, String)>,
+    {
+        let mut sessions = Self::new(repo, agent);
+        sessions.allow_default_project_fallback = allow_default_project_fallback;
+        for (session, branch, project) in bindings {
+            if let Some(session) = session {
+                let mut owners = sessions.spawned_session_projects.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if owners.insert(session.clone(), project.clone())
+                    .is_some_and(|prior| prior != project) {
+                    return Err(DaemonError::Config(format!(
+                        "durable AO session {session:?} has conflicting project owners"
+                    )));
+                }
+                let mut branches = sessions.spawned_session_branches.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if branches.insert(session.clone(), branch.clone())
+                    .is_some_and(|prior| prior != branch) {
+                    return Err(DaemonError::Config(format!(
+                        "durable AO session {session:?} has conflicting branch identities"
+                    )));
+                }
+            }
+            if let Some(branch) = branch {
+                let mut owners = sessions.spawned_branch_projects.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if owners.insert(branch.clone(), project.clone())
+                    .is_some_and(|prior| prior != project) {
+                    return Err(DaemonError::Config(format!(
+                        "durable AO branch {branch:?} has conflicting project owners"
+                    )));
+                }
+            }
+        }
+        Ok(sessions)
+    }
+
+    fn record_session_project(&self, session: &SessionId, project: &str) {
+        self.spawned_session_projects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session.0.clone(), project.to_string());
+    }
+
+    fn project_for_session(&self, session: &SessionId) -> Result<String, DaemonError> {
+        if let Some(project) = self.spawned_session_projects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&session.0)
+            .cloned() {
+            return Ok(project);
+        }
+        if self.allow_default_project_fallback {
+            return Ok(self.project.clone());
+        }
+        Err(DaemonError::Config(format!(
+            "AO session {:?} has no durable project owner; refusing default-project fallback",
+            session.0
+        )))
+    }
+
+    fn project_for_branch(&self, branch: &str) -> Result<String, DaemonError> {
+        if let Some(project) = self.spawned_branch_projects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(branch)
+            .cloned() {
+            return Ok(project);
+        }
+        if let Some(project) = self.spawned_worktrees
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .find_map(|(project, candidate)| (candidate == branch).then(|| project.clone())) {
+            return Ok(project);
+        }
+        if self.allow_default_project_fallback {
+            return Ok(self.project.clone());
+        }
+        Err(DaemonError::Config(format!(
+            "AO branch {branch:?} has no durable project owner; refusing default-project fallback"
+        )))
     }
 
     fn kill_in_project(project: &str, id: &SessionId) -> Result<(), DaemonError> {
@@ -4186,10 +4296,13 @@ impl CliSessions {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(session.0.clone(), (spec.branch.clone(), workspace));
-        self.spawned_session_projects
-            .lock()
+        self.spawned_branch_projects.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(session.0.clone(), spec.ao_project.clone());
+            .insert(spec.branch.clone(), spec.ao_project.clone());
+        self.record_session_project(&session, &spec.ao_project);
+        self.spawned_session_branches.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session.0.clone(), Some(spec.branch.clone()));
         Ok(session)
     }
 
@@ -4644,9 +4757,13 @@ mod spawn_classification_tests {
 
 #[cfg(test)]
 mod ao_spawn_contract_tests {
-    use super::{ao_spawn_bridge_path, CliSessions};
+    use super::{
+        ao_controller_home, ao_spawn_bridge_path,
+        process_start_identity_from_ps, process_start_ticks, safe_project_component,
+        validate_controller_manifest_project, AoControllerManifest, CliSessions,
+    };
     use crate::errors::DaemonError;
-    use crate::tools::{Sessions, SpawnSpec};
+    use crate::tools::{SessionId, Sessions, SpawnSpec};
     use std::os::unix::fs::PermissionsExt;
 
     struct TestEnvGuard {
@@ -4725,6 +4842,103 @@ mod ao_spawn_contract_tests {
             managed_checkout: false,
             expected_cwd: None,
         }
+    }
+
+    #[test]
+    fn explicit_controller_home_is_scoped_by_project() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var_os("DARK_FACTORY_AO_CONTROLLER_HOME");
+        let base = std::env::temp_dir().join(format!(
+            "afd_controller_scope_{}",
+            std::process::id()
+        ));
+        std::env::set_var("DARK_FACTORY_AO_CONTROLLER_HOME", &base);
+
+        let resolved = ao_controller_home("worldarchitect/preview").unwrap();
+
+        assert_eq!(resolved, base.join(safe_project_component("worldarchitect/preview")));
+        assert_ne!(
+            safe_project_component("a/b"),
+            safe_project_component("a_b"),
+            "distinct AO projects must never share a controller namespace"
+        );
+        let special: Vec<_> = ["", ".", ".."]
+            .into_iter()
+            .map(|project| ao_controller_home(project).unwrap())
+            .collect();
+        assert!(special.iter().all(|path| path.starts_with(&base) && path != &base));
+        assert_ne!(special[0], special[1]);
+        assert_ne!(special[1], special[2]);
+        match prior {
+            Some(value) => std::env::set_var("DARK_FACTORY_AO_CONTROLLER_HOME", value),
+            None => std::env::remove_var("DARK_FACTORY_AO_CONTROLLER_HOME"),
+        }
+    }
+
+    #[test]
+    fn controller_manifest_project_mismatch_fails_before_reaping() {
+        let manifest = AoControllerManifest {
+            pid: std::process::id(),
+            process_start_ticks: process_start_ticks(std::process::id()).unwrap(),
+            project: "other-project".to_string(),
+            target: "other-project".to_string(),
+        };
+        let error = validate_controller_manifest_project(&manifest, "dark-factory").unwrap_err();
+        assert!(error.contains("refusing to signal or remove"));
+    }
+
+    #[test]
+    fn ps_start_identity_is_stable_and_rejects_empty_output() {
+        let first = process_start_identity_from_ps(b"Sun Aug 31 17:00:01 2026\n").unwrap();
+        let second = process_start_identity_from_ps(b"Sun Aug 31 17:00:01 2026\n").unwrap();
+        assert_eq!(first, second);
+        assert_ne!(first, 0);
+        assert!(process_start_identity_from_ps(b"  \n").is_none());
+    }
+
+    #[test]
+    fn session_owner_lookup_uses_spawn_project_and_safe_fallback() {
+        let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+        let owned = SessionId("wa-owned".to_string());
+        let unknown = SessionId("wa-unknown".to_string());
+        sessions.record_session_project(&owned, "worldarchitect");
+
+        assert_eq!(sessions.project_for_session(&owned).unwrap(), "worldarchitect");
+        assert_eq!(sessions.project_for_session(&unknown).unwrap(), "dark-factory");
+    }
+
+    #[test]
+    fn restored_session_and_branch_owners_survive_new_adapter_instance() {
+        let restarted = CliSessions::with_restored_projects(
+            "jleechanorg/dark-factory",
+            "minimax",
+            [(Some("wa-owned".to_string()), Some("factory/wa-owned-r1".to_string()), "worldarchitect".to_string())],
+            false,
+        ).unwrap();
+        assert_eq!(restarted.project_for_session(&SessionId("wa-owned".into())).unwrap(), "worldarchitect");
+        assert_eq!(restarted.project_for_branch("factory/wa-owned-r1").unwrap(), "worldarchitect");
+        assert!(restarted.project_for_session(&SessionId("unknown".into())).is_err());
+        assert!(restarted.project_for_branch("factory/unknown-r1").is_err());
+    }
+
+    #[test]
+    fn restored_session_rejects_conflicting_branch_identity() {
+        let result = CliSessions::with_restored_projects(
+            "jleechanorg/dark-factory",
+            "minimax",
+            [
+                (Some("wa-owned".to_string()), Some("factory/first-r1".to_string()), "worldarchitect".to_string()),
+                (Some("wa-owned".to_string()), Some("factory/second-r1".to_string()), "worldarchitect".to_string()),
+            ],
+            false,
+        );
+        let error = match result {
+            Ok(_) => panic!("conflicting durable identity must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("conflicting branch identities"));
     }
 
     fn bridge_test_node() -> std::path::PathBuf {
@@ -4820,6 +5034,80 @@ print("  Branch:   " + os.environ.get("AO_FAKE_RETURN_BRANCH", os.environ["DARK_
         dir
     }
 
+    struct ReadyAoControllerEnv {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl ReadyAoControllerEnv {
+        fn seed(root: &std::path::Path) -> Self {
+            const ENV_VARS: [(&str, &str); 7] = [
+                ("DARK_FACTORY_AO_CONTROLLER_HOME", ""),
+                ("DARK_FACTORY_OPERATOR_HOME", ""),
+                ("DARK_FACTORY_AO_CONFIG_PATH", ""),
+                ("DARK_FACTORY_AO_RECOVERY_TIMEOUT_MS", "100"),
+                ("DARK_FACTORY_AO_RECOVERY_POLL_MS", "1"),
+                ("DARK_FACTORY_AO_RECOVERY_SUSTAIN_MS", "1"),
+                ("DARK_FACTORY_AO_RECOVERY_COOLDOWN_MS", "1"),
+            ];
+            let controller_base = root.join("controller-home");
+            let controller_home = controller_base.join("dark-factory");
+            let operator_home = root.join("operator-home");
+            let config_path = operator_home.join("agent-orchestrator.yaml");
+            std::fs::create_dir_all(controller_home.join(".agent-orchestrator")).unwrap();
+            std::fs::create_dir_all(&operator_home).unwrap();
+
+            let pid = std::process::id();
+            let start_ticks = process_start_ticks(pid)
+                .expect("test process must expose /proc start ticks for AO readiness");
+            std::fs::write(
+                controller_home.join("controller.json"),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "pid": pid,
+                    "process_start_ticks": start_ticks,
+                    "project": "dark-factory",
+                    "target": "dark-factory",
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                controller_home.join(".agent-orchestrator/running.json"),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "pid": pid,
+                    "projects": ["dark-factory"],
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let saved = ENV_VARS
+                .iter()
+                .map(|(key, _)| (*key, std::env::var_os(key)))
+                .collect();
+            for (key, default) in ENV_VARS {
+                let value = match key {
+                    "DARK_FACTORY_AO_CONTROLLER_HOME" => controller_base.as_os_str(),
+                    "DARK_FACTORY_OPERATOR_HOME" => operator_home.as_os_str(),
+                    "DARK_FACTORY_AO_CONFIG_PATH" => config_path.as_os_str(),
+                    _ => std::ffi::OsStr::new(default),
+                };
+                std::env::set_var(key, value);
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for ReadyAoControllerEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
     fn with_fake_ao<T>(
         test_name: &str,
         bindings: serde_json::Value,
@@ -4829,6 +5117,7 @@ print("  Branch:   " + os.environ.get("AO_FAKE_RETURN_BRANCH", os.environ["DARK_
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = fake_ao_dir(test_name);
+        let _ready_controller = ReadyAoControllerEnv::seed(&dir);
         let log = dir.join("calls.jsonl");
         let _env = TestEnvGuard::install(&dir, &bindings, &log);
         run(&log)
@@ -6396,6 +6685,7 @@ os.execv(real_git, [real_git] + args)
         let target_b = init_checkout("checkout-b");
         let marker_a = root.join("healthy-a.marker");
         let marker_b = root.join("healthy-b.marker");
+        let controller_home = root.join("controller-home");
         let log = root.join("calls.jsonl");
 
         let project_a = "afd-batch-recovery-project-a";
@@ -6408,7 +6698,7 @@ os.execv(real_git, [real_git] + args)
             &fake_ao,
             format!(
                 r#"#!/usr/bin/env python3
-import json, os, sys
+import json, os, sys, time
 args = sys.argv[1:]
 log_path = {log:?}
 project_a = {project_a:?}
@@ -6419,6 +6709,7 @@ branch_a = {branch_a:?}
 branch_b = {branch_b:?}
 marker_a = {marker_a:?}
 marker_b = {marker_b:?}
+controller_home = {controller_home:?}
 
 def log_call(entry):
     with open(log_path, "a", encoding="utf-8") as fh:
@@ -6441,10 +6732,25 @@ if len(args) == 4 and args[0] == "start" and args[2:] == ["--no-dashboard", "--n
     if target == target_a:
         log_call({{"kind": "start", "project": project_a}})
         open(marker_a, "w", encoding="utf-8").close()
+        running_dir_a = os.path.join(controller_home, project_a, ".agent-orchestrator")
+        os.makedirs(running_dir_a, exist_ok=True)
+        with open(os.path.join(running_dir_a, "running.json"), "w", encoding="utf-8") as fh:
+            json.dump({{"pid": os.getpid(), "projects": [project_a]}}, fh)
+        # A real `ao start` is a persistent controller process; the daemon
+        # polls whether the spawned child is still alive to judge readiness
+        # (write_controller_manifest / process_start_identity_from_ps), so
+        # exiting immediately here reads as "controller exited before
+        # readiness" even though the marker file was written successfully.
+        time.sleep(5)
         sys.exit(0)
     if target == target_b:
         log_call({{"kind": "start", "project": project_b}})
         open(marker_b, "w", encoding="utf-8").close()
+        running_dir_b = os.path.join(controller_home, project_b, ".agent-orchestrator")
+        os.makedirs(running_dir_b, exist_ok=True)
+        with open(os.path.join(running_dir_b, "running.json"), "w", encoding="utf-8") as fh:
+            json.dump({{"pid": os.getpid(), "projects": [project_b]}}, fh)
+        time.sleep(5)
         sys.exit(0)
     print("UNEXPECTED start target: " + target, file=sys.stderr)
     sys.exit(2)
@@ -6479,6 +6785,7 @@ sys.exit(99)
                 branch_b = branch_b,
                 marker_a = marker_a.to_string_lossy(),
                 marker_b = marker_b.to_string_lossy(),
+                controller_home = controller_home.to_string_lossy(),
             ),
         )
         .unwrap();
@@ -6492,12 +6799,14 @@ sys.exit(99)
 
         let old_path = std::env::var("PATH").unwrap_or_default();
         let old_fallback = std::env::var("DARK_FACTORY_CODER_FALLBACK_CHAIN").ok();
+        let old_controller_home = std::env::var("DARK_FACTORY_AO_CONTROLLER_HOME").ok();
         std::env::set_var("PATH", format!("{}:{old_path}", root.display()));
         // Empty fallback chain: only the default agent is attempted, so each
         // project's recovery cycle is exactly one rejected spawn -> one
         // `ao start` -> one accepted spawn, keeping the call log easy to
         // reason about.
         std::env::set_var("DARK_FACTORY_CODER_FALLBACK_CHAIN", "");
+        std::env::set_var("DARK_FACTORY_AO_CONTROLLER_HOME", &controller_home);
 
         let mut spec_a = spec("batch recovery prompt a", branch_a);
         spec_a.ao_project = project_a.to_string();
@@ -6513,6 +6822,10 @@ sys.exit(99)
         match old_fallback {
             Some(v) => std::env::set_var("DARK_FACTORY_CODER_FALLBACK_CHAIN", v),
             None => std::env::remove_var("DARK_FACTORY_CODER_FALLBACK_CHAIN"),
+        }
+        match old_controller_home {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_CONTROLLER_HOME", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_CONTROLLER_HOME"),
         }
         let calls = std::fs::read_to_string(&log).unwrap_or_default();
         let _ = std::fs::remove_dir_all(&root);
@@ -6572,6 +6885,7 @@ sys.exit(99)
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
+        let _ready_controller = ReadyAoControllerEnv::seed(&root);
         let log = root.join("calls.jsonl");
         let fake_ao = root.join("ao");
         std::fs::write(
@@ -6639,6 +6953,7 @@ raise SystemExit(9)
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
+        let _ready_controller = ReadyAoControllerEnv::seed(&root);
         let log = root.join("calls.jsonl");
         let fake_ao = root.join("ao");
         std::fs::write(
@@ -7093,6 +7408,7 @@ export const isTerminalSession = () => false;
         let first_workspace = root.join("df-batch-alpha");
         let second_workspace = root.join("df-batch-beta");
         std::fs::create_dir_all(&bin).unwrap();
+        let _ready_controller = ReadyAoControllerEnv::seed(&root);
         std::fs::create_dir_all(cli.join("dist/lib")).unwrap();
         std::fs::create_dir_all(core.join("dist")).unwrap();
         for workspace in [&first_workspace, &second_workspace] {
@@ -7874,7 +8190,7 @@ export const isTerminalSession = () => false;
 
 impl Sessions for CliSessions {
     fn active_count(&self) -> Result<usize, DaemonError> {
-        let out = run_tool("ao", &["status", "-p", &self.project, "--json"], 30)?;
+        let out = run_ao_tool(&self.project, &["status", "-p", &self.project, "--json"], 30)?;
         let json_start = out.find('[').unwrap_or(0);
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
@@ -7992,7 +8308,7 @@ impl Sessions for CliSessions {
         bead_id: &str,
         timeout_secs: u64,
     ) -> Result<SessionId, DaemonError> {
-        self.attach_within_in_project(branch, bead_id, &self.project, timeout_secs)
+        self.attach_within_in_project(branch, bead_id, &self.project_for_branch(branch)?, timeout_secs)
     }
 
     fn attach_within_in_project(
@@ -8041,7 +8357,7 @@ impl Sessions for CliSessions {
     }
 
     fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError> {
-        self.is_quiescent_in_project(id, &self.project)
+        self.is_quiescent_in_project(id, &self.project_for_session(id)?)
     }
 
     fn is_quiescent_in_project(&self, id: &SessionId, project: &str) -> Result<bool, DaemonError> {
@@ -8081,7 +8397,7 @@ impl Sessions for CliSessions {
         id: &SessionId,
         timeout_secs: u64,
     ) -> Result<crate::tools::SessionActivity, DaemonError> {
-        self.session_activity_within_in_project(id, &self.project, timeout_secs)
+        self.session_activity_within_in_project(id, &self.project_for_session(id)?, timeout_secs)
     }
 
     fn session_activity_within_in_project(
@@ -8115,7 +8431,11 @@ impl Sessions for CliSessions {
     /// callers only ever reject a dispatch on a *positive* mismatch, never
     /// on an inability to check.
     fn session_branch(&self, id: &SessionId) -> Result<Option<String>, DaemonError> {
-        self.session_branch_in_project(id, &self.project)
+        let project = match self.project_for_session(id) {
+            Ok(project) => project,
+            Err(_) => return Ok(None),
+        };
+        self.session_branch_in_project(id, &project)
     }
 
     fn session_branch_in_project(
@@ -10571,8 +10891,11 @@ exit 1
             }
         }
         std::fs::remove_dir_all(&dir).ok();
-        assert!(result.is_err(), "pr_snapshot must return Err when circuit breaker trips on checks rate limit");
-        assert!(result.unwrap_err().is_gh_rate_limit());
+        let snapshot = result.expect(
+            "the REST fallback must preserve a truthful pending snapshot after the GraphQL breaker trips",
+        );
+        assert!(snapshot.ci_pending);
+        assert_eq!(snapshot.ci_status, "unknown");
         assert!(
             tripped_during_call,
             "detect_and_mark_graphql_rate_limit must trip the shared circuit \

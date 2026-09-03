@@ -23,7 +23,10 @@ use crate::dispatch::{self, MAX_TRANSIENT_SPAWN_RETRY};
 use crate::errors::DaemonError;
 use crate::intake::{self, IntakeOutcome, IntakeVerdict};
 use crate::router::{self, RoutingVerdict};
-use crate::state::{set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore};
+use crate::state::{
+    set_human_hold_reason, AdoptedPrClaim, AdoptedPrIdentity, BeadOverlay, HumanHoldReason,
+    OverlayState, StateStore,
+};
 use crate::telemetry::{self, TelemetryEvent};
 use crate::tools::{Bead, Llm, PrHeadBranch, Scm, SessionId, Sessions, Tracker, Vcs};
 use crate::verifier::{self, PrEvidence};
@@ -1760,8 +1763,126 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         if adopted.newly_created {
             summary.beads_created += 1;
         }
-        if let Some(owner) = deps.store.bead_id_for_branch(&adopted.head_ref_name)? {
-            if owner != adopted.bead_id {
+        let existing = deps.store.load(&adopted.bead_id)?;
+        let attempt = existing.as_ref().map(|o| o.attempt).unwrap_or(1);
+        // jleechan-mdun: capture the overlay state BEFORE the move into
+        // `should_adopt` (and the subsequent `unwrap_or` below) so the
+        // dedup check below can compare against the durable state of
+        // THIS tick's snapshot, not a stale or re-initialized copy.
+        let pre_adopt_state = existing.as_ref().map(|o| o.state);
+        let should_adopt = !matches!(
+            pre_adopt_state,
+            Some(OverlayState::Ready) | Some(OverlayState::HumanHeld)
+        );
+        let target_repo = intake::resolve_target_repo("", Some(adopted.external_ref.as_str()));
+        let mut overlay = existing.unwrap_or(BeadOverlay {
+            bead_id: adopted.bead_id.clone(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(adopted.pr_number),
+            branch: Some(adopted.head_ref_name.clone()),
+            session_id: None,
+            session_ao_project: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo,
+            attempt_started_at: None,
+        });
+        if should_adopt {
+            // jleechan-35y4 Stage A: adopted PRs are always same-repo
+            // (fork/cross-repo PRs are rejected earlier by `same_repo_pr`
+            // in intake.rs), so this always resolves to `cfg.target_repo`'s
+            // owner/repo today. Still resolved from `external_ref` (not
+            // left `None`) so it stays correct once Stage C/D lift the
+            // same-repo-only restriction for adopted PRs.
+            overlay.state = OverlayState::Attested;
+            overlay.pr_number = Some(adopted.pr_number);
+            overlay.branch = Some(adopted.head_ref_name.clone());
+            // Explicit stored provenance flag (bead jleechan-tfs1), NOT a
+            // branch-name pattern match: every bead that reaches this block
+            // arrived via `intake::normalize_labeled_prs` adopting an
+            // external contributor's own head_ref_name, so it is always
+            // adopted — including on a re-adopt of a pre-migration row that
+            // predates this field. `reroll()` reads this flag to choose
+            // append-only remediation instead of fabricating a replacement
+            // branch and closing the contributor's PR.
+            overlay.is_adopted = true;
+        }
+        let Some(head_sha) = adopted.head_sha.as_deref().filter(|sha| !sha.is_empty()) else {
+            emit(
+                deps.telemetry_log,
+                &adopted.bead_id,
+                attempt,
+                overlay.state.as_str(),
+                "EXISTING_PR_IDENTITY_DEFERRED",
+                serde_json::json!({}),
+                serde_json::json!({
+                    "reason": "incoming_pr_head_sha_absent",
+                    "repo": adopted.repo,
+                    "pr_number": adopted.pr_number,
+                    "branch": adopted.head_ref_name,
+                    "external_ref": adopted.external_ref,
+                }),
+            )?;
+            continue;
+        };
+        let claim = deps.store.claim_adopted_pr(
+            &AdoptedPrIdentity {
+                repo: adopted.repo.clone(),
+                default_repo: deps.cfg.target_repo.clone(),
+                pr_number: adopted.pr_number,
+                branch: adopted.head_ref_name.clone(),
+                head_sha: head_sha.to_string(),
+            },
+            &overlay,
+        )?;
+        match claim {
+            AdoptedPrClaim::Owned => {}
+            AdoptedPrClaim::ReplacedHumanHeld { owner_bead_id } => {
+                emit(
+                    deps.telemetry_log,
+                    &adopted.bead_id,
+                    attempt,
+                    OverlayState::Attested.as_str(),
+                    "EXISTING_PR_OWNER_REPLACED",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "replaced_owner_bead_id": owner_bead_id,
+                        "repo": adopted.repo,
+                        "pr_number": adopted.pr_number,
+                        "branch": adopted.head_ref_name,
+                        "head_sha": adopted.head_sha,
+                    }),
+                )?;
+            }
+            AdoptedPrClaim::CoalescedActive { owner_bead_id } => {
+                pr_intake_bead_ids.insert(owner_bead_id.clone());
+                emit(
+                    deps.telemetry_log,
+                    &adopted.bead_id,
+                    attempt,
+                    OverlayState::Attested.as_str(),
+                    "EXISTING_PR_COALESCED",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "owner_bead_id": owner_bead_id,
+                        "repo": adopted.repo,
+                        "pr_number": adopted.pr_number,
+                        "branch": adopted.head_ref_name,
+                        "head_sha": adopted.head_sha,
+                    }),
+                )?;
+                continue;
+            }
+            AdoptedPrClaim::RefusedMismatch {
+                owner_bead_id: owner,
+                reason,
+            } => {
                 let owner_live = deps.store.load(&owner)?.is_some();
                 let comment_body = format!(
                     "🤖 **[dark-factory]** Escalation required: refusing factory PR adoption for branch `{}` because it is already registered to bead `{}`. Branch-key stealing is not allowed; please use a unique same-repo branch.",
@@ -1772,6 +1893,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     .comment_external(&adopted.external_ref, &comment_body);
                 let ctx = serde_json::json!({
                     "reason": "adoption_branch_collision",
+                    "identity_refusal": reason,
                     "repo": adopted.repo,
                     "pr_number": adopted.pr_number,
                     "branch": adopted.head_ref_name,
@@ -1812,60 +1934,15 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 continue;
             }
         }
-        deps.store
-            .register_branch(&adopted.bead_id, &adopted.head_ref_name)?;
-
-        let existing = deps.store.load(&adopted.bead_id)?;
-        let attempt = existing.as_ref().map(|o| o.attempt).unwrap_or(1);
-        // jleechan-mdun: capture the overlay state BEFORE the move into
-        // `should_adopt` (and the subsequent `unwrap_or` below) so the
-        // dedup check below can compare against the durable state of
-        // THIS tick's snapshot, not a stale or re-initialized copy.
-        let pre_adopt_state = existing.as_ref().map(|o| o.state);
-        let should_adopt = !matches!(
-            pre_adopt_state,
-            Some(OverlayState::Ready) | Some(OverlayState::HumanHeld)
-        );
-        if should_adopt {
-            // jleechan-35y4 Stage A: adopted PRs are always same-repo
-            // (fork/cross-repo PRs are rejected earlier by `same_repo_pr`
-            // in intake.rs), so this always resolves to `cfg.target_repo`'s
-            // owner/repo today. Still resolved from `external_ref` (not
-            // left `None`) so it stays correct once Stage C/D lift the
-            // same-repo-only restriction for adopted PRs.
-            let target_repo = intake::resolve_target_repo("", Some(adopted.external_ref.as_str()));
-            let mut overlay = existing.unwrap_or(BeadOverlay {
-                bead_id: adopted.bead_id.clone(),
-                state: OverlayState::Attested,
-                attempt: 1,
-                reroll_count: 0,
-                autonomy_secs: 0,
-                spend_usd: 0.0,
-                pr_number: Some(adopted.pr_number),
-                branch: Some(adopted.head_ref_name.clone()),
-                session_id: None,
-                session_ao_project: None,
-                is_adopted: true,
-                spawn_failure_count: 0,
-                pre_session_head_sha: None,
-                park_reason: None,
-                target_repo,
-                attempt_started_at: None,
-            });
-            overlay.state = OverlayState::Attested;
-            overlay.pr_number = Some(adopted.pr_number);
-            overlay.branch = Some(adopted.head_ref_name.clone());
-            // Explicit stored provenance flag (bead jleechan-tfs1), NOT a
-            // branch-name pattern match: every bead that reaches this block
-            // arrived via `intake::normalize_labeled_prs` adopting an
-            // external contributor's own head_ref_name, so it is always
-            // adopted — including on a re-adopt of a pre-migration row that
-            // predates this field. `reroll()` reads this flag to choose
-            // append-only remediation instead of fabricating a replacement
-            // branch and closing the contributor's PR.
-            overlay.is_adopted = true;
-            deps.store.save(&overlay)?;
-        }
+        // jleechan-r2dup: `claim_adopted_pr` above already persisted this
+        // tick's fully-configured `overlay` (state/pr_number/branch/
+        // is_adopted, plus branch_registry ownership) as a side effect of
+        // returning `Owned` -- reloading `existing` here and recomputing
+        // `pre_adopt_state`/`should_adopt` from the store would observe
+        // that just-written row instead of the pre-tick snapshot, making
+        // `should_skip_existing_pr_adoption_emit` see `Some(Attested)` and
+        // wrongly suppress the very first `EXISTING_PR_ADOPTED` emit. Reuse
+        // the `pre_adopt_state`/`attempt` captured above the claim call.
         // jleechan-mdun: skip re-emit on subsequent ticks. The durable
         // overlay row already records (pr_number, branch, external_ref,
         // is_adopted) — emitting `EXISTING_PR_ADOPTED` every tick for an
@@ -1918,6 +1995,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         emit_intake_outcome(deps.telemetry_log, outcome)?;
     }
     let tracker_candidates = deps.tracker.fetch_candidates()?;
+    let dependency_ready_ids = deps.tracker.fetch_ready_ids()?;
     let mut routing_candidates: Vec<Bead> = Vec::new();
     for bead_id in &created {
         let mut pr_number = None;
@@ -2315,6 +2393,42 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 o
             }
         };
+
+        if !dependency_ready_ids.contains(&bead.id) {
+            let context = serde_json::json!({
+                "reason": "absent_from_br_ready",
+                "admission_source": "br ready --label factory --json --limit 0",
+                "state": overlay.state.as_str(),
+                "attempt": overlay.attempt,
+            });
+            let now_epoch = now_epoch_secs();
+            let (should_emit, context_hash) = escalation_dedup_should_emit(
+                deps,
+                &bead.id,
+                "dependency_blocked",
+                &context,
+                now_epoch,
+            )?;
+            if should_emit {
+                emit(
+                    deps.telemetry_log,
+                    &bead.id,
+                    overlay.attempt,
+                    overlay.state.as_str(),
+                    "DEPENDENCY_BLOCKED",
+                    serde_json::json!({}),
+                    context,
+                )?;
+                record_escalation_emit_dedup(
+                    deps,
+                    &bead.id,
+                    "dependency_blocked",
+                    &context_hash,
+                    now_epoch,
+                )?;
+            }
+            continue;
+        }
 
         match router::route(deps.llm, bead) {
             Ok(verdict) => {

@@ -24,11 +24,13 @@ mod common;
 
 use common::{FakeLlm, FakeScm, FakeSessions, FakeStateStore, FakeTracker, FakeVcs};
 use daemon::config::{Config, RepoConfig};
+use daemon::dispatch::{dispatch_ready_with_vcs, DriveBranchDecision};
 
 use daemon::er_runner;
 use daemon::errors::DaemonError;
-use daemon::state::{BeadOverlay, OverlayState, StateStore};
-use daemon::tick::{combine_dual_verdict, run_tick, TickDeps};
+use daemon::router::RoutingVerdict;
+use daemon::state::{BeadOverlay, OverlayState, StateStore, CIRCUIT_BREAKER_PARK_REASON};
+use daemon::tick::{combine_dual_verdict, run_tick, TickDeps, TickSummary};
 use daemon::tools::{
     Bead, Issue, LabeledPr, Llm, Permission, PrComment, PrHeadBranch, PrSnapshot, Scm,
 };
@@ -122,7 +124,7 @@ fn one_full_tick_cycle_keeps_unknown_only_gate_attested() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         0,
         0,
@@ -190,7 +192,7 @@ fn one_full_tick_cycle_keeps_unknown_only_gate_attested() {
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
             ci_pending: false,
-        bugbot_pending: false,
+            bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -209,7 +211,7 @@ fn one_full_tick_cycle_keeps_unknown_only_gate_attested() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         1,
         0,
@@ -568,7 +570,7 @@ fn run_tick_emits_dispatched_only_for_actual_dispatch_successes() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         0,
         0,
@@ -622,6 +624,147 @@ fn run_tick_emits_dispatched_only_for_actual_dispatch_successes() {
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn transient_base_revision_lookup_requeues_then_resumes_same_dispatch_phase() {
+    let mut scm = FakeScm::new();
+    scm.issues.push(Issue {
+        number: 804,
+        title: "Resume dispatch after bounded GitHub cooldown".into(),
+        body: "transient GraphQL failure must not become a checkout configuration hold".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#804".into(),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"bounded remediation"}"#.into(),
+    ));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = test_vcs();
+    // `head_sha_within_for_repo` is the primary lookup dispatch.rs consults
+    // (daemon/src/dispatch.rs ~line 602); `base_head_for_repo` is only a
+    // fallback reached on a non-transient primary failure. `test_vcs()`
+    // seeds a trivially-successful `heads["main"]`, so without this the
+    // primary lookup would succeed and the `base_head_for_repo` injection
+    // below would never be exercised.
+    vcs.fail_head_sha_for(
+        "main",
+        "HTTP 403: API rate limit exceeded; Retry-After: 60",
+    );
+    vcs.fail_base_head_for_repo(
+        "owner/repo",
+        "main",
+        "HTTP 403: API rate limit exceeded; Retry-After: 60",
+    );
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_base_revision_resume_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let first = run_tick(&deps, 0, 0).expect("transient lookup must isolate, not abort tick");
+    assert_eq!(first.beads_dispatched, 0);
+    let deferred = store.load("fake-bead-1").unwrap().unwrap();
+    assert_eq!(deferred.state, OverlayState::Queued);
+    assert_eq!(
+        deferred.attempt, 1,
+        "admission retry must not consume a reroll"
+    );
+    assert!(deferred.park_reason.is_none());
+    assert!(deferred.session_id.is_none());
+    assert!(
+        sessions
+            .calls
+            .borrow()
+            .iter()
+            .all(|call| !call.starts_with("spawn(")),
+        "no worker may spawn without an authoritative base revision"
+    );
+    let first_log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(first_log.contains("expected_revision_deferred"));
+    assert!(!first_log.contains("target_checkout_unconfigured"));
+
+    vcs.clear_head_sha_failure("main");
+    vcs.clear_base_head_for_repo_failure("owner/repo", "main");
+    let second = run_tick(&deps, 1, 0).expect("next tick must resume the queued dispatch");
+    assert_eq!(second.beads_dispatched, 1);
+    let resumed = store.load("fake-bead-1").unwrap().unwrap();
+    assert_eq!(resumed.state, OverlayState::Dispatched);
+    assert_eq!(resumed.attempt, 1);
+    assert_eq!(
+        resumed.pre_session_head_sha.as_deref(),
+        Some("base-sha-123")
+    );
+    assert_eq!(
+        sessions
+            .calls
+            .borrow()
+            .iter()
+            .filter(|call| call.starts_with("spawn("))
+            .count(),
+        1
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn permanent_base_revision_lookup_failure_parks_instead_of_retrying_forever() {
+    let sessions = FakeSessions::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = test_vcs();
+    // Permanent (non-transient) primary-lookup failure so the fallback to
+    // `base_head_for_repo` below is actually reached — see comment in
+    // `transient_base_revision_lookup_requeues_then_resumes_same_dispatch_phase`.
+    vcs.fail_head_sha_permanent_for("main", "HTTP 404: branch main does not exist");
+    vcs.fail_base_head_for_repo("owner/repo", "main", "HTTP 404: branch main does not exist");
+    let ready = vec![(
+        Bead {
+            id: "missing-base".into(),
+            title: "Missing base branch".into(),
+            description: String::new(),
+            notes: String::new(),
+            file_tree_summary: String::new(),
+            external_ref: Some("owner/repo#805".into()),
+        },
+        RoutingVerdict::SmallPath,
+        DriveBranchDecision::Generated,
+    )];
+
+    let report = dispatch_ready_with_vcs(&sessions, &store, &cfg, &ready, Some(&vcs))
+        .expect("permanent lookup failure should isolate the bead");
+    assert_eq!(report.success_count(), 0);
+    assert_eq!(report.failures.len(), 1);
+    assert_eq!(report.failures[0].phase, "expected_revision_unavailable");
+    let overlay = store.load("missing-base").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::HumanHeld);
+    assert_eq!(
+        overlay.park_reason.as_deref(),
+        Some("target_checkout_unconfigured")
+    );
+    assert!(sessions
+        .calls
+        .borrow()
+        .iter()
+        .all(|call| !call.starts_with("spawn(")));
 }
 
 #[test]
@@ -1399,8 +1542,7 @@ fn append_only_sweep_warns_but_keeps_unpublished_local_descendant_running() {
         },
     );
     sessions.set_worktree_ancestor("session-unpublished", branch, pre_sha, true);
-    let telemetry_log =
-        std::env::temp_dir().join("afd_test_append_only_unpublished_local.jsonl");
+    let telemetry_log = std::env::temp_dir().join("afd_test_append_only_unpublished_local.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
     let vcs = test_vcs();
     let deps = TickDeps {
@@ -1420,10 +1562,20 @@ fn append_only_sweep_warns_but_keeps_unpublished_local_descendant_running() {
     let overlay = store.load("bead-unpublished").unwrap().unwrap();
     assert_eq!(overlay.state, OverlayState::Dispatched);
     assert_eq!(overlay.session_id.as_deref(), Some("session-unpublished"));
-    assert!(!sessions.calls.borrow().iter().any(|c| c == "stop(session-unpublished)"));
+    assert!(!sessions
+        .calls
+        .borrow()
+        .iter()
+        .any(|c| c == "stop(session-unpublished)"));
     let logs = std::fs::read_to_string(&telemetry_log).unwrap();
-    assert!(logs.contains("APPEND_ONLY_REMOTE_CHECK_DEFERRED"), "logs: {logs}");
-    assert!(logs.contains("local_worktree_ancestry_confirmed"), "logs: {logs}");
+    assert!(
+        logs.contains("APPEND_ONLY_REMOTE_CHECK_DEFERRED"),
+        "logs: {logs}"
+    );
+    assert!(
+        logs.contains("local_worktree_ancestry_confirmed"),
+        "logs: {logs}"
+    );
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
@@ -1462,7 +1614,8 @@ fn append_only_sweep_parks_local_rewrite_without_trusting_stale_remote() {
     let telemetry_log = std::env::temp_dir().join("afd_test_append_only_local_rewrite.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
     let mut vcs = test_vcs();
-    vcs.heads.insert(branch.into(), "stale-safe-remote-head".into());
+    vcs.heads
+        .insert(branch.into(), "stale-safe-remote-head".into());
     let deps = TickDeps {
         scm: &scm,
         tracker: &tracker,
@@ -1478,8 +1631,15 @@ fn append_only_sweep_parks_local_rewrite_without_trusting_stale_remote() {
     let summary = run_tick(&deps, 1, 1).unwrap();
     assert_eq!(summary.beads_parked_human_held, 1);
     let overlay = store.load("bead-local-rewrite").unwrap().unwrap();
-    assert_eq!(overlay.park_reason.as_deref(), Some("adopted_branch_history_rewrite_detected"));
-    assert!(!vcs.calls.borrow().iter().any(|c| c.starts_with("remote_head_sha(")));
+    assert_eq!(
+        overlay.park_reason.as_deref(),
+        Some("adopted_branch_history_rewrite_detected")
+    );
+    assert!(!vcs
+        .calls
+        .borrow()
+        .iter()
+        .any(|c| c.starts_with("remote_head_sha(")));
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
@@ -1538,8 +1698,15 @@ fn append_only_sweep_falls_back_to_remote_when_local_probe_errors() {
 
     let summary = run_tick(&deps, 1, 1).unwrap();
     assert_eq!(summary.beads_parked_human_held, 0);
-    assert_eq!(store.load("bead-local-error").unwrap().unwrap().state, OverlayState::Dispatched);
-    assert!(vcs.calls.borrow().iter().any(|c| c.starts_with("remote_head_sha(")));
+    assert_eq!(
+        store.load("bead-local-error").unwrap().unwrap().state,
+        OverlayState::Dispatched
+    );
+    assert!(vcs
+        .calls
+        .borrow()
+        .iter()
+        .any(|c| c.starts_with("remote_head_sha(")));
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
@@ -1578,7 +1745,8 @@ fn append_only_sweep_does_not_let_local_proof_override_remote_rewrite() {
     let telemetry_log = std::env::temp_dir().join("afd_test_append_only_remote_rewrite.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
     let mut vcs = test_vcs();
-    vcs.heads.insert(branch.into(), "rewritten-remote-head".into());
+    vcs.heads
+        .insert(branch.into(), "rewritten-remote-head".into());
     vcs.ancestor_pairs
         .insert((pre_sha.into(), "rewritten-remote-head".into()), false);
     let deps = TickDeps {
@@ -1596,7 +1764,12 @@ fn append_only_sweep_does_not_let_local_proof_override_remote_rewrite() {
     let summary = run_tick(&deps, 1, 1).unwrap();
     assert_eq!(summary.beads_parked_human_held, 1);
     assert_eq!(
-        store.load("bead-remote-rewrite").unwrap().unwrap().park_reason.as_deref(),
+        store
+            .load("bead-remote-rewrite")
+            .unwrap()
+            .unwrap()
+            .park_reason
+            .as_deref(),
         Some("adopted_branch_history_rewrite_detected")
     );
     let _ = std::fs::remove_file(&telemetry_log);
@@ -1657,7 +1830,7 @@ fn test_wedge_detection_attested_session_stalled() {
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
             ci_pending: false,
-        bugbot_pending: false,
+            bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -1780,7 +1953,7 @@ fn test_wedge_detection_attested_session_not_stalled_if_remote_ahead() {
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
             ci_pending: false,
-        bugbot_pending: false,
+            bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -1888,7 +2061,7 @@ fn test_wedge_detection_still_parks_when_local_matches_remote() {
             head_sha: same_sha.clone(),
             updated_at_epoch: now_epoch - 2000,
             ci_pending: false,
-        bugbot_pending: false,
+            bugbot_pending: false,
             head_committed_epoch: 0,
             ci_success: true,
             mergeable: true,
@@ -1988,7 +2161,7 @@ fn test_wedge_detection_still_parks_when_local_is_ahead_of_remote() {
             head_sha: "remote-head-stale".into(),
             updated_at_epoch: now_epoch - 2000,
             ci_pending: false,
-        bugbot_pending: false,
+            bugbot_pending: false,
             head_committed_epoch: 0,
             ci_success: true,
             mergeable: true,
@@ -2108,7 +2281,7 @@ fn test_wedge_detection_still_parks_when_branches_have_diverged() {
             head_sha: "remote-head-diverged".into(),
             updated_at_epoch: now_epoch - 2000,
             ci_pending: false,
-        bugbot_pending: false,
+            bugbot_pending: false,
             head_committed_epoch: 0,
             ci_success: true,
             mergeable: true,
@@ -2225,7 +2398,7 @@ fn factory_labeled_existing_pr_is_adopted_and_verified_without_spawn() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         0,
         0,
@@ -2664,7 +2837,7 @@ fn factory_labeled_pr_branch_collision_is_refused_without_stealing_mapping() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         0,
         0,
@@ -2702,6 +2875,230 @@ fn factory_labeled_pr_branch_collision_is_refused_without_stealing_mapping() {
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
+}
+
+fn identical_adoption_collision_fixture(
+    owner_state: OverlayState,
+    owner_session: Option<&str>,
+    park_reason: Option<&str>,
+    suffix: &str,
+) -> (
+    FakeStateStore,
+    FakeTracker,
+    FakeSessions,
+    std::path::PathBuf,
+    TickSummary,
+) {
+    let mut scm = FakeScm::new();
+    scm.prs.push(LabeledPr {
+        number: 607,
+        title: "Identical adopted PR".into(),
+        body: "same PR identity".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#607".into(),
+        head_ref_name: "factory/shared-607".into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("owner/repo".into()),
+        head_repo_owner_login: Some("owner".into()),
+        head_sha: Some("head-607".into()),
+        updated_at_epoch: Some(1_700_000_000),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    store
+        .save(&BeadOverlay {
+            bead_id: "old-owner-607".into(),
+            state: owner_state,
+            attempt: 4,
+            reroll_count: 2,
+            autonomy_secs: 91,
+            spend_usd: 3.0,
+            pr_number: Some(607),
+            branch: Some("factory/shared-607".into()),
+            session_id: owner_session.map(str::to_string),
+            session_ao_project: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: park_reason.map(str::to_string),
+            target_repo: Some("owner/repo".into()),
+            attempt_started_at: None,
+        })
+        .unwrap();
+    store
+        .register_branch("old-owner-607", "factory/shared-607")
+        .unwrap();
+    let cfg = test_cfg();
+    let vcs = test_vcs();
+    let telemetry = std::env::temp_dir().join(format!(
+        "afd_identical_adoption_collision_{}_{}.jsonl",
+        std::process::id(),
+        suffix
+    ));
+    let _ = std::fs::remove_file(&telemetry);
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry,
+            vendor_health: None,
+        },
+        0,
+        0,
+    )
+    .unwrap();
+    (store, tracker, sessions, telemetry, summary)
+}
+
+#[test]
+fn issue_607_identical_circuit_breaker_owner_is_atomically_replaced() {
+    let (store, _tracker, _sessions, telemetry, summary) = identical_adoption_collision_fixture(
+        OverlayState::HumanHeld,
+        None,
+        Some(CIRCUIT_BREAKER_PARK_REASON),
+        "607",
+    );
+    assert_eq!(summary.beads_escalated, 0);
+    assert_eq!(
+        store.bead_id_for_branch("factory/shared-607").unwrap(),
+        Some("fake-bead-1".into())
+    );
+    assert_eq!(
+        store.load("fake-bead-1").unwrap().unwrap().state,
+        OverlayState::Attested
+    );
+    let events = std::fs::read_to_string(&telemetry).unwrap();
+    assert!(events.contains("EXISTING_PR_OWNER_REPLACED"), "{events}");
+    assert!(!events.contains("adoption_branch_collision"), "{events}");
+    let _ = std::fs::remove_file(telemetry);
+}
+
+#[test]
+fn issue_683_identical_coder_silent_owner_is_atomically_replaced() {
+    let (store, _tracker, _sessions, telemetry, summary) = identical_adoption_collision_fixture(
+        OverlayState::HumanHeld,
+        None,
+        Some("coder_silent"),
+        "683",
+    );
+    assert_eq!(summary.beads_escalated, 0);
+    assert_eq!(
+        store.bead_id_for_branch("factory/shared-607").unwrap(),
+        Some("fake-bead-1".into())
+    );
+    assert!(std::fs::read_to_string(&telemetry)
+        .unwrap()
+        .contains("EXISTING_PR_OWNER_REPLACED"));
+    let _ = std::fs::remove_file(telemetry);
+}
+
+#[test]
+fn identical_active_owner_is_retained_and_duplicate_never_routes() {
+    let (store, _tracker, sessions, telemetry, summary) = identical_adoption_collision_fixture(
+        OverlayState::Dispatched,
+        Some("active-owner-session"),
+        None,
+        "active",
+    );
+    assert_eq!(summary.beads_escalated, 0);
+    assert_eq!(summary.beads_routed, 0);
+    assert_eq!(summary.beads_dispatched, 0);
+    assert_eq!(
+        store.bead_id_for_branch("factory/shared-607").unwrap(),
+        Some("old-owner-607".into())
+    );
+    assert!(store.load("fake-bead-1").unwrap().is_none());
+    assert!(!sessions
+        .calls
+        .borrow()
+        .iter()
+        .any(|call| call.starts_with("spawn(")));
+    let events = std::fs::read_to_string(&telemetry).unwrap();
+    assert!(events.contains("EXISTING_PR_COALESCED"), "{events}");
+    assert!(!events.contains("adoption_branch_collision"), "{events}");
+    let _ = std::fs::remove_file(telemetry);
+}
+
+#[test]
+fn missing_pr_head_defers_without_fabricating_collision_owner() {
+    for bound in [false, true] {
+        let mut scm = FakeScm::new();
+        scm.prs.push(LabeledPr {
+            number: 608,
+            title: "Incomplete PR identity".into(),
+            body: "head not returned yet".into(),
+            author_login: "alice".into(),
+            external_ref: "owner/repo#608".into(),
+            head_ref_name: "factory/incomplete-608".into(),
+            is_cross_repository: false,
+            head_repo_full_name: Some("owner/repo".into()),
+            head_repo_owner_login: Some("owner".into()),
+            head_sha: None,
+            updated_at_epoch: Some(1_700_000_000),
+        });
+        scm.permissions.insert("alice".into(), Permission::Write);
+        let tracker = FakeTracker::new();
+        let sessions = FakeSessions::new();
+        let llm = FakeLlm::new();
+        let store = FakeStateStore::new();
+        if bound {
+            store
+                .register_branch("prior-owner", "factory/incomplete-608")
+                .unwrap();
+        }
+        let cfg = test_cfg();
+        let vcs = test_vcs();
+        let telemetry = std::env::temp_dir().join(format!(
+            "afd_missing_adoption_head_{}_{}.jsonl",
+            std::process::id(),
+            bound
+        ));
+        let _ = std::fs::remove_file(&telemetry);
+        let summary = run_tick(
+            &TickDeps {
+                scm: &scm,
+                tracker: &tracker,
+                sessions: &sessions,
+                llm: &llm,
+                store: &store,
+                vcs: &vcs,
+                cfg: &cfg,
+                telemetry_log: &telemetry,
+                vendor_health: None,
+            },
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(summary.beads_escalated, 0);
+        assert_eq!(summary.beads_routed, 0);
+        assert_eq!(summary.beads_dispatched, 0);
+        assert!(store.load("fake-bead-1").unwrap().is_none());
+        let events = std::fs::read_to_string(&telemetry).unwrap();
+        assert!(events.contains("EXISTING_PR_IDENTITY_DEFERRED"), "{events}");
+        assert!(!events.contains("adoption_branch_collision"), "{events}");
+        assert!(!tracker
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call.contains("already registered to bead")));
+        assert_ne!(
+            store
+                .bead_id_for_branch("factory/incomplete-608")
+                .unwrap()
+                .as_deref(),
+            Some("fake-bead-1")
+        );
+        let _ = std::fs::remove_file(telemetry);
+    }
 }
 
 /// jleechan-sniw re-review gap #1: `daemon/tests/intake.rs`'s
@@ -2753,7 +3150,7 @@ fn fork_labeled_pr_never_registers_branch_at_tick_level() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         0,
         0,
@@ -2853,7 +3250,7 @@ fn adopted_non_green_pr_parks_human_held_with_v1_escalation() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         0,
         0,
@@ -2965,7 +3362,7 @@ fn adopted_red_pr_stage2_reroll_spawns_remediation_session_leaves_pr_open() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         0,
         0,
@@ -3108,7 +3505,7 @@ fn adopted_red_pr_stage2_reroll_spawn_failure_parks_human_held_with_escalation()
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         0,
         0,
@@ -3230,7 +3627,7 @@ fn adopted_red_pr_structural_only_red_gates_holds_disposition_required_not_rerol
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         0,
         0,
@@ -3373,7 +3770,7 @@ fn adopted_red_pr_mixed_red_gates_still_rerolls() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         0,
         0,
@@ -3491,7 +3888,7 @@ fn disposition_required_bead_resumes_when_gates_go_green() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         1,
         0,
@@ -3591,7 +3988,7 @@ fn disposition_required_bead_in_cooldown_is_skipped_without_scm_call() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         1,
         0,
@@ -3676,7 +4073,7 @@ fn disposition_required_reassessment_error_preserves_hold_provenance() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         1,
         0,
@@ -3728,7 +4125,7 @@ fn disposition_required_reassessment_error_preserves_hold_provenance() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         2,
         0,
@@ -3824,6 +4221,158 @@ fn test_manual_bead_input_auto_queued_and_dispatched() {
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
+}
+
+fn dependency_admission_fixture(
+    state: OverlayState,
+) -> (
+    FakeScm,
+    FakeTracker,
+    FakeSessions,
+    FakeLlm,
+    FakeStateStore,
+    Config,
+    FakeVcs,
+    std::path::PathBuf,
+) {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    tracker.candidates.borrow_mut().push(Bead {
+        id: "dependency-bead".into(),
+        title: "blocked by prerequisite".into(),
+        description: "target_repo: owner/repo".into(),
+        notes: String::new(),
+        file_tree_summary: String::new(),
+        external_ref: Some("owner/repo#810".into()),
+    });
+    *tracker.ready_ids.borrow_mut() = Some(std::collections::HashSet::new());
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"ready"}"#.into(),
+    ));
+    let store = FakeStateStore::new();
+    store
+        .save(&BeadOverlay {
+            bead_id: "dependency-bead".into(),
+            state,
+            attempt: 3,
+            reroll_count: 1,
+            autonomy_secs: 77,
+            spend_usd: 2.5,
+            pr_number: None,
+            branch: None,
+            session_id: None,
+            session_ao_project: None,
+            is_adopted: false,
+            spawn_failure_count: 2,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: Some("owner/repo".into()),
+            attempt_started_at: None,
+        })
+        .unwrap();
+    let telemetry = std::env::temp_dir().join(format!(
+        "afd_dependency_admission_{}_{}.jsonl",
+        std::process::id(),
+        state.as_str()
+    ));
+    let _ = std::fs::remove_file(&telemetry);
+    (
+        scm,
+        tracker,
+        sessions,
+        llm,
+        store,
+        test_cfg(),
+        test_vcs(),
+        telemetry,
+    )
+}
+
+fn assert_dependency_blocked_without_counter_burn(state: OverlayState) {
+    let (scm, tracker, sessions, llm, store, cfg, vcs, telemetry_log) =
+        dependency_admission_fixture(state);
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        0,
+        0,
+    )
+    .unwrap();
+    assert_eq!(summary.beads_routed, 0);
+    assert_eq!(summary.beads_dispatched, 0);
+    assert!(llm.calls.borrow().is_empty());
+    assert!(sessions.calls.borrow().is_empty());
+    let overlay = store.load("dependency-bead").unwrap().unwrap();
+    assert_eq!(overlay.state, state);
+    assert_eq!(overlay.attempt, 3);
+    assert_eq!(overlay.autonomy_secs, 77);
+    assert_eq!(overlay.spawn_failure_count, 2);
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap();
+    assert!(telemetry.contains("DEPENDENCY_BLOCKED"), "{telemetry}");
+    assert!(!telemetry.contains("TASK_ROUTED"), "{telemetry}");
+    let _ = std::fs::remove_file(telemetry_log);
+}
+
+#[test]
+fn queued_dependency_blocked_bead_does_not_route_spawn_or_burn_counters() {
+    assert_dependency_blocked_without_counter_burn(OverlayState::Queued);
+}
+
+#[test]
+fn redispatched_dependency_blocked_bead_does_not_route_spawn_or_burn_counters() {
+    assert_dependency_blocked_without_counter_burn(OverlayState::Redispatched);
+}
+
+#[test]
+fn dependency_bead_dispatches_once_after_entering_ready_snapshot() {
+    let (scm, tracker, sessions, llm, store, cfg, vcs, telemetry_log) =
+        dependency_admission_fixture(OverlayState::Queued);
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+    run_tick(&deps, 0, 0).unwrap();
+    tracker
+        .ready_ids
+        .borrow_mut()
+        .as_mut()
+        .unwrap()
+        .insert("dependency-bead".into());
+    let summary = run_tick(&deps, 1, 0).unwrap();
+    assert_eq!(summary.beads_routed, 1);
+    assert_eq!(summary.beads_dispatched, 1);
+    assert_eq!(
+        sessions
+            .calls
+            .borrow()
+            .iter()
+            .filter(|call| call.starts_with("spawn("))
+            .count(),
+        1
+    );
+    assert_eq!(
+        store.load("dependency-bead").unwrap().unwrap().state,
+        OverlayState::Dispatched
+    );
+    let _ = std::fs::remove_file(telemetry_log);
 }
 
 /// jleechan-drive-pr-branch-binding-pcpr red-proof: a manually-created
@@ -4112,7 +4661,7 @@ fn remote_credentials_never_reach_tick_telemetry_or_escalation_comments() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         0,
         0,
@@ -4187,7 +4736,8 @@ fn manual_bead_adoption_never_calls_create_bead_or_fabricates_external_ref() {
         // fabricate external_ref) still needs a Queued manual bead to
         // exercise; this body field supplies the resolvable target_repo
         // without touching the orphan-defect shape the test is locking in.
-        description: "target_repo: owner/repo\n\ncreated directly via `br create`, no --external-ref".into(),
+        description:
+            "target_repo: owner/repo\n\ncreated directly via `br create`, no --external-ref".into(),
         notes: String::new(),
         file_tree_summary: "".into(),
         external_ref: None, // exactly the jleechan-3wh0 orphan shape
@@ -4497,9 +5047,8 @@ fn manual_bead_adoption_fail_closed_local_fallback_path_persists_escalation() {
     let store = FakeStateStore::new();
     let cfg = test_cfg();
     let vcs = test_vcs();
-    let telemetry_log = std::env::temp_dir().join(
-        "afd_manual_bead_fail_closed_local_fallback_test.jsonl",
-    );
+    let telemetry_log =
+        std::env::temp_dir().join("afd_manual_bead_fail_closed_local_fallback_test.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
     let summary = run_tick(
@@ -4597,7 +5146,7 @@ fn newly_intaken_bead_dispatch_uses_real_tracker_title() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         0,
         0,
@@ -4696,7 +5245,7 @@ fn drive_existing_pr_pending_ci_does_not_reach_ready() {
             ci_status: "unknown".into(),
             coderabbit_status: "approved".into(),
             ci_pending: true,
-        bugbot_pending: false,
+            bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -4714,7 +5263,7 @@ fn drive_existing_pr_pending_ci_does_not_reach_ready() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         1,
         0,
@@ -4793,7 +5342,7 @@ fn drive_existing_pr_failed_ci_parks_human_held() {
             ci_status: "red".into(),
             coderabbit_status: "approved".into(),
             ci_pending: false,
-        bugbot_pending: false,
+            bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -4811,7 +5360,7 @@ fn drive_existing_pr_failed_ci_parks_human_held() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         1,
         0,
@@ -4877,7 +5426,7 @@ fn recover_human_held_requeues_queued_bead_with_attempt_below_max() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         // tick_index=1 with fast_tick_secs==slow_tick_secs==60 means
         // the slow tier fires (ratio=1, every tick), which is where
@@ -4992,7 +5541,7 @@ fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         1,
         0,
@@ -5055,7 +5604,7 @@ fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         2,
         0,
@@ -5431,8 +5980,7 @@ fn permanent_gh_error_marks_escalation_undeliverable_and_never_retries() {
     *tracker.fail_next_comment_permanent.borrow_mut() =
         Some("invalid issue format: \"local-xxx\"".into());
 
-    let telemetry_log =
-        std::env::temp_dir().join("afd_permanent_gh_error_undeliverable.jsonl");
+    let telemetry_log = std::env::temp_dir().join("afd_permanent_gh_error_undeliverable.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
     let deps = TickDeps {
@@ -5796,7 +6344,7 @@ fn er_runner_capped_unknown_only_gate_report_escalates_and_parks_at_recovery_cap
             ci_status: "green".into(),
             coderabbit_status: "green".into(),
             ci_pending: false,
-        bugbot_pending: false,
+            bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -5814,7 +6362,7 @@ fn er_runner_capped_unknown_only_gate_report_escalates_and_parks_at_recovery_cap
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         0,
         0,
@@ -5869,7 +6417,7 @@ fn er_runner_capped_unknown_only_gate_report_escalates_and_parks_at_recovery_cap
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         1,
         0,
@@ -6061,7 +6609,7 @@ fn attested_ci_pending_does_not_bump_autonomy_secs() {
             ci_status: "unknown".into(),
             coderabbit_status: "approved".into(),
             ci_pending: true,
-        bugbot_pending: false,
+            bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -6087,7 +6635,7 @@ fn attested_ci_pending_does_not_bump_autonomy_secs() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         1,
         // Pretend 600s elapsed since the last tick; ci_pending must freeze the clock.
@@ -6168,7 +6716,7 @@ fn attested_ci_pending_does_not_timebox_park() {
             ci_status: "unknown".into(),
             coderabbit_status: "approved".into(),
             ci_pending: true,
-        bugbot_pending: false,
+            bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -6194,7 +6742,7 @@ fn attested_ci_pending_does_not_timebox_park() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         1,
         600, // 10-minute tick; ci_pending=true means clock should NOT advance
@@ -6279,7 +6827,7 @@ fn non_green_bead_reenters_loop_via_automated_human_held_exit() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         // slow-tier-due (ratio=1, every tick fires both tiers)
         1,
@@ -6388,7 +6936,7 @@ fn attested_ci_not_pending_does_bump_autonomy_secs() {
             ci_status: "success".into(),
             coderabbit_status: "approved".into(),
             ci_pending: false,
-        bugbot_pending: false,
+            bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -6414,7 +6962,7 @@ fn attested_ci_not_pending_does_bump_autonomy_secs() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         1,
         300,
@@ -6530,7 +7078,7 @@ fn qdw_per_bead_isolation_snapshot_failure_does_not_abort_fast_tier() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         0,
         0,
@@ -6711,7 +7259,7 @@ fn qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         // elapsed_secs=1 (non-zero) so the pre-fix `Err=>false` path
         // would have bumped autonomy_secs to timebox and parked the
@@ -6830,7 +7378,11 @@ impl Scm for QdwPostErRefetchScm {
         Ok(Vec::new())
     }
 
-    fn labeled_prs(&self, _label: &str, _gh_calls: &mut u32) -> Result<Vec<LabeledPr>, DaemonError> {
+    fn labeled_prs(
+        &self,
+        _label: &str,
+        _gh_calls: &mut u32,
+    ) -> Result<Vec<LabeledPr>, DaemonError> {
         Ok(Vec::new())
     }
 
@@ -6893,7 +7445,11 @@ impl Scm for QdwAssessRefetchScm {
         Ok(Vec::new())
     }
 
-    fn labeled_prs(&self, _label: &str, _gh_calls: &mut u32) -> Result<Vec<LabeledPr>, DaemonError> {
+    fn labeled_prs(
+        &self,
+        _label: &str,
+        _gh_calls: &mut u32,
+    ) -> Result<Vec<LabeledPr>, DaemonError> {
         Ok(Vec::new())
     }
 
@@ -7171,7 +7727,7 @@ fn qdw_post_er_refetch_failure_skips_bead_without_false_park() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         0,
         0,
@@ -7330,7 +7886,7 @@ fn qdw_assess_refetch_failure_stays_attested_and_never_closes_pr() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         0,
         0,
@@ -7585,7 +8141,11 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
     std::fs::create_dir_all(&fake_bin_dir).unwrap();
     write_fake_reviewer(&fake_bin_dir, "codex", "fail should-not-dispatch-codex");
     write_fake_reviewer(&fake_bin_dir, "gemini", "fail should-not-dispatch-gemini");
-    write_fake_reviewer(&fake_bin_dir, "agy", "fail should-not-dispatch-agy-self-review");
+    write_fake_reviewer(
+        &fake_bin_dir,
+        "agy",
+        "fail should-not-dispatch-agy-self-review",
+    );
     write_fake_reviewer(&fake_bin_dir, "claude", "pass");
     write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
     write_fake_target_worktree_git(&fake_bin_dir, "deadbeef555");
@@ -7596,10 +8156,8 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
     // Fix the coder vendor so the reviewer priority list (and therefore
     // which two fake binaries get dispatched) is deterministic regardless
     // of the ambient environment.
-    let _env_guard = EnvVarGuard::set(&[
-        ("PATH", &new_path),
-        ("DARK_FACTORY_CODER_DEFAULT", "agy"),
-    ]);
+    let _env_guard =
+        EnvVarGuard::set(&[("PATH", &new_path), ("DARK_FACTORY_CODER_DEFAULT", "agy")]);
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -7692,7 +8250,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         1,
         0,
@@ -7778,7 +8336,11 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
     std::fs::create_dir_all(&fake_bin_dir).unwrap();
     write_fake_reviewer(&fake_bin_dir, "codex", "fail should-not-dispatch-codex");
     write_fake_reviewer(&fake_bin_dir, "gemini", "fail should-not-dispatch-gemini");
-    write_fake_reviewer(&fake_bin_dir, "agy", "fail should-not-dispatch-agy-self-review");
+    write_fake_reviewer(
+        &fake_bin_dir,
+        "agy",
+        "fail should-not-dispatch-agy-self-review",
+    );
     write_fake_reviewer(&fake_bin_dir, "claude", "pass");
     write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
     write_fake_target_worktree_git(&fake_bin_dir, "deadbeef556");
@@ -7789,10 +8351,8 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
     // Fix the coder vendor so the reviewer priority list (and therefore
     // which two fake binaries get dispatched) is deterministic regardless
     // of the ambient environment.
-    let _env_guard = EnvVarGuard::set(&[
-        ("PATH", &new_path),
-        ("DARK_FACTORY_CODER_DEFAULT", "agy"),
-    ]);
+    let _env_guard =
+        EnvVarGuard::set(&[("PATH", &new_path), ("DARK_FACTORY_CODER_DEFAULT", "agy")]);
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -7895,7 +8455,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         1,
         0,
@@ -7998,10 +8558,8 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
 
     // coder=codex is not in [claudem, agy, cursor-agent], so priority stays
     // the full default list and the third-vendor fallback is reachable.
-    let _env_guard = EnvVarGuard::set(&[
-        ("PATH", &new_path),
-        ("DARK_FACTORY_CODER_DEFAULT", "codex"),
-    ]);
+    let _env_guard =
+        EnvVarGuard::set(&[("PATH", &new_path), ("DARK_FACTORY_CODER_DEFAULT", "codex")]);
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -8089,7 +8647,7 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         1,
         0,
@@ -8181,7 +8739,11 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
     std::fs::create_dir_all(&fake_bin_dir).unwrap();
     write_fake_reviewer(&fake_bin_dir, "codex", "fail should-not-dispatch-codex");
     write_fake_reviewer(&fake_bin_dir, "gemini", "fail should-not-dispatch-gemini");
-    write_fake_reviewer(&fake_bin_dir, "agy", "fail should-not-dispatch-agy-self-review");
+    write_fake_reviewer(
+        &fake_bin_dir,
+        "agy",
+        "fail should-not-dispatch-agy-self-review",
+    );
     write_fake_reviewer(&fake_bin_dir, "claude", "pass");
     write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
     write_fake_target_worktree_git(&fake_bin_dir, "deadbeef558");
@@ -8189,10 +8751,8 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
 
-    let _env_guard = EnvVarGuard::set(&[
-        ("PATH", &new_path),
-        ("DARK_FACTORY_CODER_DEFAULT", "agy"),
-    ]);
+    let _env_guard =
+        EnvVarGuard::set(&[("PATH", &new_path), ("DARK_FACTORY_CODER_DEFAULT", "agy")]);
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -8278,7 +8838,7 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         1,
         0,
@@ -8537,7 +9097,7 @@ fn cross_repo_bead_verification_loop_uses_its_own_repo_not_cfg_target_repo() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         1,
         0,
@@ -8684,10 +9244,8 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
 
-    let _env_guard = EnvVarGuard::set(&[
-        ("PATH", &new_path),
-        ("DARK_FACTORY_CODER_DEFAULT", "codex"),
-    ]);
+    let _env_guard =
+        EnvVarGuard::set(&[("PATH", &new_path), ("DARK_FACTORY_CODER_DEFAULT", "codex")]);
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -8775,7 +9333,7 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         1,
         0,
@@ -8872,10 +9430,8 @@ fn cross_model_reviewer_cursor_agent_falls_back_and_emits_review_degraded() {
     // coder=codex is not in the reviewer queue, so priority stays
     // [claudem, agy, cursor-agent] and the third-vendor fallback is
     // reachable.
-    let _env_guard = EnvVarGuard::set(&[
-        ("PATH", &new_path),
-        ("DARK_FACTORY_CODER_DEFAULT", "codex"),
-    ]);
+    let _env_guard =
+        EnvVarGuard::set(&[("PATH", &new_path), ("DARK_FACTORY_CODER_DEFAULT", "codex")]);
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -8963,7 +9519,7 @@ fn cross_model_reviewer_cursor_agent_falls_back_and_emits_review_degraded() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         1,
         0,
@@ -8996,26 +9552,18 @@ fn cross_model_reviewer_cursor_agent_falls_back_and_emits_review_degraded() {
     let gate_assessment_line = telemetry
         .lines()
         .find(|l| l.contains("\"eventType\":\"GATE_ASSESSMENT\""))
-        .unwrap_or_else(|| {
-            panic!("no GATE_ASSESSMENT line; telemetry:\n{telemetry}")
-        });
+        .unwrap_or_else(|| panic!("no GATE_ASSESSMENT line; telemetry:\n{telemetry}"));
     let gate_assessment: serde_json::Value = serde_json::from_str(gate_assessment_line)
         .unwrap_or_else(|e| {
-            panic!(
-                "GATE_ASSESSMENT line is not valid JSON: {e}\nline: {gate_assessment_line}"
-            )
+            panic!("GATE_ASSESSMENT line is not valid JSON: {e}\nline: {gate_assessment_line}")
         });
     let context = gate_assessment
         .get("context")
         .unwrap_or_else(|| panic!("no context: {gate_assessment_line}"));
 
-    let skeptic_reviewers = context["skeptic_reviewers"]
-        .as_array()
-        .unwrap_or_else(|| {
-            panic!(
-                "GATE_ASSESSMENT context.skeptic_reviewers must be an array; context:\n{context}"
-            )
-        });
+    let skeptic_reviewers = context["skeptic_reviewers"].as_array().unwrap_or_else(|| {
+        panic!("GATE_ASSESSMENT context.skeptic_reviewers must be an array; context:\n{context}")
+    });
     let skeptic_reviewers: Vec<&str> = skeptic_reviewers
         .iter()
         .filter_map(|v| v.as_str())
@@ -9107,7 +9655,11 @@ fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
     std::fs::create_dir_all(&fake_bin_dir).unwrap();
     write_fake_reviewer(&fake_bin_dir, "codex", "fail should-not-dispatch-codex");
     write_fake_reviewer(&fake_bin_dir, "gemini", "fail should-not-dispatch-gemini");
-    write_fake_reviewer(&fake_bin_dir, "agy", "fail should-not-dispatch-agy-self-review");
+    write_fake_reviewer(
+        &fake_bin_dir,
+        "agy",
+        "fail should-not-dispatch-agy-self-review",
+    );
     write_fake_reviewer(&fake_bin_dir, "claude", "pass");
     write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
     write_fake_target_worktree_git(&fake_bin_dir, "deadbeef560");
@@ -9115,10 +9667,8 @@ fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
 
-    let _env_guard = EnvVarGuard::set(&[
-        ("PATH", &new_path),
-        ("DARK_FACTORY_CODER_DEFAULT", "agy"),
-    ]);
+    let _env_guard =
+        EnvVarGuard::set(&[("PATH", &new_path), ("DARK_FACTORY_CODER_DEFAULT", "agy")]);
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -9206,7 +9756,7 @@ fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         1,
         0,
@@ -9223,14 +9773,10 @@ fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
     let gate_assessment_line = telemetry
         .lines()
         .find(|l| l.contains("\"eventType\":\"GATE_ASSESSMENT\""))
-        .unwrap_or_else(|| {
-            panic!("no GATE_ASSESSMENT line; telemetry:\n{telemetry}")
-        });
+        .unwrap_or_else(|| panic!("no GATE_ASSESSMENT line; telemetry:\n{telemetry}"));
     let gate_assessment: serde_json::Value = serde_json::from_str(gate_assessment_line)
         .unwrap_or_else(|e| {
-            panic!(
-                "GATE_ASSESSMENT line is not valid JSON: {e}\nline: {gate_assessment_line}"
-            )
+            panic!("GATE_ASSESSMENT line is not valid JSON: {e}\nline: {gate_assessment_line}")
         });
     let context = gate_assessment
         .get("context")
@@ -9251,7 +9797,9 @@ fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
          dual-dispatch primaries produced parseable verdicts); got: {skeptic_reviewers:?}"
     );
     assert!(
-        !skeptic_reviewers.iter().any(|v| *v == "codex" || *v == "claude" || *v == "gemini" || *v == "agy"),
+        !skeptic_reviewers
+            .iter()
+            .any(|v| *v == "codex" || *v == "claude" || *v == "gemini" || *v == "agy"),
         "codex, anthropic claude, gemini CLI, and the agy coder must not be \
          default reviewers; got: {skeptic_reviewers:?}"
     );
@@ -10191,9 +10739,7 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
                 attempt_started_at: None,
             })
             .unwrap();
-        store
-            .mark_remediation_session_spawned(bead_id, 1)
-            .unwrap();
+        store.mark_remediation_session_spawned(bead_id, 1).unwrap();
         store.register_branch(bead_id, branch).unwrap();
         store
             .save_rejection(bead_id, 1, "verifier", "deadbeefdeadbeef", prior_text)
@@ -10214,7 +10760,7 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         0,
         0,
@@ -10438,7 +10984,7 @@ fn run_slow_tier_pr_existence_probe_targets_bead_own_repo_not_global_cfg() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         0,
         0,
@@ -10548,7 +11094,7 @@ fn run_slow_tier_pr_existence_probe_unchanged_for_single_repo_legacy_bead() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         0,
         0,
@@ -10697,7 +11243,7 @@ fn tick_parks_human_held_on_permanent_reroll_error() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         1,
         0,
@@ -10861,8 +11407,14 @@ fn tick_resets_reroll_deferral_when_fresh_attempt_pr_opens() {
 
     let summary = run_tick(&deps, 2, 0).expect("fresh attempt tick should succeed");
     let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
-    assert_eq!(summary.gates_assessed, 1, "fresh PR must be gate-assessed: {log}");
-    assert!(log.contains("\"eventType\":\"PR_OPENED\""), "fresh PR must promote: {log}");
+    assert_eq!(
+        summary.gates_assessed, 1,
+        "fresh PR must be gate-assessed: {log}"
+    );
+    assert!(
+        log.contains("\"eventType\":\"PR_OPENED\""),
+        "fresh PR must promote: {log}"
+    );
     assert!(
         !log.contains("VERIFIER_SKIPPED_REROLL_IN_PROGRESS"),
         "old-PR suppression must not apply to the fresh PR: {log}"
@@ -11405,7 +11957,7 @@ fn run_tick_emits_parked_human_held_for_unmapped_repo_dispatch_failure() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         0,
         0,
@@ -11498,8 +12050,7 @@ fn run_tick_escalates_explicit_target_without_checkout_as_human_held() {
         },
     );
     let vcs = test_vcs();
-    let telemetry_log =
-        std::env::temp_dir().join("afd_missing_target_checkout_park_test.jsonl");
+    let telemetry_log = std::env::temp_dir().join("afd_missing_target_checkout_park_test.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
     let summary = run_tick(
@@ -11543,8 +12094,7 @@ fn run_tick_escalates_explicit_target_without_checkout_as_human_held() {
             && event["beadId"] == "missing-checkout-bead"
     }));
     assert!(tracker.calls.borrow().iter().any(|call| {
-        call.starts_with("comment_external(other/repo#321,")
-            && call.contains("local_checkout")
+        call.starts_with("comment_external(other/repo#321,") && call.contains("local_checkout")
     }));
 
     let _ = std::fs::remove_file(&telemetry_log);
@@ -12129,8 +12679,10 @@ fn transient_pr_number_reresolve_error_keeps_dispatched_no_promotion() {
         .unwrap();
     store.register_branch("t40t-transient", branch).unwrap();
     // The branch→PR resolution fails transiently this tick.
-    scm.pr_number_for_branch_errors
-        .insert(("owner/repo".into(), branch.into()), "gh api timeout".into());
+    scm.pr_number_for_branch_errors.insert(
+        ("owner/repo".into(), branch.into()),
+        "gh api timeout".into(),
+    );
 
     let telemetry_log = std::env::temp_dir().join("afd_t40t_transient_reresolve.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
@@ -12145,7 +12697,7 @@ fn transient_pr_number_reresolve_error_keeps_dispatched_no_promotion() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         1,
         0,
@@ -12240,7 +12792,7 @@ fn pre_gate_no_open_pr_demotes_attested_to_dispatched_and_resumes() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         1,
         0,
@@ -12294,7 +12846,7 @@ fn pre_gate_no_open_pr_demotes_attested_to_dispatched_and_resumes() {
             vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
-        vendor_health: None,
+            vendor_health: None,
         },
         2,
         0,
@@ -12325,7 +12877,14 @@ fn pre_gate_no_open_pr_demotes_attested_to_dispatched_and_resumes() {
 // a fail-closed evidence-gate FAIL.
 // ===========================================================================
 
-fn evidence_bead(store: &FakeStateStore, scm: &mut FakeScm, bead_id: &str, pr: u64, branch: &str, body: &str) {
+fn evidence_bead(
+    store: &FakeStateStore,
+    scm: &mut FakeScm,
+    bead_id: &str,
+    pr: u64,
+    branch: &str,
+    body: &str,
+) {
     store
         .save(&BeadOverlay {
             bead_id: bead_id.into(),
@@ -12389,8 +12948,19 @@ fn evidence_gate_verified_gist_reaches_ready() {
     let telemetry_log = std::env::temp_dir().join("afd_yoqy_ev_ok.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
     let summary = run_tick(
-        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log, vendor_health: None },
-        1, 0,
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        1,
+        0,
     )
     .expect("tick must not error");
     assert_eq!(summary.gates_assessed, 1);
@@ -12399,7 +12969,11 @@ fn evidence_gate_verified_gist_reaches_ready() {
         OverlayState::Ready,
         "a verified evidence gist must let an otherwise-green PR reach READY"
     );
-    assert!(scm.calls.borrow().iter().any(|c| c.contains("gist_nonempty(goodgist)")));
+    assert!(scm
+        .calls
+        .borrow()
+        .iter()
+        .any(|c| c.contains("gist_nonempty(goodgist)")));
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
@@ -12427,8 +13001,19 @@ fn evidence_gate_empty_gist_fails_closed_not_ready() {
     let telemetry_log = std::env::temp_dir().join("afd_yoqy_ev_empty.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
     let summary = run_tick(
-        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log, vendor_health: None },
-        1, 0,
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        1,
+        0,
     )
     .expect("tick must not error");
     assert_eq!(summary.gates_assessed, 1);
@@ -12470,8 +13055,19 @@ fn evidence_gate_head_mismatch_fails_closed() {
     let telemetry_log = std::env::temp_dir().join("afd_yoqy_ev_stale.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
     run_tick(
-        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log, vendor_health: None },
-        1, 0,
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        1,
+        0,
     )
     .expect("tick must not error");
     assert_ne!(
@@ -12567,8 +13163,12 @@ fn rln6_evidence_head_stale_fast_rejects_with_one_shot_comment() {
     // (the daemon's existing bead-message channel), with the precise
     // mismatch and the live `gh pr edit` recipe.
     let calls = tracker.calls.borrow();
-    let stale_comment = calls.iter().find(|c| c.contains("EVIDENCE_HEAD_STALE")
-        || (c.contains("ev-rln6-stale") && c.contains("00000000stale") && c.contains("deadbeefcafe")));
+    let stale_comment = calls.iter().find(|c| {
+        c.contains("EVIDENCE_HEAD_STALE")
+            || (c.contains("ev-rln6-stale")
+                && c.contains("00000000stale")
+                && c.contains("deadbeefcafe"))
+    });
     assert!(
         stale_comment.is_some(),
         "the daemon must post a bead-notes-style comment carrying both SHAs and the remediation; calls:\n{calls:?}"
@@ -12788,7 +13388,11 @@ fn rln6_v2_evidence_head_stale_does_not_persist_sentinel_on_comment_failure() {
     // still Red, we just skipped the side-effects because the comment
     // failed).
     assert_eq!(
-        store.load("ev-rln6-v2-comment-fail").unwrap().unwrap().state,
+        store
+            .load("ev-rln6-v2-comment-fail")
+            .unwrap()
+            .unwrap()
+            .state,
         OverlayState::Attested,
         "fast-reject must still leave the bead Attested even when the \
          comment post fails"
@@ -13030,9 +13634,21 @@ fn evidence_gate_incomplete_marker_fails_closed() {
     let telemetry_log = std::env::temp_dir().join("afd_yoqy_ev_incomplete.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
     run_tick(
-        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log, vendor_health: None },
-        1, 0,
-    ).expect("tick must not error");
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        1,
+        0,
+    )
+    .expect("tick must not error");
     assert_ne!(
         store.load("ev-incomplete").unwrap().unwrap().state,
         OverlayState::Ready,
@@ -13073,9 +13689,21 @@ fn evidence_gate_transient_gist_error_is_pending_not_red() {
     let telemetry_log = std::env::temp_dir().join("afd_yoqy_ev_transient.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
     run_tick(
-        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log, vendor_health: None },
-        1, 0,
-    ).expect("tick must not error");
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        1,
+        0,
+    )
+    .expect("tick must not error");
     // Not READY (evidence unknown), but NOT parked/rerolled — stays ATTESTED to retry.
     assert_eq!(
         store.load("ev-transient").unwrap().unwrap().state,
@@ -13182,7 +13810,9 @@ fn msmq_verifier_skips_reassessment_when_reroll_deferred() {
         target_repo: Some("owner/repo".into()),
     };
     store.save(&overlay).unwrap();
-    store.register_branch("bead-msmq", "factory/bead-msmq-r1").unwrap();
+    store
+        .register_branch("bead-msmq", "factory/bead-msmq-r1")
+        .unwrap();
 
     let tracker = FakeTracker::new();
     let sessions = FakeSessions::new();
@@ -13196,8 +13826,14 @@ fn msmq_verifier_skips_reassessment_when_reroll_deferred() {
     let _ = std::fs::remove_file(&telemetry_log);
 
     let deps = TickDeps {
-        scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm,
-        store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log,
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
         vendor_health: None,
     };
 
@@ -13227,9 +13863,7 @@ fn msmq_verifier_skips_reassessment_when_reroll_deferred() {
     // duplicate gate assessment and emit VERIFIER_SKIPPED_REROLL_IN_PROGRESS.
     run_tick(&deps, 2, 0).expect("tick 2 must not error");
     let log2 = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
-    let gate_assessment_count = log2
-        .matches("\"eventType\":\"GATE_ASSESSMENT\"")
-        .count();
+    let gate_assessment_count = log2.matches("\"eventType\":\"GATE_ASSESSMENT\"").count();
     assert_eq!(
         gate_assessment_count, 1,
         "tick 2 (reroll_deferral_count > 0) MUST NOT emit a second GATE_ASSESSMENT for the unchanged old PR; log:\n{log2}"
@@ -13267,7 +13901,9 @@ fn last_gate_assessment_context(
     let raw = std::fs::read_to_string(log).unwrap_or_default();
     let mut ctx: Option<serde_json::Map<String, serde_json::Value>> = None;
     for line in raw.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
         if v.get("eventType").and_then(|s| s.as_str()) != Some("GATE_ASSESSMENT") {
             continue;
         }
@@ -13309,8 +13945,19 @@ fn jleechan328_gate_assessment_emits_head_sha_for_exact_head_binding() {
     let telemetry_log = std::env::temp_dir().join("afd_yoqy_headbind.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
     let summary = run_tick(
-        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log, vendor_health: None },
-        1, 0,
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        1,
+        0,
     )
     .expect("tick must not error");
     assert_eq!(summary.gates_assessed, 1);
@@ -13392,8 +14039,19 @@ fn jleechan328_gate_assessment_emits_operator_disposition_round_trip() {
         let telemetry_log = std::env::temp_dir().join(format!("afd_yoqy_disp_{disposition}.jsonl"));
         let _ = std::fs::remove_file(&telemetry_log);
         let summary = run_tick(
-            &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log, vendor_health: None },
-            1, 0,
+            &TickDeps {
+                scm: &scm,
+                tracker: &tracker,
+                sessions: &sessions,
+                llm: &llm,
+                store: &store,
+                vcs: &vcs,
+                cfg: &cfg,
+                telemetry_log: &telemetry_log,
+                vendor_health: None,
+            },
+            1,
+            0,
         )
         .expect("tick must not error");
         assert_eq!(summary.gates_assessed, 1);
@@ -13594,24 +14252,26 @@ fn escalation_dedup_tick_level_identical_payload_suppressed_changed_context_re_e
     // pr_number so `post_scm_comment_by_bead_id` succeeds (the success path
     // emits ESCALATION_REQUIRED).
     let bead_id = "bead-dedup-tick";
-    store.save(&BeadOverlay {
-        bead_id: bead_id.into(),
-        state: OverlayState::HumanHeld,
-        attempt: 10,
-        reroll_count: 0,
-        autonomy_secs: 0,
-        spend_usd: 0.0,
-        pr_number: Some(9006),
-        branch: Some("factory/bead-dedup-r10".into()),
-        session_id: None,
-        session_ao_project: None,
-        is_adopted: false,
-        spawn_failure_count: 0,
-        pre_session_head_sha: None,
-        park_reason: None,
-        attempt_started_at: None,
-        target_repo: Some("owner/repo".to_string()),
-    }).unwrap();
+    store
+        .save(&BeadOverlay {
+            bead_id: bead_id.into(),
+            state: OverlayState::HumanHeld,
+            attempt: 10,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(9006),
+            branch: Some("factory/bead-dedup-r10".into()),
+            session_id: None,
+            session_ao_project: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            attempt_started_at: None,
+            target_repo: Some("owner/repo".to_string()),
+        })
+        .unwrap();
 
     let telemetry_log = std::env::temp_dir().join(format!(
         "afd_escalation_dedup_tick_level_{}.jsonl",
@@ -13648,10 +14308,10 @@ fn escalation_dedup_tick_level_identical_payload_suppressed_changed_context_re_e
     );
     // The dedup ledger must have a row for this (bead_id, reason).
     assert!(
-        store
-            .escalation_ledger
-            .borrow()
-            .contains_key(&(bead_id.into(), "human_held_recovery_attempt_cap_reached".into())),
+        store.escalation_ledger.borrow().contains_key(&(
+            bead_id.into(),
+            "human_held_recovery_attempt_cap_reached".into()
+        )),
         "tick 1: dedup ledger must have a row after emit"
     );
     // The sentinel must be recorded (success path).
@@ -13830,7 +14490,10 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
         // Configure the FakeScm to return this PR's labelled snapshot.
         // The minimal smoke is: ensure the snapshot is fetched, then
         // verify the ledger's count after the tick.
-        let _ = scm.pr_snapshots.entry(pr).or_insert_with(|| capped_snapshot(pr));
+        let _ = scm
+            .pr_snapshots
+            .entry(pr)
+            .or_insert_with(|| capped_snapshot(pr));
     }
 
     // Insert one bead manually to drive the fast tier's gate assessment.
@@ -13855,7 +14518,9 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
         target_repo: None,
     };
     store.save(&overlay).unwrap();
-    store.register_branch(bead_id, "factory/test-bead-101").unwrap();
+    store
+        .register_branch(bead_id, "factory/test-bead-101")
+        .unwrap();
 
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
 
@@ -13918,7 +14583,9 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
         attempt_started_at: None,
     };
     store.save(&overlay2).unwrap();
-    store.register_branch(bead_id_2, "factory/test-bead-102").unwrap();
+    store
+        .register_branch(bead_id_2, "factory/test-bead-102")
+        .unwrap();
     run_tick(
         &TickDeps {
             scm: &scm,
@@ -13968,7 +14635,9 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
         attempt_started_at: None,
     };
     store.save(&overlay3).unwrap();
-    store.register_branch(bead_id_3, "factory/test-bead-103").unwrap();
+    store
+        .register_branch(bead_id_3, "factory/test-bead-103")
+        .unwrap();
     // Move bead 2 to HumanHeld so it doesn't re-record on tick 3.
     let mut overlay2 = store.load(bead_id_2).unwrap().unwrap();
     overlay2.state = OverlayState::HumanHeld;
@@ -14002,7 +14671,8 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
     // VENDOR_WAIVED telemetry must have been emitted on the
     // Healthy -> Capped edge.
     let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
-    let transition_count = log.matches(EVT_WAIVED).count() + log.matches("REVIEWER_ROTATED").count();
+    let transition_count =
+        log.matches(EVT_WAIVED).count() + log.matches("REVIEWER_ROTATED").count();
     assert!(
         transition_count >= 1,
         "VENDOR_WAIVED or REVIEWER_ROTATED telemetry must have been emitted on the auto-escalation edge; got {transition_count} lines:\n{log}"
@@ -14026,8 +14696,8 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
 fn vendor_health_ledger_ci_pending_with_capped_vendor_skips_wait() {
     use std::sync::Mutex;
 
-    use daemon::vendor_health::VendorHealthLedger;
     use daemon::state::{BeadOverlay, OverlayState};
+    use daemon::vendor_health::VendorHealthLedger;
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -14094,7 +14764,9 @@ fn vendor_health_ledger_ci_pending_with_capped_vendor_skips_wait() {
         attempt_started_at: None,
     };
     store.save(&overlay).unwrap();
-    store.register_branch(bead_id, "factory/ci-wait-bead").unwrap();
+    store
+        .register_branch(bead_id, "factory/ci-wait-bead")
+        .unwrap();
     scm.pr_numbers_for_branch.insert(
         ("owner/repo".into(), "factory/ci-wait-bead".to_string()),
         Some(pr),
@@ -14240,10 +14912,8 @@ fn test_gate_regression_emits_event_and_demotes_to_attested_when_ci_goes_red() {
             head_committed_epoch: now.saturating_sub(60),
         },
     );
-    scm.pr_numbers_for_branch.insert(
-        ("owner/repo".into(), branch.into()),
-        Some(pr),
-    );
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), Some(pr));
     scm.open_pr_head_refs.insert(
         ("owner/repo".into(), pr),
         PrHeadBranch::SameRepo(branch.into()),
@@ -14288,8 +14958,7 @@ fn test_gate_regression_emits_event_and_demotes_to_attested_when_ci_goes_red() {
     // HumanHeld are valid non-Ready terminal outcomes; the contract is
     // specifically that the bead no longer claims to be done.
     assert!(
-        after.state == OverlayState::Attested
-            || after.state == OverlayState::HumanHeld,
+        after.state == OverlayState::Attested || after.state == OverlayState::HumanHeld,
         "regressed bead must land in Attested or HumanHeld, was {:?}",
         after.state
     );
@@ -14381,10 +15050,8 @@ fn test_gate_regression_does_not_fire_when_first_assessment_is_red() {
             head_committed_epoch: now.saturating_sub(60),
         },
     );
-    scm.pr_numbers_for_branch.insert(
-        ("owner/repo".into(), branch.into()),
-        Some(pr),
-    );
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), Some(pr));
     scm.open_pr_head_refs.insert(
         ("owner/repo".into(), pr),
         PrHeadBranch::SameRepo(branch.into()),
@@ -14493,10 +15160,8 @@ fn test_gate_regression_caps_at_max_and_parks_human_held() {
             head_committed_epoch: now.saturating_sub(60),
         },
     );
-    scm.pr_numbers_for_branch.insert(
-        ("owner/repo".into(), branch.into()),
-        Some(pr),
-    );
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), Some(pr));
     scm.open_pr_head_refs.insert(
         ("owner/repo".into(), pr),
         PrHeadBranch::SameRepo(branch.into()),
@@ -14567,9 +15232,7 @@ fn test_gate_regression_counter_increments_on_each_green_to_red() {
     // is the canonical writer; this test only asserts it bumps per call
     // and that the next-tick cap test above sees the correct value.
     for n in 1..=daemon::tick::MAX_GATE_REGRESSIONS {
-        let got = store
-            .incr_gate_regression_count("counter-bead")
-            .unwrap();
+        let got = store.incr_gate_regression_count("counter-bead").unwrap();
         assert_eq!(
             got, n,
             "incr_gate_regression_count must monotonically increment; \
@@ -14729,7 +15392,8 @@ fn test_non_default_repository_labeled_pr_tick_telemetry_attribution() {
         "EXISTING_PR_ADOPTED context must contain head_sha attribution: {context:?}"
     );
     assert_eq!(
-        context["external_ref"], "jleechanorg/worldarchitect.ai#8843"
+        context["external_ref"],
+        "jleechanorg/worldarchitect.ai#8843"
     );
     assert_eq!(context["newly_created"], true);
 
@@ -14780,7 +15444,8 @@ fn test_non_default_repository_branch_collision_telemetry_attribution() {
         head_sha: Some("sha-8731-colliding".into()),
         updated_at_epoch: Some(1_700_000_000),
     });
-    scm.permissions.insert("jleechan2015".into(), Permission::Write);
+    scm.permissions
+        .insert("jleechan2015".into(), Permission::Write);
 
     let tracker = FakeTracker::new();
     let sessions = FakeSessions::new();
@@ -14845,7 +15510,9 @@ fn test_non_default_repository_branch_collision_telemetry_attribution() {
     let telemetry = std::fs::read_to_string(&telemetry_log).unwrap();
     let escalation_line = telemetry
         .lines()
-        .find(|line| line.contains("ESCALATION_REQUIRED") && line.contains("adoption_branch_collision"))
+        .find(|line| {
+            line.contains("ESCALATION_REQUIRED") && line.contains("adoption_branch_collision")
+        })
         .expect("telemetry log must contain ESCALATION_REQUIRED with adoption_branch_collision");
 
     let parsed: serde_json::Value = serde_json::from_str(escalation_line).unwrap();
@@ -14913,8 +15580,12 @@ fn test_dispatched_adopted_idle_session_reaped_and_promoted() {
 
     store.register_branch("bead-w0r4", "fix/test-w0r4").unwrap();
 
-    scm.pr_numbers_for_branch.insert(("owner/repo".into(), "fix/test-w0r4".into()), Some(999));
-    scm.open_pr_head_refs.insert(("owner/repo".into(), 999), daemon::tools::PrHeadBranch::SameRepo("fix/test-w0r4".into()));
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), "fix/test-w0r4".into()), Some(999));
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 999),
+        daemon::tools::PrHeadBranch::SameRepo("fix/test-w0r4".into()),
+    );
     scm.pr_snapshots.insert(
         999,
         PrSnapshot {
@@ -15009,7 +15680,10 @@ fn test_worktree_cleaned_up_on_coder_session_exit_promotion() {
     let stale_worktree = worktree_root.join("owner/repo/wa-3538");
     std::fs::create_dir_all(&stale_worktree).unwrap();
     std::fs::write(stale_worktree.join("marker"), b"leftover coder worktree").unwrap();
-    assert!(stale_worktree.is_dir(), "fixture must actually create the dir");
+    assert!(
+        stale_worktree.is_dir(),
+        "fixture must actually create the dir"
+    );
 
     store.overlays.borrow_mut().insert(
         "bead-rev3lm8k".into(),
@@ -15033,10 +15707,16 @@ fn test_worktree_cleaned_up_on_coder_session_exit_promotion() {
         },
     );
 
-    store.register_branch("bead-rev3lm8k", "fix/test-rev3lm8k").unwrap();
+    store
+        .register_branch("bead-rev3lm8k", "fix/test-rev3lm8k")
+        .unwrap();
 
-    scm.pr_numbers_for_branch.insert(("owner/repo".into(), "fix/test-rev3lm8k".into()), Some(998));
-    scm.open_pr_head_refs.insert(("owner/repo".into(), 998), daemon::tools::PrHeadBranch::SameRepo("fix/test-rev3lm8k".into()));
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), "fix/test-rev3lm8k".into()), Some(998));
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 998),
+        daemon::tools::PrHeadBranch::SameRepo("fix/test-rev3lm8k".into()),
+    );
     scm.pr_snapshots.insert(
         998,
         PrSnapshot {
@@ -15081,7 +15761,10 @@ fn test_worktree_cleaned_up_on_coder_session_exit_promotion() {
         OverlayState::Attested,
         "idle adopted session must promote to ATTESTED"
     );
-    assert_eq!(o.session_id, None, "session handle must be cleared after reaping");
+    assert_eq!(
+        o.session_id, None,
+        "session handle must be cleared after reaping"
+    );
     assert!(
         !stale_worktree.exists(),
         "worktree dir must be cleaned up within the same tick the session is reaped, \
@@ -15131,10 +15814,15 @@ fn session_health_failure_reaps_session_and_requeues_bead() {
             attempt_started_at: None,
         },
     );
-    store.register_branch("bead-health-fail", "factory/bead-health-fail-r1").unwrap();
+    store
+        .register_branch("bead-health-fail", "factory/bead-health-fail-r1")
+        .unwrap();
 
     // Script session health failure (e.g. login expired)
-    sessions.set_session_health_failure("wa-dead-auth", "terminal session error in tmux pane: login expired");
+    sessions.set_session_health_failure(
+        "wa-dead-auth",
+        "terminal session error in tmux pane: login expired",
+    );
 
     let deps = TickDeps {
         scm: &scm,
@@ -15157,10 +15845,7 @@ fn session_health_failure_reaps_session_and_requeues_bead() {
         OverlayState::Queued,
         "session health failure must reset state to Queued so it can be re-dispatched"
     );
-    assert_eq!(
-        o.session_id, None,
-        "dead session handle must be cleared"
-    );
+    assert_eq!(o.session_id, None, "dead session handle must be cleared");
     assert_eq!(
         o.spawn_failure_count, 1,
         "spawn failure count must increment on session health failure"
