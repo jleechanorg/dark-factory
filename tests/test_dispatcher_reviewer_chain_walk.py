@@ -402,3 +402,133 @@ def test_chain_walk_preserves_provenance_check(monkeypatch, dispatcher, stub_eva
     )
     # And the chain-walk tried every vendor before settling.
     assert _seen_with_spy == ["claudem", "agy", "cursor-agent"]
+
+
+# ---------------------------------------------------------------------------
+# Chain-walk: self-review pre-filter (PR #819 round-6)
+#
+# ``verify_provenance`` used to be the ONLY thing standing between a
+# self-authored commit and a self-reviewed verdict, and it only runs
+# AFTER the chain-walk already picked one vendor and returned a terminal
+# result — so a self-review collision surfaced as a hard failure with
+# no fallback, even when the priority queue has other, non-colliding
+# vendors configured. These tests exercise the pre-filter that skips a
+# self-review match BEFORE dispatch, advancing the queue exactly like a
+# pre-emptively-known rate-limit bust.
+# ---------------------------------------------------------------------------
+
+
+def test_chain_walk_self_review_no_fallback_configured(monkeypatch, stub_evaluate):
+    """Only claudem configured, implementer IS claudem -> the walk must
+    fail with a clear, actionable self-review message (not a raw
+    verify_provenance rejection, not the generic rate-limit-exhaustion
+    message), and invoke_reviewer must never be called."""
+    monkeypatch.setattr(
+        "runner.reviewer_priority.skeptic_reviewer_priority",
+        lambda: ["claudem"],
+    )
+    solo_dispatcher = VerifierDispatcher(
+        cheap_reviewer="claudem", cheap_model="MiniMax-M3",
+        premium_reviewer="claudem", premium_model="MiniMax-M3",
+    )
+    fake_invoke, seen = _stub_invoke_reviewer({
+        "claudem": (VALID_OUTPUT, None),
+    })
+    monkeypatch.setattr(
+        "runner.skeptic_gate_cli.invoke_reviewer", fake_invoke
+    )
+
+    results = solo_dispatcher.dispatch(
+        rules=[PREMIUM_RULE],
+        changed_files=["foo.py"],
+        diff="diff",
+        repo="jleechanorg/dark-factory",
+        pr_number=123,
+        head_sha="0123456789abcdef0123456789abcdef01234567",
+        base_sha="0000000000000000000000000000000000000000",
+        implementation_identity="claudem",
+    )
+
+    _, res = results[0]
+    assert res.verdict is None
+    assert res.check_state == "failure"
+    assert seen == [], (
+        f"invoke_reviewer must never be called when every configured "
+        f"reviewer collides with the implementer's identity; got seen={seen!r}"
+    )
+    assert "self-review" in res.reason, (
+        f"reason must clearly name the self-review condition, got {res.reason!r}"
+    )
+    assert "claudem" in res.reason
+    assert "skeptic_reviewer_priority.json" in res.reason, (
+        f"reason must give the operator an actionable next step, got {res.reason!r}"
+    )
+    assert "all reviewers exhausted" not in res.reason, (
+        "self-review-only exhaustion must not be confused with the "
+        "generic rate-limit exhaustion message"
+    )
+
+
+def test_chain_walk_self_review_skips_to_next_vendor(monkeypatch, dispatcher, stub_evaluate):
+    """Default priority (claudem, agy, cursor-agent), implementer IS
+    claudem -> claudem is skipped as a pre-filtered self-review (never
+    invoked), agy is attempted next and succeeds."""
+    fake_invoke, seen = _stub_invoke_reviewer({
+        "agy": (VALID_OUTPUT, None),
+    })
+    monkeypatch.setattr(
+        "runner.skeptic_gate_cli.invoke_reviewer", fake_invoke
+    )
+
+    results = dispatcher.dispatch(
+        rules=[PREMIUM_RULE],
+        changed_files=["foo.py"],
+        diff="diff",
+        repo="jleechanorg/dark-factory",
+        pr_number=123,
+        head_sha="0123456789abcdef0123456789abcdef01234567",
+        base_sha="0000000000000000000000000000000000000000",
+        implementation_identity="claudem",
+    )
+
+    _, res = results[0]
+    assert "claudem" not in seen, (
+        f"claudem must be pre-filtered out (never invoked) when it "
+        f"collides with the implementer's identity; got seen={seen!r}"
+    )
+    assert seen == ["agy"], f"expected agy to be tried next, got seen={seen!r}"
+    assert res.reviewer == "agy", f"expected fallback to agy, got reviewer={res.reviewer!r}"
+    assert res.check_state == "success"
+
+
+def test_chain_walk_non_colliding_identity_unaffected(monkeypatch, dispatcher, stub_evaluate):
+    """Regression guard: a non-colliding implementer identity (codex)
+    is completely unaffected by the self-review pre-filter -- claudem
+    (the resolved premium reviewer) is invoked normally, first try,
+    no fallback."""
+    fake_invoke, seen = _stub_invoke_reviewer({
+        "claudem": (VALID_OUTPUT, None),
+    })
+    monkeypatch.setattr(
+        "runner.skeptic_gate_cli.invoke_reviewer", fake_invoke
+    )
+
+    results = dispatcher.dispatch(
+        rules=[PREMIUM_RULE],
+        changed_files=["foo.py"],
+        diff="diff",
+        repo="jleechanorg/dark-factory",
+        pr_number=123,
+        head_sha="0123456789abcdef0123456789abcdef01234567",
+        base_sha="0000000000000000000000000000000000000000",
+        implementation_identity="codex",
+    )
+
+    _, res = results[0]
+    assert seen == ["claudem"], (
+        f"non-colliding identity must not perturb the chain-walk at all, "
+        f"got seen={seen!r}"
+    )
+    assert res.reviewer == "claudem"
+    assert res.check_state == "success"
+    assert "fallback_used" not in res.reason

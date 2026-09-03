@@ -250,6 +250,43 @@ class VerifierDispatcher:
         last_err: Optional[str] = None
         last_vendor: str = original_vendor
 
+        # Pre-filter self-review out of the queue BEFORE dispatch, not
+        # after. ``expected_identity_for_vendor`` is knowable statically
+        # for every configured vendor, and ``implementation_identity`` is
+        # already known here, so a vendor that would produce a self-review
+        # can be skipped with zero wasted API calls and zero risk of ever
+        # emitting a genuine self-reviewed verdict — the walker advances
+        # past it exactly like a pre-emptively-known rate-limit bust.
+        # ``verify_provenance`` in ``dispatch()`` below remains as a
+        # belt-and-suspenders post-hoc check (not removed): this pre-filter
+        # only covers vendors whose identity is staticaly known in advance
+        # via ``expected_identity_for_vendor``; any path that bypasses it
+        # (or a vendor whose actual declared identity differs from its
+        # expected one) still needs the terminal safety net.
+        implementation_identity_norm = (implementation_identity or "").strip().lower() or "unknown"
+        self_review_vendors = [
+            v for v in queue if _expected_identity_for_vendor(v) == implementation_identity_norm
+        ]
+        queue = [
+            v for v in queue if _expected_identity_for_vendor(v) != implementation_identity_norm
+        ]
+        if not queue:
+            skipped = ", ".join(self_review_vendors) if self_review_vendors else "(none configured)"
+            reason = (
+                f"all configured reviewers share the implementer's identity "
+                f"('{implementation_identity_norm}'); reviewers skipped as "
+                f"self-review: {skipped}. Add a differently-identified "
+                f"reviewer to skeptic_reviewer_priority.json."
+            )
+            return SkepticResult(
+                check_state="failure",
+                verdict=None,
+                reason=reason,
+                comment_body="",
+                parsed=None,
+                reviewer=self_review_vendors[-1] if self_review_vendors else original_vendor,
+            )
+
         for vendor in queue:
             last_vendor = vendor
             try:
