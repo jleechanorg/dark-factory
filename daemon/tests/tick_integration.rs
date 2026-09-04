@@ -12021,6 +12021,11 @@ fn run_tick_emits_parked_human_held_for_unmapped_repo_dispatch_failure() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+/// `target_checkout_unconfigured` moved into recoverable_exact_values in
+/// `daemon/src/state.rs`, and recovery executes in the same tick as the park.
+/// For fixture repo `other/repo`, the bead will recover from `HumanHeld` to
+/// `Queued` on first park while still emitting PARKED_HUMAN_HELD telemetry; if
+/// it keeps failing, it will eventually bounce to attempt cap 10 and stay held.
 #[test]
 fn run_tick_escalates_explicit_target_without_checkout_as_human_held() {
     let scm = FakeScm::new();
@@ -12073,11 +12078,9 @@ fn run_tick_escalates_explicit_target_without_checkout_as_human_held() {
     assert_eq!(summary.beads_parked_human_held, 1);
     assert_eq!(summary.beads_dispatched, 0);
     let overlay = store.load("missing-checkout-bead").unwrap().unwrap();
-    assert_eq!(overlay.state, OverlayState::HumanHeld);
-    assert_eq!(
-        overlay.park_reason.as_deref(),
-        Some("target_checkout_unconfigured")
-    );
+    assert_eq!(overlay.state, OverlayState::Queued);
+    assert_eq!(overlay.park_reason.as_deref(), None);
+    assert_eq!(overlay.attempt, 2);
 
     let telemetry = std::fs::read_to_string(&telemetry_log).unwrap();
     let events: Vec<serde_json::Value> = telemetry
