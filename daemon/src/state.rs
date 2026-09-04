@@ -822,13 +822,17 @@ impl HumanHoldReason {
             || reason.starts_with(ROUTER_PARSE_PARK_REASON_PREFIX)
     }
 
-    fn recoverable_exact_values() -> [String; 5] {
+    /// This park can now auto-recover because operators confirmed the
+    /// affected repos resolve cleanly in config today, so a plain requeue is
+    /// no longer a replay loop and is safe for existing stuck beads.
+    fn recoverable_exact_values() -> [String; 6] {
         [
             Self::TransientSpawnRetryCapExceeded,
             Self::AdoptedPreSessionShaCaptureFailed,
             Self::SessionStalled,
             Self::Stage1GateNotGreen,
             Self::SpecValidationFailed,
+            Self::TargetCheckoutUnconfigured,
         ]
         .map(|candidate| candidate.value())
     }
@@ -2231,8 +2235,8 @@ impl StateStore for SqliteStateStore {
              WHERE state = 'HUMAN_HELD' \
                AND attempt < ?2 \
                AND session_id IS NULL \
-               AND (park_reason IN (?3, ?4, ?5, ?6, ?7) \
-                    OR substr(park_reason, 1, length(?8)) = ?8) \
+               AND (park_reason IN (?3, ?4, ?5, ?6, ?7, ?8) \
+                    OR substr(park_reason, 1, length(?9)) = ?9) \
              RETURNING bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
                  pr_number, branch, session_id, is_adopted, spawn_failure_count, \
                  pre_session_head_sha, park_reason, target_repo, session_ao_project, attempt_started_at",
@@ -2248,6 +2252,7 @@ impl StateStore for SqliteStateStore {
                     &recoverable[2],
                     &recoverable[3],
                     &recoverable[4],
+                    &recoverable[5],
                     ROUTER_PARSE_PARK_REASON_PREFIX,
                 ],
                 |row| {
@@ -4676,6 +4681,89 @@ mod tests {
         let transient = store.load("transient-stalled").unwrap().unwrap();
         assert_eq!(transient.state, OverlayState::Queued);
         assert_eq!(transient.attempt, 3);
+    }
+
+    #[test]
+    fn recover_human_held_recovers_target_checkout_unconfigured_parks() {
+        let schema = include_str!("../contracts/schema.sql");
+        let store = SqliteStateStore::open_in_memory_with_schema(schema).unwrap();
+
+        let mut overlays = HashMap::new();
+        overlays.insert(
+            "target-checkout-unconfigured-recovered".to_string(),
+            BeadOverlay {
+                bead_id: "target-checkout-unconfigured-recovered".into(),
+                state: OverlayState::HumanHeld,
+                attempt: 2,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: Some("factory/target-checkout-reconfigured-r1".into()),
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: Some("target_checkout_unconfigured".to_string()),
+                target_repo: Some("jleechanorg/dark-factory".to_string()),
+                attempt_started_at: None,
+                session_ao_project: None,
+            },
+        );
+        overlays.insert(
+            "target-checkout-unconfigured-capped".to_string(),
+            BeadOverlay {
+                bead_id: "target-checkout-unconfigured-capped".into(),
+                state: OverlayState::HumanHeld,
+                attempt: 10,
+                reroll_count: 0,
+                autonomy_secs: 1800,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: Some("factory/target-checkout-reconfigured-r2".into()),
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: Some("target_checkout_unconfigured".to_string()),
+                target_repo: Some("jleechanorg/worldarchitect.ai".to_string()),
+                attempt_started_at: None,
+                session_ao_project: None,
+            },
+        );
+        for overlay in overlays.values() {
+            store.save(overlay).unwrap();
+        }
+
+        let recovered = store.recover_human_held(10).unwrap();
+        assert_eq!(
+            recovered.len(),
+            1,
+            "exactly one target_checkout_unconfigured overlay should be recovered"
+        );
+        assert_eq!(
+            recovered[0].bead_id,
+            "target-checkout-unconfigured-recovered",
+            "the below-cap attempt should be the recovered overlay"
+        );
+
+        let recovered_overlay = store
+            .load("target-checkout-unconfigured-recovered")
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered_overlay.state, OverlayState::Queued);
+        assert_eq!(recovered_overlay.attempt, 3);
+        assert_eq!(
+            recovered_overlay.park_reason, None,
+            "recover_human_held clears park_reason on recovered rows"
+        );
+
+        let capped = store
+            .load("target-checkout-unconfigured-capped")
+            .unwrap()
+            .unwrap();
+        assert_eq!(capped.state, OverlayState::HumanHeld);
+        assert_eq!(capped.attempt, 10);
     }
 
     /// jleechan-8jxr r2: a bead parked HUMAN_HELD with
