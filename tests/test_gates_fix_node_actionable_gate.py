@@ -26,12 +26,25 @@ running this same test fails — `fix` executes and creates a commit.
 
 from __future__ import annotations
 
+import os
 import pathlib
 import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+
+# The global pre-commit hook (~/.claude/hooks/pre-commit-git-identity-
+# example-com-guard.sh, wired via core.hooksPath onto any fresh `git init`)
+# rejects an @example.com committer email unconditionally — its own
+# message advertises HERMES_SKIP_EXAMPLE_COM_GUARD=1 as an escape hatch but
+# the script never actually reads that var (repo-owned; not this branch's
+# fix to make). Use a non-example.com placeholder instead, matching the
+# hook's OWN suggested identity, so real commits in these fixtures aren't
+# silently blocked (which would make "zero commits" pass for the WRONG
+# reason — the guard, not the routing fix under test).
+_GIT_ENV = dict(os.environ)
+_TEST_GIT_EMAIL = "darkfactory-sidekick-test@users.noreply.github.com"
 
 from runner.engine import run  # noqa: E402
 from runner.handlers import Context, Result, TYPE_REGISTRY  # noqa: E402
@@ -51,14 +64,15 @@ _NULL_VERDICT_OUTPUT = (
 
 def _git(*args: str, cwd: pathlib.Path) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=False
+        ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=False,
+        env=_GIT_ENV,
     )
 
 
 def _init_repo(workdir: pathlib.Path) -> None:
     workdir.mkdir(parents=True, exist_ok=True)
     _git("init", "-q", cwd=workdir)
-    _git("config", "user.email", "test@example.com", cwd=workdir)
+    _git("config", "user.email", _TEST_GIT_EMAIL, cwd=workdir)
     _git("config", "user.name", "Test", cwd=workdir)
     (workdir / "README.md").write_text("original\n", encoding="utf-8")
     _git("add", "-A", cwd=workdir)

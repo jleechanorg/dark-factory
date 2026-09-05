@@ -873,6 +873,12 @@ def run(
                 ctx.run_id = candidate_run_id
     if not ctx.run_id:
         ctx.run_id = uuid.uuid4().hex[:12]
+    # dark-factory#828 item (e): snapshot HEAD + upstream SHA before any
+    # node runs so run_end can report commits_created/refs_pushed. Guarded
+    # so a resume (which reuses `ctx`) does not overwrite the ORIGINAL
+    # run's base with a mid-run snapshot.
+    if not ctx.state.get("_df_run_base_sha") and not ctx.state.get("_df_run_base_upstream_sha"):
+        ctx.state.update(_obs._capture_run_base_state(getattr(ctx, "workdir", None)))
     if controller_graph or resume is not None:
         _load_controller_snapshot_journal(ctx)
 
@@ -1756,6 +1762,20 @@ def run(
         # work sitting in the worktree. Surfaced into BOTH the run_end event
         # payload (CXDB record) AND the human-readable log line.
         uncommitted = _obs._collect_uncommitted_state(getattr(ctx, "workdir", None))
+        # dark-factory#828 item (e): commits_created/refs_pushed — the
+        # fields that would have caught the real incident even though
+        # "uncommitted_files": "0" was technically true (the coder had
+        # already committed AND pushed).
+        commit_push = _obs._collect_commit_push_state(
+            getattr(ctx, "workdir", None),
+            str(ctx.state.get("_df_run_base_sha", "") or ""),
+            str(ctx.state.get("_df_run_base_upstream_sha", "") or ""),
+        )
+        # Stash into ctx.state so the CLI's top-line JSON summary
+        # (runner/__main__.py) can surface the same values without a
+        # second round of git subprocess calls.
+        ctx.state["_df_run_commits_created"] = commit_push.get("commits_created", "")
+        ctx.state["_df_run_refs_pushed"] = commit_push.get("refs_pushed", "")
         _obs._emit_event(
             ctx,
             "run_end",
@@ -1765,13 +1785,17 @@ def run(
                 "ended_at_exit": str(ended_at_exit),
                 "steps": str(len(history)),
                 **uncommitted,
+                **commit_push,
             },
             seq,
         )
         uncommitted_log = _obs._format_uncommitted_for_log(uncommitted)
+        commit_push_log = _obs._format_commit_push_for_log(commit_push)
         log_line = f"run end final={final_outcome!r} steps={len(history)}"
         if uncommitted_log:
             log_line = f"{log_line} {uncommitted_log}"
+        if commit_push_log:
+            log_line = f"{log_line} {commit_push_log}"
         _obs._log(log, log_line)
         success_count, failure_count, error_count = _obs._outcome_counts(history)
         perf_log.close_run(

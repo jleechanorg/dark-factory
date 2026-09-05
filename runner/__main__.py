@@ -681,6 +681,12 @@ def main(argv: list[str] | None = None) -> int:
             "evidence_bundle": str(args.evidence_bundle) if args.evidence_bundle else None,
             "steps": len(history),
             "final_outcome": history[-1].outcome if history else "empty",
+            # dark-factory#828 item (e): the real incident's summary gave
+            # zero indication a write occurred. Empty string means
+            # undeterminable (not a git repo, or the base snapshot never
+            # captured) — never confused with a confirmed "0".
+            "commits_created": ctx.state.get("_df_run_commits_created", "") if ctx else "",
+            "refs_pushed": ctx.state.get("_df_run_refs_pushed", "") if ctx else "",
             "trace": [
                 {
                     "node": r.node,
