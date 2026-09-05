@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import pathlib
 import shutil
@@ -315,6 +316,19 @@ def main(argv: list[str] | None = None) -> int:
                 "ctx.state['target']; see rev-xfy23 for the follow-up."
             ),
         )
+        p.add_argument(
+            "--target-intent",
+            default=None,
+            help=(
+                "Free-text task/intent statement for a --target run (e.g. "
+                "what a calling LLM changed and wants reviewed, used by "
+                "/factory-review). Requires --target. Sets "
+                "ctx.state['intent'] the same way a worker visit's --goal "
+                "does (D2's Base64-encoded task-record envelope) — this is "
+                "a dedicated CLI flag, not the generic --state escape "
+                "hatch that D2/D3/D8a refuse for the reserved 'intent' key."
+            ),
+        )
         p.add_argument("--workdir", type=pathlib.Path, default=pathlib.Path.cwd())
         p.add_argument("--preflight", action="store_true", help="Validate pipeline and emit diagnostics, then exit.")
         p.add_argument(
@@ -455,6 +469,8 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.target and args.goal:
             p.error("--target and --goal are mutually exclusive (D5): pass one or the other")
+        if args.target_intent and not args.target:
+            p.error("--target-intent requires --target")
 
         resolved_target_locator = None
         if args.target:
@@ -598,6 +614,10 @@ def main(argv: list[str] | None = None) -> int:
         if resolved_target_locator is not None:
             ctx.state["target"] = resolved_target_locator.canonical
             ctx.state["_df_target_mode"] = "true"
+            if args.target_intent:
+                ctx.state["intent"] = base64.b64encode(
+                    args.target_intent.strip().encode("utf-8")
+                ).decode("ascii")
         if args.backend == "ao":
             if not args.ao_project:
                 p.error("--backend ao requires --ao-project")
