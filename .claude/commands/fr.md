@@ -17,7 +17,7 @@ truth.
 ```
 /fr                                                  # review the calling repo's current diff vs its default branch
 /fr --target "PR 811"                                # review an existing PR
-/fr --target-intent "added a caching layer; review for correctness"
+/fr --target-intent "added a caching layer; review for correctness"  # always paired with a --target (explicit or auto-derived per SKILL.md Step 1)
 ```
 
 ## See also
