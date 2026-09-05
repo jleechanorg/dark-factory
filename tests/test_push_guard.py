@@ -34,7 +34,16 @@ def _git(*args: str, cwd: pathlib.Path, env: dict | None = None) -> subprocess.C
 
 def _init_repo(workdir: pathlib.Path) -> None:
     workdir.mkdir(parents=True, exist_ok=True)
-    _git("init", "-q", cwd=workdir)
+    # Explicit -b main: some hosts (e.g. our own Mac dev env, which already
+    # defaults init.defaultBranch=main) never hit this, but a CI runner
+    # whose global git config leaves init.defaultBranch at git's old
+    # "master" default gets a LOCAL branch name that doesn't match the
+    # `HEAD:refs/heads/main` this file's tests push to -- with git's
+    # push.default=simple (the default since git 2.0), a later bare
+    # `git push` then fails with "the upstream branch of your current
+    # branch does not match the name of your current branch". Found live
+    # in CI on PR #832 (this exact test), not reproduced locally.
+    _git("init", "-q", "-b", "main", cwd=workdir)
     _git("config", "user.email", _TEST_GIT_EMAIL, cwd=workdir)
     _git("config", "user.name", "Test", cwd=workdir)
     (workdir / "README.md").write_text("original\n", encoding="utf-8")

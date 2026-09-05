@@ -37,7 +37,12 @@ def _git(*args: str, cwd: pathlib.Path) -> subprocess.CompletedProcess:
 
 def _init_repo(workdir: pathlib.Path) -> None:
     workdir.mkdir(parents=True, exist_ok=True)
-    _git("init", "-q", cwd=workdir)
+    # Explicit -b main: see tests/test_push_guard.py::_init_repo for the
+    # full explanation -- a CI runner without init.defaultBranch=main
+    # produces a local branch name that doesn't match the explicit
+    # `HEAD:refs/heads/main` push below, breaking a later bare `git push`
+    # under push.default=simple. Found live in CI on PR #832.
+    _git("init", "-q", "-b", "main", cwd=workdir)
     _git("config", "user.email", _TEST_GIT_EMAIL, cwd=workdir)
     _git("config", "user.name", "Test", cwd=workdir)
     (workdir / "README.md").write_text("original\n", encoding="utf-8")
