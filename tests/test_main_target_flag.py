@@ -201,6 +201,51 @@ class TestTargetFlagResolution:
         err = capsys.readouterr().err
         assert "reserved key 'intent'" in err
 
+    def test_target_intent_requires_target(self, tmp_path, capsys):
+        """`/factory-review` (/fr) needs a way to carry the calling LLM's
+        task description into a --target run's ${intent}; --target-intent
+        is that dedicated flag and must refuse to run without --target."""
+        with pytest.raises(SystemExit) as exc_info:
+            main([
+                "--pipeline", "pipelines/factory/hello.dot",
+                "--goal", "do something",
+                "--target-intent", "reviewed change description",
+                "--backend", "echo",
+                "--workdir", str(tmp_path),
+                "--no-perf-log",
+            ])
+        assert exc_info.value.code == 2
+        err = capsys.readouterr().err
+        assert "--target-intent requires --target" in err
+
+    def test_target_intent_sets_base64_intent_state(self, tmp_path, monkeypatch):
+        """--target-intent free text lands in ctx.state['intent'] as the
+        same Base64-encoded envelope shape _mint_post_worker_target uses
+        for a worker's --goal (D2), so review_only.dot's cold_reviewer
+        renders a real task record instead of the default placeholder."""
+        import base64
+
+        target_file = tmp_path / "spec.md"
+        target_file.write_text("spec body")
+        captured: dict = {}
+        _stub_run(monkeypatch, captured)
+        pipeline = _reviewer_first_pipeline(tmp_path)
+
+        rc = main([
+            "--pipeline", str(pipeline),
+            "--target", str(target_file),
+            "--target-intent", "added a caching layer; please review",
+            "--backend", "echo",
+            "--workdir", str(tmp_path),
+            "--no-perf-log",
+            "--evidence-bundle", str(tmp_path / "evidence"),
+        ])
+
+        assert rc == 0
+        ctx = captured["ctx"]
+        decoded = base64.b64decode(ctx.state["intent"]).decode("utf-8")
+        assert decoded == "added a caching layer; please review"
+
     @pytest.mark.parametrize(
         "reserved_key",
         [
