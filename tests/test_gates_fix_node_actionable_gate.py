@@ -143,6 +143,68 @@ def test_pr_gates_dot_null_verdict_never_reaches_fix(monkeypatch, tmp_path):
     assert _commit_count(workdir) == commits_before
 
 
+def test_verify_dot_has_no_code_producing_node():
+    """dark-factory#828 item (a): pipelines/factory/verify.dot is the
+    STRUCTURAL guarantee — a review-only pipeline with no fix/coder node at
+    all, so no gate outcome, verdict, or routing bug can ever cause a
+    write. Unlike gates.dot (fixed at the routing-logic level above), this
+    holds even if verdict-parsing regresses again."""
+    from runner import graph_audit as _graph_audit
+    from runner import handlers as _handlers
+    from runner.parser import parse
+
+    g = parse(ROOT / "pipelines" / "factory" / "verify.dot")
+    assert "start" in g.nodes and "exit" in g.nodes
+    for name, node in g.nodes.items():
+        if name in ("start", "exit"):
+            continue
+        assert not _graph_audit._is_code_producing(node), (
+            f"verify.dot node {name!r} is code-producing (resolves to the "
+            f"codergen handler) — verify.dot must contain NO node capable "
+            f"of writing to the target repo"
+        )
+    # Explicit belt-and-braces: no node literally declares type="codergen"
+    # and no node is unlabeled (which would default-resolve to codergen).
+    for name, node in g.nodes.items():
+        if name in ("start", "exit"):
+            continue
+        assert node.attrs.get("type") not in (None, "", "codergen"), (
+            f"verify.dot node {name!r} has no explicit non-codergen type"
+        )
+    violations = _graph_audit.audit_graph(ROOT / "pipelines" / "factory" / "verify.dot")
+    assert violations == [], f"graph_audit violations on verify.dot: {violations}"
+
+
+def test_verify_dot_null_verdict_reaches_exit_with_zero_commits(monkeypatch, tmp_path):
+    """Same repro shape as test_gates_dot_null_verdict_never_reaches_fix,
+    against verify.dot — proves the structural guarantee holds for the
+    exact incident shape too, not just the gates.dot routing fix."""
+    from runner.parser import parse
+
+    graph = parse(ROOT / "pipelines" / "factory" / "verify.dot")
+    workdir = tmp_path / "target_repo"
+    _init_repo(workdir)
+    commits_before = _commit_count(workdir)
+
+    def fake_holdout(node, ctx):
+        return Result(outcome="success", output="holdout ok")
+
+    def fake_null_verdict_skeptic(node, ctx):
+        raw, outcome = _parse_verdict(_NULL_VERDICT_OUTPUT)
+        return Result(outcome=outcome, output=_NULL_VERDICT_OUTPUT, metadata={"verdict": raw})
+
+    monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+    monkeypatch.setitem(TYPE_REGISTRY, "gate_skeptic", fake_null_verdict_skeptic)
+
+    ctx = Context(goal="Adversarially review; verify only, do not change code.", workdir=workdir, backend="echo")
+    history = run(graph, ctx, max_steps=30)
+    executed_nodes = [step.node for step in history]
+
+    assert "exit" in executed_nodes
+    assert "codergen" not in executed_nodes  # no such node exists in this graph
+    assert _commit_count(workdir) == commits_before
+
+
 def test_gates_dot_real_failure_still_reaches_fix(monkeypatch, tmp_path):
     """Control case: a GENUINE reviewer rejection (a real finding) must
     still route to fix — this fix must not turn `fix` into dead code."""
