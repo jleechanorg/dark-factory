@@ -212,6 +212,14 @@ jobs:
       SKEPTIC_REVIEWERS_JSON: '[["codex",""],["gemini","gemini-3.7-pro"]]'
       SKEPTIC_STATUS_CONTEXT: "skeptic"
       SKEPTIC_EXPECTED_ACTOR: "github-actions[bot]"
+      # This unattended CI gate is not a manual/interactive `/factory`
+      # invocation -- it must resolve `runner.reviewer_priority`'s
+      # claudem-first /af list (not the codex-first manual list), same
+      # as every AO-worker-spawned dark-factory process. Without this,
+      # `skeptic_reviewer_priority()`'s chain-walk premium reviewer here
+      # (runner/skeptic_gate_cli.py) silently becomes codex, burning
+      # codex quota on every gated PR post-merge.
+      DARK_FACTORY_VIA_AF: "1"
       # Pinned reviewer binary locations + integrity (mandatory — no
       # defaults; absence = fatal per post-audit comment 4953116428).
       SKEPTIC_CODEX_BIN: ${{ vars.SKEPTIC_CODEX_BIN }}
