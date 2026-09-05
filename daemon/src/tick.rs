@@ -4062,11 +4062,46 @@ fn skeptic_evidence(
 ///
 /// This is the PRODUCTION-side wiring of the gate-8 path that the
 /// verifier side (`vacuous_red_green_gate`) consumes. It is intentionally
-/// minimal: the detector runs only when the daemon's own CWD is a checkout
-/// of a cargo project (the typical Stage-2 production-adjacent lane). For
+/// minimal: the detector runs only when the daemon has a configured target
+/// worktree with a supported Cargo or Python manifest (the typical Stage-2
+/// production-adjacent lane). For
 /// the Stage-1 test-repo lane (`is_test_repo`) the detector is not invoked
 /// and the status stays `NotProvided`, so the gate stays Green.
 ///
+/// Resolve the vacuous-test detector backend and its manifest in a target
+/// worktree. Cargo remains preferred when both manifests are present, which
+/// preserves the mixed-stack repository contract; Python-only targets route
+/// to pytest instead of being rejected as Cargo `ManifestMissing`.
+fn resolve_vacuous_red_green_manifest(
+    repo_root: &Path,
+) -> Result<(crate::vacuous_red_green::Backend, std::path::PathBuf), String> {
+    use crate::vacuous_red_green::{
+        find_cargo_manifest, find_cargo_manifest_recursive, find_pytest_manifest_recursive,
+        Backend,
+    };
+
+    let backend = Backend::detect(repo_root).ok_or_else(|| {
+        format!(
+            "no Cargo.toml or pyproject.toml/pytest.ini reachable from {} (walk-up + recursive depth-4 both failed)",
+            repo_root.display()
+        )
+    })?;
+    let manifest = match backend {
+        Backend::Cargo => find_cargo_manifest(repo_root)
+            .or_else(|| find_cargo_manifest_recursive(repo_root, 4)),
+        Backend::Pytest => find_pytest_manifest_recursive(repo_root, 4),
+    };
+    manifest
+        .map(|path| (backend, path))
+        .ok_or_else(|| {
+            format!(
+                "detected {} backend but its manifest disappeared under {}",
+                backend.as_str(),
+                repo_root.display()
+            )
+        })
+}
+
 /// The detector's verdict is translated verbatim — the r5 contract says
 /// the gate consumer is the source of truth on what each verdict means for
 /// merge eligibility (`Vacuous -> Red`, others -> Green/Unknown).
@@ -4131,29 +4166,15 @@ fn vacuous_red_green_for_pr(
             ));
         }
     };
-    let manifest = match crate::vacuous_red_green::find_cargo_manifest(&repo_root) {
-        Some(m) => m,
-        None => {
-            // jleechan-ni1k / issue #437 bonus: dark-factory's daemon
-            // crate lives at `<repo_root>/daemon/Cargo.toml`, not at the
-            // repo root. The walk-up `find_cargo_manifest` returns None
-            // on this nested-crate layout, surfacing `ManifestMissing`
-            // on the very repo the gate is supposed to vet. Fall back
-            // to a bounded recursive search (skips `target` /
-            // `node_modules` / `.git`, capped at depth 4) so a nested
-            // crate manifest is reachable. If both lookups fail, we
-            // keep the original error message so operators see both
-            // paths attempted.
-            match crate::vacuous_red_green::find_cargo_manifest_recursive(&repo_root, 4) {
-                Some(m) => m,
-                None => {
-                    return verifier::VacuousRedGreenStatus::ManifestMissing(format!(
-                        "no Cargo.toml reachable from {} (walk-up + recursive depth-4 both failed)",
-                        repo_root.display()
-                    ));
-                }
-            }
-        }
+    // Select the runner from the target worktree, preserving Cargo's
+    // precedence for mixed Rust/Python repositories while allowing a Python
+    // target with no Cargo manifest to reach the already-implemented pytest
+    // backend.  The old path unconditionally searched for Cargo.toml here,
+    // so every Python assessment stopped at ManifestMissing before
+    // Backend::detect could participate.
+    let (_backend, manifest) = match resolve_vacuous_red_green_manifest(&repo_root) {
+        Ok(resolved) => resolved,
+        Err(reason) => return verifier::VacuousRedGreenStatus::ManifestMissing(reason),
     };
 
     // Resolve the base ref from the PR's merge-base. Use `gh pr view`
@@ -4189,14 +4210,7 @@ fn vacuous_red_green_for_pr(
         .files
         .iter()
         .map(|f| {
-            let kind = if f.path.contains("/tests/")
-                || f.path.starts_with("tests/")
-                || f.path.ends_with("_test.rs")
-            {
-                crate::vacuous_red_green::FileClass::Test
-            } else {
-                crate::vacuous_red_green::FileClass::Production
-            };
+            let kind = classify_vacuous_changed_file(&f.path);
             Ok((repo_root.join(&f.path), kind))
         })
         .collect::<Result<Vec<_>, std::convert::Infallible>>()
@@ -4215,6 +4229,257 @@ fn vacuous_red_green_for_pr(
     ) {
         Ok(report) => translate_verdict(report.verdict, report.failed_on_revert),
         Err(e) => translate_error(e),
+    }
+}
+
+/// Classify a PR path for gate 8. Python production modules remain
+/// `Production`, while pytest's conventional root and nested test names are
+/// routed as `Test` so `compute_targeted_python_test_fns` can select the
+/// changed test functions.
+fn classify_vacuous_changed_file(path: &str) -> crate::vacuous_red_green::FileClass {
+    let basename = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path);
+    if path.contains("/tests/")
+        || path.starts_with("tests/")
+        || path.ends_with("_test.rs")
+        || basename.starts_with("test_")
+        || basename.ends_with("_test.py")
+    {
+        crate::vacuous_red_green::FileClass::Test
+    } else {
+        crate::vacuous_red_green::FileClass::Production
+    }
+}
+
+#[cfg(test)]
+mod vacuous_red_green_routing_tests {
+    use super::{classify_vacuous_changed_file, resolve_vacuous_red_green_manifest};
+    use crate::vacuous_red_green::{check_red_green_with_manifest, Backend, FileClass, Verdict};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn run(dir: &Path, args: &[&str]) {
+        let out = Command::new(args[0])
+            .current_dir(dir)
+            .args(&args[1..])
+            .output()
+            .expect("spawn fixture command");
+        assert!(
+            out.status.success(),
+            "fixture command {:?} failed: stdout={} stderr={}",
+            args,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn temp_fixture(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "dark_factory_tick_{name}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("create fixture");
+        root
+    }
+
+    fn build_nested_mvp_project(vacuous: bool) -> (PathBuf, String, PathBuf, Vec<(PathBuf, FileClass)>) {
+        let root = temp_fixture(if vacuous { "nested_mvp_vacuous" } else { "nested_mvp_genuine" });
+        let project = root.join("mvp_site");
+        std::fs::create_dir_all(project.join("pkg")).unwrap();
+        std::fs::create_dir_all(project.join("tests")).unwrap();
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[project]\nname='mvp-site'\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("pkg/__init__.py"), "").unwrap();
+        std::fs::write(project.join("pkg/value.py"), "def value():\n    return 'old'\n").unwrap();
+        std::fs::write(project.join("tests/__init__.py"), "").unwrap();
+        std::fs::write(
+            project.join("tests/test_value.py"),
+            "from pkg.value import value\n\ndef test_value():\n    assert value() == 'old'\n",
+        )
+        .unwrap();
+        let run = |args: &[&str]| {
+            let out = Command::new(args[0])
+                .current_dir(&root)
+                .args(&args[1..])
+                .output()
+                .expect("spawn nested fixture command");
+            assert!(out.status.success(), "fixture command {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["git", "init", "-q", "-b", "main"]);
+        run(&["git", "config", "user.email", "nested@example.com"]);
+        run(&["git", "config", "user.name", "nested"]);
+        run(&["git", "add", "."]);
+        run(&["git", "commit", "-q", "-m", "base"]);
+        let base = String::from_utf8(
+            Command::new("git")
+                .current_dir(&root)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+
+        std::fs::write(project.join("pkg/value.py"), "def value():\n    return 'new'\n").unwrap();
+        std::fs::write(
+            project.join("tests/test_value.py"),
+            if vacuous {
+                "def test_value():\n    assert 2 + 2 == 4\n"
+            } else {
+                "from pkg.value import value\n\ndef test_value():\n    assert value() == 'new'\n"
+            },
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("tests/test_new.py"),
+            "def test_new():\n    assert 3 + 3 == 6\n",
+        )
+        .unwrap();
+        run(&["git", "add", "."]);
+        run(&["git", "commit", "-q", "-m", "head"]);
+
+        let changed = vec![
+            (project.join("pkg/value.py"), FileClass::Production),
+            (project.join("tests/test_value.py"), FileClass::Test),
+            (project.join("tests/test_new.py"), FileClass::Test),
+        ];
+        (root, base, project.join("pyproject.toml"), changed)
+    }
+
+    #[test]
+    fn python_target_worktree_routes_to_pytest_and_runs_targeted_test() {
+        assert!(
+            Command::new("pytest")
+                .arg("--version")
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false),
+            "pytest is required for the routed Python gate regression"
+        );
+
+        let root = temp_fixture("python_gate8");
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(root.join("pyproject.toml"), "[project]\nname = 'gate8-fixture'\n").unwrap();
+        std::fs::write(root.join("pkg/__init__.py"), "").unwrap();
+        std::fs::write(root.join("tests/__init__.py"), "").unwrap();
+        std::fs::write(root.join("pkg/value.py"), "def value():\n    return 'old'\n").unwrap();
+        std::fs::write(
+            root.join("tests/test_value.py"),
+            "from pkg.value import value\n\ndef test_value():\n    assert value() == 'old'\n",
+        )
+        .unwrap();
+        run(&root, &["git", "init", "-q", "-b", "main"]);
+        run(&root, &["git", "config", "user.email", "gate8@example.com"]);
+        run(&root, &["git", "config", "user.name", "gate8"]);
+        run(&root, &["git", "add", "."]);
+        run(&root, &["git", "commit", "-q", "-m", "base"]);
+        let base = String::from_utf8(
+            Command::new("git")
+                .current_dir(&root)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        std::fs::write(root.join("pkg/value.py"), "def value():\n    return 'new'\n").unwrap();
+        std::fs::write(
+            root.join("tests/test_value.py"),
+            "from pkg.value import value\n\ndef test_value():\n    assert value() == 'new'\n",
+        )
+        .unwrap();
+        run(&root, &["git", "add", "."]);
+        run(&root, &["git", "commit", "-q", "-m", "feat"]);
+
+        let (backend, manifest) = resolve_vacuous_red_green_manifest(&root).expect("route");
+        assert_eq!(backend, Backend::Pytest);
+        assert_eq!(manifest.file_name().and_then(|n| n.to_str()), Some("pyproject.toml"));
+        assert_eq!(classify_vacuous_changed_file("pkg/value.py"), FileClass::Production);
+        assert_eq!(classify_vacuous_changed_file("tests/test_value.py"), FileClass::Test);
+        assert_eq!(
+            classify_vacuous_changed_file("pkg/test_widget.py"),
+            FileClass::Test
+        );
+        assert_eq!(
+            classify_vacuous_changed_file("test_root.py"),
+            FileClass::Test
+        );
+        assert_eq!(
+            classify_vacuous_changed_file("pkg/widget.py"),
+            FileClass::Production
+        );
+
+        let changed = vec![
+            (root.join("pkg/value.py"), FileClass::Production),
+            (root.join("tests/test_value.py"), FileClass::Test),
+        ];
+        let report = check_red_green_with_manifest(&root, &base, &changed, Some(&manifest))
+            .expect("pytest backend should execute");
+        assert_eq!(report.verdict, Verdict::Genuine, "report={report:?}");
+
+        // Keep the same routed target and production diff, then replace the
+        // assertion with a tautology. The backend must still execute pytest,
+        // but now correctly classify the test as vacuous rather than
+        // weakening gate 8 to a mere "pytest exited zero" check.
+        std::fs::write(
+            root.join("tests/test_value.py"),
+            "def test_value():\n    assert 1 + 1 == 2\n",
+        )
+        .unwrap();
+        run(&root, &["git", "add", "."]);
+        run(&root, &["git", "commit", "-q", "-m", "test-vacuous"]);
+        let vacuous = check_red_green_with_manifest(&root, &base, &changed, Some(&manifest))
+            .expect("pytest backend should execute vacuous test");
+        assert_eq!(vacuous.verdict, Verdict::Vacuous, "report={vacuous:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nested_mvp_site_routes_genuine_pytest_with_new_test_file() {
+        let (root, base, manifest, changed) = build_nested_mvp_project(false);
+        let (backend, detected_manifest) =
+            resolve_vacuous_red_green_manifest(&root).expect("nested route");
+        assert_eq!(backend, Backend::Pytest);
+        assert_eq!(detected_manifest, manifest);
+        let report = check_red_green_with_manifest(&root, &base, &changed, Some(&manifest))
+            .expect("nested pytest backend should execute");
+        assert_eq!(report.verdict, Verdict::Genuine, "report={report:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nested_mvp_site_routes_vacuous_pytest_with_new_test_file() {
+        let (root, base, manifest, changed) = build_nested_mvp_project(true);
+        let report = check_red_green_with_manifest(&root, &base, &changed, Some(&manifest))
+            .expect("nested pytest backend should execute");
+        assert_eq!(report.verdict, Verdict::Vacuous, "report={report:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mixed_target_worktree_keeps_cargo_precedence() {
+        let root = temp_fixture("mixed_gate8");
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname='gate8'\nversion='0.1.0'\nedition='2021'\n").unwrap();
+        std::fs::write(root.join("pyproject.toml"), "[project]\nname='gate8'\n").unwrap();
+        let (backend, manifest) = resolve_vacuous_red_green_manifest(&root).expect("route");
+        assert_eq!(backend, Backend::Cargo);
+        assert_eq!(manifest.file_name().and_then(|n| n.to_str()), Some("Cargo.toml"));
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 

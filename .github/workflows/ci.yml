@@ -243,6 +243,23 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Set up Python for gate-8 pytest backend
+        uses: actions/setup-python@8d9ed9ac5c53483de85588cdf95a591a75ab9f55  # v5.5.0
+        with:
+          python-version: "3.13"
+
+      - name: Install pinned pytest capability
+        # daemon/tests/vacuous_red_green_pytest_integration.rs exercises the
+        # real pytest subprocess and detached pyproject baseline semantics;
+        # do not replace this with a fake executable or a skip.
+        run: python -m pip install --disable-pip-version-check "pytest==8.3.5"
+
+      - name: Report gate-8 pytest capability
+        run: |
+          set -euo pipefail
+          python --version
+          pytest --version
+
       - name: Ensure main ref for VCS integration test
         # daemon/tests/adapters_integration.rs:7 calls `git base_head main` which
         # requires a local `main` ref. actions/checkout by default does NOT create
