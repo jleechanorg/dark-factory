@@ -18,6 +18,7 @@ digraph gates {
         label="Skeptic (inverted-incentive review)",
         backend_priority="codex,minimax,agy,claude-sonnet",
         prefer_adversarial="true",
+        max_retries=2,
         timeout=600
     ]
     adversarial_reviewer [
@@ -87,8 +88,30 @@ digraph gates {
     holdout -> gate_skeptic [condition="outcome=success"]
     holdout -> fix         [condition="outcome!=success"]
 
+    // Issue #827 Defect 1: a null/unparseable verdict is scored as its own
+    // `inconclusive` outcome (see runner/handler_universal_prompts.py
+    // _gate_skeptic), distinct from a real `failure` rejection. It is
+    // retried up to `max_retries` times above (in-node, no extra graph
+    // steps); if still inconclusive after that, there is no finding for
+    // `fix` to act on, so this routes straight to `exit` instead — the
+    // `_exit` handler (runner/handler_core.py) propagates a non-success
+    // predecessor outcome rather than masking it as a pass, so
+    // `final_outcome` never reads as a false "success"/"pass".
+    //
+    // The condition below matches on the `no_verdict` metadata flag, NOT
+    // on `outcome=inconclusive` directly: the engine's
+    // `_run_single_node` normalizes every Result's `.outcome` through
+    // `_classify_outcome` before any edge condition sees it, and that
+    // classifier buckets "inconclusive" into "failure" (same bucket as a
+    // real rejection) — so an `outcome`-keyed condition could never tell
+    // the two apart at routing time. `metadata` is untouched by that
+    // normalization, which is also why this is not the `outcome!=success`
+    // shape the G2 graph audit forbids on reviewer->exit edges: this
+    // reroutes a non-actionable "no verdict produced" event, not a real
+    // failure verdict, off the fix loop.
     gate_skeptic -> adversarial_reviewer [condition="outcome=success"]
-    gate_skeptic -> fix                  [condition="outcome!=success"]
+    gate_skeptic -> exit                 [condition="no_verdict=true"]
+    gate_skeptic -> fix                  [condition="outcome!=success and no_verdict!=true"]
 
     adversarial_reviewer -> gate_es [condition="outcome=success"]
     adversarial_reviewer -> fix     [condition="outcome!=success"]
