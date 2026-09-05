@@ -1762,6 +1762,18 @@ def run(
         # work sitting in the worktree. Surfaced into BOTH the run_end event
         # payload (CXDB record) AND the human-readable log line.
         uncommitted = _obs._collect_uncommitted_state(getattr(ctx, "workdir", None))
+        # dark-factory#828 item (c): the ONE centralized push the runner
+        # itself may perform, gated on --allow-push AND a genuine success
+        # final_outcome (never on exhausted/failure/error). Must run
+        # BEFORE _collect_commit_push_state below so refs_pushed reflects
+        # this push if it happened — every node-level subprocess is always
+        # blocked from pushing directly (see _sanitized_env), so this is
+        # the only path by which refs_pushed can ever become "1".
+        from . import push_guard as _push_guard
+
+        push_result = _push_guard.maybe_push_at_run_end(
+            getattr(ctx, "workdir", None), final_outcome
+        )
         # dark-factory#828 item (e): commits_created/refs_pushed — the
         # fields that would have caught the real incident even though
         # "uncommitted_files": "0" was technically true (the coder had
@@ -1776,6 +1788,9 @@ def run(
         # second round of git subprocess calls.
         ctx.state["_df_run_commits_created"] = commit_push.get("commits_created", "")
         ctx.state["_df_run_refs_pushed"] = commit_push.get("refs_pushed", "")
+        ctx.state["_df_run_push_attempted"] = push_result.get("push_attempted", "0")
+        ctx.state["_df_run_push_succeeded"] = push_result.get("push_succeeded", "0")
+        ctx.state["_df_run_push_skip_reason"] = push_result.get("push_skip_reason", "")
         _obs._emit_event(
             ctx,
             "run_end",
@@ -1786,6 +1801,7 @@ def run(
                 "steps": str(len(history)),
                 **uncommitted,
                 **commit_push,
+                **push_result,
             },
             seq,
         )

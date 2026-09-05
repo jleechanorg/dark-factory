@@ -527,6 +527,19 @@ def main(argv: list[str] | None = None) -> int:
 
         graph = parse(pipeline_path)
 
+        # dark-factory#828 item (c): --allow-push defaults to False. Set
+        # once, process-wide, before any node runs. Every subprocess
+        # launched through runner.handler_sandbox._sanitized_env() (all
+        # codergen/gate/holdout/healer backends) is ALWAYS blocked from
+        # pushing directly, regardless of this flag — this flag instead
+        # gates the runner's own single centralized push at run end (see
+        # runner/push_guard.maybe_push_at_run_end, invoked from
+        # runner/engine_run.py), which never fires unless final_outcome is
+        # a genuine success.
+        from .push_guard import set_allow_push
+
+        set_allow_push(args.allow_push)
+
         # dark-factory#828 item (d): refuse to touch a live/open-PR target
         # without an explicit ack. Checked here (after --preflight's early
         # return, before any node executes) so `--preflight` itself never
@@ -729,6 +742,9 @@ def main(argv: list[str] | None = None) -> int:
             # captured) — never confused with a confirmed "0".
             "commits_created": ctx.state.get("_df_run_commits_created", "") if ctx else "",
             "refs_pushed": ctx.state.get("_df_run_refs_pushed", "") if ctx else "",
+            "push_attempted": ctx.state.get("_df_run_push_attempted", "0") if ctx else "0",
+            "push_succeeded": ctx.state.get("_df_run_push_succeeded", "0") if ctx else "0",
+            "push_skip_reason": ctx.state.get("_df_run_push_skip_reason", "") if ctx else "",
             "trace": [
                 {
                     "node": r.node,
