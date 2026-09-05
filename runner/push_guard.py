@@ -49,8 +49,12 @@ _SHIM_TEMPLATE = """#!/bin/sh
 # a literal "push" token anywhere is over-inclusive (a filename literally
 # named "push" on an unrelated command would also block) but that is the
 # safe failure direction for a push guard: false-block, never false-allow.
+# Also blocks "send-pack" — the plumbing command `git push` invokes under
+# the hood to actually write objects/refs to a remote; calling it directly
+# performs the exact same write and is not caught by looking for "push"
+# alone. Found by an independent adversarial review pass before merge.
 for arg in "$@"; do
-    if [ "$arg" = "push" ]; then
+    if [ "$arg" = "push" ] || [ "$arg" = "send-pack" ]; then
         echo "dark-factory: git push blocked by the fix-node push guard (pass --allow-push to the dark-factory CLI to enable it). See dark-factory#828." >&2
         exit 1
     fi

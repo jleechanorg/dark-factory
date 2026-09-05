@@ -80,6 +80,21 @@ def test_push_guard_blocks_push_with_leading_global_options(tmp_path):
     assert "blocked" in blocked2.stderr.lower()
 
 
+def test_push_guard_blocks_send_pack(tmp_path):
+    """`git push` is a convenience wrapper around the plumbing command
+    `git send-pack`, which performs the exact same write to a remote --
+    calling it directly bypassed a guard that only looked for "push".
+    Found by an independent adversarial /er review of PR #832 before
+    merge (dark-factory#828 item c)."""
+    workdir = tmp_path / "repo3"
+    _init_repo(workdir)
+    guarded_env = push_guard.push_guard_env(dict(os.environ))
+
+    blocked = _git("-C", str(workdir), "send-pack", "origin", "HEAD", cwd=tmp_path, env=guarded_env)
+    assert blocked.returncode != 0
+    assert "blocked" in blocked.stderr.lower()
+
+
 def test_sanitized_env_always_includes_push_guard():
     """_sanitized_env() blocks push unconditionally, regardless of
     --allow-push — that flag only gates the SEPARATE centralized push."""

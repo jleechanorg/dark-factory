@@ -85,6 +85,51 @@ class TestDetectLivePr:
     def test_empty_workdir_fails_open(self):
         assert detect_live_pr(None) is None
 
+    def test_detached_head_falls_back_to_sha_match(self, monkeypatch, tmp_path):
+        """`gh pr view`'s branch-name lookup fails on a detached-HEAD
+        checkout or a locally-renamed branch (both routine in this repo's
+        own disposable-worktree review conventions) -- a real, non-
+        adversarial case, not just uncertainty to fail open on. The
+        HEAD-SHA fallback via `gh pr list` must still catch it. Found by
+        an independent adversarial /er review of PR #832 before merge."""
+        sha = "abc123def456"
+
+        def fake_run(args, **kwargs):
+            if "view" in args:
+                return _fake_proc(1, "", "no pull requests found for current branch")
+            if "rev-parse" in args:
+                return _fake_proc(0, sha + "\n")
+            if "list" in args:
+                return _fake_proc(
+                    0,
+                    json.dumps(
+                        [
+                            {"number": 1, "url": "https://x/1", "state": "CLOSED", "headRefOid": "deadbeef"},
+                            {"number": 9583, "url": "https://x/9583", "state": "OPEN", "headRefOid": sha},
+                        ]
+                    ),
+                )
+            raise AssertionError(f"unexpected gh/git invocation: {args}")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        result = detect_live_pr(tmp_path)
+        assert result is not None
+        assert result["number"] == 9583
+        assert result["state"] == "OPEN"
+
+    def test_detached_head_no_matching_pr_fails_open(self, monkeypatch, tmp_path):
+        def fake_run(args, **kwargs):
+            if "view" in args:
+                return _fake_proc(1, "", "no pull requests found for current branch")
+            if "rev-parse" in args:
+                return _fake_proc(0, "abc123\n")
+            if "list" in args:
+                return _fake_proc(0, json.dumps([]))
+            raise AssertionError(f"unexpected gh/git invocation: {args}")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert detect_live_pr(tmp_path) is None
+
 
 def _fake_history_record(outcome: str = "success"):
     return types.SimpleNamespace(node="start", outcome=outcome, output_preview="ok", metadata={})
