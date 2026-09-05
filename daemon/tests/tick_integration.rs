@@ -13975,6 +13975,12 @@ fn jleechan328_gate_assessment_emits_head_sha_for_exact_head_binding() {
         "GATE_ASSESSMENT context MUST carry the PR's current head_sha (P1 #1 \
          exact-head binding); context:\n{ctx:?}"
     );
+    assert_eq!(
+        ctx.get("repo").and_then(|v| v.as_str()),
+        Some("owner/repo"),
+        "GATE_ASSESSMENT context MUST carry the resolved repository so exact-head \
+         funnel observations cannot collide across configured repositories; context:\n{ctx:?}"
+    );
     // Canonical gate-key set (P1 #2): every GateName::as_str() value
     // MUST be present in the emitted gates object — a regression that
     // dropped a key would slip past a permissive shell predicate.
