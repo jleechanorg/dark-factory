@@ -62,6 +62,24 @@ def test_push_guard_env_blocks_push_but_allows_other_git_commands(tmp_path):
     assert "828" in blocked.stderr
 
 
+def test_push_guard_blocks_push_with_leading_global_options(tmp_path):
+    """A $1-only check (`[ "$1" = "push" ]`) is defeated by any global git
+    option before the subcommand -- `git -C <dir> push`, `git --no-pager
+    push`, etc. all reach the real git unblocked. Found by direct testing
+    during PR review (dark-factory#828 item c)."""
+    workdir = tmp_path / "repo2"
+    _init_repo(workdir)
+    guarded_env = push_guard.push_guard_env(dict(os.environ))
+
+    blocked = _git("-C", str(workdir), "push", cwd=tmp_path, env=guarded_env)
+    assert blocked.returncode != 0
+    assert "blocked" in blocked.stderr.lower()
+
+    blocked2 = _git("--no-pager", "push", cwd=workdir, env=guarded_env)
+    assert blocked2.returncode != 0
+    assert "blocked" in blocked2.stderr.lower()
+
+
 def test_sanitized_env_always_includes_push_guard():
     """_sanitized_env() blocks push unconditionally, regardless of
     --allow-push — that flag only gates the SEPARATE centralized push."""
