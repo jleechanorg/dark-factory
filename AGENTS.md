@@ -236,3 +236,33 @@ Each node emits `ENTER` on visit and `EXIT` with classified outcome (`success`, 
    `tool` nodes when separating coder and reviewer/evaluator CLIs.
 6. Use `model_stylesheet="path.model.css"` when a graph needs CSS-like
    backend/model routing without cluttering every node.
+
+## CLI account scoping — mandatory policy for every AI CLI launch
+
+This is a mandatory launch policy, not a claim that every current runtime path
+already enforces it. `Command::new` inherits the daemon environment unless the
+launch code explicitly removes inherited variables and builds a scoped child
+environment. A launch is compliant only when its account/provider scope is
+validated before the process starts.
+
+Every direct Claude launch (`claude` or `claude-sonnet`) MUST validate
+`DARK_FACTORY_CLAUDE_CONFIG_DIR` as an existing project-scoped directory, pass
+that directory to the child as `CLAUDE_CONFIG_DIR`, and scrub inherited Claude
+and provider authentication variables. Keep this environment construction and
+provider scrubbing centralized; do not rely on a bare host `~/.claude` account.
+
+MiniMax is a separate provider lane. It MUST require a nonblank
+`MINIMAX_API_KEY`, pin `ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic` and
+`ANTHROPIC_MODEL=MiniMax-M3`, and remove Claude account state/configuration from
+the child environment. A MiniMax launch must never inherit `CLAUDE_CONFIG_DIR`
+or another host Claude login as an implicit credential.
+
+Every Codex launch, including `codex exec`, MUST use an intended existing
+`CODEX_HOME` or an explicitly supported provider credential/configuration such
+as `OPENAI_API_KEY` or `CODEX_ACCESS_TOKEN` where that launch mode supports it.
+Do not let Codex silently fall back to the operator's default `~/.codex`
+account.
+
+Unscoped or unsupported dispatch MUST fail closed. Fallback is allowed only to
+another lane that has its own explicit, validated scope; never fall back to an
+unscoped Claude, MiniMax, or Codex process.
