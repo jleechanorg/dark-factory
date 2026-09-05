@@ -92,7 +92,15 @@ def _detect_live_pr_by_head_sha(workdir: pathlib.Path, timeout: int) -> Optional
     if not sha:
         return None
     stdout = _run_gh(
-        ["gh", "pr", "list", "--state", "open", "--json", "number,url,state,headRefOid"],
+        [
+            "gh", "pr", "list", "--state", "open",
+            # gh defaults to a 30-result page; a repo with more open PRs
+            # than that (dark-factory itself routinely does) would silently
+            # miss a match past the first page — found live during an
+            # independent /er review before merge.
+            "--limit", "1000",
+            "--json", "number,url,state,headRefOid",
+        ],
         workdir,
         timeout,
     )

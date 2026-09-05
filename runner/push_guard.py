@@ -10,6 +10,18 @@ PATH resolution — the same acceptance ceiling as any PATH-based sandbox,
 noted here rather than pretended away. Real incident: a `fix` node with
 full repo write+push authority pushed to a LIVE PR branch with nothing
 actionable to act on.
+
+Acceptance ceiling, part 2 (found in an independent /er review before
+merge): git's own alias/config machinery is resolved by the REAL git
+binary, after this shim has already decided to `exec` into it — so
+`git -c alias.p=push p ...` (or a `p = push` alias already sitting in a
+committed or global `.gitconfig`, no `-c` needed) reaches the real push
+with no "push"/"send-pack" token ever appearing in argv for this shim to
+see. Deliberately NOT chased with more argv pattern-matching: aliases can
+originate from a config *file*, not just `-c`, so there is no bounded set
+of argv shapes to enumerate — this is the same class of gap as (b) above,
+a fundamental limit of any PATH-based git wrapper, not a fixable oversight
+like the earlier `-C`/`send-pack` gaps were.
 """
 
 from __future__ import annotations

@@ -117,6 +117,28 @@ class TestDetectLivePr:
         assert result["number"] == 9583
         assert result["state"] == "OPEN"
 
+    def test_sha_fallback_requests_a_large_page_not_ghs_default_30(self, monkeypatch, tmp_path):
+        """`gh pr list` defaults to a 30-result page -- a repo with more
+        open PRs than that (this repo routinely does) would silently miss
+        a match past the first page. Found by an independent adversarial
+        /er review of PR #832 before merge."""
+        captured: dict = {}
+
+        def fake_run(args, **kwargs):
+            if "view" in args:
+                return _fake_proc(1, "", "no pull requests found for current branch")
+            if "rev-parse" in args:
+                return _fake_proc(0, "abc123\n")
+            if "list" in args:
+                captured["list_args"] = args
+                return _fake_proc(0, json.dumps([]))
+            raise AssertionError(f"unexpected gh/git invocation: {args}")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        detect_live_pr(tmp_path)
+        assert "list_args" in captured
+        assert "--limit" in captured["list_args"]
+
     def test_detached_head_no_matching_pr_fails_open(self, monkeypatch, tmp_path):
         def fake_run(args, **kwargs):
             if "view" in args:
