@@ -1,6 +1,7 @@
 {
   "reviewer_priority": ["claudem", "agy", "cursor-agent"],
+  "reviewer_priority_manual": ["codex", "claudem", "agy", "claude"],
   "default_coder": "agy",
   "coder_fallback_chain": ["claudem"],
-  "_comment": "Single source of truth for daemon skeptic/er and GHA skeptic_gate_cli. Operator 2026-08-18: claudem (MiniMax via claude --print) -> agy -> cursor-agent. Gemini CLI and Codex are not default reviewers."
+  "_comment": "Single source of truth for daemon skeptic/er and GHA skeptic_gate_cli. `reviewer_priority` is the /af daemon default (Operator 2026-08-18: claudem -> agy -> cursor-agent; codex excluded to conserve codex quota for interactive/manual use). `reviewer_priority_manual` is used for any invocation NOT launched by the /af daemon (a human running dark-factory/`/factory` directly) — operator intent: codex first there. `runner/reviewer_priority.py::skeptic_reviewer_priority()` picks between the two based on the DARK_FACTORY_VIA_AF env var, which the daemon sets on every AO worker it spawns (`daemon/src/adapters.rs::ao_spawn_command_with_mode`). The Rust daemon itself (`daemon/src/reviewer_priority.rs`) always reads `reviewer_priority` unconditionally — it IS the /af context by definition and never branches on this env var."
 }

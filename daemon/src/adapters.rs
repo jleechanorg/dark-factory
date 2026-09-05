@@ -3679,7 +3679,15 @@ fn ao_spawn_command_with_mode(
     cmd.arg("--")
         .arg(&spec.prompt)
         .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
-        .env("DARK_FACTORY_AO_SPAWN_BRANCH", &spec.branch);
+        .env("DARK_FACTORY_AO_SPAWN_BRANCH", &spec.branch)
+        // Marks this worker (and anything it runs, e.g. a Python
+        // dark-factory pipeline invocation) as /af-daemon-dispatched, so
+        // `runner/reviewer_priority.py::skeptic_reviewer_priority()`
+        // resolves the claudem-first /af list instead of the manual
+        // codex-first default. Every caller of `ao_spawn_command_with_mode`
+        // IS /af-driven automated bead dispatch by construction, so this is
+        // unconditional.
+        .env("DARK_FACTORY_VIA_AF", "1");
     if diagnostic {
         cmd.env("DARK_FACTORY_AO_BRIDGE_DIAGNOSTIC", "1");
     }
