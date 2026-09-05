@@ -1395,7 +1395,15 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                 text=True,
                 timeout=timeout_s,
                 check=False,
-                input="",
+                # Issue #827 Defect 2: `input=""` still attaches a PIPE for
+                # stdin that Python must close via `communicate()`; codex
+                # v0.147.0 printed "Reading additional input from stdin..."
+                # and blocked on it until this node's own timeout fired.
+                # `stdin=subprocess.DEVNULL` is the same unambiguous,
+                # pipe-free sentinel already used by the `claude` backend
+                # branch above — mirror it here instead of relying on an
+                # empty-string PIPE close.
+                stdin=subprocess.DEVNULL,
                 env=_handlers_shim._sanitized_env(),
             )
         except subprocess.TimeoutExpired as exc:
