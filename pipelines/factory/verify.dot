@@ -6,6 +6,7 @@ digraph verify {
         skip_explore="true"
         skip_plan="true"
         skip_implement="true"
+        skip_fix="true"
     ]
     rankdir=LR
 
