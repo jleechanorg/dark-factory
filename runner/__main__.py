@@ -332,6 +332,30 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--workdir", type=pathlib.Path, default=pathlib.Path.cwd())
         p.add_argument("--preflight", action="store_true", help="Validate pipeline and emit diagnostics, then exit.")
         p.add_argument(
+            "--allow-live-pr-target",
+            action="store_true",
+            help=(
+                "dark-factory#828: required to run against a workdir whose "
+                "current branch has an OPEN pull request. Without this flag "
+                "the run refuses to start (checked via `gh pr view`, fails "
+                "open on any detection uncertainty — e.g. gh not installed/"
+                "authed, or no PR for this branch). Real incident: a "
+                "review-only run silently wrote to and pushed a live PR "
+                "branch."
+            ),
+        )
+        p.add_argument(
+            "--allow-push",
+            action="store_true",
+            help=(
+                "dark-factory#828: allow codergen/fix nodes to push over "
+                "git. Defaults to OFF — a `git push` from any codergen node "
+                "is blocked (commits are still allowed locally) unless this "
+                "flag is set. Real incident: a fix node pushed to a live PR "
+                "branch with nothing actionable to act on."
+            ),
+        )
+        p.add_argument(
             "--backend",
             choices=["echo", "claude", "codex", "ao", "agy"],
             default="ao",
@@ -502,6 +526,24 @@ def main(argv: list[str] | None = None) -> int:
             args.goal = ""
 
         graph = parse(pipeline_path)
+
+        # dark-factory#828 item (d): refuse to touch a live/open-PR target
+        # without an explicit ack. Checked here (after --preflight's early
+        # return, before any node executes) so `--preflight` itself never
+        # needs `gh` configured.
+        if not args.allow_live_pr_target:
+            from .live_pr_guard import detect_live_pr
+
+            live_pr = detect_live_pr(args.workdir)
+            if live_pr is not None:
+                p.error(
+                    f"refusing to run against a LIVE open PR target "
+                    f"(#{live_pr.get('number')} — {live_pr.get('url')}) "
+                    f"without --allow-live-pr-target. dark-factory#828: a "
+                    f"prior run silently wrote to and pushed a live PR "
+                    f"branch from this exact gap. Pass --allow-live-pr-"
+                    f"target if you intend to run against this PR."
+                )
 
         def _is_verdict_gated_review_node(n) -> bool:
             return (
