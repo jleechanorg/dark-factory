@@ -99,16 +99,21 @@ def _run_null_verdict_repro(monkeypatch, tmp_path, pipeline_name: str):
         return Result(outcome="success", output="holdout ok")
 
     def fake_null_verdict_skeptic(node, ctx):
-        # Route through the REAL verdict parser, exactly like the real
-        # gate_skeptic handler does — this is the actual code path being
-        # fixed, not a hand-picked outcome string. A null/unparseable
-        # verdict normalizes to outcome=error (an infra state, NOT a
-        # failure finding) — see runner/handler_verdict.py.
-        raw, outcome = _parse_verdict(_NULL_VERDICT_OUTPUT)
-        assert outcome == "error", (
-            f"expected the null-verdict shape to parse as error, got {outcome!r}"
+        # gate_skeptic has its OWN bespoke implementation (RuleLoader /
+        # VerifierDispatcher / ConsensusAggregator in
+        # runner/handler_universal_prompts.py) that does NOT go through
+        # `_parse_verdict` — it signals "no reviewer produced a parseable
+        # verdict" via outcome="inconclusive" + metadata["no_verdict"]="true"
+        # (dark-factory#830 / issue #827 Defect 1). Mirror that exact shape
+        # here rather than `_parse_verdict`'s shape, which is what the
+        # OTHER four gates (adversarial_reviewer/gate_es/gate_er/gate_cs)
+        # actually use — see test_gates_dot_real_failure_still_reaches_fix's
+        # sibling coverage of that path via _parse_verdict.
+        return Result(
+            outcome="inconclusive",
+            output=_NULL_VERDICT_OUTPUT,
+            metadata={"slash_command": "skeptic", "verdict": None, "no_verdict": "true"},
         )
-        return Result(outcome=outcome, output=_NULL_VERDICT_OUTPUT, metadata={"verdict": raw})
 
     def destructive_fix(node, ctx):
         # If this ever runs, prove it by actually mutating the repo — the

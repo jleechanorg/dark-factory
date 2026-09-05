@@ -21,6 +21,7 @@ digraph pr_gates {
         label="Skeptic (inverted-incentive review)",
         backend_priority="codex,minimax,agy,claude-sonnet",
         prefer_adversarial="true",
+        max_retries=2,
         timeout=600
     ]
     adversarial_reviewer [
@@ -83,22 +84,26 @@ digraph pr_gates {
         timeout=600
     ]
 
-    // dark-factory#828: `fix` must only fire on an actionable finding
-    // (outcome=failure — a REAL reviewer rejection). A gate that could not
-    // produce a verdict at all (a null/unparseable verdict — normalized to
-    // outcome=error, NOT failure, see runner/handler_verdict.py) or hit an
-    // infra problem (outcome=error) has nothing for `fix` to act on;
-    // routing either there let the coder improvise destructively with a
+    // dark-factory#828: `fix` must only fire on an actionable finding, not
+    // a gate that produced no real verdict at all or hit an infra problem
+    // — routing either there let the coder improvise destructively with a
     // live PR checked out (real incident, 2026-08-30 — this exact
-    // pipeline, PR #9583). outcome=error routes straight to exit instead —
+    // pipeline, PR #9583). Mirrors pipelines/factory/gates.dot's mechanism
+    // split (see that file's comment for the full rationale): gate_skeptic
+    // uses the `no_verdict=true` metadata flag from its bespoke
+    // RuleLoader/VerifierDispatcher implementation (issue #827 Defect 1,
+    // dark-factory#830); the other four gates route through
+    // runner/handler_verdict.py's `_parse_verdict`, where a null/
+    // unparseable verdict normalizes to outcome=error (same bucket as a
+    // genuine infra problem), NOT failure. Both route straight to exit —
     // same "stop, don't act" contract as web_advice below.
     start -> holdout
     holdout -> gate_skeptic [condition="outcome=success"]
     holdout -> fix         [condition="outcome!=success"]
 
     gate_skeptic -> adversarial_reviewer [condition="outcome=success"]
-    gate_skeptic -> fix                  [condition="outcome=failure"]
-    gate_skeptic -> exit                 [condition="outcome=error"]
+    gate_skeptic -> exit                 [condition="no_verdict=true"]
+    gate_skeptic -> fix                  [condition="outcome!=success and no_verdict!=true"]
 
     adversarial_reviewer -> gate_es [condition="outcome=success"]
     adversarial_reviewer -> fix     [condition="outcome=failure"]

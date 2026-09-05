@@ -232,8 +232,10 @@ def test_migrated_gates_still_have_fix_loop():
     Updated per dark-factory#828: `fix` now only fires on an actionable
     finding (`outcome=failure`), not the blanket `outcome!=success` that
     used to also catch a null/unparseable verdict (normalized to
-    `outcome=error`, see runner/handler_verdict.py) or an infra `error`
-    (see test_gates_error_outcome_does_not_route_to_fix below).
+    `outcome=error` for the four `_parse_verdict`-based gates, or gated by
+    the `no_verdict` metadata flag for gate_skeptic's bespoke
+    implementation — dark-factory#830) or an infra `error` (see
+    test_gates_error_outcome_does_not_route_to_fix below).
     """
     g = parse(_pipeline("gates.dot"))
     fix_loop_edges = [
@@ -246,12 +248,20 @@ def test_migrated_gates_still_have_fix_loop():
     )
     # The blanket outcome!=success->fix edge on REVIEWER nodes must be gone
     # — that was the exact routing bug that let a null-verdict gate reach
-    # fix. `holdout -> fix` deliberately keeps `outcome!=success` (holdout
-    # failures are real test failures, not LLM verdict-parse ambiguity —
-    # out of scope for this fix).
+    # fix. Two deliberate exceptions:
+    #   - `holdout -> fix` keeps `outcome!=success` (holdout failures are
+    #     real test failures, not LLM verdict-parse ambiguity — out of
+    #     scope for this fix).
+    #   - `gate_skeptic -> fix` keeps the COMPOUND condition
+    #     `outcome!=success and no_verdict!=true` (dark-factory#830) — the
+    #     `no_verdict!=true` clause is exactly what makes this edge safe
+    #     (it no longer fires on a null verdict); only a BARE
+    #     `outcome!=success` with no `no_verdict` clause would be the
+    #     stale, unfixed shape.
     stale_edges = [
         e for e in g.edges
         if "outcome!=success" in str(e.condition or "")
+        and "no_verdict" not in str(e.condition or "")
         and e.dst == "fix"
         and e.src != "holdout"
     ]
@@ -262,12 +272,13 @@ def test_migrated_gates_still_have_fix_loop():
 
 def test_gates_error_outcome_does_not_route_to_fix():
     """dark-factory#828: a gate that could not produce a verdict at all (a
-    null/unparseable verdict, normalized to outcome=error per
-    runner/handler_verdict.py — NOT outcome=failure) or hit an infra
-    problem (outcome=error) must NEVER reach `fix` — there is no finding
-    for the coder to act on. Checks both factory/gates.dot and
-    factory/pr_gates.dot (the two pipelines implicated in the real
-    incident)."""
+    null/unparseable verdict — normalized to outcome=error for the four
+    `_parse_verdict`-based gates, or signaled via the `no_verdict`
+    metadata flag for gate_skeptic's bespoke implementation,
+    dark-factory#830) or an infra problem (outcome=error) must NEVER
+    reach `fix` — there is no finding for the coder to act on. Checks
+    both factory/gates.dot and factory/pr_gates.dot (the two pipelines
+    implicated in the real incident)."""
     for pipeline_name in ("gates.dot", "pr_gates.dot"):
         g = parse(_pipeline(pipeline_name))
         bad_edges = [
@@ -277,8 +288,14 @@ def test_gates_error_outcome_does_not_route_to_fix():
         assert bad_edges == [], (
             f"{pipeline_name}: outcome=error must not route to fix: {bad_edges}"
         )
-        # And it must be routed SOMEWHERE (not silently dropped) — to exit.
-        gate_nodes = [n for n in g.nodes if n.startswith("gate_") or n == "adversarial_reviewer"]
+        # gate_skeptic uses the no_verdict metadata mechanism instead of a
+        # literal outcome=error edge (dark-factory#830) — checked
+        # separately below, not against the outcome=error contract the
+        # other four gates use.
+        gate_nodes = [
+            n for n in g.nodes
+            if (n.startswith("gate_") or n == "adversarial_reviewer") and n != "gate_skeptic"
+        ]
         for node_name in gate_nodes:
             error_edges = [
                 e for e in g.edges
@@ -288,6 +305,25 @@ def test_gates_error_outcome_does_not_route_to_fix():
                 f"{pipeline_name}:{node_name} must route outcome=error to exit, "
                 f"got {error_edges}"
             )
+        # gate_skeptic: the no_verdict=true edge must go to exit, and the
+        # fix edge must carry the no_verdict!=true guard (dark-factory#830).
+        skeptic_no_verdict_edges = [
+            e for e in g.edges
+            if e.src == "gate_skeptic" and str(e.condition or "") == "no_verdict=true"
+        ]
+        assert len(skeptic_no_verdict_edges) == 1 and skeptic_no_verdict_edges[0].dst == "exit", (
+            f"{pipeline_name}: gate_skeptic must route no_verdict=true to exit, "
+            f"got {skeptic_no_verdict_edges}"
+        )
+        skeptic_fix_edges = [
+            e for e in g.edges if e.src == "gate_skeptic" and e.dst == "fix"
+        ]
+        assert len(skeptic_fix_edges) == 1 and "no_verdict!=true" in str(
+            skeptic_fix_edges[0].condition or ""
+        ), (
+            f"{pipeline_name}: gate_skeptic->fix must guard on no_verdict!=true, "
+            f"got {skeptic_fix_edges}"
+        )
 
 
 def test_migrated_dot_files_end_with_newline():

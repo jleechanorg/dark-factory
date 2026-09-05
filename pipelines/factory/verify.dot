@@ -103,6 +103,11 @@ digraph verify {
     gate_skeptic -> adversarial_reviewer [condition="outcome=success"]
     gate_skeptic -> exit                 [condition="outcome=failure"]
     gate_skeptic -> exit                 [condition="outcome=error"]
+    // gate_skeptic's bespoke implementation (runner/handler_universal_
+    // prompts.py, dark-factory#830) sets outcome="inconclusive" (not
+    // "error") for a null/unparseable verdict — the other four gates
+    // never emit this literal outcome, only gate_skeptic needs this edge.
+    gate_skeptic -> exit                 [condition="outcome=inconclusive"]
 
     adversarial_reviewer -> gate_es [condition="outcome=success"]
     adversarial_reviewer -> exit    [condition="outcome=failure"]
