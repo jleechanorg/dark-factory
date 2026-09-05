@@ -99,3 +99,27 @@ def test_malformed_reviewer_priority_manual_fails_closed(monkeypatch):
     )
     with pytest.raises(ValueError, match="reviewer_priority_manual"):
         rp.skeptic_reviewer_priority()
+
+
+def test_skeptic_gate_workflow_sets_via_af_for_ci_gate():
+    """The GHA skeptic gate is an unattended CI job, not a manual/interactive
+    `/factory` invocation -- without DARK_FACTORY_VIA_AF, skeptic_gate_cli.py's
+    chain-walk premium reviewer would silently resolve to codex (the manual
+    list's head), burning codex quota on every gated PR post-merge, which is
+    exactly what the /af-vs-manual split exists to prevent."""
+    import yaml
+
+    workflow_path = (
+        Path(__file__).resolve().parent.parent / ".github" / "workflows" / "skeptic-gate.yml"
+    )
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    jobs = workflow.get("jobs", {})
+    assert "skeptic" in jobs, "expected a 'skeptic' job in skeptic-gate.yml"
+    job_env = jobs["skeptic"].get("env", {})
+    assert str(job_env.get("DARK_FACTORY_VIA_AF", "")).strip().lower() not in (
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    ), "skeptic job must set a truthy DARK_FACTORY_VIA_AF so the CI gate stays claudem-first"
