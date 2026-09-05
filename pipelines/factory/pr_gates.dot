@@ -83,23 +83,38 @@ digraph pr_gates {
         timeout=600
     ]
 
+    // dark-factory#828: `fix` must only fire on an actionable finding
+    // (outcome=failure — a REAL reviewer rejection). A gate that could not
+    // produce a verdict at all (a null/unparseable verdict — normalized to
+    // outcome=error, NOT failure, see runner/handler_verdict.py) or hit an
+    // infra problem (outcome=error) has nothing for `fix` to act on;
+    // routing either there let the coder improvise destructively with a
+    // live PR checked out (real incident, 2026-08-30 — this exact
+    // pipeline, PR #9583). outcome=error routes straight to exit instead —
+    // same "stop, don't act" contract as web_advice below.
     start -> holdout
     holdout -> gate_skeptic [condition="outcome=success"]
     holdout -> fix         [condition="outcome!=success"]
 
     gate_skeptic -> adversarial_reviewer [condition="outcome=success"]
-    gate_skeptic -> fix                  [condition="outcome!=success"]
+    gate_skeptic -> fix                  [condition="outcome=failure"]
+    gate_skeptic -> exit                 [condition="outcome=error"]
 
     adversarial_reviewer -> gate_es [condition="outcome=success"]
-    adversarial_reviewer -> fix     [condition="outcome!=success"]
+    adversarial_reviewer -> fix     [condition="outcome=failure"]
+    adversarial_reviewer -> exit    [condition="outcome=error"]
 
     gate_es -> gate_er [condition="outcome=success"]
-    gate_es -> fix     [condition="outcome!=success"]
+    gate_es -> fix     [condition="outcome=failure"]
+    gate_es -> exit    [condition="outcome=error"]
 
     gate_er -> gate_cs [condition="outcome=success"]
-    gate_er -> fix     [condition="outcome!=success"]
+    gate_er -> fix     [condition="outcome=failure"]
+    gate_er -> exit    [condition="outcome=error"]
 
     gate_cs -> web_advice [condition="outcome=success"]
+    gate_cs -> fix        [condition="outcome=failure"]
+    gate_cs -> exit       [condition="outcome=error"]
 
     // Fail-open heart: single unconditional edge to exit.
     web_advice -> exit

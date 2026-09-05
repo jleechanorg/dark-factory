@@ -250,7 +250,7 @@ class TestEnforceOutcomeVerdictConsistency:
         """outcome=failure with verdict=inconclusive → TRUE contradiction, adjusted.
 
         Per dark-factory#827/#828, "inconclusive" now normalizes to the
-        "inconclusive" outcome (not "failure") — an explicit outcome=failure
+        "error" outcome (not "failure") — an explicit outcome=failure
         paired with a verdict metadata of "inconclusive" is a genuine
         disagreement, same shape as the "approve" contradiction case below.
         """
@@ -262,7 +262,7 @@ class TestEnforceOutcomeVerdictConsistency:
 
         adjusted = _enforce_outcome_verdict_consistency(result, gate_strict=False)
 
-        # inconclusive→inconclusive, but outcome=failure → contradiction
+        # inconclusive→error, but outcome=failure → contradiction
         assert adjusted.metadata["verdict"] == "fail"
         assert adjusted.metadata["verdict_adjusted_for_consistency"] == "true"
         assert adjusted.metadata["original_verdict"] == "inconclusive"
@@ -361,7 +361,7 @@ class TestEnforceOutcomeVerdictConsistency:
             for i, line in enumerate(text.splitlines(), 1):
                 if pattern.match(line):
                     definitions.append(py.relative_to(ROOT).as_posix() + f":{i}")
-        assert definitions == ["runner/handler_verdict.py:232"], (
+        assert definitions == ["runner/handler_verdict.py:243"], (
             f"expected exactly one canonical definition in handler_verdict.py, "
             f"got: {definitions}"
         )
@@ -391,8 +391,8 @@ class TestEnforceOutcomeVerdictConsistency:
         """FAIL-family outcomes: failure token with matching outcome is unchanged.
 
         "inconclusive" is deliberately excluded from this list — per
-        dark-factory#827/#828 it normalizes to the "inconclusive" outcome,
-        not "failure" (see test_failure_outcome_with_inconclusive_verdict_
+        dark-factory#827/#828 it normalizes to the "error" outcome, not
+        "failure" (see test_failure_outcome_with_inconclusive_verdict_
         adjusted below for its own, now-distinct, contradiction case).
         """
         for token in ("fail", "partial", "insufficient",

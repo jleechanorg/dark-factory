@@ -47,10 +47,19 @@ _VERDICT_NORMALIZE = {
     # reach a verdict at all (no finding to act on). Conflating it with
     # "failure" is exactly the dark-factory#828 defect: an inconclusive
     # gate routed to the `fix` node, which then improvised destructively
-    # with nothing real to fix. Kept distinct so callers can route it away
-    # from `fix` (see `_parse_verdict`'s "unknown" case below, which shares
-    # this same outcome bucket).
-    "inconclusive": "inconclusive",
+    # with nothing real to fix. Maps to "error" (NOT a new outcome bucket):
+    # `runner.engine_observability._normalized_result` re-buckets EVERY
+    # handler outcome through `runner._classify._classify_outcome` before
+    # DOT-edge routing ever sees it, and that classifier only recognizes
+    # {success, partial, error, failure} — an invented "inconclusive"
+    # outcome would silently collapse back into "failure" there, making
+    # this fix a no-op (caught by actually running the pipeline end-to-end,
+    # not just unit-testing `_parse_verdict` in isolation). "error" is an
+    # EXISTING safe bucket that survives that re-bucketing unchanged and
+    # already carries "infra state, not a verdict disagreement" semantics
+    # (see `_HEAD_SHA_ECHO_RE` comment below) — a null/inconclusive verdict
+    # fits that same shape.
+    "inconclusive": "error",
     "insufficient": "failure",
     "invalid": "failure",
     "incomplete": "failure",
@@ -172,7 +181,7 @@ def _parse_verdict(text: str, *, gate_strict: bool = False) -> tuple[str, str]:
       2. If a marker word was present but no matching token followed it,
          return ("unknown", "failure") — conservative fail-safe — UNLESS
          the remainder is a null sentinel (see below), which returns
-         ("unknown", "inconclusive") instead.
+         ("null", "error") instead.
       3. With no marker at all, scan the last 40 lines for a *standalone*
          verdict token (not embedded in prose). No standalone match either
          → ("unknown", "failure") — conservative fail-safe.
@@ -192,8 +201,10 @@ def _parse_verdict(text: str, *, gate_strict: bool = False) -> tuple[str, str]:
     "n/a") — e.g. `VERDICT: None`, the exact incident shape where a
     template substitution echoed Python's ``None`` instead of a real
     token. That is "the reviewer produced no verdict at all", not a
-    rejection, and grades as ("unknown", "inconclusive") so callers do not
-    route it to a fix/coder node with nothing actionable to act on.
+    rejection, and grades as ("null", "error") — "error" (not a fabricated
+    third outcome bucket) so callers do not route it to a fix/coder node
+    with nothing actionable to act on. See `_VERDICT_NORMALIZE["inconclusive"]`
+    above for why "error", not "inconclusive", is the target bucket.
     """
     body = text or ""
     matches = list(_MARKER_RE.finditer(body))
@@ -206,7 +217,7 @@ def _parse_verdict(text: str, *, gate_strict: bool = False) -> tuple[str, str]:
         # guess. Distinguish a null-sentinel remainder (nothing was
         # decided) from other unparseable prose (conservative fail-safe).
         if _marker_remainder_is_null(body):
-            return "unknown", "inconclusive"
+            return "null", "error"
         return "unknown", "failure"
 
     tail = "\n".join(body.splitlines()[-40:])
