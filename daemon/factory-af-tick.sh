@@ -36,6 +36,11 @@ O="$ROOT/daemon/factory-overlay.sh"
 I="${AFD_INTAKE_BIN:-$ROOT/daemon/factory-intake-from-gh.sh}"
 R="${AFD_REMEDIATE_BIN:-$ROOT/daemon/factory-ao-remediate.sh}"
 DB="${AFD_DB:-$HOME/.dark-factory/daemon-cxdb.sqlite}"
+SPAWN_STATE_DIR="${AFD_SPAWN_STATE_DIR:-$HOME/Library/Application Support/dark-factory/spawns}"
+PENDING_MAX_AGE="${AFD_PENDING_MAX_AGE_SEC:-180}"
+case "$PENDING_MAX_AGE" in ''|*[!0-9]*) PENDING_MAX_AGE=180 ;; esac
+AO_PROBE_TIMEOUT="${AFD_AO_READY_TIMEOUT_SEC:-5}"
+case "$AO_PROBE_TIMEOUT" in ''|*[!0-9]*|0) AO_PROBE_TIMEOUT=5 ;; esac
 MAX_DISPATCH="${MAX_DISPATCH:-2}"
 AO_PROJECT="${AFD_AO_PROJECT:-worldarchitect}"
 # CONFIG/TARGET_REPO mirror the sibling scripts' pattern (daemon/factory-overlay.sh,
@@ -229,8 +234,9 @@ if [ -n "$AO" ]; then
     # --json call would count sessions across ALL AO projects, inflating
     # ao_active and falsely tripping AO_MAX_CONCURRENT_SESSIONS for
     # deployments using a non-default AFD_AO_PROJECT.
-    if "$AO" session ls -p "$AO_PROJECT" --json >/dev/null 2>&1; then
-        ao_active="$("$AO" session ls -p "$AO_PROJECT" --json 2>/dev/null | python3 -c '
+    ao_inventory_json="$(timeout "$AO_PROBE_TIMEOUT" "$AO" session ls -p "$AO_PROJECT" --json 2>/dev/null || true)"
+    if [ -n "$ao_inventory_json" ] && printf '%s' "$ao_inventory_json" | python3 -c 'import json,sys; json.load(sys.stdin)' >/dev/null 2>&1; then
+        ao_active="$(printf '%s' "$ao_inventory_json" | python3 -c '
 import json,sys
 try:
     d = json.load(sys.stdin)
@@ -243,7 +249,8 @@ try:
 except Exception:
     print(0)' 2>/dev/null || echo 0)"
     else
-        ao_active="$("$AO" session ls -p "$AO_PROJECT" 2>/dev/null | rg -c '\[(spawning|running|active|working|pr_open)\]' || echo 0)"
+        ao_inventory_text="$(timeout "$AO_PROBE_TIMEOUT" "$AO" session ls -p "$AO_PROJECT" 2>/dev/null || true)"
+        ao_active="$(printf '%s\n' "$ao_inventory_text" | grep -Ec '\[(spawning|running|active|working|pr_open)\]' || echo 0)"
     fi
     # Ensure ao_active is a non-negative integer (defensive: rg/race could leave empty)
     case "${ao_active:-0}" in
@@ -292,7 +299,64 @@ fi
 dispatched=0
 ERR_TMP="$(mktemp -t af_dispatch_err.XXXXXX)"
 trap 'rm -f "$ERR_TMP"' EXIT
-while IFS='|' read -r bead_id pr branch bead_repo; do
+
+record_dispatch_block() { # bead row_state nonce pr branch repo reason detail
+    local ctx transition_rc
+    ctx="$(python3 - "$4" "$5" "$6" "$7" "$8" <<'PY'
+import json, sys
+pr = int(sys.argv[1]) if sys.argv[1].isdigit() else None
+print(json.dumps({"pr_number": pr, "branch": sys.argv[2], "repo": sys.argv[3], "reason": sys.argv[4], "detail": sys.argv[5]}))
+PY
+    )"
+    if [ "$2" = "DISPATCHING" ] && [ -n "$3" ]; then
+        if "$O" dispatch-release "$1" "$3" "$7" "$ctx" >/dev/null; then
+            transition_rc=0
+        else
+            transition_rc=$?
+        fi
+    else
+        if "$O" dispatch-blocked "$1" "$7" "$ctx" >/dev/null; then
+            transition_rc=0
+        else
+            transition_rc=$?
+        fi
+    fi
+    case "$transition_rc" in
+        0) ;;
+        10)
+            echo "[af] dispatch block transition lost for $1; reservation/state changed concurrently" >&2
+            return 0
+            ;;
+        *)
+            echo "[af] dispatch block transition failed for $1 (rc=$transition_rc)" >&2
+            return "$transition_rc"
+            ;;
+    esac
+    echo "[af] dispatch blocked $1: $7 ($8)" >&2
+}
+
+complete_dispatch_reservation() { # bead branch nonce pr repo
+    local rc detail
+    if "$O" dispatch-complete "$1" "$2" "$3" 2>"$ERR_TMP"; then
+        return 0
+    else
+        rc=$?
+    fi
+    detail="dispatch-complete rc=$rc: $(cat "$ERR_TMP" 2>/dev/null || true)"
+    if ! record_dispatch_block "$1" DISPATCHING "$3" "$4" "$2" "$5" dispatch_complete_failed "$detail"; then
+        echo "[af] failed to release completion reservation $1 nonce=$3" >&2
+    fi
+    return 1
+}
+
+active_pr_session() { # project pr
+    [ -n "$AO" ] || return 1
+    timeout "$AO_PROBE_TIMEOUT" "$AO" session ls -p "$1" 2>/dev/null \
+      | grep -E "pulls/${2}\\b" \
+      | grep -Eq '\[(spawning|running|active|working|pr_open)\]'
+}
+
+while IFS='|' read -r bead_id pr branch bead_repo row_state dispatch_nonce attempt reserve_epoch; do
     [ -n "$bead_id" ] || continue
     [ "$dispatched" -ge "$MAX_DISPATCH" ] && break
 
@@ -302,7 +366,8 @@ while IFS='|' read -r bead_id pr branch bead_repo; do
     # this per-bead repo resolution exists to prevent.
     repo="${bead_repo:-${TARGET_REPO:-}}"
     if [ -z "$repo" ]; then
-        echo "[af] skip $bead_id: no repo mapping (fail-closed, no bead_repo or TARGET_REPO)" >&2
+        record_dispatch_block "$bead_id" "$row_state" "$dispatch_nonce" "$pr" "$branch" "" missing_target_repo \
+          "no bead target_repo or configured TARGET_REPO fallback"
         continue
     fi
 
@@ -342,75 +407,179 @@ PY
 )"
 
     if [ -z "$proj" ]; then
-        echo "[af] fail closed: target repo '$repo' has no matching configured AO project. Parking bead $bead_id." >&2
-        "$O" park "$bead_id" "unmapped_target_repo" >/dev/null || true
+        record_dispatch_block "$bead_id" "$row_state" "$dispatch_nonce" "$pr" "$branch" "$repo" unmapped_target_repo \
+          "target repo has no matching configured AO project"
         continue
     fi
 
-    if [ -n "$AO" ] && "$AO" session ls -p "$proj" 2>/dev/null | rg "pulls/${pr}\\b" | rg -q '\[(spawning|running|active|working|pr_open)\]'; then
-        echo "[af] skip $bead_id PR #$pr (active session exists in project $proj)" >&2
+    has_active_session=0
+    if active_pr_session "$proj" "$pr"; then
+        has_active_session=1
+    fi
+
+    # A claim-pr spawn must receive an exact target checkout so we can prove
+    # no other worktree owns the requested branch before DISPATCHED is ever
+    # recorded. AO itself creates its managed isolated worktree when the
+    # branch is free; the legacy CLI provides no safe "reuse this arbitrary
+    # worktree" argument, so a pre-existing checkout is a fail-closed block.
+    checkout="$(python3 - "$CONFIG" "$repo" <<'PY'
+import os, pathlib, sys, toml
+try:
+    cfg = toml.load(sys.argv[1])
+except Exception:
+    cfg = {}
+repo = sys.argv[2]
+entry = (cfg.get("repos") or {}).get(repo) or {}
+explicit = entry.get("local_checkout", "")
+if explicit:
+    print(explicit)
+elif repo.count("/") == 1 and all(part not in ("", ".", "..") for part in repo.split("/")):
+    root = os.environ.get("DARK_FACTORY_TARGET_WORKTREE_ROOT")
+    if not root:
+        root = str(pathlib.Path.home() / ".dark-factory" / "target-worktrees")
+    print(str(pathlib.Path(root) / repo))
+else:
+    print("")
+PY
+)"
+    block_reason=""
+    block_detail=""
+    if [ -z "$branch" ]; then
+        block_reason="missing_branch"
+        block_detail="no exact branch was recorded for this PR"
+    elif [ -z "$checkout" ] || ! git -C "$checkout" rev-parse --git-dir >/dev/null 2>&1; then
+        block_reason="target_checkout_unavailable"
+        block_detail="configured or managed target checkout is unavailable for worktree ownership preflight"
+    elif ! git -C "$checkout" remote get-url origin 2>/dev/null | python3 -c '
+import re, sys, urllib.parse
+repo = sys.argv[1]
+url = sys.stdin.read().strip()
+scp = re.fullmatch(r"[^@]+@([^:]+):(.+)", url)
+if scp:
+    host, path = scp.group(1), scp.group(2)
+else:
+    parsed = urllib.parse.urlsplit(url)
+    host, path = parsed.hostname or "", parsed.path.lstrip("/")
+path = path.rstrip("/")
+if path.endswith(".git"):
+    path = path[:-4]
+ok = host.lower() == "github.com" and path == repo
+raise SystemExit(0 if ok else 1)
+' "$repo"; then
+        block_reason="target_checkout_mismatch"
+        block_detail="target checkout origin does not match $repo"
+    else
+        owner_path="$(git -C "$checkout" worktree list --porcelain 2>/dev/null | awk -v want="refs/heads/$branch" '
+          /^worktree / { path=substr($0, 10) }
+          /^branch / && substr($0, 8) == want { print path; exit }
+        ')"
+        if [ -n "$owner_path" ] && [ "$has_active_session" -ne 1 ]; then
+            block_reason="branch_checked_out"
+            block_detail="branch is checked out at $owner_path"
+        fi
+    fi
+    if [ -n "$block_reason" ]; then
+        record_dispatch_block "$bead_id" "$row_state" "$dispatch_nonce" "$pr" "$branch" "$repo" "$block_reason" "$block_detail"
         continue
     fi
-    echo "[af] remediate $bead_id PR #$pr on $repo in project $proj"
-    # CX-2: thread proj and repo through to factory-ao-remediate.sh so the spawned
-    # session lives in the same AO project.
-    if bash "$R" "$bead_id" "$pr" "$repo" "$proj" 2>&1; then
-        cur_state="$(sqlite3 "$DB" "SELECT state FROM bead_overlay WHERE bead_id='$(printf "%s" "$bead_id" | sed "s/'/''/g")';" 2>/dev/null || true)"
-        if [ "$cur_state" = "QUEUED" ]; then
-            if [ -n "$branch" ]; then
-                "$O" route-record "$bead_id" STANDARD_PATH "drive-existing-pr" 2>/dev/null || true
-            fi
-            # Capture both rc and stderr; case on rc (structured) — stderr is
-            # logged verbatim for human operators but never parsed.
-            set +e
-            "$O" dispatch-record "$bead_id" "$branch" 2>"$ERR_TMP"
-            rc=$?
-            set -e
-            err="$(cat "$ERR_TMP" 2>/dev/null || true)"
-            case "$rc" in
-                0) : ;;
-                3)  # over capacity — capacity gate refused
-                    cur_cap="$("$O" capacity 2>/dev/null || echo 0)"
-                    echo "[af] over capacity — skip $bead_id (capacity=$cur_cap)" >&2
-                    continue
-                    ;;
-                4)  # branch conflict — branch owned by another bead
-                    echo "[af] branch conflict $branch — skip $bead_id: $err" >&2
-                    continue
-                    ;;
-                5)  # require_state — bead is not QUEUED (race or already advanced)
-                    echo "[af] require_state failed for $bead_id (state=$cur_state not QUEUED)" >&2
-                    continue
-                    ;;
-                6)  # valid_branch / valid_pr — input format invalid (will not fix)
-                    echo "[af] invalid input for $bead_id: $err" >&2
-                    continue
-                    ;;
-                7)  # invalid bead_id — input format invalid (will not fix)
-                    echo "[af] invalid bead_id for $bead_id: $err" >&2
-                    continue
-                    ;;
-                9)  # EX_IO — sqlite / fs failure. CR-5: hard-fail the tick so
-                    # the IO error is not silently swallowed by the generic
-                    # 'continue' branch. The overlay returned a structured code
-                    # specifically because it could not write — continuing would
-                    # mask real disk/db problems and re-dispatch the same bead.
-                    echo "[af] dispatch-record EX_IO for $bead_id (rc=9): $err" >&2
-                    exit 9
-                    ;;
-                *)  # unexpected / genuine failure
-                    echo "[af] dispatch-record failed for $bead_id (rc=$rc): $err" >&2
-                    continue
-                    ;;
-            esac
+
+    if [ "$row_state" = "DISPATCHING" ]; then
+        # Only the state file carrying THIS reservation's nonce may reconcile
+        # it. An older detached writer has a different filename and cannot
+        # satisfy or release this attempt out of order.
+        if [ -z "$dispatch_nonce" ]; then
+            echo "[af] dispatch reservation $bead_id has no nonce; waiting for stale recovery" >&2
+            continue
         fi
-        dispatched=$((dispatched + 1))
-    else
-        echo "[af] skip $bead_id (ao spawn failed)" >&2
+        state_file="$SPAWN_STATE_DIR/${bead_id}-${pr}-${dispatch_nonce}.state"
+        spawn_state="$(cat "$state_file" 2>/dev/null || true)"
+        state_mtime="$(stat -c %Y "$state_file" 2>/dev/null || stat -f %m "$state_file" 2>/dev/null || echo "${reserve_epoch:-0}")"
+        now_epoch="$(date +%s)"
+        case "$spawn_state" in
+            ok)
+                if [ "$has_active_session" -eq 1 ]; then
+                    if complete_dispatch_reservation "$bead_id" "$branch" "$dispatch_nonce" "$pr" "$repo"; then
+                        dispatched=$((dispatched + 1))
+                    fi
+                    continue
+                fi
+                if [[ "$state_mtime" =~ ^[0-9]+$ ]] && [ $((now_epoch - state_mtime)) -lt "$PENDING_MAX_AGE" ]; then
+                    echo "[af] awaiting session visibility $bead_id PR #$pr in project $proj" >&2
+                    continue
+                fi
+                record_dispatch_block "$bead_id" "$row_state" "$dispatch_nonce" "$pr" "$branch" "$repo" verified_session_missing \
+                  "verified spawn has no visible project-scoped session after ${PENDING_MAX_AGE}s"
+                continue
+                ;;
+            fail:*)
+                record_dispatch_block "$bead_id" "$row_state" "$dispatch_nonce" "$pr" "$branch" "$repo" async_spawn_failed "$spawn_state"
+                continue
+                ;;
+            pending|"")
+                if [[ "$state_mtime" =~ ^[0-9]+$ ]] && [ $((now_epoch - state_mtime)) -lt "$PENDING_MAX_AGE" ]; then
+                    echo "[af] pending reserved spawn $bead_id PR #$pr nonce=$dispatch_nonce" >&2
+                    continue
+                fi
+                record_dispatch_block "$bead_id" "$row_state" "$dispatch_nonce" "$pr" "$branch" "$repo" pending_spawn_stale \
+                  "spawn remained pending beyond ${PENDING_MAX_AGE}s"
+                continue
+                ;;
+            *)
+                record_dispatch_block "$bead_id" "$row_state" "$dispatch_nonce" "$pr" "$branch" "$repo" invalid_spawn_state "$spawn_state"
+                continue
+                ;;
+        esac
     fi
+
+    # QUEUED/ATTESTED rows must win an atomic compare-and-set reservation
+    # before crossing the AO boundary. Losing overlapping ticks return rc=10
+    # and never spawn a duplicate claim.
+    if [ "$row_state" = "QUEUED" ] && [ -n "$branch" ]; then
+        "$O" route-record "$bead_id" STANDARD_PATH "drive-existing-pr" 2>/dev/null || true
+    fi
+    dispatch_nonce="${attempt}-$(date +%s)-$$-${RANDOM}"
+    set +e
+    "$O" dispatch-reserve "$bead_id" "$dispatch_nonce" 2>"$ERR_TMP"
+    rc=$?
+    set -e
+    case "$rc" in
+        0) : ;;
+        10)
+            echo "[af] reservation lost for $bead_id; another tick owns dispatch" >&2
+            continue
+            ;;
+        9)  # EX_IO — reservation persistence is unavailable; hard-fail tick.
+            echo "[af] dispatch-reserve EX_IO for $bead_id: $(cat "$ERR_TMP" 2>/dev/null || true)" >&2
+            exit 9
+            ;;
+        *)
+            echo "[af] dispatch-reserve failed for $bead_id (rc=$rc): $(cat "$ERR_TMP" 2>/dev/null || true)" >&2
+            continue
+            ;;
+    esac
+
+    if [ "$has_active_session" -eq 1 ]; then
+        # Compatible already-active PR claim: the reservation serializes the
+        # state transition, and the exact project-scoped session is verified.
+        if complete_dispatch_reservation "$bead_id" "$branch" "$dispatch_nonce" "$pr" "$repo"; then
+            dispatched=$((dispatched + 1))
+        fi
+        continue
+    fi
+
+    echo "[af] remediate $bead_id PR #$pr on $repo in project $proj nonce=$dispatch_nonce"
+    if ! ASYNC=1 AFD_ASYNC_WAIT_SEC=0 AFD_REQUIRE_SESSION=1 \
+      bash "$R" "$bead_id" "$pr" "$repo" "$proj" "$dispatch_nonce" 2>&1; then
+        record_dispatch_block "$bead_id" DISPATCHING "$dispatch_nonce" "$pr" "$branch" "$repo" ao_spawn_rejected \
+          "AO remediation wrapper rejected the asynchronous spawn"
+        continue
+    fi
+    dispatched=$((dispatched + 1))
 done < <(sqlite3 "$DB" -separator '|' \
-  "SELECT bead_id, pr_number, coalesce(branch,''), coalesce(target_repo,'') FROM bead_overlay
-   WHERE state IN ('QUEUED','ATTESTED') AND pr_number IS NOT NULL
+  "SELECT bead_id, pr_number, coalesce(branch,''), coalesce(target_repo,''), state,
+          coalesce(session_id,''), coalesce(attempt,1), coalesce(strftime('%s',updated_at),0)
+   FROM bead_overlay
+   WHERE state IN ('QUEUED','ATTESTED','DISPATCHING') AND pr_number IS NOT NULL
    $bead_filter
    $pr_sql_filter
    $order_clause;")

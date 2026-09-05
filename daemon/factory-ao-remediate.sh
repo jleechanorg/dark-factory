@@ -18,10 +18,10 @@
 #   - Pre-flight probe (≤5s wallclock): ensure AO daemon is reachable; if not,
 #     kick the Go daemon with a bounded retry loop. Fail loud if unreachable.
 #   - Detach the real spawn into a background process. Return 0 immediately
-#     with an "[remediate] async-spawned" message that includes pid + log path
-#     so the AF tick can record the dispatch state without waiting.
-#   - The background process writes its result to a state file so the NEXT
-#     tick can detect failures via the existing `ao session ls` check.
+#     with an "[remediate] async-spawned" message that includes pid + log path.
+#   - With AFD_REQUIRE_SESSION=1, the background process writes `ok` only after
+#     the exact project-scoped AO session is visible. The next AF tick then
+#     reconciles that session and records DISPATCHED without blocking here.
 #
 # Sync behavior (SYNC=1):
 #   - Preserves the original blocking behavior for tests and manual callers.
@@ -41,6 +41,8 @@
 #                             optimistically (default 5). Most auth/project
 #                             errors fail within 1-2s; cold-start slow spawns
 #                             exceed this bound and proceed optimistically.
+#   AFD_REQUIRE_SESSION=1     sync callers require a visible, active
+#                             project-scoped AO session before accepting spawn
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export AO_MAX_CONCURRENT_SESSIONS="${AO_MAX_CONCURRENT_SESSIONS:-30}"
@@ -49,12 +51,18 @@ BEAD_ID="${1:?bead_id required}"
 PR="${2:?pr_number required}"
 TARGET_REPO="${3:-jleechanorg/worldarchitect.ai}"
 AO_PROJECT="${4:-worldarchitect}"
+DISPATCH_NONCE="${5:-}"
+[ -z "$DISPATCH_NONCE" ] || [[ "$DISPATCH_NONCE" =~ ^[A-Za-z0-9._-]+$ ]] \
+  || { echo "[remediate] invalid dispatch nonce" >&2; exit 2; }
 SPAWN_TIMEOUT="${AO_SPAWN_TIMEOUT_SEC:-120}"
+READY_TIMEOUT="${AFD_AO_READY_TIMEOUT_SEC:-5}"
+case "$READY_TIMEOUT" in ''|*[!0-9]*|0) READY_TIMEOUT=5 ;; esac
+READY_DEADLINE=0
 DISPLAY_NAME="$(python3 -c 'import sys; print(sys.argv[1][:20])' "$BEAD_ID")"
 LOG_DIR="${AFD_LOG_DIR:-$HOME/Library/Logs/dark-factory}"
 STATE_DIR="${AFD_SPAWN_STATE_DIR:-$HOME/Library/Application Support/dark-factory/spawns}"
 SPAWN_LOG="$LOG_DIR/remediate-${BEAD_ID}-$(date -u +%Y%m%dT%H%M%SZ).log"
-STATE_FILE="$STATE_DIR/${BEAD_ID}-${PR}.state"
+STATE_FILE="$STATE_DIR/${BEAD_ID}-${PR}${DISPATCH_NONCE:+-$DISPATCH_NONCE}.state"
 
 # Mode resolution: SYNC=1 OR ASYNC=0 → sync; otherwise async (default).
 if [ "${SYNC:-0}" = "1" ] || [ "${ASYNC:-1}" = "0" ]; then
@@ -107,6 +115,17 @@ if [ -r "$ROOT/daemon/scripts/libnotify-slack.sh" ]; then
   slack_announce ":rocket: bead \`${BEAD_ID}\` PR #${PR} on ${TARGET_REPO} — async-spawning via AO" || true
 fi
 
+start_ready_deadline() {
+  READY_DEADLINE=$(( $(date +%s) + READY_TIMEOUT ))
+}
+
+ao_ready_probe() {
+  local remaining
+  remaining=$(( READY_DEADLINE - $(date +%s) ))
+  [ "$remaining" -gt 0 ] || return 124
+  timeout "$remaining" "$AO" "$@"
+}
+
 # Pre-flight: ensure AO is reachable. Bounded at 5s wallclock so the
 # async path never blocks more than that on cold-start. Two failure modes
 # are caught:
@@ -115,26 +134,27 @@ fi
 #      so the tick can skip the bead instead of silently queueing a doomed
 #      spawn that will never produce an `ao session ls` row.
 ensure_ao_daemon() {
+  start_ready_deadline
   # Catch broken AO binary first: a 127 exit on any command means the
   # CLI is misconfigured (wrong path, missing exec bit, broken install).
   # Don't queue a doomed spawn in that case.
-  if ! "$AO" --version >/dev/null 2>&1 && ! "$AO" status >/dev/null 2>&1; then
+  if ! ao_ready_probe --version >/dev/null 2>&1 && ! ao_ready_probe status >/dev/null 2>&1; then
     return 1
   fi
   if [[ "$(basename "$AO")" != "ao-go" ]]; then
     # ao-ts manages its own lifecycle; binary is the daemon.
     return 0
   fi
-  if "$AO" status >/dev/null 2>&1; then
+  if ao_ready_probe status >/dev/null 2>&1; then
     return 0
   fi
   echo "[remediate] starting Go AO daemon" >&2
   nohup "$AO" daemon >> /tmp/ao-go-daemon.log 2>&1 &
-  for _ in 1 2 3 4 5; do
-    if "$AO" status >/dev/null 2>&1; then
+  while [ $((READY_DEADLINE - $(date +%s))) -gt 0 ]; do
+    if ao_ready_probe status >/dev/null 2>&1; then
       return 0
     fi
-    sleep 1
+    [ $((READY_DEADLINE - $(date +%s))) -gt 0 ] && sleep 1
   done
   return 1
 }
@@ -143,7 +163,7 @@ run_spawn_foreground() {
   # Returns "exit_code<TAB>output" so the caller can branch on rc.
   local out rc
   set +e
-  if "$AO" spawn --help 2>&1 | grep -Eq '\-\-name'; then
+  if ao_ready_probe spawn --help 2>&1 | grep -Eq '\-\-name'; then
     out="$(timeout "$SPAWN_TIMEOUT" "$AO" spawn --project "$AO_PROJECT" --name "$DISPLAY_NAME" --agent claude-code --claim-pr "$PR" --prompt "$PROMPT" 2>&1)"
   else
     out="$(timeout "$SPAWN_TIMEOUT" "$AO" spawn --project "$AO_PROJECT" --claim-pr "$PR" --agent claude-code "$PROMPT" 2>&1)"
@@ -160,9 +180,27 @@ classify_spawn_outcome() {
   if echo "$out" | grep -Eq 'spawned session |Session [a-z0-9_-]+ created|✓ Session|pr_open|working|spawning|claimed https://'; then
     return 0
   fi
-  if "$AO" session ls 2>/dev/null | grep -E "pulls/${PR}\b" | grep -Eq "\[(spawning|running|active|working|pr_open)\]"; then
+  if ao_ready_probe session ls -p "$AO_PROJECT" 2>/dev/null | grep -E "pulls/${PR}\b" | grep -Eq "\[(spawning|running|active|working|pr_open)\]"; then
     return 0
   fi
+  return 1
+}
+
+verify_active_session() {
+  # A zero exit from `ao spawn` only means the CLI accepted the request. The
+  # factory's DISPATCHED state is stronger: an AO session for this exact PR
+  # must be visible and active. Scope every query to the selected project.
+  local sessions remaining
+  while :; do
+    remaining=$(( READY_DEADLINE - $(date +%s) ))
+    [ "$remaining" -gt 0 ] || return 1
+    sessions="$(ao_ready_probe session ls -p "$AO_PROJECT" 2>/dev/null || true)"
+    if printf '%s\n' "$sessions" | grep -E "pulls/${PR}\\b" | grep -Eq '\[(spawning|running|active|working|pr_open)\]'; then
+      return 0
+    fi
+    remaining=$(( READY_DEADLINE - $(date +%s) ))
+    [ "$remaining" -gt 0 ] && sleep 1
+  done
   return 1
 }
 
@@ -172,23 +210,33 @@ if [ "$MODE" = "sync" ]; then
   if [ -x "$MINIMAX_SYNC" ]; then
     bash "$MINIMAX_SYNC" --all || echo "[remediate] WARN: MiniMax sync failed — sessions may use Anthropic OAuth" >&2
   fi
-  # Best-effort daemon readiness for sync path (no bounded probe — caller
-  # is opting into blocking semantics).
+  start_ready_deadline
+  # Best-effort daemon readiness for sync path. Spawn capability detection
+  # and required session verification still share one bounded probe deadline.
   if [[ "$(basename "$AO")" == "ao-go" ]]; then
-    state="$("$AO" status --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("state",""))' 2>/dev/null || true)"
+    state="$(ao_ready_probe status --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("state",""))' 2>/dev/null || true)"
     if [ "$state" != "ready" ] && [ "$state" != "running" ]; then
       echo "[remediate] starting Go AO daemon" >&2
       nohup "$AO" daemon >> /tmp/ao-go-daemon.log 2>&1 &
-      sleep 2
+      ready_wait=$(( READY_DEADLINE - $(date +%s) ))
+      [ "$ready_wait" -gt 2 ] && ready_wait=2
+      [ "$ready_wait" -gt 0 ] && sleep "$ready_wait"
     fi
   fi
   result="$(run_spawn_foreground)"
   rc="${result%%$'\t'*}"
   out="${result#*$'\t'}"
-  if classify_spawn_outcome "$rc" "$out" >/dev/null; then
+  # Spawn has its own SPAWN_TIMEOUT budget. Give outcome/session probes a
+  # fresh bounded window so a legitimate cold spawn cannot consume it.
+  start_ready_deadline
+  if classify_spawn_outcome "$rc" "$out" >/dev/null \
+     && { [ "${AFD_REQUIRE_SESSION:-0}" != "1" ] || verify_active_session; }; then
     [ "$rc" -eq 0 ] || echo "[remediate] spawn accepted for PR #$PR (timeout=${SPAWN_TIMEOUT}s, rc=$rc)" >&2
     echo "$out"
     exit 0
+  fi
+  if [ "${AFD_REQUIRE_SESSION:-0}" = "1" ]; then
+    echo "[remediate] spawn for PR #$PR has no verified active AO session; refusing dispatch acknowledgement" >&2
   fi
   echo "$out" >&2
   exit 1
@@ -198,7 +246,7 @@ fi
 # Pre-flight: bounded 5s probe. Fail loud if AO is unreachable so the tick
 # can skip the bead instead of silently queueing a doomed spawn.
 if ! ensure_ao_daemon; then
-  echo "[remediate] AO unreachable after 5s probe — refusing to async-spawn" >&2
+  echo "[remediate] AO unreachable after ${READY_TIMEOUT}s readiness deadline — refusing to async-spawn" >&2
   exit 1
 fi
 
@@ -210,14 +258,23 @@ echo "pending" > "$STATE_FILE"
 # Detach the real spawn. Background process records outcome to STATE_FILE.
 (
   set +e
+  start_ready_deadline
   result="$(run_spawn_foreground)"
   rc="${result%%$'\t'*}"
   out="${result#*$'\t'}"
   printf '%s' "$out" > "$SPAWN_LOG"
-  if classify_spawn_outcome "$rc" "$out" >/dev/null; then
+  # Keep post-spawn verification independent from both daemon readiness and
+  # the separately bounded spawn duration.
+  start_ready_deadline
+  if classify_spawn_outcome "$rc" "$out" >/dev/null \
+     && { [ "${AFD_REQUIRE_SESSION:-0}" != "1" ] || verify_active_session; }; then
     echo "ok" > "$STATE_FILE"
   else
-    echo "fail:rc=$rc" > "$STATE_FILE"
+    if [ "${AFD_REQUIRE_SESSION:-0}" = "1" ]; then
+      echo "fail:rc=$rc:session_unverified" > "$STATE_FILE"
+    else
+      echo "fail:rc=$rc" > "$STATE_FILE"
+    fi
   fi
 ) >/dev/null 2>&1 &
 SPAWN_PID=$!
@@ -248,7 +305,7 @@ while [ $(( $(date +%s) - start_ts )) -lt "$ASYNC_WAIT_SEC" ]; do
   sleep 0.2
 done
 
-echo "[remediate] async-spawned PR #$PR bead=${BEAD_ID} pid=${SPAWN_PID} log=${SPAWN_LOG} state=${final_state:-pending}"
+echo "[remediate] async-spawned PR #$PR bead=${BEAD_ID} nonce=${DISPATCH_NONCE:-legacy} pid=${SPAWN_PID} log=${SPAWN_LOG} state=${final_state:-pending}"
 case "$final_state" in
   fail:*)
     # Fast-fail detected within wait window. Refuse so dispatch-record is
