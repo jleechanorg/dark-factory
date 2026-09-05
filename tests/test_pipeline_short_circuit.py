@@ -116,6 +116,30 @@ def test_gate_failure_short_circuits(monkeypatch):
     assert history[-1].outcome in ("failure", "exhausted")
 
 
+def test_gate_skeptic_inconclusive_routes_to_exit_not_fix(monkeypatch):
+    """Issue #827 Defect 1 (graph-level): a null-verdict `inconclusive`
+    outcome from gate_skeptic must never reach the `fix` node — there is no
+    finding to fix — and must not be masked as a pass at exit."""
+    def fake_holdout(node, ctx):
+        return Result(outcome="success", output="ok")
+    monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+    g = parse(_pipeline("gates.dot"))
+    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx.state["gate_skeptic.outcome"] = "inconclusive"
+
+    history = run(g, ctx, max_steps=20)
+    nodes = [r.node for r in history]
+
+    assert "fix" not in nodes
+    assert "gate_skeptic" in nodes
+    assert history[-1].node == "exit"
+    # `_classify_outcome` (runner/_classify.py) buckets the raw
+    # "inconclusive" outcome into "failure" for engine-internal routing —
+    # the important, previously-broken invariant is that it never reaches
+    # `exit` looking like a pass, and never routes through `fix`.
+    assert history[-1].outcome != "success"
+
+
 def test_gate_nonzero_returncode_cannot_spoof_pass(monkeypatch, tmp_path):
     def fake_holdout(node, ctx):
         return Result(outcome="success", output="ok")

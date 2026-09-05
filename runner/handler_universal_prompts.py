@@ -465,10 +465,16 @@ def _gate_skeptic(node: "Node", ctx: "Context") -> "Result":
     # 1. Handle echo/mock_llm backend
     if ctx.backend in ("echo", "mock_llm"):
         hint = ctx.state.get(f"{node.name}.outcome", "success")
+        echo_metadata = {"slash_command": "skeptic", "verdict": "echo:" + hint}
+        if hint == "inconclusive":
+            # Mirror the real handler's issue #827 Defect 1 contract so
+            # echo-backend graph tests can exercise gates.dot's
+            # `no_verdict`-keyed routing without a real reviewer call.
+            echo_metadata["no_verdict"] = "true"
         return Result(
             outcome=hint,
             output=f"echo gate skeptic: pre-seeded {hint}",
-            metadata={"slash_command": "skeptic", "verdict": "echo:" + hint},
+            metadata=echo_metadata,
         )
 
     # 2. Get expected SHA
@@ -623,9 +629,34 @@ def _gate_skeptic(node: "Node", ctx: "Context") -> "Result":
         results, repo, pr_num, expected_sha, expected_sha, implementation_identity
     )
     
-    outcome = "success" if verdict == "PASS" else "failure"
+    # Issue #827 Defect 1: a `None` verdict means no reviewer produced a
+    # parseable structured verdict (ConsensusAggregator.aggregate's
+    # `has_invalid` branch) — a distinct event from a reviewer having
+    # actually rejected the diff (verdict == "FAIL"). Conflating the two
+    # as `outcome="failure"` routed an absent verdict to the `fix` node,
+    # which has no real finding to act on. `outcome="inconclusive"` is
+    # already a first-class engine outcome token (see runner/_classify.py
+    # and runner/handler_verdict.py's `_VERDICT_NORMALIZE`) — reuse it here
+    # instead of inventing a new one.
+    #
+    # `runner.engine_run._run_single_node` normalizes every Result's
+    # `.outcome` through `_classify_outcome` before the graph ever sees it
+    # for edge routing (`_classify_outcome("inconclusive") == "failure"`,
+    # same bucket as a real rejection), so a `.dot` edge condition on the
+    # literal `outcome` value cannot distinguish the two. `metadata` is
+    # never touched by that normalization, so `no_verdict="true"` is the
+    # signal `pipelines/factory/gates.dot` actually routes on.
+    if verdict == "PASS":
+        outcome = "success"
+    elif verdict is None:
+        outcome = "inconclusive"
+    else:
+        outcome = "failure"
+    metadata = {"slash_command": "skeptic", "verdict": verdict}
+    if verdict is None:
+        metadata["no_verdict"] = "true"
     return Result(
         outcome=outcome,
         output=body,
-        metadata={"slash_command": "skeptic", "verdict": verdict},
+        metadata=metadata,
     )
