@@ -304,6 +304,18 @@ def _cleanup_controller_runtime(run_dir: pathlib.Path) -> None:
 
 
 def _sanitized_env() -> dict[str, str]:
+    """Strip holdout env vars AND block `git push` unconditionally.
+
+    dark-factory#828 item (c): no individual subprocess (codergen backend,
+    gate/holdout/healer diagnostic, anything launched through this helper)
+    is ever allowed to push directly — that's the "structural, not a
+    runtime flag a misbehaving node could ignore" requirement. `--allow-
+    push` does NOT lift this per-subprocess block; it instead gates a
+    SEPARATE, centralized push performed by the runner itself at run end
+    (`runner.push_guard.maybe_push_at_run_end`), only when the run's
+    final_outcome is a genuine success — never on `exhausted`/`failure`/
+    `error`. See runner/push_guard.py for the full design rationale.
+    """
     env = {}
     for k, v in os.environ.items():
         if k == "DARK_FACTORY_HOLDOUTS":
@@ -311,7 +323,8 @@ def _sanitized_env() -> dict[str, str]:
         if "HOLDOUT" in k.upper():
             continue
         env[k] = v
-    return env
+    from .push_guard import push_guard_env
+    return push_guard_env(env)
 
 
 def _get_claude_executable() -> str:

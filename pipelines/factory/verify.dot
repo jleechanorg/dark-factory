@@ -1,0 +1,131 @@
+digraph verify {
+    graph [
+        goal="Review-only verification: holdout + 3 adversarial gates. NO code changes are made — structurally impossible, this graph contains no fix/coder node at all."
+        level5="true"
+        label="Verify (review-only, no writes)"
+        skip_explore="true"
+        skip_plan="true"
+        skip_implement="true"
+        skip_fix="true"
+    ]
+    rankdir=LR
+
+    // dark-factory#828: the real incident was a "review/verify only, do
+    // not change code" goal run through gates.dot, which DOES contain a
+    // fix/coder node — a null-verdict gate routed there and the coder
+    // improvised destructively on a live PR branch. gates.dot's fix
+    // routing has since been fixed too (fix only fires on outcome=failure,
+    // a real finding — see gates.dot's own header comment), but that fix
+    // is a RUNTIME behavior, not a structural guarantee. This pipeline is
+    // the structural guarantee the issue asked for: use --pipeline
+    // pipelines/factory/verify.dot for ANY goal that must never write or
+    // push, and no gate outcome, verdict, or bug in gate routing logic can
+    // ever cause a write — there is no node in this graph capable of one.
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    holdout [type="holdout_eval", label="Holdout Eval", feature="hello", timeout=600]
+    gate_skeptic [
+        type="gate_skeptic",
+        label="Skeptic (inverted-incentive review)",
+        backend_priority="codex,minimax,agy,claude-sonnet",
+        prefer_adversarial="true",
+        timeout=600
+    ]
+    adversarial_reviewer [
+        type="parallel_reviewer",
+        label="Adversarial reviewer (primary + N shadows, density-enforced)",
+        review_contract="cold-review-v1",
+        prompt="@prompts/slim/review_phase5_shadow.md",
+        backend_priority="minimax,agy,codex,claude-sonnet",
+        prefer_adversarial="true",
+        n_shadows="3",
+        gate_strict="true",
+        receipt_required="true",
+        timeout=600
+    ]
+    gate_es [
+        type="gate_es",
+        label="/es Evidence Standards",
+        backend_priority="codex,minimax,agy,claude-sonnet",
+        prefer_adversarial="true",
+        gate_strict="true",
+        timeout=600
+    ]
+    gate_er [
+        type="gate_er",
+        label="/er Evidence Review",
+        backend_priority="codex,minimax,agy,claude-sonnet",
+        prefer_adversarial="true",
+        gate_strict="true",
+        timeout=600
+    ]
+    gate_cs [
+        type="gate_code_standards",
+        label="/code_standards (ZFC + leveling + RCF)",
+        backend_priority="codex,minimax,agy,claude-sonnet",
+        prefer_adversarial="true",
+        gate_strict="true",
+        timeout=600
+    ]
+
+    // /web-advice fail-open advisory node (read-only browser review; never
+    // writes to the target checkout).
+    web_advice [
+        type="web_advice",
+        label="/web-advice (fail-open)",
+        prompt="@prompts/web_advice.txt",
+        backend="claude",
+        timeout=900,
+        min_diff_lines="5",
+        transport="auto",
+        decision="continue",
+        fail_open="true",
+        description="Multi-model browser review (gemini/grok/chatgpt/perplexity) via real authenticated browser sessions. FAIL-OPEN: never blocks. Signal goes to CXDB + PR comment."
+    ]
+
+    // No `fix` node exists in this graph. Every non-success outcome routes
+    // to exit with the real outcome preserved in that step's CXDB record
+    // (per-step history, not the top-line final_outcome — see
+    // runner/handler_core.py's `_exit` handler, which always reports
+    // outcome=success for the exit step itself; this is a pre-existing,
+    // repo-wide convention also relied on by web_advice's fail-open edge,
+    // out of scope to change here). Explicit EQ conditions (never `!=`) so
+    // this intentional review-only design does not trip
+    // runner.graph_audit's G2 check, which flags a literal
+    // `outcome != success` on a reviewer->exit edge as accidentally
+    // dropping a fix-loop contract that this graph deliberately never had.
+    start -> holdout
+    holdout -> gate_skeptic [condition="outcome=success"]
+    holdout -> exit         [condition="outcome=failure"]
+    holdout -> exit         [condition="outcome=error"]
+
+    gate_skeptic -> adversarial_reviewer [condition="outcome=success"]
+    gate_skeptic -> exit                 [condition="outcome=failure"]
+    gate_skeptic -> exit                 [condition="outcome=error"]
+    // gate_skeptic's bespoke implementation (runner/handler_universal_
+    // prompts.py, dark-factory#830) sets outcome="inconclusive" (not
+    // "error") for a null/unparseable verdict — the other four gates
+    // never emit this literal outcome, only gate_skeptic needs this edge.
+    gate_skeptic -> exit                 [condition="outcome=inconclusive"]
+
+    adversarial_reviewer -> gate_es [condition="outcome=success"]
+    adversarial_reviewer -> exit    [condition="outcome=failure"]
+    adversarial_reviewer -> exit    [condition="outcome=error"]
+
+    gate_es -> gate_er [condition="outcome=success"]
+    gate_es -> exit    [condition="outcome=failure"]
+    gate_es -> exit    [condition="outcome=error"]
+
+    gate_er -> gate_cs [condition="outcome=success"]
+    gate_er -> exit    [condition="outcome=failure"]
+    gate_er -> exit    [condition="outcome=error"]
+
+    gate_cs -> web_advice [condition="outcome=success"]
+    gate_cs -> exit       [condition="outcome=failure"]
+    gate_cs -> exit       [condition="outcome=error"]
+
+    // Fail-open heart: single unconditional edge to exit.
+    web_advice -> exit
+}

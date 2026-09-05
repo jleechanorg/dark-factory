@@ -84,6 +84,25 @@ digraph gates {
         timeout=600
     ]
 
+    // dark-factory#828: `fix` must only fire on an actionable finding, not
+    // a gate that produced no real verdict at all or hit an infra problem
+    // — routing either there let the coder improvise destructively with a
+    // live PR checked out (real incident, 2026-08-30). Two distinct
+    // mechanisms below because gate_skeptic (bespoke RuleLoader/
+    // VerifierDispatcher implementation in
+    // runner/handler_universal_prompts.py) and the other four gates
+    // (route through runner/handler_verdict.py's `_parse_verdict` via
+    // `_run_gate_once`) are different code paths with different "no real
+    // verdict" signals:
+    //   - gate_skeptic: the `no_verdict=true` metadata flag (see the
+    //     comment just above its edges).
+    //   - adversarial_reviewer / gate_es / gate_er / gate_cs: a null/
+    //     unparseable verdict (e.g. `VERDICT: None`) normalizes to
+    //     outcome=error, NOT failure, in `_parse_verdict` — same bucket as
+    //     a genuine infra problem (backend missing, subprocess crash,
+    //     SHA-echo mismatch). Both route straight to exit — same "stop,
+    //     don't act" contract already used by web_advice's fail-open edge
+    //     below.
     start -> holdout
     holdout -> gate_skeptic [condition="outcome=success"]
     holdout -> fix         [condition="outcome!=success"]
@@ -114,15 +133,20 @@ digraph gates {
     gate_skeptic -> fix                  [condition="outcome!=success and no_verdict!=true"]
 
     adversarial_reviewer -> gate_es [condition="outcome=success"]
-    adversarial_reviewer -> fix     [condition="outcome!=success"]
+    adversarial_reviewer -> fix     [condition="outcome=failure"]
+    adversarial_reviewer -> exit    [condition="outcome=error"]
 
     gate_es -> gate_er [condition="outcome=success"]
-    gate_es -> fix     [condition="outcome!=success"]
+    gate_es -> fix     [condition="outcome=failure"]
+    gate_es -> exit    [condition="outcome=error"]
 
     gate_er -> gate_cs [condition="outcome=success"]
-    gate_er -> fix     [condition="outcome!=success"]
+    gate_er -> fix     [condition="outcome=failure"]
+    gate_er -> exit    [condition="outcome=error"]
 
     gate_cs -> web_advice [condition="outcome=success"]
+    gate_cs -> fix        [condition="outcome=failure"]
+    gate_cs -> exit       [condition="outcome=error"]
 
     // Fail-open heart: single unconditional edge to exit.
     web_advice -> exit
