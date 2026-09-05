@@ -374,9 +374,10 @@ if [[ "${LINK}" -eq 1 ]]; then
 fi
 
 # Mirror repo-scope commands + skills to user-scope (~/.claude/) so /f /fs
-# /factory /factory-spec and the dark-factory / factory-spec skills resolve
-# from any cwd. The repo is the single source of truth — any drift in
-# ~/.claude/ is overwritten on re-run. Pass --no-cmds to skip.
+# /factory /factory-spec /fr /factory-review and the dark-factory /
+# factory-spec / factory-review skills resolve from any cwd. The repo is
+# the single source of truth — any drift in ~/.claude/ is overwritten on
+# re-run. Pass --no-cmds to skip.
 if [[ "${CMDS}" -eq 1 ]]; then
   CLAUDE_DIR="${HOME}/.claude"
   mkdir -p "${CLAUDE_DIR}/commands" "${CLAUDE_DIR}/skills"
@@ -384,7 +385,7 @@ if [[ "${CMDS}" -eq 1 ]]; then
   # 4 factory commands — point at the installed runtime. On Linux this keeps
   # every executable prompt payload inside the immutable release rather than
   # reaching back into the Git checkout.
-  for cmd in f fs factory factory-spec; do
+  for cmd in f fs factory factory-spec fr factory-review; do
     src="${RUNTIME_ROOT}/.claude/commands/${cmd}.md"
     dst="${CLAUDE_DIR}/commands/${cmd}.md"
     if [[ -f "${src}" ]]; then
@@ -399,7 +400,7 @@ if [[ "${CMDS}" -eq 1 ]]; then
   # Existing regular directories are backed up to <dst>.bak.<unix-ts> so the
   # operator can recover user-scope edits; subsequent runs replace the symlink
   # cleanly with `ln -sfn`.
-  for skill in dark-factory factory-spec; do
+  for skill in dark-factory factory-spec factory-review; do
     src="${RUNTIME_ROOT}/.claude/skills/${skill}"
     dst="${CLAUDE_DIR}/skills/${skill}"
     if [[ ! -d "${src}" ]]; then
