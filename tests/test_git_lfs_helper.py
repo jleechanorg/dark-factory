@@ -128,10 +128,6 @@ def _git_lfs_absent() -> bool:
     return shutil.which("git-lfs") is None
 
 
-@pytest.mark.skipif(
-    shutil.which("git-lfs") is not None,
-    reason="requires git-lfs to be absent on PATH",
-)
 def test_helper_exits_two_when_git_lfs_missing(capsys) -> None:
     proc = subprocess.run(
         [str(HELPER), "post-checkout"],
@@ -146,6 +142,10 @@ def test_helper_exits_two_when_git_lfs_missing(capsys) -> None:
     assert "_git-lfs-hook.sh" in combined, (
         f"error should name the helper file, got: {combined!r}"
     )
+    assert "git-lfs was not found on PATH" in combined, (
+        f"error should explain git-lfs was not found, got: {combined!r}"
+    )
+
 
 
 @pytest.mark.parametrize("name", CONSUMERS)
@@ -254,3 +254,61 @@ def test_consumer_invokes_git_lfs_with_verb_when_present(
     assert "arg1" in argv and "arg2" in argv, (
         f"git-lfs should receive forwarded args; got argv={argv!r}"
     )
+
+
+def test_helper_invokes_git_lfs_with_verb_when_present(
+    tmp_path: pathlib.Path,
+) -> None:
+    """When executed directly with positional verb, helper runs `git lfs <verb>`
+    and forwards only the remaining args (verb shifted)."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    record = tmp_path / "invocation.json"
+    record.write_text("")
+
+    git_lfs_script = "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + str(record) + "\nexit 0\n"
+    fake_git_lfs = fake_bin / "git-lfs"
+    fake_git_lfs.write_text(git_lfs_script)
+    fake_git_lfs.chmod(0o755)
+
+    git_script = '#!/bin/sh\nif [ "$1" = lfs ]; then\n  shift\n  exec git-lfs "$@"\nfi\nexit 0\n'
+    fake_git = fake_bin / "git"
+    fake_git.write_text(git_script)
+    fake_git.chmod(0o755)
+
+    test_path = os.pathsep.join([str(fake_bin), "/usr/bin", "/bin"])
+
+    proc = subprocess.run(
+        [str(HELPER), "post-checkout", "arg1", "arg2"],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": test_path},
+    )
+    assert proc.returncode == 0, (
+        f"helper should succeed when git-lfs shim is present; "
+        f"rc={proc.returncode}, stderr={proc.stderr!r}"
+    )
+    argv = record.read_text().splitlines()
+    assert argv and argv[0] == "post-checkout", (
+        f"git-lfs should be called with verb='post-checkout'; got argv={argv!r}"
+    )
+    assert argv == ["post-checkout", "arg1", "arg2"], (
+        f"git-lfs should receive forwarded args without extra verb; got argv={argv!r}"
+    )
+
+
+def test_helper_exits_two_when_no_verb_provided() -> None:
+    """When executed with neither GIT_LFS_VERB nor positional argument, helper exits 2."""
+    proc = subprocess.run(
+        [str(HELPER)],
+        capture_output=True,
+        text=True,
+        env={k: v for k, v in os.environ.items() if k != "GIT_LFS_VERB"},
+    )
+    assert proc.returncode == 2, (
+        f"helper should exit 2 when no verb is provided, got {proc.returncode}"
+    )
+    combined = (proc.stdout or "") + (proc.stderr or "")
+    assert "_git-lfs-hook.sh" in combined
+    assert "verb must be set" in combined
+
