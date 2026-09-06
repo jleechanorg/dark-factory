@@ -594,6 +594,20 @@ def _gate_subprocess_args(
             return sealed_args_builder([
                 "codex", "exec", "--yolo", "--skip-git-repo-check", prompt,
             ], workdir)
+        # Registered (non-built-in) backends: route through their argv
+        # hook so downstream forks (snap_factory) can ship their own
+        # subprocess without colliding with the catch-all Claude line.
+        # The hook's argv is wrapped through the sealed sandbox-exec
+        # builder so the jleechan-113 holdout-deny rules still apply.
+        import runner.backend_registry as _backend_registry  # late-bound shim
+        registered = _backend_registry.get_backend(backend)
+        if registered is not None:
+            argv: list[str] | None = registered.gate_args(
+                backend, prompt, ctx, timeout, workdir=workdir
+            )
+            if argv is None:
+                return None
+            return sealed_args_builder(list(argv), workdir)
         claude_bin = _handlers_shim._get_claude_executable()
         return sealed_args_builder([claude_bin, "--print", "--dangerously-skip-permissions", prompt], workdir)
     if backend == "agy":
@@ -609,6 +623,18 @@ def _gate_subprocess_args(
         return _handlers_shim._sandboxed_args([
             "codex", "exec", "--yolo", "--skip-git-repo-check", prompt,
         ])
+    # Registered (non-built-in) backends on the legacy holdout-only
+    # path. Hook argv is wrapped through ``_sandboxed_args`` so the
+    # legacy sandbox-exec deny rules still apply.
+    import runner.backend_registry as _backend_registry  # late-bound shim
+    registered = _backend_registry.get_backend(backend)
+    if registered is not None:
+        argv: list[str] | None = registered.gate_args(
+            backend, prompt, ctx, timeout, workdir=None
+        )
+        if argv is None:
+            return None
+        return _handlers_shim._sandboxed_args(list(argv))
     # ``claude-sonnet`` (priority-queue name), bare ``claude`` (run-level
     # default), and any other claude-routed backend → Anthropic Claude CLI.
     # ``minimax`` is a special case of this path with a different base URL
@@ -619,6 +645,7 @@ def _gate_subprocess_args(
 
 def _gate_subprocess_env(backend: str) -> dict[str, str]:
     import runner.handlers as _handlers_shim  # late-bound shim
+    import runner.backend_registry as _backend_registry  # late-bound shim
     """Env overrides for a reviewer-gate subprocess on ``backend``.
 
     For ``minimax`` the Claude CLI must route through the minimax Anthropic-
@@ -626,10 +653,18 @@ def _gate_subprocess_env(backend: str) -> dict[str, str]:
     on top of ``_sanitized_env`` (never raw ``os.environ`` — holdout vars
     must not reach any reviewer subprocess). All other backends use
     ``_sanitized_env`` unchanged.
+
+    Registered (non-built-in) backends may add their own env vars via
+    ``gate_env``; the hook return is layered on top of the sanitized
+    base.
     """
+    base = _handlers_shim._sanitized_env()
     if backend == "minimax":
-        return {**_handlers_shim._sanitized_env(), "ANTHROPIC_BASE_URL": "https://api.minimax.io/anthropic"}
-    return _handlers_shim._sanitized_env()
+        base = {**base, "ANTHROPIC_BASE_URL": "https://api.minimax.io/anthropic"}
+    registered = _backend_registry.get_backend(backend)
+    if registered is not None:
+        return {**base, **registered.gate_env(backend)}
+    return base
 
 
 def _build_controller_codex_transport(
