@@ -121,9 +121,35 @@ pipeline before invoking `dark-factory`, unless the user passed `--pipeline`.
 ## Architecture
 
 ### Agent Orchestrator (AO) Repository Policy
-- The canonical AO engine used by dark-factory is upstream **Golang `agent-orchestrator`** (`https://github.com/strongdm/agent-orchestrator` / `jleechanorg/agent-orchestrator`). We do NOT use `agent-orchestrator-ts`.
-- The AO repository is **read-only / reference only**. We almost never want to modify or open PRs against AO; all session liveness interpretation, reaping triggers, timeout logic, and promotion handling must live within `dark-factory` itself (e.g. in `daemon/src/adapters.rs` and `daemon/src/tick.rs`).
-- **Hard Safety Gate**: Agents must **NEVER** write or modify `agent-orchestrator` code unless the human operator explicitly provides the verbatim authorization: `AO CODE APPROVED`.
+- The actual production worker-spawn path — `ao_spawn_command_with_mode()` in
+  `daemon/src/adapters.rs` — is hard-pinned to the **Node/TS fork**
+  (`@jleechanorg/ao-cli`), not the Go rewrite. It sets
+  `NODE_OPTIONS=--import=<path>` to preload
+  `daemon/scripts/ao-spawn-v013-bridge.mjs`, and that bridge script itself
+  refuses to run unless the resolved `ao` binary's `package.json` reports
+  `name === "@jleechanorg/ao-cli"` and `version === "0.1.3"`
+  (`daemon/scripts/ao-spawn-v013-bridge.mjs:30-41`). This is enforced by the
+  bridge's own runtime check, independent of anything stated here.
+- A separate **Go rewrite** (`ao-go`, upstream
+  `https://github.com/strongdm/agent-orchestrator` /
+  `jleechanorg/agent-orchestrator`) exists on the production host as its own
+  binary with its own systemd unit (`ao-daemon.service`) and project
+  registry, but as of 2026-09 it has never had `dark-factory` registered as a
+  project, and no code under `daemon/src/*.rs` calls it — it is an
+  aspirational/future migration target, not the engine currently in use.
+  (`daemon/factory-ao-remediate.sh`, a legacy Mac-side shell script separate
+  from the Rust daemon's tick loop, defaults to `~/bin/ao-go` for its own
+  narrower remediation purpose, but that script is not part of the
+  `adapters.rs` spawn path either.)
+- The AO repository (whichever engine) is **read-only / reference only**. We
+  almost never want to modify or open PRs against AO; all session liveness
+  interpretation, reaping triggers, timeout logic, and promotion handling
+  must live within `dark-factory` itself (e.g. in `daemon/src/adapters.rs`
+  and `daemon/src/tick.rs`).
+- **Hard Safety Gate**: Agents must **NEVER** write or modify
+  `agent-orchestrator` (or `agent-orchestrator-ts`) code unless the human
+  operator explicitly provides the verbatim authorization: `AO CODE
+  APPROVED`.
 
 ### Durable artifacts vs. dorodango
 The `.dot` files under `pipelines/` are the artifact worth versioning — they encode the development process. The Python under `runner/` is treated as throwaway code: polish, discard, rebuild from spec. Learning accumulates in the **CXDB** event log, not in the runner code.
