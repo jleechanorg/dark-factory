@@ -4223,6 +4223,195 @@ fn test_manual_bead_input_auto_queued_and_dispatched() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+/// Scripted `Llm` fake that returns a fixed sequence of `judge()` results
+/// (`Ok` or a caller-supplied `DaemonError`), consumed in call order. Unlike
+/// the shared `FakeLlm`, this lets a single test script candidate N to fail
+/// with a specific non-`Parse` error while candidates N-1 and N+1 succeed —
+/// the exact shape needed to prove `run_slow_tier`'s routing loop continues
+/// past one bad candidate instead of aborting the whole tick.
+struct SequencedJudgeLlm {
+    replies: std::cell::RefCell<Vec<Result<String, DaemonError>>>,
+}
+
+impl SequencedJudgeLlm {
+    fn new(replies: Vec<Result<&str, DaemonError>>) -> Self {
+        Self {
+            replies: std::cell::RefCell::new(
+                replies
+                    .into_iter()
+                    .map(|r| r.map(|s| s.to_string()))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+impl Llm for SequencedJudgeLlm {
+    fn judge(&self, _prompt: &str) -> Result<String, DaemonError> {
+        let mut replies = self.replies.borrow_mut();
+        if replies.is_empty() {
+            return Err(DaemonError::Tool {
+                tool: "llm".into(),
+                rc: 1,
+                stderr: "no scripted judge reply left".into(),
+            });
+        }
+        replies.remove(0)
+    }
+}
+
+/// jleechan (af-e2e-proof session, 2026-09-05): `run_slow_tier`'s routing
+/// loop used to `return Err(other)` the instant ANY candidate's
+/// `router::route()` call failed with a non-`Parse` error (e.g. a
+/// `DaemonError::Tool`/`Timeout` surfaced from the underlying `Llm::judge`
+/// call). That `?`-propagation aborted the ENTIRE tick's routing phase —
+/// every candidate after the failing one, in every repo, silently never got
+/// routed, with no ERROR telemetry and no `consecutive_failures` bump (the
+/// error is `is_transient()`, so the daemon's outer tick loop just retries
+/// next tick — forever, if the same candidate keeps failing first). This
+/// test proves the fix: one candidate's non-Parse router error must park
+/// only that bead and let the loop continue to the rest of the batch.
+#[test]
+fn run_slow_tier_router_error_does_not_abort_remaining_candidates() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    tracker.candidates.borrow_mut().extend([
+        Bead {
+            id: "bead-routes-first".into(),
+            title: "routes fine first".into(),
+            description: String::new(),
+            notes: String::new(),
+            file_tree_summary: String::new(),
+            external_ref: None,
+        },
+        Bead {
+            id: "bead-router-errors".into(),
+            title: "router::route() returns a non-Parse error".into(),
+            description: String::new(),
+            notes: String::new(),
+            file_tree_summary: String::new(),
+            external_ref: None,
+        },
+        Bead {
+            id: "bead-routes-after".into(),
+            title: "must still route despite the earlier error".into(),
+            description: String::new(),
+            notes: String::new(),
+            file_tree_summary: String::new(),
+            external_ref: None,
+        },
+    ]);
+
+    let llm = SequencedJudgeLlm::new(vec![
+        Ok(r#"{"routingVerdict":"SMALL_PATH","justification":"scripted"}"#),
+        Err(DaemonError::Tool {
+            tool: "codex".into(),
+            rc: 1,
+            stderr: "simulated non-Parse judge failure".into(),
+        }),
+        Ok(r#"{"routingVerdict":"SMALL_PATH","justification":"scripted"}"#),
+    ]);
+
+    let sessions = FakeSessions::new();
+    let store = FakeStateStore::new();
+    for bead_id in [
+        "bead-routes-first",
+        "bead-router-errors",
+        "bead-routes-after",
+    ] {
+        store
+            .save(&BeadOverlay {
+                bead_id: bead_id.into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                session_ao_project: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("owner/repo".to_string()),
+                attempt_started_at: None,
+            })
+            .unwrap();
+    }
+
+    let cfg = test_cfg();
+    let vcs = test_vcs();
+    let telemetry_log = std::env::temp_dir().join("afd_router_error_continues.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        },
+        0,
+        0,
+    )
+    .expect("a non-Parse router error for one candidate must not abort the whole tick");
+
+    assert_eq!(
+        summary.beads_routed, 2,
+        "the two candidates whose judge() succeeded must still be routed \
+         despite the middle candidate's non-Parse router error"
+    );
+    assert_eq!(
+        summary.beads_parked_human_held, 1,
+        "the candidate whose router::route() returned a non-Parse error \
+         must be parked, not silently dropped or left QUEUED forever"
+    );
+
+    let after = store.load("bead-routes-after").unwrap().unwrap();
+    assert_ne!(
+        after.state,
+        OverlayState::Queued,
+        "the LAST candidate must have been reached and routed/dispatched, \
+         proving the loop continued past the earlier router error"
+    );
+
+    // `router_error:` is a recoverable park reason (mirroring
+    // `router_parse_error:`), so the SAME tick's "jleechan-gib" automated
+    // HUMAN_HELD-exit sweep (which runs after `run_slow_tier`, per the
+    // dispatch-scheduling-guarantee ordering) immediately requeues it —
+    // it does not stay parked. That auto-recovery is the correct, existing
+    // behavior for a transient router failure; the assertions below only
+    // check that the park + real error content were genuinely recorded
+    // along the way, not that the bead is stuck forever.
+    assert_eq!(
+        summary.beads_recovered_from_held, 1,
+        "the parked bead's transient router error must auto-recover to QUEUED \
+         in the same tick, same as other recoverable HUMAN_HELD reasons"
+    );
+    let errored = store.load("bead-router-errors").unwrap().unwrap();
+    assert_eq!(
+        errored.state,
+        OverlayState::Queued,
+        "a router-error park is recoverable and must be requeued, not stuck"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("simulated non-Parse judge failure"),
+        "telemetry must log the real error content for follow-up investigation; \
+         telemetry was:\n{telemetry}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 fn dependency_admission_fixture(
     state: OverlayState,
 ) -> (

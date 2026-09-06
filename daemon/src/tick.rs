@@ -2490,7 +2490,41 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     let _ = deps.tracker.comment_external(ext_ref, &comment_body);
                 }
             }
-            Err(other) => return Err(other),
+            Err(other) => {
+                // jleechan (af-e2e-proof session, 2026-09-05): this used to
+                // `return Err(other)`, propagating via `?` out of
+                // `run_slow_tier` and aborting the ENTIRE tick's routing
+                // phase the instant any single candidate's `judge()` call
+                // failed with a non-`Parse` error — silently starving every
+                // candidate after it, for every repo, forever if the same
+                // candidate keeps failing first (the error is typically
+                // `is_transient()`, so the outer tick loop just retries next
+                // tick with no ERROR telemetry and no `consecutive_failures`
+                // bump). Park just this one bead — mirroring the `Parse` arm
+                // above — and let the loop continue.
+                let reason = other.to_string();
+                let mut held = overlay;
+                held.state = OverlayState::HumanHeld;
+                set_human_hold_reason(&mut held, HumanHoldReason::RouterError(reason.clone()));
+                deps.store.save(&held)?;
+                summary.beads_parked_human_held += 1;
+                emit(
+                    deps.telemetry_log,
+                    &bead.id,
+                    held.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "PARKED_HUMAN_HELD",
+                    serde_json::json!({}),
+                    serde_json::json!({"reason": reason}),
+                )?;
+                let comment_body = format!(
+                    "🤖 **[dark-factory]** Router error (human held): {}",
+                    reason
+                );
+                if let Some(ref ext_ref) = bead.external_ref {
+                    let _ = deps.tracker.comment_external(ext_ref, &comment_body);
+                }
+            }
         }
     }
 
