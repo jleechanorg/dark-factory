@@ -669,6 +669,7 @@ pub fn now_iso8601() -> String {
 pub const CIRCUIT_BREAKER_PARK_REASON: &str =
     "circuit-breaker triggered: same reviewer and feedback hash as prior attempt";
 const ROUTER_PARSE_PARK_REASON_PREFIX: &str = "router_parse_error:";
+const ROUTER_ERROR_PARK_REASON_PREFIX: &str = "router_error:";
 
 pub enum HumanHoldReason {
     TransientSpawnRetryCapExceeded,
@@ -677,6 +678,20 @@ pub enum HumanHoldReason {
     Stage1GateNotGreen,
     SpecValidationFailed,
     RouterParse(String),
+    /// A non-`Parse` error from `router::route()` (e.g. `DaemonError::Tool`
+    /// or `DaemonError::Timeout` bubbling up from the underlying
+    /// `Llm::judge` call). This used to propagate via `?` straight out of
+    /// `run_slow_tier`'s routing loop, aborting the ENTIRE tick's routing
+    /// phase the instant any single candidate's judge call failed —
+    /// silently starving every candidate after it, for every repo, with no
+    /// ERROR telemetry (the error is typically `is_transient()`, so the
+    /// outer tick loop just retries next tick — forever, if the same
+    /// candidate keeps failing first). Parking just this one bead lets the
+    /// loop continue to the next candidate instead. Recoverable via the
+    /// same prefix-matching discipline as `RouterParse`: the underlying
+    /// failure is usually a transient tool/LLM call, so a plain requeue on
+    /// the next recovery sweep is safe.
+    RouterError(String),
     UnmappedTargetRepo,
     TargetCheckoutUnconfigured,
     /// Bead jleechan-8jxr r2: a manually-created factory bead whose intake
@@ -778,6 +793,9 @@ impl HumanHoldReason {
             Self::RouterParse(reason) => {
                 return format!("{ROUTER_PARSE_PARK_REASON_PREFIX} {reason}");
             }
+            Self::RouterError(reason) => {
+                return format!("{ROUTER_ERROR_PARK_REASON_PREFIX} {reason}");
+            }
             Self::UnmappedTargetRepo => "unmapped_target_repo",
             Self::TargetCheckoutUnconfigured => "target_checkout_unconfigured",
             Self::UnmappedRepo => "unmapped_repo",
@@ -820,6 +838,7 @@ impl HumanHoldReason {
             .iter()
             .any(|candidate| candidate == reason)
             || reason.starts_with(ROUTER_PARSE_PARK_REASON_PREFIX)
+            || reason.starts_with(ROUTER_ERROR_PARK_REASON_PREFIX)
     }
 
     /// This park can now auto-recover because operators confirmed the
